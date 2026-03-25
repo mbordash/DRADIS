@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# =============================================================================
+# stop-all.sh TEMPLATE
+# Stops and removes all 3 rustpolybot containers
+# 
+# SETUP:
+# 1. Copy this file and update HOST, USER, and KEY variables
+# 2. Run: chmod +x stop-all.sh.example && ./stop-all.sh.example
+# =============================================================================
+
+# ⚙️  CUSTOMIZE THESE VALUES FOR YOUR SERVER
+HOST="<YOUR_SERVER_IP>"              # e.g., "192.168.1.100" or "example.com"
+USER="<YOUR_USERNAME>"               # e.g., "ubuntu", "root", "ec2-user"
+KEY="<PATH_TO_SSH_KEY>"              # e.g., "~/.ssh/id_rsa"
+SSH_PORT="22"                        # SSH port (usually 22)
+
+echo "🛑 Stopping all rustpolybot containers on $HOST..."
+ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" '
+    docker stop rustpolybot-btc rustpolybot-eth rustpolybot-sol 2>/dev/null || true
+    docker rm rustpolybot-btc rustpolybot-eth rustpolybot-sol 2>/dev/null || true
+    echo "✅ All containers stopped."
+'

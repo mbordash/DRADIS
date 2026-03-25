@@ -1,0 +1,36 @@
+#!/usr/bin/env bash
+# =============================================================================
+# status.sh TEMPLATE
+# Displays status of all 3 rustpolybot containers with uptime and recent logs
+# 
+# SETUP:
+# 1. Copy this file and update HOST, USER, and KEY variables
+# 2. Run: chmod +x status.sh.example && ./status.sh.example
+# =============================================================================
+
+# ⚙️  CUSTOMIZE THESE VALUES FOR YOUR SERVER
+HOST="<YOUR_SERVER_IP>"              # e.g., "192.168.1.100" or "example.com"
+USER="<YOUR_USERNAME>"               # e.g., "ubuntu", "root", "ec2-user"
+KEY="<PATH_TO_SSH_KEY>"              # e.g., "~/.ssh/id_rsa"
+SSH_PORT="22"                        # SSH port (usually 22)
+
+echo "📊 RUSTPOLYBOT STATUS (BTC | ETH | SOL)"
+echo "───────────────────────────────────────────────────────────────"
+
+ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" '
+    for c in btc eth sol; do
+        cont="rustpolybot-$c"
+        if docker ps --format "{{.Names}}" | grep -q "^$cont$"; then
+            uptime=$(docker ps --format "{{.RunningFor}}" --filter "name=$cont" | cut -d" " -f1-3)
+            market=$(docker logs "$cont" --tail 150 2>/dev/null | grep "→ " | grep -E "Up or Down" | tail -1 | sed "s/.*→ //" | tr -d "\r")
+            echo "✅ $c → running | uptime: $uptime"
+            echo "   Market: ${market:-(none selected yet)}"
+            echo "   Last 3 logs:"
+            docker logs "$cont" --tail 3 2>/dev/null | sed "s/^/     /"
+            echo ""
+        else
+            echo "❌ $c → container not running"
+            echo ""
+        fi
+    done
+'

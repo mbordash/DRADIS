@@ -1,0 +1,40 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Environment / Secrets (CRITICAL - Never commit!)
+.env
+.env.local
+.env.*
+!.env.example
+
+# Example scripts (don't commit, use .example versions for public repo)
+deploy-multi.sh
+logs-all.sh
+status.sh
+stop-all.sh
+!deploy-multi.sh.example
+!logs-all.sh.example
+!status.sh.example
+!stop-all.sh.example
+
+# Private notes
+.README
+
+# Docker
+Dockerfile.*
+.dockerignore
+**/.docker
+
+# Logs & temp
+*.log
+logs/
+*.tmp
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*.swo
