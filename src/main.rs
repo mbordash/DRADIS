@@ -169,6 +169,7 @@ async fn fetch_simplified_crypto_candidates(
     let mut skipped_time_window = 0usize;
     let mut skipped_filter = 0usize;
     let mut skipped_not_updown = 0usize;
+    let mut skipped_long_window = 0usize;
 
     let mut candidates_debug: Vec<(String, f64, i64)> = vec![];
 
@@ -207,13 +208,13 @@ async fn fetch_simplified_crypto_candidates(
             if config::is_bad_market(&name) { skipped_bad += 1; continue; }
             if !get_enable_orderbook(market) { skipped_no_orderbook += 1; continue; }
 
-            if lower.contains("15 minutes") || lower.contains("15 minute") {
-                skipped_ultra_short += 1;
+            if !lower.contains("up or down") {
+                skipped_not_updown += 1;
                 continue;
             }
 
-            if !lower.contains("up or down") {
-                skipped_not_updown += 1;
+            if !is_short_term_window(&name) {
+                skipped_long_window += 1;
                 continue;
             }
 
@@ -223,8 +224,12 @@ async fn fetch_simplified_crypto_candidates(
             let close_time = extract_close_time(&serde_json::Value::Null, market);
             let seconds_left = close_time.map_or(0i64, |ct| (ct - now).num_seconds());
 
-            if seconds_left < 10 || seconds_left > 7200 {
-                skipped_time_window += 1;
+            if seconds_left < 1800 {
+                skipped_ultra_short += 1;
+                continue;
+            }
+            if seconds_left > 7200 {
+                skipped_long_window += 1;
                 continue;
             }
 
@@ -256,18 +261,39 @@ async fn fetch_simplified_crypto_candidates(
     info!("🧨 Simplified crypto scan summary:");
     info!("   Seen: {} | Not crypto: {} | Bad: {} | Ultra-short: {} | No orderbook: {}",
           seen, skipped_not_crypto, skipped_bad, skipped_ultra_short, skipped_no_orderbook);
-    info!("   Not 'up or down': {} | No tokens: {} | Bad time window: {} | Filter mismatch: {}",
-          skipped_not_updown, skipped_no_tokens, skipped_time_window, skipped_filter);
+    info!("   Not 'up or down': {} | Long-window (>2h): {} | No tokens: {} | Bad time window: {} | Filter mismatch: {}",
+          skipped_not_updown, skipped_long_window, skipped_no_tokens, skipped_time_window, skipped_filter);
     info!("   ✅ Found {} valid candidates", out.len());
 
     candidates_debug.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
-    info!("📋 Top 5 hourly/5m Up-or-Down markets considered:");
+    info!("📋 Top 5 short-term Up-or-Down markets considered:");
     for (i, (name, vol, secs)) in candidates_debug.iter().take(5).enumerate() {
         let minutes = *secs as f64 / 60.0;
         info!("   #{} | ${:.0} vol | {:.1} min left → {}", i+1, vol, minutes, name);
     }
 
     out
+}
+
+fn is_short_term_window(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    if lower.contains("et") && (lower.contains("am") || lower.contains("pm")) {
+        if lower.contains("12:00pm") || lower.contains("am-12:") || lower.contains("pm-12:") {
+            return false;
+        }
+        let parts: Vec<&str> = lower.split(&['-', ':'][..]).collect();
+        if parts.len() >= 3 {
+            let start_str = parts[parts.len() - 3].trim();
+            let end_str = parts[parts.len() - 2].trim();
+            if start_str.contains("am") || start_str.contains("pm") {
+                return true;
+            }
+        }
+        if lower.contains(":") && (lower.contains("am") || lower.contains("pm")) {
+            return true;
+        }
+    }
+    lower.contains("hour") || lower.contains("et")
 }
 
 #[tokio::main]
@@ -390,133 +416,205 @@ async fn main() -> Result<()> {
                     let combined_ask = yes_ask + no_ask;
                     let profit_margin = dec!(1.0) - combined_ask;
 
+                    // === ARBITRAGE ENTRY ===
                     if profit_margin >= config::ARBITRAGE_PROFIT_THRESHOLD {
-                        info!("💰 Arbitrage opportunity found! Margin: {:.4}¢ (YES ${:.4} + NO ${:.4})",
+                        // === SAFETY GUARDS ===
+                        if let Some(close_time) = _market_close_time {
+                            let secs_left = (close_time - Utc::now()).num_seconds();
+                            if secs_left < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY {
+                                info!("⏳ Too close to expiry ({}s left) — skipping new entry", secs_left);
+                                continue;
+                            }
+                        }
+
+                        let already_holding = {
+                            let pos = positions.lock().await;
+                            pos.get(&yes_token).map_or(dec!(0), |p| p.shares) > dec!(0) ||
+                            pos.get(&no_token).map_or(dec!(0), |p| p.shares) > dec!(0)
+                        };
+                        if already_holding {
+                            info!("⛔ Already holding position on this market — skipping new entry");
+                            continue;
+                        }
+                        // === end safety ===
+
+                        info!("💰 Arbitrage opportunity! Margin: {:.4}¢ (YES ${:.4} + NO ${:.4})",
                               profit_margin * dec!(100), yes_ask, no_ask);
 
-                        let risk_engine = RiskEngine::new();
-                        let exposure = {
+                        // === PERFECT-HEDGE SIZING ===
+                        let total_ask = yes_ask + no_ask;
+                        let target_shares = (trade_size_usdc / total_ask * dec!(100)).floor() / dec!(100);
+
+                        let current_exposure = {
                             let pos = positions.lock().await;
                             pos.values().map(|p| p.shares * p.avg_entry).sum::<Decimal>()
                         };
 
-                        if !risk_engine.approve_buy(yes_ask, exposure, *total_pnl.lock().await, trade_size_usdc, *starting_collateral.lock().await) ||
-                           !risk_engine.approve_buy(no_ask, exposure, *total_pnl.lock().await, trade_size_usdc, *starting_collateral.lock().await) {
-                            warn!("Risk engine rejected arbitrage trade.");
+                        let session_pnl = *total_pnl.lock().await;
+
+                        let risk_engine = RiskEngine::new();
+                        if !risk_engine.approve_buy(
+                            yes_ask,
+                            no_ask,
+                            current_exposure,
+                            trade_size_usdc,
+                            *starting_collateral.lock().await,
+                            session_pnl
+                        ) {
                             continue;
                         }
 
-                        let yes_shares = (trade_size_usdc / yes_ask).round_dp(4);
-                        let no_shares = (trade_size_usdc / no_ask).round_dp(4);
+                        let yes_price = yes_ask.round_dp(2);
+                        let no_price  = no_ask.round_dp(2);
 
-                        info!("📤 Placing buys — YES: {:.4} shares @ ${:.4} | NO: {:.4} shares @ ${:.4}",
-                              yes_shares, yes_ask, no_shares, no_ask);
+                        info!("📤 Placing PERFECT-HEDGE buys — {:.4} shares each @ ${:.4} (YES) + ${:.4} (NO)",
+                              target_shares, yes_price, no_price);
 
+                        // Buy YES leg
                         let yes_filled = {
-                            let client = Arc::clone(&trading_client);
-                            let signer_clone = signer.clone();
-                            let order = client.market_order()
+                            let amount = Amount::shares(target_shares).unwrap();
+                            let order = trading_client
+                                .market_order()
                                 .token_id(yes_token)
-                                .amount(Amount::shares(yes_shares).unwrap())
+                                .amount(amount)
                                 .side(Side::Buy)
-                                .price(yes_ask)
-                                .order_type(OrderType::FAK)
-                                .build().await.unwrap();
-
-                            let signed = client.sign(&signer_clone, order).await.unwrap();
-                            match client.post_order(signed).await {
-                                Ok(r) if r.success => { info!("✅ YES leg filled"); yes_shares }
-                                Ok(r) => { error!("❌ YES rejected: {:?}", r); dec!(0) }
-                                Err(e) => { error!("❌ YES post error: {}", e); dec!(0) }
+                                .price(yes_price)
+                                .order_type(OrderType::GTC)
+                                .build()
+                                .await
+                                .unwrap();
+                            let signed = trading_client.sign(&signer, order).await.unwrap();
+                            match trading_client.post_order(signed).await {
+                                Ok(r) if r.success => target_shares,
+                                _ => dec!(0),
                             }
                         };
 
+                        // Buy NO leg
                         let no_filled = {
-                            let client = Arc::clone(&trading_client);
-                            let signer_clone = signer.clone();
-                            let order = client.market_order()
+                            let amount = Amount::shares(target_shares).unwrap();
+                            let order = trading_client
+                                .market_order()
                                 .token_id(no_token)
-                                .amount(Amount::shares(no_shares).unwrap())
+                                .amount(amount)
                                 .side(Side::Buy)
-                                .price(no_ask)
-                                .order_type(OrderType::FAK)
-                                .build().await.unwrap();
-
-                            let signed = client.sign(&signer_clone, order).await.unwrap();
-                            match client.post_order(signed).await {
-                                Ok(r) if r.success => { info!("✅ NO leg filled"); no_shares }
-                                Ok(r) => { error!("❌ NO rejected: {:?}", r); dec!(0) }
-                                Err(e) => { error!("❌ NO post error: {}", e); dec!(0) }
+                                .price(no_price)
+                                .order_type(OrderType::GTC)
+                                .build()
+                                .await
+                                .unwrap();
+                            let signed = trading_client.sign(&signer, order).await.unwrap();
+                            match trading_client.post_order(signed).await {
+                                Ok(r) if r.success => target_shares,
+                                _ => dec!(0),
                             }
                         };
 
                         if yes_filled > dec!(0) && no_filled > dec!(0) {
-                            let expected_profit = (yes_filled.min(no_filled)) * profit_margin;
+                            let locked_profit = target_shares * profit_margin;
 
                             {
                                 let mut pos_map = positions.lock().await;
                                 let now = Utc::now();
-                                pos_map.entry(yes_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: yes_ask, opened_at: now, close_time: None }).shares += yes_filled;
-                                pos_map.entry(no_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: no_ask, opened_at: now, close_time: None }).shares += no_filled;
+                                pos_map.entry(yes_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: yes_price, opened_at: now, close_time: None }).shares += yes_filled;
+                                pos_map.entry(no_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: no_price,  opened_at: now, close_time: None }).shares += no_filled;
                             }
                             {
                                 let mut pnl = total_pnl.lock().await;
-                                *pnl += expected_profit;
+                                *pnl += locked_profit;
                             }
 
-                            info!("📈 BOTH LEGS FILLED — Locked profit ${:.4}", expected_profit);
-
-                            let pnl_clone = Arc::clone(&total_pnl);
-                            let market_name_clone = market_name.clone();
-                            let tg_token_clone = tg_token.clone();
-                            let tg_chat_id_clone = tg_chat_id.clone();
-                            tokio::spawn(async move {
-                                let pnl_val = *pnl_clone.lock().await;
-                                let msg = format!("💸 *ARBITRAGE EXECUTED* 💸\n*Market:* `{}`\n*Margin:* `{:.2}¢`\n*Profit:* `${:.4}`\n*Session:* `${:.4}`",
-                                                  market_name_clone, profit_margin * dec!(100), expected_profit, pnl_val);
-                                let _ = rustpolybot::notifications::send_notification(&tg_token_clone, &tg_chat_id_clone, &msg).await;
-                            });
-
+                            info!("📈 PERFECT-HEDGE BOTH LEGS FILLED — Locked profit ${:.4}", locked_profit);
                             trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
-
                         } else {
-                            warn!("⚠️ Partial/fail fill detected — auto-flattening any filled leg");
-
+                            warn!("⚠️ Partial fill detected — auto-flattening filled legs");
                             if yes_filled > dec!(0) {
-                                info!("🔄 Auto-flattening YES leg (market sell)");
-                                let client = Arc::clone(&trading_client);
-                                let signer_clone = signer.clone();
-                                let order = client.market_order()
+                                let amount = Amount::shares(yes_filled).unwrap();
+                                let order = trading_client
+                                    .market_order()
                                     .token_id(yes_token)
-                                    .amount(Amount::shares(yes_filled).unwrap())
+                                    .amount(amount)
                                     .side(Side::Sell)
-                                    .price(dec!(0))
+                                    .price(dec!(0.01))
                                     .order_type(OrderType::FAK)
-                                    .build().await.unwrap();
-                                let signed = client.sign(&signer_clone, order).await.unwrap();
-                                let _ = client.post_order(signed).await;
+                                    .build()
+                                    .await
+                                    .unwrap();
+                                let signed = trading_client.sign(&signer, order).await.unwrap();
+                                let _ = trading_client.post_order(signed).await;
                             }
-
                             if no_filled > dec!(0) {
-                                info!("🔄 Auto-flattening NO leg (market sell)");
-                                let client = Arc::clone(&trading_client);
-                                let signer_clone = signer.clone();
-                                let order = client.market_order()
+                                let amount = Amount::shares(no_filled).unwrap();
+                                let order = trading_client
+                                    .market_order()
                                     .token_id(no_token)
-                                    .amount(Amount::shares(no_filled).unwrap())
+                                    .amount(amount)
                                     .side(Side::Sell)
-                                    .price(dec!(0))
+                                    .price(dec!(0.01))
                                     .order_type(OrderType::FAK)
-                                    .build().await.unwrap();
-                                let signed = client.sign(&signer_clone, order).await.unwrap();
-                                let _ = client.post_order(signed).await;
+                                    .build()
+                                    .await
+                                    .unwrap();
+                                let signed = trading_client.sign(&signer, order).await.unwrap();
+                                let _ = trading_client.post_order(signed).await;
                             }
-
                             trade_cooldown = Utc::now() + chrono::Duration::seconds(5);
                         }
                     }
-                }
 
+                    // === PAIR CLOSURE CHECK (runs every tick) ===
+                    {
+                        let pos_map = positions.lock().await;
+                        let yes_pos = pos_map.get(&yes_token);
+                        let no_pos  = pos_map.get(&no_token);
+
+                        if let (Some(yes_pos), Some(no_pos)) = (yes_pos, no_pos) {
+                            if yes_pos.shares > dec!(0) && no_pos.shares > dec!(0) {
+                                let combined_ask = yes_ask + no_ask;
+                                if combined_ask >= dec!(0.99) {
+                                    info!("💰 Pair normalized (sum ${:.4}) — closing both legs", combined_ask);
+
+                                    // Sell YES
+                                    let amount_yes = Amount::shares(yes_pos.shares).unwrap();
+                                    let order_yes = trading_client
+                                        .market_order()
+                                        .token_id(yes_token)
+                                        .amount(amount_yes)
+                                        .side(Side::Sell)
+                                        .price(dec!(0.01))          // ← CHANGED
+                                        .order_type(OrderType::FAK)
+                                        .build()
+                                        .await
+                                        .unwrap();
+                                    let signed_yes = trading_client.sign(&signer, order_yes).await.unwrap();
+                                    let _ = trading_client.post_order(signed_yes).await;
+
+                                    // Sell NO
+                                    let amount_no = Amount::shares(no_pos.shares).unwrap();
+                                    let order_no = trading_client
+                                        .market_order()
+                                        .token_id(no_token)
+                                        .amount(amount_no)
+                                        .side(Side::Sell)
+                                        .price(dec!(0.01))
+                                        .order_type(OrderType::FAK)
+                                        .build()
+                                        .await
+                                        .unwrap();
+                                    let signed_no = trading_client.sign(&signer, order_no).await.unwrap();
+                                    let _ = trading_client.post_order(signed_no).await;
+
+                                    // Clear internal state
+                                    let mut pos_map = positions.lock().await;
+                                    if let Some(p) = pos_map.get_mut(&yes_token) { p.shares = dec!(0); }
+                                    if let Some(p) = pos_map.get_mut(&no_token) { p.shares = dec!(0); }
+
+                                    trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
+                                }
+                            }
+                        }
+                    }
+                }
                 _ = market_rx.changed() => {
                     let new_market = market_rx.borrow().clone();
                     if new_market.0 != yes_token {

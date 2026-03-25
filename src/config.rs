@@ -17,11 +17,9 @@ pub const ENABLE_TELEGRAM: bool = true;
 /// The bot will attempt to buy a pair of YES and NO shares if their combined ask price
 /// is less than (1.0 - ARBITRAGE_PROFIT_THRESHOLD).
 /// A value of 0.01 means the bot looks for a 1-cent profit margin per pair.
-pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.015);
+pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.012);
 
-/// The maximum price for an individual share (YES or NO) that the bot is willing to buy.
-/// This prevents buying into a market that is already heavily skewed (e.g., 95¢).
-pub const MAX_SHARE_PRICE_FOR_ENTRY: Decimal = dec!(0.85);
+pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.988);
 
 
 // ============================================================================
@@ -37,7 +35,7 @@ pub const SHARE_SCALE: Decimal = dec!(1_000_000);
 // ============================================================================
 
 /// Cooldown period after a successful trade before entering a new one.
-pub const TRADE_COOLDOWN_SECS: i64 = 10;
+pub const TRADE_COOLDOWN_SECS: i64 = 8;
 
 /// Minimum time until market expiry to still allow new position entry (seconds)
 pub const MIN_SECONDS_TO_EXPIRY_FOR_ENTRY: i64 = 900;
@@ -98,7 +96,7 @@ pub fn tcp_keepalive() -> StdDuration {
 pub const MIN_MARKET_VOLUME: f64 = 500.0;
 
 /// Maximum exposure allowed per individual token (in USDC)
-pub const MAX_EXPOSURE_PER_TOKEN_USDC: Decimal = dec!(50);
+pub const MAX_EXPOSURE_PER_TOKEN_USDC: Decimal = dec!(25);
 
 /// Session drawdown limit: 1% of collateral with $5 minimum
 pub fn max_session_drawdown(collateral: Decimal) -> Decimal {
