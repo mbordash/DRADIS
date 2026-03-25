@@ -1,0 +1,87 @@
+#!/usr/bin/env bash
+# =============================================================================
+# RustPolyBot deploy-multi.sh TEMPLATE
+# Deploys 3 independent containers: BTC, ETH, SOL
+# 
+# SETUP:
+# 1. Copy this file and customize the HOST, USER, and KEY variables
+# 2. Make sure you have SSH access to your remote server
+# 3. Ensure Docker is installed on the remote server
+# 4. Run: chmod +x deploy-multi.sh.example && ./deploy-multi.sh.example
+# =============================================================================
+
+set -euo pipefail
+
+# ⚙️  CUSTOMIZE THESE VALUES FOR YOUR SERVER
+HOST="<YOUR_SERVER_IP>"              # e.g., "192.168.1.100" or "example.com"
+USER="<YOUR_USERNAME>"               # e.g., "ubuntu", "root", "ec2-user"
+KEY="<PATH_TO_SSH_KEY>"              # e.g., "~/.ssh/id_rsa" or "~/.ssh/server_key.pem"
+REMOTE_DIR="~/rustpolybot"           # Remote directory where code will be deployed
+
+# Optional: SSH port (usually 22, customize if non-standard)
+SSH_PORT="22"
+
+echo "🚀 Deploying 3 independent RustPolyBot containers to $HOST..."
+
+# 1. Create remote directory
+echo "📁 Creating remote directory structure..."
+ssh -i "$KEY" "$USER@$HOST" "mkdir -p $REMOTE_DIR/src"
+
+# 2. Copy code once
+echo "📤 Copying updated code to remote..."
+scp -P "$SSH_PORT" -i "$KEY" src/main.rs "$USER@$HOST:$REMOTE_DIR/src/main.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/config.rs "$USER@$HOST:$REMOTE_DIR/src/config.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/lib.rs "$USER@$HOST:$REMOTE_DIR/src/lib.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/risk.rs "$USER@$HOST:$REMOTE_DIR/src/risk.rs"
+scp -i "$KEY" src/notifications.rs "$USER@$HOST:$REMOTE_DIR/src/notifications.rs"
+scp -P "$SSH_PORT" -i "$KEY" .env "$USER@$HOST:$REMOTE_DIR/.env"
+scp -P "$SSH_PORT" -i "$KEY" Cargo.toml "$USER@$HOST:$REMOTE_DIR/Cargo.toml"
+scp -P "$SSH_PORT" -i "$KEY" Cargo.lock "$USER@$HOST:$REMOTE_DIR/Cargo.lock"
+scp -P "$SSH_PORT" -i "$KEY" Dockerfile "$USER@$HOST:$REMOTE_DIR/Dockerfile"
+
+
+# 3. Build + deploy all 3 containers in one SSH session
+ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" << 'REMOTE'
+    set -euo pipefail
+    cd "$1"
+
+    echo "🧹 Cleaning up old containers and images..."
+    docker stop rustpolybot-btc rustpolybot-eth rustpolybot-sol 2>/dev/null || true
+    docker rm rustpolybot-btc rustpolybot-eth rustpolybot-sol 2>/dev/null || true
+    docker system prune -af --volumes 2>/dev/null || true
+
+    echo "🔨 Building Docker image once..."
+    docker build -t rustpolybot .
+
+    echo "🚀 Starting BTC rustpolybot..."
+    docker run -d \
+        --restart unless-stopped \
+        --name rustpolybot-btc \
+        --env-file .env \
+        -e CRYPTO_FILTER=btc \
+        rustpolybot
+
+    echo "🚀 Starting ETH rustpolybot..."
+    docker run -d \
+        --restart unless-stopped \
+        --name rustpolybot-eth \
+        --env-file .env \
+        -e CRYPTO_FILTER=eth \
+        rustpolybot
+
+    echo "🚀 Starting SOL rustpolybot..."
+    docker run -d \
+        --restart unless-stopped \
+        --name rustpolybot-sol \
+        --env-file .env \
+        -e CRYPTO_FILTER=sol \
+        rustpolybot
+
+    echo "✅ All 3 containers deployed!"
+    echo "📜 Status:"
+    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep rustpolybot
+REMOTE
+
+echo "✅ Deployment complete on server!"
+echo "📡 Tailing combined logs (Ctrl+C to stop):"
+ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" "docker logs -f rustpolybot-btc rustpolybot-eth rustpolybot-sol --tail 30"

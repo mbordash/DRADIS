@@ -1,0 +1,34 @@
+#!/usr/bin/env bash
+# =============================================================================
+# logs-all.sh TEMPLATE
+# Streams live logs from all 3 rustpolybot containers with color-coded prefixes
+# 
+# SETUP:
+# 1. Copy this file and update HOST, USER, and KEY variables
+# 2. Run: chmod +x logs-all.sh.example && ./logs-all.sh.example
+# 3. Press Ctrl+C to stop streaming logs
+# =============================================================================
+
+# ⚙️  CUSTOMIZE THESE VALUES FOR YOUR SERVER
+HOST="<YOUR_SERVER_IP>"              # e.g., "192.168.1.100" or "example.com"
+USER="<YOUR_USERNAME>"               # e.g., "ubuntu", "root", "ec2-user"
+KEY="<PATH_TO_SSH_KEY>"              # e.g., "~/.ssh/id_rsa"
+SSH_PORT="22"                        # SSH port (usually 22)
+
+echo "📡 Live logs from BTC + ETH + SOL rustpolybots(Ctrl+C to stop)"
+echo "───────────────────────────────────────────────────────────────"
+
+ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" '
+    trap "kill 0" EXIT   # Cleanly kill all tails on Ctrl+C
+
+    echo "=== BTC ==="
+    docker logs -f rustpolybot-btc | sed "s/^/[BTC] /" &
+
+    echo "=== ETH ==="
+    docker logs -f rustpolybot-eth | sed "s/^/[ETH] /" &
+
+    echo "=== SOL ==="
+    docker logs -f rustpolybot-sol | sed "s/^/[SOL] /" &
+
+    wait
+'
