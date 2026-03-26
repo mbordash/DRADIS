@@ -47,13 +47,14 @@ By using this software, you agree that:
 
 ## Features
 
+- **Response-Based Accounting**: Uses the exchange's direct API response (`taking_amount`) for 100% accurate fill detection. No more "ghost" positions.
+- **Automatic Position Cleanup**: Periodically scans and removes expired markets from memory, preventing exposure bloat and ensuring accurate risk limits.
 - **Perfect-Hedge Sizing**: Calculates the exact number of shares to buy on both sides to ensure a risk-neutral position. Payoff is guaranteed regardless of market outcome.
-- **Ultra-Parallel Execution**: Uses Rust's `tokio::join!` to prepare, sign, and post YES and NO orders simultaneously, minimizing "legging risk" where the price moves between trades.
-- **Dual WebSocket Feeds**: Maintains two persistent, low-latency WebSocket connections for real-time order book data, now with a 60-second "Heartbeat" log for market monitoring.
+- **Ultra-Parallel Execution**: Uses Rust's `tokio::join!` to prepare, sign, and post YES and NO orders simultaneously, minimizing "legging risk".
+- **Dual WebSocket Feeds**: Maintains two persistent, low-latency WebSocket connections for real-time order book data, now with a 60-second "Heartbeat" log.
 - **Smart Exit Logic**: Automatically "works" the bid price for emergency flattening and early profit taking, avoiding expensive market-sell "dumps".
-- **Strict Liquidity & Expiry Filters**: Automatically filters for high-volume markets (>$5,000) and avoids the final 15 minutes of trading to prevent being trapped in illiquid expiry spreads.
+- **Strict Liquidity & Expiry Filters**: Automatically filters for high-volume markets (>$5,000) and avoids the final 15 minutes of trading.
 - **Exchange Minimum Enforcement**: Automatically enforces the exchange's minimum order size (5 shares) to prevent API rejections.
-- **Centralized Configuration**: All trading parameters are tunable in `config.rs`, including the `ARBITRAGE_PROFIT_THRESHOLD` and `MAX_SUM_PRICE_FOR_ENTRY`.
 
 ### Telegram Notifications (Optional)
 To receive real-time alerts on your phone:
@@ -68,9 +69,10 @@ To receive real-time alerts on your phone:
 │      RustPolyBot - Arbitrage Scalper        │
 ├─────────────────────────────────────────────┤
 │  Core Logic (main.rs)                       │
+│  • Response-Based Fill Detection            │
+│  • Automatic Position Cleanup Task          │
 │  • Ultra-Parallel Order Execution           │
-│  • Perfect-Hedge Position Sizing            │
-│  • WebSocket Price Heartbeats               │
+│  • Perfect-Hedge Sizing & Heartbeats        │
 ├─────────────────────────────────────────────┤
 │  Risk Engine (risk.rs)                      │
 │  • Pre-trade sum-based validation           │
@@ -131,7 +133,7 @@ To receive real-time alerts on your phone:
 
 ## Configuration (`src/config.rs`)
 
-- `ARBITRAGE_PROFIT_THRESHOLD`: Min margin to trigger entry (default: 0.025 or 2.5%).
+- `ARBITRAGE_PROFIT_THRESHOLD`: Min margin to trigger entry (default: 0.035 or 3.5%).
 - `MAX_SUM_PRICE_FOR_ENTRY`: Max combined price allowed (default: 0.975).
 - `MIN_ORDER_SHARES`: Minimum shares per order (default: 5.0).
 - `MIN_MARKET_VOLUME`: Minimum 24hr volume (default: $5,000).
@@ -155,10 +157,11 @@ RUST_LOG=info,rustpolybot=info
 1. **Scan**: Finds liquid (>$5k vol) hourly markets.
 2. **Monitor**: Subscribes to order books via WebSockets.
 3. **Heartbeat**: Every 60s, logs the current arbitrage sum.
-4. **Detect**: If `Ask(YES) + Ask(NO) < 0.975`, an opportunity exists.
-5. **Execute**: Sells both legs **simultaneously** using Ultra-Parallel tasks with a $0.01 price offset for aggressive fills.
-6. **Sizing**: Uses "Perfect-Hedge" to ensure equal share counts on both sides.
-7. **Hold**: Holds until expiry ($1.00 payoff) or early exit if `Bid(YES) + Bid(NO) > 0.995`.
+4. **Detect**: If `Ask(YES) + Ask(NO) < 0.965` (1.0 - 0.035 threshold), an opportunity exists.
+5. **Execute**: Sells both legs **simultaneously** using Ultra-Parallel tasks.
+6. **Accounting**: Uses the `taking_amount` from the exchange for perfect position tracking.
+7. **Cleanup**: Periodically removes expired markets from internal tracking.
+8. **Hold**: Holds until expiry ($1.00 payoff) or early exit if `Bid(YES) + Bid(NO) > 0.995`.
 
 ---
 
