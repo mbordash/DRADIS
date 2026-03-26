@@ -22,6 +22,22 @@ pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.975);
 /// Minimum number of shares for a single order ( exchange requirement )
 pub const MIN_ORDER_SHARES: Decimal = dec!(5.0);
 
+/// Minimum USDC value for a single order ( exchange requirement )
+pub const MIN_ORDER_USDC: Decimal = dec!(1.05);
+
+/// Price offset added to the ask price when placing buy orders to ensure aggressive fills.
+pub const BUY_PRICE_OFFSET: Decimal = dec!(0.01);
+/// Maximum price for a single share when placing a buy order.
+pub const MAX_BUY_LIMIT_PRICE: Decimal = dec!(0.99);
+
+/// Price offset subtracted from the bid price when placing sell orders to ensure aggressive fills.
+pub const SELL_PRICE_OFFSET: Decimal = dec!(0.01);
+/// Minimum price for a single share when placing a sell order.
+pub const MIN_SELL_LIMIT_PRICE: Decimal = dec!(0.01);
+
+/// Combined bid threshold (YES_bid + NO_bid) to trigger an early exit from a hedged position.
+pub const EARLY_EXIT_COMBINED_BID_THRESHOLD: Decimal = dec!(0.995);
+
 
 // ============================================================================
 // TRADING PARAMETERS - Price Thresholds and Position Sizing
@@ -38,8 +54,14 @@ pub const SHARE_SCALE: Decimal = dec!(1_000_000);
 /// Cooldown period after a successful trade before entering a new one.
 pub const TRADE_COOLDOWN_SECS: i64 = 8;
 
+/// Cooldown period after a partial fill before attempting a new trade.
+pub const PARTIAL_FILL_COOLDOWN_SECS: i64 = 5;
+
 /// Minimum time until market expiry to still allow new position entry (seconds)
 pub const MIN_SECONDS_TO_EXPIRY_FOR_ENTRY: i64 = 900;
+
+/// Maximum time until market expiry to consider a market (seconds, 2 hours)
+pub const MAX_SECONDS_TO_EXPIRY_FOR_ENTRY: i64 = 7200;
 
 /// Final expiry window: stops all trading this close to market close (seconds, 10 minutes)
 pub const FINAL_EXPIRY_WINDOW_SECS: i64 = 600;
@@ -116,6 +138,9 @@ pub const CLOB_API_BASE: &str = "https://clob.polymarket.com";
 // ============================================================================
 // MARKET FILTERING CRITERIA
 // ============================================================================
+
+/// Number of pages to scan for markets in the Gamma API.
+pub const GAMMA_API_MARKET_SCAN_PAGES: usize = 50;
 
 /// Blocked market name keywords (politics, long-term events, etc.)
 pub fn is_bad_market(name: &str) -> bool {

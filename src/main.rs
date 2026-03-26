@@ -37,14 +37,15 @@ use alloy::signers::Signer;
 
 type PriceState = (Decimal, Decimal);
 
-#[derive(Debug, Clone)] // Changed from Copy to Clone
+#[derive(Debug, Clone)]
 struct Position {
     shares: Decimal,
     avg_entry: Decimal,
+    #[allow(dead_code)]
     opened_at: DateTime<Utc>,
-    close_time: Option<DateTime<Utc>>, // Market close time
-    market_name: String, // Name of the market
-    pair_token_id: U256, // The token ID of the other side of the hedge
+    close_time: Option<DateTime<Utc>>,
+    market_name: String,
+    pair_token_id: U256,
 }
 
 fn value_to_u256(v: &serde_json::Value) -> Option<U256> {
@@ -172,7 +173,7 @@ async fn fetch_simplified_crypto_candidates(
 
     let mut candidates_debug: Vec<(String, f64, i64)> = vec![];
 
-    for page in 0..50 {
+    for page in 0..config::GAMMA_API_MARKET_SCAN_PAGES {
         let offset = page * 100;
         let url = format!(
             "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&offset={}&order=volume24hrClob&ascending=false&include=event",
@@ -181,7 +182,7 @@ async fn fetch_simplified_crypto_candidates(
 
         let resp = match http.get(&url).send().await {
             Ok(r) => r,
-            Err(e) => { error!("❌ Markets page {} failed: {}", page, e); continue; }
+            Err(e) => { warn!("⚠️ Markets page {} failed: {}", page, e); continue; }
         };
         if !resp.status().is_success() { break; }
 
@@ -236,7 +237,7 @@ async fn fetch_simplified_crypto_candidates(
                 skipped_ultra_short += 1;
                 continue;
             }
-            if seconds_left > 7200 {
+            if seconds_left > config::MAX_SECONDS_TO_EXPIRY_FOR_ENTRY {
                 skipped_long_window += 1;
                 continue;
             }
@@ -265,7 +266,7 @@ async fn fetch_simplified_crypto_candidates(
     info!("🧨 Simplified crypto scan summary:");
     info!("   Seen: {} | Not crypto: {} | Bad: {} | Ultra-short: {} | No orderbook: {}",
           seen, skipped_not_crypto, skipped_bad, skipped_ultra_short, skipped_no_orderbook);
-    info!("   Not 'up or down': {} | Long-window (>2h): {} | No tokens: {} | Low Volume: {} | Filter mismatch: {}",
+    info!("   Not 'up or down': {} | Long-window: {} | No tokens: {} | Low Volume: {} | Filter mismatch: {}",
           skipped_not_updown, skipped_long_window, skipped_no_tokens, skipped_low_volume, skipped_filter);
     info!("   ✅ Found {} valid candidates", out.len());
 
@@ -302,7 +303,7 @@ fn is_short_term_window(name: &str) -> bool {
 
 async fn cleanup_expired_positions(
     positions: Arc<Mutex<HashMap<U256, Position>>>,
-    market_name: String,
+    _market_name: String,
     yes_token: U256,
     no_token: U256,
     market_close_time: Option<DateTime<Utc>>,
@@ -346,7 +347,7 @@ async fn cleanup_expired_positions(
     }
 
     if removed_count > 0 {
-        info!("✅ Position cleanup complete. Removed {} expired position entries.", removed_count / 2); // Divide by 2 as each market has 2 tokens
+        info!("✅ Position cleanup complete. Removed {} expired position entries.", removed_count / 2);
     }
 }
 
@@ -465,7 +466,7 @@ async fn main() -> Result<()> {
                 _ = cleanup_ticker.tick() => {
                     cleanup_expired_positions(
                         Arc::clone(&positions),
-                        market_name.clone(), // Pass current market name for context
+                        market_name.clone(),
                         yes_token,
                         no_token,
                         _market_close_time,
@@ -490,9 +491,7 @@ async fn main() -> Result<()> {
                     let combined_ask = yes_ask + no_ask;
                     let profit_margin = dec!(1.0) - combined_ask;
 
-                    // === ARBITRAGE ENTRY ===
                     if profit_margin >= config::ARBITRAGE_PROFIT_THRESHOLD {
-                        // === SAFETY GUARDS ===
                         if let Some(close_time) = _market_close_time {
                             let secs_left = (close_time - Utc::now()).num_seconds();
                             if secs_left < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY {
@@ -515,11 +514,15 @@ async fn main() -> Result<()> {
                               profit_margin * dec!(100), yes_ask, no_ask);
 
                         let total_ask = yes_ask + no_ask;
-                        let target_shares = (trade_size_usdc / total_ask * dec!(100)).floor() / dec!(100);
+                        let target_shares = (trade_size_usdc / total_ask).round_dp(2);
 
-                        // === MINIMUM SIZE CHECK ===
                         if target_shares < config::MIN_ORDER_SHARES {
                             info!("⏸️ Calculated target shares ({:.2}) below minimum ({}). Increase TRADE_SIZE_USDC.", target_shares, config::MIN_ORDER_SHARES);
+                            continue;
+                        }
+
+                        if (target_shares * yes_ask < config::MIN_ORDER_USDC) || (target_shares * no_ask < config::MIN_ORDER_USDC) {
+                            info!("⏸️ Calculated order value below minimum (${}). Skipping.", config::MIN_ORDER_USDC);
                             continue;
                         }
 
@@ -542,13 +545,17 @@ async fn main() -> Result<()> {
                             continue;
                         }
 
-                        // Use a larger price offset (0.01) to ensure we cross the spread
-                        let yes_limit_price = (yes_ask + dec!(0.01)).min(dec!(0.99)).round_dp(2);
-                        let no_limit_price  = (no_ask + dec!(0.01)).min(dec!(0.99)).round_dp(2);
+                        let yes_limit_price = (yes_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
+                        let no_limit_price  = (no_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
 
                         info!("📤 Placing ULTRA-PARALLEL PERFECT-HEDGE buys — {:.4} shares each", target_shares);
 
-                        let amount = Amount::shares(target_shares).unwrap();
+                        let amount_res = Amount::shares(target_shares);
+                        if let Err(e) = amount_res {
+                            error!("❌ Failed to create Amount for target shares: {}", e);
+                            continue;
+                        }
+                        let amount = amount_res.unwrap();
 
                         let yes_task = {
                             let client = Arc::clone(&trading_client);
@@ -574,20 +581,19 @@ async fn main() -> Result<()> {
                             }
                         };
 
-                        // Execute PREP and POST in parallel for both legs
                         let (yes_res, no_res) = tokio::join!(yes_task, no_task);
 
                         let yes_filled = match yes_res {
                             Ok(r) if r.success => Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE,
                             Ok(r) => { error!("❌ YES Order Rejected: {:?}", r.error_msg); dec!(0) },
                             Err(e) => { error!("❌ YES Task Failed: {}", e); dec!(0) }
-                        };
+                        }.round_dp(2);
 
                         let no_filled = match no_res {
                             Ok(r) if r.success => Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE,
                             Ok(r) => { error!("❌ NO Order Rejected: {:?}", r.error_msg); dec!(0) },
                             Err(e) => { error!("❌ NO Task Failed: {}", e); dec!(0) }
-                        };
+                        }.round_dp(2);
 
                         if yes_filled > dec!(0) && no_filled > dec!(0) {
                             let hedged_shares = yes_filled.min(no_filled);
@@ -610,29 +616,31 @@ async fn main() -> Result<()> {
                         } else {
                             warn!("⚠️ Partial fill detected (YES: {}, NO: {}) — flattening at current bids", yes_filled, no_filled);
 
-                            // Re-fetch latest bids from channels for more accurate flattening
                             let (latest_yes_bid, _) = *yes_price_rx.borrow();
                             let (latest_no_bid, _) = *no_price_rx.borrow();
 
                             if yes_filled > dec!(0) {
-                                let exit_price = (latest_yes_bid - dec!(0.01)).max(dec!(0.01)).round_dp(2);
-                                let amount = Amount::shares(yes_filled).unwrap();
-                                let order = trading_client.market_order().token_id(yes_token).amount(amount).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await.unwrap();
-                                let signed = trading_client.sign(&signer, order).await.unwrap();
-                                let _ = trading_client.post_order(signed).await;
+                                let exit_price = (latest_yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                let amount_shares = Amount::shares(yes_filled);
+                                if let Ok(amt) = amount_shares {
+                                    let order = trading_client.market_order().token_id(yes_token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await.unwrap();
+                                    let signed = trading_client.sign(&signer, order).await.unwrap();
+                                    let _ = trading_client.post_order(signed).await;
+                                }
                             }
                             if no_filled > dec!(0) {
-                                let exit_price = (latest_no_bid - dec!(0.01)).max(dec!(0.01)).round_dp(2);
-                                let amount = Amount::shares(no_filled).unwrap();
-                                let order = trading_client.market_order().token_id(no_token).amount(amount).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await.unwrap();
-                                let signed = trading_client.sign(&signer, order).await.unwrap();
-                                let _ = trading_client.post_order(signed).await;
+                                let exit_price = (latest_no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                let amount_shares = Amount::shares(no_filled);
+                                if let Ok(amt) = amount_shares {
+                                    let order = trading_client.market_order().token_id(no_token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await.unwrap();
+                                    let signed = trading_client.sign(&signer, order).await.unwrap();
+                                    let _ = trading_client.post_order(signed).await;
+                                }
                             }
-                            trade_cooldown = Utc::now() + chrono::Duration::seconds(5);
+                            trade_cooldown = Utc::now() + chrono::Duration::seconds(config::PARTIAL_FILL_COOLDOWN_SECS);
                         }
                     }
 
-                    // === PAIR CLOSURE CHECK (Hold to Expiry preferred, but early exit if bids high) ===
                     {
                         let pos_map = positions.lock().await;
                         let yes_pos = pos_map.get(&yes_token);
@@ -641,27 +649,29 @@ async fn main() -> Result<()> {
                         if let (Some(yes_pos), Some(no_pos)) = (yes_pos, no_pos) {
                             if yes_pos.shares > dec!(0) && no_pos.shares > dec!(0) {
                                 let combined_bid = yes_bid + no_bid;
-                                // Early exit only if we can lock in 99.5% of the dollar value now
-                                if combined_bid >= dec!(0.995) {
+                                if combined_bid >= config::EARLY_EXIT_COMBINED_BID_THRESHOLD {
                                     info!("💰 Bids reached target (sum ${:.4}) — early exit", combined_bid);
 
-                                    let exit_price_yes = (yes_bid - dec!(0.01)).max(dec!(0.01)).round_dp(2);
-                                    let exit_price_no  = (no_bid - dec!(0.01)).max(dec!(0.01)).round_dp(2);
+                                    let exit_price_yes = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                    let exit_price_no  = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
 
-                                    let amount_yes = Amount::shares(yes_pos.shares).unwrap();
-                                    let order_yes = trading_client.market_order().token_id(yes_token).amount(amount_yes).side(Side::Sell).price(exit_price_yes).order_type(OrderType::FAK).build().await.unwrap();
-                                    let signed_yes = trading_client.sign(&signer, order_yes).await.unwrap();
+                                    let amount_yes_shares = Amount::shares(yes_pos.shares);
+                                    let amount_no_shares = Amount::shares(no_pos.shares);
 
-                                    let amount_no = Amount::shares(no_pos.shares).unwrap();
-                                    let order_no = trading_client.market_order().token_id(no_token).amount(amount_no).side(Side::Sell).price(exit_price_no).order_type(OrderType::FAK).build().await.unwrap();
-                                    let signed_no = trading_client.sign(&signer, order_no).await.unwrap();
+                                    if let (Ok(amt_yes), Ok(amt_no)) = (amount_yes_shares, amount_no_shares) {
+                                        let order_yes = trading_client.market_order().token_id(yes_token).amount(amt_yes).side(Side::Sell).price(exit_price_yes).order_type(OrderType::FAK).build().await.unwrap();
+                                        let signed_yes = trading_client.sign(&signer, order_yes).await.unwrap();
 
-                                    let _ = tokio::join!(trading_client.post_order(signed_yes), trading_client.post_order(signed_no));
+                                        let order_no = trading_client.market_order().token_id(no_token).amount(amt_no).side(Side::Sell).price(exit_price_no).order_type(OrderType::FAK).build().await.unwrap();
+                                        let signed_no = trading_client.sign(&signer, order_no).await.unwrap();
 
-                                    let mut pos_map = positions.lock().await;
-                                    if let Some(p) = pos_map.get_mut(&yes_token) { p.shares = dec!(0); }
-                                    if let Some(p) = pos_map.get_mut(&no_token) { p.shares = dec!(0); }
-                                    trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
+                                        let _ = tokio::join!(trading_client.post_order(signed_yes), trading_client.post_order(signed_no));
+
+                                        let mut pos_map = positions.lock().await;
+                                        if let Some(p) = pos_map.get_mut(&yes_token) { p.shares = dec!(0); }
+                                        if let Some(p) = pos_map.get_mut(&no_token) { p.shares = dec!(0); }
+                                        trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
+                                    }
                                 }
                             }
                         }
