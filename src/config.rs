@@ -15,7 +15,7 @@ pub const ENABLE_TELEGRAM: bool = true;
 
 /// Margin threshold to trigger entry.
 /// Increased from 0.012 to 0.025 to account for slippage and faster markets.
-pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.025);
+pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.035);
 
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.975);
 

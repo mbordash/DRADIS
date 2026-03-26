@@ -37,14 +37,14 @@ use alloy::signers::Signer;
 
 type PriceState = (Decimal, Decimal);
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)] // Changed from Copy to Clone
 struct Position {
     shares: Decimal,
     avg_entry: Decimal,
-    #[allow(dead_code)]
     opened_at: DateTime<Utc>,
-    #[allow(dead_code)]
-    close_time: Option<DateTime<Utc>>,
+    close_time: Option<DateTime<Utc>>, // Market close time
+    market_name: String, // Name of the market
+    pair_token_id: U256, // The token ID of the other side of the hedge
 }
 
 fn value_to_u256(v: &serde_json::Value) -> Option<U256> {
@@ -300,6 +300,57 @@ fn is_short_term_window(name: &str) -> bool {
     lower.contains("hour") || lower.contains("et")
 }
 
+async fn cleanup_expired_positions(
+    positions: Arc<Mutex<HashMap<U256, Position>>>,
+    market_name: String,
+    yes_token: U256,
+    no_token: U256,
+    market_close_time: Option<DateTime<Utc>>,
+) {
+    let mut pos_map = positions.lock().await;
+    let now = Utc::now();
+    let mut removed_count = 0;
+    let mut tokens_to_remove = Vec::new();
+
+    // Check current market first
+    if let Some(ct) = market_close_time {
+        if ct < now {
+            if pos_map.contains_key(&yes_token) {
+                tokens_to_remove.push(yes_token);
+            }
+            if pos_map.contains_key(&no_token) {
+                tokens_to_remove.push(no_token);
+            }
+        }
+    }
+
+    // Iterate through all other positions to find expired ones
+    for (token_id, pos) in pos_map.iter() {
+        if let Some(ct) = pos.close_time {
+            if ct < now {
+                tokens_to_remove.push(*token_id);
+                tokens_to_remove.push(pos.pair_token_id); // Ensure the pair is also removed
+            }
+        }
+    }
+
+    // Remove duplicates and then remove from map
+    tokens_to_remove.sort_unstable();
+    tokens_to_remove.dedup();
+
+    for token_id in tokens_to_remove {
+        if let Some(pos) = pos_map.remove(&token_id) {
+            info!("🧹 Cleaned up expired position for market \"{}\" (Token: {})", pos.market_name, token_id);
+            removed_count += 1;
+        }
+    }
+
+    if removed_count > 0 {
+        info!("✅ Position cleanup complete. Removed {} expired position entries.", removed_count / 2); // Divide by 2 as each market has 2 tokens
+    }
+}
+
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let http = Arc::new(reqwest::Client::builder().user_agent("Mozilla/5.0").timeout(config::http_timeout()).build()?);
@@ -407,9 +458,19 @@ async fn main() -> Result<()> {
         let mut trade_cooldown = Utc::now();
         let mut ticker = interval(config::main_ticker_interval());
         let mut status_ticker = interval(config::status_log_interval());
+        let mut cleanup_ticker = interval(config::periodic_sync_interval());
 
         loop {
             tokio::select! {
+                _ = cleanup_ticker.tick() => {
+                    cleanup_expired_positions(
+                        Arc::clone(&positions),
+                        market_name.clone(), // Pass current market name for context
+                        yes_token,
+                        no_token,
+                        _market_close_time,
+                    ).await;
+                }
                 _ = status_ticker.tick() => {
                     let (_, yes_ask) = *yes_price_rx.borrow();
                     let (_, no_ask) = *no_price_rx.borrow();
@@ -517,30 +578,34 @@ async fn main() -> Result<()> {
                         let (yes_res, no_res) = tokio::join!(yes_task, no_task);
 
                         let yes_filled = match yes_res {
-                            Ok(r) if r.success => target_shares,
+                            Ok(r) if r.success => Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE,
                             Ok(r) => { error!("❌ YES Order Rejected: {:?}", r.error_msg); dec!(0) },
                             Err(e) => { error!("❌ YES Task Failed: {}", e); dec!(0) }
                         };
 
                         let no_filled = match no_res {
-                            Ok(r) if r.success => target_shares,
+                            Ok(r) if r.success => Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE,
                             Ok(r) => { error!("❌ NO Order Rejected: {:?}", r.error_msg); dec!(0) },
                             Err(e) => { error!("❌ NO Task Failed: {}", e); dec!(0) }
                         };
 
                         if yes_filled > dec!(0) && no_filled > dec!(0) {
-                            let locked_profit = target_shares * profit_margin;
+                            let hedged_shares = yes_filled.min(no_filled);
+                            let locked_profit = hedged_shares * profit_margin;
                             {
                                 let mut pos_map = positions.lock().await;
                                 let now = Utc::now();
-                                pos_map.entry(yes_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: yes_limit_price, opened_at: now, close_time: None }).shares += yes_filled;
-                                pos_map.entry(no_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: no_limit_price,  opened_at: now, close_time: None }).shares += no_filled;
+                                pos_map.entry(yes_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: yes_limit_price, opened_at: now, close_time: _market_close_time, market_name: market_name.clone(), pair_token_id: no_token }).shares += yes_filled;
+                                pos_map.entry(no_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: no_limit_price,  opened_at: now, close_time: _market_close_time, market_name: market_name.clone(), pair_token_id: yes_token }).shares += no_filled;
                             }
                             {
                                 let mut pnl = total_pnl.lock().await;
                                 *pnl += locked_profit;
                             }
                             info!("📈 BOTH LEGS FILLED IN PARALLEL — Locked profit ${:.4}", locked_profit);
+                            if yes_filled != no_filled {
+                                warn!("⚖️ HEDGE IMBALANCE: YES filled {:.4}, NO filled {:.4}. Imbalance: {:.4} shares", yes_filled, no_filled, (yes_filled - no_filled).abs());
+                            }
                             trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
                         } else {
                             warn!("⚠️ Partial fill detected (YES: {}, NO: {}) — flattening at current bids", yes_filled, no_filled);
