@@ -168,6 +168,14 @@ RUST_LOG=info,rustpolybot=info
 7. **Cleanup**: Periodically removes expired markets from internal tracking.
 8. **Hold**: Holds until expiry ($1.00 payoff) or early exit if `Bid(YES) + Bid(NO) > 0.995`.
 
+## Future Enhancements (TODO)
+
+- [ ] **Maker Support**: Transition from "Taking" liquidity (paying fees) to "Providing" liquidity (earning rebates) by placing limit orders at the best bid.
+- [ ] **Book Walking**: Analyze order book depth up to 5 levels to prevent slippage on larger trade sizes.
+- [ ] **Order Chunking**: Split large orders into smaller "stealth" trades to avoid alerting competing bots.
+- [ ] **Multi-Outcome Arbitrage**: Extend logic to support markets with 3+ outcomes (e.g., price ranges) where the sum of all outcomes is < $1.00.
+- [ ] **Lagging Oracle Integration**: Monitor fast external spot exchanges (Binance/Coinbase) to predict Polymarket price movements.
+
 ---
 
 **Happy (and safer) trading! 🚀**
