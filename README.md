@@ -1,6 +1,6 @@
 # RustPolyBot 🤖
 
-A high-frequency, mean-reversion arbitrage bot for Polymarket. This bot simultaneously monitors both sides of a market ('YES' and 'NO') to find and exploit arbitrage opportunities, locking in near-risk-free profits.
+A high-frequency, "Perfect-Hedge" arbitrage bot for Polymarket. This bot simultaneously monitors both sides of a market ('YES' and 'NO') to find and exploit mispricings, locking in guaranteed profits by buying a "synthetic dollar" for less than $1.00.
 
 ---
 
@@ -16,7 +16,7 @@ A high-frequency, mean-reversion arbitrage bot for Polymarket. This bot simultan
 - **You will likely lose money.** Potentially a lot of money. This is not a "free money" machine. Arbitrage opportunities are rare and fleeting.
 - **This is NOT a guaranteed profit tool.** Trading crypto prediction markets is inherently risky.
 - **Treat this as gambling, not investing.** You should never spend money you cannot afford to lose.
-- **Start with minimal position sizes** (e.g., $1 per trade) for testing only.
+- **Start with minimal position sizes** (e.g., $8 per trade is the current minimum to meet exchange requirements) for testing only.
 
 ### Market Dynamics
 - **Polymarket is dominated by sophisticated bots**, many far more advanced than this one.
@@ -25,8 +25,8 @@ A high-frequency, mean-reversion arbitrage bot for Polymarket. This bot simultan
 
 ### What This Software Is
 - **Educational project**: Demonstrates how to interact with Polymarket APIs.
-- **Proof of concept**: Shows a classic mean-reversion/arbitrage strategy.
-- **Learning tool**: For understanding market micro-structure, order execution, and latency.
+- **Proof of concept**: Shows a classic risk-neutral arbitrage strategy.
+- **Learning tool**: For understanding market micro-structure, order execution, and parallel latency.
 
 ### What This Software Is NOT
 - A financial advisor or investment recommendation.
@@ -47,17 +47,18 @@ By using this software, you agree that:
 
 ## Features
 
-- **Arbitrage Engine**: The core logic continuously monitors the YES and NO sides of a market. If `Ask(YES) + Ask(NO) < (1.0 - Profit Margin)`, it executes simultaneous BUY orders on both to lock in the difference.
-- **Dual WebSocket Feeds**: Maintains two persistent, low-latency WebSocket connections to receive real-time order book data for both tokens in a market, crucial for accurate arbitrage calculation.
-- **Strict Liquidity Filter**: Automatically filters for and trades only in markets with significant 24-hour volume (configurable, default >$1,500) to ensure orders can be filled.
-- **Simplified Risk Management**: Focuses on maximum exposure limits and session-level drawdown, removing complex and unnecessary stop-loss logic for a hedged strategy.
-- **Centralized Configuration**: All trading parameters are decoupled into a single, tunable `config.rs` module, centered around the `ARBITRAGE_PROFIT_THRESHOLD`.
-- **Docker Deployment**: Multi-stage builds with minimal Alpine image (~50MB) and one-click deployment scripts for BTC, ETH, and SOL markets.
+- **Perfect-Hedge Sizing**: Calculates the exact number of shares to buy on both sides to ensure a risk-neutral position. Payoff is guaranteed regardless of market outcome.
+- **Ultra-Parallel Execution**: Uses Rust's `tokio::join!` to prepare, sign, and post YES and NO orders simultaneously, minimizing "legging risk" where the price moves between trades.
+- **Dual WebSocket Feeds**: Maintains two persistent, low-latency WebSocket connections for real-time order book data, now with a 60-second "Heartbeat" log for market monitoring.
+- **Smart Exit Logic**: Automatically "works" the bid price for emergency flattening and early profit taking, avoiding expensive market-sell "dumps".
+- **Strict Liquidity & Expiry Filters**: Automatically filters for high-volume markets (>$5,000) and avoids the final 15 minutes of trading to prevent being trapped in illiquid expiry spreads.
+- **Exchange Minimum Enforcement**: Automatically enforces the exchange's minimum order size (5 shares) to prevent API rejections.
+- **Centralized Configuration**: All trading parameters are tunable in `config.rs`, including the `ARBITRAGE_PROFIT_THRESHOLD` and `MAX_SUM_PRICE_FOR_ENTRY`.
 
 ### Telegram Notifications (Optional)
 To receive real-time alerts on your phone:
 1. Create a bot using [@BotFather](https://t.me/botfather) to get your `TELEGRAM_BOT_TOKEN`.
-2. Get your `TELEGRAM_CHAT_ID` (google how to do this).
+2. Get your `TELEGRAM_CHAT_ID`.
 3. Add these to your `.env` file.
 
 ## Architecture
@@ -67,17 +68,17 @@ To receive real-time alerts on your phone:
 │      RustPolyBot - Arbitrage Scalper        │
 ├─────────────────────────────────────────────┤
 │  Core Logic (main.rs)                       │
-│  • Dual WebSocket Management (YES/NO)       │
-│  • Arbitrage Calculation                    │
-│  • Simultaneous Order Execution             │
+│  • Ultra-Parallel Order Execution           │
+│  • Perfect-Hedge Position Sizing            │
+│  • WebSocket Price Heartbeats               │
 ├─────────────────────────────────────────────┤
 │  Risk Engine (risk.rs)                      │
-│  • Pre-trade validation                     │
-│  • Exposure & drawdown checks               │
+│  • Pre-trade sum-based validation           │
+│  • Session-level drawdown protection        │
 ├─────────────────────────────────────────────┤
 │  Configuration Module (config.rs)           │
 │  • Arbitrage & Sizing Parameters            │
-│  • API endpoints & Timeouts                 │
+│  • Exchange Minimums & Volume Filters       │
 ├─────────────────────────────────────────────┤
 │  External APIs                              │
 │  • Polymarket Gamma API (market discovery)  │
@@ -85,18 +86,13 @@ To receive real-time alerts on your phone:
 └─────────────────────────────────────────────┘
 ```
 
-**Deployment**: 3 independent Docker containers, each monitoring a single crypto type.
-- **rustpolybot-btc**: BTC hourly markets
-- **rustpolybot-eth**: ETH hourly markets
-- **rustpolybot-sol**: SOL hourly markets
-
 ## Quick Start
 
 ### Prerequisites
 
-- **Rust 1.91+** (for local development) or **Docker** (for deployment)
+- **Rust 1.91+** or **Docker**
 - **Polymarket Account**: With USDC collateral on Polygon
-- **SSH Access**: To your deployment server (for remote deployment)
+- **Minimum $10 USDC**: Due to exchange minimum order sizes.
 
 ### Local Development
 
@@ -110,8 +106,8 @@ To receive real-time alerts on your phone:
    ```bash
    cp .env.example .env
    # Edit .env with your values:
-   # - POLYMARKET_PRIVATE_KEY: Your Polymarket trading account private key
-   # - TRADE_SIZE_USDC: Position size in USDC per side of the arbitrage
+   # - POLYMARKET_PRIVATE_KEY: Your trading private key
+   # - TRADE_SIZE_USDC: Total position size (e.g., 8)
    ```
 
 3. **Build and run**
@@ -122,110 +118,47 @@ To receive real-time alerts on your phone:
 
 ### Docker Deployment
 
-1. **Prepare deployment scripts**
-   ```bash
-   cp deploy-multi.sh.example deploy-multi.sh
-   # ... and other scripts
-   chmod +x *.sh
-   ```
-
-2. **Customize for your server**
-   Edit the scripts and update `HOST`, `USER`, `KEY`, and `REMOTE_DIR`.
-
-3. **Deploy**
+1. **Deploy**
    ```bash
    ./deploy-multi.sh
    ```
 
-4. **Monitor**
+2. **Monitor**
    ```bash
-   ./status.sh        # Check container status
-   ./logs-all.sh      # View live logs from all 3 containers
-   ./stop-all.sh      # Stop all containers
+   ./status.sh        # Check status
+   ./logs-all.sh      # View live logs and Heartbeats
    ```
 
-## Configuration
+## Configuration (`src/config.rs`)
 
-All trading parameters are centralized in `src/config.rs`. The most important ones for the arbitrage strategy are:
-
-- `ARBITRAGE_PROFIT_THRESHOLD`: The minimum profit margin required to trigger a trade. A value of `0.01` means the bot looks for at least a 1-cent profit per pair of shares.
-- `MAX_SHARE_PRICE_FOR_ENTRY`: Prevents the bot from entering a trade if either the YES or NO side is too expensive (e.g., >85¢), as these markets are less likely to offer arbitrage opportunities.
-- `TRADE_COOLDOWN_SECS`: A brief pause after each trade to prevent spamming orders.
-- `MIN_MARKET_VOLUME`: The minimum 24-hour volume required to consider a market liquid enough to trade.
-
-To modify parameters, edit `src/config.rs` and redeploy.
+- `ARBITRAGE_PROFIT_THRESHOLD`: Min margin to trigger entry (default: 0.025 or 2.5%).
+- `MAX_SUM_PRICE_FOR_ENTRY`: Max combined price allowed (default: 0.975).
+- `MIN_ORDER_SHARES`: Minimum shares per order (default: 5.0).
+- `MIN_MARKET_VOLUME`: Minimum 24hr volume (default: $5,000).
 
 ## Environment Variables
 
 Create a `.env` file with:
 
 ```bash
-# Your Polymarket trading account private key (REQUIRED)
 POLYMARKET_PRIVATE_KEY=<your_hex_private_key>
 
-# Position size in USDC per side (REQUIRED)
-# A value of 3 means $3 on YES and $3 on NO for a total of $6 per trade.
-TRADE_SIZE_USDC=3
+# Total USDC per trade. MUST be high enough to buy at least 5 shares on each side.
+# At $0.50/share, you need $5.00 minimum. Recommended: $8.00+.
+TRADE_SIZE_USDC=8
 
-# Logging level (optional, default: info)
 RUST_LOG=info,rustpolybot=info
-
-# Crypto filter (optional, set automatically by deploy scripts)
-# CRYPTO_FILTER=btc
 ```
 
-**⚠️ IMPORTANT**: Never commit `.env` to git. It contains your private key!
+## Market Strategy
 
-## Market Selection & Strategy
-
-The bot's strategy is now purely mathematical:
-
-1. **Scan** for active, liquid hourly crypto markets.
-2. **Subscribe** to the real-time order books for both the `YES` and `NO` tokens of the most liquid market.
-3. **Calculate** the combined cost to buy one of each: `Ask(YES) + Ask(NO)`.
-4. **Check for Profit**: If the combined cost is less than `$1.00` by at least the `ARBITRAGE_PROFIT_THRESHOLD`, an opportunity exists.
-5. **Execute**: Fire simultaneous `BUY` orders for both tokens to capture this "synthetic dollar" for less than a dollar.
-6. **Hold**: The position is now fully hedged. The bot holds the pair of shares until the market resolves, at which point the pair is worth exactly $1.00.
-
-## Utility Scripts
-
-- `deploy-multi.sh`: Deploys all 3 containers.
-- `status.sh`: Shows real-time status.
-- `logs-all.sh`: Streams combined logs.
-- `stop-all.sh`: Stops all running containers.
-
-## Project Structure
-
-```
-RustPolyBot/
-├── src/
-│   ├── main.rs          # Core arbitrage logic & orchestration
-│   ├── risk.rs          # Simplified RiskEngine for exposure checks
-│   ├── config.rs        # Centralized configuration for arbitrage
-│   └── lib.rs           # Module exports
-├── ... (other project files)
-```
-
-## Building & Testing
-
-### Local Build
-```bash
-cargo build --release
-```
-
-### Docker Build
-```bash
-docker build -t RustPolyBot .
-```
-
-Before deploying with significant capital, test with `TRADE_SIZE_USDC=1`.
-
-## Troubleshooting
-
-### No Trades Happening
-This is normal. Arbitrage opportunities are rare and depend on market inefficiency. The bot is correctly waiting for a profitable spread. Check the logs for:
-- `"Arbitrage opportunity found!"` to see if it's detecting but failing trades.
-- `"No suitable market found"` if liquidity is too low across all markets.
+1. **Scan**: Finds liquid (>$5k vol) hourly markets.
+2. **Monitor**: Subscribes to order books via WebSockets.
+3. **Heartbeat**: Every 60s, logs the current arbitrage sum.
+4. **Detect**: If `Ask(YES) + Ask(NO) < 0.975`, an opportunity exists.
+5. **Execute**: Sells both legs **simultaneously** using Ultra-Parallel tasks with a $0.01 price offset for aggressive fills.
+6. **Sizing**: Uses "Perfect-Hedge" to ensure equal share counts on both sides.
+7. **Hold**: Holds until expiry ($1.00 payoff) or early exit if `Bid(YES) + Bid(NO) > 0.995`.
 
 ---
 
