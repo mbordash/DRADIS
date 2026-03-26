@@ -13,13 +13,14 @@ pub const ENABLE_TELEGRAM: bool = true;
 // ARBITRAGE STRATEGY PARAMETERS
 // ============================================================================
 
-/// The core of the mean-reversion strategy.
-/// The bot will attempt to buy a pair of YES and NO shares if their combined ask price
-/// is less than (1.0 - ARBITRAGE_PROFIT_THRESHOLD).
-/// A value of 0.01 means the bot looks for a 1-cent profit margin per pair.
-pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.012);
+/// Margin threshold to trigger entry.
+/// Increased from 0.012 to 0.025 to account for slippage and faster markets.
+pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.025);
 
-pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.988);
+pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.975);
+
+/// Minimum number of shares for a single order ( exchange requirement )
+pub const MIN_ORDER_SHARES: Decimal = dec!(5.0);
 
 
 // ============================================================================
@@ -92,8 +93,9 @@ pub fn tcp_keepalive() -> StdDuration {
 // RISK MANAGEMENT THRESHOLDS
 // ============================================================================
 
-/// Minimum volume (USDC) required to trade a market. Lowered to allow for off-peak hours.
-pub const MIN_MARKET_VOLUME: f64 = 500.0;
+/// Minimum volume (USDC) required to trade a market.
+/// Increased from 500 to 5000 to avoid illiquid "ghost town" markets.
+pub const MIN_MARKET_VOLUME: f64 = 5000.0;
 
 /// Maximum exposure allowed per individual token (in USDC)
 pub const MAX_EXPOSURE_PER_TOKEN_USDC: Decimal = dec!(25);
@@ -120,7 +122,8 @@ pub fn is_bad_market(name: &str) -> bool {
     let n = name.to_lowercase();
     n.contains("presidential") || n.contains("nomination") || n.contains("election") ||
         n.contains("democratic") || n.contains("republican") ||
-        n.contains("masters") || n.contains("tournament") || n.contains("spieth") || n.contains("jordan")
+        n.contains("masters") || n.contains("tournament") || n.contains("spieth") || n.contains("jordan") ||
+        n.contains("5-minute") || n.contains("5 minute") || n.contains("5m")
 }
 
 /// Long-term 2026 markets (typically too illiquid for short-term trading)
