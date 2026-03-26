@@ -19,7 +19,7 @@ echo "📡 Live logs from BTC + ETH + SOL rustpolybots(Ctrl+C to stop)"
 echo "───────────────────────────────────────────────────────────────"
 
 ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" '
-    trap "kill 0" EXIT   # Cleanly kill all tails on Ctrl+C
+    trap "kill 0" EXIT
 
     echo "=== BTC ==="
     docker logs -f rustpolybot-btc | sed "s/^/[BTC] /" &
