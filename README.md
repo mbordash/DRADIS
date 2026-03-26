@@ -54,7 +54,8 @@ By using this software, you agree that:
 - **Dual WebSocket Feeds**: Maintains two persistent, low-latency WebSocket connections for real-time order book data, now with a 60-second "Heartbeat" log.
 - **Smart Exit Logic**: Automatically "works" the bid price for emergency flattening and early profit taking, avoiding expensive market-sell "dumps".
 - **Strict Liquidity & Expiry Filters**: Automatically filters for high-volume markets (>$5,000) and avoids the final 15 minutes of trading.
-- **Exchange Minimum Enforcement**: Automatically enforces the exchange's minimum order size (5 shares) to prevent API rejections.
+- **Exchange Minimum Enforcement**: Automatically enforces the exchange's minimum order size (5 shares) and minimum value ($1.00) requirements.
+- **Centralized Configuration**: All trading parameters are tunable in `config.rs`, including price offsets, volume floors, and profit thresholds.
 
 ### Telegram Notifications (Optional)
 To receive real-time alerts on your phone:
@@ -133,9 +134,13 @@ To receive real-time alerts on your phone:
 
 ## Configuration (`src/config.rs`)
 
+The bot's behavior is entirely controlled by `src/config.rs`. Key tunable constants include:
+
 - `ARBITRAGE_PROFIT_THRESHOLD`: Min margin to trigger entry (default: 0.035 or 3.5%).
-- `MAX_SUM_PRICE_FOR_ENTRY`: Max combined price allowed (default: 0.975).
+- `BUY_PRICE_OFFSET`: How much to "overbid" to ensure a fast fill (default: $0.01).
+- `SELL_PRICE_OFFSET`: How much to "underbid" when flattening a position (default: $0.01).
 - `MIN_ORDER_SHARES`: Minimum shares per order (default: 5.0).
+- `MIN_ORDER_USDC`: Minimum dollar value per order (default: $1.05).
 - `MIN_MARKET_VOLUME`: Minimum 24hr volume (default: $5,000).
 
 ## Environment Variables
