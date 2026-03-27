@@ -355,7 +355,15 @@ async fn cleanup_expired_positions(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let http = Arc::new(reqwest::Client::builder().user_agent("Mozilla/5.0").timeout(config::http_timeout()).build()?);
+    // #1 Networking Optimization: Connection Pool and TCP Keep-Alive
+    let http = Arc::new(reqwest::Client::builder()
+        .user_agent("Mozilla/5.0")
+        .timeout(config::http_timeout())
+        .tcp_keepalive(Some(config::tcp_keepalive()))
+        .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
+        .pool_max_idle_per_host(10)
+        .build()?);
+
     dotenv::dotenv().ok();
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
     ring::default_provider().install_default().expect("rustls provider");
@@ -373,19 +381,43 @@ async fn main() -> Result<()> {
         info!("📱 Telegram notifications DISABLED (missing token or chat_id)");
     }
 
-    let trading_client = Arc::new(ClobClient::new(config::CLOB_API_BASE, Config::default())?.authentication_builder(&signer).signature_type(SignatureType::GnosisSafe).authenticate().await?);
+    let trading_client = Arc::new(ClobClient::new(config::CLOB_API_BASE, Config::default())?
+        .authentication_builder(&signer)
+        .signature_type(SignatureType::GnosisSafe)
+        .authenticate()
+        .await?);
     info!("Authenticated on Polymarket CLOB: {}", trading_client.address());
 
     let starting_collateral = Arc::new(Mutex::new(dec!(0.0)));
+
+    // Initialize watch channel for background balance checks
+    let (balance_tx, balance_rx) = watch::channel(dec!(0));
+
     {
         let mut req = BalanceAllowanceRequest::default();
         req.asset_type = AssetType::Collateral;
         if let Ok(resp) = trading_client.balance_allowance(req).await {
             let usdc = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
             *starting_collateral.lock().await = usdc;
+            let _ = balance_tx.send(usdc);
             info!("📈 Starting portfolio value: ${:.2}", usdc);
         }
     }
+
+    // #4 Background Balance Check Task
+    let trading_client_balance = Arc::clone(&trading_client);
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        loop {
+            interval.tick().await;
+            let mut req = BalanceAllowanceRequest::default();
+            req.asset_type = AssetType::Collateral;
+            if let Ok(resp) = trading_client_balance.balance_allowance(req).await {
+                let usdc = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
+                let _ = balance_tx.send(usdc);
+            }
+        }
+    });
 
     let positions: Arc<Mutex<HashMap<U256, Position>>> = Arc::new(Mutex::new(HashMap::new()));
     let total_pnl: Arc<Mutex<Decimal>> = Arc::new(Mutex::new(dec!(0)));
@@ -498,8 +530,6 @@ async fn main() -> Result<()> {
                         // === EMERGENCY STOP CHECK ===
                         if consecutive_failures >= 3 {
                             error!("🛑 FATAL: 3 consecutive failures detected. Emergency stopping bot to protect balance.");
-                            // In a container, exiting with non-zero will trigger a restart unless configured otherwise.
-                            // Here we just loop infinitely or exit to prevent further damage.
                             std::process::exit(1);
                         }
 
@@ -522,18 +552,11 @@ async fn main() -> Result<()> {
                             continue;
                         }
 
-                        // === STRICT BALANCE CHECK ===
-                        let current_usdc_balance = {
-                            let mut req = BalanceAllowanceRequest::default();
-                            req.asset_type = AssetType::Collateral;
-                            match trading_client.balance_allowance(req).await {
-                                Ok(resp) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
-                                Err(_) => dec!(0),
-                            }
-                        };
+                        // === FAST BALANCE CHECK (FROM CACHE) ===
+                        let current_usdc_balance = *balance_rx.borrow();
 
                         if current_usdc_balance < trade_size_usdc * dec!(2) {
-                            warn!("📉 Insufficient USDC balance (${:.2}) for safe trade (${:.2} needed).", current_usdc_balance, trade_size_usdc * dec!(2));
+                            warn!("📉 Insufficient cached USDC balance (${:.2}) for safe trade (${:.2} needed).", current_usdc_balance, trade_size_usdc * dec!(2));
                             trade_cooldown = Utc::now() + chrono::Duration::seconds(60);
                             continue;
                         }
@@ -609,23 +632,22 @@ async fn main() -> Result<()> {
                             }
                         };
 
+                        // Execute PREP and POST in parallel for both legs
                         let (yes_res, no_res) = tokio::join!(yes_task, no_task);
 
                         let yes_filled = match yes_res {
-                            Ok(r) if r.success => {
+                            Ok(r) => {
                                 let filled = Decimal::from_str(&r.making_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE;
                                 if filled > dec!(0) { filled } else { Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE }
                             },
-                            Ok(r) => { error!("❌ YES Order Rejected: {:?}", r.error_msg); dec!(0) },
                             Err(e) => { error!("❌ YES Task Failed: {}", e); dec!(0) }
                         }.round_dp(2);
 
                         let no_filled = match no_res {
-                            Ok(r) if r.success => {
+                            Ok(r) => {
                                 let filled = Decimal::from_str(&r.making_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE;
                                 if filled > dec!(0) { filled } else { Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE }
                             },
-                            Ok(r) => { error!("❌ NO Order Rejected: {:?}", r.error_msg); dec!(0) },
                             Err(e) => { error!("❌ NO Task Failed: {}", e); dec!(0) }
                         }.round_dp(2);
 
