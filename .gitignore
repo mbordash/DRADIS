@@ -35,6 +35,6 @@ logs/
 # OS / Editor
 .DS_Store
 .vscode/
-.idea/
+.idea
 *.swp
 *.swo
