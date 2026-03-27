@@ -75,6 +75,7 @@ fn extract_close_time(event: &serde_json::Value, market: &serde_json::Value) -> 
     parse_dt(market.get("endDate"))
         .or_else(|| parse_dt(market.get("end_date")))
         .or_else(|| parse_dt(market.get("closeTime")))
+        .or_else(|| parse_dt(market.get("close_time")))
         .or_else(|| parse_dt(event.get("endDate")))
         .or_else(|| parse_dt(event.get("end_date")))
         .or_else(|| parse_dt(event.get("closeTime")))
@@ -388,6 +389,7 @@ async fn main() -> Result<()> {
 
     let positions: Arc<Mutex<HashMap<U256, Position>>> = Arc::new(Mutex::new(HashMap::new()));
     let total_pnl: Arc<Mutex<Decimal>> = Arc::new(Mutex::new(dec!(0)));
+    let mut consecutive_failures = 0;
 
     let (initial_yes, initial_no, name, _, _, close_time) = loop {
         let candidate = get_top_market(&http).await;
@@ -491,7 +493,17 @@ async fn main() -> Result<()> {
                     let combined_ask = yes_ask + no_ask;
                     let profit_margin = dec!(1.0) - combined_ask;
 
+                    // === ARBITRAGE ENTRY ===
                     if profit_margin >= config::ARBITRAGE_PROFIT_THRESHOLD {
+                        // === EMERGENCY STOP CHECK ===
+                        if consecutive_failures >= 3 {
+                            error!("🛑 FATAL: 3 consecutive failures detected. Emergency stopping bot to protect balance.");
+                            // In a container, exiting with non-zero will trigger a restart unless configured otherwise.
+                            // Here we just loop infinitely or exit to prevent further damage.
+                            std::process::exit(1);
+                        }
+
+                        // === SAFETY GUARDS ===
                         if let Some(close_time) = _market_close_time {
                             let secs_left = (close_time - Utc::now()).num_seconds();
                             if secs_left < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY {
@@ -510,14 +522,30 @@ async fn main() -> Result<()> {
                             continue;
                         }
 
-                        info!("💰 Arbitrage opportunity! Margin: {:.4}¢ (YES ${:.4} + NO ${:.4})",
-                              profit_margin * dec!(100), yes_ask, no_ask);
+                        // === STRICT BALANCE CHECK ===
+                        let current_usdc_balance = {
+                            let mut req = BalanceAllowanceRequest::default();
+                            req.asset_type = AssetType::Collateral;
+                            match trading_client.balance_allowance(req).await {
+                                Ok(resp) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
+                                Err(_) => dec!(0),
+                            }
+                        };
+
+                        if current_usdc_balance < trade_size_usdc * dec!(2) {
+                            warn!("📉 Insufficient USDC balance (${:.2}) for safe trade (${:.2} needed).", current_usdc_balance, trade_size_usdc * dec!(2));
+                            trade_cooldown = Utc::now() + chrono::Duration::seconds(60);
+                            continue;
+                        }
+
+                        info!("💰 Arbitrage opportunity! Margin: {:.4}¢ (YES ${:.4} + NO ${:.4} = Combined ${:.4})",
+                              profit_margin * dec!(100), yes_ask, no_ask, combined_ask);
 
                         let total_ask = yes_ask + no_ask;
-                        let target_shares = (trade_size_usdc / total_ask).round_dp(2);
+                        let target_shares = (trade_size_usdc / total_ask).floor();
 
                         if target_shares < config::MIN_ORDER_SHARES {
-                            info!("⏸️ Calculated target shares ({:.2}) below minimum ({}). Increase TRADE_SIZE_USDC.", target_shares, config::MIN_ORDER_SHARES);
+                            info!("⏸️ Calculated target shares ({:.2}) below minimum ({}). Skipping.", target_shares, config::MIN_ORDER_SHARES);
                             continue;
                         }
 
@@ -548,11 +576,11 @@ async fn main() -> Result<()> {
                         let yes_limit_price = (yes_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
                         let no_limit_price  = (no_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
 
-                        info!("📤 Placing ULTRA-PARALLEL PERFECT-HEDGE buys — {:.4} shares each", target_shares);
+                        info!("📤 Placing ULTRA-PARALLEL PERFECT-HEDGE buys — {:.4} WHOLE shares each", target_shares);
 
                         let amount_res = Amount::shares(target_shares);
                         if let Err(e) = amount_res {
-                            error!("❌ Failed to create Amount for target shares: {}", e);
+                            error!("❌ Failed to create Amount object: {}", e);
                             continue;
                         }
                         let amount = amount_res.unwrap();
@@ -563,7 +591,7 @@ async fn main() -> Result<()> {
                             let token = yes_token;
                             let amt = amount.clone();
                             async move {
-                                let order = client.market_order().token_id(token).amount(amt).side(Side::Buy).price(yes_limit_price).order_type(OrderType::GTC).build().await?;
+                                let order = client.market_order().token_id(token).amount(amt).side(Side::Buy).price(yes_limit_price).order_type(OrderType::FAK).build().await?;
                                 let signed = client.sign(&signer, order).await?;
                                 client.post_order(signed).await
                             }
@@ -575,7 +603,7 @@ async fn main() -> Result<()> {
                             let token = no_token;
                             let amt = amount.clone();
                             async move {
-                                let order = client.market_order().token_id(token).amount(amt).side(Side::Buy).price(no_limit_price).order_type(OrderType::GTC).build().await?;
+                                let order = client.market_order().token_id(token).amount(amt).side(Side::Buy).price(no_limit_price).order_type(OrderType::FAK).build().await?;
                                 let signed = client.sign(&signer, order).await?;
                                 client.post_order(signed).await
                             }
@@ -584,18 +612,25 @@ async fn main() -> Result<()> {
                         let (yes_res, no_res) = tokio::join!(yes_task, no_task);
 
                         let yes_filled = match yes_res {
-                            Ok(r) if r.success => Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE,
+                            Ok(r) if r.success => {
+                                let filled = Decimal::from_str(&r.making_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE;
+                                if filled > dec!(0) { filled } else { Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE }
+                            },
                             Ok(r) => { error!("❌ YES Order Rejected: {:?}", r.error_msg); dec!(0) },
                             Err(e) => { error!("❌ YES Task Failed: {}", e); dec!(0) }
                         }.round_dp(2);
 
                         let no_filled = match no_res {
-                            Ok(r) if r.success => Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE,
+                            Ok(r) if r.success => {
+                                let filled = Decimal::from_str(&r.making_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE;
+                                if filled > dec!(0) { filled } else { Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE }
+                            },
                             Ok(r) => { error!("❌ NO Order Rejected: {:?}", r.error_msg); dec!(0) },
                             Err(e) => { error!("❌ NO Task Failed: {}", e); dec!(0) }
                         }.round_dp(2);
 
                         if yes_filled > dec!(0) && no_filled > dec!(0) {
+                            consecutive_failures = 0; // Reset on success
                             let hedged_shares = yes_filled.min(no_filled);
                             let locked_profit = hedged_shares * profit_margin;
                             {
@@ -608,21 +643,21 @@ async fn main() -> Result<()> {
                                 let mut pnl = total_pnl.lock().await;
                                 *pnl += locked_profit;
                             }
-                            info!("📈 BOTH LEGS FILLED IN PARALLEL — Locked profit ${:.4}", locked_profit);
+                            info!("📈 BOTH LEGS FILLED — Locked profit ${:.4}", locked_profit);
                             if yes_filled != no_filled {
                                 warn!("⚖️ HEDGE IMBALANCE: YES filled {:.4}, NO filled {:.4}. Imbalance: {:.4} shares", yes_filled, no_filled, (yes_filled - no_filled).abs());
                             }
                             trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
                         } else {
-                            warn!("⚠️ Partial fill detected (YES: {}, NO: {}) — flattening at current bids", yes_filled, no_filled);
+                            consecutive_failures += 1;
+                            warn!("⚠️ Trade Failure (Fail Count: {}/3). Flattening filled legs and entering 60s cooldown.", consecutive_failures);
 
                             let (latest_yes_bid, _) = *yes_price_rx.borrow();
                             let (latest_no_bid, _) = *no_price_rx.borrow();
 
                             if yes_filled > dec!(0) {
                                 let exit_price = (latest_yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                let amount_shares = Amount::shares(yes_filled);
-                                if let Ok(amt) = amount_shares {
+                                if let Ok(amt) = Amount::shares(yes_filled) {
                                     let order = trading_client.market_order().token_id(yes_token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await.unwrap();
                                     let signed = trading_client.sign(&signer, order).await.unwrap();
                                     let _ = trading_client.post_order(signed).await;
@@ -630,17 +665,17 @@ async fn main() -> Result<()> {
                             }
                             if no_filled > dec!(0) {
                                 let exit_price = (latest_no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                let amount_shares = Amount::shares(no_filled);
-                                if let Ok(amt) = amount_shares {
+                                if let Ok(amt) = Amount::shares(no_filled) {
                                     let order = trading_client.market_order().token_id(no_token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await.unwrap();
                                     let signed = trading_client.sign(&signer, order).await.unwrap();
                                     let _ = trading_client.post_order(signed).await;
                                 }
                             }
-                            trade_cooldown = Utc::now() + chrono::Duration::seconds(config::PARTIAL_FILL_COOLDOWN_SECS);
+                            trade_cooldown = Utc::now() + chrono::Duration::seconds(60); // Mandatory 60s pause on any failure
                         }
                     }
 
+                    // === PAIR CLOSURE CHECK ===
                     {
                         let pos_map = positions.lock().await;
                         let yes_pos = pos_map.get(&yes_token);
@@ -655,10 +690,7 @@ async fn main() -> Result<()> {
                                     let exit_price_yes = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                     let exit_price_no  = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
 
-                                    let amount_yes_shares = Amount::shares(yes_pos.shares);
-                                    let amount_no_shares = Amount::shares(no_pos.shares);
-
-                                    if let (Ok(amt_yes), Ok(amt_no)) = (amount_yes_shares, amount_no_shares) {
+                                    if let (Ok(amt_yes), Ok(amt_no)) = (Amount::shares(yes_pos.shares), Amount::shares(no_pos.shares)) {
                                         let order_yes = trading_client.market_order().token_id(yes_token).amount(amt_yes).side(Side::Sell).price(exit_price_yes).order_type(OrderType::FAK).build().await.unwrap();
                                         let signed_yes = trading_client.sign(&signer, order_yes).await.unwrap();
 
