@@ -24,7 +24,7 @@ use std::env;
 use std::str::FromStr as _;
 use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
-use tokio::time::interval;
+use tokio::time::{interval, Instant}; // Added Instant
 
 use tracing::{error, info, warn};
 
@@ -458,8 +458,8 @@ async fn main() -> Result<()> {
         let (yes_token, no_token, market_name, _market_close_time) = market_rx.borrow().clone();
         info!("🚀 Starting Arbitrage Scalper on market: \"{}\"", market_name);
 
-        let (yes_price_tx, mut yes_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(1)));
-        let (no_price_tx, mut no_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(1)));
+        let (yes_price_tx, yes_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(1)));
+        let (no_price_tx, no_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(1)));
 
         for (token, tx) in [(yes_token, yes_price_tx), (no_token, no_price_tx)] {
             tokio::spawn(async move {
@@ -527,6 +527,8 @@ async fn main() -> Result<()> {
 
                     // === ARBITRAGE ENTRY ===
                     if profit_margin >= config::ARBITRAGE_PROFIT_THRESHOLD {
+                        let arb_signal_start = Instant::now(); // Latency measurement start
+
                         // === EMERGENCY STOP CHECK ===
                         if consecutive_failures >= 3 {
                             error!("🛑 FATAL: 3 consecutive failures detected. Emergency stopping bot to protect balance.");
@@ -561,7 +563,7 @@ async fn main() -> Result<()> {
                             continue;
                         }
 
-                        info!("💰 Arbitrage opportunity! Margin: {:.4}¢ (YES ${:.4} + NO ${:.4} = Combined ${:.4})",
+                        info!("💰 Arb opportunity detected! Margin: {:.4}¢ (YES ${:.4} + NO ${:.4} = Combined ${:.4})",
                               profit_margin * dec!(100), yes_ask, no_ask, combined_ask);
 
                         let total_ask = yes_ask + no_ask;
@@ -599,8 +601,6 @@ async fn main() -> Result<()> {
                         let yes_limit_price = (yes_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
                         let no_limit_price  = (no_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
 
-                        info!("📤 Placing ULTRA-PARALLEL PERFECT-HEDGE buys — {:.4} WHOLE shares each", target_shares);
-
                         let amount_res = Amount::shares(target_shares);
                         if let Err(e) = amount_res {
                             error!("❌ Failed to create Amount object: {}", e);
@@ -632,8 +632,12 @@ async fn main() -> Result<()> {
                             }
                         };
 
+                        let reaction_time = arb_signal_start.elapsed(); // Record reaction latency
+
                         // Execute PREP and POST in parallel for both legs
                         let (yes_res, no_res) = tokio::join!(yes_task, no_task);
+
+                        let network_total_time = arb_signal_start.elapsed(); // Record total cycle latency
 
                         let yes_filled = match yes_res {
                             Ok(r) => {
@@ -652,7 +656,7 @@ async fn main() -> Result<()> {
                         }.round_dp(2);
 
                         if yes_filled > dec!(0) && no_filled > dec!(0) {
-                            consecutive_failures = 0; // Reset on success
+                            consecutive_failures = 0;
                             let hedged_shares = yes_filled.min(no_filled);
                             let locked_profit = hedged_shares * profit_margin;
                             {
@@ -665,14 +669,14 @@ async fn main() -> Result<()> {
                                 let mut pnl = total_pnl.lock().await;
                                 *pnl += locked_profit;
                             }
-                            info!("📈 BOTH LEGS FILLED — Locked profit ${:.4}", locked_profit);
+                            info!("📈 BOTH LEGS FILLED — Profit ${:.4} | Timing: Reaction {:?} Total {:?}", locked_profit, reaction_time, network_total_time);
                             if yes_filled != no_filled {
                                 warn!("⚖️ HEDGE IMBALANCE: YES filled {:.4}, NO filled {:.4}. Imbalance: {:.4} shares", yes_filled, no_filled, (yes_filled - no_filled).abs());
                             }
                             trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
                         } else {
                             consecutive_failures += 1;
-                            warn!("⚠️ Trade Failure (Fail Count: {}/3). Flattening filled legs and entering 60s cooldown.", consecutive_failures);
+                            warn!("⚠️ Trade Failure (Fail {}/3) | Timing: Reaction {:?} Total {:?}", consecutive_failures, reaction_time, network_total_time);
 
                             let (latest_yes_bid, _) = *yes_price_rx.borrow();
                             let (latest_no_bid, _) = *no_price_rx.borrow();
@@ -693,7 +697,7 @@ async fn main() -> Result<()> {
                                     let _ = trading_client.post_order(signed).await;
                                 }
                             }
-                            trade_cooldown = Utc::now() + chrono::Duration::seconds(60); // Mandatory 60s pause on any failure
+                            trade_cooldown = Utc::now() + chrono::Duration::seconds(60);
                         }
                     }
 
