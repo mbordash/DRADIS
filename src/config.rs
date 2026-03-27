@@ -14,8 +14,8 @@ pub const ENABLE_TELEGRAM: bool = true;
 // ============================================================================
 
 /// Margin threshold to trigger entry.
-/// Increased from 0.012 to 0.025 to account for slippage and faster markets.
-pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.035);
+/// Increased from 0.035 to 0.040 to account for the more aggressive BUY_PRICE_OFFSET.
+pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.040);
 
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.975);
 
@@ -26,7 +26,8 @@ pub const MIN_ORDER_SHARES: Decimal = dec!(5.0);
 pub const MIN_ORDER_USDC: Decimal = dec!(1.05);
 
 /// Price offset added to the ask price when placing buy orders to ensure aggressive fills.
-pub const BUY_PRICE_OFFSET: Decimal = dec!(0.01);
+pub const BUY_PRICE_OFFSET: Decimal = dec!(0.02);
+
 /// Maximum price for a single share when placing a buy order.
 pub const MAX_BUY_LIMIT_PRICE: Decimal = dec!(0.99);
 
@@ -37,6 +38,17 @@ pub const MIN_SELL_LIMIT_PRICE: Decimal = dec!(0.01);
 
 /// Combined bid threshold (YES_bid + NO_bid) to trigger an early exit from a hedged position.
 pub const EARLY_EXIT_COMBINED_BID_THRESHOLD: Decimal = dec!(0.995);
+
+
+// ============================================================================
+// EMERGENCY CIRCUIT BREAKERS
+// ============================================================================
+
+/// Maximum number of consecutive failed trade attempts before the bot kills itself.
+pub const MAX_CONSECUTIVE_FAILURES: u32 = 3;
+
+/// Cooldown period after a failed trade attempt (seconds).
+pub const FAILURE_COOLDOWN_SECS: i64 = 60;
 
 
 // ============================================================================
@@ -55,7 +67,7 @@ pub const SHARE_SCALE: Decimal = dec!(1_000_000);
 pub const TRADE_COOLDOWN_SECS: i64 = 8;
 
 /// Cooldown period after a partial fill before attempting a new trade.
-pub const PARTIAL_FILL_COOLDOWN_SECS: i64 = 5;
+pub const PARTIAL_FILL_COOLDOWN_SECS: i64 = 30;
 
 /// Minimum time until market expiry to still allow new position entry (seconds)
 pub const MIN_SECONDS_TO_EXPIRY_FOR_ENTRY: i64 = 900;
