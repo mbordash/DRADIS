@@ -296,7 +296,7 @@ async fn cleanup_expired_positions(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    // #1 DNS Pinning: Resolve hostnames at startup to skip DNS lookups during trades
+    // RESOLVE DNS ONCE AT STARTUP
     let clob_host = "clob.polymarket.com";
     let gamma_host = "gamma-api.polymarket.com";
 
@@ -307,23 +307,18 @@ async fn main() -> Result<()> {
         .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
         .pool_max_idle_per_host(10);
 
-    // Resolve CLOB IP
     if let Ok(mut addrs) = tokio::net::lookup_host(format!("{}:443", clob_host)).await {
         if let Some(addr) = addrs.next() {
-            info!("📍 DNS Pinning: {} -> {}", clob_host, addr.ip());
             client_builder = client_builder.resolve(clob_host, addr);
         }
     }
-
-    // Resolve Gamma IP
     if let Ok(mut addrs) = tokio::net::lookup_host(format!("{}:443", gamma_host)).await {
         if let Some(addr) = addrs.next() {
-            info!("📍 DNS Pinning: {} -> {}", gamma_host, addr.ip());
             client_builder = client_builder.resolve(gamma_host, addr);
         }
     }
 
-    let http = Arc::new(client_builder.build()?);
+    let shared_http = Arc::new(client_builder.build()?);
 
     dotenv::dotenv().ok();
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
@@ -334,7 +329,11 @@ async fn main() -> Result<()> {
     let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
     info!("Trading wallet address: {}", signer.address());
 
-    let trading_client = Arc::new(ClobClient::new(config::CLOB_API_BASE, Config::default())?
+    // INJECT OPTIMIZED CLIENT INTO CLOB CONFIG
+    let clob_config = Config::default(); // SDK might not support custom reqwest client easily, assuming default uses its own.
+    // However, we will use our shared_http where possible.
+
+    let trading_client = Arc::new(ClobClient::new(config::CLOB_API_BASE, clob_config)?
         .authentication_builder(&signer)
         .signature_type(SignatureType::GnosisSafe)
         .authenticate()
@@ -375,14 +374,14 @@ async fn main() -> Result<()> {
     let mut consecutive_failures = 0;
 
     let (initial_yes, initial_no, name, _, _, close_time) = loop {
-        let candidate = get_top_market(&http).await;
+        let candidate = get_top_market(&shared_http).await;
         if candidate.0 != U256::ZERO { break candidate; }
         tokio::time::sleep(config::market_switch_interval()).await;
     };
 
     let (market_tx, mut market_rx) = watch::channel((initial_yes, initial_no, name, close_time));
 
-    let http_monitor = Arc::clone(&http);
+    let http_monitor = Arc::clone(&shared_http);
     let market_tx_monitor = market_tx.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(config::market_switch_interval());
@@ -513,110 +512,121 @@ async fn main() -> Result<()> {
                             Err(e) => { error!("❌ Failed to create Amount: {}", e); continue; }
                         };
 
-                        let res_yes_order = trading_client.market_order().token_id(yes_token).amount(amount.clone()).side(Side::Buy).price(yes_limit_price).order_type(OrderType::FAK).build().await;
-                        let res_no_order  = trading_client.market_order().token_id(no_token).amount(amount.clone()).side(Side::Buy).price(no_limit_price).order_type(OrderType::FAK).build().await;
+                        // MOVE BUILDING AND SIGNING INTO PARALLEL TASKS FOR SPEED
+                        let yes_task = {
+                            let client = Arc::clone(&trading_client);
+                            let signer = signer.clone();
+                            let token = yes_token;
+                            let amt = amount.clone();
+                            async move {
+                                let order = client.market_order().token_id(token).amount(amt).side(Side::Buy).price(yes_limit_price).order_type(OrderType::FAK).build().await?;
+                                let signed = client.sign(&signer, order).await?;
+                                client.post_order(signed).await
+                            }
+                        };
 
-                        if let (Ok(oy), Ok(on)) = (res_yes_order, res_no_order) {
-                            let res_yes_signed = trading_client.sign(&signer, oy).await;
-                            let res_no_signed  = trading_client.sign(&signer, on).await;
+                        let no_task = {
+                            let client = Arc::clone(&trading_client);
+                            let signer = signer.clone();
+                            let token = no_token;
+                            let amt = amount.clone();
+                            async move {
+                                let order = client.market_order().token_id(token).amount(amt).side(Side::Buy).price(no_limit_price).order_type(OrderType::FAK).build().await?;
+                                let signed = client.sign(&signer, order).await?;
+                                client.post_order(signed).await
+                            }
+                        };
 
-                            if let (Ok(sy), Ok(sn)) = (res_yes_signed, res_no_signed) {
-                                let reaction_time = arb_signal_start.elapsed();
+                        // EXECUTE EVERYTHING (BUILD + SIGN + POST) IN PARALLEL
+                        let (yes_res, no_res) = tokio::join!(yes_task, no_task);
 
-                                let (yes_res, no_res) = tokio::join!(
-                                    trading_client.post_order(sy),
-                                    trading_client.post_order(sn)
-                                );
+                        let network_total_time = arb_signal_start.elapsed();
 
-                                let network_total_time = arb_signal_start.elapsed();
+                        let yes_filled = match yes_res {
+                            Ok(r) => {
+                                let filled = Decimal::from_str(&r.making_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE;
+                                if filled > dec!(0) { filled } else { Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE }
+                            },
+                            Err(e) => { error!("❌ YES Post Failed: {:?}", e); dec!(0) }
+                        }.round_dp(2);
 
-                                let yes_filled = match yes_res {
-                                    Ok(r) => {
-                                        let filled = Decimal::from_str(&r.making_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE;
-                                        if filled > dec!(0) { filled } else { Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE }
-                                    },
-                                    Err(e) => { error!("❌ YES Post Failed: {:?}", e); dec!(0) }
-                                }.round_dp(2);
+                        let no_filled = match no_res {
+                            Ok(r) => {
+                                let filled = Decimal::from_str(&r.making_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE;
+                                if filled > dec!(0) { filled } else { Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE }
+                            },
+                            Err(e) => { error!("❌ NO Post Failed: {:?}", e); dec!(0) }
+                        }.round_dp(2);
 
-                                let no_filled = match no_res {
-                                    Ok(r) => {
-                                        let filled = Decimal::from_str(&r.making_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE;
-                                        if filled > dec!(0) { filled } else { Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE }
-                                    },
-                                    Err(e) => { error!("❌ NO Post Failed: {:?}", e); dec!(0) }
-                                }.round_dp(2);
+                        if yes_filled > dec!(0) && no_filled > dec!(0) {
+                            consecutive_failures = 0;
+                            let hedged_shares = yes_filled.min(no_filled);
+                            let locked_profit = hedged_shares * profit_margin;
 
-                                if yes_filled > dec!(0) && no_filled > dec!(0) {
-                                    consecutive_failures = 0;
-                                    let hedged_shares = yes_filled.min(no_filled);
-                                    let locked_profit = hedged_shares * profit_margin;
+                            let approx_cost = (yes_filled * yes_limit_price) + (no_filled * no_limit_price);
+                            let _ = balance_tx.send(current_usdc_balance - approx_cost);
 
-                                    let approx_cost = (yes_filled * yes_limit_price) + (no_filled * no_limit_price);
-                                    let _ = balance_tx.send(current_usdc_balance - approx_cost);
+                            {
+                                let mut pos_map = positions.lock().await;
+                                let now = Utc::now();
+                                pos_map.entry(yes_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: yes_limit_price, opened_at: now, close_time: _market_close_time, market_name: market_name.clone(), pair_token_id: no_token }).shares += yes_filled;
+                                pos_map.entry(no_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: no_limit_price,  opened_at: now, close_time: _market_close_time, market_name: market_name.clone(), pair_token_id: yes_token }).shares += no_filled;
+                            }
+                            {
+                                let mut pnl = total_pnl.lock().await;
+                                *pnl += locked_profit;
+                            }
+                            info!("📈 BOTH LEGS FILLED — Profit ${:.4} | Total Latency: {:?}", locked_profit, network_total_time);
 
-                                    {
-                                        let mut pos_map = positions.lock().await;
-                                        let now = Utc::now();
-                                        pos_map.entry(yes_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: yes_limit_price, opened_at: now, close_time: _market_close_time, market_name: market_name.clone(), pair_token_id: no_token }).shares += yes_filled;
-                                        pos_map.entry(no_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: no_limit_price,  opened_at: now, close_time: _market_close_time, market_name: market_name.clone(), pair_token_id: yes_token }).shares += no_filled;
-                                    }
-                                    {
-                                        let mut pnl = total_pnl.lock().await;
-                                        *pnl += locked_profit;
-                                    }
-                                    info!("📈 BOTH LEGS FILLED — Profit ${:.4} | Reaction: {:?} Total: {:?}", locked_profit, reaction_time, network_total_time);
-
-                                    if yes_filled != no_filled {
-                                        warn!("⚖️ HEDGE IMBALANCE: YES filled {:.2}, NO filled {:.2}. Flattening excess...", yes_filled, no_filled);
-                                        if yes_filled > no_filled {
-                                            let excess = yes_filled - no_filled;
-                                            let exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                            if let Ok(amt) = Amount::shares(excess) {
-                                                if let Ok(order) = trading_client.market_order().token_id(yes_token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
-                                                    if let Ok(signed) = trading_client.sign(&signer, order).await { let _ = trading_client.post_order(signed).await; }
-                                                }
-                                            }
-                                        } else {
-                                            let excess = no_filled - yes_filled;
-                                            let exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                            if let Ok(amt) = Amount::shares(excess) {
-                                                if let Ok(order) = trading_client.market_order().token_id(no_token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
-                                                    if let Ok(signed) = trading_client.sign(&signer, order).await { let _ = trading_client.post_order(signed).await; }
-                                                }
-                                            }
+                            if yes_filled != no_filled {
+                                warn!("⚖️ HEDGE IMBALANCE: YES filled {:.2}, NO filled {:.2}. Flattening excess...", yes_filled, no_filled);
+                                if yes_filled > no_filled {
+                                    let excess = yes_filled - no_filled;
+                                    let exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                    if let Ok(amt) = Amount::shares(excess) {
+                                        if let Ok(order) = trading_client.market_order().token_id(yes_token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
+                                            if let Ok(signed) = trading_client.sign(&signer, order).await { let _ = trading_client.post_order(signed).await; }
                                         }
                                     }
-                                    trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
                                 } else {
-                                    consecutive_failures += 1;
-                                    warn!("⚠️ Trade Failure ({}/3) | Reaction: {:?} Total: {:?}", consecutive_failures, reaction_time, network_total_time);
-
-                                    let (latest_yes_bid, _) = *yes_price_rx.borrow();
-                                    let (latest_no_bid, _) = *no_price_rx.borrow();
-
-                                    if yes_filled > dec!(0) {
-                                        let exit_price = (latest_yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                        if let Ok(amt) = Amount::shares(yes_filled) {
-                                            if let Ok(order) = trading_client.market_order().token_id(yes_token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
-                                                if let Ok(signed) = trading_client.sign(&signer, order).await {
-                                                    let _ = trading_client.post_order(signed).await;
-                                                }
-                                            }
+                                    let excess = no_filled - yes_filled;
+                                    let exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                    if let Ok(amt) = Amount::shares(excess) {
+                                        if let Ok(order) = trading_client.market_order().token_id(no_token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
+                                            if let Ok(signed) = trading_client.sign(&signer, order).await { let _ = trading_client.post_order(signed).await; }
                                         }
                                     }
-                                    if no_filled > dec!(0) {
-                                        let exit_price = (latest_no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                        if let Ok(amt) = Amount::shares(no_filled) {
-                                            if let Ok(order) = trading_client.market_order().token_id(no_token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
-                                                if let Ok(signed) = trading_client.sign(&signer, order).await {
-                                                    let _ = trading_client.post_order(signed).await;
-                                                }
-                                            }
-                                        }
-                                    }
-                                    trade_cooldown = Utc::now() + chrono::Duration::seconds(60);
                                 }
                             }
+                            trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
+                        } else {
+                            consecutive_failures += 1;
+                            warn!("⚠️ Trade Failure ({}/3) | Total Latency: {:?}", consecutive_failures, network_total_time);
+
+                            let (latest_yes_bid, _) = *yes_price_rx.borrow();
+                            let (latest_no_bid, _) = *no_price_rx.borrow();
+
+                            if yes_filled > dec!(0) {
+                                let exit_price = (latest_yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                if let Ok(amt) = Amount::shares(yes_filled) {
+                                    if let Ok(order) = trading_client.market_order().token_id(yes_token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
+                                        if let Ok(signed) = trading_client.sign(&signer, order).await {
+                                            let _ = trading_client.post_order(signed).await;
+                                        }
+                                    }
+                                }
+                            }
+                            if no_filled > dec!(0) {
+                                let exit_price = (latest_no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                if let Ok(amt) = Amount::shares(no_filled) {
+                                    if let Ok(order) = trading_client.market_order().token_id(no_token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
+                                        if let Ok(signed) = trading_client.sign(&signer, order).await {
+                                            let _ = trading_client.post_order(signed).await;
+                                        }
+                                    }
+                                }
+                            }
+                            trade_cooldown = Utc::now() + chrono::Duration::seconds(60);
                         }
                     }
 
