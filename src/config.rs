@@ -14,8 +14,8 @@ pub const ENABLE_TELEGRAM: bool = true;
 // ============================================================================
 
 /// Margin threshold to trigger entry.
-/// Increased from 0.035 to 0.040 to account for the more aggressive BUY_PRICE_OFFSET.
-pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.040);
+/// Increased to 0.060 (6 cents) to account for Montreal -> CLOB latency.
+pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.060);
 
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.975);
 

@@ -296,13 +296,34 @@ async fn cleanup_expired_positions(
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let http = Arc::new(reqwest::Client::builder()
+    // #1 DNS Pinning: Resolve hostnames at startup to skip DNS lookups during trades
+    let clob_host = "clob.polymarket.com";
+    let gamma_host = "gamma-api.polymarket.com";
+
+    let mut client_builder = reqwest::Client::builder()
         .user_agent("Mozilla/5.0")
         .timeout(config::http_timeout())
         .tcp_keepalive(Some(config::tcp_keepalive()))
         .pool_idle_timeout(Some(std::time::Duration::from_secs(90)))
-        .pool_max_idle_per_host(10)
-        .build()?);
+        .pool_max_idle_per_host(10);
+
+    // Resolve CLOB IP
+    if let Ok(mut addrs) = tokio::net::lookup_host(format!("{}:443", clob_host)).await {
+        if let Some(addr) = addrs.next() {
+            info!("📍 DNS Pinning: {} -> {}", clob_host, addr.ip());
+            client_builder = client_builder.resolve(clob_host, addr);
+        }
+    }
+
+    // Resolve Gamma IP
+    if let Ok(mut addrs) = tokio::net::lookup_host(format!("{}:443", gamma_host)).await {
+        if let Some(addr) = addrs.next() {
+            info!("📍 DNS Pinning: {} -> {}", gamma_host, addr.ip());
+            client_builder = client_builder.resolve(gamma_host, addr);
+        }
+    }
+
+    let http = Arc::new(client_builder.build()?);
 
     dotenv::dotenv().ok();
     tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
@@ -321,7 +342,7 @@ async fn main() -> Result<()> {
     info!("Authenticated on Polymarket CLOB: {}", trading_client.address());
 
     let starting_collateral = Arc::new(Mutex::new(dec!(0.0)));
-    let (balance_tx, balance_rx) = watch::channel(dec!(0));
+    let (balance_tx, mut balance_rx) = watch::channel(dec!(0));
 
     {
         let mut req = BalanceAllowanceRequest::default();
@@ -544,6 +565,27 @@ async fn main() -> Result<()> {
                                         *pnl += locked_profit;
                                     }
                                     info!("📈 BOTH LEGS FILLED — Profit ${:.4} | Reaction: {:?} Total: {:?}", locked_profit, reaction_time, network_total_time);
+
+                                    if yes_filled != no_filled {
+                                        warn!("⚖️ HEDGE IMBALANCE: YES filled {:.2}, NO filled {:.2}. Flattening excess...", yes_filled, no_filled);
+                                        if yes_filled > no_filled {
+                                            let excess = yes_filled - no_filled;
+                                            let exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                            if let Ok(amt) = Amount::shares(excess) {
+                                                if let Ok(order) = trading_client.market_order().token_id(yes_token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
+                                                    if let Ok(signed) = trading_client.sign(&signer, order).await { let _ = trading_client.post_order(signed).await; }
+                                                }
+                                            }
+                                        } else {
+                                            let excess = no_filled - yes_filled;
+                                            let exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                            if let Ok(amt) = Amount::shares(excess) {
+                                                if let Ok(order) = trading_client.market_order().token_id(no_token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
+                                                    if let Ok(signed) = trading_client.sign(&signer, order).await { let _ = trading_client.post_order(signed).await; }
+                                                }
+                                            }
+                                        }
+                                    }
                                     trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
                                 } else {
                                     consecutive_failures += 1;
