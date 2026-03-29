@@ -8,7 +8,6 @@ impl RiskEngine {
         Self
     }
 
-    /// Approves a pair-based arbitrage trade
     pub fn approve_buy(
         &self,
         yes_ask: Decimal,
@@ -16,7 +15,7 @@ impl RiskEngine {
         current_exposure_usdc: Decimal,
         trade_size_usdc: Decimal,
         starting_collateral: Decimal,
-        session_pnl: Decimal,           // ← passed in from main.rs
+        session_pnl: Decimal,          
     ) -> bool {
         let sum_price = yes_ask + no_ask;
 
