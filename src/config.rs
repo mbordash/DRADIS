@@ -19,10 +19,10 @@ pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.040);
 
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.975);
 
-/// Minimum number of shares for a single order ( exchange requirement )
+/// Minimum number of shares for a single order (exchange requirement)
 pub const MIN_ORDER_SHARES: Decimal = dec!(5.0);
 
-/// Minimum USDC value for a single order ( exchange requirement )
+/// Minimum USDC value for a single order (exchange requirement)
 pub const MIN_ORDER_USDC: Decimal = dec!(1.05);
 
 /// Price offset added to the ask price when placing buy orders to ensure aggressive fills.

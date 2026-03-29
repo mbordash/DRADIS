@@ -16,23 +16,12 @@ A high-frequency, "Perfect-Hedge" arbitrage bot for Polymarket. This bot simulta
 - **You will likely lose money.** Potentially a lot of money. This is not a "free money" machine. Arbitrage opportunities are rare and fleeting.
 - **This is NOT a guaranteed profit tool.** Trading crypto prediction markets is inherently risky.
 - **Treat this as gambling, not investing.** You should never spend money you cannot afford to lose.
-- **Start with minimal position sizes** (e.g., $8 per trade is the current minimum to meet exchange requirements) for testing only.
+- **Start with minimal position sizes** (e.g., $10 per trade is the current recommended minimum) for testing only.
 
 ### Market Dynamics
 - **Polymarket is dominated by sophisticated bots**, many far more advanced than this one.
 - **Professional traders and algorithms are already operating** on these markets at scale.
 - **The odds are stacked against retail traders.** This bot is a proof-of-concept, not a money-making machine.
-
-### What This Software Is
-- **Educational project**: Demonstrates how to interact with Polymarket APIs.
-- **Proof of concept**: Shows a classic risk-neutral arbitrage strategy.
-- **Learning tool**: For understanding market micro-structure, order execution, and parallel latency.
-
-### What This Software Is NOT
-- A financial advisor or investment recommendation.
-- A guaranteed profit system.
-- A substitute for understanding market mechanics.
-- Advice to spend money on Polymarket.
 
 ### Disclaimer
 By using this software, you agree that:
@@ -47,134 +36,77 @@ By using this software, you agree that:
 
 ## Features
 
-- **Response-Based Accounting**: Uses the exchange's direct API response (`taking_amount`) for 100% accurate fill detection. No more "ghost" positions.
-- **Automatic Position Cleanup**: Periodically scans and removes expired markets from memory, preventing exposure bloat and ensuring accurate risk limits.
-- **Perfect-Hedge Sizing**: Calculates the exact number of shares to buy on both sides to ensure a risk-neutral position. Payoff is guaranteed regardless of market outcome.
-- **Ultra-Parallel Execution**: Uses Rust's `tokio::join!` to prepare, sign, and post YES and NO orders simultaneously, minimizing "legging risk".
-- **Dual WebSocket Feeds**: Maintains two persistent, low-latency WebSocket connections for real-time order book data, now with a 60-second "Heartbeat" log.
-- **Smart Exit Logic**: Automatically "works" the bid price for emergency flattening and early profit taking, avoiding expensive market-sell "dumps".
-- **Strict Liquidity & Expiry Filters**: Automatically filters for high-volume markets (>$5,000) and avoids the final 15 minutes of trading.
-- **Exchange Minimum Enforcement**: Automatically enforces the exchange's minimum order size (5 shares) and minimum value ($1.00) requirements.
-- **Centralized Configuration**: All trading parameters are tunable in `config.rs`, including price offsets, volume floors, and profit thresholds.
+- **Binance Oracle Integration**: Streams real-time BTC/ETH/SOL prices from Binance to detect "Oracle Lag" before Polymarket prices adjust.
+- **Strike Price Discovery**: Automatically extracts price targets (Strike Price) from market metadata to calculate real-time "Distance to Strike" (Diff).
+- **Response-Based Accounting**: Uses the exchange's direct API response for 100% accurate fill detection. No more "ghost" positions.
+- **Ultra-Parallel Execution**: Uses Rust's `tokio::join!` to prepare, sign, and post YES and NO orders simultaneously, achieving latency as low as 100ms.
+- **Industrial-Grade Safety**: Includes a 60-second failure cooldown, a 3-strike circuit breaker, and automatic unhedged position flattening.
+- **Network Optimizations**: Implements DNS pinning and persistent connection pooling to minimize round-trip times to the exchange.
+- **Dual WebSocket Feeds**: Maintains persistent, low-latency WebSocket connections for real-time order book data.
 
-### Telegram Notifications (Optional)
-To receive real-time alerts on your phone:
-1. Create a bot using [@BotFather](https://t.me/botfather) to get your `TELEGRAM_BOT_TOKEN`.
-2. Get your `TELEGRAM_CHAT_ID`.
-3. Add these to your `.env` file.
+---
 
-## Architecture
+## Performance Tuning (HFT Mode)
 
-```
-┌─────────────────────────────────────────────┐
-│      RustPolyBot - Arbitrage Scalper        │
-├─────────────────────────────────────────────┤
-│  Core Logic (main.rs)                       │
-│  • Response-Based Fill Detection            │
-│  • Automatic Position Cleanup Task          │
-│  • Ultra-Parallel Order Execution           │
-│  • Perfect-Hedge Sizing & Heartbeats        │
-├─────────────────────────────────────────────┤
-│  Risk Engine (risk.rs)                      │
-│  • Pre-trade sum-based validation           │
-│  • Session-level drawdown protection        │
-├─────────────────────────────────────────────┤
-│  Configuration Module (config.rs)           │
-│  • Arbitrage & Sizing Parameters            │
-│  • Exchange Minimums & Volume Filters       │
-├─────────────────────────────────────────────┤
-│  External APIs                              │
-│  • Polymarket Gamma API (market discovery)  │
-│  • CLOB API (order execution & data)        │
-└─────────────────────────────────────────────┘
-```
+To achieve the lowest possible latency, the following host and container optimizations are implemented:
+
+### 1. Ubuntu Host (Kernel Tuning)
+The Linux kernel is tuned for aggressive TCP performance by applying these `sysctl` settings:
+- `net.ipv4.tcp_fastopen=3`: Enables data exchange during the initial handshake.
+- `net.core.rmem_max / wmem_max`: Increases network buffers to prevent micro-stuttering.
+- `net.ipv4.tcp_slow_start_after_idle=0`: Keeps the TCP connection "hot" and ready to fire.
+
+### 2. Docker Container (Overhead Reduction)
+Containers are deployed with high-priority resource allocations:
+- `--network host`: Bypasses the Docker virtual bridge for direct access to the AWS network card.
+- `--cpus="1.0"`: Reserves a full physical CPU core for the bot.
+- `--cpu-shares=1024`: Assigns maximum priority to the bot process.
+
+### 3. DNS Pinning
+The bot resolves `clob.polymarket.com` once at startup and "pins" the IP address in memory, saving ~20ms of lookup time on every trade.
+
+---
 
 ## Quick Start
 
 ### Prerequisites
-
 - **Rust 1.91+** or **Docker**
-- **Polymarket Account**: With USDC collateral on Polygon
+- **AWS Server**: Recommended location: `ca-central-1` (Montreal) for ~15ms peering to the exchange.
 - **Minimum $10 USDC**: Due to exchange minimum order sizes.
 
-### Local Development
-
-1. **Clone the repository**
-   ```bash
-   git clone https://github.com/yourusername/RustPolyBot.git
-   cd RustPolyBot
-   ```
-
-2. **Set up environment**
+### Deployment
+1. **Set up environment**
    ```bash
    cp .env.example .env
-   # Edit .env with your values:
-   # - POLYMARKET_PRIVATE_KEY: Your trading private key
-   # - TRADE_SIZE_USDC: Total position size (e.g., 8)
+   # Edit .env with your POLYMARKET_PRIVATE_KEY and TRADE_SIZE_USDC
    ```
 
-3. **Build and run**
+2. **Run with Optimizations**
    ```bash
-   cargo build --release
-   ./target/release/RustPolyBot
+   docker run -d \
+       --network host \
+       --cpus="1.0" \
+       --cpu-shares=1024 \
+       --restart unless-stopped \
+       --name rustpolybot-btc \
+       --env-file .env \
+       -e CRYPTO_FILTER=btc \
+       rustpolybot
    ```
 
-### Docker Deployment
+3. **Monitor Latency**
+   Look for the following logs to audit performance:
+   - `📍 Network Pulse`: Baseline round-trip time to the exchange.
+   - `📈 BOTH LEGS FILLED`: Real-world execution latency.
 
-1. **Deploy**
-   ```bash
-   ./deploy-multi.sh
-   ```
-
-2. **Monitor**
-   ```bash
-   ./status.sh        # Check status
-   ./logs-all.sh      # View live logs and Heartbeats
-   ```
-
-## Configuration (`src/config.rs`)
-
-The bot's behavior is entirely controlled by `src/config.rs`. Key tunable constants include:
-
-- `ARBITRAGE_PROFIT_THRESHOLD`: Min margin to trigger entry (default: 0.035 or 3.5%).
-- `BUY_PRICE_OFFSET`: How much to "overbid" to ensure a fast fill (default: $0.01).
-- `SELL_PRICE_OFFSET`: How much to "underbid" when flattening a position (default: $0.01).
-- `MIN_ORDER_SHARES`: Minimum shares per order (default: 5.0).
-- `MIN_ORDER_USDC`: Minimum dollar value per order (default: $1.05).
-- `MIN_MARKET_VOLUME`: Minimum 24hr volume (default: $5,000).
-
-## Environment Variables
-
-Create a `.env` file with:
-
-```bash
-POLYMARKET_PRIVATE_KEY=<your_hex_private_key>
-
-# Total USDC per trade. MUST be high enough to buy at least 5 shares on each side.
-# At $0.50/share, you need $5.00 minimum. Recommended: $8.00+.
-TRADE_SIZE_USDC=8
-
-RUST_LOG=info,rustpolybot=info
-```
-
-## Market Strategy
-
-1. **Scan**: Finds liquid (>$5k vol) hourly markets.
-2. **Monitor**: Subscribes to order books via WebSockets.
-3. **Heartbeat**: Every 60s, logs the current arbitrage sum.
-4. **Detect**: If `Ask(YES) + Ask(NO) < 0.965` (1.0 - 0.035 threshold), an opportunity exists.
-5. **Execute**: Sells both legs **simultaneously** using Ultra-Parallel tasks.
-6. **Accounting**: Uses the `taking_amount` from the exchange for perfect position tracking.
-7. **Cleanup**: Periodically removes expired markets from internal tracking.
-8. **Hold**: Holds until expiry ($1.00 payoff) or early exit if `Bid(YES) + Bid(NO) > 0.995`.
+---
 
 ## Future Enhancements (TODO)
 
-- [ ] **Maker Support**: Transition from "Taking" liquidity (paying fees) to "Providing" liquidity (earning rebates) by placing limit orders at the best bid.
-- [ ] **Book Walking**: Analyze order book depth up to 5 levels to prevent slippage on larger trade sizes.
-- [ ] **Order Chunking**: Split large orders into smaller "stealth" trades to avoid alerting competing bots.
-- [ ] **Multi-Outcome Arbitrage**: Extend logic to support markets with 3+ outcomes (e.g., price ranges) where the sum of all outcomes is < $1.00.
-- [ ] **Lagging Oracle Integration**: Monitor fast external spot exchanges (Binance/Coinbase) to predict Polymarket price movements.
+- [ ] **Oracle Momentum Snipe**: Automatically trade when Binance moves $>X\%$ before Polymarket reacts.
+- [ ] **Maker Support**: Transition to earning rebates by placing limit orders at the best bid.
+- [ ] **Book Walking**: Analyze order book depth up to 5 levels to prevent slippage.
+- [ ] **Multi-Outcome Arbitrage**: Support markets with 3+ outcomes where the sum is < $1.00.
 
 ---
 

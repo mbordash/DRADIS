@@ -28,7 +28,6 @@ Dockerfile.*
 **/.docker
 
 # Logs & temp
-*.log
 logs/
 *.tmp
 
