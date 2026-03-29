@@ -13,9 +13,9 @@ pub const ENABLE_TELEGRAM: bool = true;
 // ARBITRAGE STRATEGY PARAMETERS
 // ============================================================================
 
-/// Margin threshold to trigger entry.
-/// Lowered to 0.040 (4 cents) temporarily to test execution speed and latency.
-pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.040);
+/// Margin threshold to trigger entry. This is dangerous if you're not fast enough.
+/// Proceed with caution
+pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.025);
 
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.975);
 
