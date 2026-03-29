@@ -20,7 +20,7 @@ use reqwest;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::str::FromStr as _;
 use std::sync::Arc;
@@ -430,7 +430,7 @@ async fn main() -> Result<()> {
 
     let trading_client = Arc::new(ClobClient::new(config::CLOB_API_BASE, Config::default())?
         .authentication_builder(&signer)
-        .signature_type(SignatureType::Eoa)
+        .signature_type(SignatureType::GnosisSafe)
         .authenticate()
         .await?);
     info!("Authenticated on Polymarket CLOB: {}", trading_client.address());
@@ -438,16 +438,23 @@ async fn main() -> Result<()> {
     let starting_collateral = Arc::new(Mutex::new(dec!(0.0)));
     let (balance_tx, mut balance_rx) = watch::channel(dec!(0));
 
-    {
+    let mut startup_balance = dec!(0);
+    for i in 1..=3 {
+        info!("🔄 Initializing portfolio balance (Attempt {}/3)...", i);
         let mut req = BalanceAllowanceRequest::default();
         req.asset_type = AssetType::Collateral;
-        if let Ok(resp) = trading_client.balance_allowance(req).await {
-            let usdc = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
-            *starting_collateral.lock().await = usdc;
-            let _ = balance_tx.send(usdc);
-            info!("📈 Starting portfolio value: ${:.2}", usdc);
+        match trading_client.balance_allowance(req).await {
+            Ok(resp) => {
+                startup_balance = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
+                if startup_balance > dec!(0) { break; }
+            },
+            Err(e) => warn!("⚠️ Balance fetch failed: {:?}", e),
         }
+        tokio::time::sleep(Duration::from_secs(1)).await;
     }
+    *starting_collateral.lock().await = startup_balance;
+    let _ = balance_tx.send(startup_balance);
+    info!("📈 Starting portfolio value: ${:.2}", startup_balance);
 
     let trading_client_balance = Arc::clone(&trading_client);
     let balance_tx_bg = balance_tx.clone();
@@ -465,6 +472,7 @@ async fn main() -> Result<()> {
     });
 
     let (oracle_tx, oracle_rx) = watch::channel(dec!(0));
+    let (velocity_tx, velocity_rx) = watch::channel(dec!(0));
     let crypto_symbol = crypto_filter.clone();
     tokio::spawn(async move {
         let binance_pair = match crypto_symbol.as_str() {
@@ -473,6 +481,8 @@ async fn main() -> Result<()> {
             _ => "btcusdt",
         };
         let url_str = format!("wss://stream.binance.com:9443/ws/{}@ticker", binance_pair);
+        let mut price_history: VecDeque<(Instant, Decimal)> = VecDeque::new();
+
         loop {
             if let Ok((mut ws_stream, _)) = connect_async(&url_str).await {
                 info!("📡 Connected to Binance Oracle for {}", binance_pair.to_uppercase());
@@ -481,7 +491,26 @@ async fn main() -> Result<()> {
                         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
                             if let Some(price_str) = v.get("c").and_then(|p| p.as_str()) {
                                 if let Ok(price) = Decimal::from_str(price_str) {
+                                    let now = Instant::now();
                                     let _ = oracle_tx.send(price);
+                                    price_history.push_back((now, price));
+                                    while let Some((t, _)) = price_history.front() {
+                                        if now.duration_since(*t).as_secs() >= config::MOMENTUM_WINDOW_SECS {
+                                            price_history.pop_front();
+                                        } else { break; }
+                                    }
+                                    if let Some((_, start_price)) = price_history.front() {
+                                        let delta = price - start_price;
+                                        let _ = velocity_tx.send(delta);
+                                        let threshold = match crypto_symbol.as_str() {
+                                            "eth" => config::ETH_MOMENTUM_THRESHOLD,
+                                            "sol" => config::SOL_MOMENTUM_THRESHOLD,
+                                            _ => config::BTC_MOMENTUM_THRESHOLD,
+                                        };
+                                        if delta.abs() >= threshold {
+                                            info!("🔥 MOMENTUM SIGNAL: {} moved ${:.2} in last {}s", binance_pair.to_uppercase(), delta, config::MOMENTUM_WINDOW_SECS);
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -489,7 +518,7 @@ async fn main() -> Result<()> {
                 }
             }
             warn!("⚠️ Binance Oracle disconnected. Reconnecting in 5s...");
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     });
 
@@ -530,11 +559,9 @@ async fn main() -> Result<()> {
                 info!("🔄 Market Switch Detected: {} -> {}", cur_name, candidate.2);
                 let mut strike = extract_strike_price_from_name(&candidate.2);
                 if strike.is_none() {
-                    info!("🔎 Name strike not found for {}, attempting historical description lookup...", candidate.2);
                     strike = fetch_historical_strike_price(&http_monitor, &crypto_filter_monitor, &candidate.4).await;
                 }
                 if strike.is_none() {
-                    info!("🔎 Still no strike for {}, trying to parse name as date...", candidate.2);
                     strike = fetch_historical_strike_price(&http_monitor, &crypto_filter_monitor, &candidate.2).await;
                 }
                 let _ = market_tx_monitor.send((candidate.0, candidate.1, candidate.2.clone(), candidate.6, strike, candidate.4.clone()));
@@ -584,7 +611,7 @@ async fn main() -> Result<()> {
                     let mut req = BalanceAllowanceRequest::default();
                     req.asset_type = AssetType::Collateral;
                     let _ = trading_client.balance_allowance(req).await;
-                    info!("📍 Network Pulse: {:?} (AWS Montreal -> Virginia)", start.elapsed());
+                    info!("📍 Network Pulse: {:?} (Bot -> PolyMarket)", start.elapsed());
                 }
                 _ = cleanup_ticker.tick() => {
                     cleanup_expired_positions(Arc::clone(&positions), market_name.clone(), yes_token, no_token, _market_close_time).await;
@@ -593,11 +620,12 @@ async fn main() -> Result<()> {
                     let (_, yes_ask) = *yes_price_rx.borrow();
                     let (_, no_ask) = *no_price_rx.borrow();
                     let binance_price = *oracle_rx.borrow();
+                    let binance_velocity = *velocity_rx.borrow();
 
                     let strike_info = if let Some(strike) = strike_price {
-                        format!(" | Strike: ${:.2} | Diff: ${:.2}", strike, binance_price - strike)
+                        format!(" | Strike: ${:.2} | Diff: ${:.2} | Velocity: ${:.2}", strike, binance_price - strike, binance_velocity)
                     } else {
-                        " | Strike: Unknown".to_string()
+                        format!(" | Strike: Unknown | Velocity: ${:.2}", binance_velocity)
                     };
 
                     if yes_ask != dec!(1) && no_ask != dec!(1) {

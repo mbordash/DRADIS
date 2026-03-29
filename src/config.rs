@@ -41,6 +41,24 @@ pub const EARLY_EXIT_COMBINED_BID_THRESHOLD: Decimal = dec!(0.995);
 
 
 // ============================================================================
+// ORACLE & MOMENTUM SETTINGS (Predictive Arbitrage)
+// ============================================================================
+
+/// Enable or disable trading based on Binance oracle signals.
+/// SET TO FALSE FOR MONITOR-ONLY MODE.
+pub const ENABLE_ORACLE_TRADING: bool = false;
+
+/// The time window (in seconds) used to calculate price velocity.
+pub const MOMENTUM_WINDOW_SECS: u64 = 10;
+
+/// Price change threshold (absolute USD) within the window to trigger a signal.
+/// e.g., if BTC moves $50 in 10 seconds.
+pub const BTC_MOMENTUM_THRESHOLD: Decimal = dec!(50.0);
+pub const ETH_MOMENTUM_THRESHOLD: Decimal = dec!(5.0);
+pub const SOL_MOMENTUM_THRESHOLD: Decimal = dec!(0.5);
+
+
+// ============================================================================
 // EMERGENCY CIRCUIT BREAKERS
 // ============================================================================
 

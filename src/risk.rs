@@ -15,7 +15,7 @@ impl RiskEngine {
         current_exposure_usdc: Decimal,
         trade_size_usdc: Decimal,
         starting_collateral: Decimal,
-        session_pnl: Decimal,          
+        session_pnl: Decimal,
     ) -> bool {
         let sum_price = yes_ask + no_ask;
 
