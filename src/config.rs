@@ -17,7 +17,7 @@ pub const ENABLE_TELEGRAM: bool = false;
 /// Proceed with caution
 pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.01);
 
-pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.975);
+pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.99);
 
 /// Minimum number of shares for a single order (exchange requirement)
 pub const MIN_ORDER_SHARES: Decimal = dec!(5.0);
