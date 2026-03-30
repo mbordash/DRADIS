@@ -3,7 +3,7 @@ use std::borrow::Cow;
 
 use polymarket_client_sdk::clob::{Client as ClobClient, Config};
 use polymarket_client_sdk::clob::types::{Amount, OrderType, Side, SignatureType, Order, SignedOrder};
-use polymarket_client_sdk::{POLYGON, PRIVATE_KEY_VAR};
+use polymarket_client_sdk::{POLYGON, PRIVATE_KEY_VAR, derive_safe_wallet};
 use polymarket_client_sdk::clob::types::request::{
     BalanceAllowanceRequest,
 };
@@ -441,21 +441,20 @@ async fn main() -> Result<()> {
     let private_key = env::var(PRIVATE_KEY_VAR).expect("POLYMARKET_PRIVATE_KEY");
     let trade_size_usdc: Decimal = env::var("TRADE_SIZE_USDC").unwrap_or_else(|_| "10".to_string()).parse()?;
     let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
-    let user_address = signer.address();
-    info!("Trading wallet address: {}", user_address);
+    let eoa_address = signer.address();
+    info!("Trading wallet (EOA) address: {}", eoa_address);
 
     let trading_client = Arc::new(ClobClient::new(config::CLOB_API_BASE, Config::default())?
         .authentication_builder(&signer)
         .signature_type(SignatureType::GnosisSafe)
         .authenticate()
         .await?);
-    info!("Authenticated on Polymarket CLOB: {}", trading_client.address());
 
-    // --- Pre-fetch Nonce ---
-    // Start at 0, or try to sync with current server state if possible.
+    // For GnosisSafe, the funder (maker) is the Safe address
+    let safe_address = derive_safe_wallet(eoa_address, POLYGON).expect("Safe derivation failed");
+    info!("Authenticated on Polymarket CLOB. Safe (Maker) address: {}", safe_address);
+
     let nonce_manager = Arc::new(Mutex::new(0u64));
-
-    // Exchange contract address on Polygon
     let verifying_contract = Address::from_str("0x4bFb304599C830208D148d51717806540c4923e4").unwrap();
 
     let starting_collateral = Arc::new(Mutex::new(dec!(0.0)));
@@ -596,6 +595,11 @@ async fn main() -> Result<()> {
         let (yes_token, no_token, market_name, _market_close_time, strike_price, _) = market_rx.borrow().clone();
         info!("🚀 Starting Arbitrage Scalper on market: \"{}\"", market_name);
 
+        // Pre-fetch and cache fee rates for the current tokens to remove from critical path
+        let yes_fee_rate = trading_client.fee_rate_bps(yes_token).await.map(|r| r.base_fee).unwrap_or(0);
+        let no_fee_rate = trading_client.fee_rate_bps(no_token).await.map(|r| r.base_fee).unwrap_or(0);
+        info!("✅ Fee Rates Cached: YES {} bps | NO {} bps", yes_fee_rate, no_fee_rate);
+
         let (yes_price_tx, yes_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(1)));
         let (no_price_tx, no_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(1)));
 
@@ -684,8 +688,18 @@ async fn main() -> Result<()> {
                         info!("💰 Arb opportunity! Margin: {:.4}¢", profit_margin * dec!(100));
 
                         let target_shares = (trade_size_usdc / combined_ask).floor();
-                        if target_shares < config::MIN_ORDER_SHARES { continue; }
-                        if (target_shares * yes_ask < config::MIN_ORDER_USDC) || (target_shares * no_ask < config::MIN_ORDER_USDC) { continue; }
+                        if target_shares < config::MIN_ORDER_SHARES {
+                            info!("⏭️ Skipping: target_shares ({:.2}) < MIN_ORDER_SHARES ({:.2})", target_shares, config::MIN_ORDER_SHARES);
+                            continue;
+                        }
+                        if target_shares * yes_ask < config::MIN_ORDER_USDC {
+                            info!("⏭️ Skipping: YES leg USDC ({:.2}) < MIN_ORDER_USDC ({:.2})", target_shares * yes_ask, config::MIN_ORDER_USDC);
+                            continue;
+                        }
+                        if target_shares * no_ask < config::MIN_ORDER_USDC {
+                            info!("⏭️ Skipping: NO leg USDC ({:.2}) < MIN_ORDER_USDC ({:.2})", target_shares * no_ask, config::MIN_ORDER_USDC);
+                            continue;
+                        }
 
                         let current_exposure = {
                             let pos = positions.lock().await;
@@ -694,6 +708,7 @@ async fn main() -> Result<()> {
 
                         let risk_engine = RiskEngine::new();
                         if !risk_engine.approve_buy(yes_ask, no_ask, current_exposure, trade_size_usdc, *starting_collateral.lock().await, *total_pnl.lock().await) {
+                            info!("⏭️ Skipping: Risk engine rejected buy (Exposure: ${:.2}, Balance: ${:.2})", current_exposure, *starting_collateral.lock().await);
                             continue;
                         }
 
@@ -721,15 +736,15 @@ async fn main() -> Result<()> {
 
                                 let mut order_struct = Order::default();
                                 order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
-                                order_struct.maker = user_address;
-                                order_struct.signer = user_address;
+                                order_struct.maker = safe_address; // Use Safe address as Maker
+                                order_struct.signer = eoa_address; // Use EOA as Signer
                                 order_struct.taker = Address::ZERO;
                                 order_struct.tokenId = token;
                                 order_struct.makerAmount = U256::from(to_fixed_u128(amt_decimal * yes_limit_price));
                                 order_struct.takerAmount = U256::from(to_fixed_u128(amt_decimal));
                                 order_struct.expiration = U256::ZERO;
                                 order_struct.nonce = U256::from(nonce);
-                                order_struct.feeRateBps = U256::ZERO;
+                                order_struct.feeRateBps = U256::from(yes_fee_rate); // Use cached fee
                                 order_struct.side = Side::Buy as u8;
                                 order_struct.signatureType = SignatureType::GnosisSafe as u8;
 
@@ -741,7 +756,6 @@ async fn main() -> Result<()> {
                                     ..Eip712Domain::default()
                                 };
 
-                                // Calculate the EIP-712 signing hash manually using the SolStruct's method
                                 let hash = order_struct.eip712_signing_hash(&domain);
                                 let signature = signer.sign_hash(&hash).await?;
 
@@ -771,15 +785,15 @@ async fn main() -> Result<()> {
 
                                 let mut order_struct = Order::default();
                                 order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
-                                order_struct.maker = user_address;
-                                order_struct.signer = user_address;
+                                order_struct.maker = safe_address; // Use Safe address as Maker
+                                order_struct.signer = eoa_address; // Use EOA as Signer
                                 order_struct.taker = Address::ZERO;
                                 order_struct.tokenId = token;
                                 order_struct.makerAmount = U256::from(to_fixed_u128(amt_decimal * no_limit_price));
                                 order_struct.takerAmount = U256::from(to_fixed_u128(amt_decimal));
                                 order_struct.expiration = U256::ZERO;
                                 order_struct.nonce = U256::from(nonce);
-                                order_struct.feeRateBps = U256::ZERO;
+                                order_struct.feeRateBps = U256::from(no_fee_rate); // Use cached fee
                                 order_struct.side = Side::Buy as u8;
                                 order_struct.signatureType = SignatureType::GnosisSafe as u8;
 

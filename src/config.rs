@@ -6,7 +6,7 @@ use std::time::Duration as StdDuration;
 // NOTIFICATION SETTINGS (Telegram)
 // ============================================================================
 
-pub const ENABLE_TELEGRAM: bool = true;
+pub const ENABLE_TELEGRAM: bool = false;
 
 
 // ============================================================================
@@ -15,7 +15,7 @@ pub const ENABLE_TELEGRAM: bool = true;
 
 /// Margin threshold to trigger entry. This is dangerous if you're not fast enough.
 /// Proceed with caution
-pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.025);
+pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.01);
 
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.975);
 
