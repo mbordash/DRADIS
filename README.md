@@ -39,7 +39,7 @@ By using this software, you agree that:
 - **Binance Oracle Integration**: Streams real-time BTC/ETH/SOL prices from Binance to detect "Oracle Lag" before Polymarket prices adjust.
 - **Strike Price Discovery**: Automatically extracts price targets (Strike Price) from market metadata to calculate real-time "Distance to Strike" (Diff).
 - **Response-Based Accounting**: Uses the exchange's direct API response for 100% accurate fill detection. No more "ghost" positions.
-- **Ultra-Parallel Execution**: Uses Rust's `tokio::join!` to prepare, sign, and post YES and NO orders simultaneously, achieving latency as low as 100ms.
+- **Ultra-Parallel Execution**: Uses Rust's `tokio::join!` to prepare, sign, and post YES and NO orders simultaneously, achieving latency as low as 26ms per leg.
 - **Industrial-Grade Safety**: Includes a 60-second failure cooldown, a 3-strike circuit breaker, and automatic unhedged position flattening.
 - **Network Optimizations**: Implements DNS pinning and persistent connection pooling to minimize round-trip times to the exchange.
 - **Dual WebSocket Feeds**: Maintains persistent, low-latency WebSocket connections for real-time order book data.
