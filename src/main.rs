@@ -1,7 +1,8 @@
 use anyhow::Result;
+use std::borrow::Cow;
 
 use polymarket_client_sdk::clob::{Client as ClobClient, Config};
-use polymarket_client_sdk::clob::types::{Amount, OrderType, Side, SignatureType};
+use polymarket_client_sdk::clob::types::{Amount, OrderType, Side, SignatureType, Order, SignedOrder};
 use polymarket_client_sdk::{POLYGON, PRIVATE_KEY_VAR};
 use polymarket_client_sdk::clob::types::request::{
     BalanceAllowanceRequest,
@@ -11,13 +12,17 @@ use polymarket_client_sdk::clob::types::AssetType;
 use futures::StreamExt as _;
 use polymarket_client_sdk::clob::ws::Client as WsClient;
 
-use alloy::primitives::U256;
+use alloy::primitives::{U256, Address};
 use alloy::signers::local::LocalSigner;
+use alloy::signers::Signer;
+use alloy::dyn_abi::Eip712Domain;
+use alloy::sol_types::SolStruct;
 
 use chrono::{DateTime, Utc, TimeZone, Datelike};
 use chrono_tz::US::Eastern;
 use reqwest;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
 
 use std::collections::{HashMap, VecDeque};
@@ -34,8 +39,6 @@ use rustpolybot::risk::RiskEngine;
 
 use rustls::crypto::ring;
 
-use alloy::signers::Signer;
-
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use regex::Regex;
 
@@ -50,6 +53,18 @@ struct Position {
     close_time: Option<DateTime<Utc>>,
     market_name: String,
     pair_token_id: U256,
+}
+
+const ORDER_NAME: &str = "Polymarket CTF Exchange";
+const VERSION: &str = "1";
+const USDC_DECIMALS: u32 = 6;
+
+fn to_fixed_u128(d: Decimal) -> u128 {
+    d.normalize()
+        .trunc_with_scale(USDC_DECIMALS)
+        .mantissa()
+        .to_u128()
+        .unwrap_or(0)
 }
 
 fn value_to_u256(v: &serde_json::Value) -> Option<U256> {
@@ -426,7 +441,8 @@ async fn main() -> Result<()> {
     let private_key = env::var(PRIVATE_KEY_VAR).expect("POLYMARKET_PRIVATE_KEY");
     let trade_size_usdc: Decimal = env::var("TRADE_SIZE_USDC").unwrap_or_else(|_| "10".to_string()).parse()?;
     let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
-    info!("Trading wallet address: {}", signer.address());
+    let user_address = signer.address();
+    info!("Trading wallet address: {}", user_address);
 
     let trading_client = Arc::new(ClobClient::new(config::CLOB_API_BASE, Config::default())?
         .authentication_builder(&signer)
@@ -434,6 +450,13 @@ async fn main() -> Result<()> {
         .authenticate()
         .await?);
     info!("Authenticated on Polymarket CLOB: {}", trading_client.address());
+
+    // --- Pre-fetch Nonce ---
+    // Start at 0, or try to sync with current server state if possible.
+    let nonce_manager = Arc::new(Mutex::new(0u64));
+
+    // Exchange contract address on Polygon
+    let verifying_contract = Address::from_str("0x4bFb304599C830208D148d51717806540c4923e4").unwrap();
 
     let starting_collateral = Arc::new(Mutex::new(dec!(0.0)));
     let (balance_tx, mut balance_rx) = watch::channel(dec!(0));
@@ -687,11 +710,49 @@ async fn main() -> Result<()> {
                             let client = Arc::clone(&trading_client);
                             let signer = signer.clone();
                             let token = yes_token;
-                            let amt = amount.clone();
+                            let amt_decimal = amount.as_inner();
+                            let nonce_manager = Arc::clone(&nonce_manager);
+                            let owner = client.credentials().key();
                             async move {
-                                let order = client.market_order().token_id(token).amount(amt).side(Side::Buy).price(yes_limit_price).order_type(OrderType::FAK).build().await?;
-                                let signed = client.sign(&signer, order).await?;
-                                client.post_order(signed).await
+                                let mut nonce_guard = nonce_manager.lock().await;
+                                let nonce = *nonce_guard;
+                                *nonce_guard += 1;
+                                drop(nonce_guard);
+
+                                let mut order_struct = Order::default();
+                                order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
+                                order_struct.maker = user_address;
+                                order_struct.signer = user_address;
+                                order_struct.taker = Address::ZERO;
+                                order_struct.tokenId = token;
+                                order_struct.makerAmount = U256::from(to_fixed_u128(amt_decimal * yes_limit_price));
+                                order_struct.takerAmount = U256::from(to_fixed_u128(amt_decimal));
+                                order_struct.expiration = U256::ZERO;
+                                order_struct.nonce = U256::from(nonce);
+                                order_struct.feeRateBps = U256::ZERO;
+                                order_struct.side = Side::Buy as u8;
+                                order_struct.signatureType = SignatureType::GnosisSafe as u8;
+
+                                let domain = Eip712Domain {
+                                    name: Some(Cow::Borrowed(ORDER_NAME)),
+                                    version: Some(Cow::Borrowed(VERSION)),
+                                    chain_id: Some(U256::from(POLYGON)),
+                                    verifying_contract: Some(verifying_contract),
+                                    ..Eip712Domain::default()
+                                };
+
+                                // Calculate the EIP-712 signing hash manually using the SolStruct's method
+                                let hash = order_struct.eip712_signing_hash(&domain);
+                                let signature = signer.sign_hash(&hash).await?;
+
+                                let signed_order = SignedOrder::builder()
+                                    .order(order_struct)
+                                    .signature(signature)
+                                    .order_type(OrderType::FAK)
+                                    .owner(owner)
+                                    .build();
+
+                                client.post_order(signed_order).await
                             }
                         };
 
@@ -699,11 +760,48 @@ async fn main() -> Result<()> {
                             let client = Arc::clone(&trading_client);
                             let signer = signer.clone();
                             let token = no_token;
-                            let amt = amount.clone();
+                            let amt_decimal = amount.as_inner();
+                            let nonce_manager = Arc::clone(&nonce_manager);
+                            let owner = client.credentials().key();
                             async move {
-                                let order = client.market_order().token_id(token).amount(amt).side(Side::Buy).price(no_limit_price).order_type(OrderType::FAK).build().await?;
-                                let signed = client.sign(&signer, order).await?;
-                                client.post_order(signed).await
+                                let mut nonce_guard = nonce_manager.lock().await;
+                                let nonce = *nonce_guard;
+                                *nonce_guard += 1;
+                                drop(nonce_guard);
+
+                                let mut order_struct = Order::default();
+                                order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
+                                order_struct.maker = user_address;
+                                order_struct.signer = user_address;
+                                order_struct.taker = Address::ZERO;
+                                order_struct.tokenId = token;
+                                order_struct.makerAmount = U256::from(to_fixed_u128(amt_decimal * no_limit_price));
+                                order_struct.takerAmount = U256::from(to_fixed_u128(amt_decimal));
+                                order_struct.expiration = U256::ZERO;
+                                order_struct.nonce = U256::from(nonce);
+                                order_struct.feeRateBps = U256::ZERO;
+                                order_struct.side = Side::Buy as u8;
+                                order_struct.signatureType = SignatureType::GnosisSafe as u8;
+
+                                let domain = Eip712Domain {
+                                    name: Some(Cow::Borrowed(ORDER_NAME)),
+                                    version: Some(Cow::Borrowed(VERSION)),
+                                    chain_id: Some(U256::from(POLYGON)),
+                                    verifying_contract: Some(verifying_contract),
+                                    ..Eip712Domain::default()
+                                };
+
+                                let hash = order_struct.eip712_signing_hash(&domain);
+                                let signature = signer.sign_hash(&hash).await?;
+
+                                let signed_order = SignedOrder::builder()
+                                    .order(order_struct)
+                                    .signature(signature)
+                                    .order_type(OrderType::FAK)
+                                    .owner(owner)
+                                    .build();
+
+                                client.post_order(signed_order).await
                             }
                         };
 
