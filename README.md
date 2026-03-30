@@ -58,7 +58,7 @@ The Linux kernel is tuned for aggressive TCP performance by applying these `sysc
 
 ### 2. Docker Container (Overhead Reduction)
 Containers are deployed with high-priority resource allocations:
-- `--network host`: Bypasses the Docker virtual bridge for direct access to the AWS network card.
+- `--network host`: Bypasses the Docker virtual bridge for direct access to the host network card.
 - `--cpus="1.0"`: Reserves a full physical CPU core for the bot.
 - `--cpu-shares=1024`: Assigns maximum priority to the bot process.
 
@@ -71,7 +71,7 @@ The bot resolves `clob.polymarket.com` once at startup and "pins" the IP address
 
 ### Prerequisites
 - **Rust 1.91+** or **Docker**
-- **AWS Server**: Recommended location: `ca-central-1` (Montreal) for ~15ms peering to the exchange.
+- **Host Server**: Research well as you'll need ~15ms peering to the exchange to even think about trading properly.
 - **Minimum $10 USDC**: Due to exchange minimum order sizes.
 
 ### Deployment
