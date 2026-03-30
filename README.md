@@ -48,7 +48,7 @@ By using this software, you agree that:
 
 ## Performance Tuning (HFT Mode)
 
-To achieve the lowest possible latency, the following host and container optimizations are implemented:
+To achieve the lowest possible latency, the following host and container optimizations should be considered:
 
 ### 1. Ubuntu Host (Kernel Tuning)
 The Linux kernel is tuned for aggressive TCP performance by applying these `sysctl` settings:
