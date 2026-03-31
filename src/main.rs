@@ -12,7 +12,7 @@ use polymarket_client_sdk::clob::types::AssetType;
 use futures::StreamExt as _;
 use polymarket_client_sdk::clob::ws::Client as WsClient;
 
-use alloy::primitives::{U256, Address};
+use alloy::primitives::{U256, Address, address};
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer;
 use alloy::dyn_abi::Eip712Domain;
@@ -58,6 +58,10 @@ struct Position {
 const ORDER_NAME: &str = "Polymarket CTF Exchange";
 const VERSION: &str = "1";
 const USDC_DECIMALS: u32 = 6;
+
+// Verified Exchange Addresses from SDK
+const EXCHANGE_NORMAL: Address = address!("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E");
+const EXCHANGE_NEG_RISK: Address = address!("0xC5d563A36AE78145C45a50134d48A1215220f80a");
 
 fn to_fixed_u128(d: Decimal) -> u128 {
     d.normalize()
@@ -440,6 +444,8 @@ async fn main() -> Result<()> {
     let crypto_filter = env::var("CRYPTO_FILTER").unwrap_or_else(|_| "btc".to_string()).to_lowercase();
     let private_key = env::var(PRIVATE_KEY_VAR).expect("POLYMARKET_PRIVATE_KEY");
     let trade_size_usdc: Decimal = env::var("TRADE_SIZE_USDC").unwrap_or_else(|_| "10".to_string()).parse()?;
+    let momentum_trade_size_usdc: Decimal = env::var("MOMENTUM_TRADE_SIZE_USDC").unwrap_or_else(|_| "5".to_string()).parse()?;
+
     let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
     let eoa_address = signer.address();
     info!("Trading wallet (EOA) address: {}", eoa_address);
@@ -455,7 +461,6 @@ async fn main() -> Result<()> {
     info!("Authenticated on Polymarket CLOB. Safe (Maker) address: {}", safe_address);
 
     let nonce_manager = Arc::new(Mutex::new(0u64));
-    let verifying_contract = Address::from_str("0x4bFb304599C830208D148d51717806540c4923e4").unwrap();
 
     let starting_collateral = Arc::new(Mutex::new(dec!(0.0)));
     let (balance_tx, mut balance_rx) = watch::channel(dec!(0));
@@ -595,10 +600,15 @@ async fn main() -> Result<()> {
         let (yes_token, no_token, market_name, _market_close_time, strike_price, _) = market_rx.borrow().clone();
         info!("🚀 Starting Arbitrage Scalper on market: \"{}\"", market_name);
 
-        // Pre-fetch and cache fee rates for the current tokens to remove from critical path
+        // Pre-fetch and cache fee rates and neg_risk status to remove from critical path
         let yes_fee_rate = trading_client.fee_rate_bps(yes_token).await.map(|r| r.base_fee).unwrap_or(0);
         let no_fee_rate = trading_client.fee_rate_bps(no_token).await.map(|r| r.base_fee).unwrap_or(0);
-        info!("✅ Fee Rates Cached: YES {} bps | NO {} bps", yes_fee_rate, no_fee_rate);
+
+        // Determine correct exchange contract for the domain based on neg_risk
+        let is_neg_risk = trading_client.neg_risk(yes_token).await.map(|r| r.neg_risk).unwrap_or(false);
+        let verifying_contract = if is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
+
+        info!("✅ Cached Settings: NegRisk: {} | Exchange: {} | YES fee {} bps | NO fee {} bps", is_neg_risk, verifying_contract, yes_fee_rate, no_fee_rate);
 
         let (yes_price_tx, yes_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(1)));
         let (no_price_tx, no_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(1)));
@@ -667,8 +677,135 @@ async fn main() -> Result<()> {
 
                     if yes_ask == dec!(1) || no_ask == dec!(1) { continue; }
 
+                    // --- Momentum Trading Logic (One-Sided) ---
+                    if config::ENABLE_MOMENTUM_TRADING {
+                        let velocity = *velocity_rx.borrow();
+                        let binance_price = *oracle_rx.borrow();
+                        let threshold = match crypto_filter.as_str() {
+                            "eth" => config::ETH_MOMENTUM_THRESHOLD,
+                            "sol" => config::SOL_MOMENTUM_THRESHOLD,
+                            _ => config::BTC_MOMENTUM_THRESHOLD,
+                        };
+                        let strike_buffer = match crypto_filter.as_str() {
+                            "eth" => config::ETH_STRIKE_BUFFER,
+                            "sol" => config::SOL_STRIKE_BUFFER,
+                            _ => config::BTC_STRIKE_BUFFER,
+                        };
+
+                        if let Some(strike) = strike_price {
+                            let mut momentum_token = None;
+                            let mut limit_price = dec!(0);
+                            let mut fee_rate = 0;
+
+                            // Apply filters: Buffer, Entry Price Cap, and Directional Lock
+                            if velocity > threshold && binance_price > (strike + strike_buffer) && yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE {
+                                let has_no_pos = {
+                                    let pos = positions.lock().await;
+                                    pos.get(&no_token).map(|p| p.shares).unwrap_or(dec!(0)) == dec!(0)
+                                };
+                                if has_no_pos {
+                                    info!("🎯 MOMENTUM BUY SIGNAL: Binance ${:.2} > Strike ${:.2} + ${:.2} (Velocity: ${:.2}) -> YES", binance_price, strike, strike_buffer, velocity);
+                                    momentum_token = Some(yes_token);
+                                    limit_price = (yes_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
+                                    fee_rate = yes_fee_rate;
+                                } else {
+                                    debug!("⏭️ Momentum Signal Suppressed: Direction Lock (Own NO, won't buy YES)");
+                                }
+                            } else if velocity < -threshold && binance_price < (strike - strike_buffer) && no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE {
+                                let has_yes_pos = {
+                                    let pos = positions.lock().await;
+                                    pos.get(&yes_token).map(|p| p.shares).unwrap_or(dec!(0)) == dec!(0)
+                                };
+                                if has_yes_pos {
+                                    info!("🎯 MOMENTUM BUY SIGNAL: Binance ${:.2} < Strike ${:.2} - ${:.2} (Velocity: ${:.2}) -> NO", binance_price, strike, strike_buffer, velocity);
+                                    momentum_token = Some(no_token);
+                                    limit_price = (no_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
+                                    fee_rate = no_fee_rate;
+                                } else {
+                                    debug!("⏭️ Momentum Signal Suppressed: Direction Lock (Own YES, won't buy NO)");
+                                }
+                            }
+
+                            if let Some(token) = momentum_token {
+                                let current_usdc_balance = *balance_rx.borrow();
+                                if current_usdc_balance >= momentum_trade_size_usdc {
+                                    let target_shares = (momentum_trade_size_usdc / limit_price).floor();
+                                    if target_shares >= config::MIN_ORDER_SHARES {
+                                        let current_exposure = {
+                                            let pos = positions.lock().await;
+                                            pos.values().map(|p| p.shares * p.avg_entry).sum::<Decimal>()
+                                        };
+
+                                        if current_exposure + momentum_trade_size_usdc <= config::MAX_EXPOSURE_PER_TOKEN_USDC {
+                                            info!("💰 [MOMENTUM SIGNAL] token {} @ ${:.2} (Size: ${:.2})", token, limit_price, momentum_trade_size_usdc);
+
+                                            if config::GHOST_MODE {
+                                                info!("👻 GHOST MODE: Momentum order would have been placed (Token: {}, Price: ${:.2})", token, limit_price);
+                                            } else {
+                                                info!("🔥 LIVE MODE: Executing one-sided momentum trade...");
+                                                let client = Arc::clone(&trading_client);
+                                                let signer = signer.clone();
+                                                let nonce_manager = Arc::clone(&nonce_manager);
+                                                let owner = client.credentials().key();
+                                                let amount = to_fixed_u128(target_shares);
+
+                                                tokio::spawn(async move {
+                                                    let mut nonce_guard = nonce_manager.lock().await;
+                                                    let nonce = *nonce_guard;
+                                                    *nonce_guard += 1;
+                                                    drop(nonce_guard);
+
+                                                    let mut order_struct = Order::default();
+                                                    order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
+                                                    order_struct.maker = safe_address;
+                                                    order_struct.signer = eoa_address;
+                                                    order_struct.taker = Address::ZERO;
+                                                    order_struct.tokenId = token;
+                                                    order_struct.makerAmount = U256::from(to_fixed_u128(target_shares * limit_price));
+                                                    order_struct.takerAmount = U256::from(amount);
+                                                    order_struct.expiration = U256::ZERO;
+                                                    order_struct.nonce = U256::from(nonce);
+                                                    order_struct.feeRateBps = U256::from(fee_rate);
+                                                    order_struct.side = Side::Buy as u8;
+                                                    order_struct.signatureType = SignatureType::GnosisSafe as u8;
+
+                                                    let domain = Eip712Domain {
+                                                        name: Some(Cow::Borrowed(ORDER_NAME)),
+                                                        version: Some(Cow::Borrowed(VERSION)),
+                                                        chain_id: Some(U256::from(POLYGON)),
+                                                        verifying_contract: Some(verifying_contract),
+                                                        ..Eip712Domain::default()
+                                                    };
+
+                                                    let hash = order_struct.eip712_signing_hash(&domain);
+                                                    if let Ok(signature) = signer.sign_hash(&hash).await {
+                                                        let signed_order = SignedOrder::builder()
+                                                            .order(order_struct)
+                                                            .signature(signature)
+                                                            .order_type(OrderType::FAK)
+                                                            .owner(owner)
+                                                            .build();
+                                                        let _ = client.post_order(signed_order).await;
+                                                    }
+                                                });
+                                            }
+                                            trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
+                                            continue; // Skip arb check for this tick
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    // --- End Momentum Trading Logic ---
+
                     let combined_ask = yes_ask + no_ask;
-                    let profit_margin = dec!(1.0) - combined_ask;
+                    let profit_margin_no_fees = dec!(1.0) - combined_ask;
+
+                    // Fee-Aware Calculation: Margin after Taker Fees
+                    let yes_fee = yes_ask * (Decimal::from(yes_fee_rate) / dec!(10_000));
+                    let no_fee = no_ask * (Decimal::from(no_fee_rate) / dec!(10_000));
+                    let profit_margin = profit_margin_no_fees - (yes_fee + no_fee);
 
                     if profit_margin >= config::ARBITRAGE_PROFIT_THRESHOLD {
                         let arb_signal_start = Instant::now();
@@ -685,7 +822,7 @@ async fn main() -> Result<()> {
                             continue;
                         }
 
-                        info!("💰 Arb opportunity! Margin: {:.4}¢", profit_margin * dec!(100));
+                        info!("💰 Arb opportunity! Margin after fees: {:.4}¢ (Gross: {:.4}¢, Fees: {:.4}¢)", profit_margin * dec!(100), profit_margin_no_fees * dec!(100), (yes_fee + no_fee) * dec!(100));
 
                         let target_shares = (trade_size_usdc / combined_ask).floor();
                         if target_shares < config::MIN_ORDER_SHARES {
@@ -714,6 +851,12 @@ async fn main() -> Result<()> {
 
                         let yes_limit_price = (yes_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
                         let no_limit_price  = (no_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
+
+                        if config::GHOST_MODE {
+                            info!("👻 GHOST MODE: Arb trade would have been placed (YES: ${:.2}, NO: ${:.2})", yes_limit_price, no_limit_price);
+                            trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
+                            continue;
+                        }
 
                         let amount_res = Amount::shares(target_shares);
                         let amount = match amount_res {
