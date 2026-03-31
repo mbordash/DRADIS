@@ -1,6 +1,6 @@
 # RustPolyBot 🤖
 
-A high-frequency, "Perfect-Hedge" arbitrage bot for Polymarket. This bot simultaneously monitors both sides of a market ('YES' and 'NO') to find and exploit mispricings, locking in guaranteed profits by buying a "synthetic dollar" for less than $1.00.
+A high-frequency hybrid trading bot for Polymarket. This bot combines "Perfect-Hedge" arbitrage with "Oracle-Lag" momentum trading to maximize opportunities in both low-volatility and trending markets.
 
 ---
 
@@ -13,22 +13,9 @@ A high-frequency, "Perfect-Hedge" arbitrage bot for Polymarket. This bot simulta
 - **Jurisdiction**: Verify that prediction markets and automated trading are legal in your country/region before deployment.
 
 ### Financial Risk
-- **You will likely lose money.** Potentially a lot of money. This is not a "free money" machine. Arbitrage opportunities are rare and fleeting.
-- **This is NOT a guaranteed profit tool.** Trading crypto prediction markets is inherently risky.
+- **You will likely lose money.** Momentum trading introduces **directional risk**—you are no longer always hedged.
+- **This is NOT a guaranteed profit tool.** Arbitrage opportunities are rare, and momentum trades can be "whiplashed" by market reversals.
 - **Treat this as gambling, not investing.** You should never spend money you cannot afford to lose.
-- **Start with minimal position sizes** (e.g., $10 per trade is the current recommended minimum) for testing only.
-
-### Market Dynamics
-- **Polymarket is dominated by sophisticated bots**, many far more advanced than this one.
-- **Professional traders and algorithms are already operating** on these markets at scale.
-- **The odds are stacked against retail traders.** This bot is a proof-of-concept, not a money-making machine.
-
-### Disclaimer
-By using this software, you agree that:
-- You understand the financial risks involved.
-- You are operating in a jurisdiction where this is legal.
-- You take full responsibility for any losses.
-- The authors bear no liability for your trading outcomes.
 
 **Use at your own risk.** 🎲
 
@@ -36,13 +23,28 @@ By using this software, you agree that:
 
 ## Features
 
-- **Binance Oracle Integration**: Streams real-time BTC/ETH/SOL prices from Binance to detect "Oracle Lag" before Polymarket prices adjust.
-- **Strike Price Discovery**: Automatically extracts price targets (Strike Price) from market metadata to calculate real-time "Distance to Strike" (Diff).
-- **Response-Based Accounting**: Uses the exchange's direct API response for 100% accurate fill detection. No more "ghost" positions.
-- **Ultra-Parallel Execution**: Uses Rust's `tokio::join!` to prepare, sign, and post YES and NO orders simultaneously, achieving latency as low as 26ms per leg.
-- **Industrial-Grade Safety**: Includes a 60-second failure cooldown, a 3-strike circuit breaker, and automatic unhedged position flattening.
-- **Network Optimizations**: Implements DNS pinning and persistent connection pooling to minimize round-trip times to the exchange.
-- **Dual WebSocket Feeds**: Maintains persistent, low-latency WebSocket connections for real-time order book data.
+- **Hybrid Strategy Engine**:
+    - **Arbitrage**: Simultaneously buys 'YES' and 'NO' when the sum is < $1.00 for a risk-free profit.
+    - **Momentum (New)**: Executes one-sided speculative trades when Binance prices move sharply ($50+ for BTC) before Polymarket adjusts.
+- **Advanced Safety Filters**:
+    - **Strike Buffer**: Momentum trades only fire when price is safely away from the strike (e.g. Strike + $50) to avoid choppy oscillations.
+    - **Directional Lock**: Prevents buying the opposite side of an open momentum position to avoid "accidental arbitrage" at a loss.
+    - **Price Cap**: Automatically stops momentum buying if the token price exceeds $0.75, ensuring a healthy risk/reward ratio.
+- **Ghost Mode Testing**: Includes a `GHOST_MODE` flag to simulate all trades in the logs without spending real capital.
+- **Dual-Sized Positions**: Supports separate trade sizes for arbitrage (hedged) and momentum (speculative) entries via `.env`.
+- **Binance Oracle Integration**: Streams real-time ticker data to detect "Oracle Lag" in milliseconds.
+- **Ultra-Parallel Execution**: Latency as low as 20ms per leg using Rust's `tokio` runtime and optimized DNS pinning.
+
+---
+
+## Configuration (`.env`)
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `TRADE_SIZE_USDC` | Size for hedged arbitrage trades. | `10` |
+| `MOMENTUM_TRADE_SIZE_USDC` | Size for speculative momentum trades. | `5` |
+| `CRYPTO_FILTER` | Target asset (`btc`, `eth`, or `sol`). | `btc` |
+| `POLYMARKET_PRIVATE_KEY` | Your Polygon EOA private key. | `REQUIRED` |
 
 ---
 
@@ -62,51 +64,19 @@ Containers are deployed with high-priority resource allocations:
 - `--cpus="1.0"`: Reserves a full physical CPU core for the bot.
 - `--cpu-shares=1024`: Assigns maximum priority to the bot process.
 
-### 3. DNS Pinning
-The bot resolves `clob.polymarket.com` once at startup and "pins" the IP address in memory, saving ~20ms of lookup time on every trade.
-
 ---
 
-## Quick Start
+## Deployment
 
-### Prerequisites
-- **Rust 1.91+** or **Docker**
-- **Host Server**: Research well as you'll need ~15ms peering to the exchange to even think about trading properly.
-- **Minimum $10 USDC**: Due to exchange minimum order sizes.
+1. **Test first in Ghost Mode**:
+   Ensure `pub const GHOST_MODE: bool = true;` is set in `src/config.rs`. Run the bot and watch the logs for `👻 GHOST MODE` signals.
 
-### Deployment
-1. **Set up environment**
+2. **Go Live**:
+   Change `GHOST_MODE` to `false` in `src/config.rs` and rebuild:
    ```bash
-   cp .env.example .env
-   # Edit .env with your POLYMARKET_PRIVATE_KEY and TRADE_SIZE_USDC
+   cargo build --release
+   ./target/release/rustpolybot
    ```
-
-2. **Run with Optimizations**
-   ```bash
-   docker run -d \
-       --network host \
-       --cpus="1.0" \
-       --cpu-shares=1024 \
-       --restart unless-stopped \
-       --name rustpolybot-btc \
-       --env-file .env \
-       -e CRYPTO_FILTER=btc \
-       rustpolybot
-   ```
-
-3. **Monitor Latency**
-   Look for the following logs to audit performance:
-   - `📍 Network Pulse`: Baseline round-trip time to the exchange.
-   - `📈 BOTH LEGS FILLED`: Real-world execution latency.
-
----
-
-## Future Enhancements (TODO)
-
-- [ ] **Oracle Momentum Snipe**: Automatically trade when Binance moves $>X\%$ before Polymarket reacts.
-- [ ] **Maker Support**: Transition to earning rebates by placing limit orders at the best bid.
-- [ ] **Book Walking**: Analyze order book depth up to 5 levels to prevent slippage.
-- [ ] **Multi-Outcome Arbitrage**: Support markets with 3+ outcomes where the sum is < $1.00.
 
 ---
 
