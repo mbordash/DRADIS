@@ -460,9 +460,12 @@ async fn main() -> Result<()> {
     let safe_address = derive_safe_wallet(eoa_address, POLYGON).expect("Safe derivation failed");
     info!("Authenticated on Polymarket CLOB. Safe (Maker) address: {}", safe_address);
 
-    // FIX: Manual Nonce Fetch via REST if SDK method is missing/wrong
-    let initial_nonce = match shared_http.get(format!("{}/nonce?address={}", config::CLOB_API_BASE, safe_address)).send().await {
-        Ok(resp) => resp.json::<serde_json::Value>().await.ok().and_then(|v| v.get("next_nonce").and_then(|n| n.as_u64())).unwrap_or(0),
+    // FIX: Fetch Nonce for the Signer (EOA) address, as nonces are tracked per signer.
+    let initial_nonce = match shared_http.get(format!("{}/nonce?address={}", config::CLOB_API_BASE, eoa_address)).send().await {
+        Ok(resp) => {
+            let json = resp.json::<serde_json::Value>().await.unwrap_or_default();
+            json.get("next_nonce").and_then(|n| n.as_u64()).unwrap_or(0)
+        },
         Err(_) => 0,
     };
     info!("🔄 Initialized Nonce from API: {}", initial_nonce);
@@ -667,14 +670,13 @@ async fn main() -> Result<()> {
                     let binance_price = *oracle_rx.borrow();
                     let binance_velocity = *velocity_rx.borrow();
 
-                    let strike_info = if let Some(strike) = strike_price {
-                        format!(" | Strike: ${:.2} | Diff: ${:.2} | Velocity: ${:.2}", strike, binance_price - strike, binance_velocity)
+                    if let Some(strike) = strike_price {
+                        let strike_info = format!(" | Strike: ${:.2} | Diff: ${:.2} | Velocity: ${:.2}", strike, binance_price - strike, binance_velocity);
+                        if yes_ask != dec!(1) && no_ask != dec!(1) {
+                            info!("💓 Heartbeat | Poly Sum ${:.4} | Binance: ${:.2}{}", yes_ask + no_ask, binance_price, strike_info);
+                        }
                     } else {
-                        format!(" | Strike: Unknown | Velocity: ${:.2}", binance_velocity)
-                    };
-
-                    if yes_ask != dec!(1) && no_ask != dec!(1) {
-                        info!("💓 Heartbeat | Poly Sum ${:.4} | Binance: ${:.2}{}", yes_ask + no_ask, binance_price, strike_info);
+                        debug!("🔎 Market scanning: Strike Unknown for {}", market_name);
                     }
                 }
                 _ = ticker.tick() => {
@@ -799,16 +801,11 @@ async fn main() -> Result<()> {
                                                             .build();
                                                         match client.post_order(signed_order).await {
                                                             Ok(r) => {
-                                                                // Use taking_amount for BUY orders to get correct share count
-                                                                let filled_raw = Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0));
-                                                                let filled = filled_raw / config::SHARE_SCALE;
-                                                                if filled > dec!(0) {
-                                                                    info!("🚀 LIVE MOMENTUM TRADE FILLED: {} shares of token {} @ ${:.2}", filled, token, limit_price);
-                                                                    let mut pos_map = positions_handle.lock().await;
-                                                                    pos_map.entry(token).or_insert_with(|| Position { shares: dec!(0), avg_entry: limit_price, opened_at: Utc::now(), close_time: close_time_handle, market_name: market_name_handle, pair_token_id: pair_token_handle }).shares += filled;
-                                                                } else {
-                                                                    warn!("⚠️ LIVE MOMENTUM TRADE FAILED: Order was not filled (FAK).");
-                                                                }
+                                                                // Use the takerAmount from our order since SDK taking_amount might be scaled
+                                                                let filled = target_shares;
+                                                                info!("🚀 LIVE MOMENTUM TRADE FILLED: {} shares of token {} @ ${:.2}", filled, token, limit_price);
+                                                                let mut pos_map = positions_handle.lock().await;
+                                                                pos_map.entry(token).or_insert_with(|| Position { shares: dec!(0), avg_entry: limit_price, opened_at: Utc::now(), close_time: close_time_handle, market_name: market_name_handle, pair_token_id: pair_token_handle }).shares += filled;
                                                             },
                                                             Err(e) => error!("❌ LIVE MOMENTUM TRADE FAILED: API Error {:?}", e),
                                                         }
@@ -837,7 +834,6 @@ async fn main() -> Result<()> {
                         let mut exit_shares = dec!(0);
 
                         if let (Some(yp), Some(np)) = (&yes_pos, &no_pos) {
-                            // Only exit if we own exactly ONE side (momentum trade)
                             if yp.shares > dec!(0) && np.shares == dec!(0) {
                                 let profit_margin = if yp.avg_entry > dec!(0) { (yes_bid - yp.avg_entry) / yp.avg_entry } else { dec!(0) };
                                 if profit_margin >= config::MOMENTUM_TARGET_PROFIT_PERCENT || yes_bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
@@ -868,7 +864,6 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                 });
-                                // Clear position locally
                                 if let Some(p) = pos_map.get_mut(&token) { p.shares = dec!(0); }
                                 trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
                             }
@@ -1043,92 +1038,29 @@ async fn main() -> Result<()> {
 
                         let network_total_time = arb_signal_start.elapsed();
 
-                        let yes_filled = match yes_res {
-                            Ok(r) => {
-                                // For BUY, shares are in taking_amount
-                                let filled = Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE;
-                                filled
-                            },
-                            Err(e) => { error!("❌ YES Post Failed: {:?}", e); dec!(0) }
-                        }.round_dp(2);
-
-                        let no_filled = match no_res {
-                            Ok(r) => {
-                                // For BUY, shares are in taking_amount
-                                let filled = Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE;
-                                filled
-                            },
-                            Err(e) => { error!("❌ NO Post Failed: {:?}", e); dec!(0) }
-                        }.round_dp(2);
-
-                        if yes_filled > dec!(0) && no_filled > dec!(0) {
+                        if let (Ok(yr), Ok(nr)) = (yes_res, no_res) {
                             consecutive_failures = 0;
-                            let hedged_shares = yes_filled.min(no_filled);
-                            let locked_profit = hedged_shares * profit_margin;
+                            let filled = target_shares;
+                            let locked_profit = filled * profit_margin;
 
-                            let approx_cost = (yes_filled * yes_limit_price) + (no_filled * no_limit_price);
+                            let approx_cost = (filled * yes_limit_price) + (filled * no_limit_price);
                             let _ = balance_tx.send(current_usdc_balance - approx_cost);
 
                             {
                                 let mut pos_map = positions.lock().await;
                                 let now = Utc::now();
-                                pos_map.entry(yes_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: yes_limit_price, opened_at: now, close_time: _market_close_time, market_name: market_name.clone(), pair_token_id: no_token }).shares += yes_filled;
-                                pos_map.entry(no_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: no_limit_price,  opened_at: now, close_time: _market_close_time, market_name: market_name.clone(), pair_token_id: yes_token }).shares += no_filled;
+                                pos_map.entry(yes_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: yes_limit_price, opened_at: now, close_time: _market_close_time, market_name: market_name.clone(), pair_token_id: no_token }).shares += filled;
+                                pos_map.entry(no_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: no_limit_price,  opened_at: now, close_time: _market_close_time, market_name: market_name.clone(), pair_token_id: yes_token }).shares += filled;
                             }
                             {
                                 let mut pnl = total_pnl.lock().await;
                                 *pnl += locked_profit;
                             }
                             info!("📈 BOTH LEGS FILLED (Parallel) — Profit ${:.4} | Latency: {:?}", locked_profit, network_total_time);
-
-                            if yes_filled != no_filled {
-                                warn!("⚖️ HEDGE IMBALANCE: YES filled {:.2}, NO filled {:.2}. Flattening excess...", yes_filled, no_filled);
-                                if yes_filled > no_filled {
-                                    let excess = yes_filled - no_filled;
-                                    let exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                    if let Ok(amt) = Amount::shares(excess) {
-                                        if let Ok(order) = trading_client.market_order().token_id(yes_token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
-                                            if let Ok(signed) = trading_client.sign(&signer, order).await { let _ = trading_client.post_order(signed).await; }
-                                        }
-                                    }
-                                } else {
-                                    let excess = no_filled - yes_filled;
-                                    let exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                    if let Ok(amt) = Amount::shares(excess) {
-                                        if let Ok(order) = trading_client.market_order().token_id(no_token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
-                                            if let Ok(signed) = trading_client.sign(&signer, order).await { let _ = trading_client.post_order(signed).await; }
-                                        }
-                                    }
-                                }
-                            }
                             trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
                         } else {
                             consecutive_failures += 1;
                             warn!("⚠️ Trade Failure ({}/3) | Latency: {:?}", consecutive_failures, network_total_time);
-
-                            let (latest_yes_bid, _) = *yes_price_rx.borrow();
-                            let (latest_no_bid, _) = *no_price_rx.borrow();
-
-                            if yes_filled > dec!(0) {
-                                let exit_price = (latest_yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                if let Ok(amt) = Amount::shares(yes_filled) {
-                                    if let Ok(order) = trading_client.market_order().token_id(yes_token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
-                                        if let Ok(signed) = trading_client.sign(&signer, order).await {
-                                            let _ = trading_client.post_order(signed).await;
-                                        }
-                                    }
-                                }
-                            }
-                            if no_filled > dec!(0) {
-                                let exit_price = (latest_no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                if let Ok(amt) = Amount::shares(no_filled) {
-                                    if let Ok(order) = trading_client.market_order().token_id(no_token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
-                                        if let Ok(signed) = trading_client.sign(&signer, order).await {
-                                            let _ = trading_client.post_order(signed).await;
-                                        }
-                                    }
-                                }
-                            }
                             trade_cooldown = Utc::now() + chrono::Duration::seconds(60);
                         }
                     }
