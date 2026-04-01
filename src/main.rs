@@ -460,7 +460,13 @@ async fn main() -> Result<()> {
     let safe_address = derive_safe_wallet(eoa_address, POLYGON).expect("Safe derivation failed");
     info!("Authenticated on Polymarket CLOB. Safe (Maker) address: {}", safe_address);
 
-    let nonce_manager = Arc::new(Mutex::new(0u64));
+    // FIX: Manual Nonce Fetch via REST if SDK method is missing/wrong
+    let initial_nonce = match shared_http.get(format!("{}/nonce?address={}", config::CLOB_API_BASE, safe_address)).send().await {
+        Ok(resp) => resp.json::<serde_json::Value>().await.ok().and_then(|v| v.get("next_nonce").and_then(|n| n.as_u64())).unwrap_or(0),
+        Err(_) => 0,
+    };
+    info!("🔄 Initialized Nonce from API: {}", initial_nonce);
+    let nonce_manager = Arc::new(Mutex::new(initial_nonce));
 
     let starting_collateral = Arc::new(Mutex::new(dec!(0.0)));
     let (balance_tx, mut balance_rx) = watch::channel(dec!(0));
@@ -793,7 +799,9 @@ async fn main() -> Result<()> {
                                                             .build();
                                                         match client.post_order(signed_order).await {
                                                             Ok(r) => {
-                                                                let filled = Decimal::from_str(&r.making_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE;
+                                                                // Use taking_amount for BUY orders to get correct share count
+                                                                let filled_raw = Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0));
+                                                                let filled = filled_raw / config::SHARE_SCALE;
                                                                 if filled > dec!(0) {
                                                                     info!("🚀 LIVE MOMENTUM TRADE FILLED: {} shares of token {} @ ${:.2}", filled, token, limit_price);
                                                                     let mut pos_map = positions_handle.lock().await;
@@ -830,16 +838,22 @@ async fn main() -> Result<()> {
 
                         if let (Some(yp), Some(np)) = (&yes_pos, &no_pos) {
                             // Only exit if we own exactly ONE side (momentum trade)
-                            if yp.shares > dec!(0) && np.shares == dec!(0) && yes_bid >= config::MOMENTUM_TAKE_PROFIT_THRESHOLD {
-                                info!("🎯 Momentum YES Target Reached (Bid: ${:.2}) - Taking Profit", yes_bid);
-                                exit_token = Some(yes_token);
-                                exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                exit_shares = yp.shares;
-                            } else if np.shares > dec!(0) && yp.shares == dec!(0) && no_bid >= config::MOMENTUM_TAKE_PROFIT_THRESHOLD {
-                                info!("🎯 Momentum NO Target Reached (Bid: ${:.2}) - Taking Profit", no_bid);
-                                exit_token = Some(no_token);
-                                exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                exit_shares = np.shares;
+                            if yp.shares > dec!(0) && np.shares == dec!(0) {
+                                let profit_margin = if yp.avg_entry > dec!(0) { (yes_bid - yp.avg_entry) / yp.avg_entry } else { dec!(0) };
+                                if profit_margin >= config::MOMENTUM_TARGET_PROFIT_PERCENT || yes_bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
+                                    info!("🎯 Momentum YES Target Reached (Bid: ${:.2}, Profit: {:.2}%) - Taking Profit", yes_bid, profit_margin * dec!(100));
+                                    exit_token = Some(yes_token);
+                                    exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                    exit_shares = yp.shares;
+                                }
+                            } else if np.shares > dec!(0) && yp.shares == dec!(0) {
+                                let profit_margin = if np.avg_entry > dec!(0) { (no_bid - np.avg_entry) / np.avg_entry } else { dec!(0) };
+                                if profit_margin >= config::MOMENTUM_TARGET_PROFIT_PERCENT || no_bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
+                                    info!("🎯 Momentum NO Target Reached (Bid: ${:.2}, Profit: {:.2}%) - Taking Profit", no_bid, profit_margin * dec!(100));
+                                    exit_token = Some(no_token);
+                                    exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                    exit_shares = np.shares;
+                                }
                             }
                         }
 
@@ -1031,16 +1045,18 @@ async fn main() -> Result<()> {
 
                         let yes_filled = match yes_res {
                             Ok(r) => {
-                                let filled = Decimal::from_str(&r.making_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE;
-                                if filled > dec!(0) { filled } else { Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE }
+                                // For BUY, shares are in taking_amount
+                                let filled = Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE;
+                                filled
                             },
                             Err(e) => { error!("❌ YES Post Failed: {:?}", e); dec!(0) }
                         }.round_dp(2);
 
                         let no_filled = match no_res {
                             Ok(r) => {
-                                let filled = Decimal::from_str(&r.making_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE;
-                                if filled > dec!(0) { filled } else { Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE }
+                                // For BUY, shares are in taking_amount
+                                let filled = Decimal::from_str(&r.taking_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE;
+                                filled
                             },
                             Err(e) => { error!("❌ NO Post Failed: {:?}", e); dec!(0) }
                         }.round_dp(2);
@@ -1132,12 +1148,14 @@ async fn main() -> Result<()> {
                                     let exit_price_no  = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
 
                                     if let (Ok(amt_yes), Ok(amt_no)) = (Amount::shares(yes_pos.shares), Amount::shares(no_pos.shares)) {
-                                        let res_yes = trading_client.market_order().token_id(yes_token).amount(amt_yes).side(Side::Sell).price(exit_price_yes).order_type(OrderType::FAK).build().await;
-                                        let res_no  = trading_client.market_order().token_id(no_token).amount(amt_no).side(Side::Sell).price(exit_price_no).order_type(OrderType::FAK).build().await;
-
-                                        if let (Ok(oy), Ok(on)) = (res_yes, res_no) {
-                                            if let (Ok(sy), Ok(sn)) = (trading_client.sign(&signer, oy).await, trading_client.sign(&signer, on).await) {
-                                                let _ = tokio::join!(trading_client.post_order(sy), trading_client.post_order(sn));
+                                        if let Ok(oy) = trading_client.market_order().token_id(yes_token).amount(amt_yes).side(Side::Sell).price(exit_price_yes).order_type(OrderType::FAK).build().await {
+                                            if let Ok(sy) = trading_client.sign(&signer, oy).await {
+                                                let _ = trading_client.post_order(sy).await;
+                                            }
+                                        }
+                                        if let Ok(on) = trading_client.market_order().token_id(no_token).amount(amt_no).side(Side::Sell).price(exit_price_no).order_type(OrderType::FAK).build().await {
+                                            if let Ok(sn) = trading_client.sign(&signer, on).await {
+                                                let _ = trading_client.post_order(sn).await;
                                             }
                                         }
 
