@@ -51,15 +51,19 @@ pub const EARLY_EXIT_COMBINED_BID_THRESHOLD: Decimal = dec!(0.995);
 /// Allow one-sided momentum trades (riskier, non-hedged entries based on Binance oracle)
 pub const ENABLE_MOMENTUM_TRADING: bool = true;
 
-/// Take profit threshold for one-sided momentum trades.
-/// Selling at $0.93 captures most of the move and recycles capital for the next session.
-pub const MOMENTUM_TAKE_PROFIT_THRESHOLD: Decimal = dec!(0.93);
+/// Dynamic Take Profit: Exit if we gain this % over our entry price.
+/// Set to 0.15 (15%) for conservative profit taking.
+pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.15);
+
+/// Static Take Profit Ceiling: Exit if bid hits this price regardless of entry.
+/// Set to $0.90 to ensure capital recycling before expiry.
+pub const MOMENTUM_TAKE_PROFIT_CEILING: Decimal = dec!(0.90);
 
 /// Minimum distance from strike price (in USD) to trigger a momentum trade.
 /// Prevents "churning" when the price is oscillating near the strike.
 pub const BTC_STRIKE_BUFFER: Decimal = dec!(50.0);
 pub const ETH_STRIKE_BUFFER: Decimal = dec!(5.0);
-pub const SOL_STRIKE_BUFFER: Decimal = dec!(0.5);
+pub const SOL_STRIKE_BUFFER: Decimal = dec!(0.2);
 
 /// Maximum token price allowed for a momentum entry.
 /// Prevents buying a token when the upside is already limited.
