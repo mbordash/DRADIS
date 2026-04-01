@@ -67,7 +67,7 @@ The bot resolves `clob.polymarket.com` once at startup and "pins" the IP address
 
 ### Prerequisites
 - **Rust 1.91+** or **Docker**
-- **AWS Server**: Recommended location: `ca-central-1` (Montreal) for ~15ms peering to the exchange.
+- **AWS Server**: Research the proper region required for ~15ms peering to the exchange.
 - **Minimum $10 USDC**: Due to exchange minimum order sizes.
 
 ### Configuration (`.env`)
