@@ -460,7 +460,7 @@ async fn main() -> Result<()> {
     let safe_address = derive_safe_wallet(eoa_address, POLYGON).expect("Safe derivation failed");
     info!("Authenticated on Polymarket CLOB. Safe (Maker) address: {}", safe_address);
 
-    // FIX: Fetch Nonce for the Signer (EOA) address, as nonces are tracked per signer.
+    // FIX: Manual Nonce Fetch via REST if SDK method is missing/wrong
     let initial_nonce = match shared_http.get(format!("{}/nonce?address={}", config::CLOB_API_BASE, eoa_address)).send().await {
         Ok(resp) => {
             let json = resp.json::<serde_json::Value>().await.unwrap_or_default();
@@ -687,6 +687,54 @@ async fn main() -> Result<()> {
 
                     if yes_ask == dec!(1) || no_ask == dec!(1) { continue; }
 
+                    // --- Momentum Take Profit Logic ---
+                    {
+                        let mut pos_map = positions.lock().await;
+                        let yes_pos = pos_map.get(&yes_token).cloned();
+                        let no_pos  = pos_map.get(&no_token).cloned();
+
+                        let mut exit_token = None;
+                        let mut exit_price = dec!(0);
+                        let mut exit_shares = dec!(0);
+
+                        if let (Some(yp), Some(np)) = (&yes_pos, &no_pos) {
+                            if yp.shares > dec!(0) && np.shares == dec!(0) {
+                                let profit_margin = if yp.avg_entry > dec!(0) { (yes_bid - yp.avg_entry) / yp.avg_entry } else { dec!(0) };
+                                if profit_margin >= config::MOMENTUM_TARGET_PROFIT_PERCENT || yes_bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
+                                    info!("🎯 Momentum YES Target Reached (Bid: ${:.2}, Profit: {:.2}%) - Taking Profit", yes_bid, profit_margin * dec!(100));
+                                    exit_token = Some(yes_token);
+                                    exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                    exit_shares = yp.shares;
+                                }
+                            } else if np.shares > dec!(0) && yp.shares == dec!(0) {
+                                let profit_margin = if np.avg_entry > dec!(0) { (no_bid - np.avg_entry) / np.avg_entry } else { dec!(0) };
+                                if profit_margin >= config::MOMENTUM_TARGET_PROFIT_PERCENT || no_bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
+                                    info!("🎯 Momentum NO Target Reached (Bid: ${:.2}, Profit: {:.2}%) - Taking Profit", no_bid, profit_margin * dec!(100));
+                                    exit_token = Some(no_token);
+                                    exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                    exit_shares = np.shares;
+                                }
+                            }
+                        }
+
+                        if let Some(token) = exit_token {
+                            let client = Arc::clone(&trading_client);
+                            let signer = signer.clone();
+                            if let Ok(amt) = Amount::shares(exit_shares) {
+                                tokio::spawn(async move {
+                                    if let Ok(order) = client.market_order().token_id(token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
+                                        if let Ok(signed) = client.sign(&signer, order).await {
+                                            let _ = client.post_order(signed).await;
+                                        }
+                                    }
+                                });
+                                if let Some(p) = pos_map.get_mut(&token) { p.shares = dec!(0); }
+                                trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
+                            }
+                        }
+                    }
+                    // --- End Momentum Take Profit Logic ---
+
                     // --- Momentum Trading Logic (One-Sided) ---
                     if config::ENABLE_MOMENTUM_TRADING && !momentum_fired_for_current_market {
                         let velocity = *velocity_rx.borrow();
@@ -801,7 +849,6 @@ async fn main() -> Result<()> {
                                                             .build();
                                                         match client.post_order(signed_order).await {
                                                             Ok(r) => {
-                                                                // Use the takerAmount from our order since SDK taking_amount might be scaled
                                                                 let filled = target_shares;
                                                                 info!("🚀 LIVE MOMENTUM TRADE FILLED: {} shares of token {} @ ${:.2}", filled, token, limit_price);
                                                                 let mut pos_map = positions_handle.lock().await;
@@ -822,54 +869,6 @@ async fn main() -> Result<()> {
                         }
                     }
                     // --- End Momentum Trading Logic ---
-
-                    // --- Momentum Take Profit Logic ---
-                    {
-                        let mut pos_map = positions.lock().await;
-                        let yes_pos = pos_map.get(&yes_token).cloned();
-                        let no_pos  = pos_map.get(&no_token).cloned();
-
-                        let mut exit_token = None;
-                        let mut exit_price = dec!(0);
-                        let mut exit_shares = dec!(0);
-
-                        if let (Some(yp), Some(np)) = (&yes_pos, &no_pos) {
-                            if yp.shares > dec!(0) && np.shares == dec!(0) {
-                                let profit_margin = if yp.avg_entry > dec!(0) { (yes_bid - yp.avg_entry) / yp.avg_entry } else { dec!(0) };
-                                if profit_margin >= config::MOMENTUM_TARGET_PROFIT_PERCENT || yes_bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
-                                    info!("🎯 Momentum YES Target Reached (Bid: ${:.2}, Profit: {:.2}%) - Taking Profit", yes_bid, profit_margin * dec!(100));
-                                    exit_token = Some(yes_token);
-                                    exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                    exit_shares = yp.shares;
-                                }
-                            } else if np.shares > dec!(0) && yp.shares == dec!(0) {
-                                let profit_margin = if np.avg_entry > dec!(0) { (no_bid - np.avg_entry) / np.avg_entry } else { dec!(0) };
-                                if profit_margin >= config::MOMENTUM_TARGET_PROFIT_PERCENT || no_bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
-                                    info!("🎯 Momentum NO Target Reached (Bid: ${:.2}, Profit: {:.2}%) - Taking Profit", no_bid, profit_margin * dec!(100));
-                                    exit_token = Some(no_token);
-                                    exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                    exit_shares = np.shares;
-                                }
-                            }
-                        }
-
-                        if let Some(token) = exit_token {
-                            let client = Arc::clone(&trading_client);
-                            let signer = signer.clone();
-                            if let Ok(amt) = Amount::shares(exit_shares) {
-                                tokio::spawn(async move {
-                                    if let Ok(order) = client.market_order().token_id(token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
-                                        if let Ok(signed) = client.sign(&signer, order).await {
-                                            let _ = client.post_order(signed).await;
-                                        }
-                                    }
-                                });
-                                if let Some(p) = pos_map.get_mut(&token) { p.shares = dec!(0); }
-                                trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
-                            }
-                        }
-                    }
-                    // --- End Momentum Take Profit Logic ---
 
                     let combined_ask = yes_ask + no_ask;
                     let profit_margin_no_fees = dec!(1.0) - combined_ask;

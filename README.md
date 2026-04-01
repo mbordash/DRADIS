@@ -34,10 +34,10 @@ A high-frequency hybrid trading bot for Polymarket. This bot combines "Perfect-H
     - **Strike Buffer**: Momentum trades only fire when price is safely away from the strike (e.g. Strike + $50) to avoid choppy oscillations.
     - **Directional Lock**: Prevents buying the opposite side of an open momentum position to avoid "accidental arbitrage" at a loss.
     - **Price Cap**: Automatically stops momentum buying if the token price exceeds $0.75, ensuring a healthy risk/reward ratio.
-- **Automated Profit Taking**: Automatically sells one-sided momentum positions when the bid reaches $0.93 to lock in gains and recycle capital for the next session.
+- **Automated Profit Taking**: Automatically sells one-sided momentum positions when a **15% profit margin** is reached (relative to entry price) or a safety ceiling of **$0.90** is hit. This ensures rapid capital recycling for the next hourly session.
 - **Ghost Mode Testing**: Includes a `GHOST_MODE` flag to simulate all trades in the logs without spending real capital.
 - **Binance Oracle Integration**: Streams real-time ticker data to detect "Oracle Lag" in milliseconds.
-- **Response-Based Accounting**: Uses the exchange's direct API response for 100% accurate fill detection.
+- **Response-Based Accounting**: Correctly handles Fill-or-Kill (FAK) responses and tracks shares with 100% precision.
 - **Ultra-Parallel Execution**: prep-signs-posts legs simultaneously using Rust's `tokio` runtime, achieving latency as low as 20ms per leg.
 
 ---
@@ -57,9 +57,6 @@ Containers are deployed with high-priority resource allocations:
 - `--network host`: Bypasses the Docker virtual bridge for direct access to the AWS network card.
 - `--cpus="1.0"`: Reserves a full physical CPU core for the bot.
 - `--cpu-shares=1024`: Assigns maximum priority to the bot process.
-
-### 3. DNS Pinning
-The bot resolves `clob.polymarket.com` once at startup and "pins" the IP address in memory, saving ~20ms of lookup time on every trade.
 
 ---
 
