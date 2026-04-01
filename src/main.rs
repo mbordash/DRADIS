@@ -641,6 +641,8 @@ async fn main() -> Result<()> {
         let mut cleanup_ticker = interval(std::time::Duration::from_secs(300));
         let mut pulse_ticker = interval(std::time::Duration::from_secs(300));
 
+        let mut momentum_fired_for_current_market = false;
+
         loop {
             tokio::select! {
                 _ = pulse_ticker.tick() => {
@@ -678,7 +680,7 @@ async fn main() -> Result<()> {
                     if yes_ask == dec!(1) || no_ask == dec!(1) { continue; }
 
                     // --- Momentum Trading Logic (One-Sided) ---
-                    if config::ENABLE_MOMENTUM_TRADING {
+                    if config::ENABLE_MOMENTUM_TRADING && !momentum_fired_for_current_market {
                         let velocity = *velocity_rx.borrow();
                         let binance_price = *oracle_rx.borrow();
                         let threshold = match crypto_filter.as_str() {
@@ -741,13 +743,17 @@ async fn main() -> Result<()> {
 
                                             if config::GHOST_MODE {
                                                 info!("👻 GHOST MODE: Momentum order would have been placed (Token: {}, Price: ${:.2})", token, limit_price);
+                                                momentum_fired_for_current_market = true;
                                             } else {
-                                                info!("🔥 LIVE MODE: Executing one-sided momentum trade...");
                                                 let client = Arc::clone(&trading_client);
                                                 let signer = signer.clone();
                                                 let nonce_manager = Arc::clone(&nonce_manager);
                                                 let owner = client.credentials().key();
                                                 let amount = to_fixed_u128(target_shares);
+                                                let positions_handle = Arc::clone(&positions);
+                                                let market_name_handle = market_name.clone();
+                                                let close_time_handle = _market_close_time;
+                                                let pair_token_handle = if token == yes_token { no_token } else { yes_token };
 
                                                 tokio::spawn(async move {
                                                     let mut nonce_guard = nonce_manager.lock().await;
@@ -785,9 +791,22 @@ async fn main() -> Result<()> {
                                                             .order_type(OrderType::FAK)
                                                             .owner(owner)
                                                             .build();
-                                                        let _ = client.post_order(signed_order).await;
+                                                        match client.post_order(signed_order).await {
+                                                            Ok(r) => {
+                                                                let filled = Decimal::from_str(&r.making_amount.to_string()).unwrap_or(dec!(0)) / config::SHARE_SCALE;
+                                                                if filled > dec!(0) {
+                                                                    info!("🚀 LIVE MOMENTUM TRADE FILLED: {} shares of token {} @ ${:.2}", filled, token, limit_price);
+                                                                    let mut pos_map = positions_handle.lock().await;
+                                                                    pos_map.entry(token).or_insert_with(|| Position { shares: dec!(0), avg_entry: limit_price, opened_at: Utc::now(), close_time: close_time_handle, market_name: market_name_handle, pair_token_id: pair_token_handle }).shares += filled;
+                                                                } else {
+                                                                    warn!("⚠️ LIVE MOMENTUM TRADE FAILED: Order was not filled (FAK).");
+                                                                }
+                                                            },
+                                                            Err(e) => error!("❌ LIVE MOMENTUM TRADE FAILED: API Error {:?}", e),
+                                                        }
                                                     }
                                                 });
+                                                momentum_fired_for_current_market = true;
                                             }
                                             trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
                                             continue; // Skip arb check for this tick
@@ -798,6 +817,50 @@ async fn main() -> Result<()> {
                         }
                     }
                     // --- End Momentum Trading Logic ---
+
+                    // --- Momentum Take Profit Logic ---
+                    {
+                        let mut pos_map = positions.lock().await;
+                        let yes_pos = pos_map.get(&yes_token).cloned();
+                        let no_pos  = pos_map.get(&no_token).cloned();
+
+                        let mut exit_token = None;
+                        let mut exit_price = dec!(0);
+                        let mut exit_shares = dec!(0);
+
+                        if let (Some(yp), Some(np)) = (&yes_pos, &no_pos) {
+                            // Only exit if we own exactly ONE side (momentum trade)
+                            if yp.shares > dec!(0) && np.shares == dec!(0) && yes_bid >= config::MOMENTUM_TAKE_PROFIT_THRESHOLD {
+                                info!("🎯 Momentum YES Target Reached (Bid: ${:.2}) - Taking Profit", yes_bid);
+                                exit_token = Some(yes_token);
+                                exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                exit_shares = yp.shares;
+                            } else if np.shares > dec!(0) && yp.shares == dec!(0) && no_bid >= config::MOMENTUM_TAKE_PROFIT_THRESHOLD {
+                                info!("🎯 Momentum NO Target Reached (Bid: ${:.2}) - Taking Profit", no_bid);
+                                exit_token = Some(no_token);
+                                exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                exit_shares = np.shares;
+                            }
+                        }
+
+                        if let Some(token) = exit_token {
+                            let client = Arc::clone(&trading_client);
+                            let signer = signer.clone();
+                            if let Ok(amt) = Amount::shares(exit_shares) {
+                                tokio::spawn(async move {
+                                    if let Ok(order) = client.market_order().token_id(token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
+                                        if let Ok(signed) = client.sign(&signer, order).await {
+                                            let _ = client.post_order(signed).await;
+                                        }
+                                    }
+                                });
+                                // Clear position locally
+                                if let Some(p) = pos_map.get_mut(&token) { p.shares = dec!(0); }
+                                trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
+                            }
+                        }
+                    }
+                    // --- End Momentum Take Profit Logic ---
 
                     let combined_ask = yes_ask + no_ask;
                     let profit_margin_no_fees = dec!(1.0) - combined_ask;
