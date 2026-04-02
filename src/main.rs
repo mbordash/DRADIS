@@ -481,7 +481,7 @@ async fn main() -> Result<()> {
         req.asset_type = AssetType::Collateral;
         match trading_client.balance_allowance(req).await {
             Ok(resp) => {
-                startup_balance = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
+                startup_balance = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(1)) / dec!(1_000_000);
                 if startup_balance > dec!(0) { break; }
             },
             Err(e) => warn!("⚠️ Balance fetch failed: {:?}", e),
@@ -687,7 +687,7 @@ async fn main() -> Result<()> {
 
                     if yes_ask == dec!(1) || no_ask == dec!(1) { continue; }
 
-                    // --- Momentum Take Profit Logic ---
+                    // --- Momentum Take Profit Logic (EXPLICITLY FIRST) ---
                     {
                         let mut pos_map = positions.lock().await;
                         let yes_pos = pos_map.get(&yes_token).cloned();
@@ -698,18 +698,23 @@ async fn main() -> Result<()> {
                         let mut exit_shares = dec!(0);
 
                         if let (Some(yp), Some(np)) = (&yes_pos, &no_pos) {
+                            // Only exit if we own exactly ONE side (momentum trade)
                             if yp.shares > dec!(0) && np.shares == dec!(0) {
                                 let profit_margin = if yp.avg_entry > dec!(0) { (yes_bid - yp.avg_entry) / yp.avg_entry } else { dec!(0) };
-                                if profit_margin >= config::MOMENTUM_TARGET_PROFIT_PERCENT || yes_bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
-                                    info!("🎯 Momentum YES Target Reached (Bid: ${:.2}, Profit: {:.2}%) - Taking Profit", yes_bid, profit_margin * dec!(100));
+                                let target = if yp.avg_entry >= dec!(0.70) { dec!(0.05) } else { config::MOMENTUM_TARGET_PROFIT_PERCENT };
+
+                                if profit_margin >= target || yes_bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
+                                    info!("🎯 Momentum YES Target Reached (Bid: ${:.2}, Profit: {:.2}% vs Target: {:.2}%) - Taking Profit", yes_bid, profit_margin * dec!(100), target * dec!(100));
                                     exit_token = Some(yes_token);
                                     exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                     exit_shares = yp.shares;
                                 }
                             } else if np.shares > dec!(0) && yp.shares == dec!(0) {
                                 let profit_margin = if np.avg_entry > dec!(0) { (no_bid - np.avg_entry) / np.avg_entry } else { dec!(0) };
-                                if profit_margin >= config::MOMENTUM_TARGET_PROFIT_PERCENT || no_bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
-                                    info!("🎯 Momentum NO Target Reached (Bid: ${:.2}, Profit: {:.2}%) - Taking Profit", no_bid, profit_margin * dec!(100));
+                                let target = if np.avg_entry >= dec!(0.70) { dec!(0.05) } else { config::MOMENTUM_TARGET_PROFIT_PERCENT };
+
+                                if profit_margin >= target || no_bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
+                                    info!("🎯 Momentum NO Target Reached (Bid: ${:.2}, Profit: {:.2}% vs Target: {:.2}%) - Taking Profit", no_bid, profit_margin * dec!(100), target * dec!(100));
                                     exit_token = Some(no_token);
                                     exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                     exit_shares = np.shares;
@@ -728,12 +733,13 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                 });
+                                // Clear position locally
                                 if let Some(p) = pos_map.get_mut(&token) { p.shares = dec!(0); }
                                 trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
+                                continue; // Exit tick to prioritize the sell
                             }
                         }
                     }
-                    // --- End Momentum Take Profit Logic ---
 
                     // --- Momentum Trading Logic (One-Sided) ---
                     if config::ENABLE_MOMENTUM_TRADING && !momentum_fired_for_current_market {
@@ -755,7 +761,6 @@ async fn main() -> Result<()> {
                             let mut limit_price = dec!(0);
                             let mut fee_rate = 0;
 
-                            // Apply filters: Buffer, Entry Price Cap, and Directional Lock
                             if velocity > threshold && binance_price > (strike + strike_buffer) && yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE {
                                 let has_no_pos = {
                                     let pos = positions.lock().await;
@@ -766,8 +771,6 @@ async fn main() -> Result<()> {
                                     momentum_token = Some(yes_token);
                                     limit_price = (yes_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
                                     fee_rate = yes_fee_rate;
-                                } else {
-                                    debug!("⏭️ Momentum Signal Suppressed: Direction Lock (Own NO, won't buy YES)");
                                 }
                             } else if velocity < -threshold && binance_price < (strike - strike_buffer) && no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE {
                                 let has_yes_pos = {
@@ -779,8 +782,6 @@ async fn main() -> Result<()> {
                                     momentum_token = Some(no_token);
                                     limit_price = (no_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
                                     fee_rate = no_fee_rate;
-                                } else {
-                                    debug!("⏭️ Momentum Signal Suppressed: Direction Lock (Own YES, won't buy NO)");
                                 }
                             }
 
@@ -797,10 +798,7 @@ async fn main() -> Result<()> {
                                         if current_exposure + momentum_trade_size_usdc <= config::MAX_EXPOSURE_PER_TOKEN_USDC {
                                             info!("💰 [MOMENTUM SIGNAL] token {} @ ${:.2} (Size: ${:.2})", token, limit_price, momentum_trade_size_usdc);
 
-                                            if config::GHOST_MODE {
-                                                info!("👻 GHOST MODE: Momentum order would have been placed (Token: {}, Price: ${:.2})", token, limit_price);
-                                                momentum_fired_for_current_market = true;
-                                            } else {
+                                            if !config::GHOST_MODE {
                                                 let client = Arc::clone(&trading_client);
                                                 let signer = signer.clone();
                                                 let nonce_manager = Arc::clone(&nonce_manager);
@@ -848,237 +846,132 @@ async fn main() -> Result<()> {
                                                             .owner(owner)
                                                             .build();
                                                         match client.post_order(signed_order).await {
-                                                            Ok(r) => {
-                                                                let filled = target_shares;
-                                                                info!("🚀 LIVE MOMENTUM TRADE FILLED: {} shares of token {} @ ${:.2}", filled, token, limit_price);
+                                                            Ok(_) => {
+                                                                info!("🚀 LIVE MOMENTUM TRADE FILLED: {} shares of token {} @ ${:.2}", target_shares, token, limit_price);
                                                                 let mut pos_map = positions_handle.lock().await;
-                                                                pos_map.entry(token).or_insert_with(|| Position { shares: dec!(0), avg_entry: limit_price, opened_at: Utc::now(), close_time: close_time_handle, market_name: market_name_handle, pair_token_id: pair_token_handle }).shares += filled;
+                                                                pos_map.entry(token).or_insert_with(|| Position { shares: dec!(0), avg_entry: limit_price, opened_at: Utc::now(), close_time: close_time_handle, market_name: market_name_handle, pair_token_id: pair_token_handle }).shares += target_shares;
                                                             },
                                                             Err(e) => error!("❌ LIVE MOMENTUM TRADE FAILED: API Error {:?}", e),
                                                         }
                                                     }
                                                 });
-                                                momentum_fired_for_current_market = true;
                                             }
+                                            momentum_fired_for_current_market = true;
                                             trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
-                                            continue; // Skip arb check for this tick
+                                            continue;
                                         }
                                     }
                                 }
                             }
                         }
                     }
-                    // --- End Momentum Trading Logic ---
 
+                    // --- Arbitrage Logic ---
                     let combined_ask = yes_ask + no_ask;
                     let profit_margin_no_fees = dec!(1.0) - combined_ask;
-
-                    // Fee-Aware Calculation: Margin after Taker Fees
                     let yes_fee = yes_ask * (Decimal::from(yes_fee_rate) / dec!(10_000));
                     let no_fee = no_ask * (Decimal::from(no_fee_rate) / dec!(10_000));
                     let profit_margin = profit_margin_no_fees - (yes_fee + no_fee);
 
                     if profit_margin >= config::ARBITRAGE_PROFIT_THRESHOLD {
                         let arb_signal_start = Instant::now();
-
                         if consecutive_failures >= config::MAX_CONSECUTIVE_FAILURES {
                             error!("🛑 FATAL: 3 consecutive failures. Emergency stopping.");
                             std::process::exit(1);
                         }
-
                         let current_usdc_balance = *balance_rx.borrow();
                         if current_usdc_balance < trade_size_usdc * dec!(2) {
                             warn!("📉 Insufficient cached USDC (${:.2}).", current_usdc_balance);
                             trade_cooldown = Utc::now() + chrono::Duration::seconds(60);
                             continue;
                         }
-
                         info!("💰 Arb opportunity! Margin after fees: {:.4}¢ (Gross: {:.4}¢, Fees: {:.4}¢)", profit_margin * dec!(100), profit_margin_no_fees * dec!(100), (yes_fee + no_fee) * dec!(100));
-
                         let target_shares = (trade_size_usdc / combined_ask).floor();
-                        if target_shares < config::MIN_ORDER_SHARES {
-                            info!("⏭️ Skipping: target_shares ({:.2}) < MIN_ORDER_SHARES ({:.2})", target_shares, config::MIN_ORDER_SHARES);
-                            continue;
-                        }
-                        if target_shares * yes_ask < config::MIN_ORDER_USDC {
-                            info!("⏭️ Skipping: YES leg USDC ({:.2}) < MIN_ORDER_USDC ({:.2})", target_shares * yes_ask, config::MIN_ORDER_USDC);
-                            continue;
-                        }
-                        if target_shares * no_ask < config::MIN_ORDER_USDC {
-                            info!("⏭️ Skipping: NO leg USDC ({:.2}) < MIN_ORDER_USDC ({:.2})", target_shares * no_ask, config::MIN_ORDER_USDC);
-                            continue;
-                        }
-
-                        let current_exposure = {
-                            let pos = positions.lock().await;
-                            pos.values().map(|p| p.shares * p.avg_entry).sum::<Decimal>()
-                        };
-
-                        let risk_engine = RiskEngine::new();
-                        if !risk_engine.approve_buy(yes_ask, no_ask, current_exposure, trade_size_usdc, *starting_collateral.lock().await, *total_pnl.lock().await) {
-                            info!("⏭️ Skipping: Risk engine rejected buy (Exposure: ${:.2}, Balance: ${:.2})", current_exposure, *starting_collateral.lock().await);
-                            continue;
-                        }
-
+                        if target_shares < config::MIN_ORDER_SHARES { continue; }
                         let yes_limit_price = (yes_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
                         let no_limit_price  = (no_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
 
-                        if config::GHOST_MODE {
-                            info!("👻 GHOST MODE: Arb trade would have been placed (YES: ${:.2}, NO: ${:.2})", yes_limit_price, no_limit_price);
-                            trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
-                            continue;
-                        }
-
-                        let amount_res = Amount::shares(target_shares);
-                        let amount = match amount_res {
-                            Ok(a) => a,
-                            Err(e) => { error!("❌ Failed to create Amount: {}", e); continue; }
-                        };
-
-                        let yes_task = {
-                            let client = Arc::clone(&trading_client);
-                            let signer = signer.clone();
-                            let token = yes_token;
-                            let amt_decimal = amount.as_inner();
-                            let nonce_manager = Arc::clone(&nonce_manager);
-                            let owner = client.credentials().key();
-                            async move {
-                                let mut nonce_guard = nonce_manager.lock().await;
-                                let nonce = *nonce_guard;
-                                *nonce_guard += 1;
-                                drop(nonce_guard);
-
-                                let mut order_struct = Order::default();
-                                order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
-                                order_struct.maker = safe_address; // Use Safe address as Maker
-                                order_struct.signer = eoa_address; // Use EOA as Signer
-                                order_struct.taker = Address::ZERO;
-                                order_struct.tokenId = token;
-                                order_struct.makerAmount = U256::from(to_fixed_u128(amt_decimal * yes_limit_price));
-                                order_struct.takerAmount = U256::from(to_fixed_u128(amt_decimal));
-                                order_struct.expiration = U256::ZERO;
-                                order_struct.nonce = U256::from(nonce);
-                                order_struct.feeRateBps = U256::from(yes_fee_rate); // Use cached fee
-                                order_struct.side = Side::Buy as u8;
-                                order_struct.signatureType = SignatureType::GnosisSafe as u8;
-
-                                let domain = Eip712Domain {
-                                    name: Some(Cow::Borrowed(ORDER_NAME)),
-                                    version: Some(Cow::Borrowed(VERSION)),
-                                    chain_id: Some(U256::from(POLYGON)),
-                                    verifying_contract: Some(verifying_contract),
-                                    ..Eip712Domain::default()
-                                };
-
-                                let hash = order_struct.eip712_signing_hash(&domain);
-                                let signature = signer.sign_hash(&hash).await?;
-
-                                let signed_order = SignedOrder::builder()
-                                    .order(order_struct)
-                                    .signature(signature)
-                                    .order_type(OrderType::FAK)
-                                    .owner(owner)
-                                    .build();
-
-                                client.post_order(signed_order).await
+                        if !config::GHOST_MODE {
+                            let yes_task = {
+                                let client = Arc::clone(&trading_client);
+                                let signer = signer.clone();
+                                let token = yes_token;
+                                let nonce_manager = Arc::clone(&nonce_manager);
+                                let owner = client.credentials().key();
+                                async move {
+                                    let mut nonce_guard = nonce_manager.lock().await;
+                                    let nonce = *nonce_guard; *nonce_guard += 1; drop(nonce_guard);
+                                    let mut order_struct = Order::default();
+                                    order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
+                                    order_struct.maker = safe_address; order_struct.signer = eoa_address; order_struct.tokenId = token;
+                                    order_struct.makerAmount = U256::from(to_fixed_u128(target_shares * yes_limit_price));
+                                    order_struct.takerAmount = U256::from(to_fixed_u128(target_shares));
+                                    order_struct.nonce = U256::from(nonce); order_struct.feeRateBps = U256::from(yes_fee_rate);
+                                    order_struct.side = Side::Buy as u8; order_struct.signatureType = SignatureType::GnosisSafe as u8;
+                                    let domain = Eip712Domain { name: Some(Cow::Borrowed(ORDER_NAME)), version: Some(Cow::Borrowed(VERSION)), chain_id: Some(U256::from(POLYGON)), verifying_contract: Some(verifying_contract), ..Eip712Domain::default() };
+                                    let hash = order_struct.eip712_signing_hash(&domain);
+                                    let signature = signer.sign_hash(&hash).await?;
+                                    let signed_order = SignedOrder::builder().order(order_struct).signature(signature).order_type(OrderType::FAK).owner(owner).build();
+                                    client.post_order(signed_order).await
+                                }
+                            };
+                            let no_task = {
+                                let client = Arc::clone(&trading_client);
+                                let signer = signer.clone();
+                                let token = no_token;
+                                let nonce_manager = Arc::clone(&nonce_manager);
+                                let owner = client.credentials().key();
+                                async move {
+                                    let mut nonce_guard = nonce_manager.lock().await;
+                                    let nonce = *nonce_guard; *nonce_guard += 1; drop(nonce_guard);
+                                    let mut order_struct = Order::default();
+                                    order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
+                                    order_struct.maker = safe_address; order_struct.signer = eoa_address; order_struct.tokenId = token;
+                                    order_struct.makerAmount = U256::from(to_fixed_u128(target_shares * no_limit_price));
+                                    order_struct.takerAmount = U256::from(to_fixed_u128(target_shares));
+                                    order_struct.nonce = U256::from(nonce); order_struct.feeRateBps = U256::from(no_fee_rate);
+                                    order_struct.side = Side::Buy as u8; order_struct.signatureType = SignatureType::GnosisSafe as u8;
+                                    let domain = Eip712Domain { name: Some(Cow::Borrowed(ORDER_NAME)), version: Some(Cow::Borrowed(VERSION)), chain_id: Some(U256::from(POLYGON)), verifying_contract: Some(verifying_contract), ..Eip712Domain::default() };
+                                    let hash = order_struct.eip712_signing_hash(&domain);
+                                    let signature = signer.sign_hash(&hash).await?;
+                                    let signed_order = SignedOrder::builder().order(order_struct).signature(signature).order_type(OrderType::FAK).owner(owner).build();
+                                    client.post_order(signed_order).await
+                                }
+                            };
+                            let (yes_res, no_res) = tokio::join!(yes_task, no_task);
+                            let network_total_time = arb_signal_start.elapsed();
+                            if let (Ok(_), Ok(_)) = (yes_res, no_res) {
+                                consecutive_failures = 0;
+                                let _ = balance_tx.send(current_usdc_balance - (target_shares * (yes_limit_price + no_limit_price)));
+                                {
+                                    let mut pos_map = positions.lock().await;
+                                    let now = Utc::now();
+                                    pos_map.entry(yes_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: yes_limit_price, opened_at: now, close_time: _market_close_time, market_name: market_name.clone(), pair_token_id: no_token }).shares += target_shares;
+                                    pos_map.entry(no_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: no_limit_price,  opened_at: now, close_time: _market_close_time, market_name: market_name.clone(), pair_token_id: yes_token }).shares += target_shares;
+                                }
+                                info!("📈 BOTH LEGS FILLED (Parallel) — Profit ${:.4} | Latency: {:?}", target_shares * profit_margin, network_total_time);
+                                trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
+                            } else {
+                                consecutive_failures += 1;
+                                warn!("⚠️ Trade Failure ({}/3) | Latency: {:?}", consecutive_failures, network_total_time);
+                                trade_cooldown = Utc::now() + chrono::Duration::seconds(60);
                             }
-                        };
-
-                        let no_task = {
-                            let client = Arc::clone(&trading_client);
-                            let signer = signer.clone();
-                            let token = no_token;
-                            let amt_decimal = amount.as_inner();
-                            let nonce_manager = Arc::clone(&nonce_manager);
-                            let owner = client.credentials().key();
-                            async move {
-                                let mut nonce_guard = nonce_manager.lock().await;
-                                let nonce = *nonce_guard;
-                                *nonce_guard += 1;
-                                drop(nonce_guard);
-
-                                let mut order_struct = Order::default();
-                                order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
-                                order_struct.maker = safe_address; // Use Safe address as Maker
-                                order_struct.signer = eoa_address; // Use EOA as Signer
-                                order_struct.taker = Address::ZERO;
-                                order_struct.tokenId = token;
-                                order_struct.makerAmount = U256::from(to_fixed_u128(amt_decimal * no_limit_price));
-                                order_struct.takerAmount = U256::from(to_fixed_u128(amt_decimal));
-                                order_struct.expiration = U256::ZERO;
-                                order_struct.nonce = U256::from(nonce);
-                                order_struct.feeRateBps = U256::from(no_fee_rate); // Use cached fee
-                                order_struct.side = Side::Buy as u8;
-                                order_struct.signatureType = SignatureType::GnosisSafe as u8;
-
-                                let domain = Eip712Domain {
-                                    name: Some(Cow::Borrowed(ORDER_NAME)),
-                                    version: Some(Cow::Borrowed(VERSION)),
-                                    chain_id: Some(U256::from(POLYGON)),
-                                    verifying_contract: Some(verifying_contract),
-                                    ..Eip712Domain::default()
-                                };
-
-                                let hash = order_struct.eip712_signing_hash(&domain);
-                                let signature = signer.sign_hash(&hash).await?;
-
-                                let signed_order = SignedOrder::builder()
-                                    .order(order_struct)
-                                    .signature(signature)
-                                    .order_type(OrderType::FAK)
-                                    .owner(owner)
-                                    .build();
-
-                                client.post_order(signed_order).await
-                            }
-                        };
-
-                        let (yes_res, no_res) = tokio::join!(yes_task, no_task);
-
-                        let network_total_time = arb_signal_start.elapsed();
-
-                        if let (Ok(yr), Ok(nr)) = (yes_res, no_res) {
-                            consecutive_failures = 0;
-                            let filled = target_shares;
-                            let locked_profit = filled * profit_margin;
-
-                            let approx_cost = (filled * yes_limit_price) + (filled * no_limit_price);
-                            let _ = balance_tx.send(current_usdc_balance - approx_cost);
-
-                            {
-                                let mut pos_map = positions.lock().await;
-                                let now = Utc::now();
-                                pos_map.entry(yes_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: yes_limit_price, opened_at: now, close_time: _market_close_time, market_name: market_name.clone(), pair_token_id: no_token }).shares += filled;
-                                pos_map.entry(no_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: no_limit_price,  opened_at: now, close_time: _market_close_time, market_name: market_name.clone(), pair_token_id: yes_token }).shares += filled;
-                            }
-                            {
-                                let mut pnl = total_pnl.lock().await;
-                                *pnl += locked_profit;
-                            }
-                            info!("📈 BOTH LEGS FILLED (Parallel) — Profit ${:.4} | Latency: {:?}", locked_profit, network_total_time);
-                            trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
-                        } else {
-                            consecutive_failures += 1;
-                            warn!("⚠️ Trade Failure ({}/3) | Latency: {:?}", consecutive_failures, network_total_time);
-                            trade_cooldown = Utc::now() + chrono::Duration::seconds(60);
                         }
                     }
 
+                    // --- Perfect Hedge Early Exit Logic ---
                     {
-                        let pos_map = positions.lock().await;
-                        let yes_pos = pos_map.get(&yes_token);
-                        let no_pos  = pos_map.get(&no_token);
-
-                        if let (Some(yes_pos), Some(no_pos)) = (yes_pos, no_pos) {
-                            if yes_pos.shares > dec!(0) && no_pos.shares > dec!(0) {
+                        let mut pos_map = positions.lock().await;
+                        let yes_pos = pos_map.get(&yes_token).cloned();
+                        let no_pos  = pos_map.get(&no_token).cloned();
+                        if let (Some(yp), Some(np)) = (yes_pos, no_pos) {
+                            if yp.shares > dec!(0) && np.shares > dec!(0) {
                                 let combined_bid = yes_bid + no_bid;
                                 if combined_bid >= config::EARLY_EXIT_COMBINED_BID_THRESHOLD {
                                     info!("💰 Bids reached target (sum ${:.4}) — early exit", combined_bid);
-
                                     let exit_price_yes = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                     let exit_price_no  = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-
-                                    if let (Ok(amt_yes), Ok(amt_no)) = (Amount::shares(yes_pos.shares), Amount::shares(no_pos.shares)) {
+                                    if let (Ok(amt_yes), Ok(amt_no)) = (Amount::shares(yp.shares), Amount::shares(np.shares)) {
                                         if let Ok(oy) = trading_client.market_order().token_id(yes_token).amount(amt_yes).side(Side::Sell).price(exit_price_yes).order_type(OrderType::FAK).build().await {
                                             if let Ok(sy) = trading_client.sign(&signer, oy).await {
                                                 let _ = trading_client.post_order(sy).await;
@@ -1089,8 +982,6 @@ async fn main() -> Result<()> {
                                                 let _ = trading_client.post_order(sn).await;
                                             }
                                         }
-
-                                        let mut pos_map = positions.lock().await;
                                         if let Some(p) = pos_map.get_mut(&yes_token) { p.shares = dec!(0); }
                                         if let Some(p) = pos_map.get_mut(&no_token) { p.shares = dec!(0); }
                                         trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);

@@ -14,12 +14,11 @@ pub const ENABLE_TELEGRAM: bool = false;
 // ============================================================================
 
 /// If true, the bot will log trades but NOT actually execute them on-chain.
-/// SET TO FALSE FOR LIVE TRADING.
 pub const GHOST_MODE: bool = false;
 
-/// Margin threshold to trigger entry. This is dangerous if you're not fast enough.
-/// Proceed with caution
-pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.01);
+/// Margin threshold to trigger entry.
+/// IMPORTANT: This should be higher than (2 * BUY_PRICE_OFFSET) to be profitable.
+pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.05);
 
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.99);
 
@@ -52,28 +51,23 @@ pub const EARLY_EXIT_COMBINED_BID_THRESHOLD: Decimal = dec!(0.995);
 pub const ENABLE_MOMENTUM_TRADING: bool = true;
 
 /// Dynamic Take Profit: Exit if we gain this % over our entry price.
-/// Set to 0.15 (15%) for conservative profit taking.
 pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.15);
 
 /// Static Take Profit Ceiling: Exit if bid hits this price regardless of entry.
-/// Set to $0.90 to ensure capital recycling before expiry.
 pub const MOMENTUM_TAKE_PROFIT_CEILING: Decimal = dec!(0.90);
 
 /// Minimum distance from strike price (in USD) to trigger a momentum trade.
-/// Prevents "churning" when the price is oscillating near the strike.
 pub const BTC_STRIKE_BUFFER: Decimal = dec!(50.0);
 pub const ETH_STRIKE_BUFFER: Decimal = dec!(5.0);
 pub const SOL_STRIKE_BUFFER: Decimal = dec!(0.2);
 
 /// Maximum token price allowed for a momentum entry.
-/// Prevents buying a token when the upside is already limited.
 pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.75);
 
 /// The time window (in seconds) used to calculate price velocity from Binance.
 pub const MOMENTUM_WINDOW_SECS: u64 = 10;
 
 /// Price change threshold (absolute USD) within the window to trigger a signal.
-/// e.g., if BTC moves $50 in 10 seconds.
 pub const BTC_MOMENTUM_THRESHOLD: Decimal = dec!(50.0);
 pub const ETH_MOMENTUM_THRESHOLD: Decimal = dec!(5.0);
 pub const SOL_MOMENTUM_THRESHOLD: Decimal = dec!(0.5);
@@ -167,8 +161,8 @@ pub fn tcp_keepalive() -> StdDuration {
 // ============================================================================
 
 /// Minimum volume (USDC) required to trade a market.
-/// Increased from 500 to 5000 to avoid illiquid "ghost town" markets.
-pub const MIN_MARKET_VOLUME: f64 = 5000.0;
+/// Lowered to 0 to catch new hourly sessions as they launch.
+pub const MIN_MARKET_VOLUME: f64 = 0.0;
 
 /// Maximum exposure allowed per individual token (in USDC)
 pub const MAX_EXPOSURE_PER_TOKEN_USDC: Decimal = dec!(25);
