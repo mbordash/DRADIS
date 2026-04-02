@@ -34,10 +34,13 @@ A high-frequency hybrid trading bot for Polymarket. This bot combines "Perfect-H
     - **Strike Buffer**: Momentum trades only fire when price is safely away from the strike (e.g. Strike + $50) to avoid choppy oscillations.
     - **Directional Lock**: Prevents buying the opposite side of an open momentum position to avoid "accidental arbitrage" at a loss.
     - **Price Cap**: Automatically stops momentum buying if the token price exceeds $0.75, ensuring a healthy risk/reward ratio.
-- **Automated Profit Taking**: Automatically sells one-sided momentum positions when a **15% profit margin** is reached (relative to entry price) or a safety ceiling of **$0.90** is hit. This ensures rapid capital recycling for the next hourly session.
+- **Dynamic Tiered Profit Taking**: Automatically manages exits based on entry risk:
+    - **Scalp Mode**: If entry is >= $0.70, bot exits at **5% profit** to minimize exposure on high-priced tokens.
+    - **Trend Mode**: If entry is < $0.70, bot exits at **15% profit** to capture larger moves.
+    - **Safety Ceiling**: Bot exits immediately if the bid reaches **$0.90** to ensure capital recycling for the next hourly session.
 - **Ghost Mode Testing**: Includes a `GHOST_MODE` flag to simulate all trades in the logs without spending real capital.
 - **Binance Oracle Integration**: Streams real-time ticker data to detect "Oracle Lag" in milliseconds.
-- **Response-Based Accounting**: Correctly handles Fill-or-Kill (FAK) responses and tracks shares with 100% precision.
+- **Response-Based Accounting**: Correctly handles Fill-or-Kill (FAK) responses and tracks shares with whole-number precision.
 - **Ultra-Parallel Execution**: prep-signs-posts legs simultaneously using Rust's `tokio` runtime, achieving latency as low as 20ms per leg.
 
 ---
@@ -54,7 +57,7 @@ The Linux kernel can be tuned for aggressive TCP performance by applying these `
 
 ### 2. Docker Container (Overhead Reduction)
 Containers are deployed with high-priority resource allocations:
-- `--network host`: Bypasses the Docker virtual bridge for direct access to the AWS network card.
+- `--network host`: Bypasses the Docker virtual bridge for direct access to the host network card.
 - `--cpus="1.0"`: Reserves a full physical CPU core for the bot.
 - `--cpu-shares=1024`: Assigns maximum priority to the bot process.
 
@@ -64,7 +67,7 @@ Containers are deployed with high-priority resource allocations:
 
 ### Prerequisites
 - **Rust 1.91+** or **Docker**
-- **AWS Server**: Research the proper region required for ~15ms peering to the exchange.
+- **Host Server**: Research the proper region required for ~15ms peering to the exchange.
 - **Minimum $10 USDC**: Due to exchange minimum order sizes.
 
 ### Configuration (`.env`)
