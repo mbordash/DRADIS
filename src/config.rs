@@ -112,8 +112,8 @@ pub const PARTIAL_FILL_COOLDOWN_SECS: i64 = 30;
 /// Minimum time until market expiry to still allow new position entry (seconds)
 pub const MIN_SECONDS_TO_EXPIRY_FOR_ENTRY: i64 = 900;
 
-/// Maximum time until market expiry to consider a market (seconds, 2 hours)
-pub const MAX_SECONDS_TO_EXPIRY_FOR_ENTRY: i64 = 7200;
+/// Maximum time until market expiry to consider a market (seconds, 4 hours)
+pub const MAX_SECONDS_TO_EXPIRY_FOR_ENTRY: i64 = 14400;
 
 /// Final expiry window: stops all trading this close to market close (seconds, 10 minutes)
 pub const FINAL_EXPIRY_WINDOW_SECS: i64 = 600;

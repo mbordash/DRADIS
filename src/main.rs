@@ -18,7 +18,7 @@ use alloy::signers::Signer;
 use alloy::dyn_abi::Eip712Domain;
 use alloy::sol_types::SolStruct;
 
-use chrono::{DateTime, Utc, TimeZone, Datelike};
+use chrono::{DateTime, Utc, TimeZone, Datelike, Timelike};
 use chrono_tz::US::Eastern;
 use reqwest;
 use rust_decimal::Decimal;
@@ -42,6 +42,7 @@ use rustls::crypto::ring;
 
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use regex::Regex;
+use urlencoding;
 
 type PriceState = (Decimal, Decimal);
 
@@ -249,6 +250,99 @@ fn extract_strike_price_from_name(market_name: &str) -> Option<Decimal> {
     None
 }
 
+// Helper to generate market names for hourly crypto events
+fn generate_hourly_market_names(crypto_filter: &str, current_time_utc: DateTime<Utc>) -> Vec<String> {
+    let mut names = Vec::new();
+    let eastern_time = current_time_utc.with_timezone(&Eastern);
+
+    let crypto_name_long = match crypto_filter {
+        "btc" => "Bitcoin",
+        "eth" => "Ethereum",
+        "sol" => "Solana",
+        _ => "Crypto",
+    };
+    let crypto_name_short = crypto_filter.to_uppercase();
+
+    // Generate names for current hour and next hour
+    for i in 0..=1 {
+        let target_time = eastern_time.clone() + chrono::Duration::hours(i);
+        let hour = target_time.hour();
+        let ampm = if hour >= 12 { "PM" } else { "AM" };
+        let display_hour = if hour == 0 { 12 } else if hour > 12 { hour - 12 } else { hour };
+        let next_hour = if display_hour == 12 { 1 } else { display_hour + 1 };
+
+        let month_name = target_time.format("%B").to_string();
+        let day = target_time.day();
+
+        // Standard: "Bitcoin Up or Down - April 3, 5PM ET"
+        names.push(format!("{} Up or Down - {} {}, {}{} ET", crypto_name_long, month_name, day, display_hour, ampm));
+        // Range: "Bitcoin Up or Down - April 3, 5-6PM ET"
+        names.push(format!("{} Up or Down - {} {}, {}-{}{} ET", crypto_name_long, month_name, day, display_hour, next_hour, ampm));
+        // Short name versions
+        names.push(format!("{} Up or Down - {} {}, {}{} ET", crypto_name_short, month_name, day, display_hour, ampm));
+        names.push(format!("{} Up or Down - {} {}, {}-{}{} ET", crypto_name_short, month_name, day, display_hour, next_hour, ampm));
+    }
+    names
+}
+
+async fn fetch_specific_hourly_market(http: &reqwest::Client, crypto_filter: &str, now: DateTime<Utc>) -> Option<(Vec<U256>, String, String, f64, bool, Option<DateTime<Utc>>, String)> {
+    let candidate_names = generate_hourly_market_names(crypto_filter, now);
+
+    for name_query in candidate_names {
+        debug!("Attempting direct search for market: \"{}\"", name_query);
+        let url = format!("https://gamma-api.polymarket.com/markets?search={}&active=true&closed=false&include=event&limit=1", urlencoding::encode(&name_query));
+
+        let resp = match http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => { warn!("⚠️ Direct market search failed for \"{}\": {}", name_query, e); continue; }
+        };
+        if !resp.status().is_success() { continue; }
+
+        let data: serde_json::Value = match resp.json().await {
+            Ok(d) => d,
+            Err(e) => { error!("❌ JSON failed for direct search \"{}\": {}", name_query, e); continue; }
+        };
+
+        let markets: Vec<&serde_json::Value> = if let Some(arr) = data.as_array() {
+            arr.iter().collect()
+        } else if let Some(arr) = data.get("data").and_then(|v| v.as_array()) {
+            arr.iter().collect()
+        } else {
+            continue;
+        };
+
+        if let Some(market) = markets.into_iter().next() {
+            let name = market.get("question").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let description = market.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let event = market.get("event").unwrap_or(&serde_json::Value::Null);
+            let event_title = event.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+            // Re-apply essential filters
+            if config::is_bad_market(&name) || config::is_bad_market(&event_title) { continue; }
+            if !get_enable_orderbook(market) { continue; }
+
+            let token_ids = extract_token_ids_u256(market);
+            if token_ids.len() < 2 { continue; }
+
+            let volume = market.get("volume24hrClob").and_then(value_to_f64)
+                .or_else(|| market.get("volume24hr").and_then(value_to_f64))
+                .unwrap_or(0.0);
+
+            let close_time = extract_close_time(event, market);
+            let seconds_left = close_time.map_or(0i64, |ct| (ct - now).num_seconds());
+
+            if seconds_left < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY { continue; }
+            if seconds_left > config::MAX_SECONDS_TO_EXPIRY_FOR_ENTRY { continue; }
+
+            let hot = config::is_high_priority_text(&name) || config::is_high_priority_text(&event_title);
+            let link = market.get("slug").and_then(|v| v.as_str()).map(|s| format!("https://polymarket.com/{}", s)).unwrap_or_default();
+
+            return Some((token_ids, name.clone(), link, volume, hot, close_time, description));
+        }
+    }
+    None
+}
+
 
 async fn get_top_market(http: &reqwest::Client) -> (U256, U256, String, String, String, bool, Option<DateTime<Utc>>) {
     let crypto_filter = env::var("CRYPTO_FILTER")
@@ -256,7 +350,15 @@ async fn get_top_market(http: &reqwest::Client) -> (U256, U256, String, String, 
         .to_lowercase();
 
     info!("🚀 Scanning Gamma API for markets (FILTER: {})", crypto_filter);
+    let now = Utc::now();
 
+    // 1. Try specifically targeted hourly markets first (Fastest)
+    if let Some(market) = fetch_specific_hourly_market(http, &crypto_filter, now).await {
+        info!("🏆 Found specific hourly market: \"{}\"", market.1);
+        return (market.0[0], market.0[1], market.1, market.2, market.6, market.4, market.5);
+    }
+
+    // 2. Fallback to general scan
     let candidates = fetch_simplified_crypto_candidates(http, &crypto_filter).await;
 
     if candidates.is_empty() {
@@ -266,7 +368,6 @@ async fn get_top_market(http: &reqwest::Client) -> (U256, U256, String, String, 
 
     let mut sorted = candidates;
     sorted.sort_by(|a, b| {
-        let now = Utc::now();
         let a_secs = a.5.map_or(9999, |t| (t - now).num_seconds());
         let b_secs = b.5.map_or(9999, |t| (t - now).num_seconds());
 
@@ -281,11 +382,8 @@ async fn get_top_market(http: &reqwest::Client) -> (U256, U256, String, String, 
     });
 
     let best = &sorted[0];
-    let yes_token = best.0[0];
-    let no_token = best.0[1];
-
     info!("🏆 Selected market: \"{}\"", best.1);
-    (yes_token, no_token, best.1.clone(), best.2.clone(), best.6.clone(), best.4, best.5)
+    (best.0[0], best.0[1], best.1.clone(), best.2.clone(), best.6.clone(), best.4, best.5)
 }
 
 async fn fetch_simplified_crypto_candidates(
@@ -296,7 +394,7 @@ async fn fetch_simplified_crypto_candidates(
     let now = Utc::now();
     let mut total_scanned = 0;
 
-    for page in 0..config::GAMMA_API_MARKET_SCAN_PAGES {
+    for page in 0..20 { // Reduced fallback scan depth for efficiency
         let offset = page * 100;
         let url = format!(
             "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&offset={}&order=volume24hrClob&ascending=false&include=event",
@@ -326,15 +424,34 @@ async fn fetch_simplified_crypto_candidates(
 
         for market in markets {
             let name = market.get("question").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let description = market.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
-            let lower = name.to_lowercase();
+            let event = market.get("event").unwrap_or(&serde_json::Value::Null);
+            let event_title = event.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
-            if !config::is_crypto_market(&lower) { continue; }
-            if config::is_bad_market(&name) { continue; }
+            let lower = name.to_lowercase();
+            let lower_event = event_title.to_lowercase();
+
+            // PRE-FILTER: Only process the coin we care about
+            let matches_crypto = match crypto_filter {
+                "btc" | "bitcoin" => lower.contains("bitcoin") || lower.contains("btc") || lower_event.contains("bitcoin") || lower_event.contains("btc"),
+                "eth" | "ethereum" => lower.contains("ethereum") || lower.contains("eth") || lower_event.contains("ethereum") || lower_event.contains("eth"),
+                "sol" | "solana" => lower.contains("solana") || lower.contains("sol") || lower_event.contains("solana") || lower_event.contains("sol"),
+                _ => true,
+            };
+            if !matches_crypto { continue; }
+
+            debug!("🔍 Evaluating candidate: \"{}\" (Event: \"{}\")", name, event_title);
+
+            if config::is_bad_market(&name) || config::is_bad_market(&event_title) { continue; }
             if !get_enable_orderbook(market) { continue; }
 
-            if !lower.contains("up or down") { continue; }
-            if !is_short_term_window(&name) { continue; }
+            if !lower.contains("up or down") && !lower_event.contains("up or down") {
+                debug!("  ⏭️ Rejected: No 'up or down' in question or event title");
+                continue;
+            }
+            if !is_short_term_window(&name) && !is_short_term_window(&event_title) {
+                debug!("  ⏭️ Rejected: Not a short-term window");
+                continue;
+            }
 
             let token_ids = extract_token_ids_u256(market);
             if token_ids.len() < 2 { continue; }
@@ -343,29 +460,16 @@ async fn fetch_simplified_crypto_candidates(
                 .or_else(|| market.get("volume24hr").and_then(value_to_f64))
                 .unwrap_or(0.0);
 
-            if volume < config::MIN_MARKET_VOLUME { continue; }
-
-            let close_time = extract_close_time(&serde_json::Value::Null, market);
+            let close_time = extract_close_time(event, market);
             let seconds_left = close_time.map_or(0i64, |ct| (ct - now).num_seconds());
 
             if seconds_left < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY { continue; }
             if seconds_left > config::MAX_SECONDS_TO_EXPIRY_FOR_ENTRY { continue; }
 
-            let matches_filter = match crypto_filter {
-                "btc" | "bitcoin" => lower.contains("bitcoin") || lower.contains("btc"),
-                "eth" | "ethereum" => lower.contains("ethereum") || lower.contains("eth"),
-                "sol" | "solana" => lower.contains("solana") || lower.contains("sol"),
-                _ => true,
-            };
-            if !matches_filter { continue; }
+            let link = market.get("slug").and_then(|v| v.as_str()).map(|s| format!("https://polymarket.com/{}", s)).unwrap_or_else(|| "https://polymarket.com/".to_string());
+            let description = market.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let hot = config::is_high_priority_text(&name) || config::is_high_priority_text(&event_title);
 
-            let link = if let Some(slug) = market.get("slug").and_then(|v| v.as_str()) {
-                format!("https://polymarket.com/{}", slug)
-            } else {
-                "https://polymarket.com/".to_string()
-            };
-
-            let hot = config::is_high_priority_text(&name);
             out.push((token_ids, name.clone(), link, volume, hot, close_time, description));
         }
     }
@@ -490,7 +594,7 @@ async fn main() -> Result<()> {
     let nonce_manager = Arc::new(Mutex::new(initial_nonce));
 
     let starting_collateral = Arc::new(Mutex::new(dec!(0.0)));
-    let (balance_tx, mut balance_rx) = watch::channel(dec!(0));
+    let (balance_tx, balance_rx) = watch::channel(dec!(0));
 
     let mut startup_balance = dec!(0);
     for i in 1..=3 {

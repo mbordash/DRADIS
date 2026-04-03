@@ -25,3 +25,4 @@ tokio-tungstenite = { version = "0.28.0", features = ["native-tls"] }
 tungstenite = "0.28.0"
 url = "2.5.8"
 regex = "1.12.3"
+urlencoding = "2.1.3"
