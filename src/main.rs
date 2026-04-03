@@ -71,6 +71,26 @@ fn to_fixed_u128(d: Decimal) -> u128 {
         .unwrap_or(0)
 }
 
+async fn fetch_next_nonce(http: &reqwest::Client, eoa_address: Address) -> Option<u64> {
+    match http.get(format!("{}/nonce?address={}", config::CLOB_API_BASE, eoa_address)).send().await {
+        Ok(resp) => {
+            if let Ok(json) = resp.json::<serde_json::Value>().await {
+                return json.get("next_nonce").and_then(|n| n.as_u64());
+            }
+        },
+        Err(e) => error!("⚠️ Failed to fetch nonce from API: {:?}", e),
+    }
+    None
+}
+
+async fn sync_nonce_manager(nonce_manager: &Arc<Mutex<u64>>, http: &reqwest::Client, eoa_address: Address) {
+    if let Some(new_nonce) = fetch_next_nonce(http, eoa_address).await {
+        let mut guard = nonce_manager.lock().await;
+        *guard = new_nonce;
+        info!("🔄 Nonce manager synchronized to: {}", new_nonce);
+    }
+}
+
 fn value_to_u256(v: &serde_json::Value) -> Option<U256> {
     if let Some(s) = v.as_str() { U256::from_str(s).ok() }
     else if let Some(n) = v.as_u64() { Some(U256::from(n)) }
@@ -152,11 +172,11 @@ async fn fetch_historical_strike_price(http: &reqwest::Client, filter: &str, tex
     let re2 = Regex::new(r"([a-z]+)\s+(\d{1,2}),\s+(\d{1,2})(?::(\d{2}))?\s*(am|pm)").unwrap();
 
     let (year, month, day, hour, min) = if let Some(cap) = re1.captures(&lower_text) {
-        let month_str = cap.get(1)?.as_str();
-        let day: u32 = cap.get(2)?.as_str().parse().ok()?;
-        let year: i32 = 2000 + cap.get(3)?.as_str().parse::<i32>().ok()?;
-        let hour: u32 = cap.get(4)?.as_str().parse().ok()?;
-        let min: u32 = cap.get(5)?.as_str().parse().ok()?;
+        let month_str = cap.get(1).map(|m| m.as_str())?;
+        let day: u32 = cap.get(2).map(|m| m.as_str().parse().ok()).flatten()?;
+        let year: i32 = 2000 + cap.get(3).map(|m| m.as_str().parse::<i32>().ok()).flatten()?;
+        let hour: u32 = cap.get(4).map(|m| m.as_str().parse().ok()).flatten()?;
+        let min: u32 = cap.get(5).map(|m| m.as_str().parse().ok()).flatten()?;
 
         let month = match month_str {
             "jan" => 1, "feb" => 2, "mar" => 3, "apr" => 4, "may" => 5, "jun" => 6,
@@ -165,11 +185,11 @@ async fn fetch_historical_strike_price(http: &reqwest::Client, filter: &str, tex
         };
         (year, month, day, hour, min)
     } else if let Some(cap) = re2.captures(&lower_text) {
-        let month_str = cap.get(1)?.as_str();
-        let day: u32 = cap.get(2)?.as_str().parse().ok()?;
-        let mut hour: u32 = cap.get(3)?.as_str().parse().ok()?;
+        let month_str = cap.get(1).map(|m| m.as_str())?;
+        let day: u32 = cap.get(2).map(|m| m.as_str().parse().ok()).flatten()?;
+        let mut hour: u32 = cap.get(3).map(|m| m.as_str().parse().ok()).flatten()?;
         let min: u32 = cap.get(4).map(|m| m.as_str().parse().unwrap_or(0)).unwrap_or(0);
-        let ampm = cap.get(5)?.as_str();
+        let ampm = cap.get(5).map(|m| m.as_str())?;
 
         if ampm == "pm" && hour < 12 { hour += 12; }
         if ampm == "am" && hour == 12 { hour = 0; }
@@ -461,13 +481,7 @@ async fn main() -> Result<()> {
     info!("Authenticated on Polymarket CLOB. Safe (Maker) address: {}", safe_address);
 
     // FIX: Manual Nonce Fetch via REST if SDK method is missing/wrong
-    let initial_nonce = match shared_http.get(format!("{}/nonce?address={}", config::CLOB_API_BASE, eoa_address)).send().await {
-        Ok(resp) => {
-            let json = resp.json::<serde_json::Value>().await.unwrap_or_default();
-            json.get("next_nonce").and_then(|n| n.as_u64()).unwrap_or(0)
-        },
-        Err(_) => 0,
-    };
+    let initial_nonce = fetch_next_nonce(&shared_http, eoa_address).await.unwrap_or(0);
     info!("🔄 Initialized Nonce from API: {}", initial_nonce);
     let nonce_manager = Arc::new(Mutex::new(initial_nonce));
 
@@ -725,11 +739,22 @@ async fn main() -> Result<()> {
                         if let Some(token) = exit_token {
                             let client = Arc::clone(&trading_client);
                             let signer = signer.clone();
+                            let nm = Arc::clone(&nonce_manager);
+                            let sh = Arc::clone(&shared_http);
                             if let Ok(amt) = Amount::shares(exit_shares) {
                                 tokio::spawn(async move {
                                     if let Ok(order) = client.market_order().token_id(token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
                                         if let Ok(signed) = client.sign(&signer, order).await {
-                                            let _ = client.post_order(signed).await;
+                                            match client.post_order(signed).await {
+                                                Ok(_) => {},
+                                                Err(e) => {
+                                                    let msg = format!("{:?}", e).to_lowercase();
+                                                    if msg.contains("invalid nonce") {
+                                                        warn!("⚠️ Invalid nonce in momentum exit. Re-syncing...");
+                                                        sync_nonce_manager(&nm, &sh, eoa_address).await;
+                                                    }
+                                                }
+                                            }
                                         }
                                     }
                                 });
@@ -808,6 +833,7 @@ async fn main() -> Result<()> {
                                                 let market_name_handle = market_name.clone();
                                                 let close_time_handle = _market_close_time;
                                                 let pair_token_handle = if token == yes_token { no_token } else { yes_token };
+                                                let shared_http_handle = Arc::clone(&shared_http);
 
                                                 tokio::spawn(async move {
                                                     let mut nonce_guard = nonce_manager.lock().await;
@@ -851,7 +877,14 @@ async fn main() -> Result<()> {
                                                                 let mut pos_map = positions_handle.lock().await;
                                                                 pos_map.entry(token).or_insert_with(|| Position { shares: dec!(0), avg_entry: limit_price, opened_at: Utc::now(), close_time: close_time_handle, market_name: market_name_handle, pair_token_id: pair_token_handle }).shares += target_shares;
                                                             },
-                                                            Err(e) => error!("❌ LIVE MOMENTUM TRADE FAILED: API Error {:?}", e),
+                                                            Err(e) => {
+                                                                let err_msg = format!("{:?}", e).to_lowercase();
+                                                                if err_msg.contains("invalid nonce") {
+                                                                    warn!("⚠️ Invalid nonce in momentum trade. Re-syncing...");
+                                                                    sync_nonce_manager(&nonce_manager, &shared_http_handle, eoa_address).await;
+                                                                }
+                                                                error!("❌ LIVE MOMENTUM TRADE FAILED: API Error {:?}", e);
+                                                            }
                                                         }
                                                     }
                                                 });
@@ -888,6 +921,17 @@ async fn main() -> Result<()> {
                         info!("💰 Arb opportunity! Margin after fees: {:.4}¢ (Gross: {:.4}¢, Fees: {:.4}¢)", profit_margin * dec!(100), profit_margin_no_fees * dec!(100), (yes_fee + no_fee) * dec!(100));
                         let target_shares = (trade_size_usdc / combined_ask).floor();
                         if target_shares < config::MIN_ORDER_SHARES { continue; }
+
+                        let current_exposure = {
+                            let pos = positions.lock().await;
+                            pos.values().map(|p| p.shares * p.avg_entry).sum::<Decimal>()
+                        };
+
+                        let risk_engine = RiskEngine::new();
+                        if !risk_engine.approve_buy(yes_ask, no_ask, current_exposure, trade_size_usdc, *starting_collateral.lock().await, *total_pnl.lock().await) {
+                            continue;
+                        }
+
                         let yes_limit_price = (yes_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
                         let no_limit_price  = (no_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
 
@@ -940,18 +984,37 @@ async fn main() -> Result<()> {
                             };
                             let (yes_res, no_res) = tokio::join!(yes_task, no_task);
                             let network_total_time = arb_signal_start.elapsed();
-                            if let (Ok(_), Ok(_)) = (yes_res, no_res) {
+                            if let (Ok(_), Ok(_)) = (&yes_res, &no_res) {
                                 consecutive_failures = 0;
-                                let _ = balance_tx.send(current_usdc_balance - (target_shares * (yes_limit_price + no_limit_price)));
+                                let approx_cost = (target_shares * yes_limit_price) + (target_shares * no_limit_price);
+                                let _ = balance_tx.send(current_usdc_balance - approx_cost);
                                 {
                                     let mut pos_map = positions.lock().await;
                                     let now = Utc::now();
                                     pos_map.entry(yes_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: yes_limit_price, opened_at: now, close_time: _market_close_time, market_name: market_name.clone(), pair_token_id: no_token }).shares += target_shares;
                                     pos_map.entry(no_token).or_insert_with(|| Position { shares: dec!(0), avg_entry: no_limit_price,  opened_at: now, close_time: _market_close_time, market_name: market_name.clone(), pair_token_id: yes_token }).shares += target_shares;
                                 }
+                                {
+                                    let mut pnl_guard = total_pnl.lock().await;
+                                    *pnl_guard += target_shares * profit_margin;
+                                }
                                 info!("📈 BOTH LEGS FILLED (Parallel) — Profit ${:.4} | Latency: {:?}", target_shares * profit_margin, network_total_time);
                                 trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
                             } else {
+                                if let Err(ref e) = yes_res {
+                                    let msg = format!("{:?}", e).to_lowercase();
+                                    if msg.contains("invalid nonce") {
+                                        warn!("⚠️ Invalid nonce (YES) in arb trade. Re-syncing...");
+                                        sync_nonce_manager(&nonce_manager, &shared_http, eoa_address).await;
+                                    }
+                                }
+                                if let Err(ref e) = no_res {
+                                    let msg = format!("{:?}", e).to_lowercase();
+                                    if msg.contains("invalid nonce") {
+                                        warn!("⚠️ Invalid nonce (NO) in arb trade. Re-syncing...");
+                                        sync_nonce_manager(&nonce_manager, &shared_http, eoa_address).await;
+                                    }
+                                }
                                 consecutive_failures += 1;
                                 warn!("⚠️ Trade Failure ({}/3) | Latency: {:?}", consecutive_failures, network_total_time);
                                 trade_cooldown = Utc::now() + chrono::Duration::seconds(60);
@@ -974,12 +1037,30 @@ async fn main() -> Result<()> {
                                     if let (Ok(amt_yes), Ok(amt_no)) = (Amount::shares(yp.shares), Amount::shares(np.shares)) {
                                         if let Ok(oy) = trading_client.market_order().token_id(yes_token).amount(amt_yes).side(Side::Sell).price(exit_price_yes).order_type(OrderType::FAK).build().await {
                                             if let Ok(sy) = trading_client.sign(&signer, oy).await {
-                                                let _ = trading_client.post_order(sy).await;
+                                                match trading_client.post_order(sy).await {
+                                                    Ok(_) => {},
+                                                    Err(e) => {
+                                                        let msg = format!("{:?}", e).to_lowercase();
+                                                        if msg.contains("invalid nonce") {
+                                                            warn!("⚠️ Invalid nonce in hedge exit (YES). Re-syncing...");
+                                                            sync_nonce_manager(&nonce_manager, &shared_http, eoa_address).await;
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                         if let Ok(on) = trading_client.market_order().token_id(no_token).amount(amt_no).side(Side::Sell).price(exit_price_no).order_type(OrderType::FAK).build().await {
                                             if let Ok(sn) = trading_client.sign(&signer, on).await {
-                                                let _ = trading_client.post_order(sn).await;
+                                                match trading_client.post_order(sn).await {
+                                                    Ok(_) => {},
+                                                    Err(e) => {
+                                                        let msg = format!("{:?}", e).to_lowercase();
+                                                        if msg.contains("invalid nonce") {
+                                                            warn!("⚠️ Invalid nonce in hedge exit (NO). Re-syncing...");
+                                                            sync_nonce_manager(&nonce_manager, &shared_http, eoa_address).await;
+                                                        }
+                                                    }
+                                                }
                                             }
                                         }
                                         if let Some(p) = pos_map.get_mut(&yes_token) { p.shares = dec!(0); }
