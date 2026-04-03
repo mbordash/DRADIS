@@ -20,7 +20,7 @@ pub const GHOST_MODE: bool = false;
 /// IMPORTANT: This should be higher than (2 * BUY_PRICE_OFFSET) to be profitable.
 pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.05);
 
-pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.99);
+pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.98);
 
 /// Minimum number of shares for a single order (exchange requirement)
 pub const MIN_ORDER_SHARES: Decimal = dec!(5.0);
@@ -29,7 +29,7 @@ pub const MIN_ORDER_SHARES: Decimal = dec!(5.0);
 pub const MIN_ORDER_USDC: Decimal = dec!(1.05);
 
 /// Price offset added to the ask price when placing buy orders to ensure aggressive fills.
-pub const BUY_PRICE_OFFSET: Decimal = dec!(0.02);
+pub const BUY_PRICE_OFFSET: Decimal = dec!(0.03);
 
 /// Maximum price for a single share when placing a buy order.
 pub const MAX_BUY_LIMIT_PRICE: Decimal = dec!(0.99);
@@ -51,7 +51,7 @@ pub const EARLY_EXIT_COMBINED_BID_THRESHOLD: Decimal = dec!(0.995);
 pub const ENABLE_MOMENTUM_TRADING: bool = true;
 
 /// Dynamic Take Profit: Exit if we gain this % over our entry price.
-pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.15);
+pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.06);
 
 /// Static Take Profit Ceiling: Exit if bid hits this price regardless of entry.
 pub const MOMENTUM_TAKE_PROFIT_CEILING: Decimal = dec!(0.90);
