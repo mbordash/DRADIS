@@ -6,7 +6,7 @@ use std::time::Duration as StdDuration;
 // NOTIFICATION SETTINGS (Telegram)
 // ============================================================================
 
-pub const ENABLE_TELEGRAM: bool = false;
+pub const ENABLE_TELEGRAM: bool = true;
 
 
 // ============================================================================

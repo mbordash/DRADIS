@@ -36,6 +36,7 @@ use tracing::{error, info, warn, debug};
 
 use rustpolybot::config;
 use rustpolybot::risk::RiskEngine;
+use rustpolybot::notifications::send_notification;
 
 use rustls::crypto::ring;
 
@@ -466,6 +467,9 @@ async fn main() -> Result<()> {
     let trade_size_usdc: Decimal = env::var("TRADE_SIZE_USDC").unwrap_or_else(|_| "10".to_string()).parse()?;
     let momentum_trade_size_usdc: Decimal = env::var("MOMENTUM_TRADE_SIZE_USDC").unwrap_or_else(|_| "5".to_string()).parse()?;
 
+    let tg_token = env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
+    let tg_chat_id = env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
+
     let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
     let eoa_address = signer.address();
     info!("Trading wallet (EOA) address: {}", eoa_address);
@@ -711,17 +715,16 @@ async fn main() -> Result<()> {
                         let mut exit_price = dec!(0);
                         let mut exit_shares = dec!(0);
 
-                        if let (Some(yp), Some(np)) = (&yes_pos, &no_pos) {
-                            let velocity = *velocity_rx.borrow();
-                            let threshold = match crypto_filter.as_str() {
-                                "eth" => config::ETH_MOMENTUM_THRESHOLD,
-                                "sol" => config::SOL_MOMENTUM_THRESHOLD,
-                                _ => config::BTC_MOMENTUM_THRESHOLD,
-                            };
-                            let reversal_threshold = threshold * config::MOMENTUM_REVERSAL_RATIO;
+                        let velocity = *velocity_rx.borrow();
+                        let threshold = match crypto_filter.as_str() {
+                            "eth" => config::ETH_MOMENTUM_THRESHOLD,
+                            "sol" => config::SOL_MOMENTUM_THRESHOLD,
+                            _ => config::BTC_MOMENTUM_THRESHOLD,
+                        };
+                        let reversal_threshold = threshold * config::MOMENTUM_REVERSAL_RATIO;
 
-                            // Only exit if we own exactly ONE side (momentum trade)
-                            if yp.shares > dec!(0) && np.shares == dec!(0) {
+                        if let Some(yp) = yes_pos {
+                            if yp.shares > dec!(0) {
                                 let profit_margin = if yp.avg_entry > dec!(0) { (yes_bid - yp.avg_entry) / yp.avg_entry } else { dec!(0) };
                                 let target = if yp.avg_entry >= dec!(0.70) { dec!(0.05) } else { config::MOMENTUM_TARGET_PROFIT_PERCENT };
                                 let stop_loss = -config::MOMENTUM_STOP_LOSS_PERCENT;
@@ -742,26 +745,32 @@ async fn main() -> Result<()> {
                                     exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                     exit_shares = yp.shares;
                                 }
-                            } else if np.shares > dec!(0) && yp.shares == dec!(0) {
-                                let profit_margin = if np.avg_entry > dec!(0) { (no_bid - np.avg_entry) / np.avg_entry } else { dec!(0) };
-                                let target = if np.avg_entry >= dec!(0.70) { dec!(0.05) } else { config::MOMENTUM_TARGET_PROFIT_PERCENT };
-                                let stop_loss = -config::MOMENTUM_STOP_LOSS_PERCENT;
+                            }
+                        }
 
-                                if profit_margin >= target || no_bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
-                                    info!("🎯 Momentum NO Target Reached (Bid: ${:.2}, Profit: {:.2}% vs Target: {:.2}%) - Taking Profit", no_bid, profit_margin * dec!(100), target * dec!(100));
-                                    exit_token = Some(no_token);
-                                    exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                    exit_shares = np.shares;
-                                } else if profit_margin <= stop_loss {
-                                    info!("🛑 Momentum NO Stop Loss Hit (Bid: ${:.2}, Loss: {:.2}%)", no_bid, profit_margin * dec!(100));
-                                    exit_token = Some(no_token);
-                                    exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                    exit_shares = np.shares;
-                                } else if velocity > -reversal_threshold {
-                                    info!("📉 Momentum NO Reversal Detected (Velocity: ${:.2} > -${:.2})", velocity, reversal_threshold);
-                                    exit_token = Some(no_token);
-                                    exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                    exit_shares = np.shares;
+                        if exit_token.is_none() {
+                            if let Some(np) = no_pos {
+                                if np.shares > dec!(0) {
+                                    let profit_margin = if np.avg_entry > dec!(0) { (no_bid - np.avg_entry) / np.avg_entry } else { dec!(0) };
+                                    let target = if np.avg_entry >= dec!(0.70) { dec!(0.05) } else { config::MOMENTUM_TARGET_PROFIT_PERCENT };
+                                    let stop_loss = -config::MOMENTUM_STOP_LOSS_PERCENT;
+
+                                    if profit_margin >= target || no_bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
+                                        info!("🎯 Momentum NO Target Reached (Bid: ${:.2}, Profit: {:.2}% vs Target: {:.2}%) - Taking Profit", no_bid, profit_margin * dec!(100), target * dec!(100));
+                                        exit_token = Some(no_token);
+                                        exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                        exit_shares = np.shares;
+                                    } else if profit_margin <= stop_loss {
+                                        info!("🛑 Momentum NO Stop Loss Hit (Bid: ${:.2}, Loss: {:.2}%)", no_bid, profit_margin * dec!(100));
+                                        exit_token = Some(no_token);
+                                        exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                        exit_shares = np.shares;
+                                    } else if velocity > -reversal_threshold {
+                                        info!("📉 Momentum NO Reversal Detected (Velocity: ${:.2} > -${:.2})", velocity, reversal_threshold);
+                                        exit_token = Some(no_token);
+                                        exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                        exit_shares = np.shares;
+                                    }
                                 }
                             }
                         }
@@ -771,6 +780,8 @@ async fn main() -> Result<()> {
                             let signer = signer.clone();
                             let nm = Arc::clone(&nonce_manager);
                             let sh = Arc::clone(&shared_http);
+                            let tt = tg_token.clone();
+                            let tc = tg_chat_id.clone();
                             if let Ok(amt) = Amount::shares(exit_shares) {
                                 tokio::spawn(async move {
                                     if let Ok(order) = client.market_order().token_id(token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
@@ -778,8 +789,11 @@ async fn main() -> Result<()> {
                                             match client.post_order(signed).await {
                                                 Ok(_) => {},
                                                 Err(e) => {
-                                                    let msg = format!("{:?}", e).to_lowercase();
-                                                    if msg.contains("invalid nonce") {
+                                                    let msg = format!("❌ [RustPolyBot] Momentum Exit Order Failed: {:?}", e);
+                                                    let _ = send_notification(&tt, &tc, &msg).await;
+                                                    error!("{}", msg);
+                                                    let err_msg = format!("{:?}", e).to_lowercase();
+                                                    if err_msg.contains("invalid nonce") {
                                                         warn!("⚠️ Invalid nonce in momentum exit. Re-syncing...");
                                                         sync_nonce_manager(&nm, &sh, eoa_address).await;
                                                     }
@@ -864,6 +878,8 @@ async fn main() -> Result<()> {
                                                 let close_time_handle = _market_close_time;
                                                 let pair_token_handle = if token == yes_token { no_token } else { yes_token };
                                                 let shared_http_handle = Arc::clone(&shared_http);
+                                                let tt = tg_token.clone();
+                                                let tc = tg_chat_id.clone();
 
                                                 tokio::spawn(async move {
                                                     let mut nonce_guard = nonce_manager.lock().await;
@@ -908,12 +924,14 @@ async fn main() -> Result<()> {
                                                                 pos_map.entry(token).or_insert_with(|| Position { shares: dec!(0), avg_entry: limit_price, opened_at: Utc::now(), close_time: close_time_handle, market_name: market_name_handle, pair_token_id: pair_token_handle }).shares += target_shares;
                                                             },
                                                             Err(e) => {
+                                                                let msg = format!("❌ [RustPolyBot] Momentum Entry Order Failed: {:?}", e);
+                                                                let _ = send_notification(&tt, &tc, &msg).await;
+                                                                error!("{}", msg);
                                                                 let err_msg = format!("{:?}", e).to_lowercase();
                                                                 if err_msg.contains("invalid nonce") {
                                                                     warn!("⚠️ Invalid nonce in momentum trade. Re-syncing...");
                                                                     sync_nonce_manager(&nonce_manager, &shared_http_handle, eoa_address).await;
                                                                 }
-                                                                error!("❌ LIVE MOMENTUM TRADE FAILED: API Error {:?}", e);
                                                             }
                                                         }
                                                     }
@@ -939,7 +957,9 @@ async fn main() -> Result<()> {
                     if profit_margin >= config::ARBITRAGE_PROFIT_THRESHOLD {
                         let arb_signal_start = Instant::now();
                         if consecutive_failures >= config::MAX_CONSECUTIVE_FAILURES {
-                            error!("🛑 FATAL: 3 consecutive failures. Emergency stopping.");
+                            let msg = format!("🛑 [RustPolyBot] FATAL: {} consecutive failures. Emergency stopping.", consecutive_failures);
+                            let _ = send_notification(&tg_token, &tg_chat_id, &msg).await;
+                            error!("{}", msg);
                             std::process::exit(1);
                         }
                         let current_usdc_balance = *balance_rx.borrow();
@@ -1032,15 +1052,21 @@ async fn main() -> Result<()> {
                                 trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
                             } else {
                                 if let Err(ref e) = yes_res {
-                                    let msg = format!("{:?}", e).to_lowercase();
-                                    if msg.contains("invalid nonce") {
+                                    let msg = format!("❌ [RustPolyBot] Arb Trade Failed (YES): {:?}", e);
+                                    let _ = send_notification(&tg_token, &tg_chat_id, &msg).await;
+                                    error!("{}", msg);
+                                    let err_msg = format!("{:?}", e).to_lowercase();
+                                    if err_msg.contains("invalid nonce") {
                                         warn!("⚠️ Invalid nonce (YES) in arb trade. Re-syncing...");
                                         sync_nonce_manager(&nonce_manager, &shared_http, eoa_address).await;
                                     }
                                 }
                                 if let Err(ref e) = no_res {
-                                    let msg = format!("{:?}", e).to_lowercase();
-                                    if msg.contains("invalid nonce") {
+                                    let msg = format!("❌ [RustPolyBot] Arb Trade Failed (NO): {:?}", e);
+                                    let _ = send_notification(&tg_token, &tg_chat_id, &msg).await;
+                                    error!("{}", msg);
+                                    let err_msg = format!("{:?}", e).to_lowercase();
+                                    if err_msg.contains("invalid nonce") {
                                         warn!("⚠️ Invalid nonce (NO) in arb trade. Re-syncing...");
                                         sync_nonce_manager(&nonce_manager, &shared_http, eoa_address).await;
                                     }
@@ -1070,8 +1096,11 @@ async fn main() -> Result<()> {
                                                 match trading_client.post_order(sy).await {
                                                     Ok(_) => {},
                                                     Err(e) => {
-                                                        let msg = format!("{:?}", e).to_lowercase();
-                                                        if msg.contains("invalid nonce") {
+                                                        let msg = format!("❌ [RustPolyBot] Hedge Exit Failed (YES): {:?}", e);
+                                                        let _ = send_notification(&tg_token, &tg_chat_id, &msg).await;
+                                                        error!("{}", msg);
+                                                        let err_msg = format!("{:?}", e).to_lowercase();
+                                                        if err_msg.contains("invalid nonce") {
                                                             warn!("⚠️ Invalid nonce in hedge exit (YES). Re-syncing...");
                                                             sync_nonce_manager(&nonce_manager, &shared_http, eoa_address).await;
                                                         }
@@ -1084,8 +1113,11 @@ async fn main() -> Result<()> {
                                                 match trading_client.post_order(sn).await {
                                                     Ok(_) => {},
                                                     Err(e) => {
-                                                        let msg = format!("{:?}", e).to_lowercase();
-                                                        if msg.contains("invalid nonce") {
+                                                        let msg = format!("❌ [RustPolyBot] Hedge Exit Failed (NO): {:?}", e);
+                                                        let _ = send_notification(&tg_token, &tg_chat_id, &msg).await;
+                                                        error!("{}", msg);
+                                                        let err_msg = format!("{:?}", e).to_lowercase();
+                                                        if err_msg.contains("invalid nonce") {
                                                             warn!("⚠️ Invalid nonce in hedge exit (NO). Re-syncing...");
                                                             sync_nonce_manager(&nonce_manager, &shared_http, eoa_address).await;
                                                         }
