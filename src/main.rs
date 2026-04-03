@@ -712,13 +712,32 @@ async fn main() -> Result<()> {
                         let mut exit_shares = dec!(0);
 
                         if let (Some(yp), Some(np)) = (&yes_pos, &no_pos) {
+                            let velocity = *velocity_rx.borrow();
+                            let threshold = match crypto_filter.as_str() {
+                                "eth" => config::ETH_MOMENTUM_THRESHOLD,
+                                "sol" => config::SOL_MOMENTUM_THRESHOLD,
+                                _ => config::BTC_MOMENTUM_THRESHOLD,
+                            };
+                            let reversal_threshold = threshold * config::MOMENTUM_REVERSAL_RATIO;
+
                             // Only exit if we own exactly ONE side (momentum trade)
                             if yp.shares > dec!(0) && np.shares == dec!(0) {
                                 let profit_margin = if yp.avg_entry > dec!(0) { (yes_bid - yp.avg_entry) / yp.avg_entry } else { dec!(0) };
                                 let target = if yp.avg_entry >= dec!(0.70) { dec!(0.05) } else { config::MOMENTUM_TARGET_PROFIT_PERCENT };
+                                let stop_loss = -config::MOMENTUM_STOP_LOSS_PERCENT;
 
                                 if profit_margin >= target || yes_bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
                                     info!("🎯 Momentum YES Target Reached (Bid: ${:.2}, Profit: {:.2}% vs Target: {:.2}%) - Taking Profit", yes_bid, profit_margin * dec!(100), target * dec!(100));
+                                    exit_token = Some(yes_token);
+                                    exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                    exit_shares = yp.shares;
+                                } else if profit_margin <= stop_loss {
+                                    info!("🛑 Momentum YES Stop Loss Hit (Bid: ${:.2}, Loss: {:.2}%)", yes_bid, profit_margin * dec!(100));
+                                    exit_token = Some(yes_token);
+                                    exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                    exit_shares = yp.shares;
+                                } else if velocity < reversal_threshold {
+                                    info!("📉 Momentum YES Reversal Detected (Velocity: ${:.2} < Threshold: ${:.2})", velocity, reversal_threshold);
                                     exit_token = Some(yes_token);
                                     exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                     exit_shares = yp.shares;
@@ -726,9 +745,20 @@ async fn main() -> Result<()> {
                             } else if np.shares > dec!(0) && yp.shares == dec!(0) {
                                 let profit_margin = if np.avg_entry > dec!(0) { (no_bid - np.avg_entry) / np.avg_entry } else { dec!(0) };
                                 let target = if np.avg_entry >= dec!(0.70) { dec!(0.05) } else { config::MOMENTUM_TARGET_PROFIT_PERCENT };
+                                let stop_loss = -config::MOMENTUM_STOP_LOSS_PERCENT;
 
                                 if profit_margin >= target || no_bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
                                     info!("🎯 Momentum NO Target Reached (Bid: ${:.2}, Profit: {:.2}% vs Target: {:.2}%) - Taking Profit", no_bid, profit_margin * dec!(100), target * dec!(100));
+                                    exit_token = Some(no_token);
+                                    exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                    exit_shares = np.shares;
+                                } else if profit_margin <= stop_loss {
+                                    info!("🛑 Momentum NO Stop Loss Hit (Bid: ${:.2}, Loss: {:.2}%)", no_bid, profit_margin * dec!(100));
+                                    exit_token = Some(no_token);
+                                    exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                    exit_shares = np.shares;
+                                } else if velocity > -reversal_threshold {
+                                    info!("📉 Momentum NO Reversal Detected (Velocity: ${:.2} > -${:.2})", velocity, reversal_threshold);
                                     exit_token = Some(no_token);
                                     exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                     exit_shares = np.shares;

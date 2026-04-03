@@ -51,7 +51,14 @@ pub const EARLY_EXIT_COMBINED_BID_THRESHOLD: Decimal = dec!(0.995);
 pub const ENABLE_MOMENTUM_TRADING: bool = true;
 
 /// Dynamic Take Profit: Exit if we gain this % over our entry price.
-pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.06);
+/// Lowered to 3% to capture quick moves in volatile markets.
+pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.03);
+
+/// Stop Loss: Exit if we lose this % from our entry price.
+pub const MOMENTUM_STOP_LOSS_PERCENT: Decimal = dec!(0.05);
+
+/// Reversal Exit: Exit if momentum velocity drops below this % of the entry threshold.
+pub const MOMENTUM_REVERSAL_RATIO: Decimal = dec!(0.20);
 
 /// Static Take Profit Ceiling: Exit if bid hits this price regardless of entry.
 pub const MOMENTUM_TAKE_PROFIT_CEILING: Decimal = dec!(0.90);
