@@ -259,7 +259,7 @@ fn generate_hourly_market_names(crypto_filter: &str, current_time_utc: DateTime<
         "btc" => "Bitcoin",
         "eth" => "Ethereum",
         "sol" => "Solana",
-        _ => "Crypto",
+        _ => "Crypto", // Should not happen with current filter logic
     };
     let crypto_name_short = crypto_filter.to_uppercase();
 
@@ -311,7 +311,7 @@ async fn fetch_specific_hourly_market(http: &reqwest::Client, crypto_filter: &st
             continue;
         };
 
-        if let Some(market) = markets.into_iter().next() {
+        if let Some(market) = markets.into_iter().next() { // Take the first result
             let name = market.get("question").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let description = market.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let event = market.get("event").unwrap_or(&serde_json::Value::Null);
@@ -350,7 +350,7 @@ async fn get_top_market(http: &reqwest::Client) -> (U256, U256, String, String, 
         .to_lowercase();
 
     info!("🚀 Scanning Gamma API for markets (FILTER: {})", crypto_filter);
-    let now = Utc::now();
+    let now = Utc::now(); // Get current time once
 
     // 1. Try specifically targeted hourly markets first (Fastest)
     if let Some(market) = fetch_specific_hourly_market(http, &crypto_filter, now).await {
@@ -394,7 +394,7 @@ async fn fetch_simplified_crypto_candidates(
     let now = Utc::now();
     let mut total_scanned = 0;
 
-    for page in 0..20 { // Reduced fallback scan depth for efficiency
+    for page in 0..config::GAMMA_API_MARKET_SCAN_PAGES { // Use config for scan pages
         let offset = page * 100;
         let url = format!(
             "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&offset={}&order=volume24hrClob&ascending=false&include=event",
@@ -441,8 +441,14 @@ async fn fetch_simplified_crypto_candidates(
 
             debug!("🔍 Evaluating candidate: \"{}\" (Event: \"{}\")", name, event_title);
 
-            if config::is_bad_market(&name) || config::is_bad_market(&event_title) { continue; }
-            if !get_enable_orderbook(market) { continue; }
+            if config::is_bad_market(&name) || config::is_bad_market(&event_title) {
+                debug!("  ⏭️ Rejected: Bad market (keyword match)");
+                continue;
+            }
+            if !get_enable_orderbook(market) {
+                debug!("  ⏭️ Rejected: Orderbook not enabled");
+                continue;
+            }
 
             if !lower.contains("up or down") && !lower_event.contains("up or down") {
                 debug!("  ⏭️ Rejected: No 'up or down' in question or event title");
@@ -454,17 +460,31 @@ async fn fetch_simplified_crypto_candidates(
             }
 
             let token_ids = extract_token_ids_u256(market);
-            if token_ids.len() < 2 { continue; }
+            if token_ids.len() < 2 {
+                debug!("  ⏭️ Rejected: Missing token IDs");
+                continue;
+            }
 
             let volume = market.get("volume24hrClob").and_then(value_to_f64)
                 .or_else(|| market.get("volume24hr").and_then(value_to_f64))
                 .unwrap_or(0.0);
 
+            if volume < config::MIN_MARKET_VOLUME {
+                debug!("  ⏭️ Rejected: Low volume (${:.2})", volume);
+                continue;
+            }
+
             let close_time = extract_close_time(event, market);
             let seconds_left = close_time.map_or(0i64, |ct| (ct - now).num_seconds());
 
-            if seconds_left < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY { continue; }
-            if seconds_left > config::MAX_SECONDS_TO_EXPIRY_FOR_ENTRY { continue; }
+            if seconds_left < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY {
+                debug!("  ⏭️ Rejected: Too close to expiry ({}s left)", seconds_left);
+                continue;
+            }
+            if seconds_left > config::MAX_SECONDS_TO_EXPIRY_FOR_ENTRY {
+                debug!("  ⏭️ Rejected: Too far from expiry ({}s left)", seconds_left);
+                continue;
+            }
 
             let link = market.get("slug").and_then(|v| v.as_str()).map(|s| format!("https://polymarket.com/{}", s)).unwrap_or_else(|| "https://polymarket.com/".to_string());
             let description = market.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
@@ -594,7 +614,7 @@ async fn main() -> Result<()> {
     let nonce_manager = Arc::new(Mutex::new(initial_nonce));
 
     let starting_collateral = Arc::new(Mutex::new(dec!(0.0)));
-    let (balance_tx, balance_rx) = watch::channel(dec!(0));
+    let (balance_tx, mut balance_rx) = watch::channel(dec!(0));
 
     let mut startup_balance = dec!(0);
     for i in 1..=3 {
@@ -888,21 +908,65 @@ async fn main() -> Result<()> {
                             let tc = tg_chat_id.clone();
                             if let Ok(amt) = Amount::shares(exit_shares) {
                                 tokio::spawn(async move {
-                                    if let Ok(order) = client.market_order().token_id(token).amount(amt).side(Side::Sell).price(exit_price).order_type(OrderType::FAK).build().await {
-                                        if let Ok(signed) = client.sign(&signer, order).await {
-                                            match client.post_order(signed).await {
-                                                Ok(_) => {},
+                                    // Retry loop for nonce issues
+                                    for attempt in 0..2 { // Max 2 attempts (initial + 1 retry)
+                                        let current_nonce = *nm.lock().await;
+                                        let mut order_struct = Order::default();
+                                        order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
+                                        order_struct.maker = safe_address;
+                                        order_struct.signer = eoa_address;
+                                        order_struct.taker = Address::ZERO;
+                                        order_struct.tokenId = token;
+                                        order_struct.makerAmount = U256::from(to_fixed_u128(exit_shares * exit_price));
+                                        order_struct.takerAmount = U256::from(to_fixed_u128(exit_shares));
+                                        order_struct.expiration = U256::ZERO;
+                                        order_struct.nonce = U256::from(current_nonce);
+                                        order_struct.feeRateBps = U256::from(0); // Assuming 0 fee for exits or use actual fee_rate
+                                        order_struct.side = Side::Sell as u8;
+                                        order_struct.signatureType = SignatureType::GnosisSafe as u8;
+
+                                        let domain = Eip712Domain {
+                                            name: Some(Cow::Borrowed(ORDER_NAME)),
+                                            version: Some(Cow::Borrowed(VERSION)),
+                                            chain_id: Some(U256::from(POLYGON)),
+                                            verifying_contract: Some(verifying_contract),
+                                            ..Eip712Domain::default()
+                                        };
+
+                                        let hash = order_struct.eip712_signing_hash(&domain);
+                                        if let Ok(signature) = signer.sign_hash(&hash).await {
+                                            let signed_order = SignedOrder::builder()
+                                                .order(order_struct)
+                                                .signature(signature)
+                                                .order_type(OrderType::FAK)
+                                                .owner(owner)
+                                                .build();
+
+                                            match client.post_order(signed_order).await {
+                                                Ok(_) => {
+                                                    info!("🚀 LIVE MOMENTUM EXIT FILLED: {} shares of token {} @ ${:.2}", exit_shares, token, exit_price);
+                                                    *nm.lock().await += 1; // Increment nonce on success
+                                                    break; // Exit retry loop
+                                                },
                                                 Err(e) => {
-                                                    let msg = format!("❌ [RustPolyBot] Momentum Exit Order Failed: {:?}", e);
-                                                    let _ = send_notification(&tt, &tc, &msg).await;
-                                                    error!("{}", msg);
                                                     let err_msg = format!("{:?}", e).to_lowercase();
-                                                    if err_msg.contains("invalid nonce") {
-                                                        warn!("⚠️ Invalid nonce in momentum exit. Re-syncing...");
+                                                    if err_msg.contains("invalid nonce") && attempt == 0 {
+                                                        warn!("⚠️ Invalid nonce in momentum exit. Re-syncing and retrying...");
                                                         sync_nonce_manager(&nm, &sh, eoa_address).await;
+                                                        continue; // Retry with new nonce
+                                                    } else {
+                                                        let msg = format!("❌ [RustPolyBot] Momentum Exit Order Failed (Attempt {}): {:?}", attempt + 1, e);
+                                                        let _ = send_notification(&tt, &tc, &msg).await;
+                                                        error!("{}", msg);
+                                                        break; // Break retry loop on other errors or after all retries
                                                     }
                                                 }
                                             }
+                                        } else {
+                                            let msg = format!("❌ [RustPolyBot] Momentum Exit Order Signing Failed (Attempt {}): {:?}", attempt + 1, token);
+                                            let _ = send_notification(&tt, &tc, &msg).await;
+                                            error!("{}", msg);
+                                            break;
                                         }
                                     }
                                 });
@@ -986,57 +1050,67 @@ async fn main() -> Result<()> {
                                                 let tc = tg_chat_id.clone();
 
                                                 tokio::spawn(async move {
-                                                    let mut nonce_guard = nonce_manager.lock().await;
-                                                    let nonce = *nonce_guard;
-                                                    *nonce_guard += 1;
-                                                    drop(nonce_guard);
+                                                    // Retry loop for nonce issues
+                                                    for attempt in 0..2 { // Max 2 attempts (initial + 1 retry)
+                                                        let current_nonce = *nonce_manager.lock().await;
+                                                        let mut order_struct = Order::default();
+                                                        order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
+                                                        order_struct.maker = safe_address;
+                                                        order_struct.signer = eoa_address;
+                                                        order_struct.taker = Address::ZERO;
+                                                        order_struct.tokenId = token;
+                                                        order_struct.makerAmount = U256::from(to_fixed_u128(target_shares * limit_price));
+                                                        order_struct.takerAmount = U256::from(amount);
+                                                        order_struct.expiration = U256::ZERO;
+                                                        order_struct.nonce = U256::from(current_nonce);
+                                                        order_struct.feeRateBps = U256::from(fee_rate);
+                                                        order_struct.side = Side::Buy as u8;
+                                                        order_struct.signatureType = SignatureType::GnosisSafe as u8;
 
-                                                    let mut order_struct = Order::default();
-                                                    order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
-                                                    order_struct.maker = safe_address;
-                                                    order_struct.signer = eoa_address;
-                                                    order_struct.taker = Address::ZERO;
-                                                    order_struct.tokenId = token;
-                                                    order_struct.makerAmount = U256::from(to_fixed_u128(target_shares * limit_price));
-                                                    order_struct.takerAmount = U256::from(amount);
-                                                    order_struct.expiration = U256::ZERO;
-                                                    order_struct.nonce = U256::from(nonce);
-                                                    order_struct.feeRateBps = U256::from(fee_rate);
-                                                    order_struct.side = Side::Buy as u8;
-                                                    order_struct.signatureType = SignatureType::GnosisSafe as u8;
+                                                        let domain = Eip712Domain {
+                                                            name: Some(Cow::Borrowed(ORDER_NAME)),
+                                                            version: Some(Cow::Borrowed(VERSION)),
+                                                            chain_id: Some(U256::from(POLYGON)),
+                                                            verifying_contract: Some(verifying_contract),
+                                                            ..Eip712Domain::default()
+                                                        };
 
-                                                    let domain = Eip712Domain {
-                                                        name: Some(Cow::Borrowed(ORDER_NAME)),
-                                                        version: Some(Cow::Borrowed(VERSION)),
-                                                        chain_id: Some(U256::from(POLYGON)),
-                                                        verifying_contract: Some(verifying_contract),
-                                                        ..Eip712Domain::default()
-                                                    };
+                                                        let hash = order_struct.eip712_signing_hash(&domain);
+                                                        if let Ok(signature) = signer.sign_hash(&hash).await {
+                                                            let signed_order = SignedOrder::builder()
+                                                                .order(order_struct)
+                                                                .signature(signature)
+                                                                .order_type(OrderType::FAK)
+                                                                .owner(owner)
+                                                                .build();
 
-                                                    let hash = order_struct.eip712_signing_hash(&domain);
-                                                    if let Ok(signature) = signer.sign_hash(&hash).await {
-                                                        let signed_order = SignedOrder::builder()
-                                                            .order(order_struct)
-                                                            .signature(signature)
-                                                            .order_type(OrderType::FAK)
-                                                            .owner(owner)
-                                                            .build();
-                                                        match client.post_order(signed_order).await {
-                                                            Ok(_) => {
-                                                                info!("🚀 LIVE MOMENTUM TRADE FILLED: {} shares of token {} @ ${:.2}", target_shares, token, limit_price);
-                                                                let mut pos_map = positions_handle.lock().await;
-                                                                pos_map.entry(token).or_insert_with(|| Position { shares: dec!(0), avg_entry: limit_price, opened_at: Utc::now(), close_time: close_time_handle, market_name: market_name_handle, pair_token_id: pair_token_handle }).shares += target_shares;
-                                                            },
-                                                            Err(e) => {
-                                                                let msg = format!("❌ [RustPolyBot] Momentum Entry Order Failed: {:?}", e);
-                                                                let _ = send_notification(&tt, &tc, &msg).await;
-                                                                error!("{}", msg);
-                                                                let err_msg = format!("{:?}", e).to_lowercase();
-                                                                if err_msg.contains("invalid nonce") {
-                                                                    warn!("⚠️ Invalid nonce in momentum trade. Re-syncing...");
-                                                                    sync_nonce_manager(&nonce_manager, &shared_http_handle, eoa_address).await;
+                                                            match client.post_order(signed_order).await {
+                                                                Ok(_) => {
+                                                                    info!("🚀 LIVE MOMENTUM TRADE FILLED: {} shares of token {} @ ${:.2}", target_shares, token, limit_price);
+                                                                    let mut pos_map = positions_handle.lock().await;
+                                                                    pos_map.entry(token).or_insert_with(|| Position { shares: dec!(0), avg_entry: limit_price, opened_at: Utc::now(), close_time: close_time_handle, market_name: market_name_handle, pair_token_id: pair_token_handle }).shares += target_shares;
+                                                                    *nonce_manager.lock().await += 1; // Increment nonce on success
+                                                                    break; // Exit retry loop
+                                                                },
+                                                                Err(e) => {
+                                                                    let err_msg = format!("{:?}", e).to_lowercase();
+                                                                    if err_msg.contains("invalid nonce") && attempt == 0 {
+                                                                        warn!("⚠️ Invalid nonce in momentum trade. Re-syncing and retrying...");
+                                                                        sync_nonce_manager(&nonce_manager, &shared_http_handle, eoa_address).await;
+                                                                        continue; // Retry with new nonce
+                                                                    } else {
+                                                                        let msg = format!("❌ [RustPolyBot] Momentum Entry Order Failed (Attempt {}): {:?}", attempt + 1, e);
+                                                                        let _ = send_notification(&tt, &tc, &msg).await;
+                                                                        error!("{}", msg);
+                                                                        break; // Break retry loop on other errors or after all retries
+                                                                    }
                                                                 }
                                                             }
+                                                        } else {
+                                                            let msg = format!("❌ [RustPolyBot] Momentum Entry Order Signing Failed (Attempt {}): {:?}", attempt + 1, token);
+                                                            let _ = send_notification(&tt, &tc, &msg).await;
+                                                            error!("{}", msg);
+                                                            break;
                                                         }
                                                     }
                                                 });
@@ -1090,50 +1164,117 @@ async fn main() -> Result<()> {
                         let no_limit_price  = (no_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
 
                         if !config::GHOST_MODE {
+                            let client_clone = Arc::clone(&trading_client);
+                            let signer_clone = signer.clone();
+                            let nonce_manager_clone = Arc::clone(&nonce_manager);
+                            let shared_http_clone = Arc::clone(&shared_http);
+                            let tg_token_clone = tg_token.clone();
+                            let tg_chat_id_clone = tg_chat_id.clone();
+
                             let yes_task = {
-                                let client = Arc::clone(&trading_client);
-                                let signer = signer.clone();
+                                let client = Arc::clone(&client_clone);
+                                let signer = signer_clone.clone();
                                 let token = yes_token;
-                                let nonce_manager = Arc::clone(&nonce_manager);
+                                let nonce_manager = Arc::clone(&nonce_manager_clone);
                                 let owner = client.credentials().key();
+                                let shared_http = Arc::clone(&shared_http_clone);
+                                let tt = tg_token_clone.clone();
+                                let tc = tg_chat_id_clone.clone();
                                 async move {
-                                    let mut nonce_guard = nonce_manager.lock().await;
-                                    let nonce = *nonce_guard; *nonce_guard += 1; drop(nonce_guard);
-                                    let mut order_struct = Order::default();
-                                    order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
-                                    order_struct.maker = safe_address; order_struct.signer = eoa_address; order_struct.tokenId = token;
-                                    order_struct.makerAmount = U256::from(to_fixed_u128(target_shares * yes_limit_price));
-                                    order_struct.takerAmount = U256::from(to_fixed_u128(target_shares));
-                                    order_struct.nonce = U256::from(nonce); order_struct.feeRateBps = U256::from(yes_fee_rate);
-                                    order_struct.side = Side::Buy as u8; order_struct.signatureType = SignatureType::GnosisSafe as u8;
-                                    let domain = Eip712Domain { name: Some(Cow::Borrowed(ORDER_NAME)), version: Some(Cow::Borrowed(VERSION)), chain_id: Some(U256::from(POLYGON)), verifying_contract: Some(verifying_contract), ..Eip712Domain::default() };
-                                    let hash = order_struct.eip712_signing_hash(&domain);
-                                    let signature = signer.sign_hash(&hash).await?;
-                                    let signed_order = SignedOrder::builder().order(order_struct).signature(signature).order_type(OrderType::FAK).owner(owner).build();
-                                    client.post_order(signed_order).await
+                                    for attempt in 0..2 { // Max 2 attempts (initial + 1 retry)
+                                        let current_nonce = *nonce_manager.lock().await;
+                                        let mut order_struct = Order::default();
+                                        order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
+                                        order_struct.maker = safe_address; order_struct.signer = eoa_address; order_struct.tokenId = token;
+                                        order_struct.makerAmount = U256::from(to_fixed_u128(target_shares * yes_limit_price));
+                                        order_struct.takerAmount = U256::from(to_fixed_u128(target_shares));
+                                        order_struct.expiration = U256::ZERO;
+                                        order_struct.nonce = U256::from(current_nonce); order_struct.feeRateBps = U256::from(yes_fee_rate);
+                                        order_struct.side = Side::Buy as u8; order_struct.signatureType = SignatureType::GnosisSafe as u8;
+                                        let domain = Eip712Domain { name: Some(Cow::Borrowed(ORDER_NAME)), version: Some(Cow::Borrowed(VERSION)), chain_id: Some(U256::from(POLYGON)), verifying_contract: Some(verifying_contract), ..Eip712Domain::default() };
+                                        let hash = order_struct.eip712_signing_hash(&domain);
+                                        if let Ok(signature) = signer.sign_hash(&hash).await {
+                                            let signed_order = SignedOrder::builder().order(order_struct).signature(signature).order_type(OrderType::FAK).owner(owner).build();
+                                            match client.post_order(signed_order).await {
+                                                Ok(_) => {
+                                                    *nonce_manager.lock().await += 1; // Increment nonce on success
+                                                    return Ok(());
+                                                },
+                                                Err(e) => {
+                                                    let err_msg = format!("{:?}", e).to_lowercase();
+                                                    if err_msg.contains("invalid nonce") && attempt == 0 {
+                                                        warn!("⚠️ Invalid nonce (YES) in arb trade. Re-syncing and retrying...");
+                                                        sync_nonce_manager(&nonce_manager, &shared_http, eoa_address).await;
+                                                        continue; // Retry with new nonce
+                                                    } else {
+                                                        let msg = format!("❌ [RustPolyBot] Arb Trade Failed (YES, Attempt {}): {:?}", attempt + 1, e);
+                                                        let _ = send_notification(&tt, &tc, &msg).await;
+                                                        error!("{}", msg);
+                                                        return Err(e); // Break retry loop on other errors or after all retries
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            let msg = format!("❌ [RustPolyBot] Arb Trade Signing Failed (YES, Attempt {}): {:?}", attempt + 1, token);
+                                            let _ = send_notification(&tt, &tc, &msg).await;
+                                            error!("{}", msg);
+                                            return Err(anyhow::anyhow!("Signing failed"));
+                                        }
+                                    }
+                                    Err(anyhow::anyhow!("Max retries reached for YES leg"))
                                 }
                             };
                             let no_task = {
-                                let client = Arc::clone(&trading_client);
-                                let signer = signer.clone();
+                                let client = Arc::clone(&client_clone);
+                                let signer = signer_clone.clone();
                                 let token = no_token;
-                                let nonce_manager = Arc::clone(&nonce_manager);
+                                let nonce_manager = Arc::clone(&nonce_manager_clone);
                                 let owner = client.credentials().key();
+                                let shared_http = Arc::clone(&shared_http_clone);
+                                let tt = tg_token_clone.clone();
+                                let tc = tg_chat_id_clone.clone();
                                 async move {
-                                    let mut nonce_guard = nonce_manager.lock().await;
-                                    let nonce = *nonce_guard; *nonce_guard += 1; drop(nonce_guard);
-                                    let mut order_struct = Order::default();
-                                    order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
-                                    order_struct.maker = safe_address; order_struct.signer = eoa_address; order_struct.tokenId = token;
-                                    order_struct.makerAmount = U256::from(to_fixed_u128(target_shares * no_limit_price));
-                                    order_struct.takerAmount = U256::from(to_fixed_u128(target_shares));
-                                    order_struct.nonce = U256::from(nonce); order_struct.feeRateBps = U256::from(no_fee_rate);
-                                    order_struct.side = Side::Buy as u8; order_struct.signatureType = SignatureType::GnosisSafe as u8;
-                                    let domain = Eip712Domain { name: Some(Cow::Borrowed(ORDER_NAME)), version: Some(Cow::Borrowed(VERSION)), chain_id: Some(U256::from(POLYGON)), verifying_contract: Some(verifying_contract), ..Eip712Domain::default() };
-                                    let hash = order_struct.eip712_signing_hash(&domain);
-                                    let signature = signer.sign_hash(&hash).await?;
-                                    let signed_order = SignedOrder::builder().order(order_struct).signature(signature).order_type(OrderType::FAK).owner(owner).build();
-                                    client.post_order(signed_order).await
+                                    for attempt in 0..2 { // Max 2 attempts (initial + 1 retry)
+                                        let current_nonce = *nonce_manager.lock().await;
+                                        let mut order_struct = Order::default();
+                                        order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
+                                        order_struct.maker = safe_address; order_struct.signer = eoa_address; order_struct.tokenId = token;
+                                        order_struct.makerAmount = U256::from(to_fixed_u128(target_shares * no_limit_price));
+                                        order_struct.takerAmount = U256::from(to_fixed_u128(target_shares));
+                                        order_struct.expiration = U256::ZERO;
+                                        order_struct.nonce = U256::from(current_nonce); order_struct.feeRateBps = U256::from(no_fee_rate);
+                                        order_struct.side = Side::Buy as u8; order_struct.signatureType = SignatureType::GnosisSafe as u8;
+                                        let domain = Eip712Domain { name: Some(Cow::Borrowed(ORDER_NAME)), version: Some(Cow::Borrowed(VERSION)), chain_id: Some(U256::from(POLYGON)), verifying_contract: Some(verifying_contract), ..Eip712Domain::default() };
+                                        let hash = order_struct.eip712_signing_hash(&domain);
+                                        if let Ok(signature) = signer.sign_hash(&hash).await {
+                                            let signed_order = SignedOrder::builder().order(order_struct).signature(signature).order_type(OrderType::FAK).owner(owner).build();
+                                            match client.post_order(signed_order).await {
+                                                Ok(_) => {
+                                                    *nonce_manager.lock().await += 1; // Increment nonce on success
+                                                    return Ok(());
+                                                },
+                                                Err(e) => {
+                                                    let err_msg = format!("{:?}", e).to_lowercase();
+                                                    if err_msg.contains("invalid nonce") && attempt == 0 {
+                                                        warn!("⚠️ Invalid nonce (NO) in arb trade. Re-syncing and retrying...");
+                                                        sync_nonce_manager(&nonce_manager, &shared_http, eoa_address).await;
+                                                        continue; // Retry with new nonce
+                                                    } else {
+                                                        let msg = format!("❌ [RustPolyBot] Arb Trade Failed (NO, Attempt {}): {:?}", attempt + 1, e);
+                                                        let _ = send_notification(&tt, &tc, &msg).await;
+                                                        error!("{}", msg);
+                                                        return Err(e); // Break retry loop on other errors or after all retries
+                                                    }
+                                                }
+                                            }
+                                        } else {
+                                            let msg = format!("❌ [RustPolyBot] Arb Trade Signing Failed (NO, Attempt {}): {:?}", attempt + 1, token);
+                                            let _ = send_notification(&tt, &tc, &msg).await;
+                                            error!("{}", msg);
+                                            return Err(anyhow::anyhow!("Signing failed"));
+                                        }
+                                    }
+                                    Err(anyhow::anyhow!("Max retries reached for NO leg"))
                                 }
                             };
                             let (yes_res, no_res) = tokio::join!(yes_task, no_task);
@@ -1194,44 +1335,165 @@ async fn main() -> Result<()> {
                                     info!("💰 Bids reached target (sum ${:.4}) — early exit", combined_bid);
                                     let exit_price_yes = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                     let exit_price_no  = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                    let client_clone = Arc::clone(&trading_client);
+                                    let signer_clone = signer.clone();
+                                    let nonce_manager_clone = Arc::clone(&nonce_manager);
+                                    let shared_http_clone = Arc::clone(&shared_http);
+                                    let tg_token_clone = tg_token.clone();
+                                    let tg_chat_id_clone = tg_chat_id.clone();
+
                                     if let (Ok(amt_yes), Ok(amt_no)) = (Amount::shares(yp.shares), Amount::shares(np.shares)) {
-                                        if let Ok(oy) = trading_client.market_order().token_id(yes_token).amount(amt_yes).side(Side::Sell).price(exit_price_yes).order_type(OrderType::FAK).build().await {
-                                            if let Ok(sy) = trading_client.sign(&signer, oy).await {
-                                                match trading_client.post_order(sy).await {
-                                                    Ok(_) => {},
-                                                    Err(e) => {
-                                                        let msg = format!("❌ [RustPolyBot] Hedge Exit Failed (YES): {:?}", e);
-                                                        let _ = send_notification(&tg_token, &tg_chat_id, &msg).await;
-                                                        error!("{}", msg);
-                                                        let err_msg = format!("{:?}", e).to_lowercase();
-                                                        if err_msg.contains("invalid nonce") {
-                                                            warn!("⚠️ Invalid nonce in hedge exit (YES). Re-syncing...");
-                                                            sync_nonce_manager(&nonce_manager, &shared_http, eoa_address).await;
+                                        let yes_exit_task = {
+                                            let client = Arc::clone(&client_clone);
+                                            let signer = signer_clone.clone();
+                                            let nonce_manager = Arc::clone(&nonce_manager_clone);
+                                            let shared_http = Arc::clone(&shared_http_clone);
+                                            let tt = tg_token_clone.clone();
+                                            let tc = tg_chat_id_clone.clone();
+                                            async move {
+                                                for attempt in 0..2 { // Max 2 attempts (initial + 1 retry)
+                                                    let current_nonce = *nonce_manager.lock().await;
+                                                    let mut order_struct = Order::default();
+                                                    order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
+                                                    order_struct.maker = safe_address;
+                                                    order_struct.signer = eoa_address;
+                                                    order_struct.taker = Address::ZERO;
+                                                    order_struct.tokenId = yes_token;
+                                                    order_struct.makerAmount = U256::from(to_fixed_u128(amt_yes.as_inner() * exit_price_yes));
+                                                    order_struct.takerAmount = U256::from(to_fixed_u128(amt_yes.as_inner()));
+                                                    order_struct.expiration = U256::ZERO;
+                                                    order_struct.nonce = U256::from(current_nonce);
+                                                    order_struct.feeRateBps = U256::from(0); // Assuming 0 fee for exits
+                                                    order_struct.side = Side::Sell as u8;
+                                                    order_struct.signatureType = SignatureType::GnosisSafe as u8;
+
+                                                    let domain = Eip712Domain {
+                                                        name: Some(Cow::Borrowed(ORDER_NAME)),
+                                                        version: Some(Cow::Borrowed(VERSION)),
+                                                        chain_id: Some(U256::from(POLYGON)),
+                                                        verifying_contract: Some(verifying_contract),
+                                                        ..Eip712Domain::default()
+                                                    };
+
+                                                    let hash = order_struct.eip712_signing_hash(&domain);
+                                                    if let Ok(signature) = signer.sign_hash(&hash).await {
+                                                        let signed_order = SignedOrder::builder()
+                                                            .order(order_struct)
+                                                            .signature(signature)
+                                                            .order_type(OrderType::FAK)
+                                                            .owner(owner)
+                                                            .build();
+
+                                                        match client.post_order(signed_order).await {
+                                                            Ok(_) => {
+                                                                *nonce_manager.lock().await += 1; // Increment nonce on success
+                                                                return Ok(());
+                                                            },
+                                                            Err(e) => {
+                                                                let err_msg = format!("{:?}", e).to_lowercase();
+                                                                if err_msg.contains("invalid nonce") && attempt == 0 {
+                                                                    warn!("⚠️ Invalid nonce in hedge exit (YES). Re-syncing and retrying...");
+                                                                    sync_nonce_manager(&nonce_manager, &shared_http, eoa_address).await;
+                                                                    continue; // Retry with new nonce
+                                                                } else {
+                                                                    let msg = format!("❌ [RustPolyBot] Hedge Exit Failed (YES, Attempt {}): {:?}", attempt + 1, e);
+                                                                    let _ = send_notification(&tt, &tc, &msg).await;
+                                                                    error!("{}", msg);
+                                                                    return Err(e); // Break retry loop on other errors or after all retries
+                                                                }
+                                                            }
                                                         }
+                                                    } else {
+                                                        let msg = format!("❌ [RustPolyBot] Hedge Exit Signing Failed (YES, Attempt {}): {:?}", attempt + 1, yes_token);
+                                                        let _ = send_notification(&tt, &tc, &msg).await;
+                                                        error!("{}", msg);
+                                                        return Err(anyhow::anyhow!("Signing failed"));
                                                     }
                                                 }
+                                                Err(anyhow::anyhow!("Max retries reached for YES exit"))
                                             }
-                                        }
-                                        if let Ok(on) = trading_client.market_order().token_id(no_token).amount(amt_no).side(Side::Sell).price(exit_price_no).order_type(OrderType::FAK).build().await {
-                                            if let Ok(sn) = trading_client.sign(&signer, on).await {
-                                                match trading_client.post_order(sn).await {
-                                                    Ok(_) => {},
-                                                    Err(e) => {
-                                                        let msg = format!("❌ [RustPolyBot] Hedge Exit Failed (NO): {:?}", e);
-                                                        let _ = send_notification(&tg_token, &tg_chat_id, &msg).await;
-                                                        error!("{}", msg);
-                                                        let err_msg = format!("{:?}", e).to_lowercase();
-                                                        if err_msg.contains("invalid nonce") {
-                                                            warn!("⚠️ Invalid nonce in hedge exit (NO). Re-syncing...");
-                                                            sync_nonce_manager(&nonce_manager, &shared_http, eoa_address).await;
+                                        };
+                                        let no_exit_task = {
+                                            let client = Arc::clone(&client_clone);
+                                            let signer = signer_clone.clone();
+                                            let nonce_manager = Arc::clone(&nonce_manager_clone);
+                                            let shared_http = Arc::clone(&shared_http_clone);
+                                            let tt = tg_token_clone.clone();
+                                            let tc = tg_chat_id_clone.clone();
+                                            async move {
+                                                for attempt in 0..2 { // Max 2 attempts (initial + 1 retry)
+                                                    let current_nonce = *nonce_manager.lock().await;
+                                                    let mut order_struct = Order::default();
+                                                    order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
+                                                    order_struct.maker = safe_address;
+                                                    order_struct.signer = eoa_address;
+                                                    order_struct.taker = Address::ZERO;
+                                                    order_struct.tokenId = no_token;
+                                                    order_struct.makerAmount = U256::from(to_fixed_u128(amt_no.as_inner() * exit_price_no));
+                                                    order_struct.takerAmount = U256::from(to_fixed_u128(amt_no.as_inner()));
+                                                    order_struct.expiration = U256::ZERO;
+                                                    order_struct.nonce = U256::from(current_nonce);
+                                                    order_struct.feeRateBps = U256::from(0); // Assuming 0 fee for exits
+                                                    order_struct.side = Side::Sell as u8;
+                                                    order_struct.signatureType = SignatureType::GnosisSafe as u8;
+
+                                                    let domain = Eip712Domain {
+                                                        name: Some(Cow::Borrowed(ORDER_NAME)),
+                                                        version: Some(Cow::Borrowed(VERSION)),
+                                                        chain_id: Some(U256::from(POLYGON)),
+                                                        verifying_contract: Some(verifying_contract),
+                                                        ..Eip712Domain::default()
+                                                    };
+
+                                                    let hash = order_struct.eip712_signing_hash(&domain);
+                                                    if let Ok(signature) = signer.sign_hash(&hash).await {
+                                                        let signed_order = SignedOrder::builder()
+                                                            .order(order_struct)
+                                                            .signature(signature)
+                                                            .order_type(OrderType::FAK)
+                                                            .owner(owner)
+                                                            .build();
+
+                                                        match client.post_order(signed_order).await {
+                                                            Ok(_) => {
+                                                                *nonce_manager.lock().await += 1; // Increment nonce on success
+                                                                return Ok(());
+                                                            },
+                                                            Err(e) => {
+                                                                let err_msg = format!("{:?}", e).to_lowercase();
+                                                                if err_msg.contains("invalid nonce") && attempt == 0 {
+                                                                    warn!("⚠️ Invalid nonce in hedge exit (NO). Re-syncing and retrying...");
+                                                                    sync_nonce_manager(&nonce_manager, &shared_http, eoa_address).await;
+                                                                    continue; // Retry with new nonce
+                                                                } else {
+                                                                    let msg = format!("❌ [RustPolyBot] Hedge Exit Failed (NO, Attempt {}): {:?}", attempt + 1, e);
+                                                                    let _ = send_notification(&tt, &tc, &msg).await;
+                                                                    error!("{}", msg);
+                                                                    return Err(e); // Break retry loop on other errors or after all retries
+                                                                }
+                                                            }
                                                         }
+                                                    } else {
+                                                        let msg = format!("❌ [RustPolyBot] Hedge Exit Signing Failed (NO, Attempt {}): {:?}", attempt + 1, no_token);
+                                                        let _ = send_notification(&tt, &tc, &msg).await;
+                                                        error!("{}", msg);
+                                                        return Err(anyhow::anyhow!("Signing failed"));
                                                     }
                                                 }
+                                                Err(anyhow::anyhow!("Max retries reached for NO exit"))
                                             }
+                                        };
+                                        let (yes_res, no_res) = tokio::join!(yes_exit_task, no_exit_task);
+                                        // Handle results and update pos_map
+                                        if yes_res.is_ok() && no_res.is_ok() {
+                                            if let Some(p) = pos_map.get_mut(&yes_token) { p.shares = dec!(0); }
+                                            if let Some(p) = pos_map.get_mut(&no_token) { p.shares = dec!(0); }
+                                            trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
+                                        } else {
+                                            warn!("⚠️ Partial or full failure during hedge exit.");
+                                            // Optionally, re-sync nonce here if any failed, though individual tasks already do
+                                            trade_cooldown = Utc::now() + chrono::Duration::seconds(config::FAILURE_COOLDOWN_SECS);
                                         }
-                                        if let Some(p) = pos_map.get_mut(&yes_token) { p.shares = dec!(0); }
-                                        if let Some(p) = pos_map.get_mut(&no_token) { p.shares = dec!(0); }
-                                        trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
                                     }
                                 }
                             }
