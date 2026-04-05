@@ -44,7 +44,7 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use regex::Regex;
 use urlencoding;
 
-type PriceState = (Decimal, Decimal);
+type PriceState = (Decimal, Decimal, Decimal); // (Bid, Ask, AskDepth)
 
 #[derive(Debug, Clone)]
 struct Position {
@@ -741,8 +741,8 @@ async fn main() -> Result<()> {
 
         info!("✅ Cached Settings: NegRisk: {} | Exchange: {} | YES fee {} bps | NO fee {} bps", is_neg_risk, verifying_contract, yes_fee_rate, no_fee_rate);
 
-        let (yes_price_tx, yes_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(1)));
-        let (no_price_tx, no_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(1)));
+        let (yes_price_tx, yes_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(1), dec!(0)));
+        let (no_price_tx, no_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(1), dec!(0)));
 
         for (token, tx) in [(yes_token, yes_price_tx), (no_token, no_price_tx)] {
             tokio::spawn(async move {
@@ -757,8 +757,11 @@ async fn main() -> Result<()> {
                     while let Some(book_result) = stream.next().await {
                         if let Ok(book) = book_result {
                             let bid = book.bids.iter().map(|l| l.price).max().unwrap_or(dec!(0));
-                            let ask = book.asks.iter().map(|l| l.price).min().unwrap_or(dec!(1));
-                            let _ = tx.send((bid, ask));
+                            let (ask, depth) = book.asks.iter()
+                                .min_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
+                                .map(|l| (l.price, l.size))
+                                .unwrap_or((dec!(1), dec!(0)));
+                            let _ = tx.send((bid, ask, depth));
                         } else { break; }
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -788,8 +791,8 @@ async fn main() -> Result<()> {
                     cleanup_expired_positions(Arc::clone(&positions), market_name.clone(), yes_token, no_token, _market_close_time).await;
                 }
                 _ = status_ticker.tick() => {
-                    let (_, yes_ask) = *yes_price_rx.borrow();
-                    let (_, no_ask) = *no_price_rx.borrow();
+                    let (_, yes_ask, _) = *yes_price_rx.borrow();
+                    let (_, no_ask, _) = *no_price_rx.borrow();
                     let binance_price = *oracle_rx.borrow();
                     let binance_velocity = *velocity_rx.borrow();
 
@@ -805,8 +808,8 @@ async fn main() -> Result<()> {
                 _ = ticker.tick() => {
                     if Utc::now() < trade_cooldown { continue; }
 
-                    let (yes_bid, yes_ask) = *yes_price_rx.borrow();
-                    let (no_bid, no_ask) = *no_price_rx.borrow();
+                    let (yes_bid, yes_ask, yes_ask_depth) = *yes_price_rx.borrow();
+                    let (no_bid, no_ask, no_ask_depth) = *no_price_rx.borrow();
 
                     if yes_ask == dec!(1) || no_ask == dec!(1) { continue; }
 
@@ -985,6 +988,7 @@ async fn main() -> Result<()> {
                         if let Some(strike) = strike_price {
                             let mut momentum_token = None;
                             let mut limit_price = dec!(0);
+                            let mut target_depth = dec!(0);
                             let mut fee_rate = 0;
 
                             let mut current_signal_token = None;
@@ -1004,14 +1008,13 @@ async fn main() -> Result<()> {
                                     };
 
                                     if !has_opposing_pos {
-                                        info!("🎯 MOMENTUM BUY SIGNAL CONFIRMED ({} ticks): Binance ${:.2} {} Strike (Velocity: ${:.2}) -> {}",
-                                            consecutive_momentum_signals, binance_price, if token == yes_token { ">" } else { "<" }, velocity, if token == yes_token { "YES" } else { "NO" });
                                         momentum_token = Some(token);
                                         limit_price = if token == yes_token {
                                             (yes_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2)
                                         } else {
                                             (no_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2)
                                         };
+                                        target_depth = if token == yes_token { yes_ask_depth } else { no_ask_depth };
                                         fee_rate = if token == yes_token { yes_fee_rate } else { no_fee_rate };
                                     }
                                 } else {
@@ -1025,6 +1028,13 @@ async fn main() -> Result<()> {
                                 let current_usdc_balance = *balance_rx.borrow();
                                 if current_usdc_balance >= momentum_trade_size_usdc {
                                     let target_shares = (momentum_trade_size_usdc / limit_price).floor();
+
+                                    // LIQUIDITY CHECK: Ensure top of book has enough shares
+                                    if target_depth < (target_shares * config::MIN_LIQUIDITY_FILL_RATIO) {
+                                        debug!("⏭️ Skipping Momentum: Insufficient liquidity (Available: {:.2}, Target: {:.2})", target_depth, target_shares);
+                                        continue;
+                                    }
+
                                     if target_shares >= config::MIN_ORDER_SHARES {
                                         let current_exposure = {
                                             let pos = positions.lock().await;
@@ -1032,6 +1042,8 @@ async fn main() -> Result<()> {
                                         };
 
                                         if current_exposure + momentum_trade_size_usdc <= config::MAX_EXPOSURE_PER_TOKEN_USDC {
+                                            info!("🎯 MOMENTUM BUY SIGNAL CONFIRMED ({} ticks): Binance ${:.2} {} Strike (Velocity: ${:.2}) -> {}",
+                                                consecutive_momentum_signals, binance_price, if token == yes_token { ">" } else { "<" }, velocity, if token == yes_token { "YES" } else { "NO" });
                                             info!("💰 [MOMENTUM SIGNAL] token {} @ ${:.2} (Size: ${:.2})", token, limit_price, momentum_trade_size_usdc);
 
                                             if !config::GHOST_MODE {
@@ -1145,9 +1157,17 @@ async fn main() -> Result<()> {
                             trade_cooldown = Utc::now() + chrono::Duration::seconds(60);
                             continue;
                         }
-                        info!("💰 Arb opportunity! Margin after fees: {:.4}¢ (Gross: {:.4}¢, Fees: {:.4}¢)", profit_margin * dec!(100), profit_margin_no_fees * dec!(100), (yes_fee + no_fee) * dec!(100));
+
                         let target_shares = (trade_size_usdc / combined_ask).floor();
                         if target_shares < config::MIN_ORDER_SHARES { continue; }
+
+                        // ARB LIQUIDITY CHECK
+                        if yes_ask_depth < (target_shares * config::MIN_LIQUIDITY_FILL_RATIO) || no_ask_depth < (target_shares * config::MIN_LIQUIDITY_FILL_RATIO) {
+                            debug!("⏭️ Skipping Arb: Insufficient depth (YES: {:.2}, NO: {:.2}, Target: {:.2})", yes_ask_depth, no_ask_depth, target_shares);
+                            continue;
+                        }
+
+                        info!("💰 Arb opportunity! Margin after fees: {:.4}¢ (Gross: {:.4}¢, Fees: {:.4}¢)", profit_margin * dec!(100), profit_margin_no_fees * dec!(100), (yes_fee + no_fee) * dec!(100));
 
                         let current_exposure = {
                             let pos = positions.lock().await;
