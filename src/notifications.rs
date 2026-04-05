@@ -33,12 +33,13 @@ pub async fn send_notification(token: &str, chat_id: &str, message: &str) -> Res
         .send()
         .await?;
 
-    if resp.status().is_success() {
+    let status = resp.status();
+    if status.is_success() {
         info!("📱 Telegram notification sent successfully");
         Ok(())
     } else {
         let err_body = resp.text().await.unwrap_or_default();
-        error!("❌ Failed to send Telegram notification: HTTP {} - {}", resp.status(), err_body);
-        Err(anyhow::anyhow!("Failed to send notification, status: {}", resp.status()))
+        error!("❌ Failed to send Telegram notification: HTTP {} - {}", status, err_body);
+        Err(anyhow::anyhow!("Failed to send notification, status: {}", status))
     }
 }
