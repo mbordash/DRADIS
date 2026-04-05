@@ -28,6 +28,10 @@ pub const MIN_ORDER_SHARES: Decimal = dec!(5.0);
 /// Minimum USDC value for a single order (exchange requirement)
 pub const MIN_ORDER_USDC: Decimal = dec!(1.05);
 
+/// Minimum ratio of target shares that MUST be available at the top of the book
+/// before firing an order. Prevents massive partial fills on thin books.
+pub const MIN_LIQUIDITY_FILL_RATIO: Decimal = dec!(0.80);
+
 /// Price offset added to the ask price when placing buy orders to ensure aggressive fills.
 pub const BUY_PRICE_OFFSET: Decimal = dec!(0.03);
 

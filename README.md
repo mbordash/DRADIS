@@ -32,6 +32,8 @@ A high-frequency hybrid trading bot for Polymarket. This bot combines "Perfect-H
     - **Arbitrage**: Simultaneously buys 'YES' and 'NO' when the sum is < $1.00 for a riskless profit.
     - **Momentum**: Executes one-sided speculative trades when Binance prices move sharply before Polymarket adjusts.
 - **Advanced Safety Filters**:
+    - **Momentum Confirmation Ticks**: Requires multiple consecutive signal updates (configurable) before firing a trade to filter out "fakeouts" and single-tick outliers.
+    - **Minimum Liquidity Check**: Analyzes real-time order book depth; only fires orders if a configurable ratio (e.g., 80%) of the target size is available at the top-of-book.
     - **Strike Buffer**: Momentum trades only fire when price is safely away from the strike price to avoid choppy oscillations.
     - **Directional Lock**: Prevents buying the opposite side of an open momentum position to avoid "accidental arbitrage" at a loss.
     - **Price Cap**: Automatically stops momentum buying if the token price exceeds a healthy risk/reward ratio.
@@ -65,13 +67,15 @@ Latency is a critical factor for the bot's success, particularly for the "Oracle
 - **Polygon Wallet**: An EOA with USDC and MATIC (for gas).
 - **Telegram Bot** (Optional): For remote monitoring.
 
-### Configuration (`.env`)
+### Configuration (`.env` & `config.rs`)
 
-| Variable | Description | Default |
+| Variable / Constant | Description | Default |
 |----------|-------------|---------|
 | `TRADE_SIZE_USDC` | Size for hedged arbitrage trades. | `10` |
 | `MOMENTUM_TRADE_SIZE_USDC` | Size for speculative momentum trades. | `5` |
 | `CRYPTO_FILTER` | Target asset (`btc`, `eth`, or `sol`). | `btc` |
+| `MOMENTUM_CONFIRMATION_TICKS` | Number of ticks required for momentum entry. | `2` |
+| `MIN_LIQUIDITY_FILL_RATIO` | Required depth ratio at top of book. | `0.80` |
 | `POLYMARKET_PRIVATE_KEY` | Your Polygon EOA private key. | `REQUIRED` |
 | `TELEGRAM_BOT_TOKEN` | Your Telegram Bot API token. | `OPTIONAL` |
 | `TELEGRAM_CHAT_ID` | Your Telegram Chat ID. | `OPTIONAL` |
@@ -100,6 +104,7 @@ Nonces are sequence numbers used to prevent replay attacks. If you use your wall
 ### Why does the bot keep scanning but not trading?
 - **Spread/Fees**: The arbitrage logic requires the margin to be higher than `ARBITRAGE_PROFIT_THRESHOLD` *after* accounting for fees.
 - **Momentum Thresholds**: Asset-specific price moves and buffers must be met as defined in `config.rs`.
+- **Liquidity Check**: The order book may be too thin at the moment to support your `TRADE_SIZE_USDC`.
 - **Ghost Mode**: Check if `GHOST_MODE` is still enabled.
 
 ### The bot says "Emergency Stopping". What happened?
@@ -127,7 +132,7 @@ Run with high-priority resource allocations: `--network host --cpus="1.0" --cpu-
 ## Future Enhancements (TODO)
 
 - [ ] **Maker Support**: Transition to earning rebates by placing limit orders at the best bid.
-- [ ] **Book Walking**: Analyze order book depth up to 5 levels to prevent slippage.
+- [ ] **Advanced Book Walking**: Analyze order book depth up to 5 levels to calculate VWAP for larger orders.
 - [ ] **Multi-Outcome Arbitrage**: Support markets with 3+ outcomes.
 
 ---
