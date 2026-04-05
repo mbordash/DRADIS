@@ -908,8 +908,8 @@ async fn main() -> Result<()> {
                                         order_struct.signer = eoa_address;
                                         order_struct.taker = Address::ZERO;
                                         order_struct.tokenId = token;
-                                        order_struct.makerAmount = U256::from(to_fixed_u128(exit_shares * exit_price));
-                                        order_struct.takerAmount = U256::from(to_fixed_u128(exit_shares));
+                                        order_struct.makerAmount = U256::from(to_fixed_u128(exit_shares));
+                                        order_struct.takerAmount = U256::from(to_fixed_u128(exit_shares * exit_price));
                                         order_struct.expiration = U256::ZERO;
                                         order_struct.nonce = U256::from(current_nonce);
                                         order_struct.feeRateBps = U256::from(exit_fee_rate);
@@ -1358,8 +1358,8 @@ async fn main() -> Result<()> {
                                                     order_struct.signer = eoa_address;
                                                     order_struct.taker = Address::ZERO;
                                                     order_struct.tokenId = yes_token;
-                                                    order_struct.makerAmount = U256::from(to_fixed_u128(amt_yes.as_inner() * exit_price_yes));
-                                                    order_struct.takerAmount = U256::from(to_fixed_u128(amt_yes.as_inner()));
+                                                    order_struct.makerAmount = U256::from(to_fixed_u128(amt_yes.as_inner()));
+                                                    order_struct.takerAmount = U256::from(to_fixed_u128(amt_yes.as_inner() * exit_price_yes));
                                                     order_struct.expiration = U256::ZERO;
                                                     order_struct.nonce = U256::from(current_nonce);
                                                     order_struct.feeRateBps = U256::from(yes_fee_rate);
@@ -1428,8 +1428,8 @@ async fn main() -> Result<()> {
                                                     order_struct.signer = eoa_address;
                                                     order_struct.taker = Address::ZERO;
                                                     order_struct.tokenId = no_token;
-                                                    order_struct.makerAmount = U256::from(to_fixed_u128(amt_no.as_inner() * exit_price_no));
-                                                    order_struct.takerAmount = U256::from(to_fixed_u128(amt_no.as_inner()));
+                                                    order_struct.makerAmount = U256::from(to_fixed_u128(amt_no.as_inner()));
+                                                    order_struct.takerAmount = U256::from(to_fixed_u128(amt_no.as_inner() * exit_price_no));
                                                     order_struct.expiration = U256::ZERO;
                                                     order_struct.nonce = U256::from(current_nonce);
                                                     order_struct.feeRateBps = U256::from(no_fee_rate);
