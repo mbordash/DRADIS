@@ -50,6 +50,10 @@ pub const EARLY_EXIT_COMBINED_BID_THRESHOLD: Decimal = dec!(0.995);
 /// Allow one-sided momentum trades (riskier, non-hedged entries based on Binance oracle)
 pub const ENABLE_MOMENTUM_TRADING: bool = true;
 
+/// Number of consecutive signal ticks required before firing a trade.
+/// Set to 2 to filter out single-tick outliers and "fakeouts".
+pub const MOMENTUM_CONFIRMATION_TICKS: u32 = 2;
+
 /// Dynamic Take Profit: Exit if we gain this % over our entry price.
 /// Lowered to 3% to capture quick moves in volatile markets.
 pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.03);
@@ -192,7 +196,7 @@ pub const CLOB_API_BASE: &str = "https://clob.polymarket.com";
 // ============================================================================
 
 /// Number of pages to scan for markets in the Gamma API.
-pub const GAMMA_API_MARKET_SCAN_PAGES: usize = 50;
+pub const GAMMA_API_MARKET_SCAN_PAGES: usize = 80;
 
 /// Blocked market name keywords (politics, long-term events, etc.)
 pub fn is_bad_market(name: &str) -> bool {

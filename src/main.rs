@@ -311,12 +311,13 @@ async fn fetch_specific_hourly_market(http: &reqwest::Client, crypto_filter: &st
             continue;
         };
 
-        if let Some(market) = markets.into_iter().next() { // Take the first result
+        if let Some(market) = markets.into_iter().next() {
             let name = market.get("question").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let description = market.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let event = market.get("event").unwrap_or(&serde_json::Value::Null);
             let event_title = event.get("title").and_then(|v| v.as_str()).unwrap_or("").to_string();
 
+            // Re-apply essential filters
             if config::is_bad_market(&name) || config::is_bad_market(&event_title) { continue; }
             if !get_enable_orderbook(market) { continue; }
 
@@ -772,6 +773,7 @@ async fn main() -> Result<()> {
         let mut pulse_ticker = interval(std::time::Duration::from_secs(300));
 
         let mut momentum_fired_for_current_market = false;
+        let mut consecutive_momentum_signals = 0u32;
 
         loop {
             tokio::select! {
@@ -817,6 +819,7 @@ async fn main() -> Result<()> {
                         let mut exit_token = None;
                         let mut exit_price = dec!(0);
                         let mut exit_shares = dec!(0);
+                        let mut exit_fee_rate = 0;
 
                         let velocity = *velocity_rx.borrow();
                         let threshold = match crypto_filter.as_str() {
@@ -837,16 +840,19 @@ async fn main() -> Result<()> {
                                     exit_token = Some(yes_token);
                                     exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                     exit_shares = yp.shares;
+                                    exit_fee_rate = yes_fee_rate;
                                 } else if profit_margin <= stop_loss {
                                     info!("🛑 Momentum YES Stop Loss Hit (Bid: ${:.2}, Loss: {:.2}%)", yes_bid, profit_margin * dec!(100));
                                     exit_token = Some(yes_token);
                                     exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                     exit_shares = yp.shares;
+                                    exit_fee_rate = yes_fee_rate;
                                 } else if velocity < reversal_threshold {
                                     info!("📉 Momentum YES Reversal Detected (Velocity: ${:.2} < Threshold: ${:.2})", velocity, reversal_threshold);
                                     exit_token = Some(yes_token);
                                     exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                     exit_shares = yp.shares;
+                                    exit_fee_rate = yes_fee_rate;
                                 }
                             }
                         }
@@ -863,16 +869,19 @@ async fn main() -> Result<()> {
                                         exit_token = Some(no_token);
                                         exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                         exit_shares = np.shares;
+                                        exit_fee_rate = no_fee_rate;
                                     } else if profit_margin <= stop_loss {
                                         info!("🛑 Momentum NO Stop Loss Hit (Bid: ${:.2}, Loss: {:.2}%)", no_bid, profit_margin * dec!(100));
                                         exit_token = Some(no_token);
                                         exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                         exit_shares = np.shares;
+                                        exit_fee_rate = no_fee_rate;
                                     } else if velocity > -reversal_threshold {
                                         info!("📉 Momentum NO Reversal Detected (Velocity: ${:.2} > -${:.2})", velocity, reversal_threshold);
                                         exit_token = Some(no_token);
                                         exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                         exit_shares = np.shares;
+                                        exit_fee_rate = no_fee_rate;
                                     }
                                 }
                             }
@@ -900,7 +909,7 @@ async fn main() -> Result<()> {
                                         order_struct.takerAmount = U256::from(to_fixed_u128(exit_shares));
                                         order_struct.expiration = U256::ZERO;
                                         order_struct.nonce = U256::from(current_nonce);
-                                        order_struct.feeRateBps = U256::from(0);
+                                        order_struct.feeRateBps = U256::from(exit_fee_rate);
                                         order_struct.side = Side::Sell as u8;
                                         order_struct.signatureType = SignatureType::GnosisSafe as u8;
 
@@ -937,7 +946,7 @@ async fn main() -> Result<()> {
                                                         let msg = format!("❌ [RustPolyBot] Momentum Exit Order Failed (Attempt {}): {:?}", attempt + 1, e);
                                                         let _ = send_notification(&tt, &tc, &msg).await;
                                                         error!("{}", msg);
-                                                        return Err(anyhow::anyhow!(msg)); // Convert SDK error to anyhow::Error
+                                                        return Err(anyhow::anyhow!(msg));
                                                     }
                                                 }
                                             }
@@ -945,7 +954,7 @@ async fn main() -> Result<()> {
                                             let msg = format!("❌ [RustPolyBot] Momentum Exit Order Signing Failed (Attempt {}): {:?}", attempt + 1, token);
                                             let _ = send_notification(&tt, &tc, &msg).await;
                                             error!("{}", msg);
-                                            return Err(anyhow::anyhow!(msg)); // Convert SDK error to anyhow::Error
+                                            return Err(anyhow::anyhow!(msg));
                                         }
                                     }
                                     Err(anyhow::anyhow!("Max retries reached for momentum exit"))
@@ -978,28 +987,38 @@ async fn main() -> Result<()> {
                             let mut limit_price = dec!(0);
                             let mut fee_rate = 0;
 
+                            let mut current_signal_token = None;
                             if velocity > threshold && binance_price > (strike + strike_buffer) && yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE {
-                                let has_no_pos = {
-                                    let pos = positions.lock().await;
-                                    pos.get(&no_token).map(|p| p.shares).unwrap_or(dec!(0)) == dec!(0)
-                                };
-                                if has_no_pos {
-                                    info!("🎯 MOMENTUM BUY SIGNAL: Binance ${:.2} > Strike ${:.2} + ${:.2} (Velocity: ${:.2}) -> YES", binance_price, strike, strike_buffer, velocity);
-                                    momentum_token = Some(yes_token);
-                                    limit_price = (yes_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
-                                    fee_rate = yes_fee_rate;
-                                }
+                                current_signal_token = Some(yes_token);
                             } else if velocity < -threshold && binance_price < (strike - strike_buffer) && no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE {
-                                let has_yes_pos = {
-                                    let pos = positions.lock().await;
-                                    pos.get(&yes_token).map(|p| p.shares).unwrap_or(dec!(0)) == dec!(0)
-                                };
-                                if has_yes_pos {
-                                    info!("🎯 MOMENTUM BUY SIGNAL: Binance ${:.2} < Strike ${:.2} - ${:.2} (Velocity: ${:.2}) -> NO", binance_price, strike, strike_buffer, velocity);
-                                    momentum_token = Some(no_token);
-                                    limit_price = (no_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
-                                    fee_rate = no_fee_rate;
+                                current_signal_token = Some(no_token);
+                            }
+
+                            if let Some(token) = current_signal_token {
+                                consecutive_momentum_signals += 1;
+                                if consecutive_momentum_signals >= config::MOMENTUM_CONFIRMATION_TICKS {
+                                    let has_opposing_pos = {
+                                        let pos = positions.lock().await;
+                                        let opposing_token = if token == yes_token { no_token } else { yes_token };
+                                        pos.get(&opposing_token).map(|p| p.shares).unwrap_or(dec!(0)) > dec!(0)
+                                    };
+
+                                    if !has_opposing_pos {
+                                        info!("🎯 MOMENTUM BUY SIGNAL CONFIRMED ({} ticks): Binance ${:.2} {} Strike (Velocity: ${:.2}) -> {}",
+                                            consecutive_momentum_signals, binance_price, if token == yes_token { ">" } else { "<" }, velocity, if token == yes_token { "YES" } else { "NO" });
+                                        momentum_token = Some(token);
+                                        limit_price = if token == yes_token {
+                                            (yes_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2)
+                                        } else {
+                                            (no_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2)
+                                        };
+                                        fee_rate = if token == yes_token { yes_fee_rate } else { no_fee_rate };
+                                    }
+                                } else {
+                                    debug!("⏳ Momentum signal detected, waiting for confirmation ({} of {} ticks)", consecutive_momentum_signals, config::MOMENTUM_CONFIRMATION_TICKS);
                                 }
+                            } else {
+                                consecutive_momentum_signals = 0;
                             }
 
                             if let Some(token) = momentum_token {
@@ -1030,7 +1049,8 @@ async fn main() -> Result<()> {
                                                 let tc = tg_chat_id.clone();
 
                                                 tokio::spawn(async move {
-                                                    for attempt in 0..2 {
+                                                    // Retry loop for nonce issues
+                                                    for attempt in 0..2 { // Max 2 attempts (initial + 1 retry)
                                                         let current_nonce = *nonce_manager.lock().await;
                                                         let mut order_struct = Order::default();
                                                         order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
@@ -1189,7 +1209,7 @@ async fn main() -> Result<()> {
                                                         let msg = format!("❌ [RustPolyBot] Arb Trade Failed (YES, Attempt {}): {:?}", attempt + 1, e);
                                                         let _ = send_notification(&tt, &tc, &msg).await;
                                                         error!("{}", msg);
-                                                        return Err(anyhow::anyhow!(msg));
+                                                        return Err(anyhow::anyhow!("Arb YES failed: {:?}", e));
                                                     }
                                                 }
                                             }
@@ -1197,7 +1217,7 @@ async fn main() -> Result<()> {
                                             let msg = format!("❌ [RustPolyBot] Arb Trade Signing Failed (YES, Attempt {}): {:?}", attempt + 1, token);
                                             let _ = send_notification(&tt, &tc, &msg).await;
                                             error!("{}", msg);
-                                            return Err(anyhow::anyhow!(msg));
+                                            return Err(anyhow::anyhow!("Signing failed"));
                                         }
                                     }
                                     Err(anyhow::anyhow!("Max retries reached for YES leg"))
@@ -1241,7 +1261,7 @@ async fn main() -> Result<()> {
                                                         let msg = format!("❌ [RustPolyBot] Arb Trade Failed (NO, Attempt {}): {:?}", attempt + 1, e);
                                                         let _ = send_notification(&tt, &tc, &msg).await;
                                                         error!("{}", msg);
-                                                        return Err(anyhow::anyhow!(msg));
+                                                        return Err(anyhow::anyhow!("Arb NO failed: {:?}", e));
                                                     }
                                                 }
                                             }
@@ -1249,7 +1269,7 @@ async fn main() -> Result<()> {
                                             let msg = format!("❌ [RustPolyBot] Arb Trade Signing Failed (NO, Attempt {}): {:?}", attempt + 1, token);
                                             let _ = send_notification(&tt, &tc, &msg).await;
                                             error!("{}", msg);
-                                            return Err(anyhow::anyhow!(msg));
+                                            return Err(anyhow::anyhow!("Signing failed"));
                                         }
                                     }
                                     Err(anyhow::anyhow!("Max retries reached for NO leg"))
@@ -1322,7 +1342,7 @@ async fn main() -> Result<()> {
                                                     order_struct.takerAmount = U256::from(to_fixed_u128(amt_yes.as_inner()));
                                                     order_struct.expiration = U256::ZERO;
                                                     order_struct.nonce = U256::from(current_nonce);
-                                                    order_struct.feeRateBps = U256::from(0);
+                                                    order_struct.feeRateBps = U256::from(yes_fee_rate);
                                                     order_struct.side = Side::Sell as u8;
                                                     order_struct.signatureType = SignatureType::GnosisSafe as u8;
 
@@ -1358,7 +1378,7 @@ async fn main() -> Result<()> {
                                                                     let msg = format!("❌ [RustPolyBot] Hedge Exit Failed (YES, Attempt {}): {:?}", attempt + 1, e);
                                                                     let _ = send_notification(&tt, &tc, &msg).await;
                                                                     error!("{}", msg);
-                                                                    return Err(anyhow::anyhow!(msg));
+                                                                    return Err(anyhow::anyhow!("Hedge YES failed: {:?}", e));
                                                                 }
                                                             }
                                                         }
@@ -1366,7 +1386,7 @@ async fn main() -> Result<()> {
                                                         let msg = format!("❌ [RustPolyBot] Hedge Exit Signing Failed (YES, Attempt {}): {:?}", attempt + 1, yes_token);
                                                         let _ = send_notification(&tt, &tc, &msg).await;
                                                         error!("{}", msg);
-                                                        return Err(anyhow::anyhow!(msg));
+                                                        return Err(anyhow::anyhow!("Signing failed"));
                                                     }
                                                 }
                                                 Err(anyhow::anyhow!("Max retries reached for YES exit"))
@@ -1392,7 +1412,7 @@ async fn main() -> Result<()> {
                                                     order_struct.takerAmount = U256::from(to_fixed_u128(amt_no.as_inner()));
                                                     order_struct.expiration = U256::ZERO;
                                                     order_struct.nonce = U256::from(current_nonce);
-                                                    order_struct.feeRateBps = U256::from(0);
+                                                    order_struct.feeRateBps = U256::from(no_fee_rate);
                                                     order_struct.side = Side::Sell as u8;
                                                     order_struct.signatureType = SignatureType::GnosisSafe as u8;
 
@@ -1428,7 +1448,7 @@ async fn main() -> Result<()> {
                                                                     let msg = format!("❌ [RustPolyBot] Hedge Exit Failed (NO, Attempt {}): {:?}", attempt + 1, e);
                                                                     let _ = send_notification(&tt, &tc, &msg).await;
                                                                     error!("{}", msg);
-                                                                    return Err(anyhow::anyhow!(msg));
+                                                                    return Err(anyhow::anyhow!("Hedge NO failed: {:?}", e));
                                                                 }
                                                             }
                                                         }
@@ -1436,7 +1456,7 @@ async fn main() -> Result<()> {
                                                         let msg = format!("❌ [RustPolyBot] Hedge Exit Signing Failed (NO, Attempt {}): {:?}", attempt + 1, no_token);
                                                         let _ = send_notification(&tt, &tc, &msg).await;
                                                         error!("{}", msg);
-                                                        return Err(anyhow::anyhow!(msg));
+                                                        return Err(anyhow::anyhow!("Signing failed"));
                                                     }
                                                 }
                                                 Err(anyhow::anyhow!("Max retries reached for NO exit"))
