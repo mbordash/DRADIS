@@ -98,6 +98,15 @@ Latency is a critical factor for the bot's success, particularly for the "Oracle
 ### Why are my orders being rejected even when the signal is right?
 Order rejections are often due to **Price Slippage** caused by network latency. The bot uses Fill-or-Kill (FAK) orders. If the order takes too long to reach the exchange, the market price may have moved beyond your limit price, causing the exchange to "Kill" the order. Reducing latency by deploying in an optimal geographic region is the primary fix for this.
 
+### EOA vs. Gnosis Safe: Which one should I use?
+If you are using a standard wallet (EOA) and encounter persistent "Unauthorized" or "Forbidden" errors when trying to trade, it is likely because your account hasn't been "onboarded" or enabled for direct EOA trading on the Polymarket CLOB. 
+
+**RustPolyBot defaults to Gnosis Safe** (Maker) address for trading. This is because:
+1. **Standard for API Trading**: Many Polymarket accounts created via the web UI actually use a Gnosis Safe proxy under the hood for gasless trading.
+2. **Simplified Onboarding**: The bot automatically derives your deterministic Gnosis Safe address from your EOA. This address is used as the "Maker" for all orders, which is often required for authentication to succeed if your EOA isn't explicitly whitelisted.
+
+If you specifically want to use an EOA, you would need to change the `SignatureType` to `EOA` in `main.rs` and ensure your EOA is correctly initialized on the CLOB. For most users, the default Gnosis Safe configuration is the "path of least resistance."
+
 ### Why did the bot fail with "invalid nonce"?
 Nonces are sequence numbers used to prevent replay attacks. If you use your wallet elsewhere (e.g., via the Polymarket UI), the bot's local counter will fall behind. RustPolyBot automatically detects this, fetches the correct nonce from the API, and retries the trade.
 
