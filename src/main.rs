@@ -1031,9 +1031,11 @@ async fn main() -> Result<()> {
                                                 } else if (err_msg.contains("not enough balance") || err_msg.contains("not enough allowance")) && attempt < 2 {
                                                     if let Some(actual_balance) = parse_balance_from_error(&err_msg) {
                                                         if actual_balance == dec!(0) {
-                                                            warn!("⚠️ Balance is 0 in momentum exit. Clearing ghost position.");
-                                                            pos_handle.lock().await.remove(&token);
-                                                            return Ok(());
+                                                            warn!("⚠️ Balance is 0 in momentum exit (likely indexer lag). Waiting 2s and retrying...");
+                                                            // Don't give up! The indexer might just be catching up
+                                                            // Sleep and retry instead of clearing the position
+                                                            tokio::time::sleep(Duration::from_millis(2000)).await;
+                                                            continue;
                                                         }
                                                         warn!("⚠️ Balance mismatch in momentum exit. Retrying with actual balance: {}", actual_balance);
                                                         current_shares = actual_balance;
@@ -1124,7 +1126,9 @@ async fn main() -> Result<()> {
                                         pos.get(&opposing_token).map(|p| p.shares).unwrap_or(dec!(0)) > dec!(0)
                                     };
 
-                                    if !has_opposing_pos {
+                                    if has_opposing_pos {
+                                        info!("⏭️ MOMENTUM REJECTED: Already holding opposing position in token {} - Cannot enter new momentum trade", if token == yes_token { no_token } else { yes_token });
+                                    } else if !has_opposing_pos {
                                         momentum_token = Some(token);
                                         limit_price = if token == yes_token {
                                             (yes_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2)
@@ -1133,15 +1137,14 @@ async fn main() -> Result<()> {
                                         };
                                         target_depth = if token == yes_token { yes_ask_depth } else { no_ask_depth };
                                         fee_rate = if token == yes_token { yes_fee_rate } else { no_fee_rate };
-                                    } else {
-                                        debug!("⏭️ Momentum signal rejected: Already holding opposing position in token {}", if token == yes_token { no_token } else { yes_token });
                                     }
                                 } else {
-                                    debug!("⏳ Momentum signal detected, waiting for confirmation ({} of {} ticks)", consecutive_momentum_signals, config::MOMENTUM_CONFIRMATION_TICKS);
+                                    debug!("⏳ Momentum signal confirmed, waiting for additional confirmation ({} of {} ticks required)", consecutive_momentum_signals, config::MOMENTUM_CONFIRMATION_TICKS);
                                 }
-                            } else {
-                                consecutive_momentum_signals = 0;
-                            }
+                                } else {
+                                    consecutive_momentum_signals = 0;
+                                    debug!("⏸️  Momentum signal lost (was at {} ticks)", consecutive_momentum_signals);
+                                }
 
                             if let Some(token) = momentum_token {
                                 let current_usdc_balance = *balance_rx.borrow();
@@ -1149,7 +1152,7 @@ async fn main() -> Result<()> {
                                     let target_shares = (momentum_trade_size_usdc / limit_price).floor();
 
                                     if target_depth < (target_shares * config::MIN_LIQUIDITY_FILL_RATIO) {
-                                        debug!("⏭️ Skipping Momentum: Insufficient liquidity (Available: {:.2}, Target: {:.2})", target_depth, target_shares);
+                                        warn!("⏭️ MOMENTUM REJECTED: Insufficient liquidity at ask (Available: {:.2} shares, Target: {:.2} shares, Ratio: {:.2})", target_depth, target_shares, config::MIN_LIQUIDITY_FILL_RATIO);
                                         continue;
                                     }
 
@@ -1237,11 +1240,11 @@ async fn main() -> Result<()> {
                                             info!("🔒 Momentum cooldown active: Next eligible trade in {}s (until {})", config::TRADE_COOLDOWN_SECS, trade_cooldown.format("%H:%M:%S UTC"));
                                             continue;
                                         } else {
-                                            warn!("⏭️ Momentum trade rejected: Exposure limit exceeded (Current: ${:.2}, Trade Size: ${:.2}, Max: ${:.2})", current_exposure, momentum_trade_size_usdc, config::MAX_EXPOSURE_PER_TOKEN_USDC);
+                                            warn!("⏭️ MOMENTUM REJECTED: Exposure limit exceeded (Current: ${:.2}, + Trade: ${:.2} = ${:.2}, Max: ${:.2})", current_exposure, momentum_trade_size_usdc, current_exposure + momentum_trade_size_usdc, config::MAX_EXPOSURE_PER_TOKEN_USDC);
                                             continue;
                                         }
                                     } else {
-                                        debug!("⏭️ Momentum trade rejected: Target shares {:.2} below minimum {:.2}", target_shares, config::MIN_ORDER_SHARES);
+                                        warn!("⏭️ MOMENTUM REJECTED: Min order size not met (Calculated: {:.2} shares vs Min: {:.2})", target_shares, config::MIN_ORDER_SHARES);
                                         continue;
                                     }
                                 } else {
@@ -1261,12 +1264,21 @@ async fn main() -> Result<()> {
 
                     if profit_margin >= config::ARBITRAGE_PROFIT_THRESHOLD {
                         let current_usdc_balance = *balance_rx.borrow();
-                        if current_usdc_balance < trade_size_usdc * dec!(2) { continue; }
+                        if current_usdc_balance < trade_size_usdc * dec!(2) {
+                            debug!("⏭️ ARB REJECTED: Insufficient balance (Have: ${:.2}, Need: ${:.2} for 2-leg arb)", current_usdc_balance, trade_size_usdc * dec!(2));
+                            continue;
+                        }
 
                         let target_shares = (trade_size_usdc / combined_ask).floor();
-                        if target_shares < config::MIN_ORDER_SHARES { continue; }
+                        if target_shares < config::MIN_ORDER_SHARES {
+                            debug!("⏭️ ARB REJECTED: Min order size not met (Calculated: {:.2} shares vs Min: {:.2})", target_shares, config::MIN_ORDER_SHARES);
+                            continue;
+                        }
 
-                        if yes_ask_depth < (target_shares * config::MIN_LIQUIDITY_FILL_RATIO) || no_ask_depth < (target_shares * config::MIN_LIQUIDITY_FILL_RATIO) { continue; }
+                        if yes_ask_depth < (target_shares * config::MIN_LIQUIDITY_FILL_RATIO) || no_ask_depth < (target_shares * config::MIN_LIQUIDITY_FILL_RATIO) {
+                            debug!("⏭️ ARB REJECTED: Insufficient liquidity (YES depth: {:.2}, NO depth: {:.2}, Need: {:.2} each)", yes_ask_depth, no_ask_depth, target_shares * config::MIN_LIQUIDITY_FILL_RATIO);
+                            continue;
+                        }
 
                         let current_exposure = {
                             let pos = positions.lock().await;
@@ -1437,11 +1449,15 @@ async fn main() -> Result<()> {
                                                                 sync_nonce_manager(&nonce_manager, &shared_http, safe_address).await;
                                                                 continue;
                                                             } else if (err_msg.contains("not enough balance") || err_msg.contains("not enough allowance")) && attempt < 2 {
-                                                                if let Some(actual_balance) = parse_balance_from_error(&err_msg) {
-                                                                    if actual_balance == dec!(0) { pos_handle.lock().await.remove(&yes_token); return Ok(()); }
-                                                                    current_shares = actual_balance; continue;
-                                                                }
-                                                            }
+                                                                 if let Some(actual_balance) = parse_balance_from_error(&err_msg) {
+                                                                     if actual_balance == dec!(0) {
+                                                                         warn!("⚠️ Balance is 0 in YES early exit (likely indexer lag). Waiting 2s and retrying...");
+                                                                         tokio::time::sleep(Duration::from_millis(2000)).await;
+                                                                         continue;
+                                                                     }
+                                                                     current_shares = actual_balance; continue;
+                                                                 }
+                                                             }
                                                             return Err(anyhow::anyhow!("{:?}", e));
                                                         }
                                                     }
@@ -1486,11 +1502,15 @@ async fn main() -> Result<()> {
                                                                 sync_nonce_manager(&nonce_manager, &shared_http, safe_address).await;
                                                                 continue;
                                                             } else if (err_msg.contains("not enough balance") || err_msg.contains("not enough allowance")) && attempt < 2 {
-                                                                if let Some(actual_balance) = parse_balance_from_error(&err_msg) {
-                                                                    if actual_balance == dec!(0) { pos_handle.lock().await.remove(&no_token); return Ok(()); }
-                                                                    current_shares = actual_balance; continue;
-                                                                }
-                                                            }
+                                                                 if let Some(actual_balance) = parse_balance_from_error(&err_msg) {
+                                                                     if actual_balance == dec!(0) {
+                                                                         warn!("⚠️ Balance is 0 in NO early exit (likely indexer lag). Waiting 2s and retrying...");
+                                                                         tokio::time::sleep(Duration::from_millis(2000)).await;
+                                                                         continue;
+                                                                     }
+                                                                     current_shares = actual_balance; continue;
+                                                                 }
+                                                             }
                                                             return Err(anyhow::anyhow!("{:?}", e));
                                                         }
                                                     }
