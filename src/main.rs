@@ -1212,7 +1212,19 @@ async fn main() -> Result<()> {
                                                                         sync_nonce_manager(&nonce_manager, &shared_http_handle, safe_address).await;
                                                                         continue;
                                                                     }
-                                                                    error!("❌ Momentum Entry Failed: {:?}", e);
+                                                                    // Extract specific error reason for clarity
+                                                                    let reason = if err_msg.contains("no orders found") {
+                                                                        "No liquidity/sellers at price".to_string()
+                                                                    } else if err_msg.contains("insufficient balance") {
+                                                                        "Insufficient maker balance".to_string()
+                                                                    } else if err_msg.contains("invalid signature") {
+                                                                        "Invalid signature".to_string()
+                                                                    } else if err_msg.contains("expired") {
+                                                                        "Order expired".to_string()
+                                                                    } else {
+                                                                        format!("{:?}", e)
+                                                                    };
+                                                                    error!("❌ FAK Order Rejected: {} @ ${:.2}", reason, limit_price);
                                                                     break;
                                                                 }
                                                             }
@@ -1222,6 +1234,7 @@ async fn main() -> Result<()> {
                                             }
                                             momentum_fired_for_current_market = true;
                                             trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
+                                            info!("🔒 Momentum cooldown active: Next eligible trade in {}s (until {})", config::TRADE_COOLDOWN_SECS, trade_cooldown.format("%H:%M:%S UTC"));
                                             continue;
                                         } else {
                                             warn!("⏭️ Momentum trade rejected: Exposure limit exceeded (Current: ${:.2}, Trade Size: ${:.2}, Max: ${:.2})", current_exposure, momentum_trade_size_usdc, config::MAX_EXPOSURE_PER_TOKEN_USDC);
