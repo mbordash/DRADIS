@@ -1089,6 +1089,30 @@ async fn main() -> Result<()> {
                                 current_signal_token = Some(yes_token);
                             } else if velocity < -threshold && binance_price < (strike - strike_buffer) && no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE {
                                 current_signal_token = Some(no_token);
+                            } else {
+                                // Log why momentum signal was rejected at entry level
+                                if velocity.abs() >= threshold {
+                                    let reason = if velocity > threshold {
+                                        if binance_price <= (strike + strike_buffer) {
+                                            format!("Price ${:.2} not above strike+buffer ${:.2}", binance_price, strike + strike_buffer)
+                                        } else if yes_ask > config::MAX_MOMENTUM_ENTRY_PRICE {
+                                            format!("YES ask ${:.2} exceeds max entry price ${:.2}", yes_ask, config::MAX_MOMENTUM_ENTRY_PRICE)
+                                        } else {
+                                            String::new()
+                                        }
+                                    } else {
+                                        if binance_price >= (strike - strike_buffer) {
+                                            format!("Price ${:.2} not below strike-buffer ${:.2}", binance_price, strike - strike_buffer)
+                                        } else if no_ask > config::MAX_MOMENTUM_ENTRY_PRICE {
+                                            format!("NO ask ${:.2} exceeds max entry price ${:.2}", no_ask, config::MAX_MOMENTUM_ENTRY_PRICE)
+                                        } else {
+                                            String::new()
+                                        }
+                                    };
+                                    if !reason.is_empty() {
+                                        debug!("⏭️ Momentum signal rejected at filter stage: {} (Velocity: ${:.2}, Threshold: ${:.2})", reason, velocity, threshold);
+                                    }
+                                }
                             }
 
                             if let Some(token) = current_signal_token {
@@ -1109,6 +1133,8 @@ async fn main() -> Result<()> {
                                         };
                                         target_depth = if token == yes_token { yes_ask_depth } else { no_ask_depth };
                                         fee_rate = if token == yes_token { yes_fee_rate } else { no_fee_rate };
+                                    } else {
+                                        debug!("⏭️ Momentum signal rejected: Already holding opposing position in token {}", if token == yes_token { no_token } else { yes_token });
                                     }
                                 } else {
                                     debug!("⏳ Momentum signal detected, waiting for confirmation ({} of {} ticks)", consecutive_momentum_signals, config::MOMENTUM_CONFIRMATION_TICKS);
@@ -1197,8 +1223,17 @@ async fn main() -> Result<()> {
                                             momentum_fired_for_current_market = true;
                                             trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
                                             continue;
+                                        } else {
+                                            warn!("⏭️ Momentum trade rejected: Exposure limit exceeded (Current: ${:.2}, Trade Size: ${:.2}, Max: ${:.2})", current_exposure, momentum_trade_size_usdc, config::MAX_EXPOSURE_PER_TOKEN_USDC);
+                                            continue;
                                         }
+                                    } else {
+                                        debug!("⏭️ Momentum trade rejected: Target shares {:.2} below minimum {:.2}", target_shares, config::MIN_ORDER_SHARES);
+                                        continue;
                                     }
+                                } else {
+                                    warn!("⏭️ Momentum trade rejected: Insufficient balance (Have: ${:.2}, Need: ${:.2})", current_usdc_balance, momentum_trade_size_usdc);
+                                    continue;
                                 }
                             }
                         }
