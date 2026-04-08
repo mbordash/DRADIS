@@ -987,10 +987,15 @@ async fn main() -> Result<()> {
                                     order_struct.signer = eoa_address;
                                     order_struct.taker = Address::ZERO;
                                     order_struct.tokenId = token;
-                                    // Round shares to 2 decimals to comply with Polymarket's precision requirements
-                                    let rounded_shares = current_shares.round_dp(2);
-                                    order_struct.makerAmount = U256::from(to_fixed_u128(rounded_shares));
-                                    order_struct.takerAmount = U256::from(to_fixed_u128(rounded_shares * exit_price));
+                                    // Truncate shares to 2 decimals to ensure we never exceed available balance
+                                    // (round_dp could round up and cause "not enough balance" errors)
+                                    let truncated_shares = current_shares.trunc_with_scale(2);
+                                    if truncated_shares != current_shares && truncated_shares > dec!(0) {
+                                        debug!("📍 Precision: Truncating {} → {} shares to fit balance constraint", current_shares, truncated_shares);
+                                    }
+                                    if truncated_shares < config::MIN_ORDER_SHARES { return Ok(()); }
+                                    order_struct.makerAmount = U256::from(to_fixed_u128(truncated_shares));
+                                    order_struct.takerAmount = U256::from(to_fixed_u128(truncated_shares * exit_price));
                                     order_struct.expiration = U256::ZERO;
                                     order_struct.nonce = U256::from(current_nonce);
                                     order_struct.feeRateBps = U256::from(exit_fee_rate);
