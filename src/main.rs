@@ -987,8 +987,10 @@ async fn main() -> Result<()> {
                                     order_struct.signer = eoa_address;
                                     order_struct.taker = Address::ZERO;
                                     order_struct.tokenId = token;
-                                    order_struct.makerAmount = U256::from(to_fixed_u128(current_shares));
-                                    order_struct.takerAmount = U256::from(to_fixed_u128(current_shares * exit_price));
+                                    // Round shares to 2 decimals to comply with Polymarket's precision requirements
+                                    let rounded_shares = current_shares.round_dp(2);
+                                    order_struct.makerAmount = U256::from(to_fixed_u128(rounded_shares));
+                                    order_struct.takerAmount = U256::from(to_fixed_u128(rounded_shares * exit_price));
                                     order_struct.expiration = U256::ZERO;
                                     order_struct.nonce = U256::from(current_nonce);
                                     order_struct.feeRateBps = U256::from(exit_fee_rate);
@@ -1150,6 +1152,22 @@ async fn main() -> Result<()> {
                                 let current_usdc_balance = *balance_rx.borrow();
                                 if current_usdc_balance >= momentum_trade_size_usdc {
                                     let target_shares = (momentum_trade_size_usdc / limit_price).floor();
+
+                                    // CRITICAL: Re-validate entry conditions before placing trade
+                                    // Market conditions may have changed since signal confirmation
+                                    let should_proceed = if token == yes_token {
+                                        velocity > threshold && binance_price > (strike + strike_buffer) && yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
+                                    } else {
+                                        velocity < -threshold && binance_price < (strike - strike_buffer) && no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
+                                    };
+
+                                    if !should_proceed {
+                                        debug!("⏭️ MOMENTUM ENTRY CANCELLED: Market conditions changed (Velocity: ${:.2}, Price: ${:.2} vs Strike+Buffer ${:.2})",
+                                            velocity, binance_price, if token == yes_token { strike + strike_buffer } else { strike - strike_buffer });
+                                        momentum_token = None;
+                                        consecutive_momentum_signals = 0;
+                                        continue;
+                                    }
 
                                     if target_depth < (target_shares * config::MIN_LIQUIDITY_FILL_RATIO) {
                                         warn!("⏭️ MOMENTUM REJECTED: Insufficient liquidity at ask (Available: {:.2} shares, Target: {:.2} shares, Ratio: {:.2})", target_depth, target_shares, config::MIN_LIQUIDITY_FILL_RATIO);
