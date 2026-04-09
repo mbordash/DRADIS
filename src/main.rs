@@ -39,6 +39,8 @@ use tracing::{error, info, warn, debug};
 use rustpolybot::config;
 use rustpolybot::risk::RiskEngine;
 use rustpolybot::notifications::send_notification;
+use rustpolybot::strategies::momentum::MomentumStrategy;
+use rustpolybot::strategies::arbitrage::ArbitrageStrategy;
 
 use rustls::crypto::ring;
 
@@ -904,29 +906,24 @@ async fn main() -> Result<()> {
                             "sol" => config::SOL_MOMENTUM_THRESHOLD,
                             _ => config::BTC_MOMENTUM_THRESHOLD,
                         };
-                        let reversal_threshold = threshold * config::MOMENTUM_REVERSAL_RATIO;
 
                         if let Some(yp) = yes_pos {
                             if yp.shares > dec!(0) {
-                                let profit_margin = if yp.avg_entry > dec!(0) { (yes_bid - yp.avg_entry) / yp.avg_entry } else { dec!(0) };
-                                let target = if yp.avg_entry >= dec!(0.70) { dec!(0.05) } else { config::MOMENTUM_TARGET_PROFIT_PERCENT };
-                                let stop_loss = -config::MOMENTUM_STOP_LOSS_PERCENT;
-
-                                if profit_margin >= target || yes_bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
-                                    info!("🎯 Momentum YES Target Reached (Bid: ${:.2}, Profit: {:.2}% vs Target: {:.2}%) - Taking Profit", yes_bid, profit_margin * dec!(100), target * dec!(100));
-                                    exit_token = Some(yes_token);
-                                    exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                    exit_shares = yp.shares;
-                                    exit_fee_rate = yes_fee_rate;
-                                } else if profit_margin <= stop_loss {
-                                    info!("🛑 Momentum YES Stop Loss Hit (Bid: ${:.2}, Loss: {:.2}%)", yes_bid, profit_margin * dec!(100));
-                                    exit_token = Some(yes_token);
-                                    exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                    exit_shares = yp.shares;
-                                    exit_fee_rate = yes_fee_rate;
-                                } else if velocity < reversal_threshold {
-                                    info!("📉 Momentum YES Reversal Detected (Velocity: ${:.2} < Threshold: ${:.2})", velocity, reversal_threshold);
-                                    exit_token = Some(yes_token);
+                                if let Some(reason) = MomentumStrategy::should_exit_momentum(yes_bid, yp.avg_entry, velocity, threshold, &crypto_filter) {
+                                    match reason {
+                                        rustpolybot::strategies::momentum::ExitReason::TakeProfit { bid_price, profit_pct, target_pct } => {
+                                            info!("🎯 Momentum YES Target Reached (Bid: ${:.2}, Profit: {:.2}% vs Target: {:.2}%) - Taking Profit", bid_price, profit_pct * dec!(100), target_pct * dec!(100));
+                                            exit_token = Some(yes_token);
+                                        },
+                                        rustpolybot::strategies::momentum::ExitReason::StopLoss { bid_price, loss_pct } => {
+                                            info!("🛑 Momentum YES Stop Loss Hit (Bid: ${:.2}, Loss: {:.2}%)", bid_price, loss_pct * dec!(100));
+                                            exit_token = Some(yes_token);
+                                        },
+                                        rustpolybot::strategies::momentum::ExitReason::Reversal { velocity: vel, threshold: thr } => {
+                                            info!("📉 Momentum YES Reversal Detected (Velocity: ${:.2} < Threshold: ${:.2})", vel, thr);
+                                            exit_token = Some(yes_token);
+                                        },
+                                    }
                                     exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                     exit_shares = yp.shares;
                                     exit_fee_rate = yes_fee_rate;
@@ -937,25 +934,21 @@ async fn main() -> Result<()> {
                         if exit_token.is_none() {
                             if let Some(np) = no_pos {
                                 if np.shares > dec!(0) {
-                                    let profit_margin = if np.avg_entry > dec!(0) { (no_bid - np.avg_entry) / np.avg_entry } else { dec!(0) };
-                                    let target = if np.avg_entry >= dec!(0.70) { dec!(0.05) } else { config::MOMENTUM_TARGET_PROFIT_PERCENT };
-                                    let stop_loss = -config::MOMENTUM_STOP_LOSS_PERCENT;
-
-                                    if profit_margin >= target || no_bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
-                                        info!("🎯 Momentum NO Target Reached (Bid: ${:.2}, Profit: {:.2}% vs Target: {:.2}%) - Taking Profit", no_bid, profit_margin * dec!(100), target * dec!(100));
-                                        exit_token = Some(no_token);
-                                        exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                        exit_shares = np.shares;
-                                        exit_fee_rate = no_fee_rate;
-                                    } else if profit_margin <= stop_loss {
-                                        info!("🛑 Momentum NO Stop Loss Hit (Bid: ${:.2}, Loss: {:.2}%)", no_bid, profit_margin * dec!(100));
-                                        exit_token = Some(no_token);
-                                        exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
-                                        exit_shares = np.shares;
-                                        exit_fee_rate = no_fee_rate;
-                                    } else if velocity > -reversal_threshold {
-                                        info!("📉 Momentum NO Reversal Detected (Velocity: ${:.2} > -${:.2})", velocity, reversal_threshold);
-                                        exit_token = Some(no_token);
+                                    if let Some(reason) = MomentumStrategy::should_exit_momentum(no_bid, np.avg_entry, -velocity, threshold, &crypto_filter) {
+                                        match reason {
+                                            rustpolybot::strategies::momentum::ExitReason::TakeProfit { bid_price, profit_pct, target_pct } => {
+                                                info!("🎯 Momentum NO Target Reached (Bid: ${:.2}, Profit: {:.2}% vs Target: {:.2}%) - Taking Profit", bid_price, profit_pct * dec!(100), target_pct * dec!(100));
+                                                exit_token = Some(no_token);
+                                            },
+                                            rustpolybot::strategies::momentum::ExitReason::StopLoss { bid_price, loss_pct } => {
+                                                info!("🛑 Momentum NO Stop Loss Hit (Bid: ${:.2}, Loss: {:.2}%)", bid_price, loss_pct * dec!(100));
+                                                exit_token = Some(no_token);
+                                            },
+                                            rustpolybot::strategies::momentum::ExitReason::Reversal { velocity: vel, threshold: thr } => {
+                                                info!("📉 Momentum NO Reversal Detected (Velocity: ${:.2} > -${:.2})", vel, thr);
+                                                exit_token = Some(no_token);
+                                            },
+                                        }
                                         exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                         exit_shares = np.shares;
                                         exit_fee_rate = no_fee_rate;
@@ -1093,12 +1086,18 @@ async fn main() -> Result<()> {
                             let mut target_depth = dec!(0);
                             let mut fee_rate = 0;
 
-                            let mut current_signal_token = None;
-                            if velocity > threshold && binance_price > (strike + strike_buffer) && yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE {
-                                current_signal_token = Some(yes_token);
-                            } else if velocity < -threshold && binance_price < (strike - strike_buffer) && no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE {
-                                current_signal_token = Some(no_token);
-                            } else {
+                            let current_signal_token = MomentumStrategy::evaluate_entry(
+                                velocity,
+                                binance_price,
+                                strike_price,
+                                yes_token,
+                                no_token,
+                                yes_ask,
+                                no_ask,
+                                &crypto_filter,
+                            );
+
+                            if current_signal_token.is_none() {
                                 // Log why momentum signal was rejected at entry level
                                 if velocity.abs() >= threshold {
                                     let reason = if velocity > threshold {
@@ -1169,7 +1168,6 @@ async fn main() -> Result<()> {
                                     if !should_proceed {
                                         debug!("⏭️ MOMENTUM ENTRY CANCELLED: Market conditions changed (Velocity: ${:.2}, Price: ${:.2} vs Strike+Buffer ${:.2})",
                                             velocity, binance_price, if token == yes_token { strike + strike_buffer } else { strike - strike_buffer });
-                                        momentum_token = None;
                                         consecutive_momentum_signals = 0;
                                         continue;
                                     }
@@ -1279,14 +1277,11 @@ async fn main() -> Result<()> {
                     }
 
                     // --- Arbitrage Logic ---
-                    let combined_ask = yes_ask + no_ask;
-                    let profit_margin_no_fees = dec!(1.0) - combined_ask;
-                    let yes_fee = yes_ask * (Decimal::from(yes_fee_rate) / dec!(10_000));
-                    let no_fee = no_ask * (Decimal::from(no_fee_rate) / dec!(10_000));
-                    let profit_margin = profit_margin_no_fees - (yes_fee + no_fee);
+                    let (_, profit_margin) = ArbitrageStrategy::calculate_profit_margin(yes_ask, no_ask, yes_fee_rate, no_fee_rate);
 
                     if profit_margin >= config::ARBITRAGE_PROFIT_THRESHOLD {
                         let current_usdc_balance = *balance_rx.borrow();
+                        let combined_ask = yes_ask + no_ask;
                         if current_usdc_balance < trade_size_usdc * dec!(2) {
                             debug!("⏭️ ARB REJECTED: Insufficient balance (Have: ${:.2}, Need: ${:.2} for 2-leg arb)", current_usdc_balance, trade_size_usdc * dec!(2));
                             continue;
@@ -1426,16 +1421,14 @@ async fn main() -> Result<()> {
                         let no_pos  = pos_map.get(&no_token).cloned();
                         if let (Some(yp), Some(np)) = (yes_pos, no_pos) {
                             if yp.shares > dec!(0) && np.shares > dec!(0) {
-                                let combined_bid = yes_bid + no_bid;
-                                if combined_bid >= config::EARLY_EXIT_COMBINED_BID_THRESHOLD {
-                                    info!("💰 Bids reached target early exit (sum ${:.4})", combined_bid);
+                                if ArbitrageStrategy::should_early_exit(yes_bid, no_bid) {
+                                    info!("💰 Bids reached target early exit (sum ${:.4})", yes_bid + no_bid);
                                     let exit_price_yes = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                     let exit_price_no  = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                     let client_clone = Arc::clone(&trading_client);
                                     let signer_clone = signer.clone();
                                     let nonce_manager_clone = Arc::clone(&nonce_manager);
                                     let shared_http_clone = Arc::clone(&shared_http);
-                                    let pos_handle = Arc::clone(&positions);
                                     let owner = client_clone.credentials().key();
 
                                     let yes_exit_task = {
@@ -1443,7 +1436,6 @@ async fn main() -> Result<()> {
                                         let signer = signer_clone.clone();
                                         let nonce_manager = Arc::clone(&nonce_manager_clone);
                                         let shared_http = Arc::clone(&shared_http_clone);
-                                        let pos_handle = Arc::clone(&pos_handle);
                                         async move {
                                             let mut current_shares = yp.shares;
                                             for attempt in 0..3 {
@@ -1494,7 +1486,6 @@ async fn main() -> Result<()> {
                                         let signer = signer_clone.clone();
                                         let nonce_manager = Arc::clone(&nonce_manager_clone);
                                         let shared_http = Arc::clone(&shared_http_clone);
-                                        let pos_handle = Arc::clone(&pos_handle);
                                         async move {
                                             let mut current_shares = np.shares;
                                             for attempt in 0..3 {
