@@ -239,7 +239,9 @@ pub const CLOB_API_BASE: &str = "https://clob.polymarket.com";
 // ============================================================================
 
 /// Number of pages to scan for markets in the Gamma API.
-pub const GAMMA_API_MARKET_SCAN_PAGES: usize = 80;
+/// 30 pages = 3000 markets (sorted by 24hr volume descending).
+/// Crypto hourly markets have enough volume to appear within the first 3000.
+pub const GAMMA_API_MARKET_SCAN_PAGES: usize = 30;
 
 /// Blocked market name keywords (politics, long-term events, etc.)
 pub fn is_bad_market(name: &str) -> bool {

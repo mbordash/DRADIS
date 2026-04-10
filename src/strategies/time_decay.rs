@@ -1,7 +1,7 @@
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use chrono::{DateTime, Utc};
-
+use alloy::primitives::U256;
 
 pub struct TimeDecayStrategy;
 
@@ -134,8 +134,8 @@ pub enum EarlyExitReason {
 
 #[derive(Debug, Clone)]
 pub struct TimeDecayPosition {
-    pub yes_token_id: u128,
-    pub no_token_id: u128,
+    pub yes_token_id: U256,
+    pub no_token_id: U256,
     pub entry_time: DateTime<Utc>,
     pub expiry_time: DateTime<Utc>,
     pub yes_entry_price: Decimal,
@@ -146,8 +146,8 @@ pub struct TimeDecayPosition {
 
 impl TimeDecayPosition {
     pub fn new(
-        yes_id: u128,
-        no_id: u128,
+        yes_id: U256,
+        no_id: U256,
         entry_time: DateTime<Utc>,
         expiry_time: DateTime<Utc>,
         yes_price: Decimal,
@@ -175,5 +175,3 @@ impl TimeDecayPosition {
         self.time_to_expiry() <= 0
     }
 }
-
-

@@ -39,11 +39,10 @@ use rustpolybot::risk::RiskEngine;
 use rustpolybot::notifications::send_notification;
 use rustpolybot::strategies::momentum::MomentumStrategy;
 use rustpolybot::strategies::arbitrage::ArbitrageStrategy;
+use rustpolybot::strategies::time_decay::{TimeDecayStrategy, TimeDecayPosition};
 use rustpolybot::helpers::{
     price::*, json::*, time::*, balance::*, nonce::*
 };
-// TIME DECAY disabled for now due to implementation issues
-//use rustpolybot::strategies::time_decay::{TimeDecayStrategy, TimeDecayPosition};
 
 use rustls::crypto::ring;
 
@@ -61,6 +60,7 @@ struct Position {
     close_time: Option<DateTime<Utc>>,
     market_name: String,
     pair_token_id: U256,
+    fill_confirmed_at: Option<DateTime<Utc>>, // When balance was first confirmed on-chain
 }
 
 const ORDER_NAME: &str = "Polymarket CTF Exchange";
@@ -90,10 +90,30 @@ async fn sync_position_balance(
             if actual_shares > dec!(0) {
                 info!("⚖️ Position Synced: Token {} quantity updated from {} to actual: {}", token_id, pos.shares, actual_shares);
                 pos.shares = actual_shares;
+                // Mark when fill was confirmed
+                if pos.fill_confirmed_at.is_none() {
+                    pos.fill_confirmed_at = Some(Utc::now());
+                }
             } else {
-                warn!("⚠️ Position Sync: Token {} balance is 0. This might be a lag in the indexer. Keeping local position for now.", token_id);
-                // Don't remove the position immediately if we just bought it or think we have it.
-                // It will be cleaned up by expiry logic or manually if it truly remains 0.
+                // Balance is 0. Check if this is indexer lag or order never filled.
+                let time_since_open = Utc::now() - pos.opened_at;
+
+                if time_since_open.num_seconds() > 15 {
+                    // 15+ seconds since entry order accepted, and balance still 0
+                    // Order likely never filled on-chain (API accepted but CLOB didn't match)
+                    warn!("⚠️ Position Sync FAILED: Token {} balance still 0 after {}s. Order likely never filled on-chain. Removing position.",
+                          token_id, time_since_open.num_seconds());
+                    pos_map.remove(&token_id);
+                } else if pos.fill_confirmed_at.is_some() {
+                    // We previously confirmed a fill, but now balance is 0?
+                    // Could indicate liquidation, transfer, or indexer issue
+                    warn!("⚠️ Position Sync WARNING: Token {} balance disappeared (was confirmed at {:?}). Possible liquidation or indexer issue.",
+                          token_id, pos.fill_confirmed_at);
+                } else {
+                    // Still within 15 second window, likely just indexer lag
+                    warn!("⚠️ Position Sync: Token {} balance is 0 ({}s since open). Might be indexer lag. Keeping local position.",
+                          token_id, time_since_open.num_seconds());
+                }
             }
         }
     }
@@ -469,6 +489,11 @@ async fn main() -> Result<()> {
 
     let (oracle_tx, oracle_rx) = watch::channel(dec!(0));
     let (velocity_tx, velocity_rx) = watch::channel(dec!(0));
+
+    // Shared state for tracking recent momentum signals to improve market selection
+    let momentum_signal_times = Arc::new(tokio::sync::Mutex::new(Vec::<DateTime<Utc>>::new()));
+    let momentum_signal_times_binance = Arc::clone(&momentum_signal_times);
+
     let crypto_symbol = crypto_filter.clone();
     tokio::spawn(async move {
         let binance_pair = match crypto_symbol.as_str() {
@@ -505,6 +530,14 @@ async fn main() -> Result<()> {
                                         };
                                         if delta.abs() >= threshold {
                                             info!("🔥 MOMENTUM SIGNAL: {} moved ${:.2} in last {}s", binance_pair.to_uppercase(), delta, config::MOMENTUM_WINDOW_SECS);
+                                            // Record timestamp of this momentum signal for market selection heuristics
+                                            tokio::spawn({
+                                                let signal_times = Arc::clone(&momentum_signal_times_binance);
+                                                async move {
+                                                    let mut times = signal_times.lock().await;
+                                                    times.push(Utc::now());
+                                                }
+                                            });
                                         }
                                     }
                                 }
@@ -520,9 +553,8 @@ async fn main() -> Result<()> {
 
     let positions: Arc<Mutex<HashMap<U256, Position>>> = Arc::new(Mutex::new(HashMap::new()));
     let total_pnl: Arc<Mutex<Decimal>> = Arc::new(Mutex::new(dec!(0)));
-    // TIME DECAY - Disabled for now due to compilation issues
-    // let time_decay_positions: Arc<Mutex<HashMap<U256, TimeDecayPosition>>> =
-    //     Arc::new(Mutex::new(HashMap::new()));
+    let time_decay_positions: Arc<Mutex<HashMap<U256, TimeDecayPosition>>> =
+        Arc::new(Mutex::new(HashMap::new()));
 
     let (initial_yes, initial_no, name, _, desc, _, close_time) = loop {
         let candidate = get_top_market(&shared_http).await;
@@ -557,25 +589,73 @@ async fn main() -> Result<()> {
     let http_monitor = Arc::clone(&shared_http);
     let market_tx_monitor = market_tx.clone();
     let crypto_filter_monitor = crypto_filter.clone();
+
+    // Reuse the shared momentum signal times from above (not creating a new one)
+    let momentum_signal_times_monitor = Arc::clone(&momentum_signal_times);
+
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(90));
         loop {
             interval.tick().await;
             let candidate = get_top_market(&http_monitor).await;
             if candidate.0 == U256::ZERO { continue; }
-            let (cur_yes, _, cur_name, _, _, _) = market_tx_monitor.borrow().clone();
-            if candidate.0 != cur_yes || candidate.2 != cur_name {
-                info!("🔄 Market Switch Detected: {} -> {}", cur_name, candidate.2);
-                // Use new market validator for strike extraction
-                let mut strike = rustpolybot::market_validator::extract_strike_price(&candidate.2);
-                if strike.is_none() {
-                    strike = fetch_historical_strike_price(&http_monitor, &crypto_filter_monitor, &candidate.4).await;
-                }
-                if strike.is_none() {
-                    strike = fetch_strike_price_from_close_time(&http_monitor, &crypto_filter_monitor, candidate.6).await;
-                }
-                let _ = market_tx_monitor.send((candidate.0, candidate.1, candidate.2.clone(), candidate.6, strike, candidate.4.clone()));
+            let (cur_yes, _, cur_name, cur_close_time, _, _) = market_tx_monitor.borrow().clone();
+
+            // Same market by token ID — nothing to do
+            if candidate.0 == cur_yes {
+                info!("🏆 Selected market: \"{}\"", candidate.2);
+                continue;
             }
+
+            // Hysteresis: only switch when current market is truly expiring or new is clearly better
+            let now_ts = Utc::now();
+            let cur_secs_left = cur_close_time.map_or(9999i64, |ct| (ct - now_ts).num_seconds());
+            let new_secs_left = candidate.6.map_or(9999i64, |ct| (ct - now_ts).num_seconds());
+
+            // Check for recent momentum signals (last 60 seconds) to determine if in high-volatility period
+            let mut signal_times = momentum_signal_times_monitor.lock().await;
+            let cutoff_time = now_ts - chrono::Duration::seconds(60);
+            signal_times.retain(|t| t > &cutoff_time);
+            let recent_momentum_signals = signal_times.len();
+            drop(signal_times);
+
+            // Determine if candidate is a binary "Up or Down" market (better for momentum trading)
+            let candidate_is_binary = candidate.2.to_lowercase().contains("up or down");
+            let current_is_binary = cur_name.to_lowercase().contains("up or down");
+
+            // Enhanced hysteresis: be more aggressive switching to binary markets during volatility
+            let should_switch = cur_secs_left < config::FINAL_EXPIRY_WINDOW_SECS  // current expiring soon
+                || cur_secs_left <= 0                                              // current already expired
+                || new_secs_left > cur_secs_left + 1800                           // new has 30+ more minutes
+                || (candidate_is_binary                                           // switching TO binary market
+                    && !current_is_binary                                         // from non-binary (strike)
+                    && recent_momentum_signals >= 5                               // during high volatility (5+ signals in 60s)
+                    && new_secs_left > 600                                        // and has at least 10 min left
+                    && cur_secs_left > 300);                                      // and current market won't expire immediately
+
+            if !should_switch {
+                info!("🏆 Selected market: \"{}\" (staying on current: {} — {}s vs {}s, no significant gain){}",
+                    candidate.2, cur_name, cur_secs_left, new_secs_left,
+                    if recent_momentum_signals > 0 { format!(" [{}x momentum signals in 60s]", recent_momentum_signals) } else { String::new() });
+                continue;
+            }
+
+            info!("🔄 Market Switch Detected: {} -> {} (Current: {}s left, New: {}s left){}",
+                cur_name, candidate.2, cur_secs_left, new_secs_left,
+                if candidate_is_binary && !current_is_binary && recent_momentum_signals >= 5 {
+                    format!(" [Switching to binary market during high volatility: {} signals in 60s]", recent_momentum_signals)
+                } else {
+                    String::new()
+                });
+            // Use new market validator for strike extraction
+            let mut strike = rustpolybot::market_validator::extract_strike_price(&candidate.2);
+            if strike.is_none() {
+                strike = fetch_historical_strike_price(&http_monitor, &crypto_filter_monitor, &candidate.4).await;
+            }
+            if strike.is_none() {
+                strike = fetch_strike_price_from_close_time(&http_monitor, &crypto_filter_monitor, candidate.6).await;
+            }
+            let _ = market_tx_monitor.send((candidate.0, candidate.1, candidate.2.clone(), candidate.6, strike, candidate.4.clone()));
         }
     });
 
@@ -664,14 +744,19 @@ async fn main() -> Result<()> {
                     let binance_price = *oracle_rx.borrow();
                     let binance_velocity = *velocity_rx.borrow();
 
-                    if let Some(strike) = strike_price {
-                        let strike_info = format!(" | Strike: ${:.2} | Diff: ${:.2} | Velocity: ${:.2}", strike, binance_price - strike, binance_velocity);
-                        if yes_ask != dec!(1) && no_ask != dec!(1) {
-                            info!("💓 Heartbeat | Poly Sum ${:.4} | Binance: ${:.2}{}", yes_ask + no_ask, binance_price, strike_info);
+                    if yes_ask != dec!(1) && no_ask != dec!(1) {
+                        if let Some(strike) = strike_price {
+                            info!("💓 Heartbeat | Poly Sum ${:.4} | Binance: ${:.2} | Strike: ${:.2} | Diff: ${:.2} | Velocity: ${:.2}",
+                                yes_ask + no_ask, binance_price, strike, binance_price - strike, binance_velocity);
+                        } else {
+                            info!("💓 Heartbeat | Poly Sum ${:.4} | Binance: ${:.2} | Velocity: ${:.2} (binary, no strike)",
+                                yes_ask + no_ask, binance_price, binance_velocity);
                         }
-                    } else {
-                        debug!("🔎 Market scanning: Strike Unknown for {}", market_name);
                     }
+                }
+                _ = market_rx.changed() => {
+                    info!("🔄 Market change detected in trading loop — restarting for new market...");
+                    break;
                 }
                 _ = ticker.tick() => {
                     if Utc::now() < trade_cooldown { continue; }
@@ -1065,7 +1150,7 @@ async fn main() -> Result<()> {
                                                                 info!("🚀 Momentum order accepted. Syncing final quantity...");
                                                                 {
                                                                     let mut pm = positions_handle.lock().await;
-                                                                    pm.insert(token, Position { shares: target_shares, avg_entry: limit_price, opened_at: Utc::now(), close_time: close_time_handle, market_name: market_name_handle, pair_token_id: pair_token_handle });
+                                                                    pm.insert(token, Position { shares: target_shares, avg_entry: limit_price, opened_at: Utc::now(), close_time: close_time_handle, market_name: market_name_handle, pair_token_id: pair_token_handle, fill_confirmed_at: None });
                                                                 }
                                                                 *guard += 1;
                                                                 let _ = sync_position_balance(&client, &positions_handle, token).await;
@@ -1079,6 +1164,14 @@ async fn main() -> Result<()> {
                                                                     sync_nonce_manager(&nonce_manager, &shared_http_handle, safe_address).await;
                                                                     // Add backoff delay after nonce resync
                                                                     tokio::time::sleep(Duration::from_millis(200 * ((attempt as u64) + 1))).await;
+                                                                    continue;
+                                                                }
+                                                                // Retry on transient server errors (500, 502, 503, 504)
+                                                                if (err_msg.contains("status_code: 500") || err_msg.contains("status_code: 502") ||
+                                                                    err_msg.contains("status_code: 503") || err_msg.contains("status_code: 504")) && attempt < 2 {
+                                                                    warn!("⚠️ Transient server error in momentum entry (attempt {}). Retrying with backoff...", attempt + 1);
+                                                                    // Exponential backoff: 300ms, 600ms
+                                                                    tokio::time::sleep(Duration::from_millis(300 * ((attempt as u64) + 1))).await;
                                                                     continue;
                                                                 }
                                                                 // Extract specific error reason for clarity
@@ -1120,11 +1213,239 @@ async fn main() -> Result<()> {
                         }
                     }
 
-                    // --- TIME DECAY (THETA) STRATEGY - DISABLED (needs debugging for variable scope) ---
-                    // TODO: Re-enable after fixing seconds_to_expiry and U256 conversion issues
-                    //if config::ENABLE_TIME_DECAY_TRADING {
-                    //    // Implementation will be re-enabled after debugging
-                    //}
+                    // --- TIME DECAY (THETA) STRATEGY ---
+                    if config::ENABLE_TIME_DECAY_TRADING {
+                        if let Some(spread) = TimeDecayStrategy::calculate_decay_spread(yes_ask, no_ask) {
+                            // Check market age constraints - need valid close time
+                            if let Some(close_time) = market_close_time {
+                                let now = Utc::now();
+                                let seconds_to_expiry = (close_time - now).num_seconds();
+
+                            if seconds_to_expiry > config::TIME_DECAY_MIN_MARKET_AGE_SECS
+                                && seconds_to_expiry < config::TIME_DECAY_MAX_MARKET_AGE_SECS {
+
+                                let current_usdc_balance = *balance_rx.borrow();
+                                let combined_cost = (yes_ask + no_ask) * config::TIME_DECAY_POSITION_SIZE_USDC;
+
+                                // Check balance
+                                if current_usdc_balance >= combined_cost * dec!(2) {
+                                    // Check position limits
+                                    let td_pos = time_decay_positions.lock().await;
+                                    let total_td_exposure: Decimal = td_pos.values()
+                                        .map(|p| p.total_invested)
+                                        .sum();
+
+                                    if td_pos.len() < config::TIME_DECAY_MAX_POSITIONS
+                                        && total_td_exposure + combined_cost <= config::TIME_DECAY_MAX_TOTAL_EXPOSURE_USDC {
+
+                                        let target_shares = config::TIME_DECAY_POSITION_SIZE_USDC;
+                                        let yes_limit_price = (yes_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
+                                        let no_limit_price = (no_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
+
+                                        info!("💰 TIME DECAY OPPORTUNITY: Spread ${:.4} | Expires in {}s | YES ${:.2} + NO ${:.2}", spread, seconds_to_expiry, yes_ask, no_ask);
+
+                                        if !config::GHOST_MODE {
+                                            drop(td_pos);
+                                            let client_clone = Arc::clone(&trading_client);
+                                            let signer_clone = signer.clone();
+                                            let nonce_manager_clone = Arc::clone(&nonce_manager);
+                                            let shared_http_clone = Arc::clone(&shared_http);
+                                            let td_pos_handle = Arc::clone(&time_decay_positions);
+                                            let owner = client_clone.credentials().key();
+
+                                            let yes_task = {
+                                                let client = Arc::clone(&client_clone);
+                                                let signer = signer_clone.clone();
+                                                let nonce_manager = Arc::clone(&nonce_manager_clone);
+                                                let shared_http = Arc::clone(&shared_http_clone);
+                                                async move {
+                                                    for attempt in 0..2 {
+                                                        let mut guard = nonce_manager.lock().await;
+                                                        let current_nonce = *guard;
+                                                        let mut order_struct = Order::default();
+                                                        order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
+                                                        order_struct.maker = safe_address; order_struct.signer = eoa_address; order_struct.tokenId = yes_token;
+                                                        order_struct.makerAmount = U256::from(to_fixed_u128(target_shares * yes_limit_price));
+                                                        order_struct.takerAmount = U256::from(to_fixed_u128(target_shares));
+                                                        order_struct.expiration = U256::ZERO; order_struct.nonce = U256::from(current_nonce);
+                                                        order_struct.feeRateBps = U256::from(yes_fee_rate);
+                                                        order_struct.side = Side::Buy as u8; order_struct.signatureType = SignatureType::GnosisSafe as u8;
+                                                        let domain = Eip712Domain { name: Some(Cow::Borrowed(ORDER_NAME)), version: Some(Cow::Borrowed(VERSION)), chain_id: Some(U256::from(POLYGON)), verifying_contract: Some(verifying_contract), ..Eip712Domain::default() };
+                                                        let hash = order_struct.eip712_signing_hash(&domain);
+                                                        if let Ok(signature) = signer.sign_hash(&hash).await {
+                                                            let signed_order = SignedOrder::builder().order(order_struct).signature(signature).order_type(OrderType::FAK).owner(owner).build();
+                                                            match client.post_order(signed_order).await {
+                                                                Ok(_) => { *guard += 1; return Ok(()); },
+                                                                Err(e) => {
+                                                                    drop(guard);
+                                                                    if format!("{:?}", e).to_lowercase().contains("invalid nonce") && attempt == 0 {
+                                                                        warn!("⚠️ Invalid nonce in time decay YES buy. Re-syncing...");
+                                                                        sync_nonce_manager(&nonce_manager, &shared_http, safe_address).await;
+                                                                        continue;
+                                                                    }
+                                                                    return Err(anyhow::anyhow!("{:?}", e));
+                                                                }
+                                                            }
+                                                        } else { return Err(anyhow::anyhow!("Signing failed")); }
+                                                    }
+                                                    Err(anyhow::anyhow!("Max retries reached"))
+                                                }
+                                            };
+                                            let no_task = {
+                                                let client = Arc::clone(&client_clone);
+                                                let signer = signer_clone.clone();
+                                                let nonce_manager = Arc::clone(&nonce_manager_clone);
+                                                let shared_http = Arc::clone(&shared_http_clone);
+                                                async move {
+                                                    for attempt in 0..2 {
+                                                        let mut guard = nonce_manager.lock().await;
+                                                        let current_nonce = *guard;
+                                                        let mut order_struct = Order::default();
+                                                        order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
+                                                        order_struct.maker = safe_address; order_struct.signer = eoa_address; order_struct.tokenId = no_token;
+                                                        order_struct.makerAmount = U256::from(to_fixed_u128(target_shares * no_limit_price));
+                                                        order_struct.takerAmount = U256::from(to_fixed_u128(target_shares));
+                                                        order_struct.expiration = U256::ZERO; order_struct.nonce = U256::from(current_nonce);
+                                                        order_struct.feeRateBps = U256::from(no_fee_rate);
+                                                        order_struct.side = Side::Buy as u8; order_struct.signatureType = SignatureType::GnosisSafe as u8;
+                                                        let domain = Eip712Domain { name: Some(Cow::Borrowed(ORDER_NAME)), version: Some(Cow::Borrowed(VERSION)), chain_id: Some(U256::from(POLYGON)), verifying_contract: Some(verifying_contract), ..Eip712Domain::default() };
+                                                        let hash = order_struct.eip712_signing_hash(&domain);
+                                                        if let Ok(signature) = signer.sign_hash(&hash).await {
+                                                            let signed_order = SignedOrder::builder().order(order_struct).signature(signature).order_type(OrderType::FAK).owner(owner).build();
+                                                            match client.post_order(signed_order).await {
+                                                                Ok(_) => { *guard += 1; return Ok(()); },
+                                                                Err(e) => {
+                                                                    drop(guard);
+                                                                    if format!("{:?}", e).to_lowercase().contains("invalid nonce") && attempt == 0 {
+                                                                        warn!("⚠️ Invalid nonce in time decay NO buy. Re-syncing...");
+                                                                        sync_nonce_manager(&nonce_manager, &shared_http, safe_address).await;
+                                                                        continue;
+                                                                    }
+                                                                    return Err(anyhow::anyhow!("{:?}", e));
+                                                                }
+                                                            }
+                                                        } else { return Err(anyhow::anyhow!("Signing failed")); }
+                                                    }
+                                                    Err(anyhow::anyhow!("Max retries reached"))
+                                                }
+                                            };
+                                            let (yes_res, no_res) = tokio::join!(yes_task, no_task);
+                                            if yes_res.is_ok() && no_res.is_ok() {
+                                                let td_position = TimeDecayPosition::new(
+                                                    yes_token,
+                                                    no_token,
+                                                    now,
+                                                    close_time,
+                                                    yes_limit_price,
+                                                    no_limit_price,
+                                                    target_shares,
+                                                );
+                                                let mut td_pos_map = td_pos_handle.lock().await;
+                                                td_pos_map.insert(yes_token, td_position.clone());
+                                                info!("💰 Time Decay position opened: YES {} + NO {} | Expires in {}s", yes_token, no_token, seconds_to_expiry);
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        // Time Decay Exit Logic
+                        {
+                            let mut td_pos_map = time_decay_positions.lock().await;
+                            let mut positions_to_close = Vec::new();
+
+                            for (token_id, td_pos) in td_pos_map.iter() {
+                                let (unrealized_pnl, pnl_pct) = TimeDecayStrategy::calculate_current_pnl(yes_bid, no_bid, td_pos.yes_entry_price + td_pos.no_entry_price, td_pos.position_size);
+
+                                // Check take profit
+                                if pnl_pct >= config::TIME_DECAY_TARGET_PROFIT_PERCENT {
+                                    info!("💰 TIME DECAY TAKE PROFIT HIT: +{:.2}% (${:.2})", pnl_pct * dec!(100), unrealized_pnl);
+                                    positions_to_close.push(*token_id);
+                                }
+                                // Check stop loss
+                                else if pnl_pct <= -config::TIME_DECAY_STOP_LOSS_PERCENT {
+                                    warn!("⚠️ TIME DECAY STOP LOSS HIT: {:.2}% (${:.2})", pnl_pct * dec!(100), unrealized_pnl);
+                                    positions_to_close.push(*token_id);
+                                }
+                                // Check market expiry (exit 30s before close)
+                                else if td_pos.time_to_expiry() <= 30 {
+                                    info!("⏰ TIME DECAY EXPIRY APPROACHING: Closing position {}s to close", td_pos.time_to_expiry());
+                                    positions_to_close.push(*token_id);
+                                }
+                            }
+
+                            if !positions_to_close.is_empty() {
+                                drop(td_pos_map);
+                                for token_to_exit in positions_to_close {
+                                    if let Some(td_position) = time_decay_positions.lock().await.remove(&token_to_exit) {
+                                        let exit_price_yes = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                        let exit_price_no = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+
+                                        let client_clone = Arc::clone(&trading_client);
+                                        let signer_clone = signer.clone();
+                                        let nonce_manager_clone = Arc::clone(&nonce_manager);
+                                        let owner = client_clone.credentials().key();
+
+                                        let yes_exit_task = {
+                                            let client = Arc::clone(&client_clone);
+                                            let signer = signer_clone.clone();
+                                            let nonce_manager = Arc::clone(&nonce_manager_clone);
+                                            async move {
+                                                let mut guard = nonce_manager.lock().await;
+                                                let current_nonce = *guard;
+                                                let mut order_struct = Order::default();
+                                                order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
+                                                order_struct.maker = safe_address; order_struct.signer = eoa_address; order_struct.tokenId = yes_token;
+                                                order_struct.makerAmount = U256::from(to_fixed_u128(td_position.position_size));
+                                                order_struct.takerAmount = U256::from(to_fixed_u128(td_position.position_size * exit_price_yes));
+                                                order_struct.expiration = U256::ZERO; order_struct.nonce = U256::from(current_nonce);
+                                                order_struct.feeRateBps = U256::from(yes_fee_rate);
+                                                order_struct.side = Side::Sell as u8; order_struct.signatureType = SignatureType::GnosisSafe as u8;
+                                                let domain = Eip712Domain { name: Some(Cow::Borrowed(ORDER_NAME)), version: Some(Cow::Borrowed(VERSION)), chain_id: Some(U256::from(POLYGON)), verifying_contract: Some(verifying_contract), ..Eip712Domain::default() };
+                                                let hash = order_struct.eip712_signing_hash(&domain);
+                                                if let Ok(signature) = signer.sign_hash(&hash).await {
+                                                    let signed_order = SignedOrder::builder().order(order_struct).signature(signature).order_type(OrderType::FAK).owner(owner).build();
+                                                    match client.post_order(signed_order).await {
+                                                        Ok(_) => { *guard += 1; return Ok(()); },
+                                                        Err(e) => { return Err(anyhow::anyhow!("{:?}", e)); }
+                                                    }
+                                                } else { return Err(anyhow::anyhow!("Signing failed")); }
+                                            }
+                                        };
+                                        let no_exit_task = {
+                                            let client = Arc::clone(&client_clone);
+                                            let signer = signer_clone.clone();
+                                            let nonce_manager = Arc::clone(&nonce_manager_clone);
+                                            async move {
+                                                let mut guard = nonce_manager.lock().await;
+                                                let current_nonce = *guard;
+                                                let mut order_struct = Order::default();
+                                                order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
+                                                order_struct.maker = safe_address; order_struct.signer = eoa_address; order_struct.tokenId = no_token;
+                                                order_struct.makerAmount = U256::from(to_fixed_u128(td_position.position_size));
+                                                order_struct.takerAmount = U256::from(to_fixed_u128(td_position.position_size * exit_price_no));
+                                                order_struct.expiration = U256::ZERO; order_struct.nonce = U256::from(current_nonce);
+                                                order_struct.feeRateBps = U256::from(no_fee_rate);
+                                                order_struct.side = Side::Sell as u8; order_struct.signatureType = SignatureType::GnosisSafe as u8;
+                                                let domain = Eip712Domain { name: Some(Cow::Borrowed(ORDER_NAME)), version: Some(Cow::Borrowed(VERSION)), chain_id: Some(U256::from(POLYGON)), verifying_contract: Some(verifying_contract), ..Eip712Domain::default() };
+                                                let hash = order_struct.eip712_signing_hash(&domain);
+                                                if let Ok(signature) = signer.sign_hash(&hash).await {
+                                                    let signed_order = SignedOrder::builder().order(order_struct).signature(signature).order_type(OrderType::FAK).owner(owner).build();
+                                                    match client.post_order(signed_order).await {
+                                                        Ok(_) => { *guard += 1; return Ok(()); },
+                                                        Err(e) => { return Err(anyhow::anyhow!("{:?}", e)); }
+                                                    }
+                                                } else { return Err(anyhow::anyhow!("Signing failed")); }
+                                            }
+                                        };
+                                        let _ = tokio::join!(yes_exit_task, no_exit_task);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    }
 
                     // --- Arbitrage Logic ---
                     if config::ARBITRAGE_PROFIT_THRESHOLD > dec!(0) {
@@ -1251,8 +1572,8 @@ async fn main() -> Result<()> {
                                     {
                                         let mut pm = pos_handle.lock().await;
                                         let now = Utc::now();
-                                        pm.insert(yes_token, Position { shares: target_shares, avg_entry: yes_limit_price, opened_at: now, close_time: market_close_time, market_name: market_name.clone(), pair_token_id: no_token });
-                                        pm.insert(no_token, Position { shares: target_shares, avg_entry: no_limit_price, opened_at: now, close_time: market_close_time, market_name: market_name.clone(), pair_token_id: yes_token });
+                                        pm.insert(yes_token, Position { shares: target_shares, avg_entry: yes_limit_price, opened_at: now, close_time: market_close_time, market_name: market_name.clone(), pair_token_id: no_token, fill_confirmed_at: None });
+                                        pm.insert(no_token, Position { shares: target_shares, avg_entry: no_limit_price, opened_at: now, close_time: market_close_time, market_name: market_name.clone(), pair_token_id: yes_token, fill_confirmed_at: None });
                                     }
                                     info!("📈 Arb legs accepted. Syncing final quantities...");
                                     let _ = tokio::join!(sync_position_balance(&client_clone, &pos_handle, yes_token), sync_position_balance(&client_clone, &pos_handle, no_token));
