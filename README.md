@@ -48,13 +48,13 @@ The bot automatically detects market conditions and applies the most appropriate
 - **Position Size**: $10 per trade (configurable)
 - **Best For**: Stable, range-bound markets
 
-### 💰 **Time Decay Trading** (Low Risk / Passive) - *Currently Disabled*
-- **Entry**: Market-neutral YES+NO purchases when spread is attractive
-- **Exit**: Auto-exit when profit reaches 1.5% target
+### 💰 **Time Decay Trading** (Low Risk / Passive) - *Now Enabled*
+- **Entry**: Market-neutral YES+NO purchases when combined spread is attractive (< 1.01)
+- **Exit**: Auto-exit when profit reaches 1.5% target, stop loss at 0.5%, or 30s before market close
 - **No Manual Cleanup**: Completely automatic position management
-- **Position Size**: $3 per side (configurable)
+- **Position Size**: $5 per side (configurable)
 - **Best For**: Short-dated markets (hourly/5-minute expiry)
-- **Status**: Disabled pending refinement; can be re-enabled via config
+- **Status**: Fully integrated and active; enable/disable via config `ENABLE_TIME_DECAY_TRADING`
 
 ---
 
@@ -70,11 +70,13 @@ The bot automatically detects market conditions and applies the most appropriate
 - **Modular Architecture**: Strategies live in `src/strategies/` as independent modules, making them easy to test, debug, and extend
 
 ### Advanced Safety Filters
+- **Market Validator**: Professional-grade market filtering that validates crypto, time windows, expiry, and strike prices with 4+ pattern recognition types
 - **Momentum Confirmation Ticks**: Requires multiple consecutive signal updates to filter out "fakeouts"
 - **Minimum Liquidity Check**: Analyzes order book depth; only fires if sufficient liquidity exists
 - **Strike Buffer**: Momentum trades only fire when price is safely away from the strike
 - **Directional Lock**: Prevents "accidental arbitrage" at a loss
 - **Price Cap**: Stops momentum buying if token price exceeds healthy risk/reward ratio
+- **Binary Market Support**: Automatically detects and handles binary outcome markets (no explicit strike needed)
 
 ### Comprehensive Exit Management
 - **Tight Take Profit**: Captures quick moves across all strategies
@@ -144,6 +146,9 @@ Latency is critical for success, particularly for the "Oracle Lag" momentum stra
    ./deploy-multi.sh
    ```
    This deploys BTC/ETH/SOL containers simultaneously with optimal resource allocation.
+   - Includes market validator integration for professional market filtering
+   - Modular strategy architecture (Momentum + Arbitrage + Time Decay)
+   - Comprehensive helper functions for maintainability
 
 ---
 
@@ -238,20 +243,28 @@ src/
 ├── config.rs                  # All tunable parameters
 ├── risk.rs                    # Risk engine & exposure tracking
 ├── notifications.rs           # Telegram alerts
-└── strategies/
-    ├── mod.rs                 # Strategy module registry
-    ├── momentum.rs            # Momentum trading logic
-    ├── arbitrage.rs           # Arbitrage trading logic
-    └── time_decay.rs          # Time decay (theta) trading
+├── market_validator.rs        # Market selection & filtering logic
+├── strategies/
+│   ├── mod.rs                 # Strategy module registry
+│   ├── momentum.rs            # Momentum trading logic
+│   ├── arbitrage.rs           # Arbitrage trading logic
+│   └── time_decay.rs          # Time decay (theta) trading
+└── helpers/
+    ├── mod.rs                 # Helper module registry
+    ├── price.rs               # Price handling utilities
+    ├── json.rs                # JSON parsing helpers
+    ├── time.rs                # Time utilities
+    ├── balance.rs             # Balance tracking
+    └── nonce.rs               # Nonce management
 ```
 
-Each strategy is independently testable and can be enabled/disabled via configuration.
+Each strategy is independently testable and can be enabled/disabled via configuration. Helper functions are modularized for maintainability and code clarity.
 
 ---
 
 ## Future Enhancements
 
-- [ ] **Time Decay Re-implementation**: Fix and enable automatic time decay trading
+- [ ] **Time Decay Refinement**: Further testing and edge case handling
 - [ ] **Maker Support**: Earn rebates by providing liquidity
 - [ ] **Advanced Book Walking**: Calculate VWAP for larger orders
 - [ ] **Multi-Outcome Arbitrage**: Support 3+ outcome markets
