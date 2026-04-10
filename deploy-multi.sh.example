@@ -2,7 +2,8 @@
 # =============================================================================
 # RustPolyBot deploy-multi.sh TEMPLATE
 # Deploys 3 independent containers: BTC, ETH, SOL
-# 
+# Features: Market validator integration, Arbitrage/Momentum strategies
+#
 # SETUP:
 # 1. Copy this file and customize the HOST, USER, and KEY variables
 # 2. Make sure you have SSH access to your remote server
@@ -23,9 +24,9 @@ SSH_PORT="22"
 
 echo "🚀 Deploying 3 independent RustPolyBot containers to $HOST..."
 
-# 1. Create remote directory
+# 1. Create remote directory structure (including strategies/ and helpers/)
 echo "📁 Creating remote directory structure..."
-ssh -i "$KEY" "$USER@$HOST" "mkdir -p $REMOTE_DIR/src"
+ssh -i "$KEY" "$USER@$HOST" "mkdir -p $REMOTE_DIR/src/strategies $REMOTE_DIR/src/helpers"
 
 # 2. Copy code once
 echo "📤 Copying updated code to remote..."
@@ -33,7 +34,20 @@ scp -P "$SSH_PORT" -i "$KEY" src/main.rs "$USER@$HOST:$REMOTE_DIR/src/main.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/config.rs "$USER@$HOST:$REMOTE_DIR/src/config.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/lib.rs "$USER@$HOST:$REMOTE_DIR/src/lib.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/risk.rs "$USER@$HOST:$REMOTE_DIR/src/risk.rs"
-scp -i "$KEY" src/notifications.rs "$USER@$HOST:$REMOTE_DIR/src/notifications.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/notifications.rs "$USER@$HOST:$REMOTE_DIR/src/notifications.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/market_validator.rs "$USER@$HOST:$REMOTE_DIR/src/market_validator.rs"
+# Copy strategy modules
+scp -P "$SSH_PORT" -i "$KEY" src/strategies/mod.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/mod.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/strategies/momentum.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/momentum.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/strategies/arbitrage.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/arbitrage.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/strategies/time_decay.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/time_decay.rs"
+# Copy helpers modules
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/mod.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/mod.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/price.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/price.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/json.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/json.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/time.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/time.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/balance.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/balance.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/nonce.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/nonce.rs"
 scp -P "$SSH_PORT" -i "$KEY" .env "$USER@$HOST:$REMOTE_DIR/.env"
 scp -P "$SSH_PORT" -i "$KEY" Cargo.toml "$USER@$HOST:$REMOTE_DIR/Cargo.toml"
 scp -P "$SSH_PORT" -i "$KEY" Cargo.lock "$USER@$HOST:$REMOTE_DIR/Cargo.lock"
@@ -51,6 +65,10 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" << 'REMOTE'
     docker system prune -af --volumes 2>/dev/null || true
 
     echo "🔨 Building Docker image once..."
+    echo "📊 Note: This build includes the market validator integration"
+    echo "   - Professional market filtering (crypto, time window, expiry)"
+    echo "   - Robust strike price extraction (4 pattern types)"
+    echo "   - Binary market support (no explicit strike needed)"
     docker build -t rustpolybot .
 
     echo "🚀 Starting BTC rustpolybot..."

@@ -1,6 +1,6 @@
 # RustPolyBot 🤖
 
-A high-frequency hybrid trading bot for Polymarket. This bot combines "Perfect-Hedge" arbitrage with "Oracle-Lag" momentum trading to maximize opportunities in both low-volatility and trending markets.
+A high-frequency hybrid trading bot for Polymarket combining **three independent strategies**: Momentum Trading, Perfect-Hedge Arbitrage, and Time Decay (Theta). Each strategy operates autonomously with its own entry/exit logic, risk controls, and profit targets.
 
 ---
 
@@ -26,37 +26,79 @@ A high-frequency hybrid trading bot for Polymarket. This bot combines "Perfect-H
 
 ---
 
+## Three-Strategy Architecture
+
+The bot automatically detects market conditions and applies the most appropriate strategy:
+
+### 🔥 **Momentum Trading** (High Risk / High Reward)
+- **Entry**: One-sided speculative trades when Binance price moves sharply before Polymarket adjusts
+- **Confirmation**: Requires multiple consecutive ticks (default: 2) to filter out false signals
+- **Exit**: 
+  - Take Profit: 3% gain
+  - Stop Loss: 5% loss
+  - Reversal: Momentum velocity drops below threshold
+- **Position Size**: $5 per trade (configurable)
+- **Best For**: Trending markets with sharp directional moves
+
+### 📈 **Arbitrage Trading** (Medium Risk / Steady)
+- **Entry**: Simultaneously buys YES and NO when combined price < $1.00
+- **Exit**: 
+  - Early Exit: When combined bid reaches safety ceiling (~99.5%)
+  - Standard Exit: Hedged exit for profit
+- **Position Size**: $10 per trade (configurable)
+- **Best For**: Stable, range-bound markets
+
+### 💰 **Time Decay Trading** (Low Risk / Passive) - *Currently Disabled*
+- **Entry**: Market-neutral YES+NO purchases when spread is attractive
+- **Exit**: Auto-exit when profit reaches 1.5% target
+- **No Manual Cleanup**: Completely automatic position management
+- **Position Size**: $3 per side (configurable)
+- **Best For**: Short-dated markets (hourly/5-minute expiry)
+- **Status**: Disabled pending refinement; can be re-enabled via config
+
+---
+
 ## Features
 
-- **Hybrid Strategy Engine**:
-    - **Arbitrage**: Simultaneously buys 'YES' and 'NO' when the sum is < $1.00 for a riskless profit.
-    - **Momentum**: Executes one-sided speculative trades when Binance prices move sharply before Polymarket adjusts.
-- **Advanced Safety Filters**:
-    - **Momentum Confirmation Ticks**: Requires multiple consecutive signal updates (configurable) before firing a trade to filter out "fakeouts" and single-tick outliers.
-    - **Minimum Liquidity Check**: Analyzes real-time order book depth; only fires orders if a configurable ratio (e.g., 80%) of the target size is available at the top-of-book.
-    - **Strike Buffer**: Momentum trades only fire when price is safely away from the strike price to avoid choppy oscillations.
-    - **Directional Lock**: Prevents buying the opposite side of an open momentum position to avoid "accidental arbitrage" at a loss.
-    - **Price Cap**: Automatically stops momentum buying if the token price exceeds a healthy risk/reward ratio.
-- **Comprehensive Exit Management**:
-    - **Tight Take Profit**: Captures quick spikes.
-    - **Stop Loss**: Limits downside on failed moves.
-    - **Momentum Reversal**: Exits immediately if the external oracle trend reverses.
-    - **Safety Ceiling**: Bot exits immediately if the bid reaches a safety ceiling to ensure capital recycling.
-- **Self-Healing Nonce Sync**: Automatically detects "invalid nonce" errors, re-synchronizes with the CLOB API, and retries the trade.
-- **Telegram Monitoring**: Real-time alerts for trade failures and emergency circuit breakers.
-- **Ghost Mode Testing**: Includes a `GHOST_MODE` flag to simulate all trades in the logs without spending real capital.
-- **Binance Oracle Integration**: Streams real-time ticker data to detect "Oracle Lag" in milliseconds.
-- **Ultra-Parallel Execution**: Pre-signs and posts legs simultaneously using Rust's `tokio` runtime.
+### Strategy Management
+- **Autonomous Strategy Selection**: Bot automatically chooses the best strategy based on market conditions
+- **Strategy Logging**: Startup logs clearly show which strategies are enabled:
+  ```
+  🎯 Strategies enabled: 🔥 Momentum Trading + 📈 Arbitrage Trading
+  ```
+- **Independent Configuration**: Each strategy has its own tunable parameters in `src/config.rs`
+- **Modular Architecture**: Strategies live in `src/strategies/` as independent modules, making them easy to test, debug, and extend
+
+### Advanced Safety Filters
+- **Momentum Confirmation Ticks**: Requires multiple consecutive signal updates to filter out "fakeouts"
+- **Minimum Liquidity Check**: Analyzes order book depth; only fires if sufficient liquidity exists
+- **Strike Buffer**: Momentum trades only fire when price is safely away from the strike
+- **Directional Lock**: Prevents "accidental arbitrage" at a loss
+- **Price Cap**: Stops momentum buying if token price exceeds healthy risk/reward ratio
+
+### Comprehensive Exit Management
+- **Tight Take Profit**: Captures quick moves across all strategies
+- **Stop Loss**: Limits downside on failed trades
+- **Momentum Reversal**: Exits immediately if oracle trend reverses
+- **Safety Ceiling**: Exits to ensure capital recycling
+- **Automatic Cleanup**: No manual position management needed
+
+### Advanced Infrastructure
+- **Self-Healing Nonce Sync**: Automatically detects and recovers from "invalid nonce" errors
+- **Telegram Monitoring**: Real-time alerts for trade failures and emergency circuit breakers
+- **Ghost Mode Testing**: Simulate all trades without spending real capital
+- **Binance Oracle Integration**: Real-time ticker data for oracle lag detection
+- **Ultra-Parallel Execution**: Pre-signs and posts orders simultaneously using Rust's `tokio` runtime
 
 ---
 
 ## Geographic Deployment & Latency
 
-Latency is a critical factor for the bot's success, particularly for the "Oracle Lag" strategy.
+Latency is critical for success, particularly for the "Oracle Lag" momentum strategy.
 
-- **The Strategy**: High-frequency trades rely on submitting an order before the exchange price fully adjusts to external market moves.
-- **Research Deployment**: Users must research the exchange's infrastructure and identify the optimal geographic region for deployment to minimize network round-trip time.
-- **Compliance First**: When choosing a deployment region, ensure that your hosting provider and the selected jurisdiction are compliant with your legal obligations.
+- **The Strategy**: High-frequency trades rely on submitting orders before exchange prices fully adjust to external moves.
+- **Research Deployment**: Identify optimal geographic regions to minimize network round-trip time.
+- **Compliance First**: Ensure your hosting jurisdiction complies with local trading regulations.
 
 ---
 
@@ -64,66 +106,115 @@ Latency is a critical factor for the bot's success, particularly for the "Oracle
 
 ### Prerequisites
 - **Rust 1.91+** or **Docker**
-- **Polygon Wallet**: An EOA with USDC and MATIC (for gas).
-- **Telegram Bot** (Optional): For remote monitoring.
+- **Polygon Wallet**: An EOA with USDC and MATIC (for gas)
+- **Telegram Bot** (Optional): For remote monitoring
 
-### Configuration (`.env` & `config.rs`)
+### Configuration (`.env` & `src/config.rs`)
 
 | Variable / Constant | Description | Default |
 |----------|-------------|---------|
-| `TRADE_SIZE_USDC` | Size for hedged arbitrage trades. | `10` |
-| `MOMENTUM_TRADE_SIZE_USDC` | Size for speculative momentum trades. | `5` |
-| `CRYPTO_FILTER` | Target asset (`btc`, `eth`, or `sol`). | `btc` |
-| `MOMENTUM_CONFIRMATION_TICKS` | Number of ticks required for momentum entry. | `2` |
-| `MIN_LIQUIDITY_FILL_RATIO` | Required depth ratio at top of book. | `0.80` |
-| `POLYMARKET_PRIVATE_KEY` | Your Polygon EOA private key. | `REQUIRED` |
-| `TELEGRAM_BOT_TOKEN` | Your Telegram Bot API token. | `OPTIONAL` |
-| `TELEGRAM_CHAT_ID` | Your Telegram Chat ID. | `OPTIONAL` |
+| `TRADE_SIZE_USDC` | Size for arbitrage trades | `10` |
+| `MOMENTUM_TRADE_SIZE_USDC` | Size for momentum trades | `5` |
+| `CRYPTO_FILTER` | Target asset (`btc`, `eth`, `sol`) | `btc` |
+| `ENABLE_MOMENTUM_TRADING` | Toggle momentum strategy | `true` |
+| `ENABLE_TIME_DECAY_TRADING` | Toggle time decay strategy | `false` |
+| `ARBITRAGE_PROFIT_THRESHOLD` | Min margin for arbitrage entry | `0.05` (5%) |
+| `MOMENTUM_CONFIRMATION_TICKS` | Signal confirmations before entry | `2` |
+| `MOMENTUM_TARGET_PROFIT_PERCENT` | Momentum take profit target | `0.03` (3%) |
+| `MOMENTUM_STOP_LOSS_PERCENT` | Momentum stop loss | `0.05` (5%) |
+| `MIN_LIQUIDITY_FILL_RATIO` | Required depth at top of book | `0.80` (80%) |
+| `POLYMARKET_PRIVATE_KEY` | Your Polygon EOA private key | `REQUIRED` |
+| `TELEGRAM_BOT_TOKEN` | Telegram Bot API token | `OPTIONAL` |
+| `TELEGRAM_CHAT_ID` | Telegram Chat ID | `OPTIONAL` |
 
 ### Deployment
+
 1. **Test first in Ghost Mode**:
-   Ensure `pub const GHOST_MODE: bool = true;` is set in `src/config.rs`. Run the bot and watch the logs for `👻 GHOST MODE` signals.
+   Set `pub const GHOST_MODE: bool = true;` in `src/config.rs`. Run and watch logs for simulated trades.
 
 2. **Go Live**:
-   Change `GHOST_MODE` to `false` in `src/config.rs` and rebuild:
    ```bash
+   # Edit config.rs to set GHOST_MODE = false
    cargo build --release
    ./target/release/rustpolybot
    ```
+
+3. **Docker Deployment** (Recommended):
+   ```bash
+   ./deploy-multi.sh
+   ```
+   This deploys BTC/ETH/SOL containers simultaneously with optimal resource allocation.
+
+---
+
+## Strategy Configuration Examples
+
+### Conservative (Low Risk)
+```rust
+ENABLE_MOMENTUM_TRADING = false              // Disable risky momentum trades
+ARBITRAGE_PROFIT_THRESHOLD = 0.08            // Higher margin requirement
+MIN_LIQUIDITY_FILL_RATIO = 0.90              // Only thick markets
+TRADE_SIZE_USDC = 5                          // Small position size
+```
+
+### Aggressive (High Volatility)
+```rust
+ENABLE_MOMENTUM_TRADING = true               // Enable momentum
+MOMENTUM_CONFIRMATION_TICKS = 1              // Faster entries
+MOMENTUM_TARGET_PROFIT_PERCENT = 0.02        // 2% take profit (capture quicker)
+MOMENTUM_STOP_LOSS_PERCENT = 0.08            // Wider stop loss
+TRADE_SIZE_USDC = 20                         // Larger positions
+```
+
+### Balanced (Default)
+```rust
+ENABLE_MOMENTUM_TRADING = true
+ENABLE_TIME_DECAY_TRADING = false
+ARBITRAGE_PROFIT_THRESHOLD = 0.05
+MOMENTUM_CONFIRMATION_TICKS = 2
+MOMENTUM_TARGET_PROFIT_PERCENT = 0.03
+TRADE_SIZE_USDC = 10
+```
 
 ---
 
 ## FAQ & Troubleshooting
 
-### Why are my orders being rejected even when the signal is right?
-Order rejections are often due to **Price Slippage** caused by network latency. The bot uses Fill-or-Kill (FAK) orders. If the order takes too long to reach the exchange, the market price may have moved beyond your limit price, causing the exchange to "Kill" the order. Reducing latency by deploying in an optimal geographic region is the primary fix for this.
+### Why are my orders being rejected?
+Order rejections are usually due to **Price Slippage** caused by network latency. The bot uses Fill-or-Kill (FAK) orders. If the order takes too long to reach the exchange, the market price may have moved beyond your limit price. Deploy closer to Polymarket's infrastructure to reduce latency.
 
-### EOA vs. Gnosis Safe: Which one should I use?
-If you are using a standard wallet (EOA) and encounter persistent "Unauthorized" or "Forbidden" errors when trying to trade, it is likely because your account hasn't been "onboarded" or enabled for direct EOA trading on the Polymarket CLOB. 
+### EOA vs. Gnosis Safe
+RustPolyBot defaults to **Gnosis Safe** (Maker address) for trading because:
+1. Standard for API Trading on Polymarket
+2. Many web-UI accounts use Gnosis Safe proxy under the hood
+3. Simplified authentication and onboarding
 
-**RustPolyBot defaults to Gnosis Safe** (Maker) address for trading. This is because:
-1. **Standard for API Trading**: Many Polymarket accounts created via the web UI actually use a Gnosis Safe proxy under the hood for gasless trading.
-2. **Simplified Onboarding**: The bot automatically derives your deterministic Gnosis Safe address from your EOA. This address is used as the "Maker" for all orders, which is often required for authentication to succeed if your EOA isn't explicitly whitelisted.
+The bot automatically derives your deterministic Gnosis Safe address from your EOA. This is usually the easiest path to success.
 
-If you specifically want to use an EOA, you would need to change the `SignatureType` to `EOA` in `main.rs` and ensure your EOA is correctly initialized on the CLOB. For most users, the default Gnosis Safe configuration is the "path of least resistance."
+### Why is the bot scanning but not trading?
+- **Spread/Fees**: Margin must exceed `ARBITRAGE_PROFIT_THRESHOLD` after fees
+- **Momentum Thresholds**: Asset-specific price moves must meet configured buffers
+- **Liquidity**: Order book may be too thin for your position size
+- **Ghost Mode**: Check if `GHOST_MODE` is still enabled
 
-### Why did the bot fail with "invalid nonce"?
-Nonces are sequence numbers used to prevent replay attacks. If you use your wallet elsewhere (e.g., via the Polymarket UI), the bot's local counter will fall behind. RustPolyBot automatically detects this, fetches the correct nonce from the API, and retries the trade.
+### What does "Emergency Stopping" mean?
+If the bot encounters **3 consecutive persistent failures**, it triggers a circuit breaker and shuts down (safety feature). You'll receive a Telegram notification. Check logs and re-enable manually.
 
-### Why does the bot keep scanning but not trading?
-- **Spread/Fees**: The arbitrage logic requires the margin to be higher than `ARBITRAGE_PROFIT_THRESHOLD` *after* accounting for fees.
-- **Momentum Thresholds**: Asset-specific price moves and buffers must be met as defined in `config.rs`.
-- **Liquidity Check**: The order book may be too thin at the moment to support your `TRADE_SIZE_USDC`.
-- **Ghost Mode**: Check if `GHOST_MODE` is still enabled.
+### How do I enable/disable individual strategies?
+Edit `src/config.rs`:
+```rust
+pub const ENABLE_MOMENTUM_TRADING = true;          // Toggle momentum
+pub const ENABLE_TIME_DECAY_TRADING = false;       // Toggle time decay
+pub const ARBITRAGE_PROFIT_THRESHOLD = dec!(0.05); // Set to 0 to disable arbitrage
+```
 
-### The bot says "Emergency Stopping". What happened?
-If the bot encounters **3 consecutive persistent failures** (meaning a trade failed even after a nonce re-sync), it will trigger a circuit breaker and shut down. This is a safety feature to protect your wallet. You will receive a Telegram notification if this happens.
+Then rebuild and redeploy.
 
 ---
 
 ## Performance Tuning (HFT Mode)
 
-To achieve the lowest possible latency (~15-30ms execution), apply these host-level optimizations if running on Linux:
+For lowest possible latency (~15-30ms execution) on Linux:
 
 ### 1. Host Kernel Tuning
 ```bash
@@ -134,15 +225,38 @@ sudo sysctl -w net.ipv4.tcp_slow_start_after_idle=0
 ```
 
 ### 2. Docker Container
-Run with high-priority resource allocations: `--network host --cpus="1.0" --cpu-shares=1024`
+Run with high-priority resources: `--network host --cpus="1.0" --cpu-shares=1024`
 
 ---
 
-## Future Enhancements (TODO)
+## Architecture
 
-- [ ] **Maker Support**: Transition to earning rebates by placing limit orders at the best bid.
-- [ ] **Advanced Book Walking**: Analyze order book depth up to 5 levels to calculate VWAP for larger orders.
-- [ ] **Multi-Outcome Arbitrage**: Support markets with 3+ outcomes.
+```
+src/
+├── main.rs                    # Main orchestrator & market loop
+├── lib.rs                     # Module exports
+├── config.rs                  # All tunable parameters
+├── risk.rs                    # Risk engine & exposure tracking
+├── notifications.rs           # Telegram alerts
+└── strategies/
+    ├── mod.rs                 # Strategy module registry
+    ├── momentum.rs            # Momentum trading logic
+    ├── arbitrage.rs           # Arbitrage trading logic
+    └── time_decay.rs          # Time decay (theta) trading
+```
+
+Each strategy is independently testable and can be enabled/disabled via configuration.
+
+---
+
+## Future Enhancements
+
+- [ ] **Time Decay Re-implementation**: Fix and enable automatic time decay trading
+- [ ] **Maker Support**: Earn rebates by providing liquidity
+- [ ] **Advanced Book Walking**: Calculate VWAP for larger orders
+- [ ] **Multi-Outcome Arbitrage**: Support 3+ outcome markets
+- [ ] **Mean Reversion**: Add counter-trend trading strategy
+- [ ] **Grid Trading**: Automated grid-based position accumulation
 
 ---
 
