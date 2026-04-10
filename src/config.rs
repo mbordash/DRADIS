@@ -33,7 +33,7 @@ pub const MIN_ORDER_USDC: Decimal = dec!(1.05);
 pub const MIN_LIQUIDITY_FILL_RATIO: Decimal = dec!(0.80);
 
 /// Price offset added to the ask price when placing buy orders to ensure aggressive fills.
-pub const BUY_PRICE_OFFSET: Decimal = dec!(0.03);
+pub const BUY_PRICE_OFFSET: Decimal = dec!(0.01);
 
 /// Maximum price for a single share when placing a buy order.
 pub const MAX_BUY_LIMIT_PRICE: Decimal = dec!(0.99);
@@ -77,15 +77,49 @@ pub const ETH_STRIKE_BUFFER: Decimal = dec!(5.0);
 pub const SOL_STRIKE_BUFFER: Decimal = dec!(0.2);
 
 /// Maximum token price allowed for a momentum entry.
-pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.75);
+/// Increased from 0.65 to 0.85 to allow entries when markets are in normal range (e.g., $0.51 to $0.49)
+pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.85);
 
 /// The time window (in seconds) used to calculate price velocity from Binance.
 pub const MOMENTUM_WINDOW_SECS: u64 = 10;
 
 /// Price change threshold (absolute USD) within the window to trigger a signal.
-pub const BTC_MOMENTUM_THRESHOLD: Decimal = dec!(50.0);
+/// Increased BTC from 80 to 100 to filter out noise and catch more mature momentum moves.
+pub const BTC_MOMENTUM_THRESHOLD: Decimal = dec!(100.0);
 pub const ETH_MOMENTUM_THRESHOLD: Decimal = dec!(5.0);
 pub const SOL_MOMENTUM_THRESHOLD: Decimal = dec!(0.5);
+
+
+// ============================================================================
+// TIME DECAY (THETA) STRATEGY PARAMETERS
+// ============================================================================
+
+/// Allow time decay trading (exploits YES+NO convergence to $1.00)
+pub const ENABLE_TIME_DECAY_TRADING: bool = true;
+
+/// Minimum spread (YES_ask + NO_ask spread) to trigger entry
+pub const MIN_TIME_DECAY_SPREAD: Decimal = dec!(0.01);
+
+/// Market must be at least this old (seconds) before entering
+pub const TIME_DECAY_MIN_MARKET_AGE_SECS: i64 = 1200;  // 20 minutes
+
+/// Don't enter if market is older than this (seconds)
+pub const TIME_DECAY_MAX_MARKET_AGE_SECS: i64 = 3300;  // 55 minutes
+
+/// Base position size for time decay (per side: YES and NO)
+pub const TIME_DECAY_POSITION_SIZE_USDC: Decimal = dec!(5);
+
+/// Auto-exit when profit reaches this percentage
+pub const TIME_DECAY_TARGET_PROFIT_PERCENT: Decimal = dec!(0.015);  // 1.5% profit target
+
+/// Maximum combined exposure in time decay positions
+pub const TIME_DECAY_MAX_TOTAL_EXPOSURE_USDC: Decimal = dec!(50);
+
+/// Maximum number of simultaneous time decay positions
+pub const TIME_DECAY_MAX_POSITIONS: usize = 5;
+
+/// Exit if spread widens more than this (lose this much)
+pub const TIME_DECAY_STOP_LOSS_PERCENT: Decimal = dec!(0.005);  // Stop at 0.5% loss
 
 
 // ============================================================================
@@ -118,13 +152,18 @@ pub const TRADE_COOLDOWN_SECS: i64 = 8;
 pub const PARTIAL_FILL_COOLDOWN_SECS: i64 = 30;
 
 /// Minimum time until market expiry to still allow new position entry (seconds)
-pub const MIN_SECONDS_TO_EXPIRY_FOR_ENTRY: i64 = 60;
+/// Increased from 60 to 300 to ensure markets don't expire while trading executes
+pub const MIN_SECONDS_TO_EXPIRY_FOR_ENTRY: i64 = 300;
 
 /// Maximum time until market expiry to consider a market (seconds, 4 hours)
 pub const MAX_SECONDS_TO_EXPIRY_FOR_ENTRY: i64 = 14400;
 
 /// Final expiry window: stops all trading this close to market close (seconds, 10 minutes)
 pub const FINAL_EXPIRY_WINDOW_SECS: i64 = 600;
+
+/// Safety buffer to re-check market expiry before each trade (seconds)
+/// Prevents selecting markets that expire during order execution
+pub const MARKET_EXPIRY_SAFETY_BUFFER_SECS: i64 = 180;
 
 
 // ============================================================================
