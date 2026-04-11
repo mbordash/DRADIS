@@ -12,7 +12,25 @@ pub async fn fetch_strike_price_from_close_time(
     close_time: Option<DateTime<Utc>>,
 ) -> Option<Decimal> {
     let close_time = close_time?;
-    let utc_millis = close_time.timestamp_millis();
+    let now = Utc::now();
+
+    // If close_time is in the future, the market hasn't closed yet.
+    // Use close_time - 1 hour as the reference (approximates the market start/reference time
+    // for standard hourly markets like "Bitcoin Up or Down - April 7, 9AM ET").
+    // If even that is in the future (very short window), fall back to the latest completed minute.
+    let reference_time = if close_time > now {
+        let one_hour_before = close_time - chrono::Duration::hours(1);
+        if one_hour_before < now - chrono::Duration::minutes(1) {
+            one_hour_before
+        } else {
+            // Market window is shorter than 1 hour; use the latest available candle
+            now - chrono::Duration::minutes(1)
+        }
+    } else {
+        close_time
+    };
+
+    let utc_millis = reference_time.timestamp_millis();
 
     let binance_symbol = match filter {
         "eth" => "ETHUSDT",
