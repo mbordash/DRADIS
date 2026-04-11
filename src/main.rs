@@ -29,6 +29,7 @@ use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::str::FromStr as _;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::{watch, Mutex};
 use tokio::time::{interval, Instant, Duration};
 
@@ -732,6 +733,8 @@ async fn main() -> Result<()> {
 
         let mut momentum_fired_for_current_market = false;
         let mut consecutive_momentum_signals = 0u32;
+        let mut last_momentum_rejection_log = Instant::now() - std::time::Duration::from_secs(10);
+        let momentum_exit_in_progress = Arc::new(AtomicBool::new(false));
 
         loop {
             tokio::select! {
@@ -770,16 +773,17 @@ async fn main() -> Result<()> {
 
                     if yes_ask != dec!(1) && no_ask != dec!(1) {
                         if let Some(strike) = strike_price {
-                            info!("💓 Heartbeat | Poly Sum ${:.4} | Binance: ${:.2} | Strike: ${:.2} | Diff: ${:.2} | Velocity: ${:.2}",
-                                yes_ask + no_ask, binance_price, strike, binance_price - strike, binance_velocity);
+                            info!("💓 Heartbeat | Poly Sum ${:.4} (Y ${:.2} / N ${:.2}) | Binance: ${:.2} | Strike: ${:.2} | Diff: ${:.2} | Velocity: ${:.2}",
+                                yes_ask + no_ask, yes_ask, no_ask, binance_price, strike, binance_price - strike, binance_velocity);
                         } else {
-                            info!("💓 Heartbeat | Poly Sum ${:.4} | Binance: ${:.2} | Velocity: ${:.2} (binary, no strike)",
-                                yes_ask + no_ask, binance_price, binance_velocity);
+                            info!("💓 Heartbeat | Poly Sum ${:.4} (Y ${:.2} / N ${:.2}) | Binance: ${:.2} | Velocity: ${:.2} (binary, no strike)",
+                                yes_ask + no_ask, yes_ask, no_ask, binance_price, binance_velocity);
                         }
                     }
                 }
                 _ = market_rx.changed() => {
                     info!("🔄 Market change detected in trading loop — restarting for new market...");
+                    momentum_exit_in_progress.store(false, Ordering::Relaxed);
 
                     // Close any open time decay positions before switching markets
                     let td_to_close: Vec<TimeDecayPosition> = {
@@ -890,8 +894,8 @@ async fn main() -> Result<()> {
                     if yes_ask == dec!(1) || no_ask == dec!(1) { continue; }
 
                     // --- Momentum Take Profit Logic (EXPLICITLY FIRST) ---
-                    {
-                        let mut pos_map = positions.lock().await;
+                    if !momentum_exit_in_progress.load(Ordering::Relaxed) {
+                        let pos_map = positions.lock().await;
                         let yes_pos = pos_map.get(&yes_token).cloned();
                         let no_pos  = pos_map.get(&no_token).cloned();
 
@@ -961,6 +965,8 @@ async fn main() -> Result<()> {
                         }
 
                         if let Some(token) = exit_token {
+                            momentum_exit_in_progress.store(true, Ordering::Relaxed);
+                            let eip_handle = Arc::clone(&momentum_exit_in_progress);
                             let client = Arc::clone(&trading_client);
                             let signer = signer.clone();
                             let nm = Arc::clone(&nonce_manager);
@@ -972,8 +978,12 @@ async fn main() -> Result<()> {
                             let pnl_handle = Arc::clone(&total_pnl);
                             tokio::spawn(async move {
                                 let mut current_shares = exit_shares;
-                                for attempt in 0..4 {
-                                    if current_shares < config::MIN_ORDER_SHARES { return Ok(()); }
+                                let mut current_exit_price = exit_price;
+                                for attempt in 0..5 {
+                                    if current_shares < config::MIN_ORDER_SHARES {
+                                        eip_handle.store(false, Ordering::Relaxed);
+                                        return Ok(());
+                                    }
 
                                     let mut guard = nm.lock().await;
                                     let current_nonce = *guard;
@@ -990,9 +1000,12 @@ async fn main() -> Result<()> {
                                     if truncated_shares != current_shares && truncated_shares > dec!(0) {
                                         debug!("📍 Precision: Truncating {} → {} shares to fit balance constraint", current_shares, truncated_shares);
                                     }
-                                    if truncated_shares < config::MIN_ORDER_SHARES { return Ok(()); }
+                                    if truncated_shares < config::MIN_ORDER_SHARES {
+                                        eip_handle.store(false, Ordering::Relaxed);
+                                        return Ok(());
+                                    }
                                     order_struct.makerAmount = U256::from(to_fixed_u128(truncated_shares));
-                                    order_struct.takerAmount = U256::from(to_fixed_u128(truncated_shares * exit_price));
+                                    order_struct.takerAmount = U256::from(to_fixed_u128(truncated_shares * current_exit_price));
                                     order_struct.expiration = U256::ZERO;
                                     order_struct.nonce = U256::from(current_nonce);
                                     order_struct.feeRateBps = U256::from(exit_fee_rate);
@@ -1018,32 +1031,30 @@ async fn main() -> Result<()> {
 
                                         match client.post_order(signed_order).await {
                                             Ok(_) => {
-                                                info!("🚀 LIVE MOMENTUM EXIT FILLED: {} shares of token {} @ ${:.2}", current_shares, token, exit_price);
+                                                info!("🚀 LIVE MOMENTUM EXIT FILLED: {} shares of token {} @ ${:.2}", current_shares, token, current_exit_price);
                                                 let mut pm = pos_handle.lock().await;
                                                 pm.remove(&token);
                                                 drop(pm);
-                                                let realized_pnl = current_shares * (exit_price - exit_avg_entry);
+                                                let realized_pnl = current_shares * (current_exit_price - exit_avg_entry);
                                                 *pnl_handle.lock().await += realized_pnl;
-                                                info!("📊 Momentum Exit P&L: ${:.4} (entry ${:.2} → exit ${:.2})", realized_pnl, exit_avg_entry, exit_price);
+                                                info!("📊 Momentum Exit P&L: ${:.4} (entry ${:.2} → exit ${:.2})", realized_pnl, exit_avg_entry, current_exit_price);
                                                 *guard += 1;
+                                                eip_handle.store(false, Ordering::Relaxed);
                                                 return Ok(());
                                             },
                                             Err(e) => {
                                                 let err_msg = format!("{:?}", e).to_lowercase();
                                                 drop(guard);
 
-                                                if err_msg.contains("invalid nonce") && attempt < 3 {
+                                                if err_msg.contains("invalid nonce") && attempt < 4 {
                                                     warn!("⚠️ Invalid nonce in momentum exit (attempt {}). Re-syncing for Maker {}...", attempt + 1, safe_address);
                                                     sync_nonce_manager(&nm, &sh, safe_address).await;
-                                                    // Add backoff delay after nonce resync to avoid race conditions
                                                     tokio::time::sleep(Duration::from_millis(200 * ((attempt as u64) + 1))).await;
                                                     continue;
-                                                } else if (err_msg.contains("not enough balance") || err_msg.contains("not enough allowance")) && attempt < 3 {
+                                                } else if (err_msg.contains("not enough balance") || err_msg.contains("not enough allowance")) && attempt < 4 {
                                                     if let Some(actual_balance) = parse_balance_from_error(&err_msg) {
                                                         if actual_balance == dec!(0) {
                                                             warn!("⚠️ Balance is 0 in momentum exit (likely indexer lag). Waiting 2s and retrying...");
-                                                            // Don't give up! The indexer might just be catching up
-                                                            // Sleep and retry instead of clearing the position
                                                             tokio::time::sleep(Duration::from_millis(2000)).await;
                                                             continue;
                                                         }
@@ -1051,7 +1062,17 @@ async fn main() -> Result<()> {
                                                         current_shares = actual_balance;
                                                         continue;
                                                     }
+                                                } else if (err_msg.contains("no orders found to match") || err_msg.contains("fak")) && attempt < 4 {
+                                                    // FAK found no matching bids — lower the sell price and retry
+                                                    let new_price = (current_exit_price - dec!(0.02)).max(config::MIN_SELL_LIMIT_PRICE);
+                                                    warn!("⚠️ FAK exit found no matching bids at ${:.2}. Lowering to ${:.2} and retrying (attempt {})...", current_exit_price, new_price, attempt + 1);
+                                                    current_exit_price = new_price;
+                                                    tokio::time::sleep(Duration::from_millis(500)).await;
+                                                    continue;
                                                 }
+                                                // All retries exhausted or unrecoverable error — restore position for main loop retry
+                                                warn!("⚠️ Momentum exit failed after attempt {}. Position preserved for retry on next tick.", attempt + 1);
+                                                eip_handle.store(false, Ordering::Relaxed);
                                                 let msg = format!("❌ [RustPolyBot] Momentum Exit Order Failed (Attempt {}): {:?}", attempt + 1, e);
                                                 let _ = send_notification(&tt, &tc, &msg).await;
                                                 error!("{}", msg);
@@ -1060,16 +1081,20 @@ async fn main() -> Result<()> {
                                         }
                                     } else {
                                         drop(guard);
+                                        eip_handle.store(false, Ordering::Relaxed);
                                         let msg = format!("❌ [RustPolyBot] Momentum Exit Order Signing Failed (Attempt {}): {:?}", attempt + 1, token);
                                         let _ = send_notification(&tt, &tc, &msg).await;
                                         error!("{}", msg);
                                         return Err(anyhow::anyhow!(msg));
                                     }
                                 }
+                                // Max retries exhausted — position stays in pos_map for main loop retry
+                                eip_handle.store(false, Ordering::Relaxed);
+                                warn!("⚠️ Momentum exit max retries reached. Position preserved for retry on next tick.");
                                 Err(anyhow::anyhow!("Max retries reached for momentum exit"))
                             });
-                            // Optimistic clear locally
-                            if let Some(p) = pos_map.get_mut(&token) { p.shares = dec!(0); }
+                            // Don't clear position — the spawned task handles it on success,
+                            // or preserves it on failure so the main loop can retry
                             trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
                             continue;
                         }
@@ -1150,8 +1175,9 @@ async fn main() -> Result<()> {
                                         String::new()
                                     }
                                 };
-                                if !reason.is_empty() {
-                                    debug!("⏭️ Momentum signal rejected at filter stage: {} (Velocity: ${:.2}, Threshold: ${:.2})", reason, velocity, threshold);
+                                if !reason.is_empty() && last_momentum_rejection_log.elapsed().as_secs() >= 1 {
+                                    warn!("⏭️ Momentum signal rejected: {} (Velocity: ${:.2}, Threshold: ${:.2}) | YES ask: ${:.4} | NO ask: ${:.4}", reason, velocity, threshold, yes_ask, no_ask);
+                                    last_momentum_rejection_log = Instant::now();
                                 }
                             }
                         }
@@ -1181,8 +1207,11 @@ async fn main() -> Result<()> {
                                 debug!("⏳ Momentum signal confirmed, waiting for additional confirmation ({} of {} ticks required)", consecutive_momentum_signals, config::MOMENTUM_CONFIRMATION_TICKS);
                             }
                         } else {
+                            let prev_ticks = consecutive_momentum_signals;
                             consecutive_momentum_signals = 0;
-                            debug!("⏸️  Momentum signal lost (was at {} ticks)", consecutive_momentum_signals);
+                            if prev_ticks > 0 {
+                                debug!("⏸️  Momentum signal lost (was at {} ticks)", prev_ticks);
+                            }
                         }
 
                         if let Some(token) = momentum_token {
@@ -1211,10 +1240,10 @@ async fn main() -> Result<()> {
 
                                 if !should_proceed {
                                     if let Some(s) = strike_price {
-                                        debug!("⏭️ MOMENTUM ENTRY CANCELLED: Market conditions changed (Velocity: ${:.2}, Price: ${:.2} vs Strike+Buffer ${:.2})",
-                                            velocity, binance_price, if token == yes_token { s + strike_buffer } else { s - strike_buffer });
+                                        warn!("⏭️ MOMENTUM ENTRY CANCELLED: Market conditions changed (Velocity: ${:.2}, Price: ${:.2} vs Strike±Buffer ${:.2}, Ask: ${:.4})",
+                                            velocity, binance_price, if token == yes_token { s + strike_buffer } else { s - strike_buffer }, if token == yes_token { yes_ask } else { no_ask });
                                     } else {
-                                        debug!("⏭️ MOMENTUM ENTRY CANCELLED: Velocity or ask price threshold not met (Velocity: ${:.2}, Threshold: ${:.2}, Ask: ${:.2})",
+                                        warn!("⏭️ MOMENTUM ENTRY CANCELLED: Velocity or ask price threshold not met (Velocity: ${:.2}, Threshold: ${:.2}, Ask: ${:.4})",
                                             velocity.abs(), threshold, if token == yes_token { yes_ask } else { no_ask });
                                     }
                                     consecutive_momentum_signals = 0;
