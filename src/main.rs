@@ -566,12 +566,17 @@ async fn main() -> Result<()> {
     // Use new market validator for strike extraction
     let mut initial_strike = rustpolybot::market_validator::extract_strike_price(&name);
     if initial_strike.is_none() {
-        // For binary markets without explicit strike, this is expected
         if name.to_lowercase().contains("up or down") {
-            info!("📊 Binary market detected - will use Binance price at market close time");
+            info!("📊 Binary market detected - checking description and name for reference time...");
         } else {
             info!("🔎 Name strike not found, attempting historical description lookup...");
-            initial_strike = fetch_historical_strike_price(&shared_http, &crypto_filter, &desc).await;
+        }
+        // Always try description lookup for all market types (including binary "up or down" markets)
+        initial_strike = fetch_historical_strike_price(&shared_http, &crypto_filter, &desc).await;
+        // Fallback: also scan the market name itself for date/time patterns
+        // e.g. "Bitcoin Up or Down - April 7, 9AM ET" → parses 9AM ET as reference time
+        if initial_strike.is_none() {
+            initial_strike = fetch_historical_strike_price(&shared_http, &crypto_filter, &name).await;
         }
     }
     if initial_strike.is_none() {
@@ -650,7 +655,12 @@ async fn main() -> Result<()> {
             // Use new market validator for strike extraction
             let mut strike = rustpolybot::market_validator::extract_strike_price(&candidate.2);
             if strike.is_none() {
+                // Try description for date/time patterns (e.g. "april 7, 9am")
                 strike = fetch_historical_strike_price(&http_monitor, &crypto_filter_monitor, &candidate.4).await;
+            }
+            // Fallback: also scan the market name itself (e.g. "Bitcoin Up or Down - April 7, 9AM ET")
+            if strike.is_none() {
+                strike = fetch_historical_strike_price(&http_monitor, &crypto_filter_monitor, &candidate.2).await;
             }
             if strike.is_none() {
                 strike = fetch_strike_price_from_close_time(&http_monitor, &crypto_filter_monitor, candidate.6).await;
