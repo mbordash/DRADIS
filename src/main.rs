@@ -735,8 +735,22 @@ async fn main() -> Result<()> {
                 _ = cleanup_ticker.tick() => {
                     cleanup_expired_positions(Arc::clone(&positions), market_name.clone(), yes_token, no_token, market_close_time).await;
 
-                    // TIME DECAY exit monitoring - Disabled for now
-                    // TODO: Re-enable after fixing compilation issues
+                    // Clean up expired time decay positions
+                    {
+                        let mut td_map = time_decay_positions.lock().await;
+                        let before_count = td_map.len();
+                        td_map.retain(|_, pos| {
+                            if pos.is_expired() {
+                                warn!("🧹 Removing expired time decay position (YES: {}, NO: {})", pos.yes_token_id, pos.no_token_id);
+                                false
+                            } else {
+                                true
+                            }
+                        });
+                        if td_map.len() < before_count {
+                            info!("✅ Cleaned up {} expired time decay positions", before_count - td_map.len());
+                        }
+                    }
                 }
                 _ = status_ticker.tick() => {
                     let (_, yes_ask, _) = *yes_price_rx.borrow();
@@ -756,6 +770,95 @@ async fn main() -> Result<()> {
                 }
                 _ = market_rx.changed() => {
                     info!("🔄 Market change detected in trading loop — restarting for new market...");
+
+                    // Close any open time decay positions before switching markets
+                    let td_to_close: Vec<TimeDecayPosition> = {
+                        let mut td_map = time_decay_positions.lock().await;
+                        td_map.drain().map(|(_, v)| v).collect()
+                    };
+
+                    if !td_to_close.is_empty() {
+                        let (last_yes_bid, _, _) = *yes_price_rx.borrow();
+                        let (last_no_bid, _, _) = *no_price_rx.borrow();
+                        let client_switch = Arc::clone(&trading_client);
+                        let signer_switch = signer.clone();
+                        let nm_switch = Arc::clone(&nonce_manager);
+                        let pnl_switch = Arc::clone(&total_pnl);
+                        let sh_switch = Arc::clone(&shared_http);
+
+                        tokio::spawn(async move {
+                            for td_pos in td_to_close {
+                                let exit_yes = (last_yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                let exit_no = (last_no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
+                                let owner = client_switch.credentials().key();
+                                info!("🧹 Closing TD position on market switch (YES: {}, NO: {})", td_pos.yes_token_id, td_pos.no_token_id);
+
+                                // Sell YES side
+                                let yes_ok = {
+                                    let mut guard = nm_switch.lock().await;
+                                    let current_nonce = *guard;
+                                    let mut order_struct = Order::default();
+                                    order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
+                                    order_struct.maker = safe_address; order_struct.signer = eoa_address;
+                                    order_struct.tokenId = td_pos.yes_token_id;
+                                    order_struct.makerAmount = U256::from(to_fixed_u128(td_pos.position_size));
+                                    order_struct.takerAmount = U256::from(to_fixed_u128(td_pos.position_size * exit_yes));
+                                    order_struct.expiration = U256::ZERO; order_struct.nonce = U256::from(current_nonce);
+                                    order_struct.feeRateBps = U256::from(yes_fee_rate);
+                                    order_struct.side = Side::Sell as u8; order_struct.signatureType = SignatureType::GnosisSafe as u8;
+                                    let domain = Eip712Domain { name: Some(Cow::Borrowed(ORDER_NAME)), version: Some(Cow::Borrowed(VERSION)), chain_id: Some(U256::from(POLYGON)), verifying_contract: Some(verifying_contract), ..Eip712Domain::default() };
+                                    let hash = order_struct.eip712_signing_hash(&domain);
+                                    if let Ok(signature) = signer_switch.sign_hash(&hash).await {
+                                        let signed_order = SignedOrder::builder().order(order_struct).signature(signature).order_type(OrderType::FAK).owner(owner).build();
+                                        match client_switch.post_order(signed_order).await {
+                                            Ok(_) => { *guard += 1; true },
+                                            Err(e) => {
+                                                warn!("⚠️ TD market-switch YES exit failed: {:?}", e);
+                                                drop(guard);
+                                                sync_nonce_manager(&nm_switch, &sh_switch, safe_address).await;
+                                                false
+                                            }
+                                        }
+                                    } else { false }
+                                };
+
+                                // Sell NO side
+                                let no_ok = {
+                                    let mut guard = nm_switch.lock().await;
+                                    let current_nonce = *guard;
+                                    let mut order_struct = Order::default();
+                                    order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
+                                    order_struct.maker = safe_address; order_struct.signer = eoa_address;
+                                    order_struct.tokenId = td_pos.no_token_id;
+                                    order_struct.makerAmount = U256::from(to_fixed_u128(td_pos.position_size));
+                                    order_struct.takerAmount = U256::from(to_fixed_u128(td_pos.position_size * exit_no));
+                                    order_struct.expiration = U256::ZERO; order_struct.nonce = U256::from(current_nonce);
+                                    order_struct.feeRateBps = U256::from(no_fee_rate);
+                                    order_struct.side = Side::Sell as u8; order_struct.signatureType = SignatureType::GnosisSafe as u8;
+                                    let domain = Eip712Domain { name: Some(Cow::Borrowed(ORDER_NAME)), version: Some(Cow::Borrowed(VERSION)), chain_id: Some(U256::from(POLYGON)), verifying_contract: Some(verifying_contract), ..Eip712Domain::default() };
+                                    let hash = order_struct.eip712_signing_hash(&domain);
+                                    if let Ok(signature) = signer_switch.sign_hash(&hash).await {
+                                        let signed_order = SignedOrder::builder().order(order_struct).signature(signature).order_type(OrderType::FAK).owner(owner).build();
+                                        match client_switch.post_order(signed_order).await {
+                                            Ok(_) => { *guard += 1; true },
+                                            Err(e) => {
+                                                warn!("⚠️ TD market-switch NO exit failed: {:?}", e);
+                                                false
+                                            }
+                                        }
+                                    } else { false }
+                                };
+
+                                // Track P&L for market-switch exits
+                                if yes_ok || no_ok {
+                                    let realized_pnl = td_pos.position_size * ((exit_yes + exit_no) - (td_pos.yes_entry_price + td_pos.no_entry_price));
+                                    *pnl_switch.lock().await += realized_pnl;
+                                    info!("📊 TD Market-Switch Exit P&L: ${:.4} ({})", realized_pnl, if yes_ok && no_ok { "both sides filled" } else { "partial fill" });
+                                }
+                            }
+                        });
+                    }
+
                     break;
                 }
                 _ = ticker.tick() => {
@@ -786,6 +889,7 @@ async fn main() -> Result<()> {
                         let mut exit_price = dec!(0);
                         let mut exit_shares = dec!(0);
                         let mut exit_fee_rate = 0;
+                        let mut exit_avg_entry = dec!(0);
 
                         let velocity = *velocity_rx.borrow();
                         let threshold = match crypto_filter.as_str() {
@@ -814,6 +918,7 @@ async fn main() -> Result<()> {
                                     exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                     exit_shares = yp.shares;
                                     exit_fee_rate = yes_fee_rate;
+                                    exit_avg_entry = yp.avg_entry;
                                 }
                             }
                         }
@@ -839,6 +944,7 @@ async fn main() -> Result<()> {
                                         exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                         exit_shares = np.shares;
                                         exit_fee_rate = no_fee_rate;
+                                        exit_avg_entry = np.avg_entry;
                                     }
                                 }
                             }
@@ -853,6 +959,7 @@ async fn main() -> Result<()> {
                             let tt = tg_token.clone();
                             let tc = tg_chat_id.clone();
                             let pos_handle = Arc::clone(&positions);
+                            let pnl_handle = Arc::clone(&total_pnl);
                             tokio::spawn(async move {
                                 let mut current_shares = exit_shares;
                                 for attempt in 0..4 {
@@ -904,6 +1011,10 @@ async fn main() -> Result<()> {
                                                 info!("🚀 LIVE MOMENTUM EXIT FILLED: {} shares of token {} @ ${:.2}", current_shares, token, exit_price);
                                                 let mut pm = pos_handle.lock().await;
                                                 pm.remove(&token);
+                                                drop(pm);
+                                                let realized_pnl = current_shares * (exit_price - exit_avg_entry);
+                                                *pnl_handle.lock().await += realized_pnl;
+                                                info!("📊 Momentum Exit P&L: ${:.4} (entry ${:.2} → exit ${:.2})", realized_pnl, exit_avg_entry, exit_price);
                                                 *guard += 1;
                                                 return Ok(());
                                             },
@@ -1439,7 +1550,13 @@ async fn main() -> Result<()> {
                                                 } else { return Err(anyhow::anyhow!("Signing failed")); }
                                             }
                                         };
-                                        let _ = tokio::join!(yes_exit_task, no_exit_task);
+                                        let (yes_exit_res, no_exit_res) = tokio::join!(yes_exit_task, no_exit_task);
+                                        if yes_exit_res.is_ok() || no_exit_res.is_ok() {
+                                            let realized_pnl = td_position.position_size * ((exit_price_yes + exit_price_no) - (td_position.yes_entry_price + td_position.no_entry_price));
+                                            *total_pnl.lock().await += realized_pnl;
+                                            info!("📊 Time Decay Exit P&L: ${:.4} (entry ${:.4}, exit ${:.4})", realized_pnl,
+                                                td_position.yes_entry_price + td_position.no_entry_price, exit_price_yes + exit_price_no);
+                                        }
                                     }
                                 }
                             }
