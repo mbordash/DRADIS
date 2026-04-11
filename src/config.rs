@@ -60,10 +60,10 @@ pub const MOMENTUM_CONFIRMATION_TICKS: u32 = 2;
 
 /// Dynamic Take Profit: Exit if we gain this % over our entry price.
 /// Lowered to 3% to capture quick moves in volatile markets.
-pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.03);
+pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.05);
 
 /// Stop Loss: Exit if we lose this % from our entry price.
-pub const MOMENTUM_STOP_LOSS_PERCENT: Decimal = dec!(0.05);
+pub const MOMENTUM_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
 
 /// Reversal Exit: Exit if momentum velocity drops below this % of the entry threshold.
 pub const MOMENTUM_REVERSAL_RATIO: Decimal = dec!(0.20);
