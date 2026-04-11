@@ -1,108 +1,110 @@
+/// Time Decay (Theta) Strategy
+///
+/// Exploits YES+NO price convergence toward $1.00 as hourly markets approach expiry.
+///
+/// Two modes:
+/// - **Settlement**: combined_ask < $1.00 after fees → hold to settlement for guaranteed profit
+/// - **Convergence**: combined_ask slightly above $1.00 (up to MAX) → exit when bids converge
+
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use chrono::{DateTime, Utc};
 use alloy::primitives::U256;
 
+use crate::config;
+
+// ============================================================================
+// Types
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ThetaMode {
+    /// Combined ask < $1.00 after fees — hold to settlement for guaranteed profit
+    Settlement,
+    /// Combined ask slightly > $1.00 — exit before settlement when bids converge
+    Convergence,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThetaSignal {
+    pub mode: ThetaMode,
+    pub combined_ask: Decimal,
+    pub net_profit_per_share: Decimal,
+    pub total_fees: Decimal,
+}
+
+// ============================================================================
+// Strategy
+// ============================================================================
+
 pub struct TimeDecayStrategy;
 
 impl TimeDecayStrategy {
-    /// Check if time decay opportunity exists
-    /// Returns the theoretical profit if we buy both sides now
-    pub fn calculate_decay_spread(yes_ask: Decimal, no_ask: Decimal) -> Option<Decimal> {
+    /// Evaluate whether a theta (time decay) opportunity exists.
+    ///
+    /// **Settlement mode**: `1.00 - combined_ask - fees > MIN_NET_PROFIT`
+    ///   → guaranteed profit if held to expiry (one side always pays $1.00)
+    ///
+    /// **Convergence mode**: `combined_ask <= MAX_COMBINED_ASK` AND close to expiry
+    ///   → spreads compress as expiry nears; exit when combined bid converges
+    pub fn calculate_theta_opportunity(
+        yes_ask: Decimal,
+        no_ask: Decimal,
+        yes_fee_bps: u32,
+        no_fee_bps: u32,
+        seconds_to_expiry: i64,
+    ) -> Option<ThetaSignal> {
         let combined_ask = yes_ask + no_ask;
 
-        // If combined ask is below 1.0, we have a decay opportunity
-        if combined_ask < dec!(1.0) {
-            let spread = dec!(1.0) - combined_ask;
-            // Only trade if spread is worth it (account for fees)
-            if spread > dec!(0.01) {
-                return Some(spread);
-            }
-        }
-        None
-    }
+        // Fee calculation: fee = price * bps / 10_000 per side
+        let yes_fee = yes_ask * Decimal::from(yes_fee_bps) / dec!(10_000);
+        let no_fee = no_ask * Decimal::from(no_fee_bps) / dec!(10_000);
+        let total_fees = yes_fee + no_fee;
 
-    /// Check if market is young enough to enter time decay
-    /// For hourly markets: ideal to enter within first 10-20 minutes
-    pub fn is_market_young_enough(_seconds_to_expiry: i64) -> bool {
-        // Market should have at least 20+ minutes left and less than 55 minutes
-        // (assuming 1-hour markets)
-        _seconds_to_expiry < 3300 && _seconds_to_expiry > 1200
-    }
-
-    /// Calculate position size based on time decay opportunity
-    /// Larger spread = higher confidence, can size up a bit
-    /// Closer to expiry = smaller size (less time for spread to decay)
-    pub fn calculate_position_size(
-        spread: Decimal,
-        available_balance: Decimal,
-        _seconds_to_expiry: i64,
-    ) -> Decimal {
-        // Base position size (standard $5-10 per side)
-        let mut position_size = dec!(5);
-
-        // Scale up if spread is very attractive (>2%)
-        if spread > dec!(0.02) {
-            position_size = dec!(7);
-        }
-        if spread > dec!(0.025) {
-            position_size = dec!(10);
-        }
-
-        // Don't exceed available balance (need $2x for both sides)
-        position_size.min(available_balance / dec!(2))
-    }
-
-    /// Determine if we should EXIT early
-    /// Reasons to exit: spread widens, market outcome becomes obvious, etc.
-    pub fn should_early_exit(
-        current_combined_bid: Decimal,
-        entry_combined_cost: Decimal,
-        _seconds_elapsed: i64,
-    ) -> Option<EarlyExitReason> {
-        // If spread widens significantly, exit (trade went wrong)
-        let combined_bid_expected = entry_combined_cost + dec!(0.005); // Small improvement expected
-        if current_combined_bid < combined_bid_expected - dec!(0.01) {
-            return Some(EarlyExitReason::SpreadWidened {
-                expected: combined_bid_expected,
-                actual: current_combined_bid,
+        // Settlement mode: combined ask below $1.00 → guaranteed profit at expiry
+        let net_profit = dec!(1.0) - combined_ask - total_fees;
+        if net_profit >= config::MIN_TIME_DECAY_NET_PROFIT {
+            return Some(ThetaSignal {
+                mode: ThetaMode::Settlement,
+                combined_ask,
+                net_profit_per_share: net_profit,
+                total_fees,
             });
         }
 
-        // If we've held for most of the market duration, hold to expiry
-        // (seconds_elapsed / time_to_expiry ratio high = close to expiry)
-        // This logic would be checked by caller with seconds_to_expiry
+        // Convergence mode: combined ask slightly above $1.00 but within tolerance
+        // Only valid in the convergence window (closer to expiry)
+        if combined_ask <= config::MAX_TIME_DECAY_COMBINED_ASK
+            && seconds_to_expiry < config::TIME_DECAY_CONVERGENCE_WINDOW_SECS
+        {
+            // Estimated profit from convergence (spread compression)
+            // As expiry approaches, combined bid → ~$0.998+
+            let convergence_target = config::TIME_DECAY_CONVERGENCE_EXIT_BID;
+            let estimated_exit_profit = convergence_target - combined_ask - total_fees;
+
+            if estimated_exit_profit > dec!(-0.005) {
+                // Allow slightly negative estimated profit — convergence often overshoots
+                return Some(ThetaSignal {
+                    mode: ThetaMode::Convergence,
+                    combined_ask,
+                    net_profit_per_share: estimated_exit_profit,
+                    total_fees,
+                });
+            }
+        }
 
         None
     }
 
-    /// Calculate expected vs actual return
-    pub fn calculate_return(
-        total_invested: Decimal,
-        current_combined_value: Decimal,
-    ) -> Decimal {
-        if total_invested <= dec!(0) {
-            return dec!(0);
-        }
-        (current_combined_value - total_invested) / total_invested
+    /// Check if the market is in the theta-optimal entry window.
+    /// For hourly crypto markets, the convergence acceleration zone is
+    /// roughly the last 4–30 minutes before expiry.
+    pub fn is_in_theta_window(seconds_to_expiry: i64) -> bool {
+        seconds_to_expiry >= config::TIME_DECAY_MIN_SECS_TO_EXPIRY
+            && seconds_to_expiry <= config::TIME_DECAY_MAX_SECS_TO_EXPIRY
     }
 
-    /// Check if we should EXIT to lock in profit
-    /// Returns Some(exit_price) if we've hit our profit target
-    pub fn should_take_profit(
-        current_combined_bid: Decimal,
-        entry_combined_cost: Decimal,
-        target_profit_pct: Decimal,
-    ) -> Option<Decimal> {
-        let target_exit_price = entry_combined_cost * (dec!(1) + target_profit_pct);
-
-        if current_combined_bid >= target_exit_price {
-            return Some(current_combined_bid);
-        }
-        None
-    }
-
-    /// Calculate current unrealized P&L
+    /// Calculate current unrealized P&L for a time decay position
     pub fn calculate_current_pnl(
         current_yes_bid: Decimal,
         current_no_bid: Decimal,
@@ -118,7 +120,19 @@ impl TimeDecayStrategy {
         };
         (unrealized_pnl, pnl_pct)
     }
+
+    /// Check if a convergence-mode position should exit because bids have converged
+    pub fn should_convergence_exit(
+        current_yes_bid: Decimal,
+        current_no_bid: Decimal,
+    ) -> bool {
+        current_yes_bid + current_no_bid >= config::TIME_DECAY_CONVERGENCE_EXIT_BID
+    }
 }
+
+// ============================================================================
+// Early Exit Reasons (retained for compatibility)
+// ============================================================================
 
 #[derive(Debug, Clone)]
 pub enum EarlyExitReason {
@@ -132,6 +146,10 @@ pub enum EarlyExitReason {
     },
 }
 
+// ============================================================================
+// Position Tracking
+// ============================================================================
+
 #[derive(Debug, Clone)]
 pub struct TimeDecayPosition {
     pub yes_token_id: U256,
@@ -142,6 +160,7 @@ pub struct TimeDecayPosition {
     pub no_entry_price: Decimal,
     pub position_size: Decimal,
     pub total_invested: Decimal,
+    pub mode: ThetaMode,
 }
 
 impl TimeDecayPosition {
@@ -153,6 +172,7 @@ impl TimeDecayPosition {
         yes_price: Decimal,
         no_price: Decimal,
         size: Decimal,
+        mode: ThetaMode,
     ) -> Self {
         let total_invested = (yes_price + no_price) * size;
         Self {
@@ -164,6 +184,7 @@ impl TimeDecayPosition {
             no_entry_price: no_price,
             position_size: size,
             total_invested,
+            mode,
         }
     }
 

@@ -97,17 +97,29 @@ pub const SOL_MOMENTUM_THRESHOLD: Decimal = dec!(0.5);
 /// Allow time decay trading (exploits YES+NO convergence to $1.00)
 pub const ENABLE_TIME_DECAY_TRADING: bool = true;
 
-/// Minimum spread (YES_ask + NO_ask spread) to trigger entry
-pub const MIN_TIME_DECAY_SPREAD: Decimal = dec!(0.01);
+/// Minimum net profit per share (after fees) for settlement-mode entry.
+/// At 0 bps fees: requires combined_ask < $0.998.  At 100 bps: < ~$0.988.
+pub const MIN_TIME_DECAY_NET_PROFIT: Decimal = dec!(0.002);
 
-/// Market must be at least this old (seconds) before entering
-pub const TIME_DECAY_MIN_MARKET_AGE_SECS: i64 = 1200;  // 20 minutes
+/// Maximum combined ask price for convergence-mode entry.
+/// Allows entries slightly above $1.00 — profit comes from bid convergence near expiry.
+pub const MAX_TIME_DECAY_COMBINED_ASK: Decimal = dec!(1.008);
 
-/// Don't enter if market is older than this (seconds)
-pub const TIME_DECAY_MAX_MARKET_AGE_SECS: i64 = 3300;  // 55 minutes
+/// Convergence mode only activates when market is within this many seconds of expiry.
+/// Tighter window = higher convergence confidence.
+pub const TIME_DECAY_CONVERGENCE_WINDOW_SECS: i64 = 1200;  // 20 minutes
+
+/// Exit convergence-mode positions when combined bid reaches this level.
+pub const TIME_DECAY_CONVERGENCE_EXIT_BID: Decimal = dec!(0.998);
+
+/// Minimum seconds to expiry for time decay entry (must exceed MARKET_EXPIRY_SAFETY_BUFFER_SECS)
+pub const TIME_DECAY_MIN_SECS_TO_EXPIRY: i64 = 240;  // 4 minutes
+
+/// Maximum seconds to expiry for time decay entry
+pub const TIME_DECAY_MAX_SECS_TO_EXPIRY: i64 = 1800;  // 30 minutes
 
 /// Base position size for time decay (per side: YES and NO)
-pub const TIME_DECAY_POSITION_SIZE_USDC: Decimal = dec!(5);
+pub const TIME_DECAY_POSITION_SIZE_USDC: Decimal = dec!(10);
 
 /// Auto-exit when profit reaches this percentage
 pub const TIME_DECAY_TARGET_PROFIT_PERCENT: Decimal = dec!(0.015);  // 1.5% profit target
@@ -119,7 +131,7 @@ pub const TIME_DECAY_MAX_TOTAL_EXPOSURE_USDC: Decimal = dec!(50);
 pub const TIME_DECAY_MAX_POSITIONS: usize = 5;
 
 /// Exit if spread widens more than this (lose this much)
-pub const TIME_DECAY_STOP_LOSS_PERCENT: Decimal = dec!(0.005);  // Stop at 0.5% loss
+pub const TIME_DECAY_STOP_LOSS_PERCENT: Decimal = dec!(0.01);  // Stop at 1% loss
 
 
 // ============================================================================

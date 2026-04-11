@@ -39,7 +39,7 @@ use rustpolybot::risk::RiskEngine;
 use rustpolybot::notifications::send_notification;
 use rustpolybot::strategies::momentum::MomentumStrategy;
 use rustpolybot::strategies::arbitrage::ArbitrageStrategy;
-use rustpolybot::strategies::time_decay::{TimeDecayStrategy, TimeDecayPosition};
+use rustpolybot::strategies::time_decay::{TimeDecayStrategy, TimeDecayPosition, ThetaMode};
 use rustpolybot::helpers::{
     price::*, json::*, time::*, balance::*, nonce::*
 };
@@ -1326,34 +1326,40 @@ async fn main() -> Result<()> {
 
                     // --- TIME DECAY (THETA) STRATEGY ---
                     if config::ENABLE_TIME_DECAY_TRADING {
-                        if let Some(spread) = TimeDecayStrategy::calculate_decay_spread(yes_ask, no_ask) {
-                            // Check market age constraints - need valid close time
-                            if let Some(close_time) = market_close_time {
-                                let now = Utc::now();
-                                let seconds_to_expiry = (close_time - now).num_seconds();
+                        if let Some(close_time) = market_close_time {
+                            let now = Utc::now();
+                            let seconds_to_expiry = (close_time - now).num_seconds();
 
-                            if seconds_to_expiry > config::TIME_DECAY_MIN_MARKET_AGE_SECS
-                                && seconds_to_expiry < config::TIME_DECAY_MAX_MARKET_AGE_SECS {
+                            // Check theta timing window (4-30 min to expiry)
+                            if TimeDecayStrategy::is_in_theta_window(seconds_to_expiry) {
+                                // Fee-aware opportunity detection with dual modes
+                                if let Some(signal) = TimeDecayStrategy::calculate_theta_opportunity(
+                                    yes_ask, no_ask, yes_fee_rate, no_fee_rate, seconds_to_expiry
+                                ) {
+                                    let current_usdc_balance = *balance_rx.borrow();
+                                    let combined_cost = signal.combined_ask * config::TIME_DECAY_POSITION_SIZE_USDC;
 
-                                let current_usdc_balance = *balance_rx.borrow();
-                                let combined_cost = (yes_ask + no_ask) * config::TIME_DECAY_POSITION_SIZE_USDC;
+                                    // Check balance (need ~2x for both sides)
+                                    if current_usdc_balance >= combined_cost * dec!(2) {
+                                        // Check position limits
+                                        let td_pos = time_decay_positions.lock().await;
+                                        let total_td_exposure: Decimal = td_pos.values()
+                                            .map(|p| p.total_invested)
+                                            .sum();
 
-                                // Check balance
-                                if current_usdc_balance >= combined_cost * dec!(2) {
-                                    // Check position limits
-                                    let td_pos = time_decay_positions.lock().await;
-                                    let total_td_exposure: Decimal = td_pos.values()
-                                        .map(|p| p.total_invested)
-                                        .sum();
+                                        if td_pos.len() < config::TIME_DECAY_MAX_POSITIONS
+                                            && total_td_exposure + combined_cost <= config::TIME_DECAY_MAX_TOTAL_EXPOSURE_USDC {
 
-                                    if td_pos.len() < config::TIME_DECAY_MAX_POSITIONS
-                                        && total_td_exposure + combined_cost <= config::TIME_DECAY_MAX_TOTAL_EXPOSURE_USDC {
+                                            let target_shares = config::TIME_DECAY_POSITION_SIZE_USDC;
+                                            let yes_limit_price = (yes_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
+                                            let no_limit_price = (no_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
 
-                                        let target_shares = config::TIME_DECAY_POSITION_SIZE_USDC;
-                                        let yes_limit_price = (yes_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
-                                        let no_limit_price = (no_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
-
-                                        info!("💰 TIME DECAY OPPORTUNITY: Spread ${:.4} | Expires in {}s | YES ${:.2} + NO ${:.2}", spread, seconds_to_expiry, yes_ask, no_ask);
+                                            let mode_label = match signal.mode {
+                                                ThetaMode::Settlement => "SETTLEMENT",
+                                                ThetaMode::Convergence => "CONVERGENCE",
+                                            };
+                                            info!("💰 THETA {} OPPORTUNITY: Combined ${:.4} | Net ${:.4}/sh | Fees ${:.4} | Expires {}s | YES ${:.2} + NO ${:.2}",
+                                                mode_label, signal.combined_ask, signal.net_profit_per_share, signal.total_fees, seconds_to_expiry, yes_ask, no_ask);
 
                                         if !config::GHOST_MODE {
                                             drop(td_pos);
@@ -1450,10 +1456,12 @@ async fn main() -> Result<()> {
                                                     yes_limit_price,
                                                     no_limit_price,
                                                     target_shares,
+                                                    signal.mode,
                                                 );
                                                 let mut td_pos_map = td_pos_handle.lock().await;
                                                 td_pos_map.insert(yes_token, td_position.clone());
-                                                info!("💰 Time Decay position opened: YES {} + NO {} | Expires in {}s", yes_token, no_token, seconds_to_expiry);
+                                                info!("💰 Theta {} position opened: YES {} + NO {} | Expires in {}s",
+                                                    mode_label, yes_token, no_token, seconds_to_expiry);
                                             }
                                         }
                                     }
@@ -1463,7 +1471,7 @@ async fn main() -> Result<()> {
 
                         // Time Decay Exit Logic
                         {
-                            let mut td_pos_map = time_decay_positions.lock().await;
+                            let td_pos_map = time_decay_positions.lock().await;
                             let mut positions_to_close = Vec::new();
 
                             for (token_id, td_pos) in td_pos_map.iter() {
@@ -1471,18 +1479,35 @@ async fn main() -> Result<()> {
 
                                 // Check take profit
                                 if pnl_pct >= config::TIME_DECAY_TARGET_PROFIT_PERCENT {
-                                    info!("💰 TIME DECAY TAKE PROFIT HIT: +{:.2}% (${:.2})", pnl_pct * dec!(100), unrealized_pnl);
+                                    info!("💰 THETA TAKE PROFIT HIT: +{:.2}% (${:.2})", pnl_pct * dec!(100), unrealized_pnl);
                                     positions_to_close.push(*token_id);
                                 }
                                 // Check stop loss
                                 else if pnl_pct <= -config::TIME_DECAY_STOP_LOSS_PERCENT {
-                                    warn!("⚠️ TIME DECAY STOP LOSS HIT: {:.2}% (${:.2})", pnl_pct * dec!(100), unrealized_pnl);
+                                    warn!("⚠️ THETA STOP LOSS HIT: {:.2}% (${:.2})", pnl_pct * dec!(100), unrealized_pnl);
                                     positions_to_close.push(*token_id);
                                 }
-                                // Check market expiry (exit 30s before close)
-                                else if td_pos.time_to_expiry() <= 30 {
-                                    info!("⏰ TIME DECAY EXPIRY APPROACHING: Closing position {}s to close", td_pos.time_to_expiry());
+                                // Convergence-mode exit: combined bid reached target
+                                else if td_pos.mode == ThetaMode::Convergence
+                                    && TimeDecayStrategy::should_convergence_exit(yes_bid, no_bid)
+                                {
+                                    info!("💰 THETA CONVERGENCE EXIT: Combined bid ${:.4} >= target ${:.4} (P&L: ${:.4})",
+                                        yes_bid + no_bid, config::TIME_DECAY_CONVERGENCE_EXIT_BID, unrealized_pnl);
                                     positions_to_close.push(*token_id);
+                                }
+                                // Convergence-mode: exit before global safety buffer blocks us
+                                else if td_pos.mode == ThetaMode::Convergence
+                                    && td_pos.time_to_expiry() <= config::TIME_DECAY_MIN_SECS_TO_EXPIRY
+                                {
+                                    info!("⏰ THETA CONVERGENCE EXPIRY EXIT: {}s to close (P&L: ${:.4})", td_pos.time_to_expiry(), unrealized_pnl);
+                                    positions_to_close.push(*token_id);
+                                }
+                                // Settlement-mode: hold to expiry (auto-settles at $1.00)
+                                // Only exit if very close and we want to be safe
+                                else if td_pos.mode == ThetaMode::Settlement && td_pos.time_to_expiry() <= 30 {
+                                    info!("⏰ THETA SETTLEMENT APPROACHING: {}s to close — holding for settlement", td_pos.time_to_expiry());
+                                    // Don't close — settlement mode profits from holding
+                                    // The position will be cleaned up after expiry
                                 }
                             }
 
