@@ -35,6 +35,14 @@ pub const MIN_LIQUIDITY_FILL_RATIO: Decimal = dec!(0.80);
 /// Price offset added to the ask price when placing buy orders to ensure aggressive fills.
 pub const BUY_PRICE_OFFSET: Decimal = dec!(0.01);
 
+/// Extra price offset for momentum buy orders — compensates for MM repricing during fast moves.
+/// Applied ON TOP of BUY_PRICE_OFFSET. Total momentum offset = BUY_PRICE_OFFSET + MOMENTUM_BUY_PRICE_OFFSET.
+pub const MOMENTUM_BUY_PRICE_OFFSET: Decimal = dec!(0.03);
+
+/// Number of price-bump retries when a momentum FAK entry is rejected for no liquidity.
+/// Each retry bumps the price by MOMENTUM_BUY_PRICE_OFFSET again, up to MAX_BUY_LIMIT_PRICE.
+pub const MOMENTUM_ENTRY_FAK_RETRIES: u32 = 2;
+
 /// Maximum price for a single share when placing a buy order.
 pub const MAX_BUY_LIMIT_PRICE: Decimal = dec!(0.99);
 
@@ -77,17 +85,20 @@ pub const ETH_STRIKE_BUFFER: Decimal = dec!(5.0);
 pub const SOL_STRIKE_BUFFER: Decimal = dec!(0.2);
 
 /// Maximum token price allowed for a momentum entry.
-/// Increased from 0.65 to 0.85 to allow entries when markets are in normal range (e.g., $0.51 to $0.49)
-pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.85);
+/// Raised from 0.85 to 0.88 to allow entries slightly after market repricing.
+/// Still blocks extreme prices (0.90+) where risk/reward is poor.
+pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.88);
 
 /// The time window (in seconds) used to calculate price velocity from Binance.
-pub const MOMENTUM_WINDOW_SECS: u64 = 10;
+/// Shortened from 10s to 5s for faster signal detection before Polymarket reprices.
+pub const MOMENTUM_WINDOW_SECS: u64 = 5;
 
 /// Price change threshold (absolute USD) within the window to trigger a signal.
-/// Increased BTC from 80 to 100 to filter out noise and catch more mature momentum moves.
-pub const BTC_MOMENTUM_THRESHOLD: Decimal = dec!(100.0);
-pub const ETH_MOMENTUM_THRESHOLD: Decimal = dec!(5.0);
-pub const SOL_MOMENTUM_THRESHOLD: Decimal = dec!(0.5);
+/// Lowered to catch momentum earlier — before market makers fully reprice the book.
+/// Thresholds scaled for 5s window (roughly half of previous 10s values).
+pub const BTC_MOMENTUM_THRESHOLD: Decimal = dec!(75.0);
+pub const ETH_MOMENTUM_THRESHOLD: Decimal = dec!(3.0);
+pub const SOL_MOMENTUM_THRESHOLD: Decimal = dec!(0.3);
 
 
 // ============================================================================
@@ -193,8 +204,11 @@ pub fn periodic_sync_interval() -> StdDuration {
 }
 
 /// Main ticker interval for trade execution checks (milliseconds)
+/// Reduced from 100ms to 50ms for faster momentum signal response.
+/// At 50ms, worst-case polling jitter is halved, and 2-tick confirmation
+/// resolves in ~100ms instead of ~200ms.
 pub fn main_ticker_interval() -> StdDuration {
-    StdDuration::from_millis(100)
+    StdDuration::from_millis(50)
 }
 
 
