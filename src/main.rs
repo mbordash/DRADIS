@@ -726,12 +726,12 @@ async fn main() -> Result<()> {
         }
 
         let mut trade_cooldown = Utc::now();
-        let mut ticker = interval(std::time::Duration::from_millis(100));
+        let mut ticker = interval(config::main_ticker_interval());
         let mut status_ticker = interval(std::time::Duration::from_secs(60));
         let mut cleanup_ticker = interval(std::time::Duration::from_secs(300));
         let mut pulse_ticker = interval(std::time::Duration::from_secs(300));
 
-        let mut momentum_fired_for_current_market = false;
+        let momentum_fired_for_current_market = Arc::new(AtomicBool::new(false));
         let mut consecutive_momentum_signals = 0u32;
         let mut last_momentum_rejection_log = Instant::now() - std::time::Duration::from_secs(10);
         let momentum_exit_in_progress = Arc::new(AtomicBool::new(false));
@@ -1102,7 +1102,7 @@ async fn main() -> Result<()> {
 
                     // --- Momentum Trading Logic (One-Sided) ---
                     // NOTE: Momentum trading works WITH OR WITHOUT resolved strike price
-                    if config::ENABLE_MOMENTUM_TRADING && !momentum_fired_for_current_market {
+                    if config::ENABLE_MOMENTUM_TRADING && !momentum_fired_for_current_market.load(Ordering::Relaxed) {
                         let velocity = *velocity_rx.borrow();
                         let binance_price = *oracle_rx.borrow();
                         let threshold = match crypto_filter.as_str() {
@@ -1196,9 +1196,9 @@ async fn main() -> Result<()> {
                                 } else if !has_opposing_pos {
                                     momentum_token = Some(token);
                                     limit_price = if token == yes_token {
-                                        (yes_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2)
+                                        (yes_ask + config::BUY_PRICE_OFFSET + config::MOMENTUM_BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2)
                                     } else {
-                                        (no_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2)
+                                        (no_ask + config::BUY_PRICE_OFFSET + config::MOMENTUM_BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2)
                                     };
                                     target_depth = if token == yes_token { yes_ask_depth } else { no_ask_depth };
                                     fee_rate = if token == yes_token { yes_fee_rate } else { no_fee_rate };
@@ -1277,74 +1277,101 @@ async fn main() -> Result<()> {
                                             let pair_token_handle = if token == yes_token { no_token } else { yes_token };
                                             let shared_http_handle = Arc::clone(&shared_http);
                                             let owner = client.credentials().key();
+                                            let momentum_fired_handle = Arc::clone(&momentum_fired_for_current_market);
 
                                             tokio::spawn(async move {
-                                                for attempt in 0..3 {
-                                                    let mut guard = nonce_manager.lock().await;
-                                                    let current_nonce = *guard;
+                                                let mut current_limit_price = limit_price;
+                                                let max_outer_attempts = 1 + config::MOMENTUM_ENTRY_FAK_RETRIES;
+                                                let mut filled = false;
 
-                                                    let mut order_struct = Order::default();
-                                                    order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
-                                                    order_struct.maker = safe_address; order_struct.signer = eoa_address; order_struct.tokenId = token;
-                                                    order_struct.makerAmount = U256::from(to_fixed_u128(target_shares * limit_price));
-                                                    order_struct.takerAmount = U256::from(amount);
-                                                    order_struct.expiration = U256::ZERO; order_struct.nonce = U256::from(current_nonce);
-                                                    order_struct.feeRateBps = U256::from(fee_rate);
-                                                    order_struct.side = Side::Buy as u8; order_struct.signatureType = SignatureType::GnosisSafe as u8;
-                                                    let domain = Eip712Domain { name: Some(Cow::Borrowed(ORDER_NAME)), version: Some(Cow::Borrowed(VERSION)), chain_id: Some(U256::from(POLYGON)), verifying_contract: Some(verifying_contract), ..Eip712Domain::default() };
-                                                    let hash = order_struct.eip712_signing_hash(&domain);
-                                                    if let Ok(signature) = signer.sign_hash(&hash).await {
-                                                        let signed_order = SignedOrder::builder().order(order_struct).signature(signature).order_type(OrderType::FAK).owner(owner).build();
-                                                        match client.post_order(signed_order).await {
-                                                            Ok(_) => {
-                                                                info!("🚀 Momentum order accepted. Syncing final quantity...");
-                                                                {
-                                                                    let mut pm = positions_handle.lock().await;
-                                                                    pm.insert(token, Position { shares: target_shares, avg_entry: limit_price, opened_at: Utc::now(), close_time: close_time_handle, market_name: market_name_handle, pair_token_id: pair_token_handle, fill_confirmed_at: None });
+                                                'outer: for fak_attempt in 0..max_outer_attempts {
+                                                    if fak_attempt > 0 {
+                                                        // Bump limit price for FAK retry
+                                                        current_limit_price = (current_limit_price + config::MOMENTUM_BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE).round_dp(2);
+                                                        warn!("🔄 Momentum FAK retry {} — bumping limit to ${:.2}", fak_attempt, current_limit_price);
+                                                        tokio::time::sleep(Duration::from_millis(150)).await;
+                                                    }
+                                                    let retry_amount = to_fixed_u128(target_shares * current_limit_price);
+
+                                                    for attempt in 0..3 {
+                                                        let mut guard = nonce_manager.lock().await;
+                                                        let current_nonce = *guard;
+
+                                                        let mut order_struct = Order::default();
+                                                        order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
+                                                        order_struct.maker = safe_address; order_struct.signer = eoa_address; order_struct.tokenId = token;
+                                                        order_struct.makerAmount = U256::from(retry_amount);
+                                                        order_struct.takerAmount = U256::from(amount);
+                                                        order_struct.expiration = U256::ZERO; order_struct.nonce = U256::from(current_nonce);
+                                                        order_struct.feeRateBps = U256::from(fee_rate);
+                                                        order_struct.side = Side::Buy as u8; order_struct.signatureType = SignatureType::GnosisSafe as u8;
+                                                        let domain = Eip712Domain { name: Some(Cow::Borrowed(ORDER_NAME)), version: Some(Cow::Borrowed(VERSION)), chain_id: Some(U256::from(POLYGON)), verifying_contract: Some(verifying_contract), ..Eip712Domain::default() };
+                                                        let hash = order_struct.eip712_signing_hash(&domain);
+                                                        if let Ok(signature) = signer.sign_hash(&hash).await {
+                                                            let signed_order = SignedOrder::builder().order(order_struct).signature(signature).order_type(OrderType::FAK).owner(owner).build();
+                                                            match client.post_order(signed_order).await {
+                                                                Ok(_) => {
+                                                                    info!("🚀 Momentum order accepted @ ${:.2}. Syncing final quantity...", current_limit_price);
+                                                                    {
+                                                                        let mut pm = positions_handle.lock().await;
+                                                                        pm.insert(token, Position { shares: target_shares, avg_entry: current_limit_price, opened_at: Utc::now(), close_time: close_time_handle, market_name: market_name_handle, pair_token_id: pair_token_handle, fill_confirmed_at: None });
+                                                                    }
+                                                                    *guard += 1;
+                                                                    let _ = sync_position_balance(&client, &positions_handle, token).await;
+                                                                    filled = true;
+                                                                    break 'outer;
+                                                                },
+                                                                Err(e) => {
+                                                                    let err_msg = format!("{:?}", e).to_lowercase();
+                                                                    drop(guard);
+                                                                    if err_msg.contains("invalid nonce") && attempt < 2 {
+                                                                        warn!("⚠️ Invalid nonce in momentum entry (attempt {}). Re-syncing for Maker {}...", attempt + 1, safe_address);
+                                                                        sync_nonce_manager(&nonce_manager, &shared_http_handle, safe_address).await;
+                                                                        tokio::time::sleep(Duration::from_millis(200 * ((attempt as u64) + 1))).await;
+                                                                        continue;
+                                                                    }
+                                                                    if (err_msg.contains("status_code: 500") || err_msg.contains("status_code: 502") ||
+                                                                        err_msg.contains("status_code: 503") || err_msg.contains("status_code: 504")) && attempt < 2 {
+                                                                        warn!("⚠️ Transient server error in momentum entry (attempt {}). Retrying with backoff...", attempt + 1);
+                                                                        tokio::time::sleep(Duration::from_millis(300 * ((attempt as u64) + 1))).await;
+                                                                        continue;
+                                                                    }
+                                                                    // FAK rejected — no liquidity at this price. Try outer loop with bumped price.
+                                                                    if err_msg.contains("no orders found") || err_msg.contains("fak") {
+                                                                        let reason = "No liquidity/sellers at price".to_string();
+                                                                        error!("❌ FAK Order Rejected: {} @ ${:.2}", reason, current_limit_price);
+                                                                        if fak_attempt + 1 < max_outer_attempts {
+                                                                            // Continue to next outer attempt with bumped price
+                                                                            continue 'outer;
+                                                                        }
+                                                                        break 'outer;
+                                                                    }
+                                                                    // Unrecoverable error
+                                                                    let reason = if err_msg.contains("insufficient balance") {
+                                                                        "Insufficient maker balance".to_string()
+                                                                    } else if err_msg.contains("invalid signature") {
+                                                                        "Invalid signature".to_string()
+                                                                    } else if err_msg.contains("expired") {
+                                                                        "Order expired".to_string()
+                                                                    } else {
+                                                                        format!("{:?}", e)
+                                                                    };
+                                                                    error!("❌ FAK Order Rejected: {} @ ${:.2}", reason, current_limit_price);
+                                                                    break 'outer;
                                                                 }
-                                                                *guard += 1;
-                                                                let _ = sync_position_balance(&client, &positions_handle, token).await;
-                                                                break;
-                                                            },
-                                                            Err(e) => {
-                                                                let err_msg = format!("{:?}", e).to_lowercase();
-                                                                drop(guard);
-                                                                if err_msg.contains("invalid nonce") && attempt < 2 {
-                                                                    warn!("⚠️ Invalid nonce in momentum entry (attempt {}). Re-syncing for Maker {}...", attempt + 1, safe_address);
-                                                                    sync_nonce_manager(&nonce_manager, &shared_http_handle, safe_address).await;
-                                                                    // Add backoff delay after nonce resync
-                                                                    tokio::time::sleep(Duration::from_millis(200 * ((attempt as u64) + 1))).await;
-                                                                    continue;
-                                                                }
-                                                                // Retry on transient server errors (500, 502, 503, 504)
-                                                                if (err_msg.contains("status_code: 500") || err_msg.contains("status_code: 502") ||
-                                                                    err_msg.contains("status_code: 503") || err_msg.contains("status_code: 504")) && attempt < 2 {
-                                                                    warn!("⚠️ Transient server error in momentum entry (attempt {}). Retrying with backoff...", attempt + 1);
-                                                                    // Exponential backoff: 300ms, 600ms
-                                                                    tokio::time::sleep(Duration::from_millis(300 * ((attempt as u64) + 1))).await;
-                                                                    continue;
-                                                                }
-                                                                // Extract specific error reason for clarity
-                                                                let reason = if err_msg.contains("no orders found") {
-                                                                    "No liquidity/sellers at price".to_string()
-                                                                } else if err_msg.contains("insufficient balance") {
-                                                                    "Insufficient maker balance".to_string()
-                                                                } else if err_msg.contains("invalid signature") {
-                                                                    "Invalid signature".to_string()
-                                                                } else if err_msg.contains("expired") {
-                                                                    "Order expired".to_string()
-                                                                } else {
-                                                                    format!("{:?}", e)
-                                                                };
-                                                                error!("❌ FAK Order Rejected: {} @ ${:.2}", reason, limit_price);
-                                                                break;
                                                             }
-                                                        }
-                                                    } else { break; }
+                                                        } else { break 'outer; }
+                                                    }
+                                                }
+
+                                                if !filled {
+                                                    // Order never filled — reset the flag so bot can retry on next signal
+                                                    warn!("⚠️ Momentum entry failed after {} FAK attempts — re-enabling momentum for this market", max_outer_attempts);
+                                                    momentum_fired_handle.store(false, Ordering::Relaxed);
                                                 }
                                             });
                                         }
-                                        momentum_fired_for_current_market = true;
+                                        momentum_fired_for_current_market.store(true, Ordering::Relaxed);
                                         trade_cooldown = Utc::now() + chrono::Duration::seconds(config::TRADE_COOLDOWN_SECS);
                                         info!("🔒 Momentum cooldown active: Next eligible trade in {}s (until {})", config::TRADE_COOLDOWN_SECS, trade_cooldown.format("%H:%M:%S UTC"));
                                         continue;
