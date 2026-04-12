@@ -73,8 +73,18 @@ pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.05);
 /// Stop Loss: Exit if we lose this % from our entry price.
 pub const MOMENTUM_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
 
-/// Reversal Exit: Exit if momentum velocity drops below this % of the entry threshold.
-pub const MOMENTUM_REVERSAL_RATIO: Decimal = dec!(0.20);
+/// Reversal Exit: Exit if momentum velocity reverses past this % of the entry threshold.
+/// NOTE: Reversal is directional — flat velocity (near zero) does NOT trigger reversal exit.
+/// Only a strong move in the OPPOSITE direction triggers this.
+/// Raised from 0.20 → 0.75: requires $56.25/5s BTC reversal (vs $15 before).
+/// This prevents being shaken out by brief bounces within a continuing trend.
+pub const MOMENTUM_REVERSAL_RATIO: Decimal = dec!(0.75);
+
+/// Minimum seconds to hold a momentum position before allowing a reversal exit.
+/// Prevents panic-exiting immediately after entry when velocity naturally decays
+/// as the 5-second measurement window slides past the initial price spike.
+/// Raised from 12 → 25: gives the position more time to develop before reversal check activates.
+pub const MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL: i64 = 25;
 
 /// Static Take Profit Ceiling: Exit if bid hits this price regardless of entry.
 pub const MOMENTUM_TAKE_PROFIT_CEILING: Decimal = dec!(0.90);
@@ -282,6 +292,18 @@ pub fn is_bad_market(name: &str) -> bool {
 pub fn is_long_term_2026(name: &str) -> bool {
     let n = name.to_lowercase();
     n.contains("2026") && (n.contains("win the") || n.contains("finals") || n.contains("cup") || n.contains("stanley"))
+}
+
+/// Detect price-range / price-band markets (e.g. "Will BTC be between $72,000 and $74,000 on April 12?")
+/// These are NegRisk markets that are often already decided and unsuitable for directional strategies.
+pub fn is_range_market(name: &str) -> bool {
+    let n = name.to_lowercase();
+    // "between $X and $Y" pattern
+    (n.contains("between") && n.contains("and $")) ||
+    // "price of X be between" pattern
+    (n.contains("price of") && n.contains("between")) ||
+    // "will ... be above/below $X" single-sided range
+    (n.contains("will") && (n.contains("above $") || n.contains("below $")) && !n.contains("up or down"))
 }
 
 /// Hourly crypto markets (high-priority short-term session)

@@ -216,14 +216,29 @@ async fn get_top_market(http: &reqwest::Client) -> (U256, U256, String, String, 
         let a_secs = a.5.map_or(9999, |t| (t - now).num_seconds());
         let b_secs = b.5.map_or(9999, |t| (t - now).num_seconds());
 
+        // Tier 1: Strongly prefer "Up or Down" directional binary markets
+        let a_up_or_down = a.1.to_lowercase().contains("up or down");
+        let b_up_or_down = b.1.to_lowercase().contains("up or down");
+        if a_up_or_down != b_up_or_down {
+            return b_up_or_down.cmp(&a_up_or_down);
+        }
+
+        // Tier 2: Deprioritize range/price-band markets (likely already decided)
+        let a_range = config::is_range_market(&a.1);
+        let b_range = config::is_range_market(&b.1);
+        if a_range != b_range {
+            return a_range.cmp(&b_range); // range markets sort last
+        }
+
+        // Tier 3: Prefer markets in the 30-60 minute sweet spot
         let a_sweet = a_secs > 1800 && a_secs < 3600;
         let b_sweet = b_secs > 1800 && b_secs < 3600;
-
         if a_sweet != b_sweet {
-            b_sweet.cmp(&a_sweet)
-        } else {
-            b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal)
+            return b_sweet.cmp(&a_sweet);
         }
+
+        // Tier 4: Volume as tiebreaker
+        b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal)
     });
 
     let best = &sorted[0];
@@ -628,16 +643,22 @@ async fn main() -> Result<()> {
             // Determine if candidate is a binary "Up or Down" market (better for momentum trading)
             let candidate_is_binary = candidate.2.to_lowercase().contains("up or down");
             let current_is_binary = cur_name.to_lowercase().contains("up or down");
+            let candidate_is_range = config::is_range_market(&candidate.2);
+
+            // Time-based upgrade: only allow if we're NOT downgrading from binary to range/non-binary
+            let time_based_upgrade = new_secs_left > cur_secs_left + 1800
+                && !(current_is_binary && !candidate_is_binary); // never abandon binary for a range/decided market on time alone
 
             // Enhanced hysteresis: be more aggressive switching to binary markets during volatility
             let should_switch = cur_secs_left < config::FINAL_EXPIRY_WINDOW_SECS  // current expiring soon
                 || cur_secs_left <= 0                                              // current already expired
-                || new_secs_left > cur_secs_left + 1800                           // new has 30+ more minutes
-                || (candidate_is_binary                                           // switching TO binary market
-                    && !current_is_binary                                         // from non-binary (strike)
-                    && recent_momentum_signals >= 5                               // during high volatility (5+ signals in 60s)
-                    && new_secs_left > 600                                        // and has at least 10 min left
-                    && cur_secs_left > 300);                                      // and current market won't expire immediately
+                || time_based_upgrade                                              // new market is significantly longer AND same/better type
+                || (candidate_is_binary                                            // switching TO binary market
+                    && !current_is_binary                                          // from non-binary (strike)
+                    && !candidate_is_range                                         // and not a dead range market
+                    && recent_momentum_signals >= 5                                // during high volatility (5+ signals in 60s)
+                    && new_secs_left > 600                                         // and has at least 10 min left
+                    && cur_secs_left > 300);                                       // and current market won't expire immediately
 
             if !should_switch {
                 info!("🏆 Selected market: \"{}\" (staying on current: {} — {}s vs {}s, no significant gain){}",
@@ -650,6 +671,8 @@ async fn main() -> Result<()> {
                 cur_name, candidate.2, cur_secs_left, new_secs_left,
                 if candidate_is_binary && !current_is_binary && recent_momentum_signals >= 5 {
                     format!(" [Switching to binary market during high volatility: {} signals in 60s]", recent_momentum_signals)
+                } else if time_based_upgrade {
+                    format!(" [Time upgrade: {}s → {}s, same/better market type]", cur_secs_left, new_secs_left)
                 } else {
                     String::new()
                 });
@@ -914,7 +937,7 @@ async fn main() -> Result<()> {
 
                         if let Some(yp) = yes_pos {
                             if yp.shares > dec!(0) {
-                                if let Some(reason) = MomentumStrategy::should_exit_momentum(yes_bid, yp.avg_entry, velocity, threshold, &crypto_filter) {
+                                if let Some(reason) = MomentumStrategy::should_exit_momentum(yes_bid, yp.avg_entry, velocity, threshold, yp.opened_at, &crypto_filter) {
                                     match reason {
                                         rustpolybot::strategies::momentum::ExitReason::TakeProfit { bid_price, profit_pct, target_pct } => {
                                             info!("🎯 Momentum YES Target Reached (Bid: ${:.2}, Profit: {:.2}% vs Target: {:.2}%) - Taking Profit", bid_price, profit_pct * dec!(100), target_pct * dec!(100));
@@ -927,8 +950,7 @@ async fn main() -> Result<()> {
                                         rustpolybot::strategies::momentum::ExitReason::Reversal { velocity: vel, threshold: thr } => {
                                             info!("📉 Momentum YES Reversal Detected (Velocity: ${:.2} < Threshold: ${:.2})", vel, thr);
                                             exit_token = Some(yes_token);
-                                        },
-                                    }
+                                        },                                    }
                                     exit_price = (yes_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                     exit_shares = yp.shares;
                                     exit_fee_rate = yes_fee_rate;
@@ -940,7 +962,7 @@ async fn main() -> Result<()> {
                         if exit_token.is_none() {
                             if let Some(np) = no_pos {
                                 if np.shares > dec!(0) {
-                                    if let Some(reason) = MomentumStrategy::should_exit_momentum(no_bid, np.avg_entry, -velocity, threshold, &crypto_filter) {
+                                    if let Some(reason) = MomentumStrategy::should_exit_momentum(no_bid, np.avg_entry, -velocity, threshold, np.opened_at, &crypto_filter) {
                                         match reason {
                                             rustpolybot::strategies::momentum::ExitReason::TakeProfit { bid_price, profit_pct, target_pct } => {
                                                 info!("🎯 Momentum NO Target Reached (Bid: ${:.2}, Profit: {:.2}% vs Target: {:.2}%) - Taking Profit", bid_price, profit_pct * dec!(100), target_pct * dec!(100));
@@ -950,10 +972,10 @@ async fn main() -> Result<()> {
                                                 info!("🛑 Momentum NO Stop Loss Hit (Bid: ${:.2}, Loss: {:.2}%)", bid_price, loss_pct * dec!(100));
                                                 exit_token = Some(no_token);
                                             },
-                                            rustpolybot::strategies::momentum::ExitReason::Reversal { velocity: vel, threshold: thr } => {
-                                                info!("📉 Momentum NO Reversal Detected (Velocity: ${:.2} > -${:.2})", vel, thr);
-                                                exit_token = Some(no_token);
-                                            },
+                                        rustpolybot::strategies::momentum::ExitReason::Reversal { velocity: vel, threshold: thr } => {
+                                            info!("📉 Momentum NO Reversal Detected (Velocity: ${:.2} < Threshold: ${:.2})", vel, thr);
+                                            exit_token = Some(no_token);
+                                        },
                                         }
                                         exit_price = (no_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE).round_dp(2);
                                         exit_shares = np.shares;
@@ -967,6 +989,8 @@ async fn main() -> Result<()> {
                         if let Some(token) = exit_token {
                             momentum_exit_in_progress.store(true, Ordering::Relaxed);
                             let eip_handle = Arc::clone(&momentum_exit_in_progress);
+                            // Reset momentum_fired flag after exit so re-entry is possible on strong signals
+                            let momentum_fired_handle = Arc::clone(&momentum_fired_for_current_market);
                             let client = Arc::clone(&trading_client);
                             let signer = signer.clone();
                             let nm = Arc::clone(&nonce_manager);
@@ -1039,6 +1063,9 @@ async fn main() -> Result<()> {
                                                 *pnl_handle.lock().await += realized_pnl;
                                                 info!("📊 Momentum Exit P&L: ${:.4} (entry ${:.2} → exit ${:.2})", realized_pnl, exit_avg_entry, current_exit_price);
                                                 *guard += 1;
+                                                // Re-enable momentum for this market so the bot can re-enter on the next strong signal
+                                                momentum_fired_handle.store(false, Ordering::Relaxed);
+                                                info!("♻️  Momentum re-enabled — position closed, ready for next signal");
                                                 eip_handle.store(false, Ordering::Relaxed);
                                                 return Ok(());
                                             },

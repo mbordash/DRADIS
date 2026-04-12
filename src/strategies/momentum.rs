@@ -65,6 +65,7 @@ impl MomentumStrategy {
         avg_entry: Decimal,
         velocity: Decimal,
         threshold: Decimal,
+        entry_time: DateTime<Utc>,
         _crypto_filter: &str,
     ) -> Option<ExitReason> {
         if avg_entry <= dec!(0) {
@@ -74,7 +75,10 @@ impl MomentumStrategy {
         let profit_margin = (position_bid - avg_entry) / avg_entry;
         let target = if avg_entry >= dec!(0.70) { dec!(0.05) } else { config::MOMENTUM_TARGET_PROFIT_PERCENT };
         let stop_loss = -config::MOMENTUM_STOP_LOSS_PERCENT;
-        let reversal_threshold = threshold * config::MOMENTUM_REVERSAL_RATIO;
+        // Reversal threshold: the velocity must be strongly NEGATIVE (opposite direction)
+        // to trigger a reversal exit — flat/zero velocity means BTC just stabilized, not reversed.
+        let reversal_threshold = -(threshold * config::MOMENTUM_REVERSAL_RATIO);
+        let secs_held = (Utc::now() - entry_time).num_seconds();
 
         if profit_margin >= target || position_bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
             Some(ExitReason::TakeProfit {
@@ -87,7 +91,11 @@ impl MomentumStrategy {
                 bid_price: position_bid,
                 loss_pct: profit_margin,
             })
-        } else if velocity.abs() < reversal_threshold {
+        } else if secs_held >= config::MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL
+            && velocity < reversal_threshold
+        {
+            // Only exit on actual directional reversal (strong move opposite to entry direction)
+            // AND only after holding long enough for the initial move to clear the velocity window
             Some(ExitReason::Reversal {
                 velocity,
                 threshold: reversal_threshold,
