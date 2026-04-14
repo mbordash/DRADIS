@@ -14,6 +14,7 @@ pub const ENABLE_TELEGRAM: bool = true;
 // ============================================================================
 
 /// If true, the bot will log trades but NOT actually execute them on-chain.
+/// ⚠️  Set to `false` only after verifying signals in a dry run.
 pub const GHOST_MODE: bool = false;
 
 /// Margin threshold to trigger entry.
@@ -98,6 +99,7 @@ pub const SOL_STRIKE_BUFFER: Decimal = dec!(0.2);
 /// Raised from 0.85 to 0.88 to allow entries slightly after market repricing.
 /// Still blocks extreme prices (0.90+) where risk/reward is poor.
 pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.88);
+pub const MAX_MOMENTUM_CROSSING_ENTRY_PRICE: Decimal = dec!(0.75);
 
 /// The time window (in seconds) used to calculate price velocity from Binance.
 /// Shortened from 10s to 5s for faster signal detection before Polymarket reprices.
