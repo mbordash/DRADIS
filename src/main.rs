@@ -6,7 +6,7 @@
 use anyhow::Result;
 
 use polymarket_client_sdk::clob::{Client as ClobClient, Config};
-use polymarket_client_sdk::clob::types::{Side, SignatureType};
+use polymarket_client_sdk::clob::types::{Side, SignatureType, OrderType};
 use polymarket_client_sdk::{POLYGON, PRIVATE_KEY_VAR, derive_safe_wallet};
 use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk::clob::types::AssetType;
@@ -463,7 +463,7 @@ async fn main() -> Result<()> {
                                 if !config::GHOST_MODE {
                                     if let Err(e) = place_limit_order(
                                         &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
-                                        verifying_contract, *token_id, Side::Sell, shares, sell_price, fee_bps,
+                                        verifying_contract, *token_id, Side::Sell, shares, sell_price, fee_bps, OrderType::FAK, false, 0,
                                     ).await {
                                         warn!("⚠️ Exit order failed: {}", e);
                                         consecutive_failures += 1;
@@ -505,7 +505,7 @@ async fn main() -> Result<()> {
                                         if !config::GHOST_MODE {
                                             if let Err(e) = place_limit_order(
                                                 &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
-                                                verifying_contract, pair_token, Side::Sell, ps, pair_sell, pair_fee,
+                                                verifying_contract, pair_token, Side::Sell, ps, pair_sell, pair_fee, OrderType::FAK, false, 0,
                                             ).await {
                                                 warn!("⚠️ Paired exit order failed: {}", e);
                                             }
@@ -603,9 +603,10 @@ async fn main() -> Result<()> {
                                 info!("📥 ENTRY [{}]: {} {} | shares={:.2}, price=${:.4}", strategy_name, side_label, market_name, shares, buy_price);
 
                                 if !config::GHOST_MODE {
+                                    let (order_type, post_only, exp) = if is_maker { (OrderType::GTC, true, 60u64) } else { (OrderType::FAK, false, 0u64) };
                                     if let Err(e) = place_limit_order(
                                         &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
-                                        verifying_contract, *token_id, Side::Buy, shares, buy_price, fee_bps,
+                                        verifying_contract, *token_id, Side::Buy, shares, buy_price, fee_bps, order_type, post_only, exp,
                                     ).await {
                                         warn!("⚠️ Entry order failed: {}", e);
                                         consecutive_failures += 1;
@@ -660,7 +661,7 @@ async fn main() -> Result<()> {
                                         if !config::GHOST_MODE {
                                             if let Err(e) = place_limit_order(
                                                 &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
-                                                verifying_contract, pair_token, Side::Buy, pair_shares, pair_buy, pair_fee,
+                                                verifying_contract, pair_token, Side::Buy, pair_shares, pair_buy, pair_fee, OrderType::FAK, false, 0,
                                             ).await {
                                                 warn!("⚠️ Paired entry order failed: {} — first leg is now one-sided!", e);
                                                 let _ = send_notification(&tg_token, &tg_chat_id,

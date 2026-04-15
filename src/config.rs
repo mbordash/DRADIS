@@ -8,7 +8,6 @@ use std::time::Duration as StdDuration;
 
 pub const ENABLE_TELEGRAM: bool = true;
 
-
 // ============================================================================
 // ARBITRAGE STRATEGY PARAMETERS
 // ============================================================================
