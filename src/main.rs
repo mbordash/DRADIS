@@ -441,13 +441,6 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
-                    // ── Cooldown gate ──
-                    if let Some(lt) = last_trade_time {
-                        if lt.elapsed() < Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64) {
-                            continue;
-                        }
-                    }
-
                     // ── Process each resolved signal ──
                     for (strategy_name, signal) in &resolved_signals {
                         match signal {
@@ -520,6 +513,8 @@ async fn main() -> Result<()> {
                                 }
 
                                 consecutive_failures = 0;
+                                momentum_confirmation_count = 0;
+                                last_momentum_signal_token = None;
                                 last_trade_time = Some(Instant::now());
 
                                 let session_pnl = *total_pnl.lock().await;
@@ -529,6 +524,13 @@ async fn main() -> Result<()> {
 
                             // ════════════════════ ENTRY ════════════════════
                             StrategySignal::Entry { token_id } => {
+                                // Cooldown gate — entries only
+                                if let Some(lt) = last_trade_time {
+                                    if lt.elapsed() < Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64) {
+                                        continue;
+                                    }
+                                }
+
                                 // Momentum confirmation gate
                                 if strategy_name == "MomentumStrategy" {
                                     if last_momentum_signal_token == Some(*token_id) {
