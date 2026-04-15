@@ -1,7 +1,8 @@
-/// Momentum Strategy - Strategy Trait Implementation
+/// Momentum Strategy
 ///
-/// Wraps the existing MomentumStrategy logic in the Strategy trait interface.
-/// This enables uniform handling across all strategies and sets up for future threading.
+/// One-sided, non-hedged trades based on Binance price oracle signals.
+/// Entry triggers when price velocity exceeds threshold and market conditions align.
+/// Exits via take-profit, stop-loss, or reversal detection.
 
 use async_trait::async_trait;
 use anyhow::Result;

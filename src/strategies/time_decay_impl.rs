@@ -1,17 +1,21 @@
-/// Time Decay (Theta) Strategy - Strategy Trait Implementation
+/// Time Decay (Theta) Strategy
 ///
-/// Wraps the existing TimeDecayStrategy logic in the Strategy trait interface.
-/// Exploits YES+NO price convergence toward $1.00 as markets approach expiry.
+/// Exploits YES+NO price convergence toward $1.00 as hourly markets approach expiry.
+///
+/// Two modes:
+/// - **Settlement**: combined_ask < $1.00 after fees → hold to settlement for guaranteed profit
+/// - **Convergence**: combined_ask slightly above $1.00 (up to MAX) → exit when bids converge
 
 use async_trait::async_trait;
 use anyhow::Result;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
+use alloy::primitives::U256;
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus};
 use crate::config;
-use crate::strategies::time_decay::TimeDecayStrategy;
 
 /// Implements Strategy trait for Time Decay trading
 pub struct TimeDecayStrategyImpl;
@@ -296,3 +300,152 @@ mod tests {
     }
 }
 
+
+
+// ============================================================================
+// Types (consolidated from time_decay.rs)
+// ============================================================================
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ThetaMode {
+    /// Combined ask < $1.00 after fees — hold to settlement for guaranteed profit
+    Settlement,
+    /// Combined ask slightly > $1.00 — exit before settlement when bids converge
+    Convergence,
+}
+
+#[derive(Debug, Clone)]
+pub struct ThetaSignal {
+    pub mode: ThetaMode,
+    pub combined_ask: Decimal,
+    pub net_profit_per_share: Decimal,
+    pub total_fees: Decimal,
+}
+
+pub struct TimeDecayStrategy;
+
+impl TimeDecayStrategy {
+    pub fn calculate_theta_opportunity(
+        yes_ask: Decimal,
+        no_ask: Decimal,
+        yes_fee_bps: u32,
+        no_fee_bps: u32,
+        seconds_to_expiry: i64,
+    ) -> Option<ThetaSignal> {
+        let combined_ask = yes_ask + no_ask;
+        let yes_fee = yes_ask * Decimal::from(yes_fee_bps) / dec!(10_000);
+        let no_fee = no_ask * Decimal::from(no_fee_bps) / dec!(10_000);
+        let total_fees = yes_fee + no_fee;
+        let net_profit = dec!(1.0) - combined_ask - total_fees;
+        if net_profit >= config::MIN_TIME_DECAY_NET_PROFIT {
+            return Some(ThetaSignal {
+                mode: ThetaMode::Settlement,
+                combined_ask,
+                net_profit_per_share: net_profit,
+                total_fees,
+            });
+        }
+        if combined_ask <= config::MAX_TIME_DECAY_COMBINED_ASK
+            && seconds_to_expiry < config::TIME_DECAY_CONVERGENCE_WINDOW_SECS
+        {
+            let convergence_target = config::TIME_DECAY_CONVERGENCE_EXIT_BID;
+            let estimated_exit_profit = convergence_target - combined_ask - total_fees;
+            if estimated_exit_profit > dec!(-0.005) {
+                return Some(ThetaSignal {
+                    mode: ThetaMode::Convergence,
+                    combined_ask,
+                    net_profit_per_share: estimated_exit_profit,
+                    total_fees,
+                });
+            }
+        }
+        None
+    }
+
+    pub fn is_in_theta_window(seconds_to_expiry: i64) -> bool {
+        seconds_to_expiry >= config::TIME_DECAY_MIN_SECS_TO_EXPIRY
+            && seconds_to_expiry <= config::TIME_DECAY_MAX_SECS_TO_EXPIRY
+    }
+
+    pub fn calculate_current_pnl(
+        current_yes_bid: Decimal,
+        current_no_bid: Decimal,
+        entry_combined_cost: Decimal,
+        position_size: Decimal,
+    ) -> (Decimal, Decimal) {
+        let current_combined_bid = current_yes_bid + current_no_bid;
+        let unrealized_pnl = (current_combined_bid - entry_combined_cost) * position_size;
+        let pnl_pct = if entry_combined_cost > dec!(0) {
+            (current_combined_bid - entry_combined_cost) / entry_combined_cost
+        } else {
+            dec!(0)
+        };
+        (unrealized_pnl, pnl_pct)
+    }
+
+    pub fn should_convergence_exit(
+        current_yes_bid: Decimal,
+        current_no_bid: Decimal,
+    ) -> bool {
+        current_yes_bid + current_no_bid >= config::TIME_DECAY_CONVERGENCE_EXIT_BID
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum EarlyExitReason {
+    SpreadWidened {
+        expected: Decimal,
+        actual: Decimal,
+    },
+    MarketOutcomeObvious {
+        dominant_side: String,
+        confidence: Decimal,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct TimeDecayPosition {
+    pub yes_token_id: U256,
+    pub no_token_id: U256,
+    pub entry_time: DateTime<Utc>,
+    pub expiry_time: DateTime<Utc>,
+    pub yes_entry_price: Decimal,
+    pub no_entry_price: Decimal,
+    pub position_size: Decimal,
+    pub total_invested: Decimal,
+    pub mode: ThetaMode,
+}
+
+impl TimeDecayPosition {
+    pub fn new(
+        yes_id: U256,
+        no_id: U256,
+        entry_time: DateTime<Utc>,
+        expiry_time: DateTime<Utc>,
+        yes_price: Decimal,
+        no_price: Decimal,
+        size: Decimal,
+        mode: ThetaMode,
+    ) -> Self {
+        let total_invested = (yes_price + no_price) * size;
+        Self {
+            yes_token_id: yes_id,
+            no_token_id: no_id,
+            entry_time,
+            expiry_time,
+            yes_entry_price: yes_price,
+            no_entry_price: no_price,
+            position_size: size,
+            total_invested,
+            mode,
+        }
+    }
+
+    pub fn time_to_expiry(&self) -> i64 {
+        (self.expiry_time - Utc::now()).num_seconds()
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.time_to_expiry() <= 0
+    }
+}

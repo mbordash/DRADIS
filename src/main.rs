@@ -35,7 +35,7 @@ use tracing::{info, warn, debug, error};
 use rustpolybot::config;
 use rustpolybot::risk::RiskEngine;
 use rustpolybot::state::{Position, StrategySignal, MarketConfig, MarketSnapshot, PositionMap};
-use rustpolybot::strategies::time_decay::TimeDecayPosition;
+use rustpolybot::strategies::time_decay_impl::TimeDecayPosition;
 use rustpolybot::orchestrator::{StrategyRegistry, StrategyContext};
 use rustpolybot::orchestrator::executor::{execute_strategies_concurrent, aggregate_and_resolve_signals};
 use rustpolybot::notifications::send_notification;
@@ -551,33 +551,46 @@ async fn main() -> Result<()> {
                                     if pos_map.contains_key(token_id) { continue; }
                                 }
 
-                                // Risk check
+                                // Compute order params
+                                let ask = if *token_id == yes_token { yes_ask } else { no_ask };
+                                let bid = if *token_id == yes_token { yes_bid } else { no_bid };
+                                let depth = if *token_id == yes_token { yes_depth } else { no_depth };
+                                let fee_bps = if *token_id == yes_token { yes_fee_rate as u16 } else { no_fee_rate as u16 };
+
+                                // Maker strategy posts a passive bid; all others lift the ask
+                                let is_maker = strategy_name == "MakerStrategy";
+                                let order_base_price = if is_maker { bid } else { ask };
+
+                                // Risk check — maker uses bid sum (posting, not lifting); takers use ask sum
                                 let collateral = *starting_collateral.lock().await;
                                 let session_pnl = *total_pnl.lock().await;
                                 let current_exposure = {
                                     let pos_map = positions.lock().await;
                                     pos_map.values().map(|p| p.shares * p.avg_entry).sum::<Decimal>()
                                 };
-                                if !risk_engine.approve_buy(yes_ask, no_ask, current_exposure, trade_size_usdc, collateral, session_pnl) {
+                                let (risk_yes_price, risk_no_price) = if is_maker {
+                                    (yes_bid, no_bid)
+                                } else {
+                                    (yes_ask, no_ask)
+                                };
+                                if !risk_engine.approve_buy(risk_yes_price, risk_no_price, current_exposure, trade_size_usdc, collateral, session_pnl) {
                                     continue;
                                 }
 
-                                // Compute order params
-                                let ask = if *token_id == yes_token { yes_ask } else { no_ask };
-                                let depth = if *token_id == yes_token { yes_depth } else { no_depth };
-                                let fee_bps = if *token_id == yes_token { yes_fee_rate as u16 } else { no_fee_rate as u16 };
-
-                                if ask <= dec!(0) { continue; }
-                                let shares = trade_size_usdc / ask;
+                                if order_base_price <= dec!(0) { continue; }
+                                let shares = trade_size_usdc / order_base_price;
                                 if shares < config::MIN_ORDER_SHARES || trade_size_usdc < config::MIN_ORDER_USDC { continue; }
-                                if depth < shares * config::MIN_LIQUIDITY_FILL_RATIO { continue; }
+                                // Maker posts a resting bid — ask-side depth is irrelevant; skip for maker
+                                if !is_maker && depth < shares * config::MIN_LIQUIDITY_FILL_RATIO { continue; }
 
-                                let price_offset = if strategy_name == "MomentumStrategy" {
-                                    config::BUY_PRICE_OFFSET + config::MOMENTUM_BUY_PRICE_OFFSET
+                                let buy_price = if is_maker {
+                                    // Post passively at bid + small improvement (GTC resting order)
+                                    (bid + config::MAKER_BID_IMPROVEMENT).min(config::MAX_BUY_LIMIT_PRICE)
+                                } else if strategy_name == "MomentumStrategy" {
+                                    (ask + config::BUY_PRICE_OFFSET + config::MOMENTUM_BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE)
                                 } else {
-                                    config::BUY_PRICE_OFFSET
+                                    (ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE)
                                 };
-                                let buy_price = (ask + price_offset).min(config::MAX_BUY_LIMIT_PRICE);
                                 let side_label = if *token_id == yes_token { "YES" } else { "NO" };
 
                                 info!("📥 ENTRY [{}]: {} {} | shares={:.2}, price=${:.4}", strategy_name, side_label, market_name, shares, buy_price);
@@ -605,7 +618,7 @@ async fn main() -> Result<()> {
                                     let mut pos_map = positions.lock().await;
                                     pos_map.insert(*token_id, Position {
                                         shares,
-                                        avg_entry: ask,
+                                        avg_entry: order_base_price,
                                         opened_at: Utc::now(),
                                         close_time: market_close_time,
                                         market_name: market_name.clone(),
@@ -672,7 +685,7 @@ async fn main() -> Result<()> {
                                 last_momentum_signal_token = None;
                                 last_trade_time = Some(Instant::now());
 
-                                let msg = format!("📥 ENTRY [{}] {} {} | ${:.4} x {:.1}", strategy_name, side_label, market_name, ask, shares);
+                                let msg = format!("📥 ENTRY [{}] {} {} | ${:.4} x {:.1}", strategy_name, side_label, market_name, order_base_price, shares);
                                 let _ = send_notification(&tg_token, &tg_chat_id, &msg).await;
                             }
 
