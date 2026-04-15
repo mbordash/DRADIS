@@ -47,6 +47,9 @@ const VERSION: &str = "1";
 /// * `quantity` - Amount of shares
 /// * `limit_price` - Limit price per share
 /// * `fee_rate_bps` - Fee rate in basis points
+/// * `order_type` - Order type (e.g. FAK, GTC, GTD)
+/// * `post_only` - If true, ensures the order only adds liquidity (fails if it would take)
+/// * `expiration_secs` - Time in seconds until order expires (0 for no expiration)
 pub async fn place_limit_order(
     client: &Arc<ClobClient<Authenticated<Normal>>>,
     nonce_manager: &Arc<Mutex<u64>>,
@@ -59,6 +62,9 @@ pub async fn place_limit_order(
     quantity: Decimal,
     limit_price: Decimal,
     fee_rate_bps: u16,
+    order_type: OrderType,
+    post_only: bool,
+    expiration_secs: u64,
 ) -> Result<()> {
     for attempt in 0..2 {
         let mut guard = nonce_manager.lock().await;
@@ -72,23 +78,25 @@ pub async fn place_limit_order(
 
         match side {
             Side::Buy => {
-                // For buy orders:
-                // makerAmount is collateral (USDC) -> max 2 decimals.
-                // takerAmount is shares -> max 4 decimals.
+                // BUY: Maker (USDC) max 2 decimals, Taker (Shares) max 4 decimals.
                 order_struct.makerAmount = U256::from(to_fixed_u128_with_precision(quantity * limit_price, 2));
                 order_struct.takerAmount = U256::from(to_fixed_u128_with_precision(quantity, 4));
             }
             Side::Sell => {
-                // For sell orders:
-                // makerAmount is shares -> max 2 decimals.
-                // takerAmount is collateral (USDC) -> max 5 decimals.
+                // SELL: Maker (Shares) max 2 decimals, Taker (USDC) max 5 decimals.
                 order_struct.makerAmount = U256::from(to_fixed_u128_with_precision(quantity, 2));
                 order_struct.takerAmount = U256::from(to_fixed_u128_with_precision(quantity * limit_price, 5));
             }
             _ => return Err(anyhow::anyhow!("Unsupported order side")),
         }
 
-        order_struct.expiration = U256::ZERO;
+        // Set expiration if provided (UNIX timestamp in seconds)
+        order_struct.expiration = if expiration_secs > 0 {
+            U256::from(Utc::now().timestamp() as u64 + expiration_secs)
+        } else {
+            U256::ZERO
+        };
+
         order_struct.nonce = U256::from(current_nonce);
         order_struct.feeRateBps = U256::from(fee_rate_bps);
         order_struct.side = side as u8;
@@ -104,11 +112,13 @@ pub async fn place_limit_order(
 
         let hash = order_struct.eip712_signing_hash(&domain);
         if let Ok(signature) = signer.sign_hash(&hash).await {
+            // Using a single chain with maybe_post_only to avoid builder type-state mismatches.
             let signed_order = SignedOrder::builder()
                 .order(order_struct)
                 .signature(signature)
-                .order_type(OrderType::FAK)
+                .order_type(order_type.clone())
                 .owner(client.credentials().key())
+                .maybe_post_only(if post_only { Some(true) } else { None })
                 .build();
 
             match client.post_order(signed_order).await {
