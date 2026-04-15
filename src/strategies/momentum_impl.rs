@@ -18,6 +18,10 @@ pub struct MomentumStrategyImpl;
 impl Strategy for MomentumStrategyImpl {
     /// Evaluate if a momentum entry signal should trigger
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
+        if !config::ENABLE_MOMENTUM_TRADING {
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // Extract data from context
         let velocity = ctx.snapshot.velocity;
         let binance_price = ctx.snapshot.oracle_price;
