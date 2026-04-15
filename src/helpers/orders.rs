@@ -72,19 +72,20 @@ pub async fn place_limit_order(
 
         match side {
             Side::Buy => {
-                // For buy orders, makerAmount is the collateral (USDC) and takerAmount is the shares.
-                // Collateral precision: 2 decimals.
-                // Share precision: 4 decimals.
+                // For buy orders:
+                // makerAmount is collateral (USDC) -> max 2 decimals.
+                // takerAmount is shares -> max 4 decimals.
                 order_struct.makerAmount = U256::from(to_fixed_u128_with_precision(quantity * limit_price, 2));
                 order_struct.takerAmount = U256::from(to_fixed_u128_with_precision(quantity, 4));
             }
             Side::Sell => {
-                // For sell orders, makerAmount is the shares and takerAmount is the collateral (USDC).
-                // Share precision: 4 decimals.
-                // Collateral precision: 2 decimals.
-                order_struct.makerAmount = U256::from(to_fixed_u128_with_precision(quantity, 4));
-                order_struct.takerAmount = U256::from(to_fixed_u128_with_precision(quantity * limit_price, 2));
+                // For sell orders:
+                // makerAmount is shares -> max 2 decimals.
+                // takerAmount is collateral (USDC) -> max 5 decimals.
+                order_struct.makerAmount = U256::from(to_fixed_u128_with_precision(quantity, 2));
+                order_struct.takerAmount = U256::from(to_fixed_u128_with_precision(quantity * limit_price, 5));
             }
+            _ => return Err(anyhow::anyhow!("Unsupported order side")),
         }
 
         order_struct.expiration = U256::ZERO;
