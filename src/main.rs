@@ -467,6 +467,13 @@ async fn main() -> Result<()> {
                                     ).await {
                                         warn!("⚠️ Exit order failed: {}", e);
                                         consecutive_failures += 1;
+                                        if consecutive_failures >= config::MAX_CONSECUTIVE_FAILURES {
+                                            error!("🚨 Circuit breaker: {} consecutive failures (EXIT) — pausing", consecutive_failures);
+                                            let _ = send_notification(&tg_token, &tg_chat_id,
+                                                &format!("🚨 Circuit breaker hit after {} EXIT failures on {}", consecutive_failures, market_name)).await;
+                                            tokio::time::sleep(Duration::from_secs(config::FAILURE_COOLDOWN_SECS as u64)).await;
+                                            consecutive_failures = 0;
+                                        }
                                         continue;
                                     }
                                 }
@@ -603,9 +610,9 @@ async fn main() -> Result<()> {
                                         warn!("⚠️ Entry order failed: {}", e);
                                         consecutive_failures += 1;
                                         if consecutive_failures >= config::MAX_CONSECUTIVE_FAILURES {
-                                            error!("🚨 Circuit breaker: {} consecutive failures — pausing", consecutive_failures);
+                                            error!("🚨 Circuit breaker: {} consecutive failures (ENTRY) — pausing", consecutive_failures);
                                             let _ = send_notification(&tg_token, &tg_chat_id,
-                                                &format!("🚨 Circuit breaker hit after {} failures on {}", consecutive_failures, market_name)).await;
+                                                &format!("🚨 Circuit breaker hit after {} ENTRY failures on {}", consecutive_failures, market_name)).await;
                                             tokio::time::sleep(Duration::from_secs(config::FAILURE_COOLDOWN_SECS as u64)).await;
                                             consecutive_failures = 0;
                                         }
@@ -697,7 +704,3 @@ async fn main() -> Result<()> {
         }
     }
 }
-
-
-
-
