@@ -38,9 +38,10 @@ scp -P "$SSH_PORT" -i "$KEY" src/notifications.rs "$USER@$HOST:$REMOTE_DIR/src/n
 scp -P "$SSH_PORT" -i "$KEY" src/market_validator.rs "$USER@$HOST:$REMOTE_DIR/src/market_validator.rs"
 # Copy strategy modules
 scp -P "$SSH_PORT" -i "$KEY" src/strategies/mod.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/mod.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/strategies/momentum.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/momentum.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/strategies/arbitrage.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/arbitrage.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/strategies/time_decay.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/time_decay.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/strategies/momentum_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/momentum_impl.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/strategies/arbitrage_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/arbitrage_impl.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/strategies/time_decay_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/time_decay_impl.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/strategies/maker_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/maker_impl.rs"
 # Copy helpers modules
 scp -P "$SSH_PORT" -i "$KEY" src/helpers/mod.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/mod.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/helpers/price.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/price.rs"
