@@ -114,6 +114,39 @@ pub const SOL_MOMENTUM_THRESHOLD: Decimal = dec!(0.3);
 
 
 // ============================================================================
+// MAKER (PASSIVE LIMIT ORDER) STRATEGY PARAMETERS
+// ============================================================================
+
+/// Allow passive maker orders (post bids below the ask to earn rebates instead of paying fees).
+/// Conservative by default — only fires when spread is wide and expiry is far away.
+pub const ENABLE_MAKER_TRADING: bool = true;
+
+/// Minimum bid-ask spread (YES or NO side) required to post a maker order.
+/// Wide spread = more room to profit before adverse selection erodes the edge.
+/// Conservative default: 5 cents. Lower only after validating fill quality.
+pub const MAKER_MIN_SPREAD: Decimal = dec!(0.05);
+
+/// How much to improve over the current best bid when posting the maker order.
+/// One tick (0.01) gives queue priority without giving away too much edge.
+pub const MAKER_BID_IMPROVEMENT: Decimal = dec!(0.01);
+
+/// Do not post maker orders if market closes within this many seconds.
+/// 600s (10 min) gives enough time for a fill and a clean exit before expiry.
+pub const MAKER_MIN_SECS_TO_EXPIRY: i64 = 600;
+
+/// Maximum token price allowed for a maker entry bid.
+/// Avoids posting bids on tokens already priced near certainty (low upside).
+pub const MAKER_MAX_ENTRY_PRICE: Decimal = dec!(0.70);
+
+/// Take-profit: exit when position gains this % over avg entry.
+pub const MAKER_TARGET_PROFIT_PERCENT: Decimal = dec!(0.04);
+
+/// Stop-loss: exit when position loses this % from avg entry.
+/// Tight at 3% — maker fills often mean someone knew something; cut quickly.
+pub const MAKER_STOP_LOSS_PERCENT: Decimal = dec!(0.03);
+
+
+// ============================================================================
 // TIME DECAY (THETA) STRATEGY PARAMETERS
 // ============================================================================
 

@@ -1,7 +1,8 @@
-/// Arbitrage Strategy - Strategy Trait Implementation
+/// Arbitrage Strategy
 ///
-/// Wraps the existing ArbitrageStrategy logic in the Strategy trait interface.
-/// Handles hedged, two-sided trades that exploit YES+NO spread inefficiencies.
+/// Hedged, two-sided trades that exploit the YES+NO spread inefficiency.
+/// Entry triggers when combined ask prices fall below a profitability threshold.
+/// Exits when combined bid prices exceed target, or via manual rebalancing.
 
 use async_trait::async_trait;
 use anyhow::Result;

@@ -7,6 +7,8 @@ use crate::orchestrator::Strategy;
 use crate::strategies::momentum_impl::MomentumStrategyImpl;
 use crate::strategies::arbitrage_impl::ArbitrageStrategyImpl;
 use crate::strategies::time_decay_impl::TimeDecayStrategyImpl;
+use crate::strategies::maker_impl::MakerStrategyImpl;
+use crate::config;
 
 /// Registry for all available strategies
 pub struct StrategyRegistry;
@@ -14,11 +16,15 @@ pub struct StrategyRegistry;
 impl StrategyRegistry {
     /// Create a vector of all enabled strategies
     pub fn create_all_strategies() -> Vec<Box<dyn Strategy>> {
-        vec![
+        let mut strategies: Vec<Box<dyn Strategy>> = vec![
             Box::new(MomentumStrategyImpl),
             Box::new(ArbitrageStrategyImpl),
             Box::new(TimeDecayStrategyImpl),
-        ]
+        ];
+        if config::ENABLE_MAKER_TRADING {
+            strategies.push(Box::new(MakerStrategyImpl));
+        }
+        strategies
     }
 
     /// Create only momentum strategy
@@ -34,6 +40,10 @@ impl StrategyRegistry {
     /// Create only time decay strategy
     pub fn create_time_decay() -> Box<dyn Strategy> {
         Box::new(TimeDecayStrategyImpl)
+    }
+    /// Create only maker strategy
+    pub fn create_maker() -> Box<dyn Strategy> {
+        Box::new(MakerStrategyImpl)
     }
 }
 
