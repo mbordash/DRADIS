@@ -8,7 +8,7 @@
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::StrategySignal;
 use anyhow::Result;
-use tracing::{debug, warn};
+use tracing::{info, debug, warn};
 use std::time::Instant;
 use alloy::primitives::U256;
 use std::collections::HashMap;
@@ -99,7 +99,7 @@ pub async fn execute_strategies_concurrent(
         match entry_result {
             Ok(signal) => {
                 if !matches!(signal, StrategySignal::NoSignal) {
-                    debug!("📍 {} entry signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
+                    info!("📍 {} entry signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
                     entry_signals.push((strategy_name.clone(), signal));
                 }
             }
@@ -112,7 +112,7 @@ pub async fn execute_strategies_concurrent(
         match exit_result {
             Ok(signal) => {
                 if !matches!(signal, StrategySignal::NoSignal) {
-                    debug!("📍 {} exit signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
+                    info!("📍 {} exit signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
                     exit_signals.push((strategy_name.clone(), signal));
                 }
             }

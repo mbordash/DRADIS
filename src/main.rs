@@ -435,7 +435,7 @@ async fn main() -> Result<()> {
                     }
 
                     if resolved_signals.is_empty() {
-                        // Reset momentum confirmation when signal disappears
+                        // No signals from any strategy — reset momentum confirmation counter.
                         momentum_confirmation_count = 0;
                         last_momentum_signal_token = None;
                         continue;
@@ -538,7 +538,7 @@ async fn main() -> Result<()> {
                                         last_momentum_signal_token = Some(*token_id);
                                     }
                                     if momentum_confirmation_count < config::MOMENTUM_CONFIRMATION_TICKS {
-                                        debug!("⏳ Momentum confirmation {}/{}", momentum_confirmation_count, config::MOMENTUM_CONFIRMATION_TICKS);
+                                        info!("⏳ Momentum confirmation {}/{}", momentum_confirmation_count, config::MOMENTUM_CONFIRMATION_TICKS);
                                         continue;
                                     }
                                 }
