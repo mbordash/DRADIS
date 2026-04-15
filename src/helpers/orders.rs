@@ -22,7 +22,7 @@ use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 use tracing::warn;
 
-use crate::helpers::price::to_fixed_u128;
+use crate::helpers::price::to_fixed_u128_with_precision;
 
 const ORDER_NAME: &str = "Polymarket CTF Exchange";
 const VERSION: &str = "1";
@@ -69,8 +69,24 @@ pub async fn place_limit_order(
         order_struct.maker = safe_address;
         order_struct.signer = eoa_address;
         order_struct.tokenId = token_id;
-        order_struct.makerAmount = U256::from(to_fixed_u128(quantity * limit_price));
-        order_struct.takerAmount = U256::from(to_fixed_u128(quantity));
+
+        match side {
+            Side::Buy => {
+                // For buy orders, makerAmount is the collateral (USDC) and takerAmount is the shares.
+                // Collateral precision: 2 decimals.
+                // Share precision: 4 decimals.
+                order_struct.makerAmount = U256::from(to_fixed_u128_with_precision(quantity * limit_price, 2));
+                order_struct.takerAmount = U256::from(to_fixed_u128_with_precision(quantity, 4));
+            }
+            Side::Sell => {
+                // For sell orders, makerAmount is the shares and takerAmount is the collateral (USDC).
+                // Share precision: 4 decimals.
+                // Collateral precision: 2 decimals.
+                order_struct.makerAmount = U256::from(to_fixed_u128_with_precision(quantity, 4));
+                order_struct.takerAmount = U256::from(to_fixed_u128_with_precision(quantity * limit_price, 2));
+            }
+        }
+
         order_struct.expiration = U256::ZERO;
         order_struct.nonce = U256::from(current_nonce);
         order_struct.feeRateBps = U256::from(fee_rate_bps);
@@ -115,6 +131,3 @@ pub async fn place_limit_order(
     }
     Err(anyhow::anyhow!("Max retries reached"))
 }
-
-
-
