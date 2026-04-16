@@ -40,37 +40,71 @@ pub async fn sync_position_balance(
     positions: &Arc<Mutex<HashMap<U256, Position>>>,
     token_id: U256,
 ) -> Result<()> {
+    // Retry loop: check every 5s for up to 60s to allow for indexer lag and GTD fill delay.
+    // If the balance is still 0 after 60s the order was never filled — remove the phantom.
+    let max_wait_secs: i64 = 60;
+    let check_interval_ms: u64 = 5000;
+
     tokio::time::sleep(Duration::from_millis(2000)).await;
 
-    let mut req = BalanceAllowanceRequest::default();
-    req.asset_type = AssetType::Conditional;
-    req.token_id = Some(token_id);
+    loop {
+        let mut req = BalanceAllowanceRequest::default();
+        req.asset_type = AssetType::Conditional;
+        req.token_id = Some(token_id);
 
-    if let Ok(resp) = client.balance_allowance(req).await {
-        let actual_shares = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
-        let mut pos_map = positions.lock().await;
-        if let Some(pos) = pos_map.get_mut(&token_id) {
-            if actual_shares > dec!(0) {
-                info!("⚖️ Position Synced: Token {} quantity updated from {} to actual: {}", token_id, pos.shares, actual_shares);
-                pos.shares = actual_shares;
-                if pos.fill_confirmed_at.is_none() {
-                    pos.fill_confirmed_at = Some(Utc::now());
+        if let Ok(resp) = client.balance_allowance(req).await {
+            let actual_shares = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
+            let mut pos_map = positions.lock().await;
+            if let Some(pos) = pos_map.get_mut(&token_id) {
+                if actual_shares > dec!(0) {
+                    info!("⚖️ Position Synced: Token {} quantity updated from {} to actual: {}", token_id, pos.shares, actual_shares);
+                    pos.shares = actual_shares;
+                    if pos.fill_confirmed_at.is_none() {
+                        pos.fill_confirmed_at = Some(Utc::now());
+                    }
+                    return Ok(());
+                } else {
+                    let time_since_open = (Utc::now() - pos.opened_at).num_seconds();
+                    if pos.fill_confirmed_at.is_some() {
+                        // Was confirmed but now gone — possible liquidation
+                        warn!("⚠️ Position Sync WARNING: Token {} balance disappeared (was confirmed at {:?}). Possible liquidation or indexer issue.",
+                              token_id, pos.fill_confirmed_at);
+                        return Ok(());
+                    } else if time_since_open >= max_wait_secs {
+                        warn!("⚠️ Position Sync FAILED: Token {} balance still 0 after {}s. Order never filled on-chain. Removing phantom position.",
+                              token_id, time_since_open);
+                        pos_map.remove(&token_id);
+                        return Ok(());
+                    } else {
+                        warn!("⚠️ Position Sync: Token {} balance is 0 ({}s since open, max {}s). Retrying in {}ms…",
+                              token_id, time_since_open, max_wait_secs, check_interval_ms);
+                        // Drop lock before sleeping
+                        drop(pos_map);
+                        tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
+                        continue;
+                    }
                 }
             } else {
-                let time_since_open = Utc::now() - pos.opened_at;
-                if time_since_open.num_seconds() > 15 {
-                    warn!("⚠️ Position Sync FAILED: Token {} balance still 0 after {}s. Order likely never filled on-chain. Removing position.",
-                          token_id, time_since_open.num_seconds());
-                    pos_map.remove(&token_id);
-                } else if pos.fill_confirmed_at.is_some() {
-                    warn!("⚠️ Position Sync WARNING: Token {} balance disappeared (was confirmed at {:?}). Possible liquidation or indexer issue.",
-                          token_id, pos.fill_confirmed_at);
-                } else {
-                    warn!("⚠️ Position Sync: Token {} balance is 0 ({}s since open). Might be indexer lag. Keeping local position.",
-                          token_id, time_since_open.num_seconds());
-                }
+                // Position was removed externally (e.g. phantom cleanup in exit handler)
+                return Ok(());
+            }
+        } else {
+            // API error — wait and retry
+            tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
+            // Check if position still exists before retrying
+            let pos_map = positions.lock().await;
+            if !pos_map.contains_key(&token_id) {
+                return Ok(());
+            }
+            let time_since_open = pos_map.get(&token_id)
+                .map(|p| (Utc::now() - p.opened_at).num_seconds())
+                .unwrap_or(0);
+            drop(pos_map);
+            if time_since_open >= max_wait_secs {
+                warn!("⚠️ Position Sync TIMEOUT: Token {} — API errors for {}s. Removing phantom position.", token_id, time_since_open);
+                positions.lock().await.remove(&token_id);
+                return Ok(());
             }
         }
     }
-    Ok(())
 }
