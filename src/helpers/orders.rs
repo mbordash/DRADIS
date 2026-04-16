@@ -22,7 +22,7 @@ use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 use tracing::warn;
 
-use crate::helpers::price::{to_fixed_u128_with_precision, round_to_tick_size};
+use crate::helpers::price::{to_fixed_u128_with_precision, round_to_tick_size, ceil_with_scale};
 
 const ORDER_NAME: &str = "Polymarket CTF Exchange";
 const VERSION: &str = "1";
@@ -85,13 +85,21 @@ pub async fn place_limit_order(
         match side {
             Side::Buy => {
                 // BUY: Maker (USDC) max 2 decimals, Taker (Shares) max 4 decimals.
-                order_struct.makerAmount = U256::from(to_fixed_u128_with_precision(quantity * rounded_price, 2));
+                // IMPORTANT: Round USDC amount UP (ceiling) to ensure effective price stays at or above target.
+                // Truncating down would result in an effective price lower than intended, breaking tick size rules.
+                let usdc_amount = quantity * rounded_price;
+                let usdc_rounded_up = ceil_with_scale(usdc_amount, 2);
+                order_struct.makerAmount = U256::from(to_fixed_u128_with_precision(usdc_rounded_up, 2));
                 order_struct.takerAmount = U256::from(to_fixed_u128_with_precision(quantity, 4));
             }
             Side::Sell => {
                 // SELL: Maker (Shares) max 2 decimals, Taker (USDC) max 5 decimals.
+                // IMPORTANT: Round USDC amount UP (ceiling) to ensure effective price stays at or above target.
+                // Truncating down would result in an effective price lower than intended, breaking tick size rules.
+                let usdc_amount = quantity * rounded_price;
+                let usdc_rounded_up = ceil_with_scale(usdc_amount, 5);
                 order_struct.makerAmount = U256::from(to_fixed_u128_with_precision(quantity, 2));
-                order_struct.takerAmount = U256::from(to_fixed_u128_with_precision(quantity * rounded_price, 5));
+                order_struct.takerAmount = U256::from(to_fixed_u128_with_precision(usdc_rounded_up, 5));
             }
             _ => return Err(anyhow::anyhow!("Unsupported order side")),
         }

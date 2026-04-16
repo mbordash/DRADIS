@@ -40,3 +40,11 @@ pub fn round_to_tick_size(price: Decimal) -> Decimal {
     let tick_size = Decimal::from_parts(1, 0, 0, false, 2); // 0.01
     (price / tick_size).round() * tick_size
 }
+
+/// Ceiling function: round UP to the specified number of decimal places
+/// Used to ensure effective order prices don't drop below minimum tick size due to truncation
+pub fn ceil_with_scale(value: Decimal, scale: u32) -> Decimal {
+    let multiplier = Decimal::from(10u32.pow(scale));
+    (value * multiplier).ceil() / multiplier
+}
+
