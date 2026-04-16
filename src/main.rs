@@ -448,6 +448,9 @@ async fn main() -> Result<()> {
                         continue;
                     }
 
+                    // Reset per-tick failure counter so circuit breaker counts across ticks, not signals within one tick
+                    let mut tick_failures: u32 = 0;
+
                     // ── Process each resolved signal ──
                     for (strategy_name, signal) in &resolved_signals {
                         match signal {
@@ -473,15 +476,44 @@ async fn main() -> Result<()> {
                                         verifying_contract, *token_id, Side::Sell, shares, sell_price, fee_bps, OrderType::FAK, false, 0,
                                         &shared_http,
                                     ).await {
+                                        let err_str = e.to_string();
+                                        // "not enough balance" means this is a phantom position (never filled on-chain)
+                                        // Remove it immediately rather than retrying indefinitely.
+                                        if err_str.contains("not enough balance") || err_str.contains("balance: 0") {
+                                            let mut pos_map = positions.lock().await;
+                                            if pos_map.remove(token_id).is_some() {
+                                                warn!("🧹 EXIT [{}]: Phantom position removed for token {} (exchange balance=0). No shares owned.", strategy_name, token_id);
+                                            }
+                                            consecutive_failures = 0;
+                                            tick_failures = 0;
+                                            continue;
+                                        }
                                         warn!("⚠️ Exit order failed: {}", e);
+                                        tick_failures += 1;
                                         consecutive_failures += 1;
                                         if consecutive_failures >= config::MAX_CONSECUTIVE_FAILURES {
                                             error!("🚨 Circuit breaker: {} consecutive failures (EXIT) — pausing", consecutive_failures);
+                                            // Clear all local positions — exchange state is ground truth
+                                            {
+                                                let mut pos_map = positions.lock().await;
+                                                if !pos_map.is_empty() {
+                                                    warn!("🧹 Circuit breaker: clearing {} local positions to resync with exchange", pos_map.len());
+                                                    pos_map.clear();
+                                                }
+                                            }
                                             let _ = send_notification(&tg_token, &tg_chat_id,
                                                 &format!("🚨 Circuit breaker hit after {} EXIT failures on {}", consecutive_failures, market_name)).await;
-                                            tokio::time::sleep(Duration::from_secs(config::FAILURE_COOLDOWN_SECS as u64)).await;
-                                            sync_nonce_manager(&nonce_manager, &shared_http, safe_address).await;
+                                            // Use select! so market switch is still detected during cooldown
+                                            tokio::select! {
+                                                _ = tokio::time::sleep(Duration::from_secs(config::FAILURE_COOLDOWN_SECS as u64)) => {
+                                                    sync_nonce_manager(&nonce_manager, &shared_http, safe_address).await;
+                                                }
+                                                _ = market_rx.changed() => {
+                                                    info!("🔄 Market switch detected during circuit breaker cooldown");
+                                                }
+                                            }
                                             consecutive_failures = 0;
+                                            tick_failures = 0;
                                         }
                                         continue;
                                     }
@@ -626,14 +658,25 @@ async fn main() -> Result<()> {
                                         &shared_http,
                                     ).await {
                                         warn!("⚠️ Entry order failed: {}", e);
+                                        // Apply cooldown on failure so the 50ms ticker can't re-fire
+                                        // immediately and exhaust the circuit breaker in 150ms.
+                                        last_trade_time = Some(Instant::now());
+                                        tick_failures += 1;
                                         consecutive_failures += 1;
                                         if consecutive_failures >= config::MAX_CONSECUTIVE_FAILURES {
                                             error!("🚨 Circuit breaker: {} consecutive failures (ENTRY) — pausing", consecutive_failures);
                                             let _ = send_notification(&tg_token, &tg_chat_id,
                                                 &format!("🚨 Circuit breaker hit after {} ENTRY failures on {}", consecutive_failures, market_name)).await;
-                                            tokio::time::sleep(Duration::from_secs(config::FAILURE_COOLDOWN_SECS as u64)).await;
-                                            sync_nonce_manager(&nonce_manager, &shared_http, safe_address).await;
+                                            tokio::select! {
+                                                _ = tokio::time::sleep(Duration::from_secs(config::FAILURE_COOLDOWN_SECS as u64)) => {
+                                                    sync_nonce_manager(&nonce_manager, &shared_http, safe_address).await;
+                                                }
+                                                _ = market_rx.changed() => {
+                                                    info!("🔄 Market switch detected during circuit breaker cooldown");
+                                                }
+                                            }
                                             consecutive_failures = 0;
+                                            tick_failures = 0;
                                         }
                                         continue;
                                     }

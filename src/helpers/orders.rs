@@ -104,11 +104,17 @@ pub async fn place_limit_order(
 
         match side {
             Side::Buy => {
-                // takerAmount: shares truncated to 4dp, scaled to 1e6
-                // = shares_4dp_int * 100  (always divisible by 100)
-                let taker_raw = to_fixed_u128_with_precision(quantity, 4);
-                // makerAmount = taker_raw / 100 * price_cents
-                // = shares_4dp_int * price_cents  (exact integer, no rounding error)
+                // BUY order precision rules (Polymarket API):
+                //   takerAmount (shares received) = max 2 decimal places
+                //       → in 1e6 units, must be divisible by 10^4 = 10000
+                //   makerAmount (USDC paid)       = max 4 decimal places
+                //       → in 1e6 units, must be divisible by 10^2 = 100
+                //
+                // We truncate shares to 2dp first to guarantee taker_raw % 10000 == 0.
+                // Then derive maker_raw = (taker_raw / 100) * price_cents.
+                // Since taker_raw is divisible by 10000, taker_raw/100 is divisible by 100,
+                // so maker_raw = (divisible_by_100) * price_cents = divisible by 100. ✓
+                let taker_raw = to_fixed_u128_with_precision(quantity, 2);
                 let maker_raw = (taker_raw / 100) * price_cents;
                 order_struct.makerAmount = U256::from(maker_raw);
                 order_struct.takerAmount = U256::from(taker_raw);
