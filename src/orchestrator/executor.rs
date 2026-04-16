@@ -11,7 +11,6 @@ use anyhow::Result;
 use tracing::{info, debug, warn};
 use std::time::Instant;
 use alloy::primitives::U256;
-use std::collections::HashMap;
 
 /// Result of evaluating all strategies
 #[derive(Debug, Clone)]
@@ -159,73 +158,30 @@ pub struct SignalConflictInfo {
     pub resolution: String,
 }
 
-/// Aggregate multiple signals and resolve conflicts
+/// Aggregate signals from all strategies.
 ///
-/// Conflicts happen when multiple strategies signal on the same token.
-/// Resolution priority: Exit > Entry (exits always win)
-/// Within same type: first signal wins
+/// With per-strategy position namespaces (Option A), each strategy owns its own
+/// book so there are no cross-strategy entry OR exit conflicts — two strategies
+/// exiting the same token are selling from their own independent position slots.
+///
+/// This function therefore simply passes all signals through with exit signals
+/// prioritised before entry signals.  The `conflicts` vec is always empty but
+/// kept in the return type for API compatibility.
 pub fn aggregate_and_resolve_signals(
     eval_result: &StrategyEvaluationResult,
 ) -> (Vec<(String, StrategySignal)>, Vec<SignalConflictInfo>) {
     let mut final_signals: Vec<(String, StrategySignal)> = Vec::new();
-    let mut conflicts: Vec<SignalConflictInfo> = Vec::new();
 
-    // Track which tokens have been processed to detect conflicts
-    let mut processed_exits: HashMap<U256, String> = HashMap::new();
-    let mut processed_entries: HashMap<U256, String> = HashMap::new();
-
-    // Process exits first (highest priority)
+    // Exits first — always higher priority than entries
     for (strategy_name, signal) in &eval_result.exit_signals {
-        if let StrategySignal::Exit { token_id, reason: _ } = signal {
-            if let Some(prev_strategy) = processed_exits.get(token_id) {
-                // Exit conflict: multiple strategies want to exit same token
-                conflicts.push(SignalConflictInfo {
-                    token_id: *token_id,
-                    signal_type: "Exit".to_string(),
-                    conflicting_strategies: vec![prev_strategy.clone(), strategy_name.clone()],
-                    resolution: format!("First exit wins: {} (dropping {})", prev_strategy, strategy_name),
-                });
-                debug!("⚠️ Exit conflict for token {}: {} vs {}, using first", token_id, prev_strategy, strategy_name);
-            } else {
-                // First exit for this token, accept it
-                processed_exits.insert(*token_id, strategy_name.clone());
-                final_signals.push((strategy_name.clone(), signal.clone()));
-                debug!("✅ Exit signal accepted: {} on token {}", strategy_name, token_id);
-            }
-        }
+        final_signals.push((strategy_name.clone(), signal.clone()));
     }
 
-    // Process entries, but check for conflicts with exits
+    // Then entries — each strategy has its own slot, no deduplication needed
     for (strategy_name, signal) in &eval_result.entry_signals {
-        if let StrategySignal::Entry { token_id } = signal {
-            if processed_exits.contains_key(token_id) {
-                // Entry/Exit conflict on same token: exit takes priority
-                let exit_strategy = processed_exits.get(token_id).unwrap();
-                conflicts.push(SignalConflictInfo {
-                    token_id: *token_id,
-                    signal_type: "Entry".to_string(),
-                    conflicting_strategies: vec![exit_strategy.clone(), strategy_name.clone()],
-                    resolution: format!("Exit takes priority: {} exit wins, dropping {} entry", exit_strategy, strategy_name),
-                });
-                debug!("⚠️ Entry/Exit conflict for token {}: {} wants exit, {} wants entry - exit wins", token_id, exit_strategy, strategy_name);
-            } else if let Some(prev_strategy) = processed_entries.get(token_id) {
-                // Entry conflict: multiple strategies want to enter same token
-                conflicts.push(SignalConflictInfo {
-                    token_id: *token_id,
-                    signal_type: "Entry".to_string(),
-                    conflicting_strategies: vec![prev_strategy.clone(), strategy_name.clone()],
-                    resolution: format!("First entry wins: {} (dropping {})", prev_strategy, strategy_name),
-                });
-                debug!("⚠️ Entry conflict for token {}: {} vs {}, using first", token_id, prev_strategy, strategy_name);
-            } else {
-                // First entry for this token and no exit conflict, accept it
-                processed_entries.insert(*token_id, strategy_name.clone());
-                final_signals.push((strategy_name.clone(), signal.clone()));
-                debug!("✅ Entry signal accepted: {} on token {}", strategy_name, token_id);
-            }
-        }
+        final_signals.push((strategy_name.clone(), signal.clone()));
     }
 
-    (final_signals, conflicts)
+    (final_signals, vec![])
 }
 

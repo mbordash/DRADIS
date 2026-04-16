@@ -1,6 +1,6 @@
 # RustPolyBot
 
-An automated trading bot for Polymarket crypto prediction markets, written in Rust. Runs three strategies concurrently — momentum, arbitrage, and time decay — with an orchestrator that resolves conflicts and manages execution.
+An automated trading bot for Polymarket crypto prediction markets, written in Rust. Runs four strategies concurrently — momentum, maker, arbitrage, and time decay — each with its own independent capital budget and position book. An orchestrator manages market selection, WS subscriptions, and order execution.
 
 ---
 
@@ -8,8 +8,8 @@ An automated trading bot for Polymarket crypto prediction markets, written in Ru
 
 **This is experimental software. You will probably lose money.**
 
-- **US Citizens**: Polymarket is not available to US persons inside the United States. Check your local laws.
 - **Risk**: Momentum trades are directional and can get whiplashed. Arbitrage spreads are thin. Time decay positions can widen against you. None of this is guaranteed profit.
+- **US Citizens**: Polymarket is rolling out US access under CFTC regulation via a waitlist. Check [polymarket.com](https://polymarket.com) for your current eligibility — crypto markets may not be available in the initial rollout.
 - **Competition**: Polymarket is full of well-funded, low-latency bots. This project is a learning exercise, not an edge.
 
 Use at your own risk.
@@ -18,17 +18,33 @@ Use at your own risk.
 
 ## How It Works
 
-The bot connects to Polymarket's CLOB via WebSocket for real-time orderbook data and to Binance for oracle pricing. Every 50ms, the orchestrator evaluates all three strategies, resolves any conflicting signals (exits always beat entries), and places orders through the CLOB API.
+The bot connects to Polymarket's CLOB via WebSocket for real-time orderbook data and to Binance for oracle pricing. Every 50ms, the orchestrator evaluates all strategies concurrently, then dispatches the resulting signals to the execution layer. Each strategy operates from its own independent position namespace and capital budget, so they never block each other.
 
 ### Strategies
 
 **Momentum** — Detects when Binance price moves sharply before Polymarket reprices. Buys the side that's about to become in-the-money. One-sided (not hedged), so this is the risky one. Requires 2 consecutive signal ticks to filter fakeouts. Exits on take profit (5%), stop loss (10%), or velocity reversal.
 
+**Maker** — Posts passive resting bids below the ask to earn maker rebates instead of paying taker fees. Only fires when the spread is wide enough (≥ 5¢) and expiry is far enough away (≥ 10 min). Uses GTD post-only orders. Exits on take profit (4%) or stop loss (3%).
+
 **Arbitrage** — Buys both YES and NO when the combined ask is cheap enough that the spread covers fees. Hedged position, lower risk. Exits when combined bid converges toward $1.00.
 
 **Time Decay** — Near expiry, YES + NO prices converge toward $1.00. This strategy buys both sides when the combined ask is attractive and rides the convergence. Only active within a configurable time window before market close (default: 4–30 minutes).
 
-All three run simultaneously. The orchestrator handles the case where, say, momentum wants to enter YES while arbitrage wants to exit it — exits win.
+### Strategy Segregation (Option A Architecture)
+
+Each strategy has its own **independent position book** keyed by `(strategy_name, token_id)`. This means:
+
+- **MomentumStrategy** and **MakerStrategy** can both hold YES simultaneously without collision.
+- Each strategy has its own **capital budget** — Maker can't consume USDC that Momentum needs for a taker fill, and vice versa.
+- Each strategy has its own **cooldown timer** — a Maker fill doesn't prevent Momentum from firing 1 second later.
+- There are no cross-strategy signal conflicts. The orchestrator passes all signals through; exits are always prioritised before entries within each strategy's own book.
+
+| Strategy | Capital Budget | Order Type |
+|---|---|---|
+| MomentumStrategy | `MOMENTUM_MAX_EXPOSURE_USDC` ($25) | FAK taker |
+| MakerStrategy | `MAKER_MAX_EXPOSURE_USDC` ($15) | GTD post-only |
+| ArbitrageStrategy | `ARBITRAGE_MAX_EXPOSURE_USDC` ($50 per leg) | FAK taker |
+| TimeDecayStrategy | `TIME_DECAY_MAX_EXPOSURE_USDC` ($50 per leg) | FAK taker |
 
 ---
 
@@ -52,19 +68,59 @@ TELEGRAM_CHAT_ID=           # optional
 
 ### Key Config (`src/config.rs`)
 
+**Global**
+
 | Parameter | What it does | Default |
 |-----------|-------------|---------|
 | `GHOST_MODE` | Log trades without executing | `false` |
-| `ARBITRAGE_PROFIT_THRESHOLD` | Min margin for arb entry | `0.05` |
-| `MOMENTUM_CONFIRMATION_TICKS` | Consecutive ticks before momentum fires | `2` |
-| `MOMENTUM_TARGET_PROFIT_PERCENT` | Momentum take profit | `0.05` (5%) |
-| `MOMENTUM_STOP_LOSS_PERCENT` | Momentum stop loss | `0.10` (10%) |
-| `BTC_MOMENTUM_THRESHOLD` | BTC velocity trigger (USD/5s) | `$75` |
+| `TRADE_COOLDOWN_SECS` | Per-strategy seconds between trades | `8` |
+| `MAX_CONSECUTIVE_FAILURES` | Circuit breaker trip count | `3` |
 | `MIN_LIQUIDITY_FILL_RATIO` | Required book depth ratio | `0.80` |
-| `ENABLE_MOMENTUM_TRADING` | Toggle momentum on/off | `true` |
-| `ENABLE_TIME_DECAY_TRADING` | Toggle time decay on/off | `true` |
-| `MAX_EXPOSURE_PER_TOKEN_USDC` | Per-token risk cap | `$25` |
-| `TRADE_COOLDOWN_SECS` | Seconds between trades | `8` |
+
+**Per-strategy capital budgets**
+
+| Parameter | Strategy | Default |
+|-----------|----------|---------|
+| `MOMENTUM_MAX_EXPOSURE_USDC` | MomentumStrategy | `$25` |
+| `MAKER_MAX_EXPOSURE_USDC` | MakerStrategy | `$15` |
+| `ARBITRAGE_MAX_EXPOSURE_USDC` | ArbitrageStrategy | `$50` per leg |
+| `TIME_DECAY_MAX_EXPOSURE_USDC` | TimeDecayStrategy | `$50` per leg |
+
+**Momentum**
+
+| Parameter | What it does | Default |
+|-----------|-------------|---------|
+| `MOMENTUM_CONFIRMATION_TICKS` | Consecutive ticks before firing | `2` |
+| `MOMENTUM_TARGET_PROFIT_PERCENT` | Take profit | `5%` |
+| `MOMENTUM_STOP_LOSS_PERCENT` | Stop loss | `10%` |
+| `BTC_MOMENTUM_THRESHOLD` | BTC velocity trigger (USD/5s) | `$75` |
+| `MAX_MOMENTUM_ENTRY_PRICE` | Max token ask for entry | `$0.88` |
+
+**Maker**
+
+| Parameter | What it does | Default |
+|-----------|-------------|---------|
+| `MAKER_MIN_SPREAD` | Min bid-ask spread to post | `$0.05` |
+| `MAKER_BID_IMPROVEMENT` | Queue priority over best bid | `$0.01` |
+| `MAKER_MIN_SECS_TO_EXPIRY` | Don't post within this window | `600s` |
+| `MAKER_MAX_ENTRY_PRICE` | Max bid price for entry | `$0.70` |
+| `MAKER_TARGET_PROFIT_PERCENT` | Take profit | `4%` |
+| `MAKER_STOP_LOSS_PERCENT` | Stop loss | `3%` |
+
+**Arbitrage**
+
+| Parameter | What it does | Default |
+|-----------|-------------|---------|
+| `ARBITRAGE_PROFIT_THRESHOLD` | Min margin after fees | `$0.05` |
+| `EARLY_EXIT_COMBINED_BID_THRESHOLD` | Combined bid exit trigger | `$0.995` |
+
+**Time Decay**
+
+| Parameter | What it does | Default |
+|-----------|-------------|---------|
+| `TIME_DECAY_MIN_SECS_TO_EXPIRY` | Earliest entry window | `240s` |
+| `TIME_DECAY_MAX_SECS_TO_EXPIRY` | Latest entry window | `1800s` |
+| `TIME_DECAY_TARGET_PROFIT_PERCENT` | Take profit | `1.5%` |
 
 ### Running
 
@@ -75,7 +131,7 @@ cargo build --release
 ./target/release/rustpolybot
 ```
 
-Watch the logs. You'll see `📥 ENTRY` and `📤 EXIT` log lines for trades it *would* have placed. Once you're comfortable with the signals, flip `GHOST_MODE` to `false` and rebuild.
+Watch the logs. You'll see `📥 ENTRY [MomentumStrategy]` and `📤 EXIT [MakerStrategy]` log lines with the strategy name for every trade it *would* have placed. Once you're comfortable with the signals, flip `GHOST_MODE` to `false` and rebuild.
 
 **Docker** (deploys BTC/ETH/SOL containers):
 
@@ -90,32 +146,31 @@ Watch the logs. You'll see `📥 ENTRY` and `📤 EXIT` log lines for trades it 
 ```
 src/
 ├── main.rs                        # Trading loop, WS connections, signal dispatch
-├── config.rs                      # All tunable parameters
-├── state.rs                       # Shared types: Position, MarketSnapshot, StrategySignal
+├── config.rs                      # All tunable parameters + per-strategy budgets
+├── state.rs                       # Shared types: Position, PositionMap (keyed by (strategy, token))
 ├── lib.rs                         # Module exports
-├── risk.rs                        # Exposure limits, drawdown checks
+├── risk.rs                        # Per-strategy exposure limits, drawdown checks
 ├── notifications.rs               # Telegram alerts
 ├── market_validator.rs            # Market filtering (crypto, expiry, strike extraction)
+├── toctou_tests.rs                # Race condition unit tests
 ├── orchestrator/
 │   ├── mod.rs
 │   ├── strategy.rs                # Strategy trait definition + StrategyContext
 │   ├── registry.rs                # Creates all strategy instances
-│   ├── executor.rs                # Concurrent evaluation, signal conflict resolution
+│   ├── executor.rs                # Concurrent evaluation, signal passthrough
 │   └── market_data.rs             # Market data broadcasting
 ├── strategies/
 │   ├── mod.rs
-│   ├── momentum.rs                # Momentum helper logic
-│   ├── momentum_impl.rs           # Strategy trait impl for momentum
-│   ├── arbitrage.rs               # Arbitrage helper logic
-│   ├── arbitrage_impl.rs          # Strategy trait impl for arbitrage
-│   ├── time_decay.rs              # Time decay helper logic
-│   └── time_decay_impl.rs         # Strategy trait impl for time decay
+│   ├── momentum_impl.rs           # Momentum: Binance oracle, velocity, strike buffer
+│   ├── maker_impl.rs              # Maker: passive GTD bids, spread filter
+│   ├── arbitrage_impl.rs          # Arbitrage: combined ask profitability, convergence exit
+│   └── time_decay_impl.rs         # Time decay: theta window, settlement vs convergence mode
 └── helpers/
     ├── mod.rs
     ├── orders.rs                  # EIP-712 order signing + CLOB placement
     ├── market.rs                  # Gamma API market discovery
-    ├── price.rs                   # Price conversions
-    ├── balance.rs                 # On-chain balance sync
+    ├── price.rs                   # Price conversions, tick size rounding
+    ├── balance.rs                 # On-chain balance sync (per-strategy key aware)
     ├── nonce.rs                   # Nonce management with retry
     ├── time.rs                    # Time/expiry utilities
     └── json.rs                    # JSON parsing helpers
@@ -125,40 +180,39 @@ src/
 
 ## Safety Features
 
-- **Circuit breaker**: Pauses trading after 3 consecutive order failures
-- **Risk engine**: Blocks entries that would exceed per-token exposure or session drawdown limits
+- **Circuit breaker**: Pauses all trading after 3 consecutive order failures; clears local positions to resync with exchange state
+- **Per-strategy risk engine**: Each strategy's exposure is checked against its own budget — one strategy can't consume another's capital
+- **TOCTOU-safe entry gate**: Position check and reservation happen in a single atomic lock scope, preventing duplicate orders from concurrent 50ms ticks
+- **Momentum confirmation**: 2 consecutive ticks required, prevents single-tick fakeouts; automatically resets if the risk engine blocks the trade to prevent log flooding
+- **Per-strategy cooldowns**: Each strategy has its own 8-second cooldown after a trade — Maker fills don't delay Momentum entries
 - **Liquidity check**: Won't fire into thin books — requires 80%+ of order size available at top of book
-- **Momentum confirmation**: 2 consecutive ticks required, prevents single-tick fakeouts
-- **Cooldown**: 8-second minimum between trades
 - **Market filtering**: Skips politics, long-term events, range markets, 5-minute markets
+- **Maker post-only guard**: GTD maker orders are flagged `post_only`; if they would cross the spread, the exchange rejects them rather than creating a taker fill
 - **Nonce recovery**: Auto-resyncs on "invalid nonce" errors
-- **Telegram alerts**: Notifications on every entry, exit, and circuit breaker event
+- **Phantom position cleanup**: `sync_position_balance` removes positions that remain unfilled on-chain after 60 seconds
+- **Telegram alerts**: Notifications on every entry, exit, circuit breaker event, and partial paired fill
 
 ---
 
 ## FAQ
 
 **Why isn't the bot trading?**
-Check in order: Is `GHOST_MODE` still true? Is the spread wide enough to beat `ARBITRAGE_PROFIT_THRESHOLD` + fees? Is the orderbook thick enough (`MIN_LIQUIDITY_FILL_RATIO`)? For momentum — is the oracle velocity actually hitting the threshold? Bump `RUST_LOG=debug` to see what's being filtered.
+Check in order: Is `GHOST_MODE` still true? Is the spread wide enough to beat `ARBITRAGE_PROFIT_THRESHOLD` + fees? Is the orderbook thick enough (`MIN_LIQUIDITY_FILL_RATIO`)? For momentum — is the oracle velocity actually hitting the threshold (`BTC_MOMENTUM_THRESHOLD` = $75/5s)? Bump `RUST_LOG=debug` to see what's being filtered.
 
 **Orders keep getting rejected**
-Usually latency. The bot uses Fill-or-Kill orders, so if the price moves between signal and execution, the order dies. Deploy closer to Polymarket's infrastructure.
+Usually latency. The bot uses Fill-or-Kill orders for taker strategies, so if the price moves between signal and execution, the order dies. Deploy closer to Polymarket's infrastructure.
+
+**I see both Momentum and Maker trading the same token — is that a bug?**
+No, this is by design (Option A strategy segregation). Each strategy has its own independent position slot keyed by `(strategy_name, token_id)`. `MomentumStrategy` and `MakerStrategy` can both hold YES simultaneously, each from their own separate capital budget. Their exits are also independent — they each only close their own position.
 
 **What's the Gnosis Safe thing?**
 Polymarket's API trading uses Gnosis Safe proxy wallets. The bot automatically derives your Safe address from your EOA private key. This is standard — the Polymarket web UI does the same thing under the hood.
 
 **How do I run only one strategy?**
-Set `ENABLE_MOMENTUM_TRADING = false` and/or `ENABLE_TIME_DECAY_TRADING = false` in config.rs. For arbitrage, set `ARBITRAGE_PROFIT_THRESHOLD` to something unreachable like `dec!(1.0)`.
+Set `ENABLE_MOMENTUM_TRADING = false`, `ENABLE_MAKER_TRADING = false`, and/or `ENABLE_TIME_DECAY_TRADING = false` in config.rs. For arbitrage, set `ARBITRAGE_PROFIT_THRESHOLD` to something unreachable like `dec!(1.0)`.
 
----
-
-## Ideas / Future Work
-
-- Maker orders (earn rebates instead of paying fees)
-- VWAP book walking for larger position sizes
-- Multi-outcome market support
-- Mean reversion / counter-trend strategy
-- Grid-based accumulation
+**How do I adjust each strategy's risk budget?**
+Edit the per-strategy constants in `src/config.rs`: `MOMENTUM_MAX_EXPOSURE_USDC`, `MAKER_MAX_EXPOSURE_USDC`, `ARBITRAGE_MAX_EXPOSURE_USDC`, `TIME_DECAY_MAX_EXPOSURE_USDC`.
 
 ---
 

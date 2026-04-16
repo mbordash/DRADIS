@@ -67,11 +67,14 @@ async fn cleanup_expired_positions(
         let is_expiring_soon = (ct - now).num_seconds() < 60;
 
         if is_expired || is_expiring_soon {
-            let removed_yes = pos_map.remove(&yes_token).is_some();
-            let removed_no = pos_map.remove(&no_token).is_some();
+            let before = pos_map.len();
+            // Remove all strategies' positions for these two tokens
+            pos_map.retain(|(_, token), _| token != &yes_token && token != &no_token);
+            let removed = before - pos_map.len();
 
-            if removed_yes || removed_no {
-                warn!("🧹 Cleaned up positions for market \"{}\" (expires {})",
+            if removed > 0 {
+                warn!("🧹 Cleaned up {} position(s) for market \"{}\" (expires {})",
+                    removed,
                     market_name,
                     if is_expired { "NOW" } else { "in <60s" }
                 );
@@ -205,7 +208,7 @@ async fn main() -> Result<()> {
         }
     });
 
-    let positions: Arc<Mutex<HashMap<U256, Position>>> = Arc::new(Mutex::new(HashMap::new()));
+    let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(PositionMap::new()));
     let total_pnl: Arc<Mutex<Decimal>> = Arc::new(Mutex::new(dec!(0)));
     let time_decay_positions: Arc<Mutex<HashMap<U256, TimeDecayPosition>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -344,7 +347,7 @@ async fn main() -> Result<()> {
         // ── Orchestrator state ──
         let strategies = StrategyRegistry::create_all_strategies();
         let risk_engine = RiskEngine::new();
-        let mut last_trade_time: Option<Instant> = None;
+        let mut last_trade_time: HashMap<String, Instant> = HashMap::new();
         let mut momentum_confirmation_count: u32 = 0;
         let mut last_momentum_signal_token: Option<U256> = None;
         let mut consecutive_failures: u32 = 0;
@@ -459,10 +462,11 @@ async fn main() -> Result<()> {
                                 let bid = if *token_id == yes_token { yes_bid } else { no_bid };
                                 let sell_price = (bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
                                 let fee_bps = if *token_id == yes_token { yes_fee_rate as u16 } else { no_fee_rate as u16 };
+                                let pos_key = (strategy_name.clone(), *token_id);
 
                                 let shares = {
                                     let pos_map = positions.lock().await;
-                                    match pos_map.get(token_id) {
+                                    match pos_map.get(&pos_key) {
                                         Some(p) => p.shares,
                                         None => continue, // no position to exit
                                     }
@@ -477,11 +481,9 @@ async fn main() -> Result<()> {
                                         &shared_http,
                                     ).await {
                                         let err_str = e.to_string();
-                                        // "not enough balance" means this is a phantom position (never filled on-chain)
-                                        // Remove it immediately rather than retrying indefinitely.
                                         if err_str.contains("not enough balance") || err_str.contains("balance: 0") {
                                             let mut pos_map = positions.lock().await;
-                                            if pos_map.remove(token_id).is_some() {
+                                            if pos_map.remove(&pos_key).is_some() {
                                                 warn!("🧹 EXIT [{}]: Phantom position removed for token {} (exchange balance=0). No shares owned.", strategy_name, token_id);
                                             }
                                             consecutive_failures = 0;
@@ -493,7 +495,6 @@ async fn main() -> Result<()> {
                                         consecutive_failures += 1;
                                         if consecutive_failures >= config::MAX_CONSECUTIVE_FAILURES {
                                             error!("🚨 Circuit breaker: {} consecutive failures (EXIT) — pausing", consecutive_failures);
-                                            // Clear all local positions — exchange state is ground truth
                                             {
                                                 let mut pos_map = positions.lock().await;
                                                 if !pos_map.is_empty() {
@@ -503,7 +504,6 @@ async fn main() -> Result<()> {
                                             }
                                             let _ = send_notification(&tg_token, &tg_chat_id,
                                                 &format!("🚨 Circuit breaker hit after {} EXIT failures on {}", consecutive_failures, market_name)).await;
-                                            // Use select! so market switch is still detected during cooldown
                                             tokio::select! {
                                                 _ = tokio::time::sleep(Duration::from_secs(config::FAILURE_COOLDOWN_SECS as u64)) => {
                                                     sync_nonce_manager(&nonce_manager, &shared_http, safe_address).await;
@@ -522,10 +522,10 @@ async fn main() -> Result<()> {
                                 // Update positions & PnL
                                 {
                                     let mut pos_map = positions.lock().await;
-                                    if let Some(pos) = pos_map.remove(token_id) {
+                                    if let Some(pos) = pos_map.remove(&pos_key) {
                                         let pnl = (bid - pos.avg_entry) * pos.shares;
                                         *total_pnl.lock().await += pnl;
-                                        info!("💰 Position closed: PnL ${:.4}", pnl);
+                                        info!("💰 Position closed [{}]: PnL ${:.4}", strategy_name, pnl);
                                     }
                                 }
 
@@ -536,10 +536,11 @@ async fn main() -> Result<()> {
                                     let pair_bid = if pair_token == yes_token { yes_bid } else { no_bid };
                                     let pair_sell = (pair_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
                                     let pair_fee = if pair_token == yes_token { yes_fee_rate as u16 } else { no_fee_rate as u16 };
+                                    let pair_key = (strategy_name.clone(), pair_token);
 
                                     let pair_shares = {
                                         let pos_map = positions.lock().await;
-                                        pos_map.get(&pair_token).map(|p| p.shares)
+                                        pos_map.get(&pair_key).map(|p| p.shares)
                                     };
                                     if let Some(ps) = pair_shares {
                                         info!("📤 EXIT (paired) [{}]: {} | shares={:.2}, bid=${:.4}", strategy_name, market_name, ps, pair_bid);
@@ -553,10 +554,10 @@ async fn main() -> Result<()> {
                                             }
                                         }
                                         let mut pos_map = positions.lock().await;
-                                        if let Some(pos) = pos_map.remove(&pair_token) {
+                                        if let Some(pos) = pos_map.remove(&pair_key) {
                                             let pnl = (pair_bid - pos.avg_entry) * pos.shares;
                                             *total_pnl.lock().await += pnl;
-                                            info!("💰 Paired position closed: PnL ${:.4}", pnl);
+                                            info!("💰 Paired position closed [{}]: PnL ${:.4}", strategy_name, pnl);
                                         }
                                     }
                                 }
@@ -564,7 +565,7 @@ async fn main() -> Result<()> {
                                 consecutive_failures = 0;
                                 momentum_confirmation_count = 0;
                                 last_momentum_signal_token = None;
-                                last_trade_time = Some(Instant::now());
+                                last_trade_time.insert(strategy_name.clone(), Instant::now());
 
                                 let session_pnl = *total_pnl.lock().await;
                                 let msg = format!("📤 EXIT [{}] {} | bid=${:.4} | reason: {} | Session PnL: ${:.4}", strategy_name, market_name, bid, reason, session_pnl);
@@ -573,8 +574,8 @@ async fn main() -> Result<()> {
 
                             // ════════════════════ ENTRY ════════════════════
                             StrategySignal::Entry { token_id } => {
-                                // Cooldown gate — entries only
-                                if let Some(lt) = last_trade_time {
+                                // Per-strategy cooldown gate
+                                if let Some(lt) = last_trade_time.get(strategy_name.as_str()) {
                                     if lt.elapsed() < Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64) {
                                         continue;
                                     }
@@ -600,14 +601,12 @@ async fn main() -> Result<()> {
                                 let depth = if *token_id == yes_token { yes_depth } else { no_depth };
                                 let fee_bps = if *token_id == yes_token { yes_fee_rate as u16 } else { no_fee_rate as u16 };
 
-                                // Maker strategy posts a passive bid; all others lift the ask
                                 let is_maker = strategy_name == "MakerStrategy";
                                 let order_base_price = if is_maker { bid } else { ask };
 
                                 if order_base_price <= dec!(0) { continue; }
                                 let shares = trade_size_usdc / order_base_price;
                                 if shares < config::MIN_ORDER_SHARES || trade_size_usdc < config::MIN_ORDER_USDC { continue; }
-                                // Maker posts a resting bid — ask-side depth is irrelevant; skip for maker
                                 if !is_maker && depth < shares * config::MIN_LIQUIDITY_FILL_RATIO { continue; }
 
                                 let buy_price = if is_maker {
@@ -619,31 +618,31 @@ async fn main() -> Result<()> {
                                 };
                                 let side_label = if *token_id == yes_token { "YES" } else { "NO" };
 
-                                // ── Atomic check-and-reserve ──────────────────────────────────────
-                                // Read exposure and check for an existing position in ONE lock scope,
-                                // then immediately insert a sentinel so no concurrent tick can race
-                                // past the same gate and send a duplicate order.
+                                // ── Atomic check-and-reserve (TOCTOU fix) ────────────────────────
+                                // Per-strategy key: only block re-entry within the same strategy's
+                                // own book.  Other strategies can enter the same token independently.
+                                let pos_key = (strategy_name.clone(), *token_id);
                                 let collateral = *starting_collateral.lock().await;
                                 let session_pnl = *total_pnl.lock().await;
-                                let (risk_yes_price, risk_no_price) = if is_maker {
-                                    (yes_bid, no_bid)
-                                } else {
-                                    (yes_ask, no_ask)
-                                };
+                                let (risk_yes_price, risk_no_price) = if is_maker { (yes_bid, no_bid) } else { (yes_ask, no_ask) };
+                                let strategy_budget = RiskEngine::strategy_max_exposure(strategy_name);
                                 {
                                     let mut pos_map = positions.lock().await;
-                                    // TOCTOU fix: check AND reserve in the same lock scope
-                                    if pos_map.contains_key(token_id) { continue; }
-                                    let current_exposure = pos_map.values()
-                                        .map(|p| p.shares * p.avg_entry)
+                                    if pos_map.contains_key(&pos_key) { continue; }
+                                    // Exposure: only count this strategy's own positions
+                                    let current_exposure = pos_map.iter()
+                                        .filter(|((s, _), _)| s == strategy_name)
+                                        .map(|(_, p)| p.shares * p.avg_entry)
                                         .sum::<Decimal>();
-                                    if !risk_engine.approve_buy(risk_yes_price, risk_no_price, current_exposure, trade_size_usdc, collateral, session_pnl) {
+                                    if !risk_engine.approve_buy(risk_yes_price, risk_no_price, current_exposure, trade_size_usdc, collateral, session_pnl, strategy_budget) {
+                                        if strategy_name == "MomentumStrategy" {
+                                            momentum_confirmation_count = 0;
+                                            last_momentum_signal_token = None;
+                                        }
                                         continue;
                                     }
-                                    // Reserve the slot — subsequent ticks see this and skip.
-                                    // The position is updated with final values on success,
-                                    // or removed on failure.
-                                    pos_map.insert(*token_id, Position {
+                                    // Reserve the slot atomically
+                                    pos_map.insert(pos_key.clone(), Position {
                                         shares,
                                         avg_entry: order_base_price,
                                         opened_at: Utc::now(),
@@ -655,7 +654,6 @@ async fn main() -> Result<()> {
                                 }
                                 // ─────────────────────────────────────────────────────────────────
 
-                                // Log both original and rounded prices for transparency
                                 let rounded_price = round_to_tick_size(buy_price);
                                 if (rounded_price - buy_price).abs() > rust_decimal::Decimal::ZERO {
                                     info!("📥 ENTRY [{}]: {} {} | shares={:.2}, price=${:.4} (rounded from ${:.10})", strategy_name, side_label, market_name, shares, rounded_price, buy_price);
@@ -671,11 +669,9 @@ async fn main() -> Result<()> {
                                         &shared_http,
                                     ).await {
                                         warn!("⚠️ Entry order failed: {}", e);
-                                        // Roll back the sentinel — position was never filled
-                                        positions.lock().await.remove(token_id);
-                                        // Apply cooldown on failure so the 50ms ticker can't re-fire
-                                        // immediately and exhaust the circuit breaker in 150ms.
-                                        last_trade_time = Some(Instant::now());
+                                        // Roll back sentinel
+                                        positions.lock().await.remove(&pos_key);
+                                        last_trade_time.insert(strategy_name.clone(), Instant::now());
                                         tick_failures += 1;
                                         consecutive_failures += 1;
                                         if consecutive_failures >= config::MAX_CONSECUTIVE_FAILURES {
@@ -703,9 +699,10 @@ async fn main() -> Result<()> {
                                 {
                                     let client_sync = Arc::clone(&trading_client);
                                     let positions_sync = Arc::clone(&positions);
+                                    let strategy_sync = strategy_name.clone();
                                     let token_sync = *token_id;
                                     tokio::spawn(async move {
-                                        let _ = sync_position_balance(&client_sync, &positions_sync, token_sync).await;
+                                        let _ = sync_position_balance(&client_sync, &positions_sync, &strategy_sync, token_sync).await;
                                     });
                                 }
 
@@ -715,6 +712,7 @@ async fn main() -> Result<()> {
                                     let pair_token = if *token_id == yes_token { no_token } else { yes_token };
                                     let pair_ask = if pair_token == yes_token { yes_ask } else { no_ask };
                                     let pair_fee = if pair_token == yes_token { yes_fee_rate as u16 } else { no_fee_rate as u16 };
+                                    let pair_key = (strategy_name.clone(), pair_token);
                                     if pair_ask > dec!(0) {
                                         let pair_shares = trade_size_usdc / pair_ask;
                                         let pair_buy = (pair_ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE);
@@ -735,7 +733,7 @@ async fn main() -> Result<()> {
                                         }
 
                                         let mut pos_map = positions.lock().await;
-                                        pos_map.insert(pair_token, Position {
+                                        pos_map.insert(pair_key.clone(), Position {
                                             shares: pair_shares,
                                             avg_entry: pair_ask,
                                             opened_at: Utc::now(),
@@ -747,8 +745,9 @@ async fn main() -> Result<()> {
 
                                         let client_sync = Arc::clone(&trading_client);
                                         let positions_sync = Arc::clone(&positions);
+                                        let strategy_sync = strategy_name.clone();
                                         tokio::spawn(async move {
-                                            let _ = sync_position_balance(&client_sync, &positions_sync, pair_token).await;
+                                            let _ = sync_position_balance(&client_sync, &positions_sync, &strategy_sync, pair_token).await;
                                         });
                                     }
                                 }
@@ -756,7 +755,7 @@ async fn main() -> Result<()> {
                                 consecutive_failures = 0;
                                 momentum_confirmation_count = 0;
                                 last_momentum_signal_token = None;
-                                last_trade_time = Some(Instant::now());
+                                last_trade_time.insert(strategy_name.clone(), Instant::now());
 
                                 let msg = format!("📥 ENTRY [{}] {} {} | ${:.4} x {:.1}", strategy_name, side_label, market_name, order_base_price, shares);
                                 let _ = send_notification(&tg_token, &tg_chat_id, &msg).await;

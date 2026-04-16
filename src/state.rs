@@ -26,9 +26,16 @@ pub struct Position {
     pub fill_confirmed_at: Option<DateTime<Utc>>,
 }
 
+/// Compound key for the shared position map: (strategy_name, token_id).
+/// Each strategy has its own position slot per token, enabling fully independent
+/// capital allocation and eliminating cross-strategy entry conflicts (Option A).
+pub type PositionKey = (String, U256);
+
 /// Shared positions state accessible by all strategies.
+/// Keyed by (strategy_name, token_id) so that MomentumStrategy and MakerStrategy
+/// can both hold YES simultaneously without colliding.
 /// Typically wrapped in Arc<Mutex<>> for concurrent access.
-pub type PositionMap = HashMap<U256, Position>;
+pub type PositionMap = HashMap<PositionKey, Position>;
 
 /// Current market data snapshot.
 /// Used for broadcasting to strategies.
