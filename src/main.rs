@@ -594,13 +594,7 @@ async fn main() -> Result<()> {
                                     }
                                 }
 
-                                // Already have this position?
-                                {
-                                    let pos_map = positions.lock().await;
-                                    if pos_map.contains_key(token_id) { continue; }
-                                }
-
-                                // Compute order params
+                                // Compute order params (no lock needed)
                                 let ask = if *token_id == yes_token { yes_ask } else { no_ask };
                                 let bid = if *token_id == yes_token { yes_bid } else { no_bid };
                                 let depth = if *token_id == yes_token { yes_depth } else { no_depth };
@@ -610,22 +604,6 @@ async fn main() -> Result<()> {
                                 let is_maker = strategy_name == "MakerStrategy";
                                 let order_base_price = if is_maker { bid } else { ask };
 
-                                // Risk check — maker uses bid sum (posting, not lifting); takers use ask sum
-                                let collateral = *starting_collateral.lock().await;
-                                let session_pnl = *total_pnl.lock().await;
-                                let current_exposure = {
-                                    let pos_map = positions.lock().await;
-                                    pos_map.values().map(|p| p.shares * p.avg_entry).sum::<Decimal>()
-                                };
-                                let (risk_yes_price, risk_no_price) = if is_maker {
-                                    (yes_bid, no_bid)
-                                } else {
-                                    (yes_ask, no_ask)
-                                };
-                                if !risk_engine.approve_buy(risk_yes_price, risk_no_price, current_exposure, trade_size_usdc, collateral, session_pnl) {
-                                    continue;
-                                }
-
                                 if order_base_price <= dec!(0) { continue; }
                                 let shares = trade_size_usdc / order_base_price;
                                 if shares < config::MIN_ORDER_SHARES || trade_size_usdc < config::MIN_ORDER_USDC { continue; }
@@ -633,7 +611,6 @@ async fn main() -> Result<()> {
                                 if !is_maker && depth < shares * config::MIN_LIQUIDITY_FILL_RATIO { continue; }
 
                                 let buy_price = if is_maker {
-                                    // Post passively at bid + small improvement (GTC resting order)
                                     (bid + config::MAKER_BID_IMPROVEMENT).min(config::MAX_BUY_LIMIT_PRICE)
                                 } else if strategy_name == "MomentumStrategy" {
                                     (ask + config::BUY_PRICE_OFFSET + config::MOMENTUM_BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE)
@@ -641,6 +618,42 @@ async fn main() -> Result<()> {
                                     (ask + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE)
                                 };
                                 let side_label = if *token_id == yes_token { "YES" } else { "NO" };
+
+                                // ── Atomic check-and-reserve ──────────────────────────────────────
+                                // Read exposure and check for an existing position in ONE lock scope,
+                                // then immediately insert a sentinel so no concurrent tick can race
+                                // past the same gate and send a duplicate order.
+                                let collateral = *starting_collateral.lock().await;
+                                let session_pnl = *total_pnl.lock().await;
+                                let (risk_yes_price, risk_no_price) = if is_maker {
+                                    (yes_bid, no_bid)
+                                } else {
+                                    (yes_ask, no_ask)
+                                };
+                                {
+                                    let mut pos_map = positions.lock().await;
+                                    // TOCTOU fix: check AND reserve in the same lock scope
+                                    if pos_map.contains_key(token_id) { continue; }
+                                    let current_exposure = pos_map.values()
+                                        .map(|p| p.shares * p.avg_entry)
+                                        .sum::<Decimal>();
+                                    if !risk_engine.approve_buy(risk_yes_price, risk_no_price, current_exposure, trade_size_usdc, collateral, session_pnl) {
+                                        continue;
+                                    }
+                                    // Reserve the slot — subsequent ticks see this and skip.
+                                    // The position is updated with final values on success,
+                                    // or removed on failure.
+                                    pos_map.insert(*token_id, Position {
+                                        shares,
+                                        avg_entry: order_base_price,
+                                        opened_at: Utc::now(),
+                                        close_time: market_close_time,
+                                        market_name: market_name.clone(),
+                                        pair_token_id: *token_id,
+                                        fill_confirmed_at: None,
+                                    });
+                                }
+                                // ─────────────────────────────────────────────────────────────────
 
                                 // Log both original and rounded prices for transparency
                                 let rounded_price = round_to_tick_size(buy_price);
@@ -658,6 +671,8 @@ async fn main() -> Result<()> {
                                         &shared_http,
                                     ).await {
                                         warn!("⚠️ Entry order failed: {}", e);
+                                        // Roll back the sentinel — position was never filled
+                                        positions.lock().await.remove(token_id);
                                         // Apply cooldown on failure so the 50ms ticker can't re-fire
                                         // immediately and exhaust the circuit breaker in 150ms.
                                         last_trade_time = Some(Instant::now());
@@ -682,19 +697,7 @@ async fn main() -> Result<()> {
                                     }
                                 }
 
-                                // Record position
-                                {
-                                    let mut pos_map = positions.lock().await;
-                                    pos_map.insert(*token_id, Position {
-                                        shares,
-                                        avg_entry: order_base_price,
-                                        opened_at: Utc::now(),
-                                        close_time: market_close_time,
-                                        market_name: market_name.clone(),
-                                        pair_token_id: *token_id,
-                                        fill_confirmed_at: None,
-                                    });
-                                }
+                                // Position already recorded in the map above (sentinel is now real)
 
                                 // Spawn async balance sync
                                 {

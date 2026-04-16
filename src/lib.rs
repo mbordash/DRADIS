@@ -6,3 +6,7 @@ pub mod market_validator;
 pub mod helpers;
 pub mod state;
 pub mod orchestrator;
+
+#[cfg(test)]
+mod toctou_tests;
+
