@@ -639,12 +639,21 @@ async fn main() -> Result<()> {
                                             momentum_confirmation_count = 0;
                                             last_momentum_signal_token = None;
                                         }
+                                        // Apply cooldown after risk rejection to prevent log flooding
+                                        last_trade_time.insert(strategy_name.clone(), Instant::now());
                                         continue;
                                     }
                                     // Reserve the slot atomically
+                                    // For Maker, use buy_price (bid + improvement) as avg_entry
+                                    // since that's the actual limit price posted, not the raw bid.
+                                    let sentinel_entry = if is_maker {
+                                        (bid + config::MAKER_BID_IMPROVEMENT).min(config::MAX_BUY_LIMIT_PRICE)
+                                    } else {
+                                        order_base_price
+                                    };
                                     pos_map.insert(pos_key.clone(), Position {
                                         shares,
-                                        avg_entry: order_base_price,
+                                        avg_entry: sentinel_entry,
                                         opened_at: Utc::now(),
                                         close_time: market_close_time,
                                         market_name: market_name.clone(),
