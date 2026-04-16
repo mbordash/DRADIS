@@ -88,9 +88,14 @@ impl Strategy for MakerStrategyImpl {
                 continue;
             };
 
-            // Only manage positions opened by this strategy
-            // (identified by checking the position's market name matches and
-            //  it's a single-sided position — maker never opens paired legs)
+            // Don't evaluate exits until the GTD order has actually filled on-chain.
+            // Without this guard, the exit evaluator sees the sentinel position on
+            // the very next tick and compares current_bid vs sentinel_entry, triggering
+            // a phantom take-profit on shares we don't own yet.
+            if position.fill_confirmed_at.is_none() {
+                continue;
+            }
+
             let bid = if token_id == ctx.market.yes_token {
                 ctx.snapshot.yes_bid
             } else {
