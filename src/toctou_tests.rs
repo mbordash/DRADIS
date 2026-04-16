@@ -39,6 +39,12 @@ mod tests {
     }
 
     const TOKEN: U256 = U256::from_limbs([42, 0, 0, 0]);
+    const STRATEGY: &str = "TestStrategy";
+
+    // compound key used everywhere in the tests
+    fn key(token_id: U256) -> (String, U256) {
+        (STRATEGY.to_string(), token_id)
+    }
 
     // ── Vulnerable pattern (old code) ─────────────────────────────────────────
     //
@@ -58,7 +64,7 @@ mod tests {
         // Step 1: check only — lock is released immediately after
         {
             let pos_map = positions.lock().await;
-            if pos_map.contains_key(&token_id) {
+            if pos_map.contains_key(&key(token_id)) {
                 return; // already have a position
             }
         } // ← lock dropped here; RACE WINDOW OPENS
@@ -72,7 +78,7 @@ mod tests {
         // Step 3: record position (separate lock acquisition)
         {
             let mut pos_map = positions.lock().await;
-            pos_map.insert(token_id, make_position(token_id));
+            pos_map.insert(key(token_id), make_position(token_id));
         }
     }
 
@@ -119,11 +125,11 @@ mod tests {
         // Atomic check-and-reserve in ONE lock scope
         {
             let mut pos_map = positions.lock().await;
-            if pos_map.contains_key(&token_id) {
+            if pos_map.contains_key(&key(token_id)) {
                 return; // already reserved by another task
             }
             // Reserve slot immediately — no gap for a second racer
-            pos_map.insert(token_id, make_position(token_id));
+            pos_map.insert(key(token_id), make_position(token_id));
         } // ← lock dropped only AFTER insert
 
         // Simulate async work
@@ -205,24 +211,24 @@ mod tests {
         // Simulate the winning task: reserve slot, then order fails → roll back
         {
             let mut pos_map = positions.lock().await;
-            assert!(!pos_map.contains_key(&TOKEN));
-            pos_map.insert(TOKEN, make_position(TOKEN));
+            assert!(!pos_map.contains_key(&key(TOKEN)));
+            pos_map.insert(key(TOKEN), make_position(TOKEN));
         }
 
         // Simulate order failure: roll back the sentinel
-        positions.lock().await.remove(&TOKEN);
+        positions.lock().await.remove(&key(TOKEN));
 
         // Slot is free again — a subsequent tick can successfully enter
         assert!(
-            !positions.lock().await.contains_key(&TOKEN),
+            !positions.lock().await.contains_key(&key(TOKEN)),
             "After rollback the slot must be free for the next tick"
         );
 
         // Simulate next tick succeeding
         {
             let mut pos_map = positions.lock().await;
-            assert!(!pos_map.contains_key(&TOKEN));
-            pos_map.insert(TOKEN, make_position(TOKEN));
+            assert!(!pos_map.contains_key(&key(TOKEN)));
+            pos_map.insert(key(TOKEN), make_position(TOKEN));
         }
 
         assert_eq!(positions.lock().await.len(), 1);

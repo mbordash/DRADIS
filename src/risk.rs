@@ -9,6 +9,21 @@ impl RiskEngine {
         Self
     }
 
+    /// Return the configured max exposure for a given strategy name.
+    pub fn strategy_max_exposure(strategy_name: &str) -> Decimal {
+        match strategy_name {
+            "MomentumStrategy"  => config::MOMENTUM_MAX_EXPOSURE_USDC,
+            "MakerStrategy"     => config::MAKER_MAX_EXPOSURE_USDC,
+            "ArbitrageStrategy" => config::ARBITRAGE_MAX_EXPOSURE_USDC,
+            "TimeDecayStrategy" => config::TIME_DECAY_MAX_EXPOSURE_USDC,
+            _                   => config::MAX_EXPOSURE_PER_TOKEN_USDC,
+        }
+    }
+
+    /// Approve or reject a buy order.
+    ///
+    /// `max_exposure_usdc` should be the per-strategy budget from
+    /// `RiskEngine::strategy_max_exposure(strategy_name)`.
     pub fn approve_buy(
         &self,
         yes_ask: Decimal,
@@ -17,6 +32,7 @@ impl RiskEngine {
         trade_size_usdc: Decimal,
         starting_collateral: Decimal,
         session_pnl: Decimal,
+        max_exposure_usdc: Decimal,
     ) -> bool {
         let sum_price = yes_ask + no_ask;
 
@@ -25,8 +41,8 @@ impl RiskEngine {
             return false;
         }
 
-        if current_exposure_usdc + trade_size_usdc > config::MAX_EXPOSURE_PER_TOKEN_USDC {
-            info!("🛡️ Risk Reject: Exposure ${:.2} would exceed Max ${:.2}", current_exposure_usdc + trade_size_usdc, config::MAX_EXPOSURE_PER_TOKEN_USDC);
+        if current_exposure_usdc + trade_size_usdc > max_exposure_usdc {
+            info!("🛡️ Risk Reject: Exposure ${:.2} would exceed Strategy Max ${:.2}", current_exposure_usdc + trade_size_usdc, max_exposure_usdc);
             return false;
         }
 

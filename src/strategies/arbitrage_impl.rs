@@ -43,27 +43,16 @@ impl Strategy for ArbitrageStrategyImpl {
         use crate::state::PositionMap;
         use tokio::sync::MutexGuard;
 
-        // Lock and iterate through positions looking for arbitrage positions
         let positions: MutexGuard<PositionMap> = ctx.positions.lock().await;
 
-        // For arbitrage, we typically hold both YES and NO positions
-        // Check if we should exit based on combined bid convergence
-        let yes_combined_bid = if positions.contains_key(&ctx.market.yes_token) {
-            ctx.snapshot.yes_bid
-        } else {
-            dec!(0)
-        };
+        // Only look at ArbitrageStrategy-owned positions
+        let yes_key = ("ArbitrageStrategy".to_string(), ctx.market.yes_token);
+        let no_key  = ("ArbitrageStrategy".to_string(), ctx.market.no_token);
 
-        let no_combined_bid = if positions.contains_key(&ctx.market.no_token) {
-            ctx.snapshot.no_bid
-        } else {
-            dec!(0)
-        };
+        let yes_combined_bid = if positions.contains_key(&yes_key) { ctx.snapshot.yes_bid } else { dec!(0) };
+        let no_combined_bid  = if positions.contains_key(&no_key)  { ctx.snapshot.no_bid  } else { dec!(0) };
 
-        // If we have both positions and combined bid exceeds early exit threshold
-        if positions.contains_key(&ctx.market.yes_token)
-            && positions.contains_key(&ctx.market.no_token)
-        {
+        if positions.contains_key(&yes_key) && positions.contains_key(&no_key) {
             if should_arbitrage_exit(yes_combined_bid, no_combined_bid) {
                 return Ok(StrategySignal::Exit {
                     token_id: ctx.market.yes_token,
@@ -170,7 +159,7 @@ mod tests {
         // Create context with positions that should trigger exit
         let mut positions = PositionMap::new();
         positions.insert(
-            yes_token,
+            ("ArbitrageStrategy".to_string(), yes_token),
             Position {
                 shares: dec!(100),
                 avg_entry: dec!(0.40),
@@ -182,7 +171,7 @@ mod tests {
             },
         );
         positions.insert(
-            no_token,
+            ("ArbitrageStrategy".to_string(), no_token),
             Position {
                 shares: dec!(100),
                 avg_entry: dec!(0.45),

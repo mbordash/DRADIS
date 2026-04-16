@@ -82,10 +82,11 @@ impl Strategy for MomentumStrategyImpl {
         use crate::state::PositionMap;
         use tokio::sync::MutexGuard;
 
-        // Lock and iterate through positions looking for momentum positions
+        // Lock and iterate — only inspect positions owned by MomentumStrategy
         let positions: MutexGuard<PositionMap> = ctx.positions.lock().await;
 
-        for (token_id, position) in positions.iter() {
+        for ((strategy_name, token_id), position) in positions.iter() {
+            if strategy_name != "MomentumStrategy" { continue; }
             // Determine if this is a YES or NO position and get the bid price
             let position_bid = if token_id == &ctx.market.yes_token {
                 ctx.snapshot.yes_bid

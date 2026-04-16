@@ -64,12 +64,14 @@ impl Strategy for TimeDecayStrategyImpl {
         use crate::state::PositionMap;
         use tokio::sync::MutexGuard;
 
-        // Lock and iterate through positions looking for time decay positions
         let positions: MutexGuard<PositionMap> = ctx.positions.lock().await;
 
-        // For time decay, we typically hold both YES and NO positions
-        let has_yes_position = positions.contains_key(&ctx.market.yes_token);
-        let has_no_position = positions.contains_key(&ctx.market.no_token);
+        // Only look at TimeDecayStrategy-owned positions
+        let yes_key = ("TimeDecayStrategy".to_string(), ctx.market.yes_token);
+        let no_key  = ("TimeDecayStrategy".to_string(), ctx.market.no_token);
+
+        let has_yes_position = positions.contains_key(&yes_key);
+        let has_no_position  = positions.contains_key(&no_key);
 
         // If we have both positions, check exit conditions
         if has_yes_position && has_no_position {
@@ -201,7 +203,7 @@ mod tests {
         // Create context with positions that should trigger exit
         let mut positions = PositionMap::new();
         positions.insert(
-            yes_token,
+            ("TimeDecayStrategy".to_string(), yes_token),
             crate::state::Position {
                 shares: dec!(100),
                 avg_entry: dec!(0.45),
@@ -213,7 +215,7 @@ mod tests {
             },
         );
         positions.insert(
-            no_token,
+            ("TimeDecayStrategy".to_string(), no_token),
             crate::state::Position {
                 shares: dec!(100),
                 avg_entry: dec!(0.48),

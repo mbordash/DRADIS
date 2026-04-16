@@ -42,11 +42,11 @@ impl Strategy for MakerStrategyImpl {
         let no_ask = ctx.snapshot.no_ask;
         let no_bid = ctx.snapshot.no_bid;
 
-        // Don't enter if we already hold a position on either token
+        // Don't enter if MakerStrategy already holds a position on either token
         {
             let pos_map = ctx.positions.lock().await;
-            if pos_map.contains_key(&ctx.market.yes_token)
-                || pos_map.contains_key(&ctx.market.no_token)
+            if pos_map.contains_key(&("MakerStrategy".to_string(), ctx.market.yes_token))
+                || pos_map.contains_key(&("MakerStrategy".to_string(), ctx.market.no_token))
             {
                 return Ok(StrategySignal::NoSignal);
             }
@@ -84,7 +84,7 @@ impl Strategy for MakerStrategyImpl {
         let pos_map = ctx.positions.lock().await;
 
         for token_id in [ctx.market.yes_token, ctx.market.no_token] {
-            let Some(position) = pos_map.get(&token_id) else {
+            let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id)) else {
                 continue;
             };
 
@@ -232,7 +232,7 @@ mod tests {
         let strategy = MakerStrategyImpl;
         let yes_token = U256::from(1u64);
         let mut positions = PositionMap::new();
-        positions.insert(yes_token, Position {
+        positions.insert(("MakerStrategy".to_string(), yes_token), Position {
             shares: dec!(20),
             avg_entry: dec!(0.30),
             opened_at: Utc::now(),
@@ -256,7 +256,7 @@ mod tests {
         let strategy = MakerStrategyImpl;
         let yes_token = U256::from(1u64);
         let mut positions = PositionMap::new();
-        positions.insert(yes_token, Position {
+        positions.insert(("MakerStrategy".to_string(), yes_token), Position {
             shares: dec!(20),
             avg_entry: dec!(0.30),
             opened_at: Utc::now(),

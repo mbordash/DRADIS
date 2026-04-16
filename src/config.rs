@@ -288,8 +288,25 @@ pub fn tcp_keepalive() -> StdDuration {
 /// Lowered to 0 to catch new hourly sessions as they launch.
 pub const MIN_MARKET_VOLUME: f64 = 0.0;
 
-/// Maximum exposure allowed per individual token (in USDC)
+/// Maximum exposure allowed per individual token (in USDC) — global fallback
 pub const MAX_EXPOSURE_PER_TOKEN_USDC: Decimal = dec!(25);
+
+// ── Per-strategy capital budgets ─────────────────────────────────────────────
+// Each strategy has its own independent exposure ceiling.  The risk engine uses
+// these instead of the global cap so each strategy can run its full book without
+// being blocked by another strategy's open positions.
+
+/// Maximum on-risk USDC for MomentumStrategy positions
+pub const MOMENTUM_MAX_EXPOSURE_USDC: Decimal = dec!(25);
+
+/// Maximum on-risk USDC for MakerStrategy positions
+pub const MAKER_MAX_EXPOSURE_USDC: Decimal = dec!(15);
+
+/// Maximum on-risk USDC for ArbitrageStrategy positions (per leg; total = 2×)
+pub const ARBITRAGE_MAX_EXPOSURE_USDC: Decimal = dec!(50);
+
+/// Maximum on-risk USDC for TimeDecayStrategy positions (per leg; total = 2×)
+pub const TIME_DECAY_MAX_EXPOSURE_USDC: Decimal = dec!(50);
 
 /// Session drawdown limit: 1% of collateral with $5 minimum
 pub fn max_session_drawdown(collateral: Decimal) -> Decimal {
