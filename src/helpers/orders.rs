@@ -7,7 +7,7 @@ use anyhow::Result;
 use std::borrow::Cow;
 use std::sync::Arc;
 
-use polymarket_client_sdk::clob::{Client as ClobClient, Config};
+use polymarket_client_sdk::clob::{Client as ClobClient};
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::auth::Normal;
 use polymarket_client_sdk::clob::types::{OrderType, Side, SignatureType, Order, SignedOrder};
@@ -22,10 +22,13 @@ use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 use tracing::warn;
 
-use crate::helpers::price::to_fixed_u128_with_precision;
+use crate::helpers::price::{to_fixed_u128_with_precision, round_to_tick_size};
 
 const ORDER_NAME: &str = "Polymarket CTF Exchange";
 const VERSION: &str = "1";
+/// Polymarket requires expiration timestamp to be >= now + 1 minute + 30 seconds
+/// We add 90 seconds (1.5 minutes) as a safety buffer
+const EXPIRATION_BUFFER_SECS: u64 = 90;
 
 /// Generic order placement helper - works for any token, buy/sell, strategy
 ///
@@ -76,23 +79,30 @@ pub async fn place_limit_order(
         order_struct.signer = eoa_address;
         order_struct.tokenId = token_id;
 
+        // Round price to minimum tick size (0.01) to comply with Polymarket validation
+        let rounded_price = round_to_tick_size(limit_price);
+
         match side {
             Side::Buy => {
                 // BUY: Maker (USDC) max 2 decimals, Taker (Shares) max 4 decimals.
-                order_struct.makerAmount = U256::from(to_fixed_u128_with_precision(quantity * limit_price, 2));
+                order_struct.makerAmount = U256::from(to_fixed_u128_with_precision(quantity * rounded_price, 2));
                 order_struct.takerAmount = U256::from(to_fixed_u128_with_precision(quantity, 4));
             }
             Side::Sell => {
                 // SELL: Maker (Shares) max 2 decimals, Taker (USDC) max 5 decimals.
                 order_struct.makerAmount = U256::from(to_fixed_u128_with_precision(quantity, 2));
-                order_struct.takerAmount = U256::from(to_fixed_u128_with_precision(quantity * limit_price, 5));
+                order_struct.takerAmount = U256::from(to_fixed_u128_with_precision(quantity * rounded_price, 5));
             }
             _ => return Err(anyhow::anyhow!("Unsupported order side")),
         }
 
-        // Set expiration if provided (UNIX timestamp in seconds)
+        // Set expiration with safety buffer
+        // Polymarket requires: now + 1 minute + 30 seconds minimum
+        // We add EXPIRATION_BUFFER_SECS (90s) as safety margin
         order_struct.expiration = if expiration_secs > 0 {
-            U256::from(Utc::now().timestamp() as u64 + expiration_secs)
+            let now = Utc::now().timestamp() as u64;
+            let buffer = expiration_secs.max(EXPIRATION_BUFFER_SECS);
+            U256::from(now + buffer)
         } else {
             U256::ZERO
         };

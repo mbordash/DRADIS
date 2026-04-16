@@ -40,7 +40,7 @@ use rustpolybot::orchestrator::{StrategyRegistry, StrategyContext};
 use rustpolybot::orchestrator::executor::{execute_strategies_concurrent, aggregate_and_resolve_signals};
 use rustpolybot::notifications::send_notification;
 use rustpolybot::helpers::{
-    time::*, balance::*, nonce::*, orders::*, market::*
+    time::*, balance::*, nonce::*, orders::*, market::*, price::round_to_tick_size
 };
 
 use rustls::crypto::ring;
@@ -600,10 +600,16 @@ async fn main() -> Result<()> {
                                 };
                                 let side_label = if *token_id == yes_token { "YES" } else { "NO" };
 
-                                info!("📥 ENTRY [{}]: {} {} | shares={:.2}, price=${:.4}", strategy_name, side_label, market_name, shares, buy_price);
+                                // Log both original and rounded prices for transparency
+                                let rounded_price = round_to_tick_size(buy_price);
+                                if (rounded_price - buy_price).abs() > rust_decimal::Decimal::ZERO {
+                                    info!("📥 ENTRY [{}]: {} {} | shares={:.2}, price=${:.4} (rounded from ${:.10})", strategy_name, side_label, market_name, shares, rounded_price, buy_price);
+                                } else {
+                                    info!("📥 ENTRY [{}]: {} {} | shares={:.2}, price=${:.4}", strategy_name, side_label, market_name, shares, buy_price);
+                                }
 
                                 if !config::GHOST_MODE {
-                                    let (order_type, post_only, exp) = if is_maker { (OrderType::GTC, true, 60u64) } else { (OrderType::FAK, false, 0u64) };
+                                    let (order_type, post_only, exp) = if is_maker { (OrderType::GTD, true, 60u64) } else { (OrderType::FAK, false, 0u64) };
                                     if let Err(e) = place_limit_order(
                                         &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
                                         verifying_contract, *token_id, Side::Buy, shares, buy_price, fee_bps, order_type, post_only, exp,

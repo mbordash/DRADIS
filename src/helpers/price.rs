@@ -31,3 +31,12 @@ pub fn value_to_f64(v: &serde_json::Value) -> Option<f64> {
         None
     }
 }
+
+/// Round price to the nearest tick size (0.01 for Polymarket)
+/// Polymarket enforces: "Price breaks minimum tick size rule: 0.01"
+///
+/// This ensures prices like 0.1998802998204497 are rounded to valid values like 0.20
+pub fn round_to_tick_size(price: Decimal) -> Decimal {
+    let tick_size = Decimal::from_parts(1, 0, 0, false, 2); // 0.01
+    (price / tick_size).round() * tick_size
+}
