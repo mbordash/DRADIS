@@ -391,6 +391,13 @@ async fn main() -> Result<()> {
                     }
                 }
                 _ = ticker.tick() => {
+                    // If the market changed while we were waiting, break immediately
+                    // instead of firing orders on a stale market token.
+                    if market_rx.has_changed().unwrap_or(false) {
+                        info!("🔄 Market switch detected during ticker — restarting trading loop");
+                        break;
+                    }
+
                     let (yes_bid, yes_ask, yes_depth) = *yes_price_rx.borrow();
                     let (no_bid, no_ask, no_depth) = *no_price_rx.borrow();
                     let oracle_price = *oracle_rx.borrow();
@@ -464,6 +471,7 @@ async fn main() -> Result<()> {
                                     if let Err(e) = place_limit_order(
                                         &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
                                         verifying_contract, *token_id, Side::Sell, shares, sell_price, fee_bps, OrderType::FAK, false, 0,
+                                        &shared_http,
                                     ).await {
                                         warn!("⚠️ Exit order failed: {}", e);
                                         consecutive_failures += 1;
@@ -472,6 +480,7 @@ async fn main() -> Result<()> {
                                             let _ = send_notification(&tg_token, &tg_chat_id,
                                                 &format!("🚨 Circuit breaker hit after {} EXIT failures on {}", consecutive_failures, market_name)).await;
                                             tokio::time::sleep(Duration::from_secs(config::FAILURE_COOLDOWN_SECS as u64)).await;
+                                            sync_nonce_manager(&nonce_manager, &shared_http, safe_address).await;
                                             consecutive_failures = 0;
                                         }
                                         continue;
@@ -506,6 +515,7 @@ async fn main() -> Result<()> {
                                             if let Err(e) = place_limit_order(
                                                 &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
                                                 verifying_contract, pair_token, Side::Sell, ps, pair_sell, pair_fee, OrderType::FAK, false, 0,
+                                                &shared_http,
                                             ).await {
                                                 warn!("⚠️ Paired exit order failed: {}", e);
                                             }
@@ -613,6 +623,7 @@ async fn main() -> Result<()> {
                                     if let Err(e) = place_limit_order(
                                         &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
                                         verifying_contract, *token_id, Side::Buy, shares, buy_price, fee_bps, order_type, post_only, exp,
+                                        &shared_http,
                                     ).await {
                                         warn!("⚠️ Entry order failed: {}", e);
                                         consecutive_failures += 1;
@@ -621,6 +632,7 @@ async fn main() -> Result<()> {
                                             let _ = send_notification(&tg_token, &tg_chat_id,
                                                 &format!("🚨 Circuit breaker hit after {} ENTRY failures on {}", consecutive_failures, market_name)).await;
                                             tokio::time::sleep(Duration::from_secs(config::FAILURE_COOLDOWN_SECS as u64)).await;
+                                            sync_nonce_manager(&nonce_manager, &shared_http, safe_address).await;
                                             consecutive_failures = 0;
                                         }
                                         continue;
@@ -668,6 +680,7 @@ async fn main() -> Result<()> {
                                             if let Err(e) = place_limit_order(
                                                 &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
                                                 verifying_contract, pair_token, Side::Buy, pair_shares, pair_buy, pair_fee, OrderType::FAK, false, 0,
+                                                &shared_http,
                                             ).await {
                                                 warn!("⚠️ Paired entry order failed: {} — first leg is now one-sided!", e);
                                                 let _ = send_notification(&tg_token, &tg_chat_id,

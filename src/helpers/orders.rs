@@ -22,7 +22,9 @@ use rust_decimal::Decimal;
 use tokio::sync::Mutex;
 use tracing::warn;
 
-use crate::helpers::price::{to_fixed_u128_with_precision, round_to_tick_size, ceil_with_scale};
+use rust_decimal::prelude::ToPrimitive;
+use crate::helpers::price::{to_fixed_u128_with_precision, round_to_tick_size};
+use crate::helpers::nonce::fetch_next_nonce;
 
 const ORDER_NAME: &str = "Polymarket CTF Exchange";
 const VERSION: &str = "1";
@@ -68,6 +70,7 @@ pub async fn place_limit_order(
     order_type: OrderType,
     post_only: bool,
     expiration_secs: u64,
+    http: &reqwest::Client,
 ) -> Result<()> {
     for attempt in 0..2 {
         let mut guard = nonce_manager.lock().await;
@@ -82,24 +85,43 @@ pub async fn place_limit_order(
         // Round price to minimum tick size (0.01) to comply with Polymarket validation
         let rounded_price = round_to_tick_size(limit_price);
 
+        // Convert price to integer cents (e.g. 0.63 → 63) for exact arithmetic.
+        // Polymarket validates: makerAmount / takerAmount must be an exact multiple of 0.01.
+        // To guarantee this, we derive one amount from the other using integer price_cents.
+        //
+        // BUY:  takerAmount = trunc(shares, 4dp) * 1e6  → always divisible by 100
+        //       makerAmount = takerAmount / 100 * price_cents  → exact integer, ratio = price_cents/100
+        //
+        // SELL: makerAmount = trunc(shares, 2dp) * 1e6  → always divisible by 10^4 (i.e. by 100)
+        //       takerAmount = makerAmount / 100 * price_cents  → exact integer, ratio = price_cents/100
+        //
+        // This eliminates the rounding residual that previously caused
+        // "Price (0.6305...) breaks minimum tick size rule: 0.01" rejections.
+        let price_cents = (rounded_price * Decimal::from(100u32))
+            .round()
+            .to_u128()
+            .unwrap_or(0);
+
         match side {
             Side::Buy => {
-                // BUY: Maker (USDC) max 2 decimals, Taker (Shares) max 4 decimals.
-                // IMPORTANT: Round USDC amount UP (ceiling) to ensure effective price stays at or above target.
-                // Truncating down would result in an effective price lower than intended, breaking tick size rules.
-                let usdc_amount = quantity * rounded_price;
-                let usdc_rounded_up = ceil_with_scale(usdc_amount, 2);
-                order_struct.makerAmount = U256::from(to_fixed_u128_with_precision(usdc_rounded_up, 2));
-                order_struct.takerAmount = U256::from(to_fixed_u128_with_precision(quantity, 4));
+                // takerAmount: shares truncated to 4dp, scaled to 1e6
+                // = shares_4dp_int * 100  (always divisible by 100)
+                let taker_raw = to_fixed_u128_with_precision(quantity, 4);
+                // makerAmount = taker_raw / 100 * price_cents
+                // = shares_4dp_int * price_cents  (exact integer, no rounding error)
+                let maker_raw = (taker_raw / 100) * price_cents;
+                order_struct.makerAmount = U256::from(maker_raw);
+                order_struct.takerAmount = U256::from(taker_raw);
             }
             Side::Sell => {
-                // SELL: Maker (Shares) max 2 decimals, Taker (USDC) max 5 decimals.
-                // IMPORTANT: Round USDC amount UP (ceiling) to ensure effective price stays at or above target.
-                // Truncating down would result in an effective price lower than intended, breaking tick size rules.
-                let usdc_amount = quantity * rounded_price;
-                let usdc_rounded_up = ceil_with_scale(usdc_amount, 5);
-                order_struct.makerAmount = U256::from(to_fixed_u128_with_precision(quantity, 2));
-                order_struct.takerAmount = U256::from(to_fixed_u128_with_precision(usdc_rounded_up, 5));
+                // makerAmount: shares truncated to 2dp, scaled to 1e6
+                // = shares_2dp_int * 10^4  (always divisible by 100)
+                let maker_raw = to_fixed_u128_with_precision(quantity, 2);
+                // takerAmount = maker_raw / 100 * price_cents
+                // = shares_2dp_int * 10^2 * price_cents  (exact integer, no rounding error)
+                let taker_raw = (maker_raw / 100) * price_cents;
+                order_struct.makerAmount = U256::from(maker_raw);
+                order_struct.takerAmount = U256::from(taker_raw);
             }
             _ => return Err(anyhow::anyhow!("Unsupported order side")),
         }
@@ -148,7 +170,13 @@ pub async fn place_limit_order(
                     drop(guard);
                     let err_msg = format!("{:?}", e).to_lowercase();
                     if err_msg.contains("invalid nonce") && attempt == 0 {
-                        warn!("⚠️ Invalid nonce. Re-syncing...");
+                        warn!("⚠️ Invalid nonce. Re-syncing from API...");
+                        // Actually fetch the correct nonce from the API before retrying
+                        if let Some(fresh_nonce) = fetch_next_nonce(http, safe_address).await {
+                            let mut g = nonce_manager.lock().await;
+                            *g = fresh_nonce;
+                            warn!("🔄 Nonce re-synced to {} — retrying order", fresh_nonce);
+                        }
                         continue;
                     }
                     return Err(anyhow::anyhow!("Order placement failed: {}", e));
