@@ -18,6 +18,10 @@ use polymarket_client_sdk::clob::types::AssetType;
 
 pub use crate::state::{Position, PositionMap};
 
+/// Known strategy names for reconciliation adoption priority.
+/// Maker is first because orphaned GTD fills are the most common cause.
+const ADOPTION_STRATEGIES: &[&str] = &["MakerStrategy", "ArbitrageStrategy", "TimeDecayStrategy", "MomentumStrategy"];
+
 /// Parse balance from error message
 /// Extracts numeric balance value from error strings like "balance: 1000000"
 pub fn parse_balance_from_error(err_msg: &str) -> Option<Decimal> {
@@ -106,3 +110,76 @@ pub async fn sync_position_balance(
         }
     }
 }
+
+/// Periodic reconciliation: checks on-chain balances for the given tokens and
+/// re-adopts any shares the bot has forgotten about (e.g. orphaned GTD fills).
+///
+/// For each token, if a non-zero on-chain balance exists but NO strategy has a
+/// local position tracking it, a new position is created under the first
+/// available strategy slot (preferring MakerStrategy, since orphaned GTD fills
+/// are the most common cause).
+pub async fn reconcile_orphaned_positions(
+    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    positions: &Arc<Mutex<PositionMap>>,
+    tokens: &[(U256, &str)],  // (token_id, side_label)
+    market_name: &str,
+    market_close_time: Option<chrono::DateTime<Utc>>,
+) {
+    for &(token_id, side_label) in tokens {
+        // Query on-chain balance for this token
+        let mut req = BalanceAllowanceRequest::default();
+        req.asset_type = AssetType::Conditional;
+        req.token_id = Some(token_id);
+
+        let actual_shares = match client.balance_allowance(req).await {
+            Ok(resp) => {
+                Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000)
+            }
+            Err(_) => continue,
+        };
+
+        if actual_shares <= dec!(0) {
+            continue;
+        }
+
+        // Check if ANY strategy already tracks this token
+        let pos_map = positions.lock().await;
+        let already_tracked = pos_map.iter().any(|((_, tid), _)| *tid == token_id);
+        drop(pos_map);
+
+        if already_tracked {
+            continue;
+        }
+
+        // Orphan detected — adopt under the first available strategy slot
+        let adopted_strategy = {
+            let pos_map = positions.lock().await;
+            ADOPTION_STRATEGIES.iter().find(|&&s| {
+                !pos_map.contains_key(&(s.to_string(), token_id))
+            }).map(|s| s.to_string())
+        };
+
+        if let Some(strategy_name) = adopted_strategy {
+            let mut pos_map = positions.lock().await;
+            // Double-check after re-acquiring lock
+            let key = (strategy_name.clone(), token_id);
+            if pos_map.contains_key(&key) {
+                continue;
+            }
+            pos_map.insert(key, Position {
+                shares: actual_shares,
+                avg_entry: dec!(0.50), // unknown entry price — use midpoint as conservative estimate
+                opened_at: Utc::now(),
+                close_time: market_close_time,
+                market_name: market_name.to_string(),
+                pair_token_id: token_id,
+                fill_confirmed_at: Some(Utc::now()), // already confirmed on-chain
+            });
+            warn!(
+                "🔁 RECONCILE: Adopted {} orphaned {} shares for token {} under [{}] on \"{}\"",
+                actual_shares, side_label, token_id, strategy_name, market_name
+            );
+        }
+    }
+}
+
