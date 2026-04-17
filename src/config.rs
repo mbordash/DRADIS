@@ -127,7 +127,25 @@ pub const MAKER_MIN_SPREAD: Decimal = dec!(0.05);
 
 /// How much to improve over the current best bid when posting the maker order.
 /// One tick (0.01) gives queue priority without giving away too much edge.
+/// This is the FALLBACK value used when spread is zero or not computable.
 pub const MAKER_BID_IMPROVEMENT: Decimal = dec!(0.01);
+
+/// Fraction of the current bid-ask spread to use as the bid improvement.
+/// e.g. 0.30 = post 30% of the way through the spread above the best bid.
+/// This keeps the order below the ask in tight-spread markets, preventing
+/// "invalid post-only order: order crosses book" rejections.
+pub const MAKER_BID_IMPROVEMENT_RATIO: Decimal = dec!(0.30);
+
+/// Floor for the computed spread-relative bid improvement (one tick minimum).
+pub const MAKER_MIN_BID_IMPROVEMENT: Decimal = dec!(0.01);
+
+/// Ceiling for the computed spread-relative bid improvement (avoid overpaying).
+pub const MAKER_MAX_BID_IMPROVEMENT: Decimal = dec!(0.03);
+
+/// Short cooldown (seconds) applied after a "crosses book" post-only rejection.
+/// These are market-microstructure events, NOT system failures — they must NOT
+/// count toward the circuit breaker's consecutive_failures counter.
+pub const CROSSES_BOOK_COOLDOWN_SECS: i64 = 30;
 
 /// Do not post maker orders if market closes within this many seconds.
 /// 600s (10 min) gives enough time for a fill and a clean exit before expiry.
