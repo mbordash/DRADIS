@@ -55,22 +55,28 @@ impl Strategy for MakerStrategyImpl {
         let yes_spread = yes_ask - yes_bid;
         let no_spread = no_ask - no_bid;
 
-        // YES side: wide spread, bid price within acceptable range
+        // YES side: wide spread, bid price within acceptable range,
+        // and the NO side (complementary token) must not be priced near certainty.
+        // If NO bid > MAKER_MAX_ENTRY_PRICE it means YES is collapsing — don't post YES.
         let yes_bid_price = yes_bid + config::MAKER_BID_IMPROVEMENT;
         if yes_spread >= config::MAKER_MIN_SPREAD
             && yes_bid_price > dec!(0)
             && yes_bid_price <= config::MAKER_MAX_ENTRY_PRICE
+            && no_bid <= config::MAKER_MAX_ENTRY_PRICE  // complementary check: market not too directional
         {
             return Ok(StrategySignal::Entry {
                 token_id: ctx.market.yes_token,
             });
         }
 
-        // NO side: wide spread, bid price within acceptable range
+        // NO side: wide spread, bid price within acceptable range,
+        // and the YES side must not be priced near certainty.
+        // If YES bid > MAKER_MAX_ENTRY_PRICE the market is strongly directional — don't post NO.
         let no_bid_price = no_bid + config::MAKER_BID_IMPROVEMENT;
         if no_spread >= config::MAKER_MIN_SPREAD
             && no_bid_price > dec!(0)
             && no_bid_price <= config::MAKER_MAX_ENTRY_PRICE
+            && yes_bid <= config::MAKER_MAX_ENTRY_PRICE  // complementary check: market not too directional
         {
             return Ok(StrategySignal::Entry {
                 token_id: ctx.market.no_token,
@@ -88,14 +94,6 @@ impl Strategy for MakerStrategyImpl {
                 continue;
             };
 
-            // Don't evaluate exits until the GTD order has actually filled on-chain.
-            // Without this guard, the exit evaluator sees the sentinel position on
-            // the very next tick and compares current_bid vs sentinel_entry, triggering
-            // a phantom take-profit on shares we don't own yet.
-            if position.fill_confirmed_at.is_none() {
-                continue;
-            }
-
             let bid = if token_id == ctx.market.yes_token {
                 ctx.snapshot.yes_bid
             } else {
@@ -107,8 +105,12 @@ impl Strategy for MakerStrategyImpl {
             }
 
             let profit_pct = (bid - position.avg_entry) / position.avg_entry;
+            let secs_since_open = (Utc::now() - position.opened_at).num_seconds();
 
-            if profit_pct >= config::MAKER_TARGET_PROFIT_PERCENT {
+            // Take-profit: only evaluate after fill is confirmed on-chain.
+            // Without this guard, the sentinel position (inserted before the order is sent)
+            // would trigger a phantom take-profit on the very next tick.
+            if position.fill_confirmed_at.is_some() && profit_pct >= config::MAKER_TARGET_PROFIT_PERCENT {
                 return Ok(StrategySignal::Exit {
                     token_id,
                     reason: format!(
@@ -120,14 +122,19 @@ impl Strategy for MakerStrategyImpl {
                 });
             }
 
-            if profit_pct <= -config::MAKER_STOP_LOSS_PERCENT {
+            // Stop-loss: use opened_at (NOT fill_confirmed_at) so we are never blind
+            // during the fill-sync window (which can take 5–60 s for GTD orders).
+            // If the order somehow never filled, the resulting sell will get a
+            // "balance: 0" error which is already handled gracefully in main.rs.
+            if profit_pct <= -config::MAKER_STOP_LOSS_PERCENT && secs_since_open >= config::MIN_HOLD_SECS_BEFORE_STOP_LOSS {
                 return Ok(StrategySignal::Exit {
                     token_id,
                     reason: format!(
-                        "Maker stop-loss: bid=${:.4}, entry=${:.4}, loss={:.2}%",
+                        "Maker stop-loss: bid=${:.4}, entry=${:.4}, loss={:.2}% ({}s since open)",
                         bid,
                         position.avg_entry,
-                        profit_pct * dec!(100)
+                        profit_pct * dec!(100),
+                        secs_since_open,
                     ),
                 });
             }

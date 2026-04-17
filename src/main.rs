@@ -636,8 +636,24 @@ async fn main() -> Result<()> {
                                 if shares < config::MIN_ORDER_SHARES || trade_size_usdc < config::MIN_ORDER_USDC { continue; }
                                 if !is_maker && depth < shares * config::MIN_LIQUIDITY_FILL_RATIO { continue; }
 
+                                // ── Dynamic spread-relative bid improvement (Maker only) ──────────
+                                // Use a fraction of the live spread so we always post below the ask,
+                                // even in tight-spread markets where a fixed tick would cross the book.
+                                let maker_improvement = if is_maker {
+                                    let spread = ask - bid;
+                                    if spread > dec!(0) {
+                                        (spread * config::MAKER_BID_IMPROVEMENT_RATIO)
+                                            .max(config::MAKER_MIN_BID_IMPROVEMENT)
+                                            .min(config::MAKER_MAX_BID_IMPROVEMENT)
+                                    } else {
+                                        config::MAKER_BID_IMPROVEMENT // fallback: zero-spread market
+                                    }
+                                } else {
+                                    dec!(0)
+                                };
+
                                 let buy_price = if is_maker {
-                                    (bid + config::MAKER_BID_IMPROVEMENT).min(config::MAX_BUY_LIMIT_PRICE)
+                                    (bid + maker_improvement).min(config::MAX_BUY_LIMIT_PRICE)
                                 } else if strategy_name == "MomentumStrategy" {
                                     (ask + config::BUY_PRICE_OFFSET + config::MOMENTUM_BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE)
                                 } else {
@@ -671,10 +687,10 @@ async fn main() -> Result<()> {
                                         continue;
                                     }
                                     // Reserve the slot atomically
-                                    // For Maker, use buy_price (bid + improvement) as avg_entry
+                                    // For Maker, use buy_price (bid + dynamic improvement) as avg_entry
                                     // since that's the actual limit price posted, not the raw bid.
                                     let sentinel_entry = if is_maker {
-                                        (bid + config::MAKER_BID_IMPROVEMENT).min(config::MAX_BUY_LIMIT_PRICE)
+                                        (bid + maker_improvement).min(config::MAX_BUY_LIMIT_PRICE)
                                     } else {
                                         order_base_price
                                     };
@@ -693,6 +709,9 @@ async fn main() -> Result<()> {
                                 let rounded_price = round_to_tick_size(buy_price);
                                 if (rounded_price - buy_price).abs() > rust_decimal::Decimal::ZERO {
                                     info!("📥 ENTRY [{}]: {} {} | shares={:.2}, price=${:.4} (rounded from ${:.10})", strategy_name, side_label, market_name, shares, rounded_price, buy_price);
+                                } else if is_maker {
+                                    let spread = ask - bid;
+                                    info!("📥 ENTRY [{}]: {} {} | shares={:.2}, price=${:.4} (spread=${:.4}, improvement=${:.4})", strategy_name, side_label, market_name, shares, buy_price, spread, maker_improvement);
                                 } else {
                                     info!("📥 ENTRY [{}]: {} {} | shares={:.2}, price=${:.4}", strategy_name, side_label, market_name, shares, buy_price);
                                 }
@@ -704,6 +723,19 @@ async fn main() -> Result<()> {
                                         verifying_contract, *token_id, Side::Buy, shares, buy_price, fee_bps, order_type, post_only, exp,
                                         &shared_http,
                                     ).await {
+                                        let err_str = e.to_string();
+                                        // "crosses book" is a market-microstructure rejection, NOT a system failure.
+                                        // Apply a short cooldown and skip — do NOT count toward the circuit breaker.
+                                        if err_str.contains("crosses book") || err_str.contains("post-only") {
+                                            warn!("⚠️ Maker post-only rejected (spread too tight): {} — cooling down {}s", err_str, config::CROSSES_BOOK_COOLDOWN_SECS);
+                                            positions.lock().await.remove(&pos_key);
+                                            last_trade_time.insert(
+                                                strategy_name.clone(),
+                                                Instant::now() - Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64)
+                                                    + Duration::from_secs(config::CROSSES_BOOK_COOLDOWN_SECS as u64),
+                                            );
+                                            continue;
+                                        }
                                         warn!("⚠️ Entry order failed: {}", e);
                                         // Roll back sentinel
                                         positions.lock().await.remove(&pos_key);

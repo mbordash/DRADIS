@@ -224,6 +224,14 @@ pub async fn fetch_simplified_crypto_candidates(
                 continue;
             }
 
+            // Hard-exclude range/price-band markets (e.g. "between $X and $Y").
+            // These are often already settled and unsuitable for directional strategies.
+            // Previously these were only deprioritised in the sort — now we exclude them.
+            if config::is_range_market(&name) {
+                debug!("  ⏭️ Rejected (range market): {}", name);
+                continue;
+            }
+
             // Check if market has started
             if let Some(st) = start_time {
                 if now < st {

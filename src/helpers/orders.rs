@@ -169,7 +169,13 @@ pub async fn place_limit_order(
 
             match client.post_order(signed_order).await {
                 Ok(_) => {
-                    *guard += 1;
+                    // NOTE: Polymarket CLOB always returns next_nonce=0 for this wallet type
+                    // (GnosisSafe signatureType).  The nonce field in Polymarket orders acts as
+                    // a "minimum cancel nonce" for batch cancellation, not a strict per-order
+                    // replay counter.  Incrementing it locally causes every subsequent order
+                    // to present nonce=1 which is rejected, requiring an extra API round-trip
+                    // to re-sync back to 0.  We leave the counter unchanged so it stays in
+                    // sync with the API without the latency penalty.
                     return Ok(());
                 }
                 Err(e) => {

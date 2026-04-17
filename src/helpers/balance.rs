@@ -138,7 +138,7 @@ pub async fn reconcile_orphaned_positions(
             Err(_) => continue,
         };
 
-        if actual_shares <= dec!(0) {
+        if actual_shares <= dec!(0) || actual_shares < crate::config::MIN_ORDER_SHARES {
             continue;
         }
 
