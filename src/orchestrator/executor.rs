@@ -98,7 +98,7 @@ pub async fn execute_strategies_concurrent(
         match entry_result {
             Ok(signal) => {
                 if !matches!(signal, StrategySignal::NoSignal) {
-                    info!("📍 {} entry signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
+                    debug!("📍 {} entry signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
                     entry_signals.push((strategy_name.clone(), signal));
                 }
             }
@@ -111,7 +111,7 @@ pub async fn execute_strategies_concurrent(
         match exit_result {
             Ok(signal) => {
                 if !matches!(signal, StrategySignal::NoSignal) {
-                    info!("📍 {} exit signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
+                    debug!("📍 {} exit signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
                     exit_signals.push((strategy_name.clone(), signal));
                 }
             }

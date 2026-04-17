@@ -372,6 +372,19 @@ async fn main() -> Result<()> {
                 _ = cleanup_ticker.tick() => {
                     cleanup_expired_positions(Arc::clone(&positions), market_name.clone(), yes_token, no_token, market_close_time).await;
 
+                    // Periodic reconciliation: re-adopt any on-chain shares not tracked locally
+                    let tokens_to_check = vec![
+                        (yes_token, "YES"),
+                        (no_token, "NO"),
+                    ];
+                    reconcile_orphaned_positions(
+                        &trading_client,
+                        &positions,
+                        &tokens_to_check,
+                        &market_name,
+                        market_close_time,
+                    ).await;
+
                     let mut td_map = time_decay_positions.lock().await;
                     let before_count = td_map.len();
                     td_map.retain(|_, pos| {
@@ -471,6 +484,20 @@ async fn main() -> Result<()> {
                                         None => continue, // no position to exit
                                     }
                                 };
+
+                                // Dust position guard: if shares are too small to sell,
+                                // just clean up the position instead of sending an order
+                                // that the exchange will reject with "invalid amounts".
+                                if shares < config::MIN_ORDER_SHARES {
+                                    let mut pos_map = positions.lock().await;
+                                    if let Some(pos) = pos_map.remove(&pos_key) {
+                                        let pnl = (bid - pos.avg_entry) * pos.shares;
+                                        *total_pnl.lock().await += pnl;
+                                        warn!("🧹 EXIT [{}]: Dust position removed ({:.6} shares < min {}). PnL ${:.4}",
+                                            strategy_name, shares, config::MIN_ORDER_SHARES, pnl);
+                                    }
+                                    continue;
+                                }
 
                                 info!("📤 EXIT [{}]: {} | shares={:.2}, bid=${:.4} | {}", strategy_name, market_name, shares, bid, reason);
 
