@@ -518,6 +518,9 @@ async fn main() -> Result<()> {
                                             if pos_map.remove(&pos_key).is_some() {
                                                 warn!("🧹 EXIT [{}]: Phantom position removed for token {} (exchange balance=0). No shares owned.", strategy_name, token_id);
                                             }
+                                            // Apply cooldown so the strategy doesn't immediately re-enter
+                                            // on the next tick while the market is still in a crashed state.
+                                            last_trade_time.insert(strategy_name.clone(), Instant::now());
                                             consecutive_failures = 0;
                                             tick_failures = 0;
                                             continue;
@@ -611,7 +614,7 @@ async fn main() -> Result<()> {
                                     let elapsed = lt.elapsed();
                                     let cooldown = Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64);
                                     if elapsed < cooldown {
-                                        info!("⏸️ ENTRY [{}]: signal suppressed — cooldown ({:.1}s remaining)",
+                                        debug!("⏸️ ENTRY [{}]: signal suppressed — cooldown ({:.1}s remaining)",
                                             strategy_name, (cooldown - elapsed).as_secs_f32());
                                         continue;
                                     }
