@@ -159,10 +159,8 @@ pub const MAKER_MAX_ENTRY_PRICE: Decimal = dec!(0.70);
 pub const MAKER_TARGET_PROFIT_PERCENT: Decimal = dec!(0.04);
 
 /// Stop-loss: exit when position loses this % from avg entry.
-pub const MAKER_STOP_LOSS_PERCENT: Decimal = dec!(0.08);
-
-/// Minimum seconds since position open before the stop-loss is allowed to fire.
-/// Prevents being stopped out by normal bid/ask noise immediately after a maker fill.
+/// Tight at 3% — maker fills often mean someone knew something; cut quickly.
+pub const MAKER_STOP_LOSS_PERCENT: Decimal = dec!(0.03);
 pub const MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 15;
 
 

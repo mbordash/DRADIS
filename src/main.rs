@@ -377,12 +377,17 @@ async fn main() -> Result<()> {
                         (yes_token, "YES"),
                         (no_token, "NO"),
                     ];
+                    let token_bids = vec![
+                        (yes_token, yes_price_rx.borrow().0),
+                        (no_token, no_price_rx.borrow().0),
+                    ];
                     reconcile_orphaned_positions(
                         &trading_client,
                         &positions,
                         &tokens_to_check,
                         &market_name,
                         market_close_time,
+                        &token_bids,
                     ).await;
 
                     let mut td_map = time_decay_positions.lock().await;
@@ -603,7 +608,11 @@ async fn main() -> Result<()> {
                             StrategySignal::Entry { token_id } => {
                                 // Per-strategy cooldown gate
                                 if let Some(lt) = last_trade_time.get(strategy_name.as_str()) {
-                                    if lt.elapsed() < Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64) {
+                                    let elapsed = lt.elapsed();
+                                    let cooldown = Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64);
+                                    if elapsed < cooldown {
+                                        info!("⏸️ ENTRY [{}]: signal suppressed — cooldown ({:.1}s remaining)",
+                                            strategy_name, (cooldown - elapsed).as_secs_f32());
                                         continue;
                                     }
                                 }
@@ -678,6 +687,8 @@ async fn main() -> Result<()> {
                                         .map(|(_, p)| p.shares * p.avg_entry)
                                         .sum::<Decimal>();
                                     if !risk_engine.approve_buy(risk_yes_price, risk_no_price, current_exposure, trade_size_usdc, collateral, session_pnl, strategy_budget) {
+                                        info!("🚫 ENTRY [{}]: signal suppressed — risk check failed (exposure=${:.4}, budget=${:.4}, trade=${:.4})",
+                                            strategy_name, current_exposure, strategy_budget, trade_size_usdc);
                                         if strategy_name == "MomentumStrategy" {
                                             momentum_confirmation_count = 0;
                                             last_momentum_signal_token = None;

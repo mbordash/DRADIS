@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 use anyhow::Result;
 use chrono::Utc;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use crate::orchestrator::{Strategy, StrategyContext};

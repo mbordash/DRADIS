@@ -124,6 +124,7 @@ pub async fn reconcile_orphaned_positions(
     tokens: &[(U256, &str)],  // (token_id, side_label)
     market_name: &str,
     market_close_time: Option<chrono::DateTime<Utc>>,
+    token_bids: &[(U256, Decimal)],  // (token_id, current_bid) for avg_entry
 ) {
     for &(token_id, side_label) in tokens {
         // Query on-chain balance for this token
@@ -166,9 +167,16 @@ pub async fn reconcile_orphaned_positions(
             if pos_map.contains_key(&key) {
                 continue;
             }
+            // Use the current bid as avg_entry so stop-loss starts at breakeven.
+            // Hardcoding $0.50 previously caused immediate stop-loss when bid != $0.50.
+            let avg_entry = token_bids.iter()
+                .find(|(tid, _)| *tid == token_id)
+                .map(|(_, bid)| *bid)
+                .filter(|b| *b > dec!(0))
+                .unwrap_or(dec!(0.50)); // fallback only if bid unavailable
             pos_map.insert(key, Position {
                 shares: actual_shares,
-                avg_entry: dec!(0.50), // unknown entry price — use midpoint as conservative estimate
+                avg_entry,
                 opened_at: Utc::now(),
                 close_time: market_close_time,
                 market_name: market_name.to_string(),
