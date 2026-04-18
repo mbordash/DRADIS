@@ -47,6 +47,7 @@ pub async fn fetch_specific_hourly_market(
 
             // Re-apply essential filters
             if config::is_bad_market(&name) || config::is_bad_market(&event_title) { continue; }
+            if config::is_ultra_short_window_market(&name) { continue; }
             if !get_enable_orderbook(market) { continue; }
 
             let token_ids = extract_token_ids_u256(market);
@@ -229,6 +230,13 @@ pub async fn fetch_simplified_crypto_candidates(
             // Previously these were only deprioritised in the sort — now we exclude them.
             if config::is_range_market(&name) {
                 debug!("  ⏭️ Rejected (range market): {}", name);
+                continue;
+            }
+
+            // Hard-exclude ultra-short-window markets (e.g. "6:00PM-6:15PM ET").
+            // These 15-minute windows reprice too fast for reliable entry/exit.
+            if config::is_ultra_short_window_market(&name) {
+                debug!("  ⏭️ Rejected (ultra-short window): {}", name);
                 continue;
             }
 
