@@ -48,12 +48,17 @@ pub fn parse_balance_from_error(err_msg: &str) -> Option<Decimal> {
 ///
 /// Fetches the actual balance from the exchange ledger and updates the local
 /// position keyed by `(strategy_name, token_id)`.
+///
+/// `baseline_shares` is the on-chain balance that existed *before* the order
+/// was placed.  The true fill is `actual - baseline`, not the raw balance.
+/// This prevents residual shares from previous trades inflating the position.
 pub async fn sync_position_balance(
     client: &Arc<ClobClient<Authenticated<Normal>>>,
     positions: &Arc<Mutex<PositionMap>>,
     strategy_name: &str,
     token_id: U256,
     phantom_cooldowns: Option<&PhantomCooldowns>,
+    baseline_shares: Decimal,
 ) -> Result<()> {
     let key = (strategy_name.to_string(), token_id);
 
@@ -68,15 +73,28 @@ pub async fn sync_position_balance(
         req.token_id = Some(token_id);
 
         if let Ok(resp) = client.balance_allowance(req).await {
-            let actual_shares = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
+            let raw_shares = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
+            // Subtract pre-order residual so we only count shares from THIS fill.
+            let actual_shares = (raw_shares - baseline_shares).max(dec!(0));
             let mut pos_map = positions.lock().await;
             if let Some(pos) = pos_map.get_mut(&key) {
-                if actual_shares > dec!(0) {
-                    info!("⚖️ Position Synced [{}]: Token {} quantity updated from {} to actual: {}",
-                          strategy_name, token_id, pos.shares, actual_shares);
+                if actual_shares >= crate::config::MIN_ORDER_SHARES {
+                    info!("⚖️ Position Synced [{}]: Token {} quantity updated from {} to actual: {} (raw: {}, baseline: {})",
+                          strategy_name, token_id, pos.shares, actual_shares, raw_shares, baseline_shares);
                     pos.shares = actual_shares;
                     if pos.fill_confirmed_at.is_none() {
                         pos.fill_confirmed_at = Some(Utc::now());
+                    }
+                    return Ok(());
+                } else if actual_shares > dec!(0) {
+                    // Dust fill: net new shares are non-zero but below MIN_ORDER_SHARES.
+                    // Treat it the same as a zero balance: remove the position and apply phantom cooldown.
+                    warn!("⚠️ Position Sync DUST [{}]: Token {} has only {} net new shares (raw: {}, baseline: {}, < MIN_ORDER_SHARES {}). Treating as phantom and removing.",
+                          strategy_name, token_id, actual_shares, raw_shares, baseline_shares, crate::config::MIN_ORDER_SHARES);
+                    pos_map.remove(&key);
+                    drop(pos_map);
+                    if let Some(cooldowns) = phantom_cooldowns {
+                        cooldowns.lock().await.insert(strategy_name.to_string(), Instant::now());
                     }
                     return Ok(());
                 } else {

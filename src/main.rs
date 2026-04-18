@@ -737,6 +737,15 @@ async fn main() -> Result<()> {
                                 // ─────────────────────────────────────────────────────────────────
 
                                 let rounded_price = if is_maker { floor_to_tick_size(buy_price) } else { round_to_tick_size(buy_price) };
+                                // Patch sentinel avg_entry to the floored price so stop-loss math is accurate.
+                                // Previously, avg_entry was set to the pre-floor buy_price, causing the
+                                // stop-loss to fire prematurely (e.g. at -3.1% when threshold is higher)
+                                // because the actual order fills at rounded_price, not buy_price.
+                                if is_maker && rounded_price != buy_price {
+                                    if let Some(pos) = positions.lock().await.get_mut(&pos_key) {
+                                        pos.avg_entry = rounded_price;
+                                    }
+                                }
                                 if (rounded_price - buy_price).abs() > rust_decimal::Decimal::ZERO {
                                     info!("📥 ENTRY [{}]: {} {} | shares={:.2}, price=${:.4} (rounded from ${:.10})", strategy_name, side_label, market_name, shares, rounded_price, buy_price);
                                 } else if is_maker {
@@ -746,8 +755,22 @@ async fn main() -> Result<()> {
                                     info!("📥 ENTRY [{}]: {} {} | shares={:.2}, price=${:.4}", strategy_name, side_label, market_name, shares, buy_price);
                                 }
 
+                                // Snapshot the pre-order on-chain balance so the sync task can compute
+                                // the true fill delta (actual - baseline) rather than the raw total.
+                                // This prevents residual shares from previous trades inflating positions.
+                                let baseline_shares = {
+                                    let mut req = BalanceAllowanceRequest::default();
+                                    req.asset_type = AssetType::Conditional;
+                                    req.token_id = Some(*token_id);
+                                    match trading_client.balance_allowance(req).await {
+                                        Ok(resp) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
+                                        Err(_) => dec!(0),
+                                    }
+                                };
+
                                 if !config::GHOST_MODE {
                                     let (order_type, post_only, exp) = if is_maker { (OrderType::GTD, true, 60u64) } else { (OrderType::FAK, false, 0u64) };
+
                                     if let Err(e) = place_limit_order(
                                         &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
                                         verifying_contract, *token_id, Side::Buy, shares, buy_price, fee_bps, order_type, post_only, exp,
@@ -801,7 +824,7 @@ async fn main() -> Result<()> {
                                     let strategy_sync = strategy_name.clone();
                                     let token_sync = *token_id;
                                     tokio::spawn(async move {
-                                        let _ = sync_position_balance(&client_sync, &positions_sync, &strategy_sync, token_sync, Some(&phantom_cooldowns_sync)).await;
+                                        let _ = sync_position_balance(&client_sync, &positions_sync, &strategy_sync, token_sync, Some(&phantom_cooldowns_sync), baseline_shares).await;
                                     });
                                 }
 
@@ -847,7 +870,7 @@ async fn main() -> Result<()> {
                                         let phantom_cooldowns_sync = Arc::clone(&phantom_cooldowns);
                                         let strategy_sync = strategy_name.clone();
                                         tokio::spawn(async move {
-                                            let _ = sync_position_balance(&client_sync, &positions_sync, &strategy_sync, pair_token, Some(&phantom_cooldowns_sync)).await;
+                                            let _ = sync_position_balance(&client_sync, &positions_sync, &strategy_sync, pair_token, Some(&phantom_cooldowns_sync), dec!(0)).await;
                                         });
                                     }
                                 }
