@@ -155,6 +155,12 @@ pub const MAKER_MIN_SECS_TO_EXPIRY: i64 = 600;
 /// Avoids posting bids on tokens already priced near certainty (low upside).
 pub const MAKER_MAX_ENTRY_PRICE: Decimal = dec!(0.70);
 
+/// Minimum bid price for a maker entry.
+/// Blocks entries on tokens priced near zero (market already resolved against this side).
+/// A WS snapshot lag can cause the complementary-token check to pass on a crashed market;
+/// this floor catches it regardless of snapshot staleness.
+pub const MAKER_MIN_ENTRY_PRICE: Decimal = dec!(0.10);
+
 /// Take-profit: exit when position gains this % over avg entry.
 pub const MAKER_TARGET_PROFIT_PERCENT: Decimal = dec!(0.04);
 

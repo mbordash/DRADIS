@@ -60,7 +60,7 @@ impl Strategy for MakerStrategyImpl {
         // If NO bid > MAKER_MAX_ENTRY_PRICE it means YES is collapsing — don't post YES.
         let yes_bid_price = yes_bid + config::MAKER_BID_IMPROVEMENT;
         if yes_spread >= config::MAKER_MIN_SPREAD
-            && yes_bid_price > dec!(0)
+            && yes_bid_price >= config::MAKER_MIN_ENTRY_PRICE
             && yes_bid_price <= config::MAKER_MAX_ENTRY_PRICE
             && no_bid <= config::MAKER_MAX_ENTRY_PRICE  // complementary check: market not too directional
         {
@@ -74,7 +74,7 @@ impl Strategy for MakerStrategyImpl {
         // If YES bid > MAKER_MAX_ENTRY_PRICE the market is strongly directional — don't post NO.
         let no_bid_price = no_bid + config::MAKER_BID_IMPROVEMENT;
         if no_spread >= config::MAKER_MIN_SPREAD
-            && no_bid_price > dec!(0)
+            && no_bid_price >= config::MAKER_MIN_ENTRY_PRICE
             && no_bid_price <= config::MAKER_MAX_ENTRY_PRICE
             && yes_bid <= config::MAKER_MAX_ENTRY_PRICE  // complementary check: market not too directional
         {
