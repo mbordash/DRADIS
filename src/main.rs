@@ -40,7 +40,7 @@ use rustpolybot::orchestrator::{StrategyRegistry, StrategyContext};
 use rustpolybot::orchestrator::executor::{execute_strategies_concurrent, aggregate_and_resolve_signals};
 use rustpolybot::notifications::send_notification;
 use rustpolybot::helpers::{
-    time::*, balance::*, nonce::*, orders::*, market::*, price::round_to_tick_size
+    time::*, balance::*, nonce::*, orders::*, market::*, price::{round_to_tick_size, floor_to_tick_size}
 };
 
 use rustls::crypto::ring;
@@ -210,6 +210,7 @@ async fn main() -> Result<()> {
 
     let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(PositionMap::new()));
     let total_pnl: Arc<Mutex<Decimal>> = Arc::new(Mutex::new(dec!(0)));
+    let phantom_cooldowns: rustpolybot::helpers::balance::PhantomCooldowns = Arc::new(Mutex::new(HashMap::new()));
     let time_decay_positions: Arc<Mutex<HashMap<U256, TimeDecayPosition>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
@@ -620,6 +621,21 @@ async fn main() -> Result<()> {
                                     }
                                 }
 
+                                // Phantom cooldown gate: block re-entry after an unfilled GTD order
+                                // was removed by sync_position_balance, to prevent phantom loops.
+                                {
+                                    let pc = phantom_cooldowns.lock().await;
+                                    if let Some(removed_at) = pc.get(strategy_name.as_str()) {
+                                        let elapsed = removed_at.elapsed();
+                                        let cooldown = Duration::from_secs(rustpolybot::helpers::balance::PHANTOM_COOLDOWN_SECS);
+                                        if elapsed < cooldown {
+                                            debug!("⏸️ ENTRY [{}]: signal suppressed — phantom cooldown ({:.0}s remaining)",
+                                                strategy_name, (cooldown - elapsed).as_secs_f32());
+                                            continue;
+                                        }
+                                    }
+                                }
+
                                 // Momentum confirmation gate
                                 if strategy_name == "MomentumStrategy" {
                                     if last_momentum_signal_token == Some(*token_id) {
@@ -720,7 +736,7 @@ async fn main() -> Result<()> {
                                 }
                                 // ─────────────────────────────────────────────────────────────────
 
-                                let rounded_price = round_to_tick_size(buy_price);
+                                let rounded_price = if is_maker { floor_to_tick_size(buy_price) } else { round_to_tick_size(buy_price) };
                                 if (rounded_price - buy_price).abs() > rust_decimal::Decimal::ZERO {
                                     info!("📥 ENTRY [{}]: {} {} | shares={:.2}, price=${:.4} (rounded from ${:.10})", strategy_name, side_label, market_name, shares, rounded_price, buy_price);
                                 } else if is_maker {
@@ -781,10 +797,11 @@ async fn main() -> Result<()> {
                                 {
                                     let client_sync = Arc::clone(&trading_client);
                                     let positions_sync = Arc::clone(&positions);
+                                    let phantom_cooldowns_sync = Arc::clone(&phantom_cooldowns);
                                     let strategy_sync = strategy_name.clone();
                                     let token_sync = *token_id;
                                     tokio::spawn(async move {
-                                        let _ = sync_position_balance(&client_sync, &positions_sync, &strategy_sync, token_sync).await;
+                                        let _ = sync_position_balance(&client_sync, &positions_sync, &strategy_sync, token_sync, Some(&phantom_cooldowns_sync)).await;
                                     });
                                 }
 
@@ -827,9 +844,10 @@ async fn main() -> Result<()> {
 
                                         let client_sync = Arc::clone(&trading_client);
                                         let positions_sync = Arc::clone(&positions);
+                                        let phantom_cooldowns_sync = Arc::clone(&phantom_cooldowns);
                                         let strategy_sync = strategy_name.clone();
                                         tokio::spawn(async move {
-                                            let _ = sync_position_balance(&client_sync, &positions_sync, &strategy_sync, pair_token).await;
+                                            let _ = sync_position_balance(&client_sync, &positions_sync, &strategy_sync, pair_token, Some(&phantom_cooldowns_sync)).await;
                                         });
                                     }
                                 }
@@ -838,6 +856,8 @@ async fn main() -> Result<()> {
                                 momentum_confirmation_count = 0;
                                 last_momentum_signal_token = None;
                                 last_trade_time.insert(strategy_name.clone(), Instant::now());
+                                // Clear phantom cooldown on successful entry
+                                phantom_cooldowns.lock().await.remove(strategy_name.as_str());
 
                                 let msg = format!("📥 ENTRY [{}] {} {} | ${:.4} x {:.1}", strategy_name, side_label, market_name, order_base_price, shares);
                                 let _ = send_notification(&tg_token, &tg_chat_id, &msg).await;

@@ -23,7 +23,7 @@ use tokio::sync::Mutex;
 use tracing::warn;
 
 use rust_decimal::prelude::ToPrimitive;
-use crate::helpers::price::{to_fixed_u128_with_precision, round_to_tick_size};
+use crate::helpers::price::{to_fixed_u128_with_precision, round_to_tick_size, floor_to_tick_size};
 use crate::helpers::nonce::fetch_next_nonce;
 
 const ORDER_NAME: &str = "Polymarket CTF Exchange";
@@ -82,8 +82,14 @@ pub async fn place_limit_order(
         order_struct.signer = eoa_address;
         order_struct.tokenId = token_id;
 
-        // Round price to minimum tick size (0.01) to comply with Polymarket validation
-        let rounded_price = round_to_tick_size(limit_price);
+        // Round price to minimum tick size (0.01) to comply with Polymarket validation.
+        // For post-only BUY orders (maker bids), floor instead of round to prevent
+        // rounding UP from crossing the book (e.g. $0.318 → $0.32 crossing a $0.19 ask).
+        let rounded_price = if post_only && side == Side::Buy {
+            floor_to_tick_size(limit_price)
+        } else {
+            round_to_tick_size(limit_price)
+        };
 
         // Convert price to integer cents (e.g. 0.63 → 63) for exact arithmetic.
         // Polymarket validates: makerAmount / takerAmount must be an exact multiple of 0.01.
