@@ -275,7 +275,7 @@ mod tests {
         positions.insert(("MakerStrategy".to_string(), yes_token), Position {
             shares: dec!(20),
             avg_entry: dec!(0.30),
-            opened_at: Utc::now(),
+            opened_at: Utc::now() - Duration::seconds(30),
             close_time: None,
             market_name: "Test Market".to_string(),
             pair_token_id: yes_token,

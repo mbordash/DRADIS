@@ -2,11 +2,12 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use regex::Regex;
 use anyhow::Result;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::str::FromStr;
 use alloy::primitives::U256;
 use tokio::sync::Mutex;
-use tokio::time::Duration;
+use tokio::time::{Duration, Instant};
 use chrono::Utc;
 use tracing::{info, warn};
 
@@ -17,6 +18,15 @@ use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk::clob::types::AssetType;
 
 pub use crate::state::{Position, PositionMap};
+
+/// Shared map of strategy → Instant for phantom removal cooldowns.
+/// When sync_position_balance removes a phantom, it records the time here.
+/// The entry gate in main.rs checks this to prevent immediate re-entry.
+pub type PhantomCooldowns = Arc<Mutex<HashMap<String, Instant>>>;
+
+/// How long to block re-entry after a phantom removal (seconds).
+/// Prevents the bot from immediately re-posting the same unfillable GTD order.
+pub const PHANTOM_COOLDOWN_SECS: u64 = 120;
 
 /// Known strategy names for reconciliation adoption priority.
 /// Maker is first because orphaned GTD fills are the most common cause.
@@ -43,6 +53,7 @@ pub async fn sync_position_balance(
     positions: &Arc<Mutex<PositionMap>>,
     strategy_name: &str,
     token_id: U256,
+    phantom_cooldowns: Option<&PhantomCooldowns>,
 ) -> Result<()> {
     let key = (strategy_name.to_string(), token_id);
 
@@ -78,6 +89,10 @@ pub async fn sync_position_balance(
                         warn!("⚠️ Position Sync FAILED [{}]: Token {} balance still 0 after {}s. Order never filled on-chain. Removing phantom position.",
                               strategy_name, token_id, time_since_open);
                         pos_map.remove(&key);
+                        drop(pos_map);
+                        if let Some(cooldowns) = phantom_cooldowns {
+                            cooldowns.lock().await.insert(strategy_name.to_string(), Instant::now());
+                        }
                         return Ok(());
                     } else {
                         warn!("⚠️ Position Sync [{}]: Token {} balance is 0 ({}s since open, max {}s). Retrying in {}ms…",
@@ -105,6 +120,9 @@ pub async fn sync_position_balance(
                 warn!("⚠️ Position Sync TIMEOUT [{}]: Token {} — API errors for {}s. Removing phantom position.",
                       strategy_name, token_id, time_since_open);
                 positions.lock().await.remove(&key);
+                if let Some(cooldowns) = phantom_cooldowns {
+                    cooldowns.lock().await.insert(strategy_name.to_string(), Instant::now());
+                }
                 return Ok(());
             }
         }

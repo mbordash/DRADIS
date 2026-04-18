@@ -41,6 +41,14 @@ pub fn round_to_tick_size(price: Decimal) -> Decimal {
     (price / tick_size).round() * tick_size
 }
 
+/// Floor price to the tick size (0.01) — always rounds DOWN.
+/// Used for buy/bid orders to ensure rounding never pushes the price
+/// above the intended level (which would cross the book on post-only orders).
+pub fn floor_to_tick_size(price: Decimal) -> Decimal {
+    let tick_size = Decimal::from_parts(1, 0, 0, false, 2); // 0.01
+    (price / tick_size).floor() * tick_size
+}
+
 /// Ceiling function: round UP to the specified number of decimal places
 /// Used to ensure effective order prices don't drop below minimum tick size due to truncation
 pub fn ceil_with_scale(value: Decimal, scale: u32) -> Decimal {
