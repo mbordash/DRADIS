@@ -23,7 +23,10 @@ pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.05);
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.98);
 
 /// Minimum number of shares for a single order (exchange requirement)
-pub const MIN_ORDER_SHARES: Decimal = dec!(5.0);
+/// Minimum shares to treat a fill as real (not dust).
+/// At MAKER_MIN_ENTRY_PRICE=$0.10, 1 share = $0.10 minimum value — still economical.
+/// Lowered from 5.0: a 3.87-share partial fill at $0.61 is a real $2.36 position.
+pub const MIN_ORDER_SHARES: Decimal = dec!(1.0);
 
 /// Minimum USDC value for a single order (exchange requirement)
 pub const MIN_ORDER_USDC: Decimal = dec!(1.05);
@@ -148,12 +151,14 @@ pub const MAKER_MAX_BID_IMPROVEMENT: Decimal = dec!(0.03);
 pub const CROSSES_BOOK_COOLDOWN_SECS: i64 = 30;
 
 /// Do not post maker orders if market closes within this many seconds.
-/// 600s (10 min) gives enough time for a fill and a clean exit before expiry.
-pub const MAKER_MIN_SECS_TO_EXPIRY: i64 = 600;
+/// Raised from 600s (10 min) → 1800s (30 min): blocks late-session entries where
+/// adverse selection risk is highest and there is no time for price recovery.
+pub const MAKER_MIN_SECS_TO_EXPIRY: i64 = 1800;
 
 /// Maximum token price allowed for a maker entry bid.
-/// Avoids posting bids on tokens already priced near certainty (low upside).
-pub const MAKER_MAX_ENTRY_PRICE: Decimal = dec!(0.70);
+/// Lowered from $0.70 → $0.65: avoids highly directional markets where
+/// adverse selection (someone selling to us because they know the outcome) is more likely.
+pub const MAKER_MAX_ENTRY_PRICE: Decimal = dec!(0.65);
 
 /// Minimum bid price for a maker entry.
 /// Blocks entries on tokens priced near zero (market already resolved against this side).
@@ -162,12 +167,14 @@ pub const MAKER_MAX_ENTRY_PRICE: Decimal = dec!(0.70);
 pub const MAKER_MIN_ENTRY_PRICE: Decimal = dec!(0.10);
 
 /// Take-profit: exit when position gains this % over avg entry.
-pub const MAKER_TARGET_PROFIT_PERCENT: Decimal = dec!(0.04);
+/// Raised from 4% → 8%: improves risk/reward to 1.6:1 (need only 38% wins to break even).
+pub const MAKER_TARGET_PROFIT_PERCENT: Decimal = dec!(0.08);
 
 /// Stop-loss: exit when position loses this % from avg entry.
-/// Tight at 3% — maker fills often mean someone knew something; cut quickly.
-pub const MAKER_STOP_LOSS_PERCENT: Decimal = dec!(0.03);
-pub const MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 15;
+/// Raised from 3% → 5%: at $0.62 entry, 3% stop = $0.019 move — too tight for market noise.
+/// 5% gives $0.031 breathing room while still cutting adverse selections quickly.
+pub const MAKER_STOP_LOSS_PERCENT: Decimal = dec!(0.05);
+pub const MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 30;
 
 
 // ============================================================================

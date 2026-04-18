@@ -207,8 +207,8 @@ mod tests {
     async fn test_maker_entry_wide_spread_yes() {
         let strategy = MakerStrategyImpl;
         // YES spread = 0.40 - 0.30 = 0.10 >= MAKER_MIN_SPREAD (0.05) ✓
-        // bid_price = 0.30 + 0.01 = 0.31 <= MAKER_MAX_ENTRY_PRICE (0.70) ✓
-        let ctx = make_ctx(dec!(0.30), dec!(0.40), dec!(0.55), dec!(0.58), 1200, PositionMap::new());
+        // bid_price = 0.30 + 0.01 = 0.31 <= MAKER_MAX_ENTRY_PRICE (0.65) ✓
+        let ctx = make_ctx(dec!(0.30), dec!(0.40), dec!(0.55), dec!(0.58), 2400, PositionMap::new());
         let signal = strategy.evaluate_entry(&ctx).await.unwrap();
         assert!(matches!(signal, StrategySignal::Entry { .. }));
     }
@@ -218,7 +218,7 @@ mod tests {
         let strategy = MakerStrategyImpl;
         // YES spread = 0.51 - 0.50 = 0.01 < MAKER_MIN_SPREAD (0.05) ✗
         // NO spread  = 0.50 - 0.49 = 0.01 < MAKER_MIN_SPREAD (0.05) ✗
-        let ctx = make_ctx(dec!(0.50), dec!(0.51), dec!(0.49), dec!(0.50), 1200, PositionMap::new());
+        let ctx = make_ctx(dec!(0.50), dec!(0.51), dec!(0.49), dec!(0.50), 2400, PositionMap::new());
         let signal = strategy.evaluate_entry(&ctx).await.unwrap();
         assert!(matches!(signal, StrategySignal::NoSignal));
     }
@@ -226,7 +226,7 @@ mod tests {
     #[tokio::test]
     async fn test_maker_no_entry_too_close_to_expiry() {
         let strategy = MakerStrategyImpl;
-        // Wide spread but only 300s to expiry < MAKER_MIN_SECS_TO_EXPIRY (600) ✗
+        // Wide spread but only 300s to expiry < MAKER_MIN_SECS_TO_EXPIRY (1800) ✗
         let ctx = make_ctx(dec!(0.30), dec!(0.40), dec!(0.55), dec!(0.58), 300, PositionMap::new());
         let signal = strategy.evaluate_entry(&ctx).await.unwrap();
         assert!(matches!(signal, StrategySignal::NoSignal));
@@ -235,8 +235,8 @@ mod tests {
     #[tokio::test]
     async fn test_maker_no_entry_price_too_high() {
         let strategy = MakerStrategyImpl;
-        // YES bid_price = 0.72 + 0.01 = 0.73 > MAKER_MAX_ENTRY_PRICE (0.70) ✗
-        let ctx = make_ctx(dec!(0.72), dec!(0.80), dec!(0.10), dec!(0.13), 1200, PositionMap::new());
+        // YES bid_price = 0.72 + 0.01 = 0.73 > MAKER_MAX_ENTRY_PRICE (0.65) ✗
+        let ctx = make_ctx(dec!(0.72), dec!(0.80), dec!(0.10), dec!(0.13), 2400, PositionMap::new());
         let signal = strategy.evaluate_entry(&ctx).await.unwrap();
         // YES blocked by price cap; NO spread = 0.03 < 0.05 also blocked
         assert!(matches!(signal, StrategySignal::NoSignal));
@@ -257,11 +257,11 @@ mod tests {
             pair_token_id: yes_token,
             fill_confirmed_at: Some(Utc::now()),
         });
-        // bid = 0.32, entry = 0.30 → profit = 6.67% >= MAKER_TARGET_PROFIT_PERCENT (4%) ✓
-        let ctx = make_ctx(dec!(0.30), dec!(0.40), dec!(0.55), dec!(0.58), 1200, positions);
-        // Override yes_bid to 0.32 via a fresh ctx snapshot
+        // bid = 0.32, entry = 0.30 → profit = 6.67% < MAKER_TARGET_PROFIT_PERCENT (8%) ✗ → no exit yet
+        let ctx = make_ctx(dec!(0.30), dec!(0.40), dec!(0.55), dec!(0.58), 2400, positions);
+        // Override yes_bid to 0.33 (10% gain) to trigger take-profit
         let mut ctx2 = ctx.clone();
-        ctx2.snapshot.yes_bid = dec!(0.32);
+        ctx2.snapshot.yes_bid = dec!(0.33);
         let signal = strategy.evaluate_exit(&ctx2).await.unwrap();
         assert!(matches!(signal, StrategySignal::Exit { .. }));
     }
@@ -281,8 +281,8 @@ mod tests {
             pair_token_id: yes_token,
             fill_confirmed_at: Some(Utc::now()),
         });
-        // bid = 0.27, entry = 0.30 → loss = -10% <= -MAKER_STOP_LOSS_PERCENT (-3%) ✓
-        let ctx = make_ctx(dec!(0.30), dec!(0.40), dec!(0.55), dec!(0.58), 1200, positions);
+        // bid = 0.27, entry = 0.30 → loss = -10% <= -MAKER_STOP_LOSS_PERCENT (-5%) ✓
+        let ctx = make_ctx(dec!(0.30), dec!(0.40), dec!(0.55), dec!(0.58), 2400, positions);
         let mut ctx2 = ctx.clone();
         ctx2.snapshot.yes_bid = dec!(0.27);
         let signal = strategy.evaluate_exit(&ctx2).await.unwrap();
