@@ -122,11 +122,15 @@ impl Strategy for MakerStrategyImpl {
                 });
             }
 
-            // Stop-loss: use opened_at (NOT fill_confirmed_at) so we are never blind
-            // during the fill-sync window (which can take 5–60 s for GTD orders).
-            // If the order somehow never filled, the resulting sell will get a
-            // "balance: 0" error which is already handled gracefully in main.rs.
-            if profit_pct <= -config::MAKER_STOP_LOSS_PERCENT && secs_since_open >= config::MIN_HOLD_SECS_BEFORE_STOP_LOSS {
+            // Stop-loss: require fill confirmation before firing.
+            // Previously we fired on unconfirmed (phantom) positions, which caused
+            // a wasteful sell → "balance: 0" → phantom cleanup → cooldown cycle on
+            // every GTD order that never matched.  The 60s sync timeout in
+            // sync_position_balance already removes true phantoms gracefully.
+            if position.fill_confirmed_at.is_some()
+                && profit_pct <= -config::MAKER_STOP_LOSS_PERCENT
+                && secs_since_open >= config::MIN_HOLD_SECS_BEFORE_STOP_LOSS
+            {
                 return Ok(StrategySignal::Exit {
                     token_id,
                     reason: format!(
