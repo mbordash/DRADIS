@@ -6,6 +6,7 @@
 use anyhow::Result;
 use std::borrow::Cow;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use polymarket_client_sdk::clob::{Client as ClobClient};
 use polymarket_client_sdk::auth::state::Authenticated;
@@ -19,7 +20,6 @@ use alloy::dyn_abi::Eip712Domain;
 use alloy::sol_types::SolStruct;
 use chrono::Utc;
 use rust_decimal::Decimal;
-use tokio::sync::Mutex;
 use tracing::warn;
 
 use rust_decimal::prelude::ToPrimitive;
@@ -57,7 +57,7 @@ const EXPIRATION_BUFFER_SECS: u64 = 90;
 /// * `expiration_secs` - Time in seconds until order expires (0 for no expiration)
 pub async fn place_limit_order(
     client: &Arc<ClobClient<Authenticated<Normal>>>,
-    nonce_manager: &Arc<Mutex<u64>>,
+    nonce_manager: &Arc<AtomicU64>,
     signer: &LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
     safe_address: Address,
     eoa_address: Address,
@@ -73,8 +73,10 @@ pub async fn place_limit_order(
     http: &reqwest::Client,
 ) -> Result<()> {
     for attempt in 0..2 {
-        let mut guard = nonce_manager.lock().await;
-        let current_nonce = *guard;
+        // AtomicU64 load — no lock needed. Polymarket's GnosisSafe nonce acts as a
+        // minimum-cancel-nonce for batch cancellation, not a strict replay counter,
+        // so the same value can be used by concurrent orders without conflict.
+        let current_nonce = nonce_manager.load(Ordering::SeqCst);
 
         let mut order_struct = Order::default();
         order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
@@ -178,21 +180,16 @@ pub async fn place_limit_order(
                     // NOTE: Polymarket CLOB always returns next_nonce=0 for this wallet type
                     // (GnosisSafe signatureType).  The nonce field in Polymarket orders acts as
                     // a "minimum cancel nonce" for batch cancellation, not a strict per-order
-                    // replay counter.  Incrementing it locally causes every subsequent order
-                    // to present nonce=1 which is rejected, requiring an extra API round-trip
-                    // to re-sync back to 0.  We leave the counter unchanged so it stays in
+                    // replay counter.  We leave the counter unchanged so it stays in
                     // sync with the API without the latency penalty.
                     return Ok(());
                 }
                 Err(e) => {
-                    drop(guard);
                     let err_msg = format!("{:?}", e).to_lowercase();
                     if err_msg.contains("invalid nonce") && attempt == 0 {
                         warn!("⚠️ Invalid nonce. Re-syncing from API...");
-                        // Actually fetch the correct nonce from the API before retrying
                         if let Some(fresh_nonce) = fetch_next_nonce(http, safe_address).await {
-                            let mut g = nonce_manager.lock().await;
-                            *g = fresh_nonce;
+                            nonce_manager.store(fresh_nonce, Ordering::SeqCst);
                             warn!("🔄 Nonce re-synced to {} — retrying order", fresh_nonce);
                         }
                         continue;

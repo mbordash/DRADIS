@@ -27,6 +27,7 @@ use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::str::FromStr as _;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use tokio::sync::{watch, Mutex};
 use tokio::time::{interval, Instant, Duration};
 
@@ -126,7 +127,7 @@ async fn main() -> Result<()> {
 
     let initial_nonce = fetch_next_nonce(&shared_http, safe_address).await.unwrap_or(0);
     info!("🔄 Initialized Nonce from API (Maker/Safe): {}", initial_nonce);
-    let nonce_manager = Arc::new(Mutex::new(initial_nonce));
+    let nonce_manager = Arc::new(AtomicU64::new(initial_nonce));
 
     let starting_collateral = Arc::new(Mutex::new(dec!(0.0)));
     let (balance_tx, balance_rx) = watch::channel(dec!(0));
@@ -946,6 +947,206 @@ async fn main() -> Result<()> {
                             }
 
                             StrategySignal::NoSignal => {}
+
+                            // ════════════════════ MAKER QUOTE (two-sided) ════════════════════
+                            StrategySignal::MakerQuote { yes_bid_price, no_bid_price } => {
+                                // Per-strategy cooldown gate
+                                if let Some(lt) = last_trade_time.get(strategy_name.as_str()) {
+                                    let elapsed = lt.elapsed();
+                                    let cooldown = Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64);
+                                    if elapsed < cooldown {
+                                        debug!("⏸️ MakerQuote [{}]: cooldown ({:.1}s remaining)",
+                                            strategy_name, (cooldown - elapsed).as_secs_f32());
+                                        continue;
+                                    }
+                                }
+                                // Phantom cooldown gate
+                                {
+                                    let pc = phantom_cooldowns.lock().await;
+                                    if let Some(removed_at) = pc.get(strategy_name.as_str()) {
+                                        let elapsed = removed_at.elapsed();
+                                        let cooldown = Duration::from_secs(rustpolybot::helpers::balance::PHANTOM_COOLDOWN_SECS);
+                                        if elapsed < cooldown {
+                                            debug!("⏸️ MakerQuote [{}]: phantom cooldown ({:.0}s remaining)",
+                                                strategy_name, (cooldown - elapsed).as_secs_f32());
+                                            continue;
+                                        }
+                                    }
+                                }
+                                // Stop-loss cooldown gate
+                                if let Some(sl_time) = last_stop_loss_time.get(strategy_name.as_str()) {
+                                    let elapsed = sl_time.elapsed();
+                                    let cooldown = Duration::from_secs(config::MAKER_STOP_LOSS_COOLDOWN_SECS as u64);
+                                    if elapsed < cooldown {
+                                        debug!("⏸️ MakerQuote [{}]: stop-loss cooldown ({:.0}s remaining)",
+                                            strategy_name, (cooldown - elapsed).as_secs_f32());
+                                        continue;
+                                    }
+                                }
+
+                                // Compute current inventory values for net exposure check
+                                let (yes_inv_value, no_inv_value) = {
+                                    let pos_map = positions.lock().await;
+                                    let yv = pos_map.get(&(strategy_name.clone(), yes_token))
+                                        .map(|p| p.shares * p.avg_entry).unwrap_or(dec!(0));
+                                    let nv = pos_map.get(&(strategy_name.clone(), no_token))
+                                        .map(|p| p.shares * p.avg_entry).unwrap_or(dec!(0));
+                                    (yv, nv)
+                                };
+
+                                // USDC value of the proposed new orders
+                                let yes_new_value = yes_bid_price.map(|_| trade_size_usdc).unwrap_or(dec!(0));
+                                let no_new_value  = no_bid_price.map(|_| trade_size_usdc).unwrap_or(dec!(0));
+
+                                let collateral = *starting_collateral.lock().await;
+                                let session_pnl = *total_pnl.lock().await;
+
+                                if !risk_engine.approve_maker_net_exposure(
+                                    yes_inv_value, no_inv_value,
+                                    yes_new_value, no_new_value,
+                                    session_pnl, collateral,
+                                ) {
+                                    info!("🚫 MakerQuote [{}]: net exposure risk check failed (YES=${:.2} NO=${:.2})",
+                                        strategy_name, yes_inv_value + yes_new_value, no_inv_value + no_new_value);
+                                    continue;
+                                }
+
+                                let mut any_placed = false;
+
+                                // ── YES side ───────────────────────────────────────────────────────
+                                if let Some(&yes_price) = yes_bid_price.as_ref() {
+                                    let pos_key = (strategy_name.clone(), yes_token);
+                                    let already_open = positions.lock().await.contains_key(&pos_key);
+                                    if !already_open && yes_price > dec!(0) {
+                                        let shares = trade_size_usdc / yes_price;
+                                        if shares >= config::MIN_ORDER_SHARES && trade_size_usdc >= config::MIN_ORDER_USDC {
+                                            let rounded_price = floor_to_tick_size(yes_price);
+                                            let baseline_shares = {
+                                                let mut req = BalanceAllowanceRequest::default();
+                                                req.asset_type = AssetType::Conditional;
+                                                req.token_id = Some(yes_token);
+                                                match trading_client.balance_allowance(req).await {
+                                                    Ok(resp) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
+                                                    Err(_) => dec!(0),
+                                                }
+                                            };
+                                            info!("📥 MakerQuote YES [{}]: {} | shares={:.2}, bid=${:.4}", strategy_name, market_name, shares, rounded_price);
+                                            positions.lock().await.insert(pos_key.clone(), Position {
+                                                shares, avg_entry: rounded_price, opened_at: Utc::now(),
+                                                close_time: market_close_time, market_name: market_name.clone(),
+                                                pair_token_id: yes_token, fill_confirmed_at: None,
+                                            });
+                                            if !config::GHOST_MODE {
+                                                match place_limit_order(
+                                                    &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
+                                                    verifying_contract, yes_token, Side::Buy, shares, rounded_price,
+                                                    0u16, OrderType::GTD, true, 60u64, &shared_http,
+                                                ).await {
+                                                    Ok(_) => {
+                                                        any_placed = true;
+                                                        let cs = Arc::clone(&trading_client); let ps = Arc::clone(&positions);
+                                                        let pcs = Arc::clone(&phantom_cooldowns); let ss = strategy_name.clone();
+                                                        tokio::spawn(async move { let _ = sync_position_balance(&cs, &ps, &ss, yes_token, Some(&pcs), baseline_shares).await; });
+                                                    }
+                                                    Err(e) => {
+                                                        positions.lock().await.remove(&pos_key);
+                                                        let err_str = e.to_string();
+                                                        if err_str.contains("crosses book") || err_str.contains("post-only") {
+                                                            warn!("⚠️ MakerQuote YES crosses book — cooling down {}s", config::CROSSES_BOOK_COOLDOWN_SECS);
+                                                            last_trade_time.insert(strategy_name.clone(),
+                                                                Instant::now() - Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64)
+                                                                    + Duration::from_secs(config::CROSSES_BOOK_COOLDOWN_SECS as u64));
+                                                        } else {
+                                                            warn!("⚠️ MakerQuote YES order failed: {}", e);
+                                                            consecutive_failures += 1;
+                                                        }
+                                                    }
+                                                }
+                                            } else { any_placed = true; }
+                                        }
+                                    }
+                                }
+
+                                // ── NO side ────────────────────────────────────────────────────────
+                                if let Some(&no_price) = no_bid_price.as_ref() {
+                                    let pos_key = (strategy_name.clone(), no_token);
+                                    let already_open = positions.lock().await.contains_key(&pos_key);
+                                    if !already_open && no_price > dec!(0) {
+                                        let shares = trade_size_usdc / no_price;
+                                        if shares >= config::MIN_ORDER_SHARES && trade_size_usdc >= config::MIN_ORDER_USDC {
+                                            let rounded_price = floor_to_tick_size(no_price);
+                                            let baseline_shares = {
+                                                let mut req = BalanceAllowanceRequest::default();
+                                                req.asset_type = AssetType::Conditional;
+                                                req.token_id = Some(no_token);
+                                                match trading_client.balance_allowance(req).await {
+                                                    Ok(resp) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
+                                                    Err(_) => dec!(0),
+                                                }
+                                            };
+                                            info!("📥 MakerQuote NO [{}]: {} | shares={:.2}, bid=${:.4}", strategy_name, market_name, shares, rounded_price);
+                                            positions.lock().await.insert(pos_key.clone(), Position {
+                                                shares, avg_entry: rounded_price, opened_at: Utc::now(),
+                                                close_time: market_close_time, market_name: market_name.clone(),
+                                                pair_token_id: no_token, fill_confirmed_at: None,
+                                            });
+                                            if !config::GHOST_MODE {
+                                                match place_limit_order(
+                                                    &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
+                                                    verifying_contract, no_token, Side::Buy, shares, rounded_price,
+                                                    0u16, OrderType::GTD, true, 60u64, &shared_http,
+                                                ).await {
+                                                    Ok(_) => {
+                                                        any_placed = true;
+                                                        let cs = Arc::clone(&trading_client); let ps = Arc::clone(&positions);
+                                                        let pcs = Arc::clone(&phantom_cooldowns); let ss = strategy_name.clone();
+                                                        tokio::spawn(async move { let _ = sync_position_balance(&cs, &ps, &ss, no_token, Some(&pcs), baseline_shares).await; });
+                                                    }
+                                                    Err(e) => {
+                                                        positions.lock().await.remove(&pos_key);
+                                                        let err_str = e.to_string();
+                                                        if err_str.contains("crosses book") || err_str.contains("post-only") {
+                                                            warn!("⚠️ MakerQuote NO crosses book — cooling down {}s", config::CROSSES_BOOK_COOLDOWN_SECS);
+                                                            if !any_placed {
+                                                                last_trade_time.insert(strategy_name.clone(),
+                                                                    Instant::now() - Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64)
+                                                                        + Duration::from_secs(config::CROSSES_BOOK_COOLDOWN_SECS as u64));
+                                                            }
+                                                        } else {
+                                                            warn!("⚠️ MakerQuote NO order failed: {}", e);
+                                                            consecutive_failures += 1;
+                                                        }
+                                                    }
+                                                }
+                                            } else { any_placed = true; }
+                                        }
+                                    }
+                                }
+
+                                if any_placed {
+                                    consecutive_failures = 0;
+                                    last_trade_time.insert(strategy_name.clone(), Instant::now());
+                                    phantom_cooldowns.lock().await.remove(strategy_name.as_str());
+                                    let yes_str = yes_bid_price.map(|p| format!("YES@${:.4}", p)).unwrap_or_default();
+                                    let no_str  = no_bid_price.map(|p| format!("NO@${:.4}", p)).unwrap_or_default();
+                                    let msg = format!("📥 MakerQuote [{}] {} {} | {}", strategy_name, yes_str, no_str, market_name);
+                                    let _ = send_notification(&tg_token, &tg_chat_id, &msg).await;
+                                }
+
+                                // Circuit breaker check
+                                if consecutive_failures >= config::MAX_CONSECUTIVE_FAILURES {
+                                    error!("🚨 Circuit breaker: {} consecutive MakerQuote failures — pausing", consecutive_failures);
+                                    let _ = send_notification(&tg_token, &tg_chat_id,
+                                        &format!("🚨 Circuit breaker: {} MakerQuote failures on {}", consecutive_failures, market_name)).await;
+                                    tokio::select! {
+                                        _ = tokio::time::sleep(Duration::from_secs(config::FAILURE_COOLDOWN_SECS as u64)) => {
+                                            sync_nonce_manager(&nonce_manager, &shared_http, safe_address).await;
+                                        }
+                                        _ = market_rx.changed() => {}
+                                    }
+                                    consecutive_failures = 0;
+                                }
+                            }
                         }
                     }
                 }
