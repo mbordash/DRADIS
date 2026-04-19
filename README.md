@@ -70,7 +70,7 @@ Exits: take profit (+6%), stop loss (−8%), **skew-collapse exit** (YES mid ret
 
 Uses fractional Kelly sizing: $5 at 1× threshold → $15 at 3× skew.
 
-**Custom Strategy** — Develop and link your own strategies within the same codebase. See [CUSTOM_STRATEGY.md](docs/CUSTOM_STRATEGY.mdGY.md) for a full developer guide: the `Strategy` trait API, all `StrategyContext` fields, the five integration steps, common gotchas, and a ready-to-run test harness.
+**Custom Strategy** — Develop and link your own strategies within the same codebase. See [CUSTOM_STRATEGY.md](docs/CUSTOM_STRATEGY.md) for a full developer guide: the `Strategy` trait API, all `StrategyContext` fields, the five integration steps, common gotchas, and a ready-to-run test harness.
 
 
 ### Strategy Segregation
