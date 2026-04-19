@@ -131,6 +131,27 @@ pub const MAX_MOMENTUM_CROSSING_ENTRY_PRICE: Decimal = dec!(0.75);
 /// Shortened from 10s to 5s for faster signal detection before Polymarket reprices.
 pub const MOMENTUM_WINDOW_SECS: u64 = 5;
 
+/// Short confirmation window (seconds) for multi-timeframe momentum.
+/// velocity_1s must exceed MOMENTUM_SHORT_WINDOW_FRACTION × threshold to confirm
+/// the move is still active NOW, not just a residual 5s average from an impulse
+/// that already exhausted itself.
+pub const MOMENTUM_SHORT_WINDOW_SECS: u64 = 1;
+
+/// Minimum 1s velocity as a fraction of the primary threshold for entry.
+/// 0.40 = at least 40% of threshold strength must be present in the last 1s.
+/// Prevents entering when the 5s window is high but the last second is flat.
+pub const MOMENTUM_SHORT_WINDOW_FRACTION: Decimal = dec!(0.40);
+
+/// If velocity_5s exceeds this multiple of threshold, bypass the acceleration
+/// gate. A move this strong is worth entering even if it's slightly decelerating.
+pub const MOMENTUM_ACCELERATION_BYPASS_MULTIPLIER: Decimal = dec!(2.5);
+
+/// Minimum 1s velocity (as fraction of threshold) below which we trigger an
+/// early take-profit on a profitable position. If the short-term signal has
+/// collapsed below this level the move is likely exhausted — exit early rather
+/// than waiting for the full TP and risking a reversal.
+pub const MOMENTUM_DECAY_EXIT_FRACTION: Decimal = dec!(0.20);
+
 /// Price change threshold (absolute USD) within the window to trigger a signal.
 /// Lowered to catch momentum earlier — before market makers fully reprice the book.
 /// Thresholds scaled for 5s window (roughly half of previous 10s values).
@@ -228,6 +249,77 @@ pub const MAKER_INVENTORY_SKEW_MAX: Decimal = dec!(0.03);
 /// often have wild, unstable pricing (large swings) — entering during this phase
 /// leads to buying local peaks that immediately revert.
 pub const MAKER_MIN_MARKET_AGE_SECS: i64 = 600; // 10 minutes
+
+
+// ============================================================================
+// BASIS / FUNDING RATE STRATEGY PARAMETERS
+// ============================================================================
+
+/// Enable the Basis/Funding strategy (retail-vs-smart-money mean reversion).
+pub const ENABLE_BASIS_TRADING: bool = true;
+
+/// Minimum deviation of the YES mid-price from 0.50 required to consider a
+/// basis trade.  0.08 = YES mid must be above 0.58 or below 0.42 before we
+/// consider the market to be mis-priced relative to Binance.
+pub const BASIS_ENTRY_SKEW_THRESHOLD: Decimal = dec!(0.08);
+
+/// Funding rate (from Binance perp) below which we consider smart money to be
+/// net bearish.  −0.0001 = −0.01%/8h.  When funding is negative, shorts are
+/// paying longs — the institutional bias is downward even though retail has
+/// pushed Polymarket YES higher.  Used as a *confirming* signal only; the skew
+/// threshold alone is sufficient for entry.
+pub const BASIS_NEGATIVE_FUNDING_THRESHOLD: Decimal = dec!(-0.0001);
+
+/// Funding rate above which we consider smart money to be net bullish.
+pub const BASIS_POSITIVE_FUNDING_THRESHOLD: Decimal = dec!(0.0001);
+
+/// Maximum Binance velocity (abs) still considered "flat" for basis trades.
+/// If price is already running hard in one direction the Polymarket repricing
+/// is legitimate — not a retail skew — so we skip the basis trade.
+/// BTC: $30/5s.  Scale for ETH/SOL proportionally.
+pub const BASIS_BTC_MAX_VELOCITY: Decimal = dec!(30.0);
+pub const BASIS_ETH_MAX_VELOCITY: Decimal = dec!(1.5);
+pub const BASIS_SOL_MAX_VELOCITY: Decimal = dec!(0.15);
+
+/// Maximum distance (USD) between Binance spot and strike price for a basis trade.
+/// If spot is already far on the winning side we don't fade the move.
+/// BTC: $200 (≈ 0.2% buffer).  Scaled for ETH/SOL.
+pub const BASIS_BTC_ORACLE_STRIKE_BUFFER: Decimal = dec!(200.0);
+pub const BASIS_ETH_ORACLE_STRIKE_BUFFER: Decimal = dec!(10.0);
+pub const BASIS_SOL_ORACLE_STRIKE_BUFFER: Decimal = dec!(0.5);
+
+/// Maximum ask price for the token we are buying in a basis trade.
+/// We don't want to fade retail at extreme prices where liquidity is thin.
+pub const BASIS_MAX_ENTRY_PRICE: Decimal = dec!(0.60);
+
+/// Take-profit target for basis positions.
+pub const BASIS_TARGET_PROFIT_PERCENT: Decimal = dec!(0.06);
+
+/// Stop-loss for basis positions.
+pub const BASIS_STOP_LOSS_PERCENT: Decimal = dec!(0.08);
+
+/// Skew-collapse exit: exit if yes_mid returns within this distance of 0.50
+/// (the thesis has played out — no need to wait for full TP).
+pub const BASIS_SKEW_COLLAPSE_THRESHOLD: Decimal = dec!(0.03);
+
+/// Do not trade basis strategy within this many seconds of market expiry.
+pub const BASIS_MIN_SECS_TO_EXPIRY: i64 = 1200; // 20 minutes
+
+/// Maximum USDC exposure for the Basis strategy.
+pub const BASIS_MAX_EXPOSURE_USDC: Decimal = dec!(20.0);
+
+/// Minimum trade size for basis entries.
+pub const BASIS_MIN_TRADE_SIZE_USDC: Decimal = dec!(5.0);
+
+/// Maximum trade size for basis entries.
+pub const BASIS_MAX_TRADE_SIZE_USDC: Decimal = dec!(15.0);
+
+/// How aggressively to size the basis trade based on skew strength.
+/// At 1× threshold → MIN; at BASIS_KELLY_MAX_MULTIPLIER× threshold → MAX.
+pub const BASIS_KELLY_MAX_MULTIPLIER: Decimal = dec!(3.0);
+
+/// Polling interval (seconds) for the Binance futures funding rate endpoint.
+pub const BASIS_FUNDING_POLL_SECS: u64 = 60;
 
 
 // ============================================================================

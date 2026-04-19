@@ -14,6 +14,7 @@ impl RiskEngine {
             "MakerStrategy"     => config::MAKER_MAX_EXPOSURE_USDC,
             "ArbitrageStrategy" => config::ARBITRAGE_MAX_EXPOSURE_USDC,
             "TimeDecayStrategy" => config::TIME_DECAY_MAX_EXPOSURE_USDC,
+            "BasisStrategy"     => config::BASIS_MAX_EXPOSURE_USDC,
             _                   => config::MAX_EXPOSURE_PER_TOKEN_USDC,
         }
     }

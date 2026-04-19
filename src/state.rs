@@ -55,8 +55,18 @@ pub struct MarketSnapshot {
     pub no_ask_depth: Decimal,
     /// Current oracle price from Binance
     pub oracle_price: Decimal,
-    /// Price velocity (rate of change)
+    /// Price velocity over the primary window (MOMENTUM_WINDOW_SECS = 5s)
     pub velocity: Decimal,
+    /// Price velocity over the short window (1s) — confirms move is still happening NOW
+    pub velocity_1s: Decimal,
+    /// Velocity rate-of-change: velocity_now - velocity_prev_tick
+    /// Positive = momentum building, negative = momentum fading
+    pub acceleration: Decimal,
+    /// Binance perpetual futures funding rate (from /fapi/v1/premiumIndex).
+    /// Negative = shorts paying longs (bearish bias from smart money).
+    /// Positive = longs paying shorts (bullish bias from smart money).
+    /// Updated every ~60 seconds; zero if unavailable.
+    pub funding_rate: Decimal,
     /// Timestamp of this snapshot
     pub timestamp: DateTime<Utc>,
 }
