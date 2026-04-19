@@ -156,9 +156,11 @@ pub const CROSSES_BOOK_COOLDOWN_SECS: i64 = 30;
 pub const MAKER_MIN_SECS_TO_EXPIRY: i64 = 1800;
 
 /// Maximum token price allowed for a maker entry bid.
-/// Lowered from $0.70 → $0.65: avoids highly directional markets where
-/// adverse selection (someone selling to us because they know the outcome) is more likely.
-pub const MAKER_MAX_ENTRY_PRICE: Decimal = dec!(0.65);
+/// Lowered from $0.65 → $0.55: entries at $0.55+ mean the market already believes
+/// the outcome is likely decided — adverse selection risk is maximum at high YES prices.
+/// The 7PM winner entered at $0.50 (allowed). The 8PM -$2.38 disaster entered at $0.64 (blocked).
+/// At $0.55 we only post bids when the market is genuinely uncertain (near 50/50).
+pub const MAKER_MAX_ENTRY_PRICE: Decimal = dec!(0.55);
 
 /// Minimum bid price for a maker entry.
 /// Blocks entries on tokens priced near zero (market already resolved against this side).
@@ -174,7 +176,7 @@ pub const MAKER_TARGET_PROFIT_PERCENT: Decimal = dec!(0.08);
 /// Raised from 3% → 5%: at $0.62 entry, 3% stop = $0.019 move — too tight for market noise.
 /// 5% gives $0.031 breathing room while still cutting adverse selections quickly.
 pub const MAKER_STOP_LOSS_PERCENT: Decimal = dec!(0.05);
-pub const MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 30;
+pub const MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 300;
 
 
 // ============================================================================
