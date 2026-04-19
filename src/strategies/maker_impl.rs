@@ -235,7 +235,7 @@ mod tests {
     #[tokio::test]
     async fn test_maker_no_entry_price_too_high() {
         let strategy = MakerStrategyImpl;
-        // YES bid_price = 0.72 + 0.01 = 0.73 > MAKER_MAX_ENTRY_PRICE (0.65) ✗
+        // YES bid_price = 0.72 + 0.01 = 0.73 > MAKER_MAX_ENTRY_PRICE (0.55) ✗
         let ctx = make_ctx(dec!(0.72), dec!(0.80), dec!(0.10), dec!(0.13), 2400, PositionMap::new());
         let signal = strategy.evaluate_entry(&ctx).await.unwrap();
         // YES blocked by price cap; NO spread = 0.03 < 0.05 also blocked
@@ -275,7 +275,7 @@ mod tests {
         positions.insert(("MakerStrategy".to_string(), yes_token), Position {
             shares: dec!(20),
             avg_entry: dec!(0.30),
-            opened_at: Utc::now() - Duration::seconds(30),
+            opened_at: Utc::now() - Duration::seconds(config::MIN_HOLD_SECS_BEFORE_STOP_LOSS),
             close_time: None,
             market_name: "Test Market".to_string(),
             pair_token_id: yes_token,
