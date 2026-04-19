@@ -24,11 +24,14 @@ The bot connects to Polymarket's CLOB via WebSocket for real-time orderbook data
 
 **Momentum** — Detects when Binance price moves sharply before Polymarket reprices. Buys the side that's about to become in-the-money. One-sided (not hedged), so this is the risky one. Requires 2 consecutive signal ticks to filter fakeouts. Exits on take profit (5%), stop loss (10%), or velocity reversal.
 
-**Maker** — Posts passive resting bids below the ask to earn maker rebates instead of paying taker fees. Only fires when the spread is wide enough (≥ 5¢) and expiry is far enough away (≥ 10 min). Uses GTD post-only orders. Exits on take profit (4%) or stop loss (3%).
+**Maker** — Posts passive resting bids below the ask. Per Polymarket's fee structure, makers pay 0 fees on entry; only taker exits incur the market fee rate. Filled maker orders also earn daily USDC rebates from Polymarket's Maker Rebates program (paid to your wallet each day, minimum $1 accrued). Only fires when the spread is wide enough (≥ 5¢), expiry is far enough away (≥ 30 min), and the market has been active for at least 10 minutes (maturation gate filters chaotic initial pricing). Uses GTD post-only orders. Exits on take profit (8%) or stop loss (5%).
 
 **Arbitrage** — Buys both YES and NO when the combined ask is cheap enough that the spread covers fees. Hedged position, lower risk. Exits when combined bid converges toward $1.00.
 
 **Time Decay** — Near expiry, YES + NO prices converge toward $1.00. This strategy buys both sides when the combined ask is attractive and rides the convergence. Only active within a configurable time window before market close (default: 4–30 minutes).
+
+**Custom Strategy** — Develop and link your own strategies within the same codebase.
+
 
 ### Strategy Segregation (Option A Architecture)
 
@@ -101,11 +104,17 @@ TELEGRAM_CHAT_ID=           # optional
 | Parameter | What it does | Default |
 |-----------|-------------|---------|
 | `MAKER_MIN_SPREAD` | Min bid-ask spread to post | `$0.05` |
-| `MAKER_BID_IMPROVEMENT` | Queue priority over best bid | `$0.01` |
-| `MAKER_MIN_SECS_TO_EXPIRY` | Don't post within this window | `600s` |
-| `MAKER_MAX_ENTRY_PRICE` | Max bid price for entry | `$0.70` |
-| `MAKER_TARGET_PROFIT_PERCENT` | Take profit | `4%` |
-| `MAKER_STOP_LOSS_PERCENT` | Stop loss | `3%` |
+| `MAKER_BID_IMPROVEMENT` | Queue priority over best bid (fallback) | `$0.01` |
+| `MAKER_BID_IMPROVEMENT_RATIO` | Spread fraction used as bid improvement | `0.30` |
+| `MAKER_MIN_SECS_TO_EXPIRY` | Don't post within this window of expiry | `1800s (30 min)` |
+| `MAKER_MIN_MARKET_AGE_SECS` | Wait this long after market opens before posting | `600s (10 min)` |
+| `MAKER_MAX_ENTRY_PRICE` | Max bid price for entry | `$0.55` |
+| `MAKER_MIN_ENTRY_PRICE` | Min bid price for entry (avoids near-zero resolved tokens) | `$0.10` |
+| `MAKER_TARGET_PROFIT_PERCENT` | Take profit | `8%` |
+| `MAKER_STOP_LOSS_PERCENT` | Stop loss | `5%` |
+| `MIN_HOLD_SECS_BEFORE_STOP_LOSS` | Minimum hold time before stop loss activates | `300s` |
+| `MAKER_STOP_LOSS_COOLDOWN_SECS` | Cooldown after a stop loss before re-entry | `600s` |
+| `CROSSES_BOOK_COOLDOWN_SECS` | Cooldown after a post-only "crosses book" rejection | `30s` |
 
 **Arbitrage**
 
@@ -197,7 +206,7 @@ src/
 ## FAQ
 
 **Why isn't the bot trading?**
-Check in order: Is `GHOST_MODE` still true? Is the spread wide enough to beat `ARBITRAGE_PROFIT_THRESHOLD` + fees? Is the orderbook thick enough (`MIN_LIQUIDITY_FILL_RATIO`)? For momentum — is the oracle velocity actually hitting the threshold (`BTC_MOMENTUM_THRESHOLD` = $75/5s)? Bump `RUST_LOG=debug` to see what's being filtered.
+Check in order: Is `GHOST_MODE` still true? Is the spread wide enough to beat `ARBITRAGE_PROFIT_THRESHOLD` + fees? Is the orderbook thick enough (`MIN_LIQUIDITY_FILL_RATIO`)? For momentum — is the oracle velocity actually hitting the threshold (`BTC_MOMENTUM_THRESHOLD` = $75/5s)? For maker — is the market less than 10 minutes old (`MAKER_MIN_MARKET_AGE_SECS`)? Is the market closing in less than 30 minutes (`MAKER_MIN_SECS_TO_EXPIRY`)? Bump `RUST_LOG=debug` to see what's being filtered.
 
 **Orders keep getting rejected**
 Usually latency. The bot uses Fill-or-Kill orders for taker strategies, so if the price moves between signal and execution, the order dies. Deploy closer to Polymarket's infrastructure.
