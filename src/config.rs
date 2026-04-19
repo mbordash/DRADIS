@@ -65,6 +65,30 @@ pub const EARLY_EXIT_COMBINED_BID_THRESHOLD: Decimal = dec!(0.995);
 /// Allow one-sided momentum trades (riskier, non-hedged entries based on Binance oracle)
 pub const ENABLE_MOMENTUM_TRADING: bool = true;
 
+// ── Fractional Kelly Position Sizing (Momentum only) ─────────────────────────
+//
+// Trade size scales linearly between MIN and MAX based on how many multiples of
+// the velocity threshold the current signal is.  At exactly 1× threshold you get
+// the minimum size; at KELLY_MAX_MULTIPLIER× (or above) you get the maximum.
+// This rewards high-conviction signals without over-betting on marginal ones.
+//
+// Example (BTC, threshold = $75/5s):
+//   velocity = $75  →  1× → $5  USDC
+//   velocity = $150 →  2× → $11.67 USDC
+//   velocity = $300 →  4× → $25 USDC (max)
+
+/// Signal strength at which trade size saturates at MOMENTUM_MAX_TRADE_SIZE_USDC.
+/// Signals above this multiple are capped — no benefit to overbetting extreme moves.
+pub const MOMENTUM_KELLY_MAX_MULTIPLIER: Decimal = dec!(4.0);
+
+/// Minimum trade size for a momentum entry (used at exactly 1× threshold).
+/// Keep above MIN_ORDER_USDC ($1.05).
+pub const MOMENTUM_MIN_TRADE_SIZE_USDC: Decimal = dec!(5.0);
+
+/// Maximum trade size for a momentum entry (used at MOMENTUM_KELLY_MAX_MULTIPLIER× threshold).
+/// Should not exceed MOMENTUM_MAX_EXPOSURE_USDC ($25).
+pub const MOMENTUM_MAX_TRADE_SIZE_USDC: Decimal = dec!(25.0);
+
 /// Number of consecutive signal ticks required before firing a trade.
 /// Set to 2 to filter out single-tick outliers and "fakeouts".
 pub const MOMENTUM_CONFIRMATION_TICKS: u32 = 2;
