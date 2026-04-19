@@ -33,7 +33,7 @@ The bot connects to Polymarket's CLOB via WebSocket for real-time orderbook data
 **Custom Strategy** — Develop and link your own strategies within the same codebase.
 
 
-### Strategy Segregation (Option A Architecture)
+### Strategy Segregation
 
 Each strategy has its own **independent position book** keyed by `(strategy_name, token_id)`. This means:
 
@@ -204,6 +204,17 @@ src/
 ---
 
 ## FAQ
+
+**Why Rust instead of Python or JavaScript?**
+
+Short answer: the concurrency model and compile-time safety guarantees are a better fit for a multi-strategy bot with shared state.
+
+- **No GIL.** Python's Global Interpreter Lock means threads don't actually run in parallel for CPU-bound work. This bot evaluates four strategies concurrently every 50ms — in Python that's cooperative multitasking at best, not true parallelism. Rust's `tokio` async runtime and `Arc<Mutex<>>` primitives give real concurrent execution across OS threads.
+- **No GC pauses.** Python and Node.js both have garbage collectors that can pause execution at unpredictable times. In a 50ms evaluation loop, even a 5–20ms GC pause is a meaningful fraction of your cycle. Rust's ownership model frees memory deterministically, with no stop-the-world pauses.
+- **Fearless concurrency.** The borrow checker enforces at compile time that shared state (like the position map) can't be accessed unsafely from multiple threads. The TOCTOU-safe entry gate in this bot is only reliable because Rust makes data races a compile error, not a runtime surprise.
+- **Zero-cost abstractions.** Iterators, closures, and async compile down to the same machine code you'd write by hand. Python's abstractions carry runtime overhead; Node.js is better but still JIT-dependent.
+
+Honest caveats: Python would have been faster to build — the trading bot ecosystem (CCXT, pandas, asyncio) is mature and the borrow checker has a real learning curve. And if you're running on a VPS far from Polymarket's infrastructure, network RTT will dominate any language-level latency advantage. The real payoff here is **correctness**: a bot that doesn't corrupt its position state at 3am is worth more than one that's 2ms faster.
 
 **Why isn't the bot trading?**
 Check in order: Is `GHOST_MODE` still true? Is the spread wide enough to beat `ARBITRAGE_PROFIT_THRESHOLD` + fees? Is the orderbook thick enough (`MIN_LIQUIDITY_FILL_RATIO`)? For momentum — is the oracle velocity actually hitting the threshold (`BTC_MOMENTUM_THRESHOLD` = $75/5s)? For maker — is the market less than 10 minutes old (`MAKER_MIN_MARKET_AGE_SECS`)? Is the market closing in less than 30 minutes (`MAKER_MIN_SECS_TO_EXPIRY`)? Bump `RUST_LOG=debug` to see what's being filtered.
