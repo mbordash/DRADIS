@@ -691,9 +691,27 @@ async fn main() -> Result<()> {
                                 let order_base_price = if is_maker { bid } else { ask };
 
                                 if order_base_price <= dec!(0) { continue; }
-                                let shares = trade_size_usdc / order_base_price;
-                                if shares < config::MIN_ORDER_SHARES || trade_size_usdc < config::MIN_ORDER_USDC { continue; }
+
+                                // ── Fractional Kelly sizing (MomentumStrategy only) ──────────────
+                                // Scale trade size proportionally to signal strength.
+                                // At 1× threshold → MOMENTUM_MIN_TRADE_SIZE_USDC ($5).
+                                // At MOMENTUM_KELLY_MAX_MULTIPLIER× threshold → MOMENTUM_MAX_TRADE_SIZE_USDC ($25).
+                                // All other strategies use the flat env-var trade size.
+                                let effective_trade_size = if strategy_name == "MomentumStrategy" {
+                                    let threshold = match crypto_filter.as_str() {
+                                        "eth" => config::ETH_MOMENTUM_THRESHOLD,
+                                        "sol" => config::SOL_MOMENTUM_THRESHOLD,
+                                        _     => config::BTC_MOMENTUM_THRESHOLD,
+                                    };
+                                    rustpolybot::strategies::momentum_impl::kelly_momentum_size(velocity, threshold)
+                                } else {
+                                    trade_size_usdc
+                                };
+
+                                let shares = effective_trade_size / order_base_price;
+                                if shares < config::MIN_ORDER_SHARES || effective_trade_size < config::MIN_ORDER_USDC { continue; }
                                 if !is_maker && depth < shares * config::MIN_LIQUIDITY_FILL_RATIO { continue; }
+                                // `effective_trade_size` is used for risk checks and order placement below.
 
                                 // ── Dynamic spread-relative bid improvement (Maker only) ──────────
                                 // Use a fraction of the live spread so we always post below the ask,
@@ -736,10 +754,10 @@ async fn main() -> Result<()> {
                                         .filter(|((s, _), _)| s == strategy_name)
                                         .map(|(_, p)| p.shares * p.avg_entry)
                                         .sum::<Decimal>();
-                                    if !risk_engine.approve_buy(risk_yes_price, risk_no_price, current_exposure, trade_size_usdc, collateral, session_pnl, strategy_budget,
+                                    if !risk_engine.approve_buy(risk_yes_price, risk_no_price, current_exposure, effective_trade_size, collateral, session_pnl, strategy_budget,
                                         strategy_name != "ArbitrageStrategy" && strategy_name != "TimeDecayStrategy") {
                                         info!("🚫 ENTRY [{}]: signal suppressed — risk check failed (exposure=${:.4}, budget=${:.4}, trade=${:.4})",
-                                            strategy_name, current_exposure, strategy_budget, trade_size_usdc);
+                                            strategy_name, current_exposure, strategy_budget, effective_trade_size);
                                         if strategy_name == "MomentumStrategy" {
                                             momentum_confirmation_count = 0;
                                             last_momentum_signal_token = None;

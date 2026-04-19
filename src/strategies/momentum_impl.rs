@@ -178,6 +178,47 @@ impl Strategy for MomentumStrategyImpl {
     }
 }
 
+/// Compute a fractional Kelly trade size based on momentum signal strength.
+///
+/// Trade size scales linearly from `MOMENTUM_MIN_TRADE_SIZE_USDC` (at exactly 1× threshold)
+/// to `MOMENTUM_MAX_TRADE_SIZE_USDC` (at `MOMENTUM_KELLY_MAX_MULTIPLIER`× threshold or above).
+///
+/// Formula:
+///   signal_strength = |velocity| / threshold          (clamped to [1.0, MAX_MULTIPLIER])
+///   kelly_fraction  = (signal_strength − 1) / (MAX_MULTIPLIER − 1)   // 0.0 → 1.0
+///   trade_size      = MIN + kelly_fraction × (MAX − MIN)
+///
+/// Examples (BTC, threshold = $75/5s):
+///   |velocity| =  $75  → 1× → $5.00  (marginal signal, minimum bet)
+///   |velocity| = $150  → 2× → $11.67
+///   |velocity| = $225  → 3× → $18.33
+///   |velocity| = $300+ → 4× → $25.00 (high-conviction, maximum bet)
+pub fn kelly_momentum_size(velocity: rust_decimal::Decimal, threshold: rust_decimal::Decimal) -> rust_decimal::Decimal {
+    use tracing::info;
+
+    if threshold <= rust_decimal::Decimal::ZERO {
+        return config::MOMENTUM_MIN_TRADE_SIZE_USDC;
+    }
+
+    let signal_strength = (velocity.abs() / threshold)
+        .max(rust_decimal::Decimal::ONE)
+        .min(config::MOMENTUM_KELLY_MAX_MULTIPLIER);
+
+    let max_mult = config::MOMENTUM_KELLY_MAX_MULTIPLIER;
+    let min_size = config::MOMENTUM_MIN_TRADE_SIZE_USDC;
+    let max_size = config::MOMENTUM_MAX_TRADE_SIZE_USDC;
+
+    let kelly_fraction = (signal_strength - rust_decimal::Decimal::ONE) / (max_mult - rust_decimal::Decimal::ONE);
+    let sized = min_size + kelly_fraction * (max_size - min_size);
+
+    info!(
+        "📐 Kelly sizing: |velocity|={:.2}, threshold={:.2}, strength={:.2}×, size=${:.2}",
+        velocity.abs(), threshold, signal_strength, sized
+    );
+
+    sized
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

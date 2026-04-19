@@ -20,6 +20,7 @@ impl RiskEngine {
         }
     }
 
+
     /// Approve or reject a buy order.
     ///
     /// `max_exposure_usdc` should be the per-strategy budget from
