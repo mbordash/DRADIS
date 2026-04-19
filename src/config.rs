@@ -208,6 +208,20 @@ pub const MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 300;
 /// 10 minutes gives the market time to mean-revert (or confirm the trend).
 pub const MAKER_STOP_LOSS_COOLDOWN_SECS: i64 = 600;
 
+/// Maximum combined bid for simultaneous YES + NO maker quotes.
+/// If YES_bid_price + NO_bid_price >= this threshold we would be offering
+/// a near-riskless arb to takers who sell both legs to us (they collect
+/// our combined bid and receive $1.00 at settlement).
+/// 0.90 leaves a minimum 10¢ margin on every two-sided quote.
+pub const MAKER_MAX_COMBINED_BID: Decimal = dec!(0.90);
+
+/// Maximum per-side bid price offset applied for inventory skew.
+/// When inventory is 100% imbalanced (all YES, no NO), the YES bid
+/// is lowered by this amount (less aggressive) and the NO bid is
+/// raised by this amount (more aggressive to rebalance faster).
+/// 3¢ at full imbalance is meaningful without overshooting the spread.
+pub const MAKER_INVENTORY_SKEW_MAX: Decimal = dec!(0.03);
+
 
 /// Minimum seconds the bot must have been trading on the CURRENT market before
 /// MakerStrategy is allowed to enter.  The first few minutes of a new hourly market

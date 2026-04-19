@@ -1,6 +1,6 @@
 use alloy::primitives::Address;
 use std::sync::Arc;
-use tokio::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tracing::{info, warn, error};
 
 /// Fetch nonce for an address from the CLOB API
@@ -27,34 +27,30 @@ pub async fn fetch_next_nonce(http: &reqwest::Client, address: Address) -> Optio
     None
 }
 
-/// Synchronize nonce manager with the latest nonce from the API
+/// Synchronize nonce manager with the latest nonce from the API.
+/// Uses AtomicU64 for lock-free access — safe to call from concurrent contexts.
 pub async fn sync_nonce_manager(
-    nonce_manager: &Arc<Mutex<u64>>,
+    nonce_manager: &Arc<AtomicU64>,
     http: &reqwest::Client,
     address: Address,
 ) {
     if let Some(new_nonce) = fetch_next_nonce(http, address).await {
-        let mut guard = nonce_manager.lock().await;
-        *guard = new_nonce;
+        nonce_manager.store(new_nonce, Ordering::SeqCst);
         info!("🔄 Nonce manager synchronized to: {} for address {}", new_nonce, address);
     }
 }
 
 /// Log nonce state for debugging nonce-related failures
 pub async fn log_nonce_state(
-    nonce_manager: &Arc<Mutex<u64>>,
+    nonce_manager: &Arc<AtomicU64>,
     http: &reqwest::Client,
     address: Address,
     context: &str,
 ) {
-    let local_nonce = {
-        let guard = nonce_manager.lock().await;
-        *guard
-    };
+    let local_nonce = nonce_manager.load(Ordering::SeqCst);
     if let Some(chain_nonce) = fetch_next_nonce(http, address).await {
         if local_nonce != chain_nonce {
             warn!("📊 [NONCE MISMATCH] {}: Local={}, Chain={}, Diff={}", context, local_nonce, chain_nonce, (chain_nonce as i64) - (local_nonce as i64));
         }
     }
 }
-

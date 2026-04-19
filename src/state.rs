@@ -98,6 +98,12 @@ pub enum StrategyStatus {
 pub enum StrategySignal {
     /// Entry signal: which token to buy
     Entry { token_id: U256 },
+    /// Two-sided maker quote: post passive bids on YES and/or NO simultaneously.
+    /// Prices already include inventory skew. None means skip that side.
+    MakerQuote {
+        yes_bid_price: Option<Decimal>,
+        no_bid_price: Option<Decimal>,
+    },
     /// Exit signal: which token to sell
     Exit { token_id: U256, reason: String },
     /// No action at this time
