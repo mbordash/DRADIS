@@ -487,6 +487,9 @@ async fn main() -> Result<()> {
                                 let bid = if *token_id == yes_token { yes_bid } else { no_bid };
                                 let sell_price = (bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
                                 let fee_bps = if *token_id == yes_token { yes_fee_rate as u16 } else { no_fee_rate as u16 };
+                                // Makers pay 0 fees on entry (post-only); exits are taker sells at market fee rate.
+                                // Adjust PnL accounting: buy-side fee = 0 for MakerStrategy entries.
+                                let entry_fee_bps = if strategy_name == "MakerStrategy" { 0u16 } else { fee_bps };
                                 let pos_key = (strategy_name.clone(), *token_id);
 
                                 let shares = {
@@ -503,7 +506,7 @@ async fn main() -> Result<()> {
                                 if shares < config::MIN_ORDER_SHARES {
                                     let mut pos_map = positions.lock().await;
                                     if let Some(pos) = pos_map.remove(&pos_key) {
-                                        let buy_fee = pos.avg_entry * pos.shares * Decimal::from(fee_bps) / dec!(10_000);
+                                        let buy_fee = pos.avg_entry * pos.shares * Decimal::from(entry_fee_bps) / dec!(10_000);
                                         let sell_fee = bid * pos.shares * Decimal::from(fee_bps) / dec!(10_000);
                                         let pnl = (bid - pos.avg_entry) * pos.shares - buy_fee - sell_fee;
                                         *total_pnl.lock().await += pnl;
@@ -567,7 +570,7 @@ async fn main() -> Result<()> {
                                 {
                                     let mut pos_map = positions.lock().await;
                                     if let Some(pos) = pos_map.remove(&pos_key) {
-                                        let buy_fee = pos.avg_entry * pos.shares * Decimal::from(fee_bps) / dec!(10_000);
+                                        let buy_fee = pos.avg_entry * pos.shares * Decimal::from(entry_fee_bps) / dec!(10_000);
                                         let sell_fee = bid * pos.shares * Decimal::from(fee_bps) / dec!(10_000);
                                         let pnl = (bid - pos.avg_entry) * pos.shares - buy_fee - sell_fee;
                                         *total_pnl.lock().await += pnl;
@@ -822,10 +825,14 @@ async fn main() -> Result<()> {
 
                                 if !config::GHOST_MODE {
                                     let (order_type, post_only, exp) = if is_maker { (OrderType::GTD, true, 60u64) } else { (OrderType::FAK, false, 0u64) };
+                                    // Makers are never charged fees on Polymarket — embed 0 bps in the
+                                    // signed order struct for post-only orders.  Takers embed the market
+                                    // fee rate so the exchange can validate and collect it on fill.
+                                    let order_fee_bps = if is_maker { 0u16 } else { fee_bps };
 
                                     if let Err(e) = place_limit_order(
                                         &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
-                                        verifying_contract, *token_id, Side::Buy, shares, buy_price, fee_bps, order_type, post_only, exp,
+                                        verifying_contract, *token_id, Side::Buy, shares, buy_price, order_fee_bps, order_type, post_only, exp,
                                         &shared_http,
                                     ).await {
                                         let err_str = e.to_string();

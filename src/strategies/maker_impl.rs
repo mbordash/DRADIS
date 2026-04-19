@@ -33,15 +33,9 @@ impl Strategy for MakerStrategyImpl {
         }
 
         // ── Fee gate ─────────────────────────────────────────────────────────
-        // With high fees the round-trip cost exceeds the take-profit target —
-        // no entry will ever be profitable, so block entirely.
-        if ctx.market.yes_fee_bps > config::MAKER_MAX_FEE_BPS
-            || ctx.market.no_fee_bps > config::MAKER_MAX_FEE_BPS
-        {
-            debug!("🚫 MakerStrategy blocked: fees too high (YES {}bps / NO {}bps > {}bps threshold)",
-                ctx.market.yes_fee_bps, ctx.market.no_fee_bps, config::MAKER_MAX_FEE_BPS);
-            return Ok(StrategySignal::NoSignal);
-        }
+        // Per Polymarket docs: makers are NEVER charged fees (0 bps always).
+        // The cached yes_fee_bps/no_fee_bps are the TAKER fee rates — irrelevant
+        // to post-only maker orders.  No fee gate is needed here; removed.
 
         // ── Market maturation gate ────────────────────────────────────────────
         // New hourly markets have wild initial pricing for the first several minutes.
