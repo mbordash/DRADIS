@@ -12,6 +12,7 @@ use anyhow::Result;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use tracing::debug;
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus};
@@ -28,6 +29,27 @@ pub struct MakerStrategyImpl;
 impl Strategy for MakerStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         if !config::ENABLE_MAKER_TRADING {
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Fee gate ─────────────────────────────────────────────────────────
+        // With high fees the round-trip cost exceeds the take-profit target —
+        // no entry will ever be profitable, so block entirely.
+        if ctx.market.yes_fee_bps > config::MAKER_MAX_FEE_BPS
+            || ctx.market.no_fee_bps > config::MAKER_MAX_FEE_BPS
+        {
+            debug!("🚫 MakerStrategy blocked: fees too high (YES {}bps / NO {}bps > {}bps threshold)",
+                ctx.market.yes_fee_bps, ctx.market.no_fee_bps, config::MAKER_MAX_FEE_BPS);
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Market maturation gate ────────────────────────────────────────────
+        // New hourly markets have wild initial pricing for the first several minutes.
+        // Entering during this window leads to buying local peaks that immediately revert.
+        let secs_since_market_start = (Utc::now() - ctx.market_started_at).num_seconds();
+        if secs_since_market_start < config::MAKER_MIN_MARKET_AGE_SECS {
+            debug!("🚫 MakerStrategy blocked: market too young ({}s < {}s maturation gate)",
+                secs_since_market_start, config::MAKER_MIN_MARKET_AGE_SECS);
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -219,7 +241,30 @@ mod tests {
             },
             positions: Arc::new(tokio::sync::Mutex::new(positions)),
             crypto_filter: "btc".to_string(),
+            // Simulate a market that has been running for 20 minutes (past the maturation gate)
+            market_started_at: Utc::now() - Duration::seconds(1200),
         }
+    }
+
+    #[tokio::test]
+    async fn test_maker_no_entry_fees_too_high() {
+        let strategy = MakerStrategyImpl;
+        // Wide spread but 1000 bps fees > MAKER_MAX_FEE_BPS (200) ✗
+        let mut ctx = make_ctx(dec!(0.30), dec!(0.40), dec!(0.55), dec!(0.58), 2400, PositionMap::new());
+        ctx.market.yes_fee_bps = 1000;
+        ctx.market.no_fee_bps = 1000;
+        let signal = strategy.evaluate_entry(&ctx).await.unwrap();
+        assert!(matches!(signal, StrategySignal::NoSignal));
+    }
+
+    #[tokio::test]
+    async fn test_maker_no_entry_market_too_young() {
+        let strategy = MakerStrategyImpl;
+        // Wide spread, low fees, but market only started 60s ago ✗
+        let mut ctx = make_ctx(dec!(0.30), dec!(0.40), dec!(0.55), dec!(0.58), 2400, PositionMap::new());
+        ctx.market_started_at = Utc::now() - Duration::seconds(60);
+        let signal = strategy.evaluate_entry(&ctx).await.unwrap();
+        assert!(matches!(signal, StrategySignal::NoSignal));
     }
 
     #[tokio::test]

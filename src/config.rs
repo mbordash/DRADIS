@@ -207,6 +207,18 @@ pub const MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 300;
 /// 10 minutes gives the market time to mean-revert (or confirm the trend).
 pub const MAKER_STOP_LOSS_COOLDOWN_SECS: i64 = 600;
 
+/// Maximum fee (in bps) on either side that MakerStrategy will accept.
+/// With 1000 bps fees (10% per side = 20% round-trip), the strategy can NEVER
+/// profit with an 8% take-profit target.  Block entry when fees exceed this threshold.
+/// 200 bps = 2% per side → 4% round-trip → still achievable with 8% TP.
+pub const MAKER_MAX_FEE_BPS: u32 = 200;
+
+/// Minimum seconds the bot must have been trading on the CURRENT market before
+/// MakerStrategy is allowed to enter.  The first few minutes of a new hourly market
+/// often have wild, unstable pricing (large swings) — entering during this phase
+/// leads to buying local peaks that immediately revert.
+pub const MAKER_MIN_MARKET_AGE_SECS: i64 = 600; // 10 minutes
+
 
 // ============================================================================
 // TIME DECAY (THETA) STRATEGY PARAMETERS
