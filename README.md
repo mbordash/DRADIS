@@ -217,21 +217,27 @@ Short answer: the concurrency model and compile-time safety guarantees are a bet
 Honest caveats: Python would have been faster to build — the trading bot ecosystem (CCXT, pandas, asyncio) is mature and the borrow checker has a real learning curve. And if you're running on a VPS far from Polymarket's infrastructure, network RTT will dominate any language-level latency advantage. The real payoff here is **correctness**: a bot that doesn't corrupt its position state at 3am is worth more than one that's 2ms faster.
 
 **Why isn't the bot trading?**
+
 Check in order: Is `GHOST_MODE` still true? Is the spread wide enough to beat `ARBITRAGE_PROFIT_THRESHOLD` + fees? Is the orderbook thick enough (`MIN_LIQUIDITY_FILL_RATIO`)? For momentum — is the oracle velocity actually hitting the threshold (`BTC_MOMENTUM_THRESHOLD` = $75/5s)? For maker — is the market less than 10 minutes old (`MAKER_MIN_MARKET_AGE_SECS`)? Is the market closing in less than 30 minutes (`MAKER_MIN_SECS_TO_EXPIRY`)? Bump `RUST_LOG=debug` to see what's being filtered.
 
 **Orders keep getting rejected**
+
 Usually latency. The bot uses Fill-or-Kill orders for taker strategies, so if the price moves between signal and execution, the order dies. Deploy closer to Polymarket's infrastructure.
 
 **I see both Momentum and Maker trading the same token — is that a bug?**
+
 No, this is by design (Option A strategy segregation). Each strategy has its own independent position slot keyed by `(strategy_name, token_id)`. `MomentumStrategy` and `MakerStrategy` can both hold YES simultaneously, each from their own separate capital budget. Their exits are also independent — they each only close their own position.
 
 **What's the Gnosis Safe thing?**
+
 Polymarket's API trading uses Gnosis Safe proxy wallets. The bot automatically derives your Safe address from your EOA private key. This is standard — the Polymarket web UI does the same thing under the hood.
 
 **How do I run only one strategy?**
+
 Set `ENABLE_MOMENTUM_TRADING = false`, `ENABLE_MAKER_TRADING = false`, and/or `ENABLE_TIME_DECAY_TRADING = false` in config.rs. For arbitrage, set `ARBITRAGE_PROFIT_THRESHOLD` to something unreachable like `dec!(1.0)`.
 
 **How do I adjust each strategy's risk budget?**
+
 Edit the per-strategy constants in `src/config.rs`: `MOMENTUM_MAX_EXPOSURE_USDC`, `MAKER_MAX_EXPOSURE_USDC`, `ARBITRAGE_MAX_EXPOSURE_USDC`, `TIME_DECAY_MAX_EXPOSURE_USDC`.
 
 ---
