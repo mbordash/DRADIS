@@ -45,6 +45,9 @@ impl MarketDataBroadcaster {
         no_ask_depth: Decimal,
         oracle_price: Decimal,
         velocity: Decimal,
+        velocity_1s: Decimal,
+        acceleration: Decimal,
+        funding_rate: Decimal,
     ) -> MarketSnapshot {
         MarketSnapshot {
             yes_bid,
@@ -55,6 +58,9 @@ impl MarketDataBroadcaster {
             no_ask_depth,
             oracle_price,
             velocity,
+            velocity_1s,
+            acceleration,
+            funding_rate,
             timestamp: Utc::now(),
         }
     }

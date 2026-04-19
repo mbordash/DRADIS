@@ -8,6 +8,7 @@ use crate::strategies::momentum_impl::MomentumStrategyImpl;
 use crate::strategies::arbitrage_impl::ArbitrageStrategyImpl;
 use crate::strategies::time_decay_impl::TimeDecayStrategyImpl;
 use crate::strategies::maker_impl::MakerStrategyImpl;
+use crate::strategies::basis_impl::BasisStrategyImpl;
 use crate::config;
 
 /// Registry for all available strategies
@@ -23,6 +24,9 @@ impl StrategyRegistry {
         ];
         if config::ENABLE_MAKER_TRADING {
             strategies.push(Box::new(MakerStrategyImpl));
+        }
+        if config::ENABLE_BASIS_TRADING {
+            strategies.push(Box::new(BasisStrategyImpl));
         }
         strategies
     }

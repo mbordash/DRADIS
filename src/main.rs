@@ -166,7 +166,10 @@ async fn main() -> Result<()> {
     });
 
     let (oracle_tx, oracle_rx) = watch::channel(dec!(0));
-    let (velocity_tx, velocity_rx) = watch::channel(dec!(0));
+    // Broadcast (velocity_5s, velocity_1s, acceleration)
+    let (velocity_tx, velocity_rx) = watch::channel((dec!(0), dec!(0), dec!(0)));
+    // Broadcast latest Binance perpetual funding rate (updated every ~60s)
+    let (funding_tx, funding_rx) = watch::channel(dec!(0));
 
     let crypto_symbol = crypto_filter.clone();
     tokio::spawn(async move {
@@ -177,6 +180,7 @@ async fn main() -> Result<()> {
         };
         let url_str = format!("wss://stream.binance.com:9443/ws/{}@ticker", binance_pair);
         let mut price_history: VecDeque<(Instant, Decimal)> = VecDeque::new();
+        let mut prev_velocity = dec!(0);
 
         loop {
             if let Ok((mut ws_stream, _)) = connect_async(&url_str).await {
@@ -189,15 +193,37 @@ async fn main() -> Result<()> {
                                     let now = Instant::now();
                                     let _ = oracle_tx.send(price);
                                     price_history.push_back((now, price));
+
+                                    // Trim entries older than the primary window (5s)
                                     while let Some((t, _)) = price_history.front() {
                                         if now.duration_since(*t).as_secs() >= config::MOMENTUM_WINDOW_SECS {
                                             price_history.pop_front();
                                         } else { break; }
                                     }
-                                    if let Some((_, start_price)) = price_history.front() {
-                                        let delta = price - start_price;
-                                        let _ = velocity_tx.send(delta);
-                                    }
+
+                                    // ── Primary velocity (5s window) ──────────────────
+                                    let velocity_5s = if let Some((_, start_price)) = price_history.front() {
+                                        price - start_price
+                                    } else { dec!(0) };
+
+                                    // ── Short velocity (1s window) ────────────────────
+                                    // Walk back through history to find the price ~1s ago.
+                                    let velocity_1s = {
+                                        let cutoff = config::MOMENTUM_SHORT_WINDOW_SECS;
+                                        let start_1s = price_history.iter()
+                                            .find(|(t, _)| now.duration_since(*t).as_secs() < cutoff);
+                                        match start_1s {
+                                            Some((_, p)) => price - p,
+                                            None => velocity_5s, // insufficient history → use 5s
+                                        }
+                                    };
+
+                                    // ── Acceleration ──────────────────────────────────
+                                    // Rate of change of velocity: positive = building, negative = fading
+                                    let acceleration = velocity_5s - prev_velocity;
+                                    prev_velocity = velocity_5s;
+
+                                    let _ = velocity_tx.send((velocity_5s, velocity_1s, acceleration));
                                 }
                             }
                         }
@@ -205,9 +231,45 @@ async fn main() -> Result<()> {
                 }
             }
             warn!("⚠️ Binance Oracle disconnected. Reconnecting in 5s...");
+            prev_velocity = dec!(0);
             tokio::time::sleep(std::time::Duration::from_secs(5)).await;
         }
     });
+
+    // ── Binance Futures Funding Rate Poller ────────────────────────────────
+    // Polls /fapi/v1/premiumIndex every BASIS_FUNDING_POLL_SECS (60s) to get
+    // lastFundingRate.  Negative rate = shorts paying longs (bearish smart money).
+    {
+        let http_funding = Arc::clone(&shared_http);
+        let funding_tx_bg = funding_tx.clone();
+        let symbol_funding = match crypto_filter.as_str() {
+            "eth" => "ETHUSDT",
+            "sol" => "SOLUSDT",
+            _     => "BTCUSDT",
+        };
+        tokio::spawn(async move {
+            let url = format!(
+                "https://fapi.binance.com/fapi/v1/premiumIndex?symbol={}",
+                symbol_funding
+            );
+            loop {
+                match http_funding.get(&url).send().await {
+                    Ok(resp) => {
+                        if let Ok(v) = resp.json::<serde_json::Value>().await {
+                            if let Some(rate_str) = v.get("lastFundingRate").and_then(|r| r.as_str()) {
+                                if let Ok(rate) = Decimal::from_str(rate_str) {
+                                    let _ = funding_tx_bg.send(rate);
+                                    debug!("📡 Funding rate {}: {:.6}%", symbol_funding, rate * dec!(100));
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => warn!("⚠️ Funding rate poll failed: {}", e),
+                }
+                tokio::time::sleep(std::time::Duration::from_secs(config::BASIS_FUNDING_POLL_SECS)).await;
+            }
+        });
+    }
 
     let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(PositionMap::new()));
     let total_pnl: Arc<Mutex<Decimal>> = Arc::new(Mutex::new(dec!(0)));
@@ -429,7 +491,8 @@ async fn main() -> Result<()> {
                     let (yes_bid, yes_ask, yes_depth) = *yes_price_rx.borrow();
                     let (no_bid, no_ask, no_depth) = *no_price_rx.borrow();
                     let oracle_price = *oracle_rx.borrow();
-                    let velocity = *velocity_rx.borrow();
+                    let (velocity, velocity_1s, acceleration) = *velocity_rx.borrow();
+                    let funding_rate = *funding_rx.borrow();
 
                     // Skip if prices not yet initialised from the orderbook WS
                     if yes_ask == dec!(1) && no_ask == dec!(1) {
@@ -440,7 +503,8 @@ async fn main() -> Result<()> {
                     let snapshot = MarketSnapshot {
                         yes_bid, yes_ask, yes_ask_depth: yes_depth,
                         no_bid, no_ask, no_ask_depth: no_depth,
-                        oracle_price, velocity,
+                        oracle_price, velocity, velocity_1s, acceleration,
+                        funding_rate,
                         timestamp: Utc::now(),
                     };
                     let market_cfg = MarketConfig {
@@ -710,6 +774,13 @@ async fn main() -> Result<()> {
                                         _     => config::BTC_MOMENTUM_THRESHOLD,
                                     };
                                     rustpolybot::strategies::momentum_impl::kelly_momentum_size(velocity, threshold)
+                                } else if strategy_name == "BasisStrategy" {
+                                    // Compute current yes_mid skew to drive Kelly sizing
+                                    let yes_mid = if yes_bid > dec!(0) && yes_ask < dec!(1) {
+                                        (yes_bid + yes_ask) / dec!(2)
+                                    } else { dec!(0.5) };
+                                    let skew_abs = (yes_mid - dec!(0.50)).abs();
+                                    rustpolybot::strategies::basis_impl::basis_trade_size(skew_abs)
                                 } else {
                                     trade_size_usdc
                                 };

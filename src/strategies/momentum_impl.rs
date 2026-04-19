@@ -25,6 +25,8 @@ impl Strategy for MomentumStrategyImpl {
 
         // Extract data from context
         let velocity = ctx.snapshot.velocity;
+        let velocity_1s = ctx.snapshot.velocity_1s;
+        let acceleration = ctx.snapshot.acceleration;
         let binance_price = ctx.snapshot.oracle_price;
         let strike_price = ctx.market.strike_price;
         let yes_token = ctx.market.yes_token;
@@ -47,12 +49,35 @@ impl Strategy for MomentumStrategyImpl {
             _ => config::BTC_STRIKE_BUFFER,
         };
 
+        // ── Multi-timeframe confirmation gates ────────────────────────────────
+        //
+        // Gate 1: Short-window (1s) confirmation.
+        //   The 5s velocity might be elevated from an impulse that already
+        //   ended. The 1s velocity must still be at least 40% of threshold,
+        //   proving the move is still happening right now.
+        let short_min = threshold * config::MOMENTUM_SHORT_WINDOW_FRACTION;
+        let short_ok_bull = velocity_1s >= short_min;
+        let short_ok_bear = velocity_1s <= -short_min;
+
+        // Gate 2: Acceleration check.
+        //   Positive acceleration = building momentum → green light.
+        //   Negative acceleration = decelerating. We still allow entry if the
+        //   signal is very strong (≥ ACCELERATION_BYPASS_MULTIPLIER × threshold),
+        //   because a powerful but slightly-fading move is still worth trading.
+        let accel_bypass = threshold * config::MOMENTUM_ACCELERATION_BYPASS_MULTIPLIER;
+        let accel_ok_bull = acceleration >= dec!(0) || velocity >= accel_bypass;
+        let accel_ok_bear = acceleration <= dec!(0) || velocity <= -accel_bypass;
+
         // Call existing logic - if strike exists, use it
         if let Some(strike) = strike_price {
             // Primary entry: velocity strong AND price has clearly cleared strike ± buffer.
-            if velocity > threshold && binance_price > (strike + strike_buffer) && yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE {
+            if velocity > threshold && binance_price > (strike + strike_buffer) && yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
+                && short_ok_bull && accel_ok_bull
+            {
                 return Ok(StrategySignal::Entry { token_id: yes_token });
-            } else if velocity < -threshold && binance_price < (strike - strike_buffer) && no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE {
+            } else if velocity < -threshold && binance_price < (strike - strike_buffer) && no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
+                && short_ok_bear && accel_ok_bear
+            {
                 return Ok(StrategySignal::Entry { token_id: no_token });
             }
 
@@ -60,16 +85,24 @@ impl Strategy for MomentumStrategyImpl {
             // Price has already crossed the strike in the momentum direction but hasn't yet
             // cleared the full buffer. Only valid when the token is still significantly discounted
             // (ask ≤ crossing cap), meaning the book hasn't yet repriced the in-the-money side.
-            if velocity > threshold && binance_price > strike && yes_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE {
+            if velocity > threshold && binance_price > strike && yes_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE
+                && short_ok_bull && accel_ok_bull
+            {
                 return Ok(StrategySignal::Entry { token_id: yes_token });
-            } else if velocity < -threshold && binance_price < strike && no_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE {
+            } else if velocity < -threshold && binance_price < strike && no_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE
+                && short_ok_bear && accel_ok_bear
+            {
                 return Ok(StrategySignal::Entry { token_id: no_token });
             }
         } else {
             // Without strike: simpler velocity-based evaluation
-            if velocity > threshold && yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE {
+            if velocity > threshold && yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
+                && short_ok_bull && accel_ok_bull
+            {
                 return Ok(StrategySignal::Entry { token_id: yes_token });
-            } else if velocity < -threshold && no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE {
+            } else if velocity < -threshold && no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
+                && short_ok_bear && accel_ok_bear
+            {
                 return Ok(StrategySignal::Entry { token_id: no_token });
             }
         }
@@ -98,6 +131,7 @@ impl Strategy for MomentumStrategyImpl {
 
             let avg_entry = position.avg_entry;
             let velocity = ctx.snapshot.velocity;
+            let velocity_1s = ctx.snapshot.velocity_1s;
             let crypto_filter = &ctx.crypto_filter;
 
             // Get threshold for this crypto
@@ -142,10 +176,30 @@ impl Strategy for MomentumStrategyImpl {
                 });
             }
 
+            // ── Velocity-decay early take-profit ──────────────────────────────
+            // If we're in profit AND the short-term velocity has collapsed below
+            // DECAY_EXIT_FRACTION × threshold, the move has likely exhausted.
+            // Exit now rather than wait for a full reversal to eat the gains.
+            let decay_min = threshold * config::MOMENTUM_DECAY_EXIT_FRACTION;
+            let is_yes_position = token_id == &ctx.market.yes_token;
+            let velocity_decayed = if is_yes_position {
+                velocity_1s < decay_min   // bull position: upward momentum has faded
+            } else {
+                velocity_1s > -decay_min  // bear position: downward momentum has faded
+            };
+            if profit_margin > dec!(0) && velocity_decayed {
+                return Ok(StrategySignal::Exit {
+                    token_id: *token_id,
+                    reason: format!(
+                        "MomentumDecay: bid=${:.4}, profit={:.2}%, velocity_1s={:.6}",
+                        position_bid, profit_margin * dec!(100), velocity_1s
+                    ),
+                });
+            }
+
             // Check reversal — direction-aware:
             // YES position (entered on positive velocity) reverses when velocity goes strongly negative.
             // NO position (entered on negative velocity) reverses when velocity goes strongly positive.
-            let is_yes_position = token_id == &ctx.market.yes_token;
             let reversal_triggered = if is_yes_position {
                 velocity < reversal_threshold  // YES: exit on strong negative velocity
             } else {
@@ -302,6 +356,9 @@ mod tests {
                 no_ask_depth: dec!(100),
                 oracle_price,
                 velocity,
+                velocity_1s: velocity, // same as 5s for tests — both above threshold
+                acceleration: dec!(0),
+                funding_rate: dec!(0),
                 timestamp: Utc::now(),
             },
             positions: Arc::new(Mutex::new(PositionMap::new())),
