@@ -4,6 +4,7 @@
 /// enabling independent strategy threading later while maintaining a common interface.
 
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use crate::state::{MarketConfig, MarketSnapshot, StrategySignal, StrategyStatus, PositionMap};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -19,6 +20,9 @@ pub struct StrategyContext {
     pub positions: Arc<Mutex<PositionMap>>,
     /// Crypto identifier (e.g., "BTC", "ETH", "SOL") for threshold lookups
     pub crypto_filter: String,
+    /// Timestamp when the bot started trading the current market.
+    /// Used by strategies to enforce a minimum market maturation period before entry.
+    pub market_started_at: DateTime<Utc>,
 }
 
 /// Trait that all strategies must implement.

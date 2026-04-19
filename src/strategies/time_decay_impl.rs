@@ -252,6 +252,7 @@ mod tests {
             },
             positions: Arc::new(Mutex::new(positions)),
             crypto_filter: "btc".to_string(),
+            market_started_at: Utc::now(),
         };
 
         let signal = strategy.evaluate_exit(&ctx).await.unwrap();
@@ -298,6 +299,7 @@ mod tests {
             },
             positions: Arc::new(Mutex::new(PositionMap::new())),
             crypto_filter: "btc".to_string(),
+            market_started_at: Utc::now(),
         }
     }
 }

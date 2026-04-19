@@ -304,6 +304,7 @@ async fn main() -> Result<()> {
         }
 
         info!("🚀 Starting Orchestrated Trading on market: \"{}\"", market_name);
+        let market_started_at = Utc::now();
 
         let yes_fee_rate = trading_client.fee_rate_bps(yes_token).await.map(|r| r.base_fee).unwrap_or(0);
         let no_fee_rate = trading_client.fee_rate_bps(no_token).await.map(|r| r.base_fee).unwrap_or(0);
@@ -455,6 +456,7 @@ async fn main() -> Result<()> {
                         snapshot,
                         positions: Arc::clone(&positions),
                         crypto_filter: crypto_filter.clone(),
+                        market_started_at,
                     };
 
                     // ── Evaluate all strategies ──
