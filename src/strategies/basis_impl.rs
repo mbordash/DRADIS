@@ -65,6 +65,15 @@ impl Strategy for BasisStrategyImpl {
             None => return Ok(StrategySignal::NoSignal),
         };
 
+        // ── Fee gate: skip high-fee markets ──────────────────────────────────
+        // BasisStrategy is a taker strategy. At 1000bps (10%) per leg, the round-trip
+        // cost is ~20% — far exceeding any realistic profit target.  Only enter when
+        // the taker fee on BOTH tokens is within the configured threshold.
+        let max_fee = market.yes_fee_bps.max(market.no_fee_bps);
+        if max_fee > config::BASIS_MAX_TAKER_FEE_BPS {
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Select per-crypto constants ───────────────────────────────────────
         let (max_velocity, oracle_buffer) = match ctx.crypto_filter.as_str() {
             "eth" => (config::BASIS_ETH_MAX_VELOCITY, config::BASIS_ETH_ORACLE_STRIKE_BUFFER),
@@ -148,6 +157,8 @@ impl Strategy for BasisStrategyImpl {
             if avg_entry <= dec!(0) { continue; }
 
             let profit_margin = (position_bid - avg_entry) / avg_entry;
+            let now = Utc::now();
+            let secs_held = (now - position.opened_at).num_seconds();
 
             // Recompute current YES mid to detect skew-collapse
             let yes_mid = if ctx.snapshot.yes_bid > dec!(0) && ctx.snapshot.yes_ask < dec!(1) {
@@ -168,8 +179,12 @@ impl Strategy for BasisStrategyImpl {
                 });
             }
 
-            // Stop loss
-            if profit_margin <= -config::BASIS_STOP_LOSS_PERCENT {
+            // Stop loss — only after minimum hold time so FAK phantom positions
+            // don't trigger a stop-loss before sync_position_balance can confirm
+            // whether shares were actually received.
+            if profit_margin <= -config::BASIS_STOP_LOSS_PERCENT
+                && secs_held >= config::BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS
+            {
                 return Ok(StrategySignal::Exit {
                     token_id: *token_id,
                     reason: format!(
@@ -253,8 +268,8 @@ mod tests {
                 market_close_time: None,
                 strike_price: strike,
                 is_neg_risk: false,
-                yes_fee_bps: 1000,
-                no_fee_bps: 1000,
+                yes_fee_bps: 50,  // low-fee market so fee gate passes
+                no_fee_bps: 50,
             },
             snapshot: MarketSnapshot {
                 yes_bid, yes_ask, yes_ask_depth: dec!(100),

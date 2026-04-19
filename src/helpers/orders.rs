@@ -112,28 +112,64 @@ pub async fn place_limit_order(
 
         match side {
             Side::Buy => {
-                // BUY order precision rules (Polymarket API):
-                //   takerAmount (shares received) = max 2 decimal places
-                //       → in 1e6 units, must be divisible by 10^4 = 10000
-                //   makerAmount (USDC paid)       = max 4 decimal places
-                //       → in 1e6 units, must be divisible by 10^2 = 100
+                // Polymarket BUY precision rules (from API error messages):
+                //   makerAmount (USDC you pay)        = max 2 decimal places  → in 1e6 units, must be divisible by 10000
+                //   takerAmount (shares you receive)  = max 4 decimal places  → in 1e6 units, must be divisible by 100
                 //
-                // We truncate shares to 2dp first to guarantee taker_raw % 10000 == 0.
-                // Then derive maker_raw = (taker_raw / 100) * price_cents.
-                // Since taker_raw is divisible by 10000, taker_raw/100 is divisible by 100,
-                // so maker_raw = (divisible_by_100) * price_cents = divisible by 100. ✓
-                let taker_raw = to_fixed_u128_with_precision(quantity, 2);
-                let maker_raw = (taker_raw / 100) * price_cents;
+                // Strategy: USDC-first alignment.
+                // 1. Compute desired USDC in cents: usdc_cents = floor(qty * price * 100)
+                // 2. Align to nearest multiple of price_cents (so exact share count is an integer):
+                //    usdc_cents_aligned = floor(usdc_cents / price_cents) * price_cents
+                // 3. maker_raw = usdc_cents_aligned * 10000  → divisible by 10000 ✓ (2dp USDC)
+                // 4. taker_raw = maker_raw * 100 / price_cents → exact integer ✓  (4dp shares)
+                //
+                // Example: qty=57.69 shares @ $0.27 (price_cents=27)
+                //   usdc_cents = floor(57.69*27) = floor(1557.63) = 1557
+                //   aligned    = floor(1557/27)*27 = 57*27 = 1539  ($15.39)
+                //   maker_raw  = 1539*10000 = 15390000  → $15.39 (2dp ✓)
+                //   taker_raw  = 15390000*100/27 = 57000000 → 57.0000 shares (4dp ✓)
+                let usdc_cents = (quantity * rounded_price * rust_decimal::Decimal::from(100))
+                    .floor()
+                    .to_u128()
+                    .unwrap_or(0);
+                let usdc_cents_aligned = if price_cents > 0 {
+                    (usdc_cents / price_cents) * price_cents
+                } else {
+                    usdc_cents
+                };
+                let maker_raw = usdc_cents_aligned * 10000u128;
+                let taker_raw = if price_cents > 0 { maker_raw * 100 / price_cents } else { 0 };
                 order_struct.makerAmount = U256::from(maker_raw);
                 order_struct.takerAmount = U256::from(taker_raw);
             }
             Side::Sell => {
-                // makerAmount: shares truncated to 2dp, scaled to 1e6
-                // = shares_2dp_int * 10^4  (always divisible by 100)
-                let maker_raw = to_fixed_u128_with_precision(quantity, 2);
-                // takerAmount = maker_raw / 100 * price_cents
-                // = shares_2dp_int * 10^2 * price_cents  (exact integer, no rounding error)
-                let taker_raw = (maker_raw / 100) * price_cents;
+                // Polymarket SELL precision rules:
+                //   makerAmount (shares you give)     = max 4 decimal places  → in 1e6 divisible by 100
+                //   takerAmount (USDC you receive)    = max 2 decimal places  → in 1e6 divisible by 10000
+                //
+                // Strategy: shares-first alignment (SELL gives shares, receives USDC).
+                // 1. Align shares in cents of shares: shares_aligned = floor(qty*100)/100 (2dp)
+                //    maker_raw = shares_2dp * 10^6 scaled to 1e6 → divisible by 10000 (≥ 4dp) ✓
+                // 2. taker_raw (USDC) = (maker_raw / price_cents) * price_cents^2 / 100
+                //    Simplified: taker_raw = (maker_raw / 100) * price_cents
+                //    maker_raw divisible by 10000 → maker_raw/100 divisible by 100
+                //    → taker_raw divisible by 100 ← need divisible by 10000 for 2dp USDC
+                //
+                // To guarantee 2dp USDC on sells, align shares to a multiple of price_cents:
+                //   shares_cents = floor(qty*100), aligned = floor(shares_cents/price_cents)*price_cents
+                //   maker_raw = aligned * 10000, taker_raw = maker_raw * price_cents / 10000  (= aligned*price_cents)
+                //   taker_raw = aligned * price_cents  → exact integer divisible by price_cents, but need /100 for USDC...
+                //
+                // Simpler: truncate shares to 4dp (always safe for makerAmount),
+                // derive USDC by truncating to 2dp (round down so we never over-receive).
+                let shares_4dp_cents = (quantity * rust_decimal::Decimal::from(10000))
+                    .floor()
+                    .to_u128()
+                    .unwrap_or(0);
+                let maker_raw = shares_4dp_cents * 100u128;   // in 1e6, divisible by 100 ✓ (4dp shares)
+                // USDC = shares * price; align to 2dp by flooring USDC cents then ×10000
+                let usdc_cents = if price_cents > 0 { (maker_raw / 100) * price_cents / 10000 } else { 0 };
+                let taker_raw = usdc_cents * 10000u128;         // divisible by 10000 ✓ (2dp USDC)
                 order_struct.makerAmount = U256::from(maker_raw);
                 order_struct.takerAmount = U256::from(taker_raw);
             }

@@ -318,6 +318,19 @@ pub const BASIS_MAX_TRADE_SIZE_USDC: Decimal = dec!(15.0);
 /// At 1× threshold → MIN; at BASIS_KELLY_MAX_MULTIPLIER× threshold → MAX.
 pub const BASIS_KELLY_MAX_MULTIPLIER: Decimal = dec!(3.0);
 
+/// Maximum taker fee rate (in bps) allowed for a Basis entry.
+/// BTC/ETH hourly markets charge 1000 bps (10%) per leg — 20% round-trip — which
+/// consumes any realistic profit target for a taker strategy.  Skip those markets.
+/// Set to 200 bps (2%) or lower to only trade low-fee markets.
+pub const BASIS_MAX_TAKER_FEE_BPS: u32 = 200;
+
+/// Minimum seconds to hold a Basis position before the stop-loss activates.
+/// FAK orders often place successfully (API returns 200) but receive no fill.
+/// Without this guard, the stop-loss can fire on the very next 50ms tick before
+/// sync_position_balance has confirmed whether any shares were actually received,
+/// producing a phantom exit cycle.  10 seconds gives sync enough time to run.
+pub const BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 10;
+
 /// Polling interval (seconds) for the Binance futures funding rate endpoint.
 pub const BASIS_FUNDING_POLL_SECS: u64 = 60;
 
