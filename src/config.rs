@@ -178,6 +178,11 @@ pub const MAKER_TARGET_PROFIT_PERCENT: Decimal = dec!(0.08);
 pub const MAKER_STOP_LOSS_PERCENT: Decimal = dec!(0.05);
 pub const MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 300;
 
+/// Cooldown (seconds) before MakerStrategy may re-enter after a stop-loss exit.
+/// Prevents immediately re-posting into the same adverse directional move.
+/// 10 minutes gives the market time to mean-revert (or confirm the trend).
+pub const MAKER_STOP_LOSS_COOLDOWN_SECS: i64 = 600;
+
 
 // ============================================================================
 // TIME DECAY (THETA) STRATEGY PARAMETERS

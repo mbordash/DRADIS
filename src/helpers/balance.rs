@@ -210,10 +210,15 @@ pub async fn reconcile_orphaned_positions(
                 .map(|(_, bid)| *bid)
                 .filter(|b| *b > dec!(0))
                 .unwrap_or(dec!(0.50)); // fallback only if bid unavailable
+            // Pre-satisfy the stop-loss hold timer: orphaned shares are already
+            // confirmed on-chain, so there's no reason to wait another 300s at a
+            // bad price before allowing a stop-loss to fire.
+            let orphan_opened_at = Utc::now()
+                - chrono::Duration::seconds(crate::config::MIN_HOLD_SECS_BEFORE_STOP_LOSS);
             pos_map.insert(key, Position {
                 shares: actual_shares,
                 avg_entry,
-                opened_at: Utc::now(),
+                opened_at: orphan_opened_at,
                 close_time: market_close_time,
                 market_name: market_name.to_string(),
                 pair_token_id: token_id,

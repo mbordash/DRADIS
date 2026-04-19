@@ -349,6 +349,10 @@ async fn main() -> Result<()> {
         let strategies = StrategyRegistry::create_all_strategies();
         let risk_engine = RiskEngine::new();
         let mut last_trade_time: HashMap<String, Instant> = HashMap::new();
+        // Tracks the last stop-loss exit time per strategy.
+        // MakerStrategy enforces MAKER_STOP_LOSS_COOLDOWN_SECS before re-entering
+        // after a stop-loss to avoid chasing adverse directional moves.
+        let mut last_stop_loss_time: HashMap<String, Instant> = HashMap::new();
         let mut momentum_confirmation_count: u32 = 0;
         let mut last_momentum_signal_token: Option<U256> = None;
         let mut consecutive_failures: u32 = 0;
@@ -497,7 +501,9 @@ async fn main() -> Result<()> {
                                 if shares < config::MIN_ORDER_SHARES {
                                     let mut pos_map = positions.lock().await;
                                     if let Some(pos) = pos_map.remove(&pos_key) {
-                                        let pnl = (bid - pos.avg_entry) * pos.shares;
+                                        let buy_fee = pos.avg_entry * pos.shares * Decimal::from(fee_bps) / dec!(10_000);
+                                        let sell_fee = bid * pos.shares * Decimal::from(fee_bps) / dec!(10_000);
+                                        let pnl = (bid - pos.avg_entry) * pos.shares - buy_fee - sell_fee;
                                         *total_pnl.lock().await += pnl;
                                         warn!("🧹 EXIT [{}]: Dust position removed ({:.6} shares < min {}). PnL ${:.4}",
                                             strategy_name, shares, config::MIN_ORDER_SHARES, pnl);
@@ -555,13 +561,15 @@ async fn main() -> Result<()> {
                                     }
                                 }
 
-                                // Update positions & PnL
+                                // Update positions & PnL (fee-aware)
                                 {
                                     let mut pos_map = positions.lock().await;
                                     if let Some(pos) = pos_map.remove(&pos_key) {
-                                        let pnl = (bid - pos.avg_entry) * pos.shares;
+                                        let buy_fee = pos.avg_entry * pos.shares * Decimal::from(fee_bps) / dec!(10_000);
+                                        let sell_fee = bid * pos.shares * Decimal::from(fee_bps) / dec!(10_000);
+                                        let pnl = (bid - pos.avg_entry) * pos.shares - buy_fee - sell_fee;
                                         *total_pnl.lock().await += pnl;
-                                        info!("💰 Position closed [{}]: PnL ${:.4}", strategy_name, pnl);
+                                        info!("💰 Position closed [{}]: PnL ${:.4} (fees: ${:.4})", strategy_name, pnl, buy_fee + sell_fee);
                                     }
                                 }
 
@@ -591,9 +599,11 @@ async fn main() -> Result<()> {
                                         }
                                         let mut pos_map = positions.lock().await;
                                         if let Some(pos) = pos_map.remove(&pair_key) {
-                                            let pnl = (pair_bid - pos.avg_entry) * pos.shares;
+                                            let buy_fee = pos.avg_entry * pos.shares * Decimal::from(pair_fee) / dec!(10_000);
+                                            let sell_fee = pair_bid * pos.shares * Decimal::from(pair_fee) / dec!(10_000);
+                                            let pnl = (pair_bid - pos.avg_entry) * pos.shares - buy_fee - sell_fee;
                                             *total_pnl.lock().await += pnl;
-                                            info!("💰 Paired position closed [{}]: PnL ${:.4}", strategy_name, pnl);
+                                            info!("💰 Paired position closed [{}]: PnL ${:.4} (fees: ${:.4})", strategy_name, pnl, buy_fee + sell_fee);
                                         }
                                     }
                                 }
@@ -602,6 +612,12 @@ async fn main() -> Result<()> {
                                 momentum_confirmation_count = 0;
                                 last_momentum_signal_token = None;
                                 last_trade_time.insert(strategy_name.clone(), Instant::now());
+
+                                // Record stop-loss time so the strategy waits MAKER_STOP_LOSS_COOLDOWN_SECS
+                                // before re-entering, preventing immediate re-entry into an adverse trend.
+                                if reason.contains("stop-loss") {
+                                    last_stop_loss_time.insert(strategy_name.clone(), Instant::now());
+                                }
 
                                 let session_pnl = *total_pnl.lock().await;
                                 let msg = format!("📤 EXIT [{}] {} | bid=${:.4} | reason: {} | Session PnL: ${:.4}", strategy_name, market_name, bid, reason, session_pnl);
@@ -630,6 +646,21 @@ async fn main() -> Result<()> {
                                         let cooldown = Duration::from_secs(rustpolybot::helpers::balance::PHANTOM_COOLDOWN_SECS);
                                         if elapsed < cooldown {
                                             debug!("⏸️ ENTRY [{}]: signal suppressed — phantom cooldown ({:.0}s remaining)",
+                                                strategy_name, (cooldown - elapsed).as_secs_f32());
+                                            continue;
+                                        }
+                                    }
+                                }
+
+                                // Stop-loss cooldown gate (MakerStrategy only): after a stop-loss
+                                // exit, block re-entry for MAKER_STOP_LOSS_COOLDOWN_SECS to avoid
+                                // immediately re-posting into the same adverse directional move.
+                                if strategy_name == "MakerStrategy" {
+                                    if let Some(sl_time) = last_stop_loss_time.get(strategy_name.as_str()) {
+                                        let elapsed = sl_time.elapsed();
+                                        let cooldown = Duration::from_secs(config::MAKER_STOP_LOSS_COOLDOWN_SECS as u64);
+                                        if elapsed < cooldown {
+                                            debug!("⏸️ ENTRY [{}]: stop-loss cooldown ({:.0}s remaining)",
                                                 strategy_name, (cooldown - elapsed).as_secs_f32());
                                             continue;
                                         }
@@ -705,7 +736,8 @@ async fn main() -> Result<()> {
                                         .filter(|((s, _), _)| s == strategy_name)
                                         .map(|(_, p)| p.shares * p.avg_entry)
                                         .sum::<Decimal>();
-                                    if !risk_engine.approve_buy(risk_yes_price, risk_no_price, current_exposure, trade_size_usdc, collateral, session_pnl, strategy_budget) {
+                                    if !risk_engine.approve_buy(risk_yes_price, risk_no_price, current_exposure, trade_size_usdc, collateral, session_pnl, strategy_budget,
+                                        strategy_name != "ArbitrageStrategy" && strategy_name != "TimeDecayStrategy") {
                                         info!("🚫 ENTRY [{}]: signal suppressed — risk check failed (exposure=${:.4}, budget=${:.4}, trade=${:.4})",
                                             strategy_name, current_exposure, strategy_budget, trade_size_usdc);
                                         if strategy_name == "MomentumStrategy" {

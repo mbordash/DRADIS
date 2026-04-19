@@ -142,9 +142,17 @@ impl Strategy for MomentumStrategyImpl {
                 });
             }
 
-            // Check reversal
+            // Check reversal — direction-aware:
+            // YES position (entered on positive velocity) reverses when velocity goes strongly negative.
+            // NO position (entered on negative velocity) reverses when velocity goes strongly positive.
+            let is_yes_position = token_id == &ctx.market.yes_token;
+            let reversal_triggered = if is_yes_position {
+                velocity < reversal_threshold  // YES: exit on strong negative velocity
+            } else {
+                velocity > -reversal_threshold // NO: exit on strong positive velocity
+            };
             if secs_held >= config::MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL
-                && velocity < reversal_threshold
+                && reversal_triggered
             {
                 return Ok(StrategySignal::Exit {
                     token_id: *token_id,
