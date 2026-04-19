@@ -24,6 +24,8 @@ impl RiskEngine {
     ///
     /// `max_exposure_usdc` should be the per-strategy budget from
     /// `RiskEngine::strategy_max_exposure(strategy_name)`.
+    /// `is_one_sided` should be true for strategies that only buy one token (e.g. Momentum, Maker).
+    /// When true, the sum-price check is skipped since only one side is being purchased.
     pub fn approve_buy(
         &self,
         yes_ask: Decimal,
@@ -33,10 +35,13 @@ impl RiskEngine {
         starting_collateral: Decimal,
         session_pnl: Decimal,
         max_exposure_usdc: Decimal,
+        is_one_sided: bool,
     ) -> bool {
         let sum_price = yes_ask + no_ask;
 
-        if sum_price > config::MAX_SUM_PRICE_FOR_ENTRY {
+        // Sum-price check only applies to two-sided strategies (Arbitrage, TimeDecay)
+        // that buy BOTH YES and NO — for one-sided strategies it's irrelevant.
+        if !is_one_sided && sum_price > config::MAX_SUM_PRICE_FOR_ENTRY {
             info!("🛡️ Risk Reject: Sum Price ${:.4} > Max ${:.4}", sum_price, config::MAX_SUM_PRICE_FOR_ENTRY);
             return false;
         }

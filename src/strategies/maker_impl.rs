@@ -17,6 +17,11 @@ use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus};
 use crate::config;
 
+/// Velocity threshold (oracle USD/s) above which we consider the market
+/// strongly directional and suppress the adverse maker side.
+/// BTC moves ~$75/5s = $15/s in a fast move; $25/s = clearly trending.
+const MAKER_VELOCITY_BIAS_THRESHOLD: Decimal = dec!(25.0);
+
 pub struct MakerStrategyImpl;
 
 #[async_trait]
@@ -55,32 +60,46 @@ impl Strategy for MakerStrategyImpl {
         let yes_spread = yes_ask - yes_bid;
         let no_spread = no_ask - no_bid;
 
-        // YES side: wide spread, bid price within acceptable range,
-        // and the NO side (complementary token) must not be priced near certainty.
-        // If NO bid > MAKER_MAX_ENTRY_PRICE it means YES is collapsing — don't post YES.
+        // Velocity filter: if the oracle is moving strongly in one direction,
+        // suppress the maker bid on the token that would be adversely selected.
+        // A strongly FALLING oracle (negative velocity) means YES is likely to
+        // drop further — don't post YES bids into that move.
+        // A strongly RISING oracle means NO is likely to drop — skip NO bids.
+        let velocity = ctx.snapshot.velocity;
+        let velocity_bias_strong_negative = velocity <= -MAKER_VELOCITY_BIAS_THRESHOLD;
+        let velocity_bias_strong_positive = velocity >= MAKER_VELOCITY_BIAS_THRESHOLD;
+
+        // Evaluate both sides independently, then pick the one with the wider spread.
+        // Previously YES was always evaluated first and returned immediately — this caused
+        // a hard YES bias even during falling markets where NO was the better side.
         let yes_bid_price = yes_bid + config::MAKER_BID_IMPROVEMENT;
-        if yes_spread >= config::MAKER_MIN_SPREAD
+        let yes_qualifies = yes_spread >= config::MAKER_MIN_SPREAD
             && yes_bid_price >= config::MAKER_MIN_ENTRY_PRICE
             && yes_bid_price <= config::MAKER_MAX_ENTRY_PRICE
-            && no_bid <= config::MAKER_MAX_ENTRY_PRICE  // complementary check: market not too directional
-        {
-            return Ok(StrategySignal::Entry {
-                token_id: ctx.market.yes_token,
-            });
-        }
+            && no_bid <= config::MAKER_MAX_ENTRY_PRICE   // complementary check: market not too directional
+            && !velocity_bias_strong_negative;           // don't post YES into a falling oracle
 
-        // NO side: wide spread, bid price within acceptable range,
-        // and the YES side must not be priced near certainty.
-        // If YES bid > MAKER_MAX_ENTRY_PRICE the market is strongly directional — don't post NO.
         let no_bid_price = no_bid + config::MAKER_BID_IMPROVEMENT;
-        if no_spread >= config::MAKER_MIN_SPREAD
+        let no_qualifies = no_spread >= config::MAKER_MIN_SPREAD
             && no_bid_price >= config::MAKER_MIN_ENTRY_PRICE
             && no_bid_price <= config::MAKER_MAX_ENTRY_PRICE
             && yes_bid <= config::MAKER_MAX_ENTRY_PRICE  // complementary check: market not too directional
-        {
-            return Ok(StrategySignal::Entry {
-                token_id: ctx.market.no_token,
-            });
+            && !velocity_bias_strong_positive;           // don't post NO into a rising oracle
+
+        // Pick the side with the wider spread — more spread = more edge and less adverse selection.
+        // If only one side qualifies, use that one. If neither, no signal.
+        match (yes_qualifies, no_qualifies) {
+            (true, true) => {
+                let token_id = if yes_spread >= no_spread {
+                    ctx.market.yes_token
+                } else {
+                    ctx.market.no_token
+                };
+                return Ok(StrategySignal::Entry { token_id });
+            }
+            (true, false) => return Ok(StrategySignal::Entry { token_id: ctx.market.yes_token }),
+            (false, true) => return Ok(StrategySignal::Entry { token_id: ctx.market.no_token }),
+            (false, false) => {}
         }
 
         Ok(StrategySignal::NoSignal)
