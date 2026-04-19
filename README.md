@@ -226,7 +226,7 @@ Usually latency. The bot uses Fill-or-Kill orders for taker strategies, so if th
 
 **I see both Momentum and Maker trading the same token — is that a bug?**
 
-No, this is by design (Option A strategy segregation). Each strategy has its own independent position slot keyed by `(strategy_name, token_id)`. `MomentumStrategy` and `MakerStrategy` can both hold YES simultaneously, each from their own separate capital budget. Their exits are also independent — they each only close their own position.
+No, this is by design. Each strategy has its own independent position slot keyed by `(strategy_name, token_id)`. `MomentumStrategy` and `MakerStrategy` can both hold YES simultaneously, each from their own separate capital budget. Their exits are also independent — they each only close their own position.
 
 **What's the Gnosis Safe thing?**
 
