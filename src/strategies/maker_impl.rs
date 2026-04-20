@@ -38,7 +38,17 @@ impl Strategy for MakerStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── Select venue: prefer maker_market (window/daily) over hourly ─────
+        // When a window or daily market is available, Maker uses it exclusively.
+        // This gives GTD orders a much better chance of filling before the market
+        // reprices. Falls back to the hourly market when no alternative exists.
+        let market = ctx.maker_market.as_ref().unwrap_or(&ctx.market);
+        let snapshot = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
+
         // ── Market maturation gate ────────────────────────────────────────────
+        // When using a dedicated maker market the maturation clock resets to when
+        // that specific market opened, not the hourly market. We approximate by
+        // checking how long the bot has been running (conservative).
         let secs_since_market_start = (Utc::now() - ctx.market_started_at).num_seconds();
         if secs_since_market_start < config::MAKER_MIN_MARKET_AGE_SECS {
             debug!("🚫 MakerStrategy blocked: market too young ({}s < {}s maturation gate)",
@@ -47,7 +57,7 @@ impl Strategy for MakerStrategyImpl {
         }
 
         // ── Expiry gate ───────────────────────────────────────────────────────
-        if let Some(close_time) = ctx.market.market_close_time {
+        if let Some(close_time) = market.market_close_time {
             if (close_time - Utc::now()).num_seconds() < config::MAKER_MIN_SECS_TO_EXPIRY {
                 return Ok(StrategySignal::NoSignal);
             }
@@ -55,20 +65,17 @@ impl Strategy for MakerStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
-        let yes_bid = ctx.snapshot.yes_bid;
-        let yes_ask = ctx.snapshot.yes_ask;
-        let no_bid  = ctx.snapshot.no_bid;
-        let no_ask  = ctx.snapshot.no_ask;
+        let yes_bid = snapshot.yes_bid;
+        let yes_ask = snapshot.yes_ask;
+        let no_bid  = snapshot.no_bid;
+        let no_ask  = snapshot.no_ask;
 
         // ── Inventory skew ────────────────────────────────────────────────────
-        // Compute current YES/NO position values to determine imbalance.
-        // Heavy YES → lower YES bid (less aggressive), raise NO bid (more aggressive).
-        // Heavy NO  → raise YES bid (more aggressive), lower NO bid (less aggressive).
         let (yes_inv_value, no_inv_value) = {
             let pos_map = ctx.positions.lock().await;
-            let yv = pos_map.get(&("MakerStrategy".to_string(), ctx.market.yes_token))
+            let yv = pos_map.get(&("MakerStrategy".to_string(), market.yes_token))
                 .map(|p| p.shares * p.avg_entry).unwrap_or(dec!(0));
-            let nv = pos_map.get(&("MakerStrategy".to_string(), ctx.market.no_token))
+            let nv = pos_map.get(&("MakerStrategy".to_string(), market.no_token))
                 .map(|p| p.shares * p.avg_entry).unwrap_or(dec!(0));
             (yv, nv)
         };
@@ -78,7 +85,7 @@ impl Strategy for MakerStrategyImpl {
             .clamp(dec!(-1), dec!(1));
         let skew = imbalance * config::MAKER_INVENTORY_SKEW_MAX;
 
-        // ── Velocity bias ─────────────────────────────────────────────────────
+        // ── Velocity bias uses the hourly oracle (always) ─────────────────────
         let velocity = ctx.snapshot.velocity;
         let velocity_bias_strong_negative = velocity <= -MAKER_VELOCITY_BIAS_THRESHOLD;
         let velocity_bias_strong_positive = velocity >= MAKER_VELOCITY_BIAS_THRESHOLD;
@@ -163,17 +170,21 @@ impl Strategy for MakerStrategyImpl {
     }
 
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
+        // Use the same venue selection as evaluate_entry
+        let market = ctx.maker_market.as_ref().unwrap_or(&ctx.market);
+        let snapshot = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
+
         let pos_map = ctx.positions.lock().await;
 
-        for token_id in [ctx.market.yes_token, ctx.market.no_token] {
+        for token_id in [market.yes_token, market.no_token] {
             let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id)) else {
                 continue;
             };
 
-            let bid = if token_id == ctx.market.yes_token {
-                ctx.snapshot.yes_bid
+            let bid = if token_id == market.yes_token {
+                snapshot.yes_bid
             } else {
-                ctx.snapshot.no_bid
+                snapshot.no_bid
             };
 
             if position.avg_entry <= dec!(0) { continue; }
@@ -257,6 +268,8 @@ mod tests {
             positions: Arc::new(tokio::sync::Mutex::new(positions)),
             crypto_filter: "btc".to_string(),
             market_started_at: Utc::now() - Duration::seconds(1200),
+            maker_market: None,
+            maker_snapshot: None,
         }
     }
 
