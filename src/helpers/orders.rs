@@ -230,6 +230,14 @@ pub async fn place_limit_order(
                         }
                         continue;
                     }
+                    // Polymarket's execution engine sometimes returns a transient 500
+                    // "could not run the execution" — especially around market open.
+                    // Retry once after a short delay.
+                    if err_msg.contains("could not run the execution") && attempt == 0 {
+                        warn!("⚠️ Execution engine 500 — retrying in 500ms (attempt {}/2)", attempt + 1);
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                        continue;
+                    }
                     return Err(anyhow::anyhow!("Order placement failed: {}", e));
                 }
             }

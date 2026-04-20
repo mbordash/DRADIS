@@ -552,9 +552,6 @@ async fn main() -> Result<()> {
                                 let bid = if *token_id == yes_token { yes_bid } else { no_bid };
                                 let sell_price = (bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
                                 let fee_bps = if *token_id == yes_token { yes_fee_rate as u16 } else { no_fee_rate as u16 };
-                                // Makers pay 0 fees on entry (post-only); exits are taker sells at market fee rate.
-                                // Adjust PnL accounting: buy-side fee = 0 for MakerStrategy entries.
-                                let entry_fee_bps = if strategy_name == "MakerStrategy" { 0u16 } else { fee_bps };
                                 let pos_key = (strategy_name.clone(), *token_id);
 
                                 let shares = {
@@ -571,9 +568,7 @@ async fn main() -> Result<()> {
                                 if shares < config::MIN_ORDER_SHARES {
                                     let mut pos_map = positions.lock().await;
                                     if let Some(pos) = pos_map.remove(&pos_key) {
-                                        let buy_fee = pos.avg_entry * pos.shares * Decimal::from(entry_fee_bps) / dec!(10_000);
-                                        let sell_fee = bid * pos.shares * Decimal::from(fee_bps) / dec!(10_000);
-                                        let pnl = (bid - pos.avg_entry) * pos.shares - buy_fee - sell_fee;
+                                        let pnl = (bid - pos.avg_entry) * pos.shares;
                                         *total_pnl.lock().await += pnl;
                                         warn!("🧹 EXIT [{}]: Dust position removed ({:.6} shares < min {}). PnL ${:.4}",
                                             strategy_name, shares, config::MIN_ORDER_SHARES, pnl);
@@ -635,11 +630,9 @@ async fn main() -> Result<()> {
                                 {
                                     let mut pos_map = positions.lock().await;
                                     if let Some(pos) = pos_map.remove(&pos_key) {
-                                        let buy_fee = pos.avg_entry * pos.shares * Decimal::from(entry_fee_bps) / dec!(10_000);
-                                        let sell_fee = bid * pos.shares * Decimal::from(fee_bps) / dec!(10_000);
-                                        let pnl = (bid - pos.avg_entry) * pos.shares - buy_fee - sell_fee;
+                                        let pnl = (bid - pos.avg_entry) * pos.shares;
                                         *total_pnl.lock().await += pnl;
-                                        info!("💰 Position closed [{}]: PnL ${:.4} (fees: ${:.4})", strategy_name, pnl, buy_fee + sell_fee);
+                                        info!("💰 Position closed [{}]: PnL ${:.4}", strategy_name, pnl);
                                     }
                                 }
 
@@ -669,11 +662,9 @@ async fn main() -> Result<()> {
                                         }
                                         let mut pos_map = positions.lock().await;
                                         if let Some(pos) = pos_map.remove(&pair_key) {
-                                            let buy_fee = pos.avg_entry * pos.shares * Decimal::from(pair_fee) / dec!(10_000);
-                                            let sell_fee = pair_bid * pos.shares * Decimal::from(pair_fee) / dec!(10_000);
-                                            let pnl = (pair_bid - pos.avg_entry) * pos.shares - buy_fee - sell_fee;
+                                            let pnl = (pair_bid - pos.avg_entry) * pos.shares;
                                             *total_pnl.lock().await += pnl;
-                                            info!("💰 Paired position closed [{}]: PnL ${:.4} (fees: ${:.4})", strategy_name, pnl, buy_fee + sell_fee);
+                                            info!("💰 Paired position closed [{}]: PnL ${:.4}", strategy_name, pnl);
                                         }
                                     }
                                 }
@@ -696,6 +687,19 @@ async fn main() -> Result<()> {
 
                             // ════════════════════ ENTRY ════════════════════
                             StrategySignal::Entry { token_id } => {
+                                // Close-time guard: block new entries if market expires within
+                                // MIN_SECONDS_TO_EXPIRY_FOR_ENTRY seconds to avoid the
+                                // "could not run the execution" 500 error from Polymarket's CLOB
+                                // when placing orders on an expiring/resolving market.
+                                if let Some(close_time) = market_close_time {
+                                    let secs_left = (close_time - Utc::now()).num_seconds();
+                                    if secs_left < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY {
+                                        debug!("⏸️ ENTRY [{}]: blocked — market closes in {}s (<{}s threshold)",
+                                            strategy_name, secs_left, config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY);
+                                        continue;
+                                    }
+                                }
+
                                 // Per-strategy cooldown gate
                                 if let Some(lt) = last_trade_time.get(strategy_name.as_str()) {
                                     let elapsed = lt.elapsed();
@@ -900,7 +904,10 @@ async fn main() -> Result<()> {
                                     // Makers are never charged fees on Polymarket — embed 0 bps in the
                                     // signed order struct for post-only orders.  Takers embed the market
                                     // fee rate so the exchange can validate and collect it on fill.
-                                    let order_fee_bps = if is_maker { 0u16 } else { fee_bps };
+                                // Polymarket fee rates are per-market, not per-order-type.
+                                // Some markets (e.g. hourly crypto) charge maker fees (up to 1000 bps).
+                                // Always use the actual market fee rate from the API.
+                                let order_fee_bps = fee_bps;
 
                                     if let Err(e) = place_limit_order(
                                         &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
@@ -1110,8 +1117,8 @@ async fn main() -> Result<()> {
                                             if !config::GHOST_MODE {
                                                 match place_limit_order(
                                                     &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
-                                                    verifying_contract, yes_token, Side::Buy, shares, rounded_price,
-                                                    0u16, OrderType::GTD, true, 60u64, &shared_http,
+                                    verifying_contract, yes_token, Side::Buy, shares, rounded_price,
+                                                     yes_fee_rate as u16, OrderType::GTD, true, 60u64, &shared_http,
                                                 ).await {
                                                     Ok(_) => {
                                                         any_placed = true;
@@ -1164,8 +1171,8 @@ async fn main() -> Result<()> {
                                             if !config::GHOST_MODE {
                                                 match place_limit_order(
                                                     &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
-                                                    verifying_contract, no_token, Side::Buy, shares, rounded_price,
-                                                    0u16, OrderType::GTD, true, 60u64, &shared_http,
+                                    verifying_contract, no_token, Side::Buy, shares, rounded_price,
+                                                     no_fee_rate as u16, OrderType::GTD, true, 60u64, &shared_http,
                                                 ).await {
                                                     Ok(_) => {
                                                         any_placed = true;
