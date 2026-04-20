@@ -1,6 +1,29 @@
 use rust_decimal::Decimal;
 use crate::config;
 use tracing::info;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+/// Rate-limit interval for rejection logs (in seconds)
+const REJECTION_LOG_INTERVAL_SECS: u64 = 5;
+
+static LAST_MAKER_NET_REJECT_LOG: AtomicU64 = AtomicU64::new(0);
+static LAST_EXPOSURE_REJECT_LOG: AtomicU64 = AtomicU64::new(0);
+
+/// Returns true if enough time has passed since last log (and updates the timestamp)
+fn should_log_rejection(last_log: &AtomicU64) -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = last_log.load(Ordering::Relaxed);
+    if now >= last + REJECTION_LOG_INTERVAL_SECS {
+        last_log.store(now, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
 
 pub struct RiskEngine;
 
@@ -47,7 +70,9 @@ impl RiskEngine {
         }
 
         if current_exposure_usdc + trade_size_usdc > max_exposure_usdc {
-            info!("🛡️ Risk Reject: Exposure ${:.2} would exceed Strategy Max ${:.2}", current_exposure_usdc + trade_size_usdc, max_exposure_usdc);
+            if should_log_rejection(&LAST_EXPOSURE_REJECT_LOG) {
+                info!("🛡️ Risk Reject: Exposure ${:.2} would exceed Strategy Max ${:.2}", current_exposure_usdc + trade_size_usdc, max_exposure_usdc);
+            }
             return false;
         }
 
@@ -82,8 +107,10 @@ impl RiskEngine {
         let net_exposure  = (projected_yes - projected_no).abs();
 
         if net_exposure > config::MAKER_MAX_EXPOSURE_USDC {
-            info!("🛡️ Maker Net Exposure Reject: |YES ${:.2} - NO ${:.2}| = ${:.2} > Max ${:.2}",
-                projected_yes, projected_no, net_exposure, config::MAKER_MAX_EXPOSURE_USDC);
+            if should_log_rejection(&LAST_MAKER_NET_REJECT_LOG) {
+                info!("🛡️ Maker Net Exposure Reject: |YES ${:.2} - NO ${:.2}| = ${:.2} > Max ${:.2}",
+                    projected_yes, projected_no, net_exposure, config::MAKER_MAX_EXPOSURE_USDC);
+            }
             return false;
         }
 

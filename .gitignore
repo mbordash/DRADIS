@@ -9,6 +9,9 @@ Cargo.lock
 .env.*
 !.env.example
 
+# Personal config — users must copy an example to create their own
+src/config.rs
+
 # Example scripts (don't commit, use .example versions for public repo)
 deploy-multi.sh
 logs-all.sh

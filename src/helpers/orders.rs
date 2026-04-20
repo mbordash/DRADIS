@@ -160,16 +160,18 @@ pub async fn place_limit_order(
                 //   maker_raw = aligned * 10000, taker_raw = maker_raw * price_cents / 10000  (= aligned*price_cents)
                 //   taker_raw = aligned * price_cents  → exact integer divisible by price_cents, but need /100 for USDC...
                 //
-                // Simpler: truncate shares to 4dp (always safe for makerAmount),
-                // derive USDC by truncating to 2dp (round down so we never over-receive).
-                let shares_4dp_cents = (quantity * rust_decimal::Decimal::from(10000))
+                // Truncate shares to 2dp (Polymarket requires sell makerAmount max 2 decimals).
+                // In 1e6 units, 2dp means divisible by 10000.
+                let shares_2dp = (quantity * rust_decimal::Decimal::from(100))
                     .floor()
                     .to_u128()
                     .unwrap_or(0);
-                let maker_raw = shares_4dp_cents * 100u128;   // in 1e6, divisible by 100 ✓ (4dp shares)
-                // USDC = shares * price; align to 2dp by flooring USDC cents then ×10000
-                let usdc_cents = if price_cents > 0 { (maker_raw / 100) * price_cents / 10000 } else { 0 };
-                let taker_raw = usdc_cents * 10000u128;         // divisible by 10000 ✓ (2dp USDC)
+                let maker_raw = shares_2dp * 10000u128;   // in 1e6, divisible by 10000 ✓ (2dp shares)
+                // USDC = shares * price; align to 2dp (divisible by 10000 in 1e6)
+                // maker_raw is divisible by 10000, so maker_raw/10000 = shares_2dp (integer)
+                // usdc_cents = shares_2dp * price_cents → exact integer
+                let usdc_cents = if price_cents > 0 { shares_2dp * price_cents } else { 0 };
+                let taker_raw = usdc_cents * 100u128;           // ×100 (not ×10000): usdc_cents = qty*100*price*100 = qty*price*10000, so ×100 → qty*price*1e6 ✓
                 order_struct.makerAmount = U256::from(maker_raw);
                 order_struct.takerAmount = U256::from(taker_raw);
             }
