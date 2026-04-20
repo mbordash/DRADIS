@@ -80,7 +80,157 @@ pub async fn fetch_specific_hourly_market(
     None
 }
 
-/// Get the top market based on filters and sorting
+/// A classified market candidate returned by the scanner.
+#[derive(Clone, Debug)]
+pub struct MarketCandidate {
+    pub yes_token: U256,
+    pub no_token: U256,
+    pub name: String,
+    pub link: String,
+    pub description: String,
+    pub is_hot: bool,
+    pub close_time: Option<DateTime<Utc>>,
+    pub volume: f64,
+}
+
+/// Market type classification used to route strategies to the right venue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MarketKind {
+    /// Standard hourly "Up or Down" market — ideal for Momentum, Basis, TimeDecay.
+    Hourly,
+    /// Multi-hour window market (e.g. "4:00PM-8:00PM ET") — ideal for Maker.
+    Window,
+    /// Daily market (e.g. "Up or Down on April 21?") — Maker fallback when no window exists.
+    Daily,
+}
+
+impl MarketCandidate {
+    pub fn kind(&self) -> MarketKind {
+        if config::is_window_market(&self.name) {
+            MarketKind::Window
+        } else if config::is_daily_market(&self.name) {
+            MarketKind::Daily
+        } else {
+            MarketKind::Hourly
+        }
+    }
+}
+
+/// Returns `(hourly_market, Option<maker_market>)`.
+///
+/// `hourly_market` is the best active hourly "Up or Down" market for the given crypto.
+/// `maker_market` is the best window or daily market if one exists concurrently,
+/// giving the Maker strategy a slower-moving venue with wider spreads.
+/// Both are `None`/fallback when no valid market is found.
+pub async fn get_market_pair(
+    http: &reqwest::Client,
+) -> (MarketCandidate, Option<MarketCandidate>) {
+    let crypto_filter = env::var("CRYPTO_FILTER")
+        .unwrap_or_else(|_| "all".to_string())
+        .to_lowercase();
+
+    info!("🚀 Scanning Gamma API for markets (FILTER: {})", crypto_filter);
+    let now = Utc::now();
+
+    // 1. Try fast-path for the hourly market first
+    let hourly_fast = fetch_specific_hourly_market(http, &crypto_filter, now).await
+        .map(|m| MarketCandidate {
+            yes_token: m.0[0],
+            no_token: m.0[1],
+            name: m.1,
+            link: m.2,
+            description: m.6,
+            is_hot: m.4,
+            close_time: m.5,
+            volume: 0.0,
+        });
+
+    // 2. Full scan to find all candidates (needed to find window/daily markets)
+    let all_candidates = fetch_simplified_crypto_candidates(http, &crypto_filter).await;
+
+    // Separate into buckets
+    let mut hourly_candidates: Vec<_> = all_candidates.iter()
+        .filter(|c| {
+            let kind = if config::is_window_market(&c.1) { MarketKind::Window }
+                       else if config::is_daily_market(&c.1) { MarketKind::Daily }
+                       else { MarketKind::Hourly };
+            kind == MarketKind::Hourly
+        })
+        .collect();
+
+    let mut maker_candidates: Vec<_> = all_candidates.iter()
+        .filter(|c| config::is_window_market(&c.1) || config::is_daily_market(&c.1))
+        .collect();
+
+    // Sort hourly by the existing priority logic
+    hourly_candidates.sort_by(|a, b| {
+        let a_secs = a.5.map_or(9999, |t| (t - now).num_seconds());
+        let b_secs = b.5.map_or(9999, |t| (t - now).num_seconds());
+        let a_up = a.1.to_lowercase().contains("up or down");
+        let b_up = b.1.to_lowercase().contains("up or down");
+        if a_up != b_up { return b_up.cmp(&a_up); }
+        let a_sweet = a_secs > 1800 && a_secs < 3600;
+        let b_sweet = b_secs > 1800 && b_secs < 3600;
+        if a_sweet != b_sweet { return b_sweet.cmp(&a_sweet); }
+        b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal)
+    });
+
+    // Sort maker candidates: window markets preferred over daily; more time left preferred
+    maker_candidates.sort_by(|a, b| {
+        let a_window = config::is_window_market(&a.1);
+        let b_window = config::is_window_market(&b.1);
+        if a_window != b_window { return b_window.cmp(&a_window); }
+        // More time remaining = better for passive orders
+        let a_secs = a.5.map_or(0, |t| (t - now).num_seconds());
+        let b_secs = b.5.map_or(0, |t| (t - now).num_seconds());
+        b_secs.cmp(&a_secs)
+    });
+
+    // Build the hourly result — prefer fast-path, fall back to scanned
+    let hourly = if let Some(fast) = hourly_fast {
+        fast
+    } else if let Some(best) = hourly_candidates.first() {
+        info!("🏆 Selected market: \"{}\"", best.1);
+        MarketCandidate {
+            yes_token: best.0[0],
+            no_token: best.0[1],
+            name: best.1.clone(),
+            link: best.2.clone(),
+            description: best.6.clone(),
+            is_hot: best.4,
+            close_time: best.5,
+            volume: best.3,
+        }
+    } else {
+        warn!("⚠️ No valid markets found matching filters.");
+        return (MarketCandidate {
+            yes_token: U256::ZERO, no_token: U256::ZERO,
+            name: String::new(), link: String::new(), description: String::new(),
+            is_hot: false, close_time: None, volume: 0.0,
+        }, None);
+    };
+
+    // Build the maker market result (window or daily, if available)
+    let maker_market = maker_candidates.first().map(|best| {
+        let kind = if config::is_window_market(&best.1) { "Window" } else { "Daily" };
+        info!("🏦 Maker {} market selected: \"{}\"", kind, best.1);
+        MarketCandidate {
+            yes_token: best.0[0],
+            no_token: best.0[1],
+            name: best.1.clone(),
+            link: best.2.clone(),
+            description: best.6.clone(),
+            is_hot: best.4,
+            close_time: best.5,
+            volume: best.3,
+        }
+    });
+
+    (hourly, maker_market)
+}
+
+/// Backwards-compatible wrapper — returns the hourly market only.
+/// Existing call sites that don't need the maker market can continue using this.
 pub async fn get_top_market(http: &reqwest::Client) -> (U256, U256, String, String, String, bool, Option<DateTime<Utc>>) {
     let crypto_filter = env::var("CRYPTO_FILTER")
         .unwrap_or_else(|_| "all".to_string())
@@ -91,7 +241,7 @@ pub async fn get_top_market(http: &reqwest::Client) -> (U256, U256, String, Stri
 
     // 1. Try specifically targeted hourly markets first (Fastest)
     if let Some(market) = fetch_specific_hourly_market(http, &crypto_filter, now).await {
-        info!("🏆 Found specific hourly market: \"{}\"", market.1);
+        info!("🏆 Selected market: \"{}\"", market.1);
         return (market.0[0], market.0[1], market.1, market.2, market.6, market.4, market.5);
     }
 
@@ -107,30 +257,16 @@ pub async fn get_top_market(http: &reqwest::Client) -> (U256, U256, String, Stri
     sorted.sort_by(|a, b| {
         let a_secs = a.5.map_or(9999, |t| (t - now).num_seconds());
         let b_secs = b.5.map_or(9999, |t| (t - now).num_seconds());
-
-        // Tier 1: Strongly prefer "Up or Down" directional binary markets
         let a_up_or_down = a.1.to_lowercase().contains("up or down");
         let b_up_or_down = b.1.to_lowercase().contains("up or down");
-        if a_up_or_down != b_up_or_down {
-            return b_up_or_down.cmp(&a_up_or_down);
-        }
-
-        // Tier 2: Deprioritize range/price-band markets (likely already decided)
+        if a_up_or_down != b_up_or_down { return b_up_or_down.cmp(&a_up_or_down); }
         let a_range = config::is_range_market(&a.1);
         let b_range = config::is_range_market(&b.1);
-        if a_range != b_range {
-            return a_range.cmp(&b_range); // range markets sort last
-        }
-
-        // Tier 3: Prefer markets in the 30-60 minute sweet spot
+        if a_range != b_range { return a_range.cmp(&b_range); }
         let a_sweet = a_secs > 1800 && a_secs < 3600;
         let b_sweet = b_secs > 1800 && b_secs < 3600;
-        if a_sweet != b_sweet {
-            return b_sweet.cmp(&a_sweet);
-        }
-
-        // Tier 4: Volume as tiebreaker
-        b.3.partial_cmp(&a.3).unwrap_or(Ordering::Equal)
+        if a_sweet != b_sweet { return b_sweet.cmp(&a_sweet); }
+        b.3.partial_cmp(&a.3).unwrap_or(std::cmp::Ordering::Equal)
     });
 
     let best = &sorted[0];
@@ -265,4 +401,3 @@ pub async fn fetch_simplified_crypto_candidates(
     info!("✅ Total scanned: {} | Candidates after filters: {}", total_scanned, out.len());
     out
 }
-

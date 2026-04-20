@@ -295,11 +295,17 @@ async fn main() -> Result<()> {
     let time_decay_positions: Arc<Mutex<HashMap<U256, TimeDecayPosition>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    let (initial_yes, initial_no, name, _, desc, _, close_time) = loop {
-        let candidate = get_top_market(&shared_http).await;
-        if candidate.0 != U256::ZERO { break candidate; }
+    let (initial_hourly, initial_maker_market) = loop {
+        let pair = get_market_pair(&shared_http).await;
+        if pair.0.yes_token != U256::ZERO { break pair; }
         tokio::time::sleep(std::time::Duration::from_secs(90)).await;
     };
+
+    let (initial_yes, initial_no, name, close_time) = (
+        initial_hourly.yes_token, initial_hourly.no_token,
+        initial_hourly.name.clone(), initial_hourly.close_time,
+    );
+    let desc = initial_hourly.description.clone();
 
     info!("🧪 Initializing market: {}", name);
     let mut initial_strike = rustpolybot::market_validator::extract_strike_price(&name);
@@ -317,7 +323,7 @@ async fn main() -> Result<()> {
         info!("✅ Strike price resolved: ${}", initial_strike.unwrap());
     }
 
-    let (market_tx, mut market_rx) = watch::channel((initial_yes, initial_no, name, close_time, initial_strike, desc));
+    let (market_tx, mut market_rx) = watch::channel((initial_yes, initial_no, name, close_time, initial_strike, desc, initial_maker_market));
 
     let http_monitor = Arc::clone(&shared_http);
     let market_tx_monitor = market_tx.clone();
@@ -327,21 +333,32 @@ async fn main() -> Result<()> {
         let mut interval = tokio::time::interval(std::time::Duration::from_secs(90));
         loop {
             interval.tick().await;
-            let candidate = get_top_market(&http_monitor).await;
-            if candidate.0 == U256::ZERO { continue; }
-            let (cur_yes, _, cur_name, cur_close_time, _, _) = market_tx_monitor.borrow().clone();
+            let (candidate, maker_candidate) = get_market_pair(&http_monitor).await;
+            if candidate.yes_token == U256::ZERO { continue; }
+            let (cur_yes, _, cur_name, cur_close_time, _, _, _) = market_tx_monitor.borrow().clone();
 
-            if candidate.0 == cur_yes {
+            if candidate.yes_token == cur_yes {
+                // Hourly market unchanged — still check if maker market changed
+                let cur_maker = market_tx_monitor.borrow().6.clone();
+                let cur_maker_yes = cur_maker.as_ref().map(|m| m.yes_token);
+                let new_maker_yes = maker_candidate.as_ref().map(|m| m.yes_token);
+                if cur_maker_yes != new_maker_yes {
+                    if let Some(ref mk) = maker_candidate {
+                        info!("🏦 Maker market updated: \"{}\"", mk.name);
+                    }
+                    let (y, n, nm, ct, sp, ds, _) = market_tx_monitor.borrow().clone();
+                    let _ = market_tx_monitor.send((y, n, nm, ct, sp, ds, maker_candidate));
+                }
                 continue;
             }
 
             let now_ts = Utc::now();
             let cur_secs_left = cur_close_time.map_or(9999i64, |ct| (ct - now_ts).num_seconds());
-            let new_secs_left = candidate.6.map_or(9999i64, |ct| (ct - now_ts).num_seconds());
+            let new_secs_left = candidate.close_time.map_or(9999i64, |ct| (ct - now_ts).num_seconds());
 
-            let candidate_is_binary = candidate.2.to_lowercase().contains("up or down");
+            let candidate_is_binary = candidate.name.to_lowercase().contains("up or down");
             let current_is_binary = cur_name.to_lowercase().contains("up or down");
-            let candidate_is_range = config::is_range_market(&candidate.2);
+            let candidate_is_range = config::is_range_market(&candidate.name);
 
             let time_based_upgrade = new_secs_left > cur_secs_left + 1800
                 && !(current_is_binary && !candidate_is_binary);
@@ -355,23 +372,28 @@ async fn main() -> Result<()> {
                 continue;
             }
 
-            info!("🔄 Market Switch Detected: {} -> {}", cur_name, candidate.2);
-            let mut strike = rustpolybot::market_validator::extract_strike_price(&candidate.2);
+            info!("🔄 Market Switch Detected: {} -> {}", cur_name, candidate.name);
+            let mut strike = rustpolybot::market_validator::extract_strike_price(&candidate.name);
             if strike.is_none() {
-                strike = fetch_historical_strike_price(&http_monitor, &crypto_filter_monitor, &candidate.4).await;
+                strike = fetch_historical_strike_price(&http_monitor, &crypto_filter_monitor, &candidate.description).await;
             }
             if strike.is_none() {
-                strike = fetch_historical_strike_price(&http_monitor, &crypto_filter_monitor, &candidate.2).await;
+                strike = fetch_historical_strike_price(&http_monitor, &crypto_filter_monitor, &candidate.name).await;
             }
             if strike.is_none() {
-                strike = fetch_strike_price_from_close_time(&http_monitor, &crypto_filter_monitor, candidate.6).await;
+                strike = fetch_strike_price_from_close_time(&http_monitor, &crypto_filter_monitor, candidate.close_time).await;
             }
-            let _ = market_tx_monitor.send((candidate.0, candidate.1, candidate.2.clone(), candidate.6, strike, candidate.4.clone()));
+            let _ = market_tx_monitor.send((
+                candidate.yes_token, candidate.no_token,
+                candidate.name.clone(), candidate.close_time,
+                strike, candidate.description.clone(),
+                maker_candidate,
+            ));
         }
     });
 
     loop {
-        let (yes_token, no_token, market_name, market_close_time, strike_price, _) = market_rx.borrow().clone();
+        let (yes_token, no_token, market_name, market_close_time, strike_price, _, maker_market_candidate) = market_rx.borrow().clone();
 
         let now = Utc::now();
         if let Some(close_time) = market_close_time {
@@ -422,6 +444,62 @@ async fn main() -> Result<()> {
             });
         }
 
+        // ── Maker market WS subscriptions (window/daily venue) ───────────────
+        // When a window or daily market is available, subscribe its orderbook so
+        // MakerStrategy can post quotes with live bid/ask data from that venue.
+        let (maker_yes_price_rx, maker_no_price_rx) = if let Some(ref mk) = maker_market_candidate {
+            let (mk_yes_tx, mk_yes_rx) = watch::channel::<PriceState>((dec!(0), dec!(1), dec!(0)));
+            let (mk_no_tx, mk_no_rx) = watch::channel::<PriceState>((dec!(0), dec!(1), dec!(0)));
+            for (token, tx) in [(mk.yes_token, mk_yes_tx), (mk.no_token, mk_no_tx)] {
+                tokio::spawn(async move {
+                    loop {
+                        let client = WsClient::default();
+                        let stream = match client.subscribe_orderbook(vec![token]) {
+                            Ok(s) => s,
+                            Err(_) => { tokio::time::sleep(std::time::Duration::from_secs(5)).await; continue; }
+                        };
+                        let mut stream = Box::pin(stream);
+                        info!("✅ WS orderbook subscribed for maker token {}", token);
+                        while let Some(book_result) = stream.next().await {
+                            if let Ok(book) = book_result {
+                                let bid = book.bids.iter().map(|l| l.price).max().unwrap_or(dec!(0));
+                                let (ask, depth) = book.asks.iter()
+                                    .min_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
+                                    .map(|l| (l.price, l.size))
+                                    .unwrap_or((dec!(1), dec!(0)));
+                                let _ = tx.send((bid, ask, depth));
+                            } else { break; }
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                    }
+                });
+            }
+            (Some(mk_yes_rx), Some(mk_no_rx))
+        } else {
+            (None, None)
+        };
+
+        // Fetch maker market fee/risk settings if we have one
+        let maker_market_config: Option<MarketConfig> = if let Some(ref mk) = maker_market_candidate {
+            let mk_yes_fee = trading_client.fee_rate_bps(mk.yes_token).await.map(|r| r.base_fee).unwrap_or(0);
+            let mk_no_fee = trading_client.fee_rate_bps(mk.no_token).await.map(|r| r.base_fee).unwrap_or(0);
+            let mk_neg_risk = trading_client.neg_risk(mk.yes_token).await.map(|r| r.neg_risk).unwrap_or(false);
+            info!("✅ Maker market settings: \"{}\" | NegRisk: {} | YES {} bps | NO {} bps",
+                mk.name, mk_neg_risk, mk_yes_fee, mk_no_fee);
+            Some(MarketConfig {
+                yes_token: mk.yes_token,
+                no_token: mk.no_token,
+                market_name: mk.name.clone(),
+                market_close_time: mk.close_time,
+                strike_price,
+                is_neg_risk: mk_neg_risk,
+                yes_fee_bps: mk_yes_fee,
+                no_fee_bps: mk_no_fee,
+            })
+        } else {
+            None
+        };
+
         let mut ticker = interval(config::main_ticker_interval());
         let mut status_ticker = interval(std::time::Duration::from_secs(60));
         let mut cleanup_ticker = interval(std::time::Duration::from_secs(300));
@@ -448,8 +526,7 @@ async fn main() -> Result<()> {
                 _ = market_rx.changed() => {
                     info!("🔄 Market switch detected — restarting trading loop with new market");
                     break; // break inner loop → outer loop picks up the new market
-                }
-                _ = pulse_ticker.tick() => {
+                }                _ = pulse_ticker.tick() => {
                     let start = Instant::now();
                     let mut req = BalanceAllowanceRequest::default();
                     req.asset_type = AssetType::Collateral;
@@ -534,12 +611,31 @@ async fn main() -> Result<()> {
                         yes_fee_bps: yes_fee_rate,
                         no_fee_bps: no_fee_rate,
                     };
+
+                    // Build optional maker snapshot from the window/daily venue prices
+                    let maker_snapshot = match (&maker_yes_price_rx, &maker_no_price_rx) {
+                        (Some(my_rx), Some(mn_rx)) => {
+                            let (mk_yes_bid, mk_yes_ask, mk_yes_depth) = *my_rx.borrow();
+                            let (mk_no_bid, mk_no_ask, mk_no_depth) = *mn_rx.borrow();
+                            Some(MarketSnapshot {
+                                yes_bid: mk_yes_bid, yes_ask: mk_yes_ask, yes_ask_depth: mk_yes_depth,
+                                no_bid: mk_no_bid, no_ask: mk_no_ask, no_ask_depth: mk_no_depth,
+                                oracle_price, velocity, velocity_1s, acceleration,
+                                funding_rate,
+                                timestamp: Utc::now(),
+                            })
+                        }
+                        _ => None,
+                    };
+
                     let ctx = StrategyContext {
                         market: market_cfg,
                         snapshot,
                         positions: Arc::clone(&positions),
                         crypto_filter: crypto_filter.clone(),
                         market_started_at,
+                        maker_market: maker_market_config.clone(),
+                        maker_snapshot,
                     };
 
                     // ── Evaluate all strategies ──
@@ -1076,6 +1172,15 @@ async fn main() -> Result<()> {
 
                             // ════════════════════ MAKER QUOTE (two-sided) ════════════════════
                             StrategySignal::MakerQuote { yes_bid_price, no_bid_price } => {
+                                // Resolve which venue (window/daily vs hourly) Maker is quoting on
+                                let mk_yes_token = maker_market_config.as_ref().map(|m| m.yes_token).unwrap_or(yes_token);
+                                let mk_no_token  = maker_market_config.as_ref().map(|m| m.no_token).unwrap_or(no_token);
+                                let mk_yes_fee   = maker_market_config.as_ref().map(|m| m.yes_fee_bps as u16).unwrap_or(yes_fee_rate as u16);
+                                let mk_no_fee    = maker_market_config.as_ref().map(|m| m.no_fee_bps as u16).unwrap_or(no_fee_rate as u16);
+                                let mk_neg_risk  = maker_market_config.as_ref().map(|m| m.is_neg_risk).unwrap_or(is_neg_risk);
+                                let mk_verifying = if mk_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
+                                let mk_market_name = maker_market_config.as_ref().map(|m| m.market_name.clone()).unwrap_or(market_name.clone());
+
                                 // Per-strategy cooldown gate
                                 if let Some(lt) = last_trade_time.get(strategy_name.as_str()) {
                                     let elapsed = lt.elapsed();
@@ -1113,9 +1218,9 @@ async fn main() -> Result<()> {
                                 // Compute current inventory values for net exposure check
                                 let (yes_inv_value, no_inv_value) = {
                                     let pos_map = positions.lock().await;
-                                    let yv = pos_map.get(&(strategy_name.clone(), yes_token))
+                                    let yv = pos_map.get(&(strategy_name.clone(), mk_yes_token))
                                         .map(|p| p.shares * p.avg_entry).unwrap_or(dec!(0));
-                                    let nv = pos_map.get(&(strategy_name.clone(), no_token))
+                                    let nv = pos_map.get(&(strategy_name.clone(), mk_no_token))
                                         .map(|p| p.shares * p.avg_entry).unwrap_or(dec!(0));
                                     (yv, nv)
                                 };
@@ -1143,7 +1248,7 @@ async fn main() -> Result<()> {
 
                                 // ── YES side ───────────────────────────────────────────────────────
                                 if let Some(&yes_price) = yes_bid_price.as_ref() {
-                                    let pos_key = (strategy_name.clone(), yes_token);
+                                    let pos_key = (strategy_name.clone(), mk_yes_token);
                                     let already_open = positions.lock().await.contains_key(&pos_key);
                                     if !already_open && yes_price > dec!(0) {
                                         let shares = trade_size_usdc / yes_price;
@@ -1152,29 +1257,30 @@ async fn main() -> Result<()> {
                                             let baseline_shares = {
                                                 let mut req = BalanceAllowanceRequest::default();
                                                 req.asset_type = AssetType::Conditional;
-                                                req.token_id = Some(yes_token);
+                                                req.token_id = Some(mk_yes_token);
                                                 match trading_client.balance_allowance(req).await {
                                                     Ok(resp) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
                                                     Err(_) => dec!(0),
                                                 }
                                             };
-                                            info!("📥 MakerQuote YES [{}]: {} | shares={:.2}, bid=${:.4}", strategy_name, market_name, shares, rounded_price);
+                                            info!("📥 MakerQuote YES [{}]: {} | shares={:.2}, bid=${:.4}", strategy_name, mk_market_name, shares, rounded_price);
                                             positions.lock().await.insert(pos_key.clone(), Position {
                                                 shares, avg_entry: rounded_price, opened_at: Utc::now(),
-                                                close_time: market_close_time, market_name: market_name.clone(),
-                                                pair_token_id: yes_token, fill_confirmed_at: None,
+                                close_time: maker_market_config.as_ref().and_then(|m| m.market_close_time).or(market_close_time),
+                                market_name: mk_market_name.clone(),
+                                pair_token_id: mk_yes_token, fill_confirmed_at: None,
                                             });
                                             if !config::GHOST_MODE {
                                                 match place_limit_order(
                                                     &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
-                                    verifying_contract, yes_token, Side::Buy, shares, rounded_price,
-                                                     yes_fee_rate as u16, OrderType::GTD, true, 60u64, &shared_http,
+                                    mk_verifying, mk_yes_token, Side::Buy, shares, rounded_price,
+                                                     mk_yes_fee, OrderType::GTD, true, 60u64, &shared_http,
                                                 ).await {
                                                     Ok(_) => {
                                                         any_placed = true;
                                                         let cs = Arc::clone(&trading_client); let ps = Arc::clone(&positions);
                                                         let pcs = Arc::clone(&phantom_cooldowns); let ss = strategy_name.clone();
-                                                        tokio::spawn(async move { let _ = sync_position_balance(&cs, &ps, &ss, yes_token, Some(&pcs), baseline_shares).await; });
+                                                        tokio::spawn(async move { let _ = sync_position_balance(&cs, &ps, &ss, mk_yes_token, Some(&pcs), baseline_shares).await; });
                                                     }
                                                     Err(e) => {
                                                         positions.lock().await.remove(&pos_key);
@@ -1197,7 +1303,7 @@ async fn main() -> Result<()> {
 
                                 // ── NO side ────────────────────────────────────────────────────────
                                 if let Some(&no_price) = no_bid_price.as_ref() {
-                                    let pos_key = (strategy_name.clone(), no_token);
+                                    let pos_key = (strategy_name.clone(), mk_no_token);
                                     let already_open = positions.lock().await.contains_key(&pos_key);
                                     if !already_open && no_price > dec!(0) {
                                         let shares = trade_size_usdc / no_price;
@@ -1206,29 +1312,30 @@ async fn main() -> Result<()> {
                                             let baseline_shares = {
                                                 let mut req = BalanceAllowanceRequest::default();
                                                 req.asset_type = AssetType::Conditional;
-                                                req.token_id = Some(no_token);
+                                                req.token_id = Some(mk_no_token);
                                                 match trading_client.balance_allowance(req).await {
                                                     Ok(resp) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
                                                     Err(_) => dec!(0),
                                                 }
                                             };
-                                            info!("📥 MakerQuote NO [{}]: {} | shares={:.2}, bid=${:.4}", strategy_name, market_name, shares, rounded_price);
+                                            info!("📥 MakerQuote NO [{}]: {} | shares={:.2}, bid=${:.4}", strategy_name, mk_market_name, shares, rounded_price);
                                             positions.lock().await.insert(pos_key.clone(), Position {
                                                 shares, avg_entry: rounded_price, opened_at: Utc::now(),
-                                                close_time: market_close_time, market_name: market_name.clone(),
-                                                pair_token_id: no_token, fill_confirmed_at: None,
+                                close_time: maker_market_config.as_ref().and_then(|m| m.market_close_time).or(market_close_time),
+                                market_name: mk_market_name.clone(),
+                                pair_token_id: mk_no_token, fill_confirmed_at: None,
                                             });
                                             if !config::GHOST_MODE {
                                                 match place_limit_order(
                                                     &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
-                                    verifying_contract, no_token, Side::Buy, shares, rounded_price,
-                                                     no_fee_rate as u16, OrderType::GTD, true, 60u64, &shared_http,
+                                    mk_verifying, mk_no_token, Side::Buy, shares, rounded_price,
+                                                     mk_no_fee, OrderType::GTD, true, 60u64, &shared_http,
                                                 ).await {
                                                     Ok(_) => {
                                                         any_placed = true;
                                                         let cs = Arc::clone(&trading_client); let ps = Arc::clone(&positions);
                                                         let pcs = Arc::clone(&phantom_cooldowns); let ss = strategy_name.clone();
-                                                        tokio::spawn(async move { let _ = sync_position_balance(&cs, &ps, &ss, no_token, Some(&pcs), baseline_shares).await; });
+                                                        tokio::spawn(async move { let _ = sync_position_balance(&cs, &ps, &ss, mk_no_token, Some(&pcs), baseline_shares).await; });
                                                     }
                                                     Err(e) => {
                                                         positions.lock().await.remove(&pos_key);
@@ -1257,7 +1364,7 @@ async fn main() -> Result<()> {
                                     phantom_cooldowns.lock().await.remove(strategy_name.as_str());
                                     let yes_str = yes_bid_price.map(|p| format!("YES@${:.4}", p)).unwrap_or_default();
                                     let no_str  = no_bid_price.map(|p| format!("NO@${:.4}", p)).unwrap_or_default();
-                                    let msg = format!("📥 MakerQuote [{}] {} {} | {}", strategy_name, yes_str, no_str, market_name);
+                                    let msg = format!("📥 MakerQuote [{}] {} {} | {}", strategy_name, yes_str, no_str, mk_market_name);
                                     let _ = send_notification(&tg_token, &tg_chat_id, &msg).await;
                                 }
 
@@ -1265,7 +1372,7 @@ async fn main() -> Result<()> {
                                 if consecutive_failures >= config::MAX_CONSECUTIVE_FAILURES {
                                     error!("🚨 Circuit breaker: {} consecutive MakerQuote failures — pausing", consecutive_failures);
                                     let _ = send_notification(&tg_token, &tg_chat_id,
-                                        &format!("🚨 Circuit breaker: {} MakerQuote failures on {}", consecutive_failures, market_name)).await;
+                                        &format!("🚨 Circuit breaker: {} MakerQuote failures on {}", consecutive_failures, mk_market_name)).await;
                                     tokio::select! {
                                         _ = tokio::time::sleep(Duration::from_secs(config::FAILURE_COOLDOWN_SECS as u64)) => {
                                             sync_nonce_manager(&nonce_manager, &shared_http, safe_address).await;

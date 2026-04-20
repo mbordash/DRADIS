@@ -34,11 +34,11 @@ Multi-timeframe confirmation gates (added to filter fakeouts and stale signals):
 
 Exits on take profit (5%), stop loss (10%), velocity reversal (75% of threshold in the opposite direction), or velocity decay.
 
-**Maker** — Posts passive resting bids on **both YES and NO simultaneously** (two-sided market making). Per Polymarket's fee structure, makers pay 0 fees on entry; only taker exits incur the market fee rate. Filled maker orders also earn daily USDC rebates from Polymarket's Maker Rebates program (paid to your wallet each day, minimum $1 accrued).
+**Maker** — Posts passive resting bids on **both YES and NO simultaneously** (two-sided market making) on the **best available slow-moving venue**: a multi-hour window market if one is active, a daily market if not, or the hourly market as a last resort. Per Polymarket's fee structure, makers pay 0 fees on entry; only taker exits incur the market fee rate. Filled maker orders also earn daily USDC rebates from Polymarket's Maker Rebates program (paid to your wallet each day, minimum $1 accrued).
 
 Two income streams per filled order: (1) spread profit when the position reaches take-profit, (2) daily rebate on the fill.
 
-Key behaviours:
+Key behaviors:
 - **Inventory skew**: if YES inventory outweighs NO, the YES bid is lowered (less aggressive to avoid deepening the skew) and the NO bid is raised (more aggressive to rebalance faster). Skew scales linearly with imbalance up to `MAKER_INVENTORY_SKEW_MAX`.
 - **Combined price guard**: `YES_bid + NO_bid` must be below `MAKER_MAX_COMBINED_BID` (0.90). If both sides would sum above the threshold, the side with the tighter spread (less edge) is suppressed. This prevents offering a riskless arb to takers who could sell both legs to us and pocket the $1.00 settlement.
 - **Net exposure risk**: risk is measured as `|YES_value − NO_value|` (directional imbalance), not gross `YES + NO`. A balanced two-sided book has near-zero directional risk, so the strategy can quote larger notional without increasing drawdown risk.
@@ -72,6 +72,43 @@ Uses fractional Kelly sizing: $5 at 1× threshold → $15 at 3× skew.
 
 **Custom Strategy** — Develop and link your own strategies within the same codebase. See [CUSTOM_STRATEGY.md](docs/CUSTOM_STRATEGY.md) for a full developer guide: the `Strategy` trait API, all `StrategyContext` fields, the five integration steps, common gotchas, and a ready-to-run test harness.
 
+
+### Market Selection
+
+Every scan cycle the bot calls `get_market_pair()`, which runs two passes against the Gamma API:
+
+**Pass 1 — Hourly market (primary venue)**
+A fast direct-search for the current or next hourly "Bitcoin Up or Down – [Hour] ET" market. If that misses, it falls back to the full scan and picks the best hourly candidate by:
+1. "Up or Down" in title (deprioritises range/exotic markets)
+2. Sweet-spot time window: 30–60 minutes to expiry (enough runway for entries, not so much that pricing is stale)
+3. Highest 24h CLOB volume as a tiebreaker
+
+This is the primary market used by Momentum, Arbitrage, Time Decay, and Basis strategies.
+
+**Pass 2 — Maker market (secondary venue)**
+The full scan also collects any concurrent **window** or **daily** markets for the same crypto, classified by name pattern:
+
+| Type | Example name | `MarketKind` |
+|------|-------------|--------------|
+| Hourly | "Bitcoin Up or Down – April 20, 7PM ET" | `Hourly` |
+| Window | "Bitcoin Up or Down – April 20, 4:00PM–8:00PM ET" | `Window` |
+| Daily | "Bitcoin Up or Down on April 20?" | `Daily` |
+
+Window markets are preferred over daily (more active book), and within each type the market with **more time remaining** wins. The Maker strategy is then routed to this secondary venue instead of the hourly, because:
+- Longer time horizons mean slower price discovery — a $100 BTC move barely affects a 4-hour window market's fair value
+- Resting GTD bids have 4× longer to fill before expiry
+- The book reprices more gently, so Maker's combined-price guard and inventory skew are less likely to be stale by the time orders rest
+
+If no window or daily market exists, the Maker strategy falls back to the hourly market (but will largely be dormant due to the 30-minute expiry gate).
+
+**What you see in logs:**
+```
+🏆 Selected market: "Bitcoin Up or Down - April 20, 7PM ET"       ← hourly (primary)
+🏦 Maker Window market selected: "Bitcoin Up or Down - April 20, 4:00PM-8:00PM ET"  ← maker venue
+```
+Both markets subscribe separate WS orderbook feeds. The hourly feeds drive Momentum/Arb/TimeDecay/Basis; the maker feeds drive MakerStrategy exclusively.
+
+---
 
 ### Strategy Segregation
 
@@ -274,7 +311,7 @@ src/
 ├── lib.rs                         # Module exports
 ├── risk.rs                        # Per-strategy exposure limits, drawdown checks
 ├── notifications.rs               # Telegram alerts
-├── market_validator.rs            # Market filtering (crypto, expiry, strike extraction)
+├── market_validator.rs            # Market filtering (crypto, expiry, strike extraction); MarketKind classification (Hourly/Window/Daily)
 ├── toctou_tests.rs                # Race condition unit tests
 ├── orchestrator/
 │   ├── mod.rs
@@ -338,7 +375,7 @@ Honest caveats: Python would have been faster to build — the trading bot ecosy
 
 **Why isn't the bot trading?**
 
-Check in order: Is `GHOST_MODE` still true? Is the spread wide enough to beat `ARBITRAGE_PROFIT_THRESHOLD` + fees? Is the orderbook thick enough (`MIN_LIQUIDITY_FILL_RATIO`)? For momentum — is the oracle velocity actually hitting the threshold (`BTC_MOMENTUM_THRESHOLD` = $75/5s) AND the 1s velocity also hitting 40% of that AND acceleration is positive? For maker — is the market less than 10 minutes old (`MAKER_MIN_MARKET_AGE_SECS`)? Is the market closing in less than 30 minutes (`MAKER_MIN_SECS_TO_EXPIRY`)? For basis — is the YES/NO mid-price more than 8¢ from 0.50, and is Binance velocity below $30/5s? Bump `RUST_LOG=debug` to see what's being filtered.
+Check in order: Is `GHOST_MODE` still true? Is the spread wide enough to beat `ARBITRAGE_PROFIT_THRESHOLD` + fees? Is the orderbook thick enough (`MIN_LIQUIDITY_FILL_RATIO`)? For momentum — is the oracle velocity actually hitting the threshold (`BTC_MOMENTUM_THRESHOLD` = $75/5s) AND the 1s velocity also hitting 40% of that AND acceleration is positive? For maker — is the market less than 10 minutes old (`MAKER_MIN_MARKET_AGE_SECS`)? Is the market closing in less than 30 minutes (`MAKER_MIN_SECS_TO_EXPIRY`)? Note that Maker runs on a **secondary venue** (window or daily market if available, hourly fallback) — check logs for a `🏦 Maker Window/Daily market selected` line to confirm it has a venue. For basis — is the YES/NO mid-price more than 8¢ from 0.50, and is Binance velocity below $30/5s? Bump `RUST_LOG=debug` to see what's being filtered.
 
 **Orders keep getting rejected**
 
