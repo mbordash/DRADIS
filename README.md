@@ -230,16 +230,18 @@ Once you have a working `config.rs`, treat it as your own — tune it, experimen
 |-----------|-------------|----------|------------|
 | Momentum enabled | ❌ | ✅ | ✅ |
 | Basis enabled | ❌ | ✅ | ✅ |
-| Momentum max size | $10 | $15 | $25 |
-| Maker max exposure | $8 | $12 | $15 |
-| BTC velocity threshold | $100/5s | $85/5s | $75/5s |
-| Maker expiry gate | 45 min | 35 min | 15 min |
-| Max entry price (Maker) | $0.48 | $0.52 | $0.55 |
+| Momentum confirmation ticks | 3 | 2 | 1 |
+| Momentum max size | $10 | $15 | $30 |
+| Maker max exposure | $8 | $12 | $25 |
+| BTC velocity threshold | $100/5s | $85/5s | $60/5s |
+| Maker expiry gate | 45 min | 35 min | 10 min |
+| Max entry price (Maker) | $0.48 | $0.52 | $0.62 |
+| Basis skew threshold | 10¢ | 7¢ | 4¢ |
 | Main tick rate | 100ms | 75ms | 50ms |
-| Trade cooldown | 15s | 10s | 8s |
-| Session drawdown limit | 0.75% | 1% | 1% |
+| Trade cooldown | 15s | 10s | 5s |
+| Session drawdown limit | 0.75% | 1% | 1.5% |
 
-> **Recommended path**: Start with Conservative and `GHOST_MODE = true` for at least one trading session (1–2 hours). Watch for entry/exit log lines. Once you understand the signal patterns, switch to Balanced and flip `GHOST_MODE = false`. Only move to Aggressive after you've observed live trades across multiple markets and are comfortable with the drawdown behaviour. From there, your config is yours to evolve.
+> **Recommended path**: Start with Conservative and `GHOST_MODE = true` for at least one trading session (1–2 hours). Watch for entry/exit log lines. Once you understand the signal patterns, switch to Balanced and flip `GHOST_MODE = false`. Only move to Aggressive after you've observed live trades across multiple markets and are comfortable with the drawdown behavior. From there, your config is yours to evolve.
 
 ---
 
