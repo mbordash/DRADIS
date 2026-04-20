@@ -27,7 +27,8 @@ use std::collections::{HashMap, VecDeque};
 use std::env;
 use std::str::FromStr as _;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::{watch, Mutex};
 use tokio::time::{interval, Instant, Duration};
 
@@ -47,6 +48,23 @@ use rustpolybot::helpers::{
 use rustls::crypto::ring;
 
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
+
+/// Rate-limit the "net exposure risk check failed" log to once per 5s to prevent log spam.
+static LAST_MAKER_EXPOSURE_REJECT_CALLER_LOG: AtomicU64 = AtomicU64::new(0);
+
+fn should_log_maker_exposure_reject() -> bool {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_MAKER_EXPOSURE_REJECT_CALLER_LOG.load(Ordering::Relaxed);
+    if now >= last + 5 {
+        LAST_MAKER_EXPOSURE_REJECT_CALLER_LOG.store(now, Ordering::Relaxed);
+        true
+    } else {
+        false
+    }
+}
 
 type PriceState = (Decimal, Decimal, Decimal); // (Bid, Ask, AskDepth)
 
@@ -576,6 +594,21 @@ async fn main() -> Result<()> {
                                     continue;
                                 }
 
+                                // Dead market guard: if bid is zero the market is expired/resolved
+                                // and there are no buyers. Write off the position instead of
+                                // sending unsellable orders that trigger the circuit breaker.
+                                if bid <= Decimal::ZERO {
+                                    let mut pos_map = positions.lock().await;
+                                    if let Some(pos) = pos_map.remove(&pos_key) {
+                                        let pnl = -pos.avg_entry * pos.shares;
+                                        *total_pnl.lock().await += pnl;
+                                        warn!("🧹 EXIT [{}]: Position written off (bid=$0, market expired/resolved). shares={:.2}, loss=${:.4}",
+                                            strategy_name, pos.shares, pnl);
+                                    }
+                                    consecutive_failures = 0;
+                                    continue;
+                                }
+
                                 info!("📤 EXIT [{}]: {} | shares={:.2}, bid=${:.4} | {}", strategy_name, market_name, shares, bid, reason);
 
                                 if !config::GHOST_MODE {
@@ -592,6 +625,21 @@ async fn main() -> Result<()> {
                                             }
                                             // Apply cooldown so the strategy doesn't immediately re-enter
                                             // on the next tick while the market is still in a crashed state.
+                                            last_trade_time.insert(strategy_name.clone(), Instant::now());
+                                            consecutive_failures = 0;
+                                            tick_failures = 0;
+                                            continue;
+                                        }
+                                        // "invalid price" means the market is likely expired/resolved
+                                        // (bid=$0 → sell_price=$0.01 but no valid orderbook).
+                                        // Clean up to prevent infinite retry loops.
+                                        if err_str.contains("invalid price") {
+                                            let mut pos_map = positions.lock().await;
+                                            if let Some(pos) = pos_map.remove(&pos_key) {
+                                                let pnl = (bid - pos.avg_entry) * pos.shares;
+                                                *total_pnl.lock().await += pnl;
+                                                warn!("🧹 EXIT [{}]: Position removed after invalid price error (market likely expired). PnL ${:.4}", strategy_name, pnl);
+                                            }
                                             last_trade_time.insert(strategy_name.clone(), Instant::now());
                                             consecutive_failures = 0;
                                             tick_failures = 0;
@@ -1084,8 +1132,10 @@ async fn main() -> Result<()> {
                                     yes_new_value, no_new_value,
                                     session_pnl, collateral,
                                 ) {
-                                    info!("🚫 MakerQuote [{}]: net exposure risk check failed (YES=${:.2} NO=${:.2})",
-                                        strategy_name, yes_inv_value + yes_new_value, no_inv_value + no_new_value);
+                                    if should_log_maker_exposure_reject() {
+                                        info!("🚫 MakerQuote [{}]: net exposure risk check failed (YES=${:.2} NO=${:.2})",
+                                            strategy_name, yes_inv_value + yes_new_value, no_inv_value + no_new_value);
+                                    }
                                     continue;
                                 }
 

@@ -1,0 +1,370 @@
+// ============================================================================
+// CONSERVATIVE CONFIG EXAMPLE
+// ============================================================================
+//
+// Designed for users who want to minimize risk and drawdown while learning
+// the bot's behavior. Lower position sizes, tighter filters, fewer strategies.
+//
+// Good for: first-time users, small wallets (<$100), high-volatility markets.
+//
+// To use: copy this file to src/config.rs, then `cargo build --release`.
+// ============================================================================
+
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+use std::time::Duration as StdDuration;
+
+// ============================================================================
+// NOTIFICATION SETTINGS (Telegram)
+// ============================================================================
+
+pub const ENABLE_TELEGRAM: bool = true;
+
+// ============================================================================
+// ARBITRAGE STRATEGY PARAMETERS
+// ============================================================================
+
+/// Dry-run mode — logs trades without executing them on-chain.
+/// ⚠️ Set to `false` only after validating signals in ghost mode for 30+ minutes.
+pub const GHOST_MODE: bool = false;
+
+/// Requires a wider margin before entering arbitrage — fewer trades, higher quality.
+pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.07);
+
+pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.96);
+
+/// Minimum shares and order size (exchange minimums — do not lower).
+pub const MIN_ORDER_SHARES: Decimal = dec!(1.0);
+pub const MIN_ORDER_USDC: Decimal = dec!(1.05);
+
+/// Requires 90% book depth before firing — very conservative on thin markets.
+pub const MIN_LIQUIDITY_FILL_RATIO: Decimal = dec!(0.90);
+
+pub const BUY_PRICE_OFFSET: Decimal = dec!(0.01);
+pub const MOMENTUM_BUY_PRICE_OFFSET: Decimal = dec!(0.02);
+pub const MOMENTUM_ENTRY_FAK_RETRIES: u32 = 1;
+pub const MAX_BUY_LIMIT_PRICE: Decimal = dec!(0.95);
+pub const SELL_PRICE_OFFSET: Decimal = dec!(0.01);
+pub const MIN_SELL_LIMIT_PRICE: Decimal = dec!(0.01);
+pub const EARLY_EXIT_COMBINED_BID_THRESHOLD: Decimal = dec!(0.995);
+
+
+// ============================================================================
+// MOMENTUM & ORACLE SETTINGS (Predictive Arbitrage)
+// ============================================================================
+
+/// Momentum is disabled in conservative mode — it's the riskiest strategy.
+pub const ENABLE_MOMENTUM_TRADING: bool = false;
+
+pub const MOMENTUM_KELLY_MAX_MULTIPLIER: Decimal = dec!(2.0);
+pub const MOMENTUM_MIN_TRADE_SIZE_USDC: Decimal = dec!(3.0);
+pub const MOMENTUM_MAX_TRADE_SIZE_USDC: Decimal = dec!(10.0);
+
+/// Requires 3 consecutive confirming ticks to filter fakeouts aggressively.
+pub const MOMENTUM_CONFIRMATION_TICKS: u32 = 3;
+
+pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.06);
+pub const MOMENTUM_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
+
+/// Requires a very strong reversal before exiting — avoids shaking out on noise.
+pub const MOMENTUM_REVERSAL_RATIO: Decimal = dec!(1.00);
+pub const MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL: i64 = 60;
+pub const MOMENTUM_TAKE_PROFIT_CEILING: Decimal = dec!(0.90);
+
+/// Tighter strike buffers — only trade when well away from the strike.
+pub const BTC_STRIKE_BUFFER: Decimal = dec!(100.0);
+pub const ETH_STRIKE_BUFFER: Decimal = dec!(8.0);
+pub const SOL_STRIKE_BUFFER: Decimal = dec!(0.5);
+
+/// Lower max entry price — better risk/reward at conservative prices.
+pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.80);
+pub const MAX_MOMENTUM_CROSSING_ENTRY_PRICE: Decimal = dec!(0.65);
+
+pub const MOMENTUM_WINDOW_SECS: u64 = 5;
+pub const MOMENTUM_SHORT_WINDOW_SECS: u64 = 1;
+pub const MOMENTUM_SHORT_WINDOW_FRACTION: Decimal = dec!(0.50);
+pub const MOMENTUM_ACCELERATION_BYPASS_MULTIPLIER: Decimal = dec!(3.5);
+pub const MOMENTUM_DECAY_EXIT_FRACTION: Decimal = dec!(0.30);
+
+/// Higher threshold — only the strongest BTC moves trigger entry.
+pub const BTC_MOMENTUM_THRESHOLD: Decimal = dec!(100.0);
+pub const ETH_MOMENTUM_THRESHOLD: Decimal = dec!(5.0);
+pub const SOL_MOMENTUM_THRESHOLD: Decimal = dec!(0.5);
+
+
+// ============================================================================
+// MAKER (PASSIVE LIMIT ORDER) STRATEGY PARAMETERS
+// ============================================================================
+
+pub const ENABLE_MAKER_TRADING: bool = true;
+
+/// Requires a wider spread before posting — more edge per fill.
+pub const MAKER_MIN_SPREAD: Decimal = dec!(0.05);
+pub const MAKER_BID_IMPROVEMENT: Decimal = dec!(0.01);
+pub const MAKER_BID_IMPROVEMENT_RATIO: Decimal = dec!(0.25);
+pub const MAKER_MIN_BID_IMPROVEMENT: Decimal = dec!(0.01);
+pub const MAKER_MAX_BID_IMPROVEMENT: Decimal = dec!(0.02);
+pub const CROSSES_BOOK_COOLDOWN_SECS: i64 = 60;
+
+/// Won't post maker orders within 45 minutes of expiry.
+pub const MAKER_MIN_SECS_TO_EXPIRY: i64 = 2700;
+
+/// Lower max entry price — only post bids on genuinely uncertain markets.
+pub const MAKER_MAX_ENTRY_PRICE: Decimal = dec!(0.48);
+pub const MAKER_MIN_ENTRY_PRICE: Decimal = dec!(0.10);
+
+pub const MAKER_TARGET_PROFIT_PERCENT: Decimal = dec!(0.10);
+pub const MAKER_STOP_LOSS_PERCENT: Decimal = dec!(0.05);
+
+/// Longer hold before stop-loss can fire — avoids cutting on noise.
+pub const MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 900;
+pub const MAKER_STOP_LOSS_COOLDOWN_SECS: i64 = 900;
+pub const MAKER_MAX_COMBINED_BID: Decimal = dec!(0.88);
+pub const MAKER_INVENTORY_SKEW_MAX: Decimal = dec!(0.02);
+
+/// Waits 10 minutes after market open before posting any maker orders.
+pub const MAKER_MIN_MARKET_AGE_SECS: i64 = 600;
+pub const MOMENTUM_MIN_MARKET_AGE_SECS: i64 = 600;
+
+
+// ============================================================================
+// BASIS / FUNDING RATE STRATEGY PARAMETERS
+// ============================================================================
+
+/// Basis disabled in conservative mode — requires more experience to calibrate.
+pub const ENABLE_BASIS_TRADING: bool = false;
+
+/// Higher skew required before considering a fade.
+pub const BASIS_ENTRY_SKEW_THRESHOLD: Decimal = dec!(0.10);
+
+pub const BASIS_NEGATIVE_FUNDING_THRESHOLD: Decimal = dec!(-0.0001);
+pub const BASIS_POSITIVE_FUNDING_THRESHOLD: Decimal = dec!(0.0001);
+
+/// More conservative velocity filter — only fades truly flat markets.
+pub const BASIS_BTC_MAX_VELOCITY: Decimal = dec!(20.0);
+pub const BASIS_ETH_MAX_VELOCITY: Decimal = dec!(1.0);
+pub const BASIS_SOL_MAX_VELOCITY: Decimal = dec!(0.1);
+
+pub const BASIS_BTC_ORACLE_STRIKE_BUFFER: Decimal = dec!(150.0);
+pub const BASIS_ETH_ORACLE_STRIKE_BUFFER: Decimal = dec!(8.0);
+pub const BASIS_SOL_ORACLE_STRIKE_BUFFER: Decimal = dec!(0.4);
+
+pub const BASIS_MAX_ENTRY_PRICE: Decimal = dec!(0.55);
+pub const BASIS_TARGET_PROFIT_PERCENT: Decimal = dec!(0.08);
+pub const BASIS_STOP_LOSS_PERCENT: Decimal = dec!(0.06);
+pub const BASIS_SKEW_COLLAPSE_THRESHOLD: Decimal = dec!(0.04);
+pub const BASIS_MIN_SECS_TO_EXPIRY: i64 = 1800;
+pub const BASIS_MIN_TRADE_SIZE_USDC: Decimal = dec!(3.0);
+pub const BASIS_MAX_TRADE_SIZE_USDC: Decimal = dec!(8.0);
+pub const BASIS_KELLY_MAX_MULTIPLIER: Decimal = dec!(2.0);
+pub const BASIS_MAX_TAKER_FEE_BPS: u32 = 100;
+pub const BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 60;
+pub const BASIS_FUNDING_POLL_SECS: u64 = 60;
+
+
+// ============================================================================
+// TIME DECAY (THETA) STRATEGY PARAMETERS
+// ============================================================================
+
+pub const ENABLE_TIME_DECAY_TRADING: bool = true;
+
+pub const MIN_TIME_DECAY_NET_PROFIT: Decimal = dec!(0.004);
+pub const MAX_TIME_DECAY_COMBINED_ASK: Decimal = dec!(1.005);
+
+/// Tighter window — only trades very close to expiry with high convergence confidence.
+pub const TIME_DECAY_CONVERGENCE_WINDOW_SECS: i64 = 900;
+pub const TIME_DECAY_CONVERGENCE_EXIT_BID: Decimal = dec!(0.998);
+pub const TIME_DECAY_MIN_SECS_TO_EXPIRY: i64 = 240;
+pub const TIME_DECAY_MAX_SECS_TO_EXPIRY: i64 = 900;
+
+/// Smaller positions and lower total exposure.
+pub const TIME_DECAY_POSITION_SIZE_USDC: Decimal = dec!(8);
+pub const TIME_DECAY_TARGET_PROFIT_PERCENT: Decimal = dec!(0.015);
+pub const TIME_DECAY_MAX_TOTAL_EXPOSURE_USDC: Decimal = dec!(24);
+pub const TIME_DECAY_MAX_POSITIONS: usize = 3;
+pub const TIME_DECAY_STOP_LOSS_PERCENT: Decimal = dec!(0.02);
+
+
+// ============================================================================
+// EMERGENCY CIRCUIT BREAKERS
+// ============================================================================
+
+pub const MAX_CONSECUTIVE_FAILURES: u32 = 2;
+pub const FAILURE_COOLDOWN_SECS: i64 = 120;
+
+
+// ============================================================================
+// TRADING PARAMETERS - Price Thresholds and Position Sizing
+// ============================================================================
+
+pub const SHARE_SCALE: Decimal = dec!(1_000_000);
+
+
+// ============================================================================
+// POSITION DURATION AND TIMING (Seconds)
+// ============================================================================
+
+pub const TRADE_COOLDOWN_SECS: i64 = 15;
+pub const PARTIAL_FILL_COOLDOWN_SECS: i64 = 60;
+pub const MIN_SECONDS_TO_EXPIRY_FOR_ENTRY: i64 = 600;
+pub const MAX_SECONDS_TO_EXPIRY_FOR_ENTRY: i64 = 14400;
+pub const FINAL_EXPIRY_WINDOW_SECS: i64 = 900;
+pub const MARKET_EXPIRY_SAFETY_BUFFER_SECS: i64 = 300;
+
+
+// ============================================================================
+// INTERVAL TIMINGS
+// ============================================================================
+
+pub fn market_switch_interval() -> StdDuration {
+    StdDuration::from_secs(120)
+}
+
+pub fn periodic_sync_interval() -> StdDuration {
+    StdDuration::from_secs(300)
+}
+
+pub fn main_ticker_interval() -> StdDuration {
+    StdDuration::from_millis(100)
+}
+
+
+// ============================================================================
+// MONITORING AND LOGGING INTERVALS
+// ============================================================================
+
+pub fn status_log_interval() -> StdDuration {
+    StdDuration::from_secs(60)
+}
+
+
+// ============================================================================
+// WEBSOCKET AND CONNECTION TIMEOUTS
+// ============================================================================
+
+pub fn http_timeout() -> StdDuration {
+    StdDuration::from_secs(20)
+}
+
+pub fn tcp_keepalive() -> StdDuration {
+    StdDuration::from_secs(30)
+}
+
+
+// ============================================================================
+// RISK MANAGEMENT THRESHOLDS
+// ============================================================================
+
+pub const MIN_MARKET_VOLUME: f64 = 0.0;
+pub const MAX_EXPOSURE_PER_TOKEN_USDC: Decimal = dec!(10);
+
+// Smaller per-strategy budgets across the board.
+pub const MOMENTUM_MAX_EXPOSURE_USDC: Decimal = dec!(10);
+pub const MAKER_MAX_EXPOSURE_USDC: Decimal = dec!(8);
+pub const ARBITRAGE_MAX_EXPOSURE_USDC: Decimal = dec!(20);
+pub const TIME_DECAY_MAX_EXPOSURE_USDC: Decimal = dec!(24);
+pub const BASIS_MAX_EXPOSURE_USDC: Decimal = dec!(10);
+
+/// Session drawdown limit: 0.75% of collateral with $3 minimum.
+pub fn max_session_drawdown(collateral: Decimal) -> Decimal {
+    (collateral * dec!(0.0075)).max(dec!(3.00))
+}
+
+
+// ============================================================================
+// API ENDPOINTS AND URLS
+// ============================================================================
+
+pub const CLOB_API_BASE: &str = "https://clob.polymarket.com";
+
+
+// ============================================================================
+// MARKET FILTERING CRITERIA
+// ============================================================================
+
+pub const GAMMA_API_MARKET_SCAN_PAGES: usize = 30;
+
+pub fn is_bad_market(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("presidential") || n.contains("nomination") || n.contains("election") ||
+        n.contains("democratic") || n.contains("republican") ||
+        n.contains("masters") || n.contains("tournament") || n.contains("spieth") || n.contains("jordan") ||
+        n.contains("5-minute") || n.contains("5 minute") || n.contains("5m")
+}
+
+pub fn is_long_term_2026(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("2026") && (n.contains("win the") || n.contains("finals") || n.contains("cup") || n.contains("stanley"))
+}
+
+pub fn is_range_market(name: &str) -> bool {
+    let n = name.to_lowercase();
+    (n.contains("between") && n.contains("and $")) ||
+    (n.contains("price of") && n.contains("between")) ||
+    (n.contains("will") && (n.contains("above $") || n.contains("below $")) && !n.contains("up or down"))
+}
+
+pub fn is_hourly_crypto_market(name: &str) -> bool {
+    let n = name.to_lowercase();
+    is_crypto_market(&n) && (
+        n.contains("up or down") ||
+            n.contains("hour") ||
+            n.contains("et") ||
+            n.contains("pm et") ||
+            n.contains("am et")
+    )
+}
+
+pub fn is_high_priority_text(s: &str) -> bool {
+    let n = s.to_lowercase();
+    n.contains("up or down") ||
+        n.contains("5 minutes") ||
+        n.contains("5m") ||
+        n.contains("updown") ||
+        n.contains("next 5") ||
+        n.contains("next hour")
+}
+
+pub fn is_crypto_market(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("btc") || n.contains("bitcoin") ||
+        n.contains("eth") || n.contains("ethereum") ||
+        n.contains("sol") || n.contains("solana")
+}
+
+pub fn is_ultra_short_window_market(name: &str) -> bool {
+    let n = name.to_lowercase();
+
+    if n.contains("15 minutes") || n.contains("15 minute") {
+        return true;
+    }
+
+    let has_et = n.contains(" et");
+    let has_range = n.contains('-');
+    let has_time_marker = n.contains("am") || n.contains("pm");
+    let has_minutes = n.contains(':');
+
+    has_et && has_range && has_time_marker && has_minutes
+}
+
+
+// ============================================================================
+// SLEEP AND RETRY DURATIONS
+// ============================================================================
+
+pub fn retry_sleep_duration() -> StdDuration {
+    StdDuration::from_secs(5)
+}
+
+pub fn startup_delay() -> StdDuration {
+    StdDuration::from_secs(10)
+}
+
+pub fn connector_init_delay() -> StdDuration {
+    StdDuration::from_secs(10)
+}
+
+pub fn order_execution_delay() -> StdDuration {
+    StdDuration::from_millis(500)
+}
+
