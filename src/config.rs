@@ -249,6 +249,10 @@ pub const MAKER_INVENTORY_SKEW_MAX: Decimal = dec!(0.03);
 /// often have wild, unstable pricing (large swings) — entering during this phase
 /// leads to buying local peaks that immediately revert.
 pub const MAKER_MIN_MARKET_AGE_SECS: i64 = 600; // 10 minutes
+/// Minimum seconds since bot first observed a market before MomentumStrategy
+/// will place entry orders.  Prevents 500 "could not run the execution" errors
+/// from Polymarket's CLOB when the orderbook is still initializing at market open.
+pub const MOMENTUM_MIN_MARKET_AGE_SECS: i64 = 300; // 5 minutes
 
 
 // ============================================================================
