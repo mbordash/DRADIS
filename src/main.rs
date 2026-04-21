@@ -1000,6 +1000,41 @@ async fn main() -> Result<()> {
                                     trade_size_usdc
                                 };
 
+                                // ── Late-market size reduction ────────────────────────────────────
+                                // When approaching expiry, scale down position size to limit
+                                // adverse-selection exposure in illiquid/decided markets.
+                                // Linear taper: 100% at ≥ LATE_MARKET_SIZE_THRESHOLD_SECS, 50% at
+                                // MIN_SECONDS_TO_EXPIRY_FOR_ENTRY. Maker GTD orders are exempt
+                                // because MAKER_MIN_SECS_TO_EXPIRY already enforces a safe window.
+                                let effective_trade_size = if !is_maker {
+                                    if let Some(close_time) = market_close_time {
+                                        let secs_left = (close_time - Utc::now()).num_seconds().max(0);
+                                        let threshold = config::LATE_MARKET_SIZE_THRESHOLD_SECS;
+                                        let floor = config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY;
+                                        if secs_left < threshold && secs_left >= floor {
+                                            let range = (threshold - floor) as f64;
+                                            let remaining = (secs_left - floor) as f64;
+                                            let scale_f = 0.5 + 0.5 * (remaining / range);
+                                            let scale = Decimal::try_from(scale_f).unwrap_or(dec!(1));
+                                            let scaled = effective_trade_size * scale;
+                                            if scaled < config::MIN_ORDER_USDC {
+                                                debug!("⏸️ ENTRY [{}]: late-market size ${:.2} below MIN_ORDER_USDC — skipping",
+                                                    strategy_name, scaled);
+                                                continue;
+                                            }
+                                            debug!("📉 ENTRY [{}]: late-market size taper {:.0}% ({}s left) → ${:.2}",
+                                                strategy_name, scale_f * 100.0, secs_left, scaled);
+                                            scaled
+                                        } else {
+                                            effective_trade_size
+                                        }
+                                    } else {
+                                        effective_trade_size
+                                    }
+                                } else {
+                                    effective_trade_size
+                                };
+
                                 let shares = effective_trade_size / order_base_price;
                                 if shares < config::MIN_ORDER_SHARES || effective_trade_size < config::MIN_ORDER_USDC { continue; }
                                 if !is_maker && depth < shares * config::MIN_LIQUIDITY_FILL_RATIO { continue; }

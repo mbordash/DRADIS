@@ -118,13 +118,13 @@ impl Strategy for MakerStrategyImpl {
         let yes_qualifies = yes_spread >= config::MAKER_MIN_SPREAD
             && yes_bid_price >= config::MAKER_MIN_ENTRY_PRICE
             && yes_bid_price <= config::MAKER_MAX_ENTRY_PRICE
-            && no_bid <= config::MAKER_MAX_ENTRY_PRICE   // complementary: market not too directional
+            && no_bid <= config::MAKER_MAX_COMPLEMENTARY_PRICE  // complementary: market not too directional
             && !velocity_bias_strong_negative;           // don't post YES into a falling oracle
 
         let no_qualifies = no_spread >= config::MAKER_MIN_SPREAD
             && no_bid_price >= config::MAKER_MIN_ENTRY_PRICE
             && no_bid_price <= config::MAKER_MAX_ENTRY_PRICE
-            && yes_bid <= config::MAKER_MAX_ENTRY_PRICE  // complementary: market not too directional
+            && yes_bid <= config::MAKER_MAX_COMPLEMENTARY_PRICE  // complementary: market not too directional
             && !velocity_bias_strong_positive;           // don't post NO into a rising oracle
 
         if !yes_qualifies && !no_qualifies {
