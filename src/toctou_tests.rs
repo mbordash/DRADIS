@@ -35,6 +35,7 @@ mod tests {
             market_name: "Test Market".to_string(),
             pair_token_id: token_id,
             fill_confirmed_at: None,
+            paired_leg_token_id: None,
         }
     }
 

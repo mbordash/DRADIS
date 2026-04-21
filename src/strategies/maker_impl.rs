@@ -346,6 +346,7 @@ mod tests {
             market_name: "Test".to_string(),
             pair_token_id: yes_token,
             fill_confirmed_at: Some(Utc::now()),
+            paired_leg_token_id: None,
         });
         let ctx = make_ctx(dec!(0.30), dec!(0.40), dec!(0.35), dec!(0.45), 2400, positions);
         let signal = strategy.evaluate_entry(&ctx).await.unwrap();
@@ -375,6 +376,7 @@ mod tests {
             market_name: "Test Market".to_string(),
             pair_token_id: yes_token,
             fill_confirmed_at: Some(Utc::now()),
+            paired_leg_token_id: None,
         });
         let ctx = make_ctx(dec!(0.30), dec!(0.40), dec!(0.55), dec!(0.65), 2400, positions);
         let mut ctx2 = ctx.clone();
@@ -397,6 +399,7 @@ mod tests {
             market_name: "Test Market".to_string(),
             pair_token_id: yes_token,
             fill_confirmed_at: Some(Utc::now()),
+            paired_leg_token_id: None,
         });
         let ctx = make_ctx(dec!(0.30), dec!(0.40), dec!(0.55), dec!(0.65), 2400, positions);
         let mut ctx2 = ctx.clone();

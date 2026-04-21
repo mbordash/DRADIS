@@ -24,6 +24,10 @@ pub struct Position {
     pub pair_token_id: U256,
     /// When the position balance was confirmed on-chain
     pub fill_confirmed_at: Option<DateTime<Utc>>,
+    /// For paired strategies (Arbitrage, TimeDecay): token ID of the complementary leg.
+    /// If Some, this position is part of a hedged pair. Used to detect orphaned positions
+    /// when the paired leg fails to fill.
+    pub paired_leg_token_id: Option<U256>,
 }
 
 /// Compound key for the shared position map: (strategy_name, token_id).
