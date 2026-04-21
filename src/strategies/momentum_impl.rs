@@ -147,6 +147,28 @@ impl Strategy for MomentumStrategyImpl {
             }
 
             let profit_margin = (position_bid - avg_entry) / avg_entry;
+
+            // ── Near-expiry forced exit ───────────────────────────────────────
+            // If the market is within MOMENTUM_EXPIRY_EXIT_SECS of close AND the
+            // position is not sufficiently profitable, exit immediately.
+            // This prevents the "ride to zero at binary resolution" failure mode
+            // where a position hovers just above the stop-loss then goes to $0.
+            if let Some(close_time) = ctx.market.market_close_time {
+                let secs_to_expiry = (close_time - chrono::Utc::now()).num_seconds();
+                if secs_to_expiry <= config::MOMENTUM_EXPIRY_EXIT_SECS
+                    && profit_margin < config::MOMENTUM_EXPIRY_MIN_PROFIT_TO_HOLD
+                {
+                    return Ok(StrategySignal::Exit {
+                        token_id: *token_id,
+                        reason: format!(
+                            "NearExpiry: {}s to close, profit={:.2}% < hold threshold {:.2}% — exiting to avoid binary resolution risk",
+                            secs_to_expiry,
+                            profit_margin * dec!(100),
+                            config::MOMENTUM_EXPIRY_MIN_PROFIT_TO_HOLD * dec!(100),
+                        ),
+                    });
+                }
+            }
             let target = if avg_entry >= dec!(0.70) {
                 dec!(0.05)
             } else {
