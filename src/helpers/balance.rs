@@ -14,7 +14,7 @@ use tracing::{info, warn};
 use polymarket_client_sdk::clob::{Client as ClobClient};
 use polymarket_client_sdk::auth::state::Authenticated;
 use polymarket_client_sdk::auth::Normal;
-use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
+use polymarket_client_sdk::clob::types::request::{BalanceAllowanceRequest, OrdersRequest};
 use polymarket_client_sdk::clob::types::AssetType;
 
 pub use crate::state::{Position, PositionMap};
@@ -104,10 +104,27 @@ pub async fn sync_position_balance(
                               strategy_name, token_id, pos.fill_confirmed_at);
                         return Ok(());
                     } else if time_since_open >= max_wait_secs {
-                        warn!("⚠️ Position Sync FAILED [{}]: Token {} balance still 0 after {}s. Order never filled on-chain. Removing phantom position.",
-                              strategy_name, token_id, time_since_open);
-                        pos_map.remove(&key);
+                        // Before declaring phantom, check if a resting GTD order
+                        // still exists in the CLOB for this token. If so, the order
+                        // hasn't filled yet but is live — do not remove the position.
                         drop(pos_map);
+                        let orders_req = OrdersRequest::builder()
+                            .asset_id(token_id)
+                            .build();
+                        let has_resting_order = match client.orders(&orders_req, None).await {
+                            Ok(page) => !page.data.is_empty(),
+                            Err(_) => false, // if API fails, err on the side of caution and remove
+                        };
+                        if has_resting_order {
+                            warn!("⏳ Position Sync [{}]: Token {} balance still 0 after {}s but resting GTD order found in CLOB — keeping position alive.",
+                                  strategy_name, token_id, time_since_open);
+                            tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
+                            continue;
+                        }
+                        warn!("⚠️ Position Sync FAILED [{}]: Token {} balance still 0 after {}s and no open orders in CLOB. \
+                               Order was silently discarded (likely post-only crossed book at placement). Removing phantom position.",
+                              strategy_name, token_id, time_since_open);
+                        positions.lock().await.remove(&key);
                         if let Some(cooldowns) = phantom_cooldowns {
                             cooldowns.lock().await.insert(strategy_name.to_string(), Instant::now());
                         }

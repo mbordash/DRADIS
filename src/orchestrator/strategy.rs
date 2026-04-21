@@ -12,7 +12,7 @@ use tokio::sync::Mutex;
 /// Context passed to strategies containing all market data and shared state they need.
 #[derive(Clone)]
 pub struct StrategyContext {
-    /// Current market configuration and metadata (hourly market — used by all strategies)
+    /// Current market configuration and metadata
     pub market: MarketConfig,
     /// Current market snapshot (prices, oracle, velocity)
     pub snapshot: MarketSnapshot,
@@ -23,12 +23,13 @@ pub struct StrategyContext {
     /// Timestamp when the bot started trading the current market.
     /// Used by strategies to enforce a minimum market maturation period before entry.
     pub market_started_at: DateTime<Utc>,
-    /// Optional alternative market for the Maker strategy.
-    /// When Some, MakerStrategy uses this window/daily market instead of `market`.
-    /// All other strategies ignore this field.
+    /// Optional dedicated maker venue (window or daily market).
+    /// When set, MakerStrategy uses this market for GTD order placement instead of
+    /// the primary hourly market. This gives passive orders more time to fill and
+    /// avoids the thin liquidity at hourly market open.
     pub maker_market: Option<MarketConfig>,
-    /// Live price snapshot for the maker_market venue.
-    /// Populated only when maker_market is Some.
+    /// Live orderbook snapshot for the maker venue.
+    /// Paired with maker_market — always Some when maker_market is Some, None otherwise.
     pub maker_snapshot: Option<MarketSnapshot>,
 }
 
