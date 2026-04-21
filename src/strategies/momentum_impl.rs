@@ -129,6 +129,32 @@ impl Strategy for MomentumStrategyImpl {
                 continue; // Not a token in this market
             };
 
+            // ── Fill confirmation gate ────────────────────────────────────────
+            // FAK orders fill immediately on-chain but the Polymarket indexer
+            // can take several seconds to reflect the balance.  If we attempt
+            // to exit before confirmation, the sell returns "not enough balance"
+            // and the position is incorrectly removed as a phantom — even though
+            // shares were actually received.
+            //
+            // Rule: block ALL exits until fill_confirmed_at is set, EXCEPT allow
+            // a stop-loss after MOMENTUM_FILL_CONFIRM_MIN_HOLD_SECS (a safety
+            // window that gives the indexer time to settle without leaving a
+            // large loss completely unprotected).
+            let secs_held = (chrono::Utc::now() - position.opened_at).num_seconds();
+            if position.fill_confirmed_at.is_none() {
+                if secs_held < config::MOMENTUM_FILL_CONFIRM_MIN_HOLD_SECS {
+                    continue; // too early — wait for on-chain confirmation
+                }
+                // After the minimum hold, only a deep stop-loss is allowed.
+                // Take-profit and decay exits need confirmed fill to fire.
+                let stop_loss = -config::MOMENTUM_STOP_LOSS_PERCENT;
+                let profit_margin_check = (position_bid - position.avg_entry) / position.avg_entry;
+                if profit_margin_check > stop_loss {
+                    continue; // not in stop-loss territory, keep waiting for confirmation
+                }
+                // Fall through — deep stop-loss is allowed even without confirmation.
+            }
+
             let avg_entry = position.avg_entry;
             let velocity = ctx.snapshot.velocity;
             let velocity_1s = ctx.snapshot.velocity_1s;
