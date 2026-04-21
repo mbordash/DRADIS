@@ -240,6 +240,7 @@ pub async fn reconcile_orphaned_positions(
                 market_name: market_name.to_string(),
                 pair_token_id: token_id,
                 fill_confirmed_at: Some(Utc::now()), // already confirmed on-chain
+                paired_leg_token_id: None, // reconciled orphans are single-leg (not part of a pair)
             });
             warn!(
                 "🔁 RECONCILE: Adopted {} orphaned {} shares for token {} under [{}] on \"{}\"",

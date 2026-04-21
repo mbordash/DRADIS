@@ -12,6 +12,9 @@ use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus};
 use crate::config;
 
+/// Strategy identifier constant
+const STRATEGY_NAME: &str = "ArbitrageStrategy";
+
 /// Implements Strategy trait for Arbitrage trading
 pub struct ArbitrageStrategyImpl;
 
@@ -46,8 +49,8 @@ impl Strategy for ArbitrageStrategyImpl {
         let positions: MutexGuard<PositionMap> = ctx.positions.lock().await;
 
         // Only look at ArbitrageStrategy-owned positions
-        let yes_key = ("ArbitrageStrategy".to_string(), ctx.market.yes_token);
-        let no_key  = ("ArbitrageStrategy".to_string(), ctx.market.no_token);
+        let yes_key = (STRATEGY_NAME.to_string(), ctx.market.yes_token);
+        let no_key  = (STRATEGY_NAME.to_string(), ctx.market.no_token);
 
         let yes_combined_bid = if positions.contains_key(&yes_key) { ctx.snapshot.yes_bid } else { dec!(0) };
         let no_combined_bid  = if positions.contains_key(&no_key)  { ctx.snapshot.no_bid  } else { dec!(0) };
@@ -76,7 +79,7 @@ impl Strategy for ArbitrageStrategyImpl {
 
     /// Strategy name for logging
     fn name(&self) -> String {
-        "ArbitrageStrategy".to_string()
+        STRATEGY_NAME.to_string()
     }
 }
 
@@ -88,13 +91,13 @@ fn is_arbitrage_profitable(
     no_fee_bps: u32,
 ) -> bool {
     let combined_ask = yes_ask + no_ask;
-    let profit_margin_no_fees = dec!(1.0) - combined_ask;
+    let gross_profit = dec!(1.0) - combined_ask;
 
     let yes_fee = yes_ask * (rust_decimal::Decimal::from(yes_fee_bps) / dec!(10_000));
     let no_fee = no_ask * (rust_decimal::Decimal::from(no_fee_bps) / dec!(10_000));
-    let profit_margin_with_fees = profit_margin_no_fees - (yes_fee + no_fee);
+    let net_profit = gross_profit - (yes_fee + no_fee);
 
-    profit_margin_with_fees >= config::ARBITRAGE_PROFIT_THRESHOLD
+    net_profit >= config::ARBITRAGE_PROFIT_THRESHOLD
 }
 
 /// Helper: Check if we should exit arbitrage position
@@ -159,7 +162,7 @@ mod tests {
         // Create context with positions that should trigger exit
         let mut positions = PositionMap::new();
         positions.insert(
-            ("ArbitrageStrategy".to_string(), yes_token),
+            (STRATEGY_NAME.to_string(), yes_token),
             Position {
                 shares: dec!(100),
                 avg_entry: dec!(0.40),
@@ -168,10 +171,11 @@ mod tests {
                 market_name: "Test".to_string(),
                 pair_token_id: yes_token,
                 fill_confirmed_at: None,
+                paired_leg_token_id: Some(no_token),
             },
         );
         positions.insert(
-            ("ArbitrageStrategy".to_string(), no_token),
+            (STRATEGY_NAME.to_string(), no_token),
             Position {
                 shares: dec!(100),
                 avg_entry: dec!(0.45),
@@ -180,6 +184,7 @@ mod tests {
                 market_name: "Test".to_string(),
                 pair_token_id: no_token,
                 fill_confirmed_at: None,
+                paired_leg_token_id: Some(yes_token),
             },
         );
 

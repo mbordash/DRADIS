@@ -212,6 +212,7 @@ mod tests {
                 market_name: "Test".to_string(),
                 pair_token_id: yes_token,
                 fill_confirmed_at: None,
+                paired_leg_token_id: Some(no_token),
             },
         );
         positions.insert(
@@ -224,6 +225,7 @@ mod tests {
                 market_name: "Test".to_string(),
                 pair_token_id: no_token,
                 fill_confirmed_at: None,
+                paired_leg_token_id: Some(yes_token),
             },
         );
 
