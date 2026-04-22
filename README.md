@@ -52,7 +52,9 @@ Uses GTD post-only orders. Exits on take profit (8%) or stop loss (8%).
 
 **Arbitrage** — Buys both YES and NO when the combined ask is cheap enough that the spread covers fees. Hedged position, lower risk. Exits when combined bid converges toward $1.00.
 
-**High-fee market filter**: The strategy skips any market where either leg's taker fee exceeds `ARBITRAGE_MAX_TAKER_FEE_BPS` (200 bps). At 1000 bps (10%) per leg — the rate on BTC/ETH hourly markets — combined asks would need to be below $0.82 to net any profit, which essentially never happens on a liquid book. Evaluating those markets is wasted computation.
+Operates on the **same window/daily venue as MakerStrategy** when one is available, falling back to the hourly market otherwise. Window and daily markets typically charge much lower taker fees than hourly BTC/ETH markets, making the combined-ask profitability threshold actually reachable.
+
+**High-fee market filter**: The strategy skips any market where either leg's taker fee exceeds `ARBITRAGE_MAX_TAKER_FEE_BPS` (200 bps). At 1000 bps (10%) per leg — the rate on BTC/ETH hourly markets — combined asks would need to be below $0.82 to net any profit, which essentially never happens on a liquid book.
 
 > **Why is YES+NO > $1.00 not exploitable?** The heartbeat logs show the **sum of asks**. When asks sum to $1.01, sellers want $1.01 for tokens that pay $1.00 at settlement — that's a loss for any buyer. To exploit it, you'd need to mint tokens (split $1 USDC → 1 YES + 1 NO) and sell both legs, but you'd be selling at the **bid** prices, which sum to well under $1.00. At 1000 bps fees the math is even worse. The bot watches the **bid sum** for the true signal: if `YES_bid + NO_bid > $1.00` it logs a `🔔 Reverse-Arb Signal` — this almost never happens on liquid markets.
 
@@ -90,7 +92,7 @@ A fast direct-search for the current or next hourly "Bitcoin Up or Down – [Hou
 2. Sweet-spot time window: 30–60 minutes to expiry (enough runway for entries, not so much that pricing is stale)
 3. Highest 24h CLOB volume as a tiebreaker
 
-This is the primary market used by Momentum, Arbitrage, Time Decay, and Basis strategies.
+This is the primary market used by Momentum, Time Decay, and Basis strategies. ArbitrageStrategy also falls back to this venue when no window/daily market is available.
 
 **Pass 2 — Maker market (secondary venue)**
 The full scan also collects any concurrent **window** or **daily** markets for the same crypto, classified by name pattern:
@@ -101,19 +103,19 @@ The full scan also collects any concurrent **window** or **daily** markets for t
 | Window | "Bitcoin Up or Down – April 20, 4:00PM–8:00PM ET" | `Window` |
 | Daily | "Bitcoin Up or Down on April 20?" | `Daily` |
 
-Window markets are preferred over daily (more active book), and within each type the market with **more time remaining** wins. The Maker strategy is then routed to this secondary venue instead of the hourly, because:
+Window markets are preferred over daily (more active book), and within each type the market with **more time remaining** wins. The Maker and Arbitrage strategies are then routed to this secondary venue instead of the hourly, because:
 - Longer time horizons mean slower price discovery — a $100 BTC move barely affects a 4-hour window market's fair value
-- Resting GTD bids have 4× longer to fill before expiry
-- The book reprices more gently, so Maker's combined-price guard and inventory skew are less likely to be stale by the time orders rest
+- For Maker: resting GTD bids have 4× longer to fill before expiry; the book reprices more gently, so Maker's combined-price guard and inventory skew are less likely to be stale by the time orders rest
+- For Arbitrage: window/daily markets typically charge far lower taker fees than hourly BTC/ETH markets (1000 bps), so the combined-ask threshold is actually reachable
 
-If no window or daily market exists, the Maker strategy falls back to the hourly market (but will largely be dormant due to the 15-minute expiry gate).
+If no window or daily market exists, both Maker and Arbitrage fall back to the hourly market (Maker largely dormant due to the 15-minute expiry gate; Arbitrage skipped by the 200 bps fee gate on BTC/ETH hourly markets).
 
 **What you see in logs:**
 ```
 🏆 Selected market: "Bitcoin Up or Down - April 20, 7PM ET"       ← hourly (primary)
 🏦 Maker Window market selected: "Bitcoin Up or Down - April 20, 4:00PM-8:00PM ET"  ← maker venue
 ```
-Both markets subscribe separate WS orderbook feeds. The hourly feeds drive Momentum/Arb/TimeDecay/Basis; the maker feeds drive MakerStrategy exclusively.
+Both markets subscribe separate WS orderbook feeds. The hourly feeds drive Momentum/TimeDecay/Basis; the maker feeds drive MakerStrategy and ArbitrageStrategy.
 
 ---
 
@@ -404,7 +406,7 @@ Honest caveats: Python would have been faster to build — the trading bot ecosy
 
 **Why isn't the bot trading?**
 
-Check in order: Is `GHOST_MODE` still true? Is the spread wide enough to beat `ARBITRAGE_PROFIT_THRESHOLD` + fees? Is the orderbook thick enough (`MIN_LIQUIDITY_FILL_RATIO`)? For momentum — is the oracle velocity actually hitting the threshold (`BTC_MOMENTUM_THRESHOLD` = $75/5s) AND the 1s velocity also hitting 40% of that AND acceleration is positive? For maker — is the market less than 5 minutes old (`MAKER_MIN_MARKET_AGE_SECS`)? Is the market closing in less than 15 minutes (`MAKER_MIN_SECS_TO_EXPIRY`)? Is the orderbook heavily skewed (ask depth > 3× bid depth)? Note that Maker runs on a **secondary venue** (window or daily market if available, hourly fallback) — check logs for a `🏦 Maker Window/Daily market selected` line to confirm it has a venue. For arbitrage — is the market fee above 200 bps? Those markets are skipped entirely. For basis — is the YES/NO mid-price more than 6¢ from 0.50, and is Binance velocity below $30/5s? Bump `RUST_LOG=debug` to see what's being filtered.
+Check in order: Is `GHOST_MODE` still true? Is the spread wide enough to beat `ARBITRAGE_PROFIT_THRESHOLD` + fees? Is the orderbook thick enough (`MIN_LIQUIDITY_FILL_RATIO`)? For momentum — is the oracle velocity actually hitting the threshold (`BTC_MOMENTUM_THRESHOLD` = $75/5s) AND the 1s velocity also hitting 40% of that AND acceleration is positive? For maker — is the market less than 5 minutes old (`MAKER_MIN_MARKET_AGE_SECS`)? Is the market closing in less than 15 minutes (`MAKER_MIN_SECS_TO_EXPIRY`)? Is the orderbook heavily skewed (ask depth > 3× bid depth)? Note that Maker runs on a **secondary venue** (window or daily market if available, hourly fallback) — check logs for a `🏦 Maker Window/Daily market selected` line to confirm it has a venue. For arbitrage — both Maker and Arbitrage now run on the **secondary venue** (window or daily market if available). Check logs for a `🏦 Maker Window/Daily market selected` line — if that venue is absent, Arbitrage falls back to hourly which is immediately skipped by the 200 bps fee gate. For basis — is the YES/NO mid-price more than 6¢ from 0.50, and is Binance velocity below $30/5s? Bump `RUST_LOG=debug` to see what's being filtered.
 
 **Orders keep getting rejected**
 
