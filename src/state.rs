@@ -47,15 +47,19 @@ pub type PositionMap = HashMap<PositionKey, Position>;
 pub struct MarketSnapshot {
     /// YES token best bid price
     pub yes_bid: Decimal,
+    /// YES token bid-side depth (shares available at best bid)
+    pub yes_bid_depth: Decimal,
     /// YES token best ask price
     pub yes_ask: Decimal,
-    /// YES token ask-side depth
+    /// YES token ask-side depth (shares available at best ask)
     pub yes_ask_depth: Decimal,
     /// NO token best bid price
     pub no_bid: Decimal,
+    /// NO token bid-side depth (shares available at best bid)
+    pub no_bid_depth: Decimal,
     /// NO token best ask price
     pub no_ask: Decimal,
-    /// NO token ask-side depth
+    /// NO token ask-side depth (shares available at best ask)
     pub no_ask_depth: Decimal,
     /// Current oracle price from Binance
     pub oracle_price: Decimal,

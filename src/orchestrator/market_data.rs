@@ -38,9 +38,11 @@ impl MarketDataBroadcaster {
     pub fn create_snapshot(
         _market: &MarketConfig,
         yes_bid: Decimal,
+        yes_bid_depth: Decimal,
         yes_ask: Decimal,
         yes_ask_depth: Decimal,
         no_bid: Decimal,
+        no_bid_depth: Decimal,
         no_ask: Decimal,
         no_ask_depth: Decimal,
         oracle_price: Decimal,
@@ -51,9 +53,11 @@ impl MarketDataBroadcaster {
     ) -> MarketSnapshot {
         MarketSnapshot {
             yes_bid,
+            yes_bid_depth,
             yes_ask,
             yes_ask_depth,
             no_bid,
+            no_bid_depth,
             no_ask,
             no_ask_depth,
             oracle_price,

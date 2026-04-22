@@ -28,11 +28,17 @@ impl Strategy for ArbitrageStrategyImpl {
         let yes_fee_bps = ctx.market.yes_fee_bps;
         let no_fee_bps = ctx.market.no_fee_bps;
 
+        // Skip markets where fees are so high that combined asks would need to be
+        // unrealistically low (<$0.82 at 1000 bps) to net any profit.
+        // e.g. BTC hourly markets charge 1000 bps — arb is effectively impossible there.
+        if yes_fee_bps > config::ARBITRAGE_MAX_TAKER_FEE_BPS
+            || no_fee_bps > config::ARBITRAGE_MAX_TAKER_FEE_BPS
+        {
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // Check if arbitrage opportunity is profitable
         if is_arbitrage_profitable(yes_ask, no_ask, yes_fee_bps, no_fee_bps) {
-            // For arbitrage, we buy both YES and NO, so return a synthetic signal
-            // In practice, the orchestrator will need to handle buying both sides
-            // We return YES token ID as the entry signal (both sides are implied)
             return Ok(StrategySignal::Entry {
                 token_id: ctx.market.yes_token,
             });
@@ -201,9 +207,11 @@ mod tests {
             },
             snapshot: MarketSnapshot {
                 yes_bid: dec!(0.60),  // Bid has improved
+                yes_bid_depth: dec!(100),
                 yes_ask: dec!(0.61),
                 yes_ask_depth: dec!(100),
                 no_bid: dec!(0.40),   // NO bid has improved
+                no_bid_depth: dec!(100),
                 no_ask: dec!(0.41),
                 no_ask_depth: dec!(100),
                 oracle_price: dec!(0),
@@ -255,9 +263,11 @@ mod tests {
             },
             snapshot: MarketSnapshot {
                 yes_bid: dec!(0.35),
+                yes_bid_depth: dec!(100),
                 yes_ask,
                 yes_ask_depth: dec!(100),
                 no_bid: dec!(0.40),
+                no_bid_depth: dec!(100),
                 no_ask,
                 no_ask_depth: dec!(100),
                 oracle_price: dec!(0),

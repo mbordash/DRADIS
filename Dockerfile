@@ -10,8 +10,25 @@ RUN apk add --no-cache \
     zlib-dev
 RUN rustup target add x86_64-unknown-linux-musl
 WORKDIR /app
-COPY . .
-RUN cargo build --release --target x86_64-unknown-linux-musl
+
+# ── Dependency caching layer ────────────────────────────────────────────────
+# Copy only the manifest files first. Docker will cache this layer and the
+# cargo build below as long as Cargo.toml/Cargo.lock don't change.
+# Changing source files will NOT invalidate the dependency cache.
+COPY Cargo.toml Cargo.lock ./
+
+# Create a minimal stub so `cargo build` can resolve and compile all deps.
+RUN mkdir -p src && echo "fn main() {}" > src/main.rs && \
+    cargo build --release --target x86_64-unknown-linux-musl && \
+    rm -rf src
+
+# ── Application source ──────────────────────────────────────────────────────
+# Copy the real source. Only this layer and the final link step are re-run
+# when source files change.
+COPY src ./src
+# Touch main.rs so cargo knows the source is newer than the cached dep artifacts.
+RUN touch src/main.rs && \
+    cargo build --release --target x86_64-unknown-linux-musl
 
 FROM alpine:latest
 RUN apk --no-cache add ca-certificates

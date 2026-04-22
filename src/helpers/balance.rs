@@ -122,7 +122,7 @@ pub async fn sync_position_balance(
                             continue;
                         }
                         warn!("⚠️ Position Sync FAILED [{}]: Token {} balance still 0 after {}s and no open orders in CLOB. \
-                               Order was silently discarded (likely post-only crossed book at placement). Removing phantom position.",
+                               GTD order expired without a fill, or was silently discarded (e.g. post-only rejected without an API error). Removing phantom position.",
                               strategy_name, token_id, time_since_open);
                         positions.lock().await.remove(&key);
                         if let Some(cooldowns) = phantom_cooldowns {
