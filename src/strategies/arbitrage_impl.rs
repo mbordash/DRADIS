@@ -22,11 +22,15 @@ pub struct ArbitrageStrategyImpl;
 impl Strategy for ArbitrageStrategyImpl {
     /// Evaluate if an arbitrage entry signal should trigger
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
-        // Extract data from context
-        let yes_ask = ctx.snapshot.yes_ask;
-        let no_ask = ctx.snapshot.no_ask;
-        let yes_fee_bps = ctx.market.yes_fee_bps;
-        let no_fee_bps = ctx.market.no_fee_bps;
+        // Prefer the window/daily maker market when available — lower fees, slower book.
+        // Fall back to the hourly market when no maker venue is present.
+        let market   = ctx.maker_market.as_ref().unwrap_or(&ctx.market);
+        let snapshot = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
+
+        let yes_ask = snapshot.yes_ask;
+        let no_ask  = snapshot.no_ask;
+        let yes_fee_bps = market.yes_fee_bps;
+        let no_fee_bps  = market.no_fee_bps;
 
         // Skip markets where fees are so high that combined asks would need to be
         // unrealistically low (<$0.82 at 1000 bps) to net any profit.
@@ -40,7 +44,7 @@ impl Strategy for ArbitrageStrategyImpl {
         // Check if arbitrage opportunity is profitable
         if is_arbitrage_profitable(yes_ask, no_ask, yes_fee_bps, no_fee_bps) {
             return Ok(StrategySignal::Entry {
-                token_id: ctx.market.yes_token,
+                token_id: market.yes_token,
             });
         }
 
@@ -52,19 +56,23 @@ impl Strategy for ArbitrageStrategyImpl {
         use crate::state::PositionMap;
         use tokio::sync::MutexGuard;
 
+        // Use the same venue as entry — maker market preferred, hourly as fallback.
+        let market   = ctx.maker_market.as_ref().unwrap_or(&ctx.market);
+        let snapshot = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
+
         let positions: MutexGuard<PositionMap> = ctx.positions.lock().await;
 
         // Only look at ArbitrageStrategy-owned positions
-        let yes_key = (STRATEGY_NAME.to_string(), ctx.market.yes_token);
-        let no_key  = (STRATEGY_NAME.to_string(), ctx.market.no_token);
+        let yes_key = (STRATEGY_NAME.to_string(), market.yes_token);
+        let no_key  = (STRATEGY_NAME.to_string(), market.no_token);
 
-        let yes_combined_bid = if positions.contains_key(&yes_key) { ctx.snapshot.yes_bid } else { dec!(0) };
-        let no_combined_bid  = if positions.contains_key(&no_key)  { ctx.snapshot.no_bid  } else { dec!(0) };
+        let yes_combined_bid = if positions.contains_key(&yes_key) { snapshot.yes_bid } else { dec!(0) };
+        let no_combined_bid  = if positions.contains_key(&no_key)  { snapshot.no_bid  } else { dec!(0) };
 
         if positions.contains_key(&yes_key) && positions.contains_key(&no_key) {
             if should_arbitrage_exit(yes_combined_bid, no_combined_bid) {
                 return Ok(StrategySignal::Exit {
-                    token_id: ctx.market.yes_token,
+                    token_id: market.yes_token,
                     reason: format!(
                         "Arbitrage convergence: YES bid=${:.4}, NO bid=${:.4}, combined=${:.4}",
                         yes_combined_bid,
