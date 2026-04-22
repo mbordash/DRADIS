@@ -913,14 +913,73 @@ async fn main() -> Result<()> {
                                     }
                                 }
 
-                                // Update positions & PnL (fee-aware)
-                                {
+                                // Update positions & PnL
+                                // FAK exits may partially fill if book depth < order size.
+                                // We remove the position immediately (prevents double-sell on the
+                                // next 50ms tick), then spawn a deferred balance check that
+                                // re-inserts any remaining on-chain shares so the exit handler
+                                // can retry on the next signal rather than letting them expire.
+                                let (removed_avg_entry, removed_shares, removed_close_time) = {
                                     let mut pos_map = positions.lock().await;
                                     if let Some(pos) = pos_map.remove(&pos_key) {
                                         let pnl = (bid - pos.avg_entry) * pos.shares;
                                         *total_pnl.lock().await += pnl;
                                         info!("💰 Position closed [{}]: PnL ${:.4}", strategy_name, pnl);
+                                        (pos.avg_entry, pos.shares, pos.close_time)
+                                    } else {
+                                        (dec!(0), dec!(0), None)
                                     }
+                                };
+                                // Spawn post-sell balance check to catch FAK partial fills
+                                if removed_shares > dec!(0) {
+                                    let positions_ps  = Arc::clone(&positions);
+                                    let client_ps     = Arc::clone(&trading_client);
+                                    let total_pnl_ps  = Arc::clone(&total_pnl);
+                                    let strategy_ps   = strategy_name.clone();
+                                    let token_ps      = *token_id;
+                                    let bid_ps        = bid;
+                                    let mkt_name_ps   = market_name.clone();
+                                    let tg_tok_ps     = tg_token.clone();
+                                    let tg_chat_ps    = tg_chat_id.clone();
+                                    tokio::spawn(async move {
+                                        tokio::time::sleep(Duration::from_millis(2500)).await;
+                                        let mut req = BalanceAllowanceRequest::default();
+                                        req.asset_type = AssetType::Conditional;
+                                        req.token_id = Some(token_ps);
+                                        let remaining = match client_ps.balance_allowance(req).await {
+                                            Ok(resp) => Decimal::from_str(&resp.balance.to_string())
+                                                            .unwrap_or(dec!(0)) / dec!(1_000_000),
+                                            Err(_) => return, // can't confirm — leave removed
+                                        };
+                                        if remaining >= crate::config::MIN_ORDER_SHARES {
+                                            // Partial fill: correct overcounted PnL and re-insert
+                                            let filled = (removed_shares - remaining).max(dec!(0));
+                                            let pnl_correction = -((bid_ps - removed_avg_entry) * remaining);
+                                            *total_pnl_ps.lock().await += pnl_correction;
+                                            warn!("⚠️ PARTIAL EXIT [{}]: FAK sold {:.4}/{:.4} shares; \
+                                                   {:.4} remain on-chain. PnL corrected by ${:.4}. Re-inserting for re-exit.",
+                                                  strategy_ps, filled, removed_shares, remaining, pnl_correction);
+                                            let pos_key_ps = (strategy_ps.clone(), token_ps);
+                                            let mut pos_map = positions_ps.lock().await;
+                                            if !pos_map.contains_key(&pos_key_ps) {
+                                                pos_map.insert(pos_key_ps, Position {
+                                                    shares: remaining,
+                                                    avg_entry: removed_avg_entry,
+                                                    opened_at: Utc::now(),
+                                                    close_time: removed_close_time,
+                                                    market_name: mkt_name_ps,
+                                                    pair_token_id: token_ps,
+                                                    fill_confirmed_at: Some(Utc::now()),
+                                                    paired_leg_token_id: None,
+                                                });
+                                            }
+                                            drop(pos_map);
+                                            let _ = send_notification(&tg_tok_ps, &tg_chat_ps,
+                                                &format!("⚠️ Partial exit [{strategy_ps}]: {filled:.4}/{removed_shares:.4} shares sold. \
+                                                          {remaining:.4} remain on-chain — re-inserted for re-exit."),
+                                            ).await;
+                                        }
+                                    });
                                 }
 
                                 // For paired strategies, also exit the other leg
@@ -947,11 +1006,54 @@ async fn main() -> Result<()> {
                                                 warn!("⚠️ Paired exit order failed: {}", e);
                                             }
                                         }
-                                        let mut pos_map = positions.lock().await;
-                                        if let Some(pos) = pos_map.remove(&pair_key) {
-                                            let pnl = (pair_bid - pos.avg_entry) * pos.shares;
-                                            *total_pnl.lock().await += pnl;
-                                            info!("💰 Paired position closed [{}]: PnL ${:.4}", strategy_name, pnl);
+                                        let (pair_avg, pair_shares_rm, pair_close) = {
+                                            let mut pos_map = positions.lock().await;
+                                            if let Some(pos) = pos_map.remove(&pair_key) {
+                                                let pnl = (pair_bid - pos.avg_entry) * pos.shares;
+                                                *total_pnl.lock().await += pnl;
+                                                info!("💰 Paired position closed [{}]: PnL ${:.4}", strategy_name, pnl);
+                                                (pos.avg_entry, pos.shares, pos.close_time)
+                                            } else { (dec!(0), dec!(0), None) }
+                                        };
+                                        if pair_shares_rm > dec!(0) {
+                                            let positions_pp  = Arc::clone(&positions);
+                                            let client_pp     = Arc::clone(&trading_client);
+                                            let total_pnl_pp  = Arc::clone(&total_pnl);
+                                            let strategy_pp   = strategy_name.clone();
+                                            let mkt_pp        = market_name.clone();
+                                            tokio::spawn(async move {
+                                                tokio::time::sleep(Duration::from_millis(2500)).await;
+                                                let mut req = BalanceAllowanceRequest::default();
+                                                req.asset_type = AssetType::Conditional;
+                                                req.token_id = Some(pair_token);
+                                                let remaining = match client_pp.balance_allowance(req).await {
+                                                    Ok(resp) => Decimal::from_str(&resp.balance.to_string())
+                                                                    .unwrap_or(dec!(0)) / dec!(1_000_000),
+                                                    Err(_) => return,
+                                                };
+                                                if remaining >= crate::config::MIN_ORDER_SHARES {
+                                                    let filled = (pair_shares_rm - remaining).max(dec!(0));
+                                                    let correction = -((pair_bid - pair_avg) * remaining);
+                                                    *total_pnl_pp.lock().await += correction;
+                                                    warn!("⚠️ PARTIAL EXIT (paired) [{}]: FAK sold {:.4}/{:.4} shares; \
+                                                           {:.4} remain. PnL corrected by ${:.4}. Re-inserting.",
+                                                          strategy_pp, filled, pair_shares_rm, remaining, correction);
+                                                    let pk = (strategy_pp.clone(), pair_token);
+                                                    let mut pos_map = positions_pp.lock().await;
+                                                    if !pos_map.contains_key(&pk) {
+                                                        pos_map.insert(pk, Position {
+                                                            shares: remaining,
+                                                            avg_entry: pair_avg,
+                                                            opened_at: Utc::now(),
+                                                            close_time: pair_close,
+                                                            market_name: mkt_pp,
+                                                            pair_token_id: pair_token,
+                                                            fill_confirmed_at: Some(Utc::now()),
+                                                            paired_leg_token_id: None,
+                                                        });
+                                                    }
+                                                }
+                                            });
                                         }
                                     }
                                 }

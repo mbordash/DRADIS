@@ -27,10 +27,7 @@ use crate::config;
 
 /// Velocity threshold (oracle USD/s) above which we consider the market
 /// strongly directional and suppress the adverse maker side.
-/// Reduced from 25 → 8: at $77k BTC, 8 USD/s = $480/min.  That's a meaningful
-/// intra-minute move already underway — fast enough that a resting GTD bid
-/// will likely be adversely selected before the 90s TTL expires.
-const MAKER_VELOCITY_BIAS_THRESHOLD: Decimal = dec!(8.0);
+const MAKER_VELOCITY_BIAS_THRESHOLD: Decimal = dec!(25.0);
 
 pub struct MakerStrategyImpl;
 
@@ -54,7 +51,7 @@ impl Strategy for MakerStrategyImpl {
         // checking how long the bot has been running (conservative).
         let secs_since_market_start = (Utc::now() - ctx.market_started_at).num_seconds();
         if secs_since_market_start < config::MAKER_MIN_MARKET_AGE_SECS {
-            debug!("🚫 MakerStrategy blocked: market too young ({}s < {}s maturation gate)",
+            debug!(" MakerStrategy blocked: market too young ({}s < {}s maturation gate)",
                 secs_since_market_start, config::MAKER_MIN_MARKET_AGE_SECS);
             return Ok(StrategySignal::NoSignal);
         }
@@ -90,7 +87,7 @@ impl Strategy for MakerStrategyImpl {
             && (no_ask_depth  / no_bid_depth)  <= config::MAKER_MAX_BOOK_IMBALANCE_RATIO;
 
         if !yes_book_ok && !no_book_ok {
-            debug!("🚫 MakerStrategy blocked: both sides orderbook heavily skewed (YES ask/bid depth ratio: {:.1}, NO ask/bid: {:.1})",
+            debug!(" MakerStrategy blocked: both sides orderbook heavily skewed (YES ask/bid depth ratio: {:.1}, NO ask/bid: {:.1})",
                 if yes_bid_depth > dec!(0) { yes_ask_depth / yes_bid_depth } else { dec!(99) },
                 if no_bid_depth  > dec!(0) { no_ask_depth  / no_bid_depth  } else { dec!(99) });
             return Ok(StrategySignal::NoSignal);
@@ -140,47 +137,9 @@ impl Strategy for MakerStrategyImpl {
         let yes_bid_price = (yes_bid + yes_improvement - skew).max(dec!(0.01));
         let no_bid_price  = (no_bid  + no_improvement  + skew).max(dec!(0.01));
 
-        // ── Oracle-vs-strike deviation gate ───────────────────────────────────
-        // When the Binance oracle has moved significantly away from the market's
-        // strike price, one side is almost certainly going to lose.  Posting a
-        // bid on the losing side invites adverse selection: informed takers dump
-        // the losing token into our resting bid.
-        //
-        // Rule: if oracle > strike * (1 + THRESHOLD) → oracle is above strike →
-        //       NO is the likely loser → suppress NO bids.
-        //       if oracle < strike * (1 - THRESHOLD) → oracle is below strike →
-        //       YES is the likely loser → suppress YES bids.
-        //
-        // Uses the HOURLY oracle (ctx.snapshot.oracle_price) because that is the
-        // live Binance price feed, regardless of which venue (window/daily) we quote on.
-        let oracle_strike_yes_ok;
-        let oracle_strike_no_ok;
-        if let Some(strike) = market.strike_price {
-            if strike > dec!(0) {
-                let dev = (ctx.snapshot.oracle_price - strike) / strike;
-                // Oracle above strike: NO (BTC stays below) is unlikely → suppress NO
-                oracle_strike_no_ok  = dev <= config::MAKER_MAX_ORACLE_STRIKE_DEVIATION;
-                // Oracle below strike: YES (BTC closes above) is unlikely → suppress YES
-                oracle_strike_yes_ok = dev >= -config::MAKER_MAX_ORACLE_STRIKE_DEVIATION;
-                if !oracle_strike_yes_ok || !oracle_strike_no_ok {
-                    debug!("📐 Oracle deviation {:.4}% vs strike ${:.2} — suppressing {} side",
-                        dev * dec!(100), strike,
-                        if !oracle_strike_yes_ok { "YES" } else { "NO" });
-                }
-            } else {
-                oracle_strike_yes_ok = true;
-                oracle_strike_no_ok  = true;
-            }
-        } else {
-            // No strike price available — don't suppress (can't evaluate deviation)
-            oracle_strike_yes_ok = true;
-            oracle_strike_no_ok  = true;
-        }
-
         // ── Per-side qualification checks ─────────────────────────────────────
         let yes_qualifies = yes_book_ok                             // ask-side not overwhelming bid-side
             && yes_spread >= config::MAKER_MIN_SPREAD
-            && oracle_strike_yes_ok                              // oracle not decisively below strike
             && yes_bid_price >= config::MAKER_MIN_ENTRY_PRICE
             && yes_bid_price <= config::MAKER_MAX_ENTRY_PRICE
             && yes_bid_price < yes_ask               // never cross the book (guards against stale WS + skew edge cases)
@@ -189,7 +148,6 @@ impl Strategy for MakerStrategyImpl {
 
         let no_qualifies = no_book_ok                              // ask-side not overwhelming bid-side
             && no_spread >= config::MAKER_MIN_SPREAD
-            && oracle_strike_no_ok                               // oracle not decisively above strike
             && no_bid_price >= config::MAKER_MIN_ENTRY_PRICE
             && no_bid_price <= config::MAKER_MAX_ENTRY_PRICE
             && no_bid_price < no_ask                // never cross the book (guards against stale WS + skew edge cases)
@@ -229,7 +187,7 @@ impl Strategy for MakerStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
-        debug!("📊 MakerQuote: YES={:?} NO={:?} | imbalance={:.2} skew={:.4}",
+        debug!(" MakerQuote: YES={:?} NO={:?} | imbalance={:.2} skew={:.4}",
             final_yes, final_no, imbalance, skew);
 
         Ok(StrategySignal::MakerQuote {
