@@ -30,9 +30,12 @@ Multi-timeframe confirmation gates (added to filter fakeouts and stale signals):
 - **Acceleration**: velocity must be building (positive delta), or the 5s move must be so large (≥ 2.5× threshold) that it's worth entering even if slightly decelerating
 - Requires 2 consecutive signal ticks to filter single-tick fakeouts
 - **Velocity-decay exit**: if the 1s velocity collapses below 20% of threshold *while in profit*, exit early rather than waiting for a full reversal to eat the gains
-- **Fractional Kelly sizing**: trade size scales with signal strength from `MOMENTUM_MIN_TRADE_SIZE_USDC` ($5) at 1× threshold to `MOMENTUM_MAX_TRADE_SIZE_USDC` ($25) at 4×
+- **Fractional Kelly sizing**: trade size scales with signal strength from `MOMENTUM_MIN_TRADE_SIZE_USDC` ($4) at 1× threshold to `MOMENTUM_MAX_TRADE_SIZE_USDC` ($15) at 3× (`MOMENTUM_KELLY_MAX_MULTIPLIER`)
+- **FAK retry**: if a momentum FAK entry is rejected for insufficient liquidity, the bot bumps the bid price by `MOMENTUM_BUY_PRICE_OFFSET` and retries up to `MOMENTUM_ENTRY_FAK_RETRIES` (2) times before giving up
+- **Late-market size tapering**: when a market is within `LATE_MARKET_SIZE_THRESHOLD_SECS` (30 min) of expiry, entry size scales linearly from 100% down to 50% at `MIN_SECONDS_TO_EXPIRY_FOR_ENTRY` (5 min), limiting exposure on late-session adverse-selection risk
+- **Near-expiry profit guard**: momentum positions entering the expiry window (`MOMENTUM_EXPIRY_EXIT_SECS` = 15 min) must show at least `MOMENTUM_EXPIRY_MIN_PROFIT_TO_HOLD` (2%) profit to be held; otherwise they are force-exited before binary resolution
 
-Exits on take profit (8%), stop loss (20%), velocity reversal (75% of threshold in the opposite direction), or velocity decay.
+Exits on take profit (7%), stop loss (15%), velocity reversal (85% of threshold in the opposite direction), or velocity decay.
 
 **Maker** — Posts passive resting bids on **both YES and NO simultaneously** (two-sided market making) on the **best available slow-moving venue**: a multi-hour window market if one is active, a daily market if not, or the hourly market as a last resort. Filled maker orders also earn daily USDC rebates from Polymarket's Maker Rebates program (paid to your wallet each day, minimum $1 accrued).
 
@@ -46,9 +49,10 @@ Key behaviors:
 - **Net exposure risk**: risk is measured as `|YES_value − NO_value|` (directional imbalance), not gross `YES + NO`. A balanced two-sided book has near-zero directional risk, so the strategy can quote larger notional without increasing drawdown risk.
 - **Market maturation gate**: waits 5 minutes after a new market opens before posting (filters chaotic initial pricing).
 - **Expiry gate**: no new quotes within 15 minutes of market close.
-- **Long GTD TTL**: resting bids stay live for 5 minutes (`MAKER_GTD_TTL_SECS = 300`), giving passive orders a real chance to fill. The balance sync loop keeps the position alive while the order is resting in the CLOB and only declares a phantom after the GTD expires with no fill.
+- **Oracle strike deviation gate**: when the Binance oracle has moved more than `MAKER_MAX_ORACLE_STRIKE_DEVIATION` (0.4%) above the strike, NO is suppressed (BTC is already above the level needed to win); when it has moved that far below the strike, YES is suppressed. This prevents buying the obviously-losing token when the market is already directionally decided.
+- **GTD TTL**: resting bids stay live for 90 seconds (`MAKER_GTD_TTL_SECS = 90`). The shorter TTL limits adverse-selection exposure from oracle drift while the order sits in the CLOB. The balance sync loop keeps the position alive while a resting order exists, and only declares a phantom after both the balance and open-orders checks confirm nothing is on-chain.
 
-Uses GTD post-only orders. Exits on take profit (8%) or stop loss (8%).
+Uses GTD post-only orders. Exits on take profit (8%) or stop loss (7%).
 
 **Arbitrage** — Buys both YES and NO when the combined ask is cheap enough that the spread covers fees. Hedged position, lower risk. Exits when combined bid converges toward $1.00.
 
@@ -58,7 +62,12 @@ Operates on the **same window/daily venue as MakerStrategy** when one is availab
 
 > **Why is YES+NO > $1.00 not exploitable?** The heartbeat logs show the **sum of asks**. When asks sum to $1.01, sellers want $1.01 for tokens that pay $1.00 at settlement — that's a loss for any buyer. To exploit it, you'd need to mint tokens (split $1 USDC → 1 YES + 1 NO) and sell both legs, but you'd be selling at the **bid** prices, which sum to well under $1.00. At 1000 bps fees the math is even worse. The bot watches the **bid sum** for the true signal: if `YES_bid + NO_bid > $1.00` it logs a `🔔 Reverse-Arb Signal` — this almost never happens on liquid markets.
 
-**Time Decay** — Near expiry, YES + NO prices converge toward $1.00. This strategy buys both sides when the combined ask is attractive and rides the convergence. Only active within a configurable time window before market close (default: 4–30 minutes).
+**Time Decay** — Near expiry, YES + NO prices converge toward $1.00. This strategy operates in two modes:
+
+- **Settlement mode** (default): buys both sides when the combined ask is cheap enough that the spread covers fees (`MIN_TIME_DECAY_NET_PROFIT = $0.002` minimum net profit per share). Active within the full entry window (4–30 min to close).
+- **Convergence mode**: activates within the final 20 minutes (`TIME_DECAY_CONVERGENCE_WINDOW_SECS`). Allows combined asks up to `MAX_TIME_DECAY_COMBINED_ASK` ($1.008) — slightly above $1.00 — because profit comes from bid convergence as the book collapses toward $1.00, not from a spread at entry. Exits when combined bid reaches `TIME_DECAY_CONVERGENCE_EXIT_BID` ($0.998).
+
+Supports up to `TIME_DECAY_MAX_POSITIONS` (5) simultaneous positions across different markets.
 
 **Basis / Funding-Rate** — Mean-reversion strategy that fades retail skew using Binance perpetual futures data as a confirming signal.
 
@@ -69,15 +78,13 @@ The core thesis: Polymarket hourly "Up or Down" markets frequently exhibit **ret
 The funding rate is polled from `fapi.binance.com/fapi/v1/premiumIndex` every 60 seconds and injected into every MarketSnapshot as `funding_rate`.
 
 Entry gates (example: YES overpriced):
-1. YES mid-price > 0.50 + `BASIS_ENTRY_SKEW_THRESHOLD` (6¢) — retail significantly over-bet YES
-2. Binance velocity is flat (< `BASIS_BTC_MAX_VELOCITY` = $30/5s) — real moves are not fades
-3. Spot within `BASIS_BTC_ORACLE_STRIKE_BUFFER` ($200) of strike — market not already decided
+1. YES mid-price > 0.50 + `BASIS_ENTRY_SKEW_THRESHOLD` (7¢) — retail significantly over-bet YES
+2. Binance velocity is flat (< `BASIS_BTC_MAX_VELOCITY` = $25/5s for BTC; $1.20/5s for ETH; $0.12/5s for SOL) — real moves are not fades
+3. Spot within `BASIS_BTC_ORACLE_STRIKE_BUFFER` ($175 for BTC; $9 for ETH; $0.45 for SOL) of strike — market not already decided
 4. Funding rate < `BASIS_NEGATIVE_FUNDING_THRESHOLD` (−0.01%/8h), confirming bearish institutional bias — **or** skew ≥ 2× threshold (extreme skew bypasses the funding gate)
-5. NO ask ≤ `BASIS_MAX_ENTRY_PRICE` ($0.60)
+5. NO ask ≤ `BASIS_MAX_ENTRY_PRICE` ($0.58)
 
-Exits: take profit (+6%), stop loss (−10%), **skew-collapse exit** (YES mid returns within 3¢ of 0.50 while in profit — thesis played out early), or expiry guard (<20 min to close).
-
-Uses fractional Kelly sizing: $5 at 1× threshold → $15 at 3× skew.
+Exits: take profit (+7%), stop loss (−9%), **skew-collapse exit** (YES mid returns within 3.5¢ of 0.50 while in profit — thesis played out early), or expiry guard (<25 min to close).
 
 **Custom Strategy** — Develop and link your own strategies within the same codebase. See [CUSTOM_STRATEGY.md](docs/CUSTOM_STRATEGY.md) for a full developer guide: the `Strategy` trait API, all `StrategyContext` fields, the five integration steps, common gotchas, and a ready-to-run test harness.
 
@@ -130,11 +137,11 @@ Each strategy has its own **independent position book** keyed by `(strategy_name
 
 | Strategy | Capital Budget | Risk Model | Order Type |
 |---|---|---|---|
-| MomentumStrategy | `MOMENTUM_MAX_EXPOSURE_USDC` ($50) | Gross one-sided | FAK taker |
-| MakerStrategy | `MAKER_MAX_EXPOSURE_USDC` ($30) | Net \|YES−NO\| | GTD post-only (two-sided) |
-| ArbitrageStrategy | `ARBITRAGE_MAX_EXPOSURE_USDC` ($50 per leg) | Gross hedged | FAK taker |
-| TimeDecayStrategy | `TIME_DECAY_MAX_EXPOSURE_USDC` ($50 per leg) | Gross hedged | FAK taker |
-| BasisStrategy | `BASIS_MAX_EXPOSURE_USDC` ($20) | Gross one-sided | FAK taker |
+| MomentumStrategy | `MOMENTUM_MAX_EXPOSURE_USDC` ($15) | Gross one-sided | FAK taker |
+| MakerStrategy | `MAKER_MAX_EXPOSURE_USDC` ($12) | Net \|YES−NO\| | GTD post-only (two-sided) |
+| ArbitrageStrategy | `ARBITRAGE_MAX_EXPOSURE_USDC` ($35 per leg) | Gross hedged | FAK taker |
+| TimeDecayStrategy | `TIME_DECAY_MAX_EXPOSURE_USDC` ($36 per leg) | Gross hedged | FAK taker |
+| BasisStrategy | `BASIS_MAX_EXPOSURE_USDC` ($15) | Gross one-sided | FAK taker |
 
 ---
 
@@ -162,96 +169,110 @@ TELEGRAM_CHAT_ID=           # optional
 
 **Global**
 
-| Parameter | What it does | Default |
+| Parameter | What it does | Balanced profile |
 |-----------|-------------|---------|
 | `GHOST_MODE` | Log trades without executing | `false` |
-| `TRADE_COOLDOWN_SECS` | Per-strategy seconds between trades | `8` |
+| `TRADE_COOLDOWN_SECS` | Per-strategy seconds between trades | `10` |
 | `MAX_CONSECUTIVE_FAILURES` | Circuit breaker trip count | `3` |
-| `MIN_LIQUIDITY_FILL_RATIO` | Required book depth ratio | `0.80` |
+| `MIN_LIQUIDITY_FILL_RATIO` | Required book depth ratio | `0.85` |
 
 **Per-strategy capital budgets**
 
-| Parameter | Strategy | Default |
+| Parameter | Strategy | Balanced profile |
 |-----------|----------|---------|
-| `MOMENTUM_MAX_EXPOSURE_USDC` | MomentumStrategy | `$50` |
-| `MAKER_MAX_EXPOSURE_USDC` | MakerStrategy | `$30` |
-| `ARBITRAGE_MAX_EXPOSURE_USDC` | ArbitrageStrategy | `$50` per leg |
-| `TIME_DECAY_MAX_EXPOSURE_USDC` | TimeDecayStrategy | `$50` per leg |
-| `BASIS_MAX_EXPOSURE_USDC` | BasisStrategy | `$20` |
+| `MOMENTUM_MAX_EXPOSURE_USDC` | MomentumStrategy | `$15` |
+| `MAKER_MAX_EXPOSURE_USDC` | MakerStrategy | `$12` |
+| `ARBITRAGE_MAX_EXPOSURE_USDC` | ArbitrageStrategy | `$35` per leg |
+| `TIME_DECAY_MAX_EXPOSURE_USDC` | TimeDecayStrategy | `$36` per leg |
+| `BASIS_MAX_EXPOSURE_USDC` | BasisStrategy | `$15` |
 
 **Momentum**
 
-| Parameter | What it does | Default |
+| Parameter | What it does | Balanced profile |
 |-----------|-------------|---------|
 | `MOMENTUM_CONFIRMATION_TICKS` | Consecutive ticks before firing | `2` |
-| `MOMENTUM_TARGET_PROFIT_PERCENT` | Take profit | `8%` |
-| `MOMENTUM_STOP_LOSS_PERCENT` | Stop loss | `20%` |
-| `BTC_MOMENTUM_THRESHOLD` | BTC velocity trigger (USD/5s) | `$75` |
-| `MAX_MOMENTUM_ENTRY_PRICE` | Max token ask for entry | `$0.88` |
+| `MOMENTUM_TARGET_PROFIT_PERCENT` | Take profit | `7%` |
+| `MOMENTUM_STOP_LOSS_PERCENT` | Stop loss | `15%` |
+| `BTC_MOMENTUM_THRESHOLD` | BTC velocity trigger (USD/5s) | `$85` |
+| `MAX_MOMENTUM_ENTRY_PRICE` | Max token ask for entry | `$0.85` |
 | `MOMENTUM_SHORT_WINDOW_SECS` | Short-window confirmation window | `1s` |
-| `MOMENTUM_SHORT_WINDOW_FRACTION` | Min 1s velocity as fraction of threshold | `0.40` (40%) |
-| `MOMENTUM_ACCELERATION_BYPASS_MULTIPLIER` | Bypass accel gate at this signal strength | `2.5×` |
-| `MOMENTUM_DECAY_EXIT_FRACTION` | 1s velocity collapse threshold for early exit | `0.20` (20%) |
-| `MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL` | Min hold before reversal exit can fire | `45s` |
+| `MOMENTUM_SHORT_WINDOW_FRACTION` | Min 1s velocity as fraction of threshold | `0.45` (45%) |
+| `MOMENTUM_ACCELERATION_BYPASS_MULTIPLIER` | Bypass accel gate at this signal strength | `3.0×` |
+| `MOMENTUM_DECAY_EXIT_FRACTION` | 1s velocity collapse threshold for early exit | `0.25` (25%) |
+| `MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL` | Min hold before reversal exit can fire | `35s` |
 | `MOMENTUM_EXPIRY_EXIT_SECS` | Force-exit momentum positions this close to expiry | `900s (15 min)` |
+| `MOMENTUM_EXPIRY_MIN_PROFIT_TO_HOLD` | Min profit % required to hold through expiry window | `2%` |
+| `MOMENTUM_ENTRY_FAK_RETRIES` | Price-bump retries on liquidity-rejected FAK entries | `2` |
+| `MOMENTUM_BUY_PRICE_OFFSET` | Extra price offset per retry bump for momentum FAK orders | `$0.02` |
+| `LATE_MARKET_SIZE_THRESHOLD_SECS` | Seconds-to-expiry at which size tapering begins | `1800s (30 min)` |
 
 **Maker**
 
-| Parameter | What it does | Default |
+| Parameter | What it does | Balanced profile |
 |-----------|-------------|---------|
-| `MAKER_MIN_SPREAD` | Min bid-ask spread on a side to post that side | `$0.03` |
+| `MAKER_MIN_SPREAD` | Min bid-ask spread on a side to post that side | `$0.04` |
 | `MAKER_BID_IMPROVEMENT` | Queue priority over best bid (fallback, zero-spread markets) | `$0.01` |
-| `MAKER_BID_IMPROVEMENT_RATIO` | Spread fraction used as bid improvement | `0.30` |
-| `MAKER_MAX_COMBINED_BID` | Max YES_bid + NO_bid for simultaneous two-sided quote | `$0.90` |
+| `MAKER_BID_IMPROVEMENT_RATIO` | Spread fraction used as bid improvement | `0.28` |
+| `MAKER_MAX_COMBINED_BID` | Max YES_bid + NO_bid for simultaneous two-sided quote | `$0.89` |
 | `MAKER_INVENTORY_SKEW_MAX` | Max per-side price adjustment for inventory rebalancing | `$0.03` |
 | `MAKER_MAX_BOOK_IMBALANCE_RATIO` | Skip bids when ask depth exceeds bid depth by this ratio | `3.0×` |
-| `MAKER_GTD_TTL_SECS` | How long a resting maker bid stays live | `300s (5 min)` |
-| `MAKER_MIN_SECS_TO_EXPIRY` | Don't post within this window of expiry | `900s (15 min)` |
-| `MAKER_MIN_MARKET_AGE_SECS` | Wait this long after market opens before posting | `300s (5 min)` |
-| `MAKER_MAX_ENTRY_PRICE` | Max bid price for entry on either side | `$0.55` |
+| `MAKER_GTD_TTL_SECS` | How long a resting maker bid stays live | `90s` |
+| `MAKER_MIN_SECS_TO_EXPIRY` | Don't post within this window of expiry | `2100s (35 min)` |
+| `MAKER_MIN_MARKET_AGE_SECS` | Wait this long after market opens before posting | `420s (7 min)` |
+| `MAKER_MAX_ENTRY_PRICE` | Max bid price for entry on either side | `$0.52` |
 | `MAKER_MIN_ENTRY_PRICE` | Min bid price for entry (avoids near-zero resolved tokens) | `$0.10` |
 | `MAKER_MAX_COMPLEMENTARY_PRICE` | Max bid on the other side (prevents strongly directional entries) | `$0.65` |
+| `MAKER_MAX_ORACLE_STRIKE_DEVIATION` | Max oracle % deviation from strike before suppressing the losing-side bid | `0.4%` |
 | `MAKER_TARGET_PROFIT_PERCENT` | Take profit | `8%` |
-| `MAKER_STOP_LOSS_PERCENT` | Stop loss | `8%` |
-| `MIN_HOLD_SECS_BEFORE_STOP_LOSS` | Minimum hold time before stop loss activates | `90s` |
-| `MAKER_STOP_LOSS_COOLDOWN_SECS` | Cooldown after a stop loss before re-entry | `600s` |
-| `CROSSES_BOOK_COOLDOWN_SECS` | Cooldown after a post-only "crosses book" rejection | `30s` |
+| `MAKER_STOP_LOSS_PERCENT` | Stop loss | `7%` |
+| `MIN_HOLD_SECS_BEFORE_STOP_LOSS` | Minimum hold time before stop loss activates | `720s (12 min)` |
+| `MAKER_STOP_LOSS_COOLDOWN_SECS` | Cooldown after a stop loss before re-entry | `720s (12 min)` |
+| `CROSSES_BOOK_COOLDOWN_SECS` | Cooldown after a post-only "crosses book" rejection | `45s` |
 
 **Arbitrage**
 
-| Parameter | What it does | Default |
+| Parameter | What it does | Balanced profile |
 |-----------|-------------|---------|
-| `ARBITRAGE_PROFIT_THRESHOLD` | Min net margin after fees to trigger entry | `$0.03` |
+| `ARBITRAGE_PROFIT_THRESHOLD` | Min net margin after fees to trigger entry | `$0.05` |
 | `ARBITRAGE_MAX_TAKER_FEE_BPS` | Skip markets where either leg's fee exceeds this | `200 bps` |
 | `EARLY_EXIT_COMBINED_BID_THRESHOLD` | Combined bid exit trigger | `$0.995` |
-| `MAX_SUM_PRICE_FOR_ENTRY` | Max combined ask allowed for entry | `$0.98` |
+| `MAX_SUM_PRICE_FOR_ENTRY` | Max combined ask allowed for entry | `$0.97` |
 
 **Time Decay**
 
-| Parameter | What it does | Default |
+| Parameter | What it does | Balanced profile |
 |-----------|-------------|---------|
 | `TIME_DECAY_MIN_SECS_TO_EXPIRY` | Earliest entry window | `240s` |
-| `TIME_DECAY_MAX_SECS_TO_EXPIRY` | Latest entry window | `1800s` |
+| `TIME_DECAY_MAX_SECS_TO_EXPIRY` | Latest entry window | `1350s` |
 | `TIME_DECAY_TARGET_PROFIT_PERCENT` | Take profit | `1.5%` |
-| `TIME_DECAY_STOP_LOSS_PERCENT` | Stop loss | `3%` |
+| `TIME_DECAY_STOP_LOSS_PERCENT` | Stop loss | `2.5%` |
+| `MIN_TIME_DECAY_NET_PROFIT` | Min net profit/share for settlement-mode entry | `$0.003` |
+| `MAX_TIME_DECAY_COMBINED_ASK` | Max combined ask for convergence-mode entry (slightly above $1.00 allowed) | `$1.006` |
+| `TIME_DECAY_CONVERGENCE_WINDOW_SECS` | Time window within which convergence mode activates | `1050s (17.5 min)` |
+| `TIME_DECAY_CONVERGENCE_EXIT_BID` | Combined bid level to exit convergence-mode positions | `$0.998` |
+| `TIME_DECAY_MAX_POSITIONS` | Max simultaneous time decay positions | `3` |
 
 **Basis / Funding-Rate**
 
-| Parameter | What it does | Default |
+| Parameter | What it does | Balanced profile |
 |-----------|-------------|---------|
 | `ENABLE_BASIS_TRADING` | Enable/disable the strategy | `true` |
-| `BASIS_ENTRY_SKEW_THRESHOLD` | Min YES mid deviation from 0.50 to consider a trade | `0.06` (6¢) |
+| `BASIS_ENTRY_SKEW_THRESHOLD` | Min YES mid deviation from 0.50 to consider a trade | `0.07` (7¢) |
 | `BASIS_NEGATIVE_FUNDING_THRESHOLD` | Funding rate below which smart money is bearish | `−0.0001` |
 | `BASIS_POSITIVE_FUNDING_THRESHOLD` | Funding rate above which smart money is bullish | `+0.0001` |
-| `BASIS_BTC_MAX_VELOCITY` | Max Binance velocity still considered "flat" | `$30/5s` |
-| `BASIS_BTC_ORACLE_STRIKE_BUFFER` | Max spot distance from strike for entry | `$200` |
-| `BASIS_MAX_ENTRY_PRICE` | Max ask for the token being bought | `$0.60` |
-| `BASIS_TARGET_PROFIT_PERCENT` | Take profit | `6%` |
-| `BASIS_STOP_LOSS_PERCENT` | Stop loss | `10%` |
-| `BASIS_SKEW_COLLAPSE_THRESHOLD` | Exit if YES mid returns within this of 0.50 while in profit | `3¢` |
-| `BASIS_MIN_SECS_TO_EXPIRY` | No entry within this window of close | `1200s (20 min)` |
-| `BASIS_MIN_TRADE_SIZE_USDC` | Trade size at minimum skew signal | `$5` |
-| `BASIS_MAX_TRADE_SIZE_USDC` | Trade size at maximum skew signal | `$15` |
+| `BASIS_BTC_MAX_VELOCITY` | Max Binance velocity still considered "flat" (BTC) | `$25/5s` |
+| `BASIS_ETH_MAX_VELOCITY` | Max Binance velocity still considered "flat" (ETH) | `$1.20/5s` |
+| `BASIS_SOL_MAX_VELOCITY` | Max Binance velocity still considered "flat" (SOL) | `$0.12/5s` |
+| `BASIS_BTC_ORACLE_STRIKE_BUFFER` | Max spot distance from strike for entry (BTC) | `$175` |
+| `BASIS_ETH_ORACLE_STRIKE_BUFFER` | Max spot distance from strike for entry (ETH) | `$9` |
+| `BASIS_SOL_ORACLE_STRIKE_BUFFER` | Max spot distance from strike for entry (SOL) | `$0.45` |
+| `BASIS_MAX_ENTRY_PRICE` | Max ask for the token being bought | `$0.58` |
+| `BASIS_TARGET_PROFIT_PERCENT` | Take profit | `7%` |
+| `BASIS_STOP_LOSS_PERCENT` | Stop loss | `9%` |
+| `BASIS_SKEW_COLLAPSE_THRESHOLD` | Exit if YES mid returns within this of 0.50 while in profit | `3.5¢` |
+| `BASIS_MIN_SECS_TO_EXPIRY` | No entry within this window of close | `1500s (25 min)` |
+| `BASIS_MIN_TRADE_SIZE_USDC` | Trade size at minimum skew signal | `$4` |
+| `BASIS_MAX_TRADE_SIZE_USDC` | Trade size at maximum skew signal | `$12` |
 | `BASIS_KELLY_MAX_MULTIPLIER` | Skew multiple at which size saturates | `3×` |
 | `BASIS_MAX_TAKER_FEE_BPS` | Skip markets where fee exceeds this | `200 bps` |
 | `BASIS_FUNDING_POLL_SECS` | Binance futures polling interval | `60s` |
@@ -374,13 +395,17 @@ src/
 - **Momentum confirmation**: 2 consecutive ticks required, prevents single-tick fakeouts; automatically resets if the risk engine blocks the trade to prevent log flooding
 - **Multi-timeframe momentum gates**: 1s short-window gate (move still happening now) + acceleration gate (momentum building, not fading) prevent entries on stale 5s signals
 - **Velocity-decay exit**: exits a profitable momentum position early when the 1s velocity collapses, locking in gains before a full reversal
+- **Momentum expiry profit guard**: momentum positions entering the final 15-minute expiry window are force-exited unless they show at least 2% profit — prevents holding a losing directional position through binary settlement
+- **Late-market size tapering**: position size scales from 100% down to 50% in the 30-minute window before expiry, limiting adverse-selection exposure on late entries
 - **Per-strategy cooldowns**: Each strategy has its own 8-second cooldown after a trade — Maker fills don't delay Momentum entries
 - **Liquidity check**: Won't fire into thin books — requires 80%+ of order size available at top of book
 - **Market filtering**: Skips politics, long-term events, range markets, 5-minute markets
 - **Maker orderbook imbalance gate**: Suppresses bids on any side where ask depth > 3× bid depth — prevents adverse selection when sellers are overwhelming buyers on a falling token
 - **Maker book-crossing pre-check**: bid price is verified < ask price using the live WS snapshot before placing any post-only GTD order; prevents "crosses book" rejections caused by stale data or inventory-skew edge cases
 - **Maker post-only guard**: GTD maker orders are flagged `post_only`; if they would cross the spread, the exchange rejects them rather than creating a taker fill
-- **Maker phantom cleanup**: resting GTD bids stay alive in the CLOB for 5 minutes; `sync_position_balance` keeps the position open while a resting order exists, and only declares a phantom (expired GTD with no fill) after both the balance and open-orders checks confirm nothing is on-chain
+- **Maker phantom cleanup**: resting GTD bids stay alive in the CLOB for 90 seconds; `sync_position_balance` keeps the position open while a resting order exists, and only declares a phantom (expired GTD with no fill) after both the balance and open-orders checks confirm nothing is on-chain
+- **Maker oracle-strike deviation gate**: suppresses the likely-losing bid side when the Binance oracle has drifted more than 0.4% above or below the market strike — prevents buying tokens that are already effectively decided by the oracle
+- **Orphaned pair detection**: Arbitrage and TimeDecay strategies require hedged YES+NO pairs. If the first leg fills but the second fails, the remaining one-sided position is detected after 60 seconds and immediately exited (with a Telegram alert) to prevent unhedged losses
 - **Arbitrage fee gate**: automatically skips markets where taker fees (≥ 200 bps) make profitable arbitrage mathematically impossible, avoiding wasted computation on high-fee hourly markets
 - **Bid-sum monitoring**: heartbeat logs both ask-sum and bid-sum; if bid sum ever exceeds $1.00 (reverse-arb signal) a `🔔 Reverse-Arb Signal` alert is logged
 - **LCM-aligned order amounts**: BUY and SELL amounts are computed using `lcm(price_cents, 10000)` alignment to guarantee Polymarket's precision rules (makerAmount max 2dp, takerAmount max 4dp) at any price without rounding errors
@@ -406,7 +431,7 @@ Honest caveats: Python would have been faster to build — the trading bot ecosy
 
 **Why isn't the bot trading?**
 
-Check in order: Is `GHOST_MODE` still true? Is the spread wide enough to beat `ARBITRAGE_PROFIT_THRESHOLD` + fees? Is the orderbook thick enough (`MIN_LIQUIDITY_FILL_RATIO`)? For momentum — is the oracle velocity actually hitting the threshold (`BTC_MOMENTUM_THRESHOLD` = $75/5s) AND the 1s velocity also hitting 40% of that AND acceleration is positive? For maker — is the market less than 5 minutes old (`MAKER_MIN_MARKET_AGE_SECS`)? Is the market closing in less than 15 minutes (`MAKER_MIN_SECS_TO_EXPIRY`)? Is the orderbook heavily skewed (ask depth > 3× bid depth)? Note that Maker runs on a **secondary venue** (window or daily market if available, hourly fallback) — check logs for a `🏦 Maker Window/Daily market selected` line to confirm it has a venue. For arbitrage — both Maker and Arbitrage now run on the **secondary venue** (window or daily market if available). Check logs for a `🏦 Maker Window/Daily market selected` line — if that venue is absent, Arbitrage falls back to hourly which is immediately skipped by the 200 bps fee gate. For basis — is the YES/NO mid-price more than 6¢ from 0.50, and is Binance velocity below $30/5s? Bump `RUST_LOG=debug` to see what's being filtered.
+Check in order: Is `GHOST_MODE` still true? Is the spread wide enough to beat `ARBITRAGE_PROFIT_THRESHOLD` + fees? Is the orderbook thick enough (`MIN_LIQUIDITY_FILL_RATIO`)? For momentum — is the oracle velocity actually hitting the threshold (`BTC_MOMENTUM_THRESHOLD` = $85/5s) AND the 1s velocity also hitting 45% of that AND acceleration is positive? For maker — is the market less than 7 minutes old (`MAKER_MIN_MARKET_AGE_SECS`)? Is the market closing in less than 35 minutes (`MAKER_MIN_SECS_TO_EXPIRY`)? Is the orderbook heavily skewed (ask depth > 3× bid depth)? Note that Maker runs on a **secondary venue** (window or daily market if available, hourly fallback) — check logs for a `🏦 Maker Window/Daily market selected` line to confirm it has a venue. For arbitrage — both Maker and Arbitrage now run on the **secondary venue** (window or daily market if available). Check logs for a `🏦 Maker Window/Daily market selected` line — if that venue is absent, Arbitrage falls back to hourly which is immediately skipped by the 200 bps fee gate. For basis — is the YES/NO mid-price more than 7¢ from 0.50, and is Binance velocity below $25/5s? Bump `RUST_LOG=debug` to see what's being filtered.
 
 **Orders keep getting rejected**
 
@@ -430,7 +455,7 @@ Edit the per-strategy constants in `src/config.rs`: `MOMENTUM_MAX_EXPOSURE_USDC`
 
 **What happens if the Binance futures API is down?**
 
-The `funding_rate` field in `MarketSnapshot` defaults to `0.0`. At zero funding, the Basis strategy requires the **extreme skew bypass** (YES/NO mid-price ≥ 2× the 6¢ threshold, i.e., >12¢ from 0.50) to fire an entry. This means the strategy becomes more conservative but doesn't fully disable — extreme retail imbalances are still traded even without funding confirmation.
+The `funding_rate` field in `MarketSnapshot` defaults to `0.0`. At zero funding, the Basis strategy requires the **extreme skew bypass** (YES/NO mid-price ≥ 2× the 7¢ threshold, i.e., >14¢ from 0.50) to fire an entry. This means the strategy becomes more conservative but doesn't fully disable — extreme retail imbalances are still traded even without funding confirmation.
 
 **Why does the deploy script take so long the first time?**
 
