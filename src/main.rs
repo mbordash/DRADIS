@@ -775,9 +775,40 @@ async fn main() -> Result<()> {
                         match signal {
                             // ════════════════════ EXIT ════════════════════
                             StrategySignal::Exit { token_id, reason } => {
-                                let bid = if *token_id == yes_token { yes_bid } else { no_bid };
+                                // ── Maker venue routing for EXIT ──────────────────────────────────
+                                // MakerStrategy opens positions on the window/daily maker venue
+                                // (mk_yes_token / mk_no_token). The generic yes_token/no_token here
+                                // are the HOURLY market tokens. If we compute bid or fee from the
+                                // wrong venue we get a stale/wrong price and the FAK sell is
+                                // rejected → circuit breaker fires → shares are orphaned on-chain.
+                                let (exit_bid, exit_fee_bps, exit_verifying) = {
+                                    let mk_yes = maker_market_config.as_ref().map(|m| m.yes_token).unwrap_or(yes_token);
+                                    let mk_no  = maker_market_config.as_ref().map(|m| m.no_token).unwrap_or(no_token);
+                                    let mk_neg = maker_market_config.as_ref().map(|m| m.is_neg_risk).unwrap_or(is_neg_risk);
+                                    let mk_vc  = if mk_neg { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
+
+                                    if *token_id == mk_yes {
+                                        let b = maker_yes_price_rx.as_ref()
+                                            .map(|rx| rx.borrow().0)
+                                            .unwrap_or(yes_bid);
+                                        let f = maker_market_config.as_ref().map(|m| m.yes_fee_bps as u16).unwrap_or(yes_fee_rate as u16);
+                                        (b, f, mk_vc)
+                                    } else if *token_id == mk_no {
+                                        let b = maker_no_price_rx.as_ref()
+                                            .map(|rx| rx.borrow().0)
+                                            .unwrap_or(no_bid);
+                                        let f = maker_market_config.as_ref().map(|m| m.no_fee_bps as u16).unwrap_or(no_fee_rate as u16);
+                                        (b, f, mk_vc)
+                                    } else if *token_id == yes_token {
+                                        (yes_bid, yes_fee_rate as u16, verifying_contract)
+                                    } else {
+                                        (no_bid, no_fee_rate as u16, verifying_contract)
+                                    }
+                                };
+                                let bid = exit_bid;
                                 let sell_price = (bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
-                                let fee_bps = if *token_id == yes_token { yes_fee_rate as u16 } else { no_fee_rate as u16 };
+                                let fee_bps = exit_fee_bps;
+                                let exit_vc = exit_verifying;
                                 let pos_key = (strategy_name.clone(), *token_id);
 
                                 let shares = {
@@ -822,7 +853,7 @@ async fn main() -> Result<()> {
                                 if !config::GHOST_MODE {
                                     if let Err(e) = place_limit_order(
                                         &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
-                                        verifying_contract, *token_id, Side::Sell, shares, sell_price, fee_bps, OrderType::FAK, false, 0,
+                                        exit_vc, *token_id, Side::Sell, shares, sell_price, fee_bps, OrderType::FAK, false, 0,
                                         &shared_http,
                                     ).await {
                                         let err_str = e.to_string();
