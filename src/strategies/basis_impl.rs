@@ -272,8 +272,8 @@ mod tests {
                 no_fee_bps: 50,
             },
             snapshot: MarketSnapshot {
-                yes_bid, yes_ask, yes_ask_depth: dec!(100),
-                no_bid, no_ask, no_ask_depth: dec!(100),
+                yes_bid, yes_bid_depth: dec!(100), yes_ask, yes_ask_depth: dec!(100),
+                no_bid, no_bid_depth: dec!(100), no_ask, no_ask_depth: dec!(100),
                 oracle_price, velocity, velocity_1s: velocity,
                 acceleration: dec!(0), funding_rate,
                 timestamp: Utc::now(),

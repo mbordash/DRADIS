@@ -66,7 +66,7 @@ fn should_log_maker_exposure_reject() -> bool {
     }
 }
 
-type PriceState = (Decimal, Decimal, Decimal); // (Bid, Ask, AskDepth)
+type PriceState = (Decimal, Decimal, Decimal, Decimal); // (Bid, BidDepth, Ask, AskDepth)
 
 const EXCHANGE_NORMAL: Address = address!("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E");
 const EXCHANGE_NEG_RISK: Address = address!("0xC5d563A36AE78145C45a50134d48A1215220f80a");
@@ -486,8 +486,8 @@ async fn main() -> Result<()> {
 
         info!("✅ Cached Settings: NegRisk: {} | YES fee {} bps | NO fee {} bps", is_neg_risk, yes_fee_rate, no_fee_rate);
 
-        let (yes_price_tx, yes_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(1), dec!(0)));
-        let (no_price_tx, no_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(1), dec!(0)));
+        let (yes_price_tx, yes_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0)));
+        let (no_price_tx, no_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0)));
 
         for (token, tx) in [(yes_token, yes_price_tx), (no_token, no_price_tx)] {
             tokio::spawn(async move {
@@ -501,12 +501,15 @@ async fn main() -> Result<()> {
                     info!("✅ WS orderbook subscribed for token {}", token);
                     while let Some(book_result) = stream.next().await {
                         if let Ok(book) = book_result {
-                            let bid = book.bids.iter().map(|l| l.price).max().unwrap_or(dec!(0));
-                            let (ask, depth) = book.asks.iter()
+                            let (bid, bid_depth) = book.bids.iter()
+                                .max_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
+                                .map(|l| (l.price, l.size))
+                                .unwrap_or((dec!(0), dec!(0)));
+                            let (ask, ask_depth) = book.asks.iter()
                                 .min_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
                                 .map(|l| (l.price, l.size))
                                 .unwrap_or((dec!(1), dec!(0)));
-                            let _ = tx.send((bid, ask, depth));
+                            let _ = tx.send((bid, bid_depth, ask, ask_depth));
                         } else { break; }
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -518,8 +521,8 @@ async fn main() -> Result<()> {
         // When a window or daily market is available, subscribe its orderbook so
         // MakerStrategy can post quotes with live bid/ask data from that venue.
         let (maker_yes_price_rx, maker_no_price_rx) = if let Some(ref mk) = maker_market_candidate {
-            let (mk_yes_tx, mk_yes_rx) = watch::channel::<PriceState>((dec!(0), dec!(1), dec!(0)));
-            let (mk_no_tx, mk_no_rx) = watch::channel::<PriceState>((dec!(0), dec!(1), dec!(0)));
+            let (mk_yes_tx, mk_yes_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0)));
+            let (mk_no_tx, mk_no_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0)));
             for (token, tx) in [(mk.yes_token, mk_yes_tx), (mk.no_token, mk_no_tx)] {
                 tokio::spawn(async move {
                     loop {
@@ -532,12 +535,15 @@ async fn main() -> Result<()> {
                         info!("✅ WS orderbook subscribed for maker token {}", token);
                         while let Some(book_result) = stream.next().await {
                             if let Ok(book) = book_result {
-                                let bid = book.bids.iter().map(|l| l.price).max().unwrap_or(dec!(0));
-                                let (ask, depth) = book.asks.iter()
+                                let (bid, bid_depth) = book.bids.iter()
+                                    .max_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
+                                    .map(|l| (l.price, l.size))
+                                    .unwrap_or((dec!(0), dec!(0)));
+                                let (ask, ask_depth) = book.asks.iter()
                                     .min_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
                                     .map(|l| (l.price, l.size))
                                     .unwrap_or((dec!(1), dec!(0)));
-                                let _ = tx.send((bid, ask, depth));
+                                let _ = tx.send((bid, bid_depth, ask, ask_depth));
                             } else { break; }
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
@@ -632,13 +638,22 @@ async fn main() -> Result<()> {
                     });
                 }
                 _ = status_ticker.tick() => {
-                    let (_, yes_ask, _) = *yes_price_rx.borrow();
-                    let (_, no_ask, _) = *no_price_rx.borrow();
+                    let (yes_bid, _, yes_ask, _) = *yes_price_rx.borrow();
+                    let (no_bid,  _, no_ask,  _) = *no_price_rx.borrow();
                     let binance_price = *oracle_rx.borrow();
 
                     if yes_ask != dec!(1) && no_ask != dec!(1) {
                         if let Some(strike) = strike_price {
-                            info!("💓 Heartbeat | Poly Sum ${:.4} (Y ${:.2} / N ${:.2}) | Binance: ${:.2}", yes_ask + no_ask, yes_ask, no_ask, binance_price);
+                            let ask_sum = yes_ask + no_ask;
+                            let bid_sum = yes_bid + no_bid;
+                            // ask_sum < 1.00 → "buy-both" arb opportunity (current strategy)
+                            // bid_sum > 1.00 → "sell-both" (reverse arb via mint+sell) opportunity
+                            info!("💓 Heartbeat | Ask Sum ${:.4} (Y ask ${:.2} / N ask ${:.2}) | Bid Sum ${:.4} (Y bid ${:.2} / N bid ${:.2}) | Binance: ${:.2}",
+                                ask_sum, yes_ask, no_ask, bid_sum, yes_bid, no_bid, binance_price);
+                            if bid_sum > dec!(1.0) {
+                                info!("🔔 Reverse-Arb Signal: YES bid ${:.3} + NO bid ${:.3} = ${:.4} > $1.00 — mint+sell opportunity (check fees!)",
+                                    yes_bid, no_bid, bid_sum);
+                            }
                         }
                     }
                 }
@@ -650,8 +665,8 @@ async fn main() -> Result<()> {
                         break;
                     }
 
-                    let (yes_bid, yes_ask, yes_depth) = *yes_price_rx.borrow();
-                    let (no_bid, no_ask, no_depth) = *no_price_rx.borrow();
+                    let (yes_bid, yes_bid_depth, yes_ask, yes_depth) = *yes_price_rx.borrow();
+                    let (no_bid, no_bid_depth, no_ask, no_depth) = *no_price_rx.borrow();
                     let oracle_price = *oracle_rx.borrow();
                     let (velocity, velocity_1s, acceleration) = *velocity_rx.borrow();
                     let funding_rate = *funding_rx.borrow();
@@ -663,8 +678,8 @@ async fn main() -> Result<()> {
 
                     // ── Build StrategyContext ──
                     let snapshot = MarketSnapshot {
-                        yes_bid, yes_ask, yes_ask_depth: yes_depth,
-                        no_bid, no_ask, no_ask_depth: no_depth,
+                        yes_bid, yes_bid_depth, yes_ask, yes_ask_depth: yes_depth,
+                        no_bid, no_bid_depth, no_ask, no_ask_depth: no_depth,
                         oracle_price, velocity, velocity_1s, acceleration,
                         funding_rate,
                         timestamp: Utc::now(),
@@ -682,11 +697,13 @@ async fn main() -> Result<()> {
                     // Build optional maker snapshot from the window/daily venue prices
                     let maker_snapshot = match (&maker_yes_price_rx, &maker_no_price_rx) {
                         (Some(my_rx), Some(mn_rx)) => {
-                            let (mk_yes_bid, mk_yes_ask, mk_yes_depth) = *my_rx.borrow();
-                            let (mk_no_bid, mk_no_ask, mk_no_depth) = *mn_rx.borrow();
+                            let (mk_yes_bid, mk_yes_bid_depth, mk_yes_ask, mk_yes_depth) = *my_rx.borrow();
+                            let (mk_no_bid, mk_no_bid_depth, mk_no_ask, mk_no_depth) = *mn_rx.borrow();
                             Some(MarketSnapshot {
-                                yes_bid: mk_yes_bid, yes_ask: mk_yes_ask, yes_ask_depth: mk_yes_depth,
-                                no_bid: mk_no_bid, no_ask: mk_no_ask, no_ask_depth: mk_no_depth,
+                                yes_bid: mk_yes_bid, yes_bid_depth: mk_yes_bid_depth,
+                                yes_ask: mk_yes_ask, yes_ask_depth: mk_yes_depth,
+                                no_bid: mk_no_bid, no_bid_depth: mk_no_bid_depth,
+                                no_ask: mk_no_ask, no_ask_depth: mk_no_depth,
                                 oracle_price, velocity, velocity_1s, acceleration,
                                 funding_rate,
                                 timestamp: Utc::now(),
@@ -1154,7 +1171,7 @@ async fn main() -> Result<()> {
                                 };
 
                                 if !config::GHOST_MODE {
-                                    let (order_type, post_only, exp) = if is_maker { (OrderType::GTD, true, 60u64) } else { (OrderType::FAK, false, 0u64) };
+                                    let (order_type, post_only, exp) = if is_maker { (OrderType::GTD, true, config::MAKER_GTD_TTL_SECS) } else { (OrderType::FAK, false, 0u64) };
                                     // Makers are never charged fees on Polymarket — embed 0 bps in the
                                     // signed order struct for post-only orders.  Takers embed the market
                                     // fee rate so the exchange can validate and collect it on fill.
@@ -1386,7 +1403,7 @@ async fn main() -> Result<()> {
                                                 match place_limit_order(
                                                     &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
                                     mk_verifying, mk_yes_token, Side::Buy, shares, rounded_price,
-                                                     mk_yes_fee, OrderType::GTD, true, 60u64, &shared_http,
+                                                     mk_yes_fee, OrderType::GTD, true, config::MAKER_GTD_TTL_SECS, &shared_http,
                                                 ).await {
                                                     Ok(_) => {
                                                         any_placed = true;
@@ -1442,7 +1459,7 @@ async fn main() -> Result<()> {
                                                 match place_limit_order(
                                                     &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
                                     mk_verifying, mk_no_token, Side::Buy, shares, rounded_price,
-                                                     mk_no_fee, OrderType::GTD, true, 60u64, &shared_http,
+                                                     mk_no_fee, OrderType::GTD, true, config::MAKER_GTD_TTL_SECS, &shared_http,
                                                 ).await {
                                                     Ok(_) => {
                                                         any_placed = true;

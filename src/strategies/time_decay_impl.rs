@@ -242,9 +242,11 @@ mod tests {
             },
             snapshot: MarketSnapshot {
                 yes_bid: dec!(0.60),  // Bid has improved significantly
+                yes_bid_depth: dec!(100),
                 yes_ask: dec!(0.61),
                 yes_ask_depth: dec!(100),
                 no_bid: dec!(0.40),   // NO bid has improved significantly
+                no_bid_depth: dec!(100),
                 no_ask: dec!(0.41),
                 no_ask_depth: dec!(100),
                 oracle_price: dec!(0),
@@ -295,9 +297,11 @@ mod tests {
             },
             snapshot: MarketSnapshot {
                 yes_bid: dec!(0.40),
+                yes_bid_depth: dec!(100),
                 yes_ask,
                 yes_ask_depth: dec!(100),
                 no_bid: dec!(0.43),
+                no_bid_depth: dec!(100),
                 no_ask,
                 no_ask_depth: dec!(100),
                 oracle_price: dec!(0),

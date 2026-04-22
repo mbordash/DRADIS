@@ -70,6 +70,29 @@ impl Strategy for MakerStrategyImpl {
         let no_bid  = snapshot.no_bid;
         let no_ask  = snapshot.no_ask;
 
+        // ── Orderbook imbalance gate ──────────────────────────────────────────
+        // If the ask side has significantly more depth than the bid side, the
+        // book is skewed by sellers.  Bids posted into a one-sided book are
+        // likely to be adversely selected by motivated sellers on a falling market.
+        let yes_bid_depth = snapshot.yes_bid_depth;
+        let yes_ask_depth = snapshot.yes_ask_depth;
+        let no_bid_depth  = snapshot.no_bid_depth;
+        let no_ask_depth  = snapshot.no_ask_depth;
+
+        // Compute imbalance: ask_depth / bid_depth.  When bid_depth is zero we
+        // treat it as maximally imbalanced to avoid division by zero.
+        let yes_book_ok = yes_bid_depth > dec!(0)
+            && (yes_ask_depth / yes_bid_depth) <= config::MAKER_MAX_BOOK_IMBALANCE_RATIO;
+        let no_book_ok  = no_bid_depth > dec!(0)
+            && (no_ask_depth  / no_bid_depth)  <= config::MAKER_MAX_BOOK_IMBALANCE_RATIO;
+
+        if !yes_book_ok && !no_book_ok {
+            debug!("🚫 MakerStrategy blocked: both sides orderbook heavily skewed (YES ask/bid depth ratio: {:.1}, NO ask/bid: {:.1})",
+                if yes_bid_depth > dec!(0) { yes_ask_depth / yes_bid_depth } else { dec!(99) },
+                if no_bid_depth  > dec!(0) { no_ask_depth  / no_bid_depth  } else { dec!(99) });
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Inventory skew ────────────────────────────────────────────────────
         let (yes_inv_value, no_inv_value) = {
             let pos_map = ctx.positions.lock().await;
@@ -115,15 +138,19 @@ impl Strategy for MakerStrategyImpl {
         let no_bid_price  = (no_bid  + no_improvement  + skew).max(dec!(0.01));
 
         // ── Per-side qualification checks ─────────────────────────────────────
-        let yes_qualifies = yes_spread >= config::MAKER_MIN_SPREAD
+        let yes_qualifies = yes_book_ok                             // ask-side not overwhelming bid-side
+            && yes_spread >= config::MAKER_MIN_SPREAD
             && yes_bid_price >= config::MAKER_MIN_ENTRY_PRICE
             && yes_bid_price <= config::MAKER_MAX_ENTRY_PRICE
+            && yes_bid_price < yes_ask               // never cross the book (guards against stale WS + skew edge cases)
             && no_bid <= config::MAKER_MAX_COMPLEMENTARY_PRICE  // complementary: market not too directional
             && !velocity_bias_strong_negative;           // don't post YES into a falling oracle
 
-        let no_qualifies = no_spread >= config::MAKER_MIN_SPREAD
+        let no_qualifies = no_book_ok                              // ask-side not overwhelming bid-side
+            && no_spread >= config::MAKER_MIN_SPREAD
             && no_bid_price >= config::MAKER_MIN_ENTRY_PRICE
             && no_bid_price <= config::MAKER_MAX_ENTRY_PRICE
+            && no_bid_price < no_ask                // never cross the book (guards against stale WS + skew edge cases)
             && yes_bid <= config::MAKER_MAX_COMPLEMENTARY_PRICE  // complementary: market not too directional
             && !velocity_bias_strong_positive;           // don't post NO into a rising oracle
 
@@ -255,8 +282,10 @@ mod tests {
             },
             snapshot: MarketSnapshot {
                 yes_bid, yes_ask,
+                yes_bid_depth: dec!(500),
                 yes_ask_depth: dec!(500),
                 no_bid, no_ask,
+                no_bid_depth: dec!(500),
                 no_ask_depth: dec!(500),
                 oracle_price: dec!(74000),
                 velocity: dec!(0),
