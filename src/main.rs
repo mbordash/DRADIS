@@ -744,6 +744,34 @@ async fn main() -> Result<()> {
 
                     // ── Process each resolved signal ──
                     for (strategy_name, signal) in &resolved_signals {
+                        // ArbitrageStrategy: route to the window/daily maker market when available.
+                        // Shadow the outer hourly-market variables for this loop iteration only so
+                        // all downstream order-placement and exit logic uses the correct venue.
+                        let (yes_token, no_token, yes_ask, no_ask, yes_bid, no_bid,
+                             yes_depth, no_depth, yes_fee_rate, no_fee_rate,
+                             market_close_time, market_name) =
+                            if strategy_name == "ArbitrageStrategy" {
+                                if let (Some(ref mk), Some(ref mky_rx), Some(ref mkn_rx)) =
+                                    (&maker_market_config, &maker_yes_price_rx, &maker_no_price_rx)
+                                {
+                                    let (mky_bid, _, mky_ask, mky_depth) = *mky_rx.borrow();
+                                    let (mkn_bid, _, mkn_ask, mkn_depth) = *mkn_rx.borrow();
+                                    (mk.yes_token, mk.no_token,
+                                     mky_ask, mkn_ask, mky_bid, mkn_bid,
+                                     mky_depth, mkn_depth,
+                                     mk.yes_fee_bps, mk.no_fee_bps,
+                                     mk.market_close_time, mk.market_name.clone())
+                                } else {
+                                    (yes_token, no_token, yes_ask, no_ask, yes_bid, no_bid,
+                                     yes_depth, no_depth, yes_fee_rate, no_fee_rate,
+                                     market_close_time, market_name.clone())
+                                }
+                            } else {
+                                (yes_token, no_token, yes_ask, no_ask, yes_bid, no_bid,
+                                 yes_depth, no_depth, yes_fee_rate, no_fee_rate,
+                                 market_close_time, market_name.clone())
+                            };
+
                         match signal {
                             // ════════════════════ EXIT ════════════════════
                             StrategySignal::Exit { token_id, reason } => {
