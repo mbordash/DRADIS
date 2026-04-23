@@ -201,6 +201,20 @@ impl Strategy for MakerStrategyImpl {
         let market = ctx.maker_market.as_ref().unwrap_or(&ctx.market);
         let snapshot = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
 
+        // Seconds until this market resolves — used to tighten the stop near expiry.
+        let secs_to_expiry = market.market_close_time
+            .map(|t| (t - Utc::now()).num_seconds())
+            .unwrap_or(9999);
+
+        // Near-expiry: binary markets can gap 30-60% on tiny BTC moves as the
+        // market converges toward 0 or 1. Halve the stop-loss tolerance when
+        // within MAKER_LATE_MARKET_STOP_TIGHTEN_SECS of resolution.
+        let effective_stop_pct = if secs_to_expiry < config::MAKER_LATE_MARKET_STOP_TIGHTEN_SECS {
+            config::MAKER_LATE_MARKET_STOP_LOSS_PERCENT
+        } else {
+            config::MAKER_STOP_LOSS_PERCENT
+        };
+
         let pos_map = ctx.positions.lock().await;
 
         for token_id in [market.yes_token, market.no_token] {
@@ -230,16 +244,21 @@ impl Strategy for MakerStrategyImpl {
                 });
             }
 
-            // Stop-loss: require fill confirmation + minimum hold time.
+            // Stop-loss: requires fill confirmation (prevents phantom stops on GTD orders that
+            // never filled). The previous MIN_HOLD_SECS_BEFORE_STOP_LOSS gate is removed:
+            // fill_confirmed_at.is_some() is already the correct phantom guard — adding a
+            // 90s timer on top delayed stops and turned 8% losses into 39%+ disasters.
+            // Near-expiry: effective_stop_pct is halved (see above) so the stop fires earlier
+            // before binary resolution dynamics cause a catastrophic gap.
             if position.fill_confirmed_at.is_some()
-                && profit_pct <= -config::MAKER_STOP_LOSS_PERCENT
-                && secs_since_open >= config::MIN_HOLD_SECS_BEFORE_STOP_LOSS
+                && profit_pct <= -effective_stop_pct
             {
                 return Ok(StrategySignal::Exit {
                     token_id,
                     reason: format!(
-                        "Maker stop-loss: bid=${:.4}, entry=${:.4}, loss={:.2}% ({}s since open)",
+                        "Maker stop-loss: bid=${:.4}, entry=${:.4}, loss={:.2}% ({}s since open, stop={:.1}%, {}s to expiry)",
                         bid, position.avg_entry, profit_pct * dec!(100), secs_since_open,
+                        effective_stop_pct * dec!(100), secs_to_expiry,
                     ),
                 });
             }
@@ -423,17 +442,68 @@ mod tests {
         positions.insert(("MakerStrategy".to_string(), yes_token), Position {
             shares: dec!(20),
             avg_entry: dec!(0.30),
-            opened_at: Utc::now() - Duration::seconds(config::MIN_HOLD_SECS_BEFORE_STOP_LOSS),
+            opened_at: Utc::now(),
+            close_time: None,
+            market_name: "Test Market".to_string(),
+            pair_token_id: yes_token,
+            // Fill confirmed: stop-loss is now eligible immediately without a hold timer.
+            fill_confirmed_at: Some(Utc::now()),
+            paired_leg_token_id: None,
+        });
+        let ctx = make_ctx(dec!(0.30), dec!(0.40), dec!(0.55), dec!(0.65), 2400, positions);
+        let mut ctx2 = ctx.clone();
+        ctx2.snapshot.yes_bid = dec!(0.27); // -10% loss > 8% SL
+        let signal = strategy.evaluate_exit(&ctx2).await.unwrap();
+        assert!(matches!(signal, StrategySignal::Exit { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_maker_exit_stop_loss_no_fire_without_fill_confirmation() {
+        use crate::state::Position;
+        let strategy = MakerStrategyImpl;
+        let yes_token = U256::from(1u64);
+        let mut positions = PositionMap::new();
+        positions.insert(("MakerStrategy".to_string(), yes_token), Position {
+            shares: dec!(20),
+            avg_entry: dec!(0.30),
+            opened_at: Utc::now(),
+            close_time: None,
+            market_name: "Test Market".to_string(),
+            pair_token_id: yes_token,
+            fill_confirmed_at: None, // NOT yet confirmed — stop must be blocked
+            paired_leg_token_id: None,
+        });
+        let ctx = make_ctx(dec!(0.30), dec!(0.40), dec!(0.55), dec!(0.65), 2400, positions);
+        let mut ctx2 = ctx.clone();
+        ctx2.snapshot.yes_bid = dec!(0.20); // -33% loss but no fill confirmation
+        let signal = strategy.evaluate_exit(&ctx2).await.unwrap();
+        // Stop-loss must NOT fire: fill_confirmed_at is None (phantom guard)
+        assert!(matches!(signal, StrategySignal::NoSignal));
+    }
+
+    #[tokio::test]
+    async fn test_maker_exit_near_expiry_tighter_stop() {
+        use crate::state::Position;
+        let strategy = MakerStrategyImpl;
+        let yes_token = U256::from(1u64);
+        let mut positions = PositionMap::new();
+        positions.insert(("MakerStrategy".to_string(), yes_token), Position {
+            shares: dec!(20),
+            avg_entry: dec!(0.38),
+            opened_at: Utc::now(),
             close_time: None,
             market_name: "Test Market".to_string(),
             pair_token_id: yes_token,
             fill_confirmed_at: Some(Utc::now()),
             paired_leg_token_id: None,
         });
-        let ctx = make_ctx(dec!(0.30), dec!(0.40), dec!(0.55), dec!(0.65), 2400, positions);
+        // secs_to_expiry = 1500 < MAKER_LATE_MARKET_STOP_TIGHTEN_SECS = 2700
+        let ctx = make_ctx(dec!(0.38), dec!(0.48), dec!(0.55), dec!(0.65), 1500, positions);
         let mut ctx2 = ctx.clone();
-        ctx2.snapshot.yes_bid = dec!(0.27); // -10% loss > 5% SL
+        // -5.3% loss: above normal 8% stop but below the 4% tighter near-expiry stop
+        ctx2.snapshot.yes_bid = dec!(0.36);
         let signal = strategy.evaluate_exit(&ctx2).await.unwrap();
+        // Near-expiry: stop should fire at 4% threshold (0.36 / 0.38 - 1 = -5.3% < -4%)
         assert!(matches!(signal, StrategySignal::Exit { .. }));
     }
 }
