@@ -75,6 +75,12 @@ pub struct MarketSnapshot {
     /// Positive = longs paying shorts (bullish bias from smart money).
     /// Updated every ~60 seconds; zero if unavailable.
     pub funding_rate: Decimal,
+    /// 60-minute oracle price drift (current_price − price_60_minutes_ago).
+    /// Positive = BTC trending UP over the last hour.
+    /// Negative = BTC trending DOWN over the last hour.
+    /// Zero when insufficient history is available (first hour of bot runtime).
+    /// Used by MakerStrategy to suppress adverse-side bids during slow sustained trends.
+    pub oracle_drift_60m: Decimal,
     /// Timestamp of this snapshot
     pub timestamp: DateTime<Utc>,
 }

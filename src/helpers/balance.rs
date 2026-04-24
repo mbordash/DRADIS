@@ -19,9 +19,8 @@ use polymarket_client_sdk::clob::types::AssetType;
 
 pub use crate::state::{Position, PositionMap};
 
-/// Shared map of strategy → Instant for phantom removal cooldowns.
-/// When sync_position_balance removes a phantom, it records the time here.
-/// The entry gate in main.rs checks this to prevent immediate re-entry.
+/// Shared map of (strategy:token_id) → Instant for phantom removal cooldowns.
+/// Now per-token instead of per-strategy so one side doesn't block the other.
 pub type PhantomCooldowns = Arc<Mutex<HashMap<String, Instant>>>;
 
 /// How long to block re-entry after a phantom removal (seconds).
@@ -61,40 +60,70 @@ pub async fn sync_position_balance(
     baseline_shares: Decimal,
 ) -> Result<()> {
     let key = (strategy_name.to_string(), token_id);
+    let max_wait_secs: i64 = 180;        // increased
+    let check_interval_ms: u64 = 3000;   // slightly faster polling
 
-    let max_wait_secs: i64 = 60;
-    let check_interval_ms: u64 = 5000;
-
-    tokio::time::sleep(Duration::from_millis(2000)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
 
     loop {
         let mut req = BalanceAllowanceRequest::default();
         req.asset_type = AssetType::Conditional;
         req.token_id = Some(token_id);
 
-        if let Ok(resp) = client.balance_allowance(req).await {
-            let raw_shares = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
-            // Subtract pre-order residual so we only count shares from THIS fill.
-            let actual_shares = (raw_shares - baseline_shares).max(dec!(0));
-            let mut pos_map = positions.lock().await;
-            if let Some(pos) = pos_map.get_mut(&key) {
-                if actual_shares >= crate::config::MIN_ORDER_SHARES {
-                    info!("⚖️ Position Synced [{}]: Token {} quantity updated from {} to actual: {} (raw: {}, baseline: {})",
-                          strategy_name, token_id, pos.shares, actual_shares, raw_shares, baseline_shares);
-                    pos.shares = actual_shares;
-                    if pos.fill_confirmed_at.is_none() {
-                        pos.fill_confirmed_at = Some(Utc::now());
-                    }
-                    return Ok(());
-                } else if actual_shares > dec!(0) {
-                    // Dust fill: net new shares are non-zero but below MIN_ORDER_SHARES.
-                    // Treat it the same as a zero balance: remove the position and apply phantom cooldown.
-                    warn!("⚠️ Position Sync DUST [{}]: Token {} has only {} net new shares (raw: {}, baseline: {}, < MIN_ORDER_SHARES {}). Treating as phantom and removing.",
-                          strategy_name, token_id, actual_shares, raw_shares, baseline_shares, crate::config::MIN_ORDER_SHARES);
-                    pos_map.remove(&key);
+        let balance_resp = client.balance_allowance(req).await;
+        let raw_shares = match balance_resp {
+            Ok(resp) => Decimal::from_str(&resp.balance.to_string())
+                .unwrap_or(dec!(0)) / dec!(1_000_000),
+            Err(e) => {
+                warn!("Position Sync API error [{}]: {}", strategy_name, e);
+                // continue polling
+                tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
+                continue;
+            }
+        };
+
+        let actual_shares = (raw_shares - baseline_shares).max(dec!(0));
+        let mut pos_map = positions.lock().await;
+
+        if let Some(pos) = pos_map.get_mut(&key) {
+            let expected = pos.shares;
+            let time_since_open = (Utc::now() - pos.opened_at).num_seconds();
+            let fill_ratio = if expected > dec!(0) { actual_shares / expected } else { dec!(1) };
+
+            if actual_shares >= crate::config::MIN_ORDER_SHARES {
+                // Looser partial guard
+                if fill_ratio < dec!(0.60) && time_since_open < 120 {
+                    warn!("⚠️ Position Sync PARTIAL [{}]: Token {} has {:.4} of {:.4} expected ({:.0}%) — still settling. Retrying...",
+                          strategy_name, token_id, actual_shares, expected, fill_ratio * dec!(100));
                     drop(pos_map);
+                    tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
+                    continue;
+                }
+
+                info!("⚖️ Position Synced [{}]: Token {} updated from {} to actual: {} (raw: {}, baseline: {})",
+                      strategy_name, token_id, pos.shares, actual_shares, raw_shares, baseline_shares);
+                pos.shares = actual_shares;
+                if pos.fill_confirmed_at.is_none() {
+                    pos.fill_confirmed_at = Some(Utc::now());
+                }
+                return Ok(());
+            } else if actual_shares == dec!(0) {
+                if time_since_open >= max_wait_secs {
+                    drop(pos_map);
+                    // Check resting order EARLIER and MORE OFTEN
+                    let has_resting = check_for_resting_order(client, token_id).await;
+                    if has_resting {
+                        warn!("⏳ Position Sync [{}]: Token {} still 0 after {}s but resting GTD found — keeping alive.",
+                          strategy_name, token_id, time_since_open);
+                        tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
+                        continue;
+                    }
+                    warn!("⚠️ Position Sync FAILED [{}]: Token {} — no open orders after {}s. Removing phantom.",
+                      strategy_name, token_id, time_since_open);
+                    positions.lock().await.remove(&key);
                     if let Some(cooldowns) = phantom_cooldowns {
-                        cooldowns.lock().await.insert(strategy_name.to_string(), Instant::now());
+                        let cooldown_key = format!("{}:{}", strategy_name, token_id);
+                        cooldowns.lock().await.insert(cooldown_key, Instant::now());
                     }
                     return Ok(());
                 } else {
@@ -126,7 +155,8 @@ pub async fn sync_position_balance(
                               strategy_name, token_id, time_since_open);
                         positions.lock().await.remove(&key);
                         if let Some(cooldowns) = phantom_cooldowns {
-                            cooldowns.lock().await.insert(strategy_name.to_string(), Instant::now());
+                            let cooldown_key = format!("{}:{}", strategy_name, token_id);
+                            cooldowns.lock().await.insert(cooldown_key, Instant::now());
                         }
                         return Ok(());
                     } else {
@@ -156,10 +186,22 @@ pub async fn sync_position_balance(
                       strategy_name, token_id, time_since_open);
                 positions.lock().await.remove(&key);
                 if let Some(cooldowns) = phantom_cooldowns {
-                    cooldowns.lock().await.insert(strategy_name.to_string(), Instant::now());
+                    let cooldown_key = format!("{}:{}", strategy_name, token_id);
+                    cooldowns.lock().await.insert(cooldown_key, Instant::now());
                 }
                 return Ok(());
             }
+        }
+    }
+}
+
+async fn check_for_resting_order(client: &Arc<ClobClient<Authenticated<Normal>>>, token_id: U256) -> bool {
+    let req = OrdersRequest::builder().asset_id(token_id).build();
+    match client.orders(&req, None).await {
+        Ok(page) => !page.data.is_empty(),
+        Err(e) => {
+            warn!("CLOB orders API failed: {}", e);
+            false // conservative: assume no order
         }
     }
 }

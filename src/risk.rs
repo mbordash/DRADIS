@@ -4,20 +4,26 @@ use tracing::info;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-/// Rate-limit interval for rejection logs (in seconds)
+/// Rate-limit interval for exposure/net-exposure rejection logs (in seconds)
 const REJECTION_LOG_INTERVAL_SECS: u64 = 5;
+/// Rate-limit interval for session-drawdown rejection logs (in seconds).
+/// Once the drawdown limit is tripped the bot is fully locked — log once per
+/// minute so the file doesn't fill with thousands of duplicate lines.
+const DRAWDOWN_LOG_INTERVAL_SECS: u64 = 60;
 
 static LAST_MAKER_NET_REJECT_LOG: AtomicU64 = AtomicU64::new(0);
 static LAST_EXPOSURE_REJECT_LOG: AtomicU64 = AtomicU64::new(0);
+static LAST_DRAWDOWN_REJECT_LOG: AtomicU64 = AtomicU64::new(0);
 
-/// Returns true if enough time has passed since last log (and updates the timestamp)
-fn should_log_rejection(last_log: &AtomicU64) -> bool {
+/// Returns true if enough time has passed since last log (and updates the timestamp).
+/// `interval_secs` lets each call site control its own throttle rate.
+fn should_log_rejection(last_log: &AtomicU64, interval_secs: u64) -> bool {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let last = last_log.load(Ordering::Relaxed);
-    if now >= last + REJECTION_LOG_INTERVAL_SECS {
+    if now >= last + interval_secs {
         last_log.store(now, Ordering::Relaxed);
         true
     } else {
@@ -70,7 +76,7 @@ impl RiskEngine {
         }
 
         if current_exposure_usdc + trade_size_usdc > max_exposure_usdc {
-            if should_log_rejection(&LAST_EXPOSURE_REJECT_LOG) {
+            if should_log_rejection(&LAST_EXPOSURE_REJECT_LOG, REJECTION_LOG_INTERVAL_SECS) {
                 info!("🛡️ Risk Reject: Exposure ${:.2} would exceed Strategy Max ${:.2}", current_exposure_usdc + trade_size_usdc, max_exposure_usdc);
             }
             return false;
@@ -78,7 +84,9 @@ impl RiskEngine {
 
         let max_dd = config::max_session_drawdown(starting_collateral);
         if session_pnl <= -max_dd {
-            info!("🛡️ Risk Reject: Session Drawdown ${:.2} >= Max ${:.2}", session_pnl.abs(), max_dd);
+            if should_log_rejection(&LAST_DRAWDOWN_REJECT_LOG, DRAWDOWN_LOG_INTERVAL_SECS) {
+                info!("🛡️ Risk Reject: Session Drawdown ${:.2} >= Max ${:.2}", session_pnl.abs(), max_dd);
+            }
             return false;
         }
 
@@ -107,7 +115,7 @@ impl RiskEngine {
         let net_exposure  = (projected_yes - projected_no).abs();
 
         if net_exposure > config::MAKER_MAX_EXPOSURE_USDC {
-            if should_log_rejection(&LAST_MAKER_NET_REJECT_LOG) {
+            if should_log_rejection(&LAST_MAKER_NET_REJECT_LOG, REJECTION_LOG_INTERVAL_SECS) {
                 info!("🛡️ Maker Net Exposure Reject: |YES ${:.2} - NO ${:.2}| = ${:.2} > Max ${:.2}",
                     projected_yes, projected_no, net_exposure, config::MAKER_MAX_EXPOSURE_USDC);
             }
@@ -116,7 +124,9 @@ impl RiskEngine {
 
         let max_dd = config::max_session_drawdown(starting_collateral);
         if session_pnl <= -max_dd {
-            info!("🛡️ Risk Reject: Session Drawdown ${:.2} >= Max ${:.2}", session_pnl.abs(), max_dd);
+            if should_log_rejection(&LAST_DRAWDOWN_REJECT_LOG, DRAWDOWN_LOG_INTERVAL_SECS) {
+                info!("🛡️ Risk Reject: Session Drawdown ${:.2} >= Max ${:.2}", session_pnl.abs(), max_dd);
+            }
             return false;
         }
         true

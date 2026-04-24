@@ -409,6 +409,7 @@ mod tests {
                 velocity_1s: velocity, // same as 5s for tests — both above threshold
                 acceleration: dec!(0),
                 funding_rate: dec!(0),
+                oracle_drift_60m: Default::default(),
                 timestamp: Utc::now(),
             },
             positions: Arc::new(Mutex::new(PositionMap::new())),
