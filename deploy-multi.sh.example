@@ -24,26 +24,34 @@ SSH_PORT="22"
 
 echo "🚀 Deploying 3 independent RustPolyBot containers to $HOST..."
 
-# 1. Create remote directory structure (including strategies/ and helpers/)
+# 1. Create remote directory structure (including strategies/, helpers/, orchestrator/, tasks/)
 echo "📁 Creating remote directory structure..."
-ssh -i "$KEY" "$USER@$HOST" "mkdir -p $REMOTE_DIR/src/strategies $REMOTE_DIR/src/helpers"
+ssh -i "$KEY" "$USER@$HOST" "mkdir -p $REMOTE_DIR/src/strategies $REMOTE_DIR/src/helpers $REMOTE_DIR/src/orchestrator $REMOTE_DIR/src/tasks"
 
 # 2. Copy code once
 echo "📤 Copying updated code to remote..."
 scp -P "$SSH_PORT" -i "$KEY" src/main.rs "$USER@$HOST:$REMOTE_DIR/src/main.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/config.rs "$USER@$HOST:$REMOTE_DIR/src/config.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/lib.rs "$USER@$HOST:$REMOTE_DIR/src/lib.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/state.rs "$USER@$HOST:$REMOTE_DIR/src/state.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/risk.rs "$USER@$HOST:$REMOTE_DIR/src/risk.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/metrics.rs "$USER@$HOST:$REMOTE_DIR/src/metrics.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/notifications.rs "$USER@$HOST:$REMOTE_DIR/src/notifications.rs"
-scp -i "$KEY" src/market_validator.rs "$USER@$HOST:$REMOTE_DIR/src/market_validator.rs"
-scp -i "$KEY" src/toctou_tests.rs "$USER@$HOST:$REMOTE_DIR/src/toctou_tests.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/market_validator.rs "$USER@$HOST:$REMOTE_DIR/src/market_validator.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/toctou_tests.rs "$USER@$HOST:$REMOTE_DIR/src/toctou_tests.rs"
 # Copy strategy modules
 scp -P "$SSH_PORT" -i "$KEY" src/strategies/mod.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/mod.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/strategies/momentum_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/momentum_impl.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/strategies/arbitrage_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/arbitrage_impl.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/strategies/time_decay_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/time_decay_impl.rs"
-scp -i "$KEY" src/strategies/maker_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/maker_impl.rs"
-scp -i "$KEY" src/strategies/basis_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/basis_impl.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/strategies/maker_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/maker_impl.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/strategies/basis_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/basis_impl.rs"
+# Copy orchestrator modules
+scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/mod.rs "$USER@$HOST:$REMOTE_DIR/src/orchestrator/mod.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/strategy.rs "$USER@$HOST:$REMOTE_DIR/src/orchestrator/strategy.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/registry.rs "$USER@$HOST:$REMOTE_DIR/src/orchestrator/registry.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/executor.rs "$USER@$HOST:$REMOTE_DIR/src/orchestrator/executor.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/market_data.rs "$USER@$HOST:$REMOTE_DIR/src/orchestrator/market_data.rs"
 # Copy helpers modules
 scp -P "$SSH_PORT" -i "$KEY" src/helpers/mod.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/mod.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/helpers/price.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/price.rs"
@@ -51,6 +59,17 @@ scp -P "$SSH_PORT" -i "$KEY" src/helpers/json.rs "$USER@$HOST:$REMOTE_DIR/src/he
 scp -P "$SSH_PORT" -i "$KEY" src/helpers/time.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/time.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/helpers/balance.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/balance.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/helpers/nonce.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/nonce.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/orders.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/orders.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/market.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/market.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/volatility.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/volatility.rs"
+# Copy tasks modules
+scp -P "$SSH_PORT" -i "$KEY" src/tasks/mod.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/mod.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/tasks/balance.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/balance.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/tasks/cleanup.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/cleanup.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/tasks/funding.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/funding.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/tasks/market_monitor.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/market_monitor.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/tasks/merge.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/merge.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/tasks/oracle.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/oracle.rs"
 scp -P "$SSH_PORT" -i "$KEY" .env "$USER@$HOST:$REMOTE_DIR/.env"
 scp -P "$SSH_PORT" -i "$KEY" Cargo.toml "$USER@$HOST:$REMOTE_DIR/Cargo.toml"
 scp -P "$SSH_PORT" -i "$KEY" Cargo.lock "$USER@$HOST:$REMOTE_DIR/Cargo.lock"
