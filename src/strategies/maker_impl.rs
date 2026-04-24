@@ -311,6 +311,7 @@ mod tests {
                 velocity_1s: dec!(0),
                 acceleration: dec!(0),
                 funding_rate: dec!(0),
+                oracle_drift_60m: Default::default(),
                 timestamp: Utc::now(),
             },
             positions: Arc::new(tokio::sync::Mutex::new(positions)),

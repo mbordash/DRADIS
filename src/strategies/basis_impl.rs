@@ -276,6 +276,7 @@ mod tests {
                 no_bid, no_bid_depth: dec!(100), no_ask, no_ask_depth: dec!(100),
                 oracle_price, velocity, velocity_1s: velocity,
                 acceleration: dec!(0), funding_rate,
+                oracle_drift_60m: Default::default(),
                 timestamp: Utc::now(),
             },
             positions: Arc::new(Mutex::new(PositionMap::new())),

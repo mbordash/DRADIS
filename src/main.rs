@@ -258,6 +258,8 @@ async fn main() -> Result<()> {
     let (velocity_tx, velocity_rx) = watch::channel((dec!(0), dec!(0), dec!(0)));
     // Broadcast latest Binance perpetual funding rate (updated every ~60s)
     let (funding_tx, funding_rx) = watch::channel(dec!(0));
+    // Broadcast 60-minute oracle price drift (current − price_60m_ago)
+    let (drift_60m_tx, drift_60m_rx) = watch::channel(dec!(0));
 
     let crypto_symbol = crypto_filter.clone();
     tokio::spawn(async move {
@@ -268,6 +270,7 @@ async fn main() -> Result<()> {
         };
         let url_str = format!("wss://stream.binance.com:9443/ws/{}@ticker", binance_pair);
         let mut price_history: VecDeque<(Instant, Decimal)> = VecDeque::new();
+        let mut price_history_60m: VecDeque<(Instant, Decimal)> = VecDeque::new();
         let mut prev_velocity = dec!(0);
 
         loop {
@@ -312,6 +315,22 @@ async fn main() -> Result<()> {
                                     prev_velocity = velocity_5s;
 
                                     let _ = velocity_tx.send((velocity_5s, velocity_1s, acceleration));
+
+                                    // ── 60-minute drift ──────────────────────────────
+                                    price_history_60m.push_back((now, price));
+                                    while let Some((t, _)) = price_history_60m.front() {
+                                        if now.duration_since(*t).as_secs() > 3600 {
+                                            price_history_60m.pop_front();
+                                        } else { break; }
+                                    }
+                                    let drift_60m = if price_history_60m.len() > 1 {
+                                        if let Some((oldest_t, oldest_p)) = price_history_60m.front() {
+                                            if now.duration_since(*oldest_t).as_secs() >= 3600 {
+                                                price - oldest_p
+                                            } else { dec!(0) }
+                                        } else { dec!(0) }
+                                    } else { dec!(0) };
+                                    let _ = drift_60m_tx.send(drift_60m);
                                 }
                             }
                         }
@@ -670,6 +689,7 @@ async fn main() -> Result<()> {
                     let oracle_price = *oracle_rx.borrow();
                     let (velocity, velocity_1s, acceleration) = *velocity_rx.borrow();
                     let funding_rate = *funding_rx.borrow();
+                    let oracle_drift_60m = *drift_60m_rx.borrow();
 
                     // Skip if prices not yet initialised from the orderbook WS
                     if yes_ask == dec!(1) && no_ask == dec!(1) {
@@ -682,6 +702,7 @@ async fn main() -> Result<()> {
                         no_bid, no_bid_depth, no_ask, no_ask_depth: no_depth,
                         oracle_price, velocity, velocity_1s, acceleration,
                         funding_rate,
+                        oracle_drift_60m,
                         timestamp: Utc::now(),
                     };
                     let market_cfg = MarketConfig {
@@ -706,6 +727,7 @@ async fn main() -> Result<()> {
                                 no_ask: mk_no_ask, no_ask_depth: mk_no_depth,
                                 oracle_price, velocity, velocity_1s, acceleration,
                                 funding_rate,
+                                oracle_drift_60m,
                                 timestamp: Utc::now(),
                             })
                         }
@@ -859,8 +881,23 @@ async fn main() -> Result<()> {
                                         let err_str = e.to_string();
                                         if err_str.contains("not enough balance") || err_str.contains("balance: 0") {
                                             let mut pos_map = positions.lock().await;
-                                            if pos_map.remove(&pos_key).is_some() {
-                                                warn!("🧹 EXIT [{}]: Phantom position removed for token {} (exchange balance=0). No shares owned.", strategy_name, token_id);
+                                            if let Some(pos) = pos_map.remove(&pos_key) {
+                                                if pos.fill_confirmed_at.is_some() {
+                                                    // Position was confirmed held on-chain (fill_confirmed_at set),
+                                                    // meaning these shares were real and are now confirmed sold
+                                                    // (exchange balance=0).  This happens when:
+                                                    //   1. A FAK exit returned 200 OK but filled 0 shares
+                                                    //   2. PARTIAL EXIT re-inserted the position
+                                                    //   3. The re-exit FAK sold the shares but returned a transient
+                                                    //      500, so the subsequent retry hit "not enough balance"
+                                                    // Record PnL at current bid (best approximation of exit price).
+                                                    let pnl = (bid - pos.avg_entry) * pos.shares;
+                                                    *total_pnl.lock().await += pnl;
+                                                    warn!("🧹 EXIT [{}]: Position sold (balance=0 confirmed). PnL ${:.4} | token {}", strategy_name, pnl, token_id);
+                                                } else {
+                                                    // True phantom: GTD order never filled, balance was always 0.
+                                                    warn!("🧹 EXIT [{}]: Phantom position removed for token {} (exchange balance=0). No shares owned.", strategy_name, token_id);
+                                                }
                                             }
                                             // Apply cooldown so the strategy doesn't immediately re-enter
                                             // on the next tick while the market is still in a crashed state.
@@ -885,6 +922,13 @@ async fn main() -> Result<()> {
                                             continue;
                                         }
                                         warn!("⚠️ Exit order failed: {}", e);
+                                        // "no orders found to match with FAK order" means the market bid
+                                        // moved between snapshot time and order arrival — a normal market
+                                        // microstructure event, NOT a system failure.  Don't charge the
+                                        // circuit breaker; the next tick will re-evaluate at the fresh bid.
+                                        if err_str.contains("no orders found") {
+                                            continue; // skip failure counters
+                                        }
                                         tick_failures += 1;
                                         consecutive_failures += 1;
                                         if consecutive_failures >= config::MAX_CONSECUTIVE_FAILURES {
@@ -952,9 +996,30 @@ async fn main() -> Result<()> {
                                             Err(_) => return, // can't confirm — leave removed
                                         };
                                         if remaining >= crate::config::MIN_ORDER_SHARES {
-                                            // Partial fill: correct overcounted PnL and re-insert
+                                            // Partial fill: correct overcounted PnL and re-insert.
+                                            //
+                                            // The first close booked PnL on `removed_shares`.  We need to
+                                            // reverse only the portion that was NOT actually sold — i.e. the
+                                            // shares that are still on-chain AND were counted in the first close.
+                                            //
+                                            // IMPORTANT: `remaining` can be GREATER than `removed_shares` when
+                                            // a slow-settling GTD order was still filling during the exit window
+                                            // (Polygon delivers fills in batches).  In that case the first close
+                                            // only booked PnL for `removed_shares`, so the correction ceiling is
+                                            // `removed_shares`, not `remaining`.  Using `remaining` directly
+                                            // over-corrects and understates the true loss.
+                                            //
+                                            // Example (this exact bug, 2026-04-24):
+                                            //   removed_shares = 2.45  (position snapped mid-settlement)
+                                            //   remaining      = 24.55 (22.1 more shares arrived 2.5s later)
+                                            //   filled         = 0     (FAK was killed — 0 sold)
+                                            //   OLD correction = -((bid - entry) × 24.55) = +$0.491  ← wrong
+                                            //   NEW correction = -((bid - entry) × 2.45)  = +$0.049  ← correct
+                                            //   Net recorded OLD: -$0.049 + $0.491 - $0.491 = -$0.049  (off by $0.442)
+                                            //   Net recorded NEW: -$0.049 + $0.049 - $0.491 = -$0.491  ✓
                                             let filled = (removed_shares - remaining).max(dec!(0));
-                                            let pnl_correction = -((bid_ps - removed_avg_entry) * remaining);
+                                            let over_booked_shares = remaining.min(removed_shares);
+                                            let pnl_correction = -((bid_ps - removed_avg_entry) * over_booked_shares);
                                             *total_pnl_ps.lock().await += pnl_correction;
                                             warn!("⚠️ PARTIAL EXIT [{}]: FAK sold {:.4}/{:.4} shares; \
                                                    {:.4} remain on-chain. PnL corrected by ${:.4}. Re-inserting for re-exit.",
@@ -1104,12 +1169,13 @@ async fn main() -> Result<()> {
                                 // was removed by sync_position_balance, to prevent phantom loops.
                                 {
                                     let pc = phantom_cooldowns.lock().await;
-                                    if let Some(removed_at) = pc.get(strategy_name.as_str()) {
+                                    let cooldown_key = format!("{}:{}", strategy_name, token_id);   // ← NEW: per-token key
+                                    if let Some(removed_at) = pc.get(&cooldown_key) {
                                         let elapsed = removed_at.elapsed();
                                         let cooldown = Duration::from_secs(rustpolybot::helpers::balance::PHANTOM_COOLDOWN_SECS);
                                         if elapsed < cooldown {
-                                            debug!("⏸️ ENTRY [{}]: signal suppressed — phantom cooldown ({:.0}s remaining)",
-                                                strategy_name, (cooldown - elapsed).as_secs_f32());
+                                            debug!("⏸️ ENTRY [{} | Token {}]: signal suppressed — phantom cooldown ({:.0}s remaining)",
+                                                strategy_name, token_id, (cooldown - elapsed).as_secs_f32());
                                             continue;
                                         }
                                     }

@@ -50,6 +50,7 @@ impl MarketDataBroadcaster {
         velocity_1s: Decimal,
         acceleration: Decimal,
         funding_rate: Decimal,
+        oracle_drift_60m: Decimal,
     ) -> MarketSnapshot {
         MarketSnapshot {
             yes_bid,
@@ -65,6 +66,7 @@ impl MarketDataBroadcaster {
             velocity_1s,
             acceleration,
             funding_rate,
+            oracle_drift_60m,
             timestamp: Utc::now(),
         }
     }
