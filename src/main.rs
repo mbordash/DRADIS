@@ -996,7 +996,7 @@ async fn main() -> Result<()> {
                                             Err(_) => return, // can't confirm — leave removed
                                         };
                                         if remaining >= crate::config::MIN_ORDER_SHARES {
-                                            // Partial fill: correct overcounted PnL and re-insert.
+                                            // Partial fill: correct overcounted PnL.
                                             //
                                             // The first close booked PnL on `removed_shares`.  We need to
                                             // reverse only the portion that was NOT actually sold — i.e. the
@@ -1021,28 +1021,46 @@ async fn main() -> Result<()> {
                                             let over_booked_shares = remaining.min(removed_shares);
                                             let pnl_correction = -((bid_ps - removed_avg_entry) * over_booked_shares);
                                             *total_pnl_ps.lock().await += pnl_correction;
-                                            warn!("⚠️ PARTIAL EXIT [{}]: FAK sold {:.4}/{:.4} shares; \
-                                                   {:.4} remain on-chain. PnL corrected by ${:.4}. Re-inserting for re-exit.",
-                                                  strategy_ps, filled, removed_shares, remaining, pnl_correction);
-                                            let pos_key_ps = (strategy_ps.clone(), token_ps);
-                                            let mut pos_map = positions_ps.lock().await;
-                                            if !pos_map.contains_key(&pos_key_ps) {
-                                                pos_map.insert(pos_key_ps, Position {
-                                                    shares: remaining,
-                                                    avg_entry: removed_avg_entry,
-                                                    opened_at: Utc::now(),
-                                                    close_time: removed_close_time,
-                                                    market_name: mkt_name_ps,
-                                                    pair_token_id: token_ps,
-                                                    fill_confirmed_at: Some(Utc::now()),
-                                                    paired_leg_token_id: None,
-                                                });
+
+                                            if filled < crate::config::MIN_ORDER_SHARES {
+                                                // FAK filled 0 shares — abort, do not re-insert.
+                                                // Re-inserting into a zero-fill FAK creates an infinite
+                                                // retry loop (seen in logs: PARTIAL EXIT × 3 on same position).
+                                                // The next strategy evaluation cycle will re-signal an exit
+                                                // if the position is still on-chain.
+                                                warn!("⚠️ PARTIAL EXIT [{}]: FAK filled 0/{:.4} shares; \
+                                                       {:.4} remain on-chain. PnL corrected by ${:.4}. \
+                                                       Aborting re-insert — next eval cycle will re-exit.",
+                                                      strategy_ps, removed_shares, remaining, pnl_correction);
+                                                let _ = send_notification(&tg_tok_ps, &tg_chat_ps,
+                                                    &format!("⚠️ Exit FAK filled 0 [{strategy_ps}]: {remaining:.4} shares remain — will retry on next cycle."),
+                                                ).await;
+                                            } else {
+                                                // Genuine partial fill: re-insert remaining shares so the
+                                                // next evaluation cycle can attempt a clean exit.
+                                                warn!("⚠️ PARTIAL EXIT [{}]: FAK sold {:.4}/{:.4} shares; \
+                                                       {:.4} remain on-chain. PnL corrected by ${:.4}. Re-inserting for re-exit.",
+                                                      strategy_ps, filled, removed_shares, remaining, pnl_correction);
+                                                let pos_key_ps = (strategy_ps.clone(), token_ps);
+                                                let mut pos_map = positions_ps.lock().await;
+                                                if !pos_map.contains_key(&pos_key_ps) {
+                                                    pos_map.insert(pos_key_ps, Position {
+                                                        shares: remaining,
+                                                        avg_entry: removed_avg_entry,
+                                                        opened_at: Utc::now(),
+                                                        close_time: removed_close_time,
+                                                        market_name: mkt_name_ps,
+                                                        pair_token_id: token_ps,
+                                                        fill_confirmed_at: Some(Utc::now()),
+                                                        paired_leg_token_id: None,
+                                                    });
+                                                }
+                                                drop(pos_map);
+                                                let _ = send_notification(&tg_tok_ps, &tg_chat_ps,
+                                                    &format!("⚠️ Partial exit [{strategy_ps}]: {filled:.4}/{removed_shares:.4} shares sold. \
+                                                              {remaining:.4} remain on-chain — re-inserted for re-exit."),
+                                                ).await;
                                             }
-                                            drop(pos_map);
-                                            let _ = send_notification(&tg_tok_ps, &tg_chat_ps,
-                                                &format!("⚠️ Partial exit [{strategy_ps}]: {filled:.4}/{removed_shares:.4} shares sold. \
-                                                          {remaining:.4} remain on-chain — re-inserted for re-exit."),
-                                            ).await;
                                         }
                                     });
                                 }
