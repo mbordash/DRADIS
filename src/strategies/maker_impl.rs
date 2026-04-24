@@ -134,8 +134,14 @@ impl Strategy for MakerStrategyImpl {
 
         // Apply skew: heavy YES → lower YES bid price, raise NO bid price.
         // skew > 0 when heavy YES, so YES bid decreases and NO bid increases.
-        let yes_bid_price = (yes_bid + yes_improvement - skew).max(dec!(0.01));
-        let no_bid_price  = (no_bid  + no_improvement  + skew).max(dec!(0.01));
+        // Clamp to at most (best_ask - 2 ticks) to guarantee we never cross the book,
+        // even after tick-rounding or stale WS snapshots.
+        let yes_bid_price = (yes_bid + yes_improvement - skew)
+            .min(yes_ask - config::MAKER_CROSS_BUFFER)
+            .max(dec!(0.01));
+        let no_bid_price  = (no_bid  + no_improvement  + skew)
+            .min(no_ask - config::MAKER_CROSS_BUFFER)
+            .max(dec!(0.01));
 
         // ── Per-side qualification checks ─────────────────────────────────────
         let yes_qualifies = yes_book_ok                             // ask-side not overwhelming bid-side
@@ -245,12 +251,15 @@ impl Strategy for MakerStrategyImpl {
             }
 
             // Stop-loss: requires fill confirmation (prevents phantom stops on GTD orders that
-            // never filled). The previous MIN_HOLD_SECS_BEFORE_STOP_LOSS gate is removed:
-            // fill_confirmed_at.is_some() is already the correct phantom guard — adding a
-            // 90s timer on top delayed stops and turned 8% losses into 39%+ disasters.
+            // never filled). A minimum hold time (MAKER_MIN_HOLD_SECS_BEFORE_STOP) is enforced
+            // so normal market noise in the first few minutes doesn't trigger an early exit.
             // Near-expiry: effective_stop_pct is halved (see above) so the stop fires earlier
             // before binary resolution dynamics cause a catastrophic gap.
+            let secs_since_fill = position.fill_confirmed_at
+                .map(|t| (Utc::now() - t).num_seconds())
+                .unwrap_or(0);
             if position.fill_confirmed_at.is_some()
+                && secs_since_fill >= config::MAKER_MIN_HOLD_SECS_BEFORE_STOP
                 && profit_pct <= -effective_stop_pct
             {
                 return Ok(StrategySignal::Exit {
@@ -443,17 +452,17 @@ mod tests {
         positions.insert(("MakerStrategy".to_string(), yes_token), Position {
             shares: dec!(20),
             avg_entry: dec!(0.30),
-            opened_at: Utc::now(),
+            opened_at: Utc::now() - Duration::seconds(400),
             close_time: None,
             market_name: "Test Market".to_string(),
             pair_token_id: yes_token,
-            // Fill confirmed: stop-loss is now eligible immediately without a hold timer.
-            fill_confirmed_at: Some(Utc::now()),
+            // Fill confirmed 400s ago — past the 300s hold gate.
+            fill_confirmed_at: Some(Utc::now() - Duration::seconds(400)),
             paired_leg_token_id: None,
         });
         let ctx = make_ctx(dec!(0.30), dec!(0.40), dec!(0.55), dec!(0.65), 2400, positions);
         let mut ctx2 = ctx.clone();
-        ctx2.snapshot.yes_bid = dec!(0.27); // -10% loss > 8% SL
+        ctx2.snapshot.yes_bid = dec!(0.25); // -16.7% loss > 15% SL
         let signal = strategy.evaluate_exit(&ctx2).await.unwrap();
         assert!(matches!(signal, StrategySignal::Exit { .. }));
     }
@@ -491,20 +500,21 @@ mod tests {
         positions.insert(("MakerStrategy".to_string(), yes_token), Position {
             shares: dec!(20),
             avg_entry: dec!(0.38),
-            opened_at: Utc::now(),
+            opened_at: Utc::now() - Duration::seconds(400),
             close_time: None,
             market_name: "Test Market".to_string(),
             pair_token_id: yes_token,
-            fill_confirmed_at: Some(Utc::now()),
+            // Fill confirmed 400s ago — past the 300s hold gate.
+            fill_confirmed_at: Some(Utc::now() - Duration::seconds(400)),
             paired_leg_token_id: None,
         });
         // secs_to_expiry = 1500 < MAKER_LATE_MARKET_STOP_TIGHTEN_SECS = 2700
         let ctx = make_ctx(dec!(0.38), dec!(0.48), dec!(0.55), dec!(0.65), 1500, positions);
         let mut ctx2 = ctx.clone();
-        // -5.3% loss: above normal 8% stop but below the 4% tighter near-expiry stop
-        ctx2.snapshot.yes_bid = dec!(0.36);
+        // -13.2% loss: above normal 15% stop but below the 10% tighter near-expiry stop
+        ctx2.snapshot.yes_bid = dec!(0.33);
         let signal = strategy.evaluate_exit(&ctx2).await.unwrap();
-        // Near-expiry: stop should fire at 4% threshold (0.36 / 0.38 - 1 = -5.3% < -4%)
+        // Near-expiry: stop should fire at 10% threshold (0.33 / 0.38 - 1 = -13.2% < -10%)
         assert!(matches!(signal, StrategySignal::Exit { .. }));
     }
 }
