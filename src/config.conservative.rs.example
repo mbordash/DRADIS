@@ -30,6 +30,7 @@ pub const GHOST_MODE: bool = false;
 
 /// Requires a wider margin before entering arbitrage — fewer trades, higher quality.
 pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.07);
+pub const ARBITRAGE_MAX_TAKER_FEE_BPS: u32 = 100;
 
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.96);
 
@@ -69,6 +70,10 @@ pub const MOMENTUM_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
 /// Requires a very strong reversal before exiting — avoids shaking out on noise.
 pub const MOMENTUM_REVERSAL_RATIO: Decimal = dec!(1.00);
 pub const MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL: i64 = 60;
+pub const MOMENTUM_FILL_CONFIRM_MIN_HOLD_SECS: i64 = 45;
+pub const LATE_MARKET_SIZE_THRESHOLD_SECS: i64 = 2400;
+pub const MOMENTUM_EXPIRY_EXIT_SECS: i64 = 1200;
+pub const MOMENTUM_EXPIRY_MIN_PROFIT_TO_HOLD: Decimal = dec!(0.03);
 pub const MOMENTUM_TAKE_PROFIT_CEILING: Decimal = dec!(0.90);
 
 /// Tighter strike buffers — only trade when well away from the strike.
@@ -104,6 +109,7 @@ pub const MAKER_BID_IMPROVEMENT: Decimal = dec!(0.01);
 pub const MAKER_BID_IMPROVEMENT_RATIO: Decimal = dec!(0.25);
 pub const MAKER_MIN_BID_IMPROVEMENT: Decimal = dec!(0.01);
 pub const MAKER_MAX_BID_IMPROVEMENT: Decimal = dec!(0.02);
+pub const MAKER_CROSS_BUFFER: Decimal = dec!(0.02);
 pub const CROSSES_BOOK_COOLDOWN_SECS: i64 = 60;
 
 /// Won't post maker orders within 45 minutes of expiry.
@@ -111,15 +117,22 @@ pub const MAKER_MIN_SECS_TO_EXPIRY: i64 = 2700;
 
 /// Lower max entry price — only post bids on genuinely uncertain markets.
 pub const MAKER_MAX_ENTRY_PRICE: Decimal = dec!(0.48);
+pub const MAKER_MAX_COMPLEMENTARY_PRICE: Decimal = dec!(0.58);
 pub const MAKER_MIN_ENTRY_PRICE: Decimal = dec!(0.10);
 
 pub const MAKER_TARGET_PROFIT_PERCENT: Decimal = dec!(0.10);
 pub const MAKER_STOP_LOSS_PERCENT: Decimal = dec!(0.05);
+pub const MAKER_LATE_MARKET_STOP_TIGHTEN_SECS: i64 = 3600;
+pub const MAKER_LATE_MARKET_STOP_LOSS_PERCENT: Decimal = dec!(0.04);
 
 /// Longer hold before stop-loss can fire — avoids cutting on noise.
-pub const MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 900;
+pub const MAKER_MIN_HOLD_SECS_BEFORE_STOP: i64 = 900;
+pub const MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = MAKER_MIN_HOLD_SECS_BEFORE_STOP;
 pub const MAKER_STOP_LOSS_COOLDOWN_SECS: i64 = 900;
+pub const MAKER_GTD_TTL_SECS: u64 = 120;
 pub const MAKER_MAX_COMBINED_BID: Decimal = dec!(0.88);
+pub const MAKER_MAX_BOOK_IMBALANCE_RATIO: Decimal = dec!(2.5);
+pub const MAKER_SLOW_TREND_THRESHOLD_BTC: Decimal = dec!(400.0);
 pub const MAKER_INVENTORY_SKEW_MAX: Decimal = dec!(0.02);
 
 /// Waits 10 minutes after market open before posting any maker orders.
@@ -160,6 +173,16 @@ pub const BASIS_KELLY_MAX_MULTIPLIER: Decimal = dec!(2.0);
 pub const BASIS_MAX_TAKER_FEE_BPS: u32 = 100;
 pub const BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 60;
 pub const BASIS_FUNDING_POLL_SECS: u64 = 60;
+
+
+// ============================================================================
+// POSITION MERGE SETTINGS
+// ============================================================================
+
+pub const MERGE_SCAN_INTERVAL_SECS: u64 = 60;
+pub const MERGE_COOLDOWN_SECS: u64 = 180;
+pub const MIN_MERGE_SHARES: Decimal = dec!(1.0);
+pub const MIN_MERGE_RATIO: Decimal = dec!(0.10);
 
 
 // ============================================================================
@@ -339,12 +362,60 @@ pub fn is_ultra_short_window_market(name: &str) -> bool {
         return true;
     }
 
-    let has_et = n.contains(" et");
-    let has_range = n.contains('-');
-    let has_time_marker = n.contains("am") || n.contains("pm");
-    let has_minutes = n.contains(':');
+    if let Some(window_mins) = parse_window_duration_minutes(name) {
+        return window_mins <= 30;
+    }
 
-    has_et && has_range && has_time_marker && has_minutes
+    false
+}
+
+pub fn parse_window_duration_minutes(name: &str) -> Option<u32> {
+    let n = name.to_lowercase();
+    if !n.contains(" et") { return None; }
+
+    let et_pos = n.find(" et")?;
+    let segment = &n[..et_pos];
+
+    let dash_pos = segment.rfind('-')?;
+    let end_part = segment[dash_pos + 1..].trim();
+    let start_part = {
+        let before_dash = &segment[..dash_pos];
+        let space_pos = before_dash.rfind(' ').unwrap_or(0);
+        before_dash[space_pos..].trim()
+    };
+
+    fn parse_minutes(s: &str) -> Option<u32> {
+        let s = s.trim();
+        let is_pm = s.ends_with("pm");
+        let is_am = s.ends_with("am");
+        if !is_pm && !is_am { return None; }
+        let time_part = &s[..s.len() - 2];
+        let colon = time_part.find(':')?;
+        let h: u32 = time_part[..colon].parse().ok()?;
+        let m: u32 = time_part[colon + 1..].parse().ok()?;
+        let mut total = h * 60 + m;
+        if is_pm && h != 12 { total += 720; }
+        if is_am && h == 12 { total = m; }
+        Some(total)
+    }
+
+    let start_mins = parse_minutes(start_part)?;
+    let end_mins = parse_minutes(end_part)?;
+    let duration = if end_mins >= start_mins { end_mins - start_mins } else { end_mins + 1440 - start_mins };
+    Some(duration)
+}
+
+pub fn is_window_market(name: &str) -> bool {
+    if let Some(mins) = parse_window_duration_minutes(name) {
+        mins > 30
+    } else {
+        false
+    }
+}
+
+pub fn is_daily_market(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("up or down") && n.contains(" on ") && !n.contains(" et")
 }
 
 
