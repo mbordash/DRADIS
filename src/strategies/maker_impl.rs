@@ -305,6 +305,7 @@ mod tests {
                 market_close_time: Some(Utc::now() + Duration::seconds(secs_to_expiry)),
                 strike_price: None,
                 is_neg_risk: false,
+                condition_id: "".to_string(),
                 yes_fee_bps: 100,
                 no_fee_bps: 100,
             },

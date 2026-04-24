@@ -91,6 +91,8 @@ pub struct MarketCandidate {
     pub is_hot: bool,
     pub close_time: Option<DateTime<Utc>>,
     pub volume: f64,
+    /// Polymarket condition ID (bytes32 hex) — required for on-chain merge operations.
+    pub condition_id: String,
 }
 
 /// Market type classification used to route strategies to the right venue.
@@ -143,6 +145,7 @@ pub async fn get_market_pair(
             is_hot: m.4,
             close_time: m.5,
             volume: 0.0,
+            condition_id: String::new(),
         });
 
     // 2. Full scan to find all candidates (needed to find window/daily markets)
@@ -200,6 +203,7 @@ pub async fn get_market_pair(
             is_hot: best.4,
             close_time: best.5,
             volume: best.3,
+            condition_id: best.7.clone(),
         }
     } else {
         warn!("⚠️ No valid markets found matching filters.");
@@ -207,6 +211,7 @@ pub async fn get_market_pair(
             yes_token: U256::ZERO, no_token: U256::ZERO,
             name: String::new(), link: String::new(), description: String::new(),
             is_hot: false, close_time: None, volume: 0.0,
+            condition_id: String::new(),
         }, None);
     };
 
@@ -223,6 +228,7 @@ pub async fn get_market_pair(
             is_hot: best.4,
             close_time: best.5,
             volume: best.3,
+            condition_id: best.7.clone(),
         }
     });
 
@@ -278,7 +284,7 @@ pub async fn get_top_market(http: &reqwest::Client) -> (U256, U256, String, Stri
 pub async fn fetch_simplified_crypto_candidates(
     http: &reqwest::Client,
     crypto_filter: &str,
-) -> Vec<(Vec<U256>, String, String, f64, bool, Option<DateTime<Utc>>, String)> {
+) -> Vec<(Vec<U256>, String, String, f64, bool, Option<DateTime<Utc>>, String, String)> {
     let mut out = vec![];
     let now = Utc::now();
     let mut total_scanned = 0;
@@ -392,10 +398,11 @@ pub async fn fetch_simplified_crypto_candidates(
 
             let link = market.get("slug").and_then(|v| v.as_str()).map(|s| format!("https://polymarket.com/{}", s)).unwrap_or_else(|| "https://polymarket.com/".to_string());
             let description = market.get("description").and_then(|v| v.as_str()).unwrap_or("").to_string();
+            let condition_id = market.get("conditionId").and_then(|v| v.as_str()).unwrap_or("").to_string();
             let hot = config::is_high_priority_text(&name) || config::is_high_priority_text(&event_title);
 
             debug!("  ✅ Valid market passed all checks");
-            out.push((token_ids, name.clone(), link, volume, hot, close_time, description));
+            out.push((token_ids, name.clone(), link, volume, hot, close_time, description, condition_id));
         }
     }
     info!("✅ Total scanned: {} | Candidates after filters: {}", total_scanned, out.len());

@@ -268,6 +268,7 @@ mod tests {
                 market_close_time: None,
                 strike_price: strike,
                 is_neg_risk: false,
+                condition_id: "".to_string(),
                 yes_fee_bps: 50,  // low-fee market so fee gate passes
                 no_fee_bps: 50,
             },

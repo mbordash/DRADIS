@@ -100,6 +100,9 @@ pub struct MarketConfig {
     pub strike_price: Option<Decimal>,
     /// Whether the market uses negative risk pricing
     pub is_neg_risk: bool,
+    /// Polymarket condition ID (bytes32 hex) — required for on-chain merge operations.
+    /// Empty string when not available (non-maker markets).
+    pub condition_id: String,
     /// YES token fee rate in basis points
     pub yes_fee_bps: u32,
     /// NO token fee rate in basis points

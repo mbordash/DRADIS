@@ -27,6 +27,12 @@ pub type PhantomCooldowns = Arc<Mutex<HashMap<String, Instant>>>;
 /// Prevents the bot from immediately re-posting the same unfillable GTD order.
 pub const PHANTOM_COOLDOWN_SECS: u64 = 120;
 
+/// Max seconds to wait for an on-chain balance to appear after an order,
+/// per venue. The window/4-hour CLOB is more aggressive about expiring GTD
+/// post-only orders, so we give it a longer leash before declaring a phantom.
+pub const MAX_WAIT_SECS_HOURLY: i64 = 180;
+pub const MAX_WAIT_SECS_WINDOW: i64 = 300;
+
 /// Known strategy names for reconciliation adoption priority.
 /// Maker is first because orphaned GTD fills are the most common cause.
 const ADOPTION_STRATEGIES: &[&str] = &["MakerStrategy", "ArbitrageStrategy", "TimeDecayStrategy", "MomentumStrategy"];
@@ -58,9 +64,9 @@ pub async fn sync_position_balance(
     token_id: U256,
     phantom_cooldowns: Option<&PhantomCooldowns>,
     baseline_shares: Decimal,
+    max_wait_secs: i64,
 ) -> Result<()> {
     let key = (strategy_name.to_string(), token_id);
-    let max_wait_secs: i64 = 180;        // increased
     let check_interval_ms: u64 = 3000;   // slightly faster polling
 
     tokio::time::sleep(Duration::from_millis(1500)).await;

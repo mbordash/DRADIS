@@ -71,106 +71,6 @@ type PriceState = (Decimal, Decimal, Decimal, Decimal); // (Bid, BidDepth, Ask, 
 const EXCHANGE_NORMAL: Address = address!("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E");
 const EXCHANGE_NEG_RISK: Address = address!("0xC5d563A36AE78145C45a50134d48A1215220f80a");
 
-async fn cleanup_expired_positions(
-    positions: Arc<Mutex<PositionMap>>,
-    market_name: String,
-    yes_token: U256,
-    no_token: U256,
-    close_time: Option<DateTime<Utc>>,
-) {
-    let mut pos_map = positions.lock().await;
-    let now = Utc::now();
-
-    if let Some(ct) = close_time {
-        let is_expired = ct <= now;
-        let is_expiring_soon = (ct - now).num_seconds() < 60;
-
-        if is_expired || is_expiring_soon {
-            let before = pos_map.len();
-            // Remove all strategies' positions for these two tokens
-            pos_map.retain(|(_, token), _| token != &yes_token && token != &no_token);
-            let removed = before - pos_map.len();
-
-            if removed > 0 {
-                warn!("🧹 Cleaned up {} position(s) for market \"{}\" (expires {})",
-                    removed,
-                    market_name,
-                    if is_expired { "NOW" } else { "in <60s" }
-                );
-            }
-        }
-    }
-}
-
-/// Reconcile orphaned paired positions.
-///
-/// For Arbitrage and TimeDecay strategies, positions must come in hedged pairs (YES+NO).
-/// If the first leg fills but the second leg fails, we're left with a one-sided position.
-/// This function detects such orphans (opened >60s ago with no matching pair leg) and
-/// immediately exits them to prevent unlimited unhedged losses.
-async fn reconcile_orphaned_positions(
-    positions: Arc<Mutex<PositionMap>>,
-    _trading_client: &Arc<ClobClient<polymarket_client_sdk::auth::state::Authenticated<polymarket_client_sdk::auth::Normal>>>,
-    _nonce_manager: &Arc<AtomicU64>,
-    _signer: &dyn Signer,
-    _safe_address: Address,
-    _eoa_address: Address,
-    tg_token: &str,
-    tg_chat_id: &str,
-    _shared_http: &Arc<reqwest::Client>,
-) -> Result<()> {
-    let mut pos_map = positions.lock().await;
-    let now = Utc::now();
-
-    // Find all paired-strategy positions that are missing their hedge
-    let mut orphans_to_exit: Vec<((String, U256), Position)> = Vec::new();
-
-    for ((strategy_name, token_id), position) in pos_map.iter() {
-        // Only check paired strategies
-        if strategy_name != "ArbitrageStrategy" && strategy_name != "TimeDecayStrategy" {
-            continue;
-        }
-
-        // Position must be open for at least 60 seconds (allows time for fill/sync)
-        let age_secs = (now - position.opened_at).num_seconds();
-        if age_secs < 60 {
-            continue;
-        }
-
-        // Check if the paired leg exists
-        if let Some(paired_token) = position.paired_leg_token_id {
-            let pair_key = (strategy_name.clone(), paired_token);
-            if pos_map.contains_key(&pair_key) {
-                // Pair exists, not an orphan
-                continue;
-            }
-
-            // Orphan detected: first leg exists, but paired leg doesn't
-            orphans_to_exit.push(((strategy_name.clone(), *token_id), position.clone()));
-        }
-    }
-
-    // Exit all orphaned positions immediately
-    for ((strategy_name, token_id), position) in orphans_to_exit {
-        warn!("🚨 ORPHANED PAIR DETECTED [{}]: {} shares at ${:.4} ({}s old) — exiting immediately",
-              strategy_name, position.shares, position.avg_entry,
-              (now - position.opened_at).num_seconds());
-
-        // Sell the orphaned position immediately at market (use current bid - sell offset)
-        // For now, we'll remove from tracking and log; in production, place a market sell
-        pos_map.remove(&(strategy_name.clone(), token_id));
-
-        // Notify user of the orphan
-        let _ = send_notification(tg_token, tg_chat_id,
-            &format!("🚨 Orphaned pair exited [{}]: {} {} shares @ ${:.4}",
-                     strategy_name,
-                     if token_id == position.pair_token_id { "YES" } else { "NO" },
-                     position.shares.trunc(),
-                     position.avg_entry)).await;
-    }
-
-    Ok(())
-}
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -238,20 +138,10 @@ async fn main() -> Result<()> {
     let _ = balance_tx.send(startup_balance);
     info!("📈 Starting portfolio value: ${:.2}", startup_balance);
 
-    let trading_client_balance = Arc::clone(&trading_client);
-    let balance_tx_bg = balance_tx.clone();
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(5));
-        loop {
-            interval.tick().await;
-            let mut req = BalanceAllowanceRequest::default();
-            req.asset_type = AssetType::Collateral;
-            if let Ok(resp) = trading_client_balance.balance_allowance(req).await {
-                let usdc = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
-                let _ = balance_tx_bg.send(usdc);
-            }
-        }
-    });
+    tokio::spawn(rustpolybot::tasks::balance::run_balance_poller(
+        Arc::clone(&trading_client),
+        balance_tx.clone(),
+    ));
 
     let (oracle_tx, oracle_rx) = watch::channel(dec!(0));
     // Broadcast (velocity_5s, velocity_1s, acceleration)
@@ -261,122 +151,18 @@ async fn main() -> Result<()> {
     // Broadcast 60-minute oracle price drift (current − price_60m_ago)
     let (drift_60m_tx, drift_60m_rx) = watch::channel(dec!(0));
 
-    let crypto_symbol = crypto_filter.clone();
-    tokio::spawn(async move {
-        let binance_pair = match crypto_symbol.as_str() {
-            "eth" => "ethusdt",
-            "sol" => "solusdt",
-            _ => "btcusdt",
-        };
-        let url_str = format!("wss://stream.binance.com:9443/ws/{}@ticker", binance_pair);
-        let mut price_history: VecDeque<(Instant, Decimal)> = VecDeque::new();
-        let mut price_history_60m: VecDeque<(Instant, Decimal)> = VecDeque::new();
-        let mut prev_velocity = dec!(0);
+    tokio::spawn(rustpolybot::tasks::oracle::run_oracle(
+        crypto_filter.clone(),
+        oracle_tx,
+        velocity_tx,
+        drift_60m_tx,
+    ));
 
-        loop {
-            if let Ok((mut ws_stream, _)) = connect_async(&url_str).await {
-                info!("📡 Connected to Binance Oracle for {}", binance_pair.to_uppercase());
-                while let Some(Ok(msg)) = ws_stream.next().await {
-                    if let Message::Text(text) = msg {
-                        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                            if let Some(price_str) = v.get("c").and_then(|p| p.as_str()) {
-                                if let Ok(price) = Decimal::from_str(price_str) {
-                                    let now = Instant::now();
-                                    let _ = oracle_tx.send(price);
-                                    price_history.push_back((now, price));
-
-                                    // Trim entries older than the primary window (5s)
-                                    while let Some((t, _)) = price_history.front() {
-                                        if now.duration_since(*t).as_secs() >= config::MOMENTUM_WINDOW_SECS {
-                                            price_history.pop_front();
-                                        } else { break; }
-                                    }
-
-                                    // ── Primary velocity (5s window) ──────────────────
-                                    let velocity_5s = if let Some((_, start_price)) = price_history.front() {
-                                        price - start_price
-                                    } else { dec!(0) };
-
-                                    // ── Short velocity (1s window) ────────────────────
-                                    // Walk back through history to find the price ~1s ago.
-                                    let velocity_1s = {
-                                        let cutoff = config::MOMENTUM_SHORT_WINDOW_SECS;
-                                        let start_1s = price_history.iter()
-                                            .find(|(t, _)| now.duration_since(*t).as_secs() < cutoff);
-                                        match start_1s {
-                                            Some((_, p)) => price - p,
-                                            None => velocity_5s, // insufficient history → use 5s
-                                        }
-                                    };
-
-                                    // ── Acceleration ──────────────────────────────────
-                                    // Rate of change of velocity: positive = building, negative = fading
-                                    let acceleration = velocity_5s - prev_velocity;
-                                    prev_velocity = velocity_5s;
-
-                                    let _ = velocity_tx.send((velocity_5s, velocity_1s, acceleration));
-
-                                    // ── 60-minute drift ──────────────────────────────
-                                    price_history_60m.push_back((now, price));
-                                    while let Some((t, _)) = price_history_60m.front() {
-                                        if now.duration_since(*t).as_secs() > 3600 {
-                                            price_history_60m.pop_front();
-                                        } else { break; }
-                                    }
-                                    let drift_60m = if price_history_60m.len() > 1 {
-                                        if let Some((oldest_t, oldest_p)) = price_history_60m.front() {
-                                            if now.duration_since(*oldest_t).as_secs() >= 3600 {
-                                                price - oldest_p
-                                            } else { dec!(0) }
-                                        } else { dec!(0) }
-                                    } else { dec!(0) };
-                                    let _ = drift_60m_tx.send(drift_60m);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-            warn!("⚠️ Binance Oracle disconnected. Reconnecting in 5s...");
-            prev_velocity = dec!(0);
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-        }
-    });
-
-    // ── Binance Futures Funding Rate Poller ────────────────────────────────
-    // Polls /fapi/v1/premiumIndex every BASIS_FUNDING_POLL_SECS (60s) to get
-    // lastFundingRate.  Negative rate = shorts paying longs (bearish smart money).
-    {
-        let http_funding = Arc::clone(&shared_http);
-        let funding_tx_bg = funding_tx.clone();
-        let symbol_funding = match crypto_filter.as_str() {
-            "eth" => "ETHUSDT",
-            "sol" => "SOLUSDT",
-            _     => "BTCUSDT",
-        };
-        tokio::spawn(async move {
-            let url = format!(
-                "https://fapi.binance.com/fapi/v1/premiumIndex?symbol={}",
-                symbol_funding
-            );
-            loop {
-                match http_funding.get(&url).send().await {
-                    Ok(resp) => {
-                        if let Ok(v) = resp.json::<serde_json::Value>().await {
-                            if let Some(rate_str) = v.get("lastFundingRate").and_then(|r| r.as_str()) {
-                                if let Ok(rate) = Decimal::from_str(rate_str) {
-                                    let _ = funding_tx_bg.send(rate);
-                                    debug!("📡 Funding rate {}: {:.6}%", symbol_funding, rate * dec!(100));
-                                }
-                            }
-                        }
-                    }
-                    Err(e) => warn!("⚠️ Funding rate poll failed: {}", e),
-                }
-                tokio::time::sleep(std::time::Duration::from_secs(config::BASIS_FUNDING_POLL_SECS)).await;
-            }
-        });
-    }
+    tokio::spawn(rustpolybot::tasks::funding::run_funding_poller(
+        Arc::clone(&shared_http),
+        crypto_filter.clone(),
+        funding_tx,
+    ));
 
     let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(PositionMap::new()));
     let total_pnl: Arc<Mutex<Decimal>> = Arc::new(Mutex::new(dec!(0)));
@@ -414,72 +200,25 @@ async fn main() -> Result<()> {
 
     let (market_tx, mut market_rx) = watch::channel((initial_yes, initial_no, name, close_time, initial_strike, desc, initial_maker_market));
 
-    let http_monitor = Arc::clone(&shared_http);
-    let market_tx_monitor = market_tx.clone();
-    let crypto_filter_monitor = crypto_filter.clone();
+    tokio::spawn(rustpolybot::tasks::market_monitor::run_market_monitor(
+        Arc::clone(&shared_http),
+        crypto_filter.clone(),
+        market_tx.clone(),
+    ));
 
-    tokio::spawn(async move {
-        let mut interval = tokio::time::interval(std::time::Duration::from_secs(90));
-        loop {
-            interval.tick().await;
-            let (candidate, maker_candidate) = get_market_pair(&http_monitor).await;
-            if candidate.yes_token == U256::ZERO { continue; }
-            let (cur_yes, _, cur_name, cur_close_time, _, _, _) = market_tx_monitor.borrow().clone();
-
-            if candidate.yes_token == cur_yes {
-                // Hourly market unchanged — still check if maker market changed
-                let cur_maker = market_tx_monitor.borrow().6.clone();
-                let cur_maker_yes = cur_maker.as_ref().map(|m| m.yes_token);
-                let new_maker_yes = maker_candidate.as_ref().map(|m| m.yes_token);
-                if cur_maker_yes != new_maker_yes {
-                    if let Some(ref mk) = maker_candidate {
-                        info!("🏦 Maker market updated: \"{}\"", mk.name);
-                    }
-                    let (y, n, nm, ct, sp, ds, _) = market_tx_monitor.borrow().clone();
-                    let _ = market_tx_monitor.send((y, n, nm, ct, sp, ds, maker_candidate));
-                }
-                continue;
-            }
-
-            let now_ts = Utc::now();
-            let cur_secs_left = cur_close_time.map_or(9999i64, |ct| (ct - now_ts).num_seconds());
-            let new_secs_left = candidate.close_time.map_or(9999i64, |ct| (ct - now_ts).num_seconds());
-
-            let candidate_is_binary = candidate.name.to_lowercase().contains("up or down");
-            let current_is_binary = cur_name.to_lowercase().contains("up or down");
-            let candidate_is_range = config::is_range_market(&candidate.name);
-
-            let time_based_upgrade = new_secs_left > cur_secs_left + 1800
-                && !(current_is_binary && !candidate_is_binary);
-
-            let should_switch = cur_secs_left < config::FINAL_EXPIRY_WINDOW_SECS
-                || cur_secs_left <= 0
-                || time_based_upgrade
-                || (candidate_is_binary && !current_is_binary && !candidate_is_range && new_secs_left > 600 && cur_secs_left > 300);
-
-            if !should_switch {
-                continue;
-            }
-
-            info!("🔄 Market Switch Detected: {} -> {}", cur_name, candidate.name);
-            let mut strike = rustpolybot::market_validator::extract_strike_price(&candidate.name);
-            if strike.is_none() {
-                strike = fetch_historical_strike_price(&http_monitor, &crypto_filter_monitor, &candidate.description).await;
-            }
-            if strike.is_none() {
-                strike = fetch_historical_strike_price(&http_monitor, &crypto_filter_monitor, &candidate.name).await;
-            }
-            if strike.is_none() {
-                strike = fetch_strike_price_from_close_time(&http_monitor, &crypto_filter_monitor, candidate.close_time).await;
-            }
-            let _ = market_tx_monitor.send((
-                candidate.yes_token, candidate.no_token,
-                candidate.name.clone(), candidate.close_time,
-                strike, candidate.description.clone(),
-                maker_candidate,
-            ));
-        }
-    });
+    // ── Merge scanner ─────────────────────────────────────────────────────────
+    // Shared list of markets to scan for mergeable YES+NO pairs.
+    // Updated each time the maker market changes (see inner loop below).
+    let merge_markets: Arc<Mutex<Vec<rustpolybot::tasks::merge::MergeMarket>>> =
+        Arc::new(Mutex::new(Vec::new()));
+    let tg_token_main = env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
+    let tg_chat_id_main = env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
+    tokio::spawn(rustpolybot::tasks::merge::run_merge_scanner(
+        Arc::clone(&positions),
+        Arc::clone(&merge_markets),
+        tg_token_main,
+        tg_chat_id_main,
+    ));
 
     loop {
         let (yes_token, no_token, market_name, market_close_time, strike_price, _, maker_market_candidate) = market_rx.borrow().clone();
@@ -588,12 +327,32 @@ async fn main() -> Result<()> {
                 market_close_time: mk.close_time,
                 strike_price,
                 is_neg_risk: mk_neg_risk,
+                condition_id: mk.condition_id.clone(),
                 yes_fee_bps: mk_yes_fee,
                 no_fee_bps: mk_no_fee,
             })
         } else {
             None
         };
+
+        // Update merge scanner market list for this trading cycle.
+        // The merge scanner watches MakerStrategy positions on the maker market.
+        {
+            let mut mm = merge_markets.lock().await;
+            mm.clear();
+            if let Some(ref mk_cfg) = maker_market_config {
+                if !mk_cfg.condition_id.is_empty() {
+                    mm.push(rustpolybot::tasks::merge::MergeMarket {
+                        yes_token: mk_cfg.yes_token,
+                        no_token: mk_cfg.no_token,
+                        condition_id: mk_cfg.condition_id.clone(),
+                        is_neg_risk: mk_cfg.is_neg_risk,
+                        market_name: mk_cfg.market_name.clone(),
+                        strategy_name: "MakerStrategy".to_string(),
+                    });
+                }
+            }
+        }
 
         let mut ticker = interval(config::main_ticker_interval());
         let mut status_ticker = interval(std::time::Duration::from_secs(60));
@@ -629,32 +388,19 @@ async fn main() -> Result<()> {
                     info!("📍 Network Pulse: {:?}", start.elapsed());
                 }
                 _ = cleanup_ticker.tick() => {
-                    cleanup_expired_positions(Arc::clone(&positions), market_name.clone(), yes_token, no_token, market_close_time).await;
+                    rustpolybot::tasks::cleanup::cleanup_expired_positions(
+                        Arc::clone(&positions), market_name.clone(), yes_token, no_token, market_close_time,
+                    ).await;
 
-                    // Reconcile orphaned paired positions (Arbitrage/TimeDecay strategies)
-                    if let Err(e) = reconcile_orphaned_positions(
-                        Arc::clone(&positions),
-                        &trading_client,
-                        &nonce_manager,
-                        &signer,
-                        safe_address,
-                        eoa_address,
-                        &tg_token,
-                        &tg_chat_id,
-                        &shared_http,
+                    if let Err(e) = rustpolybot::tasks::cleanup::reconcile_orphaned_positions(
+                        Arc::clone(&positions), &tg_token, &tg_chat_id,
                     ).await {
                         warn!("⚠️ Orphan reconciliation error: {}", e);
                     }
 
-                    let mut td_map = time_decay_positions.lock().await;
-                    let before_count = td_map.len();
-                    td_map.retain(|_, pos| {
-                        if pos.is_expired() {
-                            false
-                        } else {
-                            true
-                        }
-                    });
+                    rustpolybot::tasks::cleanup::cleanup_time_decay_positions(
+                        Arc::clone(&time_decay_positions),
+                    ).await;
                 }
                 _ = status_ticker.tick() => {
                     let (yes_bid, _, yes_ask, _) = *yes_price_rx.borrow();
@@ -711,6 +457,7 @@ async fn main() -> Result<()> {
                         market_close_time,
                         strike_price,
                         is_neg_risk,
+                        condition_id: String::new(),
                         yes_fee_bps: yes_fee_rate,
                         no_fee_bps: no_fee_rate,
                     };
@@ -1477,8 +1224,13 @@ async fn main() -> Result<()> {
                                     let phantom_cooldowns_sync = Arc::clone(&phantom_cooldowns);
                                     let strategy_sync = strategy_name.clone();
                                     let token_sync = *token_id;
+                                    let sync_max_wait = if is_maker {
+                                        rustpolybot::helpers::balance::MAX_WAIT_SECS_WINDOW
+                                    } else {
+                                        rustpolybot::helpers::balance::MAX_WAIT_SECS_HOURLY
+                                    };
                                     tokio::spawn(async move {
-                                        let _ = sync_position_balance(&client_sync, &positions_sync, &strategy_sync, token_sync, Some(&phantom_cooldowns_sync), baseline_shares).await;
+                                        let _ = sync_position_balance(&client_sync, &positions_sync, &strategy_sync, token_sync, Some(&phantom_cooldowns_sync), baseline_shares, sync_max_wait).await;
                                     });
                                 }
 
@@ -1525,7 +1277,7 @@ async fn main() -> Result<()> {
                                         let phantom_cooldowns_sync = Arc::clone(&phantom_cooldowns);
                                         let strategy_sync = strategy_name.clone();
                                         tokio::spawn(async move {
-                                            let _ = sync_position_balance(&client_sync, &positions_sync, &strategy_sync, pair_token, Some(&phantom_cooldowns_sync), dec!(0)).await;
+                                            let _ = sync_position_balance(&client_sync, &positions_sync, &strategy_sync, pair_token, Some(&phantom_cooldowns_sync), dec!(0), rustpolybot::helpers::balance::MAX_WAIT_SECS_HOURLY).await;
                                         });
                                     }
                                 }
@@ -1654,7 +1406,7 @@ async fn main() -> Result<()> {
                                                         any_placed = true;
                                                         let cs = Arc::clone(&trading_client); let ps = Arc::clone(&positions);
                                                         let pcs = Arc::clone(&phantom_cooldowns); let ss = strategy_name.clone();
-                                                        tokio::spawn(async move { let _ = sync_position_balance(&cs, &ps, &ss, mk_yes_token, Some(&pcs), baseline_shares).await; });
+                                                        tokio::spawn(async move { let _ = sync_position_balance(&cs, &ps, &ss, mk_yes_token, Some(&pcs), baseline_shares, rustpolybot::helpers::balance::MAX_WAIT_SECS_WINDOW).await; });
                                                     }
                                                     Err(e) => {
                                                         positions.lock().await.remove(&pos_key);
@@ -1710,7 +1462,7 @@ async fn main() -> Result<()> {
                                                         any_placed = true;
                                                         let cs = Arc::clone(&trading_client); let ps = Arc::clone(&positions);
                                                         let pcs = Arc::clone(&phantom_cooldowns); let ss = strategy_name.clone();
-                                                        tokio::spawn(async move { let _ = sync_position_balance(&cs, &ps, &ss, mk_no_token, Some(&pcs), baseline_shares).await; });
+                                                        tokio::spawn(async move { let _ = sync_position_balance(&cs, &ps, &ss, mk_no_token, Some(&pcs), baseline_shares, rustpolybot::helpers::balance::MAX_WAIT_SECS_WINDOW).await; });
                                                     }
                                                     Err(e) => {
                                                         positions.lock().await.remove(&pos_key);

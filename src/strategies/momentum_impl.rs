@@ -392,6 +392,7 @@ mod tests {
                 market_close_time: None,
                 strike_price,
                 is_neg_risk: false,
+                condition_id: "".to_string(),
                 yes_fee_bps: 50,
                 no_fee_bps: 50,
             },
