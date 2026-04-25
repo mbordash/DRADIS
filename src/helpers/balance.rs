@@ -9,7 +9,7 @@ use alloy::primitives::U256;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 use chrono::Utc;
-use tracing::{info, warn};
+use tracing::{debug, error, info, warn};
 
 use polymarket_client_sdk::clob::{Client as ClobClient};
 use polymarket_client_sdk::auth::state::Authenticated;
@@ -31,7 +31,7 @@ pub const PHANTOM_COOLDOWN_SECS: u64 = 120;
 /// per venue. The window/4-hour CLOB is more aggressive about expiring GTD
 /// post-only orders, so we give it a longer leash before declaring a phantom.
 pub const MAX_WAIT_SECS_HOURLY: i64 = 180;
-pub const MAX_WAIT_SECS_WINDOW: i64 = 300;
+pub const MAX_WAIT_SECS_WINDOW: i64 = 600;
 
 /// Known strategy names for reconciliation adoption priority.
 /// Maker is first because orphaned GTD fills are the most common cause.
@@ -119,13 +119,13 @@ pub async fn sync_position_balance(
                     // Check resting order EARLIER and MORE OFTEN
                     let has_resting = check_for_resting_order(client, token_id).await;
                     if has_resting {
-                        warn!("⏳ Position Sync [{}]: Token {} still 0 after {}s but resting GTD found — keeping alive.",
+                        debug!("⏳ Position Sync [{}]: Token {} still 0 after {}s but resting order found — keeping alive.",
                           strategy_name, token_id, time_since_open);
                         tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
                         continue;
                     }
-                    warn!("⚠️ Position Sync FAILED [{}]: Token {} — no open orders after {}s. Removing phantom.",
-                      strategy_name, token_id, time_since_open);
+
+                    error!("⚠️ Position Sync FAILED [{}] Token {} — no open orders after {}s. Removing phantom.", strategy_name, token_id, max_wait_secs);
                     positions.lock().await.remove(&key);
                     if let Some(cooldowns) = phantom_cooldowns {
                         let cooldown_key = format!("{}:{}", strategy_name, token_id);
@@ -151,7 +151,7 @@ pub async fn sync_position_balance(
                             Err(_) => false, // if API fails, err on the side of caution and remove
                         };
                         if has_resting_order {
-                            warn!("⏳ Position Sync [{}]: Token {} balance still 0 after {}s but resting GTD order found in CLOB — keeping position alive.",
+                            debug!("⏳ Position Sync [{}]: Token {} still 0 after {}s but resting order (GTC) found — keeping alive.",
                                   strategy_name, token_id, time_since_open);
                             tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
                             continue;
