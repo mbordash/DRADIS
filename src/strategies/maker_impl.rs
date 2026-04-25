@@ -25,10 +25,6 @@ use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus};
 use crate::config;
 
-/// Velocity threshold (oracle USD/s) above which we consider the market
-/// strongly directional and suppress the adverse maker side.
-const MAKER_VELOCITY_BIAS_THRESHOLD: Decimal = dec!(25.0);
-
 pub struct MakerStrategyImpl;
 
 #[async_trait]
@@ -110,8 +106,8 @@ impl Strategy for MakerStrategyImpl {
 
         // ── Velocity bias uses the hourly oracle (always) ─────────────────────
         let velocity = ctx.snapshot.velocity;
-        let velocity_bias_strong_negative = velocity <= -MAKER_VELOCITY_BIAS_THRESHOLD;
-        let velocity_bias_strong_positive = velocity >= MAKER_VELOCITY_BIAS_THRESHOLD;
+        let velocity_bias_strong_negative = velocity <= -config::MAKER_VELOCITY_BIAS_THRESHOLD;
+        let velocity_bias_strong_positive = velocity >= config::MAKER_VELOCITY_BIAS_THRESHOLD;
 
         // ── Compute spread-relative bid improvement for each side ─────────────
         let yes_spread = yes_ask - yes_bid;
@@ -132,16 +128,21 @@ impl Strategy for MakerStrategyImpl {
             config::MAKER_BID_IMPROVEMENT
         };
 
-        // Apply skew: heavy YES → lower YES bid price, raise NO bid price.
-        // skew > 0 when heavy YES, so YES bid decreases and NO bid increases.
-        // Clamp to at most (best_ask - 2 ticks) to guarantee we never cross the book,
-        // even after tick-rounding or stale WS snapshots.
-        let yes_bid_price = (yes_bid + yes_improvement - skew)
-            .min(yes_ask - config::MAKER_CROSS_BUFFER)
-            .max(dec!(0.01));
-        let no_bid_price  = (no_bid  + no_improvement  + skew)
-            .min(no_ask - config::MAKER_CROSS_BUFFER)
-            .max(dec!(0.01));
+        // Conservative quoting for MakerStrategy
+        // Wider buffer on window markets to avoid long-unfilled GTC orders
+        let bid_buffer = if ctx.maker_market.is_some() {
+            config::MAKER_BID_BUFFER   // 0.04 on window markets
+        } else {
+            dec!(0.015)                // smaller buffer on hourly markets
+        };
+
+        let yes_bid_price = (snapshot.yes_ask - bid_buffer)
+            .max(dec!(0.01))
+            .min(snapshot.yes_ask - dec!(0.005)); // never cross the book
+
+        let no_bid_price = (snapshot.no_ask - bid_buffer)
+            .max(dec!(0.01))
+            .min(snapshot.no_ask - dec!(0.005));  // never cross the book
 
         // ── Per-side qualification checks ─────────────────────────────────────
         let yes_qualifies = yes_book_ok                             // ask-side not overwhelming bid-side

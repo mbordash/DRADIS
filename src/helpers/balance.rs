@@ -6,6 +6,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::str::FromStr;
 use alloy::primitives::U256;
+use alloy::primitives::B256;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 use chrono::Utc;
@@ -298,3 +299,47 @@ pub async fn reconcile_orphaned_positions(
     }
 }
 
+/// Fast fill confirmation using the "instant cancel" trick (Reddit-recommended).
+/// Only affects the current market — safe for multi-strategy bots.
+pub async fn quick_confirm_fill(
+    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    strategy_name: &str,
+    token_id: U256,
+    positions: &Arc<Mutex<PositionMap>>,
+    condition_id: &str,
+) -> Result<bool> {
+    // Convert string condition_id → B256
+    let market_hash = match B256::from_str(condition_id) {
+        Ok(hash) => hash,
+        Err(e) => {
+            warn!("⚠️ quick_confirm_fill: invalid condition_id '{}': {}", condition_id, e);
+            return Ok(false);
+        }
+    };
+
+    // Correct builder usage (non-exhaustive struct)
+    let req = polymarket_client_sdk::clob::types::request::CancelMarketOrderRequest::builder()
+        .market(market_hash)      // ← NO Some() here
+        .build();
+
+    let _ = client.cancel_market_orders(&req).await;
+
+    // Check if our order is still resting
+    let still_resting = check_for_resting_order(client, token_id).await;
+
+    let mut pos_map = positions.lock().await;
+    let key = (strategy_name.to_string(), token_id);
+
+    if let Some(pos) = pos_map.get_mut(&key) {
+        if !still_resting {
+            pos.fill_confirmed_at = Some(Utc::now());
+            info!("✅ QUICK CONFIRM FILL [{}]: Token {} filled on-chain instantly", strategy_name, token_id);
+            return Ok(true);
+        } else {
+            debug!("⏳ Quick confirm [{}]: Token {} still resting (no fill yet)", strategy_name, token_id);
+            return Ok(false);
+        }
+    }
+
+    Ok(false)
+}

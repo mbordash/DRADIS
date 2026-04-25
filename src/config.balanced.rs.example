@@ -90,6 +90,8 @@ pub const SOL_MOMENTUM_THRESHOLD: Decimal = dec!(0.4);
 
 pub const ENABLE_MAKER_TRADING: bool = true;
 
+pub const MAKER_VELOCITY_BIAS_THRESHOLD: Decimal = dec!(25.0);
+pub const MAKER_BID_BUFFER: Decimal = dec!(0.03);
 pub const MAKER_MIN_SPREAD: Decimal = dec!(0.04);
 pub const MAKER_BID_IMPROVEMENT: Decimal = dec!(0.01);
 pub const MAKER_BID_IMPROVEMENT_RATIO: Decimal = dec!(0.28);
