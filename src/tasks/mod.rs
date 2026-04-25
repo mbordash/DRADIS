@@ -8,4 +8,3 @@ pub mod oracle;
 pub mod funding;
 pub mod market_monitor;
 pub mod cleanup;
-pub mod merge;

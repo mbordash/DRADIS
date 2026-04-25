@@ -204,20 +204,6 @@ async fn main() -> Result<()> {
         market_tx.clone(),
     ));
 
-    // ── Merge scanner ─────────────────────────────────────────────────────────
-    // Shared list of markets to scan for mergeable YES+NO pairs.
-    // Updated each time the maker market changes (see inner loop below).
-    let merge_markets: Arc<Mutex<Vec<rustpolybot::tasks::merge::MergeMarket>>> =
-        Arc::new(Mutex::new(Vec::new()));
-    let tg_token_main = env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
-    let tg_chat_id_main = env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
-    tokio::spawn(rustpolybot::tasks::merge::run_merge_scanner(
-        Arc::clone(&positions),
-        Arc::clone(&merge_markets),
-        tg_token_main,
-        tg_chat_id_main,
-    ));
-
     loop {
         let (yes_token, no_token, market_name, market_close_time, strike_price, _, maker_market_candidate, condition_id) = market_rx.borrow().clone();
 
@@ -332,25 +318,6 @@ async fn main() -> Result<()> {
         } else {
             None
         };
-
-        // Update merge scanner market list for this trading cycle.
-        // The merge scanner watches MakerStrategy positions on the maker market.
-        {
-            let mut mm = merge_markets.lock().await;
-            mm.clear();
-            if let Some(ref mk_cfg) = maker_market_config {
-                if !mk_cfg.condition_id.is_empty() {
-                    mm.push(rustpolybot::tasks::merge::MergeMarket {
-                        yes_token: mk_cfg.yes_token,
-                        no_token: mk_cfg.no_token,
-                        condition_id: mk_cfg.condition_id.clone(),
-                        is_neg_risk: mk_cfg.is_neg_risk,
-                        market_name: mk_cfg.market_name.clone(),
-                        strategy_name: "MakerStrategy".to_string(),
-                    });
-                }
-            }
-        }
 
         let mut ticker = interval(config::main_ticker_interval());
         let mut status_ticker = interval(std::time::Duration::from_secs(60));
