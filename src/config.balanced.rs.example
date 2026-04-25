@@ -27,7 +27,8 @@ pub const ENABLE_TELEGRAM: bool = true;
 
 pub const GHOST_MODE: bool = false;
 
-pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.05);
+/// Min net profit after fees to trigger arbitrage.
+pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.03);
 pub const ARBITRAGE_MAX_TAKER_FEE_BPS: u32 = 200;
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.97);
 pub const MIN_ORDER_SHARES: Decimal = dec!(1.0);
@@ -52,10 +53,9 @@ pub const MOMENTUM_KELLY_MAX_MULTIPLIER: Decimal = dec!(3.0);
 pub const MOMENTUM_MIN_TRADE_SIZE_USDC: Decimal = dec!(4.0);
 pub const MOMENTUM_MAX_TRADE_SIZE_USDC: Decimal = dec!(15.0);
 
-/// 2-tick confirmation — balances speed vs. fakeout protection.
 pub const MOMENTUM_CONFIRMATION_TICKS: u32 = 2;
 
-pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.07);
+pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.10);
 pub const MOMENTUM_STOP_LOSS_PERCENT: Decimal = dec!(0.15);
 pub const MOMENTUM_REVERSAL_RATIO: Decimal = dec!(0.85);
 pub const MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL: i64 = 35;
@@ -65,9 +65,9 @@ pub const MOMENTUM_EXPIRY_EXIT_SECS: i64 = 900;
 pub const MOMENTUM_EXPIRY_MIN_PROFIT_TO_HOLD: Decimal = dec!(0.02);
 pub const MOMENTUM_TAKE_PROFIT_CEILING: Decimal = dec!(0.90);
 
-pub const BTC_STRIKE_BUFFER: Decimal = dec!(75.0);
-pub const ETH_STRIKE_BUFFER: Decimal = dec!(6.0);
-pub const SOL_STRIKE_BUFFER: Decimal = dec!(0.35);
+pub const BTC_STRIKE_BUFFER: Decimal = dec!(50.0);
+pub const ETH_STRIKE_BUFFER: Decimal = dec!(5.0);
+pub const SOL_STRIKE_BUFFER: Decimal = dec!(0.2);
 
 pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.85);
 pub const MAX_MOMENTUM_CROSSING_ENTRY_PRICE: Decimal = dec!(0.70);
@@ -78,10 +78,9 @@ pub const MOMENTUM_SHORT_WINDOW_FRACTION: Decimal = dec!(0.45);
 pub const MOMENTUM_ACCELERATION_BYPASS_MULTIPLIER: Decimal = dec!(3.0);
 pub const MOMENTUM_DECAY_EXIT_FRACTION: Decimal = dec!(0.25);
 
-/// Moderate threshold — catches solid BTC moves without chasing noise.
-pub const BTC_MOMENTUM_THRESHOLD: Decimal = dec!(85.0);
-pub const ETH_MOMENTUM_THRESHOLD: Decimal = dec!(4.0);
-pub const SOL_MOMENTUM_THRESHOLD: Decimal = dec!(0.4);
+pub const BTC_MOMENTUM_THRESHOLD: Decimal = dec!(75.0);
+pub const ETH_MOMENTUM_THRESHOLD: Decimal = dec!(3.0);
+pub const SOL_MOMENTUM_THRESHOLD: Decimal = dec!(0.3);
 
 
 // ============================================================================
@@ -100,7 +99,6 @@ pub const MAKER_MAX_BID_IMPROVEMENT: Decimal = dec!(0.03);
 pub const MAKER_CROSS_BUFFER: Decimal = dec!(0.02);
 pub const CROSSES_BOOK_COOLDOWN_SECS: i64 = 45;
 
-/// No maker orders within 35 minutes of expiry.
 pub const MAKER_MIN_SECS_TO_EXPIRY: i64 = 2100;
 
 pub const MAKER_MAX_ENTRY_PRICE: Decimal = dec!(0.52);
@@ -120,7 +118,7 @@ pub const MAKER_MAX_BOOK_IMBALANCE_RATIO: Decimal = dec!(3.0);
 pub const MAKER_SLOW_TREND_THRESHOLD_BTC: Decimal = dec!(300.0);
 pub const MAKER_INVENTORY_SKEW_MAX: Decimal = dec!(0.03);
 
-pub const MAKER_MIN_MARKET_AGE_SECS: i64 = 420; // 7 minutes
+pub const MAKER_MIN_MARKET_AGE_SECS: i64 = 420;
 pub const MOMENTUM_MIN_MARKET_AGE_SECS: i64 = 420;
 
 
@@ -130,7 +128,6 @@ pub const MOMENTUM_MIN_MARKET_AGE_SECS: i64 = 420;
 
 pub const ENABLE_BASIS_TRADING: bool = true;
 
-/// Standard 7¢ skew threshold.
 pub const BASIS_ENTRY_SKEW_THRESHOLD: Decimal = dec!(0.07);
 
 pub const BASIS_NEGATIVE_FUNDING_THRESHOLD: Decimal = dec!(-0.0001);
@@ -264,7 +261,6 @@ pub const ARBITRAGE_MAX_EXPOSURE_USDC: Decimal = dec!(35);
 pub const TIME_DECAY_MAX_EXPOSURE_USDC: Decimal = dec!(36);
 pub const BASIS_MAX_EXPOSURE_USDC: Decimal = dec!(15);
 
-/// Session drawdown limit: 1% of collateral with $4 minimum.
 pub fn max_session_drawdown(collateral: Decimal) -> Decimal {
     (collateral * dec!(0.01)).max(dec!(4.00))
 }
@@ -333,25 +329,16 @@ pub fn is_crypto_market(name: &str) -> bool {
 
 pub fn is_ultra_short_window_market(name: &str) -> bool {
     let n = name.to_lowercase();
-
-    if n.contains("15 minutes") || n.contains("15 minute") {
-        return true;
-    }
-
-    if let Some(window_mins) = parse_window_duration_minutes(name) {
-        return window_mins <= 30;
-    }
-
+    if n.contains("15 minutes") || n.contains("15 minute") { return true; }
+    if let Some(window_mins) = parse_window_duration_minutes(name) { return window_mins <= 30; }
     false
 }
 
 pub fn parse_window_duration_minutes(name: &str) -> Option<u32> {
     let n = name.to_lowercase();
     if !n.contains(" et") { return None; }
-
     let et_pos = n.find(" et")?;
     let segment = &n[..et_pos];
-
     let dash_pos = segment.rfind('-')?;
     let end_part = segment[dash_pos + 1..].trim();
     let start_part = {
@@ -359,7 +346,6 @@ pub fn parse_window_duration_minutes(name: &str) -> Option<u32> {
         let space_pos = before_dash.rfind(' ').unwrap_or(0);
         before_dash[space_pos..].trim()
     };
-
     fn parse_minutes(s: &str) -> Option<u32> {
         let s = s.trim();
         let is_pm = s.ends_with("pm");
@@ -374,7 +360,6 @@ pub fn parse_window_duration_minutes(name: &str) -> Option<u32> {
         if is_am && h == 12 { total = m; }
         Some(total)
     }
-
     let start_mins = parse_minutes(start_part)?;
     let end_mins = parse_minutes(end_part)?;
     let duration = if end_mins >= start_mins { end_mins - start_mins } else { end_mins + 1440 - start_mins };
@@ -382,11 +367,7 @@ pub fn parse_window_duration_minutes(name: &str) -> Option<u32> {
 }
 
 pub fn is_window_market(name: &str) -> bool {
-    if let Some(mins) = parse_window_duration_minutes(name) {
-        mins > 30
-    } else {
-        false
-    }
+    if let Some(mins) = parse_window_duration_minutes(name) { mins > 30 } else { false }
 }
 
 pub fn is_daily_market(name: &str) -> bool {
@@ -394,24 +375,7 @@ pub fn is_daily_market(name: &str) -> bool {
     n.contains("up or down") && n.contains(" on ") && !n.contains(" et")
 }
 
-
-// ============================================================================
-// SLEEP AND RETRY DURATIONS
-// ============================================================================
-
-pub fn retry_sleep_duration() -> StdDuration {
-    StdDuration::from_secs(5)
-}
-
-pub fn startup_delay() -> StdDuration {
-    StdDuration::from_secs(10)
-}
-
-pub fn connector_init_delay() -> StdDuration {
-    StdDuration::from_secs(10)
-}
-
-pub fn order_execution_delay() -> StdDuration {
-    StdDuration::from_millis(400)
-}
-
+pub fn retry_sleep_duration() -> StdDuration { StdDuration::from_secs(5) }
+pub fn startup_delay() -> StdDuration { StdDuration::from_secs(10) }
+pub fn connector_init_delay() -> StdDuration { StdDuration::from_secs(10) }
+pub fn order_execution_delay() -> StdDuration { StdDuration::from_millis(400) }
