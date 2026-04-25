@@ -68,7 +68,6 @@ scp -P "$SSH_PORT" -i "$KEY" src/tasks/balance.rs "$USER@$HOST:$REMOTE_DIR/src/t
 scp -P "$SSH_PORT" -i "$KEY" src/tasks/cleanup.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/cleanup.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/tasks/funding.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/funding.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/tasks/market_monitor.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/market_monitor.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/tasks/merge.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/merge.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/tasks/oracle.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/oracle.rs"
 scp -P "$SSH_PORT" -i "$KEY" .env "$USER@$HOST:$REMOTE_DIR/.env"
 scp -P "$SSH_PORT" -i "$KEY" Cargo.toml "$USER@$HOST:$REMOTE_DIR/Cargo.toml"
