@@ -138,11 +138,6 @@ async fn main() -> Result<()> {
     let _ = balance_tx.send(startup_balance);
     info!("📈 Starting portfolio value: ${:.2}", startup_balance);
 
-    tokio::spawn(rustpolybot::tasks::balance::run_balance_poller(
-        Arc::clone(&trading_client),
-        balance_tx.clone(),
-    ));
-
     let (oracle_tx, oracle_rx) = watch::channel(dec!(0));
     // Broadcast (velocity_5s, velocity_1s, acceleration)
     let (velocity_tx, velocity_rx) = watch::channel((dec!(0), dec!(0), dec!(0)));
@@ -1431,10 +1426,19 @@ async fn main() -> Result<()> {
                                                 pair_token_id: mk_yes_token, fill_confirmed_at: None,
                                                 paired_leg_token_id: Some(mk_no_token),
                                             });
+
+                                            //hack to see if filled via quick cancel as balance sync is unreliable
+                                            let _ = rustpolybot::helpers::balance::quick_confirm_fill(
+                                                &trading_client,
+                                                strategy_name,
+                                                mk_yes_token,
+                                                &positions,
+                                                &condition_id
+                                            ).await;
+
                                             if !config::GHOST_MODE {
                                                 match place_limit_order(
-                                                    &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
-                                    mk_verifying, mk_yes_token, Side::Buy, shares, rounded_price,
+                                                    &trading_client, &nonce_manager, &signer, safe_address, eoa_address, mk_verifying, mk_yes_token, Side::Buy, shares, rounded_price,
                                                      mk_yes_fee, OrderType::GTC, true, 0, &shared_http,
                                                 ).await {
                                                     Ok(_) => {
@@ -1487,10 +1491,19 @@ async fn main() -> Result<()> {
                                                 pair_token_id: mk_no_token, fill_confirmed_at: None,
                                                 paired_leg_token_id: Some(mk_yes_token),
                                             });
+
+                                            //hack to see if filled via quick cancel as balance sync is unreliable
+                                            let _ = rustpolybot::helpers::balance::quick_confirm_fill(
+                                                &trading_client,
+                                                strategy_name,
+                                                mk_no_token,
+                                                &positions,
+                                                &condition_id
+                                            ).await;
+
                                             if !config::GHOST_MODE {
                                                 match place_limit_order(
-                                                    &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
-                                    mk_verifying, mk_no_token, Side::Buy, shares, rounded_price,
+                                                    &trading_client, &nonce_manager, &signer, safe_address, eoa_address, mk_verifying, mk_no_token, Side::Buy, shares, rounded_price,
                                                      mk_no_fee, OrderType::GTC, true, 0, &shared_http,
                                                 ).await {
                                                     Ok(_) => {
