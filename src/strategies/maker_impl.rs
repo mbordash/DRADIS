@@ -207,18 +207,16 @@ impl Strategy for MakerStrategyImpl {
         let market = ctx.maker_market.as_ref().unwrap_or(&ctx.market);
         let snapshot = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
 
-        // Seconds until this market resolves — used to tighten the stop near expiry.
+        // Seconds until this market resolves
         let secs_to_expiry = market.market_close_time
             .map(|t| (t - Utc::now()).num_seconds())
             .unwrap_or(9999);
 
-        // Near-expiry: binary markets can gap 30-60% on tiny BTC moves as the
-        // market converges toward 0 or 1. Halve the stop-loss tolerance when
-        // within MAKER_LATE_MARKET_STOP_TIGHTEN_SECS of resolution.
+        // Relaxed stop-loss for MakerStrategy (especially on window markets)
         let effective_stop_pct = if secs_to_expiry < config::MAKER_LATE_MARKET_STOP_TIGHTEN_SECS {
-            config::MAKER_LATE_MARKET_STOP_LOSS_PERCENT
+            config::MAKER_LATE_MARKET_STOP_LOSS_PERCENT   // -10% near expiry
         } else {
-            config::MAKER_STOP_LOSS_PERCENT
+            config::MAKER_STOP_LOSS_PERCENT               // -15% normal
         };
 
         let pos_map = ctx.positions.lock().await;
@@ -250,14 +248,12 @@ impl Strategy for MakerStrategyImpl {
                 });
             }
 
-            // Stop-loss: requires fill confirmation (prevents phantom stops on GTD orders that
-            // never filled). A minimum hold time (MAKER_MIN_HOLD_SECS_BEFORE_STOP) is enforced
-            // so normal market noise in the first few minutes doesn't trigger an early exit.
-            // Near-expiry: effective_stop_pct is halved (see above) so the stop fires earlier
-            // before binary resolution dynamics cause a catastrophic gap.
+            // Stop-loss: enforce minimum hold time (5 minutes) so normal post-entry noise doesn't trigger.
+            // This is the key fix for the -41% loss you saw.
             let secs_since_fill = position.fill_confirmed_at
                 .map(|t| (Utc::now() - t).num_seconds())
                 .unwrap_or(0);
+
             if position.fill_confirmed_at.is_some()
                 && secs_since_fill >= config::MAKER_MIN_HOLD_SECS_BEFORE_STOP
                 && profit_pct <= -effective_stop_pct
@@ -265,8 +261,8 @@ impl Strategy for MakerStrategyImpl {
                 return Ok(StrategySignal::Exit {
                     token_id,
                     reason: format!(
-                        "Maker stop-loss: bid=${:.4}, entry=${:.4}, loss={:.2}% ({}s since open, stop={:.1}%, {}s to expiry)",
-                        bid, position.avg_entry, profit_pct * dec!(100), secs_since_open,
+                        "Maker stop-loss: bid=${:.4}, entry=${:.4}, loss={:.2}% ({}s since fill, stop={:.1}%, {}s to expiry)",
+                        bid, position.avg_entry, profit_pct * dec!(100), secs_since_fill,
                         effective_stop_pct * dec!(100), secs_to_expiry,
                     ),
                 });
