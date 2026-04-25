@@ -181,6 +181,7 @@ async fn main() -> Result<()> {
         initial_hourly.name.clone(), initial_hourly.close_time,
     );
     let desc = initial_hourly.description.clone();
+    let initial_condition_id = initial_hourly.condition_id.clone();
 
     info!("🧪 Initializing market: {}", name);
     let mut initial_strike = rustpolybot::market_validator::extract_strike_price(&name);
@@ -198,7 +199,9 @@ async fn main() -> Result<()> {
         info!("✅ Strike price resolved: ${}", initial_strike.unwrap());
     }
 
-    let (market_tx, mut market_rx) = watch::channel((initial_yes, initial_no, name, close_time, initial_strike, desc, initial_maker_market));
+    let (market_tx, mut market_rx) = watch::channel((initial_yes, initial_no, name, close_time, initial_strike, desc, initial_maker_market, initial_condition_id));
+    let mut current_hourly_cid: String = String::new();
+    let mut current_maker_cid: String = String::new();
 
     tokio::spawn(rustpolybot::tasks::market_monitor::run_market_monitor(
         Arc::clone(&shared_http),
@@ -221,7 +224,7 @@ async fn main() -> Result<()> {
     ));
 
     loop {
-        let (yes_token, no_token, market_name, market_close_time, strike_price, _, maker_market_candidate) = market_rx.borrow().clone();
+        let (yes_token, no_token, market_name, market_close_time, strike_price, _, maker_market_candidate, condition_id) = market_rx.borrow().clone();
 
         let now = Utc::now();
         if let Some(close_time) = market_close_time {
@@ -378,9 +381,40 @@ async fn main() -> Result<()> {
         loop {
             tokio::select! {
                 _ = market_rx.changed() => {
-                    info!("🔄 Market switch detected — restarting trading loop with new market");
+                    // Correct 8-tuple destructuring that matches the channel type
+                    let (.., new_maker_opt, new_condition_id) = market_rx.borrow().clone();
+
+                    // Sticky check: ignore if the condition_ids are identical (no real market change)
+                    if new_condition_id == current_hourly_cid &&
+                       new_maker_opt.as_ref().map_or("", |m| m.condition_id.as_str()) == current_maker_cid {
+                        debug!("✅ Market switch signal received but markets are identical — ignoring");
+                        continue;
+                    }
+
+                    info!("🔄 Market switch required — restarting trading loop with new market");
+
+                    // Cancel EVERY open order across all strategies/markets
+                    if let Err(e) = trading_client.as_ref().cancel_all_orders().await {
+                        warn!("⚠️ Failed to cancel all orders on market switch: {}", e);
+                    } else {
+                        info!("✅ All open orders cancelled on market switch");
+                    }
+
+                    // Clear phantom cooldowns so old tokens don't block new entries
+                    {
+                        let mut pc = phantom_cooldowns.lock().await;
+                        pc.clear();
+                        info!("🧹 Cleared all phantom cooldowns for new market");
+                    }
+
+                    // Update sticky tracking
+                    current_hourly_cid = new_condition_id.clone();
+                    current_maker_cid = new_maker_opt.as_ref()
+                        .map_or_else(String::new, |m| m.condition_id.clone());
+
                     break; // break inner loop → outer loop picks up the new market
-                }                _ = pulse_ticker.tick() => {
+                }
+                _ = pulse_ticker.tick() => {
                     let start = Instant::now();
                     let mut req = BalanceAllowanceRequest::default();
                     req.asset_type = AssetType::Collateral;
@@ -457,7 +491,7 @@ async fn main() -> Result<()> {
                         market_close_time,
                         strike_price,
                         is_neg_risk,
-                        condition_id: String::new(),
+                        condition_id: condition_id.clone(),
                         yes_fee_bps: yes_fee_rate,
                         no_fee_bps: no_fee_rate,
                     };
@@ -518,7 +552,7 @@ async fn main() -> Result<()> {
                         // all downstream order-placement and exit logic uses the correct venue.
                         let (yes_token, no_token, yes_ask, no_ask, yes_bid, no_bid,
                              yes_depth, no_depth, yes_fee_rate, no_fee_rate,
-                             market_close_time, market_name) =
+                             market_close_time, market_name, condition_id) =
                             if strategy_name == "ArbitrageStrategy" {
                                 if let (Some(ref mk), Some(ref mky_rx), Some(ref mkn_rx)) =
                                     (&maker_market_config, &maker_yes_price_rx, &maker_no_price_rx)
@@ -529,16 +563,17 @@ async fn main() -> Result<()> {
                                      mky_ask, mkn_ask, mky_bid, mkn_bid,
                                      mky_depth, mkn_depth,
                                      mk.yes_fee_bps, mk.no_fee_bps,
-                                     mk.market_close_time, mk.market_name.clone())
+                                     mk.market_close_time, mk.market_name.clone(),
+                                     mk.condition_id.clone())
                                 } else {
                                     (yes_token, no_token, yes_ask, no_ask, yes_bid, no_bid,
                                      yes_depth, no_depth, yes_fee_rate, no_fee_rate,
-                                     market_close_time, market_name.clone())
+                                     market_close_time, market_name.clone(), condition_id.clone())
                                 }
                             } else {
                                 (yes_token, no_token, yes_ask, no_ask, yes_bid, no_bid,
                                  yes_depth, no_depth, yes_fee_rate, no_fee_rate,
-                                 market_close_time, market_name.clone())
+                                 market_close_time, market_name.clone(), condition_id.clone())
                             };
 
                         match signal {
@@ -1163,7 +1198,7 @@ async fn main() -> Result<()> {
                                 };
 
                                 if !config::GHOST_MODE {
-                                    let (order_type, post_only, exp) = if is_maker { (OrderType::GTD, true, config::MAKER_GTD_TTL_SECS) } else { (OrderType::FAK, false, 0u64) };
+                                    let (order_type, post_only, exp) = if is_maker { (OrderType::GTC, true, 0u64) } else { (OrderType::FAK, false, 0u64) };
                                     // Makers are never charged fees on Polymarket — embed 0 bps in the
                                     // signed order struct for post-only orders.  Takers embed the market
                                     // fee rate so the exchange can validate and collect it on fill.
@@ -1400,7 +1435,7 @@ async fn main() -> Result<()> {
                                                 match place_limit_order(
                                                     &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
                                     mk_verifying, mk_yes_token, Side::Buy, shares, rounded_price,
-                                                     mk_yes_fee, OrderType::GTD, true, config::MAKER_GTD_TTL_SECS, &shared_http,
+                                                     mk_yes_fee, OrderType::GTC, true, 0, &shared_http,
                                                 ).await {
                                                     Ok(_) => {
                                                         any_placed = true;
@@ -1456,7 +1491,7 @@ async fn main() -> Result<()> {
                                                 match place_limit_order(
                                                     &trading_client, &nonce_manager, &signer, safe_address, eoa_address,
                                     mk_verifying, mk_no_token, Side::Buy, shares, rounded_price,
-                                                     mk_no_fee, OrderType::GTD, true, config::MAKER_GTD_TTL_SECS, &shared_http,
+                                                     mk_no_fee, OrderType::GTC, true, 0, &shared_http,
                                                 ).await {
                                                     Ok(_) => {
                                                         any_placed = true;

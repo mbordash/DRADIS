@@ -24,6 +24,7 @@ pub type MarketState = (
     Option<Decimal>,             // strike_price
     String,                      // description
     Option<MarketCandidate>,     // maker_market_candidate
+    String,                      // condition_id (NEW)
 );
 
 pub async fn run_market_monitor(
@@ -37,7 +38,7 @@ pub async fn run_market_monitor(
         let (candidate, maker_candidate) = get_market_pair(&http).await;
         if candidate.yes_token == U256::ZERO { continue; }
 
-        let (cur_yes, _, cur_name, cur_close_time, _, _, _) = market_tx.borrow().clone();
+        let (cur_yes, _, cur_name, cur_close_time, _, _, _, cur_cid) = market_tx.borrow().clone();
 
         if candidate.yes_token == cur_yes {
             // Hourly market unchanged — still check if maker market changed
@@ -47,8 +48,8 @@ pub async fn run_market_monitor(
                 if let Some(ref mk) = maker_candidate {
                     info!("🏦 Maker market updated: \"{}\"", mk.name);
                 }
-                let (y, n, nm, ct, sp, ds, _) = market_tx.borrow().clone();
-                let _ = market_tx.send((y, n, nm, ct, sp, ds, maker_candidate));
+                let (y, n, nm, ct, sp, ds, _, cid) = market_tx.borrow().clone();
+                let _ = market_tx.send((y, n, nm, ct, sp, ds, maker_candidate, cid));
             }
             continue;
         }
@@ -88,6 +89,7 @@ pub async fn run_market_monitor(
             candidate.name.clone(), candidate.close_time,
             strike, candidate.description.clone(),
             maker_candidate,
+            candidate.condition_id.clone(),
         ));
     }
 }
