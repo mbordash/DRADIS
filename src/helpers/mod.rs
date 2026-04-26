@@ -5,6 +5,8 @@ pub mod balance;
 pub mod nonce;
 pub mod orders;
 pub mod market;
+pub mod notifications;
+pub mod metrics;
 
 pub use price::*;
 pub use json::*;
@@ -13,4 +15,5 @@ pub use balance::*;
 pub use nonce::*;
 pub use orders::*;
 pub use market::*;
-
+pub use notifications::*;
+pub use metrics::*;

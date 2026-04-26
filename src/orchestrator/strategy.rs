@@ -5,6 +5,7 @@
 
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use crate::state::{MarketConfig, MarketSnapshot, StrategySignal, StrategyStatus, PositionMap};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -18,6 +19,10 @@ pub struct StrategyContext {
     pub snapshot: MarketSnapshot,
     /// All open positions (shared, read-only for strategies)
     pub positions: Arc<Mutex<PositionMap>>,
+    /// Total session PnL booked so far.
+    pub session_pnl: Decimal,
+    /// Initial wallet collateral at bot startup.
+    pub starting_collateral: Decimal,
     /// Crypto identifier (e.g., "BTC", "ETH", "SOL") for threshold lookups
     pub crypto_filter: String,
     /// Timestamp when the bot started trading the current market.
@@ -38,19 +43,9 @@ pub struct StrategyContext {
 #[async_trait::async_trait]
 pub trait Strategy: Send + Sync {
     /// Evaluate if strategy should execute an entry.
-    ///
-    /// Returns:
-    /// - `Ok(StrategySignal::Entry { token_id })` if entry conditions are met
-    /// - `Ok(StrategySignal::NoSignal)` if no action should be taken
-    /// - `Err(e)` on unrecoverable errors
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal>;
 
     /// Evaluate if strategy should execute an exit.
-    ///
-    /// Returns:
-    /// - `Ok(StrategySignal::Exit { token_id, reason })` if exit conditions are met
-    /// - `Ok(StrategySignal::NoSignal)` if position should be held
-    /// - `Err(e)` on unrecoverable errors
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal>;
 
     /// Get current status of the strategy (for monitoring/lifecycle).
@@ -59,4 +54,3 @@ pub trait Strategy: Send + Sync {
     /// Strategy name for logging and identification.
     fn name(&self) -> String;
 }
-
