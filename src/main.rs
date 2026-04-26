@@ -39,7 +39,10 @@ use rustpolybot::state::{Position, StrategySignal, MarketConfig, MarketSnapshot,
 use rustpolybot::strategies::time_decay_impl::TimeDecayPosition;
 use rustpolybot::orchestrator::{StrategyRegistry, StrategyContext};
 use rustpolybot::orchestrator::executor::{execute_strategies_concurrent, aggregate_and_resolve_signals};
-use rustpolybot::helpers::{time::*, balance::*, nonce::*, orders::*, market::*, price::{round_to_tick_size, floor_to_tick_size}, notifications::send_notification, market};
+use rustpolybot::helpers::{
+    time::*, balance::*, nonce::*, orders::*, market::*, price::{round_to_tick_size, floor_to_tick_size},
+    notifications::send_notification, market_validator,
+};
 
 use rustls::crypto::ring;
 
@@ -154,7 +157,7 @@ async fn main() -> Result<()> {
     let initial_condition_id = initial_hourly.condition_id.clone();
 
     info!("🧪 Initializing market: {}", name);
-    let mut initial_strike = market::extract_strike_price(&name);
+    let mut initial_strike = market_validator::extract_strike_price(&name);
     if initial_strike.is_none() {
         initial_strike = fetch_historical_strike_price(&shared_http, &crypto_filter, &desc).await;
         if initial_strike.is_none() {
@@ -389,6 +392,7 @@ async fn main() -> Result<()> {
                     for (strategy_name, signal) in resolved_signals {
                         let sn = strategy_name.clone();
                         match signal {
+                            // ════════════════════ EXIT ════════════════════
                             StrategySignal::Exit { params, reason, exit_pair } => {
                                 let tid = params.token_id;
                                 let pos_key = (sn.clone(), tid);
@@ -439,6 +443,7 @@ async fn main() -> Result<()> {
                                 let _ = send_notification(&tg_token, &tg_chat_id, &format!("📤 EXIT [{}] {} | bid=${:.4} | reason: {} | Session PnL: ${:.4}", sn, params.market_name, params.price, reason, *total_pnl.lock().await)).await;
                             }
 
+                            // ════════════════════ ENTRY ════════════════════
                             StrategySignal::Entry { params, pair_params } => {
                                 if let Some(close_time) = market_close_time { if (close_time - Utc::now()).num_seconds() < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY { continue; } }
                                 if let Some(lt) = last_trade_time.get(&sn) { if lt.elapsed() < Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64) { continue; } }
@@ -448,6 +453,7 @@ async fn main() -> Result<()> {
                                     let mut map = positions.lock().await; if map.contains_key(&pos_key) { continue; }
                                     map.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: params.price, opened_at: Utc::now(), close_time: market_close_time, market_name: params.market_name.clone(), pair_token_id: params.token_id, fill_confirmed_at: None, paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id) });
                                 }
+                                info!("📥 ENTRY [{}]: {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares);
                                 let vc = if params.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                 if !config::GHOST_MODE {
                                     if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, params.token_id, Side::Buy, params.shares, (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), params.fee_bps, OrderType::FAK, false, 0, &shared_http).await {
@@ -468,6 +474,7 @@ async fn main() -> Result<()> {
                                 let _ = send_notification(&tg_token, &tg_chat_id, &format!("📥 ENTRY [{}] {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares)).await;
                             }
 
+                            // ════════════════════ MAKER QUOTE ════════════════════
                             StrategySignal::MakerQuote { yes, no } => {
                                 let mut placed = false;
                                 for p in [yes, no].into_iter().flatten() {
