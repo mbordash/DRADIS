@@ -23,7 +23,8 @@ use rust_decimal_macros::dec;
 use chrono::Utc;
 
 use crate::orchestrator::{Strategy, StrategyContext};
-use crate::state::{StrategySignal, StrategyStatus};
+use crate::state::{StrategySignal, StrategyStatus, OrderParams};
+use crate::strategies::is_drawdown_limit_hit;
 use crate::config;
 
 pub struct BasisStrategyImpl;
@@ -35,12 +36,15 @@ impl Strategy for BasisStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── Global Risk Check ────────────────────────────────────────────────
+        if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Venue Selection: Prefer Window/Maker venue for Basis ─────────────
-        // We do this to avoid the 1000bps (10%) fees on the primary hourly markets.
         let (market, snap) = if let (Some(mk_mkt), Some(mk_snap)) = (&ctx.maker_market, &ctx.maker_snapshot) {
             (mk_mkt, mk_snap)
         } else {
-            // Fallback to hourly market if no window market is active
             (&ctx.market, &ctx.snapshot)
         };
 
@@ -64,19 +68,19 @@ impl Strategy for BasisStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
-        // ── Select per-crypto constants (always from Binance snapshot) ───────
+        // ── Select per-crypto constants ───────────────────────────────────────
         let (max_velocity, oracle_buffer) = match ctx.crypto_filter.as_str() {
             "eth" => (config::BASIS_ETH_MAX_VELOCITY, config::BASIS_ETH_ORACLE_STRIKE_BUFFER),
             "sol" => (config::BASIS_SOL_MAX_VELOCITY, config::BASIS_SOL_ORACLE_STRIKE_BUFFER),
             _     => (config::BASIS_BTC_MAX_VELOCITY, config::BASIS_BTC_ORACLE_STRIKE_BUFFER),
         };
 
-        // ── Gate 1: Binance is flat (no strong directional move) ─────────────
+        // ── Gate 1: Binance is flat ──────────────────────────────────────────
         if ctx.snapshot.velocity.abs() >= max_velocity {
             return Ok(StrategySignal::NoSignal);
         }
 
-        // ── Gate 2: Oracle near strike (not already decided) ─────────────────
+        // ── Gate 2: Oracle near strike ───────────────────────────────────────
         if (ctx.snapshot.oracle_price - strike).abs() >= oracle_buffer {
             return Ok(StrategySignal::NoSignal);
         }
@@ -94,30 +98,70 @@ impl Strategy for BasisStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
-        // ── Gate 4: Funding rate confirmation (using Hourly/Binance snapshot) ─
+        // ── Gate 4: Funding rate confirmation ────────────────────────────────
         let funding_confirms_no_trade = skew > dec!(0) // YES over-priced
             && ctx.snapshot.funding_rate < config::BASIS_NEGATIVE_FUNDING_THRESHOLD;
         let funding_confirms_yes_trade = skew < dec!(0) // NO over-priced
             && ctx.snapshot.funding_rate > config::BASIS_POSITIVE_FUNDING_THRESHOLD;
         let extreme_skew_bypass = skew.abs() >= config::BASIS_ENTRY_SKEW_THRESHOLD * dec!(2);
 
+        // Kelly sizing
+        let trade_size = crate::strategies::basis_impl::basis_trade_size(skew.abs());
+
+        // ── Strategy Exposure Check ──────────────────────────────────────────
+        let current_exposure = {
+            let pos_map = ctx.positions.lock().await;
+            pos_map.iter()
+                .filter(|((s, _), _)| s == "BasisStrategy")
+                .map(|(_, p)| p.shares * p.avg_entry)
+                .sum::<Decimal>()
+        };
+
+        if current_exposure + trade_size > config::BASIS_MAX_EXPOSURE_USDC {
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Decide direction ─────────────────────────────────────────────────
         if skew > dec!(0) {
+            // YES overpriced → fade by buying NO
             if !funding_confirms_no_trade && !extreme_skew_bypass {
                 return Ok(StrategySignal::NoSignal);
             }
             if snap.no_ask > config::BASIS_MAX_ENTRY_PRICE {
                 return Ok(StrategySignal::NoSignal);
             }
-            return Ok(StrategySignal::Entry { token_id: market.no_token });
+            return Ok(StrategySignal::Entry {
+                params: OrderParams {
+                    token_id: market.no_token,
+                    price: snap.no_ask,
+                    shares: trade_size / snap.no_ask,
+                    fee_bps: market.no_fee_bps as u16,
+                    is_neg_risk: market.is_neg_risk,
+                    market_name: market.market_name.clone(),
+                    condition_id: market.condition_id.clone(),
+                },
+                pair_params: None,
+            });
         } else {
+            // NO overpriced → fade by buying YES
             if !funding_confirms_yes_trade && !extreme_skew_bypass {
                 return Ok(StrategySignal::NoSignal);
             }
             if snap.yes_ask > config::BASIS_MAX_ENTRY_PRICE {
                 return Ok(StrategySignal::NoSignal);
             }
-            return Ok(StrategySignal::Entry { token_id: market.yes_token });
+            return Ok(StrategySignal::Entry {
+                params: OrderParams {
+                    token_id: market.yes_token,
+                    price: snap.yes_ask,
+                    shares: trade_size / snap.yes_ask,
+                    fee_bps: market.yes_fee_bps as u16,
+                    is_neg_risk: market.is_neg_risk,
+                    market_name: market.market_name.clone(),
+                    condition_id: market.condition_id.clone(),
+                },
+                pair_params: None,
+            });
         }
     }
 
@@ -156,7 +200,7 @@ impl Strategy for BasisStrategyImpl {
             let now = Utc::now();
             let secs_held = (now - position.opened_at).num_seconds();
 
-            // Recompute skew on current venue
+            // Recompute current YES mid to detect skew-collapse
             let yes_mid = if snap.yes_bid > dec!(0) && snap.yes_ask < dec!(1) {
                 (snap.yes_bid + snap.yes_ask) / dec!(2)
             } else {
@@ -166,8 +210,17 @@ impl Strategy for BasisStrategyImpl {
 
             if profit_margin >= config::BASIS_TARGET_PROFIT_PERCENT {
                 return Ok(StrategySignal::Exit {
-                    token_id: *token_id,
+                    params: OrderParams {
+                        token_id: *token_id,
+                        price: position_bid,
+                        shares: position.shares,
+                        fee_bps: if token_id == &target_market.yes_token { target_market.yes_fee_bps as u16 } else { target_market.no_fee_bps as u16 },
+                        is_neg_risk: target_market.is_neg_risk,
+                        market_name: target_market.market_name.clone(),
+                        condition_id: target_market.condition_id.clone(),
+                    },
                     reason: format!("BasisTP: bid=${:.4}, profit={:.2}%", position_bid, profit_margin * dec!(100)),
+                    exit_pair: false,
                 });
             }
 
@@ -175,15 +228,33 @@ impl Strategy for BasisStrategyImpl {
                 && secs_held >= config::BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS
             {
                 return Ok(StrategySignal::Exit {
-                    token_id: *token_id,
+                    params: OrderParams {
+                        token_id: *token_id,
+                        price: position_bid,
+                        shares: position.shares,
+                        fee_bps: if token_id == &target_market.yes_token { target_market.yes_fee_bps as u16 } else { target_market.no_fee_bps as u16 },
+                        is_neg_risk: target_market.is_neg_risk,
+                        market_name: target_market.market_name.clone(),
+                        condition_id: target_market.condition_id.clone(),
+                    },
                     reason: format!("BasisSL: bid=${:.4}, loss={:.2}%", position_bid, profit_margin * dec!(100)),
+                    exit_pair: false,
                 });
             }
 
             if profit_margin > dec!(0) && current_skew < config::BASIS_SKEW_COLLAPSE_THRESHOLD {
                 return Ok(StrategySignal::Exit {
-                    token_id: *token_id,
-                    reason: format!("BasisSkewCollapse: yes_mid={:.4} near 0.50, profit={:.2}%", yes_mid, profit_margin * dec!(100)),
+                    params: OrderParams {
+                        token_id: *token_id,
+                        price: position_bid,
+                        shares: position.shares,
+                        fee_bps: if token_id == &target_market.yes_token { target_market.yes_fee_bps as u16 } else { target_market.no_fee_bps as u16 },
+                        is_neg_risk: target_market.is_neg_risk,
+                        market_name: target_market.market_name.clone(),
+                        condition_id: target_market.condition_id.clone(),
+                    },
+                    reason: format!("BasisSkewCollapse: yes_mid={:.4}, profit={:.2}%", yes_mid, profit_margin * dec!(100)),
+                    exit_pair: false,
                 });
             }
 
@@ -191,8 +262,17 @@ impl Strategy for BasisStrategyImpl {
                 let secs_left = (close_time - Utc::now()).num_seconds();
                 if secs_left < config::BASIS_MIN_SECS_TO_EXPIRY / 2 {
                     return Ok(StrategySignal::Exit {
-                        token_id: *token_id,
-                        reason: format!("BasisExpiry: {}s left, profit={:.2}%", secs_left, profit_margin * dec!(100)),
+                        params: OrderParams {
+                            token_id: *token_id,
+                            price: position_bid,
+                            shares: position.shares,
+                            fee_bps: if token_id == &target_market.yes_token { target_market.yes_fee_bps as u16 } else { target_market.no_fee_bps as u16 },
+                            is_neg_risk: target_market.is_neg_risk,
+                            market_name: target_market.market_name.clone(),
+                            condition_id: target_market.condition_id.clone(),
+                        },
+                        reason: format!("BasisExpiry: {}s left", secs_left),
+                        exit_pair: false,
                     });
                 }
             }

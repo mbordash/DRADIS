@@ -120,20 +120,39 @@ pub enum StrategyStatus {
     Error,
 }
 
+/// Parameters required to place an order on the CLOB.
+#[derive(Debug, Clone)]
+pub struct OrderParams {
+    pub token_id: U256,
+    pub price: Decimal,
+    pub shares: Decimal,
+    pub fee_bps: u16,
+    pub is_neg_risk: bool,
+    pub market_name: String,
+    pub condition_id: String,
+}
+
 /// Signals returned by strategies for the orchestrator to act upon.
 #[derive(Debug, Clone)]
 pub enum StrategySignal {
-    /// Entry signal: which token to buy
-    Entry { token_id: U256 },
-    /// Two-sided maker quote: post passive bids on YES and/or NO simultaneously.
-    /// Prices already include inventory skew. None means skip that side.
-    MakerQuote {
-        yes_bid_price: Option<Decimal>,
-        no_bid_price: Option<Decimal>,
+    /// Entry signal with all metadata. For paired strategies, this is the primary leg.
+    Entry {
+        params: OrderParams,
+        /// If Some, the strategy also wants to buy this second leg (Arbitrage/TimeDecay).
+        pair_params: Option<OrderParams>,
     },
-    /// Exit signal: which token to sell
-    Exit { token_id: U256, reason: String },
+    /// Two-sided maker quote with metadata.
+    MakerQuote {
+        yes: Option<OrderParams>,
+        no: Option<OrderParams>,
+    },
+    /// Exit signal with metadata.
+    Exit {
+        params: OrderParams,
+        reason: String,
+        /// If true, also exit the other leg of a paired position.
+        exit_pair: bool,
+    },
     /// No action at this time
     NoSignal,
 }
-

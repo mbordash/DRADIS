@@ -74,7 +74,7 @@ pub async fn run_market_monitor(
         if !should_switch { continue; }
 
         info!("🔄 Market Switch Detected: {} -> {}", cur_name, candidate.name);
-        let mut strike = crate::market_validator::extract_strike_price(&candidate.name);
+        let mut strike = crate::helpers::market::extract_strike_price(&candidate.name);
         if strike.is_none() {
             strike = fetch_historical_strike_price(&http, &crypto_filter, &candidate.description).await;
         }
