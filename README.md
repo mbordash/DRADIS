@@ -1,6 +1,6 @@
 # RustPolyBot
 
-An automated trading bot for Polymarket crypto prediction markets, written in Rust. Runs five strategies concurrently — momentum, maker, arbitrage, time decay, and basis/funding — each with its own independent capital budget and position book. An orchestrator manages market selection, WS subscriptions, and order execution. It includes a comprehensive interface and guide to craft and link-in your own customer strategy, like, for example, a machine-learning-based sentiment analyzer.
+An automated trading bot for Polymarket crypto prediction markets, written in Rust. Runs five strategies concurrently — momentum, maker, arbitrage, time decay, and basis/funding — each with its own independent capital budget and position book. An orchestrator manages market selection, WS subscriptions, and order execution. It includes a comprehensive interface and guide to craft and link-in your own custom strategy, like, for example, a machine-learning-based sentiment analyzer.
 
 ---
 
