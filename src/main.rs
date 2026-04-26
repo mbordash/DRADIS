@@ -39,9 +39,11 @@ use rustpolybot::state::{Position, StrategySignal, MarketConfig, MarketSnapshot,
 use rustpolybot::strategies::time_decay_impl::TimeDecayPosition;
 use rustpolybot::orchestrator::{StrategyRegistry, StrategyContext};
 use rustpolybot::orchestrator::executor::{execute_strategies_concurrent, aggregate_and_resolve_signals};
+
+// New paths for helpers
 use rustpolybot::helpers::{
     time::*, balance::*, nonce::*, orders::*, market::*, price::{round_to_tick_size, floor_to_tick_size},
-    notifications::send_notification, market_validator,
+    notifications::send_notification, metrics,
 };
 
 use rustls::crypto::ring;
@@ -157,7 +159,8 @@ async fn main() -> Result<()> {
     let initial_condition_id = initial_hourly.condition_id.clone();
 
     info!("🧪 Initializing market: {}", name);
-    let mut initial_strike = market_validator::extract_strike_price(&name);
+    // Use extract_strike_price correctly from helpers::market
+    let mut initial_strike = extract_strike_price(&name);
     if initial_strike.is_none() {
         initial_strike = fetch_historical_strike_price(&shared_http, &crypto_filter, &desc).await;
         if initial_strike.is_none() {
@@ -412,8 +415,35 @@ async fn main() -> Result<()> {
                                         if !es.contains("no orders found") { consecutive_failures += 1; } continue;
                                     }
                                 }
-                                let (re, rs, rc) = { let mut map = positions.lock().await; if let Some(p) = map.remove(&pos_key) { let pnl = (params.price - p.avg_entry) * p.shares; *total_pnl.lock().await += pnl; info!("💰 Position closed [{}]: PnL ${:.4}", sn, pnl); (p.avg_entry, p.shares, p.close_time) } else { (dec!(0), dec!(0), None) } };
-                                if rs > dec!(0) {
+
+                                let mut re_m = dec!(0);
+                                let mut rs_m = dec!(0);
+                                let mut rc_m = None;
+                                let mut pnl_m = dec!(0);
+
+                                {
+                                    let mut map = positions.lock().await;
+                                    if let Some(p) = map.remove(&pos_key) {
+                                        let pnl = (params.price - p.avg_entry) * p.shares;
+                                        *total_pnl.lock().await += pnl;
+                                        info!("💰 Position closed [{}]: PnL ${:.4}", sn, pnl);
+
+                                        re_m = p.avg_entry;
+                                        rs_m = p.shares;
+                                        rc_m = p.close_time;
+                                        pnl_m = pnl;
+
+                                        // Record trade metrics asynchronously
+                                        let sn_task = sn.clone();
+                                        let m_name = params.market_name.clone();
+                                        let sid = if tid == yes_token { "YES".to_string() } else { "NO".to_string() };
+                                        let rp = params.price;
+                                        let r_m = reason.clone();
+                                        tokio::spawn(async move { metrics::record_trade(sn_task, m_name, sid, re_m, rp, rs_m, pnl_m, r_m).await; });
+                                    } else { continue; }
+                                }
+
+                                if rs_m > dec!(0) {
                                     let ps = Arc::clone(&positions); let cl = Arc::clone(&trading_client); let tp = Arc::clone(&total_pnl); let m_name = params.market_name.clone(); let tkt = tg_token.clone(); let tkc = tg_chat_id.clone();
                                     let sn_async = sn.clone();
                                     tokio::spawn(async move {
@@ -421,9 +451,9 @@ async fn main() -> Result<()> {
                                         let mut req = BalanceAllowanceRequest::default(); req.asset_type = AssetType::Conditional; req.token_id = Some(tid);
                                         let rem = match cl.balance_allowance(req).await { Ok(r) => Decimal::from_str(&r.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000), Err(_) => return };
                                         if rem >= config::MIN_ORDER_SHARES {
-                                            let fill = (rs - rem).max(dec!(0)); let pnlc = -((params.price - re) * rem.min(rs)); *tp.lock().await += pnlc;
-                                            if fill < config::MIN_ORDER_SHARES { warn!("⚠️ PARTIAL EXIT [{}]: FAK filled 0/{:.4} shares — retry on next loop.", sn_async, rs); }
-                                            else { warn!("⚠️ PARTIAL EXIT [{}]: sold {:.4}/{:.4} — re-inserting.", sn_async, fill, rs); let mut map = ps.lock().await; if !map.contains_key(&(sn_async.clone(), tid)) { map.insert((sn_async.clone(), tid), Position { shares: rem, avg_entry: re, opened_at: Utc::now(), close_time: rc, market_name: m_name, pair_token_id: tid, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None }); } }
+                                            let fill = (rs_m - rem).max(dec!(0)); let pnlc = -((params.price - re_m) * rem.min(rs_m)); *tp.lock().await += pnlc;
+                                            if fill < config::MIN_ORDER_SHARES { warn!("⚠️ PARTIAL EXIT [{}]: FAK filled 0/{:.4} shares — retry on next loop.", sn_async, rs_m); }
+                                            else { warn!("⚠️ PARTIAL EXIT [{}]: sold {:.4}/{:.4} — re-inserting.", sn_async, fill, rs_m); let mut map = ps.lock().await; if !map.contains_key(&(sn_async.clone(), tid)) { map.insert((sn_async.clone(), tid), Position { shares: rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None }); } }
                                         }
                                     });
                                 }
@@ -435,7 +465,10 @@ async fn main() -> Result<()> {
                                         let other_fee_bps = if other_tid == yes_token { yes_fee_rate as u16 } else { no_fee_rate as u16 };
                                         let other_vc = if is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                         if !config::GHOST_MODE { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, other_tid, Side::Sell, s, (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), other_fee_bps, OrderType::FAK, false, 0, &shared_http).await; }
-                                        let mut map = positions.lock().await; if let Some(p) = map.remove(&pk) { *total_pnl.lock().await += (other_bid - p.avg_entry) * p.shares; }
+                                        let mut map = positions.lock().await; if let Some(p) = map.remove(&pk) { let pnl = (other_bid - p.avg_entry) * p.shares; *total_pnl.lock().await += pnl;
+                                            let sn_pm = sn.clone(); let m_name = params.market_name.clone(); let sid = if other_tid == yes_token { "YES".to_string() } else { "NO".to_string() }; let p_avg = p.avg_entry; let o_bid = other_bid; let p_shares = p.shares; let pn = pnl;
+                                            tokio::spawn(async move { metrics::record_trade(sn_pm, m_name, sid, p_avg, o_bid, p_shares, pn, "Convergence/PairedExit".to_string()).await; });
+                                        }
                                     }
                                 }
                                 if reason.contains("stop-loss") { last_stop_loss_time.insert(sn.clone(), Instant::now()); }
