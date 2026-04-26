@@ -64,7 +64,6 @@ scp -P "$SSH_PORT" -i "$KEY" src/helpers/metrics.rs "$USER@$HOST:$REMOTE_DIR/src
 
 # Copy tasks modules
 scp -P "$SSH_PORT" -i "$KEY" src/tasks/mod.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/mod.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/tasks/balance.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/balance.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/tasks/cleanup.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/cleanup.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/tasks/funding.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/funding.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/tasks/market_monitor.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/market_monitor.rs"
