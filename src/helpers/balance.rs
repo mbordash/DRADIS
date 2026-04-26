@@ -54,8 +54,7 @@ pub async fn sync_position_balance(
     let key = (strategy_name.to_string(), token_id);
     let check_interval_ms: u64 = 3000;
 
-    // Increased initial sleep: indexer takes time to reflect blockchain state
-    tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_secs(5)).await;
 
     loop {
         let mut req = BalanceAllowanceRequest::default();
@@ -105,7 +104,6 @@ pub async fn sync_position_balance(
                     }
                     return Ok(());
                 } else {
-                    // Suppress warning until at least 15s have passed (allow for indexer lag)
                     if time_since_open > 15 {
                         warn!("⚠️ Position Sync [{}]: Token {} balance is 0 ({}s since open). Retrying...", strategy_name, token_id, time_since_open);
                     }
@@ -146,12 +144,34 @@ pub async fn reconcile_orphaned_positions(
             Err(_) => continue,
         };
         if actual_shares < crate::config::MIN_ORDER_SHARES { continue; }
-        if positions.lock().await.iter().any(|((_, tid), _)| *tid == token_id) { continue; }
 
-        if let Some(strategy_name) = ADOPTION_STRATEGIES.iter().find(|&&s| !positions.lock().await.contains_key(&(s.to_string(), token_id))) {
+        {
+            let map = positions.lock().await;
+            if map.iter().any(|((_, tid), _)| *tid == token_id) { continue; }
+        }
+
+        let mut adopted_strategy = None;
+        for &s in ADOPTION_STRATEGIES {
+            let map = positions.lock().await;
+            if !map.contains_key(&(s.to_string(), token_id)) {
+                adopted_strategy = Some(s.to_string());
+                break;
+            }
+        }
+
+        if let Some(strategy_name) = adopted_strategy {
             let mut pos_map = positions.lock().await;
             let avg_entry = token_bids.iter().find(|(tid, _)| *tid == token_id).map(|(_, bid)| *bid).filter(|b| *b > dec!(0)).unwrap_or(dec!(0.50));
-            pos_map.insert((strategy_name.to_string(), token_id), Position { shares: actual_shares, avg_entry, opened_at: Utc::now() - chrono::Duration::seconds(crate::config::MIN_HOLD_SECS_BEFORE_STOP_LOSS), close_time: market_close_time, pair_token_id: token_id, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
+            pos_map.insert((strategy_name.to_string(), token_id), Position {
+                shares: actual_shares,
+                avg_entry,
+                opened_at: Utc::now() - chrono::Duration::seconds(crate::config::MIN_HOLD_SECS_BEFORE_STOP_LOSS),
+                close_time: market_close_time,
+                market_name: market_name.to_string(),
+                pair_token_id: token_id,
+                fill_confirmed_at: Some(Utc::now()),
+                paired_leg_token_id: None
+            });
             warn!("🔁 RECONCILE: Adopted {} {} shares for token {} under [{}]", actual_shares, side_label, token_id, strategy_name);
         }
     }
