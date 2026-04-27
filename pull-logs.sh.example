@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+# =============================================================================
+# RustPolyBot pull-logs.sh TEMPLATE
+# Downloads trade logs from the remote server to your local machine
+#
+# SETUP:
+# 1. Copy this file to pull-logs.sh
+# 2. Update the HOST, USER, and KEY variables
+# 3. Run: chmod +x pull-logs.sh && ./pull-logs.sh
+# =============================================================================
+
+set -euo pipefail
+
+# ⚙️  CUSTOMIZE THESE VALUES
+HOST="<YOUR_SERVER_IP>"
+USER="<YOUR_USERNAME>"
+KEY="<PATH_TO_SSH_KEY>"
+REMOTE_DIR="~/rustpolybot"   # Must match REMOTE_DIR in deploy-multi.sh
+LOCAL_DIR="./logs"
+
+echo "📥 Pulling trade logs from $HOST..."
+
+# Create local logs directory if it doesn't exist
+mkdir -p "$LOCAL_DIR"
+
+# Download all CSV logs from the remote server
+# Using rsync to efficiently sync only new or changed files
+rsync -avz -e "ssh -i $KEY" "$USER@$HOST:$REMOTE_DIR/logs/*.csv" "$LOCAL_DIR/"
+
+echo "✅ Sync complete! Logs are available in $LOCAL_DIR"
+ls -lh "$LOCAL_DIR"

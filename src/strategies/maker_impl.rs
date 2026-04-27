@@ -4,15 +4,7 @@
 ///   1. The spread when positions fill and converge to take-profit.
 ///   2. Daily USDC rebates from Polymarket's Maker Rebates program on every fill.
 ///
-/// Inventory Skew: if we're heavy YES, the YES bid is lowered (less aggressive)
-/// and the NO bid is raised (more aggressive) to rebalance inventory faster.
-///
-/// Combined Price Guard: YES_bid + NO_bid must be < MAKER_MAX_COMBINED_BID (0.90)
-/// to prevent offering a free arb to takers who can sell both legs to us and
-/// pocket the difference vs. $1.00 settlement.
-///
-/// Risk: uses NET exposure |YES_value - NO_value| instead of gross exposure,
-/// so a balanced two-sided book can run at larger notional without extra risk.
+/// This version is strictly tied to the Window/Daily venue via a Fee Gate.
 
 use async_trait::async_trait;
 use anyhow::Result;
@@ -41,9 +33,16 @@ impl Strategy for MakerStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
-        // ── Select venue: prefer maker_market (window/daily) over hourly ─────
+        // ── Select venue: prefer maker_market (window/daily) ──────────────────
         let market = ctx.maker_market.as_ref().unwrap_or(&ctx.market);
         let snapshot = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
+
+        // ── STRICT FEE GATE ──────────────────────────────────────────────────
+        // Only trade on venues with reasonable taker fees (<= 200 bps).
+        // This ensures MakerStrategy NEVER trades on the 1000 bps hourly markets.
+        if market.yes_fee_bps > 200 || market.no_fee_bps > 200 {
+            return Ok(StrategySignal::NoSignal);
+        }
 
         // ── Market maturation gate ────────────────────────────────────────────
         let secs_since_market_start = (Utc::now() - ctx.market_started_at).num_seconds();
@@ -66,15 +65,10 @@ impl Strategy for MakerStrategyImpl {
         let no_ask  = snapshot.no_ask;
 
         // ── Orderbook imbalance gate ──────────────────────────────────────────
-        let yes_bid_depth = snapshot.yes_bid_depth;
-        let yes_ask_depth = snapshot.yes_ask_depth;
-        let no_bid_depth  = snapshot.no_bid_depth;
-        let no_ask_depth  = snapshot.no_ask_depth;
-
-        let yes_book_ok = yes_bid_depth > dec!(0)
-            && (yes_ask_depth / yes_bid_depth) <= config::MAKER_MAX_BOOK_IMBALANCE_RATIO;
-        let no_book_ok  = no_bid_depth > dec!(0)
-            && (no_ask_depth  / no_bid_depth)  <= config::MAKER_MAX_BOOK_IMBALANCE_RATIO;
+        let yes_book_ok = snapshot.yes_bid_depth > dec!(0)
+            && (snapshot.yes_ask_depth / snapshot.yes_bid_depth) <= config::MAKER_MAX_BOOK_IMBALANCE_RATIO;
+        let no_book_ok  = snapshot.no_bid_depth > dec!(0)
+            && (snapshot.no_ask_depth  / snapshot.no_bid_depth)  <= config::MAKER_MAX_BOOK_IMBALANCE_RATIO;
 
         if !yes_book_ok && !no_book_ok {
             return Ok(StrategySignal::NoSignal);
@@ -95,12 +89,13 @@ impl Strategy for MakerStrategyImpl {
             .clamp(dec!(-1), dec!(1));
         let skew = imbalance * config::MAKER_INVENTORY_SKEW_MAX;
 
-        // Velocity bias from oracle
+        // Velocity bias from hourly oracle (always)
         let velocity = ctx.snapshot.velocity;
         let velocity_bias_strong_negative = velocity <= -config::MAKER_VELOCITY_BIAS_THRESHOLD;
         let velocity_bias_strong_positive = velocity >= config::MAKER_VELOCITY_BIAS_THRESHOLD;
 
         // ── Pricing Logic ─────────────────────────────────────────────────────
+        // Use a wider buffer to avoid long-unfilled GTC orders in slower books
         let bid_buffer = if ctx.maker_market.is_some() { config::MAKER_BID_BUFFER } else { dec!(0.015) };
 
         let raw_yes_price = (snapshot.yes_ask - bid_buffer - skew).max(config::MAKER_MIN_ENTRY_PRICE);
@@ -195,6 +190,25 @@ impl Strategy for MakerStrategyImpl {
         let secs_to_expiry = market.market_close_time
             .map(|t| (t - Utc::now()).num_seconds())
             .unwrap_or(9999);
+
+        // Near-expiry forced exit to avoid binary resolution risk
+        let profit_threshold = dec!(0.02); // 2% minimum profit to hold through the danger zone
+        if secs_to_expiry < 900 { // 15 minutes before close
+            let pos_map = ctx.positions.lock().await;
+            for token_id in [market.yes_token, market.no_token] {
+                if let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id)) {
+                    let bid = if token_id == market.yes_token { snapshot.yes_bid } else { snapshot.no_bid };
+                    let profit_pct = (bid - position.avg_entry) / position.avg_entry;
+                    if profit_pct < profit_threshold {
+                        return Ok(StrategySignal::Exit {
+                            params: OrderParams { token_id, price: bid, shares: position.shares, fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 }, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone() },
+                            reason: "NearExpiryProfitGuard".to_string(),
+                            exit_pair: false,
+                        });
+                    }
+                }
+            }
+        }
 
         let effective_stop_pct = if secs_to_expiry < config::MAKER_LATE_MARKET_STOP_TIGHTEN_SECS {
             config::MAKER_LATE_MARKET_STOP_LOSS_PERCENT
