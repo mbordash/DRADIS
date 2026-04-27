@@ -159,7 +159,7 @@ async fn main() -> Result<()> {
     let initial_condition_id = initial_hourly.condition_id.clone();
 
     info!("🧪 Initializing market: {}", name);
-    // Use extract_strike_price correctly from helpers::market
+    // Use the extract_strike_price correctly from helpers::market
     let mut initial_strike = extract_strike_price(&name);
     if initial_strike.is_none() {
         initial_strike = fetch_historical_strike_price(&shared_http, &crypto_filter, &desc).await;
@@ -217,7 +217,11 @@ async fn main() -> Result<()> {
                     let client = WsClient::default();
                     let stream = match client.subscribe_orderbook(vec![token]) {
                         Ok(s) => s,
-                        Err(_) => { tokio::time::sleep(std::time::Duration::from_secs(5)).await; continue; }
+                        Err(e) => {
+                            warn!("⚠️ WS subscribe failed for token {}: {}. Retrying in 5s...", token, e);
+                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                            continue;
+                        }
                     };
                     let mut stream = Box::pin(stream);
                     info!("✅ WS orderbook subscribed for token {}", token);
@@ -232,7 +236,10 @@ async fn main() -> Result<()> {
                                 .map(|l| (l.price, l.size))
                                 .unwrap_or((dec!(1), dec!(0)));
                             let _ = tx.send((bid, bid_depth, ask, ask_depth));
-                        } else { break; }
+                        } else {
+                            warn!("⚠️ WS stream error for token {}. Restarting...", token);
+                            break;
+                        }
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                 }
@@ -248,7 +255,11 @@ async fn main() -> Result<()> {
                         let client = WsClient::default();
                         let stream = match client.subscribe_orderbook(vec![token]) {
                             Ok(s) => s,
-                            Err(_) => { tokio::time::sleep(std::time::Duration::from_secs(5)).await; continue; }
+                            Err(e) => {
+                                warn!("⚠️ WS Maker subscribe failed for token {}: {}. Retrying in 5s...", token, e);
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                continue;
+                            }
                         };
                         let mut stream = Box::pin(stream);
                         info!("✅ WS orderbook subscribed for maker token {}", token);
@@ -263,7 +274,10 @@ async fn main() -> Result<()> {
                                     .map(|l| (l.price, l.size))
                                     .unwrap_or((dec!(1), dec!(0)));
                                 let _ = tx.send((bid, bid_depth, ask, ask_depth));
-                            } else { break; }
+                            } else {
+                                warn!("⚠️ WS Maker stream error for token {}. Restarting...", token);
+                                break;
+                            }
                         }
                         tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     }
@@ -341,10 +355,9 @@ async fn main() -> Result<()> {
                 _ = status_ticker.tick() => {
                     let (yb, _, ya, _) = *yes_price_rx.borrow();
                     let (nb, _, na, _) = *no_price_rx.borrow();
-                    if ya != dec!(1) && na != dec!(1) {
-                        info!("💓 Heartbeat | Ask Sum ${:.4} (Y ask ${:.2} / N ask ${:.2}) | Bid Sum ${:.4} (Y bid ${:.2} / N bid ${:.2}) | Binance: ${:.2}",
-                            ya + na, ya, na, yb + nb, yb, nb, *oracle_rx.borrow());
-                    }
+                    // Always print heartbeat to confirm bot is alive
+                    info!("💓 Heartbeat | Ask Sum ${:.4} (Y ask ${:.2} / N ask ${:.2}) | Bid Sum ${:.4} (Y bid ${:.2} / N bid ${:.2}) | Binance: ${:.2}",
+                        ya + na, ya, na, yb + nb, yb, nb, *oracle_rx.borrow());
                 }
                 _ = ticker.tick() => {
                     if market_rx.has_changed().unwrap_or(false) { break; }

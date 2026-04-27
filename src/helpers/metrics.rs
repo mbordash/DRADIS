@@ -8,6 +8,7 @@ use rust_decimal::Decimal;
 use chrono::{Utc, Datelike};
 use tracing::{error, info};
 use serde::Serialize;
+use std::env;
 
 #[derive(Serialize)]
 pub struct TradeRecord {
@@ -23,6 +24,7 @@ pub struct TradeRecord {
 }
 
 /// Records a completed trade to a daily CSV file asynchronously in a 'logs' directory.
+/// Prefixes filename with CRYPTO_FILTER to avoid collision in multi-container setups.
 pub async fn record_trade(
     strategy: String,
     market: String,
@@ -34,6 +36,7 @@ pub async fn record_trade(
     reason: String,
 ) {
     let now = Utc::now();
+    let crypto = env::var("CRYPTO_FILTER").unwrap_or_else(|_| "unknown".to_string()).to_lowercase();
 
     // Ensure logs directory exists
     let log_dir = "logs";
@@ -42,7 +45,8 @@ pub async fn record_trade(
         return;
     }
 
-    let filename = format!("{}/trades_{:04}-{:02}-{:02}.csv", log_dir, now.year(), now.month(), now.day());
+    // Filename: logs/btc-trades_2024-04-26.csv
+    let filename = format!("{}/{}-trades_{:04}-{:02}-{:02}.csv", log_dir, crypto, now.year(), now.month(), now.day());
     let path = Path::new(&filename);
 
     let file_exists = path.exists();

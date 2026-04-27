@@ -98,6 +98,7 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" << 'REMOTE'
         --name rustpolybot-btc \
         --env-file .env \
         -e CRYPTO_FILTER=btc \
+        -v $(pwd)/logs:/usr/src/app/logs \
         rustpolybot
 
     echo "🚀 Starting ETH rustpolybot..."
@@ -106,6 +107,7 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" << 'REMOTE'
         --name rustpolybot-eth \
         --env-file .env \
         -e CRYPTO_FILTER=eth \
+        -v $(pwd)/logs:/usr/src/app/logs \
         rustpolybot
 
     echo "🚀 Starting SOL rustpolybot..."
@@ -114,6 +116,7 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" << 'REMOTE'
         --name rustpolybot-sol \
         --env-file .env \
         -e CRYPTO_FILTER=sol \
+        -v $(pwd)/logs:/usr/src/app/logs \
         rustpolybot
 
     echo "✅ All 3 containers deployed!"
