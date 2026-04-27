@@ -82,6 +82,7 @@ async fn main() -> Result<()> {
 
     let crypto_filter = env::var("CRYPTO_FILTER").unwrap_or_else(|_| "btc".to_string()).to_lowercase();
     let private_key = env::var(PRIVATE_KEY_VAR).expect("POLYMARKET_PRIVATE_KEY");
+    let trade_size_usdc: Decimal = env::var("TRADE_SIZE_USDC").unwrap_or_else(|_| "10".to_string()).parse()?;
 
     let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
     let eoa_address = signer.address();
@@ -140,6 +141,9 @@ async fn main() -> Result<()> {
     ));
 
     let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(PositionMap::new()));
+    // Local Pending Map to debounce rapid-fire orders (log flood protection)
+    let pending_orders: Arc<Mutex<HashMap<(String, U256), Instant>>> = Arc::new(Mutex::new(HashMap::new()));
+
     let total_pnl: Arc<Mutex<Decimal>> = Arc::new(Mutex::new(dec!(0)));
     let phantom_cooldowns: rustpolybot::helpers::balance::PhantomCooldowns = Arc::new(Mutex::new(HashMap::new()));
     let time_decay_positions: Arc<Mutex<HashMap<U256, TimeDecayPosition>>> =
@@ -159,7 +163,6 @@ async fn main() -> Result<()> {
     let initial_condition_id = initial_hourly.condition_id.clone();
 
     info!("🧪 Initializing market: {}", name);
-    // Use the extract_strike_price correctly from helpers::market
     let mut initial_strike = extract_strike_price(&name);
     if initial_strike.is_none() {
         initial_strike = fetch_historical_strike_price(&shared_http, &crypto_filter, &desc).await;
@@ -205,6 +208,7 @@ async fn main() -> Result<()> {
         let yes_fee_rate = trading_client.fee_rate_bps(yes_token).await.map(|r| r.base_fee).unwrap_or(0);
         let no_fee_rate = trading_client.fee_rate_bps(no_token).await.map(|r| r.base_fee).unwrap_or(0);
         let is_neg_risk = trading_client.neg_risk(yes_token).await.map(|r| r.neg_risk).unwrap_or(false);
+        let verifying_contract = if is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
 
         info!("✅ Cached Settings: NegRisk: {} | YES fee {} bps | NO fee {} bps", is_neg_risk, yes_fee_rate, no_fee_rate);
 
@@ -336,6 +340,7 @@ async fn main() -> Result<()> {
                     info!("🔄 Market switch required — restarting trading loop with new market");
                     if let Err(e) = trading_client.as_ref().cancel_all_orders().await { warn!("⚠️ Failed to cancel all orders: {}", e); }
                     { phantom_cooldowns.lock().await.clear(); }
+                    { pending_orders.lock().await.clear(); } // Clear pending locks on market switch
                     current_hourly_cid = new_condition_id.clone();
                     current_maker_cid = new_maker_opt.as_ref().map_or_else(String::new, |m| m.condition_id.clone());
                     break;
@@ -351,11 +356,16 @@ async fn main() -> Result<()> {
                     rustpolybot::tasks::cleanup::cleanup_expired_positions(Arc::clone(&positions), market_name.clone(), yes_token, no_token, market_close_time).await;
                     if let Err(e) = rustpolybot::tasks::cleanup::reconcile_orphaned_positions(Arc::clone(&positions), &tg_token, &tg_chat_id).await { warn!("⚠️ Orphan reconciliation error: {}", e); }
                     rustpolybot::tasks::cleanup::cleanup_time_decay_positions(Arc::clone(&time_decay_positions)).await;
+
+                    // Periodically clean up expired pending order locks
+                    {
+                        let mut pending = pending_orders.lock().await;
+                        pending.retain(|_, &mut instant| instant > Instant::now());
+                    }
                 }
                 _ = status_ticker.tick() => {
                     let (yb, _, ya, _) = *yes_price_rx.borrow();
                     let (nb, _, na, _) = *no_price_rx.borrow();
-                    // Always print heartbeat to confirm bot is alive
                     info!("💓 Heartbeat | Ask Sum ${:.4} (Y ask ${:.2} / N ask ${:.2}) | Bid Sum ${:.4} (Y bid ${:.2} / N bid ${:.2}) | Binance: ${:.2}",
                         ya + na, ya, na, yb + nb, yb, nb, *oracle_rx.borrow());
                 }
@@ -495,15 +505,32 @@ async fn main() -> Result<()> {
                                 if let Some(lt) = last_trade_time.get(&sn) { if lt.elapsed() < Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64) { continue; } }
 
                                 let pos_key = (sn.clone(), params.token_id);
+
+                                // Debounce: check if an order is already pending for this token
+                                {
+                                    let pending = pending_orders.lock().await;
+                                    if let Some(expiry) = pending.get(&pos_key) {
+                                        if expiry > &Instant::now() { continue; }
+                                    }
+                                }
+
                                 {
                                     let mut map = positions.lock().await; if map.contains_key(&pos_key) { continue; }
                                     map.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: params.price, opened_at: Utc::now(), close_time: market_close_time, market_name: params.market_name.clone(), pair_token_id: params.token_id, fill_confirmed_at: None, paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id) });
                                 }
+
+                                // Set pending lock for 3 seconds
+                                {
+                                    pending_orders.lock().await.insert(pos_key.clone(), Instant::now() + Duration::from_secs(3));
+                                }
+
                                 info!("📥 ENTRY [{}]: {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares);
                                 let vc = if params.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                 if !config::GHOST_MODE {
                                     if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, params.token_id, Side::Buy, params.shares, (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), params.fee_bps, OrderType::FAK, false, 0, &shared_http).await {
-                                        positions.lock().await.remove(&pos_key); consecutive_failures += 1; continue;
+                                        positions.lock().await.remove(&pos_key);
+                                        pending_orders.lock().await.remove(&pos_key);
+                                        consecutive_failures += 1; continue;
                                     }
                                 }
                                 let cl_s = Arc::clone(&trading_client); let ps_s = Arc::clone(&positions); let pc_s = Arc::clone(&phantom_cooldowns); let sn_s = sn.clone(); let tn_s = params.token_id;
@@ -525,14 +552,31 @@ async fn main() -> Result<()> {
                                 let mut placed = false;
                                 for p in [yes, no].into_iter().flatten() {
                                     let pk = (sn.clone(), p.token_id);
+
+                                    // Debounce: check if an order is already pending for this token
+                                    {
+                                        let pending = pending_orders.lock().await;
+                                        if let Some(expiry) = pending.get(&pk) {
+                                            if expiry > &Instant::now() { continue; }
+                                        }
+                                    }
+
                                     if !positions.lock().await.contains_key(&pk) {
                                         info!("📥 MakerQuote [{}]: {} | shares={:.2}, bid=${:.4}", sn, p.market_name, p.shares, p.price);
                                         positions.lock().await.insert(pk.clone(), Position { shares: p.shares, avg_entry: p.price, opened_at: Utc::now(), close_time: None, market_name: p.market_name.clone(), pair_token_id: p.token_id, fill_confirmed_at: None, paired_leg_token_id: None });
+
+                                        // Set pending lock for 3 seconds
+                                        {
+                                            pending_orders.lock().await.insert(pk.clone(), Instant::now() + Duration::from_secs(3));
+                                        }
+
                                         let _ = rustpolybot::helpers::balance::quick_confirm_fill(&trading_client, &sn, p.token_id, &positions, &p.condition_id).await;
                                         let vc = if p.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                         if !config::GHOST_MODE {
                                             if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, p.token_id, Side::Buy, p.shares, p.price, p.fee_bps, OrderType::GTC, true, 0, &shared_http).await {
-                                                positions.lock().await.remove(&pk); if !e.to_string().contains("crosses book") { consecutive_failures += 1; } continue;
+                                                positions.lock().await.remove(&pk);
+                                                pending_orders.lock().await.remove(&pk);
+                                                if !e.to_string().contains("crosses book") { consecutive_failures += 1; } continue;
                                             }
                                             let cl_m = Arc::clone(&trading_client); let ps_m = Arc::clone(&positions); let pc_m = Arc::clone(&phantom_cooldowns);
                                             let sn_m = sn.clone();
