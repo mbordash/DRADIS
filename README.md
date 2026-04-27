@@ -35,7 +35,7 @@ The bot connects to Polymarket's CLOB via WebSocket for real-time orderbook data
 
 **Time Decay** — Exploits price convergence toward $1.00 as markets approach expiry. Operates on the **Window venue** to avoid 10% hourly fees.
 
-**Basis / Funding-Rate** — Mean-reversion strategy that fades retail skew on the **Window venue** using Binance funding rates as confirmation.
+**Basis / Funding-Rate** — Fades retail skew on the **Window venue** using Binance funding rates as confirmation.
 - **Thesis**: Fades amateur over-betting when smart money (funding) disagrees.
 
 **Custom Strategy** — Develop and link your own strategies. See [CUSTOM_STRATEGY.md](docs/CUSTOM_STRATEGY.md).
@@ -51,6 +51,16 @@ The bot connects to Polymarket's CLOB via WebSocket for real-time orderbook data
 | ArbitrageStrategy | `$35` per leg | Gross hedged | **Window** |
 | TimeDecayStrategy | `$36` per leg | Gross hedged | **Window** |
 | BasisStrategy | `$15` | Gross one-sided | **Window** |
+
+---
+
+## Performance Tracking
+
+The bot automatically records every completed trade into a daily CSV file for easy analysis.
+
+- **Location**: `logs/trades_YYYY-MM-DD.csv`
+- **Columns**: Timestamp, Strategy, Market, Side (YES/NO), Entry Price, Exit Price, Shares, Profit (USDC), and Exit Reason.
+- **Asynchronous**: Logging is non-blocking and happens in a background thread to maintain high-frequency trading performance.
 
 ---
 
