@@ -38,7 +38,7 @@ pub async fn run_market_monitor(
         let (candidate, maker_candidate) = get_market_pair(&http).await;
         if candidate.yes_token == U256::ZERO { continue; }
 
-        let (cur_yes, _, cur_name, cur_close_time, _, _, _, cur_cid) = market_tx.borrow().clone();
+        let (cur_yes, _, cur_name, cur_close_time, _, _, _, _cur_cid) = market_tx.borrow().clone();
 
         if candidate.yes_token == cur_yes {
             // Hourly market unchanged — still check if maker market changed

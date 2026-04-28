@@ -5,7 +5,7 @@
 
 use chrono::{DateTime, Utc};
 use alloy::primitives::U256;
-use tracing::{info, debug, warn, error};
+use tracing::{info, debug, warn};
 use std::cmp::Ordering;
 use std::env;
 use rust_decimal::Decimal;
@@ -13,7 +13,7 @@ use regex::Regex;
 use std::str::FromStr;
 
 use crate::config;
-use crate::helpers::json::{extract_token_ids_u256, extract_close_time, extract_start_time, get_enable_orderbook};
+use crate::helpers::json::{extract_token_ids_u256, extract_close_time, get_enable_orderbook};
 use crate::helpers::price::value_to_f64;
 
 // ============================================================================

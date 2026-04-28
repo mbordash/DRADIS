@@ -87,7 +87,7 @@ impl Strategy for ArbitrageStrategyImpl {
         let yes_key = (STRATEGY_NAME.to_string(), market.yes_token);
         let no_key  = (STRATEGY_NAME.to_string(), market.no_token);
 
-        if let (Some(yp), Some(np)) = (pos_map.get(&yes_key), pos_map.get(&no_key)) {
+        if let (Some(yp), Some(_np)) = (pos_map.get(&yes_key), pos_map.get(&no_key)) {
             let yes_bid = snapshot.yes_bid;
             let no_bid = snapshot.no_bid;
 

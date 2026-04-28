@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use anyhow::Result;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use tracing::{info, debug};
+use tracing::debug;
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};

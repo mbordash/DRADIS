@@ -24,7 +24,7 @@ use tracing::warn;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rust_decimal::prelude::ToPrimitive;
-use crate::helpers::price::{to_fixed_u128_with_precision, round_to_tick_size, floor_to_tick_size};
+use crate::helpers::price::{round_to_tick_size, floor_to_tick_size};
 use crate::helpers::nonce::fetch_next_nonce;
 
 const ORDER_NAME: &str = "Polymarket CTF Exchange";
@@ -68,7 +68,7 @@ pub async fn place_limit_order(
     side: Side,
     quantity: Decimal,
     limit_price: Decimal,
-    fee_rate_bps: u16,
+    _fee_rate_bps: u16,
     order_type: OrderType,
     post_only: bool,
     expiration_secs: u64,

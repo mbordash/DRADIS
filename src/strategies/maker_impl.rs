@@ -9,9 +9,7 @@
 use async_trait::async_trait;
 use anyhow::Result;
 use chrono::Utc;
-use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use tracing::debug;
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
@@ -37,12 +35,6 @@ impl Strategy for MakerStrategyImpl {
         let market = ctx.maker_market.as_ref().unwrap_or(&ctx.market);
         let snapshot = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
 
-        // ── STRICT FEE GATE ──────────────────────────────────────────────────
-        // Only trade on venues with reasonable taker fees (<= 200 bps).
-        // This ensures MakerStrategy NEVER trades on the 1000 bps hourly markets.
-        if market.yes_fee_bps > 200 || market.no_fee_bps > 200 {
-            return Ok(StrategySignal::NoSignal);
-        }
 
         // ── Market maturation gate ────────────────────────────────────────────
         let secs_since_market_start = (Utc::now() - ctx.market_started_at).num_seconds();

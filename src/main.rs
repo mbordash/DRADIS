@@ -18,37 +18,35 @@ use alloy::primitives::{U256, Address, address};
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer;
 
-use chrono::{DateTime, Utc};
+use chrono::Utc;
 use reqwest;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::env;
 use std::str::FromStr as _;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::sync::atomic::AtomicU64;
 use tokio::sync::{watch, Mutex};
 use tokio::time::{interval, Instant, Duration};
 
-use tracing::{info, warn, debug, error};
+use tracing::{info, warn, error};
 
 use rustpolybot::config;
-use rustpolybot::state::{Position, StrategySignal, MarketConfig, MarketSnapshot, PositionMap, OrderParams};
+use rustpolybot::state::{Position, StrategySignal, MarketConfig, MarketSnapshot, PositionMap};
 use rustpolybot::strategies::time_decay_impl::TimeDecayPosition;
 use rustpolybot::orchestrator::{StrategyRegistry, StrategyContext};
 use rustpolybot::orchestrator::executor::{execute_strategies_concurrent, aggregate_and_resolve_signals};
 
 // New paths for helpers
 use rustpolybot::helpers::{
-    time::*, balance::*, nonce::*, orders::*, market::*, price::{round_to_tick_size, floor_to_tick_size},
+    time::*, balance::*, nonce::*, orders::*, market::*,
     notifications::send_notification, metrics,
 };
 
 use rustls::crypto::ring;
 
-use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 type PriceState = (Decimal, Decimal, Decimal, Decimal); // (Bid, BidDepth, Ask, AskDepth)
 
@@ -83,7 +81,7 @@ async fn main() -> Result<()> {
 
     let crypto_filter = env::var("CRYPTO_FILTER").unwrap_or_else(|_| "btc".to_string()).to_lowercase();
     let private_key = env::var(PRIVATE_KEY_VAR).expect("POLYMARKET_PRIVATE_KEY");
-    let trade_size_usdc: Decimal = env::var("TRADE_SIZE_USDC").unwrap_or_else(|_| "10".to_string()).parse()?;
+    let _trade_size_usdc: Decimal = env::var("TRADE_SIZE_USDC").unwrap_or_else(|_| "10".to_string()).parse()?;
 
     let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
     let eoa_address = signer.address();
@@ -103,7 +101,7 @@ async fn main() -> Result<()> {
     let nonce_manager = Arc::new(AtomicU64::new(initial_nonce));
 
     let starting_collateral_store = Arc::new(Mutex::new(dec!(0.0)));
-    let (balance_tx, balance_rx) = watch::channel(dec!(0));
+    let (balance_tx, _balance_rx) = watch::channel(dec!(0));
 
     let mut startup_balance = dec!(0);
     for i in 1..=3 {
@@ -209,7 +207,7 @@ async fn main() -> Result<()> {
         let yes_fee_rate = trading_client.fee_rate_bps(yes_token).await.map(|r| r.base_fee).unwrap_or(0);
         let no_fee_rate = trading_client.fee_rate_bps(no_token).await.map(|r| r.base_fee).unwrap_or(0);
         let is_neg_risk = trading_client.neg_risk(yes_token).await.map(|r| r.neg_risk).unwrap_or(false);
-        let verifying_contract = if is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
+        let _verifying_contract = if is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
 
         info!("✅ Cached Settings: NegRisk: {} | YES fee {} bps | NO fee {} bps", is_neg_risk, yes_fee_rate, no_fee_rate);
 
@@ -323,8 +321,6 @@ async fn main() -> Result<()> {
         let strategies = StrategyRegistry::create_all_strategies();
         let mut last_trade_time: HashMap<String, Instant> = HashMap::new();
         let mut last_stop_loss_time: HashMap<String, Instant> = HashMap::new();
-        let mut momentum_confirmation_count: u32 = 0;
-        let mut last_momentum_signal_token: Option<U256> = None;
         let mut consecutive_failures: u32 = 0;
         let tg_token = env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
         let tg_chat_id = env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
@@ -469,7 +465,7 @@ async fn main() -> Result<()> {
                         Err(e) => { warn!("⚠️ Strategy evaluation error: {}", e); continue; }
                     };
                     let (resolved_signals, _) = aggregate_and_resolve_signals(&eval_result);
-                    if resolved_signals.is_empty() { momentum_confirmation_count = 0; last_momentum_signal_token = None; continue; }
+                    if resolved_signals.is_empty() { continue; }
 
                     for (strategy_name, signal) in resolved_signals {
                         let sn = strategy_name.clone();
@@ -495,10 +491,10 @@ async fn main() -> Result<()> {
                                     }
                                 }
 
-                                let mut re_m = dec!(0);
-                                let mut rs_m = dec!(0);
-                                let mut rc_m = None;
-                                let mut pnl_m = dec!(0);
+                                let re_m;
+                                let rs_m;
+                                let rc_m;
+                                let pnl_m;
 
                                 {
                                     let mut map = positions.lock().await;
@@ -523,7 +519,7 @@ async fn main() -> Result<()> {
                                 }
 
                                 if rs_m > dec!(0) {
-                                    let ps = Arc::clone(&positions); let cl = Arc::clone(&trading_client); let tp = Arc::clone(&total_pnl); let m_name = params.market_name.clone(); let tkt = tg_token.clone(); let tkc = tg_chat_id.clone();
+                                    let ps = Arc::clone(&positions); let cl = Arc::clone(&trading_client); let tp = Arc::clone(&total_pnl); let m_name = params.market_name.clone();
                                     let sn_async = sn.clone();
                                     tokio::spawn(async move {
                                         tokio::time::sleep(Duration::from_millis(2500)).await;
@@ -584,6 +580,7 @@ async fn main() -> Result<()> {
                                 let vc = if params.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                 if !config::GHOST_MODE {
                                     if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, params.token_id, Side::Buy, params.shares, (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), params.fee_bps, OrderType::FAK, false, 0, &shared_http).await {
+                                        warn!("⚠️ ENTRY order failed [{}]: {}", sn, e);
                                         positions.lock().await.remove(&pos_key);
                                         pending_orders.lock().await.remove(&pos_key);
                                         consecutive_failures += 1; continue;
