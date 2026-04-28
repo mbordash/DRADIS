@@ -8,12 +8,12 @@ use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use polymarket_client_sdk::clob::{Client as ClobClient};
-use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::auth::Normal;
-use polymarket_client_sdk::clob::types::{OrderType, Side, SignatureType, Order, SignedOrder};
-use polymarket_client_sdk::{POLYGON};
-use alloy::primitives::{U256, Address};
+use polymarket_client_sdk_v2::clob::{Client as ClobClient};
+use polymarket_client_sdk_v2::auth::state::Authenticated;
+use polymarket_client_sdk_v2::auth::Normal;
+use polymarket_client_sdk_v2::clob::types::{OrderType, Side, SignatureType, Order, SignedOrder, OrderPayload};
+use polymarket_client_sdk_v2::{POLYGON};
+use alloy::primitives::{U256, Address, B256};
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer;
 use alloy::dyn_abi::Eip712Domain;
@@ -21,13 +21,15 @@ use alloy::sol_types::SolStruct;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use tracing::warn;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use rust_decimal::prelude::ToPrimitive;
 use crate::helpers::price::{to_fixed_u128_with_precision, round_to_tick_size, floor_to_tick_size};
 use crate::helpers::nonce::fetch_next_nonce;
 
 const ORDER_NAME: &str = "Polymarket CTF Exchange";
-const VERSION: &str = "1";
+/// EIP-712 domain version for the V2 CTF Exchange (pUSD collateral migration)
+const VERSION: &str = "2";
 /// Polymarket requires expiration timestamp to be >= now + 1 minute + 30 seconds
 /// We add 90 seconds (1.5 minutes) as a safety buffer
 const EXPIRATION_BUFFER_SECS: u64 = 90;
@@ -73,16 +75,34 @@ pub async fn place_limit_order(
     http: &reqwest::Client,
 ) -> Result<()> {
     for attempt in 0..2 {
-        // AtomicU64 load — no lock needed. Polymarket's GnosisSafe nonce acts as a
-        // minimum-cancel-nonce for batch cancellation, not a strict replay counter,
-        // so the same value can be used by concurrent orders without conflict.
-        let current_nonce = nonce_manager.load(Ordering::SeqCst);
+        // AtomicU64 load — kept for API compatibility but V2 orders have no nonce field.
+        // The nonce field was removed from the CTF Exchange V2 order struct.
+        let _current_nonce = nonce_manager.load(Ordering::SeqCst);
+
+        // V2 Order: expiration is outside the signed struct (in OrderPayloadV2.expiration).
+        // nonce and feeRateBps are absent from the V2 struct; new fields: timestamp, metadata, builder.
+        let expiration_v2 = if expiration_secs > 0 {
+            let now_unix = Utc::now().timestamp() as u64;
+            let buffer = expiration_secs.max(EXPIRATION_BUFFER_SECS);
+            U256::from(now_unix + buffer)
+        } else {
+            U256::ZERO
+        };
+
+        // timestamp_ms: milliseconds since UNIX epoch — required new field in V2 order struct
+        let timestamp_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time before epoch")
+            .as_millis();
 
         let mut order_struct = Order::default();
         order_struct.salt = U256::from(Utc::now().timestamp_millis() & ((1 << 53) - 1));
         order_struct.maker = safe_address;
         order_struct.signer = eoa_address;
         order_struct.tokenId = token_id;
+        order_struct.timestamp = U256::from(timestamp_ms);
+        order_struct.metadata = B256::ZERO;
+        order_struct.builder = B256::ZERO;
 
         // Round price to minimum tick size (0.01) to comply with Polymarket validation.
         // For post-only BUY orders (maker bids), floor instead of round to prevent
@@ -178,22 +198,12 @@ pub async fn place_limit_order(
             _ => return Err(anyhow::anyhow!("Unsupported order side")),
         }
 
-        // Set expiration with safety buffer
-        // Polymarket requires: now + 1 minute + 30 seconds minimum
-        // We add EXPIRATION_BUFFER_SECS (90s) as safety margin
-        order_struct.expiration = if expiration_secs > 0 {
-            let now = Utc::now().timestamp() as u64;
-            let buffer = expiration_secs.max(EXPIRATION_BUFFER_SECS);
-            U256::from(now + buffer)
-        } else {
-            U256::ZERO
-        };
-
-        order_struct.nonce = U256::from(current_nonce);
-        order_struct.feeRateBps = U256::from(fee_rate_bps);
+        // V2: expiration is NOT part of the signed struct — it lives in OrderPayload (expiration_v2 above).
+        // V2: side and signatureType are still part of the signed struct
         order_struct.side = side as u8;
         order_struct.signatureType = SignatureType::GnosisSafe as u8;
 
+        // V2 EIP-712 domain: version "2", verifying_contract is the exchange_v2 address
         let domain = Eip712Domain {
             name: Some(Cow::Borrowed(ORDER_NAME)),
             version: Some(Cow::Borrowed(VERSION)),
@@ -204,28 +214,26 @@ pub async fn place_limit_order(
 
         let hash = order_struct.eip712_signing_hash(&domain);
         if let Ok(signature) = signer.sign_hash(&hash).await {
-            // Using a single chain with maybe_post_only to avoid builder type-state mismatches.
+            // Wrap order + expiration into OrderPayload::V2 (expiration is outside the signed struct in V2)
+            let payload = OrderPayload::new(order_struct, expiration_v2);
+
             let signed_order = SignedOrder::builder()
-                .order(order_struct)
+                .payload(payload)
                 .signature(signature)
                 .order_type(order_type.clone())
                 .owner(client.credentials().key())
-                .maybe_post_only(if post_only { Some(true) } else { None })
+                .post_only(post_only)
                 .build();
 
             match client.post_order(signed_order).await {
                 Ok(_) => {
-                    // NOTE: Polymarket CLOB always returns next_nonce=0 for this wallet type
-                    // (GnosisSafe signatureType).  The nonce field in Polymarket orders acts as
-                    // a "minimum cancel nonce" for batch cancellation, not a strict per-order
-                    // replay counter.  We leave the counter unchanged so it stays in
-                    // sync with the API without the latency penalty.
                     return Ok(());
                 }
                 Err(e) => {
                     let err_msg = format!("{:?}", e).to_lowercase();
+                    // V2 orders have no nonce field; keep branch for future-proofing but won't trigger
                     if err_msg.contains("invalid nonce") && attempt == 0 {
-                        warn!("⚠️ Invalid nonce. Re-syncing from API...");
+                        warn!("⚠️ Nonce error (unexpected in V2). Re-syncing from API...");
                         if let Some(fresh_nonce) = fetch_next_nonce(http, safe_address).await {
                             nonce_manager.store(fresh_nonce, Ordering::SeqCst);
                             warn!("🔄 Nonce re-synced to {} — retrying order", fresh_nonce);

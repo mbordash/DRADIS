@@ -12,11 +12,11 @@ use tokio::time::{Duration, Instant};
 use chrono::Utc;
 use tracing::{debug, error, info, warn};
 
-use polymarket_client_sdk::clob::{Client as ClobClient};
-use polymarket_client_sdk::auth::state::Authenticated;
-use polymarket_client_sdk::auth::Normal;
-use polymarket_client_sdk::clob::types::request::{BalanceAllowanceRequest, OrdersRequest};
-use polymarket_client_sdk::clob::types::AssetType;
+use polymarket_client_sdk_v2::clob::{Client as ClobClient};
+use polymarket_client_sdk_v2::auth::state::Authenticated;
+use polymarket_client_sdk_v2::auth::Normal;
+use polymarket_client_sdk_v2::clob::types::request::{BalanceAllowanceRequest, OrdersRequest};
+use polymarket_client_sdk_v2::clob::types::AssetType;
 
 pub use crate::state::{Position, PositionMap};
 
@@ -185,7 +185,7 @@ pub async fn quick_confirm_fill(
     condition_id: &str,
 ) -> Result<bool> {
     let market_hash = match B256::from_str(condition_id) { Ok(h) => h, Err(_) => return Ok(false) };
-    let req = polymarket_client_sdk::clob::types::request::CancelMarketOrderRequest::builder().market(market_hash).build();
+    let req = polymarket_client_sdk_v2::clob::types::request::CancelMarketOrderRequest::builder().market(market_hash).build();
     let _ = client.cancel_market_orders(&req).await;
     if !check_for_resting_order(client, token_id).await {
         let mut pos_map = positions.lock().await;

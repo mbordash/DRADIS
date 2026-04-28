@@ -8,7 +8,7 @@ use async_trait::async_trait;
 use anyhow::Result;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use tracing::info;
+use tracing::{info, debug};
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
@@ -72,9 +72,34 @@ impl Strategy for MomentumStrategyImpl {
         }
 
         if let Some(strike) = strike_price {
+            // ── Window/Daily trend filter ─────────────────────────────────────
+            // If the multi-hour market already prices in a strong directional
+            // outcome (YES < 30% or YES > 70%), don't fight that consensus with
+            // a short-window momentum trade in the opposite direction.
+            let window_blocks_bull;
+            let window_blocks_bear;
+            if let (Some(_wm), Some(ws)) = (&ctx.maker_market, &ctx.maker_snapshot) {
+                let w_yes_mid = if ws.yes_bid > dec!(0) && ws.yes_ask < dec!(1) {
+                    (ws.yes_bid + ws.yes_ask) / dec!(2)
+                } else {
+                    dec!(0.5) // neutral if book not yet populated
+                };
+                window_blocks_bull = config::MOMENTUM_WINDOW_BEARISH_BLOCK > dec!(0)
+                    && w_yes_mid < config::MOMENTUM_WINDOW_BEARISH_BLOCK;
+                window_blocks_bear = config::MOMENTUM_WINDOW_BULLISH_BLOCK > dec!(0)
+                    && w_yes_mid > config::MOMENTUM_WINDOW_BULLISH_BLOCK;
+                if window_blocks_bull || window_blocks_bear {
+                    debug!("📉 Momentum window filter: YES_mid={:.3} blocks {}",
+                        w_yes_mid, if window_blocks_bull { "BULL" } else { "BEAR" });
+                }
+            } else {
+                window_blocks_bull = false;
+                window_blocks_bear = false;
+            }
+
             // Primary entry
             if velocity > threshold && binance_price > (strike + strike_buffer) && ctx.snapshot.yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
-                && short_ok_bull && accel_ok_bull
+                && short_ok_bull && accel_ok_bull && !window_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
                     params: OrderParams {
@@ -89,7 +114,7 @@ impl Strategy for MomentumStrategyImpl {
                     pair_params: None,
                 });
             } else if velocity < -threshold && binance_price < (strike - strike_buffer) && ctx.snapshot.no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
-                && short_ok_bear && accel_ok_bear
+                && short_ok_bear && accel_ok_bear && !window_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
                     params: OrderParams {
@@ -107,7 +132,7 @@ impl Strategy for MomentumStrategyImpl {
 
             // Secondary "strike-crossing" entry
             if velocity > threshold && binance_price > strike && ctx.snapshot.yes_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE
-                && short_ok_bull && accel_ok_bull
+                && short_ok_bull && accel_ok_bull && !window_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
                     params: OrderParams {
@@ -122,7 +147,7 @@ impl Strategy for MomentumStrategyImpl {
                     pair_params: None,
                 });
             } else if velocity < -threshold && binance_price < strike && ctx.snapshot.no_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE
-                && short_ok_bear && accel_ok_bear
+                && short_ok_bear && accel_ok_bear && !window_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
                     params: OrderParams {

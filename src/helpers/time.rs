@@ -162,4 +162,35 @@ pub fn generate_hourly_market_names(crypto_filter: &str, current_time_utc: DateT
     names
 }
 
+/// Generate candidate market names for daily "Up or Down on [date]?" markets.
+/// These are the preferred window/daily venue for non-momentum strategies.
+/// Checks today and tomorrow (in ET) to handle overnight sessions crossing midnight.
+pub fn generate_daily_market_names(crypto_filter: &str, current_time_utc: DateTime<Utc>) -> Vec<String> {
+    let mut names = Vec::new();
+    let eastern_time = current_time_utc.with_timezone(&Eastern);
+
+    let crypto_name_long = match crypto_filter {
+        "btc" => "Bitcoin",
+        "eth" => "Ethereum",
+        "sol" => "Solana",
+        _ => "Crypto",
+    };
+    let crypto_name_short = crypto_filter.to_uppercase();
+
+    // Today and tomorrow in ET so overnight sessions always find the right market
+    for day_offset in 0..=1i64 {
+        let target = eastern_time + chrono::Duration::days(day_offset);
+        let month_name = target.format("%B").to_string();
+        let day = target.day();
+
+        // Polymarket canonical pattern: "Bitcoin Up or Down on April 28?"
+        names.push(format!("{} Up or Down on {} {}?", crypto_name_long, month_name, day));
+        names.push(format!("{} Up or Down on {} {}?", crypto_name_short, month_name, day));
+        // Without the question mark (some listings omit it)
+        names.push(format!("{} Up or Down on {} {}", crypto_name_long, month_name, day));
+        names.push(format!("{} Up or Down on {} {}", crypto_name_short, month_name, day));
+    }
+    names
+}
+
 

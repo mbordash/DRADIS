@@ -214,6 +214,55 @@ pub async fn fetch_specific_hourly_market(
     None
 }
 
+/// Directly search for today's (or tomorrow's for overnight sessions) daily "Up or Down on [date]?"
+/// maker venue by name, bypassing the volume-sorted scan that almost certainly ranks it too low.
+pub async fn fetch_specific_window_daily_market(
+    http: &reqwest::Client,
+    crypto_filter: &str,
+    now: DateTime<Utc>,
+) -> Option<MarketCandidate> {
+    let candidate_names = crate::helpers::time::generate_daily_market_names(crypto_filter, now);
+    for q in &candidate_names {
+        let url = format!(
+            "https://gamma-api.polymarket.com/markets?search={}&active=true&closed=false&limit=5",
+            urlencoding::encode(q)
+        );
+        let resp = match http.get(&url).send().await { Ok(r) => r, Err(e) => { warn!("⚠️ Daily market search failed for '{}': {}", q, e); continue; } };
+        let data: serde_json::Value = match resp.json().await { Ok(d) => d, Err(_) => continue };
+        let markets = data.as_array().or_else(|| data.get("data").and_then(|v| v.as_array()));
+        if let Some(arr) = markets {
+            for m in arr {
+                let name = m.get("question").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                if !config::is_daily_market(&name) { continue; }
+                if config::is_bad_market(&name) || !get_enable_orderbook(m) { continue; }
+                let tokens = extract_token_ids_u256(m);
+                if tokens.len() < 2 { continue; }
+                let close = extract_close_time(m.get("event").unwrap_or(&serde_json::Value::Null), m);
+                let left = close.map_or(0, |ct| (ct - now).num_seconds());
+                if left < config::MAKER_MIN_SECS_TO_EXPIRY || left > config::MAKER_MAX_SECS_TO_EXPIRY {
+                    debug!("⏭ Daily market '{}' skipped: {}s left (need {}-{})", name, left, config::MAKER_MIN_SECS_TO_EXPIRY, config::MAKER_MAX_SECS_TO_EXPIRY);
+                    continue;
+                }
+                let cond_id = m.get("conditionId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+                info!("🗓 Found daily maker venue via direct search: \"{}\" ({}s left)", name, left);
+                return Some(MarketCandidate {
+                    yes_token: tokens[0],
+                    no_token: tokens[1],
+                    name,
+                    link: m.get("slug").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    description: m.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                    is_hot: false,
+                    close_time: close,
+                    volume: 0.0,
+                    condition_id: cond_id,
+                });
+            }
+        }
+    }
+    debug!("⚠️ No daily maker venue found via direct search (tried: {:?})", candidate_names);
+    None
+}
+
 pub async fn get_market_pair(http: &reqwest::Client) -> (MarketCandidate, Option<MarketCandidate>) {
     let filter = env::var("CRYPTO_FILTER").unwrap_or_else(|_| "all".to_string()).to_lowercase();
     let now = Utc::now();
@@ -232,7 +281,18 @@ pub async fn get_market_pair(http: &reqwest::Client) -> (MarketCandidate, Option
     let hourly = hourly_fast.or_else(|| hourly_c.first().map(|b| MarketCandidate { yes_token: b.0[0], no_token: b.0[1], name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone() }))
         .unwrap_or(MarketCandidate { yes_token: U256::ZERO, no_token: U256::ZERO, name: String::new(), link: String::new(), description: String::new(), is_hot: false, close_time: None, volume: 0.0, condition_id: String::new() });
 
-    let maker = maker_c.first().map(|b| MarketCandidate { yes_token: b.0[0], no_token: b.0[1], name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone() });
+    // Prefer a direct targeted search for today's daily market (high confidence, volume-independent),
+    // falling back to whatever the volume-scan turned up.
+    let daily_direct = fetch_specific_window_daily_market(http, &filter, now).await;
+    let maker = daily_direct.or_else(|| {
+        if maker_c.first().is_some() {
+            info!("📋 Using volume-scan window/daily fallback for maker venue");
+        } else {
+            warn!("⚠️ No window/daily maker venue found (direct search + volume scan both empty)");
+        }
+        maker_c.first().map(|b| MarketCandidate { yes_token: b.0[0], no_token: b.0[1], name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone() })
+    });
+
     (hourly, maker)
 }
 

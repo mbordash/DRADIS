@@ -5,14 +5,14 @@
 
 use anyhow::Result;
 
-use polymarket_client_sdk::clob::{Client as ClobClient, Config};
-use polymarket_client_sdk::clob::types::{Side, SignatureType, OrderType};
-use polymarket_client_sdk::{POLYGON, PRIVATE_KEY_VAR, derive_safe_wallet};
-use polymarket_client_sdk::clob::types::request::BalanceAllowanceRequest;
-use polymarket_client_sdk::clob::types::AssetType;
+use polymarket_client_sdk_v2::clob::{Client as ClobClient, Config};
+use polymarket_client_sdk_v2::clob::types::{Side, SignatureType, OrderType};
+use polymarket_client_sdk_v2::{POLYGON, PRIVATE_KEY_VAR, derive_safe_wallet};
+use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
+use polymarket_client_sdk_v2::clob::types::AssetType;
 
 use futures::StreamExt as _;
-use polymarket_client_sdk::clob::ws::Client as WsClient;
+use polymarket_client_sdk_v2::clob::ws::Client as WsClient;
 
 use alloy::primitives::{U256, Address, address};
 use alloy::signers::local::LocalSigner;
@@ -52,8 +52,9 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
 type PriceState = (Decimal, Decimal, Decimal, Decimal); // (Bid, BidDepth, Ask, AskDepth)
 
-const EXCHANGE_NORMAL: Address = address!("0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E");
-const EXCHANGE_NEG_RISK: Address = address!("0xC5d563A36AE78145C45a50134d48A1215220f80a");
+// V2 CTF Exchange contracts (pUSD collateral, EIP-712 domain version "2")
+const EXCHANGE_NORMAL: Address = address!("0xE111180000d2663C0091e4f400237545B87B996B");
+const EXCHANGE_NEG_RISK: Address = address!("0xe2222d279d744050d28e00520010520000310F59");
 
 
 #[tokio::main]
@@ -329,6 +330,60 @@ async fn main() -> Result<()> {
         let tg_chat_id = env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
 
         info!("🤖 Orchestrator ready: {} strategies loaded", strategies.len());
+        info!("🧭 Strategy venue attachments:");
+        for strategy in &strategies {
+            let sn = strategy.name();
+            let (venue, market_name_attached, budget, risk_model) = match sn.as_str() {
+                "MomentumStrategy" => (
+                    "Hourly",
+                    market_name.clone(),
+                    config::MOMENTUM_MAX_EXPOSURE_USDC,
+                    "Gross one-sided",
+                ),
+                "MakerStrategy" => {
+                    let attached_name = maker_market_config
+                        .as_ref()
+                        .map(|m| m.market_name.clone())
+                        .unwrap_or_else(|| market_name.clone());
+                    let venue_name = if maker_market_config.is_some() { "Window/Daily" } else { "Hourly (fallback)" };
+                    (venue_name, attached_name, config::MAKER_MAX_EXPOSURE_USDC, "Net |YES-NO|")
+                }
+                "ArbitrageStrategy" => {
+                    let attached_name = maker_market_config
+                        .as_ref()
+                        .map(|m| m.market_name.clone())
+                        .unwrap_or_else(|| market_name.clone());
+                    let venue_name = if maker_market_config.is_some() { "Window/Daily" } else { "Hourly (fallback)" };
+                    (venue_name, attached_name, config::ARBITRAGE_MAX_EXPOSURE_USDC, "Gross hedged (per leg)")
+                }
+                "TimeDecayStrategy" => {
+                    let attached_name = maker_market_config
+                        .as_ref()
+                        .map(|m| m.market_name.clone())
+                        .unwrap_or_else(|| market_name.clone());
+                    let venue_name = if maker_market_config.is_some() { "Window/Daily" } else { "Hourly (fallback)" };
+                    (venue_name, attached_name, config::TIME_DECAY_MAX_EXPOSURE_USDC, "Gross hedged (per leg)")
+                }
+                "BasisStrategy" => {
+                    let attached_name = maker_market_config
+                        .as_ref()
+                        .map(|m| m.market_name.clone())
+                        .unwrap_or_else(|| market_name.clone());
+                    let venue_name = if maker_market_config.is_some() { "Window/Daily" } else { "Hourly (fallback)" };
+                    (venue_name, attached_name, config::BASIS_MAX_EXPOSURE_USDC, "Gross one-sided")
+                }
+                _ => ("Unknown", market_name.clone(), dec!(0), "Unknown"),
+            };
+
+            info!(
+                "  - {} => venue={} | market=\"{}\" | budget=${} | risk={}",
+                sn,
+                venue,
+                market_name_attached,
+                budget,
+                risk_model,
+            );
+        }
 
         loop {
             tokio::select! {

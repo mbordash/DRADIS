@@ -82,6 +82,9 @@ pub async fn execute_strategies_concurrent(
     let mut exit_signals = Vec::new();
     let start_all = Instant::now();
 
+    // INFO: Info-level Diagnostic Output — tracks each strategy's result for the tick summary.
+    let mut info_parts: Vec<String> = Vec::with_capacity(strategies.len());
+
     for strategy in strategies {
         let strategy_name = strategy.name().to_string();
         let start = Instant::now();
@@ -94,15 +97,20 @@ pub async fn execute_strategies_concurrent(
 
         let evaluation_time_ms = start.elapsed().as_millis();
 
+        let mut entry_tag = "⬜";
+        let mut exit_tag  = "⬜";
+
         // Handle entry result
         match entry_result {
             Ok(signal) => {
                 if !matches!(signal, StrategySignal::NoSignal) {
-                    debug!("📍 {} entry signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
+                    entry_tag = "🟩";
+                    info!("📍 {} entry signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
                     entry_signals.push((strategy_name.clone(), signal));
                 }
             }
             Err(e) => {
+                entry_tag = "🔴";
                 warn!("⚠️ {} entry evaluation error: {}", strategy_name, e);
             }
         }
@@ -111,20 +119,34 @@ pub async fn execute_strategies_concurrent(
         match exit_result {
             Ok(signal) => {
                 if !matches!(signal, StrategySignal::NoSignal) {
-                    debug!("📍 {} exit signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
+                    exit_tag = "🟨";
+                    info!("📍 {} exit signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
                     exit_signals.push((strategy_name.clone(), signal));
                 }
             }
             Err(e) => {
+                exit_tag = "🔴";
                 warn!("⚠️ {} exit evaluation error: {}", strategy_name, e);
             }
         }
 
         debug!("✅ {} evaluation completed in {}ms", strategy_name, evaluation_time_ms);
+
+        // Abbreviated strategy label for the compact tick line (e.g. "Momentum", "Maker")
+        let label = strategy_name.trim_end_matches("Strategy");
+        info_parts.push(format!("{}:{}{}", label, entry_tag, exit_tag));
     }
 
     let total_time_ms = start_all.elapsed().as_millis();
-    debug!("📊 All {} strategies evaluated in {}ms", strategies.len(), total_time_ms);
+    // Tick summary — only escalate to INFO when at least one strategy fired a signal
+    // so the log isn't flooded with all-⬜ lines every 50 ms.
+    // RUST_LOG=debug shows the full tick-by-tick detail when needed.
+    let has_signal = !entry_signals.is_empty() || !exit_signals.is_empty();
+    let summary = format!("📊 INFO [{}ms] {} | maker_mkt={}",
+        total_time_ms,
+        info_parts.join(" | "),
+        if ctx.maker_market.is_some() { "✅" } else { "❌" });
+    if has_signal { info!("{}", summary); } else { debug!("{}", summary); }
 
     Ok(StrategyEvaluationResult {
         entry_signals,
@@ -184,4 +206,3 @@ pub fn aggregate_and_resolve_signals(
 
     (final_signals, vec![])
 }
-

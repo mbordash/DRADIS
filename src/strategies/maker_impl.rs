@@ -157,11 +157,14 @@ impl Strategy for MakerStrategyImpl {
         }
 
         // ── Build detailed signals ───────────────────────────────────────────
+        // Maker (post-only) orders are NEVER charged a taker fee by the CLOB —
+        // the feeRateBps field is an EIP-712 struct attribute required by the API
+        // but it is NOT deducted from maker fills.  Pass 0 so our P&L math is correct.
         let yes_params = final_yes.map(|p| OrderParams {
             token_id: market.yes_token,
             price: p,
             shares: trade_size / p,
-            fee_bps: market.yes_fee_bps as u16,
+            fee_bps: 0,
             is_neg_risk: market.is_neg_risk,
             market_name: market.market_name.clone(),
             condition_id: market.condition_id.clone(),
@@ -171,7 +174,7 @@ impl Strategy for MakerStrategyImpl {
             token_id: market.no_token,
             price: p,
             shares: trade_size / p,
-            fee_bps: market.no_fee_bps as u16,
+            fee_bps: 0,
             is_neg_risk: market.is_neg_risk,
             market_name: market.market_name.clone(),
             condition_id: market.condition_id.clone(),
