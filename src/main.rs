@@ -583,6 +583,8 @@ async fn main() -> Result<()> {
                                         warn!("⚠️ ENTRY order failed [{}]: {}", sn, e);
                                         positions.lock().await.remove(&pos_key);
                                         pending_orders.lock().await.remove(&pos_key);
+                                        // Impose cooldown so the strategy backs off before retrying
+                                        last_trade_time.insert(sn.clone(), Instant::now());
                                         consecutive_failures += 1; continue;
                                     }
                                 }
