@@ -77,6 +77,7 @@ pub async fn execute_strategies_concurrent(
     strategies: &[Box<dyn Strategy>],
     ctx: &StrategyContext,
     _timeout_ms: u64,
+    last_summary: &mut String,
 ) -> Result<StrategyEvaluationResult> {
     let mut entry_signals = Vec::new();
     let mut exit_signals = Vec::new();
@@ -105,7 +106,8 @@ pub async fn execute_strategies_concurrent(
             Ok(signal) => {
                 if !matches!(signal, StrategySignal::NoSignal) {
                     entry_tag = "🟩";
-                    info!("📍 {} entry signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
+                    // Signal detail at DEBUG — actual placement is logged at INFO by main.rs (📥 ENTRY)
+                    debug!("📍 {} entry signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
                     entry_signals.push((strategy_name.clone(), signal));
                 }
             }
@@ -120,7 +122,8 @@ pub async fn execute_strategies_concurrent(
             Ok(signal) => {
                 if !matches!(signal, StrategySignal::NoSignal) {
                     exit_tag = "🟨";
-                    info!("📍 {} exit signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
+                    // Signal detail at DEBUG — actual exit is logged at INFO by main.rs (💰 Position closed)
+                    debug!("📍 {} exit signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
                     exit_signals.push((strategy_name.clone(), signal));
                 }
             }
@@ -138,15 +141,21 @@ pub async fn execute_strategies_concurrent(
     }
 
     let total_time_ms = start_all.elapsed().as_millis();
-    // Tick summary — only escalate to INFO when at least one strategy fired a signal
-    // so the log isn't flooded with all-⬜ lines every 50 ms.
-    // RUST_LOG=debug shows the full tick-by-tick detail when needed.
-    let has_signal = !entry_signals.is_empty() || !exit_signals.is_empty();
-    let summary = format!("📊 INFO [{}ms] {} | maker_mkt={}",
-        total_time_ms,
+    // Build a pattern-only key (without timing) for change detection
+    let pattern_key = format!("{} | maker_mkt={}",
         info_parts.join(" | "),
         if ctx.maker_market.is_some() { "✅" } else { "❌" });
-    if has_signal { info!("{}", summary); } else { debug!("{}", summary); }
+    let summary = format!("📊 INFO [{}ms] {}", total_time_ms, pattern_key);
+
+    // Only emit at INFO when signal pattern changes (new signal fires or clears).
+    // Sustained identical patterns log at DEBUG to avoid flooding.
+    let has_signal = !entry_signals.is_empty() || !exit_signals.is_empty();
+    if pattern_key != *last_summary {
+        if has_signal { info!("{}", summary); } else { debug!("{}", summary); }
+        *last_summary = pattern_key;
+    } else {
+        debug!("{}", summary);
+    }
 
     Ok(StrategyEvaluationResult {
         entry_signals,

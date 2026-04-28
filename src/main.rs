@@ -321,7 +321,9 @@ async fn main() -> Result<()> {
         let strategies = StrategyRegistry::create_all_strategies();
         let mut last_trade_time: HashMap<String, Instant> = HashMap::new();
         let mut last_stop_loss_time: HashMap<String, Instant> = HashMap::new();
+        let mut last_expiry_exit_time: HashMap<String, Instant> = HashMap::new(); // 5-min block after expiry exits
         let mut consecutive_failures: u32 = 0;
+        let mut last_executor_summary = String::new(); // change-detection for 📊 INFO tick summary
         let tg_token = env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
         let tg_chat_id = env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
 
@@ -460,7 +462,7 @@ async fn main() -> Result<()> {
                         },
                     };
 
-                    let eval_result = match execute_strategies_concurrent(&strategies, &ctx, 500).await {
+                    let eval_result = match execute_strategies_concurrent(&strategies, &ctx, 500, &mut last_executor_summary).await {
                         Ok(r) => r,
                         Err(e) => { warn!("⚠️ Strategy evaluation error: {}", e); continue; }
                     };
@@ -547,6 +549,8 @@ async fn main() -> Result<()> {
                                     }
                                 }
                                 if reason.contains("stop-loss") { last_stop_loss_time.insert(sn.clone(), Instant::now()); }
+                                // After an expiry exit, block re-entry for 5 minutes via a separate map.
+                                if reason.to_lowercase().contains("expir") { last_expiry_exit_time.insert(sn.clone(), Instant::now()); }
                                 last_trade_time.insert(sn.clone(), Instant::now());
                                 let _ = send_notification(&tg_token, &tg_chat_id, &format!("📤 EXIT [{}] {} | bid=${:.4} | reason: {} | Session PnL: ${:.4}", sn, params.market_name, params.price, reason, *total_pnl.lock().await)).await;
                             }
@@ -555,6 +559,8 @@ async fn main() -> Result<()> {
                             StrategySignal::Entry { params, pair_params } => {
                                 if let Some(close_time) = market_close_time { if (close_time - Utc::now()).num_seconds() < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY { continue; } }
                                 if let Some(lt) = last_trade_time.get(&sn) { if lt.elapsed() < Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64) { continue; } }
+                                // 5-minute block after an expiry exit — the market was closing, re-entry is pointless
+                                if let Some(lt) = last_expiry_exit_time.get(&sn) { if lt.elapsed() < Duration::from_secs(300) { continue; } }
 
                                 let pos_key = (sn.clone(), params.token_id);
 
