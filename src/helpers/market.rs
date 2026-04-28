@@ -125,6 +125,10 @@ pub fn validate_expiry(
 }
 
 pub fn validate_time_window(market_name: &str) -> bool {
+    if config::is_window_market(market_name) || config::is_daily_market(market_name) {
+        return true;
+    }
+
     let lower = market_name.to_lowercase();
     let has_et = lower.contains(" et");
     let has_time = lower.contains(":") && (lower.contains("am") || lower.contains("pm"));
@@ -215,7 +219,11 @@ pub async fn get_market_pair(http: &reqwest::Client) -> (MarketCandidate, Option
     let now = Utc::now();
     let hourly_fast = fetch_specific_hourly_market(http, &filter, now).await.map(|m| MarketCandidate { yes_token: m.0[0], no_token: m.0[1], name: m.1, link: m.2, description: m.6, is_hot: m.4, close_time: m.5, volume: 0.0, condition_id: String::new() });
     let all = fetch_simplified_crypto_candidates(http, &filter).await;
-    let mut hourly_c: Vec<_> = all.iter().filter(|c| !config::is_window_market(&c.1) && !config::is_daily_market(&c.1)).collect();
+    let mut hourly_c: Vec<_> = all.iter().filter(|c|
+        !config::is_window_market(&c.1)
+            && !config::is_daily_market(&c.1)
+            && !config::is_ultra_short_window_market(&c.1)
+    ).collect();
     let mut maker_c: Vec<_> = all.iter().filter(|c| config::is_window_market(&c.1) || config::is_daily_market(&c.1)).collect();
 
     hourly_c.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(Ordering::Equal));
@@ -243,11 +251,21 @@ pub async fn fetch_simplified_crypto_candidates(http: &reqwest::Client, filter: 
                 let tokens = extract_token_ids_u256(m);
                 let close = extract_close_time(event, m);
                 let vol = m.get("volume24hrClob").and_then(value_to_f64).unwrap_or(0.0);
-                let ctx = ValidationContext { now, crypto_filter: filter.to_string(), min_seconds_to_expiry: config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY, max_seconds_to_expiry: config::MAX_SECONDS_TO_EXPIRY_FOR_ENTRY, safety_buffer_secs: config::MARKET_EXPIRY_SAFETY_BUFFER_SECS, min_volume: config::MIN_MARKET_VOLUME };
+                let is_maker_venue = config::is_window_market(&name) || config::is_daily_market(&name);
+                let min_secs = if is_maker_venue { config::MAKER_MIN_SECS_TO_EXPIRY } else { config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY };
+                let max_secs = if is_maker_venue { config::MAKER_MAX_SECS_TO_EXPIRY } else { config::MAX_SECONDS_TO_EXPIRY_FOR_ENTRY };
+                let ctx = ValidationContext {
+                    now,
+                    crypto_filter: filter.to_string(),
+                    min_seconds_to_expiry: min_secs,
+                    max_seconds_to_expiry: max_secs,
+                    safety_buffer_secs: config::MARKET_EXPIRY_SAFETY_BUFFER_SECS,
+                    min_volume: config::MIN_MARKET_VOLUME,
+                };
                 let blocked = vec!["presidential", "nomination", "election", "democratic", "republican"];
                 let event_title = event.get("title").and_then(|v| v.as_str()).unwrap_or_default();
                 let (valid, _, _) = validate_market(&name, event_title, &tokens, close, vol, &ctx, &blocked);
-                if valid && !config::is_range_market(&name) && get_enable_orderbook(m) {
+                if valid && !config::is_range_market(&name) && !config::is_ultra_short_window_market(&name) && get_enable_orderbook(m) {
                     out.push((tokens, name.clone(), m.get("slug").and_then(|v| v.as_str()).unwrap_or_default().to_string(), vol, config::is_high_priority_text(&name), close, m.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(), m.get("conditionId").and_then(|v| v.as_str()).unwrap_or_default().to_string()));
                 }
             }

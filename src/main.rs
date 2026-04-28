@@ -310,6 +310,7 @@ async fn main() -> Result<()> {
                 no_fee_bps: mk_no_fee,
             })
         } else {
+            warn!("⚠️ No maker venue selected (window/daily unavailable). Non-momentum strategies will fallback to hourly market context.");
             None
         };
 
