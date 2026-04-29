@@ -1,4 +1,4 @@
-# Writing a Custom Strategy
+# Writing a Custom Viper Strategy
 
 This guide walks through implementing and integrating a new trading strategy into dradis using the new "Strategy is Sovereign" architecture.
 
