@@ -30,7 +30,7 @@ pub const ENABLE_TELEGRAM: bool = true;
 
 pub const GHOST_MODE: bool = false;
 
-pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.05);
+pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.01);
 pub const ARBITRAGE_MAX_TAKER_FEE_BPS: u32 = 300;
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.98);
 pub const MIN_ORDER_SHARES: Decimal = dec!(1.0);
@@ -61,7 +61,8 @@ pub const MOMENTUM_MAX_TRADE_SIZE_USDC: Decimal = dec!(30.0);
 /// Higher fakeout risk; compensate with a tighter stop-loss.
 pub const MOMENTUM_CONFIRMATION_TICKS: u32 = 1;
 
-pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.06);
+/// Wider TP target — rides larger moves to maximize R:R on aggressive entries.
+pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.15);
 pub const MOMENTUM_STOP_LOSS_PERCENT: Decimal = dec!(0.12);
 pub const MOMENTUM_REVERSAL_RATIO: Decimal = dec!(0.60);
 pub const MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL: i64 = 20;
@@ -89,6 +90,15 @@ pub const BTC_MOMENTUM_THRESHOLD: Decimal = dec!(60.0);
 pub const ETH_MOMENTUM_THRESHOLD: Decimal = dec!(2.5);
 pub const SOL_MOMENTUM_THRESHOLD: Decimal = dec!(0.25);
 
+/// Wider window market consensus filter — allows entries even when longer-horizon
+/// market is modestly directional.  Set tighter in balanced/conservative profiles.
+pub const MOMENTUM_WINDOW_BEARISH_BLOCK: Decimal = dec!(0.22);
+pub const MOMENTUM_WINDOW_BULLISH_BLOCK: Decimal = dec!(0.78);
+
+/// OBI adverse veto: only veto on a very strongly adverse book — aggressive style
+/// accepts more adverse-selection risk in exchange for higher fill rates.
+pub const MOMENTUM_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.75);
+
 
 // ============================================================================
 // MAKER (PASSIVE LIMIT ORDER) STRATEGY PARAMETERS
@@ -108,6 +118,8 @@ pub const CROSSES_BOOK_COOLDOWN_SECS: i64 = 15;
 
 /// Posts maker orders as close as 10 minutes to expiry.
 pub const MAKER_MIN_SECS_TO_EXPIRY: i64 = 600;
+/// Widens maker venue horizon to 2 days — more window/daily markets considered.
+pub const MAKER_MAX_SECS_TO_EXPIRY: i64 = 172800;
 
 pub const MAKER_MAX_ENTRY_PRICE: Decimal = dec!(0.62);
 pub const MAKER_MAX_COMPLEMENTARY_PRICE: Decimal = dec!(0.72);
@@ -120,7 +132,6 @@ pub const MAKER_LATE_MARKET_STOP_LOSS_PERCENT: Decimal = dec!(0.07);
 pub const MAKER_MIN_HOLD_SECS_BEFORE_STOP: i64 = 300;
 pub const MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = MAKER_MIN_HOLD_SECS_BEFORE_STOP;
 pub const MAKER_STOP_LOSS_COOLDOWN_SECS: i64 = 300;
-pub const MAKER_GTD_TTL_SECS: u64 = 180;
 pub const MAKER_MAX_COMBINED_BID: Decimal = dec!(0.92);
 pub const MAKER_MAX_BOOK_IMBALANCE_RATIO: Decimal = dec!(4.0);
 pub const MAKER_SLOW_TREND_THRESHOLD_BTC: Decimal = dec!(200.0);
@@ -129,6 +140,8 @@ pub const MAKER_INVENTORY_SKEW_MAX: Decimal = dec!(0.04);
 /// Posts immediately after 3 minutes — high adverse-selection risk on new markets.
 pub const MAKER_MIN_MARKET_AGE_SECS: i64 = 180;
 pub const MOMENTUM_MIN_MARKET_AGE_SECS: i64 = 180;
+/// Must be strictly > MOMENTUM_EXPIRY_EXIT_SECS (600s); gives 5 min breathing room.
+pub const MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY: i64 = 900;
 
 
 // ============================================================================
@@ -155,6 +168,8 @@ pub const BASIS_TARGET_PROFIT_PERCENT: Decimal = dec!(0.05);
 pub const BASIS_STOP_LOSS_PERCENT: Decimal = dec!(0.12);
 pub const BASIS_SKEW_COLLAPSE_THRESHOLD: Decimal = dec!(0.02);
 pub const BASIS_MIN_SECS_TO_EXPIRY: i64 = 900;
+/// Minimum best-bid required to fire a basis forced-exit near expiry.
+pub const BASIS_EXPIRY_MIN_EXIT_BID: Decimal = dec!(0.10);
 pub const BASIS_MIN_TRADE_SIZE_USDC: Decimal = dec!(5.0);
 pub const BASIS_MAX_TRADE_SIZE_USDC: Decimal = dec!(20.0);
 pub const BASIS_KELLY_MAX_MULTIPLIER: Decimal = dec!(4.0);
@@ -271,9 +286,10 @@ pub const ARBITRAGE_MAX_EXPOSURE_USDC: Decimal = dec!(75);
 pub const TIME_DECAY_MAX_EXPOSURE_USDC: Decimal = dec!(80);
 pub const BASIS_MAX_EXPOSURE_USDC: Decimal = dec!(30);
 
-/// Session drawdown limit: 1.5% of collateral with $7 minimum.
+/// Session drawdown limit: 6% of collateral with $15 minimum.
+/// Higher than balanced/conservative — allows more recovery room before lockout.
 pub fn max_session_drawdown(collateral: Decimal) -> Decimal {
-    (collateral * dec!(0.015)).max(dec!(7.00))
+    (collateral * dec!(0.06)).max(dec!(15.00))
 }
 
 

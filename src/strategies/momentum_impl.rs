@@ -97,9 +97,38 @@ impl Strategy for MomentumStrategyImpl {
                 window_blocks_bear = false;
             }
 
+            // ── Hourly OBI adverse-direction veto ─────────────────────────────
+            // OBI = (bid_depth - ask_depth) / (bid_depth + ask_depth) ∈ [-1, +1]
+            // A negative OBI on the side we want to BUY means Polymarket is actively
+            // fading the Binance signal: thick ask wall / thin bid.  Skip the entry
+            // when OBI is below MOMENTUM_OBI_ADVERSE_BLOCK (-0.65 by default).
+            // Falls back to neutral (0) when depth data is absent so as not to veto blindly.
+            let yes_total_depth = ctx.snapshot.yes_bid_depth + ctx.snapshot.yes_ask_depth;
+            let no_total_depth  = ctx.snapshot.no_bid_depth  + ctx.snapshot.no_ask_depth;
+            let yes_obi = if yes_total_depth > dec!(0) {
+                (ctx.snapshot.yes_bid_depth - ctx.snapshot.yes_ask_depth) / yes_total_depth
+            } else {
+                dec!(0) // no depth data — treat as neutral, don't veto
+            };
+            let no_obi = if no_total_depth > dec!(0) {
+                (ctx.snapshot.no_bid_depth - ctx.snapshot.no_ask_depth) / no_total_depth
+            } else {
+                dec!(0)
+            };
+            let obi_blocks_bull = yes_obi < config::MOMENTUM_OBI_ADVERSE_BLOCK;
+            let obi_blocks_bear = no_obi  < config::MOMENTUM_OBI_ADVERSE_BLOCK;
+            if obi_blocks_bull {
+                debug!("🚫 Momentum OBI veto (BULL): YES OBI={:.3} < block {:.3} — book fading the pump",
+                    yes_obi, config::MOMENTUM_OBI_ADVERSE_BLOCK);
+            }
+            if obi_blocks_bear {
+                debug!("🚫 Momentum OBI veto (BEAR): NO OBI={:.3} < block {:.3} — book fading the dump",
+                    no_obi, config::MOMENTUM_OBI_ADVERSE_BLOCK);
+            }
+
             // Primary entry
             if velocity > threshold && binance_price > (strike + strike_buffer) && ctx.snapshot.yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
-                && short_ok_bull && accel_ok_bull && !window_blocks_bull
+                && short_ok_bull && accel_ok_bull && !window_blocks_bull && !obi_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
                     params: OrderParams {
@@ -114,7 +143,7 @@ impl Strategy for MomentumStrategyImpl {
                     pair_params: None,
                 });
             } else if velocity < -threshold && binance_price < (strike - strike_buffer) && ctx.snapshot.no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
-                && short_ok_bear && accel_ok_bear && !window_blocks_bear
+                && short_ok_bear && accel_ok_bear && !window_blocks_bear && !obi_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
                     params: OrderParams {
@@ -132,7 +161,7 @@ impl Strategy for MomentumStrategyImpl {
 
             // Secondary "strike-crossing" entry
             if velocity > threshold && binance_price > strike && ctx.snapshot.yes_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE
-                && short_ok_bull && accel_ok_bull && !window_blocks_bull
+                && short_ok_bull && accel_ok_bull && !window_blocks_bull && !obi_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
                     params: OrderParams {
@@ -147,7 +176,7 @@ impl Strategy for MomentumStrategyImpl {
                     pair_params: None,
                 });
             } else if velocity < -threshold && binance_price < strike && ctx.snapshot.no_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE
-                && short_ok_bear && accel_ok_bear && !window_blocks_bear
+                && short_ok_bear && accel_ok_bear && !window_blocks_bear && !obi_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
                     params: OrderParams {

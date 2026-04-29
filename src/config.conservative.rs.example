@@ -96,6 +96,14 @@ pub const BTC_MOMENTUM_THRESHOLD: Decimal = dec!(100.0);
 pub const ETH_MOMENTUM_THRESHOLD: Decimal = dec!(5.0);
 pub const SOL_MOMENTUM_THRESHOLD: Decimal = dec!(0.5);
 
+/// Narrow window consensus filter — blocks entries unless longer-horizon market is near 50/50.
+pub const MOMENTUM_WINDOW_BEARISH_BLOCK: Decimal = dec!(0.35);
+pub const MOMENTUM_WINDOW_BULLISH_BLOCK: Decimal = dec!(0.65);
+
+/// OBI adverse veto: block on even moderately adverse books — conservative style prioritizes
+/// book quality over fill rate.
+pub const MOMENTUM_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.50);
+
 
 // ============================================================================
 // MAKER (PASSIVE LIMIT ORDER) STRATEGY PARAMETERS
@@ -116,6 +124,8 @@ pub const CROSSES_BOOK_COOLDOWN_SECS: i64 = 60;
 
 /// Won't post maker orders within 45 minutes of expiry.
 pub const MAKER_MIN_SECS_TO_EXPIRY: i64 = 2700;
+/// Conservative horizon — only looks at markets closing within 12 hours.
+pub const MAKER_MAX_SECS_TO_EXPIRY: i64 = 43200;
 
 /// Lower max entry price — only post bids on genuinely uncertain markets.
 pub const MAKER_MAX_ENTRY_PRICE: Decimal = dec!(0.48);
@@ -131,7 +141,6 @@ pub const MAKER_LATE_MARKET_STOP_LOSS_PERCENT: Decimal = dec!(0.04);
 pub const MAKER_MIN_HOLD_SECS_BEFORE_STOP: i64 = 900;
 pub const MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = MAKER_MIN_HOLD_SECS_BEFORE_STOP;
 pub const MAKER_STOP_LOSS_COOLDOWN_SECS: i64 = 900;
-pub const MAKER_GTD_TTL_SECS: u64 = 120;
 pub const MAKER_MAX_COMBINED_BID: Decimal = dec!(0.88);
 pub const MAKER_MAX_BOOK_IMBALANCE_RATIO: Decimal = dec!(2.5);
 pub const MAKER_SLOW_TREND_THRESHOLD_BTC: Decimal = dec!(400.0);
@@ -140,6 +149,8 @@ pub const MAKER_INVENTORY_SKEW_MAX: Decimal = dec!(0.02);
 /// Waits 10 minutes after market open before posting any maker orders.
 pub const MAKER_MIN_MARKET_AGE_SECS: i64 = 600;
 pub const MOMENTUM_MIN_MARKET_AGE_SECS: i64 = 600;
+/// Must be strictly > MOMENTUM_EXPIRY_EXIT_SECS (1200s); 5 min breathing room.
+pub const MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY: i64 = 1500;
 
 
 // ============================================================================
@@ -169,6 +180,9 @@ pub const BASIS_TARGET_PROFIT_PERCENT: Decimal = dec!(0.08);
 pub const BASIS_STOP_LOSS_PERCENT: Decimal = dec!(0.06);
 pub const BASIS_SKEW_COLLAPSE_THRESHOLD: Decimal = dec!(0.04);
 pub const BASIS_MIN_SECS_TO_EXPIRY: i64 = 1800;
+/// Minimum best-bid required to fire a basis forced-exit near expiry.
+/// Higher floor in conservative mode — skip illiquid exits entirely.
+pub const BASIS_EXPIRY_MIN_EXIT_BID: Decimal = dec!(0.20);
 pub const BASIS_MIN_TRADE_SIZE_USDC: Decimal = dec!(3.0);
 pub const BASIS_MAX_TRADE_SIZE_USDC: Decimal = dec!(8.0);
 pub const BASIS_KELLY_MAX_MULTIPLIER: Decimal = dec!(2.0);

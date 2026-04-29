@@ -460,10 +460,13 @@ async fn main() -> Result<()> {
                     }
                 }
                 _ = status_ticker.tick() => {
-                    let (yb, _, ya, _) = *yes_price_rx.borrow();
-                    let (nb, _, na, _) = *no_price_rx.borrow();
-                    info!("💓 Heartbeat | Ask Sum ${:.4} (Y ask ${:.2} / N ask ${:.2}) | Bid Sum ${:.4} (Y bid ${:.2} / N bid ${:.2}) | Binance: ${:.2}",
-                        ya + na, ya, na, yb + nb, yb, nb, *oracle_rx.borrow());
+                    let (yb, ybd, ya, yad) = *yes_price_rx.borrow();
+                    let (nb, nbd, na, nad) = *no_price_rx.borrow();
+                    // Compute OBI for heartbeat visibility so thresholds can be tuned empirically.
+                    let yes_obi = if ybd + yad > dec!(0) { (ybd - yad) / (ybd + yad) } else { dec!(0) };
+                    let no_obi  = if nbd + nad > dec!(0) { (nbd - nad) / (nbd + nad) } else { dec!(0) };
+                    info!("💓 Heartbeat | Ask Sum ${:.4} (Y ask ${:.2} / N ask ${:.2}) | Bid Sum ${:.4} (Y bid ${:.2} / N bid ${:.2}) | Binance: ${:.2} | OBI Y={:.2} N={:.2}",
+                        ya + na, ya, na, yb + nb, yb, nb, *oracle_rx.borrow(), yes_obi, no_obi);
                     // Refresh live pUSD balance so strategies can self-gate on insufficient funds.
                     let mut bal_req = BalanceAllowanceRequest::default();
                     bal_req.asset_type = AssetType::Collateral;
