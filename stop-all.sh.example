@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # stop-all.sh TEMPLATE
-# Stops and removes all 3 rustpolybot containers
+# Stops and removes all 3 dradis containers
 # 
 # SETUP:
 # 1. Copy this file and update HOST, USER, and KEY variables
@@ -14,9 +14,9 @@ USER="<YOUR_USERNAME>"               # e.g., "ubuntu", "root", "ec2-user"
 KEY="<PATH_TO_SSH_KEY>"              # e.g., "~/.ssh/id_rsa"
 SSH_PORT="22"                        # SSH port (usually 22)
 
-echo "🛑 Stopping all rustpolybot containers on $HOST..."
+echo "🛑 Stopping all dradis containers on $HOST..."
 ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" '
-    docker stop rustpolybot-btc rustpolybot-eth rustpolybot-sol 2>/dev/null || true
-    docker rm rustpolybot-btc rustpolybot-eth rustpolybot-sol 2>/dev/null || true
+    docker stop dradis-btc dradis-eth dradis-sol 2>/dev/null || true
+    docker rm dradis-btc dradis-eth dradis-sol 2>/dev/null || true
     echo "✅ All containers stopped."
 '

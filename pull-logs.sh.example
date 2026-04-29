@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# RustPolyBot pull-logs.sh TEMPLATE
+# DRADIS pull-logs.sh TEMPLATE
 # Downloads trade logs from the remote server to your local machine
 #
 # SETUP:
@@ -15,7 +15,7 @@ set -euo pipefail
 HOST="<YOUR_SERVER_IP>"
 USER="<YOUR_USERNAME>"
 KEY="<PATH_TO_SSH_KEY>"
-REMOTE_DIR="~/rustpolybot"   # Must match REMOTE_DIR in deploy-multi.sh
+REMOTE_DIR="~/dradis"   # Must match REMOTE_DIR in deploy-multi.sh
 LOCAL_DIR="./logs"
 
 echo "📥 Pulling trade logs from $HOST..."

@@ -1,6 +1,6 @@
 # Writing a Custom Strategy
 
-This guide walks through implementing and integrating a new trading strategy into RustPolyBot using the new "Strategy is Sovereign" architecture.
+This guide walks through implementing and integrating a new trading strategy into dradis using the new "Strategy is Sovereign" architecture.
 
 ---
 

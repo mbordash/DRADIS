@@ -143,7 +143,7 @@ cargo build --release
 
 ```bash
 cargo build --release
-./target/release/rustpolybot
+./target/release/dradis
 ```
 
 **Docker Deployment:** `./deploy-multi.sh`

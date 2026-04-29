@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # =============================================================================
 # status.sh TEMPLATE
-# Displays status of all 3 rustpolybot containers with uptime and recent logs
+# Displays status of all 3 DRADIS containers with uptime and recent logs
 # 
 # SETUP:
 # 1. Copy this file and update HOST, USER, and KEY variables
@@ -19,7 +19,7 @@ echo "────────────────────────�
 
 ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" '
     for c in btc eth sol; do
-        cont="rustpolybot-$c"
+        cont="dradis-$c"
         if docker ps --format "{{.Names}}" | grep -q "^$cont$"; then
             uptime=$(docker ps --format "{{.RunningFor}}" --filter "name=$cont" | cut -d" " -f1-3)
             market=$(docker logs "$cont" --tail 150 2>/dev/null | grep "→ " | grep -E "Up or Down" | tail -1 | sed "s/.*→ //" | tr -d "\r")

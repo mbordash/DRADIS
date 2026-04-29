@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =============================================================================
-# RustPolyBot deploy-multi.sh TEMPLATE
+# dradis deploy-multi.sh TEMPLATE
 # Deploys 3 independent containers: BTC, ETH, SOL
 #
 # SETUP:
@@ -16,12 +16,12 @@ set -euo pipefail
 HOST="<YOUR_SERVER_IP>"              # e.g., "192.168.1.100" or "example.com"
 USER="<YOUR_USERNAME>"               # e.g., "ubuntu", "root", "ec2-user"
 KEY="<PATH_TO_SSH_KEY>"              # e.g., "~/.ssh/id_rsa" or "~/.ssh/server_key.pem"
-REMOTE_DIR="~/rustpolybot"           # Remote directory where code will be deployed
+REMOTE_DIR="~/dradis"           # Remote directory where code will be deployed
 
 # Optional: SSH port (usually 22, customize if non-standard)
 SSH_PORT="22"
 
-echo "🚀 Deploying 3 independent RustPolyBot containers to $HOST..."
+echo "🚀 Deploying 3 independent dradis containers to $HOST..."
 
 # 1. Create remote directory structure
 echo "📁 Creating remote directory structure..."
@@ -85,45 +85,45 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" << 'REMOTE'
     cd "$1"
 
     echo "🧹 Cleaning up old containers and images..."
-    docker stop rustpolybot-btc rustpolybot-eth rustpolybot-sol 2>/dev/null || true
-    docker rm rustpolybot-btc rustpolybot-eth rustpolybot-sol 2>/dev/null || true
+    docker stop dradis-btc dradis-eth dradis-sol 2>/dev/null || true
+    docker rm dradis-btc dradis-eth dradis-sol 2>/dev/null || true
     docker system prune -af --volumes 2>/dev/null || true
 
     echo "🔨 Building Docker image once..."
-    docker build -t rustpolybot .
+    docker build -t dradis .
 
-    echo "🚀 Starting BTC rustpolybot..."
+    echo "🚀 Starting BTC dradis..."
     docker run -d \
         --restart unless-stopped \
-        --name rustpolybot-btc \
+        --name dradis-btc \
         --env-file .env \
         -e CRYPTO_FILTER=btc \
         -v $(pwd)/logs:/usr/src/app/logs \
-        rustpolybot
+        dradis
 
-    echo "🚀 Starting ETH rustpolybot..."
+    echo "🚀 Starting ETH dradis..."
     docker run -d \
         --restart unless-stopped \
-        --name rustpolybot-eth \
+        --name dradis-eth \
         --env-file .env \
         -e CRYPTO_FILTER=eth \
         -v $(pwd)/logs:/usr/src/app/logs \
-        rustpolybot
+        dradis
 
-    echo "🚀 Starting SOL rustpolybot..."
+    echo "🚀 Starting SOL dradis..."
     docker run -d \
         --restart unless-stopped \
-        --name rustpolybot-sol \
+        --name dradis-sol \
         --env-file .env \
         -e CRYPTO_FILTER=sol \
         -v $(pwd)/logs:/usr/src/app/logs \
-        rustpolybot
+        dradis
 
     echo "✅ All 3 containers deployed!"
     echo "📜 Status:"
-    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep rustpolybot
+    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep dradis
 REMOTE
 
 echo "✅ Deployment complete on server!"
 echo "📡 Tailing combined logs (Ctrl+C to stop):"
-ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" "docker logs -f rustpolybot-btc rustpolybot-eth rustpolybot-sol --tail 30"
+ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" "docker logs -f dradis-btc dradis-eth dradis-sol --tail 30"
