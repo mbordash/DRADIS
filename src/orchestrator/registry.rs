@@ -49,5 +49,16 @@ impl StrategyRegistry {
     pub fn create_maker() -> Box<dyn Strategy> {
         Box::new(MakerStrategyImpl)
     }
+
+    /// Return the names of all enabled strategies, in priority order for orphan adoption.
+    /// This is the single source of truth used by balance reconciliation so that
+    /// developers adding a new strategy only need to register it here — no other
+    /// file needs to be updated to ensure orphaned positions are adopted correctly.
+    pub fn strategy_names() -> Vec<String> {
+        Self::create_all_strategies()
+            .iter()
+            .map(|s| s.name())
+            .collect()
+    }
 }
 

@@ -319,6 +319,33 @@ async fn main() -> Result<()> {
         let mut pulse_ticker = interval(std::time::Duration::from_secs(300));
 
         let strategies = StrategyRegistry::create_all_strategies();
+        let adoption_order = StrategyRegistry::strategy_names();
+
+        // Scan on-chain balances at loop start (startup + market rotation) and adopt any
+        // untracked positions so no strategy double-enters on top of existing on-chain shares.
+        // adoption_order comes from the registry — no hardcoded strategy list here.
+        {
+            let mut tokens: Vec<(U256, &str)> = vec![(yes_token, "YES"), (no_token, "NO")];
+            let mut close_time_for_reconcile = market_close_time;
+            if let Some(ref mk) = maker_market_config {
+                tokens.push((mk.yes_token, "YES(maker)"));
+                tokens.push((mk.no_token, "NO(maker)"));
+                // Use maker close time if set (it's the relevant expiry for BasisStrategy)
+                if close_time_for_reconcile.is_none() {
+                    close_time_for_reconcile = mk.market_close_time;
+                }
+            }
+            reconcile_orphaned_positions(
+                &trading_client,
+                &positions,
+                &tokens,
+                &market_name,
+                close_time_for_reconcile,
+                &[], // bids not available yet at startup; defaults to 0.50 per-token
+                &adoption_order,
+            ).await;
+        }
+
         let mut last_trade_time: HashMap<String, Instant> = HashMap::new();
         let mut last_stop_loss_time: HashMap<String, Instant> = HashMap::new();
         let mut last_expiry_exit_time: HashMap<String, Instant> = HashMap::new(); // 5-min block after expiry exits

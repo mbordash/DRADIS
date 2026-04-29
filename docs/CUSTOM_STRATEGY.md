@@ -150,10 +150,17 @@ impl Strategy for MyStrategyImpl {
 Add `pub mod my_strategy_impl;` to `src/strategies/mod.rs`.
 
 ### Step 3 — Add to Registry
-Add your strategy to `src/orchestrator/registry.rs`:
+Add your strategy to `src/orchestrator/registry.rs`. This is the **only** file you need to touch outside your implementation:
+
 ```rust
 strategies.push(Box::new(MyStrategyImpl));
 ```
+
+The registry is the single source of truth for:
+- Which strategies run each tick (`create_all_strategies`)
+- Which strategy names are eligible to adopt orphaned on-chain positions at startup (`strategy_names`)
+
+**No other files need updating.** The orphan adoption list in `balance.rs` and the startup reconciliation in `main.rs` are both derived from the registry automatically.
 
 ---
 

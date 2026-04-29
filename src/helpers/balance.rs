@@ -30,9 +30,7 @@ pub const PHANTOM_COOLDOWN_SECS: u64 = 120;
 pub const MAX_WAIT_SECS_HOURLY: i64 = 180;
 pub const MAX_WAIT_SECS_WINDOW: i64 = 600;
 
-// BasisStrategy is first so orphaned Basis positions are re-adopted under the correct strategy,
-// preventing double-exposure when the exposure check sees $0 for BasisStrategy after a restart.
-const ADOPTION_STRATEGIES: &[&str] = &["BasisStrategy", "MakerStrategy", "ArbitrageStrategy", "TimeDecayStrategy", "MomentumStrategy"];
+
 
 pub fn parse_balance_from_error(err_msg: &str) -> Option<Decimal> {
     let re = Regex::new(r"(?:balance|available):\s*(\d+)").unwrap();
@@ -129,6 +127,10 @@ async fn check_for_resting_order(client: &Arc<ClobClient<Authenticated<Normal>>>
     }
 }
 
+/// Reconcile on-chain token balances against the in-memory position map.
+/// `adoption_order` is the ordered list of strategy names to try when assigning an
+/// orphaned position — derived from `StrategyRegistry::strategy_names()` so that
+/// developers only need to register a strategy in the registry, not also edit this file.
 pub async fn reconcile_orphaned_positions(
     client: &Arc<ClobClient<Authenticated<Normal>>>,
     positions: &Arc<Mutex<PositionMap>>,
@@ -136,6 +138,7 @@ pub async fn reconcile_orphaned_positions(
     market_name: &str,
     market_close_time: Option<chrono::DateTime<Utc>>,
     token_bids: &[(U256, Decimal)],
+    adoption_order: &[String],
 ) {
     for &(token_id, side_label) in tokens {
         let mut req = BalanceAllowanceRequest::default();
@@ -153,10 +156,10 @@ pub async fn reconcile_orphaned_positions(
         }
 
         let mut adopted_strategy = None;
-        for &s in ADOPTION_STRATEGIES {
+        for s in adoption_order {
             let map = positions.lock().await;
-            if !map.contains_key(&(s.to_string(), token_id)) {
-                adopted_strategy = Some(s.to_string());
+            if !map.contains_key(&(s.clone(), token_id)) {
+                adopted_strategy = Some(s.clone());
                 break;
             }
         }
