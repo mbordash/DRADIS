@@ -261,19 +261,30 @@ impl Strategy for BasisStrategyImpl {
             if let Some(close_time) = position.close_time {
                 let secs_left = (close_time - Utc::now()).num_seconds();
                 if secs_left < config::BASIS_MIN_SECS_TO_EXPIRY / 2 {
-                    return Ok(StrategySignal::Exit {
-                        params: OrderParams {
-                            token_id: *token_id,
-                            price: position_bid,
-                            shares: position.shares,
-                            fee_bps: if token_id == &target_market.yes_token { target_market.yes_fee_bps as u16 } else { target_market.no_fee_bps as u16 },
-                            is_neg_risk: target_market.is_neg_risk,
-                            market_name: target_market.market_name.clone(),
-                            condition_id: target_market.condition_id.clone(),
-                        },
-                        reason: format!("BasisExpiry: {}s left", secs_left),
-                        exit_pair: false,
-                    });
+                    // Skip BasisExpiry if the bid is too thin to get a FAK fill — near market
+                    // close the order book dries up and FAK returns 0 fills while the position
+                    // map is cleared optimistically, leaving orphaned on-chain shares.
+                    // Better to let the position go to settlement than send an unfillable order.
+                    if position_bid < config::BASIS_EXPIRY_MIN_EXIT_BID {
+                        tracing::info!(
+                            "⏭️  BasisExpiry skipped (bid {:.4} < floor {:.4}): {}s left — holding to settlement",
+                            position_bid, config::BASIS_EXPIRY_MIN_EXIT_BID, secs_left
+                        );
+                    } else {
+                        return Ok(StrategySignal::Exit {
+                            params: OrderParams {
+                                token_id: *token_id,
+                                price: position_bid,
+                                shares: position.shares,
+                                fee_bps: if token_id == &target_market.yes_token { target_market.yes_fee_bps as u16 } else { target_market.no_fee_bps as u16 },
+                                is_neg_risk: target_market.is_neg_risk,
+                                market_name: target_market.market_name.clone(),
+                                condition_id: target_market.condition_id.clone(),
+                            },
+                            reason: format!("BasisExpiry: {}s left", secs_left),
+                            exit_pair: false,
+                        });
+                    }
                 }
             }
         }

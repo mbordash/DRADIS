@@ -30,7 +30,9 @@ pub const PHANTOM_COOLDOWN_SECS: u64 = 120;
 pub const MAX_WAIT_SECS_HOURLY: i64 = 180;
 pub const MAX_WAIT_SECS_WINDOW: i64 = 600;
 
-const ADOPTION_STRATEGIES: &[&str] = &["MakerStrategy", "ArbitrageStrategy", "TimeDecayStrategy", "MomentumStrategy"];
+// BasisStrategy is first so orphaned Basis positions are re-adopted under the correct strategy,
+// preventing double-exposure when the exposure check sees $0 for BasisStrategy after a restart.
+const ADOPTION_STRATEGIES: &[&str] = &["BasisStrategy", "MakerStrategy", "ArbitrageStrategy", "TimeDecayStrategy", "MomentumStrategy"];
 
 pub fn parse_balance_from_error(err_msg: &str) -> Option<Decimal> {
     let re = Regex::new(r"(?:balance|available):\s*(\d+)").unwrap();
