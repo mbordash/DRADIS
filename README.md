@@ -5,6 +5,7 @@ Direct Reaction And Dynamic Intelligence System A Low-Latency Multi-Strategy Tra
 ---
 
 🛰️ Tactical Overview
+
 DRADIS is not just a bot; it is a Combat Information Center (CIC) for Polymarket. Built in Rust for maximum concurrency and memory safety, it evaluates the entire "battlespace" every 50ms, coordinating multiple autonomous strategies to defend capital and strike inefficiencies.
 
 Unlike standard linear scripts, DRADIS uses a Tokio-powered orchestrator to manage telemetry (WebSockets), signal processing (Binance Oracles), and tactical execution across five distinct "Viper" strategy classes.
@@ -12,6 +13,7 @@ Unlike standard linear scripts, DRADIS uses a Tokio-powered orchestrator to mana
 ---
 
 🛠️ The Architecture (The CIC)
+
 The core of DRADIS is the Orchestrator. It acts as the ship’s brain, maintaining the primary data link to the Polymarket CLOB and Binance Oracles.
 
 Parallel Dispatch: Every heartbeat (50ms), the CIC polls all registered strategies in parallel.
@@ -23,6 +25,7 @@ Signal Filtering: Includes a built-in OBI (Order Book Imbalance) Veto at -0.65 t
 ---
 
 🚀 The Viper Squadrons (Strategies)
+
 DRADIS currently deploys five specialized strategy classes:
 
 Momentum (The Interceptor): Scans for high-velocity Binance moves. If a "target" moves $85 in 5 seconds, the Interceptor strikes the Polymarket book before it can reprice.
@@ -38,6 +41,7 @@ Basis/Funding (The Analyst): Fades retail skew by comparing Polymarket sentiment
 ---
 
 🛡️ Safety Systems
+
 Orphaned Position Detection: Automatically "scuttles" one-sided hedged positions after 60s to prevent directional bleeding.
 
 Fee Gates: Hard-coded protection to ensure Taker strategies don't enter high-fee (1000 bps) environments.
