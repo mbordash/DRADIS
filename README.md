@@ -22,6 +22,35 @@ Isolated Pits: Each strategy operates with its own Independent Capital Budget an
 
 Signal Filtering: Includes a built-in OBI (Order Book Imbalance) Veto at -0.65 to prevent launching into "toxic flow" or distribution walls.
 
+```
+┌─────────────────────┐   ┌─────────────────────┐
+│   Binance Oracle    │   │  Polymarket CLOB    │
+│  (Price / Funding)  │   │  (WebSocket Feed)   │
+└──────────┬──────────┘   └──────────┬──────────┘
+           │                         │
+           └────────────┬────────────┘
+                        ▼
+           ┌────────────────────────┐
+           │   Orchestrator (CIC)   │
+           │     50ms Heartbeat     │
+           └────────────┬───────────┘
+                        │  parallel dispatch
+          ┌─────────────┼──────────────┐
+          ▼             ▼              ▼
+   ┌────────────┐ ┌──────────┐ ┌──────────────┐
+   │ Momentum   │ │  Maker   │ │  Arbitrage / │
+   │(Interceptor│ │ (Sentry) │ │  TimDecay /  │
+   │            │ │          │ │   Basis      │
+   └─────┬──────┘ └────┬─────┘ └──────┬───────┘
+         └─────────────┼──────────────┘
+                       ▼
+           ┌───────────────────────┐
+           │    Execution Layer    │
+           │  OBI Gate · Fee Gate  │
+           │  Circuit Breaker      │
+           └───────────────────────┘
+```
+
 ---
 
 🚀 The Viper Squadrons (Strategies)
@@ -104,7 +133,7 @@ The bot connects to Polymarket's CLOB via WebSocket for real-time orderbook data
 
 The bot automatically records every completed trade into a daily CSV file for easy analysis.
 
-- **Location**: `logs/trades_YYYY-MM-DD.csv`
+- **Location**: `logs/{token}-trades_YYYY-MM-DD.csv` (e.g. `btc-trades_2026-04-29.csv`)
 - **Columns**: Timestamp, Strategy, Market, Side (YES/NO), Entry Price, Exit Price, Shares, Profit (USDC), and Exit Reason.
 - **Asynchronous**: Logging is non-blocking and happens in a background thread to maintain high-frequency trading performance.
 
@@ -113,7 +142,7 @@ The bot automatically records every completed trade into a daily CSV file for ea
 ## Setup
 
 ### Requirements
-- Rust 1.91+ (or Docker)
+- Rust 1.95+ (or Docker)
 - A Polygon wallet with USDC and MATIC
 - Telegram bot token (optional)
 
