@@ -194,31 +194,6 @@ pub struct MarketCandidate {
     pub condition_id: String,
 }
 
-pub async fn fetch_specific_hourly_market(
-    http: &reqwest::Client,
-    crypto_filter: &str,
-    now: DateTime<Utc>,
-) -> Option<(Vec<U256>, String, String, f64, bool, Option<DateTime<Utc>>, String)> {
-    let candidate_names = crate::helpers::time::generate_hourly_market_names(crypto_filter, now);
-    for q in candidate_names {
-        let url = format!("https://gamma-api.polymarket.com/markets?search={}&active=true&closed=false&limit=1", urlencoding::encode(&q));
-        let resp = match http.get(&url).send().await { Ok(r) => r, Err(_) => continue };
-        let data: serde_json::Value = match resp.json().await { Ok(d) => d, Err(_) => continue };
-        let markets = data.as_array().or_else(|| data.get("data").and_then(|v| v.as_array()));
-        if let Some(m) = markets.and_then(|a| a.first()) {
-            let name = m.get("question").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-            if config::is_bad_market(&name) || config::is_ultra_short_window_market(&name) || !get_enable_orderbook(m) { continue; }
-            let tokens = extract_token_ids_u256(m);
-            if tokens.len() < 2 { continue; }
-            let close = extract_close_time(m.get("event").unwrap_or(&serde_json::Value::Null), m);
-            let left = close.map_or(0, |ct| (ct - now).num_seconds());
-            if left < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY || left > config::MAX_SECONDS_TO_EXPIRY_FOR_ENTRY { continue; }
-            return Some((tokens, name, m.get("slug").and_then(|v| v.as_str()).unwrap_or_default().to_string(), 0.0, true, close, m.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string()));
-        }
-    }
-    None
-}
-
 /// Directly fetch today's (or tomorrow's) daily "Up or Down on [date]?" maker venue
 /// by constructing the deterministic Polymarket event slug and querying the events endpoint.
 ///
@@ -283,20 +258,51 @@ pub async fn fetch_specific_window_daily_market(
 pub async fn get_market_pair(http: &reqwest::Client) -> (MarketCandidate, Option<MarketCandidate>) {
     let filter = env::var("CRYPTO_FILTER").unwrap_or_else(|_| "all".to_string()).to_lowercase();
     let now = Utc::now();
-    let hourly_fast = fetch_specific_hourly_market(http, &filter, now).await.map(|m| MarketCandidate { yes_token: m.0[0], no_token: m.0[1], name: m.1, link: m.2, description: m.6, is_hot: m.4, close_time: m.5, volume: 0.0, condition_id: String::new() });
-    let all = fetch_simplified_crypto_candidates(http, &filter).await;
-    let mut hourly_c: Vec<_> = all.iter().filter(|c|
+
+    // Primary scan: volume-sorted (good for established markets with accumulated volume).
+    // Secondary scan: createdAt-sorted (finds fresh hourly markets that have zero 24h volume
+    // and therefore rank below the bottom of the volume-sorted pages).
+    // Merging both ensures we never miss the current-hour market regardless of its age.
+    let (all, recent) = tokio::join!(
+        fetch_simplified_crypto_candidates(http, &filter),
+        fetch_recent_crypto_candidates(http, &filter),
+    );
+
+    // Deduplicate by conditionId — prefer recent entry if conditionId matches, since it carries
+    // the validated time-window context.
+    let mut seen_cids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut merged: Vec<_> = all.iter().collect();
+    for entry in &recent {
+        let cid = &entry.7;
+        if cid.is_empty() || seen_cids.insert(cid.clone()) {
+            // Only add from recent if not already in volume scan
+            if !all.iter().any(|a| !a.7.is_empty() && a.7 == *cid) {
+                merged.push(entry);
+            }
+        }
+    }
+    // Also populate seen_cids from all
+    for entry in &all { seen_cids.insert(entry.7.clone()); }
+
+    let mut hourly_c: Vec<_> = merged.iter().filter(|c|
         !config::is_window_market(&c.1)
             && !config::is_daily_market(&c.1)
             && !config::is_ultra_short_window_market(&c.1)
     ).collect();
-    let mut maker_c: Vec<_> = all.iter().filter(|c| config::is_window_market(&c.1) || config::is_daily_market(&c.1)).collect();
+    let mut maker_c: Vec<_> = merged.iter().filter(|c| config::is_window_market(&c.1) || config::is_daily_market(&c.1)).collect();
 
-    hourly_c.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(Ordering::Equal));
+    // Sort hourly by volume desc (high-volume markets are safer), then by most time left as tiebreak
+    hourly_c.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(Ordering::Equal)
+        .then_with(|| b.5.cmp(&a.5)));
     maker_c.sort_by(|a, b| b.5.cmp(&a.5)); // prefer more time left
 
-    let hourly = hourly_fast.or_else(|| hourly_c.first().map(|b| MarketCandidate { yes_token: b.0[0], no_token: b.0[1], name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone() }))
+    let hourly = hourly_c.first()
+        .map(|b| MarketCandidate { yes_token: b.0[0], no_token: b.0[1], name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone() })
         .unwrap_or(MarketCandidate { yes_token: U256::ZERO, no_token: U256::ZERO, name: String::new(), link: String::new(), description: String::new(), is_hot: false, close_time: None, volume: 0.0, condition_id: String::new() });
+
+    if hourly.yes_token != U256::ZERO {
+        info!("📈 Hourly market selected: \"{}\" (vol24h={:.0})", hourly.name, hourly.volume);
+    }
 
     // Prefer a direct targeted search for today's daily market (high confidence, volume-independent),
     // falling back to whatever the volume-scan turned up.
@@ -320,6 +326,50 @@ pub async fn get_market_pair(http: &reqwest::Client) -> (MarketCandidate, Option
     });
 
     (hourly, maker)
+}
+
+/// Fetch the most recently *created* active crypto markets.
+///
+/// A fresh hourly market (e.g. "Bitcoin Up or Down - April 29, 11AM ET") is published
+/// minutes before the hour starts.  It has zero 24h volume and therefore falls completely
+/// outside the volume-sorted scan used by `fetch_simplified_crypto_candidates`.
+///
+/// Sorting by `createdAt desc` guarantees the newest markets appear on page 1, so a single
+/// 100-market request reliably surfaces the current hour's market regardless of volume.
+pub async fn fetch_recent_crypto_candidates(http: &reqwest::Client, filter: &str) -> Vec<(Vec<U256>, String, String, f64, bool, Option<DateTime<Utc>>, String, String)> {
+    let mut out = vec![];
+    let now = Utc::now();
+    let url = "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&order=createdAt&ascending=false&include=event";
+    let resp = match http.get(url).send().await { Ok(r) => r, Err(_) => return out };
+    let data: serde_json::Value = match resp.json().await { Ok(d) => d, Err(_) => return out };
+    let markets = data.as_array().or_else(|| data.get("data").and_then(|v| v.as_array()));
+    if let Some(arr) = markets {
+        for m in arr {
+            let name = m.get("question").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            let event = m.get("event").unwrap_or(&serde_json::Value::Null);
+            let tokens = extract_token_ids_u256(m);
+            let close = extract_close_time(event, m);
+            let vol = m.get("volume24hrClob").and_then(value_to_f64).unwrap_or(0.0);
+            let is_maker_venue = config::is_window_market(&name) || config::is_daily_market(&name);
+            let min_secs = if is_maker_venue { config::MAKER_MIN_SECS_TO_EXPIRY } else { config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY };
+            let max_secs = if is_maker_venue { config::MAKER_MAX_SECS_TO_EXPIRY } else { config::MAX_SECONDS_TO_EXPIRY_FOR_ENTRY };
+            let ctx = ValidationContext {
+                now,
+                crypto_filter: filter.to_string(),
+                min_seconds_to_expiry: min_secs,
+                max_seconds_to_expiry: max_secs,
+                safety_buffer_secs: config::MARKET_EXPIRY_SAFETY_BUFFER_SECS,
+                min_volume: 0.0, // allow zero-volume fresh markets
+            };
+            let blocked = vec!["presidential", "nomination", "election", "democratic", "republican"];
+            let event_title = event.get("title").and_then(|v| v.as_str()).unwrap_or_default();
+            let (valid, _, _) = validate_market(&name, event_title, &tokens, close, vol, &ctx, &blocked);
+            if valid && !config::is_range_market(&name) && !config::is_ultra_short_window_market(&name) && get_enable_orderbook(m) {
+                out.push((tokens, name.clone(), m.get("slug").and_then(|v| v.as_str()).unwrap_or_default().to_string(), vol, config::is_high_priority_text(&name), close, m.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(), m.get("conditionId").and_then(|v| v.as_str()).unwrap_or_default().to_string()));
+            }
+        }
+    }
+    out
 }
 
 pub async fn fetch_simplified_crypto_candidates(http: &reqwest::Client, filter: &str) -> Vec<(Vec<U256>, String, String, f64, bool, Option<DateTime<Utc>>, String, String)> {
