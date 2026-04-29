@@ -51,9 +51,12 @@ pub async fn cleanup_expired_positions(
 /// Detect orphaned paired positions and remove them from tracking.
 ///
 /// For ArbitrageStrategy and TimeDecayStrategy, positions must come in hedged
-/// pairs (YES+NO). If the first leg fills but the second leg fails, we are left
-/// with a one-sided position. This function detects such orphans (opened >60s
-/// ago with no matching pair leg) and removes them, notifying via Telegram.
+/// pairs (YES+NO). If Leg A fills but Leg B fails, a Flash-Exit task spawned in
+/// main.rs will attempt an emergency sell within ~5-12 s of indexer confirmation.
+/// This function is the SLOW backstop: it catches any orphans the flash-exit
+/// missed (e.g., rare silent FAK failure with no explicit Err) by scanning for
+/// paired positions that are still unpaired after 60 s, then logging and removing
+/// them so they don't silently accumulate capital exposure.
 pub async fn reconcile_orphaned_positions(
     positions: Arc<Mutex<PositionMap>>,
     tg_token: &str,

@@ -1,4 +1,4 @@
-/// RustPolyBot - Multi-Strategy Orchestrator Trading Bot
+/// dradis - Multi-Strategy Orchestrator Trading Bot
 ///
 /// Phase 8: Full Orchestrator-Based Trading
 /// Strategies evaluate signals → orchestrator resolves conflicts → executor places orders.
@@ -34,14 +34,14 @@ use tokio::time::{interval, Instant, Duration};
 
 use tracing::{info, warn, error, debug};
 
-use rustpolybot::config;
-use rustpolybot::state::{Position, StrategySignal, MarketConfig, MarketSnapshot, PositionMap};
-use rustpolybot::strategies::time_decay_impl::TimeDecayPosition;
-use rustpolybot::orchestrator::{StrategyRegistry, StrategyContext};
-use rustpolybot::orchestrator::executor::{execute_strategies_concurrent, aggregate_and_resolve_signals};
+use dradis::config;
+use dradis::state::{Position, StrategySignal, MarketConfig, MarketSnapshot, PositionMap};
+use dradis::strategies::time_decay_impl::TimeDecayPosition;
+use dradis::orchestrator::{StrategyRegistry, StrategyContext};
+use dradis::orchestrator::executor::{execute_strategies_concurrent, aggregate_and_resolve_signals};
 
 // New paths for helpers
-use rustpolybot::helpers::{
+use dradis::helpers::{
     time::*, balance::*, nonce::*, orders::*, market::*,
     notifications::send_notification, metrics,
 };
@@ -142,14 +142,14 @@ async fn main() -> Result<()> {
     let (funding_tx, funding_rx) = watch::channel(dec!(0));
     let (drift_60m_tx, drift_60m_rx) = watch::channel(dec!(0));
 
-    tokio::spawn(rustpolybot::tasks::oracle::run_oracle(
+    tokio::spawn(dradis::tasks::oracle::run_oracle(
         crypto_filter.clone(),
         oracle_tx,
         velocity_tx,
         drift_60m_tx,
     ));
 
-    tokio::spawn(rustpolybot::tasks::funding::run_funding_poller(
+    tokio::spawn(dradis::tasks::funding::run_funding_poller(
         Arc::clone(&shared_http),
         crypto_filter.clone(),
         funding_tx,
@@ -163,7 +163,7 @@ async fn main() -> Result<()> {
     // Live pUSD balance — updated every 60s in the status ticker so strategies can self-gate
     // when the wallet cannot afford even the minimum trade, preventing 400 CLOB rejections.
     let live_collateral: Arc<Mutex<Decimal>> = Arc::new(Mutex::new(startup_balance));
-    let phantom_cooldowns: rustpolybot::helpers::balance::PhantomCooldowns = Arc::new(Mutex::new(HashMap::new()));
+    let phantom_cooldowns: dradis::helpers::balance::PhantomCooldowns = Arc::new(Mutex::new(HashMap::new()));
     let time_decay_positions: Arc<Mutex<HashMap<U256, TimeDecayPosition>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
@@ -200,7 +200,7 @@ async fn main() -> Result<()> {
     let mut current_hourly_cid: String = String::new();
     let mut current_maker_cid: String = String::new();
 
-    tokio::spawn(rustpolybot::tasks::market_monitor::run_market_monitor(
+    tokio::spawn(dradis::tasks::market_monitor::run_market_monitor(
         Arc::clone(&shared_http),
         crypto_filter.clone(),
         market_tx.clone(),
@@ -449,9 +449,9 @@ async fn main() -> Result<()> {
                     info!("📍 Network Pulse: {:?}", start.elapsed());
                 }
                 _ = cleanup_ticker.tick() => {
-                    rustpolybot::tasks::cleanup::cleanup_expired_positions(Arc::clone(&positions), market_name.clone(), yes_token, no_token, market_close_time).await;
-                    if let Err(e) = rustpolybot::tasks::cleanup::reconcile_orphaned_positions(Arc::clone(&positions), &tg_token, &tg_chat_id).await { warn!("⚠️ Orphan reconciliation error: {}", e); }
-                    rustpolybot::tasks::cleanup::cleanup_time_decay_positions(Arc::clone(&time_decay_positions)).await;
+                    dradis::tasks::cleanup::cleanup_expired_positions(Arc::clone(&positions), market_name.clone(), yes_token, no_token, market_close_time).await;
+                    if let Err(e) = dradis::tasks::cleanup::reconcile_orphaned_positions(Arc::clone(&positions), &tg_token, &tg_chat_id).await { warn!("⚠️ Orphan reconciliation error: {}", e); }
+                    dradis::tasks::cleanup::cleanup_time_decay_positions(Arc::clone(&time_decay_positions)).await;
 
                     // Periodically clean up expired pending order locks
                     {
@@ -656,18 +656,94 @@ async fn main() -> Result<()> {
                                     }
                                 }
                                 let cl_s = Arc::clone(&trading_client); let ps_s = Arc::clone(&positions); let pc_s = Arc::clone(&phantom_cooldowns); let sn_s = sn.clone(); let tn_s = params.token_id;
-                                tokio::spawn(async move { let _ = sync_position_balance(&cl_s, &ps_s, &sn_s, tn_s, Some(&pc_s), dec!(0), rustpolybot::helpers::balance::MAX_WAIT_SECS_HOURLY).await; });
+                                tokio::spawn(async move { let _ = sync_position_balance(&cl_s, &ps_s, &sn_s, tn_s, Some(&pc_s), dec!(0), dradis::helpers::balance::MAX_WAIT_SECS_HOURLY).await; });
 
                                 if let Some(pp) = pair_params {
                                     let vc_p = if pp.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
-                                    if !config::GHOST_MODE { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc_p, pp.token_id, Side::Buy, pp.shares, (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), pp.fee_bps, OrderType::FAK, false, 0, &shared_http).await; }
-                                    let pp_close_time = maker_market_config.as_ref()
-                                        .filter(|mk| pp.token_id == mk.yes_token || pp.token_id == mk.no_token)
-                                        .and_then(|mk| mk.market_close_time)
-                                        .or(market_close_time);
-                                    positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: pp.price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: None, paired_leg_token_id: Some(params.token_id) });
-                                    let sn_p = sn.clone(); let tn_p = pp.token_id; let ps_p = Arc::clone(&positions); let cl_p = Arc::clone(&trading_client); let pc_p = Arc::clone(&phantom_cooldowns);
-                                    tokio::spawn(async move { let _ = sync_position_balance(&cl_p, &ps_p, &sn_p, tn_p, Some(&pc_p), dec!(0), rustpolybot::helpers::balance::MAX_WAIT_SECS_HOURLY).await; });
+
+                                    // Capture Leg B result explicitly — previously discarded with `let _ = ...`.
+                                    // On failure we spawn a Flash-Exit task that sells Leg A as soon as the
+                                    // Polymarket indexer reflects the fill (~5-12 s), instead of waiting 60 s
+                                    // for the cleanup task to notice the orphan.
+                                    let leg_b_result = if !config::GHOST_MODE {
+                                        place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc_p, pp.token_id, Side::Buy, pp.shares, (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), pp.fee_bps, OrderType::FAK, false, 0, &shared_http).await
+                                    } else { Ok(()) };
+
+                                    match leg_b_result {
+                                        Err(ref e) => {
+                                            // Leg B explicitly rejected — spawn Flash-Exit for Leg A.
+                                            // The task polls Leg A's on-chain balance every FLASH_EXIT_POLL_MS;
+                                            // once confirmed, it fires an emergency FAK sell and removes the
+                                            // position.  If Leg A was also a phantom (no fill), the task exits
+                                            // after FLASH_EXIT_CONFIRM_MS and sync_position_balance handles cleanup.
+                                            warn!("⚡ Leg B FAILED [{}]: {} — Flash-Exit spawned for Leg A (token {})", sn, e, params.token_id);
+                                            let cl_fe   = Arc::clone(&trading_client);
+                                            let nm_fe   = Arc::clone(&nonce_manager);
+                                            let ps_fe   = Arc::clone(&positions);
+                                            let http_fe = Arc::clone(&shared_http);
+                                            let signer_fe = signer.clone();
+                                            let sn_fe   = sn.clone();
+                                            let tok_a   = params.token_id;
+                                            // Best bid on the Leg A token at the moment of failure.
+                                            // Stale by the time the fill is confirmed (5-12 s), so we apply
+                                            // an extra haircut (FLASH_EXIT_EXTRA_OFFSET) to guarantee the
+                                            // emergency FAK crosses the spread and fills immediately.
+                                            let bid_a   = if tok_a == yes_token { yb } else { nb };
+                                            let fee_a   = params.fee_bps;
+                                            let vc_a    = vc; // verifying contract for Leg A
+                                            tokio::spawn(async move {
+                                                let deadline = tokio::time::Instant::now()
+                                                    + Duration::from_millis(config::FLASH_EXIT_CONFIRM_MS);
+                                                loop {
+                                                    if tokio::time::Instant::now() >= deadline {
+                                                        // Leg A also phantom — sync_position_balance will clean it up
+                                                        warn!("⚡ Flash-Exit: Leg A phantom (no fill in {}ms) [{}]",
+                                                              config::FLASH_EXIT_CONFIRM_MS, sn_fe);
+                                                        break;
+                                                    }
+                                                    let mut req = BalanceAllowanceRequest::default();
+                                                    req.asset_type = AssetType::Conditional;
+                                                    req.token_id = Some(tok_a);
+                                                    if let Ok(resp) = cl_fe.balance_allowance(req).await {
+                                                        let shares = Decimal::from_str(&resp.balance.to_string())
+                                                            .unwrap_or(dec!(0)) / dec!(1_000_000);
+                                                        if shares >= config::MIN_ORDER_SHARES {
+                                                            // Leg A confirmed — emergency FAK sell
+                                                            let sell_price = (bid_a
+                                                                - config::SELL_PRICE_OFFSET
+                                                                - config::FLASH_EXIT_EXTRA_OFFSET)
+                                                                .max(config::MIN_SELL_LIMIT_PRICE);
+                                                            info!("⚡ Flash-Exit SELLING [{}]: {:.2} shares @ ${:.4} (bid was ${:.4})",
+                                                                  sn_fe, shares, sell_price, bid_a);
+                                                            match place_limit_order(
+                                                                &cl_fe, &nm_fe, &signer_fe,
+                                                                safe_address, eoa_address, vc_a,
+                                                                tok_a, Side::Sell, shares, sell_price,
+                                                                fee_a, OrderType::FAK, false, 0, &http_fe,
+                                                            ).await {
+                                                                Ok(_)  => info!("⚡ Flash-Exit sold Leg A [{}] ✓", sn_fe),
+                                                                Err(e) => warn!("⚡ Flash-Exit sell FAILED [{}]: {} — cleanup task will catch it", sn_fe, e),
+                                                            }
+                                                            ps_fe.lock().await.remove(&(sn_fe.clone(), tok_a));
+                                                            break;
+                                                        }
+                                                    }
+                                                    tokio::time::sleep(Duration::from_millis(config::FLASH_EXIT_POLL_MS)).await;
+                                                }
+                                            });
+                                            // Leg B was not filled — do NOT insert its position
+                                        },
+                                        Ok(_) => {
+                                            // Normal path: Leg B accepted — insert position and start sync
+                                            let pp_close_time = maker_market_config.as_ref()
+                                                .filter(|mk| pp.token_id == mk.yes_token || pp.token_id == mk.no_token)
+                                                .and_then(|mk| mk.market_close_time)
+                                                .or(market_close_time);
+                                            positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: pp.price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: None, paired_leg_token_id: Some(params.token_id) });
+                                            let sn_p = sn.clone(); let tn_p = pp.token_id; let ps_p = Arc::clone(&positions); let cl_p = Arc::clone(&trading_client); let pc_p = Arc::clone(&phantom_cooldowns);
+                                            tokio::spawn(async move { let _ = sync_position_balance(&cl_p, &ps_p, &sn_p, tn_p, Some(&pc_p), dec!(0), dradis::helpers::balance::MAX_WAIT_SECS_HOURLY).await; });
+                                        }
+                                    }
                                 }
                                 last_trade_time.insert(sn.clone(), Instant::now());
                                 let _ = send_notification(&tg_token, &tg_chat_id, &format!("📥 ENTRY [{}] {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares)).await;
@@ -696,7 +772,7 @@ async fn main() -> Result<()> {
                                             pending_orders.lock().await.insert(pk.clone(), Instant::now() + Duration::from_secs(3));
                                         }
 
-                                        let _ = rustpolybot::helpers::balance::quick_confirm_fill(&trading_client, &sn, p.token_id, &positions, &p.condition_id).await;
+                                        let _ = dradis::helpers::balance::quick_confirm_fill(&trading_client, &sn, p.token_id, &positions, &p.condition_id).await;
                                         let vc = if p.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                         if !config::GHOST_MODE {
                                             if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, p.token_id, Side::Buy, p.shares, p.price, p.fee_bps, OrderType::GTC, true, 0, &shared_http).await {
@@ -706,7 +782,7 @@ async fn main() -> Result<()> {
                                             }
                                             let cl_m = Arc::clone(&trading_client); let ps_m = Arc::clone(&positions); let pc_m = Arc::clone(&phantom_cooldowns);
                                             let sn_m = sn.clone();
-                                            tokio::spawn(async move { let _ = sync_position_balance(&cl_m, &ps_m, &sn_m, p.token_id, Some(&pc_m), dec!(0), rustpolybot::helpers::balance::MAX_WAIT_SECS_WINDOW).await; });
+                                            tokio::spawn(async move { let _ = sync_position_balance(&cl_m, &ps_m, &sn_m, p.token_id, Some(&pc_m), dec!(0), dradis::helpers::balance::MAX_WAIT_SECS_WINDOW).await; });
                                         }
                                         placed = true;
                                     }

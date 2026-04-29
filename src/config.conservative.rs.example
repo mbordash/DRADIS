@@ -265,6 +265,12 @@ pub const SHARE_SCALE: Decimal = dec!(1_000_000);
 
 pub const TRADE_COOLDOWN_SECS: i64 = 15;
 pub const PARTIAL_FILL_COOLDOWN_SECS: i64 = 60;
+
+/// Flash-Exit: operational constants — same across all profiles.
+pub const FLASH_EXIT_CONFIRM_MS: u64 = 12_000;
+pub const FLASH_EXIT_POLL_MS: u64 = 500;
+pub const FLASH_EXIT_EXTRA_OFFSET: Decimal = dec!(0.02);
+
 pub const MIN_SECONDS_TO_EXPIRY_FOR_ENTRY: i64 = 600;
 pub const MAX_SECONDS_TO_EXPIRY_FOR_ENTRY: i64 = 14400;
 pub const FINAL_EXPIRY_WINDOW_SECS: i64 = 900;

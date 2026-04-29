@@ -15,7 +15,7 @@ use chrono::Utc;
 use rust_decimal_macros::dec;
 use tokio::sync::Mutex;
 
-use rustpolybot::state::{Position, PositionMap};
+use dradis::state::{Position, PositionMap};
 
 // ── Helpers ──────────────────────────────────────────────────────────────
 
