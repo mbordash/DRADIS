@@ -162,6 +162,34 @@ pub fn generate_hourly_market_names(crypto_filter: &str, current_time_utc: DateT
     names
 }
 
+/// Generate Polymarket event slugs for the daily "Up or Down on [date]?" event.
+///
+/// Polymarket's slug format is: `{crypto}-up-or-down-on-{month}-{day}-{year}`
+/// e.g. `bitcoin-up-or-down-on-april-29-2026`
+///
+/// Generates today and tomorrow (ET) so overnight sessions crossing midnight still find the market.
+pub fn generate_daily_event_slugs(crypto_filter: &str, current_time_utc: DateTime<Utc>) -> Vec<String> {
+    let eastern_time = current_time_utc.with_timezone(&Eastern);
+
+    let crypto_slug = match crypto_filter {
+        "btc" => "bitcoin",
+        "eth" => "ethereum",
+        "sol" => "solana",
+        _ => "bitcoin",
+    };
+
+    let mut slugs = Vec::new();
+    for day_offset in 0..=1i64 {
+        let target = eastern_time + chrono::Duration::days(day_offset);
+        // month name in lowercase, no leading-zero day
+        let month = target.format("%B").to_string().to_lowercase();
+        let day = target.day();
+        let year = target.year();
+        slugs.push(format!("{}-up-or-down-on-{}-{}-{}", crypto_slug, month, day, year));
+    }
+    slugs
+}
+
 /// Generate candidate market names for daily "Up or Down on [date]?" markets.
 /// These are the preferred window/daily venue for non-momentum strategies.
 /// Checks today and tomorrow (in ET) to handle overnight sessions crossing midnight.

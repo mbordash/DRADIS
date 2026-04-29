@@ -31,7 +31,8 @@ RUN touch src/main.rs && \
     rm -rf target /usr/local/cargo/registry /usr/local/cargo/git
 
 FROM alpine:latest
-RUN apk --no-cache add ca-certificates
+RUN apk --no-cache add ca-certificates tzdata
+ENV TZ=America/New_York
 # Create app directory and set as working directory
 WORKDIR /app
 COPY --from=builder /rustpolybot-bin ./rustpolybot

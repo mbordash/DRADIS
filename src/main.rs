@@ -19,6 +19,7 @@ use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer;
 
 use chrono::Utc;
+use chrono_tz::US::Eastern;
 use reqwest;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -50,6 +51,18 @@ use rustls::crypto::ring;
 
 type PriceState = (Decimal, Decimal, Decimal, Decimal); // (Bid, BidDepth, Ask, AskDepth)
 
+/// Custom tracing timer that formats log timestamps in US/Eastern (ET/EDT).
+/// Ensures all log output is in the same timezone as Polymarket's market names,
+/// making it straightforward to correlate log lines with market events.
+struct EasternTime;
+
+impl tracing_subscriber::fmt::time::FormatTime for EasternTime {
+    fn format_time(&self, w: &mut tracing_subscriber::fmt::format::Writer<'_>) -> std::fmt::Result {
+        let now = Utc::now().with_timezone(&Eastern);
+        write!(w, "{}", now.format("%Y-%m-%d %H:%M:%S %Z"))
+    }
+}
+
 // V2 CTF Exchange contracts (pUSD collateral, EIP-712 domain version "2")
 const EXCHANGE_NORMAL: Address = address!("0xE111180000d2663C0091e4f400237545B87B996B");
 const EXCHANGE_NEG_RISK: Address = address!("0xe2222d279d744050d28e00520010520000310F59");
@@ -76,7 +89,10 @@ async fn main() -> Result<()> {
 
     let shared_http = Arc::new(client_builder.build()?);
     dotenv::dotenv().ok();
-    tracing_subscriber::fmt().with_env_filter(tracing_subscriber::EnvFilter::from_default_env()).init();
+    tracing_subscriber::fmt()
+        .with_timer(EasternTime)
+        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .init();
     ring::default_provider().install_default().expect("rustls provider");
 
     let crypto_filter = env::var("CRYPTO_FILTER").unwrap_or_else(|_| "btc".to_string()).to_lowercase();
@@ -144,6 +160,9 @@ async fn main() -> Result<()> {
     let pending_orders: Arc<Mutex<HashMap<(String, U256), Instant>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let total_pnl: Arc<Mutex<Decimal>> = Arc::new(Mutex::new(dec!(0)));
+    // Live pUSD balance — updated every 60s in the status ticker so strategies can self-gate
+    // when the wallet cannot afford even the minimum trade, preventing 400 CLOB rejections.
+    let live_collateral: Arc<Mutex<Decimal>> = Arc::new(Mutex::new(startup_balance));
     let phantom_cooldowns: rustpolybot::helpers::balance::PhantomCooldowns = Arc::new(Mutex::new(HashMap::new()));
     let time_decay_positions: Arc<Mutex<HashMap<U256, TimeDecayPosition>>> =
         Arc::new(Mutex::new(HashMap::new()));
@@ -320,6 +339,7 @@ async fn main() -> Result<()> {
 
         let strategies = StrategyRegistry::create_all_strategies();
         let adoption_order = StrategyRegistry::strategy_names();
+        let live_collateral = Arc::clone(&live_collateral);
 
         // Scan on-chain balances at loop start (startup + market rotation) and adopt any
         // untracked positions so no strategy double-enters on top of existing on-chain shares.
@@ -444,6 +464,14 @@ async fn main() -> Result<()> {
                     let (nb, _, na, _) = *no_price_rx.borrow();
                     info!("💓 Heartbeat | Ask Sum ${:.4} (Y ask ${:.2} / N ask ${:.2}) | Bid Sum ${:.4} (Y bid ${:.2} / N bid ${:.2}) | Binance: ${:.2}",
                         ya + na, ya, na, yb + nb, yb, nb, *oracle_rx.borrow());
+                    // Refresh live pUSD balance so strategies can self-gate on insufficient funds.
+                    let mut bal_req = BalanceAllowanceRequest::default();
+                    bal_req.asset_type = AssetType::Collateral;
+                    if let Ok(resp) = trading_client.balance_allowance(bal_req).await {
+                        let bal = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
+                        *live_collateral.lock().await = bal;
+                        info!("💰 Live pUSD balance: ${:.4}", bal);
+                    }
                 }
                 _ = ticker.tick() => {
                     if market_rx.has_changed().unwrap_or(false) { break; }
@@ -470,6 +498,7 @@ async fn main() -> Result<()> {
                         positions: Arc::clone(&positions),
                         session_pnl: *total_pnl.lock().await,
                         starting_collateral: *starting_collateral_store.lock().await,
+                        available_collateral: *live_collateral.lock().await,
                         crypto_filter: crypto_filter.clone(),
                         market_started_at,
                         maker_market: maker_market_config.clone(),

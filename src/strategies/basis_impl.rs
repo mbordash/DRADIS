@@ -112,6 +112,14 @@ impl Strategy for BasisStrategyImpl {
         let no_fee_headroom  = dec!(1) + Decimal::from(market.no_fee_bps)  / dec!(10000);
         let yes_fee_headroom = dec!(1) + Decimal::from(market.yes_fee_bps) / dec!(10000);
 
+        // ── Balance Gate ─────────────────────────────────────────────────────
+        // If the wallet can't cover even the minimum trade + fee, skip entirely.
+        // This prevents 400 rejections from firing every 60s when the balance is depleted.
+        let min_required = config::BASIS_MIN_TRADE_SIZE_USDC / no_fee_headroom.min(yes_fee_headroom);
+        if ctx.available_collateral < min_required {
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Strategy Exposure Check ──────────────────────────────────────────
         let current_exposure = {
             let pos_map = ctx.positions.lock().await;

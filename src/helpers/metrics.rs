@@ -6,6 +6,7 @@ use tokio::io::AsyncWriteExt;
 use std::path::Path;
 use rust_decimal::Decimal;
 use chrono::{Utc, Datelike};
+use chrono_tz::US::Eastern;
 use tracing::{error, info};
 use serde::Serialize;
 use std::env;
@@ -36,6 +37,9 @@ pub async fn record_trade(
     reason: String,
 ) {
     let now = Utc::now();
+    // Use Eastern date for the filename so the daily log file matches
+    // Polymarket's ET-based trading day (avoids the file rolling at 8PM ET / midnight UTC).
+    let now_et = now.with_timezone(&Eastern);
     let crypto = env::var("CRYPTO_FILTER").unwrap_or_else(|_| "unknown".to_string()).to_lowercase();
 
     // Ensure logs directory exists
@@ -45,8 +49,8 @@ pub async fn record_trade(
         return;
     }
 
-    // Filename: logs/btc-trades_2024-04-26.csv
-    let filename = format!("{}/{}-trades_{:04}-{:02}-{:02}.csv", log_dir, crypto, now.year(), now.month(), now.day());
+    // Filename: logs/btc-trades_2024-04-26.csv  (date in ET)
+    let filename = format!("{}/{}-trades_{:04}-{:02}-{:02}.csv", log_dir, crypto, now_et.year(), now_et.month(), now_et.day());
     let path = Path::new(&filename);
 
     let file_exists = path.exists();

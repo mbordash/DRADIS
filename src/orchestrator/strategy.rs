@@ -36,6 +36,10 @@ pub struct StrategyContext {
     /// Live orderbook snapshot for the maker venue.
     /// Paired with maker_market — always Some when maker_market is Some, None otherwise.
     pub maker_snapshot: Option<MarketSnapshot>,
+    /// Live pUSD collateral balance, updated every 60s.
+    /// Strategies should gate on this to avoid generating signals when the wallet cannot
+    /// afford even the minimum trade + fee, preventing 400 rejections from the CLOB.
+    pub available_collateral: Decimal,
 }
 
 /// Trait that all strategies must implement.

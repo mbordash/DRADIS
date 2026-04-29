@@ -146,9 +146,16 @@ pub async fn reconcile_orphaned_positions(
         req.token_id = Some(token_id);
         let actual_shares = match client.balance_allowance(req).await {
             Ok(resp) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
-            Err(_) => continue,
+            Err(e) => {
+                warn!("⚠️ RECONCILE: balance query failed for token {} ({}): {}", token_id, side_label, e);
+                continue;
+            }
         };
-        if actual_shares < crate::config::MIN_ORDER_SHARES { continue; }
+        debug!("🔍 RECONCILE: token {} ({}) on-chain balance = {:.4}", token_id, side_label, actual_shares);
+        if actual_shares < crate::config::MIN_ORDER_SHARES {
+            debug!("⏭️  RECONCILE: skipping token {} — balance {:.4} below threshold", token_id, actual_shares);
+            continue;
+        }
 
         {
             let map = positions.lock().await;

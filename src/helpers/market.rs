@@ -8,9 +8,14 @@ use alloy::primitives::U256;
 use tracing::{info, debug, warn};
 use std::cmp::Ordering;
 use std::env;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use rust_decimal::Decimal;
 use regex::Regex;
 use std::str::FromStr;
+
+/// Epoch-seconds timestamp of the last "no maker venue" log, used to debounce a message
+/// that fires every 90 s but is fully expected when no daily market exists for the asset.
+static LAST_NO_MAKER_VENUE_LOG: AtomicU64 = AtomicU64::new(0);
 
 use crate::config;
 use crate::helpers::json::{extract_token_ids_u256, extract_close_time, get_enable_orderbook};
@@ -214,52 +219,64 @@ pub async fn fetch_specific_hourly_market(
     None
 }
 
-/// Directly search for today's (or tomorrow's for overnight sessions) daily "Up or Down on [date]?"
-/// maker venue by name, bypassing the volume-sorted scan that almost certainly ranks it too low.
+/// Directly fetch today's (or tomorrow's) daily "Up or Down on [date]?" maker venue
+/// by constructing the deterministic Polymarket event slug and querying the events endpoint.
+///
+/// The Gamma API `search=` parameter uses fuzzy full-text matching that returns completely
+/// unrelated results for date-based queries.  The events endpoint with an exact slug is
+/// reliable and low-latency.  Slug format: `bitcoin-up-or-down-on-april-29-2026`
 pub async fn fetch_specific_window_daily_market(
     http: &reqwest::Client,
     crypto_filter: &str,
     now: DateTime<Utc>,
 ) -> Option<MarketCandidate> {
-    let candidate_names = crate::helpers::time::generate_daily_market_names(crypto_filter, now);
-    for q in &candidate_names {
+    let slugs = crate::helpers::time::generate_daily_event_slugs(crypto_filter, now);
+    for slug in &slugs {
         let url = format!(
-            "https://gamma-api.polymarket.com/markets?search={}&active=true&closed=false&limit=5",
-            urlencoding::encode(q)
+            "https://gamma-api.polymarket.com/events?slug={}&active=true&closed=false",
+            slug
         );
-        let resp = match http.get(&url).send().await { Ok(r) => r, Err(e) => { warn!("⚠️ Daily market search failed for '{}': {}", q, e); continue; } };
+        let resp = match http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => { warn!("⚠️ Daily event slug fetch failed for '{}': {}", slug, e); continue; }
+        };
         let data: serde_json::Value = match resp.json().await { Ok(d) => d, Err(_) => continue };
-        let markets = data.as_array().or_else(|| data.get("data").and_then(|v| v.as_array()));
-        if let Some(arr) = markets {
-            for m in arr {
-                let name = m.get("question").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                if !config::is_daily_market(&name) { continue; }
-                if config::is_bad_market(&name) || !get_enable_orderbook(m) { continue; }
-                let tokens = extract_token_ids_u256(m);
-                if tokens.len() < 2 { continue; }
-                let close = extract_close_time(m.get("event").unwrap_or(&serde_json::Value::Null), m);
-                let left = close.map_or(0, |ct| (ct - now).num_seconds());
-                if left < config::MAKER_MIN_SECS_TO_EXPIRY || left > config::MAKER_MAX_SECS_TO_EXPIRY {
-                    debug!("⏭ Daily market '{}' skipped: {}s left (need {}-{})", name, left, config::MAKER_MIN_SECS_TO_EXPIRY, config::MAKER_MAX_SECS_TO_EXPIRY);
-                    continue;
-                }
-                let cond_id = m.get("conditionId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                info!("🗓 Found daily maker venue via direct search: \"{}\" ({}s left)", name, left);
-                return Some(MarketCandidate {
-                    yes_token: tokens[0],
-                    no_token: tokens[1],
-                    name,
-                    link: m.get("slug").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                    description: m.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
-                    is_hot: false,
-                    close_time: close,
-                    volume: 0.0,
-                    condition_id: cond_id,
-                });
+        let events = data.as_array().or_else(|| data.get("data").and_then(|v| v.as_array()));
+        let event = match events.and_then(|a| a.first()) { Some(e) => e, None => continue };
+
+        let markets_arr = match event.get("markets").and_then(|v| v.as_array()) {
+            Some(a) if !a.is_empty() => a,
+            _ => continue,
+        };
+
+        for m in markets_arr {
+            let name = m.get("question").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            if config::is_bad_market(&name) || !get_enable_orderbook(m) { continue; }
+            let tokens = extract_token_ids_u256(m);
+            if tokens.len() < 2 { continue; }
+            // Use the event's endDate as authoritative close time (market-level endDate is identical)
+            let close = extract_close_time(event, m);
+            let left = close.map_or(0, |ct| (ct - now).num_seconds());
+            if left < config::MAKER_MIN_SECS_TO_EXPIRY || left > config::MAKER_MAX_SECS_TO_EXPIRY {
+                debug!("⏭ Daily market '{}' skipped: {}s left (need {}-{})", name, left, config::MAKER_MIN_SECS_TO_EXPIRY, config::MAKER_MAX_SECS_TO_EXPIRY);
+                continue;
             }
+            let cond_id = m.get("conditionId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+            info!("🗓 Found daily maker venue via slug '{}': \"{}\" ({}s left)", slug, name, left);
+            return Some(MarketCandidate {
+                yes_token: tokens[0],
+                no_token: tokens[1],
+                name,
+                link: m.get("slug").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                description: m.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+                is_hot: false,
+                close_time: close,
+                volume: 0.0,
+                condition_id: cond_id,
+            });
         }
     }
-    debug!("⚠️ No daily maker venue found via direct search (tried: {:?})", candidate_names);
+    debug!("No daily maker venue found via slug lookup (tried: {:?})", slugs);
     None
 }
 
@@ -285,12 +302,21 @@ pub async fn get_market_pair(http: &reqwest::Client) -> (MarketCandidate, Option
     // falling back to whatever the volume-scan turned up.
     let daily_direct = fetch_specific_window_daily_market(http, &filter, now).await;
     let maker = daily_direct.or_else(|| {
-        if maker_c.first().is_some() {
+        if let Some(b) = maker_c.first() {
             info!("📋 Using volume-scan window/daily fallback for maker venue");
+            Some(MarketCandidate { yes_token: b.0[0], no_token: b.0[1], name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone() })
         } else {
-            warn!("⚠️ No window/daily maker venue found (direct search + volume scan both empty)");
+            // No daily/window maker venue — expected for assets (e.g. BTC) where Polymarket
+            // only lists hourly "Up or Down" markets.  Log at INFO at most once per hour to
+            // avoid log spam; the bot operates normally on the hourly market instead.
+            let now_secs = now.timestamp() as u64;
+            let last = LAST_NO_MAKER_VENUE_LOG.load(AtomicOrdering::Relaxed);
+            if now_secs.saturating_sub(last) >= 3600 {
+                LAST_NO_MAKER_VENUE_LOG.store(now_secs, AtomicOrdering::Relaxed);
+                info!("ℹ️ No window/daily maker venue available for [{}] — operating on hourly market only", filter.to_uppercase());
+            }
+            None
         }
-        maker_c.first().map(|b| MarketCandidate { yes_token: b.0[0], no_token: b.0[1], name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone() })
     });
 
     (hourly, maker)
