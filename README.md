@@ -1,10 +1,10 @@
 # DRADIS
 
-Direct Reaction And Dynamic Intelligence System A Low-Latency Multi-Strategy Trading Execution Platform for Prediction Markets, like PolyMarket.
+> **Direct Reaction And Dynamic Intelligence System** — A low-latency multi-strategy trading execution platform for prediction markets like Polymarket.
 
 ---
 
-🛰️ Tactical Overview
+## 🛰️ Tactical Overview
 
 DRADIS is not just a bot; it is a Combat Information Center (CIC) for Polymarket. Built in Rust for maximum concurrency and memory safety, it evaluates the entire "battlespace" every 50ms, coordinating multiple autonomous strategies to defend capital and strike inefficiencies.
 
@@ -12,15 +12,13 @@ Unlike standard linear scripts, DRADIS uses a Tokio-powered orchestrator to mana
 
 ---
 
-🛠️ The Architecture (The CIC)
+## 🛠️ The Architecture (The CIC)
 
-The core of DRADIS is the Orchestrator. It acts as the ship’s brain, maintaining the primary data link to the Polymarket CLOB and Binance Oracles.
+The core of DRADIS is the Orchestrator. It acts as the ship's brain, maintaining the primary data link to the Polymarket CLOB and Binance Oracles.
 
-Parallel Dispatch: Every heartbeat (50ms), the CIC polls all registered strategies in parallel.
-
-Isolated Pits: Each strategy operates with its own Independent Capital Budget and Position Book. A "whiplash" in one sector won't compromise the fuel (USDC) of another.
-
-Signal Filtering: Includes a built-in OBI (Order Book Imbalance) Veto at -0.65 to prevent launching into "toxic flow" or distribution walls.
+- **Parallel Dispatch**: Every heartbeat (50ms), the CIC polls all registered strategies in parallel.
+- **Isolated Pits**: Each strategy operates with its own independent capital budget and position book. A "whiplash" in one sector won't compromise the fuel (USDC) of another.
+- **Signal Filtering**: Includes a built-in OBI (Order Book Imbalance) Veto at -0.65 to prevent launching into "toxic flow" or distribution walls.
 
 ```
 ┌─────────────────────┐   ┌─────────────────────┐
@@ -53,29 +51,23 @@ Signal Filtering: Includes a built-in OBI (Order Book Imbalance) Veto at -0.65 t
 
 ---
 
-🚀 The Viper Squadrons (Strategies)
+## 🚀 The Viper Squadrons (Strategies)
 
 DRADIS currently deploys five specialized strategy classes:
 
-Momentum (The Interceptor): Scans for high-velocity Binance moves. If a "target" moves $85 in 5 seconds, the Interceptor strikes the Polymarket book before it can reprice.
-
-Maker (The Sentry): Maintains a dual-sided presence on the Window venue, capturing the spread while managing net exposure.
-
-Arbitrage (The Surveyor): Constantly monitors the price sum of YES/NO pairs, looking for sub-$1.00 opportunities in low-fee venues.
-
-Time Decay (The Ghost): Exploits the natural convergence of prediction markets toward expiry, fading retail volatility.
-
-Basis/Funding (The Analyst): Fades retail skew by comparing Polymarket sentiment against Binance perpetual funding rates.
+- **Momentum (The Interceptor)**: Scans for high-velocity Binance moves. If a "target" moves $85 in 5 seconds, the Interceptor strikes the Polymarket book before it can reprice.
+- **Maker (The Sentry)**: Maintains a dual-sided presence on the Window venue, capturing the spread while managing net exposure.
+- **Arbitrage (The Surveyor)**: Constantly monitors the price sum of YES/NO pairs, looking for sub-$1.00 opportunities in low-fee venues.
+- **Time Decay (The Ghost)**: Exploits the natural convergence of prediction markets toward expiry, fading retail volatility.
+- **Basis/Funding (The Analyst)**: Fades retail skew by comparing Polymarket sentiment against Binance perpetual funding rates.
 
 ---
 
-🛡️ Safety Systems
+## 🛡️ Safety Systems
 
-Orphaned Position Detection: Automatically "scuttles" one-sided hedged positions after 60s to prevent directional bleeding.
-
-Fee Gates: Hard-coded protection to ensure Taker strategies don't enter high-fee (1000 bps) environments.
-
-Circuit Breaker: Total system lockdown after 3 consecutive execution failures.
+- **Orphaned Position Detection**: Automatically "scuttles" one-sided hedged positions after 60s to prevent directional bleeding.
+- **Fee Gates**: Hard-coded protection to ensure Taker strategies don't enter high-fee (1000 bps) environments.
+- **Circuit Breaker**: Total system lockdown after 3 consecutive execution failures.
 
 ---
 
@@ -191,9 +183,11 @@ cargo build --release
 ## FAQ
 
 **Why Rust instead of Python?**
+
 Rust provides **fearless concurrency**. Evaluating five strategies concurrently every 50ms requires a multi-threaded runtime without a Global Interpreter Lock (GIL) or unpredictable Garbage Collection (GC) pauses.
 
 **Why isn't the bot trading?**
+
 Check in order:
 1. Is `GHOST_MODE` true?
 2. **Fees**: Taker strategies skip high-fee (1000 bps) markets.
@@ -201,10 +195,15 @@ Check in order:
 4. **Venue**: Maker/Arb/Basis require a **Window or Daily** market to be active.
 
 **I see Momentum and Maker trading the same token — is that a bug?**
+
 No. Each strategy has its own independent position book. They can "co-habitate" on the same token without collision.
 
 **How do I adjust risk?**
+
 Edit the per-strategy constants in `src/config.rs`, specifically the `_MAX_EXPOSURE_USDC` values.
+
+**How can I optimize my host for maximum performance?**
+See [docs/PERFORMANCE_TUNING.md](docs/PERFORMANCE_TUNING.md) for a full guide covering kernel `sysctl` tuning, CPU frequency governor, CPU/IRQ affinity pinning, Docker ulimits, and instance selection tips for AWS and OCI.
 
 ---
 
