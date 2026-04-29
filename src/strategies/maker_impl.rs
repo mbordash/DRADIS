@@ -5,11 +5,21 @@
 ///   2. Daily USDC rebates from Polymarket's Maker Rebates program on every fill.
 ///
 /// This version is strictly tied to the Window/Daily venue via a Fee Gate.
+///
+/// Trade Velocity / Taker-Flow Filter (Phase 9):
+///   - evaluate_entry tracks bid-depth drain over a 1.5s window to suppress new
+///     maker bids when takers are actively sweeping one side of the book.
+///   - evaluate_exit fires an accelerated "ToxicFill" exit whenever an open
+///     position's book OBI falls below MAKER_TOXIC_FLOW_EXIT_OBI, meaning
+///     the ask side has grown 3× larger than the bid side — a book turn.
 
 use async_trait::async_trait;
 use anyhow::Result;
 use chrono::Utc;
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
+use std::time::Instant;
+use tokio::sync::Mutex;
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
@@ -17,7 +27,32 @@ use crate::strategies::is_drawdown_limit_hit;
 use crate::helpers::price::floor_to_tick_size;
 use crate::config;
 
-pub struct MakerStrategyImpl;
+/// Tracks bid-depth at the previous evaluation tick for drain-rate computation.
+struct DepthSample {
+    yes_bid_depth: Decimal,
+    no_bid_depth: Decimal,
+    sampled_at: Instant,
+}
+
+pub struct MakerStrategyImpl {
+    /// Per-strategy state: best-bid depths from the previous evaluation tick.
+    /// Used to compute how fast bid depth is being consumed by takers within
+    /// a MAKER_TAKER_FLOW_WINDOW_MS rolling window.
+    /// Wrapped in Mutex because evaluate_entry and evaluate_exit run concurrently
+    /// (tokio::join! in the executor).  evaluate_entry owns writes; evaluate_exit
+    /// reads whatever sample is available (one-tick lag is acceptable for a gate).
+    prev_depths: Mutex<Option<DepthSample>>,
+}
+
+impl MakerStrategyImpl {
+    pub fn new() -> Self {
+        Self { prev_depths: Mutex::new(None) }
+    }
+}
+
+impl Default for MakerStrategyImpl {
+    fn default() -> Self { Self::new() }
+}
 
 #[async_trait]
 impl Strategy for MakerStrategyImpl {
@@ -66,6 +101,67 @@ impl Strategy for MakerStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── Taker-Flow / Bid-Depth Drain Gate ────────────────────────────────
+        // Measure the fraction of best-bid depth consumed since the last tick.
+        // A rapid drain (≥ MAKER_TAKER_FLOW_DRAIN_THRESHOLD within
+        // MAKER_TAKER_FLOW_WINDOW_MS) indicates that takers are sweeping the book
+        // one-sidedly — classic "toxic flow" that fills maker bids at adverse prices.
+        // Suppress the affected side so we don't post into an active sweep.
+        let (taker_flow_blocks_yes, taker_flow_blocks_no) = {
+            let now_inst = Instant::now();
+            let mut prev_guard = self.prev_depths.lock().await;
+
+            let drain_flags = if let Some(ref p) = *prev_guard {
+                let elapsed_ms = now_inst.duration_since(p.sampled_at).as_millis();
+                if elapsed_ms > 0 && elapsed_ms <= config::MAKER_TAKER_FLOW_WINDOW_MS as u128 {
+                    // Positive value = depth decreased (bids were lifted by takers).
+                    // Clamp at 0 so depth replenishment (depth increased) never triggers the gate.
+                    let yes_drain = if p.yes_bid_depth > dec!(0) {
+                        ((p.yes_bid_depth - snapshot.yes_bid_depth) / p.yes_bid_depth).max(dec!(0))
+                    } else {
+                        dec!(0)
+                    };
+                    let no_drain = if p.no_bid_depth > dec!(0) {
+                        ((p.no_bid_depth - snapshot.no_bid_depth) / p.no_bid_depth).max(dec!(0))
+                    } else {
+                        dec!(0)
+                    };
+
+                    let block_yes = yes_drain >= config::MAKER_TAKER_FLOW_DRAIN_THRESHOLD;
+                    let block_no  = no_drain  >= config::MAKER_TAKER_FLOW_DRAIN_THRESHOLD;
+
+                    if block_yes {
+                        tracing::info!(
+                            "🚫 Maker YES entry suppressed: bid-depth drained {:.0}% in {}ms (taker sweep detected)",
+                            yes_drain * dec!(100), elapsed_ms
+                        );
+                    }
+                    if block_no {
+                        tracing::info!(
+                            "🚫 Maker NO entry suppressed: bid-depth drained {:.0}% in {}ms (taker sweep detected)",
+                            no_drain * dec!(100), elapsed_ms
+                        );
+                    }
+
+                    (block_yes, block_no)
+                } else {
+                    (false, false)
+                }
+            } else {
+                (false, false)
+            };
+
+            // Store current depths for the next tick's comparison.
+            // This write is owned by evaluate_entry; evaluate_exit only reads.
+            *prev_guard = Some(DepthSample {
+                yes_bid_depth: snapshot.yes_bid_depth,
+                no_bid_depth:  snapshot.no_bid_depth,
+                sampled_at:    now_inst,
+            });
+
+            drain_flags
+        };
+
         // ── Inventory and Net Exposure Check ─────────────────────────────────
         let (yes_inv_value, no_inv_value) = {
             let pos_map = ctx.positions.lock().await;
@@ -101,6 +197,7 @@ impl Strategy for MakerStrategyImpl {
 
         // ── Qualification ─────────────────────────────────────────────────────
         let yes_qualifies = yes_book_ok
+            && !taker_flow_blocks_yes          // taker-flow drain gate
             && yes_spread >= config::MAKER_MIN_SPREAD
             && yes_bid_price >= config::MAKER_MIN_ENTRY_PRICE
             && yes_bid_price <= config::MAKER_MAX_ENTRY_PRICE
@@ -109,6 +206,7 @@ impl Strategy for MakerStrategyImpl {
             && !velocity_bias_strong_negative;
 
         let no_qualifies = no_book_ok
+            && !taker_flow_blocks_no           // taker-flow drain gate
             && no_spread >= config::MAKER_MIN_SPREAD
             && no_bid_price >= config::MAKER_MIN_ENTRY_PRICE
             && no_bid_price <= config::MAKER_MAX_ENTRY_PRICE
@@ -210,6 +308,58 @@ impl Strategy for MakerStrategyImpl {
         } else {
             config::MAKER_STOP_LOSS_PERCENT
         };
+
+        // ── Taker-Flow Book-Turn Exit ─────────────────────────────────────────
+        // If the OBI for the side we are long drops below MAKER_TOXIC_FLOW_EXIT_OBI,
+        // the book has turned sharply adverse — a thick ask wall has materialised
+        // while we hold the position.  This is the "pull existing orders" effect:
+        // rather than waiting for the full stop-loss to hit, we exit early at the
+        // current (still tradeable) bid before the spread widens further.
+        // Only fires on fill-confirmed positions to avoid exiting phantom entries.
+        {
+            let pos_map = ctx.positions.lock().await;
+            for token_id in [market.yes_token, market.no_token] {
+                let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id)) else {
+                    continue;
+                };
+                if position.fill_confirmed_at.is_none() {
+                    continue; // don't pull before the fill settles on-chain
+                }
+
+                let (bid_depth, ask_depth, bid) = if token_id == market.yes_token {
+                    (snapshot.yes_bid_depth, snapshot.yes_ask_depth, snapshot.yes_bid)
+                } else {
+                    (snapshot.no_bid_depth, snapshot.no_ask_depth, snapshot.no_bid)
+                };
+
+                let total_depth = bid_depth + ask_depth;
+                let obi = if total_depth > dec!(0) {
+                    (bid_depth - ask_depth) / total_depth
+                } else {
+                    dec!(0)
+                };
+
+                if obi < config::MAKER_TOXIC_FLOW_EXIT_OBI {
+                    tracing::info!(
+                        "⚡ Maker ToxicFill exit triggered: OBI={:.2} (threshold={:.2}) | bid=${:.4}",
+                        obi, config::MAKER_TOXIC_FLOW_EXIT_OBI, bid
+                    );
+                    return Ok(StrategySignal::Exit {
+                        params: OrderParams {
+                            token_id,
+                            price: bid,
+                            shares: position.shares,
+                            fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
+                            is_neg_risk: market.is_neg_risk,
+                            market_name: market.market_name.clone(),
+                            condition_id: market.condition_id.clone(),
+                        },
+                        reason: format!("ToxicFill: OBI={:.2} (book turned adverse)", obi),
+                        exit_pair: false,
+                    });
+                }
+            }
+        }
 
         let pos_map = ctx.positions.lock().await;
 

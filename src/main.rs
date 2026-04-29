@@ -32,7 +32,7 @@ use std::sync::atomic::AtomicU64;
 use tokio::sync::{watch, Mutex};
 use tokio::time::{interval, Instant, Duration};
 
-use tracing::{info, warn, error};
+use tracing::{info, warn, error, debug};
 
 use rustpolybot::config;
 use rustpolybot::state::{Position, StrategySignal, MarketConfig, MarketSnapshot, PositionMap};
@@ -473,7 +473,7 @@ async fn main() -> Result<()> {
                     if let Ok(resp) = trading_client.balance_allowance(bal_req).await {
                         let bal = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
                         *live_collateral.lock().await = bal;
-                        info!("💰 Live pUSD balance: ${:.4}", bal);
+                        debug!("💰 Live pUSD balance: ${:.4}", bal);
                     }
                 }
                 _ = ticker.tick() => {

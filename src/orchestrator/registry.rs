@@ -23,7 +23,7 @@ impl StrategyRegistry {
             Box::new(TimeDecayStrategyImpl),
         ];
         if config::ENABLE_MAKER_TRADING {
-            strategies.push(Box::new(MakerStrategyImpl));
+            strategies.push(Box::new(MakerStrategyImpl::new()));
         }
         if config::ENABLE_BASIS_TRADING {
             strategies.push(Box::new(BasisStrategyImpl));
@@ -47,7 +47,7 @@ impl StrategyRegistry {
     }
     /// Create only maker strategy
     pub fn create_maker() -> Box<dyn Strategy> {
-        Box::new(MakerStrategyImpl)
+        Box::new(MakerStrategyImpl::new())
     }
 
     /// Return the names of all enabled strategies, in priority order for orphan adoption.
