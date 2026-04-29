@@ -201,6 +201,15 @@ pub const TIME_DECAY_MAX_TOTAL_EXPOSURE_USDC: Decimal = dec!(36);
 pub const TIME_DECAY_MAX_POSITIONS: usize = 3;
 pub const TIME_DECAY_STOP_LOSS_PERCENT: Decimal = dec!(0.025);
 
+/// Oracle volatility gate — balanced: mid-range thresholds, stop halved on vol spikes.
+pub const TIME_DECAY_MAX_FAST_VELOCITY_BTC: Decimal = dec!(15.0);
+pub const TIME_DECAY_MAX_FAST_VELOCITY_ETH: Decimal = dec!(0.75);
+pub const TIME_DECAY_MAX_FAST_VELOCITY_SOL: Decimal = dec!(0.075);
+pub const TIME_DECAY_MAX_SLOW_DRIFT_BTC: Decimal = dec!(200.0);
+pub const TIME_DECAY_MAX_SLOW_DRIFT_ETH: Decimal = dec!(8.0);
+pub const TIME_DECAY_MAX_SLOW_DRIFT_SOL: Decimal = dec!(0.80);
+pub const TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER: Decimal = dec!(0.50);
+
 
 // ============================================================================
 // EMERGENCY CIRCUIT BREAKERS

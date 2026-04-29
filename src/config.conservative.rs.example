@@ -233,6 +233,16 @@ pub const TIME_DECAY_MAX_TOTAL_EXPOSURE_USDC: Decimal = dec!(24);
 pub const TIME_DECAY_MAX_POSITIONS: usize = 3;
 pub const TIME_DECAY_STOP_LOSS_PERCENT: Decimal = dec!(0.02);
 
+/// Oracle volatility gate — conservative: tight thresholds, stop cut to 35% on any vol spike.
+/// Prefers missing trades over being caught in a repricing event.
+pub const TIME_DECAY_MAX_FAST_VELOCITY_BTC: Decimal = dec!(10.0);
+pub const TIME_DECAY_MAX_FAST_VELOCITY_ETH: Decimal = dec!(0.50);
+pub const TIME_DECAY_MAX_FAST_VELOCITY_SOL: Decimal = dec!(0.050);
+pub const TIME_DECAY_MAX_SLOW_DRIFT_BTC: Decimal = dec!(150.0);
+pub const TIME_DECAY_MAX_SLOW_DRIFT_ETH: Decimal = dec!(6.0);
+pub const TIME_DECAY_MAX_SLOW_DRIFT_SOL: Decimal = dec!(0.60);
+pub const TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER: Decimal = dec!(0.35);
+
 
 // ============================================================================
 // EMERGENCY CIRCUIT BREAKERS

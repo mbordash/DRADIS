@@ -2,6 +2,15 @@
 ///
 /// Exploits YES+NO price convergence toward $1.00 as hourly markets approach expiry.
 /// This version is venue-aware and performs its own risk management.
+///
+/// Oracle Volatility Gate (Phase 9):
+///   Entry is blocked when Binance oracle signals active volatility:
+///   - |velocity_5s| > TIME_DECAY_MAX_FAST_VELOCITY_* (active repricing in progress)
+///   - |oracle_drift_60m| > TIME_DECAY_MAX_SLOW_DRIFT_*  (sustained hourly trend)
+///
+///   For open positions, the stop-loss distance is halved when fast velocity is
+///   elevated — exiting before a vol spike blows through the static stop.
+///   This implements "Short Gamma only when the market is quiet."
 
 use async_trait::async_trait;
 use anyhow::Result;
@@ -41,6 +50,18 @@ impl Strategy for TimeDecayStrategyImpl {
         };
 
         if !TimeDecayStrategy::is_in_theta_window(seconds_to_expiry) {
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Oracle Volatility Gate ────────────────────────────────────────────
+        // TimeDecay is short-gamma: profitable only when prices are converging,
+        // not when an active repricing event or sustained trend is underway.
+        // Use per-crypto thresholds so ETH/SOL bots apply proportional scaling.
+        let (max_fast_vel, max_slow_drift) = TimeDecayStrategy::iv_thresholds(&ctx.crypto_filter);
+        if ctx.snapshot.velocity.abs() > max_fast_vel {
+            return Ok(StrategySignal::NoSignal);
+        }
+        if ctx.snapshot.oracle_drift_60m.abs() > max_slow_drift {
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -111,11 +132,25 @@ impl Strategy for TimeDecayStrategyImpl {
                 });
             }
 
+            // Dynamic stop: when fast velocity is elevated, tighten the stop distance
+            // so we exit sooner with a smaller loss instead of riding a vol spike to
+            // the full static stop.  TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER = 0.5
+            // cuts allowed drawdown in half during active repricing events.
+            let (max_fast_vel, _) = TimeDecayStrategy::iv_thresholds(&ctx.crypto_filter);
+            let iv_elevated = snap.velocity.abs() > max_fast_vel;
+            let effective_stop_pct = if iv_elevated {
+                let tight = config::TIME_DECAY_STOP_LOSS_PERCENT * config::TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER;
+                tracing::debug!("⚡ TimeDecay IV elevated (|vel|={:.2}): stop tightened to {:.1}%", snap.velocity, tight * dec!(100));
+                tight
+            } else {
+                config::TIME_DECAY_STOP_LOSS_PERCENT
+            };
+
             let combined_bid = yes_bid + no_bid;
-            if combined_bid < config::TIME_DECAY_CONVERGENCE_EXIT_BID * (dec!(1) - config::TIME_DECAY_STOP_LOSS_PERCENT) {
+            if combined_bid < config::TIME_DECAY_CONVERGENCE_EXIT_BID * (dec!(1) - effective_stop_pct) {
                 return Ok(StrategySignal::Exit {
                     params: OrderParams { token_id: market.yes_token, price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone() },
-                    reason: "Time Decay SL".to_string(),
+                    reason: format!("Time Decay SL{}", if iv_elevated { " (IV-tightened)" } else { "" }),
                     exit_pair: true,
                 });
             }
@@ -140,6 +175,16 @@ impl Strategy for TimeDecayStrategyImpl {
 pub struct TimeDecayStrategy;
 
 impl TimeDecayStrategy {
+    /// Returns (max_fast_velocity, max_slow_drift) thresholds for the given crypto.
+    /// Called by both evaluate_entry (entry gate) and evaluate_exit (dynamic stop).
+    pub fn iv_thresholds(crypto_filter: &str) -> (Decimal, Decimal) {
+        match crypto_filter {
+            "eth" => (config::TIME_DECAY_MAX_FAST_VELOCITY_ETH, config::TIME_DECAY_MAX_SLOW_DRIFT_ETH),
+            "sol" => (config::TIME_DECAY_MAX_FAST_VELOCITY_SOL, config::TIME_DECAY_MAX_SLOW_DRIFT_SOL),
+            _     => (config::TIME_DECAY_MAX_FAST_VELOCITY_BTC, config::TIME_DECAY_MAX_SLOW_DRIFT_BTC),
+        }
+    }
+
     pub fn calculate_theta_opportunity(yes_ask: Decimal, no_ask: Decimal, y_fee: u32, n_fee: u32, secs: i64) -> Option<ThetaSignal> {
         let comb = yes_ask + no_ask;
         let fees = (yes_ask * Decimal::from(y_fee) / dec!(10_000)) + (no_ask * Decimal::from(n_fee) / dec!(10_000));

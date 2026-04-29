@@ -189,8 +189,13 @@ impl Strategy for MakerStrategyImpl {
         let raw_yes_price = (snapshot.yes_ask - bid_buffer - skew).max(config::MAKER_MIN_ENTRY_PRICE);
         let raw_no_price  = (snapshot.no_ask - bid_buffer + skew).max(config::MAKER_MIN_ENTRY_PRICE);
 
-        let yes_bid_price = floor_to_tick_size(raw_yes_price.min(snapshot.yes_ask - dec!(0.01)));
-        let no_bid_price  = floor_to_tick_size(raw_no_price.min(snapshot.no_ask - dec!(0.01)));
+        // Clamp bid price to at most (ask - MAKER_CROSS_BUFFER) so that inventory-skew
+        // rebalancing can never push the bid closer than 2 ticks from the ask.
+        // Previously used a hardcoded dec!(0.01) which allowed 1-tick spreads when
+        // the skew (±0.03) exceeded the bid_buffer (0.025), triggering the cap.
+        // Now uses the configured MAKER_CROSS_BUFFER constant (0.02) for consistency.
+        let yes_bid_price = floor_to_tick_size(raw_yes_price.min(snapshot.yes_ask - config::MAKER_CROSS_BUFFER));
+        let no_bid_price  = floor_to_tick_size(raw_no_price.min(snapshot.no_ask  - config::MAKER_CROSS_BUFFER));
 
         let yes_spread = yes_ask - yes_bid;
         let no_spread  = no_ask - no_bid;
@@ -201,7 +206,7 @@ impl Strategy for MakerStrategyImpl {
             && yes_spread >= config::MAKER_MIN_SPREAD
             && yes_bid_price >= config::MAKER_MIN_ENTRY_PRICE
             && yes_bid_price <= config::MAKER_MAX_ENTRY_PRICE
-            && yes_bid_price < yes_ask
+            && yes_bid_price <= snapshot.yes_ask - config::MAKER_CROSS_BUFFER  // enforce min spread to ask
             && no_bid <= config::MAKER_MAX_COMPLEMENTARY_PRICE
             && !velocity_bias_strong_negative;
 
@@ -210,7 +215,7 @@ impl Strategy for MakerStrategyImpl {
             && no_spread >= config::MAKER_MIN_SPREAD
             && no_bid_price >= config::MAKER_MIN_ENTRY_PRICE
             && no_bid_price <= config::MAKER_MAX_ENTRY_PRICE
-            && no_bid_price < no_ask
+            && no_bid_price <= snapshot.no_ask - config::MAKER_CROSS_BUFFER    // enforce min spread to ask
             && yes_bid <= config::MAKER_MAX_COMPLEMENTARY_PRICE
             && !velocity_bias_strong_positive;
 
