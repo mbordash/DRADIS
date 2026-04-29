@@ -323,26 +323,21 @@ async fn main() -> Result<()> {
 
         // Scan on-chain balances at loop start (startup + market rotation) and adopt any
         // untracked positions so no strategy double-enters on top of existing on-chain shares.
+        // Split into two calls so each venue's positions are tagged with the correct close_time
+        // and market_name — preventing BasisExpiry from firing against the hourly market's
+        // close time when the actual position lives in the daily/maker venue.
         // adoption_order comes from the registry — no hardcoded strategy list here.
-        {
-            let mut tokens: Vec<(U256, &str)> = vec![(yes_token, "YES"), (no_token, "NO")];
-            let mut close_time_for_reconcile = market_close_time;
-            if let Some(ref mk) = maker_market_config {
-                tokens.push((mk.yes_token, "YES(maker)"));
-                tokens.push((mk.no_token, "NO(maker)"));
-                // Use maker close time if set (it's the relevant expiry for BasisStrategy)
-                if close_time_for_reconcile.is_none() {
-                    close_time_for_reconcile = mk.market_close_time;
-                }
-            }
+        tokio::time::sleep(Duration::from_secs(2)).await; // allow CLOB API to be ready
+        reconcile_orphaned_positions(
+            &trading_client, &positions,
+            &[(yes_token, "YES"), (no_token, "NO")],
+            &market_name, market_close_time, &[], &adoption_order,
+        ).await;
+        if let Some(ref mk) = maker_market_config {
             reconcile_orphaned_positions(
-                &trading_client,
-                &positions,
-                &tokens,
-                &market_name,
-                close_time_for_reconcile,
-                &[], // bids not available yet at startup; defaults to 0.50 per-token
-                &adoption_order,
+                &trading_client, &positions,
+                &[(mk.yes_token, "YES(maker)"), (mk.no_token, "NO(maker)")],
+                &mk.market_name, mk.market_close_time, &[], &adoption_order,
             ).await;
         }
 
@@ -601,7 +596,14 @@ async fn main() -> Result<()> {
 
                                 {
                                     let mut map = positions.lock().await; if map.contains_key(&pos_key) { continue; }
-                                    map.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: params.price, opened_at: Utc::now(), close_time: market_close_time, market_name: params.market_name.clone(), pair_token_id: params.token_id, fill_confirmed_at: None, paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id) });
+                                    // Use the maker market's close_time when the entry token belongs to the maker
+                                    // venue — prevents BasisExpiry from firing against the hourly market's close
+                                    // time when the position actually lives in the daily/window market.
+                                    let pos_close_time = maker_market_config.as_ref()
+                                        .filter(|mk| params.token_id == mk.yes_token || params.token_id == mk.no_token)
+                                        .and_then(|mk| mk.market_close_time)
+                                        .or(market_close_time);
+                                    map.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: params.price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: params.token_id, fill_confirmed_at: None, paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id) });
                                 }
 
                                 // Set pending lock for 3 seconds
@@ -627,7 +629,11 @@ async fn main() -> Result<()> {
                                 if let Some(pp) = pair_params {
                                     let vc_p = if pp.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                     if !config::GHOST_MODE { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc_p, pp.token_id, Side::Buy, pp.shares, (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), pp.fee_bps, OrderType::FAK, false, 0, &shared_http).await; }
-                                    positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: pp.price, opened_at: Utc::now(), close_time: market_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: None, paired_leg_token_id: Some(params.token_id) });
+                                    let pp_close_time = maker_market_config.as_ref()
+                                        .filter(|mk| pp.token_id == mk.yes_token || pp.token_id == mk.no_token)
+                                        .and_then(|mk| mk.market_close_time)
+                                        .or(market_close_time);
+                                    positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: pp.price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: None, paired_leg_token_id: Some(params.token_id) });
                                     let sn_p = sn.clone(); let tn_p = pp.token_id; let ps_p = Arc::clone(&positions); let cl_p = Arc::clone(&trading_client); let pc_p = Arc::clone(&phantom_cooldowns);
                                     tokio::spawn(async move { let _ = sync_position_balance(&cl_p, &ps_p, &sn_p, tn_p, Some(&pc_p), dec!(0), rustpolybot::helpers::balance::MAX_WAIT_SECS_HOURLY).await; });
                                 }

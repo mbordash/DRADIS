@@ -105,8 +105,12 @@ impl Strategy for BasisStrategyImpl {
             && ctx.snapshot.funding_rate > config::BASIS_POSITIVE_FUNDING_THRESHOLD;
         let extreme_skew_bypass = skew.abs() >= config::BASIS_ENTRY_SKEW_THRESHOLD * dec!(2);
 
-        // Kelly sizing
+        // Kelly sizing — then back off by the taker fee so order_amount + fee never exceeds trade_size.
+        // Without this, a $15 order at 1000 bps adds ~$0.67 in fees, pushing the required total
+        // above the available pUSD balance and causing a 400 "not enough balance" rejection.
         let trade_size = crate::strategies::basis_impl::basis_trade_size(skew.abs());
+        let no_fee_headroom  = dec!(1) + Decimal::from(market.no_fee_bps)  / dec!(10000);
+        let yes_fee_headroom = dec!(1) + Decimal::from(market.yes_fee_bps) / dec!(10000);
 
         // ── Strategy Exposure Check ──────────────────────────────────────────
         let current_exposure = {
@@ -134,7 +138,7 @@ impl Strategy for BasisStrategyImpl {
                 params: OrderParams {
                     token_id: market.no_token,
                     price: snap.no_ask,
-                    shares: trade_size / snap.no_ask,
+                    shares: (trade_size / no_fee_headroom) / snap.no_ask,
                     fee_bps: market.no_fee_bps as u16,
                     is_neg_risk: market.is_neg_risk,
                     market_name: market.market_name.clone(),
@@ -154,7 +158,7 @@ impl Strategy for BasisStrategyImpl {
                 params: OrderParams {
                     token_id: market.yes_token,
                     price: snap.yes_ask,
-                    shares: trade_size / snap.yes_ask,
+                    shares: (trade_size / yes_fee_headroom) / snap.yes_ask,
                     fee_bps: market.yes_fee_bps as u16,
                     is_neg_risk: market.is_neg_risk,
                     market_name: market.market_name.clone(),
