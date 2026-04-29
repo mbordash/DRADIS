@@ -203,6 +203,7 @@ No. Each strategy has its own independent position book. They can "co-habitate" 
 Edit the per-strategy constants in `src/config.rs`, specifically the `_MAX_EXPOSURE_USDC` values.
 
 **How can I optimize my host for maximum performance?**
+
 See [docs/PERFORMANCE_TUNING.md](docs/PERFORMANCE_TUNING.md) for a full guide covering kernel `sysctl` tuning, CPU frequency governor, CPU/IRQ affinity pinning, Docker ulimits, and instance selection tips for AWS and OCI.
 
 ---

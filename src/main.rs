@@ -63,6 +63,52 @@ impl tracing_subscriber::fmt::time::FormatTime for EasternTime {
     }
 }
 
+fn print_banner() {
+    println!(r#"
+  ██████╗ ██████╗  █████╗ ██████╗ ██╗███████╗
+  ██╔══██╗██╔══██╗██╔══██╗██╔══██╗██║██╔════╝
+  ██║  ██║██████╔╝███████║██║  ██║██║███████╗
+  ██║  ██║██╔══██╗██╔══██║██║  ██║██║╚════██║
+  ██████╔╝██║  ██║██║  ██║██████╔╝██║███████║
+  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝╚══════╝
+  Direct Reaction And Dynamic Intelligence System  v{}
+  ─────────────────────────────────────────────────────
+
+          ·  ·  ·  ·  ·  ·  ·  ·  ·
+       ·     ·        |        ·     ·
+     ·    ·     ·     |     ·     ·    ·
+    ·   ·    ·    · ──●── ·    ·    ·   ·
+     ·    ·     ·     |     ·     ·    ·
+       ·     ·        |        ·     ·
+          ·  ·  ·  ·  ·  ·  ·  ·  ·
+              C O M B A T   I N F O R M A T I O N   C E N T E R
+
+  ┌─────────────────────┐   ┌─────────────────────┐
+  │   Binance Oracle    │   │  Polymarket CLOB    │
+  │  (Price / Funding)  │   │  (WebSocket Feed)   │
+  └──────────┬──────────┘   └──────────┬──────────┘
+             └─────────────┬───────────┘
+                           ▼
+              ┌────────────────────────┐
+              │   Orchestrator (CIC)   │
+              │     50ms Heartbeat     │
+              └─────────────┬──────────┘
+             parallel dispatch to Viper squadrons
+                           ▼
+              ┌───────────────────────┐
+              │    Execution Layer    │
+              │  OBI · Fee · Breaker  │
+              └───────────────────────┘
+
+  ╔═══════════════════════════════════════════════════╗
+  ║  "It's not enough to survive.                     ║
+  ║   One has to be worthy of survival."              ║
+  ║                         — Admiral William Adama   ║
+  ╚═══════════════════════════════════════════════════╝
+                    So say we all.
+  "#, env!("CARGO_PKG_VERSION"));
+}
+
 // V2 CTF Exchange contracts (pUSD collateral, EIP-712 domain version "2")
 const EXCHANGE_NORMAL: Address = address!("0xE111180000d2663C0091e4f400237545B87B996B");
 const EXCHANGE_NEG_RISK: Address = address!("0xe2222d279d744050d28e00520010520000310F59");
@@ -94,6 +140,7 @@ async fn main() -> Result<()> {
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
         .init();
     ring::default_provider().install_default().expect("rustls provider");
+    print_banner();
 
     let crypto_filter = env::var("CRYPTO_FILTER").unwrap_or_else(|_| "btc".to_string()).to_lowercase();
     let private_key = env::var(PRIVATE_KEY_VAR).expect("POLYMARKET_PRIVATE_KEY");
