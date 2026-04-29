@@ -134,6 +134,16 @@ pub const MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = MAKER_MIN_HOLD_SECS_BEFORE_STOP;
 pub const MAKER_STOP_LOSS_COOLDOWN_SECS: i64 = 300;
 pub const MAKER_MAX_COMBINED_BID: Decimal = dec!(0.92);
 pub const MAKER_MAX_BOOK_IMBALANCE_RATIO: Decimal = dec!(4.0);
+
+/// Taker-flow / bid-depth drain gate.
+/// Aggressive: only suppress entry when 50%+ of bid depth is consumed in 1.5s —
+/// tolerates partial sweeps to maximize fill opportunities.
+pub const MAKER_TAKER_FLOW_WINDOW_MS: u64 = 1500;
+pub const MAKER_TAKER_FLOW_DRAIN_THRESHOLD: Decimal = dec!(0.50);
+/// Aggressive: only force-exit on a very severe book turn (OBI < -0.65);
+/// accepts more adverse-selection risk in exchange for fewer early exits.
+pub const MAKER_TOXIC_FLOW_EXIT_OBI: Decimal = dec!(-0.65);
+
 pub const MAKER_SLOW_TREND_THRESHOLD_BTC: Decimal = dec!(200.0);
 pub const MAKER_INVENTORY_SKEW_MAX: Decimal = dec!(0.04);
 
