@@ -18,7 +18,12 @@ pub async fn send_notification(token: &str, chat_id: &str, message: &str) -> Res
     }
 
     let url = format!("https://api.telegram.org/bot{}/sendMessage", token);
-    let client = reqwest::Client::new();
+    // 5-second hard timeout prevents a stalled Telegram connection from blocking
+    // the entire trading select! loop (reqwest::Client::new() has no default timeout).
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(5))
+        .build()
+        .unwrap_or_default();
 
     let payload = TelegramMessage {
         chat_id: chat_id.to_string(),

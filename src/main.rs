@@ -214,6 +214,19 @@ async fn main() -> Result<()> {
     let time_decay_positions: Arc<Mutex<HashMap<U256, TimeDecayPosition>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
+    // Cooldown maps live OUTSIDE the market-rotation loop so they persist across market switches.
+    // Previously declared inside the loop which reset them on every hourly market transition,
+    // allowing BasisStrategy to re-enter immediately after a stop-loss via a market switch.
+    let mut last_trade_time: HashMap<String, Instant> = HashMap::new();
+    let mut last_stop_loss_time: HashMap<String, Instant> = HashMap::new();
+    let mut last_expiry_exit_time: HashMap<String, Instant> = HashMap::new();
+
+    // Watchdog: tracks when the inner trading loop last emitted a heartbeat tick.
+    // If the inner loop goes silent for >LOOP_WATCHDOG_SECS, the outer loop logs an
+    // alarm and attempts a forced restart by breaking into a new market iteration.
+    let last_heartbeat_at: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
+    const LOOP_WATCHDOG_SECS: u64 = 180; // alert after 3 min of silence
+
     let (initial_hourly, initial_maker_market) = loop {
         let pair = get_market_pair(&shared_http).await;
         if pair.0.yes_token != U256::ZERO { break pair; }
@@ -383,6 +396,12 @@ async fn main() -> Result<()> {
         let mut status_ticker = interval(std::time::Duration::from_secs(60));
         let mut cleanup_ticker = interval(std::time::Duration::from_secs(300));
         let mut pulse_ticker = interval(std::time::Duration::from_secs(300));
+        // Watchdog ticker: checks every 120s if the strategy ticker has been alive.
+        // If the inner loop goes silent (e.g., blocked on a stalled .await), this breaks
+        // it out so the outer loop can restart with a fresh market context.
+        let mut watchdog_ticker = interval(std::time::Duration::from_secs(120));
+        watchdog_ticker.tick().await; // consume the immediate first tick
+        *last_heartbeat_at.lock().await = Instant::now(); // reset watchdog on market start
 
         let strategies = StrategyRegistry::create_all_strategies();
         let adoption_order = StrategyRegistry::strategy_names();
@@ -408,9 +427,8 @@ async fn main() -> Result<()> {
             ).await;
         }
 
-        let mut last_trade_time: HashMap<String, Instant> = HashMap::new();
-        let mut last_stop_loss_time: HashMap<String, Instant> = HashMap::new();
-        let mut last_expiry_exit_time: HashMap<String, Instant> = HashMap::new(); // 5-min block after expiry exits
+        // last_trade_time / last_stop_loss_time / last_expiry_exit_time are declared above the
+        // outer loop so they survive market switches. Do NOT re-declare them here.
         let mut consecutive_failures: u32 = 0;
         let mut last_executor_summary = String::new(); // change-detection for 📊 INFO tick summary
         let tg_token = env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
@@ -507,6 +525,7 @@ async fn main() -> Result<()> {
                     }
                 }
                 _ = status_ticker.tick() => {
+                    *last_heartbeat_at.lock().await = Instant::now();
                     let (yb, ybd, ya, yad) = *yes_price_rx.borrow();
                     let (nb, nbd, na, nad) = *no_price_rx.borrow();
                     // Compute OBI for heartbeat visibility so thresholds can be tuned empirically.
@@ -525,6 +544,7 @@ async fn main() -> Result<()> {
                 }
                 _ = ticker.tick() => {
                     if market_rx.has_changed().unwrap_or(false) { break; }
+                    *last_heartbeat_at.lock().await = Instant::now();
                     let (yb, ybd, ya, yad) = *yes_price_rx.borrow();
                     let (nb, nbd, na, nad) = *no_price_rx.borrow();
                     if ya == dec!(1) && na == dec!(1) { continue; }
@@ -644,8 +664,16 @@ async fn main() -> Result<()> {
                                         let rem = match cl.balance_allowance(req).await { Ok(r) => Decimal::from_str(&r.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000), Err(_) => return };
                                         if rem >= config::MIN_ORDER_SHARES {
                                             let fill = (rs_m - rem).max(dec!(0)); let pnlc = -((params.price - re_m) * rem.min(rs_m)); *tp.lock().await += pnlc;
-                                            if fill < config::MIN_ORDER_SHARES { warn!("⚠️ PARTIAL EXIT [{}]: FAK filled 0/{:.4} shares — retry on next loop.", sn_async, rs_m); }
-                                            else { warn!("⚠️ PARTIAL EXIT [{}]: sold {:.4}/{:.4} — re-inserting.", sn_async, fill, rs_m); let mut map = ps.lock().await; if !map.contains_key(&(sn_async.clone(), tid)) { map.insert((sn_async.clone(), tid), Position { shares: rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None }); } }
+                                            // FAK filled 0: re-insert the FULL position so the exit retries next heartbeat.
+                                            // Previously this logged and moved on, leaving shares orphaned on-chain — the
+                                            // strategy would believe it was flat and open a new position on top of them.
+                                            if fill < config::MIN_ORDER_SHARES {
+                                                warn!("⚠️ PARTIAL EXIT [{}]: FAK filled 0/{:.4} shares — re-inserting for retry.", sn_async, rs_m);
+                                                let mut map = ps.lock().await;
+                                                if !map.contains_key(&(sn_async.clone(), tid)) {
+                                                    map.insert((sn_async.clone(), tid), Position { shares: rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
+                                                }
+                                            } else { warn!("⚠️ PARTIAL EXIT [{}]: sold {:.4}/{:.4} — re-inserting.", sn_async, fill, rs_m); let mut map = ps.lock().await; if !map.contains_key(&(sn_async.clone(), tid)) { map.insert((sn_async.clone(), tid), Position { shares: rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None }); } }
                                         }
                                     });
                                 }
@@ -677,7 +705,8 @@ async fn main() -> Result<()> {
                                 // After an expiry exit, block re-entry for 5 minutes via a separate map.
                                 if reason.to_lowercase().contains("expir") { last_expiry_exit_time.insert(sn.clone(), Instant::now()); }
                                 last_trade_time.insert(sn.clone(), Instant::now());
-                                let _ = send_notification(&tg_token, &tg_chat_id, &format!("📤 EXIT [{}] {} | bid=${:.4} | reason: {} | Session PnL: ${:.4}", sn, params.market_name, params.price, reason, *total_pnl.lock().await)).await;
+                                // Detached: Telegram latency must never block the trading select! loop.
+                                { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = format!("📤 EXIT [{}] {} | bid=${:.4} | reason: {} | Session PnL: ${:.4}", sn, params.market_name, params.price, reason, *total_pnl.lock().await); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
                             }
 
                             // ════════════════════ ENTRY ════════════════════
@@ -820,7 +849,8 @@ async fn main() -> Result<()> {
                                     }
                                 }
                                 last_trade_time.insert(sn.clone(), Instant::now());
-                                let _ = send_notification(&tg_token, &tg_chat_id, &format!("📥 ENTRY [{}] {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares)).await;
+                                // Detached: Telegram latency must never block the trading select! loop.
+                                { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = format!("📥 ENTRY [{}] {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
                             }
 
                             // ════════════════════ MAKER QUOTE ════════════════════
@@ -866,6 +896,16 @@ async fn main() -> Result<()> {
                             }
                             StrategySignal::NoSignal => {}
                         }
+                    }
+                }
+                _ = watchdog_ticker.tick() => {
+                    // If the strategy ticker hasn't fired in LOOP_WATCHDOG_SECS, the inner loop
+                    // may be stuck on a blocking .await or a stalled tokio task. Force a break so
+                    // the outer loop restarts the trading context with a fresh market.
+                    let elapsed = last_heartbeat_at.lock().await.elapsed().as_secs();
+                    if elapsed > LOOP_WATCHDOG_SECS {
+                        error!("🚨 WATCHDOG: inner loop silent for {}s — forcing restart", elapsed);
+                        break;
                     }
                 }
             }
