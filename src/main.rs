@@ -663,7 +663,17 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                 }
-                                if reason.contains("stop-loss") { last_stop_loss_time.insert(sn.clone(), Instant::now()); }
+                                // Trigger 180s cooldown for any stop-loss variant: BasisSL, Maker SL,
+                                // Time Decay SL, ToxicFill, BasisSkewCollapse. Must match the same
+                                // predicate used in the FAK-miss path above (line ~601) so both the
+                                // successful-exit and the FAK-miss path are consistent.
+                                if reason.to_lowercase().contains("sl")
+                                    || reason.to_lowercase().contains("stop")
+                                    || reason.to_lowercase().contains("toxic")
+                                    || reason.to_lowercase().contains("skewcollapse")
+                                {
+                                    last_stop_loss_time.insert(sn.clone(), Instant::now());
+                                }
                                 // After an expiry exit, block re-entry for 5 minutes via a separate map.
                                 if reason.to_lowercase().contains("expir") { last_expiry_exit_time.insert(sn.clone(), Instant::now()); }
                                 last_trade_time.insert(sn.clone(), Instant::now());
