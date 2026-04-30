@@ -65,9 +65,22 @@ pub async fn run_market_monitor(
         let time_based_upgrade = new_secs_left > cur_secs_left + 1800
             && !(current_is_binary && !candidate_is_binary);
 
+        // Detect the daily-as-substitute case: we're running on a long-lived daily/window market
+        // (used as a fallback during bootstrap when no hourly was published yet) and a real hourly
+        // market has now appeared.  Force an upgrade so MomentumStrategy and other hourly-venue
+        // strategies can participate.  Without this, the time_based_upgrade check would NEVER fire
+        // because the daily's secs_left >> hourly's secs_left, and the bot would stay on the daily
+        // for the entire hour even after the 12PM-ET (or any other) hourly market is listed.
+        let current_is_daily_sub = config::is_daily_market(&cur_name) || config::is_window_market(&cur_name);
+        let candidate_is_hourly = !config::is_daily_market(&candidate.name)
+            && !config::is_window_market(&candidate.name)
+            && !config::is_ultra_short_window_market(&candidate.name);
+        let daily_to_hourly_upgrade = current_is_daily_sub && candidate_is_hourly && new_secs_left > 600;
+
         let should_switch = cur_secs_left < config::FINAL_EXPIRY_WINDOW_SECS
             || cur_secs_left <= 0
             || time_based_upgrade
+            || daily_to_hourly_upgrade
             || (candidate_is_binary && !current_is_binary && !candidate_is_range
                 && new_secs_left > 600 && cur_secs_left > 300);
 

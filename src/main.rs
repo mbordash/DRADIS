@@ -227,10 +227,27 @@ async fn main() -> Result<()> {
     let last_heartbeat_at: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
     const LOOP_WATCHDOG_SECS: u64 = 180; // alert after 3 min of silence
 
+    // Bootstrap: poll until we have a valid hourly market.  After ~90s (3 x 30s retries)
+    // fall back to the daily/maker venue so BasisStrategy and other non-hourly strategies
+    // can start trading immediately.  The market monitor will broadcast a switch to the
+    // real hourly as soon as Polymarket publishes it (hourly markets are sometimes created
+    // 20-30 minutes into the hour, causing the old 90s-flat wait to idle the whole system).
+    let mut bootstrap_attempts = 0u32;
     let (initial_hourly, initial_maker_market) = loop {
-        let pair = get_market_pair(&shared_http).await;
-        if pair.0.yes_token != U256::ZERO { break pair; }
-        tokio::time::sleep(std::time::Duration::from_secs(90)).await;
+        let (hourly, maker) = get_market_pair(&shared_http).await;
+        if hourly.yes_token != U256::ZERO {
+            break (hourly, maker);
+        }
+        bootstrap_attempts += 1;
+        // After 3 attempts (~90s total) use the daily as primary if available.
+        if bootstrap_attempts >= 3 {
+            if let Some(mk) = maker {
+                warn!("⚠️ No hourly market found after {}s — starting on daily venue '{}' until hourly is published. Market monitor will switch when hourly is listed.", bootstrap_attempts * 30, mk.name);
+                break (mk.clone(), Some(mk));
+            }
+        }
+        warn!("⏳ No active hourly market found (attempt {}) — retrying in 30s...", bootstrap_attempts);
+        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     };
 
     let (initial_yes, initial_no, name, close_time) = (
