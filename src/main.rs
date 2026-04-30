@@ -283,7 +283,11 @@ async fn main() -> Result<()> {
         market_tx.clone(),
     ));
 
-    loop {
+    // Label the outer market-rotation loop so inner `continue 'market_loop` can
+    // restart initialization if any CLOB API call times out during setup.
+    // Previously this was an unlabelled `loop {}`, which meant there was no way
+    // to escape a stalled .await without killing the process.
+    'market_loop: loop {
         let (yes_token, no_token, market_name, market_close_time, strike_price, _, maker_market_candidate, condition_id) = market_rx.borrow().clone();
 
         let now = Utc::now();
@@ -292,7 +296,7 @@ async fn main() -> Result<()> {
             if seconds_until_expiry < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY {
                 warn!("⚠️ Market expiring too soon ({}s left)!", seconds_until_expiry);
                 tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                continue;
+                continue 'market_loop;
             }
             info!("⏰ Market closes in {}s", seconds_until_expiry);
         }
@@ -300,9 +304,39 @@ async fn main() -> Result<()> {
         info!("🚀 Starting Orchestrated Trading on market: \"{}\"", market_name);
         let market_started_at = Utc::now();
 
-        let yes_fee_rate = trading_client.fee_rate_bps(yes_token).await.map(|r| r.base_fee).unwrap_or(0);
-        let no_fee_rate = trading_client.fee_rate_bps(no_token).await.map(|r| r.base_fee).unwrap_or(0);
-        let is_neg_risk = trading_client.neg_risk(yes_token).await.map(|r| r.neg_risk).unwrap_or(false);
+        // ── CLOB init queries — each wrapped in a 10s timeout ─────────────────
+        // Root cause of the 2.5-hour heartbeat silence (2026-04-30 16:14–18:54 EDT):
+        // After a market switch the outer loop re-enters here and calls fee_rate_bps /
+        // neg_risk for the new tokens.  If the CLOB API stalls mid-request (no TCP
+        // error, just no response) these .awaits hang forever.  The watchdog lives
+        // inside the INNER loop so it can never fire — the process looks alive (market
+        // monitor still polls) but the trading loop is completely frozen.
+        // Fix: hard 10s timeout on every CLOB query in the init block; on timeout or
+        // API error, sleep 5s and restart the outer loop so we retry initialization.
+        let yes_fee_rate = match tokio::time::timeout(
+            Duration::from_secs(10),
+            trading_client.fee_rate_bps(yes_token),
+        ).await {
+            Ok(Ok(r))  => r.base_fee,
+            Ok(Err(e)) => { warn!("⚠️ fee_rate YES error: {} — retrying init in 5s", e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+            Err(_)     => { warn!("⚠️ fee_rate YES timed out (10s) — retrying init in 5s"); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+        };
+        let no_fee_rate = match tokio::time::timeout(
+            Duration::from_secs(10),
+            trading_client.fee_rate_bps(no_token),
+        ).await {
+            Ok(Ok(r))  => r.base_fee,
+            Ok(Err(e)) => { warn!("⚠️ fee_rate NO error: {} — retrying init in 5s", e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+            Err(_)     => { warn!("⚠️ fee_rate NO timed out (10s) — retrying init in 5s"); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+        };
+        let is_neg_risk = match tokio::time::timeout(
+            Duration::from_secs(10),
+            trading_client.neg_risk(yes_token),
+        ).await {
+            Ok(Ok(r))  => r.neg_risk,
+            Ok(Err(e)) => { warn!("⚠️ neg_risk error: {} — retrying init in 5s", e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+            Err(_)     => { warn!("⚠️ neg_risk timed out (10s) — retrying init in 5s"); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+        };
         let _verifying_contract = if is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
 
         info!("✅ Cached Settings: NegRisk: {} | YES fee {} bps | NO fee {} bps", is_neg_risk, yes_fee_rate, no_fee_rate);
@@ -388,9 +422,32 @@ async fn main() -> Result<()> {
         };
 
         let maker_market_config: Option<MarketConfig> = if let Some(ref mk) = maker_market_candidate {
-            let mk_yes_fee = trading_client.fee_rate_bps(mk.yes_token).await.map(|r| r.base_fee).unwrap_or(0);
-            let mk_no_fee = trading_client.fee_rate_bps(mk.no_token).await.map(|r| r.base_fee).unwrap_or(0);
-            let mk_neg_risk = trading_client.neg_risk(mk.yes_token).await.map(|r| r.neg_risk).unwrap_or(false);
+            // Same timeout guards as the hourly-market queries above — maker market uses
+            // different token IDs so it gets its own CLOB round-trips.
+            let mk_yes_fee = match tokio::time::timeout(
+                Duration::from_secs(10),
+                trading_client.fee_rate_bps(mk.yes_token),
+            ).await {
+                Ok(Ok(r))  => r.base_fee,
+                Ok(Err(e)) => { warn!("⚠️ maker fee_rate YES error: {} — retrying init in 5s", e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+                Err(_)     => { warn!("⚠️ maker fee_rate YES timed out (10s) — retrying init in 5s"); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+            };
+            let mk_no_fee = match tokio::time::timeout(
+                Duration::from_secs(10),
+                trading_client.fee_rate_bps(mk.no_token),
+            ).await {
+                Ok(Ok(r))  => r.base_fee,
+                Ok(Err(e)) => { warn!("⚠️ maker fee_rate NO error: {} — retrying init in 5s", e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+                Err(_)     => { warn!("⚠️ maker fee_rate NO timed out (10s) — retrying init in 5s"); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+            };
+            let mk_neg_risk = match tokio::time::timeout(
+                Duration::from_secs(10),
+                trading_client.neg_risk(mk.yes_token),
+            ).await {
+                Ok(Ok(r))  => r.neg_risk,
+                Ok(Err(e)) => { warn!("⚠️ maker neg_risk error: {} — retrying init in 5s", e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+                Err(_)     => { warn!("⚠️ maker neg_risk timed out (10s) — retrying init in 5s"); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+            };
             info!("✅ Maker market settings: \"{}\" | NegRisk: {} | YES {} bps | NO {} bps",
                 mk.name, mk_neg_risk, mk_yes_fee, mk_no_fee);
             Some(MarketConfig {
@@ -516,7 +573,15 @@ async fn main() -> Result<()> {
                         continue;
                     }
                     info!("🔄 Market switch required — restarting trading loop with new market");
-                    if let Err(e) = trading_client.as_ref().cancel_all_orders().await { warn!("⚠️ Failed to cancel all orders: {}", e); }
+                    // Timeout the cancel so a stalled CLOB response cannot block the switch.
+                    match tokio::time::timeout(
+                        Duration::from_secs(8),
+                        trading_client.as_ref().cancel_all_orders(),
+                    ).await {
+                        Ok(Err(e)) => warn!("⚠️ Failed to cancel all orders: {}", e),
+                        Err(_)     => warn!("⚠️ cancel_all_orders timed out (8s) — proceeding with market switch"),
+                        Ok(Ok(_))  => {}
+                    }
                     { phantom_cooldowns.lock().await.clear(); }
                     { pending_orders.lock().await.clear(); } // Clear pending locks on market switch
                     current_hourly_cid = new_condition_id.clone();

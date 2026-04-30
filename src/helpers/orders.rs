@@ -7,6 +7,7 @@ use anyhow::Result;
 use std::borrow::Cow;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use tokio::time::timeout;
 
 use polymarket_client_sdk_v2::clob::{Client as ClobClient};
 use polymarket_client_sdk_v2::auth::state::Authenticated;
@@ -225,7 +226,23 @@ pub async fn place_limit_order(
                 .post_only(post_only)
                 .build();
 
-            match client.post_order(signed_order).await {
+            // Hard 12-second timeout on the SDK's post_order call.
+            // The SDK's internal reqwest client has no timeout configured, so a TCP-level
+            // stall (e.g. Polymarket API wedged mid-request) will hang forever and freeze
+            // the entire tokio::select! arm body — blocking heartbeat, network pulse, and
+            // watchdog. This timeout ensures the arm always returns within a bounded time.
+            let post_result = timeout(
+                std::time::Duration::from_secs(12),
+                client.post_order(signed_order),
+            ).await;
+            let post_result = match post_result {
+                Err(_elapsed) => {
+                    warn!("⚠️ post_order timed out after 12s (attempt {}) — treating as transient failure", attempt + 1);
+                    return Err(anyhow::anyhow!("Order placement timed out after 12s"));
+                }
+                Ok(r) => r,
+            };
+            match post_result {
                 Ok(_) => {
                     return Ok(());
                 }
