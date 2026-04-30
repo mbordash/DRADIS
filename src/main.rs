@@ -590,7 +590,21 @@ async fn main() -> Result<()> {
                                             let mut map = positions.lock().await; if let Some(p) = map.remove(&pos_key) { if p.fill_confirmed_at.is_some() { *total_pnl.lock().await += (params.price - p.avg_entry) * p.shares; } }
                                             last_trade_time.insert(sn.clone(), Instant::now()); continue;
                                         }
-                                        if !es.contains("no orders found") { consecutive_failures += 1; } continue;
+                                        if es.contains("no orders found") {
+                                            // FAK sell couldn't find buyers at the current ask level.
+                                            // Position stays in the map so the exit re-fires next heartbeat,
+                                            // BUT we impose a full stop-loss cooldown so the strategy cannot
+                                            // flip to a new ENTRY while on-chain shares may still exist.
+                                            // This was the root cause of 49-share position compounding.
+                                            warn!("⚠️ EXIT FAK miss [{}]: no buyers at ${:.4} — holding position, cooldown {}s", sn, params.price, config::STOP_LOSS_COOLDOWN_SECS);
+                                            last_trade_time.insert(sn.clone(), Instant::now());
+                                            if reason.to_lowercase().contains("sl") || reason.to_lowercase().contains("stop") || reason.to_lowercase().contains("toxic") {
+                                                last_stop_loss_time.insert(sn.clone(), Instant::now());
+                                            }
+                                        } else {
+                                            consecutive_failures += 1;
+                                        }
+                                        continue;
                                     }
                                 }
 
@@ -660,6 +674,9 @@ async fn main() -> Result<()> {
                             StrategySignal::Entry { params, pair_params } => {
                                 if let Some(close_time) = market_close_time { if (close_time - Utc::now()).num_seconds() < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY { continue; } }
                                 if let Some(lt) = last_trade_time.get(&sn) { if lt.elapsed() < Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64) { continue; } }
+                                // Block re-entry for STOP_LOSS_COOLDOWN_SECS after any stop-loss (successful or FAK miss).
+                                // Prevents compounding into a token where on-chain shares may still exist.
+                                if let Some(lt) = last_stop_loss_time.get(&sn) { if lt.elapsed() < Duration::from_secs(config::STOP_LOSS_COOLDOWN_SECS) { continue; } }
                                 // 5-minute block after an expiry exit — the market was closing, re-entry is pointless
                                 if let Some(lt) = last_expiry_exit_time.get(&sn) { if lt.elapsed() < Duration::from_secs(300) { continue; } }
 
