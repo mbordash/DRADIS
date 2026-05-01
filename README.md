@@ -6,7 +6,7 @@
 
 ## 🛰️ Tactical Overview
 
-DRADIS is not just a bot; it is a Combat Information Center (CIC) for Polymarket. Built in Rust for maximum concurrency and memory safety, it evaluates the entire "battlespace" every 50ms, coordinating multiple autonomous strategies to defend capital and strike inefficiencies.
+DRADIS is not just a bot; it is a comprehensive trading automation platform for prediction markets like Polymarket. Built in Rust for maximum concurrency and memory safety, it evaluates the selected markets every 50ms, coordinating multiple autonomous strategies to preserve capital and place orders where it sees inefficiencies.
 
 Unlike standard linear scripts, DRADIS uses a Tokio-powered orchestrator to manage telemetry (WebSockets), signal processing (Binance Oracles), and tactical execution across five distinct "Viper" strategy classes. You can also build your own Viper using our [implementation guide](docs/CUSTOM_STRATEGY.md).
 

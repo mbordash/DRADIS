@@ -38,6 +38,11 @@ pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.96);
 pub const MIN_ORDER_SHARES: Decimal = dec!(1.0);
 pub const MIN_ORDER_USDC: Decimal = dec!(1.05);
 
+/// Discount applied to current bid when setting avg_entry for a reconciled orphaned position.
+/// Guarantees profit_margin ≈ 33% on first tick → immediate TakeProfit exit at current market price.
+/// All profiles use the same value — reconciled positions should always exit promptly regardless of style.
+pub const RECONCILE_ADOPTED_ENTRY_DISCOUNT: Decimal = dec!(0.25);
+
 /// Requires 90% book depth before firing — very conservative on thin markets.
 pub const MIN_LIQUIDITY_FILL_RATIO: Decimal = dec!(0.90);
 

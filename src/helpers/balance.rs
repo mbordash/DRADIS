@@ -18,6 +18,8 @@ use polymarket_client_sdk_v2::auth::Normal;
 use polymarket_client_sdk_v2::clob::types::request::{BalanceAllowanceRequest, OrdersRequest};
 use polymarket_client_sdk_v2::clob::types::AssetType;
 
+use crate::helpers::metrics;
+
 pub use crate::state::{Position, PositionMap};
 
 /// Shared map of (strategy:token_id) → Instant for phantom removal cooldowns.
@@ -173,7 +175,30 @@ pub async fn reconcile_orphaned_positions(
 
         if let Some(strategy_name) = adopted_strategy {
             let mut pos_map = positions.lock().await;
-            let avg_entry = token_bids.iter().find(|(tid, _)| *tid == token_id).map(|(_, bid)| *bid).filter(|b| *b > dec!(0)).unwrap_or(dec!(0.50));
+            let current_bid = token_bids.iter().find(|(tid, _)| *tid == token_id)
+                .map(|(_, bid)| *bid)
+                .filter(|b| *b > dec!(0))
+                .unwrap_or(dec!(0.50));
+
+            // Try to recover the real entry price from the entry log written at order time.
+            // This is the authoritative source — the bot writes a row to {crypto}-entries_{date}.csv
+            // immediately after each successful place_limit_order, so if the bot crashed mid-session
+            // the entry is still on disk. Use the most recent matching record for this token_id.
+            //
+            // If no log entry exists (e.g. entry predates this feature, or logs dir was wiped),
+            // fall back to discounting the current bid so the position exits promptly.
+            let avg_entry = match metrics::lookup_entry_price_from_csv(&token_id.to_string()).await {
+                Some(real_entry) => {
+                    warn!("🔁 RECONCILE: Recovered real entry_price {:.4} for token {} from entry log", real_entry, token_id);
+                    real_entry
+                }
+                None => {
+                    // No log found — credit an artificial entry below current bid so profit_margin
+                    // is immediately above every strategy's take-profit threshold on the next tick.
+                    current_bid * (dec!(1) - crate::config::RECONCILE_ADOPTED_ENTRY_DISCOUNT)
+                }
+            };
+
             pos_map.insert((strategy_name.to_string(), token_id), Position {
                 shares: actual_shares,
                 avg_entry,
@@ -184,7 +209,8 @@ pub async fn reconcile_orphaned_positions(
                 fill_confirmed_at: Some(Utc::now()),
                 paired_leg_token_id: None
             });
-            warn!("🔁 RECONCILE: Adopted {} {} shares for token {} under [{}]", actual_shares, side_label, token_id, strategy_name);
+            warn!("🔁 RECONCILE: Adopted {} {} shares for token {} under [{}] — avg_entry={:.4} (bid={:.4})",
+                actual_shares, side_label, token_id, strategy_name, avg_entry, current_bid);
         }
     }
 }
