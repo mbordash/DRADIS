@@ -114,8 +114,8 @@ fn train_model(snapshots: Vec<MarketSnapshot>) -> Result<PerpetualBooster> {
 
     let mut booster = PerpetualBooster::default()
         .set_objective(Objective::LogLoss)
-        .set_budget(config::GBOOST_BUDGET)
-        .set_num_threads(Some(config::GBOOST_NUM_THREADS))
+        .set_budget(config::GBOOST_BUDGET as f32)
+        .set_num_threads(Some(config::GBOOST_NUM_THREADS as usize))
         .set_log_iterations(0)  // silent: suppress perpetual's stdout logging
         .set_max_bin(63);       // 63 bins is fast and sufficient for these features
 
