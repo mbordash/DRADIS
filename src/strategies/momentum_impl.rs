@@ -255,7 +255,8 @@ impl Strategy for MomentumStrategyImpl {
             if let Some(close_time) = ctx.market.market_close_time {
                 let secs_left = (close_time - chrono::Utc::now()).num_seconds();
                 if secs_left <= config::MOMENTUM_EXPIRY_EXIT_SECS && profit_margin < config::MOMENTUM_EXPIRY_MIN_PROFIT_TO_HOLD {
-                    return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone() }, reason: "NearExpiry".to_string(), exit_pair: false });
+                    let reason = format!("NearExpiry: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100));
+                    return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone() }, reason, exit_pair: false });
                 }
             }
 
@@ -264,23 +265,27 @@ impl Strategy for MomentumStrategyImpl {
             let reversal_threshold = -(threshold * config::MOMENTUM_REVERSAL_RATIO);
 
             if profit_margin >= target || bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
-                return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone() }, reason: "TakeProfit".to_string(), exit_pair: false });
+                let reason = format!("MomentumTP: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100));
+                return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone() }, reason, exit_pair: false });
             }
 
             if profit_margin <= stop_loss {
-                return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone() }, reason: "StopLoss".to_string(), exit_pair: false });
+                let reason = format!("MomentumSL: bid=${:.4}, loss={:.2}%", bid, profit_margin * dec!(100));
+                return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone() }, reason, exit_pair: false });
             }
 
             // Momentum Decay exit
             let decay_min = threshold * config::MOMENTUM_DECAY_EXIT_FRACTION;
             let is_yes = token_id == &ctx.market.yes_token;
             if profit_margin > dec!(0) && ((is_yes && velocity_1s < decay_min) || (!is_yes && velocity_1s > -decay_min)) {
-                return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone() }, reason: "MomentumDecay".to_string(), exit_pair: false });
+                let reason = format!("MomentumDecay: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100));
+                return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone() }, reason, exit_pair: false });
             }
 
             // Reversal exit
             if secs_held >= config::MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL && ((is_yes && velocity < reversal_threshold) || (!is_yes && velocity > -reversal_threshold)) {
-                return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone() }, reason: "Reversal".to_string(), exit_pair: false });
+                let reason = format!("MomentumReversal: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100));
+                return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone() }, reason, exit_pair: false });
             }
         }
         Ok(StrategySignal::NoSignal)
@@ -288,6 +293,9 @@ impl Strategy for MomentumStrategyImpl {
 
     fn status(&self) -> StrategyStatus { StrategyStatus::Active }
     fn name(&self) -> String { "MomentumStrategy".to_string() }
+    fn venue(&self) -> &'static str { "Hourly" }
+    fn max_exposure(&self) -> rust_decimal::Decimal { crate::config::MOMENTUM_MAX_EXPOSURE_USDC }
+    fn risk_model(&self) -> &'static str { "Gross one-sided" }
 }
 
 pub fn kelly_momentum_size(velocity: rust_decimal::Decimal, threshold: rust_decimal::Decimal) -> rust_decimal::Decimal {

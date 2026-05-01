@@ -170,6 +170,9 @@ impl Strategy for TimeDecayStrategyImpl {
 
     fn status(&self) -> StrategyStatus { StrategyStatus::Active }
     fn name(&self) -> String { "TimeDecayStrategy".to_string() }
+    fn venue(&self) -> &'static str { "Window/Daily" }
+    fn max_exposure(&self) -> rust_decimal::Decimal { crate::config::TIME_DECAY_MAX_EXPOSURE_USDC }
+    fn risk_model(&self) -> &'static str { "Gross hedged (per leg)" }
 }
 
 pub struct TimeDecayStrategy;

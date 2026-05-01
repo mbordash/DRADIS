@@ -191,6 +191,28 @@ pub const BASIS_KELLY_MAX_MULTIPLIER: Decimal = dec!(4.0);
 pub const BASIS_MAX_TAKER_FEE_BPS: u32 = 200;
 pub const BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 30;
 pub const BASIS_FUNDING_POLL_SECS: u64 = 60;
+pub const BASIS_MIN_STOP_LOSS_EXIT_BID: Decimal = dec!(0.005);
+
+
+// ============================================================================
+// GBOOST STRATEGY PARAMETERS
+// ============================================================================
+
+pub const ENABLE_GBOOST_TRADING: bool = true;
+pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 180; // 3 minutes
+pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(50.0);
+pub const GBOOST_LOOKAHEAD_TICKS: usize = 5; // 250ms (5 * 50ms orchestrator tick)
+pub const GBOOST_RETRAIN_EVERY_N: usize = 100; // Retrain every 5 seconds (100 * 50ms)
+pub const GBOOST_MIN_TRAINING_SAMPLES: usize = 200;
+pub const GBOOST_MODEL_PATH: &str = "/tmp/gboost_model.json";
+pub const GBOOST_HISTORY_BUFFER_SIZE: usize = 1000;
+pub const GBOOST_BUDGET: u32 = 1000; // Higher budget for more complex models
+pub const GBOOST_NUM_THREADS: u32 = 0; // Use all available CPU cores
+pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.60); // Lower threshold for more entries
+pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.45); // Earlier exits on signal reversal
+pub const GBOOST_TARGET_PROFIT_PERCENT: Decimal = dec!(0.20); // Higher target profit
+pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.15); // Looser stop loss
+pub const GBOOST_MIN_HOLD_SECS: i64 = 10; // Shorter minimum hold time
 
 
 // ============================================================================
@@ -280,6 +302,194 @@ pub fn periodic_sync_interval() -> StdDuration {
 
 pub fn main_ticker_interval() -> StdDuration {
     StdDuration::from_millis(50)
+}
+
+
+// ============================================================================
+// MONITORING AND LOGGING INTERVALS
+// ============================================================================
+
+pub fn status_log_interval() -> StdDuration {
+    StdDuration::from_secs(60)
+}
+
+
+// ============================================================================
+// WEBSOCKET AND CONNECTION TIMEOUTS
+// ============================================================================
+
+pub fn http_timeout() -> StdDuration {
+    StdDuration::from_secs(20)
+}
+
+pub fn tcp_keepalive() -> StdDuration {
+    StdDuration::from_secs(30)
+}
+
+
+// ============================================================================
+// RISK MANAGEMENT THRESHOLDS
+// ============================================================================
+
+pub const MIN_MARKET_VOLUME: f64 = 0.0;
+pub const MAX_EXPOSURE_PER_TOKEN_USDC: Decimal = dec!(30);
+
+pub const MOMENTUM_MAX_EXPOSURE_USDC: Decimal = dec!(30);
+pub const MAKER_MAX_EXPOSURE_USDC: Decimal = dec!(25);
+pub const ARBITRAGE_MAX_EXPOSURE_USDC: Decimal = dec!(75);
+pub const TIME_DECAY_MAX_EXPOSURE_USDC: Decimal = dec!(80);
+pub const BASIS_MAX_EXPOSURE_USDC: Decimal = dec!(30);
+
+/// Session drawdown limit: 6% of collateral with $15 minimum.
+/// Higher than balanced/conservative — allows more recovery room before lockout.
+pub fn max_session_drawdown(collateral: Decimal) -> Decimal {
+    (collateral * dec!(0.06)).max(dec!(15.00))
+}
+
+
+// ============================================================================
+// API ENDPOINTS AND URLS
+// ============================================================================
+
+pub const CLOB_API_BASE: &str = "https://clob.polymarket.com";
+
+
+// ============================================================================
+// MARKET FILTERING CRITERIA
+// ============================================================================
+
+pub const GAMMA_API_MARKET_SCAN_PAGES: usize = 30;
+
+pub fn is_bad_market(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("presidential") || n.contains("nomination") || n.contains("election") ||
+        n.contains("democratic") || n.contains("republican") ||
+        n.contains("masters") || n.contains("tournament") || n.contains("spieth") || n.contains("jordan") ||
+        n.contains("5-minute") || n.contains("5 minute") || n.contains("5m")
+}
+
+pub fn is_long_term_2026(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("2026") && (n.contains("win the") || n.contains("finals") || n.contains("cup") || n.contains("stanley"))
+}
+
+pub fn is_range_market(name: &str) -> bool {
+    let n = name.to_lowercase();
+    (n.contains("between") && n.contains("and $")) ||
+    (n.contains("price of") && n.contains("between")) ||
+    (n.contains("will") && (n.contains("above $") || n.contains("below $")) && !n.contains("up or down"))
+}
+
+pub fn is_hourly_crypto_market(name: &str) -> bool {
+    let n = name.to_lowercase();
+    is_crypto_market(&n) && (
+        n.contains("up or down") ||
+            n.contains("hour") ||
+            n.contains("et") ||
+            n.contains("pm et") ||
+            n.contains("am et")
+    )
+}
+
+pub fn is_high_priority_text(s: &str) -> bool {
+    let n = s.to_lowercase();
+    n.contains("up or down") ||
+        n.contains("5 minutes") ||
+        n.contains("5m") ||
+        n.contains("updown") ||
+        n.contains("next 5") ||
+        n.contains("next hour")
+}
+
+pub fn is_crypto_market(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("btc") || n.contains("bitcoin") ||
+        n.contains("eth") || n.contains("ethereum") ||
+        n.contains("sol") || n.contains("solana")
+}
+
+pub fn is_ultra_short_window_market(name: &str) -> bool {
+    let n = name.to_lowercase();
+
+    if n.contains("15 minutes") || n.contains("15 minute") {
+        return true;
+    }
+
+    if let Some(window_mins) = parse_window_duration_minutes(name) {
+        return window_mins <= 30;
+    }
+
+    false
+}
+
+pub fn parse_window_duration_minutes(name: &str) -> Option<u32> {
+    let n = name.to_lowercase();
+    if !n.contains(" et") { return None; }
+
+    let et_pos = n.find(" et")?;
+    let segment = &n[..et_pos];
+
+    let dash_pos = segment.rfind('-')?;
+    let end_part = segment[dash_pos + 1..].trim();
+    let start_part = {
+        let before_dash = &segment[..dash_pos];
+        let space_pos = before_dash.rfind(' ').unwrap_or(0);
+        before_dash[space_pos..].trim()
+    };
+
+    fn parse_minutes(s: &str) -> Option<u32> {
+        let s = s.trim();
+        let is_pm = s.ends_with("pm");
+        let is_am = s.ends_with("am");
+        if !is_pm && !is_am { return None; }
+        let time_part = &s[..s.len() - 2];
+        let colon = time_part.find(':')?;
+        let h: u32 = time_part[..colon].parse().ok()?;
+        let m: u32 = time_part[colon + 1..].parse().ok()?;
+        let mut total = h * 60 + m;
+        if is_pm && h != 12 { total += 720; }
+        if is_am && h == 12 { total = m; }
+        Some(total)
+    }
+
+    let start_mins = parse_minutes(start_part)?;
+    let end_mins = parse_minutes(end_part)?;
+    let duration = if end_mins >= start_mins { end_mins - start_mins } else { end_mins + 1440 - start_mins };
+    Some(duration)
+}
+
+pub fn is_window_market(name: &str) -> bool {
+    if let Some(mins) = parse_window_duration_minutes(name) {
+        mins > 30
+    } else {
+        false
+    }
+}
+
+pub fn is_daily_market(name: &str) -> bool {
+    let n = name.to_lowercase();
+    n.contains("up or down") && n.contains(" on ") && !n.contains(" et")
+}
+
+
+// ============================================================================
+// SLEEP AND RETRY DURATIONS
+// ============================================================================
+
+pub fn retry_sleep_duration() -> StdDuration {
+    StdDuration::from_secs(5)
+}
+
+pub fn startup_delay() -> StdDuration {
+    StdDuration::from_secs(10)
+}
+
+pub fn connector_init_delay() -> StdDuration {
+    StdDuration::from_secs(10)
+}
+
+pub fn order_execution_delay() -> StdDuration {
+    StdDuration::from_millis(200)
 }
 
 

@@ -176,6 +176,29 @@ pub const BASIS_KELLY_MAX_MULTIPLIER: Decimal = dec!(3.0);
 pub const BASIS_MAX_TAKER_FEE_BPS: u32 = 200;
 pub const BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 30;
 pub const BASIS_FUNDING_POLL_SECS: u64 = 60;
+pub const BASIS_MIN_STOP_LOSS_EXIT_BID: Decimal = dec!(0.005);
+
+
+
+// ============================================================================
+// GBOOST STRATEGY PARAMETERS
+// ============================================================================
+
+pub const ENABLE_GBOOST_TRADING: bool = true;
+pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300; // 5 minutes
+pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(25.0);
+pub const GBOOST_LOOKAHEAD_TICKS: usize = 10; // 500ms (10 * 50ms orchestrator tick)
+pub const GBOOST_RETRAIN_EVERY_N: usize = 200; // Retrain every 10 seconds (200 * 50ms)
+pub const GBOOST_MIN_TRAINING_SAMPLES: usize = 300;
+pub const GBOOST_MODEL_PATH: &str = "/tmp/gboost_model.json";
+pub const GBOOST_HISTORY_BUFFER_SIZE: usize = 1500;
+pub const GBOOST_BUDGET: u32 = 500; // Moderate budget
+pub const GBOOST_NUM_THREADS: u32 = 0; // Use all available CPU cores
+pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.65); // Higher threshold for fewer, more confident entries
+pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.40); // Moderate exits on signal reversal
+pub const GBOOST_TARGET_PROFIT_PERCENT: Decimal = dec!(0.10); // Moderate target profit
+pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.10); // Moderate stop loss
+pub const GBOOST_MIN_HOLD_SECS: i64 = 30; // Moderate minimum hold time
 
 
 // ============================================================================

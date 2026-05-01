@@ -239,6 +239,16 @@ impl Strategy for BasisStrategyImpl {
             if profit_margin <= -config::BASIS_STOP_LOSS_PERCENT
                 && secs_held >= config::BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS
             {
+                // EMERGENCY FIX: If the bid is too low, assume FAK will miss and defer exit.
+                // This prevents repeated exit attempts at unfillable prices, which causes log floods.
+                if position_bid < config::BASIS_MIN_STOP_LOSS_EXIT_BID {
+                    tracing::warn!(
+                        "⏭️  BasisSL skipped (bid {:.4} < floor {:.4}): assuming FAK miss, holding position.",
+                        position_bid, config::BASIS_MIN_STOP_LOSS_EXIT_BID
+                    );
+                    return Ok(StrategySignal::NoSignal);
+                }
+
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
                         token_id: *token_id,
@@ -306,6 +316,9 @@ impl Strategy for BasisStrategyImpl {
 
     fn status(&self) -> StrategyStatus { StrategyStatus::Active }
     fn name(&self) -> String { "BasisStrategy".to_string() }
+    fn venue(&self) -> &'static str { "Window/Daily" }
+    fn max_exposure(&self) -> rust_decimal::Decimal { crate::config::BASIS_MAX_EXPOSURE_USDC }
+    fn risk_model(&self) -> &'static str { "Gross one-sided" }
 }
 
 pub fn basis_trade_size(skew_abs: Decimal) -> Decimal {

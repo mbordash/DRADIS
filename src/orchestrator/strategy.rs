@@ -57,4 +57,16 @@ pub trait Strategy: Send + Sync {
 
     /// Strategy name for logging and identification.
     fn name(&self) -> String;
+
+    /// Venue label shown in the startup attachment log (e.g. "Hourly", "Window/Daily").
+    /// Default: "Hourly"
+    fn venue(&self) -> &'static str { "Hourly" }
+
+    /// Maximum USDC exposure budget for this strategy.
+    /// Default: 0 (override in each strategy impl)
+    fn max_exposure(&self) -> Decimal { Decimal::ZERO }
+
+    /// Risk model label shown in the startup attachment log.
+    /// Default: "Unknown"
+    fn risk_model(&self) -> &'static str { "Unknown" }
 }

@@ -39,6 +39,7 @@ pub const MIN_ORDER_SHARES: Decimal = dec!(1.0);
 pub const MIN_ORDER_USDC: Decimal = dec!(1.05);
 
 /// Discount applied to current bid when setting avg_entry for a reconciled orphaned position.
+/// Discount applied to current bid when setting avg_entry for a reconciled orphaned position.
 /// Guarantees profit_margin ≈ 33% on first tick → immediate TakeProfit exit at current market price.
 /// All profiles use the same value — reconciled positions should always exit promptly regardless of style.
 pub const RECONCILE_ADOPTED_ENTRY_DISCOUNT: Decimal = dec!(0.25);
@@ -204,6 +205,28 @@ pub const BASIS_KELLY_MAX_MULTIPLIER: Decimal = dec!(2.0);
 pub const BASIS_MAX_TAKER_FEE_BPS: u32 = 100;
 pub const BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 60;
 pub const BASIS_FUNDING_POLL_SECS: u64 = 60;
+pub const BASIS_MIN_STOP_LOSS_EXIT_BID: Decimal = dec!(0.005);
+
+
+// ============================================================================
+// GBOOST STRATEGY PARAMETERS
+// ============================================================================
+
+pub const ENABLE_GBOOST_TRADING: bool = false; // Disabled by default in conservative
+pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 600; // 10 minutes
+pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(10.0);
+pub const GBOOST_LOOKAHEAD_TICKS: usize = 20; // 1 second (20 * 50ms orchestrator tick)
+pub const GBOOST_RETRAIN_EVERY_N: usize = 400; // Retrain every 20 seconds (400 * 50ms)
+pub const GBOOST_MIN_TRAINING_SAMPLES: usize = 500;
+pub const GBOOST_MODEL_PATH: &str = "/tmp/gboost_model.json";
+pub const GBOOST_HISTORY_BUFFER_SIZE: usize = 2000;
+pub const GBOOST_BUDGET: u32 = 200; // Lower budget for simpler models
+pub const GBOOST_NUM_THREADS: u32 = 0; // Use all available CPU cores
+pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.70); // Very high threshold for only strongest signals
+pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.35); // Aggressive exits on signal reversal
+pub const GBOOST_TARGET_PROFIT_PERCENT: Decimal = dec!(0.08); // Lower target profit
+pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.08); // Tighter stop loss
+pub const GBOOST_MIN_HOLD_SECS: i64 = 60; // Longer minimum hold time
 
 
 // ============================================================================
@@ -485,4 +508,3 @@ pub fn connector_init_delay() -> StdDuration {
 pub fn order_execution_delay() -> StdDuration {
     StdDuration::from_millis(500)
 }
-

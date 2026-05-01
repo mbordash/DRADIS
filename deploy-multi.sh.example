@@ -41,6 +41,7 @@ scp -P "$SSH_PORT" -i "$KEY" src/strategies/arbitrage_impl.rs "$USER@$HOST:$REMO
 scp -P "$SSH_PORT" -i "$KEY" src/strategies/time_decay_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/time_decay_impl.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/strategies/maker_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/maker_impl.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/strategies/basis_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/basis_impl.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/strategies/gboost_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/gboost_impl.rs"
 
 # Copy orchestrator modules
 scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/mod.rs "$USER@$HOST:$REMOTE_DIR/src/orchestrator/mod.rs"

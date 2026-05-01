@@ -512,55 +512,24 @@ async fn main() -> Result<()> {
         info!("🧭 Strategy venue attachments:");
         for strategy in &strategies {
             let sn = strategy.name();
-            let (venue, market_name_attached, budget, risk_model) = match sn.as_str() {
-                "MomentumStrategy" => (
-                    "Hourly",
-                    market_name.clone(),
-                    config::MOMENTUM_MAX_EXPOSURE_USDC,
-                    "Gross one-sided",
-                ),
-                "MakerStrategy" => {
-                    let attached_name = maker_market_config
-                        .as_ref()
-                        .map(|m| m.market_name.clone())
-                        .unwrap_or_else(|| market_name.clone());
-                    let venue_name = if maker_market_config.is_some() { "Window/Daily" } else { "Hourly (fallback)" };
-                    (venue_name, attached_name, config::MAKER_MAX_EXPOSURE_USDC, "Net |YES-NO|")
-                }
-                "ArbitrageStrategy" => {
-                    let attached_name = maker_market_config
-                        .as_ref()
-                        .map(|m| m.market_name.clone())
-                        .unwrap_or_else(|| market_name.clone());
-                    let venue_name = if maker_market_config.is_some() { "Window/Daily" } else { "Hourly (fallback)" };
-                    (venue_name, attached_name, config::ARBITRAGE_MAX_EXPOSURE_USDC, "Gross hedged (per leg)")
-                }
-                "TimeDecayStrategy" => {
-                    let attached_name = maker_market_config
-                        .as_ref()
-                        .map(|m| m.market_name.clone())
-                        .unwrap_or_else(|| market_name.clone());
-                    let venue_name = if maker_market_config.is_some() { "Window/Daily" } else { "Hourly (fallback)" };
-                    (venue_name, attached_name, config::TIME_DECAY_MAX_EXPOSURE_USDC, "Gross hedged (per leg)")
-                }
-                "BasisStrategy" => {
-                    let attached_name = maker_market_config
-                        .as_ref()
-                        .map(|m| m.market_name.clone())
-                        .unwrap_or_else(|| market_name.clone());
-                    let venue_name = if maker_market_config.is_some() { "Window/Daily" } else { "Hourly (fallback)" };
-                    (venue_name, attached_name, config::BASIS_MAX_EXPOSURE_USDC, "Gross one-sided")
-                }
-                _ => ("Unknown", market_name.clone(), dec!(0), "Unknown"),
+            // Strategies that prefer the maker venue attach to it when configured,
+            // falling back to the hourly market name if no maker market is loaded.
+            let venue = strategy.venue();
+            let market_name_attached = if venue == "Hourly" {
+                market_name.clone()
+            } else {
+                maker_market_config
+                    .as_ref()
+                    .map(|m| m.market_name.clone())
+                    .unwrap_or_else(|| market_name.clone())
             };
-
             info!(
                 "  - {} => venue={} | market=\"{}\" | budget=${} | risk={}",
                 sn,
                 venue,
                 market_name_attached,
-                budget,
-                risk_model,
+                strategy.max_exposure(),
+                strategy.risk_model(),
             );
         }
 
@@ -616,12 +585,21 @@ async fn main() -> Result<()> {
                     info!("💓 Heartbeat | Ask Sum ${:.4} (Y ask ${:.2} / N ask ${:.2}) | Bid Sum ${:.4} (Y bid ${:.2} / N bid ${:.2}) | Binance: ${:.2} | OBI Y={:.2} N={:.2}",
                         ya + na, ya, na, yb + nb, yb, nb, *oracle_rx.borrow(), yes_obi, no_obi);
                     // Refresh live pUSD balance so strategies can self-gate on insufficient funds.
+                    // Root cause of the overnight freeze (2026-05-01): this balance_allowance call
+                    // had no timeout. When the CLOB API stalled mid-request (the status_ticker arm
+                    // had just logged 💓 Heartbeat and then hit this .await), the entire select loop
+                    // blocked — including the watchdog_ticker — and the bot went silent for 8+ hours.
+                    // Fix: hard 10s timeout; on stall, skip the balance update for this tick.
                     let mut bal_req = BalanceAllowanceRequest::default();
                     bal_req.asset_type = AssetType::Collateral;
-                    if let Ok(resp) = trading_client.balance_allowance(bal_req).await {
-                        let bal = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
-                        *live_collateral.lock().await = bal;
-                        debug!("💰 Live pUSD balance: ${:.4}", bal);
+                    match tokio::time::timeout(Duration::from_secs(10), trading_client.balance_allowance(bal_req)).await {
+                        Ok(Ok(resp)) => {
+                            let bal = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
+                            *live_collateral.lock().await = bal;
+                            debug!("💰 Live pUSD balance: ${:.4}", bal);
+                        }
+                        Ok(Err(e)) => warn!("⚠️ balance_allowance error in status ticker: {}", e),
+                        Err(_) => warn!("⚠️ balance_allowance timed out (10s) in status ticker — skipping balance update this tick"),
                     }
                 }
                 _ = ticker.tick() => {
@@ -681,7 +659,7 @@ async fn main() -> Result<()> {
                                 let pos_key = (sn.clone(), tid);
                                 let shares = { let map = positions.lock().await; match map.get(&pos_key) { Some(p) => p.shares, None => continue } };
                                 if shares < config::MIN_ORDER_SHARES || params.price <= dec!(0) {
-                                    let mut map = positions.lock().await; if let Some(p) = map.remove(&pos_key) { *total_pnl.lock().await += (params.price - p.avg_entry) * p.shares; } continue;
+                                    let mut map = positions.lock().await; if let Some(p) = map.remove(&pos_key) { let aep = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); *total_pnl.lock().await += (aep - p.avg_entry) * p.shares; } continue;
                                 }
                                 info!("📤 EXIT [{}]: {} | shares={:.2}, bid=${:.4} | {}", sn, params.market_name, shares, params.price, reason);
                                 let vc = if params.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
@@ -689,7 +667,7 @@ async fn main() -> Result<()> {
                                     if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, tid, Side::Sell, shares, (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), params.fee_bps, OrderType::FAK, false, 0, &shared_http).await {
                                         let es = e.to_string();
                                         if es.contains("not enough balance") || es.contains("balance: 0") || es.contains("invalid price") {
-                                            let mut map = positions.lock().await; if let Some(p) = map.remove(&pos_key) { if p.fill_confirmed_at.is_some() { *total_pnl.lock().await += (params.price - p.avg_entry) * p.shares; } }
+                                            let mut map = positions.lock().await; if let Some(p) = map.remove(&pos_key) { if p.fill_confirmed_at.is_some() { let aep3 = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); *total_pnl.lock().await += (aep3 - p.avg_entry) * p.shares; } }
                                             last_trade_time.insert(sn.clone(), Instant::now()); continue;
                                         }
                                         if es.contains("no orders found") {
@@ -718,7 +696,9 @@ async fn main() -> Result<()> {
                                 {
                                     let mut map = positions.lock().await;
                                     if let Some(p) = map.remove(&pos_key) {
-                                        let pnl = (params.price - p.avg_entry) * p.shares;
+                                        // Use actual sell price (bid - sell offset) for PnL to match real proceeds.
+                                        let actual_exit_price = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
+                                        let pnl = (actual_exit_price - p.avg_entry) * p.shares;
                                         *total_pnl.lock().await += pnl;
                                         info!("💰 Position closed [{}]: PnL ${:.4}", sn, pnl);
 
@@ -731,7 +711,7 @@ async fn main() -> Result<()> {
                                         let sn_task = sn.clone();
                                         let m_name = params.market_name.clone();
                                         let sid = if tid == yes_token { "YES".to_string() } else { "NO".to_string() };
-                                        let rp = params.price;
+                                        let rp = actual_exit_price;
                                         let r_m = reason.clone();
                                         tokio::spawn(async move { metrics::record_trade(sn_task, m_name, sid, re_m, rp, rs_m, pnl_m, r_m).await; });
                                     } else { continue; }
@@ -745,7 +725,7 @@ async fn main() -> Result<()> {
                                         let mut req = BalanceAllowanceRequest::default(); req.asset_type = AssetType::Conditional; req.token_id = Some(tid);
                                         let rem = match cl.balance_allowance(req).await { Ok(r) => Decimal::from_str(&r.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000), Err(_) => return };
                                         if rem >= config::MIN_ORDER_SHARES {
-                                            let fill = (rs_m - rem).max(dec!(0)); let pnlc = -((params.price - re_m) * rem.min(rs_m)); *tp.lock().await += pnlc;
+                                            let fill = (rs_m - rem).max(dec!(0)); let aep2 = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnlc = -((aep2 - re_m) * rem.min(rs_m)); *tp.lock().await += pnlc;
                                             // FAK filled 0: re-insert the FULL position so the exit retries next heartbeat.
                                             // Previously this logged and moved on, leaving shares orphaned on-chain — the
                                             // strategy would believe it was flat and open a new position on top of them.
@@ -767,8 +747,8 @@ async fn main() -> Result<()> {
                                         let other_fee_bps = if other_tid == yes_token { yes_fee_rate as u16 } else { no_fee_rate as u16 };
                                         let other_vc = if is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                         if !config::GHOST_MODE { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, other_tid, Side::Sell, s, (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), other_fee_bps, OrderType::FAK, false, 0, &shared_http).await; }
-                                        let mut map = positions.lock().await; if let Some(p) = map.remove(&pk) { let pnl = (other_bid - p.avg_entry) * p.shares; *total_pnl.lock().await += pnl;
-                                            let sn_pm = sn.clone(); let m_name = params.market_name.clone(); let sid = if other_tid == yes_token { "YES".to_string() } else { "NO".to_string() }; let p_avg = p.avg_entry; let o_bid = other_bid; let p_shares = p.shares; let pn = pnl;
+                                        let mut map = positions.lock().await; if let Some(p) = map.remove(&pk) { let actual_other_exit = (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnl = (actual_other_exit - p.avg_entry) * p.shares; *total_pnl.lock().await += pnl;
+                                            let sn_pm = sn.clone(); let m_name = params.market_name.clone(); let sid = if other_tid == yes_token { "YES".to_string() } else { "NO".to_string() }; let p_avg = p.avg_entry; let o_bid = actual_other_exit; let p_shares = p.shares; let pn = pnl;
                                             tokio::spawn(async move { metrics::record_trade(sn_pm, m_name, sid, p_avg, o_bid, p_shares, pn, "Convergence/PairedExit".to_string()).await; });
                                         }
                                     }
@@ -820,7 +800,10 @@ async fn main() -> Result<()> {
                                         .filter(|mk| params.token_id == mk.yes_token || params.token_id == mk.no_token)
                                         .and_then(|mk| mk.market_close_time)
                                         .or(market_close_time);
-                                    map.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: params.price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: params.token_id, fill_confirmed_at: None, paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id) });
+                                    // Store the actual fill price (signal price + buy offset) as avg_entry
+                                    // so PnL calculations reflect true cost basis, not the signal price.
+                                    let actual_entry_price = (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE);
+                                    map.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: params.token_id, fill_confirmed_at: None, paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id) });
                                 }
 
                                 // Set pending lock for 3 seconds
@@ -843,7 +826,7 @@ async fn main() -> Result<()> {
                                 let cl_s = Arc::clone(&trading_client); let ps_s = Arc::clone(&positions); let pc_s = Arc::clone(&phantom_cooldowns); let sn_s = sn.clone(); let tn_s = params.token_id;
                                 tokio::spawn(async move { let _ = sync_position_balance(&cl_s, &ps_s, &sn_s, tn_s, Some(&pc_s), dec!(0), dradis::helpers::balance::MAX_WAIT_SECS_HOURLY).await; });
                                 // Persist entry to disk so reconcile can recover the real cost basis after a restart.
-                                { let sn_e = sn.clone(); let tid_e = params.token_id.to_string(); let mn_e = params.market_name.clone(); let side_e = if params.token_id == yes_token { "YES" } else { "NO" }.to_string(); let ep_e = params.price; let sh_e = params.shares; tokio::spawn(async move { metrics::record_entry(sn_e, tid_e, mn_e, side_e, ep_e, sh_e).await; }); }
+                                { let sn_e = sn.clone(); let tid_e = params.token_id.to_string(); let mn_e = params.market_name.clone(); let side_e = if params.token_id == yes_token { "YES" } else { "NO" }.to_string(); let ep_e = (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE); let sh_e = params.shares; tokio::spawn(async move { metrics::record_entry(sn_e, tid_e, mn_e, side_e, ep_e, sh_e).await; }); }
 
                                 if let Some(pp) = pair_params {
                                     let vc_p = if pp.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
@@ -962,7 +945,14 @@ async fn main() -> Result<()> {
                                             pending_orders.lock().await.insert(pk.clone(), Instant::now() + Duration::from_secs(3));
                                         }
 
-                                        let _ = dradis::helpers::balance::quick_confirm_fill(&trading_client, &sn, p.token_id, &positions, &p.condition_id).await;
+                                        // Wrap quick_confirm_fill in a timeout: it calls cancel_market_orders
+                                        // and check_for_resting_order (both CLOB API calls with no internal
+                                        // timeout). If either stalls, the entire select loop freezes here —
+                                        // same root cause as the status_ticker balance_allowance freeze.
+                                        let _ = tokio::time::timeout(
+                                            Duration::from_secs(10),
+                                            dradis::helpers::balance::quick_confirm_fill(&trading_client, &sn, p.token_id, &positions, &p.condition_id),
+                                        ).await;
                                         let vc = if p.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                         if !config::GHOST_MODE {
                                             if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, p.token_id, Side::Buy, p.shares, p.price, p.fee_bps, OrderType::GTC, true, 0, &shared_http).await {

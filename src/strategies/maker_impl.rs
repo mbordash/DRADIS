@@ -425,4 +425,7 @@ impl Strategy for MakerStrategyImpl {
     }
 
     fn name(&self) -> String { "MakerStrategy".to_string() }
+    fn venue(&self) -> &'static str { "Window/Daily" }
+    fn max_exposure(&self) -> rust_decimal::Decimal { crate::config::MAKER_MAX_EXPOSURE_USDC }
+    fn risk_model(&self) -> &'static str { "Net |YES-NO|" }
 }
