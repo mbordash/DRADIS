@@ -12,11 +12,31 @@ env:
 jobs:
   build:
 
+
     runs-on: ubuntu-latest
 
     steps:
     - uses: actions/checkout@v4
-    - name: Build
-      run: cargo build --verbose
+
+    - name: Install Rust stable
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Cache cargo registry
+      uses: actions/cache@v4
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          target
+        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-cargo-
+
+    - name: Prepare CI config
+      run: cp src/config.balanced.rs.example src/config.rs
+
+    - name: Check
+      run: cargo check --verbose
+
     - name: Run tests
       run: cargo test --verbose
