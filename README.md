@@ -34,13 +34,13 @@ The core of DRADIS is the Orchestrator. It acts as the ship's brain, maintaining
            └────────────┬───────────┘
                         │  parallel dispatch
           ┌─────────────┼──────────────┐
-          ▼             ▼              ▼
-   ┌────────────┐ ┌──────────┐ ┌──────────────┐
-   │ Momentum   │ │  Maker   │ │  Arbitrage / │
-   │(Interceptor│ │ (Sentry) │ │  TimeDecay / │
-   │            │ │          │ │   Basis      │
-   └─────┬──────┘ └────┬─────┘ └──────┬───────┘
-         └─────────────┼──────────────┘
+          ▼             ▼              ▼             ▼
+   ┌────────────┐ ┌──────────┐ ┌──────────────┐ ┌──────────┐
+   │ Momentum   │ │  Maker   │ │  Arbitrage / │ │  GBoost  │
+   │(Interceptor│ │ (Sentry) │ │  TimeDecay / │ │ (Cylon) │
+   │            │ │          │ │   Basis      │ │          │
+   └─────┬──────┘ └────┬─────┘ └──────┬───────┘ └────┬─────┘
+         └─────────────┼──────────────┴──────────────┘
                        ▼
            ┌───────────────────────┐
            │    Execution Layer    │
@@ -53,13 +53,14 @@ The core of DRADIS is the Orchestrator. It acts as the ship's brain, maintaining
 
 ## 🚀 The Viper Squadrons (Strategies)
 
-DRADIS currently deploys five specialized strategy classes:
+DRADIS currently deploys six specialized strategy classes:
 
 - **Momentum (The Interceptor)**: Scans for high-velocity Binance moves. If a "target" moves $85 in 5 seconds, the Interceptor strikes the Polymarket book before it can reprice.
 - **Maker (The Sentry)**: Maintains a dual-sided presence on the Window venue, capturing the spread while managing net exposure.
 - **Arbitrage (The Surveyor)**: Constantly monitors the price sum of YES/NO pairs, looking for sub-$1.00 opportunities in low-fee venues.
 - **Time Decay (The Ghost)**: Exploits the natural convergence of prediction markets toward expiry, fading retail volatility.
 - **Basis/Funding (The Analyst)**: Fades retail skew by comparing Polymarket sentiment against Binance perpetual funding rates.
+- **GBoost (The Cylon)**: Online gradient-boosted ML model (LogLoss) that learns from live orderbook + oracle features to predict near-term YES price direction, retraining continuously in the background.
 
 ---
 
@@ -105,6 +106,15 @@ The bot connects to Polymarket's CLOB via WebSocket for real-time orderbook data
 **Basis / Funding-Rate** — Fades retail skew on the **Window venue** using Binance funding rates as confirmation.
 - **Thesis**: Fades amateur over-betting when smart money (funding) disagrees.
 
+**GBoost / ML** — Online gradient-boosted binary classifier running on the **Hourly venue**.
+- **Model**: `perpetual` crate `PerpetualBooster` with `LogLoss` objective.
+- **Features (12)**: YES/NO OBI, best ask prices, spreads, Binance 5s/1s velocity, acceleration, funding rate, 60m oracle drift, oracle price.
+- **Label**: `1.0` if YES bid rises within `GBOOST_LOOKAHEAD_TICKS` ticks, `0.0` otherwise.
+- **Retraining**: Every `GBOOST_RETRAIN_EVERY_N` ticks via `tokio::task::spawn_blocking` (never blocks the async executor). Requires `GBOOST_MIN_TRAINING_SAMPLES` snapshots before first model is available.
+- **Persistence**: Model serialised to `GBOOST_MODEL_PATH` after each retrain and warm-loaded on startup.
+- **Entry**: Buys YES if `P(UP) ≥ GBOOST_ENTRY_THRESHOLD`; buys NO if `P(UP) ≤ 1 − GBOOST_ENTRY_THRESHOLD`.
+- **Exit**: Take-profit at `GBOOST_TARGET_PROFIT_PERCENT`, stop-loss at `GBOOST_STOP_LOSS_PERCENT` (after `GBOOST_MIN_HOLD_SECS`), or signal reversal when model flips conviction.
+
 **Custom Strategy** — Develop and link your own strategies. See [CUSTOM_STRATEGY.md](docs/CUSTOM_STRATEGY.md).
 
 ---
@@ -118,6 +128,7 @@ The bot connects to Polymarket's CLOB via WebSocket for real-time orderbook data
 | ArbitrageStrategy | `$35` per leg | Gross hedged | **Window** |
 | TimeDecayStrategy | `$36` per leg | Gross hedged | **Window** |
 | BasisStrategy | `$15` | Gross one-sided | **Window** |
+| GboostStrategy | `$15` | Gross one-sided | **Hourly** |
 
 ---
 
@@ -147,8 +158,8 @@ Three ready-to-use starting profiles are provided. **You must copy one to `src/c
 | Profile | File | Wallet Size | Risk | Strategies Active |
 |---------|------|-------------|------|-------------------|
 | 🟢 Conservative | `src/config.conservative.rs.example` | < $100 | Low | Maker, Time Decay only |
-| 🟡 Balanced | `src/config.balanced.rs.example` | $100–$300 | Medium | All five, moderate sizing |
-| 🔴 Aggressive | `src/config.aggressive.rs.example` | $200+ | High | All five, maximum sizing |
+| 🟡 Balanced | `src/config.balanced.rs.example` | $100–$300 | Medium | All six, moderate sizing |
+| 🔴 Aggressive | `src/config.aggressive.rs.example` | $200+ | High | All six, maximum sizing |
 
 ```bash
 # Pick a starting profile and copy it into place

@@ -9,6 +9,7 @@ use crate::strategies::arbitrage_impl::ArbitrageStrategyImpl;
 use crate::strategies::time_decay_impl::TimeDecayStrategyImpl;
 use crate::strategies::maker_impl::MakerStrategyImpl;
 use crate::strategies::basis_impl::BasisStrategyImpl;
+use crate::strategies::gboost_impl::GboostStrategyImpl;
 use crate::config;
 
 /// Registry for all available strategies
@@ -28,6 +29,9 @@ impl StrategyRegistry {
         if config::ENABLE_BASIS_TRADING {
             strategies.push(Box::new(BasisStrategyImpl));
         }
+        if config::ENABLE_GBOOST_TRADING {
+            strategies.push(Box::new(GboostStrategyImpl::default()));
+        }
         strategies
     }
 
@@ -45,6 +49,7 @@ impl StrategyRegistry {
     pub fn create_time_decay() -> Box<dyn Strategy> {
         Box::new(TimeDecayStrategyImpl)
     }
+
     /// Create only maker strategy
     pub fn create_maker() -> Box<dyn Strategy> {
         Box::new(MakerStrategyImpl::new())
