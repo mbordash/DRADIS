@@ -151,7 +151,7 @@ pub const MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY: i64 = 1200;
 
 pub const ENABLE_BASIS_TRADING: bool = true;
 
-pub const BASIS_ENTRY_SKEW_THRESHOLD: Decimal = dec!(0.07);
+pub const BASIS_ENTRY_SKEW_THRESHOLD: Decimal = dec!(0.08);
 
 pub const BASIS_NEGATIVE_FUNDING_THRESHOLD: Decimal = dec!(-0.0001);
 pub const BASIS_POSITIVE_FUNDING_THRESHOLD: Decimal = dec!(0.0001);
@@ -163,9 +163,9 @@ pub const BASIS_BTC_ORACLE_STRIKE_BUFFER: Decimal = dec!(175.0);
 pub const BASIS_ETH_ORACLE_STRIKE_BUFFER: Decimal = dec!(9.0);
 pub const BASIS_SOL_ORACLE_STRIKE_BUFFER: Decimal = dec!(0.45);
 
-pub const BASIS_MAX_ENTRY_PRICE: Decimal = dec!(0.58);
-pub const BASIS_TARGET_PROFIT_PERCENT: Decimal = dec!(0.07);
-pub const BASIS_STOP_LOSS_PERCENT: Decimal = dec!(0.09);
+pub const BASIS_MAX_ENTRY_PRICE: Decimal = dec!(0.55);
+pub const BASIS_TARGET_PROFIT_PERCENT: Decimal = dec!(0.08);
+pub const BASIS_STOP_LOSS_PERCENT: Decimal = dec!(0.06);
 pub const BASIS_SKEW_COLLAPSE_THRESHOLD: Decimal = dec!(0.035);
 pub const BASIS_MIN_SECS_TO_EXPIRY: i64 = 1500;
 /// Minimum best-bid required to fire a basis forced-exit near expiry.
@@ -179,12 +179,12 @@ pub const BASIS_FUNDING_POLL_SECS: u64 = 60;
 pub const BASIS_MIN_STOP_LOSS_EXIT_BID: Decimal = dec!(0.005);
 
 
-
 // ============================================================================
 // GBOOST STRATEGY PARAMETERS
 // ============================================================================
 
 pub const ENABLE_GBOOST_TRADING: bool = true;
+pub const GBOOST_MAX_ENTRY_PRICE: Decimal = dec!(0.95);
 pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300; // 5 minutes
 pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(25.0);
 pub const GBOOST_LOOKAHEAD_TICKS: usize = 10; // 500ms (10 * 50ms orchestrator tick)
@@ -261,6 +261,9 @@ pub const SHARE_SCALE: Decimal = dec!(1_000_000);
 pub const TRADE_COOLDOWN_SECS: i64 = 10;
 pub const PARTIAL_FILL_COOLDOWN_SECS: i64 = 45;
 pub const STOP_LOSS_COOLDOWN_SECS: u64 = 180;
+/// Cooldown period (in seconds) before retrying a failed exit order.
+/// This prevents log floods and API hammering when FAK exits fail due to thin books.
+pub const EXIT_RETRY_COOLDOWN_SECS: u64 = 5;
 
 /// Flash-Exit: operational constants — same across balanced/conservative profiles.
 pub const FLASH_EXIT_CONFIRM_MS: u64 = 12_000;

@@ -205,6 +205,8 @@ pub const BASIS_KELLY_MAX_MULTIPLIER: Decimal = dec!(2.0);
 pub const BASIS_MAX_TAKER_FEE_BPS: u32 = 100;
 pub const BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 60;
 pub const BASIS_FUNDING_POLL_SECS: u64 = 60;
+/// Minimum best-bid required to fire a basis stop-loss exit.
+/// Prevents log floods and API hammering when FAK exits fail due to thin books.
 pub const BASIS_MIN_STOP_LOSS_EXIT_BID: Decimal = dec!(0.005);
 
 
@@ -213,6 +215,7 @@ pub const BASIS_MIN_STOP_LOSS_EXIT_BID: Decimal = dec!(0.005);
 // ============================================================================
 
 pub const ENABLE_GBOOST_TRADING: bool = false; // Disabled by default in conservative
+pub const GBOOST_MAX_ENTRY_PRICE: Decimal = dec!(0.95);
 pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 600; // 10 minutes
 pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(10.0);
 pub const GBOOST_LOOKAHEAD_TICKS: usize = 20; // 1 second (20 * 50ms orchestrator tick)
@@ -294,6 +297,9 @@ pub const SHARE_SCALE: Decimal = dec!(1_000_000);
 pub const TRADE_COOLDOWN_SECS: i64 = 15;
 pub const PARTIAL_FILL_COOLDOWN_SECS: i64 = 60;
 pub const STOP_LOSS_COOLDOWN_SECS: u64 = 180;
+/// Cooldown period (in seconds) before retrying a failed exit order.
+/// This prevents log floods and API hammering when FAK exits fail due to thin books.
+pub const EXIT_RETRY_COOLDOWN_SECS: u64 = 5;
 
 /// Flash-Exit: operational constants — same across all profiles.
 pub const FLASH_EXIT_CONFIRM_MS: u64 = 12_000;

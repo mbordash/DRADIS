@@ -220,6 +220,11 @@ async fn main() -> Result<()> {
     let mut last_trade_time: HashMap<String, Instant> = HashMap::new();
     let mut last_stop_loss_time: HashMap<String, Instant> = HashMap::new();
     let mut last_expiry_exit_time: HashMap<String, Instant> = HashMap::new();
+    // Throttle exit retries: when a FAK sell misses, the position stays in the map
+    // and evaluate_exit re-fires every 50ms heartbeat, flooding the log with hundreds
+    // of identical EXIT lines per second. This map enforces a minimum gap between
+    // successive exit attempts for the same strategy so retries are spaced out.
+    let mut last_exit_attempt_time: HashMap<String, Instant> = HashMap::new();
 
     // Watchdog: tracks when the inner trading loop last emitted a heartbeat tick.
     // If the inner loop goes silent for >LOOP_WATCHDOG_SECS, the outer loop logs an
@@ -655,6 +660,15 @@ async fn main() -> Result<()> {
                         match signal {
                             // ════════════════════ EXIT ════════════════════
                             StrategySignal::Exit { params, reason, exit_pair } => {
+                                // Throttle exit retries to prevent log floods when FAK misses.
+                                // The position stays in the map after a miss so evaluate_exit
+                                // re-fires every heartbeat — without this guard that's ~20/s.
+                                if let Some(lt) = last_exit_attempt_time.get(&sn) {
+                                    if lt.elapsed() < Duration::from_secs(config::EXIT_RETRY_COOLDOWN_SECS) {
+                                        continue;
+                                    }
+                                }
+                                last_exit_attempt_time.insert(sn.clone(), Instant::now());
                                 let tid = params.token_id;
                                 let pos_key = (sn.clone(), tid);
                                 let shares = { let map = positions.lock().await; match map.get(&pos_key) { Some(p) => p.shares, None => continue } };

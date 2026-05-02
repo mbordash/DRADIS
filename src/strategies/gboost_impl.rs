@@ -299,7 +299,7 @@ impl Strategy for GboostStrategyImpl {
         // ── YES entry: model predicts UP ──────────────────────────────────────
         if p_yes_up >= entry_thresh && !has_yes {
             let price  = floor_to_tick_size(ctx.snapshot.yes_ask);
-            if price <= dec!(0) { return Ok(StrategySignal::NoSignal); }
+            if price >= config::GBOOST_MAX_ENTRY_PRICE || price <= dec!(0) { return Ok(StrategySignal::NoSignal); }
             let shares = trade_usdc / price;
             tracing::info!(
                 "🔮 GBoost YES entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
@@ -321,7 +321,7 @@ impl Strategy for GboostStrategyImpl {
         // ── NO entry: model predicts DOWN (P(UP) is very low) ────────────────
         if p_yes_up <= (1.0 - entry_thresh) && !has_no {
             let price  = floor_to_tick_size(ctx.snapshot.no_ask);
-            if price <= dec!(0) { return Ok(StrategySignal::NoSignal); }
+            if price >= config::GBOOST_MAX_ENTRY_PRICE || price <= dec!(0) { return Ok(StrategySignal::NoSignal); }
             let shares = trade_usdc / price;
             tracing::info!(
                 "🔮 GBoost NO entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
