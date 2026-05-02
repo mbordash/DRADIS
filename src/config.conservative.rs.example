@@ -209,6 +209,23 @@ pub const BASIS_FUNDING_POLL_SECS: u64 = 60;
 /// Prevents log floods and API hammering when FAK exits fail due to thin books.
 pub const BASIS_MIN_STOP_LOSS_EXIT_BID: Decimal = dec!(0.005);
 
+// ============================================================================
+// BASIS STRATEGY MAKER ORDER PARAMETERS
+// ============================================================================
+
+/// If true, BasisStrategy attempts to enter positions by placing limit orders
+/// at the current bid price (or slightly adjusted) to act as a maker (0% fee).
+/// If false, it places taker orders at the current ask price (incurs dynamic fee).
+pub const BASIS_ENTRY_AS_MAKER: bool = true;
+
+/// If BASIS_ENTRY_AS_MAKER is true, this offset is added to the current best bid
+/// when placing a buy order.
+/// - dec!(0.00): Bid at the current best bid (passive maker).
+/// - dec!(0.01): Bid one tick above the current best bid (more aggressive maker,
+///               but risks crossing the spread if the ask is also one tick away).
+/// - dec!(-0.01): Bid one tick below the current best bid (more passive maker).
+pub const BASIS_MAKER_BUY_PRICE_ADJUSTMENT: Decimal = dec!(-0.01);
+
 
 // ============================================================================
 // GBOOST STRATEGY PARAMETERS

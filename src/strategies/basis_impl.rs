@@ -139,15 +139,42 @@ impl Strategy for BasisStrategyImpl {
             if !funding_confirms_no_trade && !extreme_skew_bypass {
                 return Ok(StrategySignal::NoSignal);
             }
-            if snap.no_ask > config::BASIS_MAX_ENTRY_PRICE {
+
+            let target_price;
+            let entry_fee_bps;
+            let effective_fee_multiplier;
+
+            if config::BASIS_ENTRY_AS_MAKER {
+                // Aim to place a maker buy order for NO token
+                let mut proposed_price = snap.no_bid + config::BASIS_MAKER_BUY_PRICE_ADJUSTMENT;
+                // Ensure the proposed price does not cross the spread (i.e., is not >= current ask)
+                // If it would cross, adjust it to be one tick below the ask, or at the bid if that's lower.
+                if proposed_price >= snap.no_ask {
+                    proposed_price = snap.no_ask - dec!(0.01);
+                    if proposed_price <= snap.no_bid {
+                        proposed_price = snap.no_bid;
+                    }
+                }
+                target_price = proposed_price;
+                entry_fee_bps = 0; // Maker orders have 0 fees
+                effective_fee_multiplier = dec!(1); // No fee to back off from trade_size
+            } else {
+                // Taker entry (current behavior)
+                target_price = snap.no_ask;
+                entry_fee_bps = market.no_fee_bps as u16;
+                effective_fee_multiplier = no_fee_headroom;
+            }
+
+            if target_price > config::BASIS_MAX_ENTRY_PRICE {
                 return Ok(StrategySignal::NoSignal);
             }
+
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
                     token_id: market.no_token,
-                    price: snap.no_ask,
-                    shares: (trade_size / no_fee_headroom) / snap.no_ask,
-                    fee_bps: market.no_fee_bps as u16,
+                    price: target_price,
+                    shares: (trade_size / effective_fee_multiplier) / target_price,
+                    fee_bps: entry_fee_bps,
                     is_neg_risk: market.is_neg_risk,
                     market_name: market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
@@ -159,15 +186,41 @@ impl Strategy for BasisStrategyImpl {
             if !funding_confirms_yes_trade && !extreme_skew_bypass {
                 return Ok(StrategySignal::NoSignal);
             }
-            if snap.yes_ask > config::BASIS_MAX_ENTRY_PRICE {
+
+            let target_price;
+            let entry_fee_bps;
+            let effective_fee_multiplier;
+
+            if config::BASIS_ENTRY_AS_MAKER {
+                // Aim to place a maker buy order for YES token
+                let mut proposed_price = snap.yes_bid + config::BASIS_MAKER_BUY_PRICE_ADJUSTMENT;
+                // Ensure the proposed price does not cross the spread (i.e., is not >= current ask)
+                if proposed_price >= snap.yes_ask {
+                    proposed_price = snap.yes_ask - dec!(0.01);
+                    if proposed_price <= snap.yes_bid {
+                        proposed_price = snap.yes_bid;
+                    }
+                }
+                target_price = proposed_price;
+                entry_fee_bps = 0; // Maker orders have 0 fees
+                effective_fee_multiplier = dec!(1); // No fee to back off from trade_size
+            } else {
+                // Taker entry (current behavior)
+                target_price = snap.yes_ask;
+                entry_fee_bps = market.yes_fee_bps as u16;
+                effective_fee_multiplier = yes_fee_headroom;
+            }
+
+            if target_price > config::BASIS_MAX_ENTRY_PRICE {
                 return Ok(StrategySignal::NoSignal);
             }
+
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
                     token_id: market.yes_token,
-                    price: snap.yes_ask,
-                    shares: (trade_size / yes_fee_headroom) / snap.yes_ask,
-                    fee_bps: market.yes_fee_bps as u16,
+                    price: target_price,
+                    shares: (trade_size / effective_fee_multiplier) / target_price,
+                    fee_bps: entry_fee_bps,
                     is_neg_risk: market.is_neg_risk,
                     market_name: market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
