@@ -222,8 +222,21 @@ impl GboostStrategyImpl {
                             tracing::warn!("🤖 GboostStrategy: model save failed: {}", e);
                         }
                     }
+
+                    // Get old tree count before moving the lock
+                    let old_tree_count = {
+                        let old_model = model_arc.lock().unwrap();
+                        old_model.as_ref().map(|m| m.trees.len()).unwrap_or(0)
+                    };
+
+                    // Log based on the comparison - fixed overflow issue
+                    if n > old_tree_count + 5 || (old_tree_count >= 5 && n < old_tree_count - 5) || (old_tree_count == 0 && n > 0) {
+                        tracing::info!("🤖 GboostStrategy: retrained — {} trees (was {})", n, old_tree_count);
+                    } else {
+                        tracing::debug!("🤖 GboostStrategy: retrained — {} trees", n);
+                    }
+
                     *model_arc.lock().unwrap() = Some(new_model);
-                    tracing::info!("🤖 GboostStrategy: retrained — {} trees", n);
                 }
                 Ok(Err(e)) => tracing::warn!("🤖 GboostStrategy: training error: {}", e),
                 Err(e)     => tracing::warn!("🤖 GboostStrategy: spawn_blocking panic: {}", e),
@@ -284,6 +297,8 @@ impl Strategy for GboostStrategyImpl {
             Some(p) => p,
             None    => return Ok(StrategySignal::NoSignal),
         };
+
+        tracing::info!("🔮 GBoost prediction: P(UP)={:.3}", p_yes_up);
 
         let entry_thresh = config::GBOOST_ENTRY_THRESHOLD.to_f64().unwrap_or(0.65);
         let trade_usdc   = config::GBOOST_MAX_EXPOSURE_USDC;

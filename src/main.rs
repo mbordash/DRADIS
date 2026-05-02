@@ -81,24 +81,7 @@ fn print_banner() {
      ·    ·     ·     |     ·     ·    ·
        ·     ·        |        ·     ·
           ·  ·  ·  ·  ·  ·  ·  ·  ·
-              C O M B A T   I N F O R M A T I O N   C E N T E R
-
-  ┌─────────────────────┐   ┌─────────────────────┐
-  │   Binance Oracle    │   │  Polymarket CLOB    │
-  │  (Price / Funding)  │   │  (WebSocket Feed)   │
-  └──────────┬──────────┘   └──────────┬──────────┘
-             └─────────────┬───────────┘
-                           ▼
-              ┌────────────────────────┐
-              │   Orchestrator (CIC)   │
-              │     50ms Heartbeat     │
-              └─────────────┬──────────┘
-             parallel dispatch to Viper squadrons
-                           ▼
-              ┌───────────────────────┐
-              │    Execution Layer    │
-              │  OBI · Fee · Breaker  │
-              └───────────────────────┘
+ P O L Y M A R K E T  C L O B  I N F O  C E N T E R
 
   ╔═══════════════════════════════════════════════════╗
   ║  "It's not enough to survive.                     ║

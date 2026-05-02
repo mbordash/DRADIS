@@ -218,6 +218,10 @@ Edit the per-strategy constants in `src/config.rs`, specifically the `_MAX_EXPOS
 See [docs/PERFORMANCE_TUNING.md](docs/PERFORMANCE_TUNING.md) for a full guide covering kernel `sysctl` tuning, CPU frequency governor, CPU/IRQ affinity pinning, Docker ulimits, and instance selection tips for AWS and OCI.
 
 ---
+## 📜 Credits & Acknowledgments
+
+- **[Perpetual](https://github.com/perpetual-ml/perpetual)** — Provided the core Gradient Boosting implementation for our ML strategy.
+- **[Tokio](https://github.com/tokio-rs/tokio)** — Powers our high-concurrency orchestrator.
 
 ## License
 See [LICENSE](LICENSE).
