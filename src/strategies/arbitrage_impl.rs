@@ -65,6 +65,7 @@ impl Strategy for ArbitrageStrategyImpl {
                     market_name: market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
                     order_type: OrderType::FAK, // Arbitrage entries are typically FAK
+                    post_only: false, // Not post-only
                 },
                 pair_params: Some(OrderParams {
                     token_id: market.no_token,
@@ -75,6 +76,7 @@ impl Strategy for ArbitrageStrategyImpl {
                     market_name: market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
                     order_type: OrderType::FAK, // Arbitrage entries are typically FAK
+                    post_only: false, // Not post-only
                 }),
             });
         }
@@ -105,6 +107,7 @@ impl Strategy for ArbitrageStrategyImpl {
                         market_name: market.market_name.clone(),
                         condition_id: market.condition_id.clone(),
                         order_type: OrderType::FAK, // Exit orders are always FAK
+                        post_only: false, // Exit orders are never post-only
                     },
                     reason: "Arbitrage convergence".to_string(),
                     exit_pair: true,

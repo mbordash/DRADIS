@@ -33,6 +33,7 @@
 
 use async_trait::async_trait;
 use anyhow::Result;
+use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
 use std::collections::VecDeque;
@@ -109,7 +110,7 @@ fn train_model(snapshots: Vec<MarketSnapshot>) -> Result<PerpetualBooster> {
     }
 
     // Matrix<'a, T> borrows the slice; both Vec and Matrix live in this closure scope.
-    let matrix = Matrix::new(&feature_data, labeled_n, NUM_FEATURES);
+    let matrix = Matrix::new(&feature_data, 1, NUM_FEATURES);
 
     let mut booster = PerpetualBooster::default()
         .set_objective(Objective::LogLoss)
@@ -252,6 +253,11 @@ impl Default for GboostStrategyImpl {
 #[async_trait]
 impl Strategy for GboostStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
+        // Maintain history and trigger background retrains.
+        // This happens regardless of ENABLE_GBOOST_TRADING so the model can learn.
+        self.push_snapshot(ctx.snapshot.clone());
+        self.maybe_retrain();
+
         if !config::ENABLE_GBOOST_TRADING {
             return Ok(StrategySignal::NoSignal);
         }
@@ -273,10 +279,6 @@ impl Strategy for GboostStrategyImpl {
         if ctx.available_collateral < config::GBOOST_MAX_EXPOSURE_USDC {
             return Ok(StrategySignal::NoSignal);
         }
-
-        // Maintain history and trigger background retrains.
-        self.push_snapshot(ctx.snapshot.clone());
-        self.maybe_retrain();
 
         let p_yes_up = match self.predict(&ctx.snapshot) {
             Some(p) => p,
@@ -313,6 +315,7 @@ impl Strategy for GboostStrategyImpl {
                     market_name: ctx.market.market_name.clone(),
                     condition_id: ctx.market.condition_id.clone(),
                     order_type: OrderType::FAK, // GBoost entries are typically FAK
+                    post_only: false, // Not post-only
                 },
                 pair_params: None,
             });
@@ -336,6 +339,7 @@ impl Strategy for GboostStrategyImpl {
                     market_name: ctx.market.market_name.clone(),
                     condition_id: ctx.market.condition_id.clone(),
                     order_type: OrderType::FAK, // GBoost entries are typically FAK
+                    post_only: false, // Not post-only
                 },
                 pair_params: None,
             });
@@ -370,6 +374,7 @@ impl Strategy for GboostStrategyImpl {
                     market_name: ctx.market.market_name.clone(),
                     condition_id: ctx.market.condition_id.clone(),
                     order_type: OrderType::FAK, // Exit orders are always FAK
+                    post_only: false, // Exit orders are never post-only
                 };
 
                 if profit_pct >= tp {
@@ -417,6 +422,7 @@ impl Strategy for GboostStrategyImpl {
                     market_name: ctx.market.market_name.clone(),
                     condition_id: ctx.market.condition_id.clone(),
                     order_type: OrderType::FAK, // Exit orders are always FAK
+                    post_only: false, // Exit orders are never post-only
                 };
 
                 if profit_pct >= tp {

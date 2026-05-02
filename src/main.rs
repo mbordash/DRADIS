@@ -214,7 +214,7 @@ async fn main() -> Result<()> {
     let time_decay_positions: Arc<Mutex<HashMap<U256, TimeDecayPosition>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
-    // Cooldown maps live OUTSIDE the market-rotation loop so they persist across market switches.
+    // Cooldown maps live OUTSIDE the market-rotation loop so they survive market switches.
     // Previously declared inside the loop which reset them on every hourly market transition,
     // allowing BasisStrategy to re-enter immediately after a stop-loss via a market switch.
     let mut last_trade_time: HashMap<String, Instant> = HashMap::new();
@@ -269,10 +269,6 @@ async fn main() -> Result<()> {
         if initial_strike.is_none() {
             initial_strike = fetch_historical_strike_price(&shared_http, &crypto_filter, &name).await;
         }
-    }
-    if initial_strike.is_none() {
-        info!("🔎 Using market close time to fetch strike price from Binance...");
-        initial_strike = fetch_strike_price_from_close_time(&shared_http, &crypto_filter, close_time).await;
     }
     if initial_strike.is_some() {
         info!("✅ Strike price resolved: ${}", initial_strike.unwrap());
@@ -678,7 +674,7 @@ async fn main() -> Result<()> {
                                 info!("📤 EXIT [{}]: {} | shares={:.2}, bid=${:.4} | {}", sn, params.market_name, shares, params.price, reason);
                                 let vc = if params.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                 if !config::GHOST_MODE {
-                                    if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, tid, Side::Sell, shares, (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), params.fee_bps, params.order_type, false, 0, &shared_http).await {
+                                    if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, tid, Side::Sell, shares, (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), params.fee_bps, params.order_type, params.post_only, 0, &shared_http).await {
                                         let es = e.to_string();
                                         if es.contains("not enough balance") || es.contains("balance: 0") || es.contains("invalid price") {
                                             let mut map = positions.lock().await; if let Some(p) = map.remove(&pos_key) { if p.fill_confirmed_at.is_some() { let aep3 = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); *total_pnl.lock().await += (aep3 - p.avg_entry) * p.shares; } }
@@ -828,7 +824,7 @@ async fn main() -> Result<()> {
                                 info!("📥 ENTRY [{}]: {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares);
                                 let vc = if params.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                 if !config::GHOST_MODE {
-                                    if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, params.token_id, Side::Buy, params.shares, (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), params.fee_bps, params.order_type, false, 0, &shared_http).await {
+                                    if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, params.token_id, Side::Buy, params.shares, (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), params.fee_bps, params.order_type, params.post_only, 0, &shared_http).await {
                                         warn!("⚠️ ENTRY order failed [{}]: {}", sn, e);
                                         positions.lock().await.remove(&pos_key);
                                         pending_orders.lock().await.remove(&pos_key);
@@ -850,7 +846,7 @@ async fn main() -> Result<()> {
                                     // Polymarket indexer reflects the fill (~5-12 s), instead of waiting 60 s
                                     // for the cleanup task to notice the orphan.
                                     let leg_b_result = if !config::GHOST_MODE {
-                                        place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc_p, pp.token_id, Side::Buy, pp.shares, (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), pp.fee_bps, pp.order_type, false, 0, &shared_http).await
+                                        place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc_p, pp.token_id, Side::Buy, pp.shares, (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), pp.fee_bps, pp.order_type, pp.post_only, 0, &shared_http).await
                                     } else { Ok(()) };
 
                                     match leg_b_result {
@@ -965,7 +961,7 @@ async fn main() -> Result<()> {
                                         // same root cause as the status_ticker balance_allowance freeze.
                                         let _ = tokio::time::timeout(
                                             Duration::from_secs(10),
-                                            dradis::helpers::balance::quick_confirm_fill(&trading_client, &sn, p.token_id, &positions, &p.condition_id),
+                                            dradis::helpers::balance::quick_confirm_fill(&trading_client, &sn, p.token_id, &positions, &p.condition_id, p.order_type.clone()),
                                         ).await;
                                         let vc = if p.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                         if !config::GHOST_MODE {

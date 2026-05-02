@@ -144,6 +144,7 @@ impl Strategy for BasisStrategyImpl {
             let target_price;
             let entry_fee_bps;
             let order_type;
+            let post_only;
             let effective_fee_multiplier;
 
             if config::BASIS_ENTRY_AS_MAKER {
@@ -160,12 +161,14 @@ impl Strategy for BasisStrategyImpl {
                 target_price = proposed_price;
                 entry_fee_bps = 0; // Maker orders have 0 fees
                 order_type = OrderType::GTC; // Good-Til-Cancelled for maker
+                post_only = true; // Ensure it's a post-only order
                 effective_fee_multiplier = dec!(1); // No fee to back off from trade_size
             } else {
                 // Taker entry (current behavior)
                 target_price = snap.no_ask;
                 entry_fee_bps = market.no_fee_bps as u16;
                 order_type = OrderType::FAK; // Fill-And-Kill for taker
+                post_only = false; // Not post-only
                 effective_fee_multiplier = no_fee_headroom;
             }
 
@@ -183,6 +186,7 @@ impl Strategy for BasisStrategyImpl {
                     market_name: market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
                     order_type,
+                    post_only,
                 },
                 pair_params: None,
             });
@@ -195,6 +199,7 @@ impl Strategy for BasisStrategyImpl {
             let target_price;
             let entry_fee_bps;
             let order_type;
+            let post_only;
             let effective_fee_multiplier;
 
             if config::BASIS_ENTRY_AS_MAKER {
@@ -210,12 +215,14 @@ impl Strategy for BasisStrategyImpl {
                 target_price = proposed_price;
                 entry_fee_bps = 0; // Maker orders have 0 fees
                 order_type = OrderType::GTC; // Good-Til-Cancelled for maker
+                post_only = true; // Ensure it's a post-only order
                 effective_fee_multiplier = dec!(1); // No fee to back off from trade_size
             } else {
                 // Taker entry (current behavior)
                 target_price = snap.yes_ask;
                 entry_fee_bps = market.yes_fee_bps as u16;
                 order_type = OrderType::FAK; // Fill-And-Kill for taker
+                post_only = false; // Not post-only
                 effective_fee_multiplier = yes_fee_headroom;
             }
 
@@ -233,6 +240,7 @@ impl Strategy for BasisStrategyImpl {
                     market_name: market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
                     order_type,
+                    post_only,
                 },
                 pair_params: None,
             });
@@ -293,6 +301,7 @@ impl Strategy for BasisStrategyImpl {
                         market_name: target_market.market_name.clone(),
                         condition_id: target_market.condition_id.clone(),
                         order_type: OrderType::FAK, // Exit orders are always FAK
+                        post_only: false, // Exit orders are never post-only
                     },
                     reason: format!("BasisTP: bid=${:.4}, profit={:.2}%", position_bid, profit_margin * dec!(100)),
                     exit_pair: false,
@@ -322,6 +331,7 @@ impl Strategy for BasisStrategyImpl {
                         market_name: target_market.market_name.clone(),
                         condition_id: target_market.condition_id.clone(),
                         order_type: OrderType::FAK, // Exit orders are always FAK
+                        post_only: false, // Exit orders are never post-only
                     },
                     reason: format!("BasisSL: bid=${:.4}, loss={:.2}%", position_bid, profit_margin * dec!(100)),
                     exit_pair: false,
@@ -339,6 +349,7 @@ impl Strategy for BasisStrategyImpl {
                         market_name: target_market.market_name.clone(),
                         condition_id: target_market.condition_id.clone(),
                         order_type: OrderType::FAK, // Exit orders are always FAK
+                        post_only: false, // Exit orders are never post-only
                     },
                     reason: format!("BasisSkewCollapse: yes_mid={:.4}, profit={:.2}%", yes_mid, profit_margin * dec!(100)),
                     exit_pair: false,
@@ -368,6 +379,7 @@ impl Strategy for BasisStrategyImpl {
                                 market_name: target_market.market_name.clone(),
                                 condition_id: target_market.condition_id.clone(),
                                 order_type: OrderType::FAK, // Exit orders are always FAK
+                                post_only: false, // Exit orders are never post-only
                             },
                             reason: format!("BasisExpiry: {}s left", secs_left),
                             exit_pair: false,

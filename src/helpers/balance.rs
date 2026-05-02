@@ -16,7 +16,7 @@ use polymarket_client_sdk_v2::clob::{Client as ClobClient};
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::Normal;
 use polymarket_client_sdk_v2::clob::types::request::{BalanceAllowanceRequest, OrdersRequest};
-use polymarket_client_sdk_v2::clob::types::AssetType;
+use polymarket_client_sdk_v2::clob::types::{AssetType, OrderType}; // Import OrderType
 
 use crate::helpers::metrics;
 
@@ -221,7 +221,13 @@ pub async fn quick_confirm_fill(
     token_id: U256,
     positions: &Arc<Mutex<PositionMap>>,
     condition_id: &str,
+    order_type: OrderType, // Added order_type parameter
 ) -> Result<bool> {
+    // Only quick-confirm FAK orders. GTC orders need to wait for on-chain sync.
+    if order_type != OrderType::FAK {
+        return Ok(false);
+    }
+
     let market_hash = match B256::from_str(condition_id) { Ok(h) => h, Err(_) => return Ok(false) };
     let req = polymarket_client_sdk_v2::clob::types::request::CancelMarketOrderRequest::builder().market(market_hash).build();
     let _ = client.cancel_market_orders(&req).await;
