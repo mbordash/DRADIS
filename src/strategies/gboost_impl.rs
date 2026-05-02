@@ -110,7 +110,7 @@ fn train_model(snapshots: Vec<MarketSnapshot>) -> Result<PerpetualBooster> {
     }
 
     // Matrix<'a, T> borrows the slice; both Vec and Matrix live in this closure scope.
-    let matrix = Matrix::new(&feature_data, 1, NUM_FEATURES);
+    let matrix = Matrix::new(&feature_data, labeled_n, NUM_FEATURES);
 
     let mut booster = PerpetualBooster::default()
         .set_objective(Objective::LogLoss)
