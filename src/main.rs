@@ -70,7 +70,7 @@ fn print_banner() {
   ██║  ██║██████╔╝███████║██║  ██║██║███████╗
   ██║  ██║██╔══██╗██╔══██║██║  ██║██║╚════██║
   ██████╔╝██║  ██║██║  ██║██████╔╝██║███████║
-  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚═╝╚══════╝
+  ╚═════╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚═════╝ ╚╝╚══════╝
   Direct Reaction And Dynamic Intelligence System  v{}
   ─────────────────────────────────────────────────────
 
@@ -399,7 +399,7 @@ async fn main() -> Result<()> {
                                 continue;
                             }
                         };
-                        let mut stream = Box::pin(stream);
+                    let mut stream = Box::pin(stream);
                         info!("✅ WS orderbook subscribed for maker token {}", token);
                         while let Some(book_result) = stream.next().await {
                             if let Ok(book) = book_result {
@@ -678,7 +678,7 @@ async fn main() -> Result<()> {
                                 info!("📤 EXIT [{}]: {} | shares={:.2}, bid=${:.4} | {}", sn, params.market_name, shares, params.price, reason);
                                 let vc = if params.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                 if !config::GHOST_MODE {
-                                    if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, tid, Side::Sell, shares, (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), params.fee_bps, OrderType::FAK, false, 0, &shared_http).await {
+                                    if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, tid, Side::Sell, shares, (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), params.fee_bps, params.order_type, false, 0, &shared_http).await {
                                         let es = e.to_string();
                                         if es.contains("not enough balance") || es.contains("balance: 0") || es.contains("invalid price") {
                                             let mut map = positions.lock().await; if let Some(p) = map.remove(&pos_key) { if p.fill_confirmed_at.is_some() { let aep3 = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); *total_pnl.lock().await += (aep3 - p.avg_entry) * p.shares; } }
@@ -828,7 +828,7 @@ async fn main() -> Result<()> {
                                 info!("📥 ENTRY [{}]: {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares);
                                 let vc = if params.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                 if !config::GHOST_MODE {
-                                    if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, params.token_id, Side::Buy, params.shares, (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), params.fee_bps, OrderType::FAK, false, 0, &shared_http).await {
+                                    if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, params.token_id, Side::Buy, params.shares, (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), params.fee_bps, params.order_type, false, 0, &shared_http).await {
                                         warn!("⚠️ ENTRY order failed [{}]: {}", sn, e);
                                         positions.lock().await.remove(&pos_key);
                                         pending_orders.lock().await.remove(&pos_key);
@@ -850,7 +850,7 @@ async fn main() -> Result<()> {
                                     // Polymarket indexer reflects the fill (~5-12 s), instead of waiting 60 s
                                     // for the cleanup task to notice the orphan.
                                     let leg_b_result = if !config::GHOST_MODE {
-                                        place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc_p, pp.token_id, Side::Buy, pp.shares, (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), pp.fee_bps, OrderType::FAK, false, 0, &shared_http).await
+                                        place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc_p, pp.token_id, Side::Buy, pp.shares, (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), pp.fee_bps, pp.order_type, false, 0, &shared_http).await
                                     } else { Ok(()) };
 
                                     match leg_b_result {
@@ -969,7 +969,7 @@ async fn main() -> Result<()> {
                                         ).await;
                                         let vc = if p.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                         if !config::GHOST_MODE {
-                                            if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, p.token_id, Side::Buy, p.shares, p.price, p.fee_bps, OrderType::GTC, true, 0, &shared_http).await {
+                                            if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, p.token_id, Side::Buy, p.shares, p.price, p.fee_bps, p.order_type, true, 0, &shared_http).await {
                                                 positions.lock().await.remove(&pk);
                                                 pending_orders.lock().await.remove(&pk);
                                                 if !e.to_string().contains("crosses book") { consecutive_failures += 1; } continue;

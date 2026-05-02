@@ -14,6 +14,7 @@ use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::strategies::is_drawdown_limit_hit;
 use crate::config;
+use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
 
 pub struct MomentumStrategyImpl;
 
@@ -139,6 +140,7 @@ impl Strategy for MomentumStrategyImpl {
                         is_neg_risk: ctx.market.is_neg_risk,
                         market_name: ctx.market.market_name.clone(),
                         condition_id: ctx.market.condition_id.clone(),
+                        order_type: OrderType::FAK, // Momentum entries are typically FAK
                     },
                     pair_params: None,
                 });
@@ -154,6 +156,7 @@ impl Strategy for MomentumStrategyImpl {
                         is_neg_risk: ctx.market.is_neg_risk,
                         market_name: ctx.market.market_name.clone(),
                         condition_id: ctx.market.condition_id.clone(),
+                        order_type: OrderType::FAK, // Momentum entries are typically FAK
                     },
                     pair_params: None,
                 });
@@ -172,6 +175,7 @@ impl Strategy for MomentumStrategyImpl {
                         is_neg_risk: ctx.market.is_neg_risk,
                         market_name: ctx.market.market_name.clone(),
                         condition_id: ctx.market.condition_id.clone(),
+                        order_type: OrderType::FAK, // Momentum entries are typically FAK
                     },
                     pair_params: None,
                 });
@@ -187,6 +191,7 @@ impl Strategy for MomentumStrategyImpl {
                         is_neg_risk: ctx.market.is_neg_risk,
                         market_name: ctx.market.market_name.clone(),
                         condition_id: ctx.market.condition_id.clone(),
+                        order_type: OrderType::FAK, // Momentum entries are typically FAK
                     },
                     pair_params: None,
                 });
@@ -205,6 +210,7 @@ impl Strategy for MomentumStrategyImpl {
                         is_neg_risk: ctx.market.is_neg_risk,
                         market_name: ctx.market.market_name.clone(),
                         condition_id: ctx.market.condition_id.clone(),
+                        order_type: OrderType::FAK, // Momentum entries are typically FAK
                     },
                     pair_params: None,
                 });
@@ -220,6 +226,7 @@ impl Strategy for MomentumStrategyImpl {
                         is_neg_risk: ctx.market.is_neg_risk,
                         market_name: ctx.market.market_name.clone(),
                         condition_id: ctx.market.condition_id.clone(),
+                        order_type: OrderType::FAK, // Momentum entries are typically FAK
                     },
                     pair_params: None,
                 });
@@ -256,7 +263,7 @@ impl Strategy for MomentumStrategyImpl {
                 let secs_left = (close_time - chrono::Utc::now()).num_seconds();
                 if secs_left <= config::MOMENTUM_EXPIRY_EXIT_SECS && profit_margin < config::MOMENTUM_EXPIRY_MIN_PROFIT_TO_HOLD {
                     let reason = format!("NearExpiry: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100));
-                    return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone() }, reason, exit_pair: false });
+                    return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone(), order_type: OrderType::FAK }, reason, exit_pair: false });
                 }
             }
 
@@ -266,12 +273,12 @@ impl Strategy for MomentumStrategyImpl {
 
             if profit_margin >= target || bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
                 let reason = format!("MomentumTP: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100));
-                return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone() }, reason, exit_pair: false });
+                return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone(), order_type: OrderType::FAK }, reason, exit_pair: false });
             }
 
             if profit_margin <= stop_loss {
                 let reason = format!("MomentumSL: bid=${:.4}, loss={:.2}%", bid, profit_margin * dec!(100));
-                return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone() }, reason, exit_pair: false });
+                return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone(), order_type: OrderType::FAK }, reason, exit_pair: false });
             }
 
             // Momentum Decay exit
@@ -279,13 +286,13 @@ impl Strategy for MomentumStrategyImpl {
             let is_yes = token_id == &ctx.market.yes_token;
             if profit_margin > dec!(0) && ((is_yes && velocity_1s < decay_min) || (!is_yes && velocity_1s > -decay_min)) {
                 let reason = format!("MomentumDecay: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100));
-                return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone() }, reason, exit_pair: false });
+                return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone(), order_type: OrderType::FAK }, reason, exit_pair: false });
             }
 
             // Reversal exit
             if secs_held >= config::MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL && ((is_yes && velocity < reversal_threshold) || (!is_yes && velocity > -reversal_threshold)) {
                 let reason = format!("MomentumReversal: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100));
-                return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone() }, reason, exit_pair: false });
+                return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone(), order_type: OrderType::FAK }, reason, exit_pair: false });
             }
         }
         Ok(StrategySignal::NoSignal)

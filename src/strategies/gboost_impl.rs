@@ -33,14 +33,12 @@
 
 use async_trait::async_trait;
 use anyhow::Result;
-use chrono::Utc;
-use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::sync::atomic::{AtomicBool, Ordering};
-
+use chrono::Utc;
 use perpetual::{Matrix, PerpetualBooster};
 use perpetual::objective::Objective;
 use perpetual::booster::config::BoosterIO;
@@ -50,6 +48,7 @@ use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{MarketSnapshot, OrderParams, StrategySignal, StrategyStatus};
 use crate::strategies::is_drawdown_limit_hit;
 use crate::helpers::price::floor_to_tick_size;
+use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
 
 /// Number of f64 features per snapshot row fed into the booster.
 const NUM_FEATURES: usize = 12;
@@ -313,6 +312,7 @@ impl Strategy for GboostStrategyImpl {
                     is_neg_risk: ctx.market.is_neg_risk,
                     market_name: ctx.market.market_name.clone(),
                     condition_id: ctx.market.condition_id.clone(),
+                    order_type: OrderType::FAK, // GBoost entries are typically FAK
                 },
                 pair_params: None,
             });
@@ -335,6 +335,7 @@ impl Strategy for GboostStrategyImpl {
                     is_neg_risk: ctx.market.is_neg_risk,
                     market_name: ctx.market.market_name.clone(),
                     condition_id: ctx.market.condition_id.clone(),
+                    order_type: OrderType::FAK, // GBoost entries are typically FAK
                 },
                 pair_params: None,
             });
@@ -368,6 +369,7 @@ impl Strategy for GboostStrategyImpl {
                     is_neg_risk: ctx.market.is_neg_risk,
                     market_name: ctx.market.market_name.clone(),
                     condition_id: ctx.market.condition_id.clone(),
+                    order_type: OrderType::FAK, // Exit orders are always FAK
                 };
 
                 if profit_pct >= tp {
@@ -414,6 +416,7 @@ impl Strategy for GboostStrategyImpl {
                     is_neg_risk: ctx.market.is_neg_risk,
                     market_name: ctx.market.market_name.clone(),
                     condition_id: ctx.market.condition_id.clone(),
+                    order_type: OrderType::FAK, // Exit orders are always FAK
                 };
 
                 if profit_pct >= tp {

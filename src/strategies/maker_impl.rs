@@ -24,8 +24,10 @@ use tokio::sync::Mutex;
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::strategies::is_drawdown_limit_hit;
-use crate::helpers::price::floor_to_tick_size;
 use crate::config;
+use polymarket_client_sdk_v2::clob::types::OrderType;
+use crate::helpers::floor_to_tick_size;
+// Import OrderType
 
 /// Tracks bid-depth at the previous evaluation tick for drain-rate computation.
 struct DepthSample {
@@ -263,6 +265,7 @@ impl Strategy for MakerStrategyImpl {
             is_neg_risk: market.is_neg_risk,
             market_name: market.market_name.clone(),
             condition_id: market.condition_id.clone(),
+            order_type: OrderType::GTC, // Maker entries are GTC
         });
 
         let no_params = final_no.map(|p| OrderParams {
@@ -273,6 +276,7 @@ impl Strategy for MakerStrategyImpl {
             is_neg_risk: market.is_neg_risk,
             market_name: market.market_name.clone(),
             condition_id: market.condition_id.clone(),
+            order_type: OrderType::GTC, // Maker entries are GTC
         });
 
         Ok(StrategySignal::MakerQuote {
@@ -299,7 +303,7 @@ impl Strategy for MakerStrategyImpl {
                     let profit_pct = (bid - position.avg_entry) / position.avg_entry;
                     if profit_pct < profit_threshold {
                         return Ok(StrategySignal::Exit {
-                            params: OrderParams { token_id, price: bid, shares: position.shares, fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 }, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone() },
+                            params: OrderParams { token_id, price: bid, shares: position.shares, fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 }, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK },
                             reason: "NearExpiryProfitGuard".to_string(),
                             exit_pair: false,
                         });
@@ -358,6 +362,7 @@ impl Strategy for MakerStrategyImpl {
                             is_neg_risk: market.is_neg_risk,
                             market_name: market.market_name.clone(),
                             condition_id: market.condition_id.clone(),
+                            order_type: OrderType::FAK, // Exit orders are always FAK
                         },
                         reason: format!("ToxicFill: OBI={:.2} (book turned adverse)", obi),
                         exit_pair: false,
@@ -391,6 +396,7 @@ impl Strategy for MakerStrategyImpl {
                         is_neg_risk: market.is_neg_risk,
                         market_name: market.market_name.clone(),
                         condition_id: market.condition_id.clone(),
+                        order_type: OrderType::FAK, // Exit orders are always FAK
                     },
                     reason: format!("Maker TP: gain={:.2}%", profit_pct * dec!(100)),
                     exit_pair: false,
@@ -410,6 +416,7 @@ impl Strategy for MakerStrategyImpl {
                         is_neg_risk: market.is_neg_risk,
                         market_name: market.market_name.clone(),
                         condition_id: market.condition_id.clone(),
+                        order_type: OrderType::FAK, // Exit orders are always FAK
                     },
                     reason: format!("Maker SL: loss={:.2}% ({}s held)", profit_pct * dec!(100), secs_since_fill),
                     exit_pair: false,

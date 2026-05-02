@@ -5,6 +5,7 @@ use alloy::primitives::U256;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
 
 /// Represents a single position held in the trading system.
 /// Shared across strategies and the main orchestrator.
@@ -130,6 +131,7 @@ pub struct OrderParams {
     pub is_neg_risk: bool,
     pub market_name: String,
     pub condition_id: String,
+    pub order_type: OrderType, // Added this field
 }
 
 /// Signals returned by strategies for the orchestrator to act upon.

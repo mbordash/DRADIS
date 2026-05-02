@@ -26,6 +26,7 @@ use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::strategies::is_drawdown_limit_hit;
 use crate::config;
+use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
 
 pub struct BasisStrategyImpl;
 
@@ -142,6 +143,7 @@ impl Strategy for BasisStrategyImpl {
 
             let target_price;
             let entry_fee_bps;
+            let order_type;
             let effective_fee_multiplier;
 
             if config::BASIS_ENTRY_AS_MAKER {
@@ -157,11 +159,13 @@ impl Strategy for BasisStrategyImpl {
                 }
                 target_price = proposed_price;
                 entry_fee_bps = 0; // Maker orders have 0 fees
+                order_type = OrderType::GTC; // Good-Til-Cancelled for maker
                 effective_fee_multiplier = dec!(1); // No fee to back off from trade_size
             } else {
                 // Taker entry (current behavior)
                 target_price = snap.no_ask;
                 entry_fee_bps = market.no_fee_bps as u16;
+                order_type = OrderType::FAK; // Fill-And-Kill for taker
                 effective_fee_multiplier = no_fee_headroom;
             }
 
@@ -178,6 +182,7 @@ impl Strategy for BasisStrategyImpl {
                     is_neg_risk: market.is_neg_risk,
                     market_name: market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
+                    order_type,
                 },
                 pair_params: None,
             });
@@ -189,6 +194,7 @@ impl Strategy for BasisStrategyImpl {
 
             let target_price;
             let entry_fee_bps;
+            let order_type;
             let effective_fee_multiplier;
 
             if config::BASIS_ENTRY_AS_MAKER {
@@ -203,11 +209,13 @@ impl Strategy for BasisStrategyImpl {
                 }
                 target_price = proposed_price;
                 entry_fee_bps = 0; // Maker orders have 0 fees
+                order_type = OrderType::GTC; // Good-Til-Cancelled for maker
                 effective_fee_multiplier = dec!(1); // No fee to back off from trade_size
             } else {
                 // Taker entry (current behavior)
                 target_price = snap.yes_ask;
                 entry_fee_bps = market.yes_fee_bps as u16;
+                order_type = OrderType::FAK; // Fill-And-Kill for taker
                 effective_fee_multiplier = yes_fee_headroom;
             }
 
@@ -224,6 +232,7 @@ impl Strategy for BasisStrategyImpl {
                     is_neg_risk: market.is_neg_risk,
                     market_name: market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
+                    order_type,
                 },
                 pair_params: None,
             });
@@ -283,6 +292,7 @@ impl Strategy for BasisStrategyImpl {
                         is_neg_risk: target_market.is_neg_risk,
                         market_name: target_market.market_name.clone(),
                         condition_id: target_market.condition_id.clone(),
+                        order_type: OrderType::FAK, // Exit orders are always FAK
                     },
                     reason: format!("BasisTP: bid=${:.4}, profit={:.2}%", position_bid, profit_margin * dec!(100)),
                     exit_pair: false,
@@ -311,6 +321,7 @@ impl Strategy for BasisStrategyImpl {
                         is_neg_risk: target_market.is_neg_risk,
                         market_name: target_market.market_name.clone(),
                         condition_id: target_market.condition_id.clone(),
+                        order_type: OrderType::FAK, // Exit orders are always FAK
                     },
                     reason: format!("BasisSL: bid=${:.4}, loss={:.2}%", position_bid, profit_margin * dec!(100)),
                     exit_pair: false,
@@ -327,6 +338,7 @@ impl Strategy for BasisStrategyImpl {
                         is_neg_risk: target_market.is_neg_risk,
                         market_name: target_market.market_name.clone(),
                         condition_id: target_market.condition_id.clone(),
+                        order_type: OrderType::FAK, // Exit orders are always FAK
                     },
                     reason: format!("BasisSkewCollapse: yes_mid={:.4}, profit={:.2}%", yes_mid, profit_margin * dec!(100)),
                     exit_pair: false,
@@ -355,6 +367,7 @@ impl Strategy for BasisStrategyImpl {
                                 is_neg_risk: target_market.is_neg_risk,
                                 market_name: target_market.market_name.clone(),
                                 condition_id: target_market.condition_id.clone(),
+                                order_type: OrderType::FAK, // Exit orders are always FAK
                             },
                             reason: format!("BasisExpiry: {}s left", secs_left),
                             exit_pair: false,

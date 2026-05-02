@@ -12,6 +12,7 @@ use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::strategies::is_drawdown_limit_hit;
 use crate::config;
+use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
 
 const STRATEGY_NAME: &str = "ArbitrageStrategy";
 
@@ -63,6 +64,7 @@ impl Strategy for ArbitrageStrategyImpl {
                     is_neg_risk: market.is_neg_risk,
                     market_name: market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
+                    order_type: OrderType::FAK, // Arbitrage entries are typically FAK
                 },
                 pair_params: Some(OrderParams {
                     token_id: market.no_token,
@@ -72,6 +74,7 @@ impl Strategy for ArbitrageStrategyImpl {
                     is_neg_risk: market.is_neg_risk,
                     market_name: market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
+                    order_type: OrderType::FAK, // Arbitrage entries are typically FAK
                 }),
             });
         }
@@ -101,6 +104,7 @@ impl Strategy for ArbitrageStrategyImpl {
                         is_neg_risk: market.is_neg_risk,
                         market_name: market.market_name.clone(),
                         condition_id: market.condition_id.clone(),
+                        order_type: OrderType::FAK, // Exit orders are always FAK
                     },
                     reason: "Arbitrage convergence".to_string(),
                     exit_pair: true,
@@ -111,7 +115,7 @@ impl Strategy for ArbitrageStrategyImpl {
     }
 
     fn status(&self) -> StrategyStatus { StrategyStatus::Active }
-    fn name(&self) -> String { STRATEGY_NAME.to_string() }
+    fn name(&self) -> String { "ArbitrageStrategy".to_string() }
     fn venue(&self) -> &'static str { "Window/Daily" }
     fn max_exposure(&self) -> rust_decimal::Decimal { crate::config::ARBITRAGE_MAX_EXPOSURE_USDC }
     fn risk_model(&self) -> &'static str { "Gross hedged (per leg)" }
