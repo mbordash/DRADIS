@@ -378,7 +378,7 @@ async fn main() -> Result<()> {
                                 continue;
                             }
                         };
-                    let mut stream = Box::pin(stream);
+                        let mut stream = Box::pin(stream);
                         info!("✅ WS orderbook subscribed for maker token {}", token);
                         while let Some(book_result) = stream.next().await {
                             if let Ok(book) = book_result {
@@ -656,6 +656,8 @@ async fn main() -> Result<()> {
                                 }
                                 info!("📤 EXIT [{}]: {} | shares={:.2}, bid=${:.4} | {}", sn, params.market_name, shares, params.price, reason);
                                 let vc = if params.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
+
+                                let mut exit_successful = false;
                                 if !config::GHOST_MODE {
                                     if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, tid, Side::Sell, shares, (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), params.fee_bps, params.order_type, params.post_only, 0, &shared_http).await {
                                         let es = e.to_string();
@@ -664,11 +666,6 @@ async fn main() -> Result<()> {
                                             last_trade_time.insert(sn.clone(), Instant::now()); continue;
                                         }
                                         if es.contains("no orders found") {
-                                            // FAK sell couldn't find buyers at the current ask level.
-                                            // Position stays in the map so the exit re-fires next heartbeat,
-                                            // BUT we impose a full stop-loss cooldown so the strategy cannot
-                                            // flip to a new ENTRY while on-chain shares may still exist.
-                                            // This was the root cause of 49-share position compounding.
                                             warn!("⚠️ EXIT FAK miss [{}]: no buyers at ${:.4} — holding position, cooldown {}s", sn, params.price, config::STOP_LOSS_COOLDOWN_SECS);
                                             last_trade_time.insert(sn.clone(), Instant::now());
                                             if reason.to_lowercase().contains("sl") || reason.to_lowercase().contains("stop") || reason.to_lowercase().contains("toxic") {
@@ -679,89 +676,99 @@ async fn main() -> Result<()> {
                                         }
                                         continue;
                                     }
+                                    exit_successful = true;
+                                } else {
+                                    // In GHOST_MODE, simulate successful exit
+                                    exit_successful = true;
                                 }
 
-                                let re_m;
-                                let rs_m;
-                                let rc_m;
-                                let pnl_m;
+                                if exit_successful {
+                                    let re_m;
+                                    let rs_m;
+                                    let rc_m;
+                                    let pnl_m;
 
-                                {
-                                    let mut map = positions.lock().await;
-                                    if let Some(p) = map.remove(&pos_key) {
-                                        // Use actual sell price (bid - sell offset) for PnL to match real proceeds.
-                                        let actual_exit_price = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
-                                        let pnl = (actual_exit_price - p.avg_entry) * p.shares;
-                                        *total_pnl.lock().await += pnl;
-                                        info!("💰 Position closed [{}]: PnL ${:.4}", sn, pnl);
+                                    {
+                                        let mut map = positions.lock().await;
+                                        if let Some(p) = map.remove(&pos_key) {
+                                            // Use actual sell price (bid - sell offset) for PnL to match real proceeds.
+                                            let actual_exit_price = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
+                                            let pnl = (actual_exit_price - p.avg_entry) * p.shares;
+                                            *total_pnl.lock().await += pnl;
+                                            info!("💰 Position closed [{}]: PnL ${:.4}", sn, pnl);
 
-                                        re_m = p.avg_entry;
-                                        rs_m = p.shares;
-                                        rc_m = p.close_time;
-                                        pnl_m = pnl;
+                                            re_m = p.avg_entry;
+                                            rs_m = p.shares;
+                                            rc_m = p.close_time;
+                                            pnl_m = pnl;
 
-                                        // Record trade metrics asynchronously
-                                        let sn_task = sn.clone();
-                                        let m_name = params.market_name.clone();
-                                        let sid = if tid == yes_token { "YES".to_string() } else { "NO".to_string() };
-                                        let rp = actual_exit_price;
-                                        let r_m = reason.clone();
-                                        tokio::spawn(async move { metrics::record_trade(sn_task, m_name, sid, re_m, rp, rs_m, pnl_m, r_m).await; });
-                                    } else { continue; }
-                                }
+                                            if !config::GHOST_MODE {
+                                                // Record trade metrics asynchronously only in real mode
+                                                let sn_task = sn.clone();
+                                                let m_name = params.market_name.clone();
+                                                let sid = if tid == yes_token { "YES".to_string() } else { "NO".to_string() };
+                                                let rp = actual_exit_price;
+                                                let r_m = reason.clone();
+                                                tokio::spawn(async move { metrics::record_trade(sn_task, m_name, sid, re_m, rp, rs_m, pnl_m, r_m).await; });
+                                            }
+                                        } else { continue; }
+                                    }
 
-                                if rs_m > dec!(0) {
-                                    let ps = Arc::clone(&positions); let cl = Arc::clone(&trading_client); let tp = Arc::clone(&total_pnl); let m_name = params.market_name.clone();
-                                    let sn_async = sn.clone();
-                                    tokio::spawn(async move {
-                                        tokio::time::sleep(Duration::from_millis(2500)).await;
-                                        let mut req = BalanceAllowanceRequest::default(); req.asset_type = AssetType::Conditional; req.token_id = Some(tid);
-                                        let rem = match cl.balance_allowance(req).await { Ok(r) => Decimal::from_str(&r.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000), Err(_) => return };
-                                        if rem >= config::MIN_ORDER_SHARES {
-                                            let fill = (rs_m - rem).max(dec!(0)); let aep2 = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnlc = -((aep2 - re_m) * rem.min(rs_m)); *tp.lock().await += pnlc;
-                                            // FAK filled 0: re-insert the FULL position so the exit retries next heartbeat.
-                                            // Previously this logged and moved on, leaving shares orphaned on-chain — the
-                                            // strategy would believe it was flat and open a new position on top of them.
-                                            if fill < config::MIN_ORDER_SHARES {
-                                                warn!("⚠️ PARTIAL EXIT [{}]: FAK filled 0/{:.4} shares — re-inserting for retry.", sn_async, rs_m);
-                                                let mut map = ps.lock().await;
-                                                if !map.contains_key(&(sn_async.clone(), tid)) {
-                                                    map.insert((sn_async.clone(), tid), Position { shares: rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
+                                    if rs_m > dec!(0) && !config::GHOST_MODE { // Only sync balance if not in ghost mode
+                                        let ps = Arc::clone(&positions); let cl = Arc::clone(&trading_client); let tp = Arc::clone(&total_pnl); let m_name = params.market_name.clone();
+                                        let sn_async = sn.clone();
+                                        tokio::spawn(async move {
+                                            tokio::time::sleep(Duration::from_millis(2500)).await;
+                                            let mut req = BalanceAllowanceRequest::default(); req.asset_type = AssetType::Conditional; req.token_id = Some(tid);
+                                            let rem = match cl.balance_allowance(req).await { Ok(r) => Decimal::from_str(&r.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000), Err(_) => return };
+                                            if rem >= config::MIN_ORDER_SHARES {
+                                                let fill = (rs_m - rem).max(dec!(0)); let aep2 = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnlc = -((aep2 - re_m) * rem.min(rs_m)); *tp.lock().await += pnlc;
+                                                // FAK filled 0: re-insert the FULL position so the exit retries next heartbeat.
+                                                // Previously this logged and moved on, leaving shares orphaned on-chain — the
+                                                // strategy would believe it was flat and open a new position on top of them.
+                                                if fill < config::MIN_ORDER_SHARES {
+                                                    warn!("⚠️ PARTIAL EXIT [{}]: FAK filled 0/{:.4} shares — re-inserting for retry.", sn_async, rs_m);
+                                                    let mut map = ps.lock().await;
+                                                    if !map.contains_key(&(sn_async.clone(), tid)) {
+                                                        map.insert((sn_async.clone(), tid), Position { shares: rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
+                                                    }
+                                                } else { warn!("⚠️ PARTIAL EXIT [{}]: sold {:.4}/{:.4} — re-inserting.", sn_async, fill, rs_m); let mut map = ps.lock().await; if !map.contains_key(&(sn_async.clone(), tid)) { map.insert((sn_async.clone(), tid), Position { shares: rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None }); } }
+                                            }
+                                        });
+                                    }
+                                    if exit_pair {
+                                        let other_tid = if tid == yes_token { no_token } else { yes_token };
+                                        let pk = (sn.clone(), other_tid); let ps = { let map = positions.lock().await; map.get(&pk).map(|p| p.shares) };
+                                        if let Some(s) = ps {
+                                            let other_bid = if other_tid == yes_token { yb } else { nb };
+                                            let other_fee_bps = if other_tid == yes_token { yes_fee_rate as u16 } else { no_fee_rate as u16 };
+                                            let other_vc = if is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
+                                            if !config::GHOST_MODE { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, other_tid, Side::Sell, s, (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), other_fee_bps, OrderType::FAK, false, 0, &shared_http).await; }
+                                            let mut map = positions.lock().await; if let Some(p) = map.remove(&pk) { let actual_other_exit = (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnl = (actual_other_exit - p.avg_entry) * p.shares; *total_pnl.lock().await += pnl;
+                                                if !config::GHOST_MODE {
+                                                    let sn_pm = sn.clone(); let m_name = params.market_name.clone(); let sid = if other_tid == yes_token { "YES".to_string() } else { "NO".to_string() }; let p_avg = p.avg_entry; let o_bid = actual_other_exit; let p_shares = p.shares; let pn = pnl;
+                                                    tokio::spawn(async move { metrics::record_trade(sn_pm, m_name, sid, p_avg, o_bid, p_shares, pn, "Convergence/PairedExit".to_string()).await; });
                                                 }
-                                            } else { warn!("⚠️ PARTIAL EXIT [{}]: sold {:.4}/{:.4} — re-inserting.", sn_async, fill, rs_m); let mut map = ps.lock().await; if !map.contains_key(&(sn_async.clone(), tid)) { map.insert((sn_async.clone(), tid), Position { shares: rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None }); } }
-                                        }
-                                    });
-                                }
-                                if exit_pair {
-                                    let other_tid = if tid == yes_token { no_token } else { yes_token };
-                                    let pk = (sn.clone(), other_tid); let ps = { let map = positions.lock().await; map.get(&pk).map(|p| p.shares) };
-                                    if let Some(s) = ps {
-                                        let other_bid = if other_tid == yes_token { yb } else { nb };
-                                        let other_fee_bps = if other_tid == yes_token { yes_fee_rate as u16 } else { no_fee_rate as u16 };
-                                        let other_vc = if is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
-                                        if !config::GHOST_MODE { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, other_tid, Side::Sell, s, (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), other_fee_bps, OrderType::FAK, false, 0, &shared_http).await; }
-                                        let mut map = positions.lock().await; if let Some(p) = map.remove(&pk) { let actual_other_exit = (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnl = (actual_other_exit - p.avg_entry) * p.shares; *total_pnl.lock().await += pnl;
-                                            let sn_pm = sn.clone(); let m_name = params.market_name.clone(); let sid = if other_tid == yes_token { "YES".to_string() } else { "NO".to_string() }; let p_avg = p.avg_entry; let o_bid = actual_other_exit; let p_shares = p.shares; let pn = pnl;
-                                            tokio::spawn(async move { metrics::record_trade(sn_pm, m_name, sid, p_avg, o_bid, p_shares, pn, "Convergence/PairedExit".to_string()).await; });
+                                            }
                                         }
                                     }
+                                    // Trigger 180s cooldown for any stop-loss variant: BasisSL, Maker SL,
+                                    // Time Decay SL, ToxicFill, BasisSkewCollapse. Must match the same
+                                    // predicate used in the FAK-miss path above (line ~601) so both the
+                                    // successful-exit and the FAK-miss path are consistent.
+                                    if reason.to_lowercase().contains("sl")
+                                        || reason.to_lowercase().contains("stop")
+                                        || reason.to_lowercase().contains("toxic")
+                                        || reason.to_lowercase().contains("skewcollapse")
+                                    {
+                                        last_stop_loss_time.insert(sn.clone(), Instant::now());
+                                    }
+                                    // After an expiry exit, block re-entry for 5 minutes via a separate map.
+                                    if reason.to_lowercase().contains("expir") { last_expiry_exit_time.insert(sn.clone(), Instant::now()); }
+                                    last_trade_time.insert(sn.clone(), Instant::now());
+                                    // Detached: Telegram latency must never block the trading select! loop.
+                                    { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = format!("📤 EXIT [{}] {} | bid=${:.4} | reason: {} | Session PnL: ${:.4}", sn, params.market_name, params.price, reason, *total_pnl.lock().await); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
                                 }
-                                // Trigger 180s cooldown for any stop-loss variant: BasisSL, Maker SL,
-                                // Time Decay SL, ToxicFill, BasisSkewCollapse. Must match the same
-                                // predicate used in the FAK-miss path above (line ~601) so both the
-                                // successful-exit and the FAK-miss path are consistent.
-                                if reason.to_lowercase().contains("sl")
-                                    || reason.to_lowercase().contains("stop")
-                                    || reason.to_lowercase().contains("toxic")
-                                    || reason.to_lowercase().contains("skewcollapse")
-                                {
-                                    last_stop_loss_time.insert(sn.clone(), Instant::now());
-                                }
-                                // After an expiry exit, block re-entry for 5 minutes via a separate map.
-                                if reason.to_lowercase().contains("expir") { last_expiry_exit_time.insert(sn.clone(), Instant::now()); }
-                                last_trade_time.insert(sn.clone(), Instant::now());
-                                // Detached: Telegram latency must never block the trading select! loop.
-                                { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = format!("📤 EXIT [{}] {} | bid=${:.4} | reason: {} | Session PnL: ${:.4}", sn, params.market_name, params.price, reason, *total_pnl.lock().await); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
                             }
 
                             // ════════════════════ ENTRY ════════════════════
@@ -784,19 +791,42 @@ async fn main() -> Result<()> {
                                     }
                                 }
 
-                                // Only proceed with actual order placement and position tracking if NOT in GHOST_MODE
-                                if !config::GHOST_MODE {
+                                // Simulate position tracking in GHOST_MODE, or place real order otherwise
+                                if config::GHOST_MODE {
+                                    if positions.lock().await.contains_key(&pos_key) { continue; }
+
+                                    // Use the maker market's close_time when the entry token belongs to the maker
+                                    // venue — prevents BasisExpiry from firing against the hourly market's close
+                                    // time when the position actually lives in the daily/window market.
+                                    let pos_close_time = maker_market_config.as_ref()
+                                        .filter(|mk| params.token_id == mk.yes_token || params.token_id == mk.no_token)
+                                        .and_then(|mk| mk.market_close_time)
+                                        .or(market_close_time);
+                                    // Store the actual fill price (signal price + buy offset) as avg_entry
+                                    // so PnL calculations reflect true cost basis, not the signal price.
+                                    let actual_entry_price = (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE);
+                                    positions.lock().await.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: params.token_id, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id) });
+
+                                    info!("👻 GHOST_MODE ENTRY [{}]: {} | ${:.4} x {:.1} (simulated)",
+                                        sn, params.market_name, params.price, params.shares);
+                                    if let Some(pp) = pair_params {
+                                        let pp_close_time = maker_market_config.as_ref()
+                                            .filter(|mk| pp.token_id == mk.yes_token || pp.token_id == mk.no_token)
+                                            .and_then(|mk| mk.market_close_time)
+                                            .or(market_close_time);
+                                        positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: pp.price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: Some(params.token_id) });
+                                        info!("👻 GHOST_MODE ENTRY (paired) [{}]: {} | ${:.4} x {:.1} (simulated)", sn, pp.market_name, pp.price, pp.shares);
+                                    }
+                                    last_trade_time.insert(sn.clone(), Instant::now());
+                                    // No actual order placement or balance sync in ghost mode
+                                } else {
+                                    // Real trading logic
                                     {
                                         let mut map = positions.lock().await; if map.contains_key(&pos_key) { continue; }
-                                        // Use the maker market's close_time when the entry token belongs to the maker
-                                        // venue — prevents BasisExpiry from firing against the hourly market's close
-                                        // time when the position actually lives in the daily/window market.
                                         let pos_close_time = maker_market_config.as_ref()
                                             .filter(|mk| params.token_id == mk.yes_token || params.token_id == mk.no_token)
                                             .and_then(|mk| mk.market_close_time)
                                             .or(market_close_time);
-                                        // Store the actual fill price (signal price + buy offset) as avg_entry
-                                        // so PnL calculations reflect true cost basis, not the signal price.
                                         let actual_entry_price = (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE);
                                         map.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: params.token_id, fill_confirmed_at: None, paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id) });
                                     }
@@ -812,31 +842,19 @@ async fn main() -> Result<()> {
                                         warn!("⚠️ ENTRY order failed [{}]: {}", sn, e);
                                         positions.lock().await.remove(&pos_key);
                                         pending_orders.lock().await.remove(&pos_key);
-                                        // Impose cooldown so the strategy backs off before retrying
                                         last_trade_time.insert(sn.clone(), Instant::now());
                                         consecutive_failures += 1; continue;
                                     }
                                     let cl_s = Arc::clone(&trading_client); let ps_s = Arc::clone(&positions); let pc_s = Arc::clone(&phantom_cooldowns); let sn_s = sn.clone(); let tn_s = params.token_id;
                                     tokio::spawn(async move { let _ = sync_position_balance(&cl_s, &ps_s, &sn_s, tn_s, Some(&pc_s), dec!(0), dradis::helpers::balance::MAX_WAIT_SECS_HOURLY).await; });
-                                    // Persist entry to disk so reconcile can recover the real cost basis after a restart.
                                     { let sn_e = sn.clone(); let tid_e = params.token_id.to_string(); let mn_e = params.market_name.clone(); let side_e = if params.token_id == yes_token { "YES" } else { "NO" }.to_string(); let ep_e = (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE); let sh_e = params.shares; tokio::spawn(async move { metrics::record_entry(sn_e, tid_e, mn_e, side_e, ep_e, sh_e).await; }); }
 
                                     if let Some(pp) = pair_params {
                                         let vc_p = if pp.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
-
-                                        // Capture Leg B result explicitly — previously discarded with `let _ = ...`.
-                                        // On failure we spawn a Flash-Exit task that sells Leg A as soon as the
-                                        // Polymarket indexer reflects the fill (~5-12 s), instead of waiting 60 s
-                                        // for the cleanup task to notice the orphan.
                                         let leg_b_result = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc_p, pp.token_id, Side::Buy, pp.shares, (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), pp.fee_bps, pp.order_type, pp.post_only, 0, &shared_http).await;
 
                                         match leg_b_result {
                                             Err(ref e) => {
-                                                // Leg B explicitly rejected — spawn Flash-Exit for Leg A.
-                                                // The task polls Leg A's on-chain balance every FLASH_EXIT_POLL_MS;
-                                                // once confirmed, it fires an emergency FAK sell and removes the
-                                                // position.  If Leg A was also a phantom (no fill), the task exits
-                                                // after FLASH_EXIT_CONFIRM_MS and sync_position_balance handles cleanup.
                                                 warn!("⚡ Leg B FAILED [{}]: {} — Flash-Exit spawned for Leg A (token {})", sn, e, params.token_id);
                                                 let cl_fe   = Arc::clone(&trading_client);
                                                 let nm_fe   = Arc::clone(&nonce_manager);
@@ -845,19 +863,14 @@ async fn main() -> Result<()> {
                                                 let signer_fe = signer.clone();
                                                 let sn_fe   = sn.clone();
                                                 let tok_a   = params.token_id;
-                                                // Best bid on the Leg A token at the moment of failure.
-                                                // Stale by the time the fill is confirmed (5-12 s), so we apply
-                                                // an extra haircut (FLASH_EXIT_EXTRA_OFFSET) to guarantee the
-                                                // emergency FAK crosses the spread and fills immediately.
                                                 let bid_a   = if tok_a == yes_token { yb } else { nb };
                                                 let fee_a   = params.fee_bps;
-                                                let vc_a    = vc; // verifying contract for Leg A
+                                                let vc_a    = vc;
                                                 tokio::spawn(async move {
                                                     let deadline = tokio::time::Instant::now()
                                                         + Duration::from_millis(config::FLASH_EXIT_CONFIRM_MS);
                                                     loop {
                                                         if tokio::time::Instant::now() >= deadline {
-                                                            // Leg A also phantom — sync_position_balance will clean it up
                                                             warn!("⚡ Flash-Exit: Leg A phantom (no fill in {}ms) [{}]",
                                                                   config::FLASH_EXIT_CONFIRM_MS, sn_fe);
                                                             break;
@@ -869,7 +882,6 @@ async fn main() -> Result<()> {
                                                             let shares = Decimal::from_str(&resp.balance.to_string())
                                                                 .unwrap_or(dec!(0)) / dec!(1_000_000);
                                                             if shares >= config::MIN_ORDER_SHARES {
-                                                                // Leg A confirmed — emergency FAK sell
                                                                 let sell_price = (bid_a
                                                                     - config::SELL_PRICE_OFFSET
                                                                     - config::FLASH_EXIT_EXTRA_OFFSET)
@@ -892,10 +904,8 @@ async fn main() -> Result<()> {
                                                         tokio::time::sleep(Duration::from_millis(config::FLASH_EXIT_POLL_MS)).await;
                                                     }
                                                 });
-                                                // Leg B was not filled — do NOT insert its position
-                                            },
+                                            }
                                             Ok(_) => {
-                                                // Normal path: Leg B accepted — insert position and start sync
                                                 let pp_close_time = maker_market_config.as_ref()
                                                     .filter(|mk| pp.token_id == mk.yes_token || pp.token_id == mk.no_token)
                                                     .and_then(|mk| mk.market_close_time)
@@ -903,21 +913,12 @@ async fn main() -> Result<()> {
                                                 positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: pp.price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: None, paired_leg_token_id: Some(params.token_id) });
                                                 let sn_p = sn.clone(); let tn_p = pp.token_id; let ps_p = Arc::clone(&positions); let cl_p = Arc::clone(&trading_client); let pc_p = Arc::clone(&phantom_cooldowns);
                                                 tokio::spawn(async move { let _ = sync_position_balance(&cl_p, &ps_p, &sn_p, tn_p, Some(&pc_p), dec!(0), dradis::helpers::balance::MAX_WAIT_SECS_HOURLY).await; });
-                                                // Persist Leg B entry to disk for reconcile recovery.
                                                 { let sn_eb = sn.clone(); let tid_eb = pp.token_id.to_string(); let mn_eb = pp.market_name.clone(); let side_eb = if pp.token_id == yes_token { "YES" } else { "NO" }.to_string(); let ep_eb = pp.price; let sh_eb = pp.shares; tokio::spawn(async move { metrics::record_entry(sn_eb, tid_eb, mn_eb, side_eb, ep_eb, sh_eb).await; }); }
                                             }
                                         }
                                     }
                                     last_trade_time.insert(sn.clone(), Instant::now());
-                                    // Detached: Telegram latency must never block the trading select! loop.
                                     { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = format!("📥 ENTRY [{}] {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
-                                } else {
-                                    // GHOST_MODE is true, log the entry but don't place order or track position
-                                    info!("👻 GHOST_MODE ENTRY [{}]: {} | ${:.4} x {:.1} (simulated)", sn, params.market_name, params.price, params.shares);
-                                    // If there are pair params, also log the simulated paired entry
-                                    if let Some(pp) = pair_params {
-                                        info!("👻 GHOST_MODE ENTRY (paired) [{}]: {} | ${:.4} x {:.1} (simulated)", sn, pp.market_name, pp.price, pp.shares);
-                                    }
                                 }
                             }
 
@@ -935,8 +936,13 @@ async fn main() -> Result<()> {
                                         }
                                     }
 
-                                    // Only proceed with actual order placement and position tracking if NOT in GHOST_MODE
-                                    if !config::GHOST_MODE {
+                                    if config::GHOST_MODE {
+                                        if positions.lock().await.contains_key(&pk) { continue; }
+                                        positions.lock().await.insert(pk.clone(), Position { shares: p.shares, avg_entry: p.price, opened_at: Utc::now(), close_time: None, market_name: p.market_name.clone(), pair_token_id: p.token_id, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
+                                        info!("👻 GHOST_MODE MakerQuote [{}]: {} | shares={:.2}, bid=${:.4} (simulated)", sn, p.market_name, p.shares, p.price);
+                                        placed = true;
+                                    } else {
+                                        // Real trading logic
                                         if !positions.lock().await.contains_key(&pk) {
                                             info!("📥 MakerQuote [{}]: {} | shares={:.2}, bid=${:.4}", sn, p.market_name, p.shares, p.price);
                                             positions.lock().await.insert(pk.clone(), Position { shares: p.shares, avg_entry: p.price, opened_at: Utc::now(), close_time: None, market_name: p.market_name.clone(), pair_token_id: p.token_id, fill_confirmed_at: None, paired_leg_token_id: None });
@@ -946,10 +952,6 @@ async fn main() -> Result<()> {
                                                 pending_orders.lock().await.insert(pk.clone(), Instant::now() + Duration::from_secs(3));
                                             }
 
-                                            // Wrap quick_confirm_fill in a timeout: it calls cancel_market_orders
-                                            // and check_for_resting_order (both CLOB API calls with no internal
-                                            // timeout). If either stalls, the entire select loop freezes here —
-                                            // same root cause as the status_ticker balance_allowance freeze.
                                             let _ = tokio::time::timeout(
                                                 Duration::from_secs(10),
                                                 dradis::helpers::balance::quick_confirm_fill(&trading_client, &sn, p.token_id, &positions, &p.condition_id, p.order_type.clone()),
@@ -963,13 +965,9 @@ async fn main() -> Result<()> {
                                             let cl_m = Arc::clone(&trading_client); let ps_m = Arc::clone(&positions); let pc_m = Arc::clone(&phantom_cooldowns);
                                             let sn_m = sn.clone();
                                             tokio::spawn(async move { let _ = sync_position_balance(&cl_m, &ps_m, &sn_m, p.token_id, Some(&pc_m), dec!(0), dradis::helpers::balance::MAX_WAIT_SECS_WINDOW).await; });
-                                            // Persist maker entry to disk for reconcile recovery.
                                             { let sn_em = sn.clone(); let tid_em = p.token_id.to_string(); let mn_em = p.market_name.clone(); let side_em = if p.token_id == yes_token { "YES" } else { "NO" }.to_string(); let ep_em = p.price; let sh_em = p.shares; tokio::spawn(async move { metrics::record_entry(sn_em, tid_em, mn_em, side_em, ep_em, sh_em).await; }); }
                                         }
                                         placed = true;
-                                    } else {
-                                        // GHOST_MODE is true, log the maker quote but don't place order or track position
-                                        info!("👻 GHOST_MODE MakerQuote [{}]: {} | shares={:.2}, bid=${:.4} (simulated)", sn, p.market_name, p.shares, p.price);
                                     }
                                 }
                                 if placed { last_trade_time.insert(sn.clone(), Instant::now()); }
