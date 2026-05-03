@@ -17,9 +17,14 @@ use std::str::FromStr;
 /// that fires every 90 s but is fully expected when no daily market exists for the asset.
 static LAST_NO_MAKER_VENUE_LOG: AtomicU64 = AtomicU64::new(0);
 
-use crate::config;
+use crate::config; // Keep this for constants
 use crate::helpers::json::{extract_token_ids_u256, extract_close_time, get_enable_orderbook};
 use crate::helpers::price::value_to_f64;
+// Import the moved functions from config_helpers via crate::helpers
+use crate::helpers::{
+    is_window_market, is_daily_market, is_ultra_short_window_market,
+    is_high_priority_text, is_crypto_market, is_range_market, is_bad_market
+};
 
 // ============================================================================
 // MARKET VALIDATION TYPES
@@ -130,7 +135,8 @@ pub fn validate_expiry(
 }
 
 pub fn validate_time_window(market_name: &str) -> bool {
-    if config::is_window_market(market_name) || config::is_daily_market(market_name) {
+    // Use the imported functions directly
+    if is_window_market(market_name) || is_daily_market(market_name) {
         return true;
     }
 
@@ -151,10 +157,9 @@ pub fn validate_market(
     close_time: Option<DateTime<Utc>>,
     volume: f64,
     ctx: &ValidationContext,
-    blocked: &[&str],
 ) -> (bool, MarketValidationStatus, String) {
     let combined = format!("{} {}", market_name, event_title).to_lowercase();
-    for kw in blocked { if combined.contains(&kw.to_lowercase()) { return (false, MarketValidationStatus::Blocked, format!("Blocked: '{}'", kw)); } }
+    if is_bad_market(&combined) { return (false, MarketValidationStatus::Blocked, format!("Blocked: '{}'", combined)); }
 
     let lower = market_name.to_lowercase();
     let match_crypto = match ctx.crypto_filter.as_str() {
@@ -226,7 +231,8 @@ pub async fn fetch_specific_window_daily_market(
 
         for m in markets_arr {
             let name = m.get("question").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-            if config::is_bad_market(&name) || !get_enable_orderbook(m) { continue; }
+            // Use the imported function directly
+            if is_bad_market(&name) || !get_enable_orderbook(m) { continue; }
             let tokens = extract_token_ids_u256(m);
             if tokens.len() < 2 { continue; }
             // Use the event's endDate as authoritative close time (market-level endDate is identical)
@@ -285,11 +291,13 @@ pub async fn get_market_pair(http: &reqwest::Client) -> (MarketCandidate, Option
     for entry in &all { seen_cids.insert(entry.7.clone()); }
 
     let mut hourly_c: Vec<_> = merged.iter().filter(|c|
-        !config::is_window_market(&c.1)
-            && !config::is_daily_market(&c.1)
-            && !config::is_ultra_short_window_market(&c.1)
+        // Use the imported functions directly
+        !is_window_market(&c.1)
+            && !is_daily_market(&c.1)
+            && !is_ultra_short_window_market(&c.1)
     ).collect();
-    let mut maker_c: Vec<_> = merged.iter().filter(|c| config::is_window_market(&c.1) || config::is_daily_market(&c.1)).collect();
+    // Use the imported functions directly
+    let mut maker_c: Vec<_> = merged.iter().filter(|c| is_window_market(&c.1) || is_daily_market(&c.1)).collect();
 
     // Sort hourly by volume desc (high-volume markets are safer), then by most time left as tiebreak
     hourly_c.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(Ordering::Equal)
@@ -350,7 +358,8 @@ pub async fn fetch_recent_crypto_candidates(http: &reqwest::Client, filter: &str
             let tokens = extract_token_ids_u256(m);
             let close = extract_close_time(event, m);
             let vol = m.get("volume24hrClob").and_then(value_to_f64).unwrap_or(0.0);
-            let is_maker_venue = config::is_window_market(&name) || config::is_daily_market(&name);
+            // Use the imported functions directly
+            let is_maker_venue = is_window_market(&name) || is_daily_market(&name);
             let min_secs = if is_maker_venue { config::MAKER_MIN_SECS_TO_EXPIRY } else { config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY };
             let max_secs = if is_maker_venue { config::MAKER_MAX_SECS_TO_EXPIRY } else { config::MAX_SECONDS_TO_EXPIRY_FOR_ENTRY };
             let ctx = ValidationContext {
@@ -361,11 +370,11 @@ pub async fn fetch_recent_crypto_candidates(http: &reqwest::Client, filter: &str
                 safety_buffer_secs: config::MARKET_EXPIRY_SAFETY_BUFFER_SECS,
                 min_volume: 0.0, // allow zero-volume fresh markets
             };
-            let blocked = vec!["presidential", "nomination", "election", "democratic", "republican"];
             let event_title = event.get("title").and_then(|v| v.as_str()).unwrap_or_default();
-            let (valid, _, _) = validate_market(&name, event_title, &tokens, close, vol, &ctx, &blocked);
-            if valid && !config::is_range_market(&name) && !config::is_ultra_short_window_market(&name) && get_enable_orderbook(m) {
-                out.push((tokens, name.clone(), m.get("slug").and_then(|v| v.as_str()).unwrap_or_default().to_string(), vol, config::is_high_priority_text(&name), close, m.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(), m.get("conditionId").and_then(|v| v.as_str()).unwrap_or_default().to_string()));
+            // Removed `blocked` argument from `validate_market` call
+            let (valid, _, _) = validate_market(&name, event_title, &tokens, close, vol, &ctx);
+            if valid && !is_range_market(&name) && !is_ultra_short_window_market(&name) && get_enable_orderbook(m) {
+                out.push((tokens, name.clone(), m.get("slug").and_then(|v| v.as_str()).unwrap_or_default().to_string(), vol, is_high_priority_text(&name), close, m.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(), m.get("conditionId").and_then(|v| v.as_str()).unwrap_or_default().to_string()));
             }
         }
     }
@@ -387,7 +396,8 @@ pub async fn fetch_simplified_crypto_candidates(http: &reqwest::Client, filter: 
                 let tokens = extract_token_ids_u256(m);
                 let close = extract_close_time(event, m);
                 let vol = m.get("volume24hrClob").and_then(value_to_f64).unwrap_or(0.0);
-                let is_maker_venue = config::is_window_market(&name) || config::is_daily_market(&name);
+                // Use the imported functions directly
+                let is_maker_venue = is_window_market(&name) || is_daily_market(&name);
                 let min_secs = if is_maker_venue { config::MAKER_MIN_SECS_TO_EXPIRY } else { config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY };
                 let max_secs = if is_maker_venue { config::MAKER_MAX_SECS_TO_EXPIRY } else { config::MAX_SECONDS_TO_EXPIRY_FOR_ENTRY };
                 let ctx = ValidationContext {
@@ -398,11 +408,11 @@ pub async fn fetch_simplified_crypto_candidates(http: &reqwest::Client, filter: 
                     safety_buffer_secs: config::MARKET_EXPIRY_SAFETY_BUFFER_SECS,
                     min_volume: config::MIN_MARKET_VOLUME,
                 };
-                let blocked = vec!["presidential", "nomination", "election", "democratic", "republican"];
                 let event_title = event.get("title").and_then(|v| v.as_str()).unwrap_or_default();
-                let (valid, _, _) = validate_market(&name, event_title, &tokens, close, vol, &ctx, &blocked);
-                if valid && !config::is_range_market(&name) && !config::is_ultra_short_window_market(&name) && get_enable_orderbook(m) {
-                    out.push((tokens, name.clone(), m.get("slug").and_then(|v| v.as_str()).unwrap_or_default().to_string(), vol, config::is_high_priority_text(&name), close, m.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(), m.get("conditionId").and_then(|v| v.as_str()).unwrap_or_default().to_string()));
+                // Removed `blocked` argument from `validate_market` call
+                let (valid, _, _) = validate_market(&name, event_title, &tokens, close, vol, &ctx);
+                if valid && !is_range_market(&name) && !is_ultra_short_window_market(&name) && get_enable_orderbook(m) {
+                    out.push((tokens, name.clone(), m.get("slug").and_then(|v| v.as_str()).unwrap_or_default().to_string(), vol, is_high_priority_text(&name), close, m.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(), m.get("conditionId").and_then(|v| v.as_str()).unwrap_or_default().to_string()));
                 }
             }
         }

@@ -29,7 +29,7 @@ pub const GHOST_MODE: bool = false;
 
 /// Min net profit after fees to trigger arbitrage.
 pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.03);
-pub const ARBITRAGE_MAX_TAKER_FEE_BPS: u32 = 200;
+pub const ARBITRAGE_MAX_TAKER_FEE_BPS: u32 = 1500; // Updated from 200
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.97);
 pub const MIN_ORDER_SHARES: Decimal = dec!(1.0);
 pub const MIN_ORDER_USDC: Decimal = dec!(1.05);
@@ -173,7 +173,7 @@ pub const BASIS_EXPIRY_MIN_EXIT_BID: Decimal = dec!(0.15);
 pub const BASIS_MIN_TRADE_SIZE_USDC: Decimal = dec!(4.0);
 pub const BASIS_MAX_TRADE_SIZE_USDC: Decimal = dec!(12.0);
 pub const BASIS_KELLY_MAX_MULTIPLIER: Decimal = dec!(3.0);
-pub const BASIS_MAX_TAKER_FEE_BPS: u32 = 200;
+pub const BASIS_MAX_TAKER_FEE_BPS: u32 = 1500; // Updated from 200
 pub const BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 30;
 pub const BASIS_FUNDING_POLL_SECS: u64 = 60;
 pub const BASIS_MIN_STOP_LOSS_EXIT_BID: Decimal = dec!(0.005);

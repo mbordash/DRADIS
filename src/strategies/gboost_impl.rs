@@ -315,7 +315,7 @@ impl Strategy for GboostStrategyImpl {
             let price  = floor_to_tick_size(ctx.snapshot.yes_ask);
             if price >= config::GBOOST_MAX_ENTRY_PRICE || price <= dec!(0) { return Ok(StrategySignal::NoSignal); }
             let shares = trade_usdc / price;
-            tracing::info!(
+            tracing::debug!(
                 "🔮 GBoost YES entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
                 p_yes_up, price, shares
             );
@@ -340,7 +340,7 @@ impl Strategy for GboostStrategyImpl {
             let price  = floor_to_tick_size(ctx.snapshot.no_ask);
             if price >= config::GBOOST_MAX_ENTRY_PRICE || price <= dec!(0) { return Ok(StrategySignal::NoSignal); }
             let shares = trade_usdc / price;
-            tracing::info!(
+            tracing::debug!(
                 "🔮 GBoost NO entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
                 p_yes_up, price, shares
             );

@@ -53,6 +53,7 @@ scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/market_data.rs "$USER@$HOST:$REMOT
 # Copy helpers modules
 scp -P "$SSH_PORT" -i "$KEY" src/helpers/mod.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/mod.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/helpers/price.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/price.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/config_helpers.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/config_helpers.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/helpers/json.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/json.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/helpers/time.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/time.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/helpers/balance.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/balance.rs"
