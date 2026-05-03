@@ -35,7 +35,7 @@ use async_trait::async_trait;
 use anyhow::Result;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
-use std::collections::VecDeque;
+use std::collections::{VecDeque, HashMap}; // Added HashMap
 use std::sync::{Arc, Mutex as StdMutex};
 use std::sync::atomic::{AtomicBool, Ordering};
 use chrono::Utc;
@@ -43,6 +43,7 @@ use perpetual::{Matrix, PerpetualBooster};
 use perpetual::objective::Objective;
 use perpetual::booster::config::BoosterIO;
 use tokio::time::{Instant, Duration}; // Import Instant and Duration
+use alloy::primitives::U256; // For token_id in pending_entries
 
 use crate::config;
 use crate::orchestrator::{Strategy, StrategyContext};
@@ -53,6 +54,15 @@ use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
 
 /// Number of f64 features per snapshot row fed into the booster.
 const NUM_FEATURES: usize = 12;
+
+/// Represents a single training sample for the Gboost model.
+/// Contains the features at the time of entry and whether the trade was profitable.
+#[derive(Debug, Clone)]
+pub struct TrainingSample {
+    pub features: [f64; NUM_FEATURES],
+    pub is_profitable: bool, // Label: true if profitable, false if loss
+    pub entry_timestamp: chrono::DateTime<chrono::Utc>, // For context/debugging
+}
 
 // ── Feature extraction ────────────────────────────────────────────────────────
 
@@ -87,30 +97,28 @@ fn extract_features(s: &MarketSnapshot) -> [f64; NUM_FEATURES] {
 
 // ── Training helper (runs inside spawn_blocking) ──────────────────────────────
 
-/// Build and train a fresh `PerpetualBooster` from a snapshot slice.
+/// Build and train a fresh `PerpetualBooster` from a slice of `TrainingSample`s.
 /// Called exclusively from `tokio::task::spawn_blocking` — never on an async thread.
-fn train_model(snapshots: Vec<MarketSnapshot>) -> Result<PerpetualBooster> {
-    let lookahead = config::GBOOST_LOOKAHEAD_TICKS;
-    let n = snapshots.len();
-    if n <= lookahead {
+fn train_model(samples: Vec<TrainingSample>) -> Result<PerpetualBooster> {
+    let n = samples.len();
+
+    if n < config::GBOOST_MIN_TRAINING_SAMPLES {
         return Err(anyhow::anyhow!(
-            "GBoost: too few snapshots ({}) for labels (need > {})", n, lookahead
+            "GBoost: too few training samples ({}) for training (need at least {})", n, config::GBOOST_MIN_TRAINING_SAMPLES
         ));
     }
 
-    let labeled_n = n - lookahead;
-    let mut feature_data: Vec<f64> = Vec::with_capacity(labeled_n * NUM_FEATURES);
-    let mut labels: Vec<f64>       = Vec::with_capacity(labeled_n);
+    let mut feature_data: Vec<f64> = Vec::with_capacity(n * NUM_FEATURES);
+    let mut labels: Vec<f64>       = Vec::with_capacity(n);
 
-    for i in 0..labeled_n {
-        feature_data.extend_from_slice(&extract_features(&snapshots[i]));
-        // Binary label: 1 if YES bid rose over the lookahead window, else 0.
-        let label = if snapshots[i + lookahead].yes_bid > snapshots[i].yes_bid { 1.0 } else { 0.0 };
-        labels.push(label);
+    for sample in samples {
+        feature_data.extend_from_slice(&sample.features);
+        // Label: 1.0 if profitable, 0.0 if not profitable
+        labels.push(if sample.is_profitable { 1.0 } else { 0.0 });
     }
 
     // Matrix<'a, T> borrows the slice; both Vec and Matrix live in this closure scope.
-    let matrix = Matrix::new(&feature_data, labeled_n, NUM_FEATURES);
+    let matrix = Matrix::new(&feature_data, n, NUM_FEATURES);
 
     let mut booster = PerpetualBooster::default()
         .set_objective(Objective::LogLoss)
@@ -137,6 +145,10 @@ pub struct GboostStrategyImpl {
     ticks_since_retrain: Arc<StdMutex<usize>>,
     /// Set to `true` while a background training task is running.
     is_training: Arc<AtomicBool>,
+    /// Stores completed trade outcomes (features + profitability) for training.
+    training_data: Arc<StdMutex<VecDeque<TrainingSample>>>,
+    /// Stores entry snapshots and prices for trades that are currently open (ghost mode).
+    pending_entries: Arc<StdMutex<HashMap<U256, (MarketSnapshot, rust_decimal::Decimal)>>>,
 }
 
 impl GboostStrategyImpl {
@@ -174,6 +186,10 @@ impl GboostStrategyImpl {
             )),
             ticks_since_retrain: Arc::new(StdMutex::new(0)),
             is_training: Arc::new(AtomicBool::new(false)),
+            training_data: Arc::new(StdMutex::new(
+                VecDeque::with_capacity(config::GBOOST_HISTORY_BUFFER_SIZE) // Use similar capacity
+            )),
+            pending_entries: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -198,8 +214,8 @@ impl GboostStrategyImpl {
         };
         if !triggered { return; }
 
-        let snapshots: Vec<MarketSnapshot> = {
-            let h = self.history.lock().unwrap();
+        let training_samples: Vec<TrainingSample> = {
+            let h = self.training_data.lock().unwrap();
             if h.len() < config::GBOOST_MIN_TRAINING_SAMPLES { return; }
             h.iter().cloned().collect()
         };
@@ -211,7 +227,7 @@ impl GboostStrategyImpl {
         let is_training = Arc::clone(&self.is_training);
 
         tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || train_model(snapshots)).await;
+            let result = tokio::task::spawn_blocking(move || train_model(training_samples)).await;
 
             match result {
                 Ok(Ok(new_model)) => {
@@ -269,6 +285,8 @@ impl Strategy for GboostStrategyImpl {
         // Maintain history and trigger background retrains.
         // This happens regardless of ENABLE_GBOOST_TRADING so the model can learn.
         self.push_snapshot(ctx.snapshot.clone());
+        // Note: maybe_retrain will now use training_data, not history.
+        // History is still maintained for other potential uses or future features.
         self.maybe_retrain();
 
         if !config::ENABLE_GBOOST_TRADING {
@@ -319,6 +337,11 @@ impl Strategy for GboostStrategyImpl {
                 "🔮 GBoost YES entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
                 p_yes_up, price, shares
             );
+            // Store entry context for training feedback
+            self.pending_entries.lock().unwrap().insert(
+                ctx.market.yes_token,
+                (ctx.snapshot.clone(), price)
+            );
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
                     token_id: ctx.market.yes_token,
@@ -343,6 +366,11 @@ impl Strategy for GboostStrategyImpl {
             tracing::debug!(
                 "🔮 GBoost NO entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
                 p_yes_up, price, shares
+            );
+            // Store entry context for training feedback
+            self.pending_entries.lock().unwrap().insert(
+                ctx.market.no_token,
+                (ctx.snapshot.clone(), price)
             );
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
@@ -393,6 +421,22 @@ impl Strategy for GboostStrategyImpl {
                     ghost_mode: config::GHOST_MODE,
                 };
 
+                // Capture PnL for training data
+                let mut pending_entries_guard = self.pending_entries.lock().unwrap();
+                if let Some((entry_snap, _entry_price)) = pending_entries_guard.remove(&ctx.market.yes_token) {
+                    let is_profitable = profit_pct > 0.0; // Simple profitability check
+                    let training_sample = TrainingSample {
+                        features: extract_features(&entry_snap),
+                        is_profitable,
+                        entry_timestamp: entry_snap.timestamp,
+                    };
+                    let mut training_data_guard = self.training_data.lock().unwrap();
+                    training_data_guard.push_back(training_sample);
+                    if training_data_guard.len() > config::GBOOST_HISTORY_BUFFER_SIZE {
+                        training_data_guard.pop_front();
+                    }
+                }
+
                 if profit_pct >= tp {
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
@@ -442,6 +486,22 @@ impl Strategy for GboostStrategyImpl {
                     ghost_mode: config::GHOST_MODE,
                 };
 
+                // Capture PnL for training data
+                let mut pending_entries_guard = self.pending_entries.lock().unwrap();
+                if let Some((entry_snap, _entry_price)) = pending_entries_guard.remove(&ctx.market.no_token) {
+                    let is_profitable = profit_pct > 0.0; // Simple profitability check
+                    let training_sample = TrainingSample {
+                        features: extract_features(&entry_snap),
+                        is_profitable,
+                        entry_timestamp: entry_snap.timestamp,
+                    };
+                    let mut training_data_guard = self.training_data.lock().unwrap();
+                    training_data_guard.push_back(training_sample);
+                    if training_data_guard.len() > config::GBOOST_HISTORY_BUFFER_SIZE {
+                        training_data_guard.pop_front();
+                    }
+                }
+
                 if profit_pct >= tp {
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
@@ -490,7 +550,7 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use crate::state::{MarketConfig, PositionMap};
-    use alloy::primitives::U256;
+    // use alloy::primitives::U256; // Already imported by the main file
 
     fn make_snapshot() -> MarketSnapshot {
         MarketSnapshot {
@@ -538,16 +598,18 @@ mod tests {
 
     #[test]
     fn train_model_returns_booster() {
-        let n = config::GBOOST_MIN_TRAINING_SAMPLES + config::GBOOST_LOOKAHEAD_TICKS + 10;
-        let mut snaps: Vec<MarketSnapshot> = Vec::with_capacity(n);
-        let mut bid = dec!(0.50);
+        // This test needs to be updated to use TrainingSample
+        let n = config::GBOOST_MIN_TRAINING_SAMPLES + 10; // No lookahead needed
+        let mut samples: Vec<TrainingSample> = Vec::with_capacity(n);
         for i in 0..n {
-            let mut s = make_snapshot();
-            bid += if i % 2 == 0 { dec!(0.01) } else { dec!(-0.01) };
-            s.yes_bid = bid;
-            snaps.push(s);
+            let snap = make_snapshot(); // Dummy snapshot
+            samples.push(TrainingSample {
+                features: extract_features(&snap),
+                is_profitable: i % 2 == 0, // Alternate profitable/unprofitable
+                entry_timestamp: Utc::now(),
+            });
         }
-        let booster = train_model(snaps).expect("train_model should succeed");
+        let booster = train_model(samples).expect("train_model should succeed");
         assert!(!booster.trees.is_empty(), "booster should have trees after training");
     }
 
@@ -561,16 +623,17 @@ mod tests {
     #[tokio::test]
     async fn evaluates_with_trained_model() {
         let strategy = GboostStrategyImpl::new();
-        let n = config::GBOOST_MIN_TRAINING_SAMPLES + config::GBOOST_LOOKAHEAD_TICKS + 10;
-        let mut snaps: Vec<MarketSnapshot> = Vec::with_capacity(n);
-        let mut bid = dec!(0.50);
+        let n = config::GBOOST_MIN_TRAINING_SAMPLES + 10; // No lookahead needed
+        let mut samples: Vec<TrainingSample> = Vec::with_capacity(n);
         for i in 0..n {
-            let mut s = make_snapshot();
-            bid += if i % 2 == 0 { dec!(0.01) } else { dec!(-0.01) };
-            s.yes_bid = bid;
-            snaps.push(s);
+            let snap = make_snapshot(); // Dummy snapshot
+            samples.push(TrainingSample {
+                features: extract_features(&snap),
+                is_profitable: i % 2 == 0, // Alternate profitable/unprofitable
+                entry_timestamp: Utc::now(),
+            });
         }
-        *strategy.model.lock().unwrap() = Some(train_model(snaps).unwrap());
+        *strategy.model.lock().unwrap() = Some(train_model(samples).unwrap());
         // Must not panic — signal depends on the dummy snapshot's feature values.
         let _ = strategy.evaluate_entry(&make_ctx()).await.unwrap();
         let _ = strategy.evaluate_exit(&make_ctx()).await.unwrap();
