@@ -1,0 +1,56 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock
+
+# Environment / Secrets (CRITICAL - Never commit!)
+.env
+.env.local
+.env.*
+!.env.example
+
+# Personal config — users must copy an example to create their own
+src/config.rs
+
+# Example scripts (don't commit, use .example versions for public repo)
+deploy-multi.sh
+logs-all.sh
+status.sh
+stop-all.sh
+!deploy-multi.sh.example
+!logs-all.sh.example
+!status.sh.example
+!stop-all.sh.example
+
+# Private notes
+.README
+
+# Docker
+Dockerfile.*
+.dockerignore
+**/.docker
+
+# Logs & temp
+logs/
+*.tmp
+
+# Agent-generated files (see AGENTS.md for guidelines)
+# Do not commit: analysis, summary, or debug documentation
+_analysis.md
+_debug.md
+_notes.md
+_summary.md
+_checklist.md
+_improvements.md
+_improvements_*.md
+_session_*.md
+PROFITABILITY_IMPROVEMENTS_*.md
+SESSION_MONITORING_CHECKLIST.md
+CONFIG_CHANGES_APPLIED.md
+
+# OS / Editor
+.DS_Store
+.vscode/
+.idea
+*.swp
+*.swo
