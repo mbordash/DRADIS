@@ -298,8 +298,6 @@ impl Strategy for GboostStrategyImpl {
             None    => return Ok(StrategySignal::NoSignal),
         };
 
-        tracing::info!("🔮 GBoost prediction: P(UP)={:.3}", p_yes_up);
-
         let entry_thresh = config::GBOOST_ENTRY_THRESHOLD.to_f64().unwrap_or(0.65);
         let trade_usdc   = config::GBOOST_MAX_EXPOSURE_USDC;
 
@@ -331,6 +329,7 @@ impl Strategy for GboostStrategyImpl {
                     condition_id: ctx.market.condition_id.clone(),
                     order_type: OrderType::FAK, // GBoost entries are typically FAK
                     post_only: false, // Not post-only
+                    ghost_mode: config::GHOST_MODE,
                 },
                 pair_params: None,
             });
@@ -355,6 +354,7 @@ impl Strategy for GboostStrategyImpl {
                     condition_id: ctx.market.condition_id.clone(),
                     order_type: OrderType::FAK, // GBoost entries are typically FAK
                     post_only: false, // Not post-only
+                    ghost_mode: config::GHOST_MODE,
                 },
                 pair_params: None,
             });
@@ -390,6 +390,7 @@ impl Strategy for GboostStrategyImpl {
                     condition_id: ctx.market.condition_id.clone(),
                     order_type: OrderType::FAK, // Exit orders are always FAK
                     post_only: false, // Exit orders are never post-only
+                    ghost_mode: config::GHOST_MODE,
                 };
 
                 if profit_pct >= tp {
@@ -438,6 +439,7 @@ impl Strategy for GboostStrategyImpl {
                     condition_id: ctx.market.condition_id.clone(),
                     order_type: OrderType::FAK, // Exit orders are always FAK
                     post_only: false, // Exit orders are never post-only
+                    ghost_mode: config::GHOST_MODE,
                 };
 
                 if profit_pct >= tp {

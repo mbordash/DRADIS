@@ -187,6 +187,7 @@ impl Strategy for BasisStrategyImpl {
                     condition_id: market.condition_id.clone(),
                     order_type,
                     post_only,
+                    ghost_mode: config::GHOST_MODE, // Set ghost_mode
                 },
                 pair_params: None,
             });
@@ -241,6 +242,7 @@ impl Strategy for BasisStrategyImpl {
                     condition_id: market.condition_id.clone(),
                     order_type,
                     post_only,
+                    ghost_mode: config::GHOST_MODE, // Set ghost_mode
                 },
                 pair_params: None,
             });
@@ -302,6 +304,7 @@ impl Strategy for BasisStrategyImpl {
                         condition_id: target_market.condition_id.clone(),
                         order_type: OrderType::FAK, // Exit orders are always FAK
                         post_only: false, // Exit orders are never post-only
+                        ghost_mode: config::GHOST_MODE, // Set ghost_mode
                     },
                     reason: format!("BasisTP: bid=${:.4}, profit={:.2}%", position_bid, profit_margin * dec!(100)),
                     exit_pair: false,
@@ -332,6 +335,7 @@ impl Strategy for BasisStrategyImpl {
                         condition_id: target_market.condition_id.clone(),
                         order_type: OrderType::FAK, // Exit orders are always FAK
                         post_only: false, // Exit orders are never post-only
+                        ghost_mode: config::GHOST_MODE, // Set ghost_mode
                     },
                     reason: format!("BasisSL: bid=${:.4}, loss={:.2}%", position_bid, profit_margin * dec!(100)),
                     exit_pair: false,
@@ -350,6 +354,7 @@ impl Strategy for BasisStrategyImpl {
                         condition_id: target_market.condition_id.clone(),
                         order_type: OrderType::FAK, // Exit orders are always FAK
                         post_only: false, // Exit orders are never post-only
+                        ghost_mode: config::GHOST_MODE, // Set ghost_mode
                     },
                     reason: format!("BasisSkewCollapse: yes_mid={:.4}, profit={:.2}%", yes_mid, profit_margin * dec!(100)),
                     exit_pair: false,
@@ -380,6 +385,7 @@ impl Strategy for BasisStrategyImpl {
                                 condition_id: target_market.condition_id.clone(),
                                 order_type: OrderType::FAK, // Exit orders are always FAK
                                 post_only: false, // Exit orders are never post-only
+                                ghost_mode: config::GHOST_MODE, // Set ghost_mode
                             },
                             reason: format!("BasisExpiry: {}s left", secs_left),
                             exit_pair: false,

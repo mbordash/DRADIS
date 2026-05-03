@@ -267,6 +267,7 @@ impl Strategy for MakerStrategyImpl {
             condition_id: market.condition_id.clone(),
             order_type: OrderType::GTC, // Maker entries are GTC
             post_only: true, // Maker entries are post-only
+            ghost_mode: config::GHOST_MODE, // Set ghost_mode
         });
 
         let no_params = final_no.map(|p| OrderParams {
@@ -279,6 +280,7 @@ impl Strategy for MakerStrategyImpl {
             condition_id: market.condition_id.clone(),
             order_type: OrderType::GTC, // Maker entries are GTC
             post_only: true, // Maker entries are post-only
+            ghost_mode: config::GHOST_MODE, // Set ghost_mode
         });
 
         Ok(StrategySignal::MakerQuote {
@@ -305,7 +307,18 @@ impl Strategy for MakerStrategyImpl {
                     let profit_pct = (bid - position.avg_entry) / position.avg_entry;
                     if profit_pct < profit_threshold {
                         return Ok(StrategySignal::Exit {
-                            params: OrderParams { token_id, price: bid, shares: position.shares, fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 }, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false },
+                            params: OrderParams {
+                                token_id,
+                                price: bid,
+                                shares: position.shares,
+                                fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
+                                is_neg_risk: market.is_neg_risk,
+                                market_name: market.market_name.clone(),
+                                condition_id: market.condition_id.clone(),
+                                order_type: OrderType::FAK, // Exit orders are always FAK
+                                post_only: false, // Exit orders are never post-only
+                                ghost_mode: config::GHOST_MODE, // Set ghost_mode
+                            },
                             reason: "NearExpiryProfitGuard".to_string(),
                             exit_pair: false,
                         });
@@ -366,6 +379,7 @@ impl Strategy for MakerStrategyImpl {
                             condition_id: market.condition_id.clone(),
                             order_type: OrderType::FAK, // Exit orders are always FAK
                             post_only: false, // Exit orders are never post-only
+                            ghost_mode: config::GHOST_MODE, // Set ghost_mode
                         },
                         reason: format!("ToxicFill: OBI={:.2} (book turned adverse)", obi),
                         exit_pair: false,
@@ -401,6 +415,7 @@ impl Strategy for MakerStrategyImpl {
                         condition_id: market.condition_id.clone(),
                         order_type: OrderType::FAK, // Exit orders are always FAK
                         post_only: false, // Exit orders are never post-only
+                        ghost_mode: config::GHOST_MODE, // Set ghost_mode
                     },
                     reason: format!("Maker TP: gain={:.2}%", profit_pct * dec!(100)),
                     exit_pair: false,
@@ -422,6 +437,7 @@ impl Strategy for MakerStrategyImpl {
                         condition_id: market.condition_id.clone(),
                         order_type: OrderType::FAK, // Exit orders are always FAK
                         post_only: false, // Exit orders are never post-only
+                        ghost_mode: config::GHOST_MODE, // Set ghost_mode
                     },
                     reason: format!("Maker SL: loss={:.2}% ({}s held)", profit_pct * dec!(100), secs_since_fill),
                     exit_pair: false,

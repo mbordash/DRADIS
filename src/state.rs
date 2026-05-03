@@ -132,7 +132,8 @@ pub struct OrderParams {
     pub market_name: String,
     pub condition_id: String,
     pub order_type: OrderType,
-    pub post_only: bool, // Added this field
+    pub post_only: bool,
+    pub ghost_mode: bool, // Added this field
 }
 
 /// Signals returned by strategies for the orchestrator to act upon.
