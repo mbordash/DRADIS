@@ -30,7 +30,7 @@ pub const GHOST_MODE: bool = false;
 
 /// Requires a wider margin before entering arbitrage — fewer trades, higher quality.
 pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.07);
-pub const ARBITRAGE_MAX_TAKER_FEE_BPS: u32 = 100;
+pub const ARBITRAGE_MAX_TAKER_FEE_BPS: u32 = 1500; // Updated from 100
 
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.96);
 
@@ -202,7 +202,7 @@ pub const BASIS_EXPIRY_MIN_EXIT_BID: Decimal = dec!(0.20);
 pub const BASIS_MIN_TRADE_SIZE_USDC: Decimal = dec!(3.0);
 pub const BASIS_MAX_TRADE_SIZE_USDC: Decimal = dec!(8.0);
 pub const BASIS_KELLY_MAX_MULTIPLIER: Decimal = dec!(2.0);
-pub const BASIS_MAX_TAKER_FEE_BPS: u32 = 100;
+pub const BASIS_MAX_TAKER_FEE_BPS: u32 = 1500; // Updated from 100
 pub const BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 60;
 pub const BASIS_FUNDING_POLL_SECS: u64 = 60;
 /// Minimum best-bid required to fire a basis stop-loss exit.
