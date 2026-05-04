@@ -40,6 +40,7 @@ use dradis::strategies::time_decay_impl::TimeDecayPosition;
 use dradis::orchestrator::{StrategyRegistry, StrategyContext};
 use dradis::orchestrator::executor::{execute_strategies_concurrent, aggregate_and_resolve_signals};
 
+
 // New paths for helpers
 use dradis::helpers::{
     time::*, balance::*, nonce::*, orders::*, market::*,
@@ -48,12 +49,16 @@ use dradis::helpers::{
 
 use rustls::crypto::ring;
 
+// Import MarketState type from market_monitor
+use dradis::tasks::market_monitor::MarketState;
+
 
 type PriceState = (Decimal, Decimal, Decimal, Decimal); // (Bid, BidDepth, Ask, AskDepth)
 
 /// Custom tracing timer that formats log timestamps in US/Eastern (ET/EDT).
 /// Ensures all log output is in the same timezone as Polymarket's market names,
 /// making it straightforward to correlate log lines with market events.
+
 struct EasternTime;
 
 impl tracing_subscriber::fmt::time::FormatTime for EasternTime {
@@ -204,9 +209,8 @@ async fn main() -> Result<()> {
     let mut last_stop_loss_time: HashMap<String, Instant> = HashMap::new();
     let mut last_expiry_exit_time: HashMap<String, Instant> = HashMap::new();
     // Throttle exit retries: when a FAK sell misses, the position stays in the map
-    // and evaluate_exit re-fires every 50ms heartbeat, flooding the log with hundreds
-    // of identical EXIT lines per second. This map enforces a minimum gap between
-    // successive exit attempts for the same strategy so retries are spaced out.
+    // and evaluate_exit re-fires every 50ms heartbeat — without this guard that floods the
+    // log with ~1200 identical EXIT lines per minute and hammers the API.
     let mut last_exit_attempt_time: HashMap<String, Instant> = HashMap::new();
 
     // Watchdog: tracks when the inner trading loop last emitted a heartbeat tick.
@@ -215,51 +219,85 @@ async fn main() -> Result<()> {
     let last_heartbeat_at: Arc<Mutex<Instant>> = Arc::new(Mutex::new(Instant::now()));
     const LOOP_WATCHDOG_SECS: u64 = 180; // alert after 3 min of silence
 
-    // Bootstrap: poll until we have a valid hourly market.  After ~90s (3 x 30s retries)
-    // fall back to the daily/maker venue so BasisStrategy and other non-hourly strategies
-    // can start trading immediately.  The market monitor will broadcast a switch to the
-    // real hourly as soon as Polymarket publishes it (hourly markets are sometimes created
-    // 20-30 minutes into the hour, causing the old 90s-flat wait to idle the whole system).
+    // Bootstrap: poll until we have a valid hourly market OR a valid maker market.
+    // If only a maker market is found, the hourly market will be an empty MarketCandidate.
+
     let mut bootstrap_attempts = 0u32;
-    let (initial_hourly, initial_maker_market) = loop {
-        let (hourly, maker) = get_market_pair(&shared_http).await;
-        if hourly.yes_token != U256::ZERO {
-            break (hourly, maker);
+    let (mut initial_hourly_candidate, mut initial_maker_candidate) = loop {
+        let (hourly_cand, maker_cand) = get_market_pair(&shared_http).await;
+
+        if hourly_cand.yes_token != U256::ZERO {
+            info!("✅ Found initial hourly market: \"{}\"", hourly_cand.name);
+            break (hourly_cand, maker_cand);
         }
+
+        if maker_cand.is_some() {
+            info!("⚠️ No hourly market found, but a maker market is available. Starting with maker market context.");
+            // Return an empty hourly candidate if only maker is available
+            break (MarketCandidate { yes_token: U256::ZERO, no_token: U256::ZERO, name: String::new(), link: String::new(), description: String::new(), is_hot: false, close_time: None, volume: 0.0, condition_id: String::new(), strike_price: None }, maker_cand);
+        }
+
         bootstrap_attempts += 1;
-        // After 3 attempts (~90s total) use the daily as primary if available.
-        if bootstrap_attempts >= 3 {
-            if let Some(mk) = maker {
-                warn!("⚠️ No hourly market found after {}s — starting on daily venue '{}' until hourly is published. Market monitor will switch when hourly is listed.", bootstrap_attempts * 30, mk.name);
-                break (mk.clone(), Some(mk));
-            }
-        }
-        warn!("⏳ No active hourly market found (attempt {}) — retrying in 30s...", bootstrap_attempts);
+        warn!("⏳ No active hourly or maker market found (attempt {}) — retrying in 30s...", bootstrap_attempts);
         tokio::time::sleep(std::time::Duration::from_secs(30)).await;
     };
 
-    let (initial_yes, initial_no, name, close_time) = (
-        initial_hourly.yes_token, initial_hourly.no_token,
-        initial_hourly.name.clone(), initial_hourly.close_time,
-    );
-    let desc = initial_hourly.description.clone();
-    let initial_condition_id = initial_hourly.condition_id.clone();
-
-    info!("🧪 Initializing market: {}", name);
-    let mut initial_strike = extract_strike_price(&name);
-    if initial_strike.is_none() {
-        initial_strike = fetch_historical_strike_price(&shared_http, &crypto_filter, &desc).await;
-        if initial_strike.is_none() {
-            initial_strike = fetch_historical_strike_price(&shared_http, &crypto_filter, &name).await;
+    // Resolve strike price for the initial hourly market if it exists
+    if initial_hourly_candidate.yes_token != U256::ZERO {
+        let mut strike = extract_strike_price(&initial_hourly_candidate.name);
+        if strike.is_none() {
+            strike = fetch_historical_strike_price(&shared_http, &crypto_filter, &initial_hourly_candidate.description).await;
+            if strike.is_none() {
+                strike = fetch_historical_strike_price(&shared_http, &crypto_filter, &initial_hourly_candidate.name).await;
+            }
         }
-    }
-    if initial_strike.is_some() {
-        info!("✅ Strike price resolved: ${}", initial_strike.unwrap());
+        initial_hourly_candidate.strike_price = strike;
+        if strike.is_some() {
+            info!("✅ Hourly market strike price resolved: ${}", strike.unwrap());
+        }
+    } else {
+        info!("🧪 No initial hourly market found. Waiting for market monitor to find one.");
     }
 
-    let (market_tx, mut market_rx) = watch::channel((initial_yes, initial_no, name, close_time, initial_strike, desc, initial_maker_market, initial_condition_id));
-    let mut current_hourly_cid: String = String::new();
-    let mut current_maker_cid: String = String::new();
+    // Resolve strike price for the initial maker market if it exists
+    if let Some(ref mut mk) = initial_maker_candidate {
+        let mut strike = extract_strike_price(&mk.name);
+        if strike.is_none() {
+            strike = fetch_historical_strike_price(&shared_http, &crypto_filter, &mk.description).await;
+            if strike.is_none() {
+                strike = fetch_historical_strike_price(&shared_http, &crypto_filter, &mk.name).await;
+            }
+        }
+        mk.strike_price = strike;
+        if strike.is_some() {
+            info!("✅ Maker market strike price resolved: ${}", strike.unwrap());
+        }
+    } else {
+        info!("🧪 No initial maker market found. Waiting for market monitor to find one.");
+    }
+
+    // Construct the initial MarketState tuple for the watch channel
+    let initial_market_state_for_channel: MarketState = (
+        initial_hourly_candidate.yes_token,
+        initial_hourly_candidate.no_token,
+        initial_hourly_candidate.name.clone(),
+        initial_hourly_candidate.close_time,
+        initial_hourly_candidate.strike_price,
+        initial_hourly_candidate.description.clone(),
+        initial_maker_candidate, // This is Option<MarketCandidate>
+        initial_hourly_candidate.condition_id.clone(),
+    );
+
+    let (market_tx, mut market_rx) = watch::channel(initial_market_state_for_channel);
+
+    // current_hourly_cid and current_maker_cid are used to detect market switches.
+    // Initialize them with the condition IDs of the initial markets.
+    // NOTE: The order of these was swapped in the previous incorrect version.
+    // `market_rx.borrow().7` is the hourly_condition_id
+    // `market_rx.borrow().6` is the Option<MarketCandidate> for maker, so we need to map its condition_id
+    let mut current_hourly_cid: String = market_rx.borrow().7.clone();
+    let mut current_maker_cid: String = market_rx.borrow().6.as_ref().map_or_else(String::new, |m| m.condition_id.clone());
+
 
     tokio::spawn(dradis::tasks::market_monitor::run_market_monitor(
         Arc::clone(&shared_http),
@@ -272,98 +310,108 @@ async fn main() -> Result<()> {
     // Previously this was an unlabelled `loop {}`, which meant there was no way
     // to escape a stalled .await without killing the process.
     'market_loop: loop {
-        let (yes_token, no_token, market_name, market_close_time, strike_price, _, maker_market_candidate, condition_id) = market_rx.borrow().clone();
+        // Destructure the 8-element MarketState tuple from the channel
+        let (
+            hourly_yes_token,
+            hourly_no_token,
+            hourly_market_name,
+            hourly_market_close_time,
+            hourly_strike_price,
+            _hourly_desc, // This is the description from the hourly market
+            maker_market_candidate_from_channel, // This is Option<MarketCandidate>
+            hourly_condition_id,
+        ) = market_rx.borrow().clone();
 
-        let now = Utc::now();
-        if let Some(close_time) = market_close_time {
-            let seconds_until_expiry = (close_time - now).num_seconds();
-            if seconds_until_expiry < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY {
-                warn!("⚠️ Market expiring too soon ({}s left)!", seconds_until_expiry);
-                tokio::time::sleep(std::time::Duration::from_secs(30)).await;
-                continue 'market_loop;
+        // If no hourly market is available, skip the hourly-dependent setup
+        let (hourly_yes_token, hourly_no_token, hourly_market_name, hourly_market_close_time, hourly_strike_price, _hourly_desc, hourly_condition_id, hourly_is_neg_risk, hourly_yes_fee_rate, hourly_no_fee_rate) = if hourly_yes_token != U256::ZERO {
+            let now = Utc::now();
+            if let Some(close_time) = hourly_market_close_time {
+                let seconds_until_expiry = (close_time - now).num_seconds();
+                if seconds_until_expiry < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY {
+                    warn!("⚠️ Hourly market expiring too soon ({}s left)!", seconds_until_expiry);
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    continue 'market_loop;
+                }
+                info!("⏰ Hourly market closes in {}s", seconds_until_expiry);
             }
-            info!("⏰ Market closes in {}s", seconds_until_expiry);
-        }
 
-        info!("🚀 Starting Orchestrated Trading on market: \"{}\"", market_name);
-        let market_started_at = Utc::now();
+            info!("🚀 Starting Orchestrated Trading on hourly market: \"{}\"", hourly_market_name);
 
-        // ── CLOB init queries — each wrapped in a 10s timeout ─────────────────
-        // Root cause of the 2.5-hour heartbeat silence (2026-04-30 16:14–18:54 EDT):
-        // After a market switch the outer loop re-enters here and calls fee_rate_bps /
-        // neg_risk for the new tokens.  If the CLOB API stalls mid-request (no TCP
-        // error, just no response) these .awaits hang forever.  The watchdog lives
-        // inside the INNER loop so it can never fire — the process looks alive (market
-        // monitor still polls) but the trading loop is completely frozen.
-        // Fix: hard 10s timeout on every CLOB query in the init block; on timeout or
-        // API error, sleep 5s and restart the outer loop so we retry initialization.
-        let yes_fee_rate = match tokio::time::timeout(
-            Duration::from_secs(10),
-            trading_client.fee_rate_bps(yes_token),
-        ).await {
-            Ok(Ok(r))  => r.base_fee,
-            Ok(Err(e)) => { warn!("⚠️ fee_rate YES error: {} — retrying init in 5s", e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
-            Err(_)     => { warn!("⚠️ fee_rate YES timed out (10s) — retrying init in 5s"); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+            let yes_fee_rate = match tokio::time::timeout(
+                Duration::from_secs(10),
+                trading_client.fee_rate_bps(hourly_yes_token),
+            ).await {
+                Ok(Ok(r))  => r.base_fee,
+                Ok(Err(e)) => { warn!("⚠️ hourly fee_rate YES error: {} — retrying init in 5s: {}", e, e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+                Err(_)     => { warn!("⚠️ hourly fee_rate YES timed out (10s) — retrying init in 5s"); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+            };
+            let no_fee_rate = match tokio::time::timeout(
+                Duration::from_secs(10),
+                trading_client.fee_rate_bps(hourly_no_token),
+            ).await {
+                Ok(Ok(r))  => r.base_fee,
+                Ok(Err(e)) => { warn!("⚠️ hourly fee_rate NO error: {} — retrying init in 5s: {}", e, e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+                Err(_)     => { warn!("⚠️ hourly fee_rate NO timed out (10s) — retrying init in 5s"); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+            };
+            let is_neg_risk = match tokio::time::timeout(
+                Duration::from_secs(10),
+                trading_client.neg_risk(hourly_yes_token),
+            ).await {
+                Ok(Ok(r))  => r.neg_risk,
+                Ok(Err(e)) => { warn!("⚠️ hourly neg_risk error: {} — retrying init in 5s: {}", e, e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+                Err(_)     => { warn!("⚠️ hourly neg_risk timed out (10s) — retrying init in 5s"); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+            };
+            info!("✅ Hourly market settings: NegRisk: {} | YES fee {} bps | NO fee {} bps", is_neg_risk, yes_fee_rate, no_fee_rate);
+            (hourly_yes_token, hourly_no_token, hourly_market_name, hourly_market_close_time, hourly_strike_price, _hourly_desc, hourly_condition_id, is_neg_risk, yes_fee_rate, no_fee_rate)
+        } else {
+            info!("⚠️ No active hourly market found. Hourly-dependent strategies will be inactive.");
+            (U256::ZERO, U256::ZERO, String::new(), None, None, String::new(), String::new(), false, 0, 0)
         };
-        let no_fee_rate = match tokio::time::timeout(
-            Duration::from_secs(10),
-            trading_client.fee_rate_bps(no_token),
-        ).await {
-            Ok(Ok(r))  => r.base_fee,
-            Ok(Err(e)) => { warn!("⚠️ fee_rate NO error: {} — retrying init in 5s", e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
-            Err(_)     => { warn!("⚠️ fee_rate NO timed out (10s) — retrying init in 5s"); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
-        };
-        let is_neg_risk = match tokio::time::timeout(
-            Duration::from_secs(10),
-            trading_client.neg_risk(yes_token),
-        ).await {
-            Ok(Ok(r))  => r.neg_risk,
-            Ok(Err(e)) => { warn!("⚠️ neg_risk error: {} — retrying init in 5s", e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
-            Err(_)     => { warn!("⚠️ neg_risk timed out (10s) — retrying init in 5s"); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
-        };
-        let _verifying_contract = if is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
 
-        info!("✅ Cached Settings: NegRisk: {} | YES fee {} bps | NO fee {} bps", is_neg_risk, yes_fee_rate, no_fee_rate);
+        let market_started_at = Utc::now(); // This timestamp is for the current trading session, not necessarily market creation
 
         let (yes_price_tx, yes_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0)));
         let (no_price_tx, no_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0)));
 
-        for (token, tx) in [(yes_token, yes_price_tx), (no_token, no_price_tx)] {
-            tokio::spawn(async move {
-                loop {
-                    let client = WsClient::default();
-                    let stream = match client.subscribe_orderbook(vec![token]) {
-                        Ok(s) => s,
-                        Err(e) => {
-                            warn!("⚠️ WS subscribe failed for token {}: {}. Retrying in 5s...", token, e);
-                            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                            continue;
+        // Only subscribe to hourly market WS if an hourly market is present
+        if hourly_yes_token != U256::ZERO {
+            for (token, tx) in [(hourly_yes_token, yes_price_tx.clone()), (hourly_no_token, no_price_tx.clone())] {
+                tokio::spawn(async move {
+                    loop {
+                        let client = WsClient::default();
+                        let stream = match client.subscribe_orderbook(vec![token]) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                warn!("⚠️ WS subscribe failed for hourly token {}: {}. Retrying in 5s...", token, e);
+                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                continue;
+                            }
+                        };
+                        let mut stream = Box::pin(stream);
+                        info!("✅ WS orderbook subscribed for hourly token {}", token);
+                        while let Some(book_result) = stream.next().await {
+                            if let Ok(book) = book_result {
+                                let (bid, bid_depth) = book.bids.iter()
+                                    .max_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
+                                    .map(|l| (l.price, l.size))
+                                    .unwrap_or((dec!(0), dec!(0)));
+                                let (ask, ask_depth) = book.asks.iter()
+                                    .min_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
+                                    .map(|l| (l.price, l.size))
+                                    .unwrap_or((dec!(1), dec!(0)));
+                                let _ = tx.send((bid, bid_depth, ask, ask_depth));
+                            } else {
+                                warn!("⚠️ WS stream error for hourly token {}. Restarting...", token);
+                                break;
+                            }
                         }
-                    };
-                    let mut stream = Box::pin(stream);
-                    info!("✅ WS orderbook subscribed for token {}", token);
-                    while let Some(book_result) = stream.next().await {
-                        if let Ok(book) = book_result {
-                            let (bid, bid_depth) = book.bids.iter()
-                                .max_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
-                                .map(|l| (l.price, l.size))
-                                .unwrap_or((dec!(0), dec!(0)));
-                            let (ask, ask_depth) = book.asks.iter()
-                                .min_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
-                                .map(|l| (l.price, l.size))
-                                .unwrap_or((dec!(1), dec!(0)));
-                            let _ = tx.send((bid, bid_depth, ask, ask_depth));
-                        } else {
-                            warn!("⚠️ WS stream error for token {}. Restarting...", token);
-                            break;
-                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
-                }
-            });
+                });
+            }
         }
 
-        let (maker_yes_price_rx, maker_no_price_rx) = if let Some(ref mk) = maker_market_candidate {
+        let (maker_yes_price_rx, maker_no_price_rx) = if let Some(ref mk) = maker_market_candidate_from_channel {
             let (mk_yes_tx, mk_yes_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0)));
             let (mk_no_tx, mk_no_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0)));
             for (token, tx) in [(mk.yes_token, mk_yes_tx), (mk.no_token, mk_no_tx)] {
@@ -405,15 +453,13 @@ async fn main() -> Result<()> {
             (None, None)
         };
 
-        let maker_market_config: Option<MarketConfig> = if let Some(ref mk) = maker_market_candidate {
-            // Same timeout guards as the hourly-market queries above — maker market uses
-            // different token IDs so it gets its own CLOB round-trips.
+        let maker_market_config: Option<MarketConfig> = if let Some(ref mk) = maker_market_candidate_from_channel {
             let mk_yes_fee = match tokio::time::timeout(
                 Duration::from_secs(10),
                 trading_client.fee_rate_bps(mk.yes_token),
             ).await {
                 Ok(Ok(r))  => r.base_fee,
-                Ok(Err(e)) => { warn!("⚠️ maker fee_rate YES error: {} — retrying init in 5s", e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+                Ok(Err(e)) => { warn!("⚠️ maker fee_rate YES error: {} — retrying init in 5s: {}", e, e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
                 Err(_)     => { warn!("⚠️ maker fee_rate YES timed out (10s) — retrying init in 5s"); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
             };
             let mk_no_fee = match tokio::time::timeout(
@@ -421,7 +467,7 @@ async fn main() -> Result<()> {
                 trading_client.fee_rate_bps(mk.no_token),
             ).await {
                 Ok(Ok(r))  => r.base_fee,
-                Ok(Err(e)) => { warn!("⚠️ maker fee_rate NO error: {} — retrying init in 5s", e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+                Ok(Err(e)) => { warn!("⚠️ maker fee_rate NO error: {} — retrying init in 5s: {}", e, e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
                 Err(_)     => { warn!("⚠️ maker fee_rate NO timed out (10s) — retrying init in 5s"); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
             };
             let mk_neg_risk = match tokio::time::timeout(
@@ -429,7 +475,7 @@ async fn main() -> Result<()> {
                 trading_client.neg_risk(mk.yes_token),
             ).await {
                 Ok(Ok(r))  => r.neg_risk,
-                Ok(Err(e)) => { warn!("⚠️ maker neg_risk error: {} — retrying init in 5s", e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
+                Ok(Err(e)) => { warn!("⚠️ maker neg_risk error: {} — retrying init in 5s: {}", e, e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
                 Err(_)     => { warn!("⚠️ maker neg_risk timed out (10s) — retrying init in 5s"); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
             };
             info!("✅ Maker market settings: \"{}\" | NegRisk: {} | YES {} bps | NO {} bps",
@@ -439,14 +485,14 @@ async fn main() -> Result<()> {
                 no_token: mk.no_token,
                 market_name: mk.name.clone(),
                 market_close_time: mk.close_time,
-                strike_price,
+                strike_price: mk.strike_price,
                 is_neg_risk: mk_neg_risk,
                 condition_id: mk.condition_id.clone(),
                 yes_fee_bps: mk_yes_fee,
                 no_fee_bps: mk_no_fee,
             })
         } else {
-            warn!("⚠️ No maker venue selected (window/daily unavailable). Non-momentum strategies will fallback to hourly market context.");
+            warn!("⚠️ No maker venue selected (window/daily unavailable). Strategies requiring maker venue will be inactive.");
             None
         };
 
@@ -457,6 +503,7 @@ async fn main() -> Result<()> {
         // Watchdog ticker: checks every 120s if the strategy ticker has been alive.
         // If the inner loop goes silent (e.g., blocked on a stalled .await), this breaks
         // it out so the outer loop can restart with a fresh market context.
+
         let mut watchdog_ticker = interval(std::time::Duration::from_secs(120));
         watchdog_ticker.tick().await; // consume the immediate first tick
         *last_heartbeat_at.lock().await = Instant::now(); // reset watchdog on market start
@@ -469,19 +516,25 @@ async fn main() -> Result<()> {
         // untracked positions so no strategy double-enters on top of existing on-chain shares.
         // Split into two calls so each venue's positions are tagged with the correct close_time
         // and market_name — preventing BasisExpiry from firing against the hourly market's
+
         // close time when the actual position lives in the daily/maker venue.
         // adoption_order comes from the registry — no hardcoded strategy list here.
         tokio::time::sleep(Duration::from_secs(2)).await; // allow CLOB API to be ready
-        reconcile_orphaned_positions(
-            &trading_client, &positions,
-            &[(yes_token, "YES"), (no_token, "NO")],
-            &market_name, market_close_time, &[], &adoption_order,
-        ).await;
-        if let Some(ref mk) = maker_market_config {
+
+        // Reconcile for hourly market if it exists
+        if hourly_yes_token != U256::ZERO {
             reconcile_orphaned_positions(
                 &trading_client, &positions,
-                &[(mk.yes_token, "YES(maker)"), (mk.no_token, "NO(maker)")],
-                &mk.market_name, mk.market_close_time, &[], &adoption_order,
+                &[(hourly_yes_token, "YES"), (hourly_no_token, "NO")],
+                &hourly_market_name, hourly_market_close_time, &[], &adoption_order,
+            ).await;
+        }
+        // Reconcile for maker market if it exists
+        if let Some(ref mk_config) = maker_market_config {
+            reconcile_orphaned_positions(
+                &trading_client, &positions,
+                &[(mk_config.yes_token, "YES(maker)"), (mk_config.no_token, "NO(maker)")],
+                &mk_config.market_name, mk_config.market_close_time, &[], &adoption_order,
             ).await;
         }
 
@@ -496,17 +549,13 @@ async fn main() -> Result<()> {
         info!("🧭 Strategy venue attachments:");
         for strategy in &strategies {
             let sn = strategy.name();
-            // Strategies that prefer the maker venue attach to it when configured,
-            // falling back to the hourly market name if no maker market is loaded.
             let venue = strategy.venue();
-            let market_name_attached = if venue == "Hourly" {
-                market_name.clone()
-            } else {
-                maker_market_config
-                    .as_ref()
-                    .map(|m| m.market_name.clone())
-                    .unwrap_or_else(|| market_name.clone())
+            let market_name_attached = match venue {
+                "Hourly" => hourly_market_name.clone(),
+                "Window/Daily" => maker_market_config.as_ref().map_or_else(String::new, |m| m.market_name.clone()),
+                _ => String::from("Unknown"),
             };
+
             info!(
                 "  - {} => venue={} | market=\"{}\" | budget=${} | risk={}",
                 sn,
@@ -520,12 +569,24 @@ async fn main() -> Result<()> {
         loop {
             tokio::select! {
                 _ = market_rx.changed() => {
-                    let (.., new_maker_opt, new_condition_id) = market_rx.borrow().clone();
-                    if new_condition_id == current_hourly_cid &&
-                       new_maker_opt.as_ref().map_or("", |m| m.condition_id.as_str()) == current_maker_cid {
+                    // Destructure the 8-element MarketState tuple from the channel
+                    let (
+                        _new_hourly_yes_token,
+                        _new_hourly_no_token,
+                        _new_hourly_market_name,
+                        _new_hourly_market_close_time,
+                        _new_hourly_strike_price,
+                        _new_hourly_desc,
+                        new_maker_market_candidate,
+                        new_hourly_condition_id,
+                    ) = market_rx.borrow().clone();
+
+                    let new_maker_cid = new_maker_market_candidate.as_ref().map_or_else(String::new, |m| m.condition_id.clone());
+
+                    if new_hourly_condition_id == current_hourly_cid && new_maker_cid == current_maker_cid {
                         continue;
                     }
-                    info!("🔄 Market switch required — restarting trading loop with new market");
+                    info!("🔄 Market switch detected — restarting trading loop with new market context");
                     // Timeout the cancel so a stalled CLOB response cannot block the switch.
                     match tokio::time::timeout(
                         Duration::from_secs(8),
@@ -535,10 +596,11 @@ async fn main() -> Result<()> {
                         Err(_)     => warn!("⚠️ cancel_all_orders timed out (8s) — proceeding with market switch"),
                         Ok(Ok(_))  => {}
                     }
+
                     { phantom_cooldowns.lock().await.clear(); }
                     { pending_orders.lock().await.clear(); } // Clear pending locks on market switch
-                    current_hourly_cid = new_condition_id.clone();
-                    current_maker_cid = new_maker_opt.as_ref().map_or_else(String::new, |m| m.condition_id.clone());
+                    current_hourly_cid = new_hourly_condition_id;
+                    current_maker_cid = new_maker_cid;
                     break;
                 }
                 _ = pulse_ticker.tick() => {
@@ -549,7 +611,15 @@ async fn main() -> Result<()> {
                     info!("📍 Network Pulse: {:?}", start.elapsed());
                 }
                 _ = cleanup_ticker.tick() => {
-                    dradis::tasks::cleanup::cleanup_expired_positions(Arc::clone(&positions), market_name.clone(), yes_token, no_token, market_close_time).await;
+                    // Cleanup for hourly market if it exists
+                    if hourly_yes_token != U256::ZERO {
+                        dradis::tasks::cleanup::cleanup_expired_positions(Arc::clone(&positions), hourly_market_name.clone(), hourly_yes_token, hourly_no_token, hourly_market_close_time).await;
+                    }
+                    // Cleanup for maker market if it exists
+                    if let Some(ref mk_config) = maker_market_config {
+                        dradis::tasks::cleanup::cleanup_expired_positions(Arc::clone(&positions), mk_config.market_name.clone(), mk_config.yes_token, mk_config.no_token, mk_config.market_close_time).await;
+                    }
+
                     if let Err(e) = dradis::tasks::cleanup::reconcile_orphaned_positions(Arc::clone(&positions), &tg_token, &tg_chat_id).await { warn!("⚠️ Orphan reconciliation error: {}", e); }
                     dradis::tasks::cleanup::cleanup_time_decay_positions(Arc::clone(&time_decay_positions)).await;
 
@@ -589,42 +659,50 @@ async fn main() -> Result<()> {
                 _ = ticker.tick() => {
                     if market_rx.has_changed().unwrap_or(false) { break; }
                     *last_heartbeat_at.lock().await = Instant::now();
-                    let (yb, ybd, ya, yad) = *yes_price_rx.borrow();
-                    let (nb, nbd, na, nad) = *no_price_rx.borrow();
-                    if ya == dec!(1) && na == dec!(1) { continue; }
 
-                    let snapshot = MarketSnapshot {
-                        yes_bid: yb, yes_bid_depth: ybd, yes_ask: ya, yes_ask_depth: yad,
-                        no_bid: nb, no_bid_depth: nbd, no_ask: na, no_ask_depth: nad,
-                        oracle_price: *oracle_rx.borrow(),
-                        velocity: velocity_rx.borrow().0,
-                        velocity_1s: velocity_rx.borrow().1,
-                        acceleration: velocity_rx.borrow().2,
-                        funding_rate: *funding_rx.borrow(),
-                        oracle_drift_60m: *drift_60m_rx.borrow(),
-                        timestamp: Utc::now(),
+                    // Get hourly market snapshot
+                    let (hourly_yb, hourly_ybd, hourly_ya, hourly_yad) = *yes_price_rx.borrow();
+                    let (hourly_nb, hourly_nbd, hourly_na, hourly_nad) = *no_price_rx.borrow();
+
+                    // Get maker market snapshot if available
+                    let (maker_yb, maker_ybd, maker_ya, maker_yad) = maker_yes_price_rx.as_ref().map_or((dec!(0), dec!(0), dec!(1), dec!(0)), |rx| *rx.borrow());
+                    let (maker_nb, maker_nbd, maker_na, maker_nad) = maker_no_price_rx.as_ref().map_or((dec!(0), dec!(0), dec!(1), dec!(0)), |rx| *rx.borrow());
+
+                    // Only proceed if at least one market has valid prices
+                    if (hourly_ya == dec!(1) && hourly_na == dec!(1)) && (maker_ya == dec!(1) && maker_na == dec!(1)) { continue; }
+
+                    let hourly_market_config_for_ctx = MarketConfig {
+                        yes_token: hourly_yes_token, no_token: hourly_no_token, market_name: hourly_market_name.clone(), market_close_time: hourly_market_close_time, strike_price: hourly_strike_price, is_neg_risk: hourly_is_neg_risk, condition_id: hourly_condition_id.clone(), yes_fee_bps: hourly_yes_fee_rate, no_fee_bps: hourly_no_fee_rate,
                     };
+
+                    let maker_market_config_for_ctx = maker_market_config.clone();
+
                     let ctx = StrategyContext {
-                        market: MarketConfig {
-                            yes_token, no_token, market_name: market_name.clone(), market_close_time, strike_price, is_neg_risk, condition_id: condition_id.clone(), yes_fee_bps: yes_fee_rate, no_fee_bps: no_fee_rate,
+                        market: hourly_market_config_for_ctx.clone(), // Clone here to resolve the borrow of moved value error
+                        snapshot: MarketSnapshot { // Snapshot for the hourly market
+                            yes_bid: hourly_yb, yes_bid_depth: hourly_ybd, yes_ask: hourly_ya, yes_ask_depth: hourly_yad,
+                            no_bid: hourly_nb, no_bid_depth: hourly_nbd, no_ask: hourly_na, no_ask_depth: hourly_nad,
+                            oracle_price: *oracle_rx.borrow(),
+                            velocity: velocity_rx.borrow().0,
+                            velocity_1s: velocity_rx.borrow().1,
+                            acceleration: velocity_rx.borrow().2,
+                            funding_rate: *funding_rx.borrow(),
+                            oracle_drift_60m: *drift_60m_rx.borrow(),
+                            timestamp: Utc::now(),
                         },
-                        snapshot: snapshot.clone(),
                         positions: Arc::clone(&positions),
                         session_pnl: *total_pnl.lock().await,
                         starting_collateral: *starting_collateral_store.lock().await,
                         available_collateral: *live_collateral.lock().await,
                         crypto_filter: crypto_filter.clone(),
                         market_started_at,
-                        maker_market: maker_market_config.clone(),
-                        maker_snapshot: match (&maker_yes_price_rx, &maker_no_price_rx) {
-                            (Some(my), Some(mn)) => Some(MarketSnapshot {
-                                yes_bid: my.borrow().0, yes_bid_depth: my.borrow().1, yes_ask: my.borrow().2, yes_ask_depth: my.borrow().3,
-                                no_bid: mn.borrow().0, no_bid_depth: mn.borrow().1, no_ask: mn.borrow().2, no_ask_depth: mn.borrow().3,
-                                oracle_price: *oracle_rx.borrow(), velocity: velocity_rx.borrow().0, velocity_1s: velocity_rx.borrow().1, acceleration: velocity_rx.borrow().2,
-                                funding_rate: *funding_rx.borrow(), oracle_drift_60m: *drift_60m_rx.borrow(), timestamp: Utc::now(),
-                            }),
-                            _ => None,
-                        },
+                        maker_market: maker_market_config_for_ctx, // This is the maker market
+                        maker_snapshot: maker_market_config.as_ref().map(|_| MarketSnapshot { // Snapshot for the maker market
+                            yes_bid: maker_yb, yes_bid_depth: maker_ybd, yes_ask: maker_ya, yes_ask_depth: maker_yad,
+                            no_bid: maker_nb, no_bid_depth: maker_nbd, no_ask: maker_na, no_ask_depth: maker_nad,
+                            oracle_price: *oracle_rx.borrow(), velocity: velocity_rx.borrow().0, velocity_1s: velocity_rx.borrow().1, acceleration: velocity_rx.borrow().2,
+                            funding_rate: *funding_rx.borrow(), oracle_drift_60m: *drift_60m_rx.borrow(), timestamp: Utc::now(),
+                        }),
                     };
 
                     let eval_result = match execute_strategies_concurrent(&strategies, &ctx, 500, &mut last_executor_summary).await {
@@ -635,7 +713,19 @@ async fn main() -> Result<()> {
                     if resolved_signals.is_empty() { continue; }
 
                     for (strategy_name, signal) in resolved_signals {
+
                         let sn = strategy_name.clone();
+                        // Determine which market context to use for this signal based on strategy's venue
+                        let (target_yes_token, target_no_token, target_market_close_time, target_is_neg_risk, target_yes_fee_bps, target_no_fee_bps) = {
+                            let strategy_venue = strategies.iter().find(|s| s.name() == sn).map(|s| s.venue()).unwrap_or("Hourly"); // Default to Hourly
+                            if strategy_venue == "Window/Daily" && maker_market_config.is_some() {
+                                let mk = maker_market_config.as_ref().unwrap();
+                                (mk.yes_token, mk.no_token, mk.market_close_time, mk.is_neg_risk, mk.yes_fee_bps, mk.no_fee_bps)
+                            } else {
+                                (hourly_yes_token, hourly_no_token, hourly_market_close_time, hourly_is_neg_risk, hourly_yes_fee_rate, hourly_no_fee_rate)
+                            }
+                        };
+
                         match signal {
                             // ════════════════════ EXIT ════════════════════
                             StrategySignal::Exit { params, reason, exit_pair } => {
@@ -655,11 +745,10 @@ async fn main() -> Result<()> {
                                     let mut map = positions.lock().await; if let Some(p) = map.remove(&pos_key) { let aep = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); *total_pnl.lock().await += (aep - p.avg_entry) * p.shares; } continue;
                                 }
                                 info!("📤 EXIT [{}]: {} | shares={:.2}, bid=${:.4} | {}", sn, params.market_name, shares, params.price, reason);
-                                let vc = if params.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
+                                let vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
 
-                                let mut exit_successful = false;
                                 if !config::GHOST_MODE {
-                                    if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, tid, Side::Sell, shares, (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), params.fee_bps, params.order_type, params.post_only, 0, &shared_http).await {
+                                    if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, tid, Side::Sell, shares, (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await { // Use target_yes_fee_bps for simplicity, assuming it's the correct fee for the token
                                         let es = e.to_string();
                                         if es.contains("not enough balance") || es.contains("balance: 0") || es.contains("invalid price") {
                                             let mut map = positions.lock().await; if let Some(p) = map.remove(&pos_key) { if p.fill_confirmed_at.is_some() { let aep3 = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); *total_pnl.lock().await += (aep3 - p.avg_entry) * p.shares; } }
@@ -676,13 +765,9 @@ async fn main() -> Result<()> {
                                         }
                                         continue;
                                     }
-                                    exit_successful = true;
-                                } else {
-                                    // In GHOST_MODE, simulate successful exit
-                                    exit_successful = true;
                                 }
 
-                                if exit_successful {
+                                {
                                     let re_m;
                                     let rs_m;
                                     let rc_m;
@@ -706,7 +791,7 @@ async fn main() -> Result<()> {
                                                 // Record trade metrics asynchronously only in real mode
                                                 let sn_task = sn.clone();
                                                 let m_name = params.market_name.clone();
-                                                let sid = if tid == yes_token { "YES".to_string() } else { "NO".to_string() };
+                                                let sid = if tid == target_yes_token { "YES".to_string() } else { "NO".to_string() };
                                                 let rp = actual_exit_price;
                                                 let r_m = reason.clone();
                                                 tokio::spawn(async move { metrics::record_trade(sn_task, m_name, sid, re_m, rp, rs_m, pnl_m, r_m).await; });
@@ -737,16 +822,16 @@ async fn main() -> Result<()> {
                                         });
                                     }
                                     if exit_pair {
-                                        let other_tid = if tid == yes_token { no_token } else { yes_token };
+                                        let other_tid = if tid == target_yes_token { target_no_token } else { target_yes_token };
                                         let pk = (sn.clone(), other_tid); let ps = { let map = positions.lock().await; map.get(&pk).map(|p| p.shares) };
                                         if let Some(s) = ps {
-                                            let other_bid = if other_tid == yes_token { yb } else { nb };
-                                            let other_fee_bps = if other_tid == yes_token { yes_fee_rate as u16 } else { no_fee_rate as u16 };
-                                            let other_vc = if is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
+                                            let other_bid = if other_tid == target_yes_token { ctx.snapshot.yes_bid } else { ctx.snapshot.no_bid }; // This needs to be from the correct snapshot
+                                            let other_fee_bps = if other_tid == target_yes_token { target_yes_fee_bps as u16 } else { target_no_fee_bps as u16 };
+                                            let other_vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                             if !config::GHOST_MODE { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, other_tid, Side::Sell, s, (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), other_fee_bps, OrderType::FAK, false, 0, &shared_http).await; }
                                             let mut map = positions.lock().await; if let Some(p) = map.remove(&pk) { let actual_other_exit = (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnl = (actual_other_exit - p.avg_entry) * p.shares; *total_pnl.lock().await += pnl;
                                                 if !config::GHOST_MODE {
-                                                    let sn_pm = sn.clone(); let m_name = params.market_name.clone(); let sid = if other_tid == yes_token { "YES".to_string() } else { "NO".to_string() }; let p_avg = p.avg_entry; let o_bid = actual_other_exit; let p_shares = p.shares; let pn = pnl;
+                                                    let sn_pm = sn.clone(); let m_name = params.market_name.clone(); let sid = if other_tid == target_yes_token { "YES".to_string() } else { "NO".to_string() }; let p_avg = p.avg_entry; let o_bid = actual_other_exit; let p_shares = p.shares; let pn = pnl;
                                                     tokio::spawn(async move { metrics::record_trade(sn_pm, m_name, sid, p_avg, o_bid, p_shares, pn, "Convergence/PairedExit".to_string()).await; });
                                                 }
                                             }
@@ -773,7 +858,7 @@ async fn main() -> Result<()> {
 
                             // ════════════════════ ENTRY ════════════════════
                             StrategySignal::Entry { params, pair_params } => {
-                                if let Some(close_time) = market_close_time { if (close_time - Utc::now()).num_seconds() < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY { continue; } }
+                                if let Some(close_time) = target_market_close_time { if (close_time - Utc::now()).num_seconds() < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY { continue; } }
                                 if let Some(lt) = last_trade_time.get(&sn) { if lt.elapsed() < Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64) { continue; } }
                                 // Block re-entry for STOP_LOSS_COOLDOWN_SECS after any stop-loss (successful or FAK miss).
                                 // Prevents compounding into a token where on-chain shares may still exist.
@@ -795,13 +880,8 @@ async fn main() -> Result<()> {
                                 if config::GHOST_MODE {
                                     if positions.lock().await.contains_key(&pos_key) { continue; }
 
-                                    // Use the maker market's close_time when the entry token belongs to the maker
-                                    // venue — prevents BasisExpiry from firing against the hourly market's close
-                                    // time when the position actually lives in the daily/window market.
-                                    let pos_close_time = maker_market_config.as_ref()
-                                        .filter(|mk| params.token_id == mk.yes_token || params.token_id == mk.no_token)
-                                        .and_then(|mk| mk.market_close_time)
-                                        .or(market_close_time);
+                                    // Use the target market's close_time
+                                    let pos_close_time = target_market_close_time;
                                     // Store the actual fill price (signal price + buy offset) as avg_entry
                                     // so PnL calculations reflect true cost basis, not the signal price.
                                     let actual_entry_price = (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE);
@@ -810,10 +890,7 @@ async fn main() -> Result<()> {
                                     info!("👻 GHOST_MODE ENTRY [{}]: {} | ${:.4} x {:.1} (simulated)",
                                         sn, params.market_name, params.price, params.shares);
                                     if let Some(pp) = pair_params {
-                                        let pp_close_time = maker_market_config.as_ref()
-                                            .filter(|mk| pp.token_id == mk.yes_token || pp.token_id == mk.no_token)
-                                            .and_then(|mk| mk.market_close_time)
-                                            .or(market_close_time);
+                                        let pp_close_time = target_market_close_time;
                                         positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: pp.price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: Some(params.token_id) });
                                         info!("👻 GHOST_MODE ENTRY (paired) [{}]: {} | ${:.4} x {:.1} (simulated)", sn, pp.market_name, pp.price, pp.shares);
                                     }
@@ -823,10 +900,7 @@ async fn main() -> Result<()> {
                                     // Real trading logic
                                     {
                                         let mut map = positions.lock().await; if map.contains_key(&pos_key) { continue; }
-                                        let pos_close_time = maker_market_config.as_ref()
-                                            .filter(|mk| params.token_id == mk.yes_token || params.token_id == mk.no_token)
-                                            .and_then(|mk| mk.market_close_time)
-                                            .or(market_close_time);
+                                        let pos_close_time = target_market_close_time;
                                         let actual_entry_price = (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE);
                                         map.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: params.token_id, fill_confirmed_at: None, paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id) });
                                     }
@@ -837,8 +911,8 @@ async fn main() -> Result<()> {
                                     }
 
                                     info!("📥 ENTRY [{}]: {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares);
-                                    let vc = if params.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
-                                    if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, params.token_id, Side::Buy, params.shares, (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), params.fee_bps, params.order_type, params.post_only, 0, &shared_http).await {
+                                    let vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
+                                    if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, params.token_id, Side::Buy, params.shares, (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await { // Use target_yes_fee_bps for simplicity
                                         warn!("⚠️ ENTRY order failed [{}]: {}", sn, e);
                                         positions.lock().await.remove(&pos_key);
                                         pending_orders.lock().await.remove(&pos_key);
@@ -847,11 +921,12 @@ async fn main() -> Result<()> {
                                     }
                                     let cl_s = Arc::clone(&trading_client); let ps_s = Arc::clone(&positions); let pc_s = Arc::clone(&phantom_cooldowns); let sn_s = sn.clone(); let tn_s = params.token_id;
                                     tokio::spawn(async move { let _ = sync_position_balance(&cl_s, &ps_s, &sn_s, tn_s, Some(&pc_s), dec!(0), dradis::helpers::balance::MAX_WAIT_SECS_HOURLY).await; });
-                                    { let sn_e = sn.clone(); let tid_e = params.token_id.to_string(); let mn_e = params.market_name.clone(); let side_e = if params.token_id == yes_token { "YES" } else { "NO" }.to_string(); let ep_e = (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE); let sh_e = params.shares; tokio::spawn(async move { metrics::record_entry(sn_e, tid_e, mn_e, side_e, ep_e, sh_e).await; }); }
+
+                                    { let sn_e = sn.clone(); let tid_e = params.token_id.to_string(); let mn_e = params.market_name.clone(); let side_e = if params.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_e = (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE); let sh_e = params.shares; tokio::spawn(async move { metrics::record_entry(sn_e, tid_e, mn_e, side_e, ep_e, sh_e).await; }); }
 
                                     if let Some(pp) = pair_params {
                                         let vc_p = if pp.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
-                                        let leg_b_result = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc_p, pp.token_id, Side::Buy, pp.shares, (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), pp.fee_bps, pp.order_type, pp.post_only, 0, &shared_http).await;
+                                        let leg_b_result = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc_p, pp.token_id, Side::Buy, pp.shares, (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), target_yes_fee_bps as u16, pp.order_type, pp.post_only, 0, &shared_http).await; // Use target_yes_fee_bps for simplicity
 
                                         match leg_b_result {
                                             Err(ref e) => {
@@ -863,8 +938,8 @@ async fn main() -> Result<()> {
                                                 let signer_fe = signer.clone();
                                                 let sn_fe   = sn.clone();
                                                 let tok_a   = params.token_id;
-                                                let bid_a   = if tok_a == yes_token { yb } else { nb };
-                                                let fee_a   = params.fee_bps;
+                                                let bid_a   = if tok_a == target_yes_token { ctx.snapshot.yes_bid } else { ctx.snapshot.no_bid }; // This needs to be from the correct snapshot
+                                                let fee_a   = target_yes_fee_bps; // Use target_yes_fee_bps for simplicity
                                                 let vc_a    = vc;
                                                 tokio::spawn(async move {
                                                     let deadline = tokio::time::Instant::now()
@@ -892,7 +967,7 @@ async fn main() -> Result<()> {
                                                                     &cl_fe, &nm_fe, &signer_fe,
                                                                     safe_address, eoa_address, vc_a,
                                                                     tok_a, Side::Sell, shares, sell_price,
-                                                                    fee_a, OrderType::FAK, false, 0, &http_fe,
+                                                                    fee_a as u16, OrderType::FAK, false, 0, &http_fe,
                                                                 ).await {
                                                                     Ok(_)  => info!("⚡ Flash-Exit sold Leg A [{}] ✓", sn_fe),
                                                                     Err(e) => warn!("⚡ Flash-Exit sell FAILED [{}]: {} — cleanup task will catch it", sn_fe, e),
@@ -906,14 +981,11 @@ async fn main() -> Result<()> {
                                                 });
                                             }
                                             Ok(_) => {
-                                                let pp_close_time = maker_market_config.as_ref()
-                                                    .filter(|mk| pp.token_id == mk.yes_token || pp.token_id == mk.no_token)
-                                                    .and_then(|mk| mk.market_close_time)
-                                                    .or(market_close_time);
+                                                let pp_close_time = target_market_close_time;
                                                 positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: pp.price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: None, paired_leg_token_id: Some(params.token_id) });
                                                 let sn_p = sn.clone(); let tn_p = pp.token_id; let ps_p = Arc::clone(&positions); let cl_p = Arc::clone(&trading_client); let pc_p = Arc::clone(&phantom_cooldowns);
                                                 tokio::spawn(async move { let _ = sync_position_balance(&cl_p, &ps_p, &sn_p, tn_p, Some(&pc_p), dec!(0), dradis::helpers::balance::MAX_WAIT_SECS_HOURLY).await; });
-                                                { let sn_eb = sn.clone(); let tid_eb = pp.token_id.to_string(); let mn_eb = pp.market_name.clone(); let side_eb = if pp.token_id == yes_token { "YES" } else { "NO" }.to_string(); let ep_eb = pp.price; let sh_eb = pp.shares; tokio::spawn(async move { metrics::record_entry(sn_eb, tid_eb, mn_eb, side_eb, ep_eb, sh_eb).await; }); }
+                                                { let sn_eb = sn.clone(); let tid_eb = pp.token_id.to_string(); let mn_eb = pp.market_name.clone(); let side_eb = if pp.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_eb = pp.price; let sh_eb = pp.shares; tokio::spawn(async move { metrics::record_entry(sn_eb, tid_eb, mn_eb, side_eb, ep_eb, sh_eb).await; }); }
                                             }
                                         }
                                     }
@@ -957,7 +1029,7 @@ async fn main() -> Result<()> {
                                                 dradis::helpers::balance::quick_confirm_fill(&trading_client, &sn, p.token_id, &positions, &p.condition_id, p.order_type.clone()),
                                             ).await;
                                             let vc = if p.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
-                                            if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, p.token_id, Side::Buy, p.shares, p.price, p.fee_bps, p.order_type, true, 0, &shared_http).await {
+                                            if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, p.token_id, Side::Buy, p.shares, p.price, target_yes_fee_bps as u16, p.order_type, true, 0, &shared_http).await { // Use target_yes_fee_bps for simplicity
                                                 positions.lock().await.remove(&pk);
                                                 pending_orders.lock().await.remove(&pk);
                                                 if !e.to_string().contains("crosses book") { consecutive_failures += 1; } continue;
@@ -965,7 +1037,7 @@ async fn main() -> Result<()> {
                                             let cl_m = Arc::clone(&trading_client); let ps_m = Arc::clone(&positions); let pc_m = Arc::clone(&phantom_cooldowns);
                                             let sn_m = sn.clone();
                                             tokio::spawn(async move { let _ = sync_position_balance(&cl_m, &ps_m, &sn_m, p.token_id, Some(&pc_m), dec!(0), dradis::helpers::balance::MAX_WAIT_SECS_WINDOW).await; });
-                                            { let sn_em = sn.clone(); let tid_em = p.token_id.to_string(); let mn_em = p.market_name.clone(); let side_em = if p.token_id == yes_token { "YES" } else { "NO" }.to_string(); let ep_em = p.price; let sh_em = p.shares; tokio::spawn(async move { metrics::record_entry(sn_em, tid_em, mn_em, side_em, ep_em, sh_em).await; }); }
+                                            { let sn_em = sn.clone(); let tid_em = p.token_id.to_string(); let mn_em = p.market_name.clone(); let side_em = if p.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_em = p.price; let sh_em = p.shares; tokio::spawn(async move { metrics::record_entry(sn_em, tid_em, mn_em, side_em, ep_em, sh_em).await; }); }
                                         }
                                         placed = true;
                                     }

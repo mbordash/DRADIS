@@ -23,7 +23,7 @@ use crate::helpers::price::value_to_f64;
 // Import the moved functions from config_helpers via crate::helpers
 use crate::helpers::{
     is_window_market, is_daily_market, is_ultra_short_window_market,
-    is_high_priority_text, is_crypto_market, is_range_market, is_bad_market
+    is_high_priority_text, is_range_market, is_bad_market
 };
 
 // ============================================================================
@@ -197,6 +197,7 @@ pub struct MarketCandidate {
     pub close_time: Option<DateTime<Utc>>,
     pub volume: f64,
     pub condition_id: String,
+    pub strike_price: Option<Decimal>, // Added strike_price field
 }
 
 /// Directly fetch today's (or tomorrow's) daily "Up or Down on [date]?" maker venue
@@ -254,6 +255,7 @@ pub async fn fetch_specific_window_daily_market(
                 close_time: close,
                 volume: 0.0,
                 condition_id: cond_id,
+                strike_price: None, // Initialize strike_price to None
             });
         }
     }
@@ -305,8 +307,8 @@ pub async fn get_market_pair(http: &reqwest::Client) -> (MarketCandidate, Option
     maker_c.sort_by(|a, b| b.5.cmp(&a.5)); // prefer more time left
 
     let hourly = hourly_c.first()
-        .map(|b| MarketCandidate { yes_token: b.0[0], no_token: b.0[1], name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone() })
-        .unwrap_or(MarketCandidate { yes_token: U256::ZERO, no_token: U256::ZERO, name: String::new(), link: String::new(), description: String::new(), is_hot: false, close_time: None, volume: 0.0, condition_id: String::new() });
+        .map(|b| MarketCandidate { yes_token: b.0[0], no_token: b.0[1], name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone(), strike_price: None })
+        .unwrap_or(MarketCandidate { yes_token: U256::ZERO, no_token: U256::ZERO, name: String::new(), link: String::new(), description: String::new(), is_hot: false, close_time: None, volume: 0.0, condition_id: String::new(), strike_price: None });
 
     if hourly.yes_token != U256::ZERO {
         info!("📈 Hourly market selected: \"{}\" (vol24h={:.0})", hourly.name, hourly.volume);
@@ -318,7 +320,7 @@ pub async fn get_market_pair(http: &reqwest::Client) -> (MarketCandidate, Option
     let maker = daily_direct.or_else(|| {
         if let Some(b) = maker_c.first() {
             info!("📋 Using volume-scan window/daily fallback for maker venue");
-            Some(MarketCandidate { yes_token: b.0[0], no_token: b.0[1], name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone() })
+            Some(MarketCandidate { yes_token: b.0[0], no_token: b.0[1], name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone(), strike_price: None })
         } else {
             // No daily/window maker venue — expected for assets (e.g. BTC) where Polymarket
             // only lists hourly "Up or Down" markets.  Log at INFO at most once per hour to

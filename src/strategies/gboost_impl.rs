@@ -42,7 +42,6 @@ use chrono::Utc;
 use perpetual::{Matrix, PerpetualBooster};
 use perpetual::objective::Objective;
 use perpetual::booster::config::BoosterIO;
-use tokio::time::{Instant, Duration}; // Import Instant and Duration
 use alloy::primitives::U256; // For token_id in pending_entries
 
 use crate::config;
@@ -271,6 +270,24 @@ impl GboostStrategyImpl {
         let matrix = Matrix::new(&feats, 1, NUM_FEATURES);
         booster.predict_proba(&matrix, false, false).first().copied()
     }
+
+    /// Persist one supervised label only when an exit signal is emitted.
+    /// This avoids training on transient mark-to-market states from non-exit ticks.
+    fn record_training_outcome_on_exit(&self, token_id: U256, is_profitable: bool) {
+        let mut pending_entries_guard = self.pending_entries.lock().unwrap();
+        if let Some((entry_snap, _entry_price)) = pending_entries_guard.remove(&token_id) {
+            let training_sample = TrainingSample {
+                features: extract_features(&entry_snap),
+                is_profitable,
+                entry_timestamp: entry_snap.timestamp,
+            };
+            let mut training_data_guard = self.training_data.lock().unwrap();
+            training_data_guard.push_back(training_sample);
+            if training_data_guard.len() > config::GBOOST_HISTORY_BUFFER_SIZE {
+                training_data_guard.pop_front();
+            }
+        }
+    }
 }
 
 impl Default for GboostStrategyImpl {
@@ -301,7 +318,21 @@ impl Strategy for GboostStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
         // ── Gate: expiry guard ────────────────────────────────────────────────
-        if let Some(close_time) = ctx.market.market_close_time {
+        // GBoost should operate on the maker_market (Window/Daily) if available,
+        // otherwise it falls back to the primary market (Hourly).
+        let target_market = if let Some(ref mk) = ctx.maker_market {
+            mk
+        } else {
+            &ctx.market
+        };
+
+        let target_snapshot = if ctx.maker_snapshot.is_some() {
+            ctx.maker_snapshot.as_ref().unwrap()
+        } else {
+            &ctx.snapshot
+        };
+
+        if let Some(close_time) = target_market.market_close_time {
             if (close_time - Utc::now()).num_seconds() < 90 {
                 return Ok(StrategySignal::NoSignal);
             }
@@ -311,7 +342,7 @@ impl Strategy for GboostStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
-        let p_yes_up = match self.predict(&ctx.snapshot) {
+        let p_yes_up = match self.predict(target_snapshot) {
             Some(p) => p,
             None    => return Ok(StrategySignal::NoSignal),
         };
@@ -323,14 +354,14 @@ impl Strategy for GboostStrategyImpl {
         let (has_yes, has_no) = {
             let map = ctx.positions.lock().await;
             (
-                map.contains_key(&("GboostStrategy".to_string(), ctx.market.yes_token)),
-                map.contains_key(&("GboostStrategy".to_string(), ctx.market.no_token)),
+                map.contains_key(&("GboostStrategy".to_string(), target_market.yes_token)),
+                map.contains_key(&("GboostStrategy".to_string(), target_market.no_token)),
             )
         };
 
         // ── YES entry: model predicts UP ──────────────────────────────────────
         if p_yes_up >= entry_thresh && !has_yes {
-            let price  = floor_to_tick_size(ctx.snapshot.yes_ask);
+            let price  = floor_to_tick_size(target_snapshot.yes_ask);
             if price >= config::GBOOST_MAX_ENTRY_PRICE || price <= dec!(0) { return Ok(StrategySignal::NoSignal); }
             let shares = trade_usdc / price;
             tracing::debug!(
@@ -339,17 +370,17 @@ impl Strategy for GboostStrategyImpl {
             );
             // Store entry context for training feedback
             self.pending_entries.lock().unwrap().insert(
-                ctx.market.yes_token,
-                (ctx.snapshot.clone(), price)
+                target_market.yes_token,
+                (target_snapshot.clone(), price)
             );
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
-                    token_id: ctx.market.yes_token,
+                    token_id: target_market.yes_token,
                     price, shares,
-                    fee_bps:     ctx.market.yes_fee_bps as u16,
-                    is_neg_risk: ctx.market.is_neg_risk,
-                    market_name: ctx.market.market_name.clone(),
-                    condition_id: ctx.market.condition_id.clone(),
+                    fee_bps:     target_market.yes_fee_bps as u16,
+                    is_neg_risk: target_market.is_neg_risk,
+                    market_name: target_market.market_name.clone(),
+                    condition_id: target_market.condition_id.clone(),
                     order_type: OrderType::FAK, // GBoost entries are typically FAK
                     post_only: false, // Not post-only
                     ghost_mode: config::GHOST_MODE,
@@ -360,7 +391,7 @@ impl Strategy for GboostStrategyImpl {
 
         // ── NO entry: model predicts DOWN (P(UP) is very low) ────────────────
         if p_yes_up <= (1.0 - entry_thresh) && !has_no {
-            let price  = floor_to_tick_size(ctx.snapshot.no_ask);
+            let price  = floor_to_tick_size(target_snapshot.no_ask);
             if price >= config::GBOOST_MAX_ENTRY_PRICE || price <= dec!(0) { return Ok(StrategySignal::NoSignal); }
             let shares = trade_usdc / price;
             tracing::debug!(
@@ -369,17 +400,17 @@ impl Strategy for GboostStrategyImpl {
             );
             // Store entry context for training feedback
             self.pending_entries.lock().unwrap().insert(
-                ctx.market.no_token,
-                (ctx.snapshot.clone(), price)
+                target_market.no_token,
+                (target_snapshot.clone(), price)
             );
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
-                    token_id: ctx.market.no_token,
+                    token_id: target_market.no_token,
                     price, shares,
-                    fee_bps:     ctx.market.no_fee_bps as u16,
-                    is_neg_risk: ctx.market.is_neg_risk,
-                    market_name: ctx.market.market_name.clone(),
-                    condition_id: ctx.market.condition_id.clone(),
+                    fee_bps:     target_market.no_fee_bps as u16,
+                    is_neg_risk: target_market.is_neg_risk,
+                    market_name: target_market.market_name.clone(),
+                    condition_id: target_market.condition_id.clone(),
                     order_type: OrderType::FAK, // GBoost entries are typically FAK
                     post_only: false, // Not post-only
                     ghost_mode: config::GHOST_MODE,
@@ -392,7 +423,21 @@ impl Strategy for GboostStrategyImpl {
     }
 
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
-        let p_yes_up           = self.predict(&ctx.snapshot);
+        // GBoost should operate on the maker_market (Window/Daily) if available,
+        // otherwise it falls back to the primary market (Hourly).
+        let target_market = if let Some(ref mk) = ctx.maker_market {
+            mk
+        } else {
+            &ctx.market
+        };
+
+        let target_snapshot = if ctx.maker_snapshot.is_some() {
+            ctx.maker_snapshot.as_ref().unwrap()
+        } else {
+            &ctx.snapshot
+        };
+
+        let p_yes_up           = self.predict(target_snapshot);
         let signal_exit_thresh = config::GBOOST_SIGNAL_EXIT_THRESHOLD.to_f64().unwrap_or(0.40);
         let tp                 = config::GBOOST_TARGET_PROFIT_PERCENT.to_f64().unwrap_or(0.15);
         let sl                 = config::GBOOST_STOP_LOSS_PERCENT.to_f64().unwrap_or(0.10);
@@ -400,9 +445,9 @@ impl Strategy for GboostStrategyImpl {
         let pos_map = ctx.positions.lock().await;
 
         // ── YES position ──────────────────────────────────────────────────────
-        if let Some(pos) = pos_map.get(&("GboostStrategy".to_string(), ctx.market.yes_token)) {
+        if let Some(pos) = pos_map.get(&("GboostStrategy".to_string(), target_market.yes_token)) {
             if pos.fill_confirmed_at.is_some() {
-                let bid = ctx.snapshot.yes_bid;
+                let bid = target_snapshot.yes_bid;
                 let profit_pct = if pos.avg_entry > dec!(0) {
                     ((bid - pos.avg_entry) / pos.avg_entry).to_f64().unwrap_or(0.0)
                 } else { 0.0 };
@@ -410,34 +455,19 @@ impl Strategy for GboostStrategyImpl {
                     .map(|t| (Utc::now() - t).num_seconds()).unwrap_or(0);
 
                 let exit_params = || OrderParams {
-                    token_id: ctx.market.yes_token,
+                    token_id: target_market.yes_token,
                     price: bid, shares: pos.shares,
-                    fee_bps: ctx.market.yes_fee_bps as u16,
-                    is_neg_risk: ctx.market.is_neg_risk,
-                    market_name: ctx.market.market_name.clone(),
-                    condition_id: ctx.market.condition_id.clone(),
+                    fee_bps: target_market.yes_fee_bps as u16,
+                    is_neg_risk: target_market.is_neg_risk,
+                    market_name: target_market.market_name.clone(),
+                    condition_id: target_market.condition_id.clone(),
                     order_type: OrderType::FAK, // Exit orders are always FAK
                     post_only: false, // Exit orders are never post-only
                     ghost_mode: config::GHOST_MODE,
                 };
 
-                // Capture PnL for training data
-                let mut pending_entries_guard = self.pending_entries.lock().unwrap();
-                if let Some((entry_snap, _entry_price)) = pending_entries_guard.remove(&ctx.market.yes_token) {
-                    let is_profitable = profit_pct > 0.0; // Simple profitability check
-                    let training_sample = TrainingSample {
-                        features: extract_features(&entry_snap),
-                        is_profitable,
-                        entry_timestamp: entry_snap.timestamp,
-                    };
-                    let mut training_data_guard = self.training_data.lock().unwrap();
-                    training_data_guard.push_back(training_sample);
-                    if training_data_guard.len() > config::GBOOST_HISTORY_BUFFER_SIZE {
-                        training_data_guard.pop_front();
-                    }
-                }
-
                 if profit_pct >= tp {
+                    self.record_training_outcome_on_exit(target_market.yes_token, profit_pct > 0.0);
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
                         reason: format!("GBoost TP YES: gain={:.2}%", profit_pct * 100.0),
@@ -445,6 +475,7 @@ impl Strategy for GboostStrategyImpl {
                     });
                 }
                 if secs_held >= config::GBOOST_MIN_HOLD_SECS && profit_pct <= -sl {
+                    self.record_training_outcome_on_exit(target_market.yes_token, profit_pct > 0.0);
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
                         reason: format!("GBoost SL YES: loss={:.2}% ({}s)", profit_pct * 100.0, secs_held),
@@ -453,7 +484,8 @@ impl Strategy for GboostStrategyImpl {
                 }
                 // Signal reversal: model now strongly predicts DOWN while we are long YES.
                 if let Some(p) = p_yes_up {
-                    if p <= signal_exit_thresh {
+                    if secs_held >= config::GBOOST_MIN_HOLD_SECS && p <= signal_exit_thresh {
+                        self.record_training_outcome_on_exit(target_market.yes_token, profit_pct > 0.0);
                         return Ok(StrategySignal::Exit {
                             params: exit_params(),
                             reason: format!("GBoost SignalRev YES: P(UP)={:.3}", p),
@@ -465,9 +497,9 @@ impl Strategy for GboostStrategyImpl {
         }
 
         // ── NO position ───────────────────────────────────────────────────────
-        if let Some(pos) = pos_map.get(&("GboostStrategy".to_string(), ctx.market.no_token)) {
+        if let Some(pos) = pos_map.get(&("GboostStrategy".to_string(), target_market.no_token)) {
             if pos.fill_confirmed_at.is_some() {
-                let bid = ctx.snapshot.no_bid;
+                let bid = target_snapshot.no_bid;
                 let profit_pct = if pos.avg_entry > dec!(0) {
                     ((bid - pos.avg_entry) / pos.avg_entry).to_f64().unwrap_or(0.0)
                 } else { 0.0 };
@@ -475,34 +507,19 @@ impl Strategy for GboostStrategyImpl {
                     .map(|t| (Utc::now() - t).num_seconds()).unwrap_or(0);
 
                 let exit_params = || OrderParams {
-                    token_id: ctx.market.no_token,
+                    token_id: target_market.no_token,
                     price: bid, shares: pos.shares,
-                    fee_bps: ctx.market.no_fee_bps as u16,
-                    is_neg_risk: ctx.market.is_neg_risk,
-                    market_name: ctx.market.market_name.clone(),
-                    condition_id: ctx.market.condition_id.clone(),
+                    fee_bps: target_market.no_fee_bps as u16,
+                    is_neg_risk: target_market.is_neg_risk,
+                    market_name: target_market.market_name.clone(),
+                    condition_id: target_market.condition_id.clone(),
                     order_type: OrderType::FAK, // Exit orders are always FAK
                     post_only: false, // Exit orders are never post-only
                     ghost_mode: config::GHOST_MODE,
                 };
 
-                // Capture PnL for training data
-                let mut pending_entries_guard = self.pending_entries.lock().unwrap();
-                if let Some((entry_snap, _entry_price)) = pending_entries_guard.remove(&ctx.market.no_token) {
-                    let is_profitable = profit_pct > 0.0; // Simple profitability check
-                    let training_sample = TrainingSample {
-                        features: extract_features(&entry_snap),
-                        is_profitable,
-                        entry_timestamp: entry_snap.timestamp,
-                    };
-                    let mut training_data_guard = self.training_data.lock().unwrap();
-                    training_data_guard.push_back(training_sample);
-                    if training_data_guard.len() > config::GBOOST_HISTORY_BUFFER_SIZE {
-                        training_data_guard.pop_front();
-                    }
-                }
-
                 if profit_pct >= tp {
+                    self.record_training_outcome_on_exit(target_market.no_token, profit_pct > 0.0);
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
                         reason: format!("GBoost TP NO: gain={:.2}%", profit_pct * 100.0),
@@ -510,6 +527,7 @@ impl Strategy for GboostStrategyImpl {
                     });
                 }
                 if secs_held >= config::GBOOST_MIN_HOLD_SECS && profit_pct <= -sl {
+                    self.record_training_outcome_on_exit(target_market.no_token, profit_pct > 0.0);
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
                         reason: format!("GBoost SL NO: loss={:.2}% ({}s)", profit_pct * 100.0, secs_held),
@@ -518,7 +536,8 @@ impl Strategy for GboostStrategyImpl {
                 }
                 // Signal reversal for NO: model now strongly predicts UP.
                 if let Some(p) = p_yes_up {
-                    if p >= (1.0 - signal_exit_thresh) {
+                    if secs_held >= config::GBOOST_MIN_HOLD_SECS && p >= (1.0 - signal_exit_thresh) {
+                        self.record_training_outcome_on_exit(target_market.no_token, profit_pct > 0.0);
                         return Ok(StrategySignal::Exit {
                             params: exit_params(),
                             reason: format!("GBoost SignalRev NO: P(UP)={:.3}", p),
@@ -533,7 +552,7 @@ impl Strategy for GboostStrategyImpl {
     }
 
     fn name(&self) -> String { "GboostStrategy".to_string() }
-    fn venue(&self) -> &'static str { "Hourly" }
+    fn venue(&self) -> &'static str { "Window/Daily" }
     fn max_exposure(&self) -> rust_decimal::Decimal { crate::config::GBOOST_MAX_EXPOSURE_USDC }
     fn risk_model(&self) -> &'static str { "Gross one-sided" }
 
@@ -549,7 +568,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tokio::sync::Mutex;
-    use crate::state::{MarketConfig, PositionMap};
+    use crate::state::{MarketConfig, Position, PositionMap};
     // use alloy::primitives::U256; // Already imported by the main file
 
     fn make_snapshot() -> MarketSnapshot {
@@ -637,5 +656,71 @@ mod tests {
         // Must not panic — signal depends on the dummy snapshot's feature values.
         let _ = strategy.evaluate_entry(&make_ctx()).await.unwrap();
         let _ = strategy.evaluate_exit(&make_ctx()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pending_entry_is_kept_when_no_exit_signal() {
+        let strategy = GboostStrategyImpl::new();
+        let ctx = make_ctx();
+
+        strategy.pending_entries.lock().unwrap().insert(
+            ctx.market.yes_token,
+            (ctx.snapshot.clone(), dec!(0.50)),
+        );
+
+        {
+            let mut map = ctx.positions.lock().await;
+            map.insert(
+                ("GboostStrategy".to_string(), ctx.market.yes_token),
+                Position {
+                    shares: dec!(10),
+                    avg_entry: dec!(0.52),
+                    opened_at: Utc::now(),
+                    close_time: ctx.market.market_close_time,
+                    market_name: ctx.market.market_name.clone(),
+                    pair_token_id: ctx.market.yes_token,
+                    fill_confirmed_at: Some(Utc::now()),
+                    paired_leg_token_id: None,
+                },
+            );
+        }
+
+        let signal = strategy.evaluate_exit(&ctx).await.unwrap();
+        assert!(matches!(signal, StrategySignal::NoSignal));
+        assert_eq!(strategy.pending_entries.lock().unwrap().len(), 1);
+        assert_eq!(strategy.training_data.lock().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn pending_entry_is_consumed_when_exit_signal_emitted() {
+        let strategy = GboostStrategyImpl::new();
+        let ctx = make_ctx();
+
+        strategy.pending_entries.lock().unwrap().insert(
+            ctx.market.yes_token,
+            (ctx.snapshot.clone(), dec!(0.40)),
+        );
+
+        {
+            let mut map = ctx.positions.lock().await;
+            map.insert(
+                ("GboostStrategy".to_string(), ctx.market.yes_token),
+                Position {
+                    shares: dec!(10),
+                    avg_entry: dec!(0.40),
+                    opened_at: Utc::now(),
+                    close_time: ctx.market.market_close_time,
+                    market_name: ctx.market.market_name.clone(),
+                    pair_token_id: ctx.market.yes_token,
+                    fill_confirmed_at: Some(Utc::now()),
+                    paired_leg_token_id: None,
+                },
+            );
+        }
+
+        let signal = strategy.evaluate_exit(&ctx).await.unwrap();
+        assert!(matches!(signal, StrategySignal::Exit { reason, .. } if reason.contains("GBoost TP YES")));
+        assert_eq!(strategy.pending_entries.lock().unwrap().len(), 0);
+        assert_eq!(strategy.training_data.lock().unwrap().len(), 1);
     }
 }
