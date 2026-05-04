@@ -231,23 +231,26 @@ pub const BASIS_MAKER_BUY_PRICE_ADJUSTMENT: Decimal = dec!(-0.01);
 // GBOOST STRATEGY PARAMETERS
 // ============================================================================
 
-pub const ENABLE_GBOOST_TRADING: bool = false; // Disabled by default in conservative
-pub const GBOOST_MIN_ENTRY_PRICE: Decimal = dec!(0.30);
-pub const GBOOST_MAX_ENTRY_PRICE: Decimal = dec!(0.95);
-pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 600; // 10 minutes
-pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(10.0);
-pub const GBOOST_LOOKAHEAD_TICKS: usize = 20; // 1 second (20 * 50ms orchestrator tick)
-pub const GBOOST_RETRAIN_EVERY_N: usize = 400; // Retrain every 20 seconds (400 * 50ms)
-pub const GBOOST_MIN_TRAINING_SAMPLES: usize = 500;
-pub const GBOOST_MODEL_PATH: &str = "logs/gboost_model_v13f.json";
-pub const GBOOST_HISTORY_BUFFER_SIZE: usize = 2000;
-pub const GBOOST_BUDGET: u32 = 200; // Lower budget for simpler models
-pub const GBOOST_NUM_THREADS: u32 = 0; // Use all available CPU cores
-pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.75); // High threshold for only strongest signals
-pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.40); // Exit only on strong reversal
-pub const GBOOST_TARGET_PROFIT_PERCENT: Decimal = dec!(0.08); // Lower target profit
-pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.08); // Tighter stop loss
-pub const GBOOST_MIN_HOLD_SECS: i64 = 60; // Minimum hold time
+pub const ENABLE_GBOOST_TRADING: bool = true;
+
+pub const GBOOST_MAX_ENTRY_PRICE: Decimal = dec!(0.60);
+pub const GBOOST_MIN_ENTRY_PRICE: Decimal = dec!(0.35);
+pub const GBOOST_HISTORY_BUFFER_SIZE: usize = 1000;
+pub const GBOOST_LOOKAHEAD_TICKS: usize = 40;
+pub const GBOOST_MIN_TRAINING_SAMPLES: usize = 320;
+pub const GBOOST_RETRAIN_EVERY_N: usize = 200;
+pub const GBOOST_BUDGET: f32 = 0.65;
+pub const GBOOST_NUM_THREADS: usize = 2;
+pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.75);
+pub const GBOOST_POST_EXIT_COOLDOWN_SECS: i64 = 300;
+pub const GBOOST_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.20);
+pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.40);
+pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(4.0);
+pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300;
+pub const GBOOST_TARGET_PROFIT_PERCENT: Decimal = dec!(0.12);
+pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.055);
+pub const GBOOST_MIN_HOLD_SECS: i64 = 60;
+pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v13f.json";
 pub const GBOOST_MAX_HOURLY_ASK_SUM: Decimal = dec!(1.20);
 pub const GBOOST_MIN_HOURLY_BID_SUM: Decimal = dec!(0.70);
 
