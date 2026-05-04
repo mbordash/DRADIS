@@ -122,13 +122,13 @@ The bot connects to Polymarket's CLOB via WebSocket for real-time orderbook data
 ### Strategy Segregation (Example Profile)
 
 | Strategy | Capital Budget | Risk Model | Primary Venue |
-|---|---|---|---|
-| MomentumStrategy | `$15` | Gross one-sided | **Hourly** |
-| MakerStrategy | `$12` | Net \|YES−NO\| | **Window** |
-| ArbitrageStrategy | `$35` per leg | Gross hedged | **Window** |
-| TimeDecayStrategy | `$36` per leg | Gross hedged | **Window** |
-| BasisStrategy | `$15` | Gross one-sided | **Window** |
-| GboostStrategy | `$15` | Gross one-sided | **Hourly** |
+|---|---|---|---------------|
+| MomentumStrategy | `$15` | Gross one-sided | **Hourly**    |
+| MakerStrategy | `$12` | Net \|YES−NO\| | **Window**    |
+| ArbitrageStrategy | `$35` per leg | Gross hedged | **Window**    |
+| TimeDecayStrategy | `$36` per leg | Gross hedged | **Window**    |
+| BasisStrategy | `$15` | Gross one-sided | **Window**    |
+| GboostStrategy | `$15` | Gross one-sided | **Window**    |
 
 ---
 
@@ -216,6 +216,29 @@ Edit the per-strategy constants in `src/config.rs`, specifically the `_MAX_EXPOS
 **How can I optimize my host for maximum performance?**
 
 See [docs/PERFORMANCE_TUNING.md](docs/PERFORMANCE_TUNING.md) for a full guide covering kernel `sysctl` tuning, CPU frequency governor, CPU/IRQ affinity pinning, Docker ulimits, and instance selection tips for AWS and OCI.
+
+**Why doesn't DRADIS include a backtesting framework?**
+
+Short answer: **Ghost mode running against live markets is a better substitute than it first appears**, and a traditional backtester would introduce more problems than it solves for prediction-market trading.
+
+Here's why:
+
+| Concern | Backtester | Ghost Mode |
+|---|---|---|
+| Market data fidelity | Requires storing full L2 orderbook snapshots (expensive, lossy) | Real-time Polymarket CLOB feed — 100% authentic |
+| Strategy fidelity | Must mock async execution, cooldown maps, drawdown guards | Full production code path runs unchanged |
+| Fill simulation | Assumes fills that may never occur in thin prediction markets | No fills in ghost mode — no wishful thinking |
+| Regime coverage | Only covers periods you've collected data for | Every session captures current live regime |
+| Build/maintain cost | Significant — separate data pipeline, replay harness, fill model | Zero — `GHOST_MODE = true` in `config.rs` |
+
+**The recommended workflow instead:**
+
+1. Set `GHOST_MODE = true` in `config.rs` and run overnight or across a full session.
+2. Download your `session.file` and run `tools/session_parser.py` (see `tools/README.md`) for a per-trade breakdown with market context.
+3. Identify loss patterns → tune `config.rs` constants → run another ghost session.
+4. Repeat until the strategy shows consistent positive expectancy in ghost mode before enabling live execution.
+
+This loop uses real market data, real strategy logic, and zero capital risk — which is exactly what a backtester promises but rarely delivers cleanly for illiquid, event-driven prediction markets.
 
 ---
 ## 📜 Credits & Acknowledgments
