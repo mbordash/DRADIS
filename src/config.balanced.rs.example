@@ -217,7 +217,8 @@ pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.40); // Moderate exits 
 pub const GBOOST_TARGET_PROFIT_PERCENT: Decimal = dec!(0.10); // Moderate target profit
 pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.10); // Moderate stop loss
 pub const GBOOST_MIN_HOLD_SECS: i64 = 30; // Moderate minimum hold time
-
+pub const GBOOST_MAX_HOURLY_ASK_SUM: Decimal = dec!(1.20);
+pub const GBOOST_MIN_HOURLY_BID_SUM: Decimal = dec!(0.70);
 
 // ============================================================================
 // POSITION MERGE SETTINGS

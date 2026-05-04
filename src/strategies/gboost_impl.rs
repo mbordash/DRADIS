@@ -3,7 +3,7 @@
 /// Uses the `perpetual` crate's `PerpetualBooster` (LogLoss objective) to predict
 /// near-term YES price direction from a rolling window of orderbook + oracle features.
 ///
-/// ── Feature Vector (NUM_FEATURES = 12) ──────────────────────────────────────
+/// ── Feature Vector (NUM_FEATURES = 13) ──────────────────────────────────────
 ///   [0]  yes_obi         — (yes_bid_depth − yes_ask_depth) / total depth
 ///   [1]  no_obi          — (no_bid_depth − no_ask_depth) / total depth
 ///   [2]  yes_ask         — best ask price for YES token
@@ -16,6 +16,13 @@
 ///   [9]  funding_rate    — Binance perpetual funding rate
 ///  [10]  oracle_drift_60m — 60-minute oracle drift (÷ 10000)
 ///  [11]  oracle_price    — Binance oracle price (÷ 100_000 to reach O(1))
+///  [12]  secs_to_expiry_norm — seconds until market expiry, clamped to
+///                             [0, MAX_SECONDS_TO_EXPIRY_FOR_ENTRY] and normalised
+///                             to [0.0, 1.0].  0 = expiry, 1 = 4h+ away.
+///                             Teaches the model that binary market microstructure
+///                             (gamma, adverse selection, spread) changes dramatically
+///                             near expiry — entries and exits should be calibrated
+///                             differently depending on time horizon.
 ///
 /// ── Label ────────────────────────────────────────────────────────────────────
 ///   1.0  if yes_bid rises in GBOOST_LOOKAHEAD_TICKS ticks
@@ -52,7 +59,7 @@ use crate::helpers::price::floor_to_tick_size;
 use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
 
 /// Number of f64 features per snapshot row fed into the booster.
-const NUM_FEATURES: usize = 12;
+const NUM_FEATURES: usize = 13;
 
 /// Represents a single training sample for the Gboost model.
 /// Contains the features at the time of entry and whether the trade was profitable.
@@ -64,6 +71,10 @@ pub struct TrainingSample {
 }
 
 // ── Feature extraction ────────────────────────────────────────────────────────
+
+/// Normalisation divisor for secs_to_expiry: same as MAX_SECONDS_TO_EXPIRY_FOR_ENTRY (4 h).
+/// Values beyond this horizon all map to 1.0; at expiry the value is 0.0.
+const SECS_TO_EXPIRY_NORM: f64 = 14_400.0;
 
 /// Convert a `MarketSnapshot` into a fixed-length `f64` feature array.
 fn extract_features(s: &MarketSnapshot) -> [f64; NUM_FEATURES] {
@@ -78,6 +89,13 @@ fn extract_features(s: &MarketSnapshot) -> [f64; NUM_FEATURES] {
         ((s.no_bid_depth - s.no_ask_depth) / no_total).to_f64().unwrap_or(0.0)
     } else { 0.0 };
 
+    // Normalise secs_to_expiry to [0.0, 1.0]:
+    //   0.0 = market has expired / about to expire
+    //   1.0 = 4 hours or more until expiry (fully safe zone)
+    let secs_to_expiry_norm = (s.secs_to_expiry.max(0) as f64)
+        .min(SECS_TO_EXPIRY_NORM)
+        / SECS_TO_EXPIRY_NORM;
+
     [
         yes_obi,
         no_obi,
@@ -91,6 +109,7 @@ fn extract_features(s: &MarketSnapshot) -> [f64; NUM_FEATURES] {
         s.funding_rate.to_f64().unwrap_or(0.0),
         s.oracle_drift_60m.to_f64().unwrap_or(0.0)  / 10_000.0,
         s.oracle_price.to_f64().unwrap_or(70_000.0) / 100_000.0,
+        secs_to_expiry_norm,
     ]
 }
 
@@ -356,6 +375,27 @@ impl Strategy for GboostStrategyImpl {
         if (Utc::now() - ctx.market_started_at).num_seconds() < config::GBOOST_MIN_MARKET_AGE_SECS {
             return Ok(StrategySignal::NoSignal);
         }
+
+        // ── Gate: hourly market health cross-check ────────────────────────────
+        // When GBoost trades on a Window/Daily venue (maker_snapshot present), the
+        // hourly market state is still a leading indicator for daily pricing.
+        // A degenerate hourly book (ask_sum >> 1.0 or bid_sum << 0.7) means a
+        // strong directional hourly move is under way — entering daily at this
+        // moment means maximum adverse selection.
+        if ctx.maker_snapshot.is_some() {
+            let hourly_ask_sum = ctx.snapshot.yes_ask + ctx.snapshot.no_ask;
+            let hourly_bid_sum = ctx.snapshot.yes_bid + ctx.snapshot.no_bid;
+            if hourly_ask_sum > config::GBOOST_MAX_HOURLY_ASK_SUM
+                || hourly_bid_sum < config::GBOOST_MIN_HOURLY_BID_SUM
+            {
+                tracing::debug!(
+                    "🚫 GBoost entry blocked: hourly book degenerate (ask_sum={:.3} bid_sum={:.3})",
+                    hourly_ask_sum, hourly_bid_sum
+                );
+                return Ok(StrategySignal::NoSignal);
+            }
+        }
+
         // ── Gate: expiry guard ────────────────────────────────────────────────
         // GBoost should operate on the maker_market (Window/Daily) if available,
         // otherwise it falls back to the primary market (Hourly).
@@ -675,6 +715,7 @@ mod tests {
             oracle_price: dec!(95000),
             velocity: dec!(50), velocity_1s: dec!(10), acceleration: dec!(5),
             funding_rate: dec!(0.0001), oracle_drift_60m: dec!(100),
+            secs_to_expiry: 3600, // 1 hour — mid-range for tests
             timestamp: Utc::now(),
         }
     }
@@ -708,6 +749,9 @@ mod tests {
         assert!(feats[1].abs() <= 1.0, "no_obi  out of [-1,1]: {}", feats[1]);
         // oracle normalised: 95000 / 100000 = 0.95
         assert!((feats[11] - 0.95).abs() < 0.01, "oracle_price feat: {}", feats[11]);
+        // secs_to_expiry_norm: 3600 / 14400 = 0.25
+        assert!((feats[12] - 0.25).abs() < 0.01, "secs_to_expiry_norm feat: {}", feats[12]);
+        assert!(feats[12] >= 0.0 && feats[12] <= 1.0, "secs_to_expiry_norm out of [0,1]: {}", feats[12]);
     }
 
     #[test]

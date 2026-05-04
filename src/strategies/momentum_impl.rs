@@ -288,7 +288,8 @@ impl Strategy for MomentumStrategyImpl {
                 return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: config::GHOST_MODE }, reason, exit_pair: false });
             }
 
-            if profit_margin <= stop_loss {
+            // Require a short minimum hold before SL to avoid immediate churn exits.
+            if secs_held >= config::MOMENTUM_FILL_CONFIRM_MIN_HOLD_SECS && profit_margin <= stop_loss {
                 let reason = format!("MomentumSL: bid=${:.4}, loss={:.2}%", bid, profit_margin * dec!(100));
                 return Ok(StrategySignal::Exit { params: OrderParams { token_id: *token_id, price: bid, shares: position.shares, fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 }, is_neg_risk: ctx.market.is_neg_risk, market_name: ctx.market.market_name.clone(), condition_id: ctx.market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: config::GHOST_MODE }, reason, exit_pair: false });
             }

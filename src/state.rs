@@ -82,6 +82,12 @@ pub struct MarketSnapshot {
     /// Zero when insufficient history is available (first hour of bot runtime).
     /// Used by MakerStrategy to suppress adverse-side bids during slow sustained trends.
     pub oracle_drift_60m: Decimal,
+    /// Seconds remaining until this market's expiry at the time of snapshot creation.
+    /// Negative if market has already expired.  Zero when close_time is unknown.
+    /// Used by GBoost as a direct feature: binary market microstructure changes
+    /// dramatically near expiry (gamma explosion, spread widening, adverse selection)
+    /// and the model should learn these dynamics from data rather than via hard-coded gates.
+    pub secs_to_expiry: i64,
     /// Timestamp of this snapshot
     pub timestamp: DateTime<Utc>,
 }
