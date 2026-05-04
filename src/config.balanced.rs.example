@@ -201,6 +201,7 @@ pub const BASIS_MAKER_BUY_PRICE_ADJUSTMENT: Decimal = dec!(0.00);
 // ============================================================================
 
 pub const ENABLE_GBOOST_TRADING: bool = true;
+pub const GBOOST_MIN_ENTRY_PRICE: Decimal = dec!(0.25);
 pub const GBOOST_MAX_ENTRY_PRICE: Decimal = dec!(0.95);
 pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300; // 5 minutes
 pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(25.0);

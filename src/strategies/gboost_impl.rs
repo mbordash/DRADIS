@@ -148,6 +148,8 @@ pub struct GboostStrategyImpl {
     training_data: Arc<StdMutex<VecDeque<TrainingSample>>>,
     /// Stores entry snapshots and prices for trades that are currently open (ghost mode).
     pending_entries: Arc<StdMutex<HashMap<U256, (MarketSnapshot, rust_decimal::Decimal)>>>,
+    /// Per-token timestamp of the last emitted exit signal to prevent rapid re-entry churn.
+    post_exit_cooldowns: Arc<StdMutex<HashMap<U256, chrono::DateTime<chrono::Utc>>>>,
 }
 
 impl GboostStrategyImpl {
@@ -189,6 +191,7 @@ impl GboostStrategyImpl {
                 VecDeque::with_capacity(config::GBOOST_HISTORY_BUFFER_SIZE) // Use similar capacity
             )),
             pending_entries: Arc::new(StdMutex::new(HashMap::new())),
+            post_exit_cooldowns: Arc::new(StdMutex::new(HashMap::new())),
         }
     }
 
@@ -288,6 +291,42 @@ impl GboostStrategyImpl {
             }
         }
     }
+
+    /// Mark token as cooling down after an emitted exit signal.
+    fn mark_post_exit_cooldown(&self, token_id: U256) {
+        let mut guard = self.post_exit_cooldowns.lock().unwrap();
+        guard.insert(token_id, Utc::now());
+    }
+
+    /// Returns remaining cooldown seconds for this token, if still cooling down.
+    fn post_exit_cooldown_remaining_secs(&self, token_id: U256) -> Option<i64> {
+        let now = Utc::now();
+        let mut guard = self.post_exit_cooldowns.lock().unwrap();
+        if let Some(ts) = guard.get(&token_id).copied() {
+            let elapsed = (now - ts).num_seconds();
+            let remaining = config::GBOOST_POST_EXIT_COOLDOWN_SECS - elapsed;
+            if remaining > 0 {
+                return Some(remaining);
+            }
+            guard.remove(&token_id);
+        }
+        None
+    }
+
+    /// Compute side-specific orderbook imbalance (OBI) in [-1, 1].
+    fn side_obi(is_yes_side: bool, s: &MarketSnapshot) -> rust_decimal::Decimal {
+        let (bid, ask) = if is_yes_side {
+            (s.yes_bid_depth, s.yes_ask_depth)
+        } else {
+            (s.no_bid_depth, s.no_ask_depth)
+        };
+        let total = bid + ask;
+        if total > dec!(0) {
+            (bid - ask) / total
+        } else {
+            dec!(0)
+        }
+    }
 }
 
 impl Default for GboostStrategyImpl {
@@ -361,8 +400,33 @@ impl Strategy for GboostStrategyImpl {
 
         // ── YES entry: model predicts UP ──────────────────────────────────────
         if p_yes_up >= entry_thresh && !has_yes {
+            if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(target_market.yes_token) {
+                tracing::debug!(
+                    "🚫 GBoost YES entry veto: cooldown active | market='{}' token={:?} remaining={}s",
+                    target_market.market_name,
+                    target_market.yes_token,
+                    remaining_secs
+                );
+                return Ok(StrategySignal::NoSignal);
+            }
+            let yes_obi = Self::side_obi(true, target_snapshot);
+            if yes_obi < config::GBOOST_OBI_ADVERSE_BLOCK {
+                tracing::debug!(
+                    "🚫 GBoost YES entry veto: adverse OBI | market='{}' token={:?} obi={:.3} block={:.3}",
+                    target_market.market_name,
+                    target_market.yes_token,
+                    yes_obi,
+                    config::GBOOST_OBI_ADVERSE_BLOCK
+                );
+                return Ok(StrategySignal::NoSignal);
+            }
             let price  = floor_to_tick_size(target_snapshot.yes_ask);
-            if price >= config::GBOOST_MAX_ENTRY_PRICE || price <= dec!(0) { return Ok(StrategySignal::NoSignal); }
+            if price >= config::GBOOST_MAX_ENTRY_PRICE
+                || price < config::GBOOST_MIN_ENTRY_PRICE
+                || price <= dec!(0)
+            {
+                return Ok(StrategySignal::NoSignal);
+            }
             let shares = trade_usdc / price;
             tracing::debug!(
                 "🔮 GBoost YES entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
@@ -391,8 +455,33 @@ impl Strategy for GboostStrategyImpl {
 
         // ── NO entry: model predicts DOWN (P(UP) is very low) ────────────────
         if p_yes_up <= (1.0 - entry_thresh) && !has_no {
+            if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(target_market.no_token) {
+                tracing::debug!(
+                    "🚫 GBoost NO entry veto: cooldown active | market='{}' token={:?} remaining={}s",
+                    target_market.market_name,
+                    target_market.no_token,
+                    remaining_secs
+                );
+                return Ok(StrategySignal::NoSignal);
+            }
+            let no_obi = Self::side_obi(false, target_snapshot);
+            if no_obi < config::GBOOST_OBI_ADVERSE_BLOCK {
+                tracing::debug!(
+                    "🚫 GBoost NO entry veto: adverse OBI | market='{}' token={:?} obi={:.3} block={:.3}",
+                    target_market.market_name,
+                    target_market.no_token,
+                    no_obi,
+                    config::GBOOST_OBI_ADVERSE_BLOCK
+                );
+                return Ok(StrategySignal::NoSignal);
+            }
             let price  = floor_to_tick_size(target_snapshot.no_ask);
-            if price >= config::GBOOST_MAX_ENTRY_PRICE || price <= dec!(0) { return Ok(StrategySignal::NoSignal); }
+            if price >= config::GBOOST_MAX_ENTRY_PRICE
+                || price < config::GBOOST_MIN_ENTRY_PRICE
+                || price <= dec!(0)
+            {
+                return Ok(StrategySignal::NoSignal);
+            }
             let shares = trade_usdc / price;
             tracing::debug!(
                 "🔮 GBoost NO entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
@@ -468,6 +557,7 @@ impl Strategy for GboostStrategyImpl {
 
                 if profit_pct >= tp {
                     self.record_training_outcome_on_exit(target_market.yes_token, profit_pct > 0.0);
+                    self.mark_post_exit_cooldown(target_market.yes_token);
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
                         reason: format!("GBoost TP YES: gain={:.2}%", profit_pct * 100.0),
@@ -476,6 +566,7 @@ impl Strategy for GboostStrategyImpl {
                 }
                 if secs_held >= config::GBOOST_MIN_HOLD_SECS && profit_pct <= -sl {
                     self.record_training_outcome_on_exit(target_market.yes_token, profit_pct > 0.0);
+                    self.mark_post_exit_cooldown(target_market.yes_token);
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
                         reason: format!("GBoost SL YES: loss={:.2}% ({}s)", profit_pct * 100.0, secs_held),
@@ -486,6 +577,7 @@ impl Strategy for GboostStrategyImpl {
                 if let Some(p) = p_yes_up {
                     if secs_held >= config::GBOOST_MIN_HOLD_SECS && p <= signal_exit_thresh {
                         self.record_training_outcome_on_exit(target_market.yes_token, profit_pct > 0.0);
+                        self.mark_post_exit_cooldown(target_market.yes_token);
                         return Ok(StrategySignal::Exit {
                             params: exit_params(),
                             reason: format!("GBoost SignalRev YES: P(UP)={:.3}", p),
@@ -520,6 +612,7 @@ impl Strategy for GboostStrategyImpl {
 
                 if profit_pct >= tp {
                     self.record_training_outcome_on_exit(target_market.no_token, profit_pct > 0.0);
+                    self.mark_post_exit_cooldown(target_market.no_token);
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
                         reason: format!("GBoost TP NO: gain={:.2}%", profit_pct * 100.0),
@@ -528,6 +621,7 @@ impl Strategy for GboostStrategyImpl {
                 }
                 if secs_held >= config::GBOOST_MIN_HOLD_SECS && profit_pct <= -sl {
                     self.record_training_outcome_on_exit(target_market.no_token, profit_pct > 0.0);
+                    self.mark_post_exit_cooldown(target_market.no_token);
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
                         reason: format!("GBoost SL NO: loss={:.2}% ({}s)", profit_pct * 100.0, secs_held),
@@ -538,6 +632,7 @@ impl Strategy for GboostStrategyImpl {
                 if let Some(p) = p_yes_up {
                     if secs_held >= config::GBOOST_MIN_HOLD_SECS && p >= (1.0 - signal_exit_thresh) {
                         self.record_training_outcome_on_exit(target_market.no_token, profit_pct > 0.0);
+                        self.mark_post_exit_cooldown(target_market.no_token);
                         return Ok(StrategySignal::Exit {
                             params: exit_params(),
                             reason: format!("GBoost SignalRev NO: P(UP)={:.3}", p),
