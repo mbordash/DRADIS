@@ -33,7 +33,7 @@ The core of DRADIS is the Orchestrator. It acts as the ship's brain, maintaining
            │     50ms Heartbeat     │
            └────────────┬───────────┘
                         │  parallel dispatch
-          ┌─────────────┼──────────────┐
+          ┌─────────────┼──────────────┬─────────────┐
           ▼             ▼              ▼             ▼
    ┌────────────┐ ┌──────────┐ ┌──────────────┐ ┌──────────┐
    │ Momentum   │ │  Maker   │ │  Arbitrage / │ │  GBoost  │
@@ -74,7 +74,7 @@ DRADIS currently deploys six specialized strategy classes:
 
 ## ⚠️ Read This First
 
-**This is experimental software. You will probably lose money.**
+**This is experimental software. You will probably lose money. Start in GHOST mode and tune.**
 
 - **Risk**: Momentum trades are directional and can get whiplashed. Arbitrage spreads are thin. Time decay positions can widen against you. None of this is guaranteed profit.
 - **US Citizens**: Polymarket is rolling out US access under CFTC regulation via a waitlist. Check [polymarket.com](https://polymarket.com) for your current eligibility.
