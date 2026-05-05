@@ -225,6 +225,13 @@ impl GboostStrategyImpl {
 
     /// Increment the retrain counter and, if the threshold is reached, kick off
     /// a background training job via `tokio::task::spawn_blocking`.
+    ///
+    /// Label sourcing priority:
+    ///   1. Real trade outcomes stored in `training_data` (highest quality — actual P&L).
+    ///   2. Lookahead labels from the `history` ring buffer when `training_data` is too
+    ///      sparse.  Label: yes_bid rises within GBOOST_LOOKAHEAD_TICKS ticks → 1.0.
+    ///      This breaks the chicken-and-egg deadlock that prevents the model from ever
+    ///      reaching the minimum sample count required to produce its first predictions.
     fn maybe_retrain(&self) {
         if self.is_training.load(Ordering::Relaxed) { return; }
 
@@ -235,11 +242,38 @@ impl GboostStrategyImpl {
         };
         if !triggered { return; }
 
-        let training_samples: Vec<TrainingSample> = {
-            let h = self.training_data.lock().unwrap();
-            if h.len() < config::GBOOST_MIN_TRAINING_SAMPLES { return; }
-            h.iter().cloned().collect()
+        // ── Source 1: real trade outcomes ────────────────────────────────────
+        let trade_samples_count = {
+            let td = self.training_data.lock().unwrap();
+            td.len()
         };
+
+        let training_samples: Vec<TrainingSample> = if trade_samples_count >= config::GBOOST_MIN_TRAINING_SAMPLES {
+            let td = self.training_data.lock().unwrap();
+            td.iter().cloned().collect()
+        } else {
+            // ── Source 2: lookahead labels from history ring buffer ───────────
+            // Generates supervised labels without needing real trade outcomes.
+            // Label = 1.0 if the YES bid rises GBOOST_LOOKAHEAD_TICKS ticks later.
+            let h = self.history.lock().unwrap();
+            let n = h.len();
+            let lookahead = config::GBOOST_LOOKAHEAD_TICKS;
+            if n < config::GBOOST_MIN_TRAINING_SAMPLES + lookahead {
+                return; // Not enough history yet, wait for more ticks
+            }
+            let usable = n - lookahead;
+            (0..usable).map(|i| {
+                let snap   = &h[i];
+                let future = &h[i + lookahead];
+                TrainingSample {
+                    features: extract_features(snap),
+                    is_profitable: future.yes_bid > snap.yes_bid,
+                    entry_timestamp: snap.timestamp,
+                }
+            }).collect()
+        };
+
+        if training_samples.len() < config::GBOOST_MIN_TRAINING_SAMPLES { return; }
 
         *self.ticks_since_retrain.lock().unwrap() = 0;
         self.is_training.store(true, Ordering::Relaxed);
@@ -360,8 +394,8 @@ impl Strategy for GboostStrategyImpl {
         // Maintain history and trigger background retrains.
         // This happens regardless of ENABLE_GBOOST_TRADING so the model can learn.
         self.push_snapshot(ctx.snapshot.clone());
-        // Note: maybe_retrain will now use training_data, not history.
-        // History is still maintained for other potential uses or future features.
+        // maybe_retrain sources labels from real trade outcomes (primary) or from
+        // the history buffer via lookahead (bootstrap fallback when no trades exist yet).
         self.maybe_retrain();
 
         if !config::ENABLE_GBOOST_TRADING {

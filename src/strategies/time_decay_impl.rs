@@ -1,16 +1,39 @@
 /// Time Decay (Theta) Strategy
 ///
 /// Exploits YES+NO price convergence toward $1.00 as hourly markets approach expiry.
-/// This version is venue-aware and performs its own risk management.
 ///
-/// Oracle Volatility Gate (Phase 9):
-///   Entry is blocked when Binance oracle signals active volatility:
-///   - |velocity_5s| > TIME_DECAY_MAX_FAST_VELOCITY_* (active repricing in progress)
-///   - |oracle_drift_60m| > TIME_DECAY_MAX_SLOW_DRIFT_*  (sustained hourly trend)
+/// ── Maker Entry (0% Fee) ────────────────────────────────────────────────────
+/// Polymarket charges 0% on GTC maker fills.  This strategy posts resting GTC
+/// bids for BOTH YES and NO tokens simultaneously during the theta window
+/// (TIME_DECAY_MIN_SECS_TO_EXPIRY ↔ TIME_DECAY_MAX_SECS_TO_EXPIRY).
+///
+///   Entry cost  = YES_bid + NO_bid  (0% fee — maker fills)
+///   Settlement  = $1.00             (0% fee — automatic at expiry)
+///   Net profit  = 1.00 − YES_bid − NO_bid
+///
+/// Typical hourly market in final 30 min: combined_bid ≈ $0.97 → +$0.03/share.
+/// At a $15 position per leg, that's ~$0.45 per round-trip, with zero fee drag.
+///
+/// Previously used FAK (taker) entries at ask prices, which were structurally
+/// unprofitable: taker fee alone (1000 bps × $1.00) = $0.10, wiping all theta.
+///
+/// ── Exit Paths ──────────────────────────────────────────────────────────────
+///   1. Settlement (preferred): hold both legs to market close; receive $1.00
+///      automatically from Polymarket — no exit order needed, no exit fee.
+///   2. Convergence exit: if combined_bid reaches TIME_DECAY_CONVERGENCE_EXIT_BID
+///      ($0.998) before expiry, sell early via FAK to bank the profit sooner.
+///      (FAK exit incurs taker fee, but profit is realized immediately.)
+///   3. Stop-loss exit: if combined_bid diverges badly (IV spike), exit via FAK.
+///   4. Expiry forced exit: sell before MARKET_EXPIRY_SAFETY_BUFFER_SECS to
+///      avoid settlement edge cases.
+///
+/// ── Oracle Volatility Gate ───────────────────────────────────────────────────
+///   Blocks entry when oracle signals active repricing or sustained trend:
+///   - |velocity_5s| > TIME_DECAY_MAX_FAST_VELOCITY_* (active move in progress)
+///   - |oracle_drift_60m| > TIME_DECAY_MAX_SLOW_DRIFT_* (sustained hourly trend)
 ///
 ///   For open positions, the stop-loss distance is halved when fast velocity is
-///   elevated — exiting before a vol spike blows through the static stop.
-///   This implements "Short Gamma only when the market is quiet."
+///   elevated — exiting before a vol spike diverges the combined bid.
 
 use async_trait::async_trait;
 use anyhow::Result;
@@ -23,7 +46,7 @@ use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::strategies::is_drawdown_limit_hit;
 use crate::config;
-use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
+use polymarket_client_sdk_v2::clob::types::OrderType;
 
 const STRATEGY_NAME: &str = "TimeDecayStrategy";
 
@@ -41,11 +64,10 @@ impl Strategy for TimeDecayStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
-        let (market, snap) = if let (Some(mk_mkt), Some(mk_snap)) = (&ctx.maker_market, &ctx.maker_snapshot) {
-            (mk_mkt, mk_snap)
-        } else {
-            (&ctx.market, &ctx.snapshot)
-        };
+        // TimeDecay is Hourly — always use the primary market/snapshot.
+        // No maker_market fallback: this strategy is intentionally scoped to
+        // the hourly market's final 30-minute theta window.
+        let (market, snap) = (&ctx.market, &ctx.snapshot);
 
         let seconds_to_expiry = match market.market_close_time {
             Some(close_time) => (close_time - Utc::now()).num_seconds(),
@@ -57,9 +79,6 @@ impl Strategy for TimeDecayStrategyImpl {
         }
 
         // ── Oracle Volatility Gate ────────────────────────────────────────────
-        // TimeDecay is short-gamma: profitable only when prices are converging,
-        // not when an active repricing event or sustained trend is underway.
-        // Use per-crypto thresholds so ETH/SOL bots apply proportional scaling.
         let (max_fast_vel, max_slow_drift) = TimeDecayStrategy::iv_thresholds(&ctx.crypto_filter);
         if ctx.snapshot.velocity.abs() > max_fast_vel {
             return Ok(StrategySignal::NoSignal);
@@ -68,12 +87,13 @@ impl Strategy for TimeDecayStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── Theta opportunity check (maker: uses bid prices, 0% fee) ─────────
         if TimeDecayStrategy::calculate_theta_opportunity(
-            snap.yes_ask, snap.no_ask, market.yes_fee_bps, market.no_fee_bps, seconds_to_expiry,
+            snap.yes_bid, snap.no_bid, seconds_to_expiry,
         ).is_some() {
             let trade_size = config::TIME_DECAY_POSITION_SIZE_USDC;
 
-            // ── Strategy Exposure Check ──────────────────────────────────────────
+            // ── Strategy Exposure Check ──────────────────────────────────────
             let current_exposure = {
                 let pos_map = ctx.positions.lock().await;
                 pos_map.iter()
@@ -81,35 +101,36 @@ impl Strategy for TimeDecayStrategyImpl {
                     .map(|(_, p)| p.shares * p.avg_entry)
                     .sum::<Decimal>()
             };
-
-            // Hedged exposure: we only count one leg
             if current_exposure + trade_size > config::TIME_DECAY_MAX_EXPOSURE_USDC {
                 return Ok(StrategySignal::NoSignal);
             }
 
+            // Post GTC maker bids at current best bid — 0% fill fee.
+            // Both legs must fill for the arb to be complete; the flash-exit
+            // mechanism handles the one-leg-fills scenario if Leg B is rejected.
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
-                    token_id: market.yes_token,
-                    price: snap.yes_ask,
-                    shares: trade_size / snap.yes_ask,
-                    fee_bps: market.yes_fee_bps as u16,
+                    token_id:    market.yes_token,
+                    price:       snap.yes_bid,          // bid price → rests on book as maker
+                    shares:      trade_size / snap.yes_bid,
+                    fee_bps:     0,                     // GTC maker fill = 0% fee
                     is_neg_risk: market.is_neg_risk,
                     market_name: market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
-                    order_type: OrderType::FAK, // Time Decay entries are typically FAK
-                    post_only: false, // Not post-only
+                    order_type: OrderType::GTC,         // rest on book until filled or cancelled
+                    post_only:  true,                   // reject if would cross (no accidental taker)
                     ghost_mode: config::GHOST_MODE,
                 },
                 pair_params: Some(OrderParams {
-                    token_id: market.no_token,
-                    price: snap.no_ask,
-                    shares: trade_size / snap.no_ask,
-                    fee_bps: market.no_fee_bps as u16,
+                    token_id:    market.no_token,
+                    price:       snap.no_bid,
+                    shares:      trade_size / snap.no_bid,
+                    fee_bps:     0,
                     is_neg_risk: market.is_neg_risk,
                     market_name: market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
-                    order_type: OrderType::FAK, // Time Decay entries are typically FAK
-                    post_only: false, // Not post-only
+                    order_type: OrderType::GTC,
+                    post_only:  true,
                     ghost_mode: config::GHOST_MODE,
                 }),
             });
@@ -120,19 +141,20 @@ impl Strategy for TimeDecayStrategyImpl {
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let pos_map = ctx.positions.lock().await;
 
-        let (market, snap) = if let Some(mk) = &ctx.maker_market {
-            if pos_map.contains_key(&("TimeDecayStrategy".to_string(), mk.yes_token)) {
-                (mk, ctx.maker_snapshot.as_ref().unwrap())
-            } else { (&ctx.market, &ctx.snapshot) }
-        } else { (&ctx.market, &ctx.snapshot) };
+        // TimeDecay is Hourly — always use the primary market/snapshot.
+        let (market, snap) = (&ctx.market, &ctx.snapshot);
 
         let yes_key = ("TimeDecayStrategy".to_string(), market.yes_token);
         let no_key  = ("TimeDecayStrategy".to_string(), market.no_token);
 
         if let (Some(yp), Some(_)) = (pos_map.get(&yes_key), pos_map.get(&no_key)) {
             let yes_bid = snap.yes_bid;
-            let no_bid = snap.no_bid;
+            let no_bid  = snap.no_bid;
 
+            // ── Convergence exit: combined bid approached $1.00 early ─────────
+            // Take profit via FAK taker before settlement — fee applies here,
+            // but the combined_bid already exceeds our maker entry cost by enough
+            // to absorb it (entry ≈ $0.97, exit triggered at $0.998).
             if TimeDecayStrategy::should_convergence_exit(yes_bid, no_bid) {
                 return Ok(StrategySignal::Exit {
                     params: OrderParams { token_id: market.yes_token, price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: config::GHOST_MODE },
@@ -141,10 +163,7 @@ impl Strategy for TimeDecayStrategyImpl {
                 });
             }
 
-            // Dynamic stop: when fast velocity is elevated, tighten the stop distance
-            // so we exit sooner with a smaller loss instead of riding a vol spike to
-            // the full static stop.  TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER = 0.5
-            // cuts allowed drawdown in half during active repricing events.
+            // ── Dynamic stop: tighten when vol is elevated ────────────────────
             let (max_fast_vel, _) = TimeDecayStrategy::iv_thresholds(&ctx.crypto_filter);
             let iv_elevated = snap.velocity.abs() > max_fast_vel;
             let effective_stop_pct = if iv_elevated {
@@ -164,6 +183,9 @@ impl Strategy for TimeDecayStrategyImpl {
                 });
             }
 
+            // ── Forced expiry exit: sell before market closes ─────────────────
+            // Preferred path is settlement ($0 fee), but if still holding at
+            // MARKET_EXPIRY_SAFETY_BUFFER_SECS we exit via FAK as a safety net.
             if let Some(close_time) = market.market_close_time {
                 if (close_time - Utc::now()).num_seconds() < config::MARKET_EXPIRY_SAFETY_BUFFER_SECS as i64 {
                     return Ok(StrategySignal::Exit {
@@ -179,7 +201,7 @@ impl Strategy for TimeDecayStrategyImpl {
 
     fn status(&self) -> StrategyStatus { StrategyStatus::Active }
     fn name(&self) -> String { "TimeDecayStrategy".to_string() }
-    fn venue(&self) -> &'static str { "Window/Daily" }
+    fn venue(&self) -> &'static str { "Hourly" }
     fn max_exposure(&self) -> rust_decimal::Decimal { crate::config::TIME_DECAY_MAX_EXPOSURE_USDC }
     fn risk_model(&self) -> &'static str { "Gross hedged (per leg)" }
 }
@@ -187,8 +209,6 @@ impl Strategy for TimeDecayStrategyImpl {
 pub struct TimeDecayStrategy;
 
 impl TimeDecayStrategy {
-    /// Returns (max_fast_velocity, max_slow_drift) thresholds for the given crypto.
-    /// Called by both evaluate_entry (entry gate) and evaluate_exit (dynamic stop).
     pub fn iv_thresholds(crypto_filter: &str) -> (Decimal, Decimal) {
         match crypto_filter {
             "eth" => (config::TIME_DECAY_MAX_FAST_VELOCITY_ETH, config::TIME_DECAY_MAX_SLOW_DRIFT_ETH),
@@ -197,20 +217,35 @@ impl TimeDecayStrategy {
         }
     }
 
-    pub fn calculate_theta_opportunity(yes_ask: Decimal, no_ask: Decimal, y_fee: u32, n_fee: u32, secs: i64) -> Option<ThetaSignal> {
-        let comb = yes_ask + no_ask;
-        let fees = (yes_ask * Decimal::from(y_fee) / dec!(10_000)) + (no_ask * Decimal::from(n_fee) / dec!(10_000));
-        let net = dec!(1.0) - comb - fees;
-        if net >= config::MIN_TIME_DECAY_NET_PROFIT { return Some(ThetaSignal { mode: ThetaMode::Settlement, combined_ask: comb, net_profit_per_share: net, total_fees: fees }); }
-        if comb <= config::MAX_TIME_DECAY_COMBINED_ASK && secs < config::TIME_DECAY_CONVERGENCE_WINDOW_SECS {
-            let target = config::TIME_DECAY_CONVERGENCE_EXIT_BID;
-            let est = target - comb - fees;
-            if est > dec!(-0.005) { return Some(ThetaSignal { mode: ThetaMode::Convergence, combined_ask: comb, net_profit_per_share: est, total_fees: fees }); }
+    /// Check whether the combined bid gap is wide enough to cover the
+    /// MIN_TIME_DECAY_NET_PROFIT threshold.
+    ///
+    /// Now takes **bid prices** (not ask prices) and assumes **0% maker fee**:
+    ///   net = 1.00 − yes_bid − no_bid
+    ///
+    /// The old signature took ask prices and deducted up to 10% taker fees,
+    /// making it structurally impossible to fire.  Maker entry eliminates that.
+    pub fn calculate_theta_opportunity(yes_bid: Decimal, no_bid: Decimal, secs: i64) -> Option<ThetaSignal> {
+        if !TimeDecayStrategy::is_in_theta_window(secs) { return None; }
+        let combined_bid = yes_bid + no_bid;
+        let net = dec!(1.0) - combined_bid;    // 0% entry fee + 0% settlement exit
+        if net >= config::MIN_TIME_DECAY_NET_PROFIT {
+            return Some(ThetaSignal {
+                mode: ThetaMode::Settlement,
+                combined_ask: combined_bid,    // field reused for combined_bid in maker mode
+                net_profit_per_share: net,
+                total_fees: dec!(0),
+            });
         }
         None
     }
-    pub fn is_in_theta_window(secs: i64) -> bool { secs >= config::TIME_DECAY_MIN_SECS_TO_EXPIRY && secs <= config::TIME_DECAY_MAX_SECS_TO_EXPIRY }
-    pub fn should_convergence_exit(yb: Decimal, nb: Decimal) -> bool { yb + nb >= config::TIME_DECAY_CONVERGENCE_EXIT_BID }
+
+    pub fn is_in_theta_window(secs: i64) -> bool {
+        secs >= config::TIME_DECAY_MIN_SECS_TO_EXPIRY && secs <= config::TIME_DECAY_MAX_SECS_TO_EXPIRY
+    }
+    pub fn should_convergence_exit(yb: Decimal, nb: Decimal) -> bool {
+        yb + nb >= config::TIME_DECAY_CONVERGENCE_EXIT_BID
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

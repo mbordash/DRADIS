@@ -1,7 +1,25 @@
 /// Arbitrage Strategy
 ///
 /// Hedged, two-sided trades that exploit the YES+NO spread inefficiency.
-/// This version is venue-aware and performs its own risk management.
+///
+/// ── Maker vs Taker ──────────────────────────────────────────────────────────
+/// Polymarket charges 0% fees on maker (GTC/post-only) orders, but 1000 bps
+/// on taker (FAK) fills.  At 10% round-trip cost, taker arb is structurally
+/// impossible on a $1.00 binary market.
+///
+/// This strategy posts GTC maker bids on BOTH YES and NO tokens simultaneously
+/// at their current best-bid prices.  If both legs fill:
+///   cost  = YES_bid + NO_bid  (no fee — maker fill)
+///   payout = $1.00  (settlement)
+///   profit = 1.00 − YES_bid − NO_bid
+///
+/// Entry fires only when that profit > ARBITRAGE_PROFIT_THRESHOLD (1.5¢).
+/// In practice combined bids of 0.97-0.98 are common on daily markets,
+/// yielding 2-3¢ net per dollar — viable as maker, not as taker.
+///
+/// Exit: collect settlement at $1.00 or sell early when bid_sum converges
+/// to EARLY_EXIT_COMBINED_BID_THRESHOLD (0.995).  Exit legs use FAK (taker)
+/// since we need a guaranteed fill before market close.
 
 use async_trait::async_trait;
 use anyhow::Result;
@@ -12,7 +30,7 @@ use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::strategies::is_drawdown_limit_hit;
 use crate::config;
-use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
+use polymarket_client_sdk_v2::clob::types::OrderType;
 
 const STRATEGY_NAME: &str = "ArbitrageStrategy";
 
@@ -29,61 +47,54 @@ impl Strategy for ArbitrageStrategyImpl {
         let market   = ctx.maker_market.as_ref().unwrap_or(&ctx.market);
         let snapshot = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
 
-        let yes_ask = snapshot.yes_ask;
-        let no_ask  = snapshot.no_ask;
-        let yes_fee_bps = market.yes_fee_bps;
-        let no_fee_bps  = market.no_fee_bps;
+        let yes_bid = snapshot.yes_bid;
+        let no_bid  = snapshot.no_bid;
 
-        if yes_fee_bps > config::ARBITRAGE_MAX_TAKER_FEE_BPS || no_fee_bps > config::ARBITRAGE_MAX_TAKER_FEE_BPS {
+        // ── Maker arb profitability gate (0% fee on GTC fills) ───────────────
+        if !is_maker_arb_profitable(yes_bid, no_bid) {
             return Ok(StrategySignal::NoSignal);
         }
 
-        if is_arbitrage_profitable(yes_ask, no_ask, yes_fee_bps, no_fee_bps) {
-            let trade_size = dec!(10.0);
-
-            // ── Strategy Exposure Check ──────────────────────────────────────────
-            let current_exposure = {
-                let pos_map = ctx.positions.lock().await;
-                pos_map.iter()
-                    .filter(|((s, _), _)| s == STRATEGY_NAME)
-                    .map(|(_, p)| p.shares * p.avg_entry)
-                    .sum::<Decimal>()
-            };
-
-            // Hedged exposure: we only count one leg (per legacy risk.rs logic)
-            if current_exposure + trade_size > config::ARBITRAGE_MAX_EXPOSURE_USDC {
-                return Ok(StrategySignal::NoSignal);
-            }
-
-            return Ok(StrategySignal::Entry {
-                params: OrderParams {
-                    token_id: market.yes_token,
-                    price: yes_ask,
-                    shares: trade_size / yes_ask,
-                    fee_bps: yes_fee_bps as u16,
-                    is_neg_risk: market.is_neg_risk,
-                    market_name: market.market_name.clone(),
-                    condition_id: market.condition_id.clone(),
-                    order_type: OrderType::FAK, // Arbitrage entries are typically FAK
-                    post_only: false, // Not post-only
-                    ghost_mode: config::GHOST_MODE, // Set ghost_mode
-                },
-                pair_params: Some(OrderParams {
-                    token_id: market.no_token,
-                    price: no_ask,
-                    shares: trade_size / no_ask,
-                    fee_bps: no_fee_bps as u16,
-                    is_neg_risk: market.is_neg_risk,
-                    market_name: market.market_name.clone(),
-                    condition_id: market.condition_id.clone(),
-                    order_type: OrderType::FAK, // Arbitrage entries are typically FAK
-                    post_only: false, // Not post-only
-                    ghost_mode: config::GHOST_MODE, // Set ghost_mode
-                }),
-            });
+        // ── Strategy Exposure Check ──────────────────────────────────────────
+        let trade_size = dec!(10.0);
+        let current_exposure = {
+            let pos_map = ctx.positions.lock().await;
+            pos_map.iter()
+                .filter(|((s, _), _)| s == STRATEGY_NAME)
+                .map(|(_, p)| p.shares * p.avg_entry)
+                .sum::<Decimal>()
+        };
+        if current_exposure + trade_size > config::ARBITRAGE_MAX_EXPOSURE_USDC {
+            return Ok(StrategySignal::NoSignal);
         }
 
-        Ok(StrategySignal::NoSignal)
+        // ── Post GTC maker bids on both legs ─────────────────────────────────
+        return Ok(StrategySignal::Entry {
+            params: OrderParams {
+                token_id: market.yes_token,
+                price: yes_bid,                        // bid at current best bid
+                shares: trade_size / yes_bid,
+                fee_bps: 0,                            // maker = 0 fees
+                is_neg_risk: market.is_neg_risk,
+                market_name: market.market_name.clone(),
+                condition_id: market.condition_id.clone(),
+                order_type: OrderType::GTC,            // rest on the book as maker
+                post_only: true,                       // reject if it would cross (no accidental taker)
+                ghost_mode: config::GHOST_MODE,
+            },
+            pair_params: Some(OrderParams {
+                token_id: market.no_token,
+                price: no_bid,
+                shares: trade_size / no_bid,
+                fee_bps: 0,
+                is_neg_risk: market.is_neg_risk,
+                market_name: market.market_name.clone(),
+                condition_id: market.condition_id.clone(),
+                order_type: OrderType::GTC,
+                post_only: true,
+                ghost_mode: config::GHOST_MODE,
+            }),
+        });
     }
 
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
@@ -96,21 +107,22 @@ impl Strategy for ArbitrageStrategyImpl {
 
         if let (Some(yp), Some(_np)) = (pos_map.get(&yes_key), pos_map.get(&no_key)) {
             let yes_bid = snapshot.yes_bid;
-            let no_bid = snapshot.no_bid;
+            let no_bid  = snapshot.no_bid;
 
+            // Exit early when combined bid has converged close to $1.00
             if yes_bid + no_bid >= config::EARLY_EXIT_COMBINED_BID_THRESHOLD {
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
                         token_id: market.yes_token,
                         price: yes_bid,
                         shares: yp.shares,
-                        fee_bps: market.yes_fee_bps as u16,
+                        fee_bps: market.yes_fee_bps as u16, // taker exit — fee applies
                         is_neg_risk: market.is_neg_risk,
                         market_name: market.market_name.clone(),
                         condition_id: market.condition_id.clone(),
-                        order_type: OrderType::FAK, // Exit orders are always FAK
-                        post_only: false, // Exit orders are never post-only
-                        ghost_mode: config::GHOST_MODE, // Set ghost_mode
+                        order_type: OrderType::FAK,   // guaranteed exit before close
+                        post_only: false,
+                        ghost_mode: config::GHOST_MODE,
                     },
                     reason: "Arbitrage convergence".to_string(),
                     exit_pair: true,
@@ -127,8 +139,11 @@ impl Strategy for ArbitrageStrategyImpl {
     fn risk_model(&self) -> &'static str { "Gross hedged (per leg)" }
 }
 
-fn is_arbitrage_profitable(yes_ask: rust_decimal::Decimal, no_ask: rust_decimal::Decimal, y_fee: u32, n_fee: u32) -> bool {
-    let combined_ask = yes_ask + no_ask;
-    let fees = (yes_ask * rust_decimal::Decimal::from(y_fee) / dec!(10_000)) + (no_ask * rust_decimal::Decimal::from(n_fee) / dec!(10_000));
-    (dec!(1.0) - combined_ask - fees) >= config::ARBITRAGE_PROFIT_THRESHOLD
+/// Returns true when posting GTC maker bids on both legs is profitable.
+///
+/// Maker fills incur 0% fee on Polymarket.  Combined cost = YES_bid + NO_bid.
+/// Settlement always pays $1.00 per pair.
+/// Profit = 1.00 − YES_bid − NO_bid ≥ ARBITRAGE_PROFIT_THRESHOLD.
+fn is_maker_arb_profitable(yes_bid: Decimal, no_bid: Decimal) -> bool {
+    (dec!(1.0) - yes_bid - no_bid) >= config::ARBITRAGE_PROFIT_THRESHOLD
 }

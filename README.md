@@ -18,7 +18,7 @@ The core of DRADIS is the Orchestrator. It acts as the ship's brain, maintaining
 
 - **Parallel Dispatch**: Every heartbeat (50ms), the CIC polls all registered strategies in parallel.
 - **Isolated Pits**: Each strategy operates with its own independent capital budget and position book. A "whiplash" in one sector won't compromise the fuel (USDC) of another.
-- **Signal Filtering**: Includes a built-in OBI (Order Book Imbalance) Veto at -0.65 to prevent launching into "toxic flow" or distribution walls.
+- **Signal Filtering**: Includes a built-in OBI (Order Book Imbalance) Veto at -0.60 to prevent launching into "toxic flow" or distribution walls.
 
 ```
 ┌─────────────────────┐   ┌─────────────────────┐
@@ -55,10 +55,10 @@ The core of DRADIS is the Orchestrator. It acts as the ship's brain, maintaining
 
 DRADIS currently deploys six specialized strategy classes:
 
-- **Momentum (The Interceptor)**: Scans for high-velocity Binance moves. If a "target" moves $85 in 5 seconds, the Interceptor strikes the Polymarket book before it can reprice.
+- **Momentum (The Interceptor)**: Scans for high-velocity Binance moves. If a "target" moves $75 in 5 seconds, the Interceptor strikes the Polymarket book before it can reprice.
 - **Maker (The Sentry)**: Maintains a dual-sided presence on the Window venue, capturing the spread while managing net exposure.
 - **Arbitrage (The Surveyor)**: Constantly monitors the price sum of YES/NO pairs, looking for sub-$1.00 opportunities in low-fee venues.
-- **Time Decay (The Ghost)**: Exploits the natural convergence of prediction markets toward expiry, fading retail volatility.
+- **Time Decay (The Ghost)**: Posts resting maker bids on both YES and NO of the Hourly venue during the theta window, earning the combined bid discount and settling at $1.00 with zero fee drag.
 - **Basis/Funding (The Analyst)**: Fades retail skew by comparing Polymarket sentiment against Binance perpetual funding rates.
 - **GBoost (The Cylon)**: Online gradient-boosted ML model (LogLoss) that learns from live orderbook + oracle features to predict near-term YES price direction, retraining continuously in the background.
 
@@ -89,7 +89,7 @@ The bot connects to Polymarket's CLOB via WebSocket for real-time orderbook data
 ### Strategies
 
 **Momentum** — Detects when Binance price moves sharply before Polymarket reprices.
-- **Velocity trigger**: `BTC_MOMENTUM_THRESHOLD` = $85/5s (example).
+- **Velocity trigger**: `BTC_MOMENTUM_THRESHOLD` = $75/5s (example).
 - **Strike buffer**: `BTC_STRIKE_BUFFER` = $50.0 (example).
 - **Gates**: Requires building acceleration and a strong 1s short-window confirmation.
 - **Sizing**: Fractional Kelly scaling based on signal strength.
@@ -101,7 +101,7 @@ The bot connects to Polymarket's CLOB via WebSocket for real-time orderbook data
 **Arbitrage** — Buys both YES and NO on the **Window/Daily venue** when combined asks are < $1.00 (net of fees).
 - **Profit Threshold**: Exploits small inefficiencies in the low-fee venue.
 
-**Time Decay** — Exploits price convergence toward $1.00 as markets approach expiry. Operates on the **Window venue** to avoid 10% hourly fees.
+**Time Decay** — Exploits price convergence toward $1.00 as markets approach expiry. Posts resting GTC maker bids on **both YES and NO** on the **Hourly venue** during the theta window, collecting the spread at 0% maker fee and settling at $1.00.
 
 **Basis / Funding-Rate** — Fades retail skew on the **Window venue** using Binance funding rates as confirmation.
 - **Thesis**: Fades amateur over-betting when smart money (funding) disagrees.
@@ -126,9 +126,9 @@ The bot connects to Polymarket's CLOB via WebSocket for real-time orderbook data
 | MomentumStrategy | `$15` | Gross one-sided | **Hourly**    |
 | MakerStrategy | `$12` | Net \|YES−NO\| | **Window**    |
 | ArbitrageStrategy | `$35` per leg | Gross hedged | **Window**    |
-| TimeDecayStrategy | `$36` per leg | Gross hedged | **Window**    |
+| TimeDecayStrategy | `$36` per leg | Gross hedged | **Hourly**    |
 | BasisStrategy | `$15` | Gross one-sided | **Window**    |
-| GboostStrategy | `$15` | Gross one-sided | **Window**    |
+| GboostStrategy | `$4` | Gross one-sided | **Window**    |
 
 ---
 
