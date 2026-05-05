@@ -174,13 +174,19 @@ impl Strategy for TimeDecayStrategyImpl {
                 config::TIME_DECAY_STOP_LOSS_PERCENT
             };
 
-            let combined_bid = yes_bid + no_bid;
-            if combined_bid < config::TIME_DECAY_CONVERGENCE_EXIT_BID * (dec!(1) - effective_stop_pct) {
-                return Ok(StrategySignal::Exit {
-                    params: OrderParams { token_id: market.yes_token, price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: config::GHOST_MODE },
-                    reason: format!("Time Decay SL{}", if iv_elevated { " (IV-tightened)" } else { "" }),
-                    exit_pair: true,
-                });
+            // ── Min-hold guard: don't allow SL on noise immediately after entry ─
+            let hold_secs = (Utc::now() - yp.opened_at).num_seconds();
+            if hold_secs < config::TIME_DECAY_MIN_HOLD_SECS {
+                tracing::debug!("⏳ TimeDecay SL suppressed: hold={}s < min={}s", hold_secs, config::TIME_DECAY_MIN_HOLD_SECS);
+            } else {
+                let combined_bid = yes_bid + no_bid;
+                if combined_bid < config::TIME_DECAY_CONVERGENCE_EXIT_BID * (dec!(1) - effective_stop_pct) {
+                    return Ok(StrategySignal::Exit {
+                        params: OrderParams { token_id: market.yes_token, price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: config::GHOST_MODE },
+                        reason: format!("Time Decay SL{}", if iv_elevated { " (IV-tightened)" } else { "" }),
+                        exit_pair: true,
+                    });
+                }
             }
 
             // ── Forced expiry exit: sell before market closes ─────────────────

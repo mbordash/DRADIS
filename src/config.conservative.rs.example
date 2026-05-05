@@ -285,6 +285,8 @@ pub const TIME_DECAY_TARGET_PROFIT_PERCENT: Decimal = dec!(0.015);
 pub const TIME_DECAY_MAX_TOTAL_EXPOSURE_USDC: Decimal = dec!(24);
 pub const TIME_DECAY_MAX_POSITIONS: usize = 3;
 pub const TIME_DECAY_STOP_LOSS_PERCENT: Decimal = dec!(0.02);
+pub const TIME_DECAY_MIN_HOLD_SECS: i64 = 120;
+pub const TIME_DECAY_STOP_LOSS_COOLDOWN_SECS: u64 = 600;
 
 /// Oracle volatility gate — conservative: tight thresholds, stop cut to 35% on any vol spike.
 /// Prefers missing trades over being caught in a repricing event.

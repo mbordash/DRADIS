@@ -867,9 +867,17 @@ async fn main() -> Result<()> {
                             StrategySignal::Entry { params, pair_params } => {
                                 if let Some(close_time) = target_market_close_time { if (close_time - Utc::now()).num_seconds() < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY { continue; } }
                                 if let Some(lt) = last_trade_time.get(&sn) { if lt.elapsed() < Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64) { continue; } }
-                                // Block re-entry for STOP_LOSS_COOLDOWN_SECS after any stop-loss (successful or FAK miss).
-                                // Prevents compounding into a token where on-chain shares may still exist.
-                                if let Some(lt) = last_stop_loss_time.get(&sn) { if lt.elapsed() < Duration::from_secs(config::STOP_LOSS_COOLDOWN_SECS) { continue; } }
+                                // Block re-entry after a stop-loss. TimeDecay uses a longer cooldown (10 min)
+                                // because it repeatedly re-enters the same market conditions that just stopped
+                                // it out — the 3-min generic cooldown is not long enough for a theta position.
+                                {
+                                    let sl_cooldown = if sn == "TimeDecayStrategy" {
+                                        config::TIME_DECAY_STOP_LOSS_COOLDOWN_SECS
+                                    } else {
+                                        config::STOP_LOSS_COOLDOWN_SECS
+                                    };
+                                    if let Some(lt) = last_stop_loss_time.get(&sn) { if lt.elapsed() < Duration::from_secs(sl_cooldown) { continue; } }
+                                }
                                 // 5-minute block after an expiry exit — the market was closing, re-entry is pointless
                                 if let Some(lt) = last_expiry_exit_time.get(&sn) { if lt.elapsed() < Duration::from_secs(300) { continue; } }
 
