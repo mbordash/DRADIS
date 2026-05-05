@@ -195,7 +195,7 @@ async fn main() -> Result<()> {
     let pending_orders: Arc<Mutex<HashMap<(String, U256), Instant>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let total_pnl: Arc<Mutex<Decimal>> = Arc::new(Mutex::new(dec!(0)));
-    // Live pUSD balance — updated every 60s in the status ticker so strategies can self-gate
+
     // when the wallet cannot afford even the minimum trade, preventing 400 CLOB rejections.
     let live_collateral: Arc<Mutex<Decimal>> = Arc::new(Mutex::new(startup_balance));
     let phantom_cooldowns: dradis::helpers::balance::PhantomCooldowns = Arc::new(Mutex::new(HashMap::new()));
@@ -787,7 +787,7 @@ async fn main() -> Result<()> {
                                             let actual_exit_price = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
                                             let pnl = (actual_exit_price - p.avg_entry) * p.shares;
                                             *total_pnl.lock().await += pnl;
-                                            info!(" Position closed [{}]: PnL ${:.4}", sn, pnl);
+                                            // Primary leg P&L logged below after paired leg is computed (combined log).
 
                                             re_m = p.avg_entry;
                                             rs_m = p.shares;
@@ -828,6 +828,8 @@ async fn main() -> Result<()> {
                                             }
                                         });
                                     }
+                                    // Accumulate paired leg P&L so we can log a single combined "Position closed" line.
+                                    let mut paired_pnl = dec!(0);
                                     if exit_pair {
                                         let other_tid = if tid == target_yes_token { target_no_token } else { target_yes_token };
                                         let pk = (sn.clone(), other_tid); let ps = { let map = positions.lock().await; map.get(&pk).map(|p| p.shares) };
@@ -836,7 +838,7 @@ async fn main() -> Result<()> {
                                             let other_fee_bps = if other_tid == target_yes_token { target_yes_fee_bps as u16 } else { target_no_fee_bps as u16 };
                                             let other_vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                             if !config::GHOST_MODE { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, other_tid, Side::Sell, s, (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), other_fee_bps, OrderType::FAK, false, 0, &shared_http).await; }
-                                            let mut map = positions.lock().await; if let Some(p) = map.remove(&pk) { let actual_other_exit = (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnl = (actual_other_exit - p.avg_entry) * p.shares; *total_pnl.lock().await += pnl;
+                                            let mut map = positions.lock().await; if let Some(p) = map.remove(&pk) { let actual_other_exit = (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnl = (actual_other_exit - p.avg_entry) * p.shares; paired_pnl = pnl; *total_pnl.lock().await += pnl;
                                                 if !config::GHOST_MODE {
                                                     let sn_pm = sn.clone(); let m_name = params.market_name.clone(); let sid = if other_tid == target_yes_token { "YES".to_string() } else { "NO".to_string() }; let p_avg = p.avg_entry; let o_bid = actual_other_exit; let p_shares = p.shares; let pn = pnl;
                                                     tokio::spawn(async move { metrics::record_trade(sn_pm, m_name, sid, p_avg, o_bid, p_shares, pn, "Convergence/PairedExit".to_string()).await; });
@@ -844,6 +846,8 @@ async fn main() -> Result<()> {
                                             }
                                         }
                                     }
+                                    // Log combined P&L (primary + paired). For single-leg exits paired_pnl == 0.
+                                    info!(" Position closed [{}]: PnL ${:.4}", sn, pnl_m + paired_pnl);
                                     // Trigger 180s cooldown for any stop-loss variant: BasisSL, Maker SL,
                                     // Time Decay SL, ToxicFill, BasisSkewCollapse. Must match the same
                                     // predicate used in the FAK-miss path above (line ~601) so both the
@@ -898,7 +902,8 @@ async fn main() -> Result<()> {
                                         sn, params.market_name, params.price, params.shares);
                                     if let Some(pp) = pair_params {
                                         let pp_close_time = target_market_close_time;
-                                        positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: pp.price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: Some(params.token_id) });
+                                        let actual_paired_entry_price = (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE);
+                                        positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: actual_paired_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: Some(params.token_id) });
                                         info!(" GHOST_MODE ENTRY (paired) [{}]: {} | ${:.4} x {:.1} (simulated)", sn, pp.market_name, pp.price, pp.shares);
                                     }
                                     last_trade_time.insert(sn.clone(), Instant::now());
