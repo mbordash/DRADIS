@@ -298,6 +298,16 @@ pub const TIME_DECAY_MAX_SLOW_DRIFT_ETH: Decimal = dec!(6.0);
 pub const TIME_DECAY_MAX_SLOW_DRIFT_SOL: Decimal = dec!(0.60);
 pub const TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER: Decimal = dec!(0.35);
 
+/// Price bounds: only enter when genuine market uncertainty exists.
+/// Extreme-probability YES prices (< MIN or > MAX) mean the book has decided
+/// an outcome — theta thesis breaks down and share counts balloon dangerously.
+pub const TIME_DECAY_MAX_ENTRY_PRICE: Decimal = dec!(0.75);
+pub const TIME_DECAY_MIN_ENTRY_PRICE: Decimal = dec!(0.25);
+
+/// OBI gate: block entry when the order book is heavily one-sided.
+/// Conservative: tightest gate — skip any book with extreme imbalance.
+pub const TIME_DECAY_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.55);
+
 
 // ============================================================================
 // EMERGENCY CIRCUIT BREAKERS

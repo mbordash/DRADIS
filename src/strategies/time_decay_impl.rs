@@ -87,9 +87,46 @@ impl Strategy for TimeDecayStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── OBI gate: don't enter when the book has already decided a winner ──
+        // An OBI of -0.89 on YES means almost no YES liquidity — the crowd has
+        // moved to one side. Both legs must pass; we hold both at settlement.
+        let yes_bid = snap.yes_bid;
+        let no_bid  = snap.no_bid;
+        let yes_total_depth = snap.yes_bid_depth + snap.yes_ask_depth;
+        let yes_obi = if yes_total_depth > dec!(0) {
+            (snap.yes_bid_depth - snap.yes_ask_depth) / yes_total_depth
+        } else {
+            dec!(0)
+        };
+        let no_total_depth = snap.no_bid_depth + snap.no_ask_depth;
+        let no_obi = if no_total_depth > dec!(0) {
+            (snap.no_bid_depth - snap.no_ask_depth) / no_total_depth
+        } else {
+            dec!(0)
+        };
+        if yes_obi < config::TIME_DECAY_OBI_ADVERSE_BLOCK || no_obi < config::TIME_DECAY_OBI_ADVERSE_BLOCK {
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Price bounds gate: only enter genuine uncertainty zone ──────────
+        // Extreme YES prices (e.g. 0.15, 0.92) mean the market has decided.
+        // Share counts balloon at extreme prices — a 1¢ move = $1 P&L swing.
+        if yes_bid > config::TIME_DECAY_MAX_ENTRY_PRICE || yes_bid < config::TIME_DECAY_MIN_ENTRY_PRICE {
+            return Ok(StrategySignal::NoSignal);
+        }
+        if no_bid > config::TIME_DECAY_MAX_ENTRY_PRICE || no_bid < config::TIME_DECAY_MIN_ENTRY_PRICE {
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Pre-entry convergence check: don't enter at the exit threshold ────
+        // If bid_sum is already ≥ convergence exit level the exit fires instantly.
+        if yes_bid + no_bid >= config::TIME_DECAY_CONVERGENCE_EXIT_BID {
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Theta opportunity check (maker: uses bid prices, 0% fee) ─────────
         if TimeDecayStrategy::calculate_theta_opportunity(
-            snap.yes_bid, snap.no_bid, seconds_to_expiry,
+            yes_bid, no_bid, seconds_to_expiry,
         ).is_some() {
             let trade_size = config::TIME_DECAY_POSITION_SIZE_USDC;
 
@@ -111,8 +148,8 @@ impl Strategy for TimeDecayStrategyImpl {
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
                     token_id:    market.yes_token,
-                    price:       snap.yes_bid,          // bid price → rests on book as maker
-                    shares:      trade_size / snap.yes_bid,
+                    price:       yes_bid,               // bid price → rests on book as maker
+                    shares:      trade_size / yes_bid,
                     fee_bps:     0,                     // GTC maker fill = 0% fee
                     is_neg_risk: market.is_neg_risk,
                     market_name: market.market_name.clone(),
@@ -123,8 +160,8 @@ impl Strategy for TimeDecayStrategyImpl {
                 },
                 pair_params: Some(OrderParams {
                     token_id:    market.no_token,
-                    price:       snap.no_bid,
-                    shares:      trade_size / snap.no_bid,
+                    price:       no_bid,
+                    shares:      trade_size / no_bid,
                     fee_bps:     0,
                     is_neg_risk: market.is_neg_risk,
                     market_name: market.market_name.clone(),

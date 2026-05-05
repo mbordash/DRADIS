@@ -148,7 +148,7 @@ async fn main() -> Result<()> {
     info!("Authenticated on Polymarket CLOB. Safe (Maker) address: {}", safe_address);
 
     let initial_nonce = fetch_next_nonce(&shared_http, safe_address).await.unwrap_or(0);
-    info!("🔄 Initialized Nonce from API (Maker/Safe): {}", initial_nonce);
+    info!(" Initialized Nonce from API (Maker/Safe): {}", initial_nonce);
     let nonce_manager = Arc::new(AtomicU64::new(initial_nonce));
 
     let starting_collateral_store = Arc::new(Mutex::new(dec!(0.0)));
@@ -156,7 +156,7 @@ async fn main() -> Result<()> {
 
     let mut startup_balance = dec!(0);
     for i in 1..=3 {
-        info!("🔄 Initializing portfolio balance (Attempt {}/3)...", i);
+        info!(" Initializing portfolio balance (Attempt {}/3)...", i);
         let mut req = BalanceAllowanceRequest::default();
         req.asset_type = AssetType::Collateral;
         match trading_client.balance_allowance(req).await {
@@ -170,7 +170,7 @@ async fn main() -> Result<()> {
     }
     *starting_collateral_store.lock().await = startup_balance;
     let _ = balance_tx.send(startup_balance);
-    info!("📈 Starting portfolio value: ${:.2}", startup_balance);
+    info!(" Starting portfolio value: ${:.2}", startup_balance);
 
     let (oracle_tx, oracle_rx) = watch::channel(dec!(0));
     let (velocity_tx, velocity_rx) = watch::channel((dec!(0), dec!(0), dec!(0)));
@@ -256,7 +256,7 @@ async fn main() -> Result<()> {
             info!("✅ Hourly market strike price resolved: ${}", strike.unwrap());
         }
     } else {
-        info!("🧪 No initial hourly market found. Waiting for market monitor to find one.");
+        info!(" No initial hourly market found. Waiting for market monitor to find one.");
     }
 
     // Resolve strike price for the initial maker market if it exists
@@ -273,7 +273,7 @@ async fn main() -> Result<()> {
             info!("✅ Maker market strike price resolved: ${}", strike.unwrap());
         }
     } else {
-        info!("🧪 No initial maker market found. Waiting for market monitor to find one.");
+        info!(" No initial maker market found. Waiting for market monitor to find one.");
     }
 
     // Construct the initial MarketState tuple for the watch channel
@@ -335,7 +335,7 @@ async fn main() -> Result<()> {
                 info!("⏰ Hourly market closes in {}s", seconds_until_expiry);
             }
 
-            info!("🚀 Starting Orchestrated Trading on hourly market: \"{}\"", hourly_market_name);
+            info!(" Starting Orchestrated Trading on hourly market: \"{}\"", hourly_market_name);
 
             let yes_fee_rate = match tokio::time::timeout(
                 Duration::from_secs(10),
@@ -541,12 +541,12 @@ async fn main() -> Result<()> {
         // last_trade_time / last_stop_loss_time / last_expiry_exit_time are declared above the
         // outer loop so they survive market switches. Do NOT re-declare them here.
         let mut consecutive_failures: u32 = 0;
-        let mut last_executor_summary = String::new(); // change-detection for 📊 INFO tick summary
+        let mut last_executor_summary = String::new(); // change-detection for  INFO tick summary
         let tg_token = env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default();
         let tg_chat_id = env::var("TELEGRAM_CHAT_ID").unwrap_or_default();
 
-        info!("🤖 Orchestrator ready: {} strategies loaded", strategies.len());
-        info!("🧭 Strategy venue attachments:");
+        info!(" Orchestrator ready: {} strategies loaded", strategies.len());
+        info!(" Strategy venue attachments:");
         for strategy in &strategies {
             let sn = strategy.name();
             let venue = strategy.venue();
@@ -586,7 +586,7 @@ async fn main() -> Result<()> {
                     if new_hourly_condition_id == current_hourly_cid && new_maker_cid == current_maker_cid {
                         continue;
                     }
-                    info!("🔄 Market switch detected — restarting trading loop with new market context");
+                    info!(" Market switch detected — restarting trading loop with new market context");
                     // Timeout the cancel so a stalled CLOB response cannot block the switch.
                     match tokio::time::timeout(
                         Duration::from_secs(8),
@@ -608,7 +608,7 @@ async fn main() -> Result<()> {
                     let mut req = BalanceAllowanceRequest::default();
                     req.asset_type = AssetType::Collateral;
                     let _ = trading_client.balance_allowance(req).await;
-                    info!("📍 Network Pulse: {:?}", start.elapsed());
+                    info!(" Network Pulse: {:?}", start.elapsed());
                 }
                 _ = cleanup_ticker.tick() => {
                     // Cleanup for hourly market if it exists
@@ -636,12 +636,12 @@ async fn main() -> Result<()> {
                     // Compute OBI for heartbeat visibility so thresholds can be tuned empirically.
                     let yes_obi = if ybd + yad > dec!(0) { (ybd - yad) / (ybd + yad) } else { dec!(0) };
                     let no_obi  = if nbd + nad > dec!(0) { (nbd - nad) / (nbd + nad) } else { dec!(0) };
-                    info!("💓 Heartbeat | Ask Sum ${:.4} (Y ask ${:.2} / N ask ${:.2}) | Bid Sum ${:.4} (Y bid ${:.2} / N bid ${:.2}) | Binance: ${:.2} | OBI Y={:.2} N={:.2}",
+                    info!(" Heartbeat | Ask Sum ${:.4} (Y ask ${:.2} / N ask ${:.2}) | Bid Sum ${:.4} (Y bid ${:.2} / N bid ${:.2}) | Binance: ${:.2} | OBI Y={:.2} N={:.2}",
                         ya + na, ya, na, yb + nb, yb, nb, *oracle_rx.borrow(), yes_obi, no_obi);
                     // Refresh live pUSD balance so strategies can self-gate on insufficient funds.
                     // Root cause of the overnight freeze (2026-05-01): this balance_allowance call
                     // had no timeout. When the CLOB API stalled mid-request (the status_ticker arm
-                    // had just logged 💓 Heartbeat and then hit this .await), the entire select loop
+                    // had just logged  Heartbeat and then hit this .await), the entire select loop
                     // blocked — including the watchdog_ticker — and the bot went silent for 8+ hours.
                     // Fix: hard 10s timeout; on stall, skip the balance update for this tick.
                     let mut bal_req = BalanceAllowanceRequest::default();
@@ -650,7 +650,7 @@ async fn main() -> Result<()> {
                         Ok(Ok(resp)) => {
                             let bal = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
                             *live_collateral.lock().await = bal;
-                            debug!("💰 Live pUSD balance: ${:.4}", bal);
+                            debug!(" Live pUSD balance: ${:.4}", bal);
                         }
                         Ok(Err(e)) => warn!("⚠️ balance_allowance error in status ticker: {}", e),
                         Err(_) => warn!("⚠️ balance_allowance timed out (10s) in status ticker — skipping balance update this tick"),
@@ -751,7 +751,7 @@ async fn main() -> Result<()> {
                                 if shares < config::MIN_ORDER_SHARES || params.price <= dec!(0) {
                                     let mut map = positions.lock().await; if let Some(p) = map.remove(&pos_key) { let aep = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); *total_pnl.lock().await += (aep - p.avg_entry) * p.shares; } continue;
                                 }
-                                info!("📤 EXIT [{}]: {} | shares={:.2}, bid=${:.4} | {}", sn, params.market_name, shares, params.price, reason);
+                                info!(" EXIT [{}]: {} | shares={:.2}, bid=${:.4} | {}", sn, params.market_name, shares, params.price, reason);
                                 let vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
 
                                 if !config::GHOST_MODE {
@@ -787,7 +787,7 @@ async fn main() -> Result<()> {
                                             let actual_exit_price = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
                                             let pnl = (actual_exit_price - p.avg_entry) * p.shares;
                                             *total_pnl.lock().await += pnl;
-                                            info!("💰 Position closed [{}]: PnL ${:.4}", sn, pnl);
+                                            info!(" Position closed [{}]: PnL ${:.4}", sn, pnl);
 
                                             re_m = p.avg_entry;
                                             rs_m = p.shares;
@@ -859,7 +859,7 @@ async fn main() -> Result<()> {
                                     if reason.to_lowercase().contains("expir") { last_expiry_exit_time.insert(sn.clone(), Instant::now()); }
                                     last_trade_time.insert(sn.clone(), Instant::now());
                                     // Detached: Telegram latency must never block the trading select! loop.
-                                    { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = format!("📤 EXIT [{}] {} | bid=${:.4} | reason: {} | Session PnL: ${:.4}", sn, params.market_name, params.price, reason, *total_pnl.lock().await); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
+                                    { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = format!(" EXIT [{}] {} | bid=${:.4} | reason: {} | Session PnL: ${:.4}", sn, params.market_name, params.price, reason, *total_pnl.lock().await); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
                                 }
                             }
 
@@ -867,17 +867,9 @@ async fn main() -> Result<()> {
                             StrategySignal::Entry { params, pair_params } => {
                                 if let Some(close_time) = target_market_close_time { if (close_time - Utc::now()).num_seconds() < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY { continue; } }
                                 if let Some(lt) = last_trade_time.get(&sn) { if lt.elapsed() < Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64) { continue; } }
-                                // Block re-entry after a stop-loss. TimeDecay uses a longer cooldown (10 min)
-                                // because it repeatedly re-enters the same market conditions that just stopped
-                                // it out — the 3-min generic cooldown is not long enough for a theta position.
-                                {
-                                    let sl_cooldown = if sn == "TimeDecayStrategy" {
-                                        config::TIME_DECAY_STOP_LOSS_COOLDOWN_SECS
-                                    } else {
-                                        config::STOP_LOSS_COOLDOWN_SECS
-                                    };
-                                    if let Some(lt) = last_stop_loss_time.get(&sn) { if lt.elapsed() < Duration::from_secs(sl_cooldown) { continue; } }
-                                }
+                                // Block re-entry for STOP_LOSS_COOLDOWN_SECS after any stop-loss (successful or FAK miss).
+                                // Prevents compounding into a token where on-chain shares may still exist.
+                                if let Some(lt) = last_stop_loss_time.get(&sn) { if lt.elapsed() < Duration::from_secs(config::STOP_LOSS_COOLDOWN_SECS) { continue; } }
                                 // 5-minute block after an expiry exit — the market was closing, re-entry is pointless
                                 if let Some(lt) = last_expiry_exit_time.get(&sn) { if lt.elapsed() < Duration::from_secs(300) { continue; } }
 
@@ -902,12 +894,12 @@ async fn main() -> Result<()> {
                                     let actual_entry_price = (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE);
                                     positions.lock().await.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: params.token_id, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id) });
 
-                                    info!("👻 GHOST_MODE ENTRY [{}]: {} | ${:.4} x {:.1} (simulated)",
+                                    info!(" GHOST_MODE ENTRY [{}]: {} | ${:.4} x {:.1} (simulated)",
                                         sn, params.market_name, params.price, params.shares);
                                     if let Some(pp) = pair_params {
                                         let pp_close_time = target_market_close_time;
                                         positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: pp.price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: Some(params.token_id) });
-                                        info!("👻 GHOST_MODE ENTRY (paired) [{}]: {} | ${:.4} x {:.1} (simulated)", sn, pp.market_name, pp.price, pp.shares);
+                                        info!(" GHOST_MODE ENTRY (paired) [{}]: {} | ${:.4} x {:.1} (simulated)", sn, pp.market_name, pp.price, pp.shares);
                                     }
                                     last_trade_time.insert(sn.clone(), Instant::now());
                                     // No actual order placement or balance sync in ghost mode
@@ -925,7 +917,7 @@ async fn main() -> Result<()> {
                                         pending_orders.lock().await.insert(pos_key.clone(), Instant::now() + Duration::from_secs(3));
                                     }
 
-                                    info!("📥 ENTRY [{}]: {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares);
+                                    info!(" ENTRY [{}]: {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares);
                                     let vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                     if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, params.token_id, Side::Buy, params.shares, (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await { // Use target_yes_fee_bps for simplicity
                                         warn!("⚠️ ENTRY order failed [{}]: {}", sn, e);
@@ -1005,7 +997,7 @@ async fn main() -> Result<()> {
                                         }
                                     }
                                     last_trade_time.insert(sn.clone(), Instant::now());
-                                    { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = format!("📥 ENTRY [{}] {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
+                                    { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = format!(" ENTRY [{}] {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
                                 }
                             }
 
@@ -1026,12 +1018,12 @@ async fn main() -> Result<()> {
                                     if config::GHOST_MODE {
                                         if positions.lock().await.contains_key(&pk) { continue; }
                                         positions.lock().await.insert(pk.clone(), Position { shares: p.shares, avg_entry: p.price, opened_at: Utc::now(), close_time: None, market_name: p.market_name.clone(), pair_token_id: p.token_id, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
-                                        info!("👻 GHOST_MODE MakerQuote [{}]: {} | shares={:.2}, bid=${:.4} (simulated)", sn, p.market_name, p.shares, p.price);
+                                        info!(" GHOST_MODE MakerQuote [{}]: {} | shares={:.2}, bid=${:.4} (simulated)", sn, p.market_name, p.shares, p.price);
                                         placed = true;
                                     } else {
                                         // Real trading logic
                                         if !positions.lock().await.contains_key(&pk) {
-                                            info!("📥 MakerQuote [{}]: {} | shares={:.2}, bid=${:.4}", sn, p.market_name, p.shares, p.price);
+                                            info!(" MakerQuote [{}]: {} | shares={:.2}, bid=${:.4}", sn, p.market_name, p.shares, p.price);
                                             positions.lock().await.insert(pk.clone(), Position { shares: p.shares, avg_entry: p.price, opened_at: Utc::now(), close_time: None, market_name: p.market_name.clone(), pair_token_id: p.token_id, fill_confirmed_at: None, paired_leg_token_id: None });
 
                                             // Set pending lock for 3 seconds
@@ -1058,7 +1050,7 @@ async fn main() -> Result<()> {
                                     }
                                 }
                                 if placed { last_trade_time.insert(sn.clone(), Instant::now()); }
-                                if consecutive_failures >= config::MAX_CONSECUTIVE_FAILURES { error!("🚨 Circuit breaker hit!"); tokio::time::sleep(Duration::from_secs(60)).await; consecutive_failures = 0; }
+                                if consecutive_failures >= config::MAX_CONSECUTIVE_FAILURES { error!(" Circuit breaker hit!"); tokio::time::sleep(Duration::from_secs(60)).await; consecutive_failures = 0; }
                             }
                             StrategySignal::NoSignal => {}
                         }
@@ -1070,7 +1062,7 @@ async fn main() -> Result<()> {
                     // the outer loop restarts the trading context with a fresh market.
                     let elapsed = last_heartbeat_at.lock().await.elapsed().as_secs();
                     if elapsed > LOOP_WATCHDOG_SECS {
-                        error!("🚨 WATCHDOG: inner loop silent for {}s — forcing restart", elapsed);
+                        error!(" WATCHDOG: inner loop silent for {}s — forcing restart", elapsed);
                         break;
                     }
                 }

@@ -262,6 +262,13 @@ pub const TIME_DECAY_MAX_SLOW_DRIFT_ETH: Decimal = dec!(8.0);
 pub const TIME_DECAY_MAX_SLOW_DRIFT_SOL: Decimal = dec!(0.80);
 pub const TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER: Decimal = dec!(0.50);
 
+/// Price bounds: only enter when genuine market uncertainty exists.
+pub const TIME_DECAY_MAX_ENTRY_PRICE: Decimal = dec!(0.78);
+pub const TIME_DECAY_MIN_ENTRY_PRICE: Decimal = dec!(0.22);
+
+/// OBI gate: block entry when the order book is heavily one-sided.
+pub const TIME_DECAY_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.65);
+
 
 // ============================================================================
 // EMERGENCY CIRCUIT BREAKERS
