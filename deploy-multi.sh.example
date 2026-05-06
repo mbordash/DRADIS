@@ -1,131 +1,193 @@
 #!/usr/bin/env bash
 # =============================================================================
 # dradis deploy-multi.sh TEMPLATE
-# Deploys 3 independent containers: BTC, ETH, SOL
+# Deploys DRADIS trading containers + Control Tower UI
 #
 # SETUP:
-# 1. Copy this file and customize the HOST, USER, and KEY variables
-# 2. Make sure you have SSH access to your remote server
-# 3. Ensure Docker is installed on the remote server
-# 4. Run: chmod +x deploy-multi.sh.example && ./deploy-multi.sh.example
+# 1. Copy this file to deploy-multi.sh and fill in HOST, USER, KEY
+# 2. Ensure Docker is installed on the remote server
+# 3. Run: chmod +x deploy-multi.sh && ./deploy-multi.sh
+#
+# Containers started:
+#   dradis-btc       — Rust trading engine (BTC filter) + axum API on :9000
+#   control-tower    — Next.js dashboard on :3000
+#   dradis-eth/sol   — Uncomment blocks below to enable additional filters
+#
+# All containers share the 'dradis-net' Docker network so the UI can reach
+# the API at http://dradis-btc:9000 without exposing it on the host.
 # =============================================================================
 
 set -euo pipefail
 
 # ⚙️  CUSTOMIZE THESE VALUES FOR YOUR SERVER
-HOST="<YOUR_SERVER_IP>"              # e.g., "192.168.1.100" or "example.com"
-USER="<YOUR_USERNAME>"               # e.g., "ubuntu", "root", "ec2-user"
-KEY="<PATH_TO_SSH_KEY>"              # e.g., "~/.ssh/id_rsa" or "~/.ssh/server_key.pem"
-REMOTE_DIR="~/dradis"           # Remote directory where code will be deployed
+HOST="<YOUR_SERVER_IP>"       # e.g. "54.12.34.56" or "myserver.example.com"
+USER="<YOUR_USERNAME>"        # e.g. "ubuntu", "ec2-user", "root"
+KEY="<PATH_TO_SSH_KEY>"       # e.g. "~/.ssh/id_rsa" or "~/.ssh/my-key.pem"
+REMOTE_DIR="~/dradis"         # Remote directory to deploy into
 
-# Optional: SSH port (usually 22, customize if non-standard)
+# Optional: SSH port (default 22)
 SSH_PORT="22"
 
-echo "🚀 Deploying 3 independent dradis containers to $HOST..."
+echo "🚀 Deploying DRADIS + Control Tower to $HOST..."
 
-# 1. Create remote directory structure
+# ── 1. Create remote directory structure ──────────────────────────────────────
 echo "📁 Creating remote directory structure..."
-ssh -i "$KEY" "$USER@$HOST" "mkdir -p $REMOTE_DIR/src/strategies $REMOTE_DIR/src/helpers $REMOTE_DIR/src/orchestrator $REMOTE_DIR/src/tasks $REMOTE_DIR/tests"
+ssh -i "$KEY" "$USER@$HOST" \
+  "mkdir -p $REMOTE_DIR/src/strategies \
+            $REMOTE_DIR/src/helpers \
+            $REMOTE_DIR/src/orchestrator \
+            $REMOTE_DIR/src/tasks \
+            $REMOTE_DIR/src/api \
+            $REMOTE_DIR/tests \
+            $REMOTE_DIR/control-tower"
 
-# 2. Copy code once
-echo "📤 Copying updated code to remote..."
-scp -P "$SSH_PORT" -i "$KEY" src/main.rs "$USER@$HOST:$REMOTE_DIR/src/main.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/config.rs "$USER@$HOST:$REMOTE_DIR/src/config.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/lib.rs "$USER@$HOST:$REMOTE_DIR/src/lib.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/state.rs "$USER@$HOST:$REMOTE_DIR/src/state.rs"
+# ── 2. Copy Rust source ───────────────────────────────────────────────────────
+echo "📤 Copying Rust source..."
+scp -P "$SSH_PORT" -i "$KEY" src/main.rs    "$USER@$HOST:$REMOTE_DIR/src/main.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/config.rs  "$USER@$HOST:$REMOTE_DIR/src/config.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/lib.rs     "$USER@$HOST:$REMOTE_DIR/src/lib.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/state.rs   "$USER@$HOST:$REMOTE_DIR/src/state.rs"
 
-# Copy strategy modules
-scp -P "$SSH_PORT" -i "$KEY" src/strategies/mod.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/mod.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/strategies/momentum_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/momentum_impl.rs"
+# Strategy modules
+scp -P "$SSH_PORT" -i "$KEY" src/strategies/mod.rs            "$USER@$HOST:$REMOTE_DIR/src/strategies/mod.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/strategies/momentum_impl.rs  "$USER@$HOST:$REMOTE_DIR/src/strategies/momentum_impl.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/strategies/arbitrage_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/arbitrage_impl.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/strategies/time_decay_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/time_decay_impl.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/strategies/maker_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/maker_impl.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/strategies/basis_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/basis_impl.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/strategies/gboost_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/gboost_impl.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/strategies/maker_impl.rs     "$USER@$HOST:$REMOTE_DIR/src/strategies/maker_impl.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/strategies/basis_impl.rs     "$USER@$HOST:$REMOTE_DIR/src/strategies/basis_impl.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/strategies/gboost_impl.rs    "$USER@$HOST:$REMOTE_DIR/src/strategies/gboost_impl.rs"
 
-# Copy orchestrator modules
-scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/mod.rs "$USER@$HOST:$REMOTE_DIR/src/orchestrator/mod.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/strategy.rs "$USER@$HOST:$REMOTE_DIR/src/orchestrator/strategy.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/registry.rs "$USER@$HOST:$REMOTE_DIR/src/orchestrator/registry.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/executor.rs "$USER@$HOST:$REMOTE_DIR/src/orchestrator/executor.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/market_data.rs "$USER@$HOST:$REMOTE_DIR/src/orchestrator/market_data.rs"
+# Orchestrator modules
+scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/mod.rs          "$USER@$HOST:$REMOTE_DIR/src/orchestrator/mod.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/strategy.rs     "$USER@$HOST:$REMOTE_DIR/src/orchestrator/strategy.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/registry.rs     "$USER@$HOST:$REMOTE_DIR/src/orchestrator/registry.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/executor.rs     "$USER@$HOST:$REMOTE_DIR/src/orchestrator/executor.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/market_data.rs  "$USER@$HOST:$REMOTE_DIR/src/orchestrator/market_data.rs"
 
-# Copy helpers modules
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/mod.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/mod.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/price.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/price.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/config_helpers.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/config_helpers.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/json.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/json.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/time.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/time.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/balance.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/balance.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/nonce.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/nonce.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/orders.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/orders.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/market.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/market.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/volatility.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/volatility.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/notifications.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/notifications.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/metrics.rs "$USER@$HOST:$REMOTE_DIR/src/helpers/metrics.rs"
+# Helper modules
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/mod.rs               "$USER@$HOST:$REMOTE_DIR/src/helpers/mod.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/config_helpers.rs    "$USER@$HOST:$REMOTE_DIR/src/helpers/config_helpers.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/price.rs             "$USER@$HOST:$REMOTE_DIR/src/helpers/price.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/json.rs              "$USER@$HOST:$REMOTE_DIR/src/helpers/json.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/time.rs              "$USER@$HOST:$REMOTE_DIR/src/helpers/time.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/balance.rs           "$USER@$HOST:$REMOTE_DIR/src/helpers/balance.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/nonce.rs             "$USER@$HOST:$REMOTE_DIR/src/helpers/nonce.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/orders.rs            "$USER@$HOST:$REMOTE_DIR/src/helpers/orders.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/market.rs            "$USER@$HOST:$REMOTE_DIR/src/helpers/market.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/volatility.rs        "$USER@$HOST:$REMOTE_DIR/src/helpers/volatility.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/notifications.rs     "$USER@$HOST:$REMOTE_DIR/src/helpers/notifications.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/metrics.rs           "$USER@$HOST:$REMOTE_DIR/src/helpers/metrics.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/db.rs                "$USER@$HOST:$REMOTE_DIR/src/helpers/db.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/dynamic_config.rs    "$USER@$HOST:$REMOTE_DIR/src/helpers/dynamic_config.rs"
 
-# Copy tasks modules
-scp -P "$SSH_PORT" -i "$KEY" src/tasks/mod.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/mod.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/tasks/cleanup.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/cleanup.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/tasks/funding.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/funding.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/tasks/market_monitor.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/market_monitor.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/tasks/oracle.rs "$USER@$HOST:$REMOTE_DIR/src/tasks/oracle.rs"
+# API modules (Control Tower REST server)
+scp -P "$SSH_PORT" -i "$KEY" src/api/mod.rs                   "$USER@$HOST:$REMOTE_DIR/src/api/mod.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/api/server.rs                "$USER@$HOST:$REMOTE_DIR/src/api/server.rs"
 
-# Copy tests modules
-scp -P "$SSH_PORT" -i "$KEY" tests/toctou.rs "$USER@$HOST:$REMOTE_DIR/tests/toctou.rs"
+# Task modules
+scp -P "$SSH_PORT" -i "$KEY" src/tasks/mod.rs                 "$USER@$HOST:$REMOTE_DIR/src/tasks/mod.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/tasks/cleanup.rs             "$USER@$HOST:$REMOTE_DIR/src/tasks/cleanup.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/tasks/funding.rs             "$USER@$HOST:$REMOTE_DIR/src/tasks/funding.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/tasks/market_monitor.rs      "$USER@$HOST:$REMOTE_DIR/src/tasks/market_monitor.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/tasks/oracle.rs              "$USER@$HOST:$REMOTE_DIR/src/tasks/oracle.rs"
 
-# Copy root files
-scp -P "$SSH_PORT" -i "$KEY" .env "$USER@$HOST:$REMOTE_DIR/.env"
-scp -P "$SSH_PORT" -i "$KEY" Cargo.toml "$USER@$HOST:$REMOTE_DIR/Cargo.toml"
-scp -P "$SSH_PORT" -i "$KEY" Cargo.lock "$USER@$HOST:$REMOTE_DIR/Cargo.lock"
-scp -P "$SSH_PORT" -i "$KEY" Dockerfile "$USER@$HOST:$REMOTE_DIR/Dockerfile"
+# Test modules
+scp -P "$SSH_PORT" -i "$KEY" tests/toctou.rs                  "$USER@$HOST:$REMOTE_DIR/tests/toctou.rs"
 
+# Root files
+scp -P "$SSH_PORT" -i "$KEY" .env           "$USER@$HOST:$REMOTE_DIR/.env"
+scp -P "$SSH_PORT" -i "$KEY" Cargo.toml     "$USER@$HOST:$REMOTE_DIR/Cargo.toml"
+scp -P "$SSH_PORT" -i "$KEY" Cargo.lock     "$USER@$HOST:$REMOTE_DIR/Cargo.lock"
+scp -P "$SSH_PORT" -i "$KEY" Dockerfile     "$USER@$HOST:$REMOTE_DIR/Dockerfile"
 
-# 3. Build + deploy all 3 containers in one SSH session
+# ── 3. Copy Control Tower UI source ──────────────────────────────────────────
+echo "📤 Copying Control Tower source..."
+scp -P "$SSH_PORT" -i "$KEY" control-tower/Dockerfile          "$USER@$HOST:$REMOTE_DIR/control-tower/Dockerfile"
+scp -P "$SSH_PORT" -i "$KEY" control-tower/.dockerignore       "$USER@$HOST:$REMOTE_DIR/control-tower/.dockerignore"
+scp -P "$SSH_PORT" -i "$KEY" control-tower/package.json        "$USER@$HOST:$REMOTE_DIR/control-tower/package.json"
+scp -P "$SSH_PORT" -i "$KEY" control-tower/package-lock.json   "$USER@$HOST:$REMOTE_DIR/control-tower/package-lock.json"
+scp -P "$SSH_PORT" -i "$KEY" control-tower/next.config.ts      "$USER@$HOST:$REMOTE_DIR/control-tower/next.config.ts"
+scp -P "$SSH_PORT" -i "$KEY" control-tower/tailwind.config.ts  "$USER@$HOST:$REMOTE_DIR/control-tower/tailwind.config.ts"
+scp -P "$SSH_PORT" -i "$KEY" control-tower/postcss.config.mjs  "$USER@$HOST:$REMOTE_DIR/control-tower/postcss.config.mjs"
+scp -P "$SSH_PORT" -i "$KEY" control-tower/tsconfig.json       "$USER@$HOST:$REMOTE_DIR/control-tower/tsconfig.json"
+# Copy entire src tree (app, components, lib)
+scp -r -P "$SSH_PORT" -i "$KEY" control-tower/src              "$USER@$HOST:$REMOTE_DIR/control-tower/"
+
+# ── 4. Build + deploy all containers in one SSH session ───────────────────────
 ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" << 'REMOTE'
     set -euo pipefail
     cd "$1"
 
-    echo "🧹 Cleaning up old containers and images..."
-    docker stop dradis-btc dradis-eth dradis-sol 2>/dev/null || true
-    docker rm dradis-btc dradis-eth dradis-sol 2>/dev/null || true
+    echo "🧹 Stopping old containers..."
+    docker stop dradis-btc dradis-eth dradis-sol control-tower 2>/dev/null || true
+    docker rm   dradis-btc dradis-eth dradis-sol control-tower 2>/dev/null || true
     docker system prune -af --volumes 2>/dev/null || true
 
-    echo "🔨 Building Docker image once..."
+    # Create isolated Docker network so containers talk internally
+    docker network create dradis-net 2>/dev/null || true
+
+    echo "🔨 Building DRADIS image..."
     docker build -t dradis .
 
-    echo "🚀 Starting BTC dradis..."
+    echo "🔨 Building Control Tower image..."
+    docker build -t dradis-ui control-tower/
+
+    echo "🚀 Starting dradis-btc (BTC filter, API on :9000)..."
     docker run -d \
         --restart unless-stopped \
         --name dradis-btc \
+        --network dradis-net \
         --env-file .env \
         -e CRYPTO_FILTER=btc \
-        -v $(pwd)/logs:/usr/src/app/logs \
+        -e API_PORT=9000 \
+        -p 9000:9000 \
+        -v $(pwd)/logs:/app/logs \
         dradis
 
-    echo "🚀 Starting ETH dradis..."
+#    echo "🚀 Starting dradis-eth..."
+#    docker run -d \
+#        --restart unless-stopped \
+#        --name dradis-eth \
+#        --network dradis-net \
+#        --env-file .env \
+#        -e CRYPTO_FILTER=eth \
+#        -e API_PORT=9000 \
+#        -v $(pwd)/logs:/app/logs \
+#        dradis
+#
+#    echo "🚀 Starting dradis-sol..."
+#    docker run -d \
+#        --restart unless-stopped \
+#        --name dradis-sol \
+#        --network dradis-net \
+#        --env-file .env \
+#        -e CRYPTO_FILTER=sol \
+#        -e API_PORT=9000 \
+#        -v $(pwd)/logs:/app/logs \
+#        dradis
+
+    echo "🌐 Starting Control Tower UI (port :3000)..."
     docker run -d \
         --restart unless-stopped \
-        --name dradis-eth \
-        --env-file .env \
-        -e CRYPTO_FILTER=eth \
-        -v $(pwd)/logs:/usr/src/app/logs \
-        dradis
+        --name control-tower \
+        --network dradis-net \
+        -e DRADIS_API_URL=http://dradis-btc:9000 \
+        -p 3000:3000 \
+        dradis-ui
 
-    echo "🚀 Starting SOL dradis..."
-    docker run -d \
-        --restart unless-stopped \
-        --name dradis-sol \
-        --env-file .env \
-        -e CRYPTO_FILTER=sol \
-        -v $(pwd)/logs:/usr/src/app/logs \
-        dradis
-
-    echo "✅ All 3 containers deployed!"
-    echo "📜 Status:"
-    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep dradis
+    echo ""
+    echo "✅ Deployment complete!"
+    echo "📜 Running containers:"
+    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep -E "(dradis|control)"
+    echo ""
+    echo "🌐 Control Tower: http://$(hostname -I | awk '{print $1}'):3000"
+    echo "📡 DRADIS API:    http://$(hostname -I | awk '{print $1}'):9000/api/health"
 REMOTE
 
-echo "✅ Deployment complete on server!"
-echo "📡 Tailing combined logs (Ctrl+C to stop):"
-ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" "docker logs -f dradis-btc dradis-eth dradis-sol --tail 30"
+echo ""
+echo "✅ Deployment complete on $HOST!"
+echo "🌐 Control Tower: http://$HOST:3000"
+echo "📡 DRADIS API:    http://$HOST:9000/api/health"
+echo ""
+echo "📜 Tailing BTC logs (Ctrl+C to stop):"
+ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" "docker logs -f dradis-btc --tail 30"

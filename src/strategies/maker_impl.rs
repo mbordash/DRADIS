@@ -59,7 +59,8 @@ impl Default for MakerStrategyImpl {
 #[async_trait]
 impl Strategy for MakerStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
-        if !config::ENABLE_MAKER_TRADING {
+        let dc = &ctx.dynamic_config;
+        if !dc.enable_maker {
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -175,7 +176,7 @@ impl Strategy for MakerStrategyImpl {
         };
 
         // Skew calculation
-        let imbalance = ((yes_inv_value - no_inv_value) / config::MAKER_MAX_EXPOSURE_USDC)
+        let imbalance = ((yes_inv_value - no_inv_value) / dc.maker_max_exposure_usdc)
             .clamp(dec!(-1), dec!(1));
         let skew = imbalance * config::MAKER_INVENTORY_SKEW_MAX;
 
@@ -188,8 +189,8 @@ impl Strategy for MakerStrategyImpl {
         // Use a wider buffer to avoid long-unfilled GTC orders in slower books
         let bid_buffer = if ctx.maker_market.is_some() { config::MAKER_BID_BUFFER } else { dec!(0.015) };
 
-        let raw_yes_price = (snapshot.yes_ask - bid_buffer - skew).max(config::MAKER_MIN_ENTRY_PRICE);
-        let raw_no_price  = (snapshot.no_ask - bid_buffer + skew).max(config::MAKER_MIN_ENTRY_PRICE);
+        let raw_yes_price = (snapshot.yes_ask - bid_buffer - skew).max(dc.maker_min_entry_price);
+        let raw_no_price  = (snapshot.no_ask - bid_buffer + skew).max(dc.maker_min_entry_price);
 
         // Clamp bid price to at most (ask - MAKER_CROSS_BUFFER) so that inventory-skew
         // rebalancing can never push the bid closer than 2 ticks from the ask.
@@ -202,22 +203,22 @@ impl Strategy for MakerStrategyImpl {
         let yes_spread = yes_ask - yes_bid;
         let no_spread  = no_ask - no_bid;
 
-        // ── Qualification ─────────────────────────────────────────────────────
+        // ── Qualification ─────────────────────────────────────────────────
         let yes_qualifies = yes_book_ok
-            && !taker_flow_blocks_yes          // taker-flow drain gate
+            && !taker_flow_blocks_yes
             && yes_spread >= config::MAKER_MIN_SPREAD
-            && yes_bid_price >= config::MAKER_MIN_ENTRY_PRICE
-            && yes_bid_price <= config::MAKER_MAX_ENTRY_PRICE
-            && yes_bid_price <= snapshot.yes_ask - config::MAKER_CROSS_BUFFER  // enforce min spread to ask
+            && yes_bid_price >= dc.maker_min_entry_price
+            && yes_bid_price <= dc.maker_max_entry_price
+            && yes_bid_price <= snapshot.yes_ask - config::MAKER_CROSS_BUFFER
             && no_bid <= config::MAKER_MAX_COMPLEMENTARY_PRICE
             && !velocity_bias_strong_negative;
 
         let no_qualifies = no_book_ok
-            && !taker_flow_blocks_no           // taker-flow drain gate
+            && !taker_flow_blocks_no
             && no_spread >= config::MAKER_MIN_SPREAD
-            && no_bid_price >= config::MAKER_MIN_ENTRY_PRICE
-            && no_bid_price <= config::MAKER_MAX_ENTRY_PRICE
-            && no_bid_price <= snapshot.no_ask - config::MAKER_CROSS_BUFFER    // enforce min spread to ask
+            && no_bid_price >= dc.maker_min_entry_price
+            && no_bid_price <= dc.maker_max_entry_price
+            && no_bid_price <= snapshot.no_ask - config::MAKER_CROSS_BUFFER
             && yes_bid <= config::MAKER_MAX_COMPLEMENTARY_PRICE
             && !velocity_bias_strong_positive;
 
@@ -231,7 +232,7 @@ impl Strategy for MakerStrategyImpl {
         let projected_no  = no_inv_value  + (if no_qualifies { trade_size } else { dec!(0.0) });
         let net_exposure  = (projected_yes - projected_no).abs();
 
-        if net_exposure > config::MAKER_MAX_EXPOSURE_USDC {
+        if net_exposure > dc.maker_max_exposure_usdc {
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -265,9 +266,9 @@ impl Strategy for MakerStrategyImpl {
             is_neg_risk: market.is_neg_risk,
             market_name: market.market_name.clone(),
             condition_id: market.condition_id.clone(),
-            order_type: OrderType::GTC, // Maker entries are GTC
-            post_only: true, // Maker entries are post-only
-            ghost_mode: config::GHOST_MODE, // Set ghost_mode
+            order_type: OrderType::GTC,
+            post_only: true,
+            ghost_mode: dc.ghost_mode,
         });
 
         let no_params = final_no.map(|p| OrderParams {
@@ -278,9 +279,9 @@ impl Strategy for MakerStrategyImpl {
             is_neg_risk: market.is_neg_risk,
             market_name: market.market_name.clone(),
             condition_id: market.condition_id.clone(),
-            order_type: OrderType::GTC, // Maker entries are GTC
-            post_only: true, // Maker entries are post-only
-            ghost_mode: config::GHOST_MODE, // Set ghost_mode
+            order_type: OrderType::GTC,
+            post_only: true,
+            ghost_mode: dc.ghost_mode,
         });
 
         Ok(StrategySignal::MakerQuote {
@@ -290,6 +291,7 @@ impl Strategy for MakerStrategyImpl {
     }
 
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
+        let dc = &ctx.dynamic_config;
         let market = ctx.maker_market.as_ref().unwrap_or(&ctx.market);
         let snapshot = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
 
@@ -298,8 +300,8 @@ impl Strategy for MakerStrategyImpl {
             .unwrap_or(9999);
 
         // Near-expiry forced exit to avoid binary resolution risk
-        let profit_threshold = dec!(0.02); // 2% minimum profit to hold through the danger zone
-        if secs_to_expiry < 900 { // 15 minutes before close
+        let profit_threshold = dec!(0.02);
+        if secs_to_expiry < 900 {
             let pos_map = ctx.positions.lock().await;
             for token_id in [market.yes_token, market.no_token] {
                 if let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id)) {
@@ -315,9 +317,9 @@ impl Strategy for MakerStrategyImpl {
                                 is_neg_risk: market.is_neg_risk,
                                 market_name: market.market_name.clone(),
                                 condition_id: market.condition_id.clone(),
-                                order_type: OrderType::FAK, // Exit orders are always FAK
-                                post_only: false, // Exit orders are never post-only
-                                ghost_mode: config::GHOST_MODE, // Set ghost_mode
+                                order_type: OrderType::FAK,
+                                post_only: false,
+                                ghost_mode: dc.ghost_mode,
                             },
                             reason: "NearExpiryProfitGuard".to_string(),
                             exit_pair: false,
@@ -330,25 +332,17 @@ impl Strategy for MakerStrategyImpl {
         let effective_stop_pct = if secs_to_expiry < config::MAKER_LATE_MARKET_STOP_TIGHTEN_SECS {
             config::MAKER_LATE_MARKET_STOP_LOSS_PERCENT
         } else {
-            config::MAKER_STOP_LOSS_PERCENT
+            dc.maker_stop_loss_pct
         };
 
         // ── Taker-Flow Book-Turn Exit ─────────────────────────────────────────
-        // If the OBI for the side we are long drops below MAKER_TOXIC_FLOW_EXIT_OBI,
-        // the book has turned sharply adverse — a thick ask wall has materialised
-        // while we hold the position.  This is the "pull existing orders" effect:
-        // rather than waiting for the full stop-loss to hit, we exit early at the
-        // current (still tradeable) bid before the spread widens further.
-        // Only fires on fill-confirmed positions to avoid exiting phantom entries.
         {
             let pos_map = ctx.positions.lock().await;
             for token_id in [market.yes_token, market.no_token] {
                 let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id)) else {
                     continue;
                 };
-                if position.fill_confirmed_at.is_none() {
-                    continue; // don't pull before the fill settles on-chain
-                }
+                if position.fill_confirmed_at.is_none() { continue; }
 
                 let (bid_depth, ask_depth, bid) = if token_id == market.yes_token {
                     (snapshot.yes_bid_depth, snapshot.yes_ask_depth, snapshot.yes_bid)
@@ -359,9 +353,7 @@ impl Strategy for MakerStrategyImpl {
                 let total_depth = bid_depth + ask_depth;
                 let obi = if total_depth > dec!(0) {
                     (bid_depth - ask_depth) / total_depth
-                } else {
-                    dec!(0)
-                };
+                } else { dec!(0) };
 
                 if obi < config::MAKER_TOXIC_FLOW_EXIT_OBI {
                     tracing::info!(
@@ -377,9 +369,9 @@ impl Strategy for MakerStrategyImpl {
                             is_neg_risk: market.is_neg_risk,
                             market_name: market.market_name.clone(),
                             condition_id: market.condition_id.clone(),
-                            order_type: OrderType::FAK, // Exit orders are always FAK
-                            post_only: false, // Exit orders are never post-only
-                            ghost_mode: config::GHOST_MODE, // Set ghost_mode
+                            order_type: OrderType::FAK,
+                            post_only: false,
+                            ghost_mode: dc.ghost_mode,
                         },
                         reason: format!("ToxicFill: OBI={:.2} (book turned adverse)", obi),
                         exit_pair: false,
@@ -403,7 +395,7 @@ impl Strategy for MakerStrategyImpl {
                 .map(|t| (Utc::now() - t).num_seconds())
                 .unwrap_or(0);
 
-            if position.fill_confirmed_at.is_some() && profit_pct >= config::MAKER_TARGET_PROFIT_PERCENT {
+            if position.fill_confirmed_at.is_some() && profit_pct >= dc.maker_target_profit_pct {
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
                         token_id,
@@ -413,9 +405,9 @@ impl Strategy for MakerStrategyImpl {
                         is_neg_risk: market.is_neg_risk,
                         market_name: market.market_name.clone(),
                         condition_id: market.condition_id.clone(),
-                        order_type: OrderType::FAK, // Exit orders are always FAK
-                        post_only: false, // Exit orders are never post-only
-                        ghost_mode: config::GHOST_MODE, // Set ghost_mode
+                        order_type: OrderType::FAK,
+                        post_only: false,
+                        ghost_mode: dc.ghost_mode,
                     },
                     reason: format!("Maker TP: gain={:.2}%", profit_pct * dec!(100)),
                     exit_pair: false,
@@ -435,9 +427,9 @@ impl Strategy for MakerStrategyImpl {
                         is_neg_risk: market.is_neg_risk,
                         market_name: market.market_name.clone(),
                         condition_id: market.condition_id.clone(),
-                        order_type: OrderType::FAK, // Exit orders are always FAK
-                        post_only: false, // Exit orders are never post-only
-                        ghost_mode: config::GHOST_MODE, // Set ghost_mode
+                        order_type: OrderType::FAK,
+                        post_only: false,
+                        ghost_mode: dc.ghost_mode,
                     },
                     reason: format!("Maker SL: loss={:.2}% ({}s held)", profit_pct * dec!(100), secs_since_fill),
                     exit_pair: false,
@@ -448,9 +440,7 @@ impl Strategy for MakerStrategyImpl {
         Ok(StrategySignal::NoSignal)
     }
 
-    fn status(&self) -> StrategyStatus {
-        if config::ENABLE_MAKER_TRADING { StrategyStatus::Active } else { StrategyStatus::Disabled }
-    }
+    fn status(&self) -> StrategyStatus { StrategyStatus::Active }
 
     fn name(&self) -> String { "MakerStrategy".to_string() }
     fn venue(&self) -> &'static str { "Window/Daily" }

@@ -39,12 +39,13 @@ use dradis::state::{Position, StrategySignal, MarketConfig, MarketSnapshot, Posi
 use dradis::strategies::time_decay_impl::TimeDecayPosition;
 use dradis::orchestrator::{StrategyRegistry, StrategyContext};
 use dradis::orchestrator::executor::{execute_strategies_concurrent, aggregate_and_resolve_signals};
-
+use dradis::helpers::dynamic_config::DynamicConfig;
 
 // New paths for helpers
 use dradis::helpers::{
     time::*, balance::*, nonce::*, orders::*, market::*,
     notifications::send_notification, notifications::tweet_trade, metrics,
+    db,
 };
 
 use rustls::crypto::ring;
@@ -129,6 +130,22 @@ async fn main() -> Result<()> {
         .init();
     ring::default_provider().install_default().expect("rustls provider");
     print_banner();
+
+    // ── SQLite + DynamicConfig ────────────────────────────────────────────────
+    // Init DB first so DynamicConfig::load_or_default can read from it.
+    if let Err(e) = db::init("logs/dradis.db").await {
+        tracing::warn!("⚠️  SQLite init failed (metrics will CSV-only): {}", e);
+    }
+    let initial_dyn_cfg = DynamicConfig::load_or_default().await;
+    // Wrap the sender in Arc so it can be shared with the axum API server.
+    let (config_tx, config_rx) = watch::channel(initial_dyn_cfg);
+    let config_tx = Arc::new(config_tx);
+
+    // ── Spawn Control Tower API server ───────────────────────────────────────
+    tokio::spawn(dradis::api::server::run_api_server(
+        Arc::clone(&config_tx),
+        config_rx.clone(),  // API server gets its own watch receiver
+    ));
 
     let crypto_filter = env::var("CRYPTO_FILTER").unwrap_or_else(|_| "btc".to_string()).to_lowercase();
     let private_key = env::var(PRIVATE_KEY_VAR).expect("POLYMARKET_PRIVATE_KEY");
@@ -656,6 +673,11 @@ async fn main() -> Result<()> {
                             let bal = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
                             *live_collateral.lock().await = bal;
                             debug!(" Live pUSD balance: ${:.4}", bal);
+                            // Persist a P&L snapshot for the Control Tower chart
+                            if let Some(pool) = db::pool() {
+                                let pnl_snap = *total_pnl.lock().await;
+                                db::record_pnl_snapshot(pool, pnl_snap, bal).await;
+                            }
                         }
                         Ok(Err(e)) => warn!("⚠️ balance_allowance error in status ticker: {}", e),
                         Err(_) => warn!("⚠️ balance_allowance timed out (10s) in status ticker — skipping balance update this tick"),
@@ -681,6 +703,9 @@ async fn main() -> Result<()> {
                     };
 
                     let maker_market_config_for_ctx = maker_market_config.clone();
+
+                    // Snapshot the latest DynamicConfig once per tick — zero-cost Arc clone
+                    let dyn_cfg = config_rx.borrow().clone();
 
                     let ctx = StrategyContext {
                         market: hourly_market_config_for_ctx.clone(), // Clone here to resolve the borrow of moved value error
@@ -715,6 +740,7 @@ async fn main() -> Result<()> {
                                 .unwrap_or(0),
                             timestamp: Utc::now(),
                         }),
+                        dynamic_config: dyn_cfg,
                     };
 
                     let eval_result = match execute_strategies_concurrent(&strategies, &ctx, 500, &mut last_executor_summary).await {

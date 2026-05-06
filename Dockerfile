@@ -33,7 +33,8 @@ RUN touch src/main.rs && \
 FROM alpine:latest
 RUN apk --no-cache add ca-certificates tzdata
 ENV TZ=America/New_York
-# Create app directory and set as working directory
 WORKDIR /app
+# Control Tower REST API (axum)
+EXPOSE 9000
 COPY --from=builder /dradis-bin ./dradis
 ENTRYPOINT ["./dradis"]

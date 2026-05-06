@@ -7,6 +7,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use crate::state::{MarketConfig, MarketSnapshot, StrategySignal, StrategyStatus, PositionMap};
+use crate::helpers::dynamic_config::DynamicConfig;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
@@ -40,6 +41,11 @@ pub struct StrategyContext {
     /// Strategies should gate on this to avoid generating signals when the wallet cannot
     /// afford even the minimum trade + fee, preventing 400 rejections from the CLOB.
     pub available_collateral: Decimal,
+    /// Runtime-tunable strategy parameters loaded from SQLite.
+    /// Snapshot is taken once per tick from the watch channel so strategies always
+    /// read the latest values without any locking overhead.
+    /// Hot-patched by the Control Tower API via `DynamicConfig::apply_patch`.
+    pub dynamic_config: Arc<DynamicConfig>,
 }
 
 /// Trait that all strategies must implement.

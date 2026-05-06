@@ -421,7 +421,8 @@ impl Strategy for GboostStrategyImpl {
         self.push_snapshot(training_snapshot);
         self.maybe_retrain();
 
-        if !config::ENABLE_GBOOST_TRADING {
+        let dc = &ctx.dynamic_config;
+        if !dc.enable_gboost {
             return Ok(StrategySignal::NoSignal);
         }
         if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
@@ -474,7 +475,7 @@ impl Strategy for GboostStrategyImpl {
             }
         }
         // ── Gate: sufficient collateral ───────────────────────────────────────
-        if ctx.available_collateral < config::GBOOST_MAX_EXPOSURE_USDC {
+        if ctx.available_collateral < dc.gboost_max_exposure_usdc {
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -483,8 +484,8 @@ impl Strategy for GboostStrategyImpl {
             None    => return Ok(StrategySignal::NoSignal),
         };
 
-        let entry_thresh = config::GBOOST_ENTRY_THRESHOLD.to_f64().unwrap_or(0.65);
-        let trade_usdc   = config::GBOOST_MAX_EXPOSURE_USDC;
+        let entry_thresh = dc.gboost_entry_threshold.to_f64().unwrap_or(0.65);
+        let trade_usdc   = dc.gboost_max_exposure_usdc;
 
         // Don't pyramid — check that no position is already open for this strategy.
         let (has_yes, has_no) = {
@@ -550,9 +551,9 @@ impl Strategy for GboostStrategyImpl {
                     is_neg_risk: target_market.is_neg_risk,
                     market_name: target_market.market_name.clone(),
                     condition_id: target_market.condition_id.clone(),
-                    order_type: OrderType::FAK, // GBoost entries are typically FAK
-                    post_only: false, // Not post-only
-                    ghost_mode: config::GHOST_MODE,
+                    order_type: OrderType::FAK,
+                    post_only: false,
+                    ghost_mode: dc.ghost_mode,
                 },
                 pair_params: None,
             });
@@ -560,16 +561,14 @@ impl Strategy for GboostStrategyImpl {
 
         // ── NO entry: model predicts DOWN (P(UP) is very low) ────────────────
         if p_yes_up <= (1.0 - entry_thresh) && !has_no {
-            // ── Entry latch: skip if an entry for this token is already in-flight ──
+            // ── Entry latch ──────────────────────────────────────────────────
             if self.pending_entries.lock().unwrap().contains_key(&target_market.no_token) {
                 return Ok(StrategySignal::NoSignal);
             }
             if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(target_market.no_token) {
                 tracing::debug!(
                     "🚫 GBoost NO entry veto: cooldown active | market='{}' token={:?} remaining={}s",
-                    target_market.market_name,
-                    target_market.no_token,
-                    remaining_secs
+                    target_market.market_name, target_market.no_token, remaining_secs
                 );
                 return Ok(StrategySignal::NoSignal);
             }
@@ -577,10 +576,7 @@ impl Strategy for GboostStrategyImpl {
             if no_obi < config::GBOOST_OBI_ADVERSE_BLOCK {
                 tracing::debug!(
                     "🚫 GBoost NO entry veto: adverse OBI | market='{}' token={:?} obi={:.3} block={:.3}",
-                    target_market.market_name,
-                    target_market.no_token,
-                    no_obi,
-                    config::GBOOST_OBI_ADVERSE_BLOCK
+                    target_market.market_name, target_market.no_token, no_obi, config::GBOOST_OBI_ADVERSE_BLOCK
                 );
                 return Ok(StrategySignal::NoSignal);
             }
@@ -596,7 +592,6 @@ impl Strategy for GboostStrategyImpl {
                 "🔮 GBoost NO entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
                 p_yes_up, price, shares
             );
-            // Store entry context for training feedback
             self.pending_entries.lock().unwrap().insert(
                 target_market.no_token,
                 (target_snapshot.clone(), price)
@@ -609,9 +604,9 @@ impl Strategy for GboostStrategyImpl {
                     is_neg_risk: target_market.is_neg_risk,
                     market_name: target_market.market_name.clone(),
                     condition_id: target_market.condition_id.clone(),
-                    order_type: OrderType::FAK, // GBoost entries are typically FAK
-                    post_only: false, // Not post-only
-                    ghost_mode: config::GHOST_MODE,
+                    order_type: OrderType::FAK,
+                    post_only: false,
+                    ghost_mode: dc.ghost_mode,
                 },
                 pair_params: None,
             });
@@ -621,6 +616,7 @@ impl Strategy for GboostStrategyImpl {
     }
 
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
+        let dc = &ctx.dynamic_config;
         // GBoost should operate on the maker_market (Window/Daily) if available,
         // otherwise it falls back to the primary market (Hourly).
         let target_market = if let Some(ref mk) = ctx.maker_market {
@@ -637,8 +633,8 @@ impl Strategy for GboostStrategyImpl {
 
         let p_yes_up           = self.predict(target_snapshot);
         let signal_exit_thresh = config::GBOOST_SIGNAL_EXIT_THRESHOLD.to_f64().unwrap_or(0.40);
-        let tp                 = config::GBOOST_TARGET_PROFIT_PERCENT.to_f64().unwrap_or(0.15);
-        let sl                 = config::GBOOST_STOP_LOSS_PERCENT.to_f64().unwrap_or(0.10);
+        let tp                 = dc.gboost_target_profit_pct.to_f64().unwrap_or(0.15);
+        let sl                 = dc.gboost_stop_loss_pct.to_f64().unwrap_or(0.10);
 
         let pos_map = ctx.positions.lock().await;
 
@@ -659,9 +655,9 @@ impl Strategy for GboostStrategyImpl {
                     is_neg_risk: target_market.is_neg_risk,
                     market_name: target_market.market_name.clone(),
                     condition_id: target_market.condition_id.clone(),
-                    order_type: OrderType::FAK, // Exit orders are always FAK
-                    post_only: false, // Exit orders are never post-only
-                    ghost_mode: config::GHOST_MODE,
+                    order_type: OrderType::FAK,
+                    post_only: false,
+                    ghost_mode: dc.ghost_mode,
                 };
 
                 if profit_pct >= tp {
@@ -715,9 +711,9 @@ impl Strategy for GboostStrategyImpl {
                     is_neg_risk: target_market.is_neg_risk,
                     market_name: target_market.market_name.clone(),
                     condition_id: target_market.condition_id.clone(),
-                    order_type: OrderType::FAK, // Exit orders are always FAK
-                    post_only: false, // Exit orders are never post-only
-                    ghost_mode: config::GHOST_MODE,
+                    order_type: OrderType::FAK,
+                    post_only: false,
+                    ghost_mode: dc.ghost_mode,
                 };
 
                 if profit_pct >= tp {
@@ -762,9 +758,7 @@ impl Strategy for GboostStrategyImpl {
     fn max_exposure(&self) -> rust_decimal::Decimal { crate::config::GBOOST_MAX_EXPOSURE_USDC }
     fn risk_model(&self) -> &'static str { "Gross one-sided" }
 
-    fn status(&self) -> StrategyStatus {
-        if config::ENABLE_GBOOST_TRADING { StrategyStatus::Active } else { StrategyStatus::Disabled }
-    }
+    fn status(&self) -> StrategyStatus { StrategyStatus::Active }
 }
 
 // ── Unit tests ────────────────────────────────────────────────────────────────
@@ -808,6 +802,7 @@ mod tests {
             crypto_filter: "btc".to_string(),
             market_started_at: Utc::now() - chrono::Duration::seconds(300),
             maker_market: None, maker_snapshot: None,
+            dynamic_config: Arc::new(Default::default()),
         }
     }
 

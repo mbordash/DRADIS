@@ -1,0 +1,195 @@
+/// DynamicConfig — runtime-tunable strategy parameters.
+///
+/// All values that operators commonly need to change between sessions
+/// (position sizes, thresholds, enable flags, stop-loss %) live here.
+/// On first startup the struct is seeded from the compile-time defaults in
+/// config.rs and written to SQLite.  Subsequent startups load from SQLite.
+///
+/// ── Hot-Reload Flow ─────────────────────────────────────────────────────────
+///   1. Control Tower UI sends  `PATCH /api/config  { "time_decay_stop_loss_pct": "0.03" }`
+///   2. axum handler deserializes the patch, calls `config.apply_patch(&json)`
+///   3. apply_patch merges, persists to SQLite, then sends the new Arc<DynamicConfig>
+///      on the `watch::Sender<Arc<DynamicConfig>>` held by the API server
+///   4. main.rs tick loop calls `config_rx.borrow().clone()` every 50ms — strategies
+///      always read the freshest snapshot via `ctx.dynamic_config.*`
+///
+/// ── What stays in config.rs ─────────────────────────────────────────────────
+///   Compile-time constants that are infrastructure, not tuning:
+///   - API endpoints, exchange addresses
+///   - Timing constants (cooldowns, retry intervals, watchdog)
+///   - Order minimums (MIN_ORDER_SHARES, MIN_ORDER_USDC)
+///   - Flash-exit timing, fee formulas
+
+use serde::{Serialize, Deserialize};
+use rust_decimal::Decimal;
+use anyhow::Result;
+use tracing::{info, warn};
+use std::sync::Arc;
+
+use crate::config;
+use crate::helpers::db;
+
+// ─── Struct ──────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DynamicConfig {
+    // ── Global ────────────────────────────────────────────────────────────────
+    /// When true all orders are simulated — no real CLOB calls.
+    pub ghost_mode: bool,
+
+    // ── Viper (strategy) enable flags ─────────────────────────────────────────
+    pub enable_time_decay: bool,
+    pub enable_momentum:   bool,
+    pub enable_maker:      bool,
+    pub enable_basis:      bool,
+    pub enable_gboost:     bool,
+
+    // ── TimeDecay Viper ───────────────────────────────────────────────────────
+    pub time_decay_position_size_usdc:  Decimal,
+    pub time_decay_max_exposure_usdc:   Decimal,
+    pub time_decay_stop_loss_pct:       Decimal,
+    pub time_decay_max_entry_price:     Decimal,
+    pub time_decay_min_entry_price:     Decimal,
+    pub time_decay_obi_adverse_block:   Decimal,
+    pub time_decay_convergence_exit_bid: Decimal,
+    pub time_decay_min_secs_to_expiry:  i64,
+    pub time_decay_max_secs_to_expiry:  i64,
+    pub min_time_decay_net_profit:      Decimal,
+
+    // ── Momentum Viper ────────────────────────────────────────────────────────
+    pub momentum_min_trade_size_usdc:  Decimal,
+    pub momentum_max_trade_size_usdc:  Decimal,
+    pub momentum_stop_loss_pct:        Decimal,
+    pub momentum_target_profit_pct:    Decimal,
+    pub momentum_max_exposure_usdc:    Decimal,
+
+    // ── Maker Viper ───────────────────────────────────────────────────────────
+    pub maker_max_entry_price:    Decimal,
+    pub maker_min_entry_price:    Decimal,
+    pub maker_stop_loss_pct:      Decimal,
+    pub maker_target_profit_pct:  Decimal,
+    pub maker_max_exposure_usdc:  Decimal,
+
+    // ── Basis Viper ───────────────────────────────────────────────────────────
+    pub basis_max_exposure_usdc:  Decimal,
+    pub basis_stop_loss_pct:      Decimal,
+    pub basis_target_profit_pct:  Decimal,
+
+    // ── GBoost Viper ──────────────────────────────────────────────────────────
+    pub gboost_entry_threshold:   Decimal,
+    pub gboost_stop_loss_pct:     Decimal,
+    pub gboost_target_profit_pct: Decimal,
+    pub gboost_max_exposure_usdc: Decimal,
+}
+
+impl Default for DynamicConfig {
+    /// Seeds all values from the compile-time defaults in config.rs.
+    /// This is the definitive single source of truth for initial values —
+    /// the SQLite row is only authoritative once the user has changed something.
+    fn default() -> Self {
+        Self {
+            ghost_mode: config::GHOST_MODE,
+
+            enable_time_decay: config::ENABLE_TIME_DECAY_TRADING,
+            enable_momentum:   config::ENABLE_MOMENTUM_TRADING,
+            enable_maker:      config::ENABLE_MAKER_TRADING,
+            enable_basis:      config::ENABLE_BASIS_TRADING,
+            enable_gboost:     config::ENABLE_GBOOST_TRADING,
+
+            time_decay_position_size_usdc:  config::TIME_DECAY_POSITION_SIZE_USDC,
+            time_decay_max_exposure_usdc:   config::TIME_DECAY_MAX_EXPOSURE_USDC,
+            time_decay_stop_loss_pct:       config::TIME_DECAY_STOP_LOSS_PERCENT,
+            time_decay_max_entry_price:     config::TIME_DECAY_MAX_ENTRY_PRICE,
+            time_decay_min_entry_price:     config::TIME_DECAY_MIN_ENTRY_PRICE,
+            time_decay_obi_adverse_block:   config::TIME_DECAY_OBI_ADVERSE_BLOCK,
+            time_decay_convergence_exit_bid: config::TIME_DECAY_CONVERGENCE_EXIT_BID,
+            time_decay_min_secs_to_expiry:  config::TIME_DECAY_MIN_SECS_TO_EXPIRY,
+            time_decay_max_secs_to_expiry:  config::TIME_DECAY_MAX_SECS_TO_EXPIRY,
+            min_time_decay_net_profit:      config::MIN_TIME_DECAY_NET_PROFIT,
+
+            momentum_min_trade_size_usdc:  config::MOMENTUM_MIN_TRADE_SIZE_USDC,
+            momentum_max_trade_size_usdc:  config::MOMENTUM_MAX_TRADE_SIZE_USDC,
+            momentum_stop_loss_pct:        config::MOMENTUM_STOP_LOSS_PERCENT,
+            momentum_target_profit_pct:    config::MOMENTUM_TARGET_PROFIT_PERCENT,
+            momentum_max_exposure_usdc:    config::MOMENTUM_MAX_EXPOSURE_USDC,
+
+            maker_max_entry_price:    config::MAKER_MAX_ENTRY_PRICE,
+            maker_min_entry_price:    config::MAKER_MIN_ENTRY_PRICE,
+            maker_stop_loss_pct:      config::MAKER_STOP_LOSS_PERCENT,
+            maker_target_profit_pct:  config::MAKER_TARGET_PROFIT_PERCENT,
+            maker_max_exposure_usdc:  config::MAKER_MAX_EXPOSURE_USDC,
+
+            basis_max_exposure_usdc:  config::BASIS_MAX_EXPOSURE_USDC,
+            basis_stop_loss_pct:      config::BASIS_STOP_LOSS_PERCENT,
+            basis_target_profit_pct:  config::BASIS_TARGET_PROFIT_PERCENT,
+
+            gboost_entry_threshold:   config::GBOOST_ENTRY_THRESHOLD,
+            gboost_stop_loss_pct:     config::GBOOST_STOP_LOSS_PERCENT,
+            gboost_target_profit_pct: config::GBOOST_TARGET_PROFIT_PERCENT,
+            gboost_max_exposure_usdc: config::GBOOST_MAX_EXPOSURE_USDC,
+        }
+    }
+}
+
+// ─── SQLite key ──────────────────────────────────────────────────────────────
+
+const DB_KEY: &str = "dynamic_config";
+
+impl DynamicConfig {
+    /// Load the most recent DynamicConfig from SQLite.
+    /// If no record exists (first run), seeds defaults and writes them to DB.
+    pub async fn load_or_default() -> Arc<Self> {
+        if let Some(pool) = db::pool() {
+            if let Some(json) = db::config_get(pool, DB_KEY).await {
+                match serde_json::from_str::<DynamicConfig>(&json) {
+                    Ok(cfg) => {
+                        info!("⚙️  DynamicConfig loaded from SQLite");
+                        return Arc::new(cfg);
+                    }
+                    Err(e) => {
+                        warn!("⚠️  DynamicConfig parse error: {} — resetting to defaults", e);
+                    }
+                }
+            } else {
+                info!("⚙️  No DynamicConfig in DB — using compile-time defaults");
+            }
+        }
+        let cfg = Arc::new(DynamicConfig::default());
+        cfg.save().await;
+        cfg
+    }
+
+    /// Persist current values as a JSON blob under DB_KEY.
+    pub async fn save(&self) {
+        if let Some(pool) = db::pool() {
+            match serde_json::to_string(self) {
+                Ok(json) => db::config_set(pool, DB_KEY, &json).await,
+                Err(e)   => warn!("⚠️  DynamicConfig serialize error: {}", e),
+            }
+        }
+    }
+
+    /// Apply a partial JSON patch (e.g. `{"time_decay_stop_loss_pct":"0.03"}`),
+    /// persist the merged result, and return it wrapped in Arc.
+    ///
+    /// Called by the Control Tower API on `PATCH /api/config`.
+    /// The watch::Sender should then broadcast the returned Arc so all in-flight
+    /// tick contexts pick up the new values on the next 50ms interval.
+    pub async fn apply_patch(current: &Arc<Self>, patch_json: &str) -> Result<Arc<Self>> {
+        let mut value = serde_json::to_value(current.as_ref())?;
+        let patch: serde_json::Value = serde_json::from_str(patch_json)?;
+
+        // Merge: patch fields overwrite current fields; unknown keys are ignored.
+        if let (Some(obj), Some(patch_obj)) = (value.as_object_mut(), patch.as_object()) {
+            for (k, v) in patch_obj {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+
+        let updated: DynamicConfig = serde_json::from_value(value)?;
+        updated.save().await;
+        info!("⚙️  DynamicConfig hot-patched and persisted");
+        Ok(Arc::new(updated))
+    }
+}
+

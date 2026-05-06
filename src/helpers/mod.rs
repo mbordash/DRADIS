@@ -7,7 +7,9 @@ pub mod orders;
 pub mod market;
 pub mod notifications;
 pub mod metrics;
-pub mod config_helpers; // Add this line
+pub mod config_helpers;
+pub mod db;
+pub mod dynamic_config;
 
 pub use price::*;
 pub use json::*;

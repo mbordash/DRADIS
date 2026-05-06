@@ -55,7 +55,9 @@ pub struct TimeDecayStrategyImpl;
 #[async_trait]
 impl Strategy for TimeDecayStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
-        if !config::ENABLE_TIME_DECAY_TRADING {
+        let dc = &ctx.dynamic_config; // hot-reloadable snapshot for this tick
+
+        if !dc.enable_time_decay {
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -64,9 +66,6 @@ impl Strategy for TimeDecayStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
-        // TimeDecay is Hourly — always use the primary market/snapshot.
-        // No maker_market fallback: this strategy is intentionally scoped to
-        // the hourly market's final 30-minute theta window.
         let (market, snap) = (&ctx.market, &ctx.snapshot);
 
         let seconds_to_expiry = match market.market_close_time {
@@ -74,7 +73,10 @@ impl Strategy for TimeDecayStrategyImpl {
             None => return Ok(StrategySignal::NoSignal),
         };
 
-        if !TimeDecayStrategy::is_in_theta_window(seconds_to_expiry) {
+        // ── Theta window gate (uses dynamic min/max secs) ────────────────────
+        if seconds_to_expiry < dc.time_decay_min_secs_to_expiry
+            || seconds_to_expiry > dc.time_decay_max_secs_to_expiry
+        {
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -87,9 +89,7 @@ impl Strategy for TimeDecayStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
-        // ── OBI gate: don't enter when the book has already decided a winner ──
-        // An OBI of -0.89 on YES means almost no YES liquidity — the crowd has
-        // moved to one side. Both legs must pass; we hold both at settlement.
+        // ── OBI gate ─────────────────────────────────────────────────────────
         let yes_bid = snap.yes_bid;
         let no_bid  = snap.no_bid;
         let yes_total_depth = snap.yes_bid_depth + snap.yes_ask_depth;
@@ -104,31 +104,28 @@ impl Strategy for TimeDecayStrategyImpl {
         } else {
             dec!(0)
         };
-        if yes_obi < config::TIME_DECAY_OBI_ADVERSE_BLOCK || no_obi < config::TIME_DECAY_OBI_ADVERSE_BLOCK {
+        if yes_obi < dc.time_decay_obi_adverse_block || no_obi < dc.time_decay_obi_adverse_block {
             return Ok(StrategySignal::NoSignal);
         }
 
-        // ── Price bounds gate: only enter genuine uncertainty zone ──────────
-        // Extreme YES prices (e.g. 0.15, 0.92) mean the market has decided.
-        // Share counts balloon at extreme prices — a 1¢ move = $1 P&L swing.
-        if yes_bid > config::TIME_DECAY_MAX_ENTRY_PRICE || yes_bid < config::TIME_DECAY_MIN_ENTRY_PRICE {
+        // ── Price bounds gate ─────────────────────────────────────────────────
+        if yes_bid > dc.time_decay_max_entry_price || yes_bid < dc.time_decay_min_entry_price {
             return Ok(StrategySignal::NoSignal);
         }
-        if no_bid > config::TIME_DECAY_MAX_ENTRY_PRICE || no_bid < config::TIME_DECAY_MIN_ENTRY_PRICE {
-            return Ok(StrategySignal::NoSignal);
-        }
-
-        // ── Pre-entry convergence check: don't enter at the exit threshold ────
-        // If bid_sum is already ≥ convergence exit level the exit fires instantly.
-        if yes_bid + no_bid >= config::TIME_DECAY_CONVERGENCE_EXIT_BID {
+        if no_bid > dc.time_decay_max_entry_price || no_bid < dc.time_decay_min_entry_price {
             return Ok(StrategySignal::NoSignal);
         }
 
-        // ── Theta opportunity check (maker: uses bid prices, 0% fee) ─────────
-        if TimeDecayStrategy::calculate_theta_opportunity(
-            yes_bid, no_bid, seconds_to_expiry,
-        ).is_some() {
-            let trade_size = config::TIME_DECAY_POSITION_SIZE_USDC;
+        // ── Pre-entry convergence check ───────────────────────────────────────
+        if yes_bid + no_bid >= dc.time_decay_convergence_exit_bid {
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Theta opportunity check (inline with dynamic thresholds) ──────────
+        let combined_bid = yes_bid + no_bid;
+        let net = dec!(1.0) - combined_bid;
+        if net >= dc.min_time_decay_net_profit {
+            let trade_size = dc.time_decay_position_size_usdc;
 
             // ── Strategy Exposure Check ──────────────────────────────────────
             let current_exposure = {
@@ -138,57 +135,36 @@ impl Strategy for TimeDecayStrategyImpl {
                     .map(|(_, p)| p.shares * p.avg_entry)
                     .sum::<Decimal>()
             };
-            if current_exposure + trade_size > config::TIME_DECAY_MAX_EXPOSURE_USDC {
+            if current_exposure + trade_size > dc.time_decay_max_exposure_usdc {
                 return Ok(StrategySignal::NoSignal);
             }
 
-            // ── Equal-shares sizing (true hedge) ─────────────────────────────
-            // Buying equal DOLLAR amounts gives unequal shares (e.g. 41.7 YES vs
-            // 23.8 NO at 0.36/0.63), which is NOT a true hedge: if YES settles you
-            // receive 41.7×$1.00 = $41.7 but paid $30 total, while if NO settles
-            // you receive only 23.8×$1.00 = $23.8 — a -$6.2 loss on a $30 investment.
-            //
-            // Equal SHARES ensure settlement payout = pair_shares×$1.00 regardless
-            // of which side wins:
-            //   pair_shares = trade_size / (yes_bid + no_bid)
-            //   total_cost  = pair_shares × (yes_bid + no_bid) = trade_size
-            //   profit      = trade_size × (1.00 / (yes_bid + no_bid) − 1)
-            //               = trade_size × net_per_dollar
-            //
-            // Example: yes_bid=0.36, no_bid=0.63, trade_size=$15
-            //   pair_shares = 15 / 0.99 = 15.15   (same count for both legs)
-            //   total_cost  = 15.15 × 0.99 = $15
-            //   payout      = 15.15 × $1.00 = $15.15  (guaranteed either side)
-            //   profit      = $0.15 (1% on $15)
-            let pair_shares = trade_size / (yes_bid + no_bid);
+            let pair_shares = trade_size / combined_bid;
 
-            // Post GTC maker bids at current best bid — 0% fill fee.
-            // Both legs must fill for the arb to be complete; the flash-exit
-            // mechanism handles the one-leg-fills scenario if Leg B is rejected.
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
                     token_id:    market.yes_token,
-                    price:       yes_bid,               // bid price → rests on book as maker
-                    shares:      pair_shares,           // equal shares on both legs — true hedge
-                    fee_bps:     0,                     // GTC maker fill = 0% fee
-                    is_neg_risk: market.is_neg_risk,
-                    market_name: market.market_name.clone(),
-                    condition_id: market.condition_id.clone(),
-                    order_type: OrderType::GTC,         // rest on book until filled or cancelled
-                    post_only:  true,                   // reject if would cross (no accidental taker)
-                    ghost_mode: config::GHOST_MODE,
-                },
-                pair_params: Some(OrderParams {
-                    token_id:    market.no_token,
-                    price:       no_bid,
-                    shares:      pair_shares,           // same count as YES leg
+                    price:       yes_bid,
+                    shares:      pair_shares,
                     fee_bps:     0,
                     is_neg_risk: market.is_neg_risk,
                     market_name: market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
                     order_type: OrderType::GTC,
                     post_only:  true,
-                    ghost_mode: config::GHOST_MODE,
+                    ghost_mode: dc.ghost_mode,
+                },
+                pair_params: Some(OrderParams {
+                    token_id:    market.no_token,
+                    price:       no_bid,
+                    shares:      pair_shares,
+                    fee_bps:     0,
+                    is_neg_risk: market.is_neg_risk,
+                    market_name: market.market_name.clone(),
+                    condition_id: market.condition_id.clone(),
+                    order_type: OrderType::GTC,
+                    post_only:  true,
+                    ghost_mode: dc.ghost_mode,
                 }),
             });
         }
@@ -196,9 +172,9 @@ impl Strategy for TimeDecayStrategyImpl {
     }
 
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
+        let dc = &ctx.dynamic_config;
         let pos_map = ctx.positions.lock().await;
 
-        // TimeDecay is Hourly — always use the primary market/snapshot.
         let (market, snap) = (&ctx.market, &ctx.snapshot);
 
         let yes_key = ("TimeDecayStrategy".to_string(), market.yes_token);
@@ -208,13 +184,10 @@ impl Strategy for TimeDecayStrategyImpl {
             let yes_bid = snap.yes_bid;
             let no_bid  = snap.no_bid;
 
-            // ── Convergence exit: combined bid approached $1.00 early ─────────
-            // Take profit via FAK taker before settlement — fee applies here,
-            // but the combined_bid already exceeds our maker entry cost by enough
-            // to absorb it (entry ≈ $0.97, exit triggered at $0.998).
-            if TimeDecayStrategy::should_convergence_exit(yes_bid, no_bid) {
+            // ── Convergence exit ──────────────────────────────────────────────
+            if yes_bid + no_bid >= dc.time_decay_convergence_exit_bid {
                 return Ok(StrategySignal::Exit {
-                    params: OrderParams { token_id: market.yes_token, price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: config::GHOST_MODE },
+                    params: OrderParams { token_id: market.yes_token, price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: dc.ghost_mode },
                     reason: "Time Decay convergence".to_string(),
                     exit_pair: true,
                 });
@@ -224,35 +197,33 @@ impl Strategy for TimeDecayStrategyImpl {
             let (max_fast_vel, _) = TimeDecayStrategy::iv_thresholds(&ctx.crypto_filter);
             let iv_elevated = snap.velocity.abs() > max_fast_vel;
             let effective_stop_pct = if iv_elevated {
-                let tight = config::TIME_DECAY_STOP_LOSS_PERCENT * config::TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER;
+                let tight = dc.time_decay_stop_loss_pct * config::TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER;
                 tracing::debug!("⚡ TimeDecay IV elevated (|vel|={:.2}): stop tightened to {:.1}%", snap.velocity, tight * dec!(100));
                 tight
             } else {
-                config::TIME_DECAY_STOP_LOSS_PERCENT
+                dc.time_decay_stop_loss_pct
             };
 
-            // ── Min-hold guard: don't allow SL on noise immediately after entry ─
+            // ── Min-hold guard ────────────────────────────────────────────────
             let hold_secs = (Utc::now() - yp.opened_at).num_seconds();
             if hold_secs < config::TIME_DECAY_MIN_HOLD_SECS {
                 tracing::debug!("⏳ TimeDecay SL suppressed: hold={}s < min={}s", hold_secs, config::TIME_DECAY_MIN_HOLD_SECS);
             } else {
                 let combined_bid = yes_bid + no_bid;
-                if combined_bid < config::TIME_DECAY_CONVERGENCE_EXIT_BID * (dec!(1) - effective_stop_pct) {
+                if combined_bid < dc.time_decay_convergence_exit_bid * (dec!(1) - effective_stop_pct) {
                     return Ok(StrategySignal::Exit {
-                        params: OrderParams { token_id: market.yes_token, price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: config::GHOST_MODE },
+                        params: OrderParams { token_id: market.yes_token, price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: dc.ghost_mode },
                         reason: format!("Time Decay SL{}", if iv_elevated { " (IV-tightened)" } else { "" }),
                         exit_pair: true,
                     });
                 }
             }
 
-            // ── Forced expiry exit: sell before market closes ─────────────────
-            // Preferred path is settlement ($0 fee), but if still holding at
-            // MARKET_EXPIRY_SAFETY_BUFFER_SECS we exit via FAK as a safety net.
+            // ── Forced expiry exit ────────────────────────────────────────────
             if let Some(close_time) = market.market_close_time {
                 if (close_time - Utc::now()).num_seconds() < config::MARKET_EXPIRY_SAFETY_BUFFER_SECS as i64 {
                     return Ok(StrategySignal::Exit {
-                        params: OrderParams { token_id: market.yes_token, price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: config::GHOST_MODE },
+                        params: OrderParams { token_id: market.yes_token, price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: dc.ghost_mode },
                         reason: "Time Decay Expiry".to_string(),
                         exit_pair: true,
                     });

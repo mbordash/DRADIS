@@ -1,4 +1,5 @@
-/// Metrics utility for tracking bot performance and trade stats in CSV format.
+/// Metrics utility for tracking bot performance and trade stats.
+/// Dual-writes to both the legacy CSV files and the SQLite database.
 /// Fully asynchronous and non-blocking for high-frequency trading.
 
 use tokio::fs::{OpenOptions, create_dir_all};
@@ -11,6 +12,7 @@ use chrono_tz::US::Eastern;
 use tracing::{error, info, warn};
 use serde::Serialize;
 use std::env;
+use crate::helpers::db;
 
 #[derive(Serialize)]
 pub struct TradeRecord {
@@ -37,6 +39,12 @@ pub async fn record_trade(
     profit_usdc: Decimal,
     reason: String,
 ) {
+    // Pre-clone for SQLite dual-write — the CSV path moves these into TradeRecord
+    // inside the match arm so they are no longer accessible after the match.
+    let db_strategy = strategy.clone();
+    let db_market   = market.clone();
+    let db_side     = side.clone();
+    let db_reason   = reason.clone();
     let now = Utc::now();
     // Use Eastern date for the filename so the daily log file matches
     // Polymarket's ET-based trading day (avoids the file rolling at 8PM ET / midnight UTC).
@@ -106,6 +114,11 @@ pub async fn record_trade(
         }
         Err(e) => error!("❌ Failed to open/create CSV file {}: {}", filename, e),
     }
+
+    // ── SQLite dual-write ────────────────────────────────────────────────────
+    if let Some(pool) = db::pool() {
+        db::record_trade_db(pool, &db_strategy, &db_market, &db_side, entry_price, exit_price, shares, profit_usdc, &db_reason).await;
+    }
 }
 
 /// Records a position entry event to a daily entry-log CSV so that `reconcile_orphaned_positions`
@@ -159,13 +172,28 @@ pub async fn record_entry(
         }
         Err(e) => error!("❌ Failed to open/create entry CSV {}: {}", filename, e),
     }
+
+    // ── SQLite dual-write ────────────────────────────────────────────────────
+    if let Some(pool) = db::pool() {
+        db::record_entry_db(pool, &strategy, &token_id, &market, &side, entry_price, shares).await;
+    }
 }
 
 /// Scans the last two ET-days of entry logs for the given token_id (decimal string).
 /// Returns the most recent recorded entry_price, or None if no log entry exists.
 ///
-/// Called by `reconcile_orphaned_positions` to recover real entry prices after a restart.
+/// SQLite is checked first (O(log n) index lookup); falls back to CSV scan
+/// for entries made before the DB was introduced.
 pub async fn lookup_entry_price_from_csv(token_id_str: &str) -> Option<Decimal> {
+    // ── SQLite fast path ─────────────────────────────────────────────────────
+    if let Some(pool) = db::pool() {
+        if let Some(price) = db::lookup_entry_price_db(pool, token_id_str).await {
+            info!("📦 DB: found entry_price={} for token {}", price, token_id_str);
+            return Some(price);
+        }
+    }
+
+    // ── CSV fallback (legacy entries pre-SQLite) ──────────────────────────────
     let crypto = env::var("CRYPTO_FILTER").unwrap_or_else(|_| "unknown".to_string()).to_lowercase();
     let now_et = Utc::now().with_timezone(&Eastern);
 

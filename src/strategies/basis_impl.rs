@@ -33,7 +33,8 @@ pub struct BasisStrategyImpl;
 #[async_trait]
 impl Strategy for BasisStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
-        if !config::ENABLE_BASIS_TRADING {
+        let dc = &ctx.dynamic_config;
+        if !dc.enable_basis {
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -130,7 +131,7 @@ impl Strategy for BasisStrategyImpl {
                 .sum::<Decimal>()
         };
 
-        if current_exposure + trade_size > config::BASIS_MAX_EXPOSURE_USDC {
+        if current_exposure + trade_size > dc.basis_max_exposure_usdc {
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -187,7 +188,7 @@ impl Strategy for BasisStrategyImpl {
                     condition_id: market.condition_id.clone(),
                     order_type,
                     post_only,
-                    ghost_mode: config::GHOST_MODE, // Set ghost_mode
+                    ghost_mode: dc.ghost_mode,
                 },
                 pair_params: None,
             });
@@ -242,7 +243,7 @@ impl Strategy for BasisStrategyImpl {
                     condition_id: market.condition_id.clone(),
                     order_type,
                     post_only,
-                    ghost_mode: config::GHOST_MODE, // Set ghost_mode
+                    ghost_mode: dc.ghost_mode,
                 },
                 pair_params: None,
             });
@@ -250,6 +251,7 @@ impl Strategy for BasisStrategyImpl {
     }
 
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
+        let dc = &ctx.dynamic_config;
         use crate::state::PositionMap;
         use tokio::sync::MutexGuard;
 
@@ -292,7 +294,7 @@ impl Strategy for BasisStrategyImpl {
             };
             let current_skew = (yes_mid - dec!(0.50)).abs();
 
-            if profit_margin >= config::BASIS_TARGET_PROFIT_PERCENT {
+            if profit_margin >= dc.basis_target_profit_pct {
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
                         token_id: *token_id,
@@ -302,16 +304,16 @@ impl Strategy for BasisStrategyImpl {
                         is_neg_risk: target_market.is_neg_risk,
                         market_name: target_market.market_name.clone(),
                         condition_id: target_market.condition_id.clone(),
-                        order_type: OrderType::FAK, // Exit orders are always FAK
-                        post_only: false, // Exit orders are never post-only
-                        ghost_mode: config::GHOST_MODE, // Set ghost_mode
+                        order_type: OrderType::FAK,
+                        post_only: false,
+                        ghost_mode: dc.ghost_mode,
                     },
                     reason: format!("BasisTP: bid=${:.4}, profit={:.2}%", position_bid, profit_margin * dec!(100)),
                     exit_pair: false,
                 });
             }
 
-            if profit_margin <= -config::BASIS_STOP_LOSS_PERCENT
+            if profit_margin <= -dc.basis_stop_loss_pct
                 && secs_held >= config::BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS
             {
                 // EMERGENCY FIX: If the bid is too low, assume FAK will miss and defer exit.
@@ -333,9 +335,9 @@ impl Strategy for BasisStrategyImpl {
                         is_neg_risk: target_market.is_neg_risk,
                         market_name: target_market.market_name.clone(),
                         condition_id: target_market.condition_id.clone(),
-                        order_type: OrderType::FAK, // Exit orders are always FAK
-                        post_only: false, // Exit orders are never post-only
-                        ghost_mode: config::GHOST_MODE, // Set ghost_mode
+                        order_type: OrderType::FAK,
+                        post_only: false,
+                        ghost_mode: dc.ghost_mode,
                     },
                     reason: format!("BasisSL: bid=${:.4}, loss={:.2}%", position_bid, profit_margin * dec!(100)),
                     exit_pair: false,
@@ -352,9 +354,9 @@ impl Strategy for BasisStrategyImpl {
                         is_neg_risk: target_market.is_neg_risk,
                         market_name: target_market.market_name.clone(),
                         condition_id: target_market.condition_id.clone(),
-                        order_type: OrderType::FAK, // Exit orders are always FAK
-                        post_only: false, // Exit orders are never post-only
-                        ghost_mode: config::GHOST_MODE, // Set ghost_mode
+                        order_type: OrderType::FAK,
+                        post_only: false,
+                        ghost_mode: dc.ghost_mode,
                     },
                     reason: format!("BasisSkewCollapse: yes_mid={:.4}, profit={:.2}%", yes_mid, profit_margin * dec!(100)),
                     exit_pair: false,
@@ -383,9 +385,9 @@ impl Strategy for BasisStrategyImpl {
                                 is_neg_risk: target_market.is_neg_risk,
                                 market_name: target_market.market_name.clone(),
                                 condition_id: target_market.condition_id.clone(),
-                                order_type: OrderType::FAK, // Exit orders are always FAK
-                                post_only: false, // Exit orders are never post-only
-                                ghost_mode: config::GHOST_MODE, // Set ghost_mode
+                                order_type: OrderType::FAK,
+                                post_only: false,
+                                ghost_mode: dc.ghost_mode,
                             },
                             reason: format!("BasisExpiry: {}s left", secs_left),
                             exit_pair: false,

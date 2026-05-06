@@ -27,12 +27,21 @@ stop-all.sh
 
 # Docker
 Dockerfile.*
+control-tower/Dockerfile
 .dockerignore
 **/.docker
 
 # Logs & temp
 logs/
 *.tmp
+session.file
+
+# Control Tower (Next.js)
+control-tower/.next/
+control-tower/node_modules/
+control-tower/package-lock.json
+control-tower/.env.local
+control-tower/.env*.local
 
 # Agent-generated files (see AGENTS.md for guidelines)
 # Do not commit: analysis, summary, or debug documentation
@@ -54,3 +63,5 @@ CONFIG_CHANGES_APPLIED.md
 .idea
 *.swp
 *.swo
+start-local.sh
+stop-local.sh
