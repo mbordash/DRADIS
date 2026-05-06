@@ -8,25 +8,13 @@ const nextConfig: NextConfig = {
   // .next/standalone/ directly, breaking the CMD path.
   output: 'standalone',
 
-
-  // Proxy /api/* to the DRADIS Rust binary.
-  //   Dev:    uses NEXT_PUBLIC_API_URL from .env.local  (e.g. http://localhost:9000)
-  //   Docker: uses DRADIS_API_URL injected at runtime   (e.g. http://dradis-btc:9000)
+  // API proxying is handled by the catch-all route handler at
+  // src/app/api/[...path]/route.ts — which runs at REQUEST time and can
+  // read DRADIS_API_URL as a true runtime env var.
   //
-  // The browser always calls same-origin /api/* so no CORS issues and no URL
-  // baked into the client bundle — DRADIS_API_URL is a server-only variable.
-  async rewrites() {
-    const apiBase =
-      process.env.DRADIS_API_URL ??
-      process.env.NEXT_PUBLIC_API_URL ??
-      'http://localhost:9000';
-    return [
-      {
-        source:      '/api/:path*',
-        destination: `${apiBase}/api/:path*`,
-      },
-    ];
-  },
+  // We do NOT use next.config.ts rewrites() here because rewrites() is
+  // evaluated at BUILD time: DRADIS_API_URL is unset during `npm run build`,
+  // so the destination bakes in as localhost:9000 and fails in Docker.
 };
 
 export default nextConfig;

@@ -87,8 +87,6 @@ DRADIS currently deploys six specialized strategy classes:
 
 DRADIS ships with a real-time web dashboard called **Control Tower** built on Next.js 15 + Tailwind CSS.
 
-![Control Tower](https://img.shields.io/badge/Control%20Tower-Next.js%2015-black?logo=next.js)
-
 ### Features
 
 | Panel | What it shows |

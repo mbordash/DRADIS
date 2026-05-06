@@ -19,6 +19,14 @@
 
 set -euo pipefail
 
+# Load .env so CT_USERNAME / CT_PASSWORD are available for the control-tower container
+if [ -f ".env" ]; then
+  set -o allexport
+  # shellcheck disable=SC1091
+  source .env
+  set +o allexport
+fi
+
 # ⚙️  CUSTOMIZE THESE VALUES FOR YOUR SERVER
 HOST="<YOUR_SERVER_IP>"       # e.g. "54.12.34.56" or "myserver.example.com"
 USER="<YOUR_USERNAME>"        # e.g. "ubuntu", "ec2-user", "root"
@@ -110,8 +118,10 @@ scp -P "$SSH_PORT" -i "$KEY" control-tower/next.config.ts      "$USER@$HOST:$REM
 scp -P "$SSH_PORT" -i "$KEY" control-tower/tailwind.config.ts  "$USER@$HOST:$REMOTE_DIR/control-tower/tailwind.config.ts"
 scp -P "$SSH_PORT" -i "$KEY" control-tower/postcss.config.mjs  "$USER@$HOST:$REMOTE_DIR/control-tower/postcss.config.mjs"
 scp -P "$SSH_PORT" -i "$KEY" control-tower/tsconfig.json       "$USER@$HOST:$REMOTE_DIR/control-tower/tsconfig.json"
-# Copy entire src tree (app, components, lib)
+# Copy entire src tree (app, components, lib) — includes api/[...path]/route.ts
 scp -r -P "$SSH_PORT" -i "$KEY" control-tower/src              "$USER@$HOST:$REMOTE_DIR/control-tower/"
+# public/ dir (may be empty but must exist for Next.js standalone)
+scp -r -P "$SSH_PORT" -i "$KEY" control-tower/public           "$USER@$HOST:$REMOTE_DIR/control-tower/"
 
 # ── 4. Build + deploy all containers in one SSH session ───────────────────────
 ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" << 'REMOTE'
@@ -172,8 +182,8 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" << 'REMOTE'
         --name control-tower \
         --network dradis-net \
         -e DRADIS_API_URL=http://dradis-btc:9000 \
-        -e CT_USERNAME="${CT_USERNAME:-admin}" \
-        -e CT_PASSWORD="${CT_PASSWORD:-changeme}" \
+        -e CT_USERNAME="${CT_USERNAME:-}" \
+        -e CT_PASSWORD="${CT_PASSWORD:-}" \
         -p 3002:3002 \
         dradis-ui
 
