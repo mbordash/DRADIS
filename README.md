@@ -19,6 +19,8 @@ The core of DRADIS is the Orchestrator. It acts as the ship's brain, maintaining
 - **Parallel Dispatch**: Every heartbeat (50ms), the CIC polls all registered strategies in parallel.
 - **Isolated Pits**: Each strategy operates with its own independent capital budget and position book. A "whiplash" in one sector won't compromise the fuel (USDC) of another.
 - **Signal Filtering**: Includes a built-in OBI (Order Book Imbalance) Veto at -0.60 to prevent launching into "toxic flow" or distribution walls.
+- **Strategy Timeout**: Each strategy evaluation is wrapped in a hard 500ms timeout. A hung strategy (e.g. GBoost mutex contention during retrain) is skipped for that tick — the engine never freezes.
+- **REST API**: An axum server on `:9000` exposes live config, P&L history, and trade data to the Control Tower UI.
 
 ```
 ┌─────────────────────┐   ┌─────────────────────┐
@@ -29,23 +31,30 @@ The core of DRADIS is the Orchestrator. It acts as the ship's brain, maintaining
            └────────────┬────────────┘
                         ▼
            ┌────────────────────────┐
-           │   Orchestrator (CIC)   │
-           │     50ms Heartbeat     │
-           └────────────┬───────────┘
-                        │  parallel dispatch
-          ┌─────────────┼──────────────┬─────────────┐
-          ▼             ▼              ▼             ▼
-   ┌────────────┐ ┌──────────┐ ┌──────────────┐ ┌──────────┐
-   │ Momentum   │ │  Maker   │ │  Arbitrage / │ │  GBoost  │
-   │(Interceptor│ │ (Sentry) │ │  TimeDecay / │ │ (Cylon)  │
-   │            │ │          │ │   Basis      │ │          │
-   └─────┬──────┘ └────┬─────┘ └──────┬───────┘ └────┬─────┘
-         └─────────────┼──────────────┴──────────────┘
+           │   Orchestrator (CIC)   │◄──── axum REST API (:9000)
+           │     50ms Heartbeat     │           │
+           └────────────┬───────────┘           │
+                        │  parallel dispatch     ▼
+          ┌─────────────┼──────────────┬─────────────────────┐
+          ▼             ▼              ▼                      ▼
+   ┌────────────┐ ┌──────────┐ ┌──────────────┐ ┌──────────────────┐
+   │ Momentum   │ │  Maker   │ │  Arbitrage / │ │     GBoost       │
+   │(Interceptor│ │ (Sentry) │ │  TimeDecay / │ │     (Cylon)      │
+   │            │ │          │ │   Basis      │ │                  │
+   └─────┬──────┘ └────┬─────┘ └──────┬───────┘ └──────┬───────────┘
+         └─────────────┼──────────────┴─────────────────┘
                        ▼
            ┌───────────────────────┐
            │    Execution Layer    │
            │  OBI Gate · Fee Gate  │
            │  Circuit Breaker      │
+           └───────────────────────┘
+
+           ┌───────────────────────┐
+           │   Control Tower UI    │  Next.js dashboard (:3002)
+           │  Strategy toggles     │  ◄── PATCH /api/config
+           │  P&L chart            │  ◄── GET  /api/pnl/history
+           │  Trade log            │  ◄── GET  /api/trades
            └───────────────────────┘
 ```
 
@@ -62,6 +71,37 @@ DRADIS currently deploys six specialized strategy classes:
 - **Basis/Funding (The Analyst)**: Fades retail skew by comparing Polymarket sentiment against Binance perpetual funding rates.
 - **GBoost (The Cylon)**: Online gradient-boosted ML model (LogLoss) that learns from live orderbook + oracle features to predict near-term YES price direction, retraining continuously in the background.
 
+---
+
+
+## 🖥️ Control Tower — The Dashboard
+
+DRADIS ships with a real-time web dashboard called **Control Tower** built on Next.js 15 + Tailwind CSS.
+
+![Control Tower](https://img.shields.io/badge/Control%20Tower-Next.js%2015-black?logo=next.js)
+
+### Features
+
+| Panel | What it shows |
+|---|---|
+| **Status Bar** | Engine online/offline indicator, GHOST mode badge, active market, current BTC oracle price, session P&L |
+| **P&L Chart** | Rolling equity curve across recent snapshots (Recharts area chart) |
+| **Viper Squadron Cards** | One card per strategy — live enabled/disabled toggle, all tunable parameters editable inline without a restart |
+| **Trade Log** | Last N completed trades with strategy, side, entry/exit prices, shares, P&L, and exit reason |
+
+### Live Config Editing
+
+Every parameter shown in the Viper cards maps directly to the runtime `DynamicConfig`. Editing a value and pressing Enter (or toggling the switch) sends a `PATCH /api/config` request to the DRADIS engine — **no restart required**. Changes take effect on the next 50ms tick.
+
+### Authentication
+
+Control Tower is protected by HTTP Basic Auth in production. Set `CT_USERNAME` and `CT_PASSWORD` in your `.env` file. The middleware is skipped automatically in local dev when these vars are absent.
+
+```bash
+# .env (production)
+CT_USERNAME=starbuck
+CT_PASSWORD=your-strong-password
+```
 ---
 
 ## 🛡️ Safety Systems
@@ -250,14 +290,70 @@ cargo build --release
 
 ## Running
 
-**Test first** — set `GHOST_MODE = true` in `config.rs`, then:
+### Local Development (One Command)
 
 ```bash
-cargo build --release
-./target/release/dradis
+# Copy and fill in your credentials
+cp .env.example .env
+cp src/config.balanced.rs.example src/config.rs
+
+# Start DRADIS engine + Control Tower UI
+./start-local.sh
+
+# In a second terminal — watch the engine logs live
+tail -f logs/dradis-local.log
+
+# Stop everything
+./stop-local.sh        # kills DRADIS (frees :9000)
+# Ctrl+C in the start-local terminal kills the UI (:3002)
 ```
 
-**Docker Deployment:** `./deploy-multi.sh`
+`start-local.sh` will:
+1. Build the release binary (`cargo build --release`)
+2. Start the DRADIS engine in the background → `logs/dradis-local.log`
+3. Wait for the API health check at `http://localhost:9000/api/health`
+4. Start the Control Tower UI with hot-reload at `http://localhost:3002`
+
+> **Note**: `CT_USERNAME` / `CT_PASSWORD` are **not** required locally. The auth middleware is skipped when they are absent.
+
+Log filtering tips:
+```bash
+tail -f logs/dradis-local.log | grep -i "trade\|pnl\|entry\|exit"   # trades only
+tail -f logs/dradis-local.log | grep -E "WARN|ERROR"                  # problems only
+RUST_LOG=debug ./start-local.sh                                        # verbose mode
+```
+
+### Production Deployment (Docker)
+
+**Open these ports in your AWS Security Group first:**
+
+| Port | Service | Visibility |
+|---|---|---|
+| `9000` | DRADIS axum API | Internal only (optional to expose) |
+| `3002` | Control Tower UI | Public (browser access) |
+
+Both containers share a private Docker network (`dradis-net`) — the UI calls the API via internal DNS (`http://dradis-btc:9000`) so port 9000 never needs to be public-facing.
+
+```bash
+./deploy-multi.sh
+```
+
+This will:
+1. SCP all source files to your server
+2. Build the DRADIS Rust image on the server (cross-compiles natively)
+3. Build the Control Tower Next.js image (3-stage: deps → build → minimal runner)
+4. Start both containers with `--restart unless-stopped`
+5. Tail the BTC engine logs
+
+After deploy:
+- **Dashboard**: `http://YOUR_SERVER_IP:3002` (login with `CT_USERNAME` / `CT_PASSWORD` from `.env`)
+- **API Health**: `http://YOUR_SERVER_IP:9000/api/health`
+
+**Check container logs remotely:**
+```bash
+ssh -i ~/.ssh/your-key.pem ubuntu@YOUR_SERVER_IP "docker logs -f dradis-btc --tail 50"
+ssh -i ~/.ssh/your-key.pem ubuntu@YOUR_SERVER_IP "docker logs control-tower --tail 50"
+```
 
 ---
 
@@ -334,12 +430,13 @@ If you pull an update and `NUM_FEATURES` in `src/strategies/gboost_impl.rs` has 
 
 The safe pattern when adding a new feature: bump the suffix in `GBOOST_MODEL_PATH` (e.g. `v13f` → `v14f`).  The old file is ignored, no manual cleanup needed.
 
----
+**How do I tune strategy parameters without restarting?**
 
-## 📜 Credits & Acknowledgments
+Use the Control Tower dashboard (`http://localhost:3002` locally, or your server IP in production). Click any parameter value in a Viper card to edit it inline — changes are applied live via `PATCH /api/config` on the next engine tick. Toggle switches enable/disable strategies instantly. No rebuild or restart needed.
 
-- **[Perpetual](https://github.com/perpetual-ml/perpetual)** — Provided the core Gradient Boosting implementation for our ML strategy.
-- **[Tokio](https://github.com/tokio-rs/tokio)** — Powers our high-concurrency orchestrator.
+**The Control Tower shows "Offline".**
 
-## License
-See [LICENSE](LICENSE).
+The UI polls `GET /api/health` every 5 seconds. "Offline" means the DRADIS engine isn't reachable. Check:
+1. Is DRADIS running? (`ps aux | grep dradis` or `docker ps`)
+2. Is the API port open? (`curl http://localhost:9000/api/health`)
+3. In Docker — is the Control Tower container on the same `dradis-net` network as `dradis-btc`?
