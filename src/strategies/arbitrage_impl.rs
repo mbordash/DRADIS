@@ -117,8 +117,24 @@ impl Strategy for ArbitrageStrategyImpl {
             let yes_bid = snapshot.yes_bid;
             let no_bid  = snapshot.no_bid;
 
-            // Exit early when combined bid has converged close to $1.00
-            if yes_bid + no_bid >= config::EARLY_EXIT_COMBINED_BID_THRESHOLD {
+            // ── Fee-adjusted early-exit gate ──────────────────────────────────
+            // Exiting via FAK (taker) incurs a fee on each leg.  The combined bid
+            // must exceed $1.00 PLUS the total taker-fee cost for the FAK exit to
+            // actually improve on holding to settlement ($1.00, 0% fee).
+            //
+            //   fee_yes = yes_fee_bps / 10_000 (e.g. 1000 bps → 0.10 / share)
+            //   fee_no  = no_fee_bps  / 10_000
+            //   threshold = 1.00 + fee_yes + fee_no
+            //
+            // At 1000 bps per side the threshold is 1.20 — structurally unreachable
+            // on a binary market — so positions correctly settle at $1.00 (0% fee).
+            // If Polymarket ever lowers taker fees, this will start firing again.
+            let yes_fee_rate = Decimal::from(market.yes_fee_bps) / dec!(10000);
+            let no_fee_rate  = Decimal::from(market.no_fee_bps)  / dec!(10000);
+            let early_exit_threshold = dec!(1.0) + yes_fee_rate + no_fee_rate;
+
+            // Exit early when combined bid has converged enough to cover fees
+            if yes_bid + no_bid >= early_exit_threshold {
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
                         token_id: market.yes_token,

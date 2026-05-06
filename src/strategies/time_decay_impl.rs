@@ -142,6 +142,26 @@ impl Strategy for TimeDecayStrategyImpl {
                 return Ok(StrategySignal::NoSignal);
             }
 
+            // ── Equal-shares sizing (true hedge) ─────────────────────────────
+            // Buying equal DOLLAR amounts gives unequal shares (e.g. 41.7 YES vs
+            // 23.8 NO at 0.36/0.63), which is NOT a true hedge: if YES settles you
+            // receive 41.7×$1.00 = $41.7 but paid $30 total, while if NO settles
+            // you receive only 23.8×$1.00 = $23.8 — a -$6.2 loss on a $30 investment.
+            //
+            // Equal SHARES ensure settlement payout = pair_shares×$1.00 regardless
+            // of which side wins:
+            //   pair_shares = trade_size / (yes_bid + no_bid)
+            //   total_cost  = pair_shares × (yes_bid + no_bid) = trade_size
+            //   profit      = trade_size × (1.00 / (yes_bid + no_bid) − 1)
+            //               = trade_size × net_per_dollar
+            //
+            // Example: yes_bid=0.36, no_bid=0.63, trade_size=$15
+            //   pair_shares = 15 / 0.99 = 15.15   (same count for both legs)
+            //   total_cost  = 15.15 × 0.99 = $15
+            //   payout      = 15.15 × $1.00 = $15.15  (guaranteed either side)
+            //   profit      = $0.15 (1% on $15)
+            let pair_shares = trade_size / (yes_bid + no_bid);
+
             // Post GTC maker bids at current best bid — 0% fill fee.
             // Both legs must fill for the arb to be complete; the flash-exit
             // mechanism handles the one-leg-fills scenario if Leg B is rejected.
@@ -149,7 +169,7 @@ impl Strategy for TimeDecayStrategyImpl {
                 params: OrderParams {
                     token_id:    market.yes_token,
                     price:       yes_bid,               // bid price → rests on book as maker
-                    shares:      trade_size / yes_bid,
+                    shares:      pair_shares,           // equal shares on both legs — true hedge
                     fee_bps:     0,                     // GTC maker fill = 0% fee
                     is_neg_risk: market.is_neg_risk,
                     market_name: market.market_name.clone(),
@@ -161,7 +181,7 @@ impl Strategy for TimeDecayStrategyImpl {
                 pair_params: Some(OrderParams {
                     token_id:    market.no_token,
                     price:       no_bid,
-                    shares:      trade_size / no_bid,
+                    shares:      pair_shares,           // same count as YES leg
                     fee_bps:     0,
                     is_neg_risk: market.is_neg_risk,
                     market_name: market.market_name.clone(),

@@ -497,6 +497,14 @@ impl Strategy for GboostStrategyImpl {
 
         // ── YES entry: model predicts UP ──────────────────────────────────────
         if p_yes_up >= entry_thresh && !has_yes {
+            // ── Entry latch: skip if an entry for this token is already in-flight ──
+            // Between emitting an Entry signal and the position being confirmed in
+            // pos_map (can be several seconds), evaluate_entry fires every tick.
+            // Without this guard those ticks all re-emit Entry signals, flooding
+            // the executor and potentially placing duplicate orders.
+            if self.pending_entries.lock().unwrap().contains_key(&target_market.yes_token) {
+                return Ok(StrategySignal::NoSignal);
+            }
             if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(target_market.yes_token) {
                 tracing::debug!(
                     "🚫 GBoost YES entry veto: cooldown active | market='{}' token={:?} remaining={}s",
@@ -552,6 +560,10 @@ impl Strategy for GboostStrategyImpl {
 
         // ── NO entry: model predicts DOWN (P(UP) is very low) ────────────────
         if p_yes_up <= (1.0 - entry_thresh) && !has_no {
+            // ── Entry latch: skip if an entry for this token is already in-flight ──
+            if self.pending_entries.lock().unwrap().contains_key(&target_market.no_token) {
+                return Ok(StrategySignal::NoSignal);
+            }
             if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(target_market.no_token) {
                 tracing::debug!(
                     "🚫 GBoost NO entry veto: cooldown active | market='{}' token={:?} remaining={}s",

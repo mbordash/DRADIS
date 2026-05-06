@@ -839,11 +839,17 @@ async fn main() -> Result<()> {
                                         let other_tid = if tid == target_yes_token { target_no_token } else { target_yes_token };
                                         let pk = (sn.clone(), other_tid); let ps = { let map = positions.lock().await; map.get(&pk).map(|p| p.shares) };
                                         if let Some(s) = ps {
-                                            // Use the same snapshot source that the strategy used for entry/exit evaluation.
-                                            // ArbitrageStrategy uses maker_snapshot (daily market); other strategies use
-                                            // the primary hourly snapshot.  Mixing them produced the wrong NO bid price
-                                            // (hourly market bid at $0.01 instead of daily market bid at $0.58).
-                                            let exit_snap = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
+                                            // Use the snapshot that matches the target market:
+                                            //   - Hourly strategies (TimeDecay) target the hourly market → use ctx.snapshot
+                                            //   - Window/Daily strategies (Arbitrage, Basis …) → use maker_snapshot
+                                            // Previously always used maker_snapshot, which caused TimeDecay's NO-leg exit
+                                            // to be priced against the daily market (~$0.16) instead of the hourly market
+                                            // (~$0.69), inflating the paired-leg loss by ~$11 and tripping the drawdown guard.
+                                            let exit_snap = if target_yes_token == ctx.market.yes_token {
+                                                &ctx.snapshot  // hourly strategy — use hourly orderbook
+                                            } else {
+                                                ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot)
+                                            };
                                             let other_bid = if other_tid == target_yes_token { exit_snap.yes_bid } else { exit_snap.no_bid };
                                             let other_fee_bps = if other_tid == target_yes_token { target_yes_fee_bps as u16 } else { target_no_fee_bps as u16 };
                                             let other_vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
