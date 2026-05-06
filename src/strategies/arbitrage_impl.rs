@@ -69,11 +69,19 @@ impl Strategy for ArbitrageStrategyImpl {
         }
 
         // ── Post GTC maker bids on both legs ─────────────────────────────────
+        // Equal shares on both legs are required for a true hedge.
+        // Buying equal dollars gives unequal shares (e.g. 24 YES vs 17 NO at 0.41/0.58),
+        // leaving the cheaper leg unhedged and creating a directional P&L on settlement.
+        // Instead: spend the full budget on N balanced pairs where
+        //   N = trade_size / (yes_bid + no_bid)
+        // so YES_cost + NO_cost = trade_size and every YES share has one NO share.
+        let pair_shares = trade_size / (yes_bid + no_bid);
+
         return Ok(StrategySignal::Entry {
             params: OrderParams {
                 token_id: market.yes_token,
                 price: yes_bid,                        // bid at current best bid
-                shares: trade_size / yes_bid,
+                shares: pair_shares,                   // balanced — same count as NO leg
                 fee_bps: 0,                            // maker = 0 fees
                 is_neg_risk: market.is_neg_risk,
                 market_name: market.market_name.clone(),
@@ -85,7 +93,7 @@ impl Strategy for ArbitrageStrategyImpl {
             pair_params: Some(OrderParams {
                 token_id: market.no_token,
                 price: no_bid,
-                shares: trade_size / no_bid,
+                shares: pair_shares,                   // same count as YES leg
                 fee_bps: 0,
                 is_neg_risk: market.is_neg_risk,
                 market_name: market.market_name.clone(),

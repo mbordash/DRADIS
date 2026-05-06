@@ -839,7 +839,12 @@ async fn main() -> Result<()> {
                                         let other_tid = if tid == target_yes_token { target_no_token } else { target_yes_token };
                                         let pk = (sn.clone(), other_tid); let ps = { let map = positions.lock().await; map.get(&pk).map(|p| p.shares) };
                                         if let Some(s) = ps {
-                                            let other_bid = if other_tid == target_yes_token { ctx.snapshot.yes_bid } else { ctx.snapshot.no_bid }; // This needs to be from the correct snapshot
+                                            // Use the same snapshot source that the strategy used for entry/exit evaluation.
+                                            // ArbitrageStrategy uses maker_snapshot (daily market); other strategies use
+                                            // the primary hourly snapshot.  Mixing them produced the wrong NO bid price
+                                            // (hourly market bid at $0.01 instead of daily market bid at $0.58).
+                                            let exit_snap = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
+                                            let other_bid = if other_tid == target_yes_token { exit_snap.yes_bid } else { exit_snap.no_bid };
                                             let other_fee_bps = if other_tid == target_yes_token { target_yes_fee_bps as u16 } else { target_no_fee_bps as u16 };
                                             let other_vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                             if !config::GHOST_MODE { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, other_tid, Side::Sell, s, (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), other_fee_bps, OrderType::FAK, false, 0, &shared_http).await; }
@@ -900,16 +905,25 @@ async fn main() -> Result<()> {
 
                                     // Use the target market's close_time
                                     let pos_close_time = target_market_close_time;
-                                    // Store the actual fill price (signal price + buy offset) as avg_entry
-                                    // so PnL calculations reflect true cost basis, not the signal price.
-                                    let actual_entry_price = (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE);
+                                    // Store the actual fill price as avg_entry so P&L reflects true cost basis.
+                                    // Maker GTC/post-only orders fill AT the posted bid price (no offset needed).
+                                    // FAK taker orders need +BUY_PRICE_OFFSET to model the aggressive fill premium.
+                                    let actual_entry_price = if params.post_only {
+                                        params.price  // maker: fills at exactly the posted bid
+                                    } else {
+                                        (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE)
+                                    };
                                     positions.lock().await.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: params.token_id, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id) });
 
                                     info!(" GHOST_MODE ENTRY [{}]: {} | ${:.4} x {:.1} (simulated)",
                                         sn, params.market_name, params.price, params.shares);
                                     if let Some(pp) = pair_params {
                                         let pp_close_time = target_market_close_time;
-                                        let actual_paired_entry_price = (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE);
+                                        let actual_paired_entry_price = if pp.post_only {
+                                            pp.price
+                                        } else {
+                                            (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE)
+                                        };
                                         positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: actual_paired_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: Some(params.token_id) });
                                         info!(" GHOST_MODE ENTRY (paired) [{}]: {} | ${:.4} x {:.1} (simulated)", sn, pp.market_name, pp.price, pp.shares);
                                     }
