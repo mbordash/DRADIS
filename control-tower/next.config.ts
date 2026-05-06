@@ -1,12 +1,13 @@
 import type { NextConfig } from 'next';
-import path from 'path';
 
 const nextConfig: NextConfig = {
-  // Standalone output: produces a self-contained server.js for Docker
+  // Standalone output: produces a self-contained server.js for Docker.
+  // Note: outputFileTracingRoot is intentionally omitted — setting it to '../'
+  // works locally but resolves to '/' inside Docker (/app/../ = /), causing
+  // Next.js to nest the output under .next/standalone/app/ instead of
+  // .next/standalone/ directly, breaking the CMD path.
   output: 'standalone',
 
-  // Silence monorepo lockfile warning — control-tower is a subdirectory of the DRADIS repo
-  outputFileTracingRoot: path.join(__dirname, '../'),
 
   // Proxy /api/* to the DRADIS Rust binary.
   //   Dev:    uses NEXT_PUBLIC_API_URL from .env.local  (e.g. http://localhost:9000)

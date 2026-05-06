@@ -10,7 +10,7 @@
 #
 # Containers started:
 #   dradis-btc       — Rust trading engine (BTC filter) + axum API on :9000
-#   control-tower    — Next.js dashboard on :3000
+#   control-tower    — Next.js dashboard on :3002
 #   dradis-eth/sol   — Uncomment blocks below to enable additional filters
 #
 # All containers share the 'dradis-net' Docker network so the UI can reach
@@ -166,7 +166,7 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" << 'REMOTE'
 #        -v $(pwd)/logs:/app/logs \
 #        dradis
 
-    echo "🌐 Starting Control Tower UI (port :3000)..."
+    echo "🌐 Starting Control Tower UI (port :3002)..."
     docker run -d \
         --restart unless-stopped \
         --name control-tower \
@@ -174,7 +174,7 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" << 'REMOTE'
         -e DRADIS_API_URL=http://dradis-btc:9000 \
         -e CT_USERNAME="${CT_USERNAME:-admin}" \
         -e CT_PASSWORD="${CT_PASSWORD:-changeme}" \
-        -p 3000:3000 \
+        -p 3002:3002 \
         dradis-ui
 
     echo ""
@@ -182,13 +182,13 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" << 'REMOTE'
     echo "📜 Running containers:"
     docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep -E "(dradis|control)"
     echo ""
-    echo "🌐 Control Tower: http://$(hostname -I | awk '{print $1}'):3000"
+    echo "🌐 Control Tower: http://$(hostname -I | awk '{print $1}'):3002"
     echo "📡 DRADIS API:    http://$(hostname -I | awk '{print $1}'):9000/api/health"
 REMOTE
 
 echo ""
 echo "✅ Deployment complete on $HOST!"
-echo "🌐 Control Tower: http://$HOST:3000"
+echo "🌐 Control Tower: http://$HOST:3002"
 echo "📡 DRADIS API:    http://$HOST:9000/api/health"
 echo ""
 echo "📜 Tailing BTC logs (Ctrl+C to stop):"
