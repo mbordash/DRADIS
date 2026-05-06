@@ -407,9 +407,18 @@ impl Strategy for GboostStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         // Maintain history and trigger background retrains.
         // This happens regardless of ENABLE_GBOOST_TRADING so the model can learn.
-        self.push_snapshot(ctx.snapshot.clone());
-        // maybe_retrain sources labels from real trade outcomes (primary) or from
-        // the history buffer via lookahead (bootstrap fallback when no trades exist yet).
+        // Push the snapshot from the market GBoost actually TRADES on (daily/maker when
+        // available, hourly otherwise).  Previously ctx.snapshot (hourly) was always pushed,
+        // meaning the model was trained on hourly OBI features but predicted from daily OBI
+        // features — a fundamental mismatch.  Near hourly expiry the hourly OBI freezes at
+        // ±0.99, flooding the history buffer with homogeneous features and causing perpetual
+        // to auto-stop at 1 tree.  Using the daily snapshot keeps features healthy.
+        let training_snapshot = if ctx.maker_snapshot.is_some() {
+            ctx.maker_snapshot.as_ref().unwrap().clone()
+        } else {
+            ctx.snapshot.clone()
+        };
+        self.push_snapshot(training_snapshot);
         self.maybe_retrain();
 
         if !config::ENABLE_GBOOST_TRADING {

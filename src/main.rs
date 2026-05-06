@@ -44,7 +44,7 @@ use dradis::orchestrator::executor::{execute_strategies_concurrent, aggregate_an
 // New paths for helpers
 use dradis::helpers::{
     time::*, balance::*, nonce::*, orders::*, market::*,
-    notifications::send_notification, notifications::tweet_entry, notifications::tweet_exit, metrics,
+    notifications::send_notification, notifications::tweet_trade, metrics,
 };
 
 use rustls::crypto::ring;
@@ -869,8 +869,8 @@ async fn main() -> Result<()> {
                                     last_trade_time.insert(sn.clone(), Instant::now());
                                     // Detached: Telegram latency must never block the trading select! loop.
                                     { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = format!(" EXIT [{}] {} | bid=${:.4} | reason: {} | Session PnL: ${:.4}", sn, params.market_name, params.price, reason, *total_pnl.lock().await); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
-                                    // Twitter/X (detached — same pattern as Telegram).
-                                    { let session_pnl = *total_pnl.lock().await; tweet_exit(tw_api_key.clone(), tw_api_secret.clone(), tw_access_token.clone(), tw_access_token_secret.clone(), sn.clone(), params.market_name.clone(), params.price, reason.clone(), pnl_m + paired_pnl, session_pnl); }
+                                    // Twitter/X — single combined trade recap on close.
+                                    { let session_pnl = *total_pnl.lock().await; tweet_trade(tw_api_key.clone(), tw_api_secret.clone(), tw_access_token.clone(), tw_access_token_secret.clone(), sn.clone(), params.market_name.clone(), re_m, params.price, reason.clone(), pnl_m + paired_pnl, session_pnl); }
                                 }
                             }
 
@@ -914,8 +914,6 @@ async fn main() -> Result<()> {
                                         info!(" GHOST_MODE ENTRY (paired) [{}]: {} | ${:.4} x {:.1} (simulated)", sn, pp.market_name, pp.price, pp.shares);
                                     }
                                     last_trade_time.insert(sn.clone(), Instant::now());
-                                    // X post — fires in ghost mode too so public feed reflects simulated activity.
-                                    tweet_entry(tw_api_key.clone(), tw_api_secret.clone(), tw_access_token.clone(), tw_access_token_secret.clone(), sn.clone(), params.market_name.clone(), params.price, params.shares);
                                     // No actual order placement or balance sync in ghost mode
                                 } else {
                                     // Real trading logic
@@ -1012,8 +1010,6 @@ async fn main() -> Result<()> {
                                     }
                                     last_trade_time.insert(sn.clone(), Instant::now());
                                     { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = format!(" ENTRY [{}] {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
-                                    // Twitter/X (detached).
-                                    tweet_entry(tw_api_key.clone(), tw_api_secret.clone(), tw_access_token.clone(), tw_access_token_secret.clone(), sn.clone(), params.market_name.clone(), params.price, params.shares);
                                 }
                             }
 

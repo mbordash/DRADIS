@@ -184,36 +184,23 @@ pub async fn post_tweet(
     }
 }
 
-/// Compose and fire an ENTRY tweet (detached — never blocks the trading loop).
-pub fn tweet_entry(
+/// Post a single combined trade recap tweet on close (detached — never blocks the trading loop).
+/// Includes entry price, exit price, reason, trade P&L, and running session P&L.
+pub fn tweet_trade(
     tw_key: String, tw_secret: String, tw_token: String, tw_token_secret: String,
-    slug: String, market_name: String, price: rust_decimal::Decimal, shares: rust_decimal::Decimal,
-) {
-    if !config::ENABLE_X { return; }
-    tokio::spawn(async move {
-        let name  = truncate(&market_name, 50);
-        let slug  = truncate(&slug, 28);
-        let text  = format!(
-            "🟢 ENTRY | {slug}\n{name}\n${price:.2} × {shares:.1} shares | #polymarket #DRADIStrading",
-        );
-        let _ = post_tweet(&tw_key, &tw_secret, &tw_token, &tw_token_secret, &text).await;
-    });
-}
-
-/// Compose and fire an EXIT tweet (detached — never blocks the trading loop).
-pub fn tweet_exit(
-    tw_key: String, tw_secret: String, tw_token: String, tw_token_secret: String,
-    slug: String, market_name: String, exit_price: rust_decimal::Decimal,
+    strategy: String, market_name: String,
+    entry_price: rust_decimal::Decimal, exit_price: rust_decimal::Decimal,
     reason: String, trade_pnl: rust_decimal::Decimal, session_pnl: rust_decimal::Decimal,
 ) {
     if !config::ENABLE_X { return; }
     tokio::spawn(async move {
         let name      = truncate(&market_name, 50);
-        let slug      = truncate(&slug, 28);
+        let strat     = truncate(&strategy, 20);
         let pnl_sign  = if trade_pnl   >= rust_decimal::Decimal::ZERO { "+" } else { "" };
         let sess_sign = if session_pnl >= rust_decimal::Decimal::ZERO { "+" } else { "" };
+        let now = chrono::Utc::now().format("%m/%d %H:%M UTC");
         let text = format!(
-            "🔴 EXIT | {slug}\n{name}\nbid=${exit_price:.2} | {reason}\nTrade P&L: {pnl_sign}{trade_pnl:.2} | Session: {sess_sign}{session_pnl:.2}| #polymarket #DRADIStrading",
+            "📊 {strat} | {name}\nEntry ${entry_price:.2} → Exit ${exit_price:.2} | {reason}\nP&L: {pnl_sign}{trade_pnl:.2} | Session: {sess_sign}{session_pnl:.2}\n{now} | #polymarket #DRADIStrading",
         );
         let _ = post_tweet(&tw_key, &tw_secret, &tw_token, &tw_token_secret, &text).await;
     });
