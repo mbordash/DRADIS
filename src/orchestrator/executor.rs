@@ -11,6 +11,7 @@ use anyhow::Result;
 use tracing::{info, debug, warn};
 use std::time::Instant;
 use alloy::primitives::U256;
+use tokio::time::Duration;
 
 /// Result of evaluating all strategies
 #[derive(Debug, Clone)]
@@ -76,7 +77,7 @@ pub async fn evaluate_strategies(
 pub async fn execute_strategies_concurrent(
     strategies: &[Box<dyn Strategy>],
     ctx: &StrategyContext,
-    _timeout_ms: u64,
+    timeout_ms: u64,
     last_summary: &mut String,
 ) -> Result<StrategyEvaluationResult> {
     let mut entry_signals = Vec::new();
@@ -90,11 +91,29 @@ pub async fn execute_strategies_concurrent(
         let strategy_name = strategy.name().to_string();
         let start = Instant::now();
 
-        // Evaluate entry and exit in parallel using tokio::join!
-        let (entry_result, exit_result) = tokio::join!(
-            strategy.evaluate_entry(ctx),
-            strategy.evaluate_exit(ctx)
-        );
+        // Evaluate entry and exit in parallel using tokio::join!, wrapped in a hard timeout.
+        // Previously `timeout_ms` was silently ignored (prefixed `_timeout_ms`), meaning a
+        // single hung strategy evaluation (e.g. StdMutex contention during GBoost retrain)
+        // could freeze the entire tokio::select! loop — including the watchdog ticker.
+        let join_result = tokio::time::timeout(
+            Duration::from_millis(timeout_ms),
+            async {
+                tokio::join!(
+                    strategy.evaluate_entry(ctx),
+                    strategy.evaluate_exit(ctx)
+                )
+            },
+        ).await;
+
+        let (entry_result, exit_result) = match join_result {
+            Ok(pair) => pair,
+            Err(_) => {
+                warn!("⚠️ {} evaluation timed out after {}ms — skipping this tick", strategy_name, timeout_ms);
+                let label = strategy_name.trim_end_matches("Strategy");
+                info_parts.push(format!("{}:⏱️⏱️", label));
+                continue;
+            }
+        };
 
         let evaluation_time_ms = start.elapsed().as_millis();
 
