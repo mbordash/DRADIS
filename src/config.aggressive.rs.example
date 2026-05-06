@@ -19,10 +19,11 @@ use rust_decimal_macros::dec;
 use std::time::Duration as StdDuration;
 
 // ============================================================================
-// NOTIFICATION SETTINGS (Telegram)
+// NOTIFICATION SETTINGS
 // ============================================================================
 
-pub const ENABLE_TELEGRAM: bool = true;
+pub const ENABLE_TELEGRAM: bool = false;
+pub const ENABLE_X: bool = false;
 
 // ============================================================================
 // ARBITRAGE STRATEGY PARAMETERS
@@ -236,6 +237,8 @@ pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300;
 pub const GBOOST_TARGET_PROFIT_PERCENT: Decimal = dec!(0.12);
 pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.055);
 pub const GBOOST_MIN_HOLD_SECS: i64 = 60;
+pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 10;
+pub const GBOOST_MIN_USABLE_TREES: usize = 5;
 pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v13f.json";
 pub const GBOOST_MAX_HOURLY_ASK_SUM: Decimal = dec!(1.20);
 pub const GBOOST_MIN_HOURLY_BID_SUM: Decimal = dec!(0.70);
@@ -282,8 +285,8 @@ pub const TIME_DECAY_MAX_SLOW_DRIFT_SOL: Decimal = dec!(1.20);
 pub const TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER: Decimal = dec!(0.70);
 
 /// Price bounds: only enter when genuine market uncertainty exists.
-pub const TIME_DECAY_MAX_ENTRY_PRICE: Decimal = dec!(0.80);
-pub const TIME_DECAY_MIN_ENTRY_PRICE: Decimal = dec!(0.20);
+pub const TIME_DECAY_MAX_ENTRY_PRICE: Decimal = dec!(0.68);
+pub const TIME_DECAY_MIN_ENTRY_PRICE: Decimal = dec!(0.32);
 
 /// OBI gate: block entry when the order book is heavily one-sided.
 pub const TIME_DECAY_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.70);

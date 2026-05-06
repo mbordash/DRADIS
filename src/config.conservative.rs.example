@@ -18,7 +18,9 @@ use std::time::Duration as StdDuration;
 // NOTIFICATION SETTINGS (Telegram)
 // ============================================================================
 
-pub const ENABLE_TELEGRAM: bool = true;
+pub const ENABLE_TELEGRAM: bool = false;
+pub const ENABLE_X: bool = false;
+
 
 // ============================================================================
 // ARBITRAGE STRATEGY PARAMETERS
@@ -250,6 +252,8 @@ pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300;
 pub const GBOOST_TARGET_PROFIT_PERCENT: Decimal = dec!(0.12);
 pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.055);
 pub const GBOOST_MIN_HOLD_SECS: i64 = 60;
+pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 10;
+pub const GBOOST_MIN_USABLE_TREES: usize = 5;
 pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v13f.json";
 pub const GBOOST_MAX_HOURLY_ASK_SUM: Decimal = dec!(1.20);
 pub const GBOOST_MIN_HOURLY_BID_SUM: Decimal = dec!(0.70);
@@ -301,8 +305,8 @@ pub const TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER: Decimal = dec!(0.35);
 /// Price bounds: only enter when genuine market uncertainty exists.
 /// Extreme-probability YES prices (< MIN or > MAX) mean the book has decided
 /// an outcome — theta thesis breaks down and share counts balloon dangerously.
-pub const TIME_DECAY_MAX_ENTRY_PRICE: Decimal = dec!(0.75);
-pub const TIME_DECAY_MIN_ENTRY_PRICE: Decimal = dec!(0.25);
+pub const TIME_DECAY_MAX_ENTRY_PRICE: Decimal = dec!(0.62);
+pub const TIME_DECAY_MIN_ENTRY_PRICE: Decimal = dec!(0.38);
 
 /// OBI gate: block entry when the order book is heavily one-sided.
 /// Conservative: tightest gate — skip any book with extreme imbalance.

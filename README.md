@@ -147,7 +147,8 @@ The bot automatically records every completed trade into a daily CSV file for ea
 ### Requirements
 - Rust 1.95+ (or Docker)
 - A Polygon wallet with USDC and MATIC
-- Telegram bot token (optional)
+- Telegram bot token (optional, see [Notifications](#notifications))
+- X developer credentials (optional, see [Notifications](#notifications))
 
 ### Configuration Profiles
 
@@ -166,6 +167,84 @@ Three ready-to-use starting profiles are provided. **You must copy one to `src/c
 cp src/config.balanced.rs.example src/config.rs
 cargo build --release
 ```
+
+---
+
+## Notifications
+
+DRADIS can push trade alerts to **Telegram** and/or **X (Twitter)** in real-time. Both channels fire asynchronously — they never block the 50ms trading loop.
+
+### Telegram
+
+1. Create a bot via [@BotFather](https://t.me/botfather) and copy the token.
+2. Start a chat with your bot (or add it to a group) and grab the `chat_id`.
+3. Set the env vars and flip the flag:
+
+```bash
+# .env or server environment
+TELEGRAM_BOT_TOKEN=123456789:AABBCCdd...
+TELEGRAM_CHAT_ID=-100123456789
+```
+
+```rust
+// src/config.rs
+pub const ENABLE_TELEGRAM: bool = true;
+```
+
+### X (Twitter)
+
+DRADIS can post every **ENTRY** and **EXIT** (with P&L) to a public X account so you can share your bot's real-time performance publicly.
+
+Example posts:
+```
+🟢 ENTRY | btc-usd-q4-2025
+Will BTC exceed $100k by Dec 31?
+$0.62 × 24.2 shares
+🔮 Ghost | #polymarket #DRADIStrading
+
+🔴 EXIT | btc-usd-q4-2025
+Will BTC exceed $100k by Dec 31?
+bid=$0.65 | TakeProfit
+Trade P&L: +$0.42 | Session: +$1.20
+🔮 Ghost | #polymarket #DRADIStrading
+```
+
+The `🔮 Ghost` / `⚡ Live` label flips automatically with `GHOST_MODE`.
+
+#### Setup
+
+1. Go to [developer.x.com](https://developer.x.com) and create a **Free** developer account.
+2. Create a new **App** — the free tier is sufficient for posting.
+3. Under **App Settings → User authentication settings**, configure:
+   - **App permissions**: ✅ Read and Write
+   - **OAuth 1.0a**: Enabled
+4. Under **Keys and Tokens**, generate all four credentials and note them:
+   - **API Key** → `X_API_KEY`
+   - **API Key Secret** → `X_API_SECRET`
+   - **Access Token** → `X_ACCESS_TOKEN`
+   - **Access Token Secret** → `X_ACCESS_TOKEN_SECRET`
+5. Add them to your server environment (or `.env` file):
+
+```bash
+X_API_KEY=your_api_key
+X_API_SECRET=your_api_secret
+X_ACCESS_TOKEN=your_access_token
+X_ACCESS_TOKEN_SECRET=your_access_token_secret
+```
+
+6. Enable in `src/config.rs`:
+
+```rust
+pub const ENABLE_X: bool = true;
+```
+
+7. Rebuild and redeploy:
+
+```bash
+cargo build --release
+```
+
+> **Pricing**: X charges **$0.01 per tweet** via a pay-as-you-go credit system. At ~30–50 trades/day that's roughly $0.30–$0.50/day. Buy credits at [developer.x.com](https://developer.x.com) → Billing. A $5 top-up covers a week or two of active sessions.
 
 ---
 

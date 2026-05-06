@@ -294,14 +294,24 @@ impl GboostStrategyImpl {
                         }
                     }
 
-                    // Get old tree count before moving the lock
+                    // Reject degenerate models — a model with fewer than
+                    // GBOOST_MIN_USABLE_TREES trees is essentially a random stump.
+                    // Keep the previous (better) model rather than regressing.
+                    if n < config::GBOOST_MIN_USABLE_TREES {
+                        tracing::warn!(
+                            "🤖 GboostStrategy: retrain produced degenerate model ({} trees < min {}), keeping previous",
+                            n, config::GBOOST_MIN_USABLE_TREES
+                        );
+                        is_training.store(false, Ordering::Relaxed);
+                        return;
+                    }
+
                     let old_tree_count = {
                         let old_model = model_arc.lock().unwrap();
                         old_model.as_ref().map(|m| m.trees.len()).unwrap_or(0)
                     };
 
-                    // Log based on the comparison - fixed overflow issue
-                    if n > old_tree_count + 5 || (old_tree_count >= 5 && n < old_tree_count - 5) || (old_tree_count == 0 && n > 0) {
+                    if n > old_tree_count + 5 || (old_tree_count >= 5 && n + 5 < old_tree_count) || (old_tree_count == 0 && n > 0) {
                         tracing::info!("🤖 GboostStrategy: retrained — {} trees (was {})", n, old_tree_count);
                     } else {
                         tracing::debug!("🤖 GboostStrategy: retrained — {} trees", n);
@@ -321,6 +331,10 @@ impl GboostStrategyImpl {
     fn predict(&self, snap: &MarketSnapshot) -> Option<f64> {
         let guard = self.model.lock().unwrap();
         let booster = guard.as_ref()?;
+        // Refuse to predict from degenerate models — a single stump is random noise.
+        if booster.trees.len() < config::GBOOST_MIN_USABLE_TREES {
+            return None;
+        }
         let feats = extract_features(snap);
         // Stack-allocated array; Matrix borrows it for the duration of this call only.
         let matrix = Matrix::new(&feats, 1, NUM_FEATURES);
@@ -502,7 +516,7 @@ impl Strategy for GboostStrategyImpl {
                 return Ok(StrategySignal::NoSignal);
             }
             let shares = trade_usdc / price;
-            tracing::debug!(
+            tracing::info!(
                 "🔮 GBoost YES entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
                 p_yes_up, price, shares
             );
@@ -557,7 +571,7 @@ impl Strategy for GboostStrategyImpl {
                 return Ok(StrategySignal::NoSignal);
             }
             let shares = trade_usdc / price;
-            tracing::debug!(
+            tracing::info!(
                 "🔮 GBoost NO entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
                 p_yes_up, price, shares
             );
@@ -638,7 +652,7 @@ impl Strategy for GboostStrategyImpl {
                         exit_pair: false,
                     });
                 }
-                if secs_held >= config::GBOOST_MIN_HOLD_SECS && profit_pct <= -sl {
+                if secs_held >= config::GBOOST_SL_MIN_HOLD_SECS && profit_pct <= -sl {
                     self.record_training_outcome_on_exit(target_market.yes_token, profit_pct > 0.0);
                     self.mark_post_exit_cooldown(target_market.yes_token);
                     return Ok(StrategySignal::Exit {
@@ -648,6 +662,7 @@ impl Strategy for GboostStrategyImpl {
                     });
                 }
                 // Signal reversal: model now strongly predicts DOWN while we are long YES.
+                // Uses the longer GBOOST_MIN_HOLD_SECS to prevent whipsawing on neutral ticks.
                 if let Some(p) = p_yes_up {
                     if secs_held >= config::GBOOST_MIN_HOLD_SECS && p <= signal_exit_thresh {
                         self.record_training_outcome_on_exit(target_market.yes_token, profit_pct > 0.0);
@@ -693,7 +708,7 @@ impl Strategy for GboostStrategyImpl {
                         exit_pair: false,
                     });
                 }
-                if secs_held >= config::GBOOST_MIN_HOLD_SECS && profit_pct <= -sl {
+                if secs_held >= config::GBOOST_SL_MIN_HOLD_SECS && profit_pct <= -sl {
                     self.record_training_outcome_on_exit(target_market.no_token, profit_pct > 0.0);
                     self.mark_post_exit_cooldown(target_market.no_token);
                     return Ok(StrategySignal::Exit {
@@ -703,6 +718,7 @@ impl Strategy for GboostStrategyImpl {
                     });
                 }
                 // Signal reversal for NO: model now strongly predicts UP.
+                // Uses the longer GBOOST_MIN_HOLD_SECS to prevent whipsawing on neutral ticks.
                 if let Some(p) = p_yes_up {
                     if secs_held >= config::GBOOST_MIN_HOLD_SECS && p >= (1.0 - signal_exit_thresh) {
                         self.record_training_outcome_on_exit(target_market.no_token, profit_pct > 0.0);
