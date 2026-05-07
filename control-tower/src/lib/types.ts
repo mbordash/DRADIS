@@ -68,6 +68,11 @@ export interface TradeRow {
   reason:      string;
 }
 
+/** Response from GET /api/status — maps strategy key to active market name. */
+export interface StatusResponse {
+  strategy_markets: Record<string, string>;
+}
+
 // ── Field descriptor for ViperCard ───────────────────────────────────────────
 
 export type FieldType = 'usd' | 'pct' | 'price' | 'decimal';
@@ -83,6 +88,8 @@ export interface ViperDef {
   enableKey:  keyof DynamicConfig;
   accentColor: string; // Tailwind color class prefix, e.g. 'indigo'
   description: string;
+  /** Lower-snake key used in /api/status strategy_markets map */
+  statusKey:  string;
   fields:     FieldDef[];
 }
 
@@ -118,4 +125,3 @@ export function fieldUnit(type: FieldType): string {
     default:      return '';
   }
 }
-

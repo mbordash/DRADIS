@@ -1,4 +1,4 @@
-import type { DynamicConfig, PnlSnapshotRow, TradeRow, ViperDef } from './types';
+import type { DynamicConfig, PnlSnapshotRow, TradeRow, ViperDef, StatusResponse } from './types';
 
 // In development, NEXT_PUBLIC_API_URL=http://localhost:9000 (set in .env.local)
 // hits the DRADIS API directly.
@@ -44,6 +44,12 @@ export async function getHealth(): Promise<string> {
   return res.ok ? 'ok' : 'error';
 }
 
+export async function getStatus(): Promise<StatusResponse> {
+  const res = await fetch(`${BASE}/api/status`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/status → ${res.status}`);
+  return res.json();
+}
+
 // ── Viper metadata ────────────────────────────────────────────────────────────
 
 export const VIPER_DEFS: ViperDef[] = [
@@ -51,6 +57,7 @@ export const VIPER_DEFS: ViperDef[] = [
     name: 'Time Decay',
     enableKey: 'enable_time_decay',
     accentColor: 'indigo',
+    statusKey: 'time_decay',
     description: 'Targets gamma as hourly markets approach expiry',
     fields: [
       { key: 'time_decay_position_size_usdc', label: 'Position Size',  type: 'usd'   },
@@ -63,6 +70,7 @@ export const VIPER_DEFS: ViperDef[] = [
     name: 'Momentum',
     enableKey: 'enable_momentum',
     accentColor: 'blue',
+    statusKey: 'momentum',
     description: 'Rides Binance oracle velocity bursts',
     fields: [
       { key: 'momentum_min_trade_size_usdc', label: 'Min Size',    type: 'usd' },
@@ -76,6 +84,7 @@ export const VIPER_DEFS: ViperDef[] = [
     name: 'Maker',
     enableKey: 'enable_maker',
     accentColor: 'emerald',
+    statusKey: 'maker',
     description: 'Two-sided resting bids — captures spread + rebates',
     fields: [
       { key: 'maker_max_entry_price',   label: 'Max Entry',   type: 'price' },
@@ -88,6 +97,7 @@ export const VIPER_DEFS: ViperDef[] = [
     name: 'Basis',
     enableKey: 'enable_basis',
     accentColor: 'orange',
+    statusKey: 'basis',
     description: 'Fades retail-skewed YES/NO implied probabilities',
     fields: [
       { key: 'basis_stop_loss_pct',     label: 'Stop Loss',   type: 'pct' },
@@ -99,6 +109,7 @@ export const VIPER_DEFS: ViperDef[] = [
     name: 'GBoost',
     enableKey: 'enable_gboost',
     accentColor: 'purple',
+    statusKey: 'gboost',
     description: 'Online gradient-boosted orderbook classifier',
     fields: [
       { key: 'gboost_entry_threshold',   label: 'Entry Threshold', type: 'decimal' },

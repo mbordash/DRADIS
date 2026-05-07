@@ -19,7 +19,8 @@ use axum::{
     Json,
     http::StatusCode,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
@@ -36,6 +37,8 @@ pub struct ApiState {
     pub config_tx: Arc<watch::Sender<Arc<DynamicConfig>>>,
     /// Receiver — GET handler reads the latest snapshot without blocking.
     pub config_rx: watch::Receiver<Arc<DynamicConfig>>,
+    /// Receiver — maps strategy key ("time_decay", "momentum", …) to current market name.
+    pub markets_rx: watch::Receiver<HashMap<String, String>>,
 }
 
 // ─── Query params ─────────────────────────────────────────────────────────────
@@ -99,6 +102,20 @@ async fn get_pnl_history(Query(q): Query<LimitQuery>) -> Response {
     }
 }
 
+/// GET /api/status
+///
+/// Returns the current market name each strategy is attached to.
+/// Response: `{ "strategy_markets": { "time_decay": "…", "momentum": "…", … } }`
+#[derive(Serialize)]
+struct StatusResponse {
+    strategy_markets: HashMap<String, String>,
+}
+
+async fn get_status(State(s): State<ApiState>) -> Response {
+    let markets = s.markets_rx.borrow().clone();
+    Json(StatusResponse { strategy_markets: markets }).into_response()
+}
+
 /// GET /api/trades?limit=100
 ///
 /// Returns up to `limit` completed trades, newest first.
@@ -120,19 +137,21 @@ async fn get_trades(Query(q): Query<LimitQuery>) -> Response {
 pub async fn run_api_server(
     config_tx: Arc<watch::Sender<Arc<DynamicConfig>>>,
     config_rx: watch::Receiver<Arc<DynamicConfig>>,
+    markets_rx: watch::Receiver<HashMap<String, String>>,
 ) {
     let port = std::env::var("API_PORT")
         .ok()
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(9000);
 
-    let state = ApiState { config_tx, config_rx };
+    let state = ApiState { config_tx, config_rx, markets_rx };
 
     let app = Router::new()
         .route("/api/health",      get(health))
         .route("/api/config",      get(get_config).patch(patch_config))
         .route("/api/pnl/history", get(get_pnl_history))
         .route("/api/trades",      get(get_trades))
+        .route("/api/status",      get(get_status))
         // Permissive CORS so the Next.js Control Tower (any port) can reach the API.
         .layer(CorsLayer::permissive())
         .with_state(state);

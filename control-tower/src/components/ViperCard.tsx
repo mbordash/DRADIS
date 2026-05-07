@@ -111,9 +111,11 @@ interface Props {
   viper:   ViperDef;
   config:  DynamicConfig;
   onPatch: (patch: Partial<DynamicConfig>) => Promise<void>;
+  /** Active market name returned by /api/status */
+  market?: string;
 }
 
-export default function ViperCard({ viper, config, onPatch }: Props) {
+export default function ViperCard({ viper, config, onPatch, market }: Props) {
   const [toggling, setToggling] = useState(false);
   const enabled  = config[viper.enableKey] as boolean;
   const accent   = ACCENT[viper.accentColor] ?? ACCENT.indigo;
@@ -143,6 +145,17 @@ export default function ViperCard({ viper, config, onPatch }: Props) {
 
       {/* Description */}
       <p className="text-xs text-gray-500 leading-snug">{viper.description}</p>
+
+      {/* Active market */}
+      {market && market.length > 0 && (
+        <div
+          className="flex items-center gap-1.5 text-xs text-gray-400 bg-[#0f0f1a] border border-[#1e1e32] rounded px-2 py-1 truncate"
+          title={market}
+        >
+          <span className="shrink-0 text-gray-600">📍</span>
+          <span className="truncate font-mono">{market}</span>
+        </div>
+      )}
 
       {/* Status badge */}
       <span className={`self-start text-xs px-2 py-0.5 rounded-full font-mono ${

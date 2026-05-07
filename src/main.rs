@@ -141,10 +141,15 @@ async fn main() -> Result<()> {
     let (config_tx, config_rx) = watch::channel(initial_dyn_cfg);
     let config_tx = Arc::new(config_tx);
 
+    // ── Strategy→market status channel (feeds /api/status) ───────────────────
+    let (markets_tx, markets_rx) = watch::channel::<std::collections::HashMap<String, String>>(std::collections::HashMap::new());
+    let markets_tx = Arc::new(markets_tx);
+
     // ── Spawn Control Tower API server ───────────────────────────────────────
     tokio::spawn(dradis::api::server::run_api_server(
         Arc::clone(&config_tx),
         config_rx.clone(),  // API server gets its own watch receiver
+        markets_rx,
     ));
 
     let crypto_filter = env::var("CRYPTO_FILTER").unwrap_or_else(|_| "btc".to_string()).to_lowercase();
@@ -569,6 +574,7 @@ async fn main() -> Result<()> {
 
         info!(" Orchestrator ready: {} strategies loaded", strategies.len());
         info!(" Strategy venue attachments:");
+        let mut strategy_markets_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
         for strategy in &strategies {
             let sn = strategy.name();
             let venue = strategy.venue();
@@ -577,6 +583,14 @@ async fn main() -> Result<()> {
                 "Window/Daily" => maker_market_config.as_ref().map_or_else(String::new, |m| m.market_name.clone()),
                 _ => String::from("Unknown"),
             };
+
+            // Build the status key used by the UI (strip "Strategy" suffix, lowercase)
+            let status_key = sn
+                .strip_suffix("Strategy")
+                .unwrap_or(&sn)
+                .to_lowercase()
+                .replace("timedecay", "time_decay");
+            strategy_markets_map.insert(status_key, market_name_attached.clone());
 
             info!(
                 "  - {} => venue={} | market=\"{}\" | budget=${} | risk={}",
@@ -587,6 +601,7 @@ async fn main() -> Result<()> {
                 strategy.risk_model(),
             );
         }
+        let _ = markets_tx.send(strategy_markets_map);
 
         loop {
             tokio::select! {
