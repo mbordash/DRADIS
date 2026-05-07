@@ -124,9 +124,12 @@ scp -r -P "$SSH_PORT" -i "$KEY" control-tower/src              "$USER@$HOST:$REM
 scp -r -P "$SSH_PORT" -i "$KEY" control-tower/public           "$USER@$HOST:$REMOTE_DIR/control-tower/"
 
 # ── 4. Build + deploy all containers in one SSH session ───────────────────────
-ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" << 'REMOTE'
+ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" "${CT_USERNAME:-}" "${CT_PASSWORD:-}" << 'REMOTE'
     set -euo pipefail
-    cd "$1"
+    REMOTE_DIR="$1"
+    CT_USERNAME="$2"
+    CT_PASSWORD="$3"
+    cd "$REMOTE_DIR"
 
     echo "🧹 Stopping old containers..."
     docker stop dradis-btc dradis-eth dradis-sol control-tower 2>/dev/null || true
@@ -182,8 +185,8 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" << 'REMOTE'
         --name control-tower \
         --network dradis-net \
         -e DRADIS_API_URL=http://dradis-btc:9000 \
-        -e CT_USERNAME="${CT_USERNAME:-}" \
-        -e CT_PASSWORD="${CT_PASSWORD:-}" \
+        -e CT_USERNAME="$CT_USERNAME" \
+        -e CT_PASSWORD="$CT_PASSWORD" \
         -p 3002:3002 \
         dradis-ui
 
