@@ -6,7 +6,7 @@ import dynamic from 'next/dynamic';
 
 import ViperCard    from '@/components/ViperCard';
 import TradesTable  from '@/components/TradesTable';
-import { getConfig, getPnlHistory, getTrades, getHealth, patchConfig, VIPER_DEFS } from '@/lib/api';
+import { getConfig, getPnlHistory, getTrades, getHealth, patchConfig, VIPER_DEFS, getStatus } from '@/lib/api';
 import type { DynamicConfig } from '@/lib/types';
 
 // Recharts must be loaded client-side only
@@ -62,6 +62,9 @@ export default function DashboardPage() {
 
   const { data: health } =
     useSWR('health', getHealth, { refreshInterval: 10_000 });
+
+  const { data: status } =
+    useSWR('status', getStatus, { refreshInterval: 30_000 });
 
   // ── Stats derived from P&L history ──────────────────────────────────────────
   const latestSnap  = pnl?.[0];
@@ -172,7 +175,7 @@ export default function DashboardPage() {
             Loading balance history…
           </div>
         ) : (
-          <PnlChart data={pnl ?? []} startingBalance={startingBal} />
+        <PnlChart data={pnl ?? []} startingBalance={startingBal} ghostMode={config?.ghost_mode} />
         )}
 
         {/* ── Viper Strategies ──────────────────────────────────────────── */}
@@ -184,10 +187,42 @@ export default function DashboardPage() {
             )}
           </div>
 
+          {/* Active markets banner */}
+          {status && (
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-3">
+              {[
+                { label: '⏰ Hourly', key: 'time_decay' },
+                { label: '📅 Window / Daily', key: 'maker' },
+              ].map(({ label, key }) => {
+                const mkt = status.strategy_markets[key];
+                return (
+                  <div
+                    key={key}
+                    className="flex items-start gap-2 bg-[#0d0d1a] border border-[#1e1e32] rounded-lg px-3 py-2"
+                  >
+                    <span className="text-xs font-mono text-gray-500 whitespace-nowrap mt-0.5">{label}</span>
+                    <span
+                      className="text-xs font-mono text-gray-300 truncate"
+                      title={mkt || undefined}
+                    >
+                      {mkt || <span className="text-gray-700 italic">none</span>}
+                    </span>
+                  </div>
+                );
+              })}
+            </div>
+          )}
+
           {config ? (
             <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
               {VIPER_DEFS.map(v => (
-                <ViperCard key={v.name} viper={v} config={config} onPatch={handlePatch} />
+                <ViperCard
+                  key={v.name}
+                  viper={v}
+                  config={config}
+                  onPatch={handlePatch}
+                  market={status?.strategy_markets[v.statusKey]}
+                />
               ))}
             </div>
           ) : (

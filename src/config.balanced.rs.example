@@ -96,6 +96,10 @@ pub const MOMENTUM_WINDOW_BULLISH_BLOCK: Decimal = dec!(0.70);
 /// OBI adverse veto: skip entries when the book is moderately stacked against the trade.
 pub const MOMENTUM_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.60);
 
+/// Maximum combined ask sum (YES_ask + NO_ask) allowed for a Momentum entry.
+/// Balanced: 3-cent combined spread cap — allows some widening but blocks clearly broken books.
+pub const MOMENTUM_MAX_ENTRY_ASK_SUM: Decimal = dec!(1.030);
+
 
 // ============================================================================
 // MAKER (PASSIVE LIMIT ORDER) STRATEGY PARAMETERS
@@ -215,6 +219,12 @@ pub const GBOOST_NUM_THREADS: usize = 2;
 pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.80);
 pub const GBOOST_POST_EXIT_COOLDOWN_SECS: i64 = 300;
 pub const GBOOST_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.20);
+/// Minimum fraction of price distance from 0.50 required for a GBoost entry.
+/// Balanced: same as default — blocks coin-flip entries at 50/50.
+pub const GBOOST_MIN_EDGE_FROM_FAIR: Decimal = dec!(0.04);
+/// Minimum net gain fraction required before a signal-reversal exit is allowed.
+/// Balanced: same as default — 4% nominal gain covers round-trip spread cost.
+pub const GBOOST_SIGNAL_REV_MIN_PROFIT: f64 = 0.04;
 pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.40);
 pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(4.0);
 pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300;
@@ -287,6 +297,9 @@ pub const FAILURE_COOLDOWN_SECS: i64 = 90;
 // ============================================================================
 
 pub const SHARE_SCALE: Decimal = dec!(1_000_000);
+
+/// Polymarket's crypto fee rate. Used in dynamic fee calculation: fee = C * feeRate * p * (1 - p)
+pub const CRYPTO_FEE_RATE: Decimal = dec!(0.072);
 
 
 // ============================================================================

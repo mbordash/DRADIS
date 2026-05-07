@@ -533,6 +533,19 @@ impl Strategy for GboostStrategyImpl {
             {
                 return Ok(StrategySignal::NoSignal);
             }
+            // ── 50-cent coin-flip zone gate ───────────────────────────────────
+            // Near 0.50 the market is directionally undecided. With 10% round-trip
+            // taker fees, GBoost needs > 10% price move to break even — impossible
+            // in a 50/50 coin flip. Require minimum edge distance from fair value.
+            if (price - dec!(0.50)).abs() < config::GBOOST_MIN_EDGE_FROM_FAIR {
+                tracing::debug!(
+                    "🚫 GBoost YES entry veto: price too close to 0.50 | ask={:.3} edge={:.3} < min {:.3}",
+                    price,
+                    (price - dec!(0.50)).abs(),
+                    config::GBOOST_MIN_EDGE_FROM_FAIR
+                );
+                return Ok(StrategySignal::NoSignal);
+            }
             let shares = trade_usdc / price;
             tracing::info!(
                 "🔮 GBoost YES entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
@@ -585,6 +598,16 @@ impl Strategy for GboostStrategyImpl {
                 || price < config::GBOOST_MIN_ENTRY_PRICE
                 || price <= dec!(0)
             {
+                return Ok(StrategySignal::NoSignal);
+            }
+            // ── 50-cent coin-flip zone gate ───────────────────────────────────
+            if (price - dec!(0.50)).abs() < config::GBOOST_MIN_EDGE_FROM_FAIR {
+                tracing::debug!(
+                    "🚫 GBoost NO entry veto: price too close to 0.50 | ask={:.3} edge={:.3} < min {:.3}",
+                    price,
+                    (price - dec!(0.50)).abs(),
+                    config::GBOOST_MIN_EDGE_FROM_FAIR
+                );
                 return Ok(StrategySignal::NoSignal);
             }
             let shares = trade_usdc / price;
@@ -682,13 +705,26 @@ impl Strategy for GboostStrategyImpl {
                 // Uses the longer GBOOST_MIN_HOLD_SECS to prevent whipsawing on neutral ticks.
                 if let Some(p) = p_yes_up {
                     if secs_held >= config::GBOOST_MIN_HOLD_SECS && p <= signal_exit_thresh {
-                        self.record_training_outcome_on_exit(target_market.yes_token, profit_pct > 0.0);
-                        self.mark_post_exit_cooldown(target_market.yes_token);
-                        return Ok(StrategySignal::Exit {
-                            params: exit_params(),
-                            reason: format!("GBoost SignalRev YES: P(UP)={:.3}", p),
-                            exit_pair: false,
-                        });
+                        // Gate: only exit on signal reversal if the position has either
+                        // (a) cleared round-trip spread costs (profit_pct ≥ SIGNAL_REV_MIN_PROFIT), OR
+                        // (b) is already deep enough in the hole (loss ≥ half the SL) that
+                        //     early protective exit is better than waiting for the full SL.
+                        // This prevents exiting break-even positions that merely wasted spread.
+                        let half_sl = sl / 2.0;
+                        if profit_pct >= config::GBOOST_SIGNAL_REV_MIN_PROFIT || profit_pct <= -half_sl {
+                            self.record_training_outcome_on_exit(target_market.yes_token, profit_pct > 0.0);
+                            self.mark_post_exit_cooldown(target_market.yes_token);
+                            return Ok(StrategySignal::Exit {
+                                params: exit_params(),
+                                reason: format!("GBoost SignalRev YES: P(UP)={:.3}", p),
+                                exit_pair: false,
+                            });
+                        } else {
+                            tracing::debug!(
+                                "🚫 GBoost SignalRev YES suppressed: profit={:.2}% not yet above min {:.0}% (not deep enough in red for protective exit)",
+                                profit_pct * 100.0, config::GBOOST_SIGNAL_REV_MIN_PROFIT * 100.0
+                            );
+                        }
                     }
                 }
             }
@@ -738,13 +774,23 @@ impl Strategy for GboostStrategyImpl {
                 // Uses the longer GBOOST_MIN_HOLD_SECS to prevent whipsawing on neutral ticks.
                 if let Some(p) = p_yes_up {
                     if secs_held >= config::GBOOST_MIN_HOLD_SECS && p >= (1.0 - signal_exit_thresh) {
-                        self.record_training_outcome_on_exit(target_market.no_token, profit_pct > 0.0);
-                        self.mark_post_exit_cooldown(target_market.no_token);
-                        return Ok(StrategySignal::Exit {
-                            params: exit_params(),
-                            reason: format!("GBoost SignalRev NO: P(UP)={:.3}", p),
-                            exit_pair: false,
-                        });
+                        // Same minimum-profit gate as YES reversal — don't exit if the position
+                        // hasn't covered round-trip costs and isn't deeply in the red.
+                        let half_sl = sl / 2.0;
+                        if profit_pct >= config::GBOOST_SIGNAL_REV_MIN_PROFIT || profit_pct <= -half_sl {
+                            self.record_training_outcome_on_exit(target_market.no_token, profit_pct > 0.0);
+                            self.mark_post_exit_cooldown(target_market.no_token);
+                            return Ok(StrategySignal::Exit {
+                                params: exit_params(),
+                                reason: format!("GBoost SignalRev NO: P(UP)={:.3}", p),
+                                exit_pair: false,
+                            });
+                        } else {
+                            tracing::debug!(
+                                "🚫 GBoost SignalRev NO suppressed: profit={:.2}% not yet above min {:.0}% (not deep enough in red for protective exit)",
+                                profit_pct * 100.0, config::GBOOST_SIGNAL_REV_MIN_PROFIT * 100.0
+                            );
+                        }
                     }
                 }
             }

@@ -118,6 +118,17 @@ impl Strategy for MomentumStrategyImpl {
                 window_blocks_bear = false;
             }
 
+            // ── Spread gate: block wide-book entries ──────────────────────────
+            // ask_sum = YES_ask + NO_ask.  Normal tight books = 1.01–1.02.
+            // At 1.03+ the round-trip cost (BUY_OFFSET + SELL_OFFSET + spread)
+            // exceeds any expected gain from a routine BTC momentum burst.
+            let ask_sum = ctx.snapshot.yes_ask + ctx.snapshot.no_ask;
+            if ask_sum > config::MOMENTUM_MAX_ENTRY_ASK_SUM {
+                debug!("🚫 Momentum spread gate: ask_sum={:.3} > max {:.3} — book too wide",
+                    ask_sum, config::MOMENTUM_MAX_ENTRY_ASK_SUM);
+                return Ok(StrategySignal::NoSignal);
+            }
+
             // ── Hourly OBI adverse-direction veto ─────────────────────────────
             let yes_total_depth = ctx.snapshot.yes_bid_depth + ctx.snapshot.yes_ask_depth;
             let no_total_depth  = ctx.snapshot.no_bid_depth  + ctx.snapshot.no_ask_depth;

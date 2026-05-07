@@ -25,6 +25,22 @@ function truncate(s: string, n: number) {
   return s.length > n ? s.slice(0, n) + '…' : s;
 }
 
+/** Inline tooltip cell: shows a dotted underline + full text on hover via native title. */
+function TipCell({ full, maxChars, className = '' }: { full: string; maxChars: number; className?: string }) {
+  const isTruncated = full.length > maxChars;
+  return (
+    <span
+      title={isTruncated ? full : undefined}
+      className={[
+        isTruncated ? 'border-b border-dotted border-gray-600 cursor-help' : '',
+        className,
+      ].filter(Boolean).join(' ')}
+    >
+      {truncate(full, maxChars)}
+    </span>
+  );
+}
+
 interface Props {
   trades: TradeRow[];
 }
@@ -62,8 +78,8 @@ export default function TradesTable({ trades }: Props) {
               >
                 <td className="px-3 py-2 text-gray-400 whitespace-nowrap">{fmtTime(t.ts)}</td>
                 <td className="px-3 py-2 text-gray-300 whitespace-nowrap">{t.strategy}</td>
-                <td className="px-3 py-2 text-gray-400 max-w-[160px]" title={t.market}>
-                  {truncate(t.market, 22)}
+                <td className="px-3 py-2 text-gray-400 max-w-[160px]">
+                  <TipCell full={t.market} maxChars={26} />
                 </td>
                 <td className={`px-3 py-2 font-semibold ${t.side === 'YES' ? 'text-green-400' : 'text-red-400'}`}>
                   {t.side}
@@ -72,8 +88,8 @@ export default function TradesTable({ trades }: Props) {
                 <td className="px-3 py-2 text-gray-300">{parseFloat(t.exit_price).toFixed(4)}</td>
                 <td className="px-3 py-2 text-gray-400">{parseFloat(t.shares).toFixed(2)}</td>
                 <td className={`px-3 py-2 font-semibold ${pnlColor(t.pnl)}`}>{fmtPnl(t.pnl)}</td>
-                <td className="px-3 py-2 text-gray-500 max-w-[180px]" title={t.reason}>
-                  {truncate(t.reason, 28)}
+                <td className="px-3 py-2 text-gray-500 max-w-[200px]">
+                  <TipCell full={t.reason} maxChars={32} />
                 </td>
               </tr>
             ))}

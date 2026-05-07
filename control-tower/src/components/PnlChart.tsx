@@ -9,6 +9,8 @@ import type { PnlSnapshotRow } from '@/lib/types';
 interface Props {
   data: PnlSnapshotRow[];
   startingBalance?: number;
+  /** When true, compute balance as startingBalance + session_pnl (ghost mode — on-chain balance is flat). */
+  ghostMode?: boolean;
 }
 
 function fmt(iso: string) {
@@ -35,11 +37,15 @@ function CustomTooltip({ active, payload, label }: any) {
   );
 }
 
-export default function PnlChart({ data, startingBalance }: Props) {
+export default function PnlChart({ data, startingBalance, ghostMode }: Props) {
   // API returns newest-first — reverse for chronological chart display
+  const base = startingBalance ?? 0;
   const chartData = [...data].reverse().map(row => ({
     time:    fmt(row.ts),
-    balance: parseFloat(row.collateral),
+    // In ghost mode the on-chain collateral never changes, so derive virtual balance from session P&L.
+    balance: ghostMode
+      ? base + parseFloat(row.session_pnl)
+      : parseFloat(row.collateral),
     pnl:     parseFloat(row.session_pnl),
   }));
 
