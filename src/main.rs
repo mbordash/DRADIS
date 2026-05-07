@@ -825,8 +825,9 @@ async fn main() -> Result<()> {
                                             rc_m = p.close_time;
                                             pnl_m = pnl;
 
-                                            if !config::GHOST_MODE {
-                                                // Record trade metrics asynchronously only in real mode
+                                            // Record trade metrics for both real and ghost mode (ghost trades
+                                            // must appear in the Control Tower trades table for monitoring).
+                                            {
                                                 let sn_task = sn.clone();
                                                 let m_name = params.market_name.clone();
                                                 let sid = if tid == target_yes_token { "YES".to_string() } else { "NO".to_string() };
@@ -880,8 +881,9 @@ async fn main() -> Result<()> {
                                             let other_fee_bps = if other_tid == target_yes_token { target_yes_fee_bps as u16 } else { target_no_fee_bps as u16 };
                                             let other_vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                             if !config::GHOST_MODE { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, other_tid, Side::Sell, s, (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), other_fee_bps, OrderType::FAK, false, 0, &shared_http).await; }
-                                            let mut map = positions.lock().await; if let Some(p) = map.remove(&pk) { let actual_other_exit = (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnl = (actual_other_exit - p.avg_entry) * p.shares; paired_pnl = pnl; *total_pnl.lock().await += pnl;
-                                                if !config::GHOST_MODE {
+                                                let mut map = positions.lock().await; if let Some(p) = map.remove(&pk) { let actual_other_exit = (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnl = (actual_other_exit - p.avg_entry) * p.shares; paired_pnl = pnl; *total_pnl.lock().await += pnl;
+                                                // Record paired-leg trade for both real and ghost mode
+                                                {
                                                     let sn_pm = sn.clone(); let m_name = params.market_name.clone(); let sid = if other_tid == target_yes_token { "YES".to_string() } else { "NO".to_string() }; let p_avg = p.avg_entry; let o_bid = actual_other_exit; let p_shares = p.shares; let pn = pnl;
                                                     tokio::spawn(async move { metrics::record_trade(sn_pm, m_name, sid, p_avg, o_bid, p_shares, pn, "Convergence/PairedExit".to_string()).await; });
                                                 }

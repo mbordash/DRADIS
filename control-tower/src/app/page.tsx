@@ -66,10 +66,15 @@ export default function DashboardPage() {
   // ── Stats derived from P&L history ──────────────────────────────────────────
   const latestSnap  = pnl?.[0];
   const oldestSnap  = pnl?.[pnl.length - 1];
-  const currentBal  = latestSnap  ? parseFloat(latestSnap.collateral)  : 0;
   const startingBal = oldestSnap  ? parseFloat(oldestSnap.collateral)  : 0;
   const sessionPnl  = latestSnap  ? parseFloat(latestSnap.session_pnl) : 0;
   const sessionPct  = startingBal > 0 ? sessionPnl / startingBal : 0;
+  // In ghost mode, the on-chain pUSD balance never changes (no real orders are placed),
+  // so we derive the virtual current balance as startingBal + accumulated session P&L.
+  // In live mode, use the actual on-chain collateral from the latest snapshot.
+  const currentBal  = config?.ghost_mode
+    ? startingBal + sessionPnl
+    : (latestSnap ? parseFloat(latestSnap.collateral) : 0);
 
   // ── Patch handler ────────────────────────────────────────────────────────────
   const handlePatch = useCallback(async (patch: Partial<DynamicConfig>) => {
@@ -147,7 +152,7 @@ export default function DashboardPage() {
           <StatCard
             label="Current Balance"
             value={pnlLoading ? '—' : fmt$(currentBal)}
-            sub="pUSD"
+            sub={config?.ghost_mode ? 'virtual pUSD' : 'pUSD'}
           />
           <StatCard
             label="Starting Balance"
