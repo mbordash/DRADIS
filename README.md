@@ -43,15 +43,15 @@ The core of DRADIS is the Orchestrator. It acts as the ship's brain, maintaining
            │   Orchestrator (CIC)   │◄──── axum REST API (:9000)
            │     50ms Heartbeat     │           │
            └────────────┬───────────┘           │
-                        │  parallel dispatch     ▼
-          ┌─────────────┼──────────────┬─────────────────────┐
-          ▼             ▼              ▼                      ▼
-   ┌────────────┐ ┌──────────┐ ┌──────────────┐ ┌──────────────────┐
-   │ Momentum   │ │  Maker   │ │  Arbitrage / │ │     GBoost       │
-   │(Interceptor│ │ (Sentry) │ │  TimeDecay / │ │     (Cylon)      │
-   │            │ │          │ │   Basis      │ │                  │
-   └─────┬──────┘ └────┬─────┘ └──────┬───────┘ └──────┬───────────┘
-         └─────────────┼──────────────┴─────────────────┘
+                        │  parallel dispatch    ▼
+          ┌─────────────┼──────────────┬────────────────┐
+          ▼             ▼              ▼                ▼
+   ┌────────────┐ ┌──────────┐ ┌──────────────┐ ┌──────────────┐
+   │ Momentum   │ │  Maker   │ │  Arbitrage / │ │   Gradient   │
+   │(Interceptor│ │ (Sentry) │ │  TimeDecay / │ │   Boost      │
+   │            │ │          │ │   Basis      │ │              │
+   └─────┬──────┘ └────┬─────┘ └──────┬───────┘ └──────┬───────┘
+         └─────────────┼──────────────┴────────────────┘
                        ▼
            ┌───────────────────────┐
            │    Execution Layer    │
@@ -372,6 +372,24 @@ ssh -i ~/.ssh/your-key.pem ubuntu@YOUR_SERVER_IP "docker logs control-tower --ta
 - **TOCTOU-safe entry**: Atomic lock scope prevents duplicate orders.
 - **Orphaned pair detection**: Automatically exits one-sided hedged positions after 60s.
 - **Fee Gates**: Blocks taker strategies from entering high-fee (10%+) markets.
+
+---
+
+## 🗺️ Roadmap
+
+The priority is consistent profitability first — abstractions and new features follow once the core strategies prove their edge.
+
+### Medium-term (deployment profiles)
+- **Static deployment profiles** (`profiles.toml`) — named configurations that each bind a market, a viper subset, capital allocation, and risk overrides; the current `config.rs` becomes the implicit `"default"` profile with zero behavior change
+- **Per-profile P&L tracking** — DB and API namespaced by `profile_id` so A/B tests across viper combinations have independent ledgers
+- **Profile selector in Control Tower** — top-level switcher so the dashboard shows the active profile's vipers, P&L curve, and trade log
+
+### Longer-term (multi-market)
+- **Polymarket market-type expansion** — extend oracle and feature layers to support politics, sports, and social event markets (not just crypto); vipers declare which market types they support and the UI only shows compatible ones for a given profile
+- **Market-agnostic viper interfaces** — formalize the strategy trait so community vipers can be built for any market type without touching core orchestrator logic (see [CUSTOM_STRATEGY.md](docs/CUSTOM_STRATEGY.md))
+- **Dynamic profile management** — create/edit/pause profiles at runtime via the API without restarting the engine
+
+> The roadmap reflects direction, not a release schedule. Items move when the underlying strategy performance warrants them.
 
 ---
 
