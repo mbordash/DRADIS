@@ -249,13 +249,19 @@ pub const GBOOST_BUDGET: f32 = 0.65;
 pub const GBOOST_NUM_THREADS: usize = 2;
 pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.80);
 pub const GBOOST_POST_EXIT_COOLDOWN_SECS: i64 = 300;
-pub const GBOOST_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.20);
+/// Conservative: tighter OBI gate — don't enter unless book is near neutral or favorable.
+pub const GBOOST_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.25);
 /// Minimum fraction of price distance from 0.50 required for a GBoost entry.
 /// Conservative: higher edge requirement — only trade when there is meaningful directional conviction.
 pub const GBOOST_MIN_EDGE_FROM_FAIR: Decimal = dec!(0.06);
 /// Minimum net gain fraction required before a signal-reversal exit is allowed.
 /// Conservative: higher bar — only allow reversal exit when there is solid realized profit.
 pub const GBOOST_SIGNAL_REV_MIN_PROFIT: f64 = 0.06;
+/// Maximum combined ask sum on the TARGET (daily/window) market at entry.
+/// Conservative: strict 1.03 — only enter the daily book when it is very tight.
+pub const GBOOST_MAX_TARGET_ASK_SUM: Decimal = dec!(1.03);
+/// Hourly OBI adverse block for daily entries — conservative blocks even mild adverse hourly OBI.
+pub const GBOOST_HOURLY_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.55);
 pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.40);
 pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(4.0);
 pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300;

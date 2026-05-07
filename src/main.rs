@@ -644,7 +644,13 @@ async fn main() -> Result<()> {
                     let start = Instant::now();
                     let mut req = BalanceAllowanceRequest::default();
                     req.asset_type = AssetType::Collateral;
-                    let _ = trading_client.balance_allowance(req).await;
+                    // Hard 10s timeout — same fix as the 2026-05-01 overnight freeze (status_ticker arm).
+                    // Without this, a TCP-level CLOB API stall blocks the entire select! loop,
+                    // including the watchdog ticker, silently for as long as the OS connection timeout.
+                    match tokio::time::timeout(Duration::from_secs(10), trading_client.balance_allowance(req)).await {
+                        Ok(_) => {}
+                        Err(_) => warn!("⚠️ Network Pulse: balance_allowance timed out (10s) — CLOB API stall suspected"),
+                    }
                     info!(" Network Pulse: {:?}", start.elapsed());
                 }
                 _ = cleanup_ticker.tick() => {

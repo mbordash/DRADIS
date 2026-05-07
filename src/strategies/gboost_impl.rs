@@ -381,6 +381,12 @@ impl GboostStrategyImpl {
     }
 
     /// Compute side-specific orderbook imbalance (OBI) in [-1, 1].
+    ///
+    /// Returns `dec!(-1.0)` (maximally adverse) when depth data is missing (total = 0).
+    /// This is intentional: a missing book means we cannot evaluate adverse selection,
+    /// so we conservatively block the entry rather than silently allowing it.
+    /// "Ghost OBI" entries (zero depth at evaluation but adverse at heartbeat time)
+    /// were responsible for losing trades in the 2026-05-07 afternoon session.
     fn side_obi(is_yes_side: bool, s: &MarketSnapshot) -> rust_decimal::Decimal {
         let (bid, ask) = if is_yes_side {
             (s.yes_bid_depth, s.yes_ask_depth)
@@ -391,7 +397,7 @@ impl GboostStrategyImpl {
         if total > dec!(0) {
             (bid - ask) / total
         } else {
-            dec!(0)
+            dec!(-1.0) // no depth data → treat as maximally adverse → block entry
         }
     }
 }
@@ -469,6 +475,22 @@ impl Strategy for GboostStrategyImpl {
             &ctx.snapshot
         };
 
+        // ── Gate: target (daily/window) market spread gate ─────────────────
+        // Guard against entering the DAILY book when it is too wide.
+        // GBOOST_MAX_HOURLY_ASK_SUM checks the hourly book; this checks the
+        // actual trading venue.  2026-05-07 afternoon: three entries with
+        // target ask_sum = 1.07, 1.11, 1.48 — all hit SL, combined loss $1.17.
+        // A healthy daily binary book sits at 1.01–1.04; anything wider means
+        // the book is illiquid/broken and round-trip costs destroy any edge.
+        let target_ask_sum = target_snapshot.yes_ask + target_snapshot.no_ask;
+        if target_ask_sum > config::GBOOST_MAX_TARGET_ASK_SUM {
+            tracing::debug!(
+                "🚫 GBoost entry blocked: target book too wide (ask_sum={:.3} > max {:.3})",
+                target_ask_sum, config::GBOOST_MAX_TARGET_ASK_SUM
+            );
+            return Ok(StrategySignal::NoSignal);
+        }
+
         if let Some(close_time) = target_market.market_close_time {
             if (close_time - Utc::now()).num_seconds() < 90 {
                 return Ok(StrategySignal::NoSignal);
@@ -525,6 +547,21 @@ impl Strategy for GboostStrategyImpl {
                     config::GBOOST_OBI_ADVERSE_BLOCK
                 );
                 return Ok(StrategySignal::NoSignal);
+            }
+            // ── Hourly OBI direction check for daily entries ──────────────────
+            // When trading daily market, the hourly YES OBI foreshadows daily direction.
+            // If hourly YES is being aggressively sold (OBI << 0), smart money is
+            // fading a pump — entering daily YES contradicts the hourly signal.
+            // 2026-05-07 afternoon: blocked entries where hourly OBI was -0.81 to -0.88.
+            if ctx.maker_snapshot.is_some() {
+                let hourly_yes_obi = Self::side_obi(true, &ctx.snapshot);
+                if hourly_yes_obi < config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK {
+                    tracing::debug!(
+                        "🚫 GBoost YES entry veto: hourly YES OBI adverse | obi={:.3} block={:.3}",
+                        hourly_yes_obi, config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK
+                    );
+                    return Ok(StrategySignal::NoSignal);
+                }
             }
             let price  = floor_to_tick_size(target_snapshot.yes_ask);
             if price >= config::GBOOST_MAX_ENTRY_PRICE
@@ -592,6 +629,23 @@ impl Strategy for GboostStrategyImpl {
                     target_market.market_name, target_market.no_token, no_obi, config::GBOOST_OBI_ADVERSE_BLOCK
                 );
                 return Ok(StrategySignal::NoSignal);
+            }
+            // ── Hourly OBI direction check for daily entries ──────────────────
+            // When trading daily market, the hourly NO OBI reveals whether smart money
+            // is selling NO (= they think BTC went UP, so NO is losing = bad for NO entry).
+            // If hourly NO is being aggressively sold (obi_n << 0), entering daily NO
+            // directly contradicts the hourly directional signal.
+            // 2026-05-07 trade 2: hourly NO OBI = -0.88 → blocked (saved $0.30).
+            // 2026-05-07 trade 9: hourly NO OBI = -0.81 → blocked (saved $0.30).
+            if ctx.maker_snapshot.is_some() {
+                let hourly_no_obi = Self::side_obi(false, &ctx.snapshot);
+                if hourly_no_obi < config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK {
+                    tracing::debug!(
+                        "🚫 GBoost NO entry veto: hourly NO OBI adverse | obi={:.3} block={:.3}",
+                        hourly_no_obi, config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK
+                    );
+                    return Ok(StrategySignal::NoSignal);
+                }
             }
             let price  = floor_to_tick_size(target_snapshot.no_ask);
             if price >= config::GBOOST_MAX_ENTRY_PRICE

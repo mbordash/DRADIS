@@ -115,6 +115,12 @@ pub async fn sync_position_balance(
                 }
             } else { return Ok(()); }
         } else {
+            // Position key not yet in the map (race between order submission and on-chain
+            // confirmation).  Must explicitly drop the guard before sleeping — holding a
+            // tokio::sync::MutexGuard across an .await is legal but keeps the lock live,
+            // which means the subsequent `positions.lock().await` below would self-deadlock
+            // (tokio Mutex is non-reentrant: same task trying to re-lock → hangs forever).
+            drop(pos_map);
             tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
             if !positions.lock().await.contains_key(&key) { return Ok(()); }
         }

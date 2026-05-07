@@ -234,13 +234,19 @@ pub const GBOOST_BUDGET: f32 = 0.65;
 pub const GBOOST_NUM_THREADS: usize = 2;
 pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.75);
 pub const GBOOST_POST_EXIT_COOLDOWN_SECS: i64 = 300;
-pub const GBOOST_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.20);
+/// Aggressive: looser OBI gate — still tighter than old -0.20, but allows more entries.
+pub const GBOOST_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.45);
 /// Minimum fraction of price distance from 0.50 required for a GBoost entry.
 /// Aggressive: lower edge requirement — enters closer to 50/50 for more opportunities.
 pub const GBOOST_MIN_EDGE_FROM_FAIR: Decimal = dec!(0.02);
 /// Minimum net gain fraction required before a signal-reversal exit is allowed.
 /// Aggressive: lower bar — exits on small reversals to capture any available profit.
 pub const GBOOST_SIGNAL_REV_MIN_PROFIT: f64 = 0.02;
+/// Maximum combined ask sum on the TARGET (daily/window) market at entry.
+/// Aggressive: slightly wider tolerance than balanced — still blocks clearly broken books.
+pub const GBOOST_MAX_TARGET_ASK_SUM: Decimal = dec!(1.05);
+/// Hourly OBI adverse block for daily entries — aggressive allows more directional noise.
+pub const GBOOST_HOURLY_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.75);
 pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.40);
 pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(4.0);
 pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300;

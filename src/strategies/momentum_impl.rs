@@ -132,12 +132,16 @@ impl Strategy for MomentumStrategyImpl {
             // ── Hourly OBI adverse-direction veto ─────────────────────────────
             let yes_total_depth = ctx.snapshot.yes_bid_depth + ctx.snapshot.yes_ask_depth;
             let no_total_depth  = ctx.snapshot.no_bid_depth  + ctx.snapshot.no_ask_depth;
+            // Default to -1.0 (maximally adverse) when depth data is missing.
+            // This prevents "ghost OBI" entries where the live snapshot has zero depth
+            // (which would default to obi=0.0 and silently pass the -0.40 gate) even though
+            // the heartbeat log shows strongly adverse OBI (-0.76 to -0.96).
             let yes_obi = if yes_total_depth > dec!(0) {
                 (ctx.snapshot.yes_bid_depth - ctx.snapshot.yes_ask_depth) / yes_total_depth
-            } else { dec!(0) };
+            } else { dec!(-1.0) };
             let no_obi = if no_total_depth > dec!(0) {
                 (ctx.snapshot.no_bid_depth - ctx.snapshot.no_ask_depth) / no_total_depth
-            } else { dec!(0) };
+            } else { dec!(-1.0) };
             let obi_blocks_bull = yes_obi < config::MOMENTUM_OBI_ADVERSE_BLOCK;
             let obi_blocks_bear = no_obi  < config::MOMENTUM_OBI_ADVERSE_BLOCK;
             if obi_blocks_bull {

@@ -96,15 +96,23 @@ impl Strategy for TimeDecayStrategyImpl {
         let yes_obi = if yes_total_depth > dec!(0) {
             (snap.yes_bid_depth - snap.yes_ask_depth) / yes_total_depth
         } else {
-            dec!(0)
+            // No depth data → treat as maximally adverse → block entry.
+            // "Ghost OBI" trades (zero depth at evaluation but adverse heartbeat OBI)
+            // were responsible for losses in the 2026-05-07 afternoon session where
+            // the live tick snapshot had missing depth but the heartbeat showed -0.76 to -0.96.
+            dec!(-1.0)
         };
         let no_total_depth = snap.no_bid_depth + snap.no_ask_depth;
         let no_obi = if no_total_depth > dec!(0) {
             (snap.no_bid_depth - snap.no_ask_depth) / no_total_depth
         } else {
-            dec!(0)
+            dec!(-1.0) // no depth data → treat as maximally adverse → block entry
         };
-        if yes_obi < dc.time_decay_obi_adverse_block || no_obi < dc.time_decay_obi_adverse_block {
+        // Use the stricter of the dynamic config value or the compile-time constant.
+        // This prevents a stale DB value (written before the constant was tightened)
+        // from silently bypassing the gate.  The config constant is the hard floor.
+        let obi_block = dc.time_decay_obi_adverse_block.max(config::TIME_DECAY_OBI_ADVERSE_BLOCK);
+        if yes_obi < obi_block || no_obi < obi_block {
             return Ok(StrategySignal::NoSignal);
         }
 

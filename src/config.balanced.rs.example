@@ -218,13 +218,19 @@ pub const GBOOST_BUDGET: f32 = 0.65;
 pub const GBOOST_NUM_THREADS: usize = 2;
 pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.80);
 pub const GBOOST_POST_EXIT_COOLDOWN_SECS: i64 = 300;
-pub const GBOOST_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.20);
+/// Balanced: matches current config.rs — tightened from -0.20 based on 2026-05-07 session data.
+pub const GBOOST_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.35);
 /// Minimum fraction of price distance from 0.50 required for a GBoost entry.
 /// Balanced: same as default — blocks coin-flip entries at 50/50.
 pub const GBOOST_MIN_EDGE_FROM_FAIR: Decimal = dec!(0.04);
 /// Minimum net gain fraction required before a signal-reversal exit is allowed.
 /// Balanced: same as default — 4% nominal gain covers round-trip spread cost.
 pub const GBOOST_SIGNAL_REV_MIN_PROFIT: f64 = 0.04;
+/// Maximum combined ask sum on the TARGET (daily/window) market at entry.
+/// Balanced: 1.04 = up to 4-cent spread on the daily book; blocks degenerate books.
+pub const GBOOST_MAX_TARGET_ASK_SUM: Decimal = dec!(1.04);
+/// Hourly OBI adverse block for daily entries — blocks contra-trend entries.
+pub const GBOOST_HOURLY_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.65);
 pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.40);
 pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(4.0);
 pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300;
