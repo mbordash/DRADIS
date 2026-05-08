@@ -17,7 +17,7 @@
 
 DRADIS is not just a bot; it is a comprehensive trading automation platform for prediction markets like Polymarket. Built in Rust for maximum concurrency and memory safety, it evaluates the selected markets every 50ms, coordinating multiple autonomous strategies to preserve capital and place orders where it sees inefficiencies.
 
-Unlike standard linear scripts, DRADIS uses a Tokio-powered orchestrator to manage telemetry (WebSockets), signal processing (Binance Oracles), and tactical execution across five distinct "Viper" strategy classes. You can also build your own Viper using our [implementation guide](docs/CUSTOM_STRATEGY.md).
+Unlike standard linear scripts, DRADIS uses a Tokio-powered orchestrator to manage telemetry (WebSockets), signal processing (**Raptors** — the recon layer that scouts external signals like Binance price feeds and funding rates), and tactical execution across six distinct **Viper** strategy classes. You can also build your own Viper using our [implementation guide](docs/CUSTOM_STRATEGY.md).
 
 ---
 
@@ -33,8 +33,9 @@ The core of DRADIS is the Orchestrator. It acts as the ship's brain, maintaining
 
 ```
 ┌─────────────────────┐   ┌─────────────────────┐
-│   Binance Oracle    │   │  Polymarket CLOB    │
-│  (Price / Funding)  │   │  (WebSocket Feed)   │
+│  Raptor Squadron    │   │  Polymarket CLOB    │
+│ (Binance Price /    │   │  (WebSocket Feed)   │
+│  Funding Oracles)   │   │                     │
 └──────────┬──────────┘   └──────────┬──────────┘
            │                         │
            └────────────┬────────────┘
@@ -71,7 +72,7 @@ The core of DRADIS is the Orchestrator. It acts as the ship's brain, maintaining
 
 ## 🚀 The Viper Squadrons (Strategies)
 
-DRADIS currently deploys six specialized strategy classes:
+DRADIS currently deploys six specialized Viper strategy classes. Each Viper is an autonomous tactical unit with its own capital budget, position book, and entry/exit logic — no Viper can compromise another's fuel.
 
 - **Momentum (The Interceptor)**: Scans for high-velocity Binance moves. If a "target" moves $75 in 5 seconds, the Interceptor strikes the Polymarket book before it can reprice.
 - **Maker (The Sentry)**: Maintains a dual-sided presence on the Window venue, capturing the spread while managing net exposure.
@@ -79,6 +80,21 @@ DRADIS currently deploys six specialized strategy classes:
 - **Time Decay (The Ghost)**: Posts resting maker bids on both YES and NO of the Hourly venue during the theta window, earning the combined bid discount and settling at $1.00 with zero fee drag.
 - **Basis/Funding (The Analyst)**: Fades retail skew by comparing Polymarket sentiment against Binance perpetual funding rates.
 - **GBoost (The Cylon)**: Online gradient-boosted ML model (LogLoss) that learns from live orderbook + oracle features to predict near-term YES price direction, retraining continuously in the background.
+
+---
+
+## 🛸 The Raptor Squadron (Oracles)
+
+Raptors are DRADIS's recon layer — lightweight signal scouts that fly ahead of the Vipers and report external intelligence back to the CIC. Each Raptor polls a specific data source on its own schedule and publishes a normalized signal the Viper strategies consume.
+
+| Raptor | Source | Signal |
+|---|---|---|
+| **Price Raptor** | Binance Spot | BTC spot price, 5s/1s velocity, acceleration |
+| **Funding Raptor** | Binance Perpetuals | Perpetual funding rate (smart-money sentiment) |
+| *(future)* **Sports Raptor** | Line movement APIs | Betting line drift, public money % |
+| *(future)* **Politics Raptor** | Polling aggregators | Approval drift, event probability shifts |
+
+When multiple Raptors are active for a profile, the Cylon (GBoost) and Analyst (Basis) strategies fuse their signals as features — no single Raptor has veto power alone.
 
 ---
 
@@ -93,7 +109,7 @@ DRADIS ships with a real-time web dashboard called **Control Tower** built on Ne
 
 | Panel | What it shows |
 |---|---|
-| **Status Bar** | Engine online/offline indicator, GHOST mode badge, active market, current BTC oracle price, session P&L |
+| **Status Bar** | Engine online/offline indicator, GHOST mode badge, active market, current BTC Raptor price, session P&L |
 | **P&L Chart** | Rolling equity curve across recent snapshots (Recharts area chart) |
 | **Viper Squadron Cards** | One card per strategy — live enabled/disabled toggle, all tunable parameters editable inline without a restart |
 | **Trade Log** | Last N completed trades with strategy, side, entry/exit prices, shares, P&L, and exit reason |
@@ -133,7 +149,7 @@ CT_PASSWORD=your-strong-password
 
 ## How It Works
 
-The bot connects to Polymarket's CLOB via WebSocket for real-time orderbook data and to Binance for oracle pricing and perpetual futures funding rates. Every 50ms, the orchestrator evaluates all strategies concurrently, then dispatches the resulting signals to the execution layer.
+The bot connects to Polymarket's CLOB via WebSocket for real-time orderbook data. **Raptor scouts** poll Binance for spot price, velocity, and perpetual futures funding rates. Every 50ms, the orchestrator evaluates all Viper strategies concurrently using the latest Raptor intelligence, then dispatches the resulting signals to the execution layer.
 
 ### Strategies
 
@@ -157,7 +173,7 @@ The bot connects to Polymarket's CLOB via WebSocket for real-time orderbook data
 
 **GBoost / ML** — Online gradient-boosted binary classifier running on the **Window/Daily venue**.
 - **Model**: `perpetual` crate `PerpetualBooster` with `LogLoss` objective.
-- **Features (13)**: YES/NO OBI, best ask prices, spreads, Binance 5s/1s velocity, acceleration, funding rate, 60m oracle drift, oracle price, **time-to-expiry (normalised to [0,1])**.
+- **Features (13)**: YES/NO OBI, best ask prices, spreads, Binance 5s/1s velocity, acceleration, funding rate, 60m oracle drift, oracle price, **time-to-expiry (normalised to [0,1])** — sourced from the active Raptor scouts.
 - **Label**: `1.0` if YES bid rises within `GBOOST_LOOKAHEAD_TICKS` ticks, `0.0` otherwise.
 - **Retraining**: Every `GBOOST_RETRAIN_EVERY_N` ticks via `tokio::task::spawn_blocking` (never blocks the async executor). Requires `GBOOST_MIN_TRAINING_SAMPLES` snapshots before first model is available.
 - **Persistence**: Model serialized to `GBOOST_MODEL_PATH` after each retrain and warm-loaded on startup. The filename is versioned (e.g. `gboost_model_v13f.json`) — see FAQ below.
@@ -385,7 +401,7 @@ The priority is consistent profitability first — abstractions and new features
 - **Profile selector in Control Tower** — top-level switcher so the dashboard shows the active profile's vipers, P&L curve, and trade log
 
 ### Longer-term (multi-market)
-- **Polymarket market-type expansion** — extend oracle and feature layers to support politics, sports, and social event markets (not just crypto); vipers declare which market types they support and the UI only shows compatible ones for a given profile
+- **Polymarket market-type expansion** — add new Raptor scouts for politics, sports, and social event markets (line movement APIs, polling aggregators); Vipers declare which Raptors they require and the UI only shows compatible Vipers for a given profile
 - **Market-agnostic viper interfaces** — formalize the strategy trait so community vipers can be built for any market type without touching core orchestrator logic (see [CUSTOM_STRATEGY.md](docs/CUSTOM_STRATEGY.md))
 - **Dynamic profile management** — create/edit/pause profiles at runtime via the API without restarting the engine
 
