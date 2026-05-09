@@ -6,11 +6,17 @@ export interface DynamicConfig {
   ghost_mode: boolean;
 
   // Viper enable flags
+  enable_arbitrage:  boolean;
   enable_time_decay: boolean;
   enable_momentum:   boolean;
   enable_maker:      boolean;
   enable_basis:      boolean;
   enable_gboost:     boolean;
+
+  // Arbitrage Viper
+  arbitrage_position_size_usdc: string;
+  arbitrage_max_exposure_usdc:  string;
+  arbitrage_profit_threshold:   string;
 
   // TimeDecay Viper
   time_decay_position_size_usdc:   string;

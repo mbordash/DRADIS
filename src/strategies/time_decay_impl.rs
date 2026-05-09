@@ -89,6 +89,20 @@ impl Strategy for TimeDecayStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── Snapshot staleness gate ───────────────────────────────────────────
+        // The snapshot is updated via WebSocket events.  Between events the snapshot
+        // retains stale depth values — a book that appears neutral can actually be
+        // adverse when the WebSocket hasn't fired recently.
+        // 2026-05-07 T3: entered with entry_hb_age_sec=34, stale OBI slipped the gate.
+        let snapshot_age_secs = (Utc::now() - snap.timestamp).num_seconds();
+        if snapshot_age_secs > config::TIME_DECAY_MAX_SNAPSHOT_AGE_SECS {
+            tracing::debug!(
+                "🚫 TimeDecay entry blocked: snapshot too stale ({}s > max {}s)",
+                snapshot_age_secs, config::TIME_DECAY_MAX_SNAPSHOT_AGE_SECS
+            );
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── OBI gate ─────────────────────────────────────────────────────────
         let yes_bid = snap.yes_bid;
         let no_bid  = snap.no_bid;
@@ -117,10 +131,16 @@ impl Strategy for TimeDecayStrategyImpl {
         }
 
         // ── Price bounds gate ─────────────────────────────────────────────────
-        if yes_bid > dc.time_decay_max_entry_price || yes_bid < dc.time_decay_min_entry_price {
+        // Use the stricter of the dynamic config value or the compile-time constant.
+        // This prevents a stale DB value (e.g. 0.65 left from an earlier session)
+        // from letting skewed entries (yes_bid=0.59, 0.63) through.
+        // 2026-05-08 session: DB had max_entry_price=0.65; compile-time is 0.50.
+        // TimeDecay only makes sense in the symmetric zone where BOTH legs are near 0.50.
+        let max_entry = dc.time_decay_max_entry_price.min(config::TIME_DECAY_MAX_ENTRY_PRICE);
+        if yes_bid > max_entry || yes_bid < dc.time_decay_min_entry_price {
             return Ok(StrategySignal::NoSignal);
         }
-        if no_bid > dc.time_decay_max_entry_price || no_bid < dc.time_decay_min_entry_price {
+        if no_bid > max_entry || no_bid < dc.time_decay_min_entry_price {
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -188,7 +208,7 @@ impl Strategy for TimeDecayStrategyImpl {
         let yes_key = ("TimeDecayStrategy".to_string(), market.yes_token);
         let no_key  = ("TimeDecayStrategy".to_string(), market.no_token);
 
-        if let (Some(yp), Some(_)) = (pos_map.get(&yes_key), pos_map.get(&no_key)) {
+        if let (Some(yp), Some(np)) = (pos_map.get(&yes_key), pos_map.get(&no_key)) {
             let yes_bid = snap.yes_bid;
             let no_bid  = snap.no_bid;
 
@@ -218,7 +238,15 @@ impl Strategy for TimeDecayStrategyImpl {
                 tracing::debug!("⏳ TimeDecay SL suppressed: hold={}s < min={}s", hold_secs, config::TIME_DECAY_MIN_HOLD_SECS);
             } else {
                 let combined_bid = yes_bid + no_bid;
-                if combined_bid < dc.time_decay_convergence_exit_bid * (dec!(1) - effective_stop_pct) {
+                // ── Entry-relative stop-loss ──────────────────────────────────────
+                // Previous formula used convergence_exit_bid (0.998) as the SL reference,
+                // which caused the threshold (0.998 × 0.95 = 0.9481) to be ABOVE typical
+                // entry combined bids (0.73–0.97) — either firing immediately or allowing
+                // huge losses.  Now anchored to actual entry cost so 5% means 5% of
+                // what we paid, regardless of how skewed the entry was.
+                let entry_combined = yp.avg_entry + np.avg_entry;
+                let sl_threshold = entry_combined * (dec!(1) - effective_stop_pct);
+                if combined_bid < sl_threshold {
                     return Ok(StrategySignal::Exit {
                         params: OrderParams { token_id: market.yes_token, price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: dc.ghost_mode },
                         reason: format!("Time Decay SL{}", if iv_elevated { " (IV-tightened)" } else { "" }),

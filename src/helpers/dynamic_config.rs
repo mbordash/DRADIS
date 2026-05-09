@@ -38,11 +38,17 @@ pub struct DynamicConfig {
     pub ghost_mode: bool,
 
     // ── Viper (strategy) enable flags ─────────────────────────────────────────
+    pub enable_arbitrage:  bool,
     pub enable_time_decay: bool,
     pub enable_momentum:   bool,
     pub enable_maker:      bool,
     pub enable_basis:      bool,
     pub enable_gboost:     bool,
+
+    // ── Arbitrage Viper ───────────────────────────────────────────────────────
+    pub arbitrage_position_size_usdc: Decimal,
+    pub arbitrage_max_exposure_usdc:  Decimal,
+    pub arbitrage_profit_threshold:   Decimal,
 
     // ── TimeDecay Viper ───────────────────────────────────────────────────────
     pub time_decay_position_size_usdc:  Decimal,
@@ -90,11 +96,16 @@ impl Default for DynamicConfig {
         Self {
             ghost_mode: config::GHOST_MODE,
 
+            enable_arbitrage:  config::ENABLE_ARBITRAGE_TRADING,
             enable_time_decay: config::ENABLE_TIME_DECAY_TRADING,
             enable_momentum:   config::ENABLE_MOMENTUM_TRADING,
             enable_maker:      config::ENABLE_MAKER_TRADING,
             enable_basis:      config::ENABLE_BASIS_TRADING,
             enable_gboost:     config::ENABLE_GBOOST_TRADING,
+
+            arbitrage_position_size_usdc: config::ARBITRAGE_POSITION_SIZE_USDC,
+            arbitrage_max_exposure_usdc:  config::ARBITRAGE_MAX_EXPOSURE_USDC,
+            arbitrage_profit_threshold:   config::ARBITRAGE_PROFIT_THRESHOLD,
 
             time_decay_position_size_usdc:  config::TIME_DECAY_POSITION_SIZE_USDC,
             time_decay_max_exposure_usdc:   config::TIME_DECAY_MAX_EXPOSURE_USDC,
@@ -142,8 +153,19 @@ impl DynamicConfig {
         if let Some(pool) = db::pool() {
             if let Some(json) = db::config_get(pool, DB_KEY).await {
                 match serde_json::from_str::<DynamicConfig>(&json) {
-                    Ok(cfg) => {
-                        info!("⚙️  DynamicConfig loaded from SQLite");
+                    Ok(mut cfg) => {
+                        // ── Safety floor enforcement ─────────────────────────────────
+                        // Compile-time constants are the hard limits.  A stale DB row can
+                        // never override a tightened constant — code fixes take effect
+                        // immediately on the next startup without a manual DB reset.
+                        //
+                        // Rule: "stricter wins" — for upper bounds use .min(), for lower
+                        // bounds (OBI block is negative) the code already uses .max(db, config).
+                        cfg.time_decay_max_entry_price = cfg.time_decay_max_entry_price
+                            .min(config::TIME_DECAY_MAX_ENTRY_PRICE);
+                        cfg.time_decay_stop_loss_pct = cfg.time_decay_stop_loss_pct
+                            .min(config::TIME_DECAY_STOP_LOSS_PERCENT);
+                        info!("⚙️  DynamicConfig loaded from SQLite (safety floors applied)");
                         return Arc::new(cfg);
                     }
                     Err(e) => {

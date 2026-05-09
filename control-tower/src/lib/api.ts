@@ -54,6 +54,18 @@ export async function getStatus(): Promise<StatusResponse> {
 
 export const VIPER_DEFS: ViperDef[] = [
   {
+    name: 'Arbitrage',
+    enableKey: 'enable_arbitrage',
+    accentColor: 'teal',
+    statusKey: 'arbitrage',
+    description: 'Hedged maker bids on YES+NO — captures mispriced spread at 0% fee',
+    fields: [
+      { key: 'arbitrage_position_size_usdc', label: 'Position Size',     type: 'usd'     },
+      { key: 'arbitrage_max_exposure_usdc',  label: 'Max Exposure',      type: 'usd'     },
+      { key: 'arbitrage_profit_threshold',   label: 'Min Profit/Share',  type: 'price'   },
+    ],
+  },
+  {
     name: 'Time Decay',
     enableKey: 'enable_time_decay',
     accentColor: 'indigo',

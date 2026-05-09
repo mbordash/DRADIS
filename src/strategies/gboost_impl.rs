@@ -45,6 +45,7 @@ use rust_decimal_macros::dec;
 use std::collections::{VecDeque, HashMap}; // Added HashMap
 use std::sync::{Arc, Mutex as StdMutex};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Instant;
 use chrono::Utc;
 use perpetual::{Matrix, PerpetualBooster};
 use perpetual::objective::Objective;
@@ -169,6 +170,12 @@ pub struct GboostStrategyImpl {
     pending_entries: Arc<StdMutex<HashMap<U256, (MarketSnapshot, rust_decimal::Decimal)>>>,
     /// Per-token timestamp of the last emitted exit signal to prevent rapid re-entry churn.
     post_exit_cooldowns: Arc<StdMutex<HashMap<U256, chrono::DateTime<chrono::Utc>>>>,
+    /// Count of consecutive degenerate (< GBOOST_MIN_USABLE_TREES) retrain results.
+    /// Used to apply exponential backoff so a 10-second retrain storm doesn't burn CPU
+    /// for 110+ minutes as seen in the 2026-05-07 evening session.
+    consecutive_degenerate: Arc<StdMutex<usize>>,
+    /// When set, `maybe_retrain` skips all retrain attempts until this instant passes.
+    retrain_backoff_until: Arc<StdMutex<Option<Instant>>>,
 }
 
 impl GboostStrategyImpl {
@@ -182,11 +189,23 @@ impl GboostStrategyImpl {
                 Ok(json) => match PerpetualBooster::from_json(&json) {
                     Ok(loaded) => {
                         let n = loaded.trees.len();
-                        *model_clone.lock().unwrap() = Some(loaded);
-                        tracing::info!(
-                            "🤖 GboostStrategy: loaded persisted model from {} ({} trees)",
-                            config::GBOOST_MODEL_PATH, n
-                        );
+                        // Discard a degenerate startup model — a stale 1-tree model is worse
+                        // than no model at all because it sticks as "previous" during retrain
+                        // storms and prevents the engine from cold-starting cleanly.
+                        // 2026-05-07 evening: startup model had 1 tree, kept as "previous"
+                        // for 110 minutes while every retrain hit the same degenerate result.
+                        if n < config::GBOOST_MIN_USABLE_TREES {
+                            tracing::warn!(
+                                "🤖 GboostStrategy: discarding persisted model ({} trees < min {}), cold-starting",
+                                n, config::GBOOST_MIN_USABLE_TREES
+                            );
+                        } else {
+                            *model_clone.lock().unwrap() = Some(loaded);
+                            tracing::info!(
+                                "🤖 GboostStrategy: loaded persisted model from {} ({} trees)",
+                                config::GBOOST_MODEL_PATH, n
+                            );
+                        }
                     }
                     Err(e) => tracing::warn!(
                         "🤖 GboostStrategy: model parse failed (will train from scratch): {:?}", e
@@ -207,10 +226,12 @@ impl GboostStrategyImpl {
             ticks_since_retrain: Arc::new(StdMutex::new(0)),
             is_training: Arc::new(AtomicBool::new(false)),
             training_data: Arc::new(StdMutex::new(
-                VecDeque::with_capacity(config::GBOOST_HISTORY_BUFFER_SIZE) // Use similar capacity
+                VecDeque::with_capacity(config::GBOOST_HISTORY_BUFFER_SIZE)
             )),
             pending_entries: Arc::new(StdMutex::new(HashMap::new())),
             post_exit_cooldowns: Arc::new(StdMutex::new(HashMap::new())),
+            consecutive_degenerate: Arc::new(StdMutex::new(0)),
+            retrain_backoff_until: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -234,6 +255,19 @@ impl GboostStrategyImpl {
     ///      reaching the minimum sample count required to produce its first predictions.
     fn maybe_retrain(&self) {
         if self.is_training.load(Ordering::Relaxed) { return; }
+
+        // ── Degenerate-retrain backoff ─────────────────────────────────────────
+        // When consecutive retrains produce degenerate models the engine must not
+        // spin at 10-second intervals burning CPU.  Backoff grows exponentially:
+        // 1st degen → 20s, 2nd → 40s, 3rd → 80s, … capped at 300s (5 min).
+        {
+            let guard = self.retrain_backoff_until.lock().unwrap();
+            if let Some(until) = *guard {
+                if Instant::now() < until {
+                    return;
+                }
+            }
+        }
 
         let triggered = {
             let mut t = self.ticks_since_retrain.lock().unwrap();
@@ -280,6 +314,8 @@ impl GboostStrategyImpl {
 
         let model_arc   = Arc::clone(&self.model);
         let is_training = Arc::clone(&self.is_training);
+        let consecutive_degenerate = Arc::clone(&self.consecutive_degenerate);
+        let retrain_backoff_until  = Arc::clone(&self.retrain_backoff_until);
 
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || train_model(training_samples)).await;
@@ -297,14 +333,24 @@ impl GboostStrategyImpl {
                     // Reject degenerate models — a model with fewer than
                     // GBOOST_MIN_USABLE_TREES trees is essentially a random stump.
                     // Keep the previous (better) model rather than regressing.
+                    // Apply exponential backoff so we don't storm every 10 seconds.
                     if n < config::GBOOST_MIN_USABLE_TREES {
+                        let mut count = consecutive_degenerate.lock().unwrap();
+                        *count += 1;
+                        let backoff_secs = (20u64 * 2u64.pow((*count).saturating_sub(1).min(4) as u32)).min(300);
+                        *retrain_backoff_until.lock().unwrap() =
+                            Some(Instant::now() + std::time::Duration::from_secs(backoff_secs));
                         tracing::warn!(
-                            "🤖 GboostStrategy: retrain produced degenerate model ({} trees < min {}), keeping previous",
-                            n, config::GBOOST_MIN_USABLE_TREES
+                            "🤖 GboostStrategy: retrain produced degenerate model ({} trees < min {}), keeping previous (backoff {}s, #{} consecutive)",
+                            n, config::GBOOST_MIN_USABLE_TREES, backoff_secs, *count
                         );
                         is_training.store(false, Ordering::Relaxed);
                         return;
                     }
+
+                    // Good model — reset degenerate backoff counters.
+                    *consecutive_degenerate.lock().unwrap() = 0;
+                    *retrain_backoff_until.lock().unwrap() = None;
 
                     let old_tree_count = {
                         let old_model = model_arc.lock().unwrap();
@@ -491,8 +537,33 @@ impl Strategy for GboostStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── Snapshot staleness gate ───────────────────────────────────────────
+        // Stale snapshot depth values can let OBI gates silently pass when the actual
+        // live book has moved adversely between WebSocket events.
+        // 2026-05-07 T6 & T7: entry_hb_age_sec 16–35s; live snapshot OBI differed
+        // from heartbeat OBI by > 0.50, causing adverse entries.
+        let target_snap_age = (chrono::Utc::now() - target_snapshot.timestamp).num_seconds();
+        if target_snap_age > config::GBOOST_MAX_SNAPSHOT_AGE_SECS {
+            tracing::debug!(
+                "🚫 GBoost entry blocked: target snapshot too stale ({}s > max {}s)",
+                target_snap_age, config::GBOOST_MAX_SNAPSHOT_AGE_SECS
+            );
+            return Ok(StrategySignal::NoSignal);
+        }
+        // Also gate on hourly snapshot staleness when trading the daily market.
+        if ctx.maker_snapshot.is_some() {
+            let hourly_snap_age = (chrono::Utc::now() - ctx.snapshot.timestamp).num_seconds();
+            if hourly_snap_age > config::GBOOST_MAX_SNAPSHOT_AGE_SECS {
+                tracing::debug!(
+                    "🚫 GBoost entry blocked: hourly snapshot too stale ({}s > max {}s)",
+                    hourly_snap_age, config::GBOOST_MAX_SNAPSHOT_AGE_SECS
+                );
+                return Ok(StrategySignal::NoSignal);
+            }
+        }
+
         if let Some(close_time) = target_market.market_close_time {
-            if (close_time - Utc::now()).num_seconds() < 90 {
+            if (close_time - Utc::now()).num_seconds() < config::GBOOST_MIN_SECS_TO_EXPIRY {
                 return Ok(StrategySignal::NoSignal);
             }
         }

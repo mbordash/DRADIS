@@ -29,6 +29,7 @@ pub const ENABLE_X: bool = false;
 /// Dry-run mode — logs trades without executing them on-chain.
 /// ⚠️ Set to `false` only after validating signals in ghost mode for 30+ minutes.
 pub const GHOST_MODE: bool = false;
+pub const ENABLE_ARBITRAGE_TRADING: bool = true;
 
 /// Requires a wider margin before entering arbitrage — fewer trades, higher quality.
 pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.07);
@@ -239,7 +240,7 @@ pub const BASIS_MAKER_BUY_PRICE_ADJUSTMENT: Decimal = dec!(-0.01);
 
 pub const ENABLE_GBOOST_TRADING: bool = true;
 
-pub const GBOOST_MAX_ENTRY_PRICE: Decimal = dec!(0.60);
+pub const GBOOST_MAX_ENTRY_PRICE: Decimal = dec!(0.55);
 pub const GBOOST_MIN_ENTRY_PRICE: Decimal = dec!(0.35);
 pub const GBOOST_HISTORY_BUFFER_SIZE: usize = 1000;
 pub const GBOOST_LOOKAHEAD_TICKS: usize = 200;
@@ -250,7 +251,7 @@ pub const GBOOST_NUM_THREADS: usize = 2;
 pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.80);
 pub const GBOOST_POST_EXIT_COOLDOWN_SECS: i64 = 300;
 /// Conservative: tighter OBI gate — don't enter unless book is near neutral or favorable.
-pub const GBOOST_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.25);
+pub const GBOOST_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.25); // already at floor; confirmed 2026-05-08
 /// Minimum fraction of price distance from 0.50 required for a GBoost entry.
 /// Conservative: higher edge requirement — only trade when there is meaningful directional conviction.
 pub const GBOOST_MIN_EDGE_FROM_FAIR: Decimal = dec!(0.06);
@@ -267,12 +268,13 @@ pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(4.0);
 pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300;
 pub const GBOOST_TARGET_PROFIT_PERCENT: Decimal = dec!(0.12);
 pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.055);
-pub const GBOOST_MIN_HOLD_SECS: i64 = 60;
+pub const GBOOST_MIN_HOLD_SECS: i64 = 180;
 pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 10;
-pub const GBOOST_MIN_USABLE_TREES: usize = 5;
+pub const GBOOST_MIN_USABLE_TREES: usize = 30;
 pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v13f.json";
 pub const GBOOST_MAX_HOURLY_ASK_SUM: Decimal = dec!(1.20);
 pub const GBOOST_MIN_HOURLY_BID_SUM: Decimal = dec!(0.70);
+pub const GBOOST_MIN_SECS_TO_EXPIRY: i64 = 900;
 
 // ============================================================================
 // POSITION MERGE SETTINGS
@@ -321,12 +323,12 @@ pub const TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER: Decimal = dec!(0.35);
 /// Price bounds: only enter when genuine market uncertainty exists.
 /// Extreme-probability YES prices (< MIN or > MAX) mean the book has decided
 /// an outcome — theta thesis breaks down and share counts balloon dangerously.
-pub const TIME_DECAY_MAX_ENTRY_PRICE: Decimal = dec!(0.62);
+pub const TIME_DECAY_MAX_ENTRY_PRICE: Decimal = dec!(0.46);
 pub const TIME_DECAY_MIN_ENTRY_PRICE: Decimal = dec!(0.38);
 
 /// OBI gate: block entry when the order book is heavily one-sided.
 /// Conservative: tightest gate — skip any book with extreme imbalance.
-pub const TIME_DECAY_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.55);
+pub const TIME_DECAY_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.20);
 
 
 // ============================================================================

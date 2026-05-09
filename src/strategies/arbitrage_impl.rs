@@ -29,7 +29,6 @@ use rust_decimal_macros::dec;
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::strategies::is_drawdown_limit_hit;
-use crate::config;
 use polymarket_client_sdk_v2::clob::types::OrderType;
 
 const STRATEGY_NAME: &str = "ArbitrageStrategy";
@@ -39,6 +38,12 @@ pub struct ArbitrageStrategyImpl;
 #[async_trait]
 impl Strategy for ArbitrageStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
+        let dc = &ctx.dynamic_config;
+
+        if !dc.enable_arbitrage {
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Global Risk Check ────────────────────────────────────────────────
         if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
             return Ok(StrategySignal::NoSignal);
@@ -51,12 +56,12 @@ impl Strategy for ArbitrageStrategyImpl {
         let no_bid  = snapshot.no_bid;
 
         // ── Maker arb profitability gate (0% fee on GTC fills) ───────────────
-        if !is_maker_arb_profitable(yes_bid, no_bid) {
+        if !is_maker_arb_profitable(yes_bid, no_bid, dc.arbitrage_profit_threshold) {
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Strategy Exposure Check ──────────────────────────────────────────
-        let trade_size = dec!(10.0);
+        let trade_size = dc.arbitrage_position_size_usdc;
         let current_exposure = {
             let pos_map = ctx.positions.lock().await;
             pos_map.iter()
@@ -64,7 +69,7 @@ impl Strategy for ArbitrageStrategyImpl {
                 .map(|(_, p)| p.shares * p.avg_entry)
                 .sum::<Decimal>()
         };
-        if current_exposure + trade_size > config::ARBITRAGE_MAX_EXPOSURE_USDC {
+        if current_exposure + trade_size > dc.arbitrage_max_exposure_usdc {
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -88,7 +93,7 @@ impl Strategy for ArbitrageStrategyImpl {
                 condition_id: market.condition_id.clone(),
                 order_type: OrderType::GTC,            // rest on the book as maker
                 post_only: true,                       // reject if it would cross (no accidental taker)
-                ghost_mode: config::GHOST_MODE,
+                ghost_mode: dc.ghost_mode,
             },
             pair_params: Some(OrderParams {
                 token_id: market.no_token,
@@ -100,12 +105,13 @@ impl Strategy for ArbitrageStrategyImpl {
                 condition_id: market.condition_id.clone(),
                 order_type: OrderType::GTC,
                 post_only: true,
-                ghost_mode: config::GHOST_MODE,
+                ghost_mode: dc.ghost_mode,
             }),
         });
     }
 
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
+        let dc = &ctx.dynamic_config;
         let market   = ctx.maker_market.as_ref().unwrap_or(&ctx.market);
         let snapshot = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
         let pos_map = ctx.positions.lock().await;
@@ -144,9 +150,9 @@ impl Strategy for ArbitrageStrategyImpl {
                         is_neg_risk: market.is_neg_risk,
                         market_name: market.market_name.clone(),
                         condition_id: market.condition_id.clone(),
-                        order_type: OrderType::FAK,   // guaranteed exit before close
-                        post_only: false,
-                        ghost_mode: config::GHOST_MODE,
+                order_type: OrderType::FAK,   // guaranteed exit before close
+                post_only: false,
+                ghost_mode: dc.ghost_mode,
                     },
                     reason: "Arbitrage convergence".to_string(),
                     exit_pair: true,
@@ -167,7 +173,7 @@ impl Strategy for ArbitrageStrategyImpl {
 ///
 /// Maker fills incur 0% fee on Polymarket.  Combined cost = YES_bid + NO_bid.
 /// Settlement always pays $1.00 per pair.
-/// Profit = 1.00 − YES_bid − NO_bid ≥ ARBITRAGE_PROFIT_THRESHOLD.
-fn is_maker_arb_profitable(yes_bid: Decimal, no_bid: Decimal) -> bool {
-    (dec!(1.0) - yes_bid - no_bid) >= config::ARBITRAGE_PROFIT_THRESHOLD
+/// Profit = 1.00 − YES_bid − NO_bid ≥ profit_threshold.
+fn is_maker_arb_profitable(yes_bid: Decimal, no_bid: Decimal, profit_threshold: Decimal) -> bool {
+    (dec!(1.0) - yes_bid - no_bid) >= profit_threshold
 }
