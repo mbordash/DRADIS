@@ -619,6 +619,19 @@ impl Strategy for GboostStrategyImpl {
                 );
                 return Ok(StrategySignal::NoSignal);
             }
+            // ── OBI exhaustion gate ───────────────────────────────────────────
+            // When |obi| is very large the move is already mature — entering YES
+            // into an already-resolved book is tail-chasing with maximum adverse
+            // selection. 2026-05-08 T2: |obi_y|=0.61 on a ~93% YES market → SL -$0.457.
+            if yes_obi.abs() > config::GBOOST_OBI_EXHAUSTION_BLOCK {
+                tracing::debug!(
+                    "🚫 GBoost YES entry veto: OBI exhaustion | market='{}' |obi|={:.3} > {:.3}",
+                    target_market.market_name,
+                    yes_obi.abs(),
+                    config::GBOOST_OBI_EXHAUSTION_BLOCK
+                );
+                return Ok(StrategySignal::NoSignal);
+            }
             // ── Hourly OBI direction check for daily entries ──────────────────
             // When trading daily market, the hourly YES OBI foreshadows daily direction.
             // If hourly YES is being aggressively sold (OBI << 0), smart money is
@@ -698,6 +711,18 @@ impl Strategy for GboostStrategyImpl {
                 tracing::debug!(
                     "🚫 GBoost NO entry veto: adverse OBI | market='{}' token={:?} obi={:.3} block={:.3}",
                     target_market.market_name, target_market.no_token, no_obi, config::GBOOST_OBI_ADVERSE_BLOCK
+                );
+                return Ok(StrategySignal::NoSignal);
+            }
+            // ── OBI exhaustion gate ───────────────────────────────────────────
+            // Blocks NO entries where the book is already heavily one-sided against
+            // the NO leg — the move is in progress and the risk/reward is exhausted.
+            if no_obi.abs() > config::GBOOST_OBI_EXHAUSTION_BLOCK {
+                tracing::debug!(
+                    "🚫 GBoost NO entry veto: OBI exhaustion | market='{}' |obi|={:.3} > {:.3}",
+                    target_market.market_name,
+                    no_obi.abs(),
+                    config::GBOOST_OBI_EXHAUSTION_BLOCK
                 );
                 return Ok(StrategySignal::NoSignal);
             }
