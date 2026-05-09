@@ -65,3 +65,4 @@ CONFIG_CHANGES_APPLIED.md
 *.swo
 start-local.sh
 stop-local.sh
+/control-tower/tsconfig.tsbuildinfo

@@ -260,6 +260,7 @@ pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v13f.json";
 pub const GBOOST_MAX_HOURLY_ASK_SUM: Decimal = dec!(1.20);
 pub const GBOOST_MIN_HOURLY_BID_SUM: Decimal = dec!(0.70);
 pub const GBOOST_MIN_SECS_TO_EXPIRY: i64 = 900;
+pub const GBOOST_MAX_SNAPSHOT_AGE_SECS: i64 = 10;
 
 
 // ============================================================================
@@ -308,6 +309,8 @@ pub const TIME_DECAY_MIN_ENTRY_PRICE: Decimal = dec!(0.32);
 
 /// OBI gate: block entry when the order book is heavily one-sided.
 pub const TIME_DECAY_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.20);
+/// Maximum age (seconds) of the live market snapshot at TimeDecay entry.
+pub const TIME_DECAY_MAX_SNAPSHOT_AGE_SECS: i64 = 10;
 
 
 // ============================================================================
@@ -400,6 +403,7 @@ pub const MAX_EXPOSURE_PER_TOKEN_USDC: Decimal = dec!(30);
 pub const MOMENTUM_MAX_EXPOSURE_USDC: Decimal = dec!(30);
 pub const MAKER_MAX_EXPOSURE_USDC: Decimal = dec!(25);
 pub const ARBITRAGE_MAX_EXPOSURE_USDC: Decimal = dec!(75);
+pub const ARBITRAGE_POSITION_SIZE_USDC: Decimal = dec!(10.0);
 pub const TIME_DECAY_MAX_EXPOSURE_USDC: Decimal = dec!(80);
 pub const BASIS_MAX_EXPOSURE_USDC: Decimal = dec!(30);
 
