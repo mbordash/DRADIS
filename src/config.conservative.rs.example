@@ -241,7 +241,8 @@ pub const BASIS_MAKER_BUY_PRICE_ADJUSTMENT: Decimal = dec!(-0.01);
 pub const ENABLE_GBOOST_TRADING: bool = true;
 
 pub const GBOOST_MAX_ENTRY_PRICE: Decimal = dec!(0.55);
-pub const GBOOST_MIN_ENTRY_PRICE: Decimal = dec!(0.38);
+pub const GBOOST_MAX_YES_ENTRY_PRICE: Decimal = dec!(0.55);
+
 pub const GBOOST_HISTORY_BUFFER_SIZE: usize = 1000;
 pub const GBOOST_LOOKAHEAD_TICKS: usize = 200;
 pub const GBOOST_MIN_TRAINING_SAMPLES: usize = 320;
