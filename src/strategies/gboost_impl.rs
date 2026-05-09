@@ -288,7 +288,7 @@ impl GboostStrategyImpl {
         } else {
             // ── Source 2: lookahead labels from history ring buffer ───────────
             // Generates supervised labels without needing real trade outcomes.
-            // Label = 1.0 if the YES bid rises GBOOST_LOOKAHEAD_TICKS ticks later.
+            // Label = 1.0 if the YES bid rises within this many ticks.
             let h = self.history.lock().unwrap();
             let n = h.len();
             let lookahead = config::GBOOST_LOOKAHEAD_TICKS;
@@ -648,7 +648,7 @@ impl Strategy for GboostStrategyImpl {
                 }
             }
             let price  = floor_to_tick_size(target_snapshot.yes_ask);
-            if price >= config::GBOOST_MAX_ENTRY_PRICE
+            if price >= config::GBOOST_MAX_YES_ENTRY_PRICE
                 || price < config::GBOOST_MIN_ENTRY_PRICE
                 || price <= dec!(0)
             {
@@ -744,7 +744,7 @@ impl Strategy for GboostStrategyImpl {
                 }
             }
             let price  = floor_to_tick_size(target_snapshot.no_ask);
-            if price >= config::GBOOST_MAX_ENTRY_PRICE
+            if price > config::GBOOST_MIN_NO_ENTRY_PRICE
                 || price < config::GBOOST_MIN_ENTRY_PRICE
                 || price <= dec!(0)
             {
@@ -964,7 +964,7 @@ mod tests {
     use super::*;
     use std::sync::Arc;
     use tokio::sync::Mutex;
-    use crate::state::{MarketConfig, Position, PositionMap};
+    use crate::state::{MarketConfig, Position, PositionMap, DynamicConfig};
     // use alloy::primitives::U256; // Already imported by the main file
 
     fn make_snapshot() -> MarketSnapshot {
@@ -998,7 +998,7 @@ mod tests {
             crypto_filter: "btc".to_string(),
             market_started_at: Utc::now() - chrono::Duration::seconds(300),
             maker_market: None, maker_snapshot: None,
-            dynamic_config: Arc::new(Default::default()),
+            dynamic_config: Arc::new(DynamicConfig::default()),
         }
     }
 

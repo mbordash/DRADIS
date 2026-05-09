@@ -225,8 +225,17 @@ pub const BASIS_MAKER_BUY_PRICE_ADJUSTMENT: Decimal = dec!(0.01);
 
 pub const ENABLE_GBOOST_TRADING: bool = true;
 
-pub const GBOOST_MAX_ENTRY_PRICE: Decimal = dec!(0.55);
-pub const GBOOST_MIN_ENTRY_PRICE: Decimal = dec!(0.38);
+/// Maximum token ask price allowed for GBoost entries (for YES side).
+/// Lowered from 0.60 → 0.55 after 2026-05-08 session analysis:
+///   T3: YES $0.56 on daily (P(UP)=0.889) → SignalRev loss -$0.21 (market already priced 56% UP)
+///   T6: NO  $0.59 on hourly (P(UP)=0.020) → SL -$1.02 (overpriced entry + near expiry)
+/// Entries above $0.55 have compressed upside and larger implied-vol swings on hourly markets.
+pub const GBOOST_MAX_YES_ENTRY_PRICE: Decimal = dec!(0.55);
+/// Minimum token ask price allowed for GBoost entries (for NO side).
+/// For NO entries, we want to buy when the price is low.
+pub const GBOOST_MIN_NO_ENTRY_PRICE: Decimal = dec!(0.45); // New constant
+pub const GBOOST_MIN_ENTRY_PRICE: Decimal = dec!(0.38); // Adjusted from 0.35
+
 pub const GBOOST_HISTORY_BUFFER_SIZE: usize = 1000;
 pub const GBOOST_LOOKAHEAD_TICKS: usize = 200;
 pub const GBOOST_MIN_TRAINING_SAMPLES: usize = 320;
