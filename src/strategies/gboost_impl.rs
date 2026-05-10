@@ -145,7 +145,9 @@ fn train_model(samples: Vec<TrainingSample>) -> Result<PerpetualBooster> {
         .set_budget(config::GBOOST_BUDGET as f32)
         .set_num_threads(Some(config::GBOOST_NUM_THREADS as usize))
         .set_log_iterations(0)  // silent: suppress perpetual's stdout logging
-        .set_max_bin(63);       // 63 bins is fast and sufficient for these features
+        .set_max_bin(63)        // 63 bins is fast and sufficient for these features
+        .set_iteration_limit(Some(100)) // Set max iterations (trees)
+        .set_stopping_rounds(None); // Disable early stopping for now
 
     booster.fit(&matrix, &labels, None, None)
         .map_err(|e| anyhow::anyhow!("perpetual fit error: {:?}", e))?;
@@ -673,7 +675,6 @@ impl Strategy for GboostStrategyImpl {
                 "🔮 GBoost YES entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
                 p_yes_up, price, shares
             );
-            // Store entry context for training feedback
             self.pending_entries.lock().unwrap().insert(
                 target_market.yes_token,
                 (target_snapshot.clone(), price)
@@ -998,7 +999,8 @@ mod tests {
             available_collateral: dec!(200),
             crypto_filter: "btc".to_string(),
             market_started_at: Utc::now() - chrono::Duration::seconds(300),
-            maker_market: None, maker_snapshot: None,
+            maker_market: None, // Added missing field
+            maker_snapshot: None, // Added missing field
             dynamic_config: Arc::new(DynamicConfig::default()),
         }
     }

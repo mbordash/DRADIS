@@ -102,6 +102,9 @@ fn print_banner() {
 const EXCHANGE_NORMAL: Address = address!("0xE111180000d2663C0091e4f400237545B87B996B");
 const EXCHANGE_NEG_RISK: Address = address!("0xe2222d279d744050d28e00520010520000310F59");
 
+// Constants for cancel_all_orders retry logic
+const MAX_CANCEL_RETRIES: u32 = 5;
+const BASE_CANCEL_RETRY_DELAY_MS: u64 = 200; // Start with 200ms
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -624,14 +627,36 @@ async fn main() -> Result<()> {
                         continue;
                     }
                     info!(" Market switch detected — restarting trading loop with new market context");
-                    // Timeout the cancel so a stalled CLOB response cannot block the switch.
-                    match tokio::time::timeout(
-                        Duration::from_secs(8),
-                        trading_client.as_ref().cancel_all_orders(),
-                    ).await {
-                        Ok(Err(e)) => warn!("⚠️ Failed to cancel all orders: {}", e),
-                        Err(_)     => warn!("⚠️ cancel_all_orders timed out (8s) — proceeding with market switch"),
-                        Ok(Ok(_))  => {}
+                    // Implement retry logic for cancel_all_orders
+                    let mut cancel_success = false;
+                    for i in 0..MAX_CANCEL_RETRIES {
+                        let delay = BASE_CANCEL_RETRY_DELAY_MS * (1 << i); // Exponential backoff
+                        match tokio::time::timeout(
+                            Duration::from_secs(8), // Keep the 8-second timeout for each attempt
+                            trading_client.as_ref().cancel_all_orders(),
+                        ).await {
+                            Ok(Ok(_)) => {
+                                info!("✅ Successfully cancelled all orders after {} retries.", i);
+                                cancel_success = true;
+                                break;
+                            },
+                            Ok(Err(e)) => {
+                                warn!("⚠️ Failed to cancel all orders (attempt {}/{}) with error: {}", i + 1, MAX_CANCEL_RETRIES, e);
+                                if i < MAX_CANCEL_RETRIES - 1 {
+                                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                                }
+                            },
+                            Err(_) => {
+                                warn!("⚠️ cancel_all_orders timed out (8s) (attempt {}/{}) — retrying in {}ms", i + 1, MAX_CANCEL_RETRIES, delay);
+                                if i < MAX_CANCEL_RETRIES - 1 {
+                                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                                }
+                            }
+                        }
+                    }
+
+                    if !cancel_success {
+                        error!("❌ Failed to cancel all orders after {} attempts. Proceeding with market switch, but orders may remain open.", MAX_CANCEL_RETRIES);
                     }
 
                     { phantom_cooldowns.lock().await.clear(); }
