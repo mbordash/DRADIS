@@ -173,10 +173,10 @@ The bot connects to Polymarket's CLOB via WebSocket for real-time orderbook data
 
 **GBoost / ML** — Online gradient-boosted binary classifier running on the **Window/Daily venue**.
 - **Model**: `perpetual` crate `PerpetualBooster` with `LogLoss` objective.
-- **Features (13)**: YES/NO OBI, best ask prices, spreads, Binance 5s/1s velocity, acceleration, funding rate, 60m oracle drift, oracle price, **time-to-expiry (normalised to [0,1])** — sourced from the active Raptor scouts.
+- **Features (14)**: YES/NO OBI, best ask prices, spreads, Binance 5s/1s velocity, acceleration, funding rate, 60m oracle drift, oracle price, **time-to-expiry (normalised to [0,1])** — sourced from the active Raptor scouts, OBI change history.
 - **Label**: `1.0` if YES bid rises within `GBOOST_LOOKAHEAD_TICKS` ticks, `0.0` otherwise.
 - **Retraining**: Every `GBOOST_RETRAIN_EVERY_N` ticks via `tokio::task::spawn_blocking` (never blocks the async executor). Requires `GBOOST_MIN_TRAINING_SAMPLES` snapshots before first model is available.
-- **Persistence**: Model serialized to `GBOOST_MODEL_PATH` after each retrain and warm-loaded on startup. The filename is versioned (e.g. `gboost_model_v13f.json`) — see FAQ below.
+- **Persistence**: Model serialized to `GBOOST_MODEL_PATH` after each retrain and warm-loaded on startup. The filename is versioned (e.g. `gboost_model_v14f.json`) — see FAQ below.
 - **Entry**: Buys YES if `P(UP) ≥ GBOOST_ENTRY_THRESHOLD`; buys NO if `P(UP) ≤ 1 − GBOOST_ENTRY_THRESHOLD`.
 - **Exit**: Take-profit at `GBOOST_TARGET_PROFIT_PERCENT`, stop-loss at `GBOOST_STOP_LOSS_PERCENT` (after `GBOOST_MIN_HOLD_SECS`), or signal reversal when model flips conviction.
 
@@ -405,7 +405,7 @@ This loop uses real market data, real strategy logic, and zero capital risk — 
 
 **I pulled an update and GBoost is producing garbage predictions / the model won't load.**
 
-The GBoost model is incompatible across feature vector changes.  The model file name in `GBOOST_MODEL_PATH` is intentionally **versioned** (e.g. `gboost_model_v13f.json`) so that a stale on-disk model with the wrong input dimension is never silently loaded against code expecting a different one.
+The GBoost model is incompatible across feature vector changes.  The model file name in `GBOOST_MODEL_PATH` is intentionally **versioned** (e.g. `gboost_model_v14f.json`) so that a stale on-disk model with the wrong input dimension is never silently loaded against code expecting a different one.
 
 If you pull an update and `NUM_FEATURES` in `src/strategies/gboost_impl.rs` has changed, you must:
 
@@ -416,7 +416,7 @@ If you pull an update and `NUM_FEATURES` in `src/strategies/gboost_impl.rs` has 
    ```
 3. Rebuild and restart. The model will cold-start, collect `GBOOST_MIN_TRAINING_SAMPLES` ticks (~16 seconds at 50 ms), then begin predicting.
 
-The safe pattern when adding a new feature: bump the suffix in `GBOOST_MODEL_PATH` (e.g. `v13f` → `v14f`).  The old file is ignored, no manual cleanup needed.
+The safe pattern when adding a new feature: bump the suffix in `GBOOST_MODEL_PATH` (e.g. `v14f` → `v15f`).  The old file is ignored, no manual cleanup needed.
 
 **How do I tune strategy parameters without restarting?**
 

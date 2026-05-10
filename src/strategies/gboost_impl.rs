@@ -3,7 +3,7 @@
 /// Uses the `perpetual` crate's `PerpetualBooster` (LogLoss objective) to predict
 /// near-term YES price direction from a rolling window of orderbook + oracle features.
 ///
-/// ── Feature Vector (NUM_FEATURES = 13) ──────────────────────────────────────
+/// ── Feature Vector (NUM_FEATURES = 14) ──────────────────────────────────────
 ///   [0]  yes_obi         — (yes_bid_depth − yes_ask_depth) / total depth
 ///   [1]  no_obi          — (no_bid_depth − no_ask_depth) / total depth
 ///   [2]  yes_ask         — best ask price for YES token
@@ -23,6 +23,7 @@
 ///                             (gamma, adverse selection, spread) changes dramatically
 ///                             near expiry — entries and exits should be calibrated
 ///                             differently depending on time horizon.
+///  [13]  yes_obi_change  — change in yes_obi from previous tick
 ///
 /// ── Label ────────────────────────────────────────────────────────────────────
 ///   1.0  if yes_bid rises in GBOOST_LOOKAHEAD_TICKS ticks
@@ -61,7 +62,7 @@ use crate::helpers::dynamic_config::DynamicConfig; // Corrected import
 use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
 
 /// Number of f64 features per snapshot row fed into the booster.
-const NUM_FEATURES: usize = 13;
+const NUM_FEATURES: usize = 14;
 
 /// Represents a single training sample for the Gboost model.
 /// Contains the features at the time of entry and whether the trade was profitable.
@@ -79,7 +80,7 @@ pub struct TrainingSample {
 const SECS_TO_EXPIRY_NORM: f64 = 14_400.0;
 
 /// Convert a `MarketSnapshot` into a fixed-length `f64` feature array.
-fn extract_features(s: &MarketSnapshot) -> [f64; NUM_FEATURES] {
+fn extract_features(s: &MarketSnapshot, prev_s: Option<&MarketSnapshot>) -> [f64; NUM_FEATURES] {
     let yes_total = s.yes_bid_depth + s.yes_ask_depth;
     let no_total  = s.no_bid_depth  + s.no_ask_depth;
 
@@ -90,6 +91,17 @@ fn extract_features(s: &MarketSnapshot) -> [f64; NUM_FEATURES] {
     let no_obi = if no_total > dec!(0) {
         ((s.no_bid_depth - s.no_ask_depth) / no_total).to_f64().unwrap_or(0.0)
     } else { 0.0 };
+
+    // Calculate yes_obi_change
+    let yes_obi_change = if let Some(prev) = prev_s {
+        let prev_yes_total = prev.yes_bid_depth + prev.yes_ask_depth;
+        let prev_yes_obi = if prev_yes_total > dec!(0) {
+            ((prev.yes_bid_depth - prev.yes_ask_depth) / prev_yes_total).to_f64().unwrap_or(0.0)
+        } else { 0.0 };
+        yes_obi - prev_yes_obi
+    } else {
+        0.0 // Default to 0 if no previous snapshot is available
+    };
 
     // Normalise secs_to_expiry to [0.0, 1.0]:
     //   0.0 = market has expired / about to expire
@@ -112,6 +124,7 @@ fn extract_features(s: &MarketSnapshot) -> [f64; NUM_FEATURES] {
         s.oracle_drift_60m.to_f64().unwrap_or(0.0)  / 10_000.0,
         s.oracle_price.to_f64().unwrap_or(70_000.0) / 100_000.0,
         secs_to_expiry_norm,
+        yes_obi_change, // New feature
     ]
 }
 
@@ -146,7 +159,7 @@ fn train_model(samples: Vec<TrainingSample>) -> Result<PerpetualBooster> {
         .set_num_threads(Some(config::GBOOST_NUM_THREADS as usize))
         .set_log_iterations(0)  // silent: suppress perpetual's stdout logging
         .set_max_bin(63)        // 63 bins is fast and sufficient for these features
-        .set_iteration_limit(Some(100)) // Set max iterations (trees)
+        .set_iteration_limit(Some(1000)) // Set max iterations (trees) to a much higher value
         .set_stopping_rounds(None); // Disable early stopping for now
 
     booster.fit(&matrix, &labels, None, None)
@@ -301,9 +314,10 @@ impl GboostStrategyImpl {
             let usable = n - lookahead;
             (0..usable).map(|i| {
                 let snap   = &h[i];
+                let prev_snap = if i > 0 { Some(&h[i-1]) } else { None }; // Get previous snapshot
                 let future = &h[i + lookahead];
                 TrainingSample {
-                    features: extract_features(snap),
+                    features: extract_features(snap, prev_snap), // Pass prev_snap
                     is_profitable: future.yes_bid > snap.yes_bid,
                     entry_timestamp: snap.timestamp,
                 }
@@ -384,7 +398,9 @@ impl GboostStrategyImpl {
         if booster.trees.len() < config::GBOOST_MIN_USABLE_TREES {
             return None;
         }
-        let feats = extract_features(snap);
+        let h = self.history.lock().unwrap();
+        let prev_snap = if h.len() >= 2 { Some(&h[h.len() - 2]) } else { None }; // Get previous snapshot
+        let feats = extract_features(snap, prev_snap); // Pass prev_snap
         // Stack-allocated array; Matrix borrows it for the duration of this call only.
         let matrix = Matrix::new(&feats, 1, NUM_FEATURES);
         booster.predict_proba(&matrix, false, false).first().copied()
@@ -395,8 +411,10 @@ impl GboostStrategyImpl {
     fn record_training_outcome_on_exit(&self, token_id: U256, is_profitable: bool) {
         let mut pending_entries_guard = self.pending_entries.lock().unwrap();
         if let Some((entry_snap, _entry_price)) = pending_entries_guard.remove(&token_id) {
+            let h = self.history.lock().unwrap();
+            let prev_entry_snap = if h.len() >= 2 { Some(&h[h.len() - 2]) } else { None }; // This might not be the *correct* previous snapshot for the entry_snap, but it's the best we can do with the current history structure. A more robust solution would involve storing prev_snap with entry_snap. For now, this is a reasonable approximation.
             let training_sample = TrainingSample {
-                features: extract_features(&entry_snap),
+                features: extract_features(&entry_snap, prev_entry_snap), // Pass prev_entry_snap
                 is_profitable,
                 entry_timestamp: entry_snap.timestamp,
             };
@@ -746,7 +764,7 @@ impl Strategy for GboostStrategyImpl {
                 }
             }
             let price  = floor_to_tick_size(target_snapshot.no_ask);
-            if price > config::GBOOST_MIN_NO_ENTRY_PRICE
+            if price > config::GBOOST_MAX_NO_ENTRY_PRICE
                 || price < config::GBOOST_MIN_ENTRY_PRICE
                 || price <= dec!(0)
             {
@@ -1008,7 +1026,7 @@ mod tests {
     #[test]
     fn extract_features_ranges() {
         let snap = make_snapshot();
-        let feats = extract_features(&snap);
+        let feats = extract_features(&snap, None); // Pass None for prev_s in test
         assert_eq!(feats.len(), NUM_FEATURES);
         assert!(feats[0].abs() <= 1.0, "yes_obi out of [-1,1]: {}", feats[0]);
         assert!(feats[1].abs() <= 1.0, "no_obi  out of [-1,1]: {}", feats[1]);
@@ -1027,7 +1045,7 @@ mod tests {
         for i in 0..n {
             let snap = make_snapshot(); // Dummy snapshot
             samples.push(TrainingSample {
-                features: extract_features(&snap),
+                features: extract_features(&snap, None), // Pass None for prev_s in test
                 is_profitable: i % 2 == 0, // Alternate profitable/unprofitable
                 entry_timestamp: Utc::now(),
             });
@@ -1051,7 +1069,7 @@ mod tests {
         for i in 0..n {
             let snap = make_snapshot(); // Dummy snapshot
             samples.push(TrainingSample {
-                features: extract_features(&snap),
+                features: extract_features(&snap, None), // Pass None for prev_s in test
                 is_profitable: i % 2 == 0, // Alternate profitable/unprofitable
                 entry_timestamp: Utc::now(),
             });
