@@ -242,6 +242,7 @@ pub const ENABLE_GBOOST_TRADING: bool = true;
 
 pub const GBOOST_MAX_ENTRY_PRICE: Decimal = dec!(0.55);
 pub const GBOOST_MAX_YES_ENTRY_PRICE: Decimal = dec!(0.55);
+pub const GBOOST_MAX_NO_ENTRY_PRICE: Decimal = dec!(0.45);
 pub const GBOOST_MIN_ENTRY_PRICE: Decimal = dec!(0.35);
 pub const GBOOST_HISTORY_BUFFER_SIZE: usize = 1000;
 pub const GBOOST_LOOKAHEAD_TICKS: usize = 200;
