@@ -110,6 +110,10 @@ pub const MOMENTUM_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.75);
 /// Aggressive: tolerates a wider spread (4-cent combined cap) to maximize fill opportunities.
 pub const MOMENTUM_MAX_ENTRY_ASK_SUM: Decimal = dec!(1.040);
 
+/// Maximum age (seconds) of the live orderbook snapshot at Momentum entry.
+/// Stale snapshots silently retain last-known OBI/depth values — unreliable veto data.
+pub const MOMENTUM_MAX_SNAPSHOT_AGE_SECS: i64 = 15;
+
 
 // ============================================================================
 // MAKER (PASSIVE LIMIT ORDER) STRATEGY PARAMETERS
@@ -281,9 +285,14 @@ pub const GBOOST_MIN_HOURLY_BID_SUM: Decimal = dec!(0.70);
 pub const GBOOST_MIN_SECS_TO_EXPIRY: i64 = 900;
 pub const GBOOST_MAX_SNAPSHOT_AGE_SECS: i64 = 10;
 
+/// Minimum hourly YES bid / maximum hourly YES ask allowed at GBoost entry.
+/// Guards against entering a daily position when the hourly market is near-resolved.
+pub const GBOOST_MIN_HOURLY_YES_BID: Decimal = dec!(0.05);
+pub const GBOOST_MAX_HOURLY_YES_ASK: Decimal = dec!(0.95);
 
-// ============================================================================
-// POSITION MERGE SETTINGS
+/// Seconds BTC spot must stay below (daily_strike − BASIS_BTC_ORACLE_STRIKE_BUFFER)
+/// before GBoost YES entries are suppressed. 3600s = 60 min sustained below-strike.
+pub const GBOOST_BELOW_STRIKE_SUPPRESS_SECS: i64 = 3600;
 // ============================================================================
 
 pub const MERGE_SCAN_INTERVAL_SECS: u64 = 30;
