@@ -133,12 +133,48 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" "${CT_USERNA
     cd "$REMOTE_DIR"
 
     echo "🧹 Stopping old containers..."
-    docker stop dradis-btc dradis-eth dradis-sol control-tower 2>/dev/null || true
-    docker rm   dradis-btc dradis-eth dradis-sol control-tower 2>/dev/null || true
-    docker system prune -af --volumes 2>/dev/null || true
+    docker stop dradis-btc dradis-eth dradis-sol control-tower ollama 2>/dev/null || true
+    docker rm   dradis-btc dradis-eth dradis-sol control-tower ollama 2>/dev/null || true
+    # Note: do NOT prune volumes — ollama-models volume holds the downloaded LLM (~4 GB).
+    # Pruning it forces a full re-download on every deploy.
+    docker system prune -af 2>/dev/null || true
 
     # Create isolated Docker network so containers talk internally
     docker network create dradis-net 2>/dev/null || true
+
+    # ── Ollama (LLM Advisor backend) ─────────────────────────────────────────
+    # Serves the Ollama API at http://ollama:11434 on the dradis-net network.
+    # Model files are stored in a named volume so they survive container restarts
+    # and re-deploys without a costly re-download (~4 GB for mistral:7b-instruct-q4_K_M).
+    #
+    # Requires: t3.xlarge (4 vCPU / 16 GB RAM) or equivalent.
+    # Disable by commenting out this block AND removing OLLAMA_URL from .env.
+    echo "🤖 Starting Ollama (LLM Advisor)..."
+    docker run -d \
+        --restart unless-stopped \
+        --name ollama \
+        --network dradis-net \
+        -v ollama-models:/root/.ollama \
+        -p 11434:11434 \
+        ollama/ollama
+
+    # Wait for Ollama HTTP API to be ready before issuing pull.
+    # docker run -d returns immediately but the server needs a few seconds to init.
+    echo "⏳ Waiting for Ollama to be ready..."
+    for i in $(seq 1 30); do
+        if docker exec ollama curl -sf http://localhost:11434/api/tags > /dev/null 2>&1; then
+            echo "✅ Ollama is ready."
+            break
+        fi
+        sleep 2
+    done
+
+    # Pull the model on first deploy (no-op if already in the volume).
+    # mistral:7b-instruct-q4_K_M — ~4.1 GB, best structured-output quality for DRADIS.
+    # Alternatives: llama3.1:8b-instruct-q4_0 (~4.7 GB), qwen2.5:7b-instruct-q4_0 (~4.3 GB)
+    # || true: a failed pull (e.g. network issue) should not abort the whole deploy.
+    echo "📥 Pulling mistral:7b-instruct-q4_K_M (skipped if already cached)..."
+    docker exec ollama ollama pull mistral:7b-instruct-q4_K_M || true
 
     echo "🔨 Building DRADIS image..."
     docker build -t dradis .
@@ -154,6 +190,8 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" "${CT_USERNA
         --env-file .env \
         -e CRYPTO_FILTER=btc \
         -e API_PORT=9000 \
+        -e OLLAMA_URL=http://ollama:11434 \
+        -e OLLAMA_MODEL=mistral:7b-instruct-q4_K_M \
         -p 9000:9000 \
         -v $(pwd)/logs:/app/logs \
         dradis
@@ -166,6 +204,8 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" "${CT_USERNA
 #        --env-file .env \
 #        -e CRYPTO_FILTER=eth \
 #        -e API_PORT=9000 \
+#        -e OLLAMA_URL=http://ollama:11434 \
+#        -e OLLAMA_MODEL=mistral:7b-instruct-q4_K_M \
 #        -v $(pwd)/logs:/app/logs \
 #        dradis
 #
@@ -177,6 +217,8 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" "${CT_USERNA
 #        --env-file .env \
 #        -e CRYPTO_FILTER=sol \
 #        -e API_PORT=9000 \
+#        -e OLLAMA_URL=http://ollama:11434 \
+#        -e OLLAMA_MODEL=mistral:7b-instruct-q4_K_M \
 #        -v $(pwd)/logs:/app/logs \
 #        dradis
 
@@ -194,16 +236,18 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" "${CT_USERNA
     echo ""
     echo "✅ Deployment complete!"
     echo "📜 Running containers:"
-    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep -E "(dradis|control)"
+    docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}" | grep -E "(dradis|control|ollama)"
     echo ""
     echo "🌐 Control Tower: http://$(hostname -I | awk '{print $1}'):3002"
     echo "📡 DRADIS API:    http://$(hostname -I | awk '{print $1}'):9000/api/health"
+    echo "🤖 Ollama API:    http://$(hostname -I | awk '{print $1}'):11434"
 REMOTE
 
 echo ""
 echo "✅ Deployment complete on $HOST!"
 echo "🌐 Control Tower: http://$HOST:3002"
 echo "📡 DRADIS API:    http://$HOST:9000/api/health"
+echo "🤖 Ollama API:    http://$HOST:11434 (internal-only; not exposed to public)"
 echo ""
 echo "📜 Tailing BTC logs (Ctrl+C to stop):"
 ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" "docker logs -f dradis-btc --tail 30"
