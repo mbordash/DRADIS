@@ -83,7 +83,14 @@ export default function LlmAdvisorCard({ recommendations, isLoading, advisorEnab
             <span className="text-3xl">🤖</span>
             <p className="text-sm text-gray-500">
               {advisorEnabled
-                ? 'Awaiting first analysis — the advisor fires after the first interval elapses and at least one trade has completed.'
+                ? <>
+                    Awaiting first analysis — fires every 30 min once at least{' '}
+                    <span className="text-gray-400 font-mono">5</span> session trades have completed,
+                    or supplemented by prior-session history.
+                    Check logs for{' '}
+                    <code className="text-xs bg-[#13131f] px-1 rounded">🤖 LLM Advisor</code>{' '}
+                    lines to trace progress.
+                  </>
                 : <>LLM Advisor is disabled. Set <code className="text-xs bg-[#13131f] px-1 rounded">ENABLE_LLM_ADVISOR&nbsp;=&nbsp;true</code> in <code className="text-xs bg-[#13131f] px-1 rounded">config.rs</code> and rebuild.</>
               }
             </p>
@@ -99,6 +106,11 @@ export default function LlmAdvisorCard({ recommendations, isLoading, advisorEnab
               <span className="text-[10px] font-mono text-gray-600">
                 {rec.trade_count} trade{rec.trade_count !== 1 ? 's' : ''} analysed
               </span>
+              {!rec.is_current_session && (
+                <span className="text-[10px] font-mono bg-gray-800 text-gray-500 border border-gray-700 rounded px-1.5 py-0.5">
+                  PRIOR SESSION
+                </span>
+              )}
               <span className={`text-[10px] font-mono ml-auto ${
                 parseFloat(rec.session_pnl) >= 0 ? 'text-green-500' : 'text-red-500'
               }`}>

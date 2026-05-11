@@ -75,12 +75,14 @@ export interface TradeRow {
 }
 
 export interface LlmRecommendationRow {
-  id:          number;
-  ts:          string;   // ISO 8601
-  model:       string;   // ollama model name
-  trade_count: number;   // trades analysed
-  session_pnl: string;   // Decimal string
-  analysis:    string;   // full LLM output text
+  id:                 number;
+  ts:                 string;   // ISO 8601
+  session_id:         string;   // session that produced this recommendation
+  model:              string;   // ollama model name
+  trade_count:        number;   // trades analysed
+  session_pnl:        string;   // Decimal string
+  analysis:           string;   // full LLM output text
+  is_current_session: boolean;  // true when generated in the currently-running session
 }
 
 /** Response from GET /api/status — maps strategy key to active market name. */

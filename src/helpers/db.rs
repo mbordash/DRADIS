@@ -667,12 +667,16 @@ pub async fn get_session_trades(pool: &SqlitePool) -> Vec<TradeRow> {
 /// Return trades from the previous session (by trades.session_id, not current one),
 /// newest first, up to `limit` rows.  Used as supplemental context when the current
 /// session has too few trades for meaningful LLM analysis.
+///
+/// Includes trades with `session_id IS NULL` — these are rows written before the
+/// session-tracking migration was applied.  They are definitionally not the current
+/// session so it is safe to treat them as prior-session context.
 pub async fn get_previous_session_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
     let sid = current_session_id();
     match sqlx::query(
         "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason
          FROM trades
-         WHERE session_id IS NOT NULL AND session_id != ?
+         WHERE (session_id IS NULL OR session_id != ?)
          ORDER BY ts DESC LIMIT ?"
     )
     .bind(sid)

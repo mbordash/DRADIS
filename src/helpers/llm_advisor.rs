@@ -140,11 +140,19 @@ inform your pattern recognition, but your primary recommendations should address
 current session's trades and conditions.
 
 == Your Role ==
-Analyse the recent trades provided and:
+Analyse the recent trades (or absence of trades) provided and:
 1. Identify loss patterns (repeated stop-losses, short hold times, common exit reasons).
 2. Flag any signals of structural issues (high entry_hb_age_sec, adverse OBI at entry).
 3. Suggest 2–5 specific, actionable DynamicConfig parameter changes with rationale.
 4. Recommend which strategies to enable/disable given current session conditions.
+5. IMPORTANT — if few or zero trades have occurred: assess whether the current parameter
+   configuration is too stringent for present market conditions.  Consider that:
+   - entry thresholds, min/max_trade_size, stop_loss_pct, and target_profit_pct all gate entry;
+   - GBoost entry_threshold near 0.9+ may suppress trades in low-confidence regimes;
+   - Momentum velocity thresholds may be too tight for a ranging/low-vol market;
+   - Arbitrage MAX_SUM_PRICE may be too low for current book spreads.
+   Recommend specific loosening adjustments and explain why inactivity is itself a risk
+   (opportunity cost, inability to gather ML training data, stale model).
 
 == Output Format ==
 Reply ONLY in this exact structure (no preamble, no markdown headers outside this):
@@ -156,11 +164,12 @@ Session P&L: [value]  |  Trades analysed: [n]
 • [bullet 1]
 • [bullet 2]
 • [bullet 3 — max 5 bullets total]
+(If trades = 0, focus observations on likely reasons for inactivity given current conditions.)
 
 ⚙️ RECOMMENDATIONS
 1. [param_name]: [current] → [suggested] — [reason, 1 sentence]
 2. [param_name]: [current] → [suggested] — [reason, 1 sentence]
-(up to 4 recommendations)
+(up to 4 recommendations; if no trades, prioritize recommendations that would unlock entries)
 
 🟢 KEEP ENABLED: [comma-separated strategy names]
 🔴 CONSIDER DISABLING: [comma-separated strategy names, or "none"]
@@ -248,7 +257,13 @@ fn build_user_prompt(
             lines.push(format!("  {}: {} wins / {} losses / ${:.2}", strat.replace("Strategy", ""), w, l, p));
         }
     } else {
-        lines.push("No trades yet this session.".to_string());
+        lines.push("⚠️  NO TRADES this session.".to_string());
+        lines.push(
+            "The bot has been running but no entries have been triggered. \
+             Please assess whether the current parameter configuration is too stringent \
+             for the current market conditions and recommend adjustments to unlock trade opportunities."
+                .to_string(),
+        );
     }
 
     // ── Prior session context (supplemental) ─────────────────────────────────
@@ -389,22 +404,34 @@ pub async fn run_llm_advisor_loop(
         let session_trades = db::get_session_trades(pool).await;
         let session_id = db::current_session_id().to_string();
 
-        // Determine supplemental context: if current session is thin, pull prior session
+        // Determine supplemental context: if current session is thin, pull prior session.
+        // NOTE: We always proceed to the LLM call — 0 trades is itself a meaningful signal
+        // (settings may be too stringent for the current market).  Prior session data is
+        // appended as supplemental context when available; absence of it is not a blocker.
         let prior_trades: Option<Vec<db::TradeRow>> =
             if session_trades.len() < LLM_ADVISOR_MIN_SESSION_TRADES {
                 let prior = db::get_previous_session_trades(pool, LLM_ADVISOR_PRIOR_SESSION_SUPPLEMENT).await;
                 if prior.is_empty() {
+                    if session_trades.is_empty() {
+                        info!(
+                            "🤖 LLM Advisor: 0 session trades, no prior history — \
+                             firing with market-conditions / settings-stringency prompt"
+                        );
+                    } else {
+                        info!(
+                            "🤖 LLM Advisor: only {} session trades (min {}), no prior session data — \
+                             proceeding with thin-data analysis",
+                            session_trades.len(), LLM_ADVISOR_MIN_SESSION_TRADES
+                        );
+                    }
+                    None // proceed without supplemental context
+                } else {
                     info!(
-                        "🤖 LLM Advisor: only {} session trades (min {}), no prior session data — skipping",
-                        session_trades.len(), LLM_ADVISOR_MIN_SESSION_TRADES
+                        "🤖 LLM Advisor: {} session trades (below min {}), supplementing with {} prior-session trades",
+                        session_trades.len(), LLM_ADVISOR_MIN_SESSION_TRADES, prior.len()
                     );
-                    continue;
+                    Some(prior)
                 }
-                info!(
-                    "🤖 LLM Advisor: {} session trades (below min {}), supplementing with {} prior-session trades",
-                    session_trades.len(), LLM_ADVISOR_MIN_SESSION_TRADES, prior.len()
-                );
-                Some(prior)
             } else {
                 None
             };
