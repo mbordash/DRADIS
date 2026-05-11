@@ -51,6 +51,7 @@ impl MarketDataBroadcaster {
         acceleration: Decimal,
         funding_rate: Decimal,
         oracle_drift_60m: Decimal,
+        oracle_drift_10m: Decimal,
         secs_to_expiry: i64,
     ) -> MarketSnapshot {
         MarketSnapshot {
@@ -68,6 +69,7 @@ impl MarketDataBroadcaster {
             acceleration,
             funding_rate,
             oracle_drift_60m,
+            oracle_drift_10m,
             secs_to_expiry,
             timestamp: Utc::now(),
         }

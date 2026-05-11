@@ -214,13 +214,13 @@ async fn main() -> Result<()> {
     let (oracle_tx, oracle_rx) = watch::channel(dec!(0));
     let (velocity_tx, velocity_rx) = watch::channel((dec!(0), dec!(0), dec!(0)));
     let (funding_tx, funding_rx) = watch::channel(dec!(0));
-    let (drift_60m_tx, drift_60m_rx) = watch::channel(dec!(0));
+    let (drift_tx, drift_rx) = watch::channel((dec!(0), dec!(0)));
 
     tokio::spawn(dradis::tasks::oracle::run_oracle(
         crypto_filter.clone(),
         oracle_tx,
         velocity_tx,
-        drift_60m_tx,
+        drift_tx,
     ));
 
     tokio::spawn(dradis::tasks::funding::run_funding_poller(
@@ -799,7 +799,8 @@ async fn main() -> Result<()> {
                             velocity_1s: velocity_rx.borrow().1,
                             acceleration: velocity_rx.borrow().2,
                             funding_rate: *funding_rx.borrow(),
-                            oracle_drift_60m: *drift_60m_rx.borrow(),
+                            oracle_drift_60m: drift_rx.borrow().0,
+                            oracle_drift_10m: drift_rx.borrow().1,
                             secs_to_expiry: hourly_market_close_time
                                 .map(|t| (t - Utc::now()).num_seconds())
                                 .unwrap_or(0),
@@ -816,7 +817,7 @@ async fn main() -> Result<()> {
                             yes_bid: maker_yb, yes_bid_depth: maker_ybd, yes_ask: maker_ya, yes_ask_depth: maker_yad,
                             no_bid: maker_nb, no_bid_depth: maker_nbd, no_ask: maker_na, no_ask_depth: maker_nad,
                             oracle_price: *oracle_rx.borrow(), velocity: velocity_rx.borrow().0, velocity_1s: velocity_rx.borrow().1, acceleration: velocity_rx.borrow().2,
-                            funding_rate: *funding_rx.borrow(), oracle_drift_60m: *drift_60m_rx.borrow(),
+                            funding_rate: *funding_rx.borrow(), oracle_drift_60m: drift_rx.borrow().0, oracle_drift_10m: drift_rx.borrow().1,
                             secs_to_expiry: mk.market_close_time
                                 .map(|t| (t - Utc::now()).num_seconds())
                                 .unwrap_or(0),

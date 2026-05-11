@@ -82,6 +82,11 @@ pub struct MarketSnapshot {
     /// Zero when insufficient history is available (first hour of bot runtime).
     /// Used by MakerStrategy to suppress adverse-side bids during slow sustained trends.
     pub oracle_drift_60m: Decimal,
+    /// 10-minute oracle price drift (current_price − price_10_minutes_ago).
+    /// Fills the temporal gap between the 5s velocity window and the 60m drift.
+    /// Captures the medium-term directional move where profitable binary trades develop.
+    /// Zero when fewer than 10 minutes of price history are available.
+    pub oracle_drift_10m: Decimal,
     /// Seconds remaining until this market's expiry at the time of snapshot creation.
     /// Negative if market has already expired.  Zero when close_time is unknown.
     /// Used by GBoost as a direct feature: binary market microstructure changes

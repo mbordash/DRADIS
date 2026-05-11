@@ -20,7 +20,9 @@ pub async fn run_oracle(
     crypto_filter: String,
     oracle_tx: watch::Sender<Decimal>,
     velocity_tx: watch::Sender<(Decimal, Decimal, Decimal)>,
-    drift_60m_tx: watch::Sender<Decimal>,
+    // Sends (drift_60m, drift_10m) — both raw USD Decimal values.
+    // drift_10m fills the 5s–60m temporal gap for GBoost feature [18].
+    drift_tx: watch::Sender<(Decimal, Decimal)>,
 ) {
     let binance_pair = match crypto_filter.as_str() {
         "eth" => "ethusdt",
@@ -30,6 +32,7 @@ pub async fn run_oracle(
     let url_str = format!("wss://stream.binance.com:9443/ws/{}@ticker", binance_pair);
     let mut price_history: VecDeque<(Instant, Decimal)> = VecDeque::new();
     let mut price_history_60m: VecDeque<(Instant, Decimal)> = VecDeque::new();
+    let mut price_history_10m: VecDeque<(Instant, Decimal)> = VecDeque::new();
     let mut prev_velocity = dec!(0);
 
     loop {
@@ -86,7 +89,24 @@ pub async fn run_oracle(
                                         } else { dec!(0) }
                                     } else { dec!(0) }
                                 } else { dec!(0) };
-                                let _ = drift_60m_tx.send(drift_60m);
+
+                                // 10-minute drift — fills the 5s–60m gap for GBoost feature [18].
+                                // Captures the medium-term trend where profitable binary moves develop.
+                                price_history_10m.push_back((now, price));
+                                while let Some((t, _)) = price_history_10m.front() {
+                                    if now.duration_since(*t).as_secs() > 600 {
+                                        price_history_10m.pop_front();
+                                    } else { break; }
+                                }
+                                let drift_10m = if price_history_10m.len() > 1 {
+                                    if let Some((oldest_t, oldest_p)) = price_history_10m.front() {
+                                        if now.duration_since(*oldest_t).as_secs() >= 600 {
+                                            price - oldest_p
+                                        } else { dec!(0) }
+                                    } else { dec!(0) }
+                                } else { dec!(0) };
+
+                                let _ = drift_tx.send((drift_60m, drift_10m));
                             }
                         }
                     }
@@ -95,6 +115,7 @@ pub async fn run_oracle(
         }
         warn!("⚠️ Binance Oracle disconnected. Reconnecting in 5s...");
         prev_velocity = dec!(0);
+        price_history_10m.clear();
         tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }

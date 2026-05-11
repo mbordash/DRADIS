@@ -3,7 +3,7 @@
 /// Uses the `perpetual` crate's `PerpetualBooster` (LogLoss objective) to predict
 /// near-term YES price direction from a rolling window of orderbook + oracle features.
 ///
-/// ── Feature Vector (NUM_FEATURES = 14) ──────────────────────────────────────
+/// ── Feature Vector (NUM_FEATURES = 19) ──────────────────────────────────────
 ///   [0]  yes_obi         — (yes_bid_depth − yes_ask_depth) / total depth
 ///   [1]  no_obi          — (no_bid_depth − no_ask_depth) / total depth
 ///   [2]  yes_ask         — best ask price for YES token
@@ -19,11 +19,21 @@
 ///  [12]  secs_to_expiry_norm — seconds until market expiry, clamped to
 ///                             [0, MAX_SECONDS_TO_EXPIRY_FOR_ENTRY] and normalised
 ///                             to [0.0, 1.0].  0 = expiry, 1 = 4h+ away.
-///                             Teaches the model that binary market microstructure
-///                             (gamma, adverse selection, spread) changes dramatically
-///                             near expiry — entries and exits should be calibrated
-///                             differently depending on time horizon.
 ///  [13]  yes_obi_change  — change in yes_obi from previous tick
+///  [14]  yes_mid_change  — change in YES mid-price ((bid+ask)/2) from previous tick.
+///                          Captures Polymarket venue momentum independent of oracle.
+///  [15]  no_obi_change   — change in no_obi from previous tick.
+///                          Detecting YES/NO OBI divergence is a stronger signal than
+///                          either change in isolation.
+///  [16]  relative_depth_ratio — yes_bid_depth / (yes_bid_depth + no_bid_depth).
+///                          Cross-token depth balance: which side has more buyers?
+///                          [0.0 = all buyers on NO, 0.5 = balanced, 1.0 = all on YES]
+///  [17]  combined_ask_spread — (yes_ask + no_ask − 1.0).
+///                          Book efficiency / round-trip cost signal.
+///                          Near 0 = tight efficient book; large = expensive or illiquid.
+///  [18]  oracle_drift_10m — 10-minute oracle drift (÷ 10000).
+///                          Fills the 5s–60m temporal gap where profitable binary moves
+///                          actually develop.  Zero until 10 min of oracle history exists.
 ///
 /// ── Label ────────────────────────────────────────────────────────────────────
 ///   1.0  if yes_bid rises in GBOOST_LOOKAHEAD_TICKS ticks
@@ -51,6 +61,7 @@ use chrono::Utc;
 use perpetual::{Matrix, PerpetualBooster};
 use perpetual::objective::Objective;
 use perpetual::booster::config::BoosterIO;
+use perpetual::drift::calculate_drift as perpetual_calculate_drift;
 use alloy::primitives::U256; // For token_id in pending_entries
 
 use crate::config;
@@ -62,7 +73,7 @@ use crate::helpers::dynamic_config::DynamicConfig; // Corrected import
 use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
 
 /// Number of f64 features per snapshot row fed into the booster.
-const NUM_FEATURES: usize = 14;
+const NUM_FEATURES: usize = 19;
 
 /// Represents a single training sample for the Gboost model.
 /// Contains the features at the time of entry and whether the trade was profitable.
@@ -105,7 +116,7 @@ fn extract_features(s: &MarketSnapshot, prev_s: Option<&MarketSnapshot>) -> [f64
     let yes_obi = obi_from_depths(s.yes_bid_depth, s.yes_ask_depth);
     let no_obi  = obi_from_depths(s.no_bid_depth,  s.no_ask_depth);
 
-    // Calculate yes_obi_change
+    // [13] yes_obi_change
     let yes_obi_change = if let Some(prev) = prev_s {
         let prev_yes_total = prev.yes_bid_depth + prev.yes_ask_depth;
         let prev_yes_obi = if prev_yes_total > dec!(0) {
@@ -113,8 +124,45 @@ fn extract_features(s: &MarketSnapshot, prev_s: Option<&MarketSnapshot>) -> [f64
         } else { 0.0 };
         yes_obi - prev_yes_obi
     } else {
-        0.0 // Default to 0 if no previous snapshot is available
+        0.0
     };
+
+    // [14] yes_mid_change — Polymarket venue price momentum, independent of oracle.
+    // When the YES mid-price ticks up, market makers are repricing YES higher.
+    let yes_mid = (s.yes_bid.to_f64().unwrap_or(0.5) + s.yes_ask.to_f64().unwrap_or(0.5)) / 2.0;
+    let yes_mid_change = if let Some(prev) = prev_s {
+        let prev_mid = (prev.yes_bid.to_f64().unwrap_or(0.5) + prev.yes_ask.to_f64().unwrap_or(0.5)) / 2.0;
+        yes_mid - prev_mid
+    } else {
+        0.0
+    };
+
+    // [15] no_obi_change — symmetric to yes_obi_change.
+    // YES/NO OBI divergence (one rising, other falling) is a stronger signal than either alone.
+    let no_obi_change = if let Some(prev) = prev_s {
+        let prev_no_total = prev.no_bid_depth + prev.no_ask_depth;
+        let prev_no_obi = if prev_no_total > dec!(0) {
+            ((prev.no_bid_depth - prev.no_ask_depth) / prev_no_total).to_f64().unwrap_or(0.0)
+        } else { 0.0 };
+        no_obi - prev_no_obi
+    } else {
+        0.0
+    };
+
+    // [16] relative_depth_ratio — cross-token depth balance [0, 1].
+    // 0.5 = balanced; > 0.5 = more buyers on YES side; < 0.5 = more buyers on NO side.
+    let yes_bid_d = s.yes_bid_depth.to_f64().unwrap_or(0.0);
+    let no_bid_d  = s.no_bid_depth.to_f64().unwrap_or(0.0);
+    let total_bid_d = yes_bid_d + no_bid_d;
+    let relative_depth_ratio = if total_bid_d > 0.0 { yes_bid_d / total_bid_d } else { 0.5 };
+
+    // [17] combined_ask_spread — (yes_ask + no_ask - 1.0).
+    // Near 0 = tight efficient book (cheap to enter); > 0 = expensive/illiquid.
+    let combined_ask_spread = (s.yes_ask + s.no_ask - dec!(1.0)).to_f64().unwrap_or(0.0);
+
+    // [18] oracle_drift_10m — medium-term oracle momentum (÷ 10000, same scale as drift_60m).
+    // Fills the 5s–60m temporal gap where real binary directional moves develop.
+    let oracle_drift_10m = s.oracle_drift_10m.to_f64().unwrap_or(0.0) / 10_000.0;
 
     // Normalise secs_to_expiry to [0.0, 1.0]:
     //   0.0 = market has expired / about to expire
@@ -124,20 +172,25 @@ fn extract_features(s: &MarketSnapshot, prev_s: Option<&MarketSnapshot>) -> [f64
         / SECS_TO_EXPIRY_NORM;
 
     [
-        yes_obi,
-        no_obi,
-        s.yes_ask.to_f64().unwrap_or(0.5),
-        s.no_ask.to_f64().unwrap_or(0.5),
-        (s.yes_ask - s.yes_bid).to_f64().unwrap_or(0.0),
-        (s.no_ask  - s.no_bid ).to_f64().unwrap_or(0.0),
-        s.velocity.to_f64().unwrap_or(0.0)          / 1_000.0,
-        s.velocity_1s.to_f64().unwrap_or(0.0)       / 1_000.0,
-        s.acceleration.to_f64().unwrap_or(0.0)      / 1_000.0,
-        s.funding_rate.to_f64().unwrap_or(0.0),
-        s.oracle_drift_60m.to_f64().unwrap_or(0.0)  / 10_000.0,
-        s.oracle_price.to_f64().unwrap_or(70_000.0) / 100_000.0,
-        secs_to_expiry_norm,
-        yes_obi_change, // New feature
+        yes_obi,                                                    // [0]
+        no_obi,                                                     // [1]
+        s.yes_ask.to_f64().unwrap_or(0.5),                         // [2]
+        s.no_ask.to_f64().unwrap_or(0.5),                          // [3]
+        (s.yes_ask - s.yes_bid).to_f64().unwrap_or(0.0),           // [4]
+        (s.no_ask  - s.no_bid ).to_f64().unwrap_or(0.0),           // [5]
+        s.velocity.to_f64().unwrap_or(0.0)          / 1_000.0,     // [6]
+        s.velocity_1s.to_f64().unwrap_or(0.0)       / 1_000.0,     // [7]
+        s.acceleration.to_f64().unwrap_or(0.0)      / 1_000.0,     // [8]
+        s.funding_rate.to_f64().unwrap_or(0.0),                    // [9]
+        s.oracle_drift_60m.to_f64().unwrap_or(0.0)  / 10_000.0,   // [10]
+        s.oracle_price.to_f64().unwrap_or(70_000.0) / 100_000.0,  // [11]
+        secs_to_expiry_norm,                                        // [12]
+        yes_obi_change,                                             // [13]
+        yes_mid_change,                                             // [14] NEW
+        no_obi_change,                                              // [15] NEW
+        relative_depth_ratio,                                       // [16] NEW
+        combined_ask_spread,                                        // [17] NEW
+        oracle_drift_10m,                                           // [18] NEW
     ]
 }
 
@@ -172,13 +225,41 @@ fn train_model(samples: Vec<TrainingSample>) -> Result<PerpetualBooster> {
         .set_num_threads(Some(config::GBOOST_NUM_THREADS as usize))
         .set_log_iterations(0)  // silent: suppress perpetual's stdout logging
         .set_max_bin(63)        // 63 bins is fast and sufficient for these features
-        .set_iteration_limit(Some(1000)) // Set max iterations (trees) to a much higher value
-        .set_stopping_rounds(None); // Disable early stopping for now
+        .set_iteration_limit(Some(1000))
+        .set_stopping_rounds(None)
+        .set_save_node_stats(true); // Required for drift detection via perpetual::drift
 
     booster.fit(&matrix, &labels, None, None)
         .map_err(|e| anyhow::anyhow!("perpetual fit error: {:?}", e))?;
 
     Ok(booster)
+}
+
+// ── Concept drift helper (runs inside spawn_blocking) ────────────────────────
+
+/// Evaluate concept drift of a freshly-trained `booster` against a slice of recent
+/// market snapshots.
+///
+/// Uses `perpetual::drift::calculate_drift(..., "concept")` which aggregates chi-squared
+/// statistics at leaf-parent tree nodes — comparing the flow of live data through the
+/// learned split points against the training-time distribution saved in each node.
+///
+/// Returns 0.0 if there are fewer than 10 snapshots (not enough data for a meaningful
+/// chi-squared estimate).  Requires the booster to have been trained with
+/// `save_node_stats = true`.
+fn compute_concept_drift(booster: &PerpetualBooster, recent_history: &[MarketSnapshot]) -> f32 {
+    let n = recent_history.len();
+    if n < 10 {
+        return 0.0;
+    }
+    let mut feature_data: Vec<f64> = Vec::with_capacity(n * NUM_FEATURES);
+    for (i, snap) in recent_history.iter().enumerate() {
+        let prev = if i > 0 { Some(&recent_history[i - 1]) } else { None };
+        let feats = extract_features(snap, prev);
+        feature_data.extend_from_slice(&feats);
+    }
+    let matrix = Matrix::new(&feature_data, n, NUM_FEATURES);
+    perpetual_calculate_drift(booster, &matrix, "concept", false)
 }
 
 // ── Strategy struct ───────────────────────────────────────────────────────────
@@ -214,6 +295,13 @@ pub struct GboostStrategyImpl {
     /// recovers above the threshold.  Used to suppress YES entries on daily markets when
     /// BTC has been continuously below the strike buffer for ≥ GBOOST_BELOW_STRIKE_SUPPRESS_SECS.
     below_strike_since: Arc<StdMutex<Option<Instant>>>,
+    /// Set to `true` after a retrain where concept drift exceeded GBOOST_CONCEPT_DRIFT_THRESHOLD.
+    /// Suppresses all GBoost entry signals until the next retrain shows drift has cleared.
+    /// This prevents the model from trading in a regime it was never trained on.
+    concept_drift_suppressed: Arc<AtomicBool>,
+    /// Most recent concept drift score from `perpetual::drift::calculate_drift`.
+    /// Logged at DEBUG level in the entry gate; exposed here for diagnostics.
+    last_concept_drift_score: Arc<StdMutex<f32>>,
 }
 
 impl GboostStrategyImpl {
@@ -222,11 +310,14 @@ impl GboostStrategyImpl {
 
         // Warm-start: try to load a previously persisted model from disk.
         //
-        // The model path is version-locked to the current feature set (NUM_FEATURES = 14).
+        // The model path is version-locked to the current feature set (NUM_FEATURES = 19).
         // NEVER load a model from a different version — the feature dimensions won't match.
+        // Previous version: v14f (14 features). Current: v19f (19 features — added
+        // yes_mid_change, no_obi_change, relative_depth_ratio, combined_ask_spread,
+        // oracle_drift_10m in May 2026).
         //
         // Override the path at runtime via the GBOOST_MODEL_PATH env var, e.g.:
-        //   GBOOST_MODEL_PATH=/path/to/gboost_model_v14f.json cargo run
+        //   GBOOST_MODEL_PATH=/path/to/gboost_model_v19f.json cargo run
         // This is the recommended way to seed a local instance with a model trained on prod.
         let model_clone = Arc::clone(&model_arc);
         tokio::spawn(async move {
@@ -284,6 +375,8 @@ impl GboostStrategyImpl {
             consecutive_degenerate: Arc::new(StdMutex::new(0)),
             retrain_backoff_until: Arc::new(StdMutex::new(None)),
             below_strike_since: Arc::new(StdMutex::new(None)),
+            concept_drift_suppressed: Arc::new(AtomicBool::new(false)),
+            last_concept_drift_score: Arc::new(StdMutex::new(0.0_f32)),
         }
     }
 
@@ -385,14 +478,28 @@ impl GboostStrategyImpl {
 
         let model_arc   = Arc::clone(&self.model);
         let is_training = Arc::clone(&self.is_training);
-        let consecutive_degenerate = Arc::clone(&self.consecutive_degenerate);
-        let retrain_backoff_until  = Arc::clone(&self.retrain_backoff_until);
+        let consecutive_degenerate    = Arc::clone(&self.consecutive_degenerate);
+        let retrain_backoff_until     = Arc::clone(&self.retrain_backoff_until);
+        let concept_drift_suppressed  = Arc::clone(&self.concept_drift_suppressed);
+        let last_concept_drift_score  = Arc::clone(&self.last_concept_drift_score);
+
+        // Capture a window of recent snapshots for concept-drift evaluation.
+        // Oldest-first order (same as extract_features expects for prev_s).
+        let history_for_drift: Vec<MarketSnapshot> = {
+            let h = self.history.lock().unwrap();
+            let n = h.len().min(config::GBOOST_DRIFT_WINDOW);
+            h.iter().skip(h.len().saturating_sub(n)).cloned().collect()
+        };
 
         tokio::spawn(async move {
-            let result = tokio::task::spawn_blocking(move || train_model(training_samples)).await;
+            let result = tokio::task::spawn_blocking(move || {
+                let model = train_model(training_samples)?;
+                let drift  = compute_concept_drift(&model, &history_for_drift);
+                Ok::<(PerpetualBooster, f32), anyhow::Error>((model, drift))
+            }).await;
 
             match result {
-                Ok(Ok(new_model)) => {
+                Ok(Ok((new_model, drift_score))) => {
                     let n = new_model.trees.len();
                     // Persist to disk first so a crash doesn't lose the trained weights.
                     if let Ok(json) = new_model.json_dump() {
@@ -423,15 +530,40 @@ impl GboostStrategyImpl {
                     *consecutive_degenerate.lock().unwrap() = 0;
                     *retrain_backoff_until.lock().unwrap() = None;
 
+                    // ── Concept drift monitoring ──────────────────────────────
+                    // Compare how live data flows through the new model's split points
+                    // vs. the training distribution.  A high chi-squared score means the
+                    // current market regime is outside what the model was trained on.
+                    *last_concept_drift_score.lock().unwrap() = drift_score;
+                    if drift_score > config::GBOOST_CONCEPT_DRIFT_THRESHOLD {
+                        tracing::warn!(
+                            "⚠️ GBoost: concept drift detected (score={:.2} > threshold {:.2}) — \
+                             suppressing entries until next retrain recaptures regime",
+                            drift_score, config::GBOOST_CONCEPT_DRIFT_THRESHOLD
+                        );
+                        concept_drift_suppressed.store(true, Ordering::Relaxed);
+                    } else {
+                        if concept_drift_suppressed.load(Ordering::Relaxed) {
+                            tracing::info!(
+                                "✅ GBoost: concept drift cleared (score={:.2} ≤ threshold {:.2}) — resuming entries",
+                                drift_score, config::GBOOST_CONCEPT_DRIFT_THRESHOLD
+                            );
+                        }
+                        concept_drift_suppressed.store(false, Ordering::Relaxed);
+                    }
+
                     let old_tree_count = {
                         let old_model = model_arc.lock().unwrap();
                         old_model.as_ref().map(|m| m.trees.len()).unwrap_or(0)
                     };
 
                     if n > old_tree_count + 5 || (old_tree_count >= 5 && n + 5 < old_tree_count) || (old_tree_count == 0 && n > 0) {
-                        tracing::info!("🤖 GboostStrategy: retrained — {} trees (was {})", n, old_tree_count);
+                        tracing::info!(
+                            "🤖 GboostStrategy: retrained — {} trees (was {}) | drift={:.2}",
+                            n, old_tree_count, drift_score
+                        );
                     } else {
-                        tracing::debug!("🤖 GboostStrategy: retrained — {} trees", n);
+                        tracing::debug!("🤖 GboostStrategy: retrained — {} trees | drift={:.2}", n, drift_score);
                     }
 
                     *model_arc.lock().unwrap() = Some(new_model);
@@ -673,6 +805,18 @@ impl Strategy for GboostStrategyImpl {
             Some(p) => p,
             None    => return Ok(StrategySignal::NoSignal),
         };
+
+        // ── Gate: concept drift suppression ──────────────────────────────────
+        // If the last retrain detected that live market data is flowing through
+        // the model's split points very differently from the training distribution,
+        // suppress entries until the next retrain recaptures the regime.
+        if self.concept_drift_suppressed.load(Ordering::Relaxed) {
+            tracing::debug!(
+                "🚫 GBoost entry blocked: concept drift (score={:.2}) — awaiting next retrain",
+                *self.last_concept_drift_score.lock().unwrap()
+            );
+            return Ok(StrategySignal::NoSignal);
+        }
 
         let entry_thresh = dc.gboost_entry_threshold.to_f64().unwrap_or(0.65);
         let trade_usdc   = dc.gboost_max_exposure_usdc;
@@ -1161,6 +1305,7 @@ mod tests {
             oracle_price: dec!(95000),
             velocity: dec!(50), velocity_1s: dec!(10), acceleration: dec!(5),
             funding_rate: dec!(0.0001), oracle_drift_60m: dec!(100),
+            oracle_drift_10m: dec!(30), // ~10min drift for test
             secs_to_expiry: 3600, // 1 hour — mid-range for tests
             timestamp: Utc::now(),
         }
