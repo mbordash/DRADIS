@@ -183,6 +183,13 @@ export default function DashboardPage() {
         <PnlChart data={pnl ?? []} startingBalance={startingBal} ghostMode={config?.ghost_mode} />
         )}
 
+        {/* ── LLM Advisor ───────────────────────────────────────────────── */}
+        <LlmAdvisorCard
+          recommendations={llmRecs ?? []}
+          isLoading={llmLoading}
+          advisorEnabled={true}
+        />
+
         {/* ── Viper Strategies ──────────────────────────────────────────── */}
         <section>
           <div className="flex items-center justify-between mb-3">
@@ -249,12 +256,6 @@ export default function DashboardPage() {
           )}
         </section>
 
-        {/* ── LLM Advisor ───────────────────────────────────────────────── */}
-        <LlmAdvisorCard
-          recommendations={llmRecs ?? []}
-          isLoading={llmLoading}
-          advisorEnabled={true}
-        />
 
         {/* Footer */}
         <footer className="text-center text-xs text-gray-700 pb-4 font-mono">

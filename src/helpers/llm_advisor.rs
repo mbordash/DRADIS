@@ -325,7 +325,7 @@ async fn call_ollama(
         ],
         stream: false,
         options: OllamaOptions {
-            num_predict: 600,
+            num_predict: 450,
             temperature: 0.3, // Low temperature: consistent, factual recommendations
         },
     };
@@ -377,9 +377,11 @@ pub async fn run_llm_advisor_loop(
         db::current_session_id(),
     );
 
-    // Long timeout: LLM inference on CPU can take 30–90s for larger models.
+    // Long timeout: CPU inference for a 7B model can take 3–6 min on a t3.large.
+    // 360s gives comfortable headroom; the model stays warm after the first call
+    // so subsequent cycles are faster (no reload penalty).
     let http_client = Client::builder()
-        .timeout(Duration::from_secs(180))
+        .timeout(Duration::from_secs(360))
         .build()
         .unwrap_or_default();
 

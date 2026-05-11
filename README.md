@@ -68,10 +68,10 @@ The core of DRADIS is the Orchestrator. It acts as the ship's brain, maintaining
            │  Trade log            │  ◄── GET  /api/trades
            └───────────────────────┘
 
-           ┌───────────────────────┐     ┌─────────────────────┐
-           │    LLM Advisor        │────►│  Ollama API          │
-           │  (background task)    │     │  (your local model)  │
-           │  reads SQLite trades  │     └─────────────────────┘
+           ┌───────────────────────┐     ┌────────────────┐
+           │    LLM Advisor        │────►│  Ollama API    │
+           │  (background task)    │     │  (your model)  │
+           │  reads SQLite trades  │     └────────────────┘
            │  every N minutes      │
            └──────────┬────────────┘
                       │ recommendations

@@ -84,9 +84,10 @@ export default function LlmAdvisorCard({ recommendations, isLoading, advisorEnab
             <p className="text-sm text-gray-500">
               {advisorEnabled
                 ? <>
-                    Awaiting first analysis — fires every 30 min once at least{' '}
-                    <span className="text-gray-400 font-mono">5</span> session trades have completed,
-                    or supplemented by prior-session history.
+                    Awaiting first analysis — fires every{' '}
+                    <span className="text-gray-400 font-mono">30 min</span>.
+                    Analyses run regardless of trade count — even zero trades triggers a
+                    settings-stringency review.
                     Check logs for{' '}
                     <code className="text-xs bg-[#13131f] px-1 rounded">🤖 LLM Advisor</code>{' '}
                     lines to trace progress.
