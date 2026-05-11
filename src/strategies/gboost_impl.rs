@@ -182,8 +182,12 @@ pub struct GboostStrategyImpl {
     is_training: Arc<AtomicBool>,
     /// Stores completed trade outcomes (features + profitability) for training.
     training_data: Arc<StdMutex<VecDeque<TrainingSample>>>,
-    /// Stores entry snapshots and prices for trades that are currently open (ghost mode).
-    pending_entries: Arc<StdMutex<HashMap<U256, (MarketSnapshot, rust_decimal::Decimal)>>>,
+    /// Stores entry snapshots, the previous snapshot (for accurate feature reconstruction),
+    /// and entry prices for trades that are currently open (ghost mode).
+    /// Storing prev_snap at entry time (not exit time) is critical: `record_training_outcome_on_exit`
+    /// used to grab `h[len-2]` at exit time — a minutes-stale prev snapshot paired with the entry
+    /// snapshot produces a corrupted feature vector and degraded training labels.
+    pending_entries: Arc<StdMutex<HashMap<U256, (MarketSnapshot, Option<MarketSnapshot>, rust_decimal::Decimal)>>>,
     /// Per-token timestamp of the last emitted exit signal to prevent rapid re-entry churn.
     post_exit_cooldowns: Arc<StdMutex<HashMap<U256, chrono::DateTime<chrono::Utc>>>>,
     /// Count of consecutive degenerate (< GBOOST_MIN_USABLE_TREES) retrain results.
@@ -199,9 +203,20 @@ impl GboostStrategyImpl {
         let model_arc = Arc::new(StdMutex::new(None::<PerpetualBooster>));
 
         // Warm-start: try to load a previously persisted model from disk.
+        //
+        // The model path is version-locked to the current feature set (NUM_FEATURES = 14).
+        // NEVER load a model from a different version — the feature dimensions won't match.
+        //
+        // Override the path at runtime via the GBOOST_MODEL_PATH env var, e.g.:
+        //   GBOOST_MODEL_PATH=/path/to/gboost_model_v14f.json cargo run
+        // This is the recommended way to seed a local instance with a model trained on prod.
         let model_clone = Arc::clone(&model_arc);
         tokio::spawn(async move {
-            match tokio::fs::read_to_string(config::GBOOST_MODEL_PATH).await {
+            // Env var takes precedence over the compiled-in path.
+            let model_path = std::env::var("GBOOST_MODEL_PATH")
+                .unwrap_or_else(|_| config::GBOOST_MODEL_PATH.to_string());
+
+            match tokio::fs::read_to_string(&model_path).await {
                 Ok(json) => match PerpetualBooster::from_json(&json) {
                     Ok(loaded) => {
                         let n = loaded.trees.len();
@@ -212,24 +227,26 @@ impl GboostStrategyImpl {
                         // for 110 minutes while every retrain hit the same degenerate result.
                         if n < config::GBOOST_MIN_USABLE_TREES {
                             tracing::warn!(
-                                "🤖 GboostStrategy: discarding persisted model ({} trees < min {}), cold-starting",
-                                n, config::GBOOST_MIN_USABLE_TREES
+                                "🤖 GboostStrategy: discarding persisted model from '{}' ({} trees < min {}), cold-starting",
+                                model_path, n, config::GBOOST_MIN_USABLE_TREES
                             );
                         } else {
                             *model_clone.lock().unwrap() = Some(loaded);
                             tracing::info!(
-                                "🤖 GboostStrategy: loaded persisted model from {} ({} trees)",
-                                config::GBOOST_MODEL_PATH, n
+                                "🤖 GboostStrategy: loaded persisted model from '{}' ({} trees)",
+                                model_path, n
                             );
                         }
                     }
                     Err(e) => tracing::warn!(
-                        "🤖 GboostStrategy: model parse failed (will train from scratch): {:?}", e
+                        "🤖 GboostStrategy: model parse failed for '{}' (will train from scratch): {:?}",
+                        model_path, e
                     ),
                 },
                 Err(_) => tracing::info!(
-                    "🤖 GboostStrategy: no persisted model at {} — collecting data to train",
-                    config::GBOOST_MODEL_PATH
+                    "🤖 GboostStrategy: no persisted model at '{}' — collecting data to train \
+                     (tip: copy prod model here, or set GBOOST_MODEL_PATH env var)",
+                    model_path
                 ),
             }
         });
@@ -326,6 +343,24 @@ impl GboostStrategyImpl {
 
         if training_samples.len() < config::GBOOST_MIN_TRAINING_SAMPLES { return; }
 
+        // ── Label-balance guard ───────────────────────────────────────────────
+        // In a strongly trending market the lookahead window is nearly all-1 or
+        // all-0.  Feeding a homogeneous batch to perpetual causes it to auto-stop
+        // at 1 tree, which then replaces the current (good) model with a random
+        // stump.  Detect and skip these cycles before spawning the expensive task.
+        let pos_count = training_samples.iter().filter(|s| s.is_profitable).count();
+        let pos_fraction = pos_count as f64 / training_samples.len() as f64;
+        if pos_fraction > config::GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX
+            || pos_fraction < (1.0 - config::GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX)
+        {
+            tracing::debug!(
+                "🤖 GBoost: skipping retrain — labels imbalanced ({:.0}% positive > max {:.0}%), waiting for balanced data",
+                pos_fraction * 100.0, config::GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX * 100.0
+            );
+            *self.ticks_since_retrain.lock().unwrap() = 0;
+            return;
+        }
+
         *self.ticks_since_retrain.lock().unwrap() = 0;
         self.is_training.store(true, Ordering::Relaxed);
 
@@ -410,11 +445,13 @@ impl GboostStrategyImpl {
     /// This avoids training on transient mark-to-market states from non-exit ticks.
     fn record_training_outcome_on_exit(&self, token_id: U256, is_profitable: bool) {
         let mut pending_entries_guard = self.pending_entries.lock().unwrap();
-        if let Some((entry_snap, _entry_price)) = pending_entries_guard.remove(&token_id) {
-            let h = self.history.lock().unwrap();
-            let prev_entry_snap = if h.len() >= 2 { Some(&h[h.len() - 2]) } else { None }; // This might not be the *correct* previous snapshot for the entry_snap, but it's the best we can do with the current history structure. A more robust solution would involve storing prev_snap with entry_snap. For now, this is a reasonable approximation.
+        if let Some((entry_snap, entry_prev_snap, _entry_price)) = pending_entries_guard.remove(&token_id) {
+            // Use the prev_snap captured AT ENTRY TIME (stored in the tuple) rather than the
+            // current history tail.  Using the current prev at exit time was a correctness bug:
+            // pairing an exit-time prev with the entry snapshot produces a hybrid feature vector
+            // that doesn't match what the model saw when it made the entry prediction.
             let training_sample = TrainingSample {
-                features: extract_features(&entry_snap, prev_entry_snap), // Pass prev_entry_snap
+                features: extract_features(&entry_snap, entry_prev_snap.as_ref()),
                 is_profitable,
                 entry_timestamp: entry_snap.timestamp,
             };
@@ -601,6 +638,16 @@ impl Strategy for GboostStrategyImpl {
         let entry_thresh = dc.gboost_entry_threshold.to_f64().unwrap_or(0.65);
         let trade_usdc   = dc.gboost_max_exposure_usdc;
 
+        // ── Gate: trend-alignment ─────────────────────────────────────────────
+        // If BTC has drifted strongly in one direction over the past 60 minutes,
+        // entering counter-trend is systematically unprofitable.
+        // Always uses the hourly snapshot for oracle data (drift is asset-level).
+        //   drift >  +$200 → uptrend  → block NO entries
+        //   drift < -$200  → downtrend → block YES entries
+        // Mirrors MAKER_SLOW_TREND_THRESHOLD_BTC and TIME_DECAY_MAX_SLOW_DRIFT_BTC.
+        let drift_60m = ctx.snapshot.oracle_drift_60m;
+        let trend_block = config::GBOOST_TREND_DRIFT_BLOCK_USD;
+
         // Don't pyramid — check that no position is already open for this strategy.
         let (has_yes, has_no) = {
             let map = ctx.positions.lock().await;
@@ -612,6 +659,14 @@ impl Strategy for GboostStrategyImpl {
 
         // ── YES entry: model predicts UP ──────────────────────────────────────
         if p_yes_up >= entry_thresh && !has_yes {
+            // Trend-alignment: block YES entries in a downtrend
+            if drift_60m < -trend_block {
+                tracing::debug!(
+                    "🚫 GBoost YES entry veto: counter-trend (drift_60m={:.0} < -{:.0})",
+                    drift_60m, trend_block
+                );
+                return Ok(StrategySignal::NoSignal);
+            }
             // ── Entry latch: skip if an entry for this token is already in-flight ──
             // Between emitting an Entry signal and the position being confirmed in
             // pos_map (can be several seconds), evaluate_entry fires every tick.
@@ -693,9 +748,13 @@ impl Strategy for GboostStrategyImpl {
                 "🔮 GBoost YES entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
                 p_yes_up, price, shares
             );
+            let entry_prev_snap = {
+                let h = self.history.lock().unwrap();
+                if h.len() >= 2 { Some(h[h.len()-2].clone()) } else { None }
+            };
             self.pending_entries.lock().unwrap().insert(
                 target_market.yes_token,
-                (target_snapshot.clone(), price)
+                (target_snapshot.clone(), entry_prev_snap, price)
             );
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
@@ -715,6 +774,14 @@ impl Strategy for GboostStrategyImpl {
 
         // ── NO entry: model predicts DOWN (P(UP) is very low) ────────────────
         if p_yes_up <= (1.0 - entry_thresh) && !has_no {
+            // Trend-alignment: block NO entries in an uptrend
+            if drift_60m > trend_block {
+                tracing::debug!(
+                    "🚫 GBoost NO entry veto: counter-trend (drift_60m={:.0} > +{:.0})",
+                    drift_60m, trend_block
+                );
+                return Ok(StrategySignal::NoSignal);
+            }
             // ── Entry latch ──────────────────────────────────────────────────
             if self.pending_entries.lock().unwrap().contains_key(&target_market.no_token) {
                 return Ok(StrategySignal::NoSignal);
@@ -785,9 +852,13 @@ impl Strategy for GboostStrategyImpl {
                 "🔮 GBoost NO entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
                 p_yes_up, price, shares
             );
+            let entry_prev_snap = {
+                let h = self.history.lock().unwrap();
+                if h.len() >= 2 { Some(h[h.len()-2].clone()) } else { None }
+            };
             self.pending_entries.lock().unwrap().insert(
                 target_market.no_token,
-                (target_snapshot.clone(), price)
+                (target_snapshot.clone(), entry_prev_snap, price)
             );
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
@@ -1087,7 +1158,7 @@ mod tests {
 
         strategy.pending_entries.lock().unwrap().insert(
             ctx.market.yes_token,
-            (ctx.snapshot.clone(), dec!(0.50)),
+            (ctx.snapshot.clone(), None, dec!(0.50)),
         );
 
         {
@@ -1120,7 +1191,7 @@ mod tests {
 
         strategy.pending_entries.lock().unwrap().insert(
             ctx.market.yes_token,
-            (ctx.snapshot.clone(), dec!(0.40)),
+            (ctx.snapshot.clone(), None, dec!(0.40)),
         );
 
         {

@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
+use tracing::{debug, error}; // Import debug and error macros
 
 use crate::helpers::dynamic_config::DynamicConfig;
 use crate::helpers::db;
@@ -52,6 +53,7 @@ struct LimitQuery {
 
 /// GET /api/health
 async fn health() -> &'static str {
+    debug!("Received GET /api/health request");
     "ok"
 }
 
@@ -60,10 +62,17 @@ async fn health() -> &'static str {
 /// Returns the full DynamicConfig as a flat JSON object.
 /// Field names match the struct fields (snake_case).
 async fn get_config(State(s): State<ApiState>) -> Response {
+    debug!("Received GET /api/config request");
     let cfg = s.config_rx.borrow().clone();
     match serde_json::to_value(cfg.as_ref()) {
-        Ok(val) => (StatusCode::OK, Json(val)).into_response(),
-        Err(e)  => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+        Ok(val) => {
+            debug!("Successfully processed GET /api/config");
+            (StatusCode::OK, Json(val)).into_response()
+        },
+        Err(e)  => {
+            error!("Error processing GET /api/config: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        },
     }
 }
 
@@ -76,17 +85,27 @@ async fn get_config(State(s): State<ApiState>) -> Response {
 /// On success, broadcasts the new config on the watch channel so all
 /// in-flight strategy tick contexts pick it up within 50 ms.
 async fn patch_config(State(s): State<ApiState>, body: String) -> Response {
+    debug!("Received PATCH /api/config request with body: {}", body);
     let current = s.config_rx.borrow().clone();
     match DynamicConfig::apply_patch(&current, &body).await {
         Ok(new_cfg) => {
             // Broadcast to all strategy tick loops.
             let _ = s.config_tx.send(new_cfg.clone());
             match serde_json::to_value(new_cfg.as_ref()) {
-                Ok(val) => (StatusCode::OK, Json(val)).into_response(),
-                Err(e)  => (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response(),
+                Ok(val) => {
+                    debug!("Successfully processed PATCH /api/config");
+                    (StatusCode::OK, Json(val)).into_response()
+                },
+                Err(e)  => {
+                    error!("Error serializing new config after PATCH /api/config: {}", e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                },
             }
         }
-        Err(e) => (StatusCode::BAD_REQUEST, e.to_string()).into_response(),
+        Err(e) => {
+            error!("Error applying patch for PATCH /api/config: {}", e);
+            (StatusCode::BAD_REQUEST, e.to_string()).into_response()
+        },
     }
 }
 
@@ -95,24 +114,34 @@ async fn patch_config(State(s): State<ApiState>, body: String) -> Response {
 /// Returns up to `limit` P&L snapshots, newest first.
 /// Each row: { ts, session_pnl, collateral }
 async fn get_pnl_history(Query(q): Query<LimitQuery>) -> Response {
+    debug!("Received GET /api/pnl/history request with limit: {:?}", q.limit);
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
     match db::pool() {
-        Some(pool) => Json(db::get_pnl_history(pool, limit).await).into_response(),
-        None       => Json(Vec::<db::PnlSnapshotRow>::new()).into_response(),
+        Some(pool) => {
+            let history = db::get_pnl_history(pool, limit).await;
+            debug!("Successfully retrieved PNL history");
+            Json(history).into_response()
+        },
+        None       => {
+            error!("Database pool not available for GET /api/pnl/history");
+            Json(Vec::<db::PnlSnapshotRow>::new()).into_response()
+        },
     }
 }
 
 /// GET /api/status
 ///
 /// Returns the current market name each strategy is attached to.
-/// Response: `{ "strategy_markets": { "time_decay": "…", "momentum": "…", … } }`
+/// Response: `{ "strategy_markets": { "time_decay", "momentum", … } }`
 #[derive(Serialize)]
 struct StatusResponse {
     strategy_markets: HashMap<String, String>,
 }
 
 async fn get_status(State(s): State<ApiState>) -> Response {
+    debug!("Received GET /api/status request");
     let markets = s.markets_rx.borrow().clone();
+    debug!("Successfully retrieved status");
     Json(StatusResponse { strategy_markets: markets }).into_response()
 }
 
@@ -121,10 +150,18 @@ async fn get_status(State(s): State<ApiState>) -> Response {
 /// Returns up to `limit` completed trades, newest first.
 /// Each row: { ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason }
 async fn get_trades(Query(q): Query<LimitQuery>) -> Response {
+    debug!("Received GET /api/trades request with limit: {:?}", q.limit);
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
     match db::pool() {
-        Some(pool) => Json(db::get_recent_trades(pool, limit).await).into_response(),
-        None       => Json(Vec::<db::TradeRow>::new()).into_response(),
+        Some(pool) => {
+            let trades = db::get_recent_trades(pool, limit).await;
+            debug!("Successfully retrieved trades");
+            Json(trades).into_response()
+        },
+        None       => {
+            error!("Database pool not available for GET /api/trades");
+            Json(Vec::<db::TradeRow>::new()).into_response()
+        },
     }
 }
 
@@ -171,5 +208,3 @@ pub async fn run_api_server(
         tracing::error!("🌐 Control Tower API error: {}", e);
     }
 }
-
-

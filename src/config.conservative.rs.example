@@ -248,7 +248,7 @@ pub const GBOOST_HISTORY_BUFFER_SIZE: usize = 1000;
 pub const GBOOST_LOOKAHEAD_TICKS: usize = 200;
 pub const GBOOST_MIN_TRAINING_SAMPLES: usize = 320;
 pub const GBOOST_RETRAIN_EVERY_N: usize = 200;
-pub const GBOOST_BUDGET: f32 = 0.65;
+pub const GBOOST_BUDGET: f32 = 0.80; // raised from 0.65 — gives perpetual room to grow past 1 tree
 pub const GBOOST_NUM_THREADS: usize = 2;
 pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.80);
 pub const GBOOST_POST_EXIT_COOLDOWN_SECS: i64 = 300;
@@ -272,11 +272,17 @@ pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.40);
 pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(4.0);
 pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300;
 pub const GBOOST_TARGET_PROFIT_PERCENT: Decimal = dec!(0.12);
-pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.055);
+pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.070); // conservative: 7.0% — raised from 0.055; tighter than balanced
 pub const GBOOST_MIN_HOLD_SECS: i64 = 180;
 pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 10;
 pub const GBOOST_MIN_USABLE_TREES: usize = 30;
-pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v13f.json";
+pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v14f.json";
+/// Max fraction of identical labels before skipping a retrain cycle (avoids degenerate storms).
+/// Conservative: same threshold — label imbalance is a data quality issue, not a risk preference.
+pub const GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX: f64 = 0.80;
+/// 60m oracle drift threshold (USD) for the trend-alignment entry gate.
+/// Conservative: $150 — tighter than balanced; blocks even moderate counter-trend entries.
+pub const GBOOST_TREND_DRIFT_BLOCK_USD: Decimal = dec!(150.0);
 pub const GBOOST_MAX_HOURLY_ASK_SUM: Decimal = dec!(1.20);
 pub const GBOOST_MIN_HOURLY_BID_SUM: Decimal = dec!(0.70);
 pub const GBOOST_MIN_SECS_TO_EXPIRY: i64 = 900;
@@ -424,6 +430,9 @@ pub fn tcp_keepalive() -> StdDuration {
 
 pub const MIN_MARKET_VOLUME: f64 = 0.0;
 pub const MAX_EXPOSURE_PER_TOKEN_USDC: Decimal = dec!(10);
+/// Soft vol24h floor for hourly market selection.
+/// Conservative: 1000 — stricter; only trade on markets with meaningful liquidity history.
+pub const MIN_HOURLY_MARKET_VOL24H: f64 = 1000.0;
 
 // Smaller per-strategy budgets across the board.
 pub const MOMENTUM_MAX_EXPOSURE_USDC: Decimal = dec!(10);

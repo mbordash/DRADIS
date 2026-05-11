@@ -301,12 +301,28 @@ pub async fn get_market_pair(http: &reqwest::Client) -> (MarketCandidate, Option
     // Use the imported functions directly
     let mut maker_c: Vec<_> = merged.iter().filter(|c| is_window_market(&c.1) || is_daily_market(&c.1)).collect();
 
-    // Sort hourly by volume desc (high-volume markets are safer), then by most time left as tiebreak
-    hourly_c.sort_by(|a, b| b.3.partial_cmp(&a.3).unwrap_or(Ordering::Equal)
-        .then_with(|| b.5.cmp(&a.5)));
+    // Sort hourly by:
+    //   1. Binary "Up or Down" markets first (is_high_priority_text, field .4)
+    //      Guarantees a freshly-published "Up or Down" beats any low-volume strike market.
+    //      Today's log: bot ran 18 min on "Bitcoin above 83,800 (vol=15)" because the
+    //      9PM "Up or Down" had just appeared with vol=0 and ranked below it on pure volume.
+    //   2. Volume desc (high-volume markets are liquidity-safe)
+    //   3. Time left desc as tiebreak
+    hourly_c.sort_by(|a, b| {
+        b.4.cmp(&a.4)
+            .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(Ordering::Equal))
+            .then_with(|| b.5.cmp(&a.5))
+    });
     maker_c.sort_by(|a, b| b.5.cmp(&a.5)); // prefer more time left
 
-    let hourly = hourly_c.first()
+    // Soft vol24h floor: prefer hourly markets that meet the minimum volume threshold.
+    // If none qualify (e.g. a brand-new market with zero 24h vol at session open),
+    // fall back to the full sorted list so the bot doesn't sit idle.
+    let vol_floor = config::MIN_HOURLY_MARKET_VOL24H;
+    let high_vol_hourly: Vec<_> = hourly_c.iter().filter(|c| c.3 >= vol_floor).cloned().collect();
+    let hourly_final = if !high_vol_hourly.is_empty() { &high_vol_hourly } else { &hourly_c };
+
+    let hourly = hourly_final.first()
         .map(|b| MarketCandidate { yes_token: b.0[0], no_token: b.0[1], name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone(), strike_price: None })
         .unwrap_or(MarketCandidate { yes_token: U256::ZERO, no_token: U256::ZERO, name: String::new(), link: String::new(), description: String::new(), is_hot: false, close_time: None, volume: 0.0, condition_id: String::new(), strike_price: None });
 

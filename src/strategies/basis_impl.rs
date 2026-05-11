@@ -58,6 +58,15 @@ impl Strategy for BasisStrategyImpl {
             }
         }
 
+        // ── Snapshot staleness gate ───────────────────────────────────────────
+        // Stale snapshot depth/price values can let OBI and mid-price gates pass
+        // silently when the actual live book has moved adversely.
+        // GBoost and TimeDecay both gate on snapshot age; same protection here.
+        let snap_age = (Utc::now() - snap.timestamp).num_seconds();
+        if snap_age > config::BASIS_MAX_SNAPSHOT_AGE_SECS {
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Require a known strike price ─────────────────────────────────────
         let strike = match market.strike_price {
             Some(s) => s,
