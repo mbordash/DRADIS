@@ -79,18 +79,31 @@ pub struct TrainingSample {
 /// Values beyond this horizon all map to 1.0; at expiry the value is 0.0.
 const SECS_TO_EXPIRY_NORM: f64 = 14_400.0;
 
+/// Compute OBI in [-1, 1] for a (bid_depth, ask_depth) pair, returning -1.0 when total=0.
+///
+/// This mirrors `GboostStrategyImpl::side_obi` exactly so that `extract_features` and
+/// the entry gate use the SAME value for zero-depth books.  Previously `extract_features`
+/// defaulted to 0.0 (neutral) while the gate defaulted to -1.0 (maximally adverse),
+/// causing the model to be trained and predict on a different OBI convention than the one
+/// used to block entries — a silent but systematic feature–gate mismatch.
+#[inline]
+fn obi_from_depths(bid: rust_decimal::Decimal, ask: rust_decimal::Decimal) -> f64 {
+    let total = bid + ask;
+    if total > dec!(0) {
+        ((bid - ask) / total).to_f64().unwrap_or(-1.0)
+    } else {
+        -1.0 // no depth data → same as side_obi → maximally adverse
+    }
+}
+
 /// Convert a `MarketSnapshot` into a fixed-length `f64` feature array.
 fn extract_features(s: &MarketSnapshot, prev_s: Option<&MarketSnapshot>) -> [f64; NUM_FEATURES] {
-    let yes_total = s.yes_bid_depth + s.yes_ask_depth;
-    let no_total  = s.no_bid_depth  + s.no_ask_depth;
-
-    let yes_obi = if yes_total > dec!(0) {
-        ((s.yes_bid_depth - s.yes_ask_depth) / yes_total).to_f64().unwrap_or(0.0)
-    } else { 0.0 };
-
-    let no_obi = if no_total > dec!(0) {
-        ((s.no_bid_depth - s.no_ask_depth) / no_total).to_f64().unwrap_or(0.0)
-    } else { 0.0 };
+    // Use obi_from_depths (which returns -1.0 on zero depth) to match the entry gate's
+    // side_obi() convention.  The entry gate blocks zero-depth entries (OBI=-1.0 < adverse
+    // threshold), so training records will also never have zero-depth — but prediction can
+    // receive any snapshot. Aligning the default removes a hidden prediction/gate mismatch.
+    let yes_obi = obi_from_depths(s.yes_bid_depth, s.yes_ask_depth);
+    let no_obi  = obi_from_depths(s.no_bid_depth,  s.no_ask_depth);
 
     // Calculate yes_obi_change
     let yes_obi_change = if let Some(prev) = prev_s {
@@ -196,6 +209,11 @@ pub struct GboostStrategyImpl {
     consecutive_degenerate: Arc<StdMutex<usize>>,
     /// When set, `maybe_retrain` skips all retrain attempts until this instant passes.
     retrain_backoff_until: Arc<StdMutex<Option<Instant>>>,
+    /// When set, records the `Instant` at which BTC spot first dropped below
+    /// (daily_strike − BASIS_BTC_ORACLE_STRIKE_BUFFER).  Resets to None whenever spot
+    /// recovers above the threshold.  Used to suppress YES entries on daily markets when
+    /// BTC has been continuously below the strike buffer for ≥ GBOOST_BELOW_STRIKE_SUPPRESS_SECS.
+    below_strike_since: Arc<StdMutex<Option<Instant>>>,
 }
 
 impl GboostStrategyImpl {
@@ -265,6 +283,7 @@ impl GboostStrategyImpl {
             post_exit_cooldowns: Arc::new(StdMutex::new(HashMap::new())),
             consecutive_degenerate: Arc::new(StdMutex::new(0)),
             retrain_backoff_until: Arc::new(StdMutex::new(None)),
+            below_strike_since: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -562,6 +581,26 @@ impl Strategy for GboostStrategyImpl {
                 );
                 return Ok(StrategySignal::NoSignal);
             }
+
+            // ── Gate: hourly market near-resolution guard ──────────────────────
+            // When hourly YES bid < 0.05 or YES ask > 0.95, the hourly market has
+            // effectively resolved in one direction.  Entering the DAILY YES in this
+            // state means buying into a confirmed loser (bid < 0.05) or buying a coin
+            // flip at maximum price (ask > 0.95) with no upside left.
+            // OBI=0.0 on a dead market is the worst possible adverse context, not neutral.
+            let hourly_yes_bid_f = ctx.snapshot.yes_bid.to_f64().unwrap_or(0.5);
+            let hourly_yes_ask_f = ctx.snapshot.yes_ask.to_f64().unwrap_or(0.5);
+            if hourly_yes_bid_f < config::GBOOST_MIN_HOURLY_YES_BID.to_f64().unwrap_or(0.05)
+                || hourly_yes_ask_f > config::GBOOST_MAX_HOURLY_YES_ASK.to_f64().unwrap_or(0.95)
+            {
+                tracing::debug!(
+                    "🚫 GBoost entry blocked: hourly market near-resolved \
+                     (yes_bid={:.3} < {:.2} or yes_ask={:.3} > {:.2})",
+                    hourly_yes_bid_f, config::GBOOST_MIN_HOURLY_YES_BID,
+                    hourly_yes_ask_f, config::GBOOST_MAX_HOURLY_YES_ASK,
+                );
+                return Ok(StrategySignal::NoSignal);
+            }
         }
 
         // ── Gate: expiry guard ────────────────────────────────────────────────
@@ -648,6 +687,51 @@ impl Strategy for GboostStrategyImpl {
         let drift_60m = ctx.snapshot.oracle_drift_60m;
         let trend_block = config::GBOOST_TREND_DRIFT_BLOCK_USD;
 
+        // ── Below-strike sustained suppressor ────────────────────────────────
+        // If the daily market has a known strike price AND BTC spot has been
+        // continuously at least BASIS_BTC_ORACLE_STRIKE_BUFFER below that strike
+        // for ≥ GBOOST_BELOW_STRIKE_SUPPRESS_SECS, suppress YES entries.
+        //
+        // Rationale: a market priced below (strike − $150) for 60+ minutes is
+        // pricing in NO predominance.  The hourly 60m drift gate ($200 threshold)
+        // can miss this: BTC might only drift $112 in 1h but be $300 below strike
+        // all session.  The strike-distance check catches this orthogonal condition.
+        //
+        // Reset: if BTC recovers above (strike − buffer), the suppressor is cleared.
+        let below_strike_suppressed_for_yes = {
+            let oracle_price = ctx.snapshot.oracle_price;
+            let opt_strike = target_market.strike_price;
+            if let Some(strike) = opt_strike {
+                let buffer = config::BASIS_BTC_ORACLE_STRIKE_BUFFER;
+                let threshold = strike - buffer;
+                let mut bss = self.below_strike_since.lock().unwrap();
+                if oracle_price < threshold {
+                    // Spot is below the buffer — start or continue the timer
+                    if bss.is_none() {
+                        *bss = Some(Instant::now());
+                        tracing::debug!(
+                            "🕐 GBoost: BTC spot ${:.0} < strike(${:.0}) − buffer(${:.0}) = ${:.0} — starting below-strike timer",
+                            oracle_price, strike, buffer, threshold
+                        );
+                    }
+                    let elapsed_secs = bss.unwrap().elapsed().as_secs() as i64;
+                    elapsed_secs >= config::GBOOST_BELOW_STRIKE_SUPPRESS_SECS
+                } else {
+                    // Spot recovered above the buffer — reset the timer
+                    if bss.is_some() {
+                        tracing::debug!(
+                            "✅ GBoost: BTC spot ${:.0} >= threshold ${:.0} — below-strike timer reset",
+                            oracle_price, threshold
+                        );
+                        *bss = None;
+                    }
+                    false
+                }
+            } else {
+                false // no strike price for this market — don't suppress
+            }
+        };
+
         // Don't pyramid — check that no position is already open for this strategy.
         let (has_yes, has_no) = {
             let map = ctx.positions.lock().await;
@@ -664,6 +748,16 @@ impl Strategy for GboostStrategyImpl {
                 tracing::debug!(
                     "🚫 GBoost YES entry veto: counter-trend (drift_60m={:.0} < -{:.0})",
                     drift_60m, trend_block
+                );
+                return Ok(StrategySignal::NoSignal);
+            }
+            // Strike-distance: block YES entries when BTC has been below (strike−buffer) for 60+ min
+            if below_strike_suppressed_for_yes {
+                tracing::debug!(
+                    "🚫 GBoost YES entry veto: below-strike suppressed \
+                     (BTC spot below daily_strike − ${:.0} for ≥ {}min)",
+                    config::BASIS_BTC_ORACLE_STRIKE_BUFFER,
+                    config::GBOOST_BELOW_STRIKE_SUPPRESS_SECS / 60
                 );
                 return Ok(StrategySignal::NoSignal);
             }

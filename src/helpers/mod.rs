@@ -10,6 +10,7 @@ pub mod metrics;
 pub mod config_helpers;
 pub mod db;
 pub mod dynamic_config;
+pub mod llm_advisor;
 
 pub use price::*;
 pub use json::*;

@@ -210,6 +210,7 @@ pub const BASIS_MIN_TRADE_SIZE_USDC: Decimal = dec!(3.0);
 pub const BASIS_MAX_TRADE_SIZE_USDC: Decimal = dec!(8.0);
 pub const BASIS_KELLY_MAX_MULTIPLIER: Decimal = dec!(2.0);
 pub const BASIS_MAX_TAKER_FEE_BPS: u32 = 1500; // Updated from 100
+pub const BASIS_MAX_SNAPSHOT_AGE_SECS: i64 = 15;
 pub const BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 60;
 pub const BASIS_FUNDING_POLL_SECS: u64 = 60;
 /// Minimum best-bid required to fire a basis stop-loss exit.
@@ -446,6 +447,31 @@ pub const BASIS_MAX_EXPOSURE_USDC: Decimal = dec!(10);
 pub fn max_session_drawdown(collateral: Decimal) -> Decimal {
     (collateral * dec!(0.0075)).max(dec!(3.00))
 }
+
+
+// ============================================================================
+// LLM ADVISOR SETTINGS
+// ============================================================================
+
+/// Enable the LLM Advisor background task.
+/// Conservative: enabled — advisory-only feature, zero trading risk.
+/// Set OLLAMA_URL / OLLAMA_MODEL env vars to point at your Ollama instance.
+pub const ENABLE_LLM_ADVISOR: bool = true;
+
+/// How often (seconds) the advisor wakes up to analyse trades and send recommendations.
+/// Conservative: every 45 minutes — lower trade frequency means less data per cycle;
+/// waiting longer accumulates more meaningful samples before each analysis.
+pub const LLM_ADVISOR_INTERVAL_SECS: u64 = 2700;
+
+/// Number of most-recent completed trades to include in each LLM analysis.
+/// Conservative: 15 trades — smaller sessions mean fewer available samples.
+pub const LLM_ADVISOR_TRADES_LOOKBACK: i64 = 15;
+
+/// Default Ollama base URL.  Override with `OLLAMA_URL` env var.
+pub const LLM_OLLAMA_URL: &str = "http://localhost:11434";
+
+/// Default Ollama model.  Override with `OLLAMA_MODEL` env var.
+pub const LLM_OLLAMA_MODEL: &str = "llama3.2";
 
 
 // ============================================================================

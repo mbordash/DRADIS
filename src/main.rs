@@ -54,7 +54,7 @@ use rustls::crypto::ring;
 use dradis::tasks::market_monitor::MarketState;
 
 
-type PriceState = (Decimal, Decimal, Decimal, Decimal); // (Bid, BidDepth, Ask, AskDepth)
+type PriceState = (Decimal, Decimal, Decimal, Decimal, chrono::DateTime<chrono::Utc>); // (Bid, BidDepth, Ask, AskDepth, WsUpdateTimestamp)
 
 /// Custom tracing timer that formats log timestamps in US/Eastern (ET/EDT).
 /// Ensures all log output is in the same timezone as Polymarket's market names,
@@ -139,6 +139,20 @@ async fn main() -> Result<()> {
     if let Err(e) = db::init("logs/dradis.db").await {
         tracing::warn!("⚠️  SQLite init failed (metrics will CSV-only): {}", e);
     }
+    // Register this process start as a new session.  Every restart is a clean
+    // session boundary: session-scoped P&L, LLM analysis, and config snapshots
+    // are all anchored to this ID for the lifetime of the process.
+    let _session_id = db::init_session(Some("dradis startup")).await;
+
+    // Snapshot the compile-time constants (config.rs) into config_history.
+    // This runs BEFORE DynamicConfig::load_or_default() so both snapshots land
+    // in the same session with the static one first.  Because these constants can
+    // only change via recompile+restart, diffing two consecutive startup_static
+    // rows immediately shows what the developer tuned between sessions.
+    if let Some(pool) = db::pool() {
+        db::record_static_config_snapshot(pool).await;
+    }
+
     let initial_dyn_cfg = DynamicConfig::load_or_default().await;
     // Wrap the sender in Arc so it can be shared with the axum API server.
     let (config_tx, config_rx) = watch::channel(initial_dyn_cfg);
@@ -220,6 +234,16 @@ async fn main() -> Result<()> {
     let pending_orders: Arc<Mutex<HashMap<(String, U256), Instant>>> = Arc::new(Mutex::new(HashMap::new()));
 
     let total_pnl: Arc<Mutex<Decimal>> = Arc::new(Mutex::new(dec!(0)));
+
+    // ── LLM Advisor (optional) ────────────────────────────────────────────────
+    // Spawned unconditionally; exits immediately when ENABLE_LLM_ADVISOR = false,
+    // so there is zero overhead when the feature is disabled.
+    tokio::spawn(dradis::helpers::llm_advisor::run_llm_advisor_loop(
+        env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
+        env::var("TELEGRAM_CHAT_ID").unwrap_or_default(),
+        Arc::clone(&total_pnl),
+        Arc::clone(&starting_collateral_store),
+    ));
 
     // when the wallet cannot afford even the minimum trade, preventing 400 CLOB rejections.
     let live_collateral: Arc<Mutex<Decimal>> = Arc::new(Mutex::new(startup_balance));
@@ -395,8 +419,8 @@ async fn main() -> Result<()> {
 
         let market_started_at = Utc::now(); // This timestamp is for the current trading session, not necessarily market creation
 
-        let (yes_price_tx, yes_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0)));
-        let (no_price_tx, no_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0)));
+        let (yes_price_tx, yes_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now()));
+        let (no_price_tx, no_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now()));
 
         // Only subscribe to hourly market WS if an hourly market is present
         if hourly_yes_token != U256::ZERO {
@@ -424,7 +448,11 @@ async fn main() -> Result<()> {
                                     .min_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
                                     .map(|l| (l.price, l.size))
                                     .unwrap_or((dec!(1), dec!(0)));
-                                let _ = tx.send((bid, bid_depth, ask, ask_depth));
+                                // Stamp the WebSocket orderbook update time here — NOT at tick time.
+                                // The snapshot timestamp will later be derived from this value so
+                                // that GBOOST_MAX_SNAPSHOT_AGE_SECS measures actual data staleness,
+                                // not just the age of the last 50ms heartbeat tick.
+                                let _ = tx.send((bid, bid_depth, ask, ask_depth, Utc::now()));
                             } else {
                                 warn!("⚠️ WS stream error for hourly token {}. Restarting...", token);
                                 break;
@@ -437,8 +465,8 @@ async fn main() -> Result<()> {
         }
 
         let (maker_yes_price_rx, maker_no_price_rx) = if let Some(ref mk) = maker_market_candidate_from_channel {
-            let (mk_yes_tx, mk_yes_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0)));
-            let (mk_no_tx, mk_no_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0)));
+            let (mk_yes_tx, mk_yes_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now()));
+            let (mk_no_tx, mk_no_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now()));
             for (token, tx) in [(mk.yes_token, mk_yes_tx), (mk.no_token, mk_no_tx)] {
                 tokio::spawn(async move {
                     loop {
@@ -463,7 +491,8 @@ async fn main() -> Result<()> {
                                     .min_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
                                     .map(|l| (l.price, l.size))
                                     .unwrap_or((dec!(1), dec!(0)));
-                                let _ = tx.send((bid, bid_depth, ask, ask_depth));
+                                // Stamp the WebSocket orderbook update time
+                                let _ = tx.send((bid, bid_depth, ask, ask_depth, Utc::now()));
                             } else {
                                 warn!("⚠️ WS Maker stream error for token {}. Restarting...", token);
                                 break;
@@ -699,8 +728,8 @@ async fn main() -> Result<()> {
                 }
                 _ = status_ticker.tick() => {
                     *last_heartbeat_at.lock().await = Instant::now();
-                    let (yb, ybd, ya, yad) = *yes_price_rx.borrow();
-                    let (nb, nbd, na, nad) = *no_price_rx.borrow();
+                    let (yb, ybd, ya, yad, _) = *yes_price_rx.borrow();
+                    let (nb, nbd, na, nad, _) = *no_price_rx.borrow();
                     // Compute OBI for heartbeat visibility so thresholds can be tuned empirically.
                     let yes_obi = if ybd + yad > dec!(0) { (ybd - yad) / (ybd + yad) } else { dec!(0) };
                     let no_obi  = if nbd + nad > dec!(0) { (nbd - nad) / (nbd + nad) } else { dec!(0) };
@@ -734,12 +763,19 @@ async fn main() -> Result<()> {
                     *last_heartbeat_at.lock().await = Instant::now();
 
                     // Get hourly market snapshot
-                    let (hourly_yb, hourly_ybd, hourly_ya, hourly_yad) = *yes_price_rx.borrow();
-                    let (hourly_nb, hourly_nbd, hourly_na, hourly_nad) = *no_price_rx.borrow();
+                    let (hourly_yb, hourly_ybd, hourly_ya, hourly_yad, hourly_yes_ws_ts) = *yes_price_rx.borrow();
+                    let (hourly_nb, hourly_nbd, hourly_na, hourly_nad, hourly_no_ws_ts) = *no_price_rx.borrow();
+                    // Use the older of YES/NO WS update timestamps as the authoritative snapshot age.
+                    // This is the WebSocket orderbook update time — NOT the tick heartbeat time.
+                    // Previously `timestamp: Utc::now()` was set at tick time which caused
+                    // GBOOST_MAX_SNAPSHOT_AGE_SECS to always read ~0s, never blocking entries
+                    // on stale data (root cause of "entry_hb_age_sec=27, gate=10, fired anyway").
+                    let hourly_snap_ts = hourly_yes_ws_ts.min(hourly_no_ws_ts);
 
                     // Get maker market snapshot if available
-                    let (maker_yb, maker_ybd, maker_ya, maker_yad) = maker_yes_price_rx.as_ref().map_or((dec!(0), dec!(0), dec!(1), dec!(0)), |rx| *rx.borrow());
-                    let (maker_nb, maker_nbd, maker_na, maker_nad) = maker_no_price_rx.as_ref().map_or((dec!(0), dec!(0), dec!(1), dec!(0)), |rx| *rx.borrow());
+                    let (maker_yb, maker_ybd, maker_ya, maker_yad, maker_yes_ws_ts) = maker_yes_price_rx.as_ref().map_or((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now()), |rx| *rx.borrow());
+                    let (maker_nb, maker_nbd, maker_na, maker_nad, maker_no_ws_ts) = maker_no_price_rx.as_ref().map_or((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now()), |rx| *rx.borrow());
+                    let maker_snap_ts = maker_yes_ws_ts.min(maker_no_ws_ts);
 
                     // Only proceed if at least one market has valid prices
                     if (hourly_ya == dec!(1) && hourly_na == dec!(1)) && (maker_ya == dec!(1) && maker_na == dec!(1)) { continue; }
@@ -767,7 +803,7 @@ async fn main() -> Result<()> {
                             secs_to_expiry: hourly_market_close_time
                                 .map(|t| (t - Utc::now()).num_seconds())
                                 .unwrap_or(0),
-                            timestamp: Utc::now(),
+                            timestamp: hourly_snap_ts, // WS orderbook update time (not tick time)
                         },
                         positions: Arc::clone(&positions),
                         session_pnl: *total_pnl.lock().await,
@@ -784,7 +820,7 @@ async fn main() -> Result<()> {
                             secs_to_expiry: mk.market_close_time
                                 .map(|t| (t - Utc::now()).num_seconds())
                                 .unwrap_or(0),
-                            timestamp: Utc::now(),
+                            timestamp: maker_snap_ts, // WS orderbook update time (not tick time)
                         }),
                         dynamic_config: dyn_cfg,
                     };

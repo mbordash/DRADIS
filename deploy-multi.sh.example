@@ -87,6 +87,7 @@ scp -P "$SSH_PORT" -i "$KEY" src/helpers/notifications.rs     "$USER@$HOST:$REMO
 scp -P "$SSH_PORT" -i "$KEY" src/helpers/metrics.rs           "$USER@$HOST:$REMOTE_DIR/src/helpers/metrics.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/helpers/db.rs                "$USER@$HOST:$REMOTE_DIR/src/helpers/db.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/helpers/dynamic_config.rs    "$USER@$HOST:$REMOTE_DIR/src/helpers/dynamic_config.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/helpers/llm_advisor.rs       "$USER@$HOST:$REMOTE_DIR/src/helpers/llm_advisor.rs"
 
 # API modules (Control Tower REST server)
 scp -P "$SSH_PORT" -i "$KEY" src/api/mod.rs                   "$USER@$HOST:$REMOTE_DIR/src/api/mod.rs"

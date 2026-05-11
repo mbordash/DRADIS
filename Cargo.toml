@@ -2,6 +2,7 @@
 name = "dradis"
 version = "0.2.0"
 edition = "2021"
+description = "Low-latency Rust prediction-market trading bot for Polymarket. Six autonomous strategies (Momentum, Maker, Arbitrage, Time Decay, Basis, GBoost ML), real-time Next.js Control Tower, and an LLM Advisor that delivers optimization recommendations via Ollama (local or remote) + Telegram."
 
 [dependencies]
 polymarket_client_sdk_v2 = { version = "0.5.1", features = ["clob", "ws"] }

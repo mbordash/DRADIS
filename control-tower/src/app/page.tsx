@@ -4,9 +4,10 @@ import { useCallback } from 'react';
 import useSWR from 'swr';
 import dynamic from 'next/dynamic';
 
-import ViperCard    from '@/components/ViperCard';
-import TradesTable  from '@/components/TradesTable';
-import { getConfig, getPnlHistory, getTrades, getHealth, patchConfig, VIPER_DEFS, getStatus } from '@/lib/api';
+import ViperCard       from '@/components/ViperCard';
+import TradesTable     from '@/components/TradesTable';
+import LlmAdvisorCard  from '@/components/LlmAdvisorCard';
+import { getConfig, getPnlHistory, getTrades, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations } from '@/lib/api';
 import type { DynamicConfig } from '@/lib/types';
 
 // Recharts must be loaded client-side only
@@ -65,6 +66,10 @@ export default function DashboardPage() {
 
   const { data: status } =
     useSWR('status', getStatus, { refreshInterval: 30_000 });
+
+  // Poll every 5 minutes — recommendations only arrive every 30 min at most.
+  const { data: llmRecs, isLoading: llmLoading } =
+    useSWR('llmRecs', () => getLlmRecommendations(10), { refreshInterval: 300_000 });
 
   // ── Stats derived from P&L history ──────────────────────────────────────────
   const latestSnap  = pnl?.[0];
@@ -243,6 +248,13 @@ export default function DashboardPage() {
             <TradesTable trades={trades ?? []} />
           )}
         </section>
+
+        {/* ── LLM Advisor ───────────────────────────────────────────────── */}
+        <LlmAdvisorCard
+          recommendations={llmRecs ?? []}
+          isLoading={llmLoading}
+          advisorEnabled={true}
+        />
 
         {/* Footer */}
         <footer className="text-center text-xs text-gray-700 pb-4 font-mono">

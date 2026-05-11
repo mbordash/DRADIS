@@ -2,9 +2,17 @@
 ///
 /// Provides:
 ///   - Async connection pool (one shared pool via OnceLock)
-///   - Schema initialization (trades, entries, pnl_snapshots, config)
+///   - Schema initialization (trades, entries, pnl_snapshots, config, sessions, config_history)
 ///   - Write helpers for trades, entries, and P&L snapshots
 ///   - Key-value store for DynamicConfig JSON blobs
+///   - Session tracking: each process start is a distinct session
+///   - Config change audit log: full history of every DynamicConfig mutation
+///     · `startup_dynamic`  — DynamicConfig (runtime-tunable params) at session start
+///     · `startup_static`   — compile-time constants from config.rs at session start
+///       (these can only change with a recompile; snapshotted so developers can diff
+///        what was active across sessions and correlate constant changes with P&L shifts)
+///     · `operator`         — Control Tower PATCH /api/config change
+///     · `llm_advisor`      — recommendation applied by operator
 ///   - Lookup helper for entry price recovery (faster than CSV scan)
 ///
 /// Call `db::init("logs/dradis.db")` once at startup before any other DB calls.
@@ -18,9 +26,21 @@ use anyhow::Result;
 use serde::Serialize;
 use tracing::{error, info};
 
+use crate::config;
+
 // ─── Shared pool ────────────────────────────────────────────────────────────
 
 static DB_POOL: OnceLock<SqlitePool> = OnceLock::new();
+
+/// The session ID for the current process lifetime.  Set once by `init_session()`
+/// and remains stable for the entire run.  Format: RFC-3339 timestamp so it is
+/// human-readable and lexicographically sortable.
+static CURRENT_SESSION_ID: OnceLock<String> = OnceLock::new();
+
+/// Returns the current session ID, or "unknown" if not yet initialized.
+pub fn current_session_id() -> &'static str {
+    CURRENT_SESSION_ID.get().map(|s| s.as_str()).unwrap_or("unknown")
+}
 
 /// Initialize the SQLite connection pool and create schema.
 /// Must be called once at startup; subsequent calls are ignored.
@@ -31,6 +51,7 @@ pub async fn init(path: &str) -> Result<()> {
         .connect(&url)
         .await?;
     init_schema(&pool).await?;
+    run_migrations(&pool).await;
     DB_POOL.set(pool).map_err(|_| anyhow::anyhow!("DB pool already initialized"))?;
     info!("📦 SQLite initialized: {}", path);
     Ok(())
@@ -93,7 +114,120 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
         )"
     ).execute(pool).await?;
 
+    // llm_recommendations: LLM Advisor analysis results persisted for the dashboard
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS llm_recommendations (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts          TEXT    NOT NULL,
+            model       TEXT    NOT NULL,
+            trade_count INTEGER NOT NULL,
+            session_pnl TEXT    NOT NULL,
+            analysis    TEXT    NOT NULL
+        )"
+    ).execute(pool).await?;
+
+    // sessions: one row per process start — the anchor for scoping all queries.
+    // session_id = RFC-3339 startup timestamp (stable, readable, sortable).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS sessions (
+            session_id   TEXT    PRIMARY KEY,
+            started_at   TEXT    NOT NULL,
+            ended_at     TEXT,
+            note         TEXT
+        )"
+    ).execute(pool).await?;
+
+    // config_history: append-only audit log of every config mutation.
+    // Lets developers reconstruct what parameters were active during any trade,
+    // correlate config changes with P&L inflection points, and review LLM-suggested
+    // changes vs. operator-applied changes over time.
+    //
+    // changed_by values:
+    //   'startup_static'  — compile-time constants from config.rs  (recompile detectable via diff)
+    //   'startup_dynamic' — DynamicConfig (runtime-tunable params) loaded at session start
+    //   'operator'        — Control Tower PATCH /api/config
+    //   'llm_advisor'     — recommendation applied by operator
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS config_history (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts           TEXT    NOT NULL,
+            session_id   TEXT    NOT NULL,
+            changed_by   TEXT    NOT NULL,
+            param_name   TEXT    NOT NULL,   -- e.g. 'static_config_snapshot', 'session_start_snapshot', field name
+            old_value    TEXT,               -- JSON of previous value (NULL on startup snapshots)
+            new_value    TEXT    NOT NULL    -- JSON of new value
+        )"
+    ).execute(pool).await?;
+
     Ok(())
+}
+
+/// Add new columns to existing tables that pre-date the session tracking feature.
+/// Uses sqlx error suppression rather than IF NOT EXISTS (SQLite does not support that syntax).
+async fn run_migrations(pool: &SqlitePool) {
+    // Add session_id to trades
+    let _ = sqlx::query("ALTER TABLE trades ADD COLUMN session_id TEXT")
+        .execute(pool).await;
+    // Add session_id to llm_recommendations
+    let _ = sqlx::query("ALTER TABLE llm_recommendations ADD COLUMN session_id TEXT")
+        .execute(pool).await;
+
+    // Index for fast session-scoped queries
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_trades_session ON trades(session_id)")
+        .execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts)")
+        .execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_llm_session ON llm_recommendations(session_id)")
+        .execute(pool).await;
+}
+
+// ─── Session lifecycle ───────────────────────────────────────────────────────
+
+/// Create a new session row and set the process-lifetime session ID.
+///
+/// Call once immediately after `db::init()`.  The session ID is the RFC-3339
+/// startup timestamp, making sessions human-readable and lexicographically
+/// sortable in any SQL query.
+///
+/// Returns the new session_id string.
+pub async fn init_session(note: Option<&str>) -> String {
+    let session_id = Utc::now().to_rfc3339();
+    let _ = CURRENT_SESSION_ID.set(session_id.clone());
+
+    if let Some(pool) = pool() {
+        let ts = session_id.clone();
+        if let Err(e) = sqlx::query(
+            "INSERT INTO sessions (session_id, started_at, note) VALUES (?, ?, ?)"
+        )
+        .bind(&session_id)
+        .bind(&ts)
+        .bind(note.unwrap_or(""))
+        .execute(pool)
+        .await {
+            error!("❌ DB session init failed: {}", e);
+        } else {
+            info!("📅 Session started: {}", session_id);
+        }
+
+        // Also persist to config KV for easy lookup by UI components
+        config_set(pool, "current_session_id", &session_id).await;
+    }
+
+    session_id
+}
+
+/// Mark the current session as ended.  Called on graceful shutdown.
+pub async fn close_session() {
+    if let (Some(pool), sid) = (pool(), current_session_id()) {
+        let ts = Utc::now().to_rfc3339();
+        let _ = sqlx::query(
+            "UPDATE sessions SET ended_at = ? WHERE session_id = ?"
+        )
+        .bind(&ts)
+        .bind(sid)
+        .execute(pool)
+        .await;
+    }
 }
 
 // ─── Trade / Entry writes ────────────────────────────────────────────────────
@@ -110,9 +244,10 @@ pub async fn record_trade_db(
     reason: &str,
 ) {
     let ts = Utc::now().to_rfc3339();
+    let sid = current_session_id();
     if let Err(e) = sqlx::query(
-        "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&ts)
     .bind(strategy)
@@ -123,6 +258,7 @@ pub async fn record_trade_db(
     .bind(shares.to_string())
     .bind(pnl.to_string())
     .bind(reason)
+    .bind(sid)
     .execute(pool)
     .await {
         error!("❌ DB trade write failed: {}", e);
@@ -221,6 +357,210 @@ pub async fn config_set(pool: &SqlitePool, key: &str, value: &str) {
     }
 }
 
+// ─── Config history (audit log) ──────────────────────────────────────────────
+
+/// Record a config change to the append-only audit log.
+///
+/// `changed_by` should be one of:
+///   - `"operator"`        — human changed via Control Tower PATCH /api/config
+///   - `"llm_advisor"`     — LLM recommendation applied manually by operator
+///   - `"startup_default"` — first write of compile-time defaults at startup
+///
+/// Both `old_value` and `new_value` are full JSON snapshots of `DynamicConfig`,
+/// so the entire parameter set is recoverable at any point in time.
+pub async fn record_config_change(
+    pool: &SqlitePool,
+    changed_by: &str,
+    param_name: &str,
+    old_value: Option<&str>,
+    new_value: &str,
+) {
+    let ts = Utc::now().to_rfc3339();
+    let sid = current_session_id();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO config_history (ts, session_id, changed_by, param_name, old_value, new_value)
+         VALUES (?, ?, ?, ?, ?, ?)"
+    )
+    .bind(&ts)
+    .bind(sid)
+    .bind(changed_by)
+    .bind(param_name)
+    .bind(old_value)
+    .bind(new_value)
+    .execute(pool)
+    .await {
+        error!("❌ DB config_history write failed: {}", e);
+    }
+}
+
+// ─── Static config snapshot ──────────────────────────────────────────────────
+
+/// Serialisable snapshot of the compile-time constants in `config.rs`.
+///
+/// All fields are `String` (for Decimal) or primitive types so the struct is
+/// trivially serialisable without bringing extra dependencies into `db.rs`.
+/// Stored as a JSON blob in `config_history` so operators can diff consecutive
+/// sessions to see exactly what changed between two compiles.
+#[derive(Serialize)]
+struct StaticConfigSnapshot<'a> {
+    // Global
+    ghost_mode:                        bool,
+    enable_momentum_trading:           bool,
+    enable_arbitrage_trading:          bool,
+    enable_maker_trading:              bool,
+    enable_telegram:                   bool,
+    enable_x:                          bool,
+    // Risk / exposure
+    max_exposure_per_token_usdc:       String,
+    min_hourly_market_vol24h:          f64,
+    momentum_max_exposure_usdc:        String,
+    maker_max_exposure_usdc:           String,
+    arbitrage_max_exposure_usdc:       String,
+    time_decay_max_exposure_usdc:      String,
+    // Momentum signals
+    btc_momentum_threshold:            String,
+    eth_momentum_threshold:            String,
+    sol_momentum_threshold:            String,
+    momentum_window_secs:              u64,
+    momentum_short_window_secs:        u64,
+    momentum_short_window_fraction:    String,
+    momentum_confirmation_ticks:       u32,
+    momentum_kelly_max_multiplier:     String,
+    momentum_min_trade_size_usdc:      String,
+    momentum_max_trade_size_usdc:      String,
+    max_momentum_entry_price:          String,
+    max_momentum_crossing_entry_price: String,
+    momentum_obi_adverse_block:        String,
+    momentum_target_profit_pct:        String,
+    momentum_stop_loss_pct:            String,
+    momentum_reversal_ratio:           String,
+    momentum_min_hold_secs_before_reversal: i64,
+    momentum_window_bearish_block:     String,
+    momentum_window_bullish_block:     String,
+    momentum_max_entry_ask_sum:        String,
+    momentum_take_profit_ceiling:      String,
+    momentum_acceleration_bypass_multiplier: String,
+    momentum_decay_exit_fraction:      String,
+    btc_strike_buffer:                 String,
+    eth_strike_buffer:                 String,
+    sol_strike_buffer:                 String,
+    // Maker
+    maker_max_entry_price:             String,
+    maker_min_spread:                  String,
+    maker_bid_buffer:                  String,
+    maker_min_secs_to_expiry:          i64,
+    maker_velocity_bias_threshold:     String,
+    // Arbitrage
+    arbitrage_profit_threshold:        String,
+    max_sum_price_for_entry:           String,
+    arbitrage_position_size_usdc:      String,
+    early_exit_combined_bid_threshold: String,
+    // Order execution
+    min_order_shares:                  String,
+    min_order_usdc:                    String,
+    min_liquidity_fill_ratio:          String,
+    buy_price_offset:                  String,
+    sell_price_offset:                 String,
+    max_buy_limit_price:               String,
+    // LLM Advisor
+    enable_llm_advisor:                bool,
+    llm_advisor_interval_secs:         u64,
+    llm_advisor_trades_lookback:       i64,
+    llm_ollama_url:                    &'a str,
+    llm_ollama_model:                  &'a str,
+}
+
+/// Snapshot the compile-time constants from `config.rs` into `config_history`.
+///
+/// Called once per process start (right after `init_session`) so there is always
+/// a complete record of the compiled trading parameters that were active during
+/// every session.  Unlike `DynamicConfig`, these values can _only_ change when the
+/// developer edits `config.rs` and recompiles — so diffing consecutive
+/// `startup_static` rows across sessions immediately reveals what was changed.
+///
+/// The row is tagged `changed_by = "startup_static"`,
+/// `param_name = "static_config_snapshot"`, and carries the full JSON in `new_value`.
+/// `old_value` is always NULL — the audit trail lets callers read the previous
+/// session's row to build a diff if they need one.
+pub async fn record_static_config_snapshot(pool: &SqlitePool) {
+    let snap = StaticConfigSnapshot {
+        ghost_mode:                        config::GHOST_MODE,
+        enable_momentum_trading:           config::ENABLE_MOMENTUM_TRADING,
+        enable_arbitrage_trading:          config::ENABLE_ARBITRAGE_TRADING,
+        enable_maker_trading:              config::ENABLE_MAKER_TRADING,
+        enable_telegram:                   config::ENABLE_TELEGRAM,
+        enable_x:                          config::ENABLE_X,
+        max_exposure_per_token_usdc:       config::MAX_EXPOSURE_PER_TOKEN_USDC.to_string(),
+        min_hourly_market_vol24h:          config::MIN_HOURLY_MARKET_VOL24H,
+        momentum_max_exposure_usdc:        config::MOMENTUM_MAX_EXPOSURE_USDC.to_string(),
+        maker_max_exposure_usdc:           config::MAKER_MAX_EXPOSURE_USDC.to_string(),
+        arbitrage_max_exposure_usdc:       config::ARBITRAGE_MAX_EXPOSURE_USDC.to_string(),
+        time_decay_max_exposure_usdc:      config::TIME_DECAY_MAX_EXPOSURE_USDC.to_string(),
+        btc_momentum_threshold:            config::BTC_MOMENTUM_THRESHOLD.to_string(),
+        eth_momentum_threshold:            config::ETH_MOMENTUM_THRESHOLD.to_string(),
+        sol_momentum_threshold:            config::SOL_MOMENTUM_THRESHOLD.to_string(),
+        momentum_window_secs:              config::MOMENTUM_WINDOW_SECS,
+        momentum_short_window_secs:        config::MOMENTUM_SHORT_WINDOW_SECS,
+        momentum_short_window_fraction:    config::MOMENTUM_SHORT_WINDOW_FRACTION.to_string(),
+        momentum_confirmation_ticks:       config::MOMENTUM_CONFIRMATION_TICKS,
+        momentum_kelly_max_multiplier:     config::MOMENTUM_KELLY_MAX_MULTIPLIER.to_string(),
+        momentum_min_trade_size_usdc:      config::MOMENTUM_MIN_TRADE_SIZE_USDC.to_string(),
+        momentum_max_trade_size_usdc:      config::MOMENTUM_MAX_TRADE_SIZE_USDC.to_string(),
+        max_momentum_entry_price:          config::MAX_MOMENTUM_ENTRY_PRICE.to_string(),
+        max_momentum_crossing_entry_price: config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE.to_string(),
+        momentum_obi_adverse_block:        config::MOMENTUM_OBI_ADVERSE_BLOCK.to_string(),
+        momentum_target_profit_pct:        config::MOMENTUM_TARGET_PROFIT_PERCENT.to_string(),
+        momentum_stop_loss_pct:            config::MOMENTUM_STOP_LOSS_PERCENT.to_string(),
+        momentum_reversal_ratio:           config::MOMENTUM_REVERSAL_RATIO.to_string(),
+        momentum_min_hold_secs_before_reversal: config::MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL,
+        momentum_window_bearish_block:     config::MOMENTUM_WINDOW_BEARISH_BLOCK.to_string(),
+        momentum_window_bullish_block:     config::MOMENTUM_WINDOW_BULLISH_BLOCK.to_string(),
+        momentum_max_entry_ask_sum:        config::MOMENTUM_MAX_ENTRY_ASK_SUM.to_string(),
+        momentum_take_profit_ceiling:      config::MOMENTUM_TAKE_PROFIT_CEILING.to_string(),
+        momentum_acceleration_bypass_multiplier: config::MOMENTUM_ACCELERATION_BYPASS_MULTIPLIER.to_string(),
+        momentum_decay_exit_fraction:      config::MOMENTUM_DECAY_EXIT_FRACTION.to_string(),
+        btc_strike_buffer:                 config::BTC_STRIKE_BUFFER.to_string(),
+        eth_strike_buffer:                 config::ETH_STRIKE_BUFFER.to_string(),
+        sol_strike_buffer:                 config::SOL_STRIKE_BUFFER.to_string(),
+        maker_max_entry_price:             config::MAKER_MAX_ENTRY_PRICE.to_string(),
+        maker_min_spread:                  config::MAKER_MIN_SPREAD.to_string(),
+        maker_bid_buffer:                  config::MAKER_BID_BUFFER.to_string(),
+        maker_min_secs_to_expiry:          config::MAKER_MIN_SECS_TO_EXPIRY,
+        maker_velocity_bias_threshold:     config::MAKER_VELOCITY_BIAS_THRESHOLD.to_string(),
+        arbitrage_profit_threshold:        config::ARBITRAGE_PROFIT_THRESHOLD.to_string(),
+        max_sum_price_for_entry:           config::MAX_SUM_PRICE_FOR_ENTRY.to_string(),
+        arbitrage_position_size_usdc:      config::ARBITRAGE_POSITION_SIZE_USDC.to_string(),
+        early_exit_combined_bid_threshold: config::EARLY_EXIT_COMBINED_BID_THRESHOLD.to_string(),
+        min_order_shares:                  config::MIN_ORDER_SHARES.to_string(),
+        min_order_usdc:                    config::MIN_ORDER_USDC.to_string(),
+        min_liquidity_fill_ratio:          config::MIN_LIQUIDITY_FILL_RATIO.to_string(),
+        buy_price_offset:                  config::BUY_PRICE_OFFSET.to_string(),
+        sell_price_offset:                 config::SELL_PRICE_OFFSET.to_string(),
+        max_buy_limit_price:               config::MAX_BUY_LIMIT_PRICE.to_string(),
+        enable_llm_advisor:                config::ENABLE_LLM_ADVISOR,
+        llm_advisor_interval_secs:         config::LLM_ADVISOR_INTERVAL_SECS,
+        llm_advisor_trades_lookback:       config::LLM_ADVISOR_TRADES_LOOKBACK,
+        llm_ollama_url:                    config::LLM_OLLAMA_URL,
+        llm_ollama_model:                  config::LLM_OLLAMA_MODEL,
+    };
+
+    match serde_json::to_string(&snap) {
+        Ok(json) => {
+            record_config_change(
+                pool,
+                "startup_static",
+                "static_config_snapshot",
+                None,   // no old_value — diff consecutive sessions in config_history to find changes
+                &json,
+            ).await;
+            info!("📸 Static config snapshot recorded for session {}", current_session_id());
+        }
+        Err(e) => {
+            error!("❌ DB static_config_snapshot serialise failed: {}", e);
+        }
+    }
+}
+
 // ─── API read models ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -241,6 +581,17 @@ pub struct TradeRow {
     pub shares: String,
     pub pnl: String,
     pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ConfigHistoryRow {
+    pub id: i64,
+    pub ts: String,
+    pub session_id: String,
+    pub changed_by: String,
+    pub param_name: String,
+    pub old_value: Option<String>,
+    pub new_value: String,
 }
 
 /// Return the most recent `limit` P&L snapshots, newest first.
@@ -281,6 +632,157 @@ pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
             reason:      r.try_get::<String, _>(8).ok()?,
         })).collect(),
         Err(e) => { error!("❌ DB get_recent_trades failed: {}", e); vec![] }
+    }
+}
+
+/// Return all completed trades for the current session, newest first.
+///
+/// This is the primary query used by the LLM Advisor during a session:
+/// analysis stays contextually coherent because all trades share the same
+/// market conditions, config snapshot, and starting collateral.
+pub async fn get_session_trades(pool: &SqlitePool) -> Vec<TradeRow> {
+    let sid = current_session_id();
+    match sqlx::query(
+        "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason
+         FROM trades WHERE session_id = ? ORDER BY ts DESC"
+    )
+    .bind(sid)
+    .fetch_all(pool)
+    .await {
+        Ok(rows) => rows.into_iter().filter_map(|r| Some(TradeRow {
+            ts:          r.try_get::<String, _>(0).ok()?,
+            strategy:    r.try_get::<String, _>(1).ok()?,
+            market:      r.try_get::<String, _>(2).ok()?,
+            side:        r.try_get::<String, _>(3).ok()?,
+            entry_price: r.try_get::<String, _>(4).ok()?,
+            exit_price:  r.try_get::<String, _>(5).ok()?,
+            shares:      r.try_get::<String, _>(6).ok()?,
+            pnl:         r.try_get::<String, _>(7).ok()?,
+            reason:      r.try_get::<String, _>(8).ok()?,
+        })).collect(),
+        Err(e) => { error!("❌ DB get_session_trades failed: {}", e); vec![] }
+    }
+}
+
+/// Return trades from the previous session (by trades.session_id, not current one),
+/// newest first, up to `limit` rows.  Used as supplemental context when the current
+/// session has too few trades for meaningful LLM analysis.
+pub async fn get_previous_session_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
+    let sid = current_session_id();
+    match sqlx::query(
+        "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason
+         FROM trades
+         WHERE session_id IS NOT NULL AND session_id != ?
+         ORDER BY ts DESC LIMIT ?"
+    )
+    .bind(sid)
+    .bind(limit)
+    .fetch_all(pool)
+    .await {
+        Ok(rows) => rows.into_iter().filter_map(|r| Some(TradeRow {
+            ts:          r.try_get::<String, _>(0).ok()?,
+            strategy:    r.try_get::<String, _>(1).ok()?,
+            market:      r.try_get::<String, _>(2).ok()?,
+            side:        r.try_get::<String, _>(3).ok()?,
+            entry_price: r.try_get::<String, _>(4).ok()?,
+            exit_price:  r.try_get::<String, _>(5).ok()?,
+            shares:      r.try_get::<String, _>(6).ok()?,
+            pnl:         r.try_get::<String, _>(7).ok()?,
+            reason:      r.try_get::<String, _>(8).ok()?,
+        })).collect(),
+        Err(e) => { error!("❌ DB get_previous_session_trades failed: {}", e); vec![] }
+    }
+}
+
+/// Return recent config history entries, newest first.
+pub async fn get_config_history(pool: &SqlitePool, limit: i64) -> Vec<ConfigHistoryRow> {
+    match sqlx::query(
+        "SELECT id, ts, session_id, changed_by, param_name, old_value, new_value
+         FROM config_history ORDER BY ts DESC LIMIT ?"
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await {
+        Ok(rows) => rows.into_iter().filter_map(|r| Some(ConfigHistoryRow {
+            id:          r.try_get::<i64,    _>(0).ok()?,
+            ts:          r.try_get::<String, _>(1).ok()?,
+            session_id:  r.try_get::<String, _>(2).ok()?,
+            changed_by:  r.try_get::<String, _>(3).ok()?,
+            param_name:  r.try_get::<String, _>(4).ok()?,
+            old_value:   r.try_get::<Option<String>, _>(5).ok()?,
+            new_value:   r.try_get::<String, _>(6).ok()?,
+        })).collect(),
+        Err(e) => { error!("❌ DB get_config_history failed: {}", e); vec![] }
+    }
+}
+
+// ─── LLM Recommendations ─────────────────────────────────────────────────────
+
+#[derive(Debug, Serialize)]
+pub struct LlmRecommendationRow {
+    pub id:          i64,
+    pub ts:          String,
+    pub session_id:  String,
+    pub model:       String,
+    pub trade_count: i64,
+    pub session_pnl: String,
+    pub analysis:    String,
+    /// True if this recommendation was generated during the current process session.
+    pub is_current_session: bool,
+}
+
+/// Persist a completed LLM Advisor analysis, tagged with the current session.
+pub async fn record_llm_recommendation(
+    pool: &SqlitePool,
+    model: &str,
+    trade_count: i64,
+    session_pnl: Decimal,
+    analysis: &str,
+) {
+    let ts = Utc::now().to_rfc3339();
+    let sid = current_session_id();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO llm_recommendations (ts, model, trade_count, session_pnl, analysis, session_id)
+         VALUES (?, ?, ?, ?, ?, ?)"
+    )
+    .bind(&ts)
+    .bind(model)
+    .bind(trade_count)
+    .bind(session_pnl.to_string())
+    .bind(analysis)
+    .bind(sid)
+    .execute(pool)
+    .await {
+        error!("❌ DB llm_recommendation write failed: {}", e);
+    }
+}
+
+/// Return the most recent `limit` LLM recommendations, newest first.
+/// The `is_current_session` field is populated by comparing each row's session_id
+/// to `db::current_session_id()`, so callers can render staleness indicators.
+pub async fn get_recent_llm_recommendations(pool: &SqlitePool, limit: i64) -> Vec<LlmRecommendationRow> {
+    let current_sid = current_session_id().to_string();
+    match sqlx::query(
+        "SELECT id, ts, COALESCE(session_id, 'legacy'), model, trade_count, session_pnl, analysis
+         FROM llm_recommendations ORDER BY ts DESC LIMIT ?"
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await {
+        Ok(rows) => rows.into_iter().filter_map(|r| {
+            let sid: String = r.try_get::<String, _>(2).ok()?;
+            Some(LlmRecommendationRow {
+                id:                  r.try_get::<i64,    _>(0).ok()?,
+                ts:                  r.try_get::<String, _>(1).ok()?,
+                session_id:          sid.clone(),
+                model:               r.try_get::<String, _>(3).ok()?,
+                trade_count:         r.try_get::<i64,    _>(4).ok()?,
+                session_pnl:         r.try_get::<String, _>(5).ok()?,
+                analysis:            r.try_get::<String, _>(6).ok()?,
+                is_current_session:  sid == current_sid,
+            })
+        }).collect(),
+        Err(e) => { error!("❌ DB get_recent_llm_recommendations failed: {}", e); vec![] }
     }
 }
 

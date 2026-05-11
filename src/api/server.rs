@@ -2,14 +2,15 @@
 ///
 /// Endpoints
 /// ─────────────────────────────────────────────────────────────────────────────
-///   GET  /api/health          — liveness check
-///   GET  /api/config          — current DynamicConfig as JSON
-///   PATCH /api/config         — JSON merge-patch; hot-reloads strategies
-///   GET  /api/pnl/history     — recent P&L snapshots  (?limit=200)
-///   GET  /api/trades          — recent completed trades (?limit=100)
+///   GET  /api/health                — liveness check
+///   GET  /api/config                — current DynamicConfig as JSON
+///   PATCH /api/config               — JSON merge-patch; hot-reloads strategies
+///   GET  /api/pnl/history           — recent P&L snapshots  (?limit=200)
+///   GET  /api/trades                — recent completed trades (?limit=100)
+///   GET  /api/llm/recommendations   — recent LLM Advisor analyses (?limit=10)
 ///
 /// The server binds to 0.0.0.0:$API_PORT (default 9000).
-/// CORS is open so the Next.js dev server on any port can reach it.
+/// CORS is open so the Next.js Control Tower on any port can reach it.
 
 use axum::{
     Router,
@@ -165,6 +166,26 @@ async fn get_trades(Query(q): Query<LimitQuery>) -> Response {
     }
 }
 
+/// GET /api/llm/recommendations?limit=10
+///
+/// Returns up to `limit` LLM Advisor analyses, newest first.
+/// Each row: { id, ts, model, trade_count, session_pnl, analysis }
+async fn get_llm_recommendations(Query(q): Query<LimitQuery>) -> Response {
+    debug!("Received GET /api/llm/recommendations request with limit: {:?}", q.limit);
+    let limit = q.limit.unwrap_or(10).clamp(1, 50);
+    match db::pool() {
+        Some(pool) => {
+            let recs = db::get_recent_llm_recommendations(pool, limit).await;
+            debug!("Successfully retrieved {} LLM recommendations", recs.len());
+            Json(recs).into_response()
+        },
+        None => {
+            error!("Database pool not available for GET /api/llm/recommendations");
+            Json(Vec::<db::LlmRecommendationRow>::new()).into_response()
+        },
+    }
+}
+
 // ─── Server startup ──────────────────────────────────────────────────────────
 
 /// Spawn the Control Tower axum server.
@@ -184,11 +205,12 @@ pub async fn run_api_server(
     let state = ApiState { config_tx, config_rx, markets_rx };
 
     let app = Router::new()
-        .route("/api/health",      get(health))
-        .route("/api/config",      get(get_config).patch(patch_config))
-        .route("/api/pnl/history", get(get_pnl_history))
-        .route("/api/trades",      get(get_trades))
-        .route("/api/status",      get(get_status))
+        .route("/api/health",                get(health))
+        .route("/api/config",                get(get_config).patch(patch_config))
+        .route("/api/pnl/history",           get(get_pnl_history))
+        .route("/api/trades",                get(get_trades))
+        .route("/api/status",                get(get_status))
+        .route("/api/llm/recommendations",   get(get_llm_recommendations))
         // Permissive CORS so the Next.js Control Tower (any port) can reach the API.
         .layer(CorsLayer::permissive())
         .with_state(state);

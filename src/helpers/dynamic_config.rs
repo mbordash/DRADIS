@@ -19,6 +19,15 @@
 ///   - Timing constants (cooldowns, retry intervals, watchdog)
 ///   - Order minimums (MIN_ORDER_SHARES, MIN_ORDER_USDC)
 ///   - Flash-exit timing, fee formulas
+///
+/// ── Config change audit log ──────────────────────────────────────────────────
+///   Every call to `save()` or `apply_patch()` appends a row to `config_history`
+///   in SQLite with:
+///     - `session_id`  — which process start made the change
+///     - `changed_by`  — "startup_default" | "operator" | "llm_advisor"
+///     - `old_value`   — the previous JSON snapshot (NULL on first write)
+///     - `new_value`   — the new JSON snapshot
+///   This lets developers reconstruct the exact config active during any trade.
 
 use serde::{Serialize, Deserialize};
 use rust_decimal::Decimal;
@@ -166,6 +175,21 @@ impl DynamicConfig {
                         cfg.time_decay_stop_loss_pct = cfg.time_decay_stop_loss_pct
                             .min(config::TIME_DECAY_STOP_LOSS_PERCENT);
                         info!("⚙️  DynamicConfig loaded from SQLite (safety floors applied)");
+
+                        // Record startup load in config_history so developers can see
+                        // exactly what DynamicConfig was active at the start of every session.
+                        // Tagged 'startup_dynamic' to distinguish from the compile-time
+                        // 'startup_static' snapshot taken immediately before this.
+                        if let Ok(new_json) = serde_json::to_string(&cfg) {
+                            db::record_config_change(
+                                pool,
+                                "startup_dynamic",
+                                "session_start_snapshot",
+                                None,   // no "previous" — this is the session anchor
+                                &new_json,
+                            ).await;
+                        }
+
                         return Arc::new(cfg);
                     }
                     Err(e) => {
@@ -177,18 +201,36 @@ impl DynamicConfig {
             }
         }
         let cfg = Arc::new(DynamicConfig::default());
-        cfg.save().await;
+        cfg.save_as("startup_dynamic").await;
         cfg
     }
 
     /// Persist current values as a JSON blob under DB_KEY.
-    pub async fn save(&self) {
+    /// Also appends to config_history with the provided `changed_by` provenance tag.
+    async fn save_as(&self, changed_by: &str) {
         if let Some(pool) = db::pool() {
             match serde_json::to_string(self) {
-                Ok(json) => db::config_set(pool, DB_KEY, &json).await,
-                Err(e)   => warn!("⚠️  DynamicConfig serialize error: {}", e),
+                Ok(new_json) => {
+                    // Read old value before overwriting so the diff is recorded.
+                    let old_json = db::config_get(pool, DB_KEY).await;
+                    db::config_set(pool, DB_KEY, &new_json).await;
+                    db::record_config_change(
+                        pool,
+                        changed_by,
+                        "full_snapshot",
+                        old_json.as_deref(),
+                        &new_json,
+                    ).await;
+                }
+                Err(e) => warn!("⚠️  DynamicConfig serialize error: {}", e),
             }
         }
+    }
+
+    /// Persist current values as a JSON blob under DB_KEY.
+    /// Convenience alias with "operator" provenance for direct calls.
+    pub async fn save(&self) {
+        self.save_as("operator").await;
     }
 
     /// Apply a partial JSON patch (e.g. `{"time_decay_stop_loss_pct":"0.03"}`),
@@ -209,7 +251,7 @@ impl DynamicConfig {
         }
 
         let updated: DynamicConfig = serde_json::from_value(value)?;
-        updated.save().await;
+        updated.save_as("operator").await;
         info!("⚙️  DynamicConfig hot-patched and persisted");
         Ok(Arc::new(updated))
     }

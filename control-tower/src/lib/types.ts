@@ -74,6 +74,15 @@ export interface TradeRow {
   reason:      string;
 }
 
+export interface LlmRecommendationRow {
+  id:          number;
+  ts:          string;   // ISO 8601
+  model:       string;   // ollama model name
+  trade_count: number;   // trades analysed
+  session_pnl: string;   // Decimal string
+  analysis:    string;   // full LLM output text
+}
+
 /** Response from GET /api/status — maps strategy key to active market name. */
 export interface StatusResponse {
   strategy_markets: Record<string, string>;

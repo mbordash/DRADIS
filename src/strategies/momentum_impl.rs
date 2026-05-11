@@ -118,6 +118,35 @@ impl Strategy for MomentumStrategyImpl {
                 window_blocks_bear = false;
             }
 
+            // ── Expiry guard ──────────────────────────────────────────────────
+            // MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY (1200s) must be GREATER than
+            // MOMENTUM_EXPIRY_EXIT_SECS (900s).  If not, the NearExpiry exit fires
+            // on the very first tick after fill confirmation — a structurally
+            // guaranteed loss (observed: 2026-05-11 Trade 2, hold=0s, -$0.39).
+            if let Some(close_time) = ctx.market.market_close_time {
+                let secs_left = (close_time - chrono::Utc::now()).num_seconds();
+                if secs_left < config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY {
+                    debug!("🚫 Momentum entry blocked: only {}s to expiry (min {}s)",
+                        secs_left, config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY);
+                    return Ok(StrategySignal::NoSignal);
+                }
+            }
+
+            // ── Snapshot staleness gate ───────────────────────────────────────
+            // Every other strategy (GBoost, TimeDecay, Basis) blocks entries when
+            // the live WS snapshot is stale.  Momentum was the only strategy
+            // missing this guard.  When the WebSocket stops pushing updates the
+            // depth, spread, and OBI values silently retain their last-known state,
+            // causing the OBI veto and spread gate to evaluate against book data
+            // that may be 30+ seconds out of date.
+            // 2026-05-11 Trade 3: entry_hb_age≈32s → stale depth → unreliable OBI.
+            let snap_age = (chrono::Utc::now() - ctx.snapshot.timestamp).num_seconds();
+            if snap_age > config::MOMENTUM_MAX_SNAPSHOT_AGE_SECS {
+                debug!("🚫 Momentum entry blocked: snapshot too stale ({}s > max {}s)",
+                    snap_age, config::MOMENTUM_MAX_SNAPSHOT_AGE_SECS);
+                return Ok(StrategySignal::NoSignal);
+            }
+
             // ── Spread gate: block wide-book entries ──────────────────────────
             // ask_sum = YES_ask + NO_ask.  Normal tight books = 1.01–1.02.
             // At 1.03+ the round-trip cost (BUY_OFFSET + SELL_OFFSET + spread)

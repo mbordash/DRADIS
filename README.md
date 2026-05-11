@@ -1,6 +1,6 @@
 # DRADIS
 
-> **Direct Reaction And Dynamic Intelligence System** — A low-latency multi-strategy trading execution platform for prediction markets like Polymarket.
+> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Polymarket. Six autonomous strategies (Momentum, Maker, Arbitrage, Time Decay, Basis, GBoost ML), real-time Next.js Control Tower, and an LLM Advisor that delivers optimization recommendations via Ollama (local or remote) + Telegram.
 
 ![Rust](https://img.shields.io/badge/Rust-1.95+-orange?logo=rust&logoColor=white)
 ![Tokio](https://img.shields.io/badge/Tokio-async%20runtime-darkgreen?logo=rust&logoColor=white)
@@ -8,6 +8,7 @@
 ![Next.js](https://img.shields.io/badge/Next.js-15-black?logo=next.js&logoColor=white)
 ![Tailwind CSS](https://img.shields.io/badge/Tailwind-CSS-38bdf8?logo=tailwindcss&logoColor=white)
 ![Node.js](https://img.shields.io/badge/Node.js-20-brightgreen?logo=node.js&logoColor=white)
+![Ollama](https://img.shields.io/badge/Ollama-LLM%20Advisor-blueviolet?logo=ollama&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-compose-2496ED?logo=docker&logoColor=white)
 ![License](https://img.shields.io/badge/License-GPLv3-blue)
 
@@ -17,7 +18,7 @@
 
 DRADIS is not just a bot; it is a comprehensive trading automation platform for prediction markets like Polymarket. Built in Rust for maximum concurrency and memory safety, it evaluates the selected markets every 50ms, coordinating multiple autonomous strategies to preserve capital and place orders where it sees inefficiencies.
 
-Unlike standard linear scripts, DRADIS uses a Tokio-powered orchestrator to manage telemetry (WebSockets), signal processing (**Raptors** — the recon layer that scouts external signals like Binance price feeds and funding rates), and tactical execution across six distinct **Viper** strategy classes. You can also build your own Viper using our [implementation guide](docs/CUSTOM_STRATEGY.md).
+Unlike standard linear scripts, DRADIS uses a Tokio-powered orchestrator to manage telemetry (WebSockets), signal processing (**Raptors** — the recon layer that scouts external signals like Binance price feeds and funding rates), and tactical execution across six distinct **Viper** strategy classes. A built-in **LLM Advisor** periodically analyses completed trades and delivers actionable optimization recommendations directly to your Telegram channel — using any locally-running Ollama model you choose. You can also build your own Viper using our [implementation guide](docs/CUSTOM_STRATEGY.md).
 
 ---
 
@@ -65,6 +66,18 @@ The core of DRADIS is the Orchestrator. It acts as the ship's brain, maintaining
            │  Strategy toggles     │  ◄── PATCH /api/config
            │  P&L chart            │  ◄── GET  /api/pnl/history
            │  Trade log            │  ◄── GET  /api/trades
+           └───────────────────────┘
+
+           ┌───────────────────────┐     ┌─────────────────────┐
+           │    LLM Advisor        │────►│  Ollama API          │
+           │  (background task)    │     │  (your local model)  │
+           │  reads SQLite trades  │     └─────────────────────┘
+           │  every N minutes      │
+           └──────────┬────────────┘
+                      │ recommendations
+                      ▼
+           ┌───────────────────────┐
+           │   Telegram Channel    │
            └───────────────────────┘
 ```
 
@@ -127,6 +140,93 @@ Control Tower is protected by HTTP Basic Auth in production. Set `CT_USERNAME` a
 CT_USERNAME=starbuck
 CT_PASSWORD=your-strong-password
 ```
+---
+
+## 🤖 LLM Advisor
+
+The LLM Advisor is an optional background task that periodically analyses your completed trades and sends **plain-English optimization recommendations** directly to your Telegram channel. It is powered by a locally-running [Ollama](https://ollama.com) instance — no data ever leaves your machine or server.
+
+### What it does
+
+Every `LLM_ADVISOR_INTERVAL_SECS` (default: 30 minutes) the advisor:
+
+1. Fetches the last `LLM_ADVISOR_TRADES_LOOKBACK` (default: 20) completed trades from SQLite
+2. Computes a per-strategy win/loss/P&L breakdown
+3. Sends the trade data + session context to Ollama with a detailed system prompt that explains all six Vipers, OBI semantics, Polymarket fee structure, and every tunable `DynamicConfig` parameter
+4. Receives a structured analysis back from the model
+5. Posts the recommendations to your Telegram channel
+
+A typical message looks like:
+
+```
+📊 DRADIS LLM ADVISOR
+Session P&L: -$1.42  |  Trades analysed: 20
+
+🔍 OBSERVATIONS
+• 6 of 8 GBoost losses had entry_obi_y ≤ -0.80 — adversely stacked books at fill time
+• Momentum avg hold 3s — MomentumDecay exits firing immediately after entry
+• BasisStrategy win rate 0% over 4 trades — oracle flat but funding signal absent
+
+⚙️ RECOMMENDATIONS
+1. gboost_obi_adverse_block: -0.25 → -0.15 — tighten to block severely adverse books
+2. momentum_decay_exit_fraction: 0.20 → 0.30 — require stronger signal collapse before early exit
+3. enable_basis: true → false — no confirming funding signal this session; reduces noise
+4. gboost_entry_threshold: 0.85 → 0.90 — raise conviction bar; borderline signals losing money
+
+🟢 KEEP ENABLED: Momentum, Arbitrage, TimeDecay
+🔴 CONSIDER DISABLING: GBoost, Basis
+```
+
+### Configuration
+
+```rust
+// src/config.rs
+pub const ENABLE_LLM_ADVISOR: bool = true;          // master switch (default: false)
+pub const LLM_ADVISOR_INTERVAL_SECS: u64 = 1800;   // how often to run (30 min default)
+pub const LLM_ADVISOR_TRADES_LOOKBACK: i64 = 20;   // trades per analysis window
+pub const LLM_OLLAMA_URL: &str = "http://localhost:11434";  // Ollama base URL
+pub const LLM_OLLAMA_MODEL: &str = "llama3.2";     // model name
+```
+
+Override the URL and model at runtime without rebuilding:
+
+```bash
+# .env or server environment
+OLLAMA_URL=http://192.168.1.10:11434   # remote Ollama instance (GPU box, etc.)
+OLLAMA_MODEL=mistral                    # any model installed in your Ollama
+```
+
+The advisor requires the same `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` env vars already used for trade alerts. If Telegram credentials are absent, the full analysis is written to the engine log instead.
+
+### Bring Your Own Model
+
+Any model that follows Ollama's instruction format works. Recommended options:
+
+| Model | Size | Notes |
+|---|---|---|
+| `llama3.2` | 2–3 GB | Fast on CPU; good instruction following; **recommended default** |
+| `llama3.1:8b` | 5 GB | Better reasoning; needs ≥8 GB RAM |
+| `mistral` | 4 GB | Strong on structured output; good alternative |
+| `qwen2.5:7b` | 5 GB | Excellent code/config reasoning; good for parameter suggestions |
+
+Install a model:
+```bash
+ollama pull llama3.2
+```
+
+Point DRADIS at a remote Ollama instance (e.g. a GPU box on your LAN or a cloud GPU) via `OLLAMA_URL` — inference latency is irrelevant since the advisor runs on a slow background timer, not in the trading hot path.
+
+### Profile defaults
+
+| Profile | `ENABLE_LLM_ADVISOR` | Interval | Lookback |
+|---|---|---|---|
+| 🔴 Aggressive | `true` | 20 min | 25 trades |
+| 🟡 Balanced | `true` | 30 min | 20 trades |
+| 🟢 Conservative | `true` | 45 min | 15 trades |
+| `config.rs` (live) | `false` | 30 min | 20 trades |
+
+The live `config.rs` ships with the advisor **off by default** — flip `ENABLE_LLM_ADVISOR = true` when you have Ollama running.
+
 ---
 
 ## 🛡️ Safety Systems
@@ -237,9 +337,11 @@ cargo build --release
 
 ## Notifications
 
-DRADIS can push trade alerts to **Telegram** and/or **X (Twitter)** in real-time. Both channels fire asynchronously — they never block the 50ms trading loop.
+DRADIS can push trade alerts to **Telegram** and/or **X (Twitter)** in real-time, and can deliver **LLM Advisor recommendations** to Telegram on a configurable schedule. All notification channels fire asynchronously — they never block the 50ms trading loop.
 
 ### Telegram
+
+Used for both **real-time trade alerts** and **LLM Advisor recommendations** (see [LLM Advisor](#-llm-advisor) above).
 
 1. Create a bot via [@BotFather](https://t.me/botfather) and copy the token.
 2. Start a chat with your bot (or add it to a group) and grab the `chat_id`.
@@ -340,10 +442,14 @@ ssh -i ~/.ssh/your-key.pem ubuntu@YOUR_SERVER_IP "docker logs control-tower --ta
 
 The priority is consistent profitability first — abstractions and new features follow once the core strategies prove their edge.
 
+### Recently shipped
+- **LLM Advisor** — periodic trade analysis via a local Ollama instance; optimization recommendations delivered to Telegram; bring-your-own model via `OLLAMA_URL` / `OLLAMA_MODEL` env vars (see [LLM Advisor](#-llm-advisor))
+
 ### Medium-term (deployment profiles)
 - **Static deployment profiles** (`profiles.toml`) — named configurations that each bind a market, a viper subset, capital allocation, and risk overrides; the current `config.rs` becomes the implicit `"default"` profile with zero behavior change
 - **Per-profile P&L tracking** — DB and API namespaced by `profile_id` so A/B tests across viper combinations have independent ledgers
 - **Profile selector in Control Tower** — top-level switcher so the dashboard shows the active profile's vipers, P&L curve, and trade log
+- **LLM live config changes** — extend the LLM Advisor from recommendations-only to optionally applying approved `DynamicConfig` patches via a Telegram approval gate (`reply YES to apply`)
 
 ### Longer-term (multi-market)
 - **Polymarket market-type expansion** — add new Raptor scouts for politics, sports, and social event markets (line movement APIs, polling aggregators); Vipers declare which Raptors they require and the UI only shows compatible Vipers for a given profile
@@ -428,3 +534,28 @@ The UI polls `GET /api/health` every 5 seconds. "Offline" means the DRADIS engin
 1. Is DRADIS running? (`ps aux | grep dradis` or `docker ps`)
 2. Is the API port open? (`curl http://localhost:9000/api/health`)
 3. In Docker — is the Control Tower container on the same `dradis-net` network as `dradis-btc`?
+
+**How do I enable the LLM Advisor?**
+
+1. Install [Ollama](https://ollama.com) and pull a model: `ollama pull llama3.2`
+2. In `src/config.rs`, set `ENABLE_LLM_ADVISOR: bool = true`
+3. Rebuild: `cargo build --release`
+4. Make sure `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` are set in your `.env` (same as trade alerts)
+5. Optionally set `OLLAMA_URL` if your Ollama instance is on a different host
+
+The advisor will fire after the first interval (`LLM_ADVISOR_INTERVAL_SECS`, default 30 min) once at least one trade has been recorded. If Telegram creds are absent, the full analysis is written to the engine log instead.
+
+**The LLM Advisor isn't sending messages.**
+
+Check in order:
+1. Is `ENABLE_LLM_ADVISOR = true` in `config.rs`? (default is `false`)
+2. Is Ollama running and reachable? `curl http://localhost:11434/api/tags`
+3. Is the model installed? `ollama list` — if not, `ollama pull llama3.2`
+4. Are `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` set? If not, check the engine log — the analysis is printed there instead.
+5. Have enough trades completed? The advisor skips cycles where the DB has no completed trades yet.
+6. Has the first interval elapsed? The advisor skips the first tick at startup and waits one full `LLM_ADVISOR_INTERVAL_SECS` before the first analysis.
+
+**Can the LLM Advisor apply config changes automatically?**
+
+Not yet — recommendations are advisory only. The automatic apply path (Telegram approval gate → `PATCH /api/config`) is on the roadmap. For now, take the suggestions and apply them manually via the Control Tower UI or by editing `src/config.rs`.
+
