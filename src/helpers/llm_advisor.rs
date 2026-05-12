@@ -44,7 +44,7 @@ use tokio::time::{interval, Duration};
 use tracing::{error, info, warn};
 
 use crate::config;
-use crate::helpers::{db, notifications};
+use crate::helpers::{db, dynamic_config::DynamicConfig, notifications};
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
@@ -55,7 +55,8 @@ const LLM_ADVISOR_MIN_SESSION_TRADES: usize = 5;
 
 /// When the current session has fewer than LLM_ADVISOR_MIN_SESSION_TRADES trades,
 /// supplement with this many trades from prior sessions as context.
-const LLM_ADVISOR_PRIOR_SESSION_SUPPLEMENT: i64 = 15;
+/// Kept low (5) to avoid prompt bloat — a 3b CPU model struggles past ~1500 input tokens.
+const LLM_ADVISOR_PRIOR_SESSION_SUPPLEMENT: i64 = 5;
 
 // ── Ollama API types ──────────────────────────────────────────────────────────
 
@@ -73,6 +74,9 @@ struct OllamaOptions {
     /// Limit output tokens so Telegram messages stay readable.
     num_predict: u32,
     temperature: f32,
+    /// Cap the KV-cache context window.  Smaller = faster prefill on CPU.
+    /// 2048 is sufficient for our prompt (~600 input tokens + 280 output).
+    num_ctx: u32,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -114,8 +118,10 @@ Maker (GTC/post-only) orders pay 0% fee; taker (FAK) orders pay the dynamic fee.
                  (short-gamma / theta strategy).  Needs flat oracle and calm book.
 5. BASIS       — Fades retail-skewed binary probabilities using Binance funding rate
                  as a smart-money confirmation signal.
-6. GBOOST      — Online gradient-boosted ML classifier predicts YES price direction
-                 from 14 orderbook + oracle features.  Retrained every 30s.
+5. GBOOST      — Online gradient-boosted ML classifier predicts YES price direction
+                 from 19 orderbook + oracle features.  Retrained every 30s.
+                 Has concept-drift suppression: if market regime shifts significantly,
+                 entries are blocked until the next retrain clears the drift flag.
 
 == Key OBI Concept ==
 OBI (Order Book Imbalance) = (bid_depth − ask_depth) / total_depth  ∈ [−1, +1]
@@ -132,6 +138,10 @@ These can be adjusted live without restarting the bot:
   Global:    ghost_mode (true = paper trading, no real orders)
   Enable flags: enable_momentum, enable_maker, enable_basis, enable_gboost,
                 enable_time_decay, enable_arbitrage
+
+IMPORTANT: The CURRENT VALUES of every parameter are provided in the user message
+under "== Current Live Configuration ==". Always use those exact values as the
+"current" baseline in your recommendations — never guess or assume values.
 
 == Session Context ==
 The trade data is scoped to the CURRENT SESSION (process lifetime).  When prior-session
@@ -174,7 +184,7 @@ Session P&L: [value]  |  Trades analysed: [n]
 🟢 KEEP ENABLED: [comma-separated strategy names]
 🔴 CONSIDER DISABLING: [comma-separated strategy names, or "none"]
 
-Keep the entire response under 400 words."#.to_string()
+Keep the entire response under 250 words."#.to_string()
 }
 
 // ── Prompt builder ────────────────────────────────────────────────────────────
@@ -184,9 +194,11 @@ Keep the entire response under 400 words."#.to_string()
 fn build_user_prompt(
     session_trades: &[db::TradeRow],
     prior_trades: Option<&[db::TradeRow]>,
+    open_positions: &[db::OpenPositionRow],
     session_pnl: rust_decimal::Decimal,
     starting_collateral: rust_decimal::Decimal,
     session_id: &str,
+    dyn_cfg: &DynamicConfig,
 ) -> String {
     let mut lines = Vec::new();
 
@@ -296,7 +308,78 @@ fn build_user_prompt(
     }
 
     lines.push(String::new());
+    lines.push("== Current Live Configuration ==".to_string());
+    lines.push(format!(
+        "Ghost mode: {} | Strategies enabled: Momentum={}, Maker={}, Basis={}, GBoost={}, TimeDecay={}, Arbitrage={}",
+        dyn_cfg.ghost_mode,
+        dyn_cfg.enable_momentum, dyn_cfg.enable_maker, dyn_cfg.enable_basis,
+        dyn_cfg.enable_gboost, dyn_cfg.enable_time_decay, dyn_cfg.enable_arbitrage,
+    ));
+    lines.push(format!(
+        "Momentum: stop_loss={:.0}%, target_profit={:.0}%, min_trade=${}, max_trade=${}, max_exposure=${}",
+        dyn_cfg.momentum_stop_loss_pct * rust_decimal::Decimal::ONE_HUNDRED,
+        dyn_cfg.momentum_target_profit_pct * rust_decimal::Decimal::ONE_HUNDRED,
+        dyn_cfg.momentum_min_trade_size_usdc,
+        dyn_cfg.momentum_max_trade_size_usdc,
+        dyn_cfg.momentum_max_exposure_usdc,
+    ));
+    lines.push(format!(
+        "  Velocity thresholds (static): BTC=${}/5s, ETH=${}/5s, SOL=${}/5s | short_window_fraction={} | max_entry_price=${}",
+        config::BTC_MOMENTUM_THRESHOLD,
+        config::ETH_MOMENTUM_THRESHOLD,
+        config::SOL_MOMENTUM_THRESHOLD,
+        config::MOMENTUM_SHORT_WINDOW_FRACTION,
+        config::MAX_MOMENTUM_ENTRY_PRICE,
+    ));
+    lines.push(format!(
+        "Maker: max_entry=${}, min_entry=${}, stop_loss={:.0}%, target_profit={:.0}%, max_exposure=${}",
+        dyn_cfg.maker_max_entry_price, dyn_cfg.maker_min_entry_price,
+        dyn_cfg.maker_stop_loss_pct * rust_decimal::Decimal::ONE_HUNDRED,
+        dyn_cfg.maker_target_profit_pct * rust_decimal::Decimal::ONE_HUNDRED,
+        dyn_cfg.maker_max_exposure_usdc,
+    ));
+    lines.push(format!(
+        "GBoost: entry_threshold={}, stop_loss={:.0}%, target_profit={:.0}%, max_exposure=${}",
+        dyn_cfg.gboost_entry_threshold,
+        dyn_cfg.gboost_stop_loss_pct * rust_decimal::Decimal::ONE_HUNDRED,
+        dyn_cfg.gboost_target_profit_pct * rust_decimal::Decimal::ONE_HUNDRED,
+        dyn_cfg.gboost_max_exposure_usdc,
+    ));
+    lines.push(format!(
+        "Basis: stop_loss={:.0}%, target_profit={:.0}%, max_exposure=${}",
+        dyn_cfg.basis_stop_loss_pct * rust_decimal::Decimal::ONE_HUNDRED,
+        dyn_cfg.basis_target_profit_pct * rust_decimal::Decimal::ONE_HUNDRED,
+        dyn_cfg.basis_max_exposure_usdc,
+    ));
+    lines.push(format!(
+        "TimeDecay: position_size=${}, stop_loss={:.0}%, max_entry=${}, max_exposure=${}",
+        dyn_cfg.time_decay_position_size_usdc,
+        dyn_cfg.time_decay_stop_loss_pct * rust_decimal::Decimal::ONE_HUNDRED,
+        dyn_cfg.time_decay_max_entry_price,
+        dyn_cfg.time_decay_max_exposure_usdc,
+    ));
+
+    lines.push(String::new());
     lines.push("Please analyse the above and provide recommendations as instructed.".to_string());
+
+    // ── Open positions (in-flight, not yet closed) ───────────────────────────
+    if !open_positions.is_empty() {
+        lines.push(String::new());
+        lines.push(format!("== Open Positions ({} currently in-flight) ==", open_positions.len()));
+        lines.push("strategy | side | market | entry_price | shares | mode".to_string());
+        for p in open_positions {
+            lines.push(format!(
+                "{} | {} | {} | {} | {} | {}",
+                p.strategy.replace("Strategy", ""),
+                p.side,
+                if p.market.len() > 32 { &p.market[..32] } else { &p.market },
+                p.entry_price,
+                p.shares,
+                if p.ghost_mode { "ghost" } else { "live" },
+            ));
+        }
+        lines.push("Note: these positions are open and awaiting exit/settlement. Account for them in your P&L and risk assessment.".to_string());
+    }
 
     lines.join("\n")
 }
@@ -337,8 +420,9 @@ async fn call_ollama(
         ],
         stream: false,
         options: OllamaOptions {
-            num_predict: 450,
+            num_predict: 280,
             temperature: 0.3, // Low temperature: consistent, factual recommendations
+            num_ctx: 2048,     // Cap KV-cache; keeps CPU inference under ~90s on t3.large
         },
     };
 
@@ -369,6 +453,7 @@ pub async fn run_llm_advisor_loop(
     tg_chat_id: String,
     session_pnl: Arc<Mutex<rust_decimal::Decimal>>,
     starting_collateral: Arc<Mutex<rust_decimal::Decimal>>,
+    mut config_rx: tokio::sync::watch::Receiver<Arc<DynamicConfig>>,
 ) {
     if !config::ENABLE_LLM_ADVISOR {
         info!("🤖 LLM Advisor: disabled (set ENABLE_LLM_ADVISOR = true in config.rs to activate)");
@@ -470,6 +555,7 @@ pub async fn run_llm_advisor_loop(
 
         let current_pnl = *session_pnl.lock().await;
         let collateral = *starting_collateral.lock().await;
+        let dyn_cfg = config_rx.borrow_and_update().clone();
 
         let session_trade_count = session_trades.len();
         let total_trade_count = session_trade_count
@@ -487,12 +573,21 @@ pub async fn run_llm_advisor_loop(
         }
 
         // ── Build prompt & call LLM (with retries) ───────────────────────────
+        // Fetch open positions so the LLM knows about in-flight entries that haven't closed yet.
+        let open_positions = if let Some(pool) = db::pool() {
+            db::get_open_positions(pool).await
+        } else {
+            vec![]
+        };
+
         let user_prompt = build_user_prompt(
             &session_trades,
             prior_trades.as_deref(),
+            &open_positions,
             current_pnl,
             collateral,
             &session_id,
+            &dyn_cfg,
         );
 
         info!(

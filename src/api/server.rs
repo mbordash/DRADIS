@@ -7,6 +7,7 @@
 ///   PATCH /api/config               — JSON merge-patch; hot-reloads strategies
 ///   GET  /api/pnl/history           — recent P&L snapshots  (?limit=200)
 ///   GET  /api/trades                — recent completed trades (?limit=100)
+///   GET  /api/positions             — current open positions (all strategies, ghost+live)
 ///   GET  /api/llm/recommendations   — recent LLM Advisor analyses (?limit=10)
 ///
 /// The server binds to 0.0.0.0:$API_PORT (default 9000).
@@ -166,12 +167,30 @@ async fn get_trades(Query(q): Query<LimitQuery>) -> Response {
     }
 }
 
+/// GET /api/positions
+///
+/// Returns all currently open positions for this session (inserted on entry, removed on exit).
+/// Covers all strategies and both ghost/live modes so the UI always has a complete picture
+/// of in-flight positions even before they appear as completed trades.
+async fn get_open_positions() -> Response {
+    debug!("Received GET /api/positions request");
+    match db::pool() {
+        Some(pool) => {
+            let positions = db::get_open_positions(pool).await;
+            Json(positions).into_response()
+        },
+        None => {
+            error!("Database pool not available for GET /api/positions");
+            Json(Vec::<db::OpenPositionRow>::new()).into_response()
+        },
+    }
+}
+
 /// GET /api/llm/recommendations?limit=10
 ///
 /// Returns up to `limit` LLM Advisor analyses, newest first.
 /// Each row: { id, ts, model, trade_count, session_pnl, analysis }
-async fn get_llm_recommendations(Query(q): Query<LimitQuery>) -> Response {
-    debug!("Received GET /api/llm/recommendations request with limit: {:?}", q.limit);
+async fn get_llm_recommendations(Query(q): Query<LimitQuery>) -> Response {    debug!("Received GET /api/llm/recommendations request with limit: {:?}", q.limit);
     let limit = q.limit.unwrap_or(10).clamp(1, 50);
     match db::pool() {
         Some(pool) => {
@@ -209,6 +228,7 @@ pub async fn run_api_server(
         .route("/api/config",                get(get_config).patch(patch_config))
         .route("/api/pnl/history",           get(get_pnl_history))
         .route("/api/trades",                get(get_trades))
+        .route("/api/positions",             get(get_open_positions))
         .route("/api/status",                get(get_status))
         .route("/api/llm/recommendations",   get(get_llm_recommendations))
         // Permissive CORS so the Next.js Control Tower (any port) can reach the API.

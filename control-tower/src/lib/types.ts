@@ -74,6 +74,18 @@ export interface TradeRow {
   reason:      string;
 }
 
+/** A position that has been entered but not yet exited (all strategies, ghost+live). */
+export interface OpenPositionRow {
+  ts:          string;  // entry timestamp (ISO 8601)
+  strategy:    string;
+  token_id:    string;
+  market:      string;
+  side:        string;  // "YES" | "NO"
+  entry_price: string;  // Decimal string
+  shares:      string;  // Decimal string
+  ghost_mode:  boolean;
+}
+
 export interface LlmRecommendationRow {
   id:                 number;
   ts:                 string;   // ISO 8601

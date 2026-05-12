@@ -289,10 +289,13 @@ impl Strategy for MomentumStrategyImpl {
             }
 
             // Near-expiry forced exit
+            // Use net profit (after sell offset) for the hold threshold so we don't
+            // artificially "hold" a position that is break-even or negative net of costs.
             if let Some(close_time) = ctx.market.market_close_time {
                 let secs_left = (close_time - chrono::Utc::now()).num_seconds();
-                if secs_left <= config::MOMENTUM_EXPIRY_EXIT_SECS && profit_margin < config::MOMENTUM_EXPIRY_MIN_PROFIT_TO_HOLD {
-                    let reason = format!("NearExpiry: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100));
+                let net_profit_for_expiry = (bid - config::SELL_PRICE_OFFSET - avg_entry) / avg_entry;
+                if secs_left <= config::MOMENTUM_EXPIRY_EXIT_SECS && net_profit_for_expiry < config::MOMENTUM_EXPIRY_MIN_PROFIT_TO_HOLD {
+                    let reason = format!("NearExpiry: bid=${:.4}, net_profit={:.2}%", bid, net_profit_for_expiry * dec!(100));
                     return Ok(StrategySignal::Exit { params: exit_params!(), reason, exit_pair: false });
                 }
             }
@@ -312,9 +315,16 @@ impl Strategy for MomentumStrategyImpl {
             }
 
             // Momentum Decay exit
+            // Use NET profit after SELL_PRICE_OFFSET to match how P&L is actually
+            // calculated in main.rs: pnl = (bid - SELL_PRICE_OFFSET - avg_entry) * shares.
+            // Previously used raw `profit_margin = (bid - avg_entry) / avg_entry > 0`,
+            // which fired when bid was only 1 cent above avg_entry — the entire "profit"
+            // was then consumed by SELL_PRICE_OFFSET, producing the observed $0.0000 PnL
+            // on MomentumDecay exits (e.g. 2026-05-12 YES @ 0.71 entry, bid=$0.72 exit).
             let decay_min = threshold * config::MOMENTUM_DECAY_EXIT_FRACTION;
             let is_yes = token_id == &ctx.market.yes_token;
-            if profit_margin > dec!(0) && ((is_yes && velocity_1s < decay_min) || (!is_yes && velocity_1s > -decay_min)) {
+            let net_profit_margin = (bid - config::SELL_PRICE_OFFSET - avg_entry) / avg_entry;
+            if net_profit_margin > dec!(0) && ((is_yes && velocity_1s < decay_min) || (!is_yes && velocity_1s > -decay_min)) {
                 let reason = format!("MomentumDecay: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100));
                 return Ok(StrategySignal::Exit { params: exit_params!(), reason, exit_pair: false });
             }

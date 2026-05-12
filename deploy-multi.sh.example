@@ -173,12 +173,18 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" "${CT_USERNA
         sleep 2
     done
 
-    # Pull the model on first deploy (no-op if already in the volume).
-    # qwen2.5:3b-instruct-q4_K_M — ~2 GB, fast CPU inference (~30-60s on t3.large).
-    # Alternatives: phi3:mini (~2.3 GB), mistral:7b-instruct-q4_0 (~4.1 GB, needs t3.xlarge)
-    # || true: a failed pull (e.g. network issue) should not abort the whole deploy.
-    echo "📥 Pulling qwen2.5:3b-instruct-q4_K_M (skipped if already cached)..."
-    docker exec ollama ollama pull qwen2.5:3b-instruct-q4_K_M || true
+    # Pull the LLM model only if it is not already present in the ollama-models volume.
+    # `ollama list` is a local operation (no registry contact) — if the model shows up, skip.
+    # This saves ~2 GB of bandwidth and 2-4 minutes on every deploy after the first.
+    # To force a re-pull (e.g. to upgrade to a newer quantization), delete the named volume
+    # with:  docker volume rm ollama-models
+    echo "📥 Checking for qwen2.5:3b-instruct-q4_K_M in local model cache..."
+    if docker exec ollama ollama list 2>/dev/null | grep -q "qwen2.5:3b-instruct-q4_K_M"; then
+        echo "✅ Model already cached — skipping pull."
+    else
+        echo "📥 Model not found — pulling qwen2.5:3b-instruct-q4_K_M (~2 GB)..."
+        docker exec ollama ollama pull qwen2.5:3b-instruct-q4_K_M || true
+    fi
 
     echo "🔨 Building DRADIS image..."
     docker build -t dradis .

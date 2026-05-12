@@ -7,7 +7,8 @@ import dynamic from 'next/dynamic';
 import ViperCard       from '@/components/ViperCard';
 import TradesTable     from '@/components/TradesTable';
 import LlmAdvisorCard  from '@/components/LlmAdvisorCard';
-import { getConfig, getPnlHistory, getTrades, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations } from '@/lib/api';
+import OpenPositionsCard from '@/components/OpenPositionsCard';
+import { getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations } from '@/lib/api';
 import type { DynamicConfig } from '@/lib/types';
 
 // Recharts must be loaded client-side only
@@ -60,6 +61,10 @@ export default function DashboardPage() {
 
   const { data: trades, isLoading: tradesLoading } =
     useSWR('trades', () => getTrades(60), { refreshInterval: 15_000 });
+
+  // Open positions polled every 15s — same cadence as trades so the activity log stays fresh.
+  const { data: openPositions, isLoading: positionsLoading } =
+    useSWR('positions', getOpenPositions, { refreshInterval: 15_000 });
 
   const { data: health } =
     useSWR('health', getHealth, { refreshInterval: 10_000 });
@@ -254,6 +259,15 @@ export default function DashboardPage() {
           ) : (
             <TradesTable trades={trades ?? []} />
           )}
+        </section>
+
+        {/* ── Open Positions ────────────────────────────────────────────── */}
+        <section>
+          <p className="label-muted mb-3">Open Positions</p>
+          <OpenPositionsCard
+            positions={openPositions ?? []}
+            isLoading={positionsLoading}
+          />
         </section>
 
 

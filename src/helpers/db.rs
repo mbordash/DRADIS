@@ -114,6 +114,24 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
         )"
     ).execute(pool).await?;
 
+    // open_positions: one row per active (not yet closed) position, across all strategies/modes.
+    // Inserted on entry, deleted on exit.  Allows the UI and LLM Advisor to see in-flight
+    // positions that have not yet settled as a completed trade.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS open_positions (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts          TEXT    NOT NULL,
+            session_id  TEXT    NOT NULL,
+            strategy    TEXT    NOT NULL,
+            token_id    TEXT    NOT NULL,
+            market      TEXT    NOT NULL,
+            side        TEXT    NOT NULL,
+            entry_price TEXT    NOT NULL,
+            shares      TEXT    NOT NULL,
+            ghost_mode  INTEGER NOT NULL DEFAULT 0
+        )"
+    ).execute(pool).await?;
+
     // llm_recommendations: LLM Advisor analysis results persisted for the dashboard
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS llm_recommendations (
@@ -178,6 +196,9 @@ async fn run_migrations(pool: &SqlitePool) {
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_trades_ts ON trades(ts)")
         .execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_llm_session ON llm_recommendations(session_id)")
+        .execute(pool).await;
+    // Migrate open_positions table for existing DBs
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_open_positions_session ON open_positions(session_id)")
         .execute(pool).await;
 }
 
@@ -561,6 +582,63 @@ pub async fn record_static_config_snapshot(pool: &SqlitePool) {
     }
 }
 
+// ─── Open positions ──────────────────────────────────────────────────────────
+
+/// Insert a row into `open_positions` when a new position is entered.
+/// Called for every entry — both ghost mode and live — so the UI and LLM Advisor
+/// can see in-flight positions that have not yet appeared as completed trades.
+pub async fn record_open_position(
+    pool: &SqlitePool,
+    strategy: &str,
+    token_id: &str,
+    market: &str,
+    side: &str,
+    entry_price: Decimal,
+    shares: Decimal,
+    ghost_mode: bool,
+) {
+    let ts = Utc::now().to_rfc3339();
+    let sid = current_session_id();
+    if let Err(e) = sqlx::query(
+        "INSERT OR REPLACE INTO open_positions
+         (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    .bind(&ts)
+    .bind(sid)
+    .bind(strategy)
+    .bind(token_id)
+    .bind(market)
+    .bind(side)
+    .bind(entry_price.to_string())
+    .bind(shares.to_string())
+    .bind(ghost_mode as i32)
+    .execute(pool)
+    .await {
+        error!("❌ DB record_open_position failed: {}", e);
+    }
+}
+
+/// Remove a row from `open_positions` when a position is closed (any exit reason).
+/// Keyed by (session_id, strategy, token_id) — unique per strategy slot.
+pub async fn close_open_position(
+    pool: &SqlitePool,
+    strategy: &str,
+    token_id: &str,
+) {
+    let sid = current_session_id();
+    if let Err(e) = sqlx::query(
+        "DELETE FROM open_positions WHERE session_id = ? AND strategy = ? AND token_id = ?"
+    )
+    .bind(sid)
+    .bind(strategy)
+    .bind(token_id)
+    .execute(pool)
+    .await {
+        error!("❌ DB close_open_position failed: {}", e);
+    }
+}
+
 // ─── API read models ─────────────────────────────────────────────────────────
 
 #[derive(Debug, Serialize)]
@@ -581,6 +659,18 @@ pub struct TradeRow {
     pub shares: String,
     pub pnl: String,
     pub reason: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct OpenPositionRow {
+    pub ts:          String,
+    pub strategy:    String,
+    pub token_id:    String,
+    pub market:      String,
+    pub side:        String,
+    pub entry_price: String,
+    pub shares:      String,
+    pub ghost_mode:  bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -632,6 +722,31 @@ pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
             reason:      r.try_get::<String, _>(8).ok()?,
         })).collect(),
         Err(e) => { error!("❌ DB get_recent_trades failed: {}", e); vec![] }
+    }
+}
+
+/// Return all open positions for the current session (inserted on entry, deleted on exit).
+/// Used by the API (/api/positions) and the LLM Advisor prompt.
+pub async fn get_open_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
+    let sid = current_session_id();
+    match sqlx::query(
+        "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode
+         FROM open_positions WHERE session_id = ? ORDER BY ts ASC"
+    )
+    .bind(sid)
+    .fetch_all(pool)
+    .await {
+        Ok(rows) => rows.into_iter().filter_map(|r| Some(OpenPositionRow {
+            ts:          r.try_get::<String, _>(0).ok()?,
+            strategy:    r.try_get::<String, _>(1).ok()?,
+            token_id:    r.try_get::<String, _>(2).ok()?,
+            market:      r.try_get::<String, _>(3).ok()?,
+            side:        r.try_get::<String, _>(4).ok()?,
+            entry_price: r.try_get::<String, _>(5).ok()?,
+            shares:      r.try_get::<String, _>(6).ok()?,
+            ghost_mode:  r.try_get::<i64, _>(7).ok()? != 0,
+        })).collect(),
+        Err(e) => { error!("❌ DB get_open_positions failed: {}", e); vec![] }
     }
 }
 

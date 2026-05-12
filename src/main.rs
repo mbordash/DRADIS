@@ -243,6 +243,7 @@ async fn main() -> Result<()> {
         env::var("TELEGRAM_CHAT_ID").unwrap_or_default(),
         Arc::clone(&total_pnl),
         Arc::clone(&starting_collateral_store),
+        config_rx.clone(),
     ));
 
     // when the wallet cannot afford even the minimum trade, preventing 400 CLOB rejections.
@@ -909,7 +910,7 @@ async fn main() -> Result<()> {
                                             pnl_m = pnl;
 
                                             // Record trade metrics for both real and ghost mode (ghost trades
-                                            // must appear in the Control Tower trades table for monitoring).
+                                             // must appear in the Control Tower trades table for monitoring).
                                             {
                                                 let sn_task = sn.clone();
                                                 let m_name = params.market_name.clone();
@@ -917,6 +918,12 @@ async fn main() -> Result<()> {
                                                 let rp = actual_exit_price;
                                                 let r_m = reason.clone();
                                                 tokio::spawn(async move { metrics::record_trade(sn_task, m_name, sid, re_m, rp, rs_m, pnl_m, r_m).await; });
+                                            }
+                                            // Remove from open_positions on exit
+                                            {
+                                                let sn_close = sn.clone();
+                                                let tid_close = tid.to_string();
+                                                tokio::spawn(async move { if let Some(pool) = db::pool() { db::close_open_position(pool, &sn_close, &tid_close).await; } });
                                             }
                                         } else { continue; }
                                     }
@@ -969,6 +976,12 @@ async fn main() -> Result<()> {
                                                 {
                                                     let sn_pm = sn.clone(); let m_name = params.market_name.clone(); let sid = if other_tid == target_yes_token { "YES".to_string() } else { "NO".to_string() }; let p_avg = p.avg_entry; let o_bid = actual_other_exit; let p_shares = p.shares; let pn = pnl;
                                                     tokio::spawn(async move { metrics::record_trade(sn_pm, m_name, sid, p_avg, o_bid, p_shares, pn, "Convergence/PairedExit".to_string()).await; });
+                                                }
+                                                // Remove paired leg from open_positions
+                                                {
+                                                    let sn_cp = sn.clone();
+                                                    let tid_cp = other_tid.to_string();
+                                                    tokio::spawn(async move { if let Some(pool) = db::pool() { db::close_open_position(pool, &sn_cp, &tid_cp).await; } });
                                                 }
                                             }
                                         }
@@ -1034,6 +1047,17 @@ async fn main() -> Result<()> {
 
                                     info!(" GHOST_MODE ENTRY [{}]: {} | ${:.4} x {:.1} (simulated)",
                                         sn, params.market_name, params.price, params.shares);
+                                    // Record ghost entries to DB — so the UI activity log and LLM advisor
+                                    // can see in-flight positions before they close as completed trades.
+                                    {
+                                        let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" };
+                                        let sn_g = sn.clone(); let tid_g = params.token_id.to_string(); let mn_g = params.market_name.clone(); let side_gs = side_g.to_string(); let ep_g = actual_entry_price; let sh_g = params.shares;
+                                        tokio::spawn(async move { metrics::record_entry(sn_g, tid_g, mn_g, side_gs, ep_g, sh_g).await; });
+                                    }
+                                    if let Some(pool) = db::pool() {
+                                        let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" };
+                                        db::record_open_position(pool, &sn, &params.token_id.to_string(), &params.market_name, side_g, actual_entry_price, params.shares, true).await;
+                                    }
                                     if let Some(pp) = pair_params {
                                         let pp_close_time = target_market_close_time;
                                         let actual_paired_entry_price = if pp.post_only {
@@ -1043,6 +1067,16 @@ async fn main() -> Result<()> {
                                         };
                                         positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: actual_paired_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: Some(params.token_id) });
                                         info!(" GHOST_MODE ENTRY (paired) [{}]: {} | ${:.4} x {:.1} (simulated)", sn, pp.market_name, pp.price, pp.shares);
+                                        // Record paired ghost entry to DB
+                                        {
+                                            let side_gp = if pp.token_id == target_yes_token { "YES" } else { "NO" };
+                                            let sn_gp = sn.clone(); let tid_gp = pp.token_id.to_string(); let mn_gp = pp.market_name.clone(); let side_gps = side_gp.to_string(); let ep_gp = actual_paired_entry_price; let sh_gp = pp.shares;
+                                            tokio::spawn(async move { metrics::record_entry(sn_gp, tid_gp, mn_gp, side_gps, ep_gp, sh_gp).await; });
+                                        }
+                                        if let Some(pool) = db::pool() {
+                                            let side_gp = if pp.token_id == target_yes_token { "YES" } else { "NO" };
+                                            db::record_open_position(pool, &sn, &pp.token_id.to_string(), &pp.market_name, side_gp, actual_paired_entry_price, pp.shares, true).await;
+                                        }
                                     }
                                     last_trade_time.insert(sn.clone(), Instant::now());
                                     // No actual order placement or balance sync in ghost mode
@@ -1073,6 +1107,11 @@ async fn main() -> Result<()> {
                                     tokio::spawn(async move { let _ = sync_position_balance(&cl_s, &ps_s, &sn_s, tn_s, Some(&pc_s), dec!(0), dradis::helpers::balance::MAX_WAIT_SECS_HOURLY).await; });
 
                                     { let sn_e = sn.clone(); let tid_e = params.token_id.to_string(); let mn_e = params.market_name.clone(); let side_e = if params.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_e = (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE); let sh_e = params.shares; tokio::spawn(async move { metrics::record_entry(sn_e, tid_e, mn_e, side_e, ep_e, sh_e).await; }); }
+                                    // Record open position for UI/LLM visibility
+                                    if let Some(pool) = db::pool() {
+                                        let side_r = if params.token_id == target_yes_token { "YES" } else { "NO" };
+                                        db::record_open_position(pool, &sn, &params.token_id.to_string(), &params.market_name, side_r, (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), params.shares, false).await;
+                                    }
 
                                     if let Some(pp) = pair_params {
                                         let vc_p = if pp.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
@@ -1136,6 +1175,11 @@ async fn main() -> Result<()> {
                                                 let sn_p = sn.clone(); let tn_p = pp.token_id; let ps_p = Arc::clone(&positions); let cl_p = Arc::clone(&trading_client); let pc_p = Arc::clone(&phantom_cooldowns);
                                                 tokio::spawn(async move { let _ = sync_position_balance(&cl_p, &ps_p, &sn_p, tn_p, Some(&pc_p), dec!(0), dradis::helpers::balance::MAX_WAIT_SECS_HOURLY).await; });
                                                 { let sn_eb = sn.clone(); let tid_eb = pp.token_id.to_string(); let mn_eb = pp.market_name.clone(); let side_eb = if pp.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_eb = pp.price; let sh_eb = pp.shares; tokio::spawn(async move { metrics::record_entry(sn_eb, tid_eb, mn_eb, side_eb, ep_eb, sh_eb).await; }); }
+                                                // Record paired leg open position for UI/LLM visibility
+                                                if let Some(pool) = db::pool() {
+                                                    let side_rb = if pp.token_id == target_yes_token { "YES" } else { "NO" };
+                                                    db::record_open_position(pool, &sn, &pp.token_id.to_string(), &pp.market_name, side_rb, pp.price, pp.shares, false).await;
+                                                }
                                             }
                                         }
                                     }

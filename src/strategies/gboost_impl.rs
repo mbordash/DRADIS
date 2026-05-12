@@ -295,13 +295,18 @@ pub struct GboostStrategyImpl {
     /// recovers above the threshold.  Used to suppress YES entries on daily markets when
     /// BTC has been continuously below the strike buffer for ≥ GBOOST_BELOW_STRIKE_SUPPRESS_SECS.
     below_strike_since: Arc<StdMutex<Option<Instant>>>,
-    /// Set to `true` after a retrain where concept drift exceeded GBOOST_CONCEPT_DRIFT_THRESHOLD.
-    /// Suppresses all GBoost entry signals until the next retrain shows drift has cleared.
-    /// This prevents the model from trading in a regime it was never trained on.
+    /// Set to `true` after TWO CONSECUTIVE retrains where concept drift exceeded
+    /// GBOOST_CONCEPT_DRIFT_THRESHOLD.  A single spike is not suppressed — it could
+    /// be a transient liquidity shock.  Two in a row implies a genuine regime change.
+    /// Cleared when any retrain scores at or below the threshold.
     concept_drift_suppressed: Arc<AtomicBool>,
     /// Most recent concept drift score from `perpetual::drift::calculate_drift`.
     /// Logged at DEBUG level in the entry gate; exposed here for diagnostics.
     last_concept_drift_score: Arc<StdMutex<f32>>,
+    /// Count of consecutive retrains where drift_score > GBOOST_CONCEPT_DRIFT_THRESHOLD.
+    /// Suppression only activates when this reaches 2 — prevents single spikes from
+    /// permanently blocking entries.  Resets to 0 on any below-threshold retrain.
+    consecutive_drift_above_threshold: Arc<StdMutex<usize>>,
 }
 
 impl GboostStrategyImpl {
@@ -377,6 +382,7 @@ impl GboostStrategyImpl {
             below_strike_since: Arc::new(StdMutex::new(None)),
             concept_drift_suppressed: Arc::new(AtomicBool::new(false)),
             last_concept_drift_score: Arc::new(StdMutex::new(0.0_f32)),
+            consecutive_drift_above_threshold: Arc::new(StdMutex::new(0)),
         }
     }
 
@@ -482,6 +488,7 @@ impl GboostStrategyImpl {
         let retrain_backoff_until     = Arc::clone(&self.retrain_backoff_until);
         let concept_drift_suppressed  = Arc::clone(&self.concept_drift_suppressed);
         let last_concept_drift_score  = Arc::clone(&self.last_concept_drift_score);
+        let consecutive_drift_counter = Arc::clone(&self.consecutive_drift_above_threshold);
 
         // Capture a window of recent snapshots for concept-drift evaluation.
         // Oldest-first order (same as extract_features expects for prev_s).
@@ -534,21 +541,41 @@ impl GboostStrategyImpl {
                     // Compare how live data flows through the new model's split points
                     // vs. the training distribution.  A high chi-squared score means the
                     // current market regime is outside what the model was trained on.
+                    //
+                    // Dampening: a SINGLE spike is insufficient for suppression — it could
+                    // be a transient liquidity shock or the temporal mismatch between the
+                    // training window (oldest ticks) and drift window (newest ticks).
+                    // Only suppress after TWO CONSECUTIVE retrains above threshold.
                     *last_concept_drift_score.lock().unwrap() = drift_score;
                     if drift_score > config::GBOOST_CONCEPT_DRIFT_THRESHOLD {
-                        tracing::warn!(
-                            "⚠️ GBoost: concept drift detected (score={:.2} > threshold {:.2}) — \
-                             suppressing entries until next retrain recaptures regime",
-                            drift_score, config::GBOOST_CONCEPT_DRIFT_THRESHOLD
-                        );
-                        concept_drift_suppressed.store(true, Ordering::Relaxed);
-                    } else {
-                        if concept_drift_suppressed.load(Ordering::Relaxed) {
-                            tracing::info!(
-                                "✅ GBoost: concept drift cleared (score={:.2} ≤ threshold {:.2}) — resuming entries",
-                                drift_score, config::GBOOST_CONCEPT_DRIFT_THRESHOLD
+                        let mut count = consecutive_drift_counter.lock().unwrap();
+                        *count += 1;
+                        if *count >= 2 {
+                            tracing::warn!(
+                                "⚠️ GBoost: concept drift confirmed ({} consecutive retrains, \
+                                 latest score={:.2} > threshold {:.2}) — suppressing entries \
+                                 until next retrain recaptures regime",
+                                *count, drift_score, config::GBOOST_CONCEPT_DRIFT_THRESHOLD
+                            );
+                            concept_drift_suppressed.store(true, Ordering::Relaxed);
+                        } else {
+                            tracing::warn!(
+                                "⚠️ GBoost: drift spike #{} (score={:.2} > threshold {:.2}) — \
+                                 watching for consecutive trigger before suppressing",
+                                *count, drift_score, config::GBOOST_CONCEPT_DRIFT_THRESHOLD
                             );
                         }
+                    } else {
+                        // Below threshold → reset consecutive counter and clear suppression
+                        let mut count = consecutive_drift_counter.lock().unwrap();
+                        if *count > 0 || concept_drift_suppressed.load(Ordering::Relaxed) {
+                            tracing::info!(
+                                "✅ GBoost: concept drift cleared (score={:.2} ≤ threshold {:.2}, \
+                                 consecutive counter was {}) — resuming entries",
+                                drift_score, config::GBOOST_CONCEPT_DRIFT_THRESHOLD, *count
+                            );
+                        }
+                        *count = 0;
                         concept_drift_suppressed.store(false, Ordering::Relaxed);
                     }
 
