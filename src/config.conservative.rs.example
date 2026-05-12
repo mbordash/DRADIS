@@ -489,6 +489,8 @@ pub fn max_session_drawdown(collateral: Decimal) -> Decimal {
 /// Set OLLAMA_URL / OLLAMA_MODEL env vars to point at your Ollama instance.
 pub const ENABLE_LLM_ADVISOR: bool = true;
 
+pub const LLM_INFERENCE_TIMEOUT_SECS: u64 = 480;
+
 /// How often (seconds) the advisor wakes up to analyse trades and send recommendations.
 /// Conservative: every 45 minutes — lower trade frequency means less data per cycle;
 /// waiting longer accumulates more meaningful samples before each analysis.
