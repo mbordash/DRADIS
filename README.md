@@ -40,7 +40,7 @@ curl -s http://<host>:11434/api/tags | python3 -m json.tool
 ```
 
 > **Prerequisites:** Docker on the remote host, Rust 1.95+ only needed for local builds.  
-> See the [Control Tower](#️-control-tower--the-dashboard) section for dashboard setup and the [Configuration](#️-configuration) section for all tunable parameters.
+> See the [Control Tower](#️-control-tower--the-dashboard) section for dashboard setup and the [Setup](#setup) section for all tunable parameters.
 
 ---
 
