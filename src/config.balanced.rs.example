@@ -249,7 +249,7 @@ pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.075); // balanced: 7.5% —
 pub const GBOOST_MIN_HOLD_SECS: i64 = 180;
 pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 10;
 pub const GBOOST_MIN_USABLE_TREES: usize = 30;
-pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v14f.json";
+pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v19f.json";
 /// Max fraction of identical labels before skipping a retrain cycle (avoids degenerate storms).
 pub const GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX: f64 = 0.80;
 /// 60m oracle drift threshold (USD) for the trend-alignment entry gate.
@@ -268,6 +268,17 @@ pub const GBOOST_MAX_HOURLY_YES_ASK: Decimal = dec!(0.95);
 /// Seconds BTC spot must stay below (daily_strike − BASIS_BTC_ORACLE_STRIKE_BUFFER)
 /// before GBoost YES entries are suppressed. 3600s = 60 min sustained below-strike.
 pub const GBOOST_BELOW_STRIKE_SUPPRESS_SECS: i64 = 3600;
+
+/// Chi-squared concept-drift threshold.  When the live data distribution deviates
+/// significantly from the training distribution (as measured by perpetual's leaf-node
+/// chi-squared statistic), GBoost entries are suppressed until the next retrain.
+/// Balanced: 5.0 — chi2(df=1) between p95 (3.84) and p99 (6.63); catches real shifts
+/// without over-triggering on normal intra-session variance.
+pub const GBOOST_CONCEPT_DRIFT_THRESHOLD: f32 = 5.0;
+
+/// Number of recent history snapshots used for the post-retrain drift check.
+/// Balanced: 200 ticks (~3 min at normal cadence).
+pub const GBOOST_DRIFT_WINDOW: usize = 200;
 
 // ============================================================================
 // POSITION MERGE SETTINGS

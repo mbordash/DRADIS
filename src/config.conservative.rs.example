@@ -281,7 +281,7 @@ pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.070); // conservative: 7.0%
 pub const GBOOST_MIN_HOLD_SECS: i64 = 180;
 pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 10;
 pub const GBOOST_MIN_USABLE_TREES: usize = 30;
-pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v14f.json";
+pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v19f.json";
 /// Max fraction of identical labels before skipping a retrain cycle (avoids degenerate storms).
 /// Conservative: same threshold — label imbalance is a data quality issue, not a risk preference.
 pub const GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX: f64 = 0.80;
@@ -301,6 +301,17 @@ pub const GBOOST_MAX_HOURLY_YES_ASK: Decimal = dec!(0.95);
 /// Seconds BTC spot must stay below (daily_strike − BASIS_BTC_ORACLE_STRIKE_BUFFER)
 /// before GBoost YES entries are suppressed. 3600s = 60 min sustained below-strike.
 pub const GBOOST_BELOW_STRIKE_SUPPRESS_SECS: i64 = 3600;
+
+/// Chi-squared concept-drift threshold.  When the live data distribution deviates
+/// significantly from the training distribution (as measured by perpetual's leaf-node
+/// chi-squared statistic), GBoost entries are suppressed until the next retrain.
+/// Conservative: 4.0 — slightly below p95 chi2(df=1)=3.84; blocks on moderate
+/// distributional shift to protect capital.
+pub const GBOOST_CONCEPT_DRIFT_THRESHOLD: f32 = 4.0;
+
+/// Number of recent history snapshots used for the post-retrain drift check.
+/// Conservative: 300 ticks (~5 min) — larger window for a more stable chi-squared estimate.
+pub const GBOOST_DRIFT_WINDOW: usize = 300;
 
 // ============================================================================
 // POSITION MERGE SETTINGS

@@ -303,6 +303,18 @@ fn build_user_prompt(
 
 // ── Ollama API call ───────────────────────────────────────────────────────────
 
+/// Quick reachability probe: GET /api/tags with a short timeout.
+/// Returns Ok(()) if Ollama is up, Err otherwise.
+async fn probe_ollama(probe_client: &Client, ollama_base_url: &str) -> anyhow::Result<()> {
+    let url = format!("{}/api/tags", ollama_base_url.trim_end_matches('/'));
+    let resp = probe_client.get(&url).send().await?;
+    if resp.status().is_success() {
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!("Ollama /api/tags returned HTTP {}", resp.status()))
+    }
+}
+
 async fn call_ollama(
     client: &Client,
     ollama_base_url: &str,
@@ -377,10 +389,28 @@ pub async fn run_llm_advisor_loop(
         db::current_session_id(),
     );
 
-    // Long timeout: CPU inference for a 7B model can take 3–6 min on a t3.large.
-    // 360s gives comfortable headroom; the model stays warm after the first call
-    // so subsequent cycles are faster (no reload penalty).
+    // Two HTTP clients with different timeout profiles:
+    //
+    // probe_client — used for the pre-flight GET /api/tags health-check.
+    //   connect_timeout: 5 s  (fail fast if the container/host is unreachable)
+    //   timeout:        10 s  (total; /api/tags returns in <1 s when healthy)
+    //
+    // inference_client — used for the actual POST /api/chat.
+    //   connect_timeout: 10 s (fast TCP failure; prevents silent 6-min hangs)
+    //   timeout:        360 s (CPU inference for a 7B model on t3.large: 3–6 min)
+    //
+    // Previously only a single 360 s total timeout was set with no connect_timeout.
+    // When the ollama container was unreachable (TCP accepted but silent), reqwest
+    // waited the full 360 s before surfacing the error — tying up the advisor loop
+    // for 6 minutes every cycle.
+    let probe_client = Client::builder()
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+
     let http_client = Client::builder()
+        .connect_timeout(Duration::from_secs(10))
         .timeout(Duration::from_secs(360))
         .build()
         .unwrap_or_default();
@@ -445,7 +475,18 @@ pub async fn run_llm_advisor_loop(
         let total_trade_count = session_trade_count
             + prior_trades.as_ref().map(|p| p.len()).unwrap_or(0);
 
-        // ── Build prompt & call LLM ───────────────────────────────────────────
+        // ── Pre-flight: verify Ollama is reachable before a 6-min inference call ──
+        // Uses the fast probe_client (5 s connect / 10 s total).
+        // On failure we skip this cycle entirely rather than blocking the loop.
+        if let Err(e) = probe_ollama(&probe_client, &ollama_url).await {
+            warn!(
+                "🤖 LLM Advisor: Ollama unreachable at {} — skipping cycle ({})",
+                ollama_url, e
+            );
+            continue;
+        }
+
+        // ── Build prompt & call LLM (with retries) ───────────────────────────
         let user_prompt = build_user_prompt(
             &session_trades,
             prior_trades.as_deref(),
@@ -463,8 +504,31 @@ pub async fn run_llm_advisor_loop(
             current_pnl,
         );
 
-        match call_ollama(&http_client, &ollama_url, &ollama_model, &user_prompt).await {
-            Ok(analysis) => {
+        // Retry up to 2 times with a 30-second backoff on transient errors.
+        const MAX_RETRIES: u32 = 2;
+        let mut last_err = String::new();
+        let mut analysis_opt: Option<String> = None;
+        for attempt in 0..=MAX_RETRIES {
+            if attempt > 0 {
+                warn!(
+                    "🤖 LLM Advisor: retry {}/{} after error: {}",
+                    attempt, MAX_RETRIES, last_err
+                );
+                tokio::time::sleep(Duration::from_secs(30)).await;
+            }
+            match call_ollama(&http_client, &ollama_url, &ollama_model, &user_prompt).await {
+                Ok(text) => {
+                    analysis_opt = Some(text);
+                    break;
+                }
+                Err(e) => {
+                    last_err = e.to_string();
+                }
+            }
+        }
+
+        match analysis_opt {
+            Some(analysis) => {
                 info!("🤖 LLM Advisor: analysis received ({} chars)", analysis.len());
 
                 // Persist to SQLite — tagged with current session_id so the
@@ -496,10 +560,10 @@ pub async fn run_llm_advisor_loop(
                     info!("🤖 LLM Advisor output:\n{}", analysis);
                 }
             }
-            Err(e) => {
+            None => {
                 error!(
-                    "🤖 LLM Advisor: Ollama call failed ({}@{}): {}",
-                    ollama_model, ollama_url, e
+                    "🤖 LLM Advisor: Ollama call failed after {} retries ({}@{}): {}",
+                    MAX_RETRIES, ollama_model, ollama_url, last_err
                 );
             }
         }

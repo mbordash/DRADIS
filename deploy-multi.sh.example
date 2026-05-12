@@ -145,9 +145,13 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" "${CT_USERNA
     # ── Ollama (LLM Advisor backend) ─────────────────────────────────────────
     # Serves the Ollama API at http://ollama:11434 on the dradis-net network.
     # Model files are stored in a named volume so they survive container restarts
-    # and re-deploys without a costly re-download (~4 GB for mistral:7b-instruct-q4_K_M).
+    # and re-deploys without a costly re-download.
     #
-    # Requires: t3.xlarge (4 vCPU / 16 GB RAM) or equivalent.
+    # Recommended model: qwen2.5:3b-instruct-q4_K_M (~2 GB, fast CPU inference)
+    #   Completes in ~30-60s on t3.large CPU — well within the 360s reqwest timeout.
+    #   Alternative: phi3:mini (~2.3 GB, very fast) or mistral:7b-instruct-q4_0 (~4.1 GB, slower).
+    #   ⚠️  mistral:7b-instruct-q4_K_M (~4.1 GB) regularly exceeds the 360s timeout on t3.large;
+    #       use only on t3.xlarge (4 vCPU / 16 GB RAM) or better.
     # Disable by commenting out this block AND removing OLLAMA_URL from .env.
     echo "🤖 Starting Ollama (LLM Advisor)..."
     docker run -d \
@@ -170,11 +174,11 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" "${CT_USERNA
     done
 
     # Pull the model on first deploy (no-op if already in the volume).
-    # mistral:7b-instruct-q4_K_M — ~4.1 GB, best structured-output quality for DRADIS.
-    # Alternatives: llama3.1:8b-instruct-q4_0 (~4.7 GB), qwen2.5:7b-instruct-q4_0 (~4.3 GB)
+    # qwen2.5:3b-instruct-q4_K_M — ~2 GB, fast CPU inference (~30-60s on t3.large).
+    # Alternatives: phi3:mini (~2.3 GB), mistral:7b-instruct-q4_0 (~4.1 GB, needs t3.xlarge)
     # || true: a failed pull (e.g. network issue) should not abort the whole deploy.
-    echo "📥 Pulling mistral:7b-instruct-q4_K_M (skipped if already cached)..."
-    docker exec ollama ollama pull mistral:7b-instruct-q4_K_M || true
+    echo "📥 Pulling qwen2.5:3b-instruct-q4_K_M (skipped if already cached)..."
+    docker exec ollama ollama pull qwen2.5:3b-instruct-q4_K_M || true
 
     echo "🔨 Building DRADIS image..."
     docker build -t dradis .
@@ -191,7 +195,7 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" "${CT_USERNA
         -e CRYPTO_FILTER=btc \
         -e API_PORT=9000 \
         -e OLLAMA_URL=http://ollama:11434 \
-        -e OLLAMA_MODEL=mistral:7b-instruct-q4_K_M \
+        -e OLLAMA_MODEL=qwen2.5:3b-instruct-q4_K_M \
         -p 9000:9000 \
         -v $(pwd)/logs:/app/logs \
         dradis
@@ -205,7 +209,7 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" "${CT_USERNA
 #        -e CRYPTO_FILTER=eth \
 #        -e API_PORT=9000 \
 #        -e OLLAMA_URL=http://ollama:11434 \
-#        -e OLLAMA_MODEL=mistral:7b-instruct-q4_K_M \
+#        -e OLLAMA_MODEL=qwen2.5:3b-instruct-q4_K_M \
 #        -v $(pwd)/logs:/app/logs \
 #        dradis
 #
@@ -218,7 +222,7 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" "${CT_USERNA
 #        -e CRYPTO_FILTER=sol \
 #        -e API_PORT=9000 \
 #        -e OLLAMA_URL=http://ollama:11434 \
-#        -e OLLAMA_MODEL=mistral:7b-instruct-q4_K_M \
+#        -e OLLAMA_MODEL=qwen2.5:3b-instruct-q4_K_M \
 #        -v $(pwd)/logs:/app/logs \
 #        dradis
 
