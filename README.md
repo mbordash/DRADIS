@@ -14,6 +14,36 @@
 
 ---
 
+## ⚡ Quick Start
+
+```bash
+# 1. Clone and configure
+git clone https://github.com/youruser/dradis.git && cd dradis
+cp .env.example .env          # fill in POLYMARKET_API_KEY, TELEGRAM_BOT_TOKEN, etc.
+cp deploy-multi.sh.example deploy-multi.sh  # fill in HOST, USER, KEY
+
+# 2. Deploy (builds Rust engine + Control Tower, starts Ollama, pulls model)
+chmod +x deploy-multi.sh && ./deploy-multi.sh
+```
+
+After ~5 minutes the stack is live:
+
+| Service | URL |
+|---|---|
+| **Control Tower** | `http://<host>:3002` |
+| **DRADIS REST API** | `http://<host>:9000/api/health` |
+| **Ollama** | `http://<host>:11434/api/tags` (internal) |
+
+**Verify Ollama is healthy** (run from your local machine):
+```bash
+curl -s http://<host>:11434/api/tags | python3 -m json.tool
+```
+
+> **Prerequisites:** Docker on the remote host, Rust 1.95+ only needed for local builds.  
+> See the [Control Tower](#️-control-tower--the-dashboard) section for dashboard setup and the [Configuration](#️-configuration) section for all tunable parameters.
+
+---
+
 ## 🛰️ Tactical Overview
 
 DRADIS is not just a bot; it is a comprehensive trading automation platform for prediction markets like Polymarket. Built in Rust for maximum concurrency and memory safety, it evaluates the selected markets every 50ms, coordinating multiple autonomous strategies to preserve capital and place orders where it sees inefficiencies.
