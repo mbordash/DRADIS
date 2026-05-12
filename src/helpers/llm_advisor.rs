@@ -481,13 +481,13 @@ pub async fn run_llm_advisor_loop(
     //   timeout:        10 s  (total; /api/tags returns in <1 s when healthy)
     //
     // inference_client — used for the actual POST /api/chat.
-    //   connect_timeout: 10 s (fast TCP failure; prevents silent 6-min hangs)
-    //   timeout:        360 s (CPU inference for a 7B model on t3.large: 3–6 min)
+    //   connect_timeout: 10 s  (fast TCP failure; prevents silent hangs)
+    //   timeout:        480 s  (LLM_INFERENCE_TIMEOUT_SECS — measured on t3.large
+    //                           qwen2.5:3b takes ~360–400s; 480s gives a 20% buffer)
     //
-    // Previously only a single 360 s total timeout was set with no connect_timeout.
-    // When the ollama container was unreachable (TCP accepted but silent), reqwest
-    // waited the full 360 s before surfacing the error — tying up the advisor loop
-    // for 6 minutes every cycle.
+    // Previously the timeout was 360s — exactly at the model's natural completion
+    // time — causing every first attempt to time out, triggering needless retry cycles
+    // that collectively consumed 12–17 min of a 30-min advisory interval.
     let probe_client = Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
@@ -496,7 +496,7 @@ pub async fn run_llm_advisor_loop(
 
     let http_client = Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(360))
+        .timeout(Duration::from_secs(config::LLM_INFERENCE_TIMEOUT_SECS))
         .build()
         .unwrap_or_default();
 

@@ -59,11 +59,21 @@ impl StrategyRegistry {
     /// This is the single source of truth used by balance reconciliation so that
     /// developers adding a new strategy only need to register it here — no other
     /// file needs to be updated to ensure orphaned positions are adopted correctly.
+    ///
+    /// NOTE: Returns static names WITHOUT instantiating strategies.
+    /// Calling create_all_strategies() here would construct a second GboostStrategyImpl
+    /// (and trigger a second async model-load tokio::spawn) on every market switch —
+    /// doubling model-load I/O and retrain CPU for no benefit.
     pub fn strategy_names() -> Vec<String> {
-        Self::create_all_strategies()
-            .iter()
-            .map(|s| s.name())
-            .collect()
+        let mut names: Vec<&str> = vec![
+            "MomentumStrategy",
+            "ArbitrageStrategy",
+            "TimeDecayStrategy",
+        ];
+        if config::ENABLE_MAKER_TRADING  { names.push("MakerStrategy"); }
+        if config::ENABLE_BASIS_TRADING  { names.push("BasisStrategy"); }
+        if config::ENABLE_GBOOST_TRADING { names.push("GboostStrategy"); }
+        names.into_iter().map(|s| s.to_string()).collect()
     }
 }
 

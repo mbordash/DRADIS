@@ -280,6 +280,13 @@ pub const GBOOST_CONCEPT_DRIFT_THRESHOLD: f32 = 5.0;
 /// Balanced: 200 ticks (~3 min at normal cadence).
 pub const GBOOST_DRIFT_WINDOW: usize = 200;
 
+/// Number of consecutive retrains above GBOOST_CONCEPT_DRIFT_THRESHOLD required
+/// before GBoost entries are suppressed.  A single retrain below the threshold
+/// resets the counter and clears suppression.
+/// Balanced: 3 — requires three consecutive drift triggers, avoiding false positives
+/// from short-lived intra-session variance.
+pub const GBOOST_DRIFT_CONSECUTIVE_REQUIRED: usize = 3;
+
 // ============================================================================
 // POSITION MERGE SETTINGS
 // ============================================================================

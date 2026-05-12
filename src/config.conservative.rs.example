@@ -313,6 +313,13 @@ pub const GBOOST_CONCEPT_DRIFT_THRESHOLD: f32 = 4.0;
 /// Conservative: 300 ticks (~5 min) — larger window for a more stable chi-squared estimate.
 pub const GBOOST_DRIFT_WINDOW: usize = 300;
 
+/// Number of consecutive retrains above GBOOST_CONCEPT_DRIFT_THRESHOLD required
+/// before GBoost entries are suppressed.  A single retrain below the threshold
+/// resets the counter and clears suppression.
+/// Conservative: 4 — very patient; suppresses only on sustained regime shifts to
+/// avoid locking out GBoost during brief liquidity events.
+pub const GBOOST_DRIFT_CONSECUTIVE_REQUIRED: usize = 4;
+
 // ============================================================================
 // POSITION MERGE SETTINGS
 // ============================================================================

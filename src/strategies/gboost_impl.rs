@@ -550,7 +550,7 @@ impl GboostStrategyImpl {
                     if drift_score > config::GBOOST_CONCEPT_DRIFT_THRESHOLD {
                         let mut count = consecutive_drift_counter.lock().unwrap();
                         *count += 1;
-                        if *count >= 2 {
+                        if *count >= config::GBOOST_DRIFT_CONSECUTIVE_REQUIRED {
                             tracing::warn!(
                                 "⚠️ GBoost: concept drift confirmed ({} consecutive retrains, \
                                  latest score={:.2} > threshold {:.2}) — suppressing entries \
@@ -561,8 +561,9 @@ impl GboostStrategyImpl {
                         } else {
                             tracing::warn!(
                                 "⚠️ GBoost: drift spike #{} (score={:.2} > threshold {:.2}) — \
-                                 watching for consecutive trigger before suppressing",
-                                *count, drift_score, config::GBOOST_CONCEPT_DRIFT_THRESHOLD
+                                 watching for {} consecutive trigger before suppressing",
+                                *count, drift_score, config::GBOOST_CONCEPT_DRIFT_THRESHOLD,
+                                config::GBOOST_DRIFT_CONSECUTIVE_REQUIRED
                             );
                         }
                     } else {
