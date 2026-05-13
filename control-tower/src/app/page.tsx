@@ -249,6 +249,15 @@ export default function DashboardPage() {
           )}
         </section>
 
+        {/* ── Open Positions ────────────────────────────────────────────── */}
+        <section>
+          <p className="label-muted mb-3">Open Positions</p>
+          <OpenPositionsCard
+            positions={openPositions ?? []}
+            isLoading={positionsLoading}
+          />
+        </section>
+
         {/* ── Recent Trades ─────────────────────────────────────────────── */}
         <section>
           <p className="label-muted mb-3">Recent Trades</p>
@@ -259,15 +268,6 @@ export default function DashboardPage() {
           ) : (
             <TradesTable trades={trades ?? []} />
           )}
-        </section>
-
-        {/* ── Open Positions ────────────────────────────────────────────── */}
-        <section>
-          <p className="label-muted mb-3">Open Positions</p>
-          <OpenPositionsCard
-            positions={openPositions ?? []}
-            isLoading={positionsLoading}
-          />
         </section>
 
 

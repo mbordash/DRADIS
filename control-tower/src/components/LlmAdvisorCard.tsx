@@ -24,12 +24,22 @@ function fmtTs(iso: string): string {
 
 export default function LlmAdvisorCard({ recommendations, isLoading, advisorEnabled }: Props) {
   const [idx, setIdx] = useState(0);
+  const [dismissed, setDismissed] = useState<Set<number>>(new Set());
 
-  const total = recommendations.length;
-  const rec   = total > 0 ? recommendations[idx] : null;
+  // Filter out dismissed recommendations
+  const visible = recommendations.filter(r => !dismissed.has(r.id));
+  const total   = visible.length;
+  const rec     = total > 0 ? visible[idx] : null;
 
-  // Reset index when new data arrives and current index is out of bounds
-  if (idx >= total && total > 0) setIdx(0);
+  // Reset index when list shrinks (e.g. after dismiss)
+  const safeIdx = total > 0 ? Math.min(idx, total - 1) : 0;
+  if (safeIdx !== idx) setIdx(safeIdx);
+
+  const dismiss = (id: number) => {
+    setDismissed(prev => new Set(prev).add(id));
+    // If we dismissed the last item, step back
+    setIdx(i => (total > 1 ? Math.min(i, total - 2) : 0));
+  };
 
   return (
     <section>
@@ -43,30 +53,52 @@ export default function LlmAdvisorCard({ recommendations, isLoading, advisorEnab
               DISABLED
             </span>
           )}
+          {dismissed.size > 0 && (
+            <button
+              onClick={() => { setDismissed(new Set()); setIdx(0); }}
+              className="text-[10px] font-mono text-gray-600 hover:text-gray-400 underline underline-offset-2 transition-colors"
+              title="Restore all dismissed recommendations"
+            >
+              restore {dismissed.size} dismissed
+            </button>
+          )}
         </div>
 
-        {/* Pagination — only shown when there are multiple entries */}
-        {total > 1 && (
+        {/* Pagination + dismiss — only shown when there are visible entries */}
+        {total > 0 && (
           <div className="flex items-center gap-2">
-            <span className="text-xs text-gray-600 font-mono">
-              {idx + 1} / {total}
-            </span>
-            <button
-              onClick={() => setIdx(i => Math.min(i + 1, total - 1))}
-              disabled={idx >= total - 1}
-              className="text-xs px-2 py-0.5 rounded bg-[#13131f] border border-[#1e1e32] text-gray-400 hover:text-gray-200 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-              title="Older"
-            >
-              ←
-            </button>
-            <button
-              onClick={() => setIdx(i => Math.max(i - 1, 0))}
-              disabled={idx === 0}
-              className="text-xs px-2 py-0.5 rounded bg-[#13131f] border border-[#1e1e32] text-gray-400 hover:text-gray-200 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
-              title="Newer"
-            >
-              →
-            </button>
+            {total > 1 && (
+              <>
+                <span className="text-xs text-gray-600 font-mono">
+                  {safeIdx + 1} / {total}
+                </span>
+                <button
+                  onClick={() => setIdx(i => Math.min(i + 1, total - 1))}
+                  disabled={safeIdx >= total - 1}
+                  className="text-xs px-2 py-0.5 rounded bg-[#13131f] border border-[#1e1e32] text-gray-400 hover:text-gray-200 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                  title="Older"
+                >
+                  ←
+                </button>
+                <button
+                  onClick={() => setIdx(i => Math.max(i - 1, 0))}
+                  disabled={safeIdx === 0}
+                  className="text-xs px-2 py-0.5 rounded bg-[#13131f] border border-[#1e1e32] text-gray-400 hover:text-gray-200 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                  title="Newer"
+                >
+                  →
+                </button>
+              </>
+            )}
+            {rec && (
+              <button
+                onClick={() => dismiss(rec.id)}
+                className="text-xs px-2 py-0.5 rounded bg-[#13131f] border border-[#1e1e32] text-gray-500 hover:text-red-400 hover:border-red-900/50 disabled:opacity-30 transition-colors"
+                title="Dismiss this recommendation"
+              >
+                ✕
+              </button>
+            )}
           </div>
         )}
       </div>
@@ -82,17 +114,19 @@ export default function LlmAdvisorCard({ recommendations, isLoading, advisorEnab
           <div className="flex flex-col items-center justify-center gap-2 py-8 text-center">
             <span className="text-3xl">🤖</span>
             <p className="text-sm text-gray-500">
-              {advisorEnabled
-                ? <>
-                    Awaiting first analysis — fires every{' '}
-                    <span className="text-gray-400 font-mono">30 min</span>.
-                    Analyses run regardless of trade count — even zero trades triggers a
-                    settings-stringency review.
-                    Check logs for{' '}
-                    <code className="text-xs bg-[#13131f] px-1 rounded">🤖 LLM Advisor</code>{' '}
-                    lines to trace progress.
-                  </>
-                : <>LLM Advisor is disabled. Set <code className="text-xs bg-[#13131f] px-1 rounded">ENABLE_LLM_ADVISOR&nbsp;=&nbsp;true</code> in <code className="text-xs bg-[#13131f] px-1 rounded">config.rs</code> and rebuild.</>
+              {dismissed.size > 0
+                ? <>All recommendations dismissed. <button onClick={() => { setDismissed(new Set()); setIdx(0); }} className="text-gray-400 underline underline-offset-2 hover:text-gray-200 transition-colors">Restore</button>.</>
+                : advisorEnabled
+                  ? <>
+                      Awaiting first analysis — fires every{' '}
+                      <span className="text-gray-400 font-mono">30 min</span>.
+                      Analyses run regardless of trade count — even zero trades triggers a
+                      settings-stringency review.
+                      Check logs for{' '}
+                      <code className="text-xs bg-[#13131f] px-1 rounded">🤖 LLM Advisor</code>{' '}
+                      lines to trace progress.
+                    </>
+                  : <>LLM Advisor is disabled. Set <code className="text-xs bg-[#13131f] px-1 rounded">ENABLE_LLM_ADVISOR&nbsp;=&nbsp;true</code> in <code className="text-xs bg-[#13131f] px-1 rounded">config.rs</code> and rebuild.</>
               }
             </p>
           </div>

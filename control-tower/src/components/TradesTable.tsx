@@ -25,18 +25,31 @@ function truncate(s: string, n: number) {
   return s.length > n ? s.slice(0, n) + '…' : s;
 }
 
-/** Inline tooltip cell: shows a dotted underline + full text on hover via native title. */
+/** Inline tooltip cell: shows dotted underline and a styled popup on hover. */
 function TipCell({ full, maxChars, className = '' }: { full: string; maxChars: number; className?: string }) {
   const isTruncated = full.length > maxChars;
+  if (!isTruncated) return <span className={className}>{full}</span>;
   return (
-    <span
-      title={isTruncated ? full : undefined}
-      className={[
-        isTruncated ? 'border-b border-dotted border-gray-600 cursor-help' : '',
+    <span className="relative group inline-block">
+      <span className={[
+        'border-b border-dotted border-gray-600 cursor-help',
         className,
-      ].filter(Boolean).join(' ')}
-    >
-      {truncate(full, maxChars)}
+      ].filter(Boolean).join(' ')}>
+        {truncate(full, maxChars)}
+      </span>
+      {/* Tooltip panel */}
+      <span className="
+        pointer-events-none absolute z-50 bottom-full left-0 mb-1.5
+        w-max max-w-xs
+        rounded-md px-2.5 py-1.5
+        bg-[#1e1e35] border border-[#2e2e4e] text-gray-200 text-[11px] font-mono leading-snug
+        shadow-lg shadow-black/60
+        opacity-0 group-hover:opacity-100
+        transition-opacity duration-100
+        whitespace-pre-wrap break-words
+      ">
+        {full}
+      </span>
     </span>
   );
 }
