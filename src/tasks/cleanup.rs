@@ -13,6 +13,12 @@ use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
 use tracing::warn;
 
+use polymarket_client_sdk_v2::clob::Client as ClobClient;
+use polymarket_client_sdk_v2::auth::state::Authenticated;
+use polymarket_client_sdk_v2::auth::Normal;
+use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
+
+use crate::helpers::balance::PhantomCooldowns;
 use crate::helpers::notifications::send_notification;
 use crate::state::{Position, PositionMap};
 use crate::strategies::time_decay_impl::TimeDecayPosition;
@@ -57,8 +63,15 @@ pub async fn cleanup_expired_positions(
 /// missed (e.g., rare silent FAK failure with no explicit Err) by scanning for
 /// paired positions that are still unpaired after 60 s, then logging and removing
 /// them so they don't silently accumulate capital exposure.
+///
+/// IMPORTANT: Before removing an orphaned position from internal tracking we also
+/// cancel any resting GTC order for that token on the Polymarket CLOB.  Without this,
+/// a GTC order that was "forgotten" by position-sync can later fill and create an
+/// untracked, unhedged position in the wallet.
 pub async fn reconcile_orphaned_positions(
     positions: Arc<Mutex<PositionMap>>,
+    clob_client: &Arc<ClobClient<Authenticated<Normal>>>,
+    phantom_cooldowns: &PhantomCooldowns,
     tg_token: &str,
     tg_chat_id: &str,
 ) -> anyhow::Result<()> {
@@ -82,10 +95,30 @@ pub async fn reconcile_orphaned_positions(
     }
 
     for ((strategy_name, token_id), position) in orphans_to_exit {
-        warn!("🚨 ORPHANED PAIR DETECTED [{}]: {} shares at ${:.4} ({}s old) — removing",
+        warn!("🚨 ORPHANED PAIR DETECTED [{}]: {} shares at ${:.4} ({}s old) — cancelling GTC + removing",
               strategy_name, position.shares, position.avg_entry,
               (now - position.opened_at).num_seconds());
+
+        // Cancel any resting GTC order so it can't fill after we forget about it.
+        let req = OrdersRequest::builder().asset_id(token_id).build();
+        if let Ok(page) = clob_client.orders(&req, None).await {
+            let ids: Vec<String> = page.data.into_iter().map(|o| o.id).collect();
+            if !ids.is_empty() {
+                let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+                warn!("🛑 Cancelling {} resting order(s) for orphaned token {}", id_refs.len(), token_id);
+                let _ = clob_client.cancel_orders(&id_refs).await;
+            }
+        }
+
         pos_map.remove(&(strategy_name.clone(), token_id));
+
+        // Block re-entry into this token for PHANTOM_COOLDOWN_SECS so the strategy
+        // cannot immediately open a new position on top of untracked on-chain shares.
+        phantom_cooldowns.lock().await.insert(
+            format!("{}:{}", strategy_name, token_id),
+            tokio::time::Instant::now(),
+        );
+
         let _ = send_notification(tg_token, tg_chat_id,
             &format!("🚨 Orphaned pair exited [{}]: {} {} shares @ ${:.4}",
                      strategy_name,

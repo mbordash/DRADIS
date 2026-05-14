@@ -35,6 +35,10 @@ pub const ENABLE_ARBITRAGE_TRADING: bool = true;
 pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.07);
 pub const ARBITRAGE_MAX_TAKER_FEE_BPS: u32 = 1500; // Updated from 100
 
+/// Maximum allowable gap between our safe bid and the current ask on each arb leg.
+/// Conservative profile: 3 ticks — only enter when the book is tight on both legs.
+pub const ARBITRAGE_MAX_FILL_GAP: Decimal = dec!(0.03);
+
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.96);
 
 /// Minimum shares and order size (exchange minimums — do not lower).

@@ -80,7 +80,7 @@ The core of DRADIS is the Orchestrator. It acts as the ship's brain, maintaining
           ▼             ▼              ▼                ▼
    ┌────────────┐ ┌──────────┐ ┌──────────────┐ ┌──────────────┐
    │ Momentum   │ │  Maker   │ │  Arbitrage / │ │   Gradient   │
-   │(Interceptor│ │ (Sentry) │ │  TimeDecay / │ │   Boost      │
+   │            │ │          │ │  TimeDecay / │ │   Boost      │
    │            │ │          │ │   Basis      │ │              │
    └─────┬──────┘ └────┬─────┘ └──────┬───────┘ └──────┬───────┘
          └─────────────┼──────────────┴────────────────┘
@@ -117,12 +117,12 @@ The core of DRADIS is the Orchestrator. It acts as the ship's brain, maintaining
 
 DRADIS currently deploys six specialized Viper strategy classes. Each Viper is an autonomous tactical unit with its own capital budget, position book, and entry/exit logic — no Viper can compromise another's fuel.
 
-- **Momentum (The Interceptor)**: Scans for high-velocity Binance moves. If a "target" moves $75 in 5 seconds, the Interceptor strikes the Polymarket book before it can reprice.
-- **Maker (The Sentry)**: Maintains a dual-sided presence on the Window venue, capturing the spread while managing net exposure.
-- **Arbitrage (The Surveyor)**: Constantly monitors the price sum of YES/NO pairs, looking for sub-$1.00 opportunities in low-fee venues.
-- **Time Decay (The Ghost)**: Posts resting maker bids on both YES and NO of the Hourly venue during the theta window, earning the combined bid discount and settling at $1.00 with zero fee drag.
-- **Basis/Funding (The Analyst)**: Fades retail skew by comparing Polymarket sentiment against Binance perpetual funding rates.
-- **GBoost (The Cylon)**: Online gradient-boosted ML model (LogLoss) that learns from live orderbook + oracle features to predict near-term YES price direction, retraining continuously in the background.
+- **Momentum**: Scans for high-velocity Binance moves. If a "target" moves $75 in 5 seconds, the Interceptor strikes the Polymarket book before it can reprice.
+- **Maker**: Maintains a dual-sided presence on the Window venue, capturing the spread while managing net exposure.
+- **Arbitrage**: Constantly monitors the price sum of YES/NO pairs, looking for sub-$1.00 opportunities in low-fee venues.
+- **Time Decay**: Posts resting maker bids on both YES and NO of the Hourly venue during the theta window, earning the combined bid discount and settling at $1.00 with zero fee drag.
+- **Basis/Funding**: Fades retail skew by comparing Polymarket sentiment against Binance perpetual funding rates.
+- **GBoost**: Online gradient-boosted ML model (LogLoss) that learns from live orderbook + oracle features to predict near-term YES price direction, retraining continuously in the background.
 
 ---
 
@@ -137,10 +137,9 @@ Raptors are DRADIS's recon layer — lightweight signal scouts that fly ahead of
 | *(future)* **Sports Raptor** | Line movement APIs | Betting line drift, public money % |
 | *(future)* **Politics Raptor** | Polling aggregators | Approval drift, event probability shifts |
 
-When multiple Raptors are active for a profile, the Cylon (GBoost) and Analyst (Basis) strategies fuse their signals as features — no single Raptor has veto power alone.
+When multiple Raptors are active for a profile, the GBoost and Basis strategies fuse their signals as features — no single Raptor has veto power alone.
 
 ---
-
 
 ## 🖥️ Control Tower — The Dashboard
 

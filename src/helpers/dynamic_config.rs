@@ -58,6 +58,9 @@ pub struct DynamicConfig {
     pub arbitrage_position_size_usdc: Decimal,
     pub arbitrage_max_exposure_usdc:  Decimal,
     pub arbitrage_profit_threshold:   Decimal,
+    /// Max gap (ask − safe_bid) allowed on each leg before skipping entry.
+    /// Prevents one-sided fills when the other side of the book is far away.
+    pub arbitrage_max_fill_gap:       Decimal,
 
     // ── TimeDecay Viper ───────────────────────────────────────────────────────
     pub time_decay_position_size_usdc:  Decimal,
@@ -115,6 +118,7 @@ impl Default for DynamicConfig {
             arbitrage_position_size_usdc: config::ARBITRAGE_POSITION_SIZE_USDC,
             arbitrage_max_exposure_usdc:  config::ARBITRAGE_MAX_EXPOSURE_USDC,
             arbitrage_profit_threshold:   config::ARBITRAGE_PROFIT_THRESHOLD,
+            arbitrage_max_fill_gap:       config::ARBITRAGE_MAX_FILL_GAP,
 
             time_decay_position_size_usdc:  config::TIME_DECAY_POSITION_SIZE_USDC,
             time_decay_max_exposure_usdc:   config::TIME_DECAY_MAX_EXPOSURE_USDC,

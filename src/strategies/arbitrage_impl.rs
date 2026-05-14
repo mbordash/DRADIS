@@ -30,6 +30,7 @@ use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::strategies::is_drawdown_limit_hit;
 use polymarket_client_sdk_v2::clob::types::OrderType;
+use tracing::debug;
 
 const STRATEGY_NAME: &str = "ArbitrageStrategy";
 
@@ -54,9 +55,41 @@ impl Strategy for ArbitrageStrategyImpl {
 
         let yes_bid = snapshot.yes_bid;
         let no_bid  = snapshot.no_bid;
+        let yes_ask = snapshot.yes_ask;
+        let no_ask  = snapshot.no_ask;
 
         // ── Maker arb profitability gate (0% fee on GTC fills) ───────────────
         if !is_maker_arb_profitable(yes_bid, no_bid, dc.arbitrage_profit_threshold) {
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Safe maker prices: cap bids one tick below ask ───────────────────
+        // A GTC post-only order is rejected with "order crosses book" if
+        // bid >= ask.  This can happen on tight markets where the WS snapshot
+        // has bid == ask or a stale/inverted spread.  Cap each leg at
+        // ask − 0.01 to guarantee the order rests on the book as a maker.
+        let safe_yes_bid = yes_bid.min(yes_ask - dec!(0.01));
+        let safe_no_bid  = no_bid.min(no_ask  - dec!(0.01));
+
+        // Re-validate profitability at the capped prices — if we had to lower
+        // the bid(s) the spread may no longer cover the threshold.
+        if !is_maker_arb_profitable(safe_yes_bid, safe_no_bid, dc.arbitrage_profit_threshold) {
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Liquidity gap gate ───────────────────────────────────────────────
+        // A GTC maker bid resting far below the current ask will almost never
+        // fill within MAX_WAIT_SECS — causing a one-sided fill and unhedged
+        // directional exposure (the root cause of the May-13 orphan episode).
+        // Skip entry if either leg's ask is more than arbitrage_max_fill_gap
+        // above our safe bid — that means no real counterparty is near our price.
+        let yes_fill_gap = yes_ask - safe_yes_bid;
+        let no_fill_gap  = no_ask  - safe_no_bid;
+        if yes_fill_gap > dc.arbitrage_max_fill_gap || no_fill_gap > dc.arbitrage_max_fill_gap {
+            debug!(
+                "🚫 Arb liquidity gap too wide — YES gap {:.3} NO gap {:.3} (max {:.3}) — skipping",
+                yes_fill_gap, no_fill_gap, dc.arbitrage_max_fill_gap
+            );
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -78,14 +111,14 @@ impl Strategy for ArbitrageStrategyImpl {
         // Buying equal dollars gives unequal shares (e.g. 24 YES vs 17 NO at 0.41/0.58),
         // leaving the cheaper leg unhedged and creating a directional P&L on settlement.
         // Instead: spend the full budget on N balanced pairs where
-        //   N = trade_size / (yes_bid + no_bid)
+        //   N = trade_size / (safe_yes_bid + safe_no_bid)
         // so YES_cost + NO_cost = trade_size and every YES share has one NO share.
-        let pair_shares = trade_size / (yes_bid + no_bid);
+        let pair_shares = trade_size / (safe_yes_bid + safe_no_bid);
 
         return Ok(StrategySignal::Entry {
             params: OrderParams {
                 token_id: market.yes_token,
-                price: yes_bid,                        // bid at current best bid
+                price: safe_yes_bid,                   // capped one tick below ask — guaranteed maker
                 shares: pair_shares,                   // balanced — same count as NO leg
                 fee_bps: 0,                            // maker = 0 fees
                 is_neg_risk: market.is_neg_risk,
@@ -97,7 +130,7 @@ impl Strategy for ArbitrageStrategyImpl {
             },
             pair_params: Some(OrderParams {
                 token_id: market.no_token,
-                price: no_bid,
+                price: safe_no_bid,                    // capped one tick below ask — guaranteed maker
                 shares: pair_shares,                   // same count as YES leg
                 fee_bps: 0,
                 is_neg_risk: market.is_neg_risk,

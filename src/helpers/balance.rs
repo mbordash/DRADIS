@@ -95,9 +95,34 @@ pub async fn sync_position_balance(
             } else if actual_shares == dec!(0) {
                 if time_since_open >= max_wait_secs {
                     drop(pos_map);
-                    if check_for_resting_order(client, token_id).await {
-                        tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;
-                        continue;
+                    // Cancel any resting GTC order to prevent future unexpected fills.
+                    // A GTC order that rested and was later matched may briefly show
+                    // zero balance AND zero resting orders while Polygon settles the fill.
+                    // After cancelling, wait one grace period and re-check the balance
+                    // before declaring phantom — this catches the settlement-lag race.
+                    let had_resting = cancel_resting_orders(client, token_id).await;
+                    if had_resting {
+                        // Order was live → may have been matching. Wait for on-chain settlement.
+                        tokio::time::sleep(Duration::from_secs(20)).await;
+                        // Re-check the balance one final time.
+                        let mut req2 = BalanceAllowanceRequest::default();
+                        req2.asset_type = AssetType::Conditional;
+                        req2.token_id = Some(token_id);
+                        if let Ok(resp) = client.balance_allowance(req2).await {
+                            let latest = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
+                            let latest_actual = (latest - baseline_shares).max(dec!(0));
+                            if latest_actual >= crate::config::MIN_ORDER_SHARES {
+                                // The order DID fill — update the position and continue normally.
+                                let mut pos_map = positions.lock().await;
+                                if let Some(pos) = pos_map.get_mut(&key) {
+                                    warn!("✅ Position Sync RECOVERED [{}]: Token {} filled after cancel ({} shares) — keeping position",
+                                          strategy_name, token_id, latest_actual);
+                                    pos.shares = latest_actual;
+                                    if pos.fill_confirmed_at.is_none() { pos.fill_confirmed_at = Some(Utc::now()); }
+                                }
+                                return Ok(());
+                            }
+                        }
                     }
                     error!("⚠️ Position Sync FAILED [{}] Token {} — phantom removed.", strategy_name, token_id);
                     positions.lock().await.remove(&key);
@@ -127,12 +152,24 @@ pub async fn sync_position_balance(
     }
 }
 
-async fn check_for_resting_order(client: &Arc<ClobClient<Authenticated<Normal>>>, token_id: U256) -> bool {
+/// Fetch all open orders for a token and cancel them.
+/// Returns true if any orders were found (and cancelled).
+/// This prevents GTC orders that were "forgotten" by position-sync from
+/// sitting on the book and filling unexpectedly later.
+async fn cancel_resting_orders(client: &Arc<ClobClient<Authenticated<Normal>>>, token_id: U256) -> bool {
     let req = OrdersRequest::builder().asset_id(token_id).build();
-    match client.orders(&req, None).await {
-        Ok(page) => !page.data.is_empty(),
-        Err(_) => false
+    let order_ids: Vec<String> = match client.orders(&req, None).await {
+        Ok(page) => page.data.into_iter().map(|o| o.id).collect(),
+        Err(_) => return false,
+    };
+    if order_ids.is_empty() {
+        return false;
     }
+    let id_refs: Vec<&str> = order_ids.iter().map(|s| s.as_str()).collect();
+    warn!("🛑 Cancelling {} resting GTC order(s) for token {} — preventing orphan fills",
+          id_refs.len(), token_id);
+    let _ = client.cancel_orders(&id_refs).await;
+    true
 }
 
 /// Reconcile on-chain token balances against the in-memory position map.
@@ -237,7 +274,10 @@ pub async fn quick_confirm_fill(
     let market_hash = match B256::from_str(condition_id) { Ok(h) => h, Err(_) => return Ok(false) };
     let req = polymarket_client_sdk_v2::clob::types::request::CancelMarketOrderRequest::builder().market(market_hash).build();
     let _ = client.cancel_market_orders(&req).await;
-    if !check_for_resting_order(client, token_id).await {
+    // After cancelling all market orders, check if there are any remaining resting orders
+    // for this specific token (belt-and-suspenders: cancel_market_orders covers everything).
+    let req2 = OrdersRequest::builder().asset_id(token_id).build();
+    if !(match client.orders(&req2, None).await { Ok(p) => p.data.is_empty(), Err(_) => true }) {
         let mut pos_map = positions.lock().await;
         if let Some(pos) = pos_map.get_mut(&(strategy_name.to_string(), token_id)) {
             pos.fill_confirmed_at = Some(Utc::now());

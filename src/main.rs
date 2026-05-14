@@ -757,7 +757,7 @@ async fn main() -> Result<()> {
                         dradis::tasks::cleanup::cleanup_expired_positions(Arc::clone(&positions), mk_config.market_name.clone(), mk_config.yes_token, mk_config.no_token, mk_config.market_close_time).await;
                     }
 
-                    if let Err(e) = dradis::tasks::cleanup::reconcile_orphaned_positions(Arc::clone(&positions), &tg_token, &tg_chat_id).await { warn!("⚠️ Orphan reconciliation error: {}", e); }
+                    if let Err(e) = dradis::tasks::cleanup::reconcile_orphaned_positions(Arc::clone(&positions), &trading_client, &phantom_cooldowns, &tg_token, &tg_chat_id).await { warn!("⚠️ Orphan reconciliation error: {}", e); }
                     dradis::tasks::cleanup::cleanup_time_decay_positions(Arc::clone(&time_decay_positions)).await;
 
                     // Periodically clean up expired pending order locks
@@ -1058,6 +1058,30 @@ async fn main() -> Result<()> {
                                 // 5-minute block after an expiry exit — the market was closing, re-entry is pointless
                                 if let Some(lt) = last_expiry_exit_time.get(&sn) { if lt.elapsed() < Duration::from_secs(300) { continue; } }
 
+                                // Block re-entry if either leg token is still in phantom cooldown.
+                                // phantom_cooldowns are set when sync_position_balance gives up on a token
+                                // (order never confirmed on-chain) AND when orphan cleanup removes a
+                                // half-filled paired position.  Without this check, the strategy fires a new
+                                // entry immediately after cleanup — potentially buying on top of untracked
+                                // on-chain shares from the failed leg.
+                                {
+                                    let cd = phantom_cooldowns.lock().await;
+                                    let a_key = format!("{}:{}", sn, params.token_id);
+                                    let a_on_cd = cd.get(&a_key)
+                                        .map(|t| t.elapsed().as_secs() < dradis::helpers::balance::PHANTOM_COOLDOWN_SECS)
+                                        .unwrap_or(false);
+                                    let pair_on_cd = pair_params.as_ref().map(|pp| {
+                                        let p_key = format!("{}:{}", sn, pp.token_id);
+                                        cd.get(&p_key)
+                                            .map(|t| t.elapsed().as_secs() < dradis::helpers::balance::PHANTOM_COOLDOWN_SECS)
+                                            .unwrap_or(false)
+                                    }).unwrap_or(false);
+                                    if a_on_cd || pair_on_cd {
+                                        debug!("⏳ ENTRY blocked by phantom cooldown [{}] — skipping tick", sn);
+                                        continue;
+                                    }
+                                }
+
                                 let pos_key = (sn.clone(), params.token_id);
 
                                 // Debounce: check if an order is already pending for this token
@@ -1121,10 +1145,19 @@ async fn main() -> Result<()> {
                                     // No actual order placement or balance sync in ghost mode
                                 } else {
                                     // Real trading logic
+                                    // Maker GTC/post-only orders must NOT have BUY_PRICE_OFFSET applied —
+                                    // adding +$0.01 to yes_bid pushes the price above the current ask,
+                                    // causing every post-only GTC order to be rejected with
+                                    // "invalid post-only order: order crosses book".
+                                    // BUY_PRICE_OFFSET is only appropriate for FAK/taker orders.
+                                    let actual_entry_price = if params.post_only {
+                                        params.price  // maker: post at exactly the bid — never cross
+                                    } else {
+                                        (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE)
+                                    };
                                     {
                                         let mut map = positions.lock().await; if map.contains_key(&pos_key) { continue; }
                                         let pos_close_time = target_market_close_time;
-                                        let actual_entry_price = (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE);
                                         map.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: params.token_id, fill_confirmed_at: None, paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id) });
                                     }
 
@@ -1135,7 +1168,7 @@ async fn main() -> Result<()> {
 
                                     info!(" ENTRY [{}]: {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares);
                                     let vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
-                                    if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, params.token_id, Side::Buy, params.shares, (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await { // Use target_yes_fee_bps for simplicity
+                                    if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, params.token_id, Side::Buy, params.shares, actual_entry_price, target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await {
                                         warn!("⚠️ ENTRY order failed [{}]: {}", sn, e);
                                         positions.lock().await.remove(&pos_key);
                                         pending_orders.lock().await.remove(&pos_key);
@@ -1143,18 +1176,30 @@ async fn main() -> Result<()> {
                                         consecutive_failures += 1; continue;
                                     }
                                     let cl_s = Arc::clone(&trading_client); let ps_s = Arc::clone(&positions); let pc_s = Arc::clone(&phantom_cooldowns); let sn_s = sn.clone(); let tn_s = params.token_id;
-                                    tokio::spawn(async move { let _ = sync_position_balance(&cl_s, &ps_s, &sn_s, tn_s, Some(&pc_s), dec!(0), dradis::helpers::balance::MAX_WAIT_SECS_HOURLY).await; });
+                                    // Use venue-appropriate timeout: daily/maker GTC orders can rest on the
+                                    // book much longer than hourly market orders before filling.
+                                    let primary_wait_secs = if target_yes_token == hourly_yes_token {
+                                        dradis::helpers::balance::MAX_WAIT_SECS_HOURLY
+                                    } else {
+                                        dradis::helpers::balance::MAX_WAIT_SECS_WINDOW
+                                    };
+                                    tokio::spawn(async move { let _ = sync_position_balance(&cl_s, &ps_s, &sn_s, tn_s, Some(&pc_s), dec!(0), primary_wait_secs).await; });
 
-                                    { let sn_e = sn.clone(); let tid_e = params.token_id.to_string(); let mn_e = params.market_name.clone(); let side_e = if params.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_e = (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE); let sh_e = params.shares; tokio::spawn(async move { metrics::record_entry(sn_e, tid_e, mn_e, side_e, ep_e, sh_e).await; }); }
+                                    { let sn_e = sn.clone(); let tid_e = params.token_id.to_string(); let mn_e = params.market_name.clone(); let side_e = if params.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_e = actual_entry_price; let sh_e = params.shares; tokio::spawn(async move { metrics::record_entry(sn_e, tid_e, mn_e, side_e, ep_e, sh_e).await; }); }
                                     // Record open position for UI/LLM visibility
                                     if let Some(pool) = db::pool() {
                                         let side_r = if params.token_id == target_yes_token { "YES" } else { "NO" };
-                                        db::record_open_position(pool, &sn, &params.token_id.to_string(), &params.market_name, side_r, (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), params.shares, false).await;
+                                        db::record_open_position(pool, &sn, &params.token_id.to_string(), &params.market_name, side_r, actual_entry_price, params.shares, false).await;
                                     }
 
                                     if let Some(pp) = pair_params {
+                                        let actual_pair_entry_price = if pp.post_only {
+                                            pp.price  // maker: post at exactly the bid — never cross
+                                        } else {
+                                            (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE)
+                                        };
                                         let vc_p = if pp.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
-                                        let leg_b_result = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc_p, pp.token_id, Side::Buy, pp.shares, (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE), target_yes_fee_bps as u16, pp.order_type, pp.post_only, 0, &shared_http).await; // Use target_yes_fee_bps for simplicity
+                                        let leg_b_result = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc_p, pp.token_id, Side::Buy, pp.shares, actual_pair_entry_price, target_yes_fee_bps as u16, pp.order_type, pp.post_only, 0, &shared_http).await;
 
                                         match leg_b_result {
                                             Err(ref e) => {
@@ -1166,7 +1211,9 @@ async fn main() -> Result<()> {
                                                 let signer_fe = signer.clone();
                                                 let sn_fe   = sn.clone();
                                                 let tok_a   = params.token_id;
-                                                let bid_a   = if tok_a == target_yes_token { ctx.snapshot.yes_bid } else { ctx.snapshot.no_bid }; // This needs to be from the correct snapshot
+                                                // Use the correct snapshot for the token's market (maker vs hourly)
+                                                let correct_snap = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
+                                                let bid_a   = if tok_a == target_yes_token { correct_snap.yes_bid } else { correct_snap.no_bid };
                                                 let fee_a   = target_yes_fee_bps; // Use target_yes_fee_bps for simplicity
                                                 let vc_a    = vc;
                                                 tokio::spawn(async move {
@@ -1212,7 +1259,15 @@ async fn main() -> Result<()> {
                                                 let pp_close_time = target_market_close_time;
                                                 positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: pp.price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: None, paired_leg_token_id: Some(params.token_id) });
                                                 let sn_p = sn.clone(); let tn_p = pp.token_id; let ps_p = Arc::clone(&positions); let cl_p = Arc::clone(&trading_client); let pc_p = Arc::clone(&phantom_cooldowns);
-                                                tokio::spawn(async move { let _ = sync_position_balance(&cl_p, &ps_p, &sn_p, tn_p, Some(&pc_p), dec!(0), dradis::helpers::balance::MAX_WAIT_SECS_HOURLY).await; });
+                                                // Same venue-aware timeout as the primary leg — GTC on a daily
+                                                // market may take far longer than 180s (MAX_WAIT_SECS_HOURLY)
+                                                // to fill.  Abandoning too early phantom-removes a valid order.
+                                                let pair_wait_secs = if tn_p == hourly_yes_token || tn_p == hourly_no_token {
+                                                    dradis::helpers::balance::MAX_WAIT_SECS_HOURLY
+                                                } else {
+                                                    dradis::helpers::balance::MAX_WAIT_SECS_WINDOW
+                                                };
+                                                tokio::spawn(async move { let _ = sync_position_balance(&cl_p, &ps_p, &sn_p, tn_p, Some(&pc_p), dec!(0), pair_wait_secs).await; });
                                                 { let sn_eb = sn.clone(); let tid_eb = pp.token_id.to_string(); let mn_eb = pp.market_name.clone(); let side_eb = if pp.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_eb = pp.price; let sh_eb = pp.shares; tokio::spawn(async move { metrics::record_entry(sn_eb, tid_eb, mn_eb, side_eb, ep_eb, sh_eb).await; }); }
                                                 // Record paired leg open position for UI/LLM visibility
                                                 if let Some(pool) = db::pool() {
