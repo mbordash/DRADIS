@@ -85,6 +85,8 @@ pub const SOL_STRIKE_BUFFER: Decimal = dec!(0.15);
 
 pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.90);
 pub const MAX_MOMENTUM_CROSSING_ENTRY_PRICE: Decimal = dec!(0.78);
+pub const MOMENTUM_MIN_ENTRY_PRICE: Decimal = dec!(0.15); // Aggressive: allow down to 15¢
+pub const MOMENTUM_CATASTROPHIC_SL_PCT: Decimal = dec!(0.10); // Aggressive: wider catastrophic SL
 
 pub const MOMENTUM_WINDOW_SECS: u64 = 5;
 pub const MOMENTUM_SHORT_WINDOW_SECS: u64 = 1;
@@ -239,7 +241,7 @@ pub const GBOOST_MAX_YES_ENTRY_PRICE: Decimal = dec!(0.55);
 /// Minimum token ask price allowed for GBoost entries (for NO side).
 /// For NO entries, we want to buy when the price is low.
 pub const GBOOST_MAX_NO_ENTRY_PRICE: Decimal = dec!(0.45);
-pub const GBOOST_MIN_ENTRY_PRICE: Decimal = dec!(0.38); // Adjusted from 0.35
+pub const GBOOST_MIN_ENTRY_PRICE: Decimal = dec!(0.38); // Aggressive: allows down to 38¢ (vs 40¢ default)
 
 pub const GBOOST_HISTORY_BUFFER_SIZE: usize = 1000;
 pub const GBOOST_LOOKAHEAD_TICKS: usize = 200;

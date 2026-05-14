@@ -79,6 +79,8 @@ pub const SOL_STRIKE_BUFFER: Decimal = dec!(0.2);
 
 pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.85);
 pub const MAX_MOMENTUM_CROSSING_ENTRY_PRICE: Decimal = dec!(0.70);
+pub const MOMENTUM_MIN_ENTRY_PRICE: Decimal = dec!(0.18); // Balanced: 18-82% probability range
+pub const MOMENTUM_CATASTROPHIC_SL_PCT: Decimal = dec!(0.08); // Balanced: 8% catastrophic floor
 
 pub const MOMENTUM_WINDOW_SECS: u64 = 5;
 pub const MOMENTUM_SHORT_WINDOW_SECS: u64 = 1;
@@ -214,7 +216,7 @@ pub const BASIS_MAKER_BUY_PRICE_ADJUSTMENT: Decimal = dec!(0.00);
 
 pub const ENABLE_GBOOST_TRADING: bool = true;
 
-pub const GBOOST_MIN_ENTRY_PRICE: Decimal = dec!(0.35);
+pub const GBOOST_MIN_ENTRY_PRICE: Decimal = dec!(0.40); // Raised from 0.35 — prevents sub-3-tick SL knockouts
 pub const GBOOST_MAX_YES_ENTRY_PRICE: Decimal = dec!(0.55);
 pub const GBOOST_MAX_NO_ENTRY_PRICE: Decimal = dec!(0.45);
 pub const GBOOST_HISTORY_BUFFER_SIZE: usize = 1000;

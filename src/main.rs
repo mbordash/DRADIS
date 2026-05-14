@@ -420,46 +420,67 @@ async fn main() -> Result<()> {
 
         let market_started_at = Utc::now(); // This timestamp is for the current trading session, not necessarily market creation
 
+        // Cancellation flag for all WS tasks belonging to THIS market iteration.
+        // When we rotate to a new market (inner loop break), we send `true` so old
+        // WS tasks stop reconnecting and release their memory / TCP connections.
+        // Without this, each market rotation leaks 4 WS tasks that loop-reconnect
+        // forever, gradually exhausting heap and triggering OOM kills.
+        let (ws_cancel_tx, ws_cancel_rx) = watch::channel(false);
+
         let (yes_price_tx, yes_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now()));
         let (no_price_tx, no_price_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now()));
 
         // Only subscribe to hourly market WS if an hourly market is present
         if hourly_yes_token != U256::ZERO {
             for (token, tx) in [(hourly_yes_token, yes_price_tx.clone()), (hourly_no_token, no_price_tx.clone())] {
+                let mut cancel_rx = ws_cancel_rx.clone();
                 tokio::spawn(async move {
                     loop {
+                        if *cancel_rx.borrow() { return; }
                         let client = WsClient::default();
                         let stream = match client.subscribe_orderbook(vec![token]) {
                             Ok(s) => s,
                             Err(e) => {
                                 warn!("⚠️ WS subscribe failed for hourly token {}: {}. Retrying in 5s...", token, e);
-                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                tokio::select! {
+                                    _ = cancel_rx.changed() => return,
+                                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                                }
                                 continue;
                             }
                         };
                         let mut stream = Box::pin(stream);
                         info!("✅ WS orderbook subscribed for hourly token {}", token);
-                        while let Some(book_result) = stream.next().await {
-                            if let Ok(book) = book_result {
-                                let (bid, bid_depth) = book.bids.iter()
-                                    .max_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
-                                    .map(|l| (l.price, l.size))
-                                    .unwrap_or((dec!(0), dec!(0)));
-                                let (ask, ask_depth) = book.asks.iter()
-                                    .min_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
-                                    .map(|l| (l.price, l.size))
-                                    .unwrap_or((dec!(1), dec!(0)));
-                                // Stamp the WebSocket orderbook update time here — NOT at tick time.
-                                // The snapshot timestamp will later be derived from this value so
-                                // that GBOOST_MAX_SNAPSHOT_AGE_SECS measures actual data staleness,
-                                // not just the age of the last 50ms heartbeat tick.
-                                let _ = tx.send((bid, bid_depth, ask, ask_depth, Utc::now()));
-                            } else {
-                                warn!("⚠️ WS stream error for hourly token {}. Restarting...", token);
-                                break;
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = cancel_rx.changed() => { return; }
+                                result = stream.next() => {
+                                    match result {
+                                        Some(Ok(book)) => {
+                                            let (bid, bid_depth) = book.bids.iter()
+                                                .max_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
+                                                .map(|l| (l.price, l.size))
+                                                .unwrap_or((dec!(0), dec!(0)));
+                                            let (ask, ask_depth) = book.asks.iter()
+                                                .min_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
+                                                .map(|l| (l.price, l.size))
+                                                .unwrap_or((dec!(1), dec!(0)));
+                                            // Stamp the WebSocket orderbook update time here — NOT at tick time.
+                                            let _ = tx.send((bid, bid_depth, ask, ask_depth, Utc::now()));
+                                        }
+                                        Some(Err(_)) | None => {
+                                            warn!("⚠️ WS stream error for hourly token {}. Restarting...", token);
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        tokio::select! {
+                            _ = cancel_rx.changed() => return,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                        }
                     }
                 });
             }
@@ -469,37 +490,54 @@ async fn main() -> Result<()> {
             let (mk_yes_tx, mk_yes_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now()));
             let (mk_no_tx, mk_no_rx) = watch::channel::<PriceState>((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now()));
             for (token, tx) in [(mk.yes_token, mk_yes_tx), (mk.no_token, mk_no_tx)] {
+                let mut cancel_rx = ws_cancel_rx.clone();
                 tokio::spawn(async move {
                     loop {
+                        if *cancel_rx.borrow() { return; }
                         let client = WsClient::default();
                         let stream = match client.subscribe_orderbook(vec![token]) {
                             Ok(s) => s,
                             Err(e) => {
                                 warn!("⚠️ WS Maker subscribe failed for token {}: {}. Retrying in 5s...", token, e);
-                                tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                                tokio::select! {
+                                    _ = cancel_rx.changed() => return,
+                                    _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                                }
                                 continue;
                             }
                         };
                         let mut stream = Box::pin(stream);
                         info!("✅ WS orderbook subscribed for maker token {}", token);
-                        while let Some(book_result) = stream.next().await {
-                            if let Ok(book) = book_result {
-                                let (bid, bid_depth) = book.bids.iter()
-                                    .max_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
-                                    .map(|l| (l.price, l.size))
-                                    .unwrap_or((dec!(0), dec!(0)));
-                                let (ask, ask_depth) = book.asks.iter()
-                                    .min_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
-                                    .map(|l| (l.price, l.size))
-                                    .unwrap_or((dec!(1), dec!(0)));
-                                // Stamp the WebSocket orderbook update time
-                                let _ = tx.send((bid, bid_depth, ask, ask_depth, Utc::now()));
-                            } else {
-                                warn!("⚠️ WS Maker stream error for token {}. Restarting...", token);
-                                break;
+                        loop {
+                            tokio::select! {
+                                biased;
+                                _ = cancel_rx.changed() => { return; }
+                                result = stream.next() => {
+                                    match result {
+                                        Some(Ok(book)) => {
+                                            let (bid, bid_depth) = book.bids.iter()
+                                                .max_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
+                                                .map(|l| (l.price, l.size))
+                                                .unwrap_or((dec!(0), dec!(0)));
+                                            let (ask, ask_depth) = book.asks.iter()
+                                                .min_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
+                                                .map(|l| (l.price, l.size))
+                                                .unwrap_or((dec!(1), dec!(0)));
+                                            // Stamp the WebSocket orderbook update time
+                                            let _ = tx.send((bid, bid_depth, ask, ask_depth, Utc::now()));
+                                        }
+                                        Some(Err(_)) | None => {
+                                            warn!("⚠️ WS Maker stream error for token {}. Restarting...", token);
+                                            break;
+                                        }
+                                    }
+                                }
                             }
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+                        tokio::select! {
+                            _ = cancel_rx.changed() => return,
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                        }
                     }
                 });
             }
@@ -693,6 +731,7 @@ async fn main() -> Result<()> {
                     { pending_orders.lock().await.clear(); } // Clear pending locks on market switch
                     current_hourly_cid = new_hourly_condition_id;
                     current_maker_cid = new_maker_cid;
+                    let _ = ws_cancel_tx.send(true); // Stop WS tasks for the old market before rotating
                     break;
                 }
                 _ = pulse_ticker.tick() => {
@@ -1250,6 +1289,7 @@ async fn main() -> Result<()> {
                     let elapsed = last_heartbeat_at.lock().await.elapsed().as_secs();
                     if elapsed > LOOP_WATCHDOG_SECS {
                         error!(" WATCHDOG: inner loop silent for {}s — forcing restart", elapsed);
+                        let _ = ws_cancel_tx.send(true); // Release WS tasks before restarting
                         break;
                     }
                 }

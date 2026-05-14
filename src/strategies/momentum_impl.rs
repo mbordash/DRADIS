@@ -95,6 +95,75 @@ impl Strategy for MomentumStrategyImpl {
             };
         }
 
+        // ── UNIVERSAL GATES (apply regardless of whether strike price is known) ──
+        //
+        // Previously, snapshot-age / spread / OBI checks only lived inside the
+        // `if let Some(strike)` branch.  When strike resolution fails the bot falls
+        // into the `else` branch which silently bypassed ALL these guards — observed
+        // in 2026-05-13 session: trades with OBI_Y=-0.80 and OBI_Y=-0.53 entered
+        // because the "without strike" path had no OBI veto.
+
+        // ── Expiry guard ──────────────────────────────────────────────────────
+        if let Some(close_time) = ctx.market.market_close_time {
+            let secs_left = (close_time - chrono::Utc::now()).num_seconds();
+            if secs_left < config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY {
+                debug!("🚫 Momentum entry blocked: only {}s to expiry (min {}s)",
+                    secs_left, config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY);
+                return Ok(StrategySignal::NoSignal);
+            }
+        }
+
+        // ── Snapshot staleness gate ───────────────────────────────────────────
+        let snap_age = (chrono::Utc::now() - ctx.snapshot.timestamp).num_seconds();
+        if snap_age > config::MOMENTUM_MAX_SNAPSHOT_AGE_SECS {
+            debug!("🚫 Momentum entry blocked: snapshot too stale ({}s > max {}s)",
+                snap_age, config::MOMENTUM_MAX_SNAPSHOT_AGE_SECS);
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Spread gate: block wide-book entries ──────────────────────────────
+        let ask_sum = ctx.snapshot.yes_ask + ctx.snapshot.no_ask;
+        if ask_sum > config::MOMENTUM_MAX_ENTRY_ASK_SUM {
+            debug!("🚫 Momentum spread gate: ask_sum={:.3} > max {:.3} — book too wide",
+                ask_sum, config::MOMENTUM_MAX_ENTRY_ASK_SUM);
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Minimum price floor ───────────────────────────────────────────────
+        // Block entries on near-zero priced tokens: buying YES at $0.09 creates
+        // 100+ shares from a $9 budget; a 1¢ bid move = $1 swing.  Combined with
+        // the 30s fill-confirm lock (no exits allowed) this caused a $2.13 loss on
+        // 2026-05-13 (Trade #7: YES $0.09 × 106 shares, bid unchanged, -10% locked).
+        // MOMENTUM_MIN_ENTRY_PRICE = 0.18 limits entries to 18%–82% probability range.
+        let yes_ask = ctx.snapshot.yes_ask;
+        let no_ask  = ctx.snapshot.no_ask;
+        if yes_ask < config::MOMENTUM_MIN_ENTRY_PRICE && no_ask < config::MOMENTUM_MIN_ENTRY_PRICE {
+            debug!("🚫 Momentum min-price blocked: yes_ask={:.3} no_ask={:.3} both below floor {:.3}",
+                yes_ask, no_ask, config::MOMENTUM_MIN_ENTRY_PRICE);
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── OBI adverse-direction veto ────────────────────────────────────────
+        // Default to -1.0 (maximally adverse) when depth data is missing.
+        let yes_total_depth = ctx.snapshot.yes_bid_depth + ctx.snapshot.yes_ask_depth;
+        let no_total_depth  = ctx.snapshot.no_bid_depth  + ctx.snapshot.no_ask_depth;
+        let yes_obi = if yes_total_depth > dec!(0) {
+            (ctx.snapshot.yes_bid_depth - ctx.snapshot.yes_ask_depth) / yes_total_depth
+        } else { dec!(-1.0) };
+        let no_obi = if no_total_depth > dec!(0) {
+            (ctx.snapshot.no_bid_depth - ctx.snapshot.no_ask_depth) / no_total_depth
+        } else { dec!(-1.0) };
+        let obi_blocks_bull = yes_obi < config::MOMENTUM_OBI_ADVERSE_BLOCK;
+        let obi_blocks_bear = no_obi  < config::MOMENTUM_OBI_ADVERSE_BLOCK;
+        if obi_blocks_bull {
+            debug!("🚫 Momentum OBI veto (BULL): YES OBI={:.3} < block {:.3} — book fading the pump",
+                yes_obi, config::MOMENTUM_OBI_ADVERSE_BLOCK);
+        }
+        if obi_blocks_bear {
+            debug!("🚫 Momentum OBI veto (BEAR): NO OBI={:.3} < block {:.3} — book fading the dump",
+                no_obi, config::MOMENTUM_OBI_ADVERSE_BLOCK);
+        }
+
         if let Some(strike) = strike_price {
             // ── Window/Daily trend filter ─────────────────────────────────────
             let window_blocks_bull;
@@ -118,121 +187,66 @@ impl Strategy for MomentumStrategyImpl {
                 window_blocks_bear = false;
             }
 
-            // ── Expiry guard ──────────────────────────────────────────────────
-            // MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY (1200s) must be GREATER than
-            // MOMENTUM_EXPIRY_EXIT_SECS (900s).  If not, the NearExpiry exit fires
-            // on the very first tick after fill confirmation — a structurally
-            // guaranteed loss (observed: 2026-05-11 Trade 2, hold=0s, -$0.39).
-            if let Some(close_time) = ctx.market.market_close_time {
-                let secs_left = (close_time - chrono::Utc::now()).num_seconds();
-                if secs_left < config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY {
-                    debug!("🚫 Momentum entry blocked: only {}s to expiry (min {}s)",
-                        secs_left, config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY);
-                    return Ok(StrategySignal::NoSignal);
-                }
-            }
-
-            // ── Snapshot staleness gate ───────────────────────────────────────
-            // Every other strategy (GBoost, TimeDecay, Basis) blocks entries when
-            // the live WS snapshot is stale.  Momentum was the only strategy
-            // missing this guard.  When the WebSocket stops pushing updates the
-            // depth, spread, and OBI values silently retain their last-known state,
-            // causing the OBI veto and spread gate to evaluate against book data
-            // that may be 30+ seconds out of date.
-            // 2026-05-11 Trade 3: entry_hb_age≈32s → stale depth → unreliable OBI.
-            let snap_age = (chrono::Utc::now() - ctx.snapshot.timestamp).num_seconds();
-            if snap_age > config::MOMENTUM_MAX_SNAPSHOT_AGE_SECS {
-                debug!("🚫 Momentum entry blocked: snapshot too stale ({}s > max {}s)",
-                    snap_age, config::MOMENTUM_MAX_SNAPSHOT_AGE_SECS);
-                return Ok(StrategySignal::NoSignal);
-            }
-
-            // ── Spread gate: block wide-book entries ──────────────────────────
-            // ask_sum = YES_ask + NO_ask.  Normal tight books = 1.01–1.02.
-            // At 1.03+ the round-trip cost (BUY_OFFSET + SELL_OFFSET + spread)
-            // exceeds any expected gain from a routine BTC momentum burst.
-            let ask_sum = ctx.snapshot.yes_ask + ctx.snapshot.no_ask;
-            if ask_sum > config::MOMENTUM_MAX_ENTRY_ASK_SUM {
-                debug!("🚫 Momentum spread gate: ask_sum={:.3} > max {:.3} — book too wide",
-                    ask_sum, config::MOMENTUM_MAX_ENTRY_ASK_SUM);
-                return Ok(StrategySignal::NoSignal);
-            }
-
-            // ── Hourly OBI adverse-direction veto ─────────────────────────────
-            let yes_total_depth = ctx.snapshot.yes_bid_depth + ctx.snapshot.yes_ask_depth;
-            let no_total_depth  = ctx.snapshot.no_bid_depth  + ctx.snapshot.no_ask_depth;
-            // Default to -1.0 (maximally adverse) when depth data is missing.
-            // This prevents "ghost OBI" entries where the live snapshot has zero depth
-            // (which would default to obi=0.0 and silently pass the -0.40 gate) even though
-            // the heartbeat log shows strongly adverse OBI (-0.76 to -0.96).
-            let yes_obi = if yes_total_depth > dec!(0) {
-                (ctx.snapshot.yes_bid_depth - ctx.snapshot.yes_ask_depth) / yes_total_depth
-            } else { dec!(-1.0) };
-            let no_obi = if no_total_depth > dec!(0) {
-                (ctx.snapshot.no_bid_depth - ctx.snapshot.no_ask_depth) / no_total_depth
-            } else { dec!(-1.0) };
-            let obi_blocks_bull = yes_obi < config::MOMENTUM_OBI_ADVERSE_BLOCK;
-            let obi_blocks_bear = no_obi  < config::MOMENTUM_OBI_ADVERSE_BLOCK;
-            if obi_blocks_bull {
-                debug!("🚫 Momentum OBI veto (BULL): YES OBI={:.3} < block {:.3} — book fading the pump",
-                    yes_obi, config::MOMENTUM_OBI_ADVERSE_BLOCK);
-            }
-            if obi_blocks_bear {
-                debug!("🚫 Momentum OBI veto (BEAR): NO OBI={:.3} < block {:.3} — book fading the dump",
-                    no_obi, config::MOMENTUM_OBI_ADVERSE_BLOCK);
-            }
-
             // Primary entry
             if velocity > threshold && binance_price > (strike + strike_buffer)
-                && ctx.snapshot.yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
+                && yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
+                && yes_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
                 && short_ok_bull && accel_ok_bull && !window_blocks_bull && !obi_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
-                    params: entry_params!(ctx.market.yes_token, ctx.snapshot.yes_ask, ctx.market.yes_fee_bps as u16),
+                    params: entry_params!(ctx.market.yes_token, yes_ask, ctx.market.yes_fee_bps as u16),
                     pair_params: None,
                 });
             } else if velocity < -threshold && binance_price < (strike - strike_buffer)
-                && ctx.snapshot.no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
+                && no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
+                && no_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
                 && short_ok_bear && accel_ok_bear && !window_blocks_bear && !obi_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
-                    params: entry_params!(ctx.market.no_token, ctx.snapshot.no_ask, ctx.market.no_fee_bps as u16),
+                    params: entry_params!(ctx.market.no_token, no_ask, ctx.market.no_fee_bps as u16),
                     pair_params: None,
                 });
             }
 
             // Secondary "strike-crossing" entry
             if velocity > threshold && binance_price > strike
-                && ctx.snapshot.yes_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE
+                && yes_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE
+                && yes_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
                 && short_ok_bull && accel_ok_bull && !window_blocks_bull && !obi_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
-                    params: entry_params!(ctx.market.yes_token, ctx.snapshot.yes_ask, ctx.market.yes_fee_bps as u16),
+                    params: entry_params!(ctx.market.yes_token, yes_ask, ctx.market.yes_fee_bps as u16),
                     pair_params: None,
                 });
             } else if velocity < -threshold && binance_price < strike
-                && ctx.snapshot.no_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE
+                && no_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE
+                && no_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
                 && short_ok_bear && accel_ok_bear && !window_blocks_bear && !obi_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
-                    params: entry_params!(ctx.market.no_token, ctx.snapshot.no_ask, ctx.market.no_fee_bps as u16),
+                    params: entry_params!(ctx.market.no_token, no_ask, ctx.market.no_fee_bps as u16),
                     pair_params: None,
                 });
             }
         } else {
-            // Without strike
-            if velocity > threshold && ctx.snapshot.yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
-                && short_ok_bull && accel_ok_bull
+            // Without strike — universal gates already applied above; only
+            // velocity + price bounds needed here.
+            if velocity > threshold
+                && yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
+                && yes_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
+                && short_ok_bull && accel_ok_bull && !obi_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
-                    params: entry_params!(ctx.market.yes_token, ctx.snapshot.yes_ask, ctx.market.yes_fee_bps as u16),
+                    params: entry_params!(ctx.market.yes_token, yes_ask, ctx.market.yes_fee_bps as u16),
                     pair_params: None,
                 });
-            } else if velocity < -threshold && ctx.snapshot.no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
-                && short_ok_bear && accel_ok_bear
+            } else if velocity < -threshold
+                && no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
+                && no_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
+                && short_ok_bear && accel_ok_bear && !obi_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
-                    params: entry_params!(ctx.market.no_token, ctx.snapshot.no_ask, ctx.market.no_fee_bps as u16),
+                    params: entry_params!(ctx.market.no_token, no_ask, ctx.market.no_fee_bps as u16),
                     pair_params: None,
                 });
             }
@@ -253,9 +267,22 @@ impl Strategy for MomentumStrategyImpl {
 
             let secs_held = (chrono::Utc::now() - position.opened_at).num_seconds();
             if position.fill_confirmed_at.is_none() {
-                if secs_held < config::MOMENTUM_FILL_CONFIRM_MIN_HOLD_SECS { continue; }
                 let profit_margin_check = (bid - position.avg_entry) / position.avg_entry;
-                if profit_margin_check > -dc.momentum_stop_loss_pct { continue; }
+                if secs_held < config::MOMENTUM_FILL_CONFIRM_MIN_HOLD_SECS {
+                    // During the fill-confirmation window, allow an immediate escape
+                    // only if the loss is catastrophic (> MOMENTUM_CATASTROPHIC_SL_PCT).
+                    // Prevents lock-in to large sudden adverse moves while waiting for
+                    // the Polymarket indexer to register the balance.
+                    // Root cause: 2026-05-13 Trade #3 lost -14% during a 30s lock with
+                    // no exit allowed; a catastrophic SL at 8% would have exited at ~5s.
+                    if profit_margin_check > -config::MOMENTUM_CATASTROPHIC_SL_PCT {
+                        continue; // Not catastrophic yet — wait for fill confirmation
+                    }
+                    // Fall through: loss > catastrophic threshold → allow exit below
+                } else {
+                    // After 30s: normal stop-loss gate
+                    if profit_margin_check > -dc.momentum_stop_loss_pct { continue; }
+                }
             }
 
             let avg_entry = position.avg_entry;
