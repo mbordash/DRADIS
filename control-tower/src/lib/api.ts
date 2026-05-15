@@ -1,4 +1,4 @@
-import type { DynamicConfig, PnlSnapshotRow, TradeRow, OpenPositionRow, LlmRecommendationRow, ViperDef, StatusResponse } from './types';
+import type { DynamicConfig, PnlSnapshotRow, TradeRow, OpenPositionRow, LlmRecommendationRow, ViperDef, StatusResponse, PortfolioValue } from './types';
 
 // In development, NEXT_PUBLIC_API_URL=http://localhost:9000 (set in .env.local)
 // hits the DRADIS API directly.
@@ -59,6 +59,12 @@ export async function getStatus(): Promise<StatusResponse> {
 export async function getLlmRecommendations(limit = 10): Promise<LlmRecommendationRow[]> {
   const res = await fetch(`${BASE}/api/llm/recommendations?limit=${limit}`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/llm/recommendations → ${res.status}`);
+  return res.json();
+}
+
+export async function getPortfolioValue(): Promise<PortfolioValue> {
+  const res = await fetch(`${BASE}/api/portfolio`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/portfolio → ${res.status}`);
   return res.json();
 }
 

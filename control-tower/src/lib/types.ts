@@ -102,6 +102,16 @@ export interface StatusResponse {
   strategy_markets: Record<string, string>;
 }
 
+/** Portfolio value response from /api/portfolio — cash + open positions at live prices. */
+export interface PortfolioValue {
+  collateral:      string; // pUSD cash on deposit
+  positions_value: string; // Σ(shares × current mid-price)
+  total_value:     string; // collateral + positions_value
+  unrealized_pnl:  string; // Σ(shares × (current_mid − entry_price))
+  position_count:  number;
+  prices_live:     boolean; // false when Polymarket CLOB was unreachable
+}
+
 // ── Field descriptor for ViperCard ───────────────────────────────────────────
 
 export type FieldType = 'usd' | 'pct' | 'price' | 'decimal';

@@ -8,7 +8,7 @@ import ViperCard       from '@/components/ViperCard';
 import TradesTable     from '@/components/TradesTable';
 import LlmAdvisorCard  from '@/components/LlmAdvisorCard';
 import OpenPositionsCard from '@/components/OpenPositionsCard';
-import { getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations } from '@/lib/api';
+import { getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getPortfolioValue } from '@/lib/api';
 import type { DynamicConfig } from '@/lib/types';
 
 // Recharts must be loaded client-side only
@@ -44,10 +44,73 @@ function StatCard({ label, value, sub, valueClass = '' }: {
 function GhostBanner({ ghost }: { ghost: boolean }) {
   return ghost ? (
     <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg px-4 py-2 text-amber-300 text-xs font-mono flex items-center gap-2">
-      <span className="text-base">👻</span>
+      <span className="text-base"></span>
       <span><strong>GHOST MODE ACTIVE</strong> — orders are simulated, no real CLOB calls.</span>
     </div>
   ) : null;
+}
+
+// ── Portfolio value banner ────────────────────────────────────────────────────
+
+function PortfolioValueBanner({
+  totalValue, collateral, positionsValue, unrealizedPnl,
+  positionCount, startingBal, ghostMode, pricesLive, isLoading,
+}: {
+  totalValue: number; collateral: number; positionsValue: number;
+  unrealizedPnl: number; positionCount: number; startingBal: number;
+  ghostMode?: boolean; pricesLive: boolean; isLoading: boolean;
+}) {
+  const delta      = totalValue - startingBal;
+  const deltaPct   = startingBal > 0 ? delta / startingBal : 0;
+  const isPositive = delta >= 0;
+
+  return (
+    <div className="card px-5 py-4 flex flex-col sm:flex-row sm:items-center gap-3 border border-indigo-500/20 bg-[#0d0d1a]">
+      {/* Main figure */}
+      <div className="flex flex-col flex-1 min-w-0">
+        <div className="flex items-center gap-2 mb-0.5">
+          <span className="label-muted text-xs">Portfolio Value</span>
+          {!pricesLive && (
+            <span className="text-[10px] font-mono bg-yellow-500/10 text-yellow-400 border border-yellow-500/20 rounded px-1.5 py-0.5">
+              ⚡ cached prices
+            </span>
+          )}
+          {ghostMode && (
+            <span className="text-[10px] font-mono bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded px-1.5 py-0.5">
+              virtual
+            </span>
+          )}
+        </div>
+        <span className={`text-3xl font-mono font-bold tracking-tight ${isLoading ? 'text-gray-600' : 'text-white'}`}>
+          {isLoading ? '——' : fmt$(totalValue)}
+        </span>
+        {!isLoading && startingBal > 0 && (
+          <span className={`text-sm font-mono mt-0.5 ${isPositive ? 'text-green-400' : 'text-red-400'}`}>
+            {isPositive ? '▲' : '▼'} {fmt$(Math.abs(delta))} ({fmtPct(Math.abs(deltaPct))}) vs session start
+          </span>
+        )}
+      </div>
+
+      {/* Breakdown */}
+      <div className="flex gap-4 sm:gap-6 text-xs font-mono flex-wrap">
+        <div className="flex flex-col gap-0.5">
+          <span className="text-gray-500">Cash</span>
+          <span className="text-gray-300">{isLoading ? '—' : fmt$(collateral)}</span>
+        </div>
+        <div className="flex flex-col gap-0.5">
+          <span className="text-gray-500">Positions</span>
+          <span className="text-gray-300">{isLoading ? '—' : fmt$(positionsValue)}</span>
+          {positionCount > 0 && <span className="text-gray-600">{positionCount} open</span>}
+        </div>
+        <div className="flex flex-col gap-0.5">
+          <span className="text-gray-500">Unrealized P&L</span>
+          <span className={isLoading ? 'text-gray-600' : unrealizedPnl >= 0 ? 'text-green-400' : 'text-red-400'}>
+            {isLoading ? '—' : (unrealizedPnl >= 0 ? '+' : '') + fmt$(unrealizedPnl)}
+          </span>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 // ── Main page ─────────────────────────────────────────────────────────────────
@@ -75,6 +138,11 @@ export default function DashboardPage() {
   // Poll every 5 minutes — recommendations only arrive every 30 min at most.
   const { data: llmRecs, isLoading: llmLoading } =
     useSWR('llmRecs', () => getLlmRecommendations(10), { refreshInterval: 300_000 });
+
+  // Portfolio value: collateral + live mark-to-market on open positions.
+  // Refresh every 30 s so the number stays fresh without hammering Polymarket CLOB.
+  const { data: portfolio, isLoading: portfolioLoading } =
+    useSWR('portfolio', getPortfolioValue, { refreshInterval: 30_000 });
 
   // ── Stats derived from P&L history ──────────────────────────────────────────
   const latestSnap  = pnl?.[0];
@@ -140,7 +208,7 @@ export default function DashboardPage() {
                     : 'bg-[#13131f] border-[#1e1e32] text-gray-400 hover:border-gray-600',
                 ].join(' ')}
               >
-                <span>{config.ghost_mode ? '👻' : '⚡'}</span>
+                <span>{config.ghost_mode ? '' : '⚡'}</span>
                 <span>{config.ghost_mode ? 'GHOST' : 'LIVE'}</span>
               </button>
             )}
@@ -153,6 +221,19 @@ export default function DashboardPage() {
 
         {/* Ghost mode banner */}
         {config?.ghost_mode && <GhostBanner ghost />}
+
+        {/* ── Portfolio Value Banner ─────────────────────────────────── */}
+        <PortfolioValueBanner
+          totalValue={portfolioLoading ? 0 : parseFloat(portfolio?.total_value ?? '0')}
+          collateral={portfolioLoading ? 0 : parseFloat(portfolio?.collateral ?? '0')}
+          positionsValue={portfolioLoading ? 0 : parseFloat(portfolio?.positions_value ?? '0')}
+          unrealizedPnl={portfolioLoading ? 0 : parseFloat(portfolio?.unrealized_pnl ?? '0')}
+          positionCount={portfolio?.position_count ?? 0}
+          startingBal={startingBal}
+          ghostMode={config?.ghost_mode}
+          pricesLive={portfolio?.prices_live ?? true}
+          isLoading={portfolioLoading}
+        />
 
         {/* ── Stats row ─────────────────────────────────────────────────── */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
@@ -209,7 +290,7 @@ export default function DashboardPage() {
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-3">
               {[
                 { label: '⏰ Hourly', key: 'time_decay' },
-                { label: '📅 Window / Daily', key: 'maker' },
+                { label: ' Window / Daily', key: 'maker' },
               ].map(({ label, key }) => {
                 const mkt = status.strategy_markets[key];
                 return (

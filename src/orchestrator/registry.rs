@@ -18,11 +18,16 @@ pub struct StrategyRegistry;
 impl StrategyRegistry {
     /// Create a vector of all enabled strategies
     pub fn create_all_strategies() -> Vec<Box<dyn Strategy>> {
-        let mut strategies: Vec<Box<dyn Strategy>> = vec![
-            Box::new(MomentumStrategyImpl),
-            Box::new(ArbitrageStrategyImpl),
-            Box::new(TimeDecayStrategyImpl),
-        ];
+        let mut strategies: Vec<Box<dyn Strategy>> = Vec::new();
+        if config::ENABLE_MOMENTUM_TRADING {
+            strategies.push(Box::new(MomentumStrategyImpl));
+        }
+        if config::ENABLE_ARBITRAGE_TRADING {
+            strategies.push(Box::new(ArbitrageStrategyImpl));
+        }
+        if config::ENABLE_TIME_DECAY_TRADING {
+            strategies.push(Box::new(TimeDecayStrategyImpl));
+        }
         if config::ENABLE_MAKER_TRADING {
             strategies.push(Box::new(MakerStrategyImpl::new()));
         }
@@ -65,14 +70,13 @@ impl StrategyRegistry {
     /// (and trigger a second async model-load tokio::spawn) on every market switch —
     /// doubling model-load I/O and retrain CPU for no benefit.
     pub fn strategy_names() -> Vec<String> {
-        let mut names: Vec<&str> = vec![
-            "MomentumStrategy",
-            "ArbitrageStrategy",
-            "TimeDecayStrategy",
-        ];
-        if config::ENABLE_MAKER_TRADING  { names.push("MakerStrategy"); }
-        if config::ENABLE_BASIS_TRADING  { names.push("BasisStrategy"); }
-        if config::ENABLE_GBOOST_TRADING { names.push("GboostStrategy"); }
+        let mut names: Vec<&str> = Vec::new();
+        if config::ENABLE_MOMENTUM_TRADING   { names.push("MomentumStrategy"); }
+        if config::ENABLE_ARBITRAGE_TRADING  { names.push("ArbitrageStrategy"); }
+        if config::ENABLE_TIME_DECAY_TRADING { names.push("TimeDecayStrategy"); }
+        if config::ENABLE_MAKER_TRADING      { names.push("MakerStrategy"); }
+        if config::ENABLE_BASIS_TRADING      { names.push("BasisStrategy"); }
+        if config::ENABLE_GBOOST_TRADING     { names.push("GboostStrategy"); }
         names.into_iter().map(|s| s.to_string()).collect()
     }
 }

@@ -5,21 +5,24 @@
 /// 2. Detect and exit orphaned paired positions (ArbitrageStrategy / TimeDecayStrategy)
 ///    where the first leg filled but the second leg never did.
 /// 3. Prune expired TimeDecay position metadata.
-use std::collections::HashMap;
+/// 4. Sync open_positions DB table against live on-chain holdings (purge stale rows).
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
-use alloy::primitives::U256;
+use alloy::primitives::{Address, U256};
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
-use tracing::warn;
+use tracing::{info, warn};
 
 use polymarket_client_sdk_v2::clob::Client as ClobClient;
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::Normal;
 use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
+use polymarket_client_sdk_v2::data::Client as DataClient;
+use polymarket_client_sdk_v2::data::types::request::PositionsRequest;
 
 use crate::helpers::balance::PhantomCooldowns;
-use crate::helpers::notifications::send_notification;
+use crate::helpers::{db, notifications::send_notification};
 use crate::state::{Position, PositionMap};
 use crate::strategies::time_decay_impl::TimeDecayPosition;
 
@@ -137,3 +140,84 @@ pub async fn cleanup_time_decay_positions(
     let mut td_map = td_positions.lock().await;
     td_map.retain(|_, pos| !pos.is_expired());
 }
+
+/// Sync the `open_positions` DB table against the wallet's actual live holdings on
+/// Polymarket.  Runs at startup and every 300 s.
+///
+/// Two-way reconciliation:
+///   PURGE  — DB rows whose token is no longer held on-chain (settled, sold, crashed
+///             session that never called close_open_position, orphan that was flash-
+///             exited) are deleted so stale rows don't inflate the portfolio value.
+///
+///   ADOPT  — On-chain positions that have no DB row (opened in a previous session
+///             that crashed before writing the row, or positions entered manually
+///             on the Polymarket UI) are re-inserted so the UI and portfolio value
+///             reflect the full wallet.
+///
+/// IMPORTANT: token IDs are stored in the DB as *decimal* U256 strings
+/// (from `U256::to_string()`).  The Data API also returns `asset` as U256, so
+/// we must use `p.asset.to_string()` — NOT `format!("{:#x}", p.asset)` — when
+/// building the live-ID set; the hex format would never match and would cause
+/// every valid DB row to be wrongly purged on every tick.
+pub async fn sync_open_positions_with_chain(safe_address: Address) {
+    let pool = match db::pool() {
+        Some(p) => p,
+        None => { warn!("⚠️ Chain-sync: DB pool not available, skipping"); return; }
+    };
+
+    let data_client = DataClient::default();
+    let req = PositionsRequest::builder().user(safe_address).build();
+
+    let live_positions = match tokio::time::timeout(
+        std::time::Duration::from_secs(15),
+        data_client.positions(&req),
+    ).await {
+        Ok(Ok(p))  => p,
+        Ok(Err(e)) => { warn!("⚠️ Chain-sync: Polymarket Data API error: {}", e); return; }
+        Err(_)     => { warn!("⚠️ Chain-sync: Polymarket Data API timed out (15s)"); return; }
+    };
+
+    // Build map: decimal_token_id → &Position  (size > 0 only).
+    // MUST use p.asset.to_string() (decimal) — the DB stores token_id as decimal U256.
+    let live_map: std::collections::HashMap<String, &_> = live_positions
+        .iter()
+        .filter(|p| p.size > rust_decimal::Decimal::ZERO)
+        .map(|p| (p.asset.to_string(), p))
+        .collect();
+
+    // ── Purge stale DB rows ───────────────────────────────────────────────────
+    let live_ids: HashSet<String> = live_map.keys().cloned().collect();
+    let purged = db::purge_stale_open_positions(pool, &live_ids).await;
+
+    // ── Re-adopt on-chain positions missing from DB ───────────────────────────
+    // Query current DB token_ids AFTER the purge so we don't re-adopt something
+    // that was just correctly removed.
+    let db_ids: HashSet<String> = sqlx::query_scalar::<_, String>(
+        "SELECT DISTINCT token_id FROM open_positions"
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+    .into_iter()
+    .collect();
+
+    let mut adopted = 0usize;
+    for (token_str, pos) in &live_map {
+        if !db_ids.contains(token_str) {
+            if db::adopt_chain_position(pool, token_str, &pos.title, pos.avg_price, pos.size).await {
+                adopted += 1;
+                info!("📥 Chain-sync: re-adopted on-chain position — token {} | {} shares @ ${:.4} | \"{}\"",
+                    &token_str[..token_str.len().min(20)],
+                    pos.size, pos.avg_price, pos.title);
+            }
+        }
+    }
+
+    if purged > 0 {
+        info!("🧹 Chain-sync: purged {} stale open_positions row(s) (not found on-chain)", purged);
+    }
+    if purged == 0 && adopted == 0 {
+        info!("✅ Chain-sync: open_positions DB is in sync with on-chain holdings ({} live)", live_map.len());
+    }
+}
+

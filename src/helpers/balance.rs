@@ -132,7 +132,14 @@ pub async fn sync_position_balance(
                     return Ok(());
                 } else {
                     if time_since_open > 15 {
-                        warn!("⚠️ Position Sync [{}]: Token {} balance is 0 ({}s since open). Retrying...", strategy_name, token_id, time_since_open);
+                        // First warning fires at ~15s.  After that, throttle to once per
+                        // 60 seconds so GTC orders resting on a slow daily market don't
+                        // flood the log with hundreds of identical WARN lines.
+                        if time_since_open <= 20 || time_since_open % 60 < 4 {
+                            warn!("⚠️ Position Sync [{}]: Token {} balance is 0 ({}s since open). Retrying...", strategy_name, token_id, time_since_open);
+                        } else {
+                            debug!("⏳ Position Sync [{}]: Token {} balance is 0 ({}s since open). Retrying...", strategy_name, token_id, time_since_open);
+                        }
                     }
                     drop(pos_map);
                     tokio::time::sleep(Duration::from_millis(check_interval_ms)).await;

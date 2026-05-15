@@ -95,6 +95,19 @@ impl Strategy for ArbitrageStrategyImpl {
 
         // ── Strategy Exposure Check ──────────────────────────────────────────
         let trade_size = dc.arbitrage_position_size_usdc;
+
+        // ── Available collateral gate ────────────────────────────────────────
+        // Both legs are placed simultaneously and each costs ~trade_size/2 in
+        // USDC from the collateral balance.  If available_collateral < trade_size
+        // the NO leg will always fail with "not enough balance" from the CLOB.
+        // A 5% buffer covers rounding and any open-order holds against the balance.
+        if ctx.available_collateral < trade_size * dec!(1.05) {
+            debug!(
+                "🚫 Arb skipped — available collateral ${:.2} < required ${:.2}",
+                ctx.available_collateral, trade_size * dec!(1.05)
+            );
+            return Ok(StrategySignal::NoSignal);
+        }
         let current_exposure = {
             let pos_map = ctx.positions.lock().await;
             pos_map.iter()

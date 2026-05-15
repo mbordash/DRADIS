@@ -620,22 +620,90 @@ pub async fn record_open_position(
 }
 
 /// Remove a row from `open_positions` when a position is closed (any exit reason).
-/// Keyed by (session_id, strategy, token_id) — unique per strategy slot.
+/// Keyed by (strategy, token_id) — unique across all sessions.
 pub async fn close_open_position(
     pool: &SqlitePool,
     strategy: &str,
     token_id: &str,
 ) {
-    let sid = current_session_id();
     if let Err(e) = sqlx::query(
-        "DELETE FROM open_positions WHERE session_id = ? AND strategy = ? AND token_id = ?"
+        "DELETE FROM open_positions WHERE strategy = ? AND token_id = ?"
     )
-    .bind(sid)
     .bind(strategy)
     .bind(token_id)
     .execute(pool)
     .await {
         error!("❌ DB close_open_position failed: {}", e);
+    }
+}
+
+/// Delete every `open_positions` row whose token_id is NOT in `live_token_ids`.
+///
+/// Called by the chain-sync task after it fetches the wallet's actual live positions
+/// from the Polymarket Data API.  Any row left in the table after that is stale
+/// (settled, sold, or from a crashed session that never called close_open_position).
+pub async fn purge_stale_open_positions(
+    pool: &SqlitePool,
+    live_token_ids: &std::collections::HashSet<String>,
+) -> usize {
+    // Fetch every token_id currently in the table.
+    let rows: Vec<String> = match sqlx::query_scalar(
+        "SELECT DISTINCT token_id FROM open_positions"
+    )
+    .fetch_all(pool)
+    .await {
+        Ok(r)  => r,
+        Err(e) => { error!("❌ DB purge_stale_open_positions fetch failed: {}", e); return 0; }
+    };
+
+    let mut purged = 0usize;
+    for token_id in rows {
+        if !live_token_ids.contains(&token_id) {
+            if let Err(e) = sqlx::query("DELETE FROM open_positions WHERE token_id = ?")
+                .bind(&token_id)
+                .execute(pool)
+                .await
+            {
+                error!("❌ DB purge_stale_open_positions delete failed for {}: {}", token_id, e);
+            } else {
+                purged += 1;
+            }
+        }
+    }
+    purged
+}
+
+/// Re-adopt a single on-chain position that is missing from `open_positions`.
+///
+/// Uses `INSERT ... WHERE NOT EXISTS` so it is safe to call repeatedly — it is a
+/// no-op if a row for `token_id` already exists.  Returns `true` if a row was
+/// inserted.
+pub async fn adopt_chain_position(
+    pool: &SqlitePool,
+    token_id: &str,
+    market: &str,
+    avg_price: rust_decimal::Decimal,
+    shares: rust_decimal::Decimal,
+) -> bool {
+    let ts  = Utc::now().to_rfc3339();
+    let sid = current_session_id();
+    match sqlx::query(
+        "INSERT INTO open_positions
+             (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode)
+         SELECT ?, ?, 'ArbitrageStrategy', ?, ?, '?', ?, ?, 0
+         WHERE NOT EXISTS (SELECT 1 FROM open_positions WHERE token_id = ?)"
+    )
+    .bind(&ts)
+    .bind(sid)
+    .bind(token_id)
+    .bind(market)
+    .bind(avg_price.to_string())
+    .bind(shares.to_string())
+    .bind(token_id)
+    .execute(pool)
+    .await {
+        Ok(r)  => r.rows_affected() > 0,
+        Err(e) => { error!("❌ DB adopt_chain_position failed for {}: {}", token_id, e); false }
     }
 }
 
@@ -725,15 +793,15 @@ pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
     }
 }
 
-/// Return all open positions for the current session (inserted on entry, deleted on exit).
+/// Return all open positions across all sessions (inserted on entry, deleted on exit).
+/// Rows are explicitly deleted when a position is closed, so every surviving row is
+/// a live open position — even if a restart created a new session_id since entry.
 /// Used by the API (/api/positions) and the LLM Advisor prompt.
 pub async fn get_open_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
-    let sid = current_session_id();
     match sqlx::query(
         "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode
-         FROM open_positions WHERE session_id = ? ORDER BY ts ASC"
+         FROM open_positions ORDER BY ts ASC"
     )
-    .bind(sid)
     .fetch_all(pool)
     .await {
         Ok(rows) => rows.into_iter().filter_map(|r| Some(OpenPositionRow {
