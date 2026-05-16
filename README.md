@@ -13,6 +13,8 @@
 [![OpenClaw](https://img.shields.io/badge/OpenClaw-AI%20Integration-CC0000?logoColor=white)](https://openclaw.ai)
 ![License](https://img.shields.io/badge/License-GPLv3-blue)
 
+**WARNING**: This is **ALPHA** software. You will probably lose money. Start in GHOST mode and tune before going live. Make sure to regularly pull updates as our own LLM advises on config and Viper strategy impls daily. 
+
 ---
 
 ## ⚡ Quick Start

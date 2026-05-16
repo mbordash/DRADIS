@@ -1,12 +1,20 @@
 ---
 name: dradis-tactical-command
-description: Real-time supervisor and control interface for the DRADIS Polymarket high-frequency trading engine. Full support for DRADIS_API_KEY authentication via X-API-Key header.
+description: Real-time supervisor and control interface for the DRADIS Polymarket high-frequency trading engine. Full support for DRADIS_API_KEY authentication.
+homepage: https://github.com/mbordash/DRADIS
 user-invocable: true
 ---
 
 # Skill: DRADIS Tactical Command (v1.1.0)
 
-Full-featured autonomous supervisor for the DRADIS high-frequency prediction market execution engine.
+Full-featured autonomous supervisor for the **DRADIS** high-frequency PolyMarket high-frequency trading engine.
+
+## About DRADIS
+
+DRADIS is an open-source, low-latency Rust-based trading engine for Polymarket.  
+It features a Viper strategy engine, real-time equity curve, dynamic config hot-reloading, and a built-in LLM advisor.
+
+**Project repository:** [https://github.com/mbordash/DRADIS](https://github.com/mbordash/DRADIS)
 
 ## Authentication (New in v1.1.0)
 
