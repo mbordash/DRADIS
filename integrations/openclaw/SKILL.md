@@ -5,9 +5,9 @@ homepage: https://github.com/mbordash/DRADIS
 user-invocable: true
 ---
 
-# Skill: DRADIS Tactical Command (v1.1.0)
+# Skill: DRADIS Tactical Command (v1.3.0)
 
-Full-featured autonomous supervisor for the **DRADIS** high-frequency PolyMarket high-frequency trading engine.
+Full-featured autonomous supervisor for the **DRADIS** high-frequency prediction market execution engine.
 
 ## About DRADIS
 
@@ -16,13 +16,21 @@ It features a Viper strategy engine, real-time equity curve, dynamic config hot-
 
 **Project repository:** [https://github.com/mbordash/DRADIS](https://github.com/mbordash/DRADIS)
 
-## Authentication (New in v1.1.0)
+## Publisher Note (Addressing ClawScan Findings)
 
-DRADIS now supports optional API key authentication (see your README).
+ClawScan has flagged two medium-risk items (as expected for any live-trading integration):
+- Ability to PATCH live strategy parameters
+- Forwarding of a sensitive `DRADIS_API_KEY`
+
+These are intentional and documented. The skill **never** applies config changes without explicit human confirmation. I strongly recommend using a dedicated, least-privilege API key and only running this skill against your own trusted DRADIS instance.
+
+## Authentication
+
+DRADIS supports optional API key authentication via the `X-API-Key` header.
 
 - Set `DRADIS_API_KEY` in your OpenClaw configuration.
-- The skill **automatically** adds the header `X-API-Key: {{DRADIS_API_KEY}}` to **every** request.
-- Local development works without a key. Remote or production deployments **should** use the key.
+- The skill automatically adds the header to every request.
+- Local use works without a key; remote/production use strongly recommends it.
 
 ## Safety & Usage Guidelines (Critical)
 
@@ -32,7 +40,7 @@ The agent **must** follow these guardrails at all times:
 - `patch_dynamic_config` changes live strategy parameters without restarting the engine.  
   **Never** apply any configuration change without first explicitly confirming the exact update with the human user and receiving clear approval.
 - Only call tools when the user’s request directly relates to monitoring or configuration.
-- If the engine returns 401 Unauthorized, immediately tell the user they need to configure the `DRADIS_API_KEY`.
+- If the engine returns 401 Unauthorized, tell the user to configure the `DRADIS_API_KEY`.
 
 ## Example Natural Language Commands
 
