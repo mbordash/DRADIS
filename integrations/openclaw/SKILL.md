@@ -1,12 +1,20 @@
 ---
 name: dradis-tactical-command
-description: Real-time supervisor and control interface for the DRADIS Polymarket high-frequency trading engine. Monitor health, positions, P&L, trades, config, strategy markets, and LLM recommendations. Dynamically adjust parameters via natural language.
+description: Real-time supervisor and control interface for the DRADIS Polymarket high-frequency trading engine. Full support for DRADIS_API_KEY authentication via X-API-Key header.
 user-invocable: true
 ---
 
-# Skill: DRADIS Tactical Command
+# Skill: DRADIS Tactical Command (v1.1.0)
 
 Full-featured autonomous supervisor for the DRADIS high-frequency prediction market execution engine.
+
+## Authentication (New in v1.1.0)
+
+DRADIS now supports optional API key authentication (see your README).
+
+- Set `DRADIS_API_KEY` in your OpenClaw configuration.
+- The skill **automatically** adds the header `X-API-Key: {{DRADIS_API_KEY}}` to **every** request.
+- Local development works without a key. Remote or production deployments **should** use the key.
 
 ## Safety & Usage Guidelines (Critical)
 
@@ -14,15 +22,11 @@ Full-featured autonomous supervisor for the DRADIS high-frequency prediction mar
 The agent **must** follow these guardrails at all times:
 
 - `patch_dynamic_config` changes live strategy parameters without restarting the engine.  
-  **Never** apply any configuration change without first explicitly confirming the exact update with the human user and receiving clear approval (e.g., “Do you want me to set gboost_obi_adverse_block to -0.15? Yes/No”).
-- Only call tools when the user’s request directly relates to monitoring status, checking P&L/trades/positions, viewing config, or requesting a specific parameter adjustment.
-- Respect DRADIS’s built-in circuit breakers, rate limits, and safety mechanisms — the engine will reject unsafe changes.
-- If the engine returns an error or unhealthy state, immediately report it and **do not** attempt further config changes until the user is informed.
-- The agent should be conservative: prefer status/monitoring tools over config changes.
+  **Never** apply any configuration change without first explicitly confirming the exact update with the human user and receiving clear approval.
+- Only call tools when the user’s request directly relates to monitoring or configuration.
+- If the engine returns 401 Unauthorized, immediately tell the user they need to configure the `DRADIS_API_KEY`.
 
 ## Example Natural Language Commands
-
-The skill is designed to respond naturally to commands like:
 
 - “What’s the current status of DRADIS?”
 - “Show me open positions and session P&L”
@@ -31,71 +35,60 @@ The skill is designed to respond naturally to commands like:
 - “What does the LLM advisor recommend right now?”
 - “Show me the current config”
 - “Can you increase the adverse block threshold? Show me the current config first and confirm before patching.”
-- “Patch the config to disable basis trading and confirm with me”
 
 ## Configuration
 
 - `DRADIS_API_URL`: Base URL for the engine API (Default: `http://localhost:9000/api`)
+- `DRADIS_API_KEY`: API key for authentication (optional locally, **recommended** for remote/production)
 
 ## Tools
 
 ### 1. check_engine_status
-Queries overall engine health/liveness.
-
 - **Method:** `GET`
 - **Endpoint:** `{{DRADIS_API_URL}}/health`
-- **Response Format:** Plain text `"ok"` (or error)
+- **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
+- **Response Format:** Text or JSON
 
 ### 2. get_current_config
-Returns the full current dynamic configuration (all Viper parameters).
-
 - **Method:** `GET`
 - **Endpoint:** `{{DRADIS_API_URL}}/config`
+- **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
 - **Response Format:** JSON object of all configurable fields
 
 ### 3. patch_dynamic_config
-Dynamically updates Viper strategy parameters on the fly without an engine restart.
-
 - **Method:** `PATCH`
 - **Endpoint:** `{{DRADIS_API_URL}}/config`
+- **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
 - **Payload Type:** `application/json`
-- **Parameters:**  
-  `updates`: Object containing modified strategy variables (e.g. `{"gboost_obi_adverse_block": -0.15, "enable_basis": false}`)
-- **Safety Note:** This tool **requires explicit user confirmation** before sending the PATCH request. The agent must summarize the exact change and wait for approval.
+- **Parameters:** `updates` object (e.g. `{"gboost_obi_adverse_block": -0.15, "enable_basis": false}`)
+- **Safety Note:** Requires explicit user confirmation before executing.
 
 ### 4. check_session_pnl
-Retrieves the real-time equity curve and session P&L snapshots.
-
 - **Method:** `GET`
 - **Endpoint:** `{{DRADIS_API_URL}}/pnl/history`
-- **Response Format:** JSON array of objects (`{ "ts": number, "session_pnl": number, "collateral": number }`)
+- **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
+- **Response Format:** JSON array of equity snapshots
 
 ### 5. get_recent_trades
-Returns a list of recently completed trades.
-
 - **Method:** `GET`
 - **Endpoint:** `{{DRADIS_API_URL}}/trades`
-- **Query Param:** `limit` (optional, default 100, clamped 1–500)
-- **Response Format:** JSON array of trade objects
+- **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
+- **Query Param:** `limit` (optional, default 100)
 
 ### 6. get_open_positions
-Returns all currently open positions across strategies.
-
 - **Method:** `GET`
 - **Endpoint:** `{{DRADIS_API_URL}}/positions`
+- **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
 - **Response Format:** JSON array of open position records
 
 ### 7. get_strategy_status
-Shows which market each strategy is currently attached to.
-
 - **Method:** `GET`
 - **Endpoint:** `{{DRADIS_API_URL}}/status`
-- **Response Format:** JSON object `{ "strategy_markets": { "strategy_name": "market_name", ... } }`
+- **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
+- **Response Format:** JSON object of strategy → market mapping
 
 ### 8. get_llm_recommendations
-Returns recent recommendations and analyses from the built-in LLM Advisor.
-
 - **Method:** `GET`
 - **Endpoint:** `{{DRADIS_API_URL}}/llm/recommendations`
-- **Query Param:** `limit` (optional, default 10, clamped 1–50)
-- **Response Format:** JSON array of recommendation objects
+- **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
+- **Query Param:** `limit` (optional, default 10)
