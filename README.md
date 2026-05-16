@@ -51,7 +51,7 @@ curl -s http://<host>:11434/api/tags | python3 -m json.tool
 
 DRADIS is not just a bot; it is a comprehensive trading automation platform for prediction markets like Polymarket. Built in Rust for maximum concurrency and memory safety, it evaluates the selected markets every 50ms, coordinating multiple autonomous strategies to preserve capital and place orders where it sees inefficiencies.
 
-Unlike standard linear scripts, DRADIS uses a Tokio-powered orchestrator to manage telemetry (WebSockets), signal processing (**Raptors** — the recon layer that scouts external signals like Binance price feeds and funding rates), and tactical execution across six distinct **Viper** strategy classes. A built-in **LLM Advisor** periodically analyses completed trades and delivers actionable optimization recommendations directly to your Telegram channel — using any locally-running Ollama model you choose. You can also build your own Viper using our [implementation guide](docs/CUSTOM_STRATEGY.md).
+Unlike standard linear scripts, DRADIS uses a Tokio-powered orchestrator to manage telemetry (WebSockets), signal processing (**Raptors** — the recon layer that scouts external signals like Binance price feeds and funding rates), and tactical execution across six distinct **Viper** strategy classes. A built-in **LLM Advisor** periodically analyzes completed trades and delivers actionable optimization recommendations directly to your Telegram channel — using any locally-running Ollama model you choose. You can also build your own Viper using our [implementation guide](docs/CUSTOM_STRATEGY.md).
 
 ---
 
@@ -176,7 +176,7 @@ CT_PASSWORD=your-strong-password
 
 ## 🤖 LLM Advisor
 
-The LLM Advisor is an optional background task that periodically analyses your completed trades and sends **plain-English optimization recommendations** directly to your Telegram channel. It is powered by a locally-running [Ollama](https://ollama.com) instance — no data ever leaves your machine or server.
+The LLM Advisor is an optional background task that periodically analyzes your completed trades and sends **plain-English optimization recommendations** directly to your Telegram channel. It is powered by a locally-running [Ollama](https://ollama.com) instance — no data ever leaves your machine or server.
 
 ### What it does
 
