@@ -774,23 +774,33 @@ async fn main() -> Result<()> {
                     info!(" Network Pulse: {:?}", start.elapsed());
                 }
                 _ = cleanup_ticker.tick() => {
-                    // Cleanup for hourly market if it exists
-                    if hourly_yes_token != U256::ZERO {
-                        dradis::tasks::cleanup::cleanup_expired_positions(Arc::clone(&positions), hourly_market_name.clone(), hourly_yes_token, hourly_no_token, hourly_market_close_time).await;
-                    }
-                    // Cleanup for maker market if it exists
-                    if let Some(ref mk_config) = maker_market_config {
-                        dradis::tasks::cleanup::cleanup_expired_positions(Arc::clone(&positions), mk_config.market_name.clone(), mk_config.yes_token, mk_config.no_token, mk_config.market_close_time).await;
-                    }
+                    // Wrap the entire cleanup arm in a 45s outer timeout.
+                    // Belt-and-suspenders guard: even if an individual CLOB call inside
+                    // reconcile_orphaned_positions gains a new unguarded .await in the future,
+                    // the select! loop cannot block longer than 45s.
+                    // (Individual calls already have their own 10s timeouts; this is the backstop.)
+                    match tokio::time::timeout(Duration::from_secs(45), async {
+                        // Cleanup for hourly market if it exists
+                        if hourly_yes_token != U256::ZERO {
+                            dradis::tasks::cleanup::cleanup_expired_positions(Arc::clone(&positions), hourly_market_name.clone(), hourly_yes_token, hourly_no_token, hourly_market_close_time).await;
+                        }
+                        // Cleanup for maker market if it exists
+                        if let Some(ref mk_config) = maker_market_config {
+                            dradis::tasks::cleanup::cleanup_expired_positions(Arc::clone(&positions), mk_config.market_name.clone(), mk_config.yes_token, mk_config.no_token, mk_config.market_close_time).await;
+                        }
 
-                    if let Err(e) = dradis::tasks::cleanup::reconcile_orphaned_positions(Arc::clone(&positions), &trading_client, &phantom_cooldowns, &tg_token, &tg_chat_id).await { warn!("⚠️ Orphan reconciliation error: {}", e); }
-                    dradis::tasks::cleanup::cleanup_time_decay_positions(Arc::clone(&time_decay_positions)).await;
-                    dradis::tasks::cleanup::sync_open_positions_with_chain(safe_address).await;
+                        if let Err(e) = dradis::tasks::cleanup::reconcile_orphaned_positions(Arc::clone(&positions), &trading_client, &phantom_cooldowns, &tg_token, &tg_chat_id).await { warn!("⚠️ Orphan reconciliation error: {}", e); }
+                        dradis::tasks::cleanup::cleanup_time_decay_positions(Arc::clone(&time_decay_positions)).await;
+                        dradis::tasks::cleanup::sync_open_positions_with_chain(safe_address).await;
 
-                    // Periodically clean up expired pending order locks
-                    {
-                        let mut pending = pending_orders.lock().await;
-                        pending.retain(|_, &mut instant| instant > Instant::now());
+                        // Periodically clean up expired pending order locks
+                        {
+                            let mut pending = pending_orders.lock().await;
+                            pending.retain(|_, &mut instant| instant > Instant::now());
+                        }
+                    }).await {
+                        Ok(_) => {}
+                        Err(_) => warn!("⚠️ cleanup_ticker arm timed out (45s) — CLOB/Data API stall suspected; select! loop unblocked"),
                     }
                 }
                 _ = status_ticker.tick() => {

@@ -12,6 +12,7 @@ use std::sync::Arc;
 use alloy::primitives::{Address, U256};
 use chrono::{DateTime, Utc};
 use tokio::sync::Mutex;
+use tokio::time::timeout as tokio_timeout;
 use tracing::{info, warn};
 
 use polymarket_client_sdk_v2::clob::Client as ClobClient;
@@ -103,14 +104,24 @@ pub async fn reconcile_orphaned_positions(
               (now - position.opened_at).num_seconds());
 
         // Cancel any resting GTC order so it can't fill after we forget about it.
+        // Hard 10s timeouts on both CLOB calls — same fix as the 2026-05-01 overnight freeze
+        // (status_ticker arm). Without these, a TCP-level CLOB API stall inside the
+        // cleanup_ticker select! arm blocks the ENTIRE event loop indefinitely.
         let req = OrdersRequest::builder().asset_id(token_id).build();
-        if let Ok(page) = clob_client.orders(&req, None).await {
-            let ids: Vec<String> = page.data.into_iter().map(|o| o.id).collect();
-            if !ids.is_empty() {
-                let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
-                warn!("🛑 Cancelling {} resting order(s) for orphaned token {}", id_refs.len(), token_id);
-                let _ = clob_client.cancel_orders(&id_refs).await;
+        match tokio_timeout(std::time::Duration::from_secs(10), clob_client.orders(&req, None)).await {
+            Ok(Ok(page)) => {
+                let ids: Vec<String> = page.data.into_iter().map(|o| o.id).collect();
+                if !ids.is_empty() {
+                    let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
+                    warn!("🛑 Cancelling {} resting order(s) for orphaned token {}", id_refs.len(), token_id);
+                    match tokio_timeout(std::time::Duration::from_secs(10), clob_client.cancel_orders(&id_refs)).await {
+                        Ok(_) => {}
+                        Err(_) => warn!("⚠️ Orphan cleanup: cancel_orders timed out (10s) for token {} — skipping cancel", token_id),
+                    }
+                }
             }
+            Ok(Err(e)) => warn!("⚠️ Orphan cleanup: orders() error for token {}: {}", token_id, e),
+            Err(_) => warn!("⚠️ Orphan cleanup: orders() timed out (10s) for token {} — skipping cancel", token_id),
         }
 
         pos_map.remove(&(strategy_name.clone(), token_id));

@@ -9,7 +9,7 @@ use futures::StreamExt as _;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tokio::sync::watch;
-use tokio::time::{Duration, Instant};
+use tokio::time::{Duration, Instant, timeout as tokio_timeout};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{info, warn};
 use std::collections::VecDeque;
@@ -38,77 +38,92 @@ pub async fn run_oracle(
     loop {
         if let Ok((mut ws_stream, _)) = connect_async(&url_str).await {
             info!("📡 Connected to Binance Oracle for {}", binance_pair.to_uppercase());
-            while let Some(Ok(msg)) = ws_stream.next().await {
-                if let Message::Text(text) = msg {
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if let Some(price_str) = v.get("c").and_then(|p| p.as_str()) {
-                            if let Ok(price) = Decimal::from_str(price_str) {
-                                let now = Instant::now();
-                                let _ = oracle_tx.send(price);
-                                price_history.push_back((now, price));
+            // 30s read timeout per message: if Binance stops sending ticks (silently dead
+            // TCP connection / half-open socket), ws_stream.next().await would wait
+            // indefinitely — parking this Tokio worker thread and contributing to runtime
+            // starvation.  A 30s ceiling forces a reconnect on any silent stream stall.
+            'ws: loop {
+                match tokio_timeout(Duration::from_secs(30), ws_stream.next()).await {
+                    Ok(Some(Ok(msg))) => {
+                        if let Message::Text(text) = msg {
+                            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                                if let Some(price_str) = v.get("c").and_then(|p| p.as_str()) {
+                                    if let Ok(price) = Decimal::from_str(price_str) {
+                                        let now = Instant::now();
+                                        let _ = oracle_tx.send(price);
+                                        price_history.push_back((now, price));
 
-                                // Trim entries older than the primary window (5s)
-                                while let Some((t, _)) = price_history.front() {
-                                    if now.duration_since(*t).as_secs() >= config::MOMENTUM_WINDOW_SECS {
-                                        price_history.pop_front();
-                                    } else { break; }
-                                }
+                                        // Trim entries older than the primary window (5s)
+                                        while let Some((t, _)) = price_history.front() {
+                                            if now.duration_since(*t).as_secs() >= config::MOMENTUM_WINDOW_SECS {
+                                                price_history.pop_front();
+                                            } else { break; }
+                                        }
 
-                                // Primary velocity (5s window)
-                                let velocity_5s = if let Some((_, start_price)) = price_history.front() {
-                                    price - start_price
-                                } else { dec!(0) };
+                                        // Primary velocity (5s window)
+                                        let velocity_5s = if let Some((_, start_price)) = price_history.front() {
+                                            price - start_price
+                                        } else { dec!(0) };
 
-                                // Short velocity (1s window)
-                                let velocity_1s = {
-                                    let cutoff = config::MOMENTUM_SHORT_WINDOW_SECS;
-                                    let start_1s = price_history.iter()
-                                        .find(|(t, _)| now.duration_since(*t).as_secs() < cutoff);
-                                    match start_1s {
-                                        Some((_, p)) => price - p,
-                                        None => velocity_5s,
+                                        // Short velocity (1s window)
+                                        let velocity_1s = {
+                                            let cutoff = config::MOMENTUM_SHORT_WINDOW_SECS;
+                                            let start_1s = price_history.iter()
+                                                .find(|(t, _)| now.duration_since(*t).as_secs() < cutoff);
+                                            match start_1s {
+                                                Some((_, p)) => price - p,
+                                                None => velocity_5s,
+                                            }
+                                        };
+
+                                        // Acceleration: rate of change of velocity
+                                        let acceleration = velocity_5s - prev_velocity;
+                                        prev_velocity = velocity_5s;
+                                        let _ = velocity_tx.send((velocity_5s, velocity_1s, acceleration));
+
+                                        // 60-minute drift
+                                        price_history_60m.push_back((now, price));
+                                        while let Some((t, _)) = price_history_60m.front() {
+                                            if now.duration_since(*t).as_secs() > 3600 {
+                                                price_history_60m.pop_front();
+                                            } else { break; }
+                                        }
+                                        let drift_60m = if price_history_60m.len() > 1 {
+                                            if let Some((oldest_t, oldest_p)) = price_history_60m.front() {
+                                                if now.duration_since(*oldest_t).as_secs() >= 3600 {
+                                                    price - oldest_p
+                                                } else { dec!(0) }
+                                            } else { dec!(0) }
+                                        } else { dec!(0) };
+
+                                        // 10-minute drift — fills the 5s–60m gap for GBoost feature [18].
+                                        // Captures the medium-term trend where profitable binary moves develop.
+                                        price_history_10m.push_back((now, price));
+                                        while let Some((t, _)) = price_history_10m.front() {
+                                            if now.duration_since(*t).as_secs() > 600 {
+                                                price_history_10m.pop_front();
+                                            } else { break; }
+                                        }
+                                        let drift_10m = if price_history_10m.len() > 1 {
+                                            if let Some((oldest_t, oldest_p)) = price_history_10m.front() {
+                                                if now.duration_since(*oldest_t).as_secs() >= 600 {
+                                                    price - oldest_p
+                                                } else { dec!(0) }
+                                            } else { dec!(0) }
+                                        } else { dec!(0) };
+
+                                        let _ = drift_tx.send((drift_60m, drift_10m));
                                     }
-                                };
-
-                                // Acceleration: rate of change of velocity
-                                let acceleration = velocity_5s - prev_velocity;
-                                prev_velocity = velocity_5s;
-                                let _ = velocity_tx.send((velocity_5s, velocity_1s, acceleration));
-
-                                // 60-minute drift
-                                price_history_60m.push_back((now, price));
-                                while let Some((t, _)) = price_history_60m.front() {
-                                    if now.duration_since(*t).as_secs() > 3600 {
-                                        price_history_60m.pop_front();
-                                    } else { break; }
                                 }
-                                let drift_60m = if price_history_60m.len() > 1 {
-                                    if let Some((oldest_t, oldest_p)) = price_history_60m.front() {
-                                        if now.duration_since(*oldest_t).as_secs() >= 3600 {
-                                            price - oldest_p
-                                        } else { dec!(0) }
-                                    } else { dec!(0) }
-                                } else { dec!(0) };
-
-                                // 10-minute drift — fills the 5s–60m gap for GBoost feature [18].
-                                // Captures the medium-term trend where profitable binary moves develop.
-                                price_history_10m.push_back((now, price));
-                                while let Some((t, _)) = price_history_10m.front() {
-                                    if now.duration_since(*t).as_secs() > 600 {
-                                        price_history_10m.pop_front();
-                                    } else { break; }
-                                }
-                                let drift_10m = if price_history_10m.len() > 1 {
-                                    if let Some((oldest_t, oldest_p)) = price_history_10m.front() {
-                                        if now.duration_since(*oldest_t).as_secs() >= 600 {
-                                            price - oldest_p
-                                        } else { dec!(0) }
-                                    } else { dec!(0) }
-                                } else { dec!(0) };
-
-                                let _ = drift_tx.send((drift_60m, drift_10m));
                             }
                         }
+                    }
+                    // Stream closed cleanly or returned an error — reconnect.
+                    Ok(None) | Ok(Some(Err(_))) => break 'ws,
+                    // 30s elapsed with no message — silent stall; force reconnect.
+                    Err(_) => {
+                        warn!("⚠️ Binance Oracle: no tick in 30s — reconnecting");
+                        break 'ws;
                     }
                 }
             }
