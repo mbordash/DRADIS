@@ -1,6 +1,6 @@
 # DRADIS
 
-> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Polymarket. Six autonomous strategies (Momentum, Maker, Arbitrage, Time Decay, Basis, GBoost ML), real-time Next.js Control Tower, and an LLM Advisor that delivers optimization recommendations via Ollama (local or remote) + Telegram.
+> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Polymarket. Six autonomous strategies (Momentum, Maker, Arbitrage, Time Decay, Basis, GBoost ML), real-time Next.js Control Tower, and an LLM Advisor that delivers optimization recommendations via Ollama (local or remote) + Telegram & OpenClaw.
 
 ![Rust](https://img.shields.io/badge/Rust-1.95+-orange?logo=rust&logoColor=white)
 ![Tokio](https://img.shields.io/badge/Tokio-async%20runtime-darkgreen?logo=rust&logoColor=white)
