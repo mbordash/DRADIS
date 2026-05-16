@@ -257,10 +257,44 @@ pub async fn reconcile_orphaned_positions(
                 market_name: market_name.to_string(),
                 pair_token_id: token_id,
                 fill_confirmed_at: Some(Utc::now()),
-                paired_leg_token_id: None
+                paired_leg_token_id: None, // fixed up below
             });
             warn!("🔁 RECONCILE: Adopted {} {} shares for token {} under [{}] — avg_entry={:.4} (bid={:.4})",
                 actual_shares, side_label, token_id, strategy_name, avg_entry, current_bid);
+        }
+    }
+
+    // ── Wire paired_leg_token_id so the cleanup orphan-detector works ─────────
+    // Each position is inserted above with paired_leg_token_id: None, which means
+    // the cleanup.rs orphan reconciler (which checks `if let Some(paired) = ...`)
+    // would never fire for session-adopted positions.
+    //
+    // Post-pass: if exactly 2 tokens were provided (YES + NO pair), point each
+    // adopted position at the other token.  If only one leg has an on-chain
+    // balance (naked orphan), the cleanup cycle will detect the missing pair on
+    // its next run and remove the position while preventing phantom re-entry.
+    if tokens.len() == 2 {
+        let (tok_a, _) = tokens[0];
+        let (tok_b, _) = tokens[1];
+        let mut pos_map = positions.lock().await;
+
+        // Find which strategy adopted each token (may be None if balance was 0)
+        let strat_a = pos_map.iter()
+            .find(|((_, tid), _)| *tid == tok_a)
+            .map(|((s, _), _)| s.clone());
+        let strat_b = pos_map.iter()
+            .find(|((_, tid), _)| *tid == tok_b)
+            .map(|((s, _), _)| s.clone());
+
+        if let Some(sa) = strat_a {
+            if let Some(p) = pos_map.get_mut(&(sa, tok_a)) {
+                p.paired_leg_token_id = Some(tok_b);
+            }
+        }
+        if let Some(sb) = strat_b {
+            if let Some(p) = pos_map.get_mut(&(sb, tok_b)) {
+                p.paired_leg_token_id = Some(tok_a);
+            }
         }
     }
 }
