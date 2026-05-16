@@ -16,7 +16,8 @@
 use axum::{
     Router,
     routing::get,
-    extract::{State, Query},
+    extract::{State, Query, Request},
+    middleware::Next,
     response::{IntoResponse, Response},
     Json,
     http::StatusCode,
@@ -26,7 +27,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error}; // Import debug and error macros
+use tracing::{debug, error, warn};
 
 use crate::helpers::dynamic_config::DynamicConfig;
 use crate::helpers::db;
@@ -42,6 +43,39 @@ pub struct ApiState {
     pub config_rx: watch::Receiver<Arc<DynamicConfig>>,
     /// Receiver — maps strategy key ("time_decay", "momentum", …) to current market name.
     pub markets_rx: watch::Receiver<HashMap<String, String>>,
+    /// Optional API key read from `DRADIS_API_KEY` env var at startup.
+    /// When `Some`, every request must include `X-API-Key: <value>`.
+    /// When `None`, no authentication is required (default for local dev).
+    pub api_key: Option<String>,
+}
+
+// ─── API-key middleware ──────────────────────────────────────────────────────
+
+/// Optional `X-API-Key` authentication gate.
+///
+/// When `DRADIS_API_KEY` is set in the environment, every request must carry a
+/// matching `X-API-Key` header — including requests from OpenClaw or any other
+/// external tool.  When the env var is absent the middleware is a no-op, keeping
+/// local-dev workflow unchanged.
+///
+/// CORS pre-flight (`OPTIONS`) requests bypass this check because they are handled
+/// by `CorsLayer` (the outer layer) before this middleware is reached.
+async fn require_api_key(
+    State(s): State<ApiState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if let Some(ref expected) = s.api_key {
+        let provided = req
+            .headers()
+            .get("x-api-key")
+            .and_then(|v| v.to_str().ok());
+        if provided != Some(expected.as_str()) {
+            warn!("🔑 API key rejected — invalid or missing X-API-Key header");
+            return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
+        }
+    }
+    next.run(req).await
 }
 
 // ─── Query params ─────────────────────────────────────────────────────────────
@@ -221,7 +255,14 @@ pub async fn run_api_server(
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(9000);
 
-    let state = ApiState { config_tx, config_rx, markets_rx };
+    let api_key = std::env::var("DRADIS_API_KEY").ok();
+    if api_key.is_some() {
+        tracing::info!("🔑 API key authentication enabled (DRADIS_API_KEY is set)");
+    } else {
+        tracing::info!("🔓 API key authentication disabled (set DRADIS_API_KEY to enable)");
+    }
+
+    let state = ApiState { config_tx, config_rx, markets_rx, api_key };
 
     let app = Router::new()
         .route("/api/health",                get(health))
@@ -231,7 +272,11 @@ pub async fn run_api_server(
         .route("/api/positions",             get(get_open_positions))
         .route("/api/status",                get(get_status))
         .route("/api/llm/recommendations",   get(get_llm_recommendations))
-        // Permissive CORS so the Next.js Control Tower (any port) can reach the API.
+        // API-key check applied to all matched routes (inner layer — runs after CORS).
+        // No-op when DRADIS_API_KEY is unset so local-dev workflow is unchanged.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), require_api_key))
+        // Permissive CORS (outer layer — runs first, handles OPTIONS pre-flight
+        // before the API-key middleware is reached).
         .layer(CorsLayer::permissive())
         .with_state(state);
 

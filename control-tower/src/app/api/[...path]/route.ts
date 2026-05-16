@@ -11,19 +11,29 @@
  *
  * Local dev:   DRADIS_API_URL=http://localhost:9000   (set in start-local.sh)
  * Docker:      DRADIS_API_URL=http://dradis-btc:9000  (set in deploy-multi.sh)
+ *
+ * API key: if DRADIS_API_KEY is set (server-side env var, never sent to the
+ * browser), it is forwarded as X-API-Key on every proxied request so external
+ * tools like OpenClaw can be gated behind the same key without exposing it in
+ * the client-side JS bundle.
  */
 import { NextRequest, NextResponse } from 'next/server';
 
 const API_BASE = process.env.DRADIS_API_URL ?? 'http://localhost:9000';
+// Server-side only — NOT NEXT_PUBLIC_ so it never appears in the browser bundle.
+const API_KEY  = process.env.DRADIS_API_KEY ?? '';
 
 async function proxy(req: NextRequest, path: string[]): Promise<NextResponse> {
   const url = new URL(req.url);
   const target = `${API_BASE}/api/${path.join('/')}${url.search}`;
 
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+  if (API_KEY) headers['X-API-Key'] = API_KEY;
+
   try {
     const upstream = await fetch(target, {
       method:  req.method,
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body:    req.method !== 'GET' && req.method !== 'HEAD'
                  ? await req.text()
                  : undefined,

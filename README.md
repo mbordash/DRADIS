@@ -489,6 +489,74 @@ The priority is consistent profitability first — abstractions and new features
 
 ---
 
+## 🔌 Integrations
+
+### 🐾 OpenClaw Integration (Live Natural-Language Control)
+
+[OpenClaw](https://openclaw.ai) is a personal AI assistant that executes tasks from plain English via WhatsApp, Telegram, or any chat app. Because DRADIS exposes a clean REST API, it can be registered as an OpenClaw **skill** — giving you full voice/text control of your trading bot from your phone, no dashboard required.
+
+```bash
+openclaw skills install dradis-tactical-command
+```
+
+Once installed, OpenClaw maps natural language to DRADIS API calls automatically:
+
+| You say | OpenClaw calls | Effect |
+|---|---|---|
+| *"Pause GBoost"* | `PATCH /api/config {"enable_gboost": false}` | Stops GBoost entries on next tick |
+| *"Enable ghost mode"* | `PATCH /api/config {"ghost_mode": true}` | Switches to paper trading instantly |
+| *"Go live"* | `PATCH /api/config {"ghost_mode": false}` | Enables real order execution |
+| *"What's my P&L today?"* | `GET /api/trades` → summarize | Returns session profit/loss |
+| *"Show open positions"* | `GET /api/positions` | Lists all in-flight positions |
+| *"What is DRADIS doing right now?"* | `GET /api/status` | Reports active strategies and current market |
+| *"Tighten GBoost stop loss to 8%"* | `PATCH /api/config {"gboost_stop_loss_pct": "0.08"}` | Updates risk parameter live |
+| *"Turn off everything except Arbitrage"* | `PATCH /api/config` (multi-field) | Disables all non-Arb strategies |
+
+#### Prerequisites
+
+OpenClaw needs to reach your DRADIS API over the internet. Port `9000` is internal by default — expose it securely using one of:
+
+- **Cloudflare Tunnel** (`cloudflared tunnel`) — zero open inbound ports, free tier available, **recommended**
+- **Nginx reverse proxy** with TLS on your server
+- **AWS Security Group** — open port `9000` to a specific IP only (your phone's egress)
+
+#### API Key Authentication
+
+DRADIS has built-in optional API key enforcement. Set `DRADIS_API_KEY` in your `.env` file and every request to the engine must include a matching `X-API-Key` header:
+
+```bash
+# .env
+DRADIS_API_KEY=replace-with-a-strong-random-secret
+```
+
+**How it works end-to-end:**
+
+```
+OpenClaw ──► X-API-Key: <secret> ──► DRADIS :9000  ✅ allowed
+curl (no key)                    ──► DRADIS :9000  ❌ 401 Unauthorized
+Control Tower (browser)          ──► Next.js proxy ──► injects key server-side ──► DRADIS :9000  ✅ allowed
+```
+
+The Control Tower proxy (`/api/[...path]/route.ts`) reads `DRADIS_API_KEY` as a **server-side env var** and forwards it automatically — the key never appears in the browser JS bundle. Local development with no `DRADIS_API_KEY` set works exactly as before with no login prompt.
+
+Generate a strong key:
+```bash
+openssl rand -hex 32
+```
+
+#### Example Cloudflare Tunnel setup
+
+```bash
+# On your server
+cloudflared tunnel create dradis
+cloudflared tunnel route dns dradis api.yourdomain.com
+cloudflared tunnel run --url http://localhost:9000 dradis
+```
+
+Then point OpenClaw at `https://api.yourdomain.com` with your `DRADIS_API_KEY` value.
+
+---
+
 ## FAQ
 
 **Why Rust instead of Python?**
