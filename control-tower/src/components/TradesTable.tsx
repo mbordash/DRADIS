@@ -37,17 +37,20 @@ function TipCell({ full, maxChars, className = '' }: { full: string; maxChars: n
       ].filter(Boolean).join(' ')}>
         {truncate(full, maxChars)}
       </span>
-      {/* Tooltip panel */}
-      <span className="
-        pointer-events-none absolute z-50 bottom-full left-0 mb-1.5
-        w-max max-w-xs
-        rounded-md px-2.5 py-1.5
-        bg-[#1e1e35] border border-[#2e2e4e] text-gray-200 text-[11px] font-mono leading-snug
-        shadow-lg shadow-black/60
-        opacity-0 group-hover:opacity-100
-        transition-opacity duration-100
-        whitespace-pre-wrap break-words
-      ">
+      {/* Tooltip panel — select-none prevents hidden text from appearing in copy/paste */}
+      <span
+        aria-hidden="true"
+        className="
+          pointer-events-none select-none absolute z-50 bottom-full left-0 mb-1.5
+          w-max max-w-xs
+          rounded-md px-2.5 py-1.5
+          bg-[#1e1e35] border border-[#2e2e4e] text-gray-200 text-[11px] font-mono leading-snug
+          shadow-lg shadow-black/60
+          opacity-0 group-hover:opacity-100
+          transition-opacity duration-100
+          whitespace-pre-wrap break-words
+        "
+      >
         {full}
       </span>
     </span>

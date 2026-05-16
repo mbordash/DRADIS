@@ -1135,8 +1135,9 @@ async fn main() -> Result<()> {
                                     };
                                     positions.lock().await.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: params.token_id, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id) });
 
-                                    info!(" GHOST_MODE ENTRY [{}]: {} | ${:.4} x {:.1} (simulated)",
-                                        sn, params.market_name, params.price, params.shares);
+                                    let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" };
+                                    info!(" GHOST_MODE ENTRY {} [{}]: {} | ${:.4} x {:.1} (simulated)",
+                                        side_g, sn, params.market_name, params.price, params.shares);
                                     // Record ghost entries to DB — so the UI activity log and LLM advisor
                                     // can see in-flight positions before they close as completed trades.
                                     {
@@ -1156,7 +1157,8 @@ async fn main() -> Result<()> {
                                             (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE)
                                         };
                                         positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: actual_paired_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: Some(params.token_id) });
-                                        info!(" GHOST_MODE ENTRY (paired) [{}]: {} | ${:.4} x {:.1} (simulated)", sn, pp.market_name, pp.price, pp.shares);
+                                        let side_gp = if pp.token_id == target_yes_token { "YES" } else { "NO" };
+                                        info!(" GHOST_MODE ENTRY {} (paired) [{}]: {} | ${:.4} x {:.1} (simulated)", side_gp, sn, pp.market_name, pp.price, pp.shares);
                                         // Record paired ghost entry to DB
                                         {
                                             let side_gp = if pp.token_id == target_yes_token { "YES" } else { "NO" };
