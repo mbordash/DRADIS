@@ -120,7 +120,7 @@ The core of DRADIS is the Orchestrator. It acts as the ship's brain, maintaining
 
 DRADIS currently deploys six specialized Viper strategy classes. Each Viper is an autonomous tactical unit with its own capital budget, position book, and entry/exit logic — no Viper can compromise another's fuel.
 
-- **Momentum**: Scans for high-velocity Binance moves. If a "target" moves $75 in 5 seconds, the Interceptor strikes the Polymarket book before it can reprice.
+- **Momentum**: Scans for high-velocity Binance moves. If a "target" moves $75 in 5 seconds, the Viper strikes the Polymarket book before it can reprice.
 - **Maker**: Maintains a dual-sided presence on the Window venue, capturing the spread while managing net exposure.
 - **Arbitrage**: Constantly monitors the price sum of YES/NO pairs, looking for sub-$1.00 opportunities in low-fee venues.
 - **Time Decay**: Posts resting maker bids on both YES and NO of the Hourly venue during the theta window, earning the combined bid discount and settling at $1.00 with zero fee drag.
