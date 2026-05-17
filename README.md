@@ -350,17 +350,21 @@ The bot automatically records every completed trade into a daily CSV file for ea
 
 ### RPC Configuration
 
-The auto-settlement feature (merging/redeeming positions after market resolution) requires a **reliable, paid Polygon RPC endpoint**. Free public RPCs (polygon-rpc.com, Ankr, PublicNode) are unsuitable — they will fail with API key or nonce errors during settlement.
+The auto-settlement feature (merging/redeeming positions after market resolution) requires a **reliable, paid Polygon (EVM) RPC endpoint**. Free public RPCs (polygon-rpc.com, Ankr, PublicNode) are unsuitable — they will fail with API key or nonce errors during settlement.
 
-**Recommended providers** (all with free tiers):
-- [Helius](https://www.helius-rpc.com/) — **recommended**; simple setup, Polygon-focused pricing
+> ⚠️ **Helius is a Solana-only RPC — do not use it for DRADIS.** Using a Solana endpoint will result in `"Method not found"` errors.
+
+**Recommended providers** (all with free tiers, all support Polygon):
+- [Alchemy](https://www.alchemy.com/) — **recommended**; excellent free tier, easy Polygon mainnet setup
 - [QuickNode](https://www.quicknode.com/) — reliable, industry standard
-- [Alchemy](https://www.alchemy.com/) — enterprise reliability
-- [Lava](https://www.lavanet.xyz/) — decentralized, Polygon-focused
+- [Infura](https://infura.io/) — simple setup, generous free tier
 
 Once you have an API key, add it to `.env`:
 ```bash
-POLYGON_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY
+# Alchemy:   POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_API_KEY
+# QuickNode: POLYGON_RPC_URL=https://polygon-mainnet.quiknode.pro/YOUR_KEY/
+# Infura:    POLYGON_RPC_URL=https://polygon-mainnet.infura.io/v3/YOUR_API_KEY
+POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_API_KEY
 ```
 
 The startup will fail with a clear error if `POLYGON_RPC_URL` is not set.
