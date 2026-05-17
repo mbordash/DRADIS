@@ -6,21 +6,27 @@
 ///    where the first leg filled but the second leg never did.
 /// 3. Prune expired TimeDecay position metadata.
 /// 4. Sync open_positions DB table against live on-chain holdings (purge stale rows).
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
-use alloy::primitives::{Address, U256};
+use alloy::primitives::{Address, B256, U256};
+use alloy::providers::Provider;
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use tokio::sync::Mutex;
 use tokio::time::timeout as tokio_timeout;
 use tracing::{info, warn};
 
+use polymarket_client_sdk_v2::ctf::Client as CtfClient;
+use polymarket_client_sdk_v2::ctf::types::{MergePositionsRequest, RedeemNegRiskRequest, RedeemPositionsRequest};
 use polymarket_client_sdk_v2::clob::Client as ClobClient;
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::Normal;
 use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
 use polymarket_client_sdk_v2::data::Client as DataClient;
 use polymarket_client_sdk_v2::data::types::request::PositionsRequest;
+use polymarket_client_sdk_v2::{POLYGON, contract_config};
 
 use crate::helpers::balance::PhantomCooldowns;
 use crate::helpers::{db, notifications::send_notification};
@@ -230,5 +236,158 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
     if purged == 0 && adopted == 0 {
         info!("✅ Chain-sync: open_positions DB is in sync with on-chain holdings ({} live)", live_map.len());
     }
+}
+
+fn shares_to_base_units(shares: Decimal) -> u128 {
+    // CTF contract methods consume 6-decimal fixed-point token amounts.
+    (shares.max(Decimal::ZERO).trunc_with_scale(6) * Decimal::from(1_000_000u32))
+        .trunc()
+        .to_u128()
+        .unwrap_or(0)
+}
+
+/// Scan for resolved/closed markets and auto-settle positions so wallet + UI stay in sync.
+///
+/// - `mergeable`: merge matched YES/NO full sets back to collateral.
+/// - `redeemable`: redeem resolved winning outcome tokens.
+pub async fn auto_settle_closed_positions<P: Provider + Clone>(
+    safe_address: Address,
+    ctf_client: &Arc<CtfClient<P>>,
+    ctf_neg_risk_client: &Arc<CtfClient<P>>,
+) -> bool {
+    let data_client = DataClient::default();
+    let req = PositionsRequest::builder().user(safe_address).build();
+
+    let positions = match tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        data_client.positions(&req),
+    )
+    .await
+    {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => {
+            warn!("⚠️ Auto-settle: Data API positions() error: {}", e);
+            return false;
+        }
+        Err(_) => {
+            warn!("⚠️ Auto-settle: Data API positions() timed out (20s)");
+            return false;
+        }
+    };
+
+    let mut by_condition: HashMap<B256, Vec<_>> = HashMap::new();
+    for p in positions.into_iter().filter(|p| p.size > Decimal::ZERO) {
+        by_condition.entry(p.condition_id).or_default().push(p);
+    }
+
+    let min_merge_units = shares_to_base_units(crate::config::MIN_MERGE_SHARES);
+    let mut settled_any = false;
+
+    for (condition_id, legs) in by_condition {
+        let has_mergeable = legs.iter().any(|p| p.mergeable);
+        let has_redeemable = legs.iter().any(|p| p.redeemable);
+        if !has_mergeable && !has_redeemable {
+            continue;
+        }
+
+        let is_neg_risk = legs.iter().any(|p| p.negative_risk);
+        let Some(cfg) = contract_config(POLYGON, is_neg_risk) else {
+            warn!("⚠️ Auto-settle: missing contract config for chain={} neg_risk={}", POLYGON, is_neg_risk);
+            continue;
+        };
+
+        let mut outcome_units: BTreeMap<i32, u128> = BTreeMap::new();
+        for p in &legs {
+            let units = shares_to_base_units(p.size);
+            if units == 0 {
+                continue;
+            }
+            *outcome_units.entry(p.outcome_index).or_insert(0) += units;
+        }
+
+        if has_mergeable && outcome_units.len() >= 2 {
+            let merge_units = outcome_units.values().copied().min().unwrap_or(0);
+            if merge_units >= min_merge_units {
+                let merge_req = MergePositionsRequest::for_binary_market(
+                    cfg.collateral,
+                    condition_id,
+                    U256::from(merge_units),
+                );
+                let merge_result = if is_neg_risk {
+                    ctf_neg_risk_client.merge_positions(&merge_req).await
+                } else {
+                    ctf_client.merge_positions(&merge_req).await
+                };
+
+                match merge_result {
+                    Ok(resp) => {
+                        settled_any = true;
+                        info!(
+                            "🔄 Auto-settle: merged {} full-set shares for condition {} (tx {})",
+                            Decimal::from(merge_units) / Decimal::from(1_000_000u32),
+                            condition_id,
+                            resp.transaction_hash
+                        );
+                    }
+                    Err(e) => warn!(
+                        "⚠️ Auto-settle: merge failed for condition {} (neg_risk={}): {}",
+                        condition_id,
+                        is_neg_risk,
+                        e
+                    ),
+                }
+            }
+        }
+
+        if has_redeemable {
+            if is_neg_risk {
+                let yes_units = *outcome_units.get(&0).unwrap_or(&0);
+                let no_units = *outcome_units.get(&1).unwrap_or(&0);
+                if yes_units == 0 && no_units == 0 {
+                    continue;
+                }
+
+                let redeem_req = RedeemNegRiskRequest::builder()
+                    .condition_id(condition_id)
+                    .amounts(vec![U256::from(yes_units), U256::from(no_units)])
+                    .build();
+
+                match ctf_neg_risk_client.redeem_neg_risk(&redeem_req).await {
+                    Ok(resp) => {
+                        settled_any = true;
+                        info!(
+                            "🏁 Auto-settle: redeemed neg-risk condition {} (tx {})",
+                            condition_id,
+                            resp.transaction_hash
+                        );
+                    }
+                    Err(e) => warn!(
+                        "⚠️ Auto-settle: neg-risk redeem failed for condition {}: {}",
+                        condition_id,
+                        e
+                    ),
+                }
+            } else {
+                let redeem_req = RedeemPositionsRequest::for_binary_market(cfg.collateral, condition_id);
+                match ctf_client.redeem_positions(&redeem_req).await {
+                    Ok(resp) => {
+                        settled_any = true;
+                        info!(
+                            "🏁 Auto-settle: redeemed condition {} (tx {})",
+                            condition_id,
+                            resp.transaction_hash
+                        );
+                    }
+                    Err(e) => warn!(
+                        "⚠️ Auto-settle: redeem failed for condition {}: {}",
+                        condition_id,
+                        e
+                    ),
+                }
+            }
+        }
+    }
+
+    settled_any
 }
 

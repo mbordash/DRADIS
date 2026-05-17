@@ -10,11 +10,13 @@ use polymarket_client_sdk_v2::clob::types::{Side, SignatureType, OrderType};
 use polymarket_client_sdk_v2::{POLYGON, PRIVATE_KEY_VAR, derive_safe_wallet};
 use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk_v2::clob::types::AssetType;
+use polymarket_client_sdk_v2::ctf::Client as CtfClient;
 
 use futures::StreamExt as _;
 use polymarket_client_sdk_v2::clob::ws::Client as WsClient;
 
 use alloy::primitives::{U256, Address, address};
+use alloy::providers::ProviderBuilder;
 use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer;
 
@@ -176,6 +178,15 @@ async fn main() -> Result<()> {
     let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
     let eoa_address = signer.address();
     info!("Trading wallet (EOA) address: {}", eoa_address);
+
+    let polygon_rpc_url = env::var("POLYGON_RPC_URL").unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
+    let wallet_provider = ProviderBuilder::new()
+        .wallet(signer.clone())
+        .connect(&polygon_rpc_url)
+        .await?;
+    let ctf_client = Arc::new(CtfClient::new(wallet_provider.clone(), POLYGON)?);
+    let ctf_neg_risk_client = Arc::new(CtfClient::with_neg_risk(wallet_provider.clone(), POLYGON)?);
+    info!("✅ CTF auto-settlement client ready (rpc={})", polygon_rpc_url);
 
     let trading_client = Arc::new(ClobClient::new(config::CLOB_API_BASE, Config::default())?
         .authentication_builder(&signer)
@@ -618,6 +629,7 @@ async fn main() -> Result<()> {
         let mut ticker = interval(config::main_ticker_interval());
         let mut status_ticker = interval(std::time::Duration::from_secs(60));
         let mut cleanup_ticker = interval(std::time::Duration::from_secs(300));
+        let mut settlement_ticker = interval(std::time::Duration::from_secs(config::MERGE_SCAN_INTERVAL_SECS));
         let mut pulse_ticker = interval(std::time::Duration::from_secs(300));
         // Watchdog ticker: checks every 120s if the strategy ticker has been alive.
         // If the inner loop goes silent (e.g., blocked on a stalled .await), this breaks
@@ -801,6 +813,23 @@ async fn main() -> Result<()> {
                     }).await {
                         Ok(_) => {}
                         Err(_) => warn!("⚠️ cleanup_ticker arm timed out (45s) — CLOB/Data API stall suspected; select! loop unblocked"),
+                    }
+                }
+                _ = settlement_ticker.tick() => {
+                    match tokio::time::timeout(Duration::from_secs(60), async {
+                        let settled = dradis::tasks::cleanup::auto_settle_closed_positions(
+                            safe_address,
+                            &ctf_client,
+                            &ctf_neg_risk_client,
+                        ).await;
+
+                        if settled {
+                            // Keep Control Tower's open_positions mirror current right after settlement.
+                            dradis::tasks::cleanup::sync_open_positions_with_chain(safe_address).await;
+                        }
+                    }).await {
+                        Ok(_) => {}
+                        Err(_) => warn!("⚠️ settlement_ticker arm timed out (60s) — skipping this cycle"),
                     }
                 }
                 _ = status_ticker.tick() => {
