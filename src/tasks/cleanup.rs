@@ -329,12 +329,27 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
                             resp.transaction_hash
                         );
                     }
-                    Err(e) => warn!(
-                        "⚠️ Auto-settle: merge failed for condition {} (neg_risk={}): {}",
-                        condition_id,
-                        is_neg_risk,
-                        e
-                    ),
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if err_str.contains("401") || err_str.contains("403") ||
+                           err_str.contains("API key") || err_str.contains("tenant disabled") ||
+                           err_str.contains("Unauthorized") {
+                            warn!(
+                                "🔑 ⚠️ Auto-settle: RPC authentication error (merge failed for {}): {}",
+                                condition_id,
+                                e
+                            );
+                            warn!("   → Check POLYGON_RPC_URL env var. API key may be disabled or expired.");
+                            warn!("   → Fallback: Use public endpoint https://polygon-rpc.com");
+                        } else {
+                            warn!(
+                                "⚠️ Auto-settle: merge failed for condition {} (neg_risk={}): {}",
+                                condition_id,
+                                is_neg_risk,
+                                e
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -361,11 +376,24 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
                             resp.transaction_hash
                         );
                     }
-                    Err(e) => warn!(
-                        "⚠️ Auto-settle: neg-risk redeem failed for condition {}: {}",
-                        condition_id,
-                        e
-                    ),
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if err_str.contains("401") || err_str.contains("403") ||
+                           err_str.contains("API key") || err_str.contains("tenant disabled") {
+                            warn!(
+                                "🔑 ⚠️ Auto-settle: RPC authentication error (neg-risk redeem failed for {}): {}",
+                                condition_id,
+                                e
+                            );
+                            warn!("   → Check POLYGON_RPC_URL env var. API key may be disabled or expired.");
+                        } else {
+                            warn!(
+                                "⚠️ Auto-settle: neg-risk redeem failed for condition {}: {}",
+                                condition_id,
+                                e
+                            );
+                        }
+                    }
                 }
             } else {
                 let redeem_req = RedeemPositionsRequest::for_binary_market(cfg.collateral, condition_id);
@@ -378,11 +406,24 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
                             resp.transaction_hash
                         );
                     }
-                    Err(e) => warn!(
-                        "⚠️ Auto-settle: redeem failed for condition {}: {}",
-                        condition_id,
-                        e
-                    ),
+                    Err(e) => {
+                        let err_str = e.to_string();
+                        if err_str.contains("401") || err_str.contains("403") ||
+                           err_str.contains("API key") || err_str.contains("tenant disabled") {
+                            warn!(
+                                "🔑 ⚠️ Auto-settle: RPC authentication error (redeem failed for {}): {}",
+                                condition_id,
+                                e
+                            );
+                            warn!("   → Check POLYGON_RPC_URL env var. API key may be disabled or expired.");
+                        } else {
+                            warn!(
+                                "⚠️ Auto-settle: redeem failed for condition {}: {}",
+                                condition_id,
+                                e
+                            );
+                        }
+                    }
                 }
             }
         }
