@@ -22,9 +22,9 @@
 ```bash
 # 1. Clone and configure
 git clone https://github.com/youruser/dradis.git && cd dradis
-cp .env.example .env          # fill in POLYMARKET_API_KEY, TELEGRAM_BOT_TOKEN, etc.
+cp .env.example .env          # fill in POLYMARKET_PRIVATE_KEY, POLYGON_RPC_URL, TELEGRAM tokens, etc.
 cp deploy-multi.sh.example deploy-multi.sh  # fill in HOST, USER, KEY
-
+```
 # 2. Deploy (builds Rust engine + Control Tower, starts Ollama, pulls model)
 chmod +x deploy-multi.sh && ./deploy-multi.sh
 ```
@@ -344,8 +344,26 @@ The bot automatically records every completed trade into a daily CSV file for ea
 ### Requirements
 - Rust 1.95+ (or Docker)
 - A Polygon wallet with USDC and MATIC
+- **A paid Polygon RPC endpoint** (required for auto-settlement) — See [RPC Configuration](#rpc-configuration) below
 - Telegram bot token (optional, see [Notifications](#notifications))
 - X developer credentials (optional, see [Notifications](#notifications))
+
+### RPC Configuration
+
+The auto-settlement feature (merging/redeeming positions after market resolution) requires a **reliable, paid Polygon RPC endpoint**. Free public RPCs (polygon-rpc.com, Ankr, PublicNode) are unsuitable — they will fail with API key or nonce errors during settlement.
+
+**Recommended providers** (all with free tiers):
+- [Helius](https://www.helius-rpc.com/) — **recommended**; simple setup, Polygon-focused pricing
+- [QuickNode](https://www.quicknode.com/) — reliable, industry standard
+- [Alchemy](https://www.alchemy.com/) — enterprise reliability
+- [Lava](https://www.lavanet.xyz/) — decentralized, Polygon-focused
+
+Once you have an API key, add it to `.env`:
+```bash
+POLYGON_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_API_KEY
+```
+
+The startup will fail with a clear error if `POLYGON_RPC_URL` is not set.
 
 ### Configuration Profiles
 

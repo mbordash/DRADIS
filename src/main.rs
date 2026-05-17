@@ -179,21 +179,16 @@ async fn main() -> Result<()> {
     let eoa_address = signer.address();
     info!("Trading wallet (EOA) address: {}", eoa_address);
 
-    let polygon_rpc_url = env::var("POLYGON_RPC_URL").unwrap_or_else(|_| "https://polygon-rpc.com".to_string());
+    let polygon_rpc_url = env::var("POLYGON_RPC_URL")
+        .map_err(|_| anyhow::anyhow!("❌ POLYGON_RPC_URL not set in .env. Required for auto-settlement transactions. Use a paid RPC service like Helius (https://www.helius-rpc.com) or QuickNode. Example: POLYGON_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"))?;
+
     let wallet_provider = ProviderBuilder::new()
         .wallet(signer.clone())
         .connect(&polygon_rpc_url)
         .await?;
     let ctf_client = Arc::new(CtfClient::new(wallet_provider.clone(), POLYGON)?);
     let ctf_neg_risk_client = Arc::new(CtfClient::with_neg_risk(wallet_provider.clone(), POLYGON)?);
-    // Dedicated public-RPC fallback for settlement txs when primary RPC auth fails.
-    let public_polygon_rpc_url = "https://polygon-rpc.com";
-    let public_wallet_provider = ProviderBuilder::new()
-        .wallet(signer.clone())
-        .connect(public_polygon_rpc_url)
-        .await?;
-    let ctf_public_client = Arc::new(CtfClient::new(public_wallet_provider.clone(), POLYGON)?);
-    let ctf_public_neg_risk_client = Arc::new(CtfClient::with_neg_risk(public_wallet_provider.clone(), POLYGON)?);
+
     info!("✅ CTF auto-settlement client ready (rpc={})", polygon_rpc_url);
 
     let trading_client = Arc::new(ClobClient::new(config::CLOB_API_BASE, Config::default())?
@@ -829,8 +824,6 @@ async fn main() -> Result<()> {
                             safe_address,
                             &ctf_client,
                             &ctf_neg_risk_client,
-                            &ctf_public_client,
-                            &ctf_public_neg_risk_client,
                         ).await;
 
                         if settled {
