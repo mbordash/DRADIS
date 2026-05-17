@@ -254,6 +254,8 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
     safe_address: Address,
     ctf_client: &Arc<CtfClient<P>>,
     ctf_neg_risk_client: &Arc<CtfClient<P>>,
+    ctf_public_client: &Arc<CtfClient<P>>,
+    ctf_public_neg_risk_client: &Arc<CtfClient<P>>,
 ) -> bool {
     let data_client = DataClient::default();
     let req = PositionsRequest::builder().user(safe_address).build();
@@ -331,16 +333,35 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
                     }
                     Err(e) => {
                         let err_str = e.to_string();
-                        if err_str.contains("401") || err_str.contains("403") ||
-                           err_str.contains("API key") || err_str.contains("tenant disabled") ||
-                           err_str.contains("Unauthorized") {
+                        if is_rpc_auth_error(&err_str) {
                             warn!(
                                 "🔑 ⚠️ Auto-settle: RPC authentication error (merge failed for {}): {}",
                                 condition_id,
                                 e
                             );
-                            warn!("   → Check POLYGON_RPC_URL env var. API key may be disabled or expired.");
-                            warn!("   → Fallback: Use public endpoint https://polygon-rpc.com");
+                            warn!("   → Retrying merge using public RPC fallback https://polygon-rpc.com");
+
+                            let fallback_result = if is_neg_risk {
+                                ctf_public_neg_risk_client.merge_positions(&merge_req).await
+                            } else {
+                                ctf_public_client.merge_positions(&merge_req).await
+                            };
+
+                            match fallback_result {
+                                Ok(resp) => {
+                                    settled_any = true;
+                                    info!(
+                                        "🔄 Auto-settle: merge succeeded via public RPC fallback for condition {} (tx {})",
+                                        condition_id,
+                                        resp.transaction_hash
+                                    );
+                                }
+                                Err(fallback_err) => warn!(
+                                    "⚠️ Auto-settle: public RPC fallback merge also failed for condition {}: {}",
+                                    condition_id,
+                                    fallback_err
+                                ),
+                            }
                         } else {
                             warn!(
                                 "⚠️ Auto-settle: merge failed for condition {} (neg_risk={}): {}",
@@ -378,14 +399,28 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
                     }
                     Err(e) => {
                         let err_str = e.to_string();
-                        if err_str.contains("401") || err_str.contains("403") ||
-                           err_str.contains("API key") || err_str.contains("tenant disabled") {
+                        if is_rpc_auth_error(&err_str) {
                             warn!(
                                 "🔑 ⚠️ Auto-settle: RPC authentication error (neg-risk redeem failed for {}): {}",
                                 condition_id,
                                 e
                             );
-                            warn!("   → Check POLYGON_RPC_URL env var. API key may be disabled or expired.");
+
+                            match ctf_public_neg_risk_client.redeem_neg_risk(&redeem_req).await {
+                                Ok(resp) => {
+                                    settled_any = true;
+                                    info!(
+                                        "🏁 Auto-settle: neg-risk redeem succeeded via public RPC fallback for condition {} (tx {})",
+                                        condition_id,
+                                        resp.transaction_hash
+                                    );
+                                }
+                                Err(fallback_err) => warn!(
+                                    "⚠️ Auto-settle: public RPC fallback neg-risk redeem also failed for condition {}: {}",
+                                    condition_id,
+                                    fallback_err
+                                ),
+                            }
                         } else {
                             warn!(
                                 "⚠️ Auto-settle: neg-risk redeem failed for condition {}: {}",
@@ -408,14 +443,28 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
                     }
                     Err(e) => {
                         let err_str = e.to_string();
-                        if err_str.contains("401") || err_str.contains("403") ||
-                           err_str.contains("API key") || err_str.contains("tenant disabled") {
+                        if is_rpc_auth_error(&err_str) {
                             warn!(
                                 "🔑 ⚠️ Auto-settle: RPC authentication error (redeem failed for {}): {}",
                                 condition_id,
                                 e
                             );
-                            warn!("   → Check POLYGON_RPC_URL env var. API key may be disabled or expired.");
+
+                            match ctf_public_client.redeem_positions(&redeem_req).await {
+                                Ok(resp) => {
+                                    settled_any = true;
+                                    info!(
+                                        "🏁 Auto-settle: redeem succeeded via public RPC fallback for condition {} (tx {})",
+                                        condition_id,
+                                        resp.transaction_hash
+                                    );
+                                }
+                                Err(fallback_err) => warn!(
+                                    "⚠️ Auto-settle: public RPC fallback redeem also failed for condition {}: {}",
+                                    condition_id,
+                                    fallback_err
+                                ),
+                            }
                         } else {
                             warn!(
                                 "⚠️ Auto-settle: redeem failed for condition {}: {}",
@@ -430,5 +479,13 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
     }
 
     settled_any
+}
+
+fn is_rpc_auth_error(err: &str) -> bool {
+    err.contains("401")
+        || err.contains("403")
+        || err.contains("API key")
+        || err.contains("tenant disabled")
+        || err.contains("Unauthorized")
 }
 
