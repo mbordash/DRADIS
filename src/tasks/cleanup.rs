@@ -271,10 +271,22 @@ pub async fn reconcile_orphaned_positions(
 
         // Block re-entry into this token for PHANTOM_COOLDOWN_SECS so the strategy
         // cannot immediately open a new position on top of untracked on-chain shares.
+        // NOTE: the cooldown is also set on the PAIRED token (if we know it) so that
+        // an arb entry can't fire a new YES+NO pair on top of the just-untracked orphan.
+        // The fill_confirmed_at check ensures we only set the extra cooldown for legs
+        // that genuinely filled on-chain (not phantom half-fills that never confirmed).
         phantom_cooldowns.lock().await.insert(
             format!("{}:{}", strategy_name, token_id),
             tokio::time::Instant::now(),
         );
+        if let Some(paired_token) = position.paired_leg_token_id {
+            // Also set cooldown on the pair so new arb entries are blocked on both legs
+            // until the orphan state fully clears (paired_leg cleanup + cooldown expiry).
+            phantom_cooldowns.lock().await.insert(
+                format!("{}:{}", strategy_name, paired_token),
+                tokio::time::Instant::now(),
+            );
+        }
 
         let _ = send_notification(tg_token, tg_chat_id,
             &format!("🚨 Orphaned pair exited [{}]: {} {} shares @ ${:.4}",

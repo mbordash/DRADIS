@@ -10,9 +10,12 @@ function pnlColor(pnl: string) {
 }
 
 function fmtTime(iso: string) {
-  return new Date(iso).toLocaleTimeString('en-US', {
+  const d = new Date(iso);
+  const date = d.toLocaleDateString('en-US', { month: '2-digit', day: '2-digit' });
+  const time = d.toLocaleTimeString('en-US', {
     hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
   });
+  return `${date} ${time}`;
 }
 
 function fmtPnl(pnl: string) {

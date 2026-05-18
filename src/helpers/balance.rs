@@ -26,7 +26,13 @@ pub use crate::state::{Position, PositionMap};
 pub type PhantomCooldowns = Arc<Mutex<HashMap<String, Instant>>>;
 
 /// How long to block re-entry after a phantom removal (seconds).
-pub const PHANTOM_COOLDOWN_SECS: u64 = 120;
+///
+/// MUST be longer than the cleanup_ticker interval (300s) so that after a YES leg is
+/// phantom-removed, the cleanup cycle has time to detect and untrack the orphaned NO leg
+/// BEFORE the cooldown expires and a new arb entry can fire.
+/// Previously 120s — this allowed re-entry at 120s even though cleanup hadn't run yet
+/// (up to 300s), causing repeated NO-only accumulation cycles.
+pub const PHANTOM_COOLDOWN_SECS: u64 = 600;
 
 /// Max seconds to wait for an on-chain balance to appear after an order.
 pub const MAX_WAIT_SECS_HOURLY: i64 = 180;
@@ -237,7 +243,8 @@ pub async fn reconcile_orphaned_positions(
             //
             // If no log entry exists (e.g. entry predates this feature, or logs dir was wiped),
             // fall back to discounting the current bid so the position exits promptly.
-            let avg_entry = match metrics::lookup_entry_price_from_csv(&token_id.to_string()).await {
+            let db_entry = metrics::lookup_entry_price_from_csv(&token_id.to_string()).await;
+            let avg_entry = match db_entry {
                 Some(real_entry) => {
                     warn!("🔁 RECONCILE: Recovered real entry_price {:.4} for token {} from entry log", real_entry, token_id);
                     real_entry
@@ -259,8 +266,16 @@ pub async fn reconcile_orphaned_positions(
                 fill_confirmed_at: Some(Utc::now()),
                 paired_leg_token_id: None, // fixed up below
             });
-            warn!("🔁 RECONCILE: Adopted {} {} shares for token {} under [{}] — avg_entry={:.4} (bid={:.4})",
-                actual_shares, side_label, token_id, strategy_name, avg_entry, current_bid);
+            // Log differs based on source so it's obvious whether avg_entry came from the
+            // DB (authoritative cost basis) or the discount heuristic (bid-derived fallback).
+            if db_entry.is_some() {
+                warn!("🔁 RECONCILE: Adopted {} {} shares for token {} under [{}] — avg_entry={:.4} (source=DB, current_bid={:.4})",
+                    actual_shares, side_label, token_id, strategy_name, avg_entry, current_bid);
+            } else {
+                warn!("🔁 RECONCILE: Adopted {} {} shares for token {} under [{}] — avg_entry={:.4} (source=discount@{:.0}%, bid={:.4})",
+                    actual_shares, side_label, token_id, strategy_name, avg_entry,
+                    crate::config::RECONCILE_ADOPTED_ENTRY_DISCOUNT * dec!(100), current_bid);
+            }
         }
     }
 

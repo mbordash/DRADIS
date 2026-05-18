@@ -649,14 +649,40 @@ async fn main() -> Result<()> {
 
         // close time when the actual position lives in the daily/maker venue.
         // adoption_order comes from the registry — no hardcoded strategy list here.
-        tokio::time::sleep(Duration::from_secs(2)).await; // allow CLOB API to be ready
+        // Allow CLOB API and WS orderbook snapshots to settle before reconciling.
+        // 5 s gives the WS subscribers spawned above time to receive at least one
+        // book snapshot so token_bids contains real prices instead of the 0.50
+        // fallback.  The fallback is still safe, but real bids produce a more
+        // accurate discount heuristic when the DB/CSV entry lookup fails.
+        tokio::time::sleep(Duration::from_secs(5)).await;
+
+        // Build bid slices from the WS receivers.  If the WS hasn't received its
+        // first snapshot yet the bid is still dec!(0) — the reconcile helper's
+        // `.filter(|b| *b > dec!(0))` gate will drop those and fall back to 0.50,
+        // preserving the original behaviour while capturing real prices when possible.
+        let hourly_token_bids: Vec<(U256, Decimal)> = if hourly_yes_token != U256::ZERO {
+            vec![
+                (hourly_yes_token, yes_price_rx.borrow().0),
+                (hourly_no_token,  no_price_rx.borrow().0),
+            ]
+        } else {
+            vec![]
+        };
+
+        let maker_token_bids: Vec<(U256, Decimal)> = match (&maker_yes_price_rx, &maker_no_price_rx, &maker_market_config) {
+            (Some(yes_rx), Some(no_rx), Some(mk)) => vec![
+                (mk.yes_token, yes_rx.borrow().0),
+                (mk.no_token,  no_rx.borrow().0),
+            ],
+            _ => vec![],
+        };
 
         // Reconcile for hourly market if it exists
         if hourly_yes_token != U256::ZERO {
             reconcile_orphaned_positions(
                 &trading_client, &positions,
                 &[(hourly_yes_token, "YES"), (hourly_no_token, "NO")],
-                &hourly_market_name, hourly_market_close_time, &[], &adoption_order,
+                &hourly_market_name, hourly_market_close_time, &hourly_token_bids, &adoption_order,
             ).await;
         }
         // Reconcile for maker market if it exists
@@ -664,7 +690,7 @@ async fn main() -> Result<()> {
             reconcile_orphaned_positions(
                 &trading_client, &positions,
                 &[(mk_config.yes_token, "YES(maker)"), (mk_config.no_token, "NO(maker)")],
-                &mk_config.market_name, mk_config.market_close_time, &[], &adoption_order,
+                &mk_config.market_name, mk_config.market_close_time, &maker_token_bids, &adoption_order,
             ).await;
         }
 
@@ -1293,6 +1319,30 @@ async fn main() -> Result<()> {
                                                 Err(_) => dec!(0),
                                             }
                                         };
+
+                                        // ── Orphan accumulation guard ─────────────────────────────────────
+                                        // For GTC paired strategies (ArbitrageStrategy), legs fill at very
+                                        // different rates on directional markets.  If the NO leg fills quickly
+                                        // but the YES leg sits unfilled for >MAX_WAIT_SECS, sync_position_balance
+                                        // cancels YES and phantom-removes it.  The NO shares stay in the wallet
+                                        // as untracked orphans.  Without this guard, new arb entries keep firing
+                                        // (the exposure check only sees the position map, not on-chain reality),
+                                        // and each cycle adds 10 more NO shares — the root cause of the
+                                        // "9 YES vs 40 NO" imbalance observed on 2026-05-19.
+                                        //
+                                        // Fix: if EITHER leg already has an on-chain balance > MIN_ORDER_SHARES,
+                                        // it is an orphaned fill from a previous cycle.  Block entry until the
+                                        // cleanup cycle sells or untrack the orphan AND the phantom cooldown clears.
+                                        if primary_baseline >= config::MIN_ORDER_SHARES || pair_baseline >= config::MIN_ORDER_SHARES {
+                                            warn!("🚫 Paired entry BLOCKED [{}]: orphan accumulation guard — \
+                                                   primary on-chain={:.4} pair on-chain={:.4} for \"{}\" \
+                                                   (wait for cleanup cycle to clear orphaned shares before re-entering)",
+                                                sn, primary_baseline, pair_baseline, params.market_name);
+                                            positions.lock().await.remove(&pos_key);
+                                            pending_orders.lock().await.remove(&pos_key);
+                                            last_trade_time.insert(sn.clone(), Instant::now());
+                                            continue;
+                                        }
 
                                         match place_limit_orders_atomic(
                                             &trading_client, &nonce_manager, &signer,
