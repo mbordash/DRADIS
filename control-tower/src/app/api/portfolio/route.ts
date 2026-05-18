@@ -15,7 +15,16 @@
 import { NextResponse } from 'next/server';
 
 const DRADIS_API = process.env.DRADIS_API_URL ?? 'http://localhost:9000';
+// Server-side only — NOT NEXT_PUBLIC_ so it never appears in the browser bundle.
+const DRADIS_API_KEY = process.env.DRADIS_API_KEY ?? '';
 const POLY_CLOB  = 'https://clob.polymarket.com';
+
+/** Build headers for internal DRADIS engine calls, injecting the API key when set. */
+function dradisHeaders(): Record<string, string> {
+  const h: Record<string, string> = {};
+  if (DRADIS_API_KEY) h['X-API-Key'] = DRADIS_API_KEY;
+  return h;
+}
 
 /** Shape of a single enriched position (superset of OpenPositionRow). */
 interface EnrichedPosition {
@@ -46,8 +55,8 @@ export async function GET(): Promise<NextResponse> {
   try {
     // ── 1. Fetch DRADIS data concurrently ──────────────────────────────────
     const [posRes, pnlRes] = await Promise.all([
-      fetch(`${DRADIS_API}/api/positions`,            { cache: 'no-store' }),
-      fetch(`${DRADIS_API}/api/pnl/history?limit=1`,  { cache: 'no-store' }),
+      fetch(`${DRADIS_API}/api/positions`,            { cache: 'no-store', headers: dradisHeaders() }),
+      fetch(`${DRADIS_API}/api/pnl/history?limit=1`,  { cache: 'no-store', headers: dradisHeaders() }),
     ]);
 
     if (!posRes.ok || !pnlRes.ok) {

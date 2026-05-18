@@ -264,8 +264,14 @@ pub async fn run_api_server(
 
     let state = ApiState { config_tx, config_rx, markets_rx, api_key };
 
-    let app = Router::new()
-        .route("/api/health",                get(health))
+    // /api/health is intentionally public — no API key required.
+    // Docker HEALTHCHECK, load balancers, and uptime monitors all probe this
+    // endpoint without credentials; gating it would mark every container unhealthy.
+    let public_routes = Router::new()
+        .route("/api/health", get(health));
+
+    // All other routes require X-API-Key when DRADIS_API_KEY is set.
+    let protected_routes = Router::new()
         .route("/api/config",                get(get_config).patch(patch_config))
         .route("/api/pnl/history",           get(get_pnl_history))
         .route("/api/trades",                get(get_trades))
@@ -275,10 +281,13 @@ pub async fn run_api_server(
         // API-key check applied to all matched routes (inner layer — runs after CORS).
         // No-op when DRADIS_API_KEY is unset so local-dev workflow is unchanged.
         .layer(axum::middleware::from_fn_with_state(state.clone(), require_api_key))
+        .with_state(state.clone());
+
+    let app = public_routes
+        .merge(protected_routes)
         // Permissive CORS (outer layer — runs first, handles OPTIONS pre-flight
         // before the API-key middleware is reached).
-        .layer(CorsLayer::permissive())
-        .with_state(state);
+        .layer(CorsLayer::permissive());
 
     let addr = format!("0.0.0.0:{}", port);
     let listener = match tokio::net::TcpListener::bind(&addr).await {
@@ -291,7 +300,7 @@ pub async fn run_api_server(
 
     tracing::info!("🌐 Control Tower API listening on port {}", port);
 
-    if let Err(e) = axum::serve(listener, app).await {
+    if let Err(e) = axum::serve(listener, app.into_make_service()).await {
         tracing::error!("🌐 Control Tower API error: {}", e);
     }
 }
