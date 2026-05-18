@@ -3,7 +3,7 @@
 /// Uses the `perpetual` crate's `PerpetualBooster` (LogLoss objective) to predict
 /// near-term YES price direction from a rolling window of orderbook + oracle features.
 ///
-/// ── Feature Vector (NUM_FEATURES = 19) ──────────────────────────────────────
+/// ── Feature Vector (NUM_FEATURES = 22) ──────────────────────────────────────
 ///   [0]  yes_obi         — (yes_bid_depth − yes_ask_depth) / total depth
 ///   [1]  no_obi          — (no_bid_depth − no_ask_depth) / total depth
 ///   [2]  yes_ask         — best ask price for YES token
@@ -34,6 +34,19 @@
 ///  [18]  oracle_drift_10m — 10-minute oracle drift (÷ 10000).
 ///                          Fills the 5s–60m temporal gap where profitable binary moves
 ///                          actually develop.  Zero until 10 min of oracle history exists.
+///  [19]  spread_velocity  — rate of change of the YES bid-ask spread (clamped [-1, +1]).
+///                          Positive = spread widening (uncertainty rising, bad for entry).
+///                          Negative = spread tightening (liquidity improving, good for entry).
+///                          Orthogonal to feature [4]: level vs. momentum of the spread.
+///  [20]  hist_vol_regime  — rolling volatility of oracle log-returns over the last 60
+///                          history snapshots, normalised to [0, 1] (0 = calm, 1 = chaotic).
+///                          2% per-tick log-return std-dev maps to 1.0 (extreme regime).
+///                          NOTE: "60 snapshots" is a proxy for ~1h; actual wall-clock
+///                          duration depends on tick rate at runtime.
+///  [21]  tick_momentum    — net directionality of the last 10 YES bid ticks, normalised
+///                          to [-1, +1] over (N−1) comparisons.
+///                          +1 = all 9 ticks up (strong up momentum).
+///                          −1 = all 9 ticks down (strong down momentum).
 ///
 /// ── Label ────────────────────────────────────────────────────────────────────
 ///   1.0  if yes_bid rises in GBOOST_LOOKAHEAD_TICKS ticks
@@ -73,7 +86,7 @@ use crate::helpers::dynamic_config::DynamicConfig; // Corrected import
 use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
 
 /// Number of f64 features per snapshot row fed into the booster.
-const NUM_FEATURES: usize = 19;
+const NUM_FEATURES: usize = 22;
 
 /// Represents a single training sample for the Gboost model.
 /// Contains the features at the time of entry and whether the trade was profitable.
@@ -107,8 +120,90 @@ fn obi_from_depths(bid: rust_decimal::Decimal, ask: rust_decimal::Decimal) -> f6
     }
 }
 
+/// Compute historical volatility regime from a slice of oracle prices (log-return std-dev).
+/// Normalised to [0, 1] where 1.0 = 2% per-tick std-dev (extreme volatility).
+fn compute_historical_volatility(prices: &[f64]) -> f64 {
+    if prices.len() < 5 {
+        return 0.0;
+    }
+    let mut log_returns: Vec<f64> = Vec::with_capacity(prices.len() - 1);
+    for i in 1..prices.len() {
+        if prices[i - 1] > 0.0 && prices[i] > 0.0 {
+            log_returns.push((prices[i] / prices[i - 1]).ln());
+        }
+    }
+    if log_returns.is_empty() {
+        return 0.0;
+    }
+    let mean = log_returns.iter().sum::<f64>() / log_returns.len() as f64;
+    let variance = log_returns.iter()
+        .map(|r| (r - mean).powi(2))
+        .sum::<f64>() / log_returns.len() as f64;
+    // Normalise: 0.020 (2% per-tick std-dev) → 1.0; cap at 1.0
+    (variance.sqrt() / 0.020).min(1.0)
+}
+
+/// Compute tick-direction momentum from a slice of YES bid prices.
+/// Returns (up_ticks − down_ticks) / (n−1), normalised to [−1, +1].
+fn compute_tick_momentum(bids: &[rust_decimal::Decimal]) -> f64 {
+    if bids.len() < 2 {
+        return 0.0;
+    }
+    let mut up_ticks = 0i32;
+    let mut down_ticks = 0i32;
+    for i in 1..bids.len() {
+        if bids[i] > bids[i - 1] {
+            up_ticks += 1;
+        } else if bids[i] < bids[i - 1] {
+            down_ticks += 1;
+        }
+    }
+    let comparisons = (bids.len() - 1) as f64;
+    (up_ticks as f64 - down_ticks as f64) / comparisons
+}
+
+/// Compute hist_vol from a position in the history VecDeque (looks back up to 60 snapshots).
+fn hist_vol_from_deque(h: &VecDeque<MarketSnapshot>, idx: usize) -> f64 {
+    let start = idx.saturating_sub(59);
+    let prices: Vec<f64> = (start..=idx)
+        .filter_map(|k| h.get(k))
+        .map(|s| s.oracle_price.to_f64().unwrap_or(1.0))
+        .collect();
+    compute_historical_volatility(&prices)
+}
+
+/// Compute tick_momentum from a position in the history VecDeque (looks back up to 10 snapshots).
+fn tick_momentum_from_deque(h: &VecDeque<MarketSnapshot>, idx: usize) -> f64 {
+    let start = idx.saturating_sub(9);
+    let bids: Vec<rust_decimal::Decimal> = (start..=idx)
+        .filter_map(|k| h.get(k))
+        .map(|s| s.yes_bid)
+        .collect();
+    compute_tick_momentum(&bids)
+}
+
+/// Compute hist_vol from a position in a `&[MarketSnapshot]` slice (used in concept-drift path).
+fn hist_vol_from_slice(snaps: &[MarketSnapshot], idx: usize) -> f64 {
+    let start = idx.saturating_sub(59);
+    let prices: Vec<f64> = snaps[start..=idx]
+        .iter()
+        .map(|s| s.oracle_price.to_f64().unwrap_or(1.0))
+        .collect();
+    compute_historical_volatility(&prices)
+}
+
+/// Compute tick_momentum from a position in a `&[MarketSnapshot]` slice.
+fn tick_momentum_from_slice(snaps: &[MarketSnapshot], idx: usize) -> f64 {
+    let start = idx.saturating_sub(9);
+    let bids: Vec<rust_decimal::Decimal> = snaps[start..=idx]
+        .iter()
+        .map(|s| s.yes_bid)
+        .collect();
+    compute_tick_momentum(&bids)
+}
+
 /// Convert a `MarketSnapshot` into a fixed-length `f64` feature array.
-fn extract_features(s: &MarketSnapshot, prev_s: Option<&MarketSnapshot>) -> [f64; NUM_FEATURES] {
+fn extract_features(s: &MarketSnapshot, prev_s: Option<&MarketSnapshot>, hist_vol: f64, tick_momentum: f64) -> [f64; NUM_FEATURES] {
     // Use obi_from_depths (which returns -1.0 on zero depth) to match the entry gate's
     // side_obi() convention.  The entry gate blocks zero-depth entries (OBI=-1.0 < adverse
     // threshold), so training records will also never have zero-depth — but prediction can
@@ -164,6 +259,23 @@ fn extract_features(s: &MarketSnapshot, prev_s: Option<&MarketSnapshot>) -> [f64
     // Fills the 5s–60m temporal gap where real binary directional moves develop.
     let oracle_drift_10m = s.oracle_drift_10m.to_f64().unwrap_or(0.0) / 10_000.0;
 
+    // [19] spread_velocity — rate of change of YES bid-ask spread, clamped to [-1, +1].
+    // Positive = spread widening (uncertainty rising, bad for entry).
+    // Negative = spread tightening (liquidity improving, good for entry).
+    // Orthogonal to feature [4]: level vs. momentum.
+    let spread_now = (s.yes_ask - s.yes_bid).to_f64().unwrap_or(0.01);
+    let spread_velocity = if let Some(prev) = prev_s {
+        let spread_prev = (prev.yes_ask - prev.yes_bid).to_f64().unwrap_or(0.01);
+        if spread_prev > 0.0 {
+            let raw_vel = (spread_now - spread_prev) / spread_prev;
+            raw_vel.max(-1.0).min(1.0)
+        } else {
+            0.0
+        }
+    } else {
+        0.0
+    };
+
     // Normalise secs_to_expiry to [0.0, 1.0]:
     //   0.0 = market has expired / about to expire
     //   1.0 = 4 hours or more until expiry (fully safe zone)
@@ -186,11 +298,14 @@ fn extract_features(s: &MarketSnapshot, prev_s: Option<&MarketSnapshot>) -> [f64
         s.oracle_price.to_f64().unwrap_or(70_000.0) / 100_000.0,  // [11]
         secs_to_expiry_norm,                                        // [12]
         yes_obi_change,                                             // [13]
-        yes_mid_change,                                             // [14] NEW
-        no_obi_change,                                              // [15] NEW
-        relative_depth_ratio,                                       // [16] NEW
-        combined_ask_spread,                                        // [17] NEW
-        oracle_drift_10m,                                           // [18] NEW
+        yes_mid_change,                                             // [14]
+        no_obi_change,                                              // [15]
+        relative_depth_ratio,                                       // [16]
+        combined_ask_spread,                                        // [17]
+        oracle_drift_10m,                                           // [18]
+        spread_velocity,                                            // [19] NEW: spread momentum
+        hist_vol,                                                   // [20] NEW: volatility regime
+        tick_momentum,                                              // [21] NEW: tick direction momentum
     ]
 }
 
@@ -255,7 +370,9 @@ fn compute_concept_drift(booster: &PerpetualBooster, recent_history: &[MarketSna
     let mut feature_data: Vec<f64> = Vec::with_capacity(n * NUM_FEATURES);
     for (i, snap) in recent_history.iter().enumerate() {
         let prev = if i > 0 { Some(&recent_history[i - 1]) } else { None };
-        let feats = extract_features(snap, prev);
+        let hv = hist_vol_from_slice(recent_history, i);
+        let tm = tick_momentum_from_slice(recent_history, i);
+        let feats = extract_features(snap, prev, hv, tm);
         feature_data.extend_from_slice(&feats);
     }
     let matrix = Matrix::new(&feature_data, n, NUM_FEATURES);
@@ -277,11 +394,14 @@ pub struct GboostStrategyImpl {
     /// Stores completed trade outcomes (features + profitability) for training.
     training_data: Arc<StdMutex<VecDeque<TrainingSample>>>,
     /// Stores entry snapshots, the previous snapshot (for accurate feature reconstruction),
-    /// and entry prices for trades that are currently open (ghost mode).
+    /// entry prices, and the hist_vol + tick_momentum values computed at entry time, for
+    /// trades that are currently open (ghost mode).
     /// Storing prev_snap at entry time (not exit time) is critical: `record_training_outcome_on_exit`
     /// used to grab `h[len-2]` at exit time — a minutes-stale prev snapshot paired with the entry
     /// snapshot produces a corrupted feature vector and degraded training labels.
-    pending_entries: Arc<StdMutex<HashMap<U256, (MarketSnapshot, Option<MarketSnapshot>, rust_decimal::Decimal)>>>,
+    /// hist_vol and tick_momentum are similarly captured at entry time so the training label
+    /// features exactly match what the model saw when it made the prediction.
+    pending_entries: Arc<StdMutex<HashMap<U256, (MarketSnapshot, Option<MarketSnapshot>, rust_decimal::Decimal, f64, f64)>>>,
     /// Per-token timestamp of the last emitted exit signal to prevent rapid re-entry churn.
     post_exit_cooldowns: Arc<StdMutex<HashMap<U256, chrono::DateTime<chrono::Utc>>>>,
     /// Count of consecutive degenerate (< GBOOST_MIN_USABLE_TREES) retrain results.
@@ -315,11 +435,11 @@ impl GboostStrategyImpl {
 
         // Warm-start: try to load a previously persisted model from disk.
         //
-        // The model path is version-locked to the current feature set (NUM_FEATURES = 19).
+        // The model path is version-locked to the current feature set (NUM_FEATURES = 22).
         // NEVER load a model from a different version — the feature dimensions won't match.
-        // Previous version: v14f (14 features). Current: v19f (19 features — added
-        // yes_mid_change, no_obi_change, relative_depth_ratio, combined_ask_spread,
-        // oracle_drift_10m in May 2026).
+        // History: v14f (14 features) → v19f (added yes_mid_change, no_obi_change,
+        // relative_depth_ratio, combined_ask_spread, oracle_drift_10m in May 2026) →
+        // v22f (added spread_velocity, hist_vol_regime, tick_momentum in May 2026).
         //
         // Override the path at runtime via the GBOOST_MODEL_PATH env var, e.g.:
         //   GBOOST_MODEL_PATH=/path/to/gboost_model_v19f.json cargo run
@@ -451,8 +571,10 @@ impl GboostStrategyImpl {
                 let snap   = &h[i];
                 let prev_snap = if i > 0 { Some(&h[i-1]) } else { None }; // Get previous snapshot
                 let future = &h[i + lookahead];
+                let hv = hist_vol_from_deque(&h, i);
+                let tm = tick_momentum_from_deque(&h, i);
                 TrainingSample {
-                    features: extract_features(snap, prev_snap), // Pass prev_snap
+                    features: extract_features(snap, prev_snap, hv, tm), // Pass prev_snap
                     is_profitable: future.yes_bid > snap.yes_bid,
                     entry_timestamp: snap.timestamp,
                 }
@@ -613,8 +735,11 @@ impl GboostStrategyImpl {
             return None;
         }
         let h = self.history.lock().unwrap();
-        let prev_snap = if h.len() >= 2 { Some(&h[h.len() - 2]) } else { None }; // Get previous snapshot
-        let feats = extract_features(snap, prev_snap); // Pass prev_snap
+        let n = h.len();
+        let prev_snap = if n >= 2 { Some(&h[n - 2]) } else { None }; // Get previous snapshot
+        let hist_vol = if n > 0 { hist_vol_from_deque(&h, n - 1) } else { 0.0 };
+        let tick_momentum = if n > 0 { tick_momentum_from_deque(&h, n - 1) } else { 0.0 };
+        let feats = extract_features(snap, prev_snap, hist_vol, tick_momentum); // Pass prev_snap
         // Stack-allocated array; Matrix borrows it for the duration of this call only.
         let matrix = Matrix::new(&feats, 1, NUM_FEATURES);
         booster.predict_proba(&matrix, false, false).first().copied()
@@ -624,13 +749,14 @@ impl GboostStrategyImpl {
     /// This avoids training on transient mark-to-market states from non-exit ticks.
     fn record_training_outcome_on_exit(&self, token_id: U256, is_profitable: bool) {
         let mut pending_entries_guard = self.pending_entries.lock().unwrap();
-        if let Some((entry_snap, entry_prev_snap, _entry_price)) = pending_entries_guard.remove(&token_id) {
+        if let Some((entry_snap, entry_prev_snap, _entry_price, hist_vol, tick_momentum)) = pending_entries_guard.remove(&token_id) {
             // Use the prev_snap captured AT ENTRY TIME (stored in the tuple) rather than the
             // current history tail.  Using the current prev at exit time was a correctness bug:
             // pairing an exit-time prev with the entry snapshot produces a hybrid feature vector
             // that doesn't match what the model saw when it made the entry prediction.
+            // hist_vol and tick_momentum are likewise the values computed at entry time.
             let training_sample = TrainingSample {
-                features: extract_features(&entry_snap, entry_prev_snap.as_ref()),
+                features: extract_features(&entry_snap, entry_prev_snap.as_ref(), hist_vol, tick_momentum),
                 is_profitable,
                 entry_timestamp: entry_snap.timestamp,
             };
@@ -1014,13 +1140,17 @@ impl Strategy for GboostStrategyImpl {
                 "🔮 GBoost YES entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
                 p_yes_up, price, shares
             );
-            let entry_prev_snap = {
+            let (entry_prev_snap, entry_hist_vol, entry_tick_momentum) = {
                 let h = self.history.lock().unwrap();
-                if h.len() >= 2 { Some(h[h.len()-2].clone()) } else { None }
+                let n = h.len();
+                let ps = if n >= 2 { Some(h[n-2].clone()) } else { None };
+                let hv = if n > 0 { hist_vol_from_deque(&h, n - 1) } else { 0.0 };
+                let tm = if n > 0 { tick_momentum_from_deque(&h, n - 1) } else { 0.0 };
+                (ps, hv, tm)
             };
             self.pending_entries.lock().unwrap().insert(
                 target_market.yes_token,
-                (target_snapshot.clone(), entry_prev_snap, price)
+                (target_snapshot.clone(), entry_prev_snap, price, entry_hist_vol, entry_tick_momentum)
             );
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
@@ -1118,13 +1248,17 @@ impl Strategy for GboostStrategyImpl {
                 "🔮 GBoost NO entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
                 p_yes_up, price, shares
             );
-            let entry_prev_snap = {
+            let (entry_prev_snap, entry_hist_vol, entry_tick_momentum) = {
                 let h = self.history.lock().unwrap();
-                if h.len() >= 2 { Some(h[h.len()-2].clone()) } else { None }
+                let n = h.len();
+                let ps = if n >= 2 { Some(h[n-2].clone()) } else { None };
+                let hv = if n > 0 { hist_vol_from_deque(&h, n - 1) } else { 0.0 };
+                let tm = if n > 0 { tick_momentum_from_deque(&h, n - 1) } else { 0.0 };
+                (ps, hv, tm)
             };
             self.pending_entries.lock().unwrap().insert(
                 target_market.no_token,
-                (target_snapshot.clone(), entry_prev_snap, price)
+                (target_snapshot.clone(), entry_prev_snap, price, entry_hist_vol, entry_tick_momentum)
             );
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
@@ -1364,7 +1498,7 @@ mod tests {
     #[test]
     fn extract_features_ranges() {
         let snap = make_snapshot();
-        let feats = extract_features(&snap, None); // Pass None for prev_s in test
+        let feats = extract_features(&snap, None, 0.0, 0.0); // Pass None for prev_s in test
         assert_eq!(feats.len(), NUM_FEATURES);
         assert!(feats[0].abs() <= 1.0, "yes_obi out of [-1,1]: {}", feats[0]);
         assert!(feats[1].abs() <= 1.0, "no_obi  out of [-1,1]: {}", feats[1]);
@@ -1373,6 +1507,10 @@ mod tests {
         // secs_to_expiry_norm: 3600 / 14400 = 0.25
         assert!((feats[12] - 0.25).abs() < 0.01, "secs_to_expiry_norm feat: {}", feats[12]);
         assert!(feats[12] >= 0.0 && feats[12] <= 1.0, "secs_to_expiry_norm out of [0,1]: {}", feats[12]);
+        // new features [19-21] should be in their normalised ranges
+        assert!(feats[19] >= -1.0 && feats[19] <= 1.0, "spread_velocity out of [-1,1]: {}", feats[19]);
+        assert!(feats[20] >= 0.0 && feats[20] <= 1.0, "hist_vol out of [0,1]: {}", feats[20]);
+        assert!(feats[21] >= -1.0 && feats[21] <= 1.0, "tick_momentum out of [-1,1]: {}", feats[21]);
     }
 
     #[test]
@@ -1383,7 +1521,7 @@ mod tests {
         for i in 0..n {
             let snap = make_snapshot(); // Dummy snapshot
             samples.push(TrainingSample {
-                features: extract_features(&snap, None), // Pass None for prev_s in test
+                features: extract_features(&snap, None, 0.0, 0.0), // Pass None for prev_s in test
                 is_profitable: i % 2 == 0, // Alternate profitable/unprofitable
                 entry_timestamp: Utc::now(),
             });
@@ -1407,7 +1545,7 @@ mod tests {
         for i in 0..n {
             let snap = make_snapshot(); // Dummy snapshot
             samples.push(TrainingSample {
-                features: extract_features(&snap, None), // Pass None for prev_s in test
+                features: extract_features(&snap, None, 0.0, 0.0), // Pass None for prev_s in test
                 is_profitable: i % 2 == 0, // Alternate profitable/unprofitable
                 entry_timestamp: Utc::now(),
             });
@@ -1425,7 +1563,7 @@ mod tests {
 
         strategy.pending_entries.lock().unwrap().insert(
             ctx.market.yes_token,
-            (ctx.snapshot.clone(), None, dec!(0.50)),
+            (ctx.snapshot.clone(), None, dec!(0.50), 0.0, 0.0),
         );
 
         {
@@ -1458,7 +1596,7 @@ mod tests {
 
         strategy.pending_entries.lock().unwrap().insert(
             ctx.market.yes_token,
-            (ctx.snapshot.clone(), None, dec!(0.40)),
+            (ctx.snapshot.clone(), None, dec!(0.40), 0.0, 0.0),
         );
 
         {

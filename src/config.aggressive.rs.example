@@ -34,7 +34,7 @@ pub const ENABLE_ARBITRAGE_TRADING: bool = true;
 
 pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.01);
 pub const ARBITRAGE_MAX_TAKER_FEE_BPS: u32 = 1500; // Updated from 300
-
+af
 /// Maximum allowable gap between our safe bid and the current ask on each arb leg.
 /// Aggressive profile: 8 ticks — allows entries even when the book is thinner.
 pub const ARBITRAGE_MAX_FILL_GAP: Decimal = dec!(0.08);
@@ -279,7 +279,7 @@ pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.080); // aggressive: 8% —
 pub const GBOOST_MIN_HOLD_SECS: i64 = 180;
 pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 10;
 pub const GBOOST_MIN_USABLE_TREES: usize = 30;
-pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v19f.json";
+pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v22f.json";
 /// Max fraction of identical labels before skipping a retrain cycle (avoids degenerate storms).
 /// Aggressive: same threshold — label imbalance is a hard data quality issue, not a risk preference.
 pub const GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX: f64 = 0.80;
@@ -317,10 +317,10 @@ pub const GBOOST_DRIFT_WINDOW: usize = 200;
 pub const GBOOST_DRIFT_CONSECUTIVE_REQUIRED: usize = 2;
 // ============================================================================
 
-pub const MERGE_SCAN_INTERVAL_SECS: u64 = 30;
-pub const MERGE_COOLDOWN_SECS: u64 = 60;
+pub const MERGE_SCAN_INTERVAL_SECS: u64 = 300;
+pub const MERGE_COOLDOWN_SECS: u64 = 120;
 pub const MIN_MERGE_SHARES: Decimal = dec!(1.0);
-pub const MIN_MERGE_RATIO: Decimal = dec!(0.03);
+pub const MIN_MERGE_RATIO: Decimal = dec!(0.05);
 
 
 // ============================================================================

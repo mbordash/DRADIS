@@ -287,7 +287,7 @@ pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.070); // conservative: 7.0%
 pub const GBOOST_MIN_HOLD_SECS: i64 = 180;
 pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 10;
 pub const GBOOST_MIN_USABLE_TREES: usize = 30;
-pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v19f.json";
+pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v22f.json";
 /// Max fraction of identical labels before skipping a retrain cycle (avoids degenerate storms).
 /// Conservative: same threshold — label imbalance is a data quality issue, not a risk preference.
 pub const GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX: f64 = 0.80;
@@ -330,10 +330,10 @@ pub const GBOOST_DRIFT_CONSECUTIVE_REQUIRED: usize = 4;
 // POSITION MERGE SETTINGS
 // ============================================================================
 
-pub const MERGE_SCAN_INTERVAL_SECS: u64 = 60;
-pub const MERGE_COOLDOWN_SECS: u64 = 180;
+pub const MERGE_SCAN_INTERVAL_SECS: u64 = 300;
+pub const MERGE_COOLDOWN_SECS: u64 = 120;
 pub const MIN_MERGE_SHARES: Decimal = dec!(1.0);
-pub const MIN_MERGE_RATIO: Decimal = dec!(0.10);
+pub const MIN_MERGE_RATIO: Decimal = dec!(0.05);
 
 
 // ============================================================================

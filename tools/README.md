@@ -12,7 +12,7 @@ python tools/session_parser.py --input session.file --asset BTC --strategy Gboos
 
 ```zsh
 python tools/session_parser.py \
-  --input session.file \
+  --input session.live \
   --csv-out logs/analysis/trades.csv \
   --json-out logs/analysis/trades.json
 ```

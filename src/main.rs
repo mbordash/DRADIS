@@ -1147,6 +1147,26 @@ async fn main() -> Result<()> {
                                     }
                                 }
 
+                                // ── Cross-position guard ─────────────────────────────────────────
+                                // Prevent a directional strategy from opening both YES and NO legs
+                                // in the same market simultaneously. This stops GBoost/Momentum
+                                // from zigzagging (buy YES → buy NO → buy YES …) and creating a
+                                // de-facto unintended arb that then spams the settlement scanner.
+                                // Paired strategies (Arbitrage) are exempt because they insert BOTH
+                                // legs atomically inside the `pair_params` branch further below.
+                                if pair_params.is_none() {
+                                    let pm = positions.lock().await;
+                                    let other_token = if params.token_id == target_yes_token {
+                                        target_no_token
+                                    } else {
+                                        target_yes_token
+                                    };
+                                    if pm.contains_key(&(sn.clone(), other_token)) {
+                                        debug!("⏳ ENTRY blocked — already hold opposite leg in same market [{}] — must exit first", sn);
+                                        continue;
+                                    }
+                                }
+
                                 let pos_key = (sn.clone(), params.token_id);
 
                                 // Debounce: check if an order is already pending for this token

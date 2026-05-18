@@ -18,7 +18,6 @@ use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use tokio::sync::Mutex;
-use tokio::time::{Duration, sleep};
 use tokio::time::timeout as tokio_timeout;
 use tracing::{info, warn};
 
@@ -56,8 +55,18 @@ const NEG_RISK_ADAPTER_ADDRESS: Address = alloy_address!("0xd91E80cF2E7be2e162c6
 /// Seconds to wait before re-submitting settlement for the same condition (indexer catch-up buffer).
 const SETTLEMENT_CONDITION_COOLDOWN_SECS: i64 = 120;
 
-/// Tracks when each condition_id was last submitted for settlement, to enforce the cooldown above.
+/// Seconds to skip a condition after a non-retryable settlement error (e.g. GS013 inner revert,
+/// wrong parentCollectionId, zero Safe balance). 30 minutes — long enough to avoid endless spam
+/// while still retrying in case the RPC or indexer was temporarily wrong.
+const SETTLEMENT_CONDITION_ERROR_COOLDOWN_SECS: i64 = 1800;
+
+/// Tracks when each condition_id was last successfully submitted for settlement.
 static RECENT_SETTLEMENT_SUBMITS: LazyLock<Mutex<HashMap<B256, DateTime<Utc>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Tracks conditions that produced a non-retryable error (GS013, inner revert, etc.).
+/// These are skipped for SETTLEMENT_CONDITION_ERROR_COOLDOWN_SECS before being retried.
+static FAILED_SETTLEMENT_CONDITIONS: LazyLock<Mutex<HashMap<B256, DateTime<Utc>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 sol! {
@@ -149,7 +158,15 @@ async fn execute_via_safe<P: Provider + Clone>(
         .await?;
 
     let tx_hash = *pending.tx_hash();
-    pending.get_receipt().await?;
+
+    // Hard 30s cap on receipt wait — Polygon block time is ~2s; 30s is generous.
+    // Without this the call can hang indefinitely if the RPC stalls post-submission,
+    // which blocks the entire tokio select! event loop.
+    tokio::time::timeout(std::time::Duration::from_secs(30), pending.get_receipt())
+        .await
+        .map_err(|_| anyhow::anyhow!("execute_via_safe: get_receipt timed out (30s)"))?
+        .map_err(|e| anyhow::anyhow!("execute_via_safe: get_receipt error: {}", e))?;
+
     Ok(tx_hash)
 }
 
@@ -358,22 +375,19 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
     }
 }
 
-fn shares_to_base_units(shares: Decimal) -> u128 {
-    // CTF contract methods consume 6-decimal fixed-point token amounts.
-    (shares.max(Decimal::ZERO).trunc_with_scale(6) * Decimal::from(1_000_000u32))
-        .trunc()
-        .to_u128()
-        .unwrap_or(0)
-}
-
 /// Scan for resolved/closed markets and auto-settle positions so wallet + UI stay in sync.
 ///
-/// - `mergeable`: merge matched YES/NO full sets back to collateral.
-/// - `redeemable`: redeem resolved winning outcome tokens.
+/// Only processes conditions where at least one leg is `redeemable: true` (market resolved).
 ///
-/// **IMPORTANT**: This function requires POLYGON_RPC_URL to be set to a reliable paid RPC service
-/// (e.g., Helius, QuickNode, Alchemy). Free RPC endpoints (polygon-rpc.com, Ankr, PublicNode)
-/// are unreliable and will cause settlement failures. Set POLYGON_RPC_URL in your .env file.
+/// **Merge is intentionally skipped.**  After resolution, `redeemPositions(indexSets=[1,2])`
+/// redeems both outcome tokens in one call: the winning outcome pays out, the losing outcome
+/// burns for $0.  There is no need to call `mergePositions` first.  Previous attempts to merge
+/// active positions caused:
+///   - GS013 reverts on NegRisk markets (wrong parentCollectionId = B256::ZERO)
+///   - 45-second settlement cycles blocking the event loop for the full 60s timeout
+///   - Watchdog triggering a market-loop restart after 3 min of strategy-ticker starvation
+///
+/// **IMPORTANT**: Requires POLYGON_RPC_URL set to a paid RPC (Alchemy / QuickNode / Infura).
 pub async fn auto_settle_closed_positions<P: Provider + Clone>(
     wallet_provider: P,
     safe_address: Address,
@@ -404,11 +418,10 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
         by_condition.entry(p.condition_id).or_default().push(p);
     }
 
-    let min_merge_units = shares_to_base_units(crate::config::MIN_MERGE_SHARES);
     let mut settled_any = false;
 
     for (condition_id, legs) in by_condition {
-        // Cooldown – avoid spamming the same condition while indexers catch up
+        // ── Success cooldown: skip if we submitted successfully recently ────────
         {
             let recent = RECENT_SETTLEMENT_SUBMITS.lock().await;
             if let Some(last_submit_at) = recent.get(&condition_id) {
@@ -417,186 +430,117 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
                 }
             }
         }
+        // ── Error cooldown: skip conditions that produced non-retryable errors ──
+        {
+            let failed = FAILED_SETTLEMENT_CONDITIONS.lock().await;
+            if let Some(failed_at) = failed.get(&condition_id) {
+                if (Utc::now() - *failed_at).num_seconds() < SETTLEMENT_CONDITION_ERROR_COOLDOWN_SECS {
+                    continue;
+                }
+            }
+        }
 
-        let has_mergeable = legs.iter().any(|p| p.mergeable);
+        // Only settle conditions where at least one leg is flagged as redeemable.
+        // Merge-only conditions (active markets with both YES and NO) are intentionally
+        // skipped — trying to merge them causes GS013 reverts on NegRisk markets and
+        // wastes gas/event-loop time on non-resolved positions.
         let has_redeemable = legs.iter().any(|p| p.redeemable);
-        if !has_mergeable && !has_redeemable {
+        if !has_redeemable {
             continue;
         }
 
         let is_neg_risk = legs.iter().any(|p| p.negative_risk);
 
         let mut outcome_units: BTreeMap<i32, u128> = BTreeMap::new();
-        let mut mergeable_outcome_units: BTreeMap<i32, u128> = BTreeMap::new();
         for p in &legs {
             let units = shares_to_base_units(p.size);
-            if units == 0 {
-                continue;
-            }
+            if units == 0 { continue; }
             *outcome_units.entry(p.outcome_index).or_insert(0) += units;
-            if p.mergeable {
-                *mergeable_outcome_units.entry(p.outcome_index).or_insert(0) += units;
-            }
         }
 
-        // ───── MERGE ─────
-        // Both normal and neg-risk merges target the CTF contract directly.
-        // We call mergePositions FROM the Safe so msg.sender == Safe (the token holder).
-        if has_mergeable && !has_redeemable && mergeable_outcome_units.len() >= 2 {
-            let merge_units = mergeable_outcome_units.values().copied().min().unwrap_or(0);
-            if merge_units >= min_merge_units {
-                let mut attempt_units = merge_units;
-                let mut merge_done = false;
-                for attempt_idx in 1..=4 {
-                    if attempt_units < min_merge_units {
-                        break;
-                    }
-                    let calldata = ICtfDirect::mergePositionsCall {
-                        collateralToken: PUSD_COLLATERAL,
-                        parentCollectionId: B256::ZERO,
-                        conditionId: condition_id,
-                        partition: vec![U256::from(1u64), U256::from(2u64)],
-                        amount: U256::from(attempt_units),
-                    }.abi_encode();
+        let yes_units = *outcome_units.get(&0).unwrap_or(&0);
+        let no_units  = *outcome_units.get(&1).unwrap_or(&0);
 
-                    match execute_via_safe(
-                        wallet_provider.clone(),
-                        safe_address,
-                        eoa_address,
-                        CTF_ADDRESS,
-                        calldata,
-                    ).await {
-                        Ok(tx_hash) => {
-                            settled_any = true;
-                            merge_done = true;
-                            RECENT_SETTLEMENT_SUBMITS.lock().await.insert(condition_id, Utc::now());
-                            info!(
-                                "✅ Auto-settle: merged {} full-set shares for condition {} (tx {})",
-                                Decimal::from(attempt_units) / Decimal::from(1_000_000u32),
-                                condition_id,
-                                tx_hash
-                            );
-                            break;
-                        }
-                        Err(e) => {
-                            let err_str = e.to_string();
-                            if is_safe_math_sub_overflow(&err_str) {
-                                warn!(
-                                    "Auto-settle: merge overflow for condition {} (neg_risk={}) at {} units (attempt {}/4). Reducing...",
-                                    condition_id, is_neg_risk, attempt_units, attempt_idx
-                                );
-                                attempt_units /= 2;
-                                continue;
-                            }
-                            if is_gapped_nonce_error(&err_str) {
-                                warn!(
-                                    "Auto-settle: merge nonce gap for condition {} (attempt {}/4) — retrying",
-                                    condition_id, attempt_idx
-                                );
-                                sleep(Duration::from_secs(1)).await;
-                                continue;
-                            }
-                            warn!(
-                                "Auto-settle: merge failed for condition {} (neg_risk={}, attempt {}/4): {}",
-                                condition_id, is_neg_risk, attempt_idx, e
-                            );
-                            break;
-                        }
-                    }
-                }
-                if !merge_done && merge_units >= min_merge_units {
-                    warn!("Auto-settle: merge exhausted retries for condition {} — will retry next cycle", condition_id);
-                }
-            }
+        if yes_units == 0 && no_units == 0 {
+            info!("Auto-settle: condition {} marked redeemable but zero units — skipping", condition_id);
+            continue;
         }
 
-        // ───── REDEEM (the part that was causing zero-payout txs) ─────
-        if has_redeemable {
-            let yes_units = *outcome_units.get(&0).unwrap_or(&0);
-            let no_units = *outcome_units.get(&1).unwrap_or(&0);
+        info!(
+            "Auto-settle: attempting redeem for condition {} | YES: {} | NO: {} units | neg_risk={}",
+            condition_id, yes_units, no_units, is_neg_risk
+        );
 
-            // Skip completely if we have zero units according to the API
-            if yes_units == 0 && no_units == 0 {
-                info!("Auto-settle: condition {} marked redeemable but zero units — skipping", condition_id);
-                continue;
-            }
+        if is_neg_risk {
+            // Neg-risk redemption via the NegRisk adapter.
+            let calldata = INegRiskDirect::redeemPositionsCall {
+                conditionId: condition_id,
+                amounts: vec![U256::from(yes_units), U256::from(no_units)],
+            }.abi_encode();
 
-            info!(
-                "Auto-settle: attempting redeem for condition {} | YES: {} | NO: {} units",
-                condition_id, yes_units, no_units
-            );
-
-            if is_neg_risk {
-                // Neg-risk redemption goes to the NegRisk adapter, not the CTF directly.
-                let calldata = INegRiskDirect::redeemPositionsCall {
-                    conditionId: condition_id,
-                    amounts: vec![U256::from(yes_units), U256::from(no_units)],
-                }.abi_encode();
-
-                match execute_via_safe(
-                    wallet_provider.clone(),
-                    safe_address,
-                    eoa_address,
-                    NEG_RISK_ADAPTER_ADDRESS,
-                    calldata,
-                ).await {
-                    Ok(tx_hash) => {
-                        settled_any = true;
-                        RECENT_SETTLEMENT_SUBMITS.lock().await.insert(condition_id, Utc::now());
-                        info!("✅ Auto-settle: redeemed neg-risk condition {} (tx {})", condition_id, tx_hash);
-                    }
-                    Err(e) => {
-                        warn!("Auto-settle: neg-risk redeem failed for condition {}: {}", condition_id, e);
-                    }
+            match execute_via_safe(
+                wallet_provider.clone(),
+                safe_address,
+                eoa_address,
+                NEG_RISK_ADAPTER_ADDRESS,
+                calldata,
+            ).await {
+                Ok(tx_hash) => {
+                    settled_any = true;
+                    RECENT_SETTLEMENT_SUBMITS.lock().await.insert(condition_id, Utc::now());
+                    info!("✅ Auto-settle: redeemed neg-risk condition {} (tx {})", condition_id, tx_hash);
                 }
-            } else {
-                // Standard binary market redeem via CTF.
-                // indexSets=[1,2] redeems both outcomes (winning outcome pays, loser burns for $0).
-                // collateralToken MUST be pUSD — positions were minted with pUSD collateral.
-                //
-                // *** We route through Safe.execTransaction so msg.sender == Safe. ***
-                // The Safe holds the ERC1155 outcome tokens; CTF burns from msg.sender's balance.
-                // Previously this was called from the EOA (balance=0), resulting in silent no-ops.
-                let calldata = ICtfDirect::redeemPositionsCall {
-                    collateralToken: PUSD_COLLATERAL,
-                    parentCollectionId: B256::ZERO,
-                    conditionId: condition_id,
-                    indexSets: vec![U256::from(1u64), U256::from(2u64)],
-                }.abi_encode();
+                Err(e) => {
+                    warn!("Auto-settle: neg-risk redeem failed for condition {}: {}", condition_id, e);
+                    FAILED_SETTLEMENT_CONDITIONS.lock().await.insert(condition_id, Utc::now());
+                }
+            }
+        } else {
+            // Standard binary market redemption via CTF.
+            // indexSets=[1,2] redeems BOTH outcomes in one call:
+            //   - winning outcome pays $1.00 per token
+            //   - losing outcome pays $0.00 and is burned
+            // collateralToken MUST be pUSD — positions were minted with pUSD.
+            // We route through Safe.execTransaction so msg.sender == Safe (the token holder).
+            let calldata = ICtfDirect::redeemPositionsCall {
+                collateralToken: PUSD_COLLATERAL,
+                parentCollectionId: B256::ZERO,
+                conditionId: condition_id,
+                indexSets: vec![U256::from(1u64), U256::from(2u64)],
+            }.abi_encode();
 
-                match execute_via_safe(
-                    wallet_provider.clone(),
-                    safe_address,
-                    eoa_address,
-                    CTF_ADDRESS,
-                    calldata,
-                ).await {
-                    Ok(tx_hash) => {
-                        settled_any = true;
-                        RECENT_SETTLEMENT_SUBMITS.lock().await.insert(condition_id, Utc::now());
-                        info!(
-                            "✅ Auto-settle: redeemed condition {} (tx {}) – YES:{}, NO:{}",
-                            condition_id, tx_hash, yes_units, no_units
-                        );
-                    }
-                    Err(e) => {
-                        warn!("Auto-settle: redeem failed for condition {}: {}", condition_id, e);
-                    }
+            match execute_via_safe(
+                wallet_provider.clone(),
+                safe_address,
+                eoa_address,
+                CTF_ADDRESS,
+                calldata,
+            ).await {
+                Ok(tx_hash) => {
+                    settled_any = true;
+                    RECENT_SETTLEMENT_SUBMITS.lock().await.insert(condition_id, Utc::now());
+                    info!(
+                        "✅ Auto-settle: redeemed condition {} (tx {}) — YES:{} NO:{} units",
+                        condition_id, tx_hash, yes_units, no_units
+                    );
+                }
+                Err(e) => {
+                    warn!("Auto-settle: redeem failed for condition {}: {}", condition_id, e);
+                    FAILED_SETTLEMENT_CONDITIONS.lock().await.insert(condition_id, Utc::now());
                 }
             }
         }
     }
 
-
     settled_any
 }
 
-fn is_safe_math_sub_overflow(err: &str) -> bool {
-    err.contains("SafeMath: subtraction overflow") || err.contains("subtraction overflow")
-}
-
-fn is_gapped_nonce_error(err: &str) -> bool {
-    err.contains("gapped-nonce") || err.contains("nonce gap")
+fn shares_to_base_units(shares: Decimal) -> u128 {
+    // CTF contract methods consume 6-decimal fixed-point token amounts.
+    (shares.max(Decimal::ZERO).trunc_with_scale(6) * Decimal::from(1_000_000u32))
+        .trunc()
+        .to_u128()
+        .unwrap_or(0)
 }
 
 
