@@ -637,6 +637,28 @@ pub async fn close_open_position(
     }
 }
 
+/// Clear all live (non-ghost) open_positions rows in one shot.
+///
+/// Called at startup in LIVE mode (`GHOST_MODE = false`) to wipe every row written
+/// by prior sessions before the chain-sync re-adopts the true on-chain state.
+/// This ensures the UI and LLM Advisor see zero stale rows from crashed sessions,
+/// avoided-fill orders, or orphan accumulation cycles — even if a prior session's
+/// `close_open_position` never ran.
+///
+/// Ghost-mode rows (`ghost_mode = 1`) are intentionally preserved so simulated
+/// trade history remains coherent across live/ghost restarts.
+///
+/// Returns the number of rows deleted.
+pub async fn purge_all_live_open_positions(pool: &SqlitePool) -> usize {
+    match sqlx::query("DELETE FROM open_positions WHERE ghost_mode = 0")
+        .execute(pool)
+        .await
+    {
+        Ok(r)  => r.rows_affected() as usize,
+        Err(e) => { error!("❌ DB purge_all_live_open_positions failed: {}", e); 0 }
+    }
+}
+
 /// Delete every `open_positions` row whose token_id is NOT in `live_token_ids`.
 ///
 /// Called by the chain-sync task after it fetches the wallet's actual live positions

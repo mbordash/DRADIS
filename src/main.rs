@@ -241,9 +241,32 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ── Startup: sync open_positions DB against actual on-chain holdings ─────────
-    // Purges any stale rows left over from crashed/restarted sessions so the UI
-    // and portfolio value are accurate from the very first tick.
+    // ── Startup: rebuild open_positions DB from on-chain state (LIVE mode only) ──
+    //
+    // In LIVE mode (GHOST_MODE = false) the local DB is NOT the source of truth —
+    // Polymarket is.  Rows written by prior sessions (orders that placed but never
+    // filled, crashes before close_open_position ran, orphan accumulations) pollute
+    // the UI and LLM analysis with phantom positions.
+    //
+    // Strategy:
+    //   1. Nuke ALL ghost_mode=0 rows — clean slate, no stale prior-session garbage.
+    //   2. sync_open_positions_with_chain() re-adopts every token that is actually
+    //      held on-chain right now, so the Control Tower shows exactly what the
+    //      wallet holds before the first strategy tick fires.
+    //   3. During the session, record_open_position() is only called AFTER a fill
+    //      is confirmed on-chain (inside the sync_position_balance spawn), so the DB
+    //      never gets a row that doesn't reflect a real on-chain position.
+    //
+    // Ghost mode keeps its own rows (ghost_mode=1) untouched across restarts so
+    // simulated trade history remains coherent.
+    if !config::GHOST_MODE {
+        if let Some(pool) = db::pool() {
+            let purged = db::purge_all_live_open_positions(pool).await;
+            if purged > 0 {
+                info!("🗑️  Cleared {} stale live open_position row(s) from prior session(s)", purged);
+            }
+        }
+    }
     info!("🔗 Syncing open_positions DB with on-chain holdings...");
     dradis::tasks::cleanup::sync_open_positions_with_chain(safe_address).await;
 
@@ -1372,8 +1395,20 @@ async fn main() -> Result<()> {
                                                 } else {
                                                     dradis::helpers::balance::MAX_WAIT_SECS_WINDOW
                                                 };
+                                                // Leg A fill-confirmation watcher.
+                                                // record_open_position is intentionally written AFTER
+                                                // on-chain fill is confirmed (Ok return) — NOT at order
+                                                // placement time — so the DB only ever holds real positions.
                                                 let cl_s = Arc::clone(&trading_client); let ps_s = Arc::clone(&positions); let pc_s = Arc::clone(&phantom_cooldowns); let sn_s = sn.clone(); let tn_s = params.token_id;
-                                                tokio::spawn(async move { let _ = sync_position_balance(&cl_s, &ps_s, &sn_s, tn_s, Some(&pc_s), primary_baseline, primary_wait_secs).await; });
+                                                let db_sn_a = sn.clone(); let db_tid_a = params.token_id.to_string(); let db_mn_a = params.market_name.clone();
+                                                let db_side_a = if params.token_id == target_yes_token { "YES" } else { "NO" }; let db_ep_a = actual_entry_price; let db_sh_a = params.shares;
+                                                tokio::spawn(async move {
+                                                    if sync_position_balance(&cl_s, &ps_s, &sn_s, tn_s, Some(&pc_s), primary_baseline, primary_wait_secs).await.is_ok() {
+                                                        if let Some(pool) = db::pool() {
+                                                            db::record_open_position(pool, &db_sn_a, &db_tid_a, &db_mn_a, db_side_a, db_ep_a, db_sh_a, false).await;
+                                                        }
+                                                    }
+                                                });
 
                                                 let pp_close_time = target_market_close_time;
                                                 positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: actual_pair_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: None, paired_leg_token_id: Some(params.token_id) });
@@ -1383,20 +1418,22 @@ async fn main() -> Result<()> {
                                                 } else {
                                                     dradis::helpers::balance::MAX_WAIT_SECS_WINDOW
                                                 };
+                                                // Leg B fill-confirmation watcher (same confirmed-fill-only DB write pattern).
                                                 let sn_p = sn.clone(); let tn_p = pp.token_id; let ps_p = Arc::clone(&positions); let cl_p = Arc::clone(&trading_client); let pc_p = Arc::clone(&phantom_cooldowns);
-                                                tokio::spawn(async move { let _ = sync_position_balance(&cl_p, &ps_p, &sn_p, tn_p, Some(&pc_p), pair_baseline, pair_wait_secs).await; });
+                                                let db_sn_b = sn.clone(); let db_tid_b = pp.token_id.to_string(); let db_mn_b = pp.market_name.clone();
+                                                let db_side_b = if pp.token_id == target_yes_token { "YES" } else { "NO" }; let db_ep_b = actual_pair_entry_price; let db_sh_b = pp.shares;
+                                                tokio::spawn(async move {
+                                                    if sync_position_balance(&cl_p, &ps_p, &sn_p, tn_p, Some(&pc_p), pair_baseline, pair_wait_secs).await.is_ok() {
+                                                        if let Some(pool) = db::pool() {
+                                                            db::record_open_position(pool, &db_sn_b, &db_tid_b, &db_mn_b, db_side_b, db_ep_b, db_sh_b, false).await;
+                                                        }
+                                                    }
+                                                });
 
-                                                // Metrics + DB for both legs
+                                                // Metrics entries (record_entry at order-placement time is fine —
+                                                // entries table is for price-lookup history, not live-position display).
                                                 { let sn_e = sn.clone(); let tid_e = params.token_id.to_string(); let mn_e = params.market_name.clone(); let side_e = if params.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_e = actual_entry_price; let sh_e = params.shares; tokio::spawn(async move { metrics::record_entry(sn_e, tid_e, mn_e, side_e, ep_e, sh_e).await; }); }
-                                                if let Some(pool) = db::pool() {
-                                                    let side_r = if params.token_id == target_yes_token { "YES" } else { "NO" };
-                                                    db::record_open_position(pool, &sn, &params.token_id.to_string(), &params.market_name, side_r, actual_entry_price, params.shares, false).await;
-                                                }
                                                 { let sn_eb = sn.clone(); let tid_eb = pp.token_id.to_string(); let mn_eb = pp.market_name.clone(); let side_eb = if pp.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_eb = actual_pair_entry_price; let sh_eb = pp.shares; tokio::spawn(async move { metrics::record_entry(sn_eb, tid_eb, mn_eb, side_eb, ep_eb, sh_eb).await; }); }
-                                                if let Some(pool) = db::pool() {
-                                                    let side_rb = if pp.token_id == target_yes_token { "YES" } else { "NO" };
-                                                    db::record_open_position(pool, &sn, &pp.token_id.to_string(), &pp.market_name, side_rb, actual_pair_entry_price, pp.shares, false).await;
-                                                }
                                             }
                                         }
                                     } else {
@@ -1412,19 +1449,24 @@ async fn main() -> Result<()> {
                                             Ok(id) => id,
                                         };
                                         let _ = leg_a_order_id; // order ID available for future cancel use
+                                        // Single-leg fill-confirmation watcher — DB write on confirmed fill only.
                                         let cl_s = Arc::clone(&trading_client); let ps_s = Arc::clone(&positions); let pc_s = Arc::clone(&phantom_cooldowns); let sn_s = sn.clone(); let tn_s = params.token_id;
                                         let primary_wait_secs = if target_yes_token == hourly_yes_token {
                                             dradis::helpers::balance::MAX_WAIT_SECS_HOURLY
                                         } else {
                                             dradis::helpers::balance::MAX_WAIT_SECS_WINDOW
                                         };
-                                        tokio::spawn(async move { let _ = sync_position_balance(&cl_s, &ps_s, &sn_s, tn_s, Some(&pc_s), primary_baseline, primary_wait_secs).await; });
+                                        let db_sn_s = sn.clone(); let db_tid_s = params.token_id.to_string(); let db_mn_s = params.market_name.clone();
+                                        let db_side_s = if params.token_id == target_yes_token { "YES" } else { "NO" }; let db_ep_s = actual_entry_price; let db_sh_s = params.shares;
+                                        tokio::spawn(async move {
+                                            if sync_position_balance(&cl_s, &ps_s, &sn_s, tn_s, Some(&pc_s), primary_baseline, primary_wait_secs).await.is_ok() {
+                                                if let Some(pool) = db::pool() {
+                                                    db::record_open_position(pool, &db_sn_s, &db_tid_s, &db_mn_s, db_side_s, db_ep_s, db_sh_s, false).await;
+                                                }
+                                            }
+                                        });
 
                                         { let sn_e = sn.clone(); let tid_e = params.token_id.to_string(); let mn_e = params.market_name.clone(); let side_e = if params.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_e = actual_entry_price; let sh_e = params.shares; tokio::spawn(async move { metrics::record_entry(sn_e, tid_e, mn_e, side_e, ep_e, sh_e).await; }); }
-                                        if let Some(pool) = db::pool() {
-                                            let side_r = if params.token_id == target_yes_token { "YES" } else { "NO" };
-                                            db::record_open_position(pool, &sn, &params.token_id.to_string(), &params.market_name, side_r, actual_entry_price, params.shares, false).await;
-                                        }
                                     }
                                     last_trade_time.insert(sn.clone(), Instant::now());
                                     { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = format!(" ENTRY [{}] {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
