@@ -10,8 +10,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::LazyLock;
 use std::sync::Arc;
 
-use alloy::primitives::{Address, B256, U256};
+use alloy::primitives::{Address, B256, Bytes, U256};
 use alloy::providers::Provider;
+use alloy::sol;
+use alloy::sol_types::SolCall;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
@@ -20,8 +22,6 @@ use tokio::time::{Duration, sleep};
 use tokio::time::timeout as tokio_timeout;
 use tracing::{info, warn};
 
-use polymarket_client_sdk_v2::ctf::Client as CtfClient;
-use polymarket_client_sdk_v2::ctf::types::{MergePositionsRequest, RedeemNegRiskRequest, RedeemPositionsRequest};
 use polymarket_client_sdk_v2::clob::Client as ClobClient;
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::Normal;
@@ -29,7 +29,12 @@ use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
 use polymarket_client_sdk_v2::data::Client as DataClient;
 use polymarket_client_sdk_v2::data::types::request::PositionsRequest;
 use alloy::primitives::address as alloy_address;
-use polymarket_client_sdk_v2::{POLYGON, contract_config};
+
+use crate::helpers::{db, send_notification, PhantomCooldowns};
+use crate::state::{Position, PositionMap};
+use crate::strategies::time_decay_impl::TimeDecayPosition;
+
+// ── On-chain settlement contracts ────────────────────────────────────────────
 
 /// pUSD (Polymarket USD) collateral token address on Polygon.
 ///
@@ -40,17 +45,113 @@ use polymarket_client_sdk_v2::{POLYGON, contract_config};
 /// finds balance = 0, and the tx succeeds as a silent no-op (no tokens burned, no payout).
 ///
 /// Reference: https://docs.polymarket.com/developers/CTF/redeem-positions
-const PUSD_COLLATERAL: alloy::primitives::Address =
-    alloy_address!("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB");
+const PUSD_COLLATERAL: Address = alloy_address!("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB");
 
-use crate::helpers::balance::PhantomCooldowns;
-use crate::helpers::{db, notifications::send_notification};
-use crate::state::{Position, PositionMap};
-use crate::strategies::time_decay_impl::TimeDecayPosition;
+/// Gnosis Conditional Token Framework contract on Polygon.
+const CTF_ADDRESS: Address = alloy_address!("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045");
 
-const SETTLEMENT_CONDITION_COOLDOWN_SECS: i64 = 300;
+/// NegRisk adapter contract on Polygon (routes neg-risk market redemptions).
+const NEG_RISK_ADAPTER_ADDRESS: Address = alloy_address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296");
+
+/// Seconds to wait before re-submitting settlement for the same condition (indexer catch-up buffer).
+const SETTLEMENT_CONDITION_COOLDOWN_SECS: i64 = 120;
+
+/// Tracks when each condition_id was last submitted for settlement, to enforce the cooldown above.
 static RECENT_SETTLEMENT_SUBMITS: LazyLock<Mutex<HashMap<B256, DateTime<Utc>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+sol! {
+    /// Gnosis Safe 1.3 — we only need execTransaction.
+    #[sol(rpc)]
+    interface IGnosisSafe {
+        function execTransaction(
+            address to,
+            uint256 value,
+            bytes calldata data,
+            uint8   operation,
+            uint256 safeTxGas,
+            uint256 baseGas,
+            uint256 gasPrice,
+            address gasToken,
+            address refundReceiver,
+            bytes   memory signatures
+        ) external payable returns (bool success);
+    }
+
+    /// Calldata encoder for the CTF contract.
+    interface ICtfDirect {
+        function redeemPositions(
+            address collateralToken,
+            bytes32 parentCollectionId,
+            bytes32 conditionId,
+            uint256[] calldata indexSets
+        ) external;
+
+        function mergePositions(
+            address collateralToken,
+            bytes32 parentCollectionId,
+            bytes32 conditionId,
+            uint256[] calldata partition,
+            uint256 amount
+        ) external;
+    }
+
+    /// Calldata encoder for the NegRisk adapter contract.
+    interface INegRiskDirect {
+        function redeemPositions(
+            bytes32 conditionId,
+            uint256[] calldata amounts
+        ) external;
+    }
+}
+
+/// Execute a contract call through the Gnosis Safe.
+///
+/// The Safe holds all ERC1155 outcome tokens. CTF methods operate on `msg.sender`'s
+/// balance, so we must call CTF *from within* the Safe using `execTransaction`.
+///
+/// ## Signature scheme
+/// For a 1-of-1 Safe where the EOA is the direct owner AND msg.sender == owner,
+/// Gnosis Safe accepts a pre-approved-owner signature without any hash computation:
+///   - r = EOA address (right-aligned in 32 bytes)
+///   - s = 0x00…00 (32 zero bytes)
+///   - v = 0x01
+/// Safe checks `msg.sender == address(r)` → passes for threshold = 1.
+async fn execute_via_safe<P: Provider + Clone>(
+    provider: P,
+    safe_address: Address,
+    eoa_address: Address,
+    ctf_contract: Address,
+    calldata: Vec<u8>,
+) -> anyhow::Result<alloy::primitives::TxHash> {
+    // Build the pre-approved owner signature (65 bytes).
+    let mut sig = Vec::with_capacity(65);
+    sig.extend_from_slice(&[0u8; 12]);           // left-pad address to 32 bytes
+    sig.extend_from_slice(eoa_address.as_slice()); // 20-byte EOA address
+    sig.extend_from_slice(&[0u8; 32]);           // s = 0
+    sig.push(0x01u8);                            // v = 1 (owner pre-approve)
+
+    let safe = IGnosisSafe::new(safe_address, provider);
+    let pending = safe
+        .execTransaction(
+            ctf_contract,
+            U256::ZERO,            // ETH value
+            Bytes::from(calldata), // inner calldata
+            0u8,                   // operation: CALL
+            U256::ZERO,            // safeTxGas
+            U256::ZERO,            // baseGas
+            U256::ZERO,            // gasPrice
+            Address::ZERO,         // gasToken
+            Address::ZERO,         // refundReceiver
+            Bytes::from(sig),      // packed signature
+        )
+        .send()
+        .await?;
+
+    let tx_hash = *pending.tx_hash();
+    pending.get_receipt().await?;
+    Ok(tx_hash)
+}
 
 /// Remove all positions for a market that has expired or is expiring within 60s.
 pub async fn cleanup_expired_positions(
@@ -274,9 +375,9 @@ fn shares_to_base_units(shares: Decimal) -> u128 {
 /// (e.g., Helius, QuickNode, Alchemy). Free RPC endpoints (polygon-rpc.com, Ankr, PublicNode)
 /// are unreliable and will cause settlement failures. Set POLYGON_RPC_URL in your .env file.
 pub async fn auto_settle_closed_positions<P: Provider + Clone>(
+    wallet_provider: P,
     safe_address: Address,
-    ctf_client: &Arc<CtfClient<P>>,
-    ctf_neg_risk_client: &Arc<CtfClient<P>>,
+    eoa_address: Address,
 ) -> bool {
     let data_client = DataClient::default();
     let req = PositionsRequest::builder().user(safe_address).build();
@@ -324,11 +425,6 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
         }
 
         let is_neg_risk = legs.iter().any(|p| p.negative_risk);
-        // Verify chain config exists (still needed for neg_risk_adapter address validation).
-        if contract_config(POLYGON, is_neg_risk).is_none() {
-            warn!("Auto-settle: missing contract config for chain={} neg_risk={}", POLYGON, is_neg_risk);
-            continue;
-        }
 
         let mut outcome_units: BTreeMap<i32, u128> = BTreeMap::new();
         let mut mergeable_outcome_units: BTreeMap<i32, u128> = BTreeMap::new();
@@ -343,7 +439,9 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
             }
         }
 
-        // ───── MERGE (unchanged except clearer logs) ─────
+        // ───── MERGE ─────
+        // Both normal and neg-risk merges target the CTF contract directly.
+        // We call mergePositions FROM the Safe so msg.sender == Safe (the token holder).
         if has_mergeable && !has_redeemable && mergeable_outcome_units.len() >= 2 {
             let merge_units = mergeable_outcome_units.values().copied().min().unwrap_or(0);
             if merge_units >= min_merge_units {
@@ -353,19 +451,22 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
                     if attempt_units < min_merge_units {
                         break;
                     }
-                    let merge_req = MergePositionsRequest::for_binary_market(
-                        PUSD_COLLATERAL,
-                        condition_id,
-                        U256::from(attempt_units),
-                    );
-                    let merge_result = if is_neg_risk {
-                        ctf_neg_risk_client.merge_positions(&merge_req).await
-                    } else {
-                        ctf_client.merge_positions(&merge_req).await
-                    };
+                    let calldata = ICtfDirect::mergePositionsCall {
+                        collateralToken: PUSD_COLLATERAL,
+                        parentCollectionId: B256::ZERO,
+                        conditionId: condition_id,
+                        partition: vec![U256::from(1u64), U256::from(2u64)],
+                        amount: U256::from(attempt_units),
+                    }.abi_encode();
 
-                    match merge_result {
-                        Ok(resp) => {
+                    match execute_via_safe(
+                        wallet_provider.clone(),
+                        safe_address,
+                        eoa_address,
+                        CTF_ADDRESS,
+                        calldata,
+                    ).await {
+                        Ok(tx_hash) => {
                             settled_any = true;
                             merge_done = true;
                             RECENT_SETTLEMENT_SUBMITS.lock().await.insert(condition_id, Utc::now());
@@ -373,7 +474,7 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
                                 "✅ Auto-settle: merged {} full-set shares for condition {} (tx {})",
                                 Decimal::from(attempt_units) / Decimal::from(1_000_000u32),
                                 condition_id,
-                                resp.transaction_hash
+                                tx_hash
                             );
                             break;
                         }
@@ -426,48 +527,56 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
             );
 
             if is_neg_risk {
-                let redeem_req = RedeemNegRiskRequest::builder()
-                    .condition_id(condition_id)
-                    .amounts(vec![U256::from(yes_units), U256::from(no_units)])
-                    .build();
+                // Neg-risk redemption goes to the NegRisk adapter, not the CTF directly.
+                let calldata = INegRiskDirect::redeemPositionsCall {
+                    conditionId: condition_id,
+                    amounts: vec![U256::from(yes_units), U256::from(no_units)],
+                }.abi_encode();
 
-                match ctf_neg_risk_client.redeem_neg_risk(&redeem_req).await {
-                    Ok(resp) => {
+                match execute_via_safe(
+                    wallet_provider.clone(),
+                    safe_address,
+                    eoa_address,
+                    NEG_RISK_ADAPTER_ADDRESS,
+                    calldata,
+                ).await {
+                    Ok(tx_hash) => {
                         settled_any = true;
                         RECENT_SETTLEMENT_SUBMITS.lock().await.insert(condition_id, Utc::now());
-                        info!("✅ Auto-settle: redeemed neg-risk condition {} (tx {})", condition_id, resp.transaction_hash);
+                        info!("✅ Auto-settle: redeemed neg-risk condition {} (tx {})", condition_id, tx_hash);
                     }
                     Err(e) => {
-                        let err_str = e.to_string();
-                        if is_gapped_nonce_error(&err_str) {
-                            // keep your existing retry logic for neg-risk
-                            // (the original code had a small retry loop here)
-                            warn!("Auto-settle: neg-risk redeem nonce gap for {} — will retry next cycle", condition_id);
-                        } else {
-                            warn!("Auto-settle: neg-risk redeem failed for condition {}: {}", condition_id, e);
-                        }
+                        warn!("Auto-settle: neg-risk redeem failed for condition {}: {}", condition_id, e);
                     }
                 }
             } else {
-                // Standard binary market redeem.
-                // Per Polymarket docs: indexSets=[1,2] redeems both outcomes (only winning pays).
-                // "Redemption burns your entire token balance — there is no amount parameter."
-                // collateralToken MUST be pUSD, not USDC.e — positions were minted with pUSD.
-                let redeem_req = RedeemPositionsRequest::for_binary_market(
-                    PUSD_COLLATERAL,
-                    condition_id,
-                );
+                // Standard binary market redeem via CTF.
+                // indexSets=[1,2] redeems both outcomes (winning outcome pays, loser burns for $0).
+                // collateralToken MUST be pUSD — positions were minted with pUSD collateral.
+                //
+                // *** We route through Safe.execTransaction so msg.sender == Safe. ***
+                // The Safe holds the ERC1155 outcome tokens; CTF burns from msg.sender's balance.
+                // Previously this was called from the EOA (balance=0), resulting in silent no-ops.
+                let calldata = ICtfDirect::redeemPositionsCall {
+                    collateralToken: PUSD_COLLATERAL,
+                    parentCollectionId: B256::ZERO,
+                    conditionId: condition_id,
+                    indexSets: vec![U256::from(1u64), U256::from(2u64)],
+                }.abi_encode();
 
-                match ctf_client.redeem_positions(&redeem_req).await {
-                    Ok(resp) => {
+                match execute_via_safe(
+                    wallet_provider.clone(),
+                    safe_address,
+                    eoa_address,
+                    CTF_ADDRESS,
+                    calldata,
+                ).await {
+                    Ok(tx_hash) => {
                         settled_any = true;
                         RECENT_SETTLEMENT_SUBMITS.lock().await.insert(condition_id, Utc::now());
                         info!(
                             "✅ Auto-settle: redeemed condition {} (tx {}) – YES:{}, NO:{}",
-                            condition_id,
-                            resp.transaction_hash,
-                            yes_units,
-                            no_units
+                            condition_id, tx_hash, yes_units, no_units
                         );
                     }
                     Err(e) => {
@@ -478,9 +587,6 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
         }
     }
 
-    if settled_any {
-        info!("Auto-settle: cycle complete – positions were redeemed/merged. Run sync_open_positions_with_chain() if you have it.");
-    }
 
     settled_any
 }

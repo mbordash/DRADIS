@@ -10,7 +10,6 @@ use polymarket_client_sdk_v2::clob::types::{Side, SignatureType, OrderType};
 use polymarket_client_sdk_v2::{POLYGON, PRIVATE_KEY_VAR, derive_safe_wallet};
 use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk_v2::clob::types::AssetType;
-use polymarket_client_sdk_v2::ctf::Client as CtfClient;
 
 use futures::StreamExt as _;
 use polymarket_client_sdk_v2::clob::ws::Client as WsClient;
@@ -186,9 +185,6 @@ async fn main() -> Result<()> {
         .wallet(signer.clone())
         .connect(&polygon_rpc_url)
         .await?;
-    let ctf_client = Arc::new(CtfClient::new(wallet_provider.clone(), POLYGON)?);
-    let ctf_neg_risk_client = Arc::new(CtfClient::with_neg_risk(wallet_provider.clone(), POLYGON)?);
-
     info!("✅ CTF auto-settlement client ready (rpc={})", polygon_rpc_url);
 
     let trading_client = Arc::new(ClobClient::new(config::CLOB_API_BASE, Config::default())?
@@ -821,9 +817,9 @@ async fn main() -> Result<()> {
                 _ = settlement_ticker.tick() => {
                     match tokio::time::timeout(Duration::from_secs(60), async {
                         let settled = dradis::tasks::cleanup::auto_settle_closed_positions(
+                            wallet_provider.clone(),
                             safe_address,
-                            &ctf_client,
-                            &ctf_neg_risk_client,
+                            eoa_address,
                         ).await;
 
                         if settled {
