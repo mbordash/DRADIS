@@ -93,6 +93,28 @@ impl Strategy for ArbitrageStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── Price symmetry / fill-rate gate ─────────────────────────────────
+        // Root cause of the 2026-05-19 "10 YES / 40 NO" imbalance:
+        //   YES bid = 72¢ → holders are winning, have no urgency to sell →
+        //   GTC bid at 72¢ sits unfilled for MAX_WAIT_SECS then gets phantom-removed.
+        //   NO bid = 27¢  → sellers are losing, want out → fills in seconds.
+        //
+        // ARBITRAGE_MAX_FILL_GAP catches wide-spread books but NOT tight-spread
+        // directional markets (bid=72¢, ask=73¢ looks tight yet never fills).
+        //
+        // Gate: if max(yes_bid, no_bid) > arbitrage_max_leg_price (0.60), the
+        // market is >60% directional and fill rates are inherently asymmetric.
+        // Require both legs to be in the genuine-uncertainty band [0.40, 0.60].
+        let max_leg_bid = safe_yes_bid.max(safe_no_bid);
+        if max_leg_bid > dc.arbitrage_max_leg_price {
+            debug!(
+                "🚫 Arb blocked — directional market fill asymmetry: \
+                 YES_bid={:.3} NO_bid={:.3} max={:.3} > limit {:.3} — skipping",
+                safe_yes_bid, safe_no_bid, max_leg_bid, dc.arbitrage_max_leg_price
+            );
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Strategy Exposure Check ──────────────────────────────────────────
         let trade_size = dc.arbitrage_position_size_usdc;
 

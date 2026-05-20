@@ -15,6 +15,17 @@ use crate::config;
 use crate::helpers::market::{get_market_pair, MarketCandidate};
 use crate::helpers::time::{fetch_historical_strike_price, fetch_strike_price_from_close_time};
 
+/// Hard cap on how long a single `get_market_pair` scan may run.
+///
+/// `fetch_simplified_crypto_candidates` pages through GAMMA_API_MARKET_SCAN_PAGES (currently 30)
+/// Gamma API pages sequentially, each with a 20-second reqwest timeout.  In the worst
+/// case (all 30 pages stall until timeout) the scan takes 600 s.  Without an outer cap
+/// the market_monitor task can go silent for up to 10 minutes, missing market switches.
+///
+/// 90 s = 1 full 90-second monitor interval.  If the scan hasn't finished in 90 s
+/// something is badly wrong with the Gamma API; log a warning and retry next tick.
+const MARKET_SCAN_TIMEOUT_SECS: u64 = 90;
+
 /// The shared market state tuple broadcast on the watch channel.
 pub type MarketState = (
     U256,                        // yes_token
@@ -35,7 +46,21 @@ pub async fn run_market_monitor(
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(90));
     loop {
         interval.tick().await;
-        let (candidate, maker_candidate) = get_market_pair(&http).await;
+        // Hard cap on market scan — see MARKET_SCAN_TIMEOUT_SECS comment above.
+        let scan_result = tokio::time::timeout(
+            std::time::Duration::from_secs(MARKET_SCAN_TIMEOUT_SECS),
+            get_market_pair(&http),
+        ).await;
+        let (candidate, maker_candidate) = match scan_result {
+            Ok(pair) => pair,
+            Err(_) => {
+                tracing::warn!(
+                    "⚠️ Market monitor: get_market_pair timed out after {}s — skipping this poll cycle",
+                    MARKET_SCAN_TIMEOUT_SECS
+                );
+                continue;
+            }
+        };
         if candidate.yes_token == U256::ZERO { continue; }
 
         let (cur_yes, _, cur_name, cur_close_time, _, _, _, _cur_cid) = market_tx.borrow().clone();

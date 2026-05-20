@@ -225,7 +225,7 @@ async fn main() -> Result<()> {
     // Without this, resting orders from a previous restart count against the
     // CLOB balance allowance and cause Leg B "not enough balance" failures on
     // the very first entry of the new session.
-    info!("🧹 Cancelling any leftover open orders from previous session...");
+    info!(" Cancelling any leftover open orders from previous session...");
     for i in 0..MAX_CANCEL_RETRIES {
         let delay = BASE_CANCEL_RETRY_DELAY_MS * (1 << i);
         match tokio::time::timeout(Duration::from_secs(8), trading_client.as_ref().cancel_all_orders()).await {
@@ -263,11 +263,11 @@ async fn main() -> Result<()> {
         if let Some(pool) = db::pool() {
             let purged = db::purge_all_live_open_positions(pool).await;
             if purged > 0 {
-                info!("🗑️  Cleared {} stale live open_position row(s) from prior session(s)", purged);
+                info!("️  Cleared {} stale live open_position row(s) from prior session(s)", purged);
             }
         }
     }
-    info!("🔗 Syncing open_positions DB with on-chain holdings...");
+    info!(" Syncing open_positions DB with on-chain holdings...");
     dradis::tasks::cleanup::sync_open_positions_with_chain(safe_address).await;
 
     let (oracle_tx, oracle_rx) = watch::channel(dec!(0));
@@ -902,10 +902,15 @@ async fn main() -> Result<()> {
                             let bal = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
                             *live_collateral.lock().await = bal;
                             debug!(" Live pUSD balance: ${:.4}", bal);
-                            // Persist a P&L snapshot for the Control Tower chart
+                            // Guard DB writes so a blocked SQLite call cannot stall status_ticker.
                             if let Some(pool) = db::pool() {
                                 let pnl_snap = *total_pnl.lock().await;
-                                db::record_pnl_snapshot(pool, pnl_snap, bal).await;
+                                if tokio::time::timeout(
+                                    Duration::from_secs(3),
+                                    db::record_pnl_snapshot(pool, pnl_snap, bal),
+                                ).await.is_err() {
+                                    warn!("⚠️ record_pnl_snapshot timed out (3s) — skipping this checkpoint");
+                                }
                             }
                         }
                         Ok(Err(e)) => warn!("⚠️ balance_allowance error in status ticker: {}", e),
@@ -1313,9 +1318,16 @@ async fn main() -> Result<()> {
                                         let mut req = BalanceAllowanceRequest::default();
                                         req.asset_type = AssetType::Conditional;
                                         req.token_id = Some(params.token_id);
-                                        match trading_client.balance_allowance(req).await {
-                                            Ok(resp) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
-                                            Err(_) => dec!(0),
+                                        match tokio::time::timeout(Duration::from_secs(10), trading_client.balance_allowance(req)).await {
+                                            Ok(Ok(resp)) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
+                                            Ok(Err(e)) => {
+                                                warn!("⚠️ entry baseline balance_allowance error [{}]: {}", sn, e);
+                                                dec!(0)
+                                            }
+                                            Err(_) => {
+                                                warn!("⚠️ entry baseline balance_allowance timed out (10s) [{}]", sn);
+                                                dec!(0)
+                                            }
                                         }
                                     };
                                     let vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
@@ -1337,9 +1349,16 @@ async fn main() -> Result<()> {
                                             let mut req = BalanceAllowanceRequest::default();
                                             req.asset_type = AssetType::Conditional;
                                             req.token_id = Some(pp.token_id);
-                                            match trading_client.balance_allowance(req).await {
-                                                Ok(resp) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
-                                                Err(_) => dec!(0),
+                                            match tokio::time::timeout(Duration::from_secs(10), trading_client.balance_allowance(req)).await {
+                                                Ok(Ok(resp)) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
+                                                Ok(Err(e)) => {
+                                                    warn!("⚠️ pair baseline balance_allowance error [{}]: {}", sn, e);
+                                                    dec!(0)
+                                                }
+                                                Err(_) => {
+                                                    warn!("⚠️ pair baseline balance_allowance timed out (10s) [{}]", sn);
+                                                    dec!(0)
+                                                }
                                             }
                                         };
 
@@ -1357,12 +1376,25 @@ async fn main() -> Result<()> {
                                         // it is an orphaned fill from a previous cycle.  Block entry until the
                                         // cleanup cycle sells or untrack the orphan AND the phantom cooldown clears.
                                         if primary_baseline >= config::MIN_ORDER_SHARES || pair_baseline >= config::MIN_ORDER_SHARES {
-                                            warn!("🚫 Paired entry BLOCKED [{}]: orphan accumulation guard — \
+                                            warn!(" Paired entry BLOCKED [{}]: orphan accumulation guard — \
                                                    primary on-chain={:.4} pair on-chain={:.4} for \"{}\" \
-                                                   (wait for cleanup cycle to clear orphaned shares before re-entering)",
-                                                sn, primary_baseline, pair_baseline, params.market_name);
+                                                   (re-checking in {}s)",
+                                                sn, primary_baseline, pair_baseline, params.market_name,
+                                                dradis::helpers::balance::PHANTOM_COOLDOWN_SECS);
                                             positions.lock().await.remove(&pos_key);
                                             pending_orders.lock().await.remove(&pos_key);
+                                            // Set a full phantom_cooldown on BOTH legs so the strategy
+                                            // backs off for PHANTOM_COOLDOWN_SECS rather than retrying
+                                            // every minute.  Without this, the guard fires ~60× per hour
+                                            // for the rest of the day whenever an unresolved orphaned
+                                            // on-chain leg (e.g. a YES fill whose NO leg never arrived)
+                                            // persists until market close — burning API budget and
+                                            // flooding the log with identical WARN lines.
+                                            {
+                                                let mut cd = phantom_cooldowns.lock().await;
+                                                cd.insert(format!("{}:{}", sn, params.token_id), tokio::time::Instant::now());
+                                                cd.insert(format!("{}:{}", sn, pp.token_id), tokio::time::Instant::now());
+                                            }
                                             last_trade_time.insert(sn.clone(), Instant::now());
                                             continue;
                                         }

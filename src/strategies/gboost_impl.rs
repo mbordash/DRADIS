@@ -631,9 +631,12 @@ impl GboostStrategyImpl {
                 Ok(Ok((new_model, drift_score))) => {
                     let n = new_model.trees.len();
                     // Persist to disk first so a crash doesn't lose the trained weights.
+                    // Use the same path resolution as startup load (env var override first).
                     if let Ok(json) = new_model.json_dump() {
-                        if let Err(e) = tokio::fs::write(config::GBOOST_MODEL_PATH, &json).await {
-                            tracing::warn!("🤖 GboostStrategy: model save failed: {}", e);
+                        let model_path = std::env::var("GBOOST_MODEL_PATH")
+                            .unwrap_or_else(|_| config::GBOOST_MODEL_PATH.to_string());
+                        if let Err(e) = tokio::fs::write(&model_path, &json).await {
+                            tracing::warn!("🤖 GboostStrategy: model save failed [{}]: {}", model_path, e);
                         }
                     }
 
