@@ -354,8 +354,6 @@ The bot automatically records every completed trade into a daily CSV file for ea
 
 The auto-settlement feature (merging/redeeming positions after market resolution) requires a **reliable, paid Polygon (EVM) RPC endpoint**. Free public RPCs (polygon-rpc.com, Ankr, PublicNode) are unsuitable — they will fail with API key or nonce errors during settlement.
 
-> ⚠️ **Helius is a Solana-only RPC — do not use it for DRADIS.** Using a Solana endpoint will result in `"Method not found"` errors.
-
 **Recommended providers** (all with free tiers, all support Polygon):
 - [Alchemy](https://www.alchemy.com/) — **recommended**; excellent free tier, easy Polygon mainnet setup
 - [QuickNode](https://www.quicknode.com/) — reliable, industry standard
