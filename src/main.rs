@@ -308,6 +308,11 @@ async fn main() -> Result<()> {
     // when the wallet cannot afford even the minimum trade, preventing 400 CLOB rejections.
     let live_collateral: Arc<Mutex<Decimal>> = Arc::new(Mutex::new(startup_balance));
     let phantom_cooldowns: dradis::helpers::balance::PhantomCooldowns = Arc::new(Mutex::new(HashMap::new()));
+    // Session-scoped set of tokens that have been through orphan-detection and removal.
+    // Lives OUTSIDE the market-rotation loop and is NEVER cleared on market switch.
+    // This breaks the infinite reconcile→re-adopt→orphan-detect cycle that happens when
+    // a daily/maker-market unhedged leg persists across many hourly market rotations.
+    let orphan_tombstones: dradis::helpers::balance::OrphanTombstones = Arc::new(Mutex::new(std::collections::HashSet::new()));
     let time_decay_positions: Arc<Mutex<HashMap<U256, TimeDecayPosition>>> =
         Arc::new(Mutex::new(HashMap::new()));
 
@@ -706,6 +711,7 @@ async fn main() -> Result<()> {
                 &trading_client, &positions,
                 &[(hourly_yes_token, "YES"), (hourly_no_token, "NO")],
                 &hourly_market_name, hourly_market_close_time, &hourly_token_bids, &adoption_order,
+                Some(&orphan_tombstones),
             ).await;
         }
         // Reconcile for maker market if it exists
@@ -714,6 +720,7 @@ async fn main() -> Result<()> {
                 &trading_client, &positions,
                 &[(mk_config.yes_token, "YES(maker)"), (mk_config.no_token, "NO(maker)")],
                 &mk_config.market_name, mk_config.market_close_time, &maker_token_bids, &adoption_order,
+                Some(&orphan_tombstones),
             ).await;
         }
 
@@ -814,7 +821,7 @@ async fn main() -> Result<()> {
                     }
 
                     { phantom_cooldowns.lock().await.clear(); }
-                    { pending_orders.lock().await.clear(); } // Clear pending locks on market switch
+                    { pending_orders.lock().await.clear(); } // Clear pending locks on market switch // Clear pending locks on market switch
                     current_hourly_cid = new_hourly_condition_id;
                     current_maker_cid = new_maker_cid;
                     let _ = ws_cancel_tx.send(true); // Stop WS tasks for the old market before rotating
@@ -849,7 +856,7 @@ async fn main() -> Result<()> {
                             dradis::tasks::cleanup::cleanup_expired_positions(Arc::clone(&positions), mk_config.market_name.clone(), mk_config.yes_token, mk_config.no_token, mk_config.market_close_time).await;
                         }
 
-                        if let Err(e) = dradis::tasks::cleanup::reconcile_orphaned_positions(Arc::clone(&positions), &trading_client, &phantom_cooldowns, &tg_token, &tg_chat_id).await { warn!("⚠️ Orphan reconciliation error: {}", e); }
+                        if let Err(e) = dradis::tasks::cleanup::reconcile_orphaned_positions(Arc::clone(&positions), &trading_client, &phantom_cooldowns, &orphan_tombstones, &tg_token, &tg_chat_id).await { warn!("⚠️ Orphan reconciliation error: {}", e); }
                         dradis::tasks::cleanup::cleanup_time_decay_positions(Arc::clone(&time_decay_positions)).await;
                         dradis::tasks::cleanup::sync_open_positions_with_chain(safe_address).await;
 

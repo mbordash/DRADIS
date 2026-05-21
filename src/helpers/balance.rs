@@ -2,7 +2,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use regex::Regex;
 use anyhow::Result;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::str::FromStr;
 use alloy::primitives::U256;
@@ -24,6 +24,12 @@ pub use crate::state::{Position, PositionMap};
 
 /// Shared map of (strategy:token_id) → Instant for phantom removal cooldowns.
 pub type PhantomCooldowns = Arc<Mutex<HashMap<String, Instant>>>;
+
+/// Session-scoped set of token IDs that have been through orphan-detection and removal.
+/// Never cleared on market switch — once a token is tombstoned it is never re-adopted
+/// within the same session. This breaks the infinite reconcile→re-adopt→orphan-detect cycle
+/// that occurs when an unhedged daily-market leg persists across many hourly rotations.
+pub type OrphanTombstones = Arc<Mutex<HashSet<U256>>>;
 
 /// How long to block re-entry after a phantom removal (seconds).
 ///
@@ -189,6 +195,10 @@ async fn cancel_resting_orders(client: &Arc<ClobClient<Authenticated<Normal>>>, 
 /// `adoption_order` is the ordered list of strategy names to try when assigning an
 /// orphaned position — derived from `StrategyRegistry::strategy_names()` so that
 /// developers only need to register a strategy in the registry, not also edit this file.
+///
+/// `orphan_tombstones` (optional) is the session-scoped set of token IDs that have been
+/// through the full orphan-detection cycle.  Tombstoned tokens are skipped permanently so
+/// the reconcile → re-adopt → orphan-detect loop cannot repeat across market switches.
 pub async fn reconcile_orphaned_positions(
     client: &Arc<ClobClient<Authenticated<Normal>>>,
     positions: &Arc<Mutex<PositionMap>>,
@@ -197,8 +207,21 @@ pub async fn reconcile_orphaned_positions(
     market_close_time: Option<chrono::DateTime<Utc>>,
     token_bids: &[(U256, Decimal)],
     adoption_order: &[String],
+    orphan_tombstones: Option<&OrphanTombstones>,
 ) {
     for &(token_id, side_label) in tokens {
+        // ── Tombstone check ───────────────────────────────────────────────────
+        // If this token has been through orphan-detection this session, skip it
+        // permanently.  Without this, cleanup removes the orphan, phantom_cooldowns
+        // are cleared on the next hourly market switch, and this reconcile re-adopts it —
+        // restarting the infinite detect→remove→re-adopt cycle.
+        if let Some(tb) = orphan_tombstones {
+            if tb.lock().await.contains(&token_id) {
+                debug!("⏭️  RECONCILE: skipping tombstoned token {} — previously orphan-removed this session", token_id);
+                continue;
+            }
+        }
+
         let mut req = BalanceAllowanceRequest::default();
         req.asset_type = AssetType::Conditional;
         req.token_id = Some(token_id);

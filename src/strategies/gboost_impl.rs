@@ -64,6 +64,7 @@
 
 use async_trait::async_trait;
 use anyhow::Result;
+use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
 use std::collections::{VecDeque, HashMap}; // Added HashMap
@@ -402,8 +403,11 @@ pub struct GboostStrategyImpl {
     /// hist_vol and tick_momentum are similarly captured at entry time so the training label
     /// features exactly match what the model saw when it made the prediction.
     pending_entries: Arc<StdMutex<HashMap<U256, (MarketSnapshot, Option<MarketSnapshot>, rust_decimal::Decimal, f64, f64)>>>,
-    /// Per-token timestamp of the last emitted exit signal to prevent rapid re-entry churn.
-    post_exit_cooldowns: Arc<StdMutex<HashMap<U256, chrono::DateTime<chrono::Utc>>>>,
+    /// Per-token (start_time, cooldown_secs) of the last emitted exit signal.
+    /// TP/SignalRev exits store GBOOST_POST_EXIT_COOLDOWN_SECS; SL exits store
+    /// GBOOST_SL_POST_EXIT_COOLDOWN_SECS (longer, because an SL means the market
+    /// moved adversely and re-entering quickly compounds the loss).
+    post_exit_cooldowns: Arc<StdMutex<HashMap<U256, (chrono::DateTime<chrono::Utc>, i64)>>>,
     /// Count of consecutive degenerate (< GBOOST_MIN_USABLE_TREES) retrain results.
     /// Used to apply exponential backoff so a 10-second retrain storm doesn't burn CPU
     /// for 110+ minutes as seen in the 2026-05-07 evening session.
@@ -547,38 +551,49 @@ impl GboostStrategyImpl {
         };
         if !triggered { return; }
 
-        // ── Source 1: real trade outcomes ────────────────────────────────────
-        let trade_samples_count = {
-            let td = self.training_data.lock().unwrap();
-            td.len()
-        };
-
-        let training_samples: Vec<TrainingSample> = if trade_samples_count >= config::GBOOST_MIN_TRAINING_SAMPLES {
+        // ── Collect real trade outcomes (Source 1: highest quality labels) ──────────
+        // These are actual entry/exit P&L labels — far more informative than lookahead
+        // proxies.  Always collected first; they are prepended to the training batch so
+        // the model encounters them before the denser lookahead fill.
+        let real_samples: Vec<TrainingSample> = {
             let td = self.training_data.lock().unwrap();
             td.iter().cloned().collect()
+        };
+
+        let training_samples: Vec<TrainingSample> = if real_samples.len() >= config::GBOOST_MIN_TRAINING_SAMPLES {
+            // Enough real trade outcomes — use them exclusively for the cleanest signal.
+            real_samples
         } else {
-            // ── Source 2: lookahead labels from history ring buffer ───────────
-            // Generates supervised labels without needing real trade outcomes.
-            // Label = 1.0 if the YES bid rises within this many ticks.
+            // ── Source 2 (+ Source 1 blend): lookahead labels from history ring buffer ──
+            // When real outcomes exist but are too few, prepend them to the lookahead batch.
+            // This breaks the chicken-and-egg bootstrap deadlock while continuously
+            // improving model quality as real trade-outcome labels accumulate.
+            // Label = 1.0 if the YES bid rises within GBOOST_LOOKAHEAD_TICKS ticks.
             let h = self.history.lock().unwrap();
             let n = h.len();
             let lookahead = config::GBOOST_LOOKAHEAD_TICKS;
-            if n < config::GBOOST_MIN_TRAINING_SAMPLES + lookahead {
+            // After blending, we need at least (MIN - real_count) lookahead samples plus
+            // the lookahead window itself.  Without real samples this collapses to the
+            // original MIN_TRAINING_SAMPLES + lookahead check.
+            let needed = config::GBOOST_MIN_TRAINING_SAMPLES.saturating_sub(real_samples.len());
+            if n < needed + lookahead {
                 return; // Not enough history yet, wait for more ticks
             }
             let usable = n - lookahead;
-            (0..usable).map(|i| {
-                let snap   = &h[i];
-                let prev_snap = if i > 0 { Some(&h[i-1]) } else { None }; // Get previous snapshot
-                let future = &h[i + lookahead];
+            let mut combined = real_samples; // Real outcomes first (highest quality)
+            combined.extend((0..usable).map(|i| {
+                let snap      = &h[i];
+                let prev_snap = if i > 0 { Some(&h[i-1]) } else { None };
+                let future    = &h[i + lookahead];
                 let hv = hist_vol_from_deque(&h, i);
                 let tm = tick_momentum_from_deque(&h, i);
                 TrainingSample {
-                    features: extract_features(snap, prev_snap, hv, tm), // Pass prev_snap
+                    features: extract_features(snap, prev_snap, hv, tm),
                     is_profitable: future.yes_bid > snap.yes_bid,
                     entry_timestamp: snap.timestamp,
                 }
-            }).collect()
+            }));
+            combined
         };
 
         if training_samples.len() < config::GBOOST_MIN_TRAINING_SAMPLES { return; }
@@ -771,19 +786,29 @@ impl GboostStrategyImpl {
         }
     }
 
-    /// Mark token as cooling down after an emitted exit signal.
+    /// Mark token as cooling down with the standard cooldown after a TP or SignalRev exit.
     fn mark_post_exit_cooldown(&self, token_id: U256) {
         let mut guard = self.post_exit_cooldowns.lock().unwrap();
-        guard.insert(token_id, Utc::now());
+        guard.insert(token_id, (Utc::now(), config::GBOOST_POST_EXIT_COOLDOWN_SECS));
+    }
+
+    /// Mark token as cooling down with the **extended** cooldown after a stop-loss exit.
+    ///
+    /// An SL exit means the market moved adversely against the position — not just that the
+    /// model changed direction.  Using a longer cooldown (GBOOST_SL_POST_EXIT_COOLDOWN_SECS)
+    /// prevents re-entering the same adverse direction within 20 minutes of a loss.
+    fn mark_post_exit_cooldown_sl(&self, token_id: U256) {
+        let mut guard = self.post_exit_cooldowns.lock().unwrap();
+        guard.insert(token_id, (Utc::now(), config::GBOOST_SL_POST_EXIT_COOLDOWN_SECS));
     }
 
     /// Returns remaining cooldown seconds for this token, if still cooling down.
     fn post_exit_cooldown_remaining_secs(&self, token_id: U256) -> Option<i64> {
         let now = Utc::now();
         let mut guard = self.post_exit_cooldowns.lock().unwrap();
-        if let Some(ts) = guard.get(&token_id).copied() {
+        if let Some((ts, cooldown_secs)) = guard.get(&token_id).copied() {
             let elapsed = (now - ts).num_seconds();
-            let remaining = config::GBOOST_POST_EXIT_COOLDOWN_SECS - elapsed;
+            let remaining = cooldown_secs - elapsed;
             if remaining > 0 {
                 return Some(remaining);
             }
@@ -811,6 +836,47 @@ impl GboostStrategyImpl {
         } else {
             dec!(-1.0) // no depth data → treat as maximally adverse → block entry
         }
+    }
+}
+
+// ── Position-sizing helpers ───────────────────────────────────────────────────
+
+/// Scale GBoost trade size by model confidence and oracle volatility regime.
+///
+/// Confidence scaling (linear):
+///   - `confidence == entry_thresh`  → GBOOST_MIN_EXPOSURE_USDC
+///   - `confidence == 1.0`           → max_exposure (dc.gboost_max_exposure_usdc)
+///   - In between                    → linear interpolation
+///
+/// Volatility scaling (multiplicative, applied on top of confidence scale):
+///   - When hist_vol_regime > GBOOST_HIGH_VOL_REGIME_THRESHOLD:
+///       apply GBOOST_HIGH_VOL_SIZE_SCALE (e.g. 0.50 × base)
+///   - Rationale: elevated oracle volatility correlates with higher adverse selection
+///     and fill-quality degradation; reducing size protects capital in these regimes.
+///
+/// Integer-basis-point arithmetic avoids a `FromPrimitive` trait dependency.
+fn scale_trade_size(
+    confidence: f64,       // model confidence for this direction (≥ entry_thresh)
+    entry_thresh: f64,     // configured entry threshold (dc.gboost_entry_threshold)
+    hist_vol: f64,         // current hist_vol_regime value in [0, 1]
+    max_exposure: Decimal, // dc.gboost_max_exposure_usdc
+) -> Decimal {
+    let min_exposure = config::GBOOST_MIN_EXPOSURE_USDC;
+    // Confidence scale: fraction of the [threshold, 1.0] range that `confidence` covers.
+    let conf_range = (1.0_f64 - entry_thresh).max(1e-9);
+    let conf_excess = (confidence - entry_thresh).max(0.0);
+    let scale_f64 = (conf_excess / conf_range).min(1.0);
+    // Convert to Decimal via integer basis-points (scale_bps / 10000).
+    let scale_bps = (scale_f64 * 10_000.0_f64) as i64;
+    let scale_dec = Decimal::new(scale_bps, 4);
+    let base = min_exposure + (max_exposure - min_exposure) * scale_dec;
+    // Apply volatility reduction when oracle is moving erratically.
+    if hist_vol > config::GBOOST_HIGH_VOL_REGIME_THRESHOLD {
+        let vol_scale_bps = (config::GBOOST_HIGH_VOL_SIZE_SCALE * 10_000.0_f64) as i64;
+        let vol_scale_dec = Decimal::new(vol_scale_bps, 4);
+        base * vol_scale_dec
+    } else {
+        base
     }
 }
 
@@ -976,7 +1042,18 @@ impl Strategy for GboostStrategyImpl {
         }
 
         let entry_thresh = dc.gboost_entry_threshold.to_f64().unwrap_or(0.65);
-        let trade_usdc   = dc.gboost_max_exposure_usdc;
+
+        // Pre-compute history-derived values once — shared by YES and NO entry paths.
+        // Avoids acquiring the history lock twice and ensures prev_snap, hist_vol, and
+        // tick_momentum are captured at the same tick for both sizing and pending_entries.
+        let (precomp_prev_snap, precomp_hist_vol, precomp_tick_momentum) = {
+            let h = self.history.lock().unwrap();
+            let n = h.len();
+            let ps = if n >= 2 { Some(h[n-2].clone()) } else { None };
+            let hv = if n > 0 { hist_vol_from_deque(&h, n-1) } else { 0.0 };
+            let tm = if n > 0 { tick_momentum_from_deque(&h, n-1) } else { 0.0 };
+            (ps, hv, tm)
+        };
 
         // ── Gate: trend-alignment ─────────────────────────────────────────────
         // If BTC has drifted strongly in one direction over the past 60 minutes,
@@ -1138,19 +1215,16 @@ impl Strategy for GboostStrategyImpl {
                 );
                 return Ok(StrategySignal::NoSignal);
             }
+            // Confidence-proportional sizing: more capital for higher-conviction signals.
+            // Volatility-scaled: reduce size when oracle hist_vol_regime is elevated.
+            let trade_usdc = scale_trade_size(p_yes_up, entry_thresh, precomp_hist_vol, dc.gboost_max_exposure_usdc);
             let shares = trade_usdc / price;
             tracing::info!(
-                "🔮 GBoost YES entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
-                p_yes_up, price, shares
+                "🔮 GBoost YES entry: P(UP)={:.3} | ask=${:.4} shares={:.2} usdc={:.2} vol={:.2}",
+                p_yes_up, price, shares, trade_usdc, precomp_hist_vol
             );
-            let (entry_prev_snap, entry_hist_vol, entry_tick_momentum) = {
-                let h = self.history.lock().unwrap();
-                let n = h.len();
-                let ps = if n >= 2 { Some(h[n-2].clone()) } else { None };
-                let hv = if n > 0 { hist_vol_from_deque(&h, n - 1) } else { 0.0 };
-                let tm = if n > 0 { tick_momentum_from_deque(&h, n - 1) } else { 0.0 };
-                (ps, hv, tm)
-            };
+            let (entry_prev_snap, entry_hist_vol, entry_tick_momentum) =
+                (precomp_prev_snap.clone(), precomp_hist_vol, precomp_tick_momentum);
             self.pending_entries.lock().unwrap().insert(
                 target_market.yes_token,
                 (target_snapshot.clone(), entry_prev_snap, price, entry_hist_vol, entry_tick_momentum)
@@ -1246,19 +1320,15 @@ impl Strategy for GboostStrategyImpl {
                 );
                 return Ok(StrategySignal::NoSignal);
             }
+            // Confidence for NO direction is (1 - p_yes_up); scale size accordingly.
+            let trade_usdc = scale_trade_size(1.0 - p_yes_up, entry_thresh, precomp_hist_vol, dc.gboost_max_exposure_usdc);
             let shares = trade_usdc / price;
             tracing::info!(
-                "🔮 GBoost NO entry: P(UP)={:.3} | ask=${:.4} shares={:.2}",
-                p_yes_up, price, shares
+                "🔮 GBoost NO entry: P(UP)={:.3} | ask=${:.4} shares={:.2} usdc={:.2} vol={:.2}",
+                p_yes_up, price, shares, trade_usdc, precomp_hist_vol
             );
-            let (entry_prev_snap, entry_hist_vol, entry_tick_momentum) = {
-                let h = self.history.lock().unwrap();
-                let n = h.len();
-                let ps = if n >= 2 { Some(h[n-2].clone()) } else { None };
-                let hv = if n > 0 { hist_vol_from_deque(&h, n - 1) } else { 0.0 };
-                let tm = if n > 0 { tick_momentum_from_deque(&h, n - 1) } else { 0.0 };
-                (ps, hv, tm)
-            };
+            let (entry_prev_snap, entry_hist_vol, entry_tick_momentum) =
+                (precomp_prev_snap.clone(), precomp_hist_vol, precomp_tick_momentum);
             self.pending_entries.lock().unwrap().insert(
                 target_market.no_token,
                 (target_snapshot.clone(), entry_prev_snap, price, entry_hist_vol, entry_tick_momentum)
@@ -1338,7 +1408,7 @@ impl Strategy for GboostStrategyImpl {
                 }
                 if secs_held >= config::GBOOST_SL_MIN_HOLD_SECS && profit_pct <= -sl {
                     self.record_training_outcome_on_exit(target_market.yes_token, profit_pct > 0.0);
-                    self.mark_post_exit_cooldown(target_market.yes_token);
+                    self.mark_post_exit_cooldown_sl(target_market.yes_token);
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
                         reason: format!("GBoost SL YES: loss={:.2}% ({}s)", profit_pct * 100.0, secs_held),
@@ -1407,7 +1477,7 @@ impl Strategy for GboostStrategyImpl {
                 }
                 if secs_held >= config::GBOOST_SL_MIN_HOLD_SECS && profit_pct <= -sl {
                     self.record_training_outcome_on_exit(target_market.no_token, profit_pct > 0.0);
-                    self.mark_post_exit_cooldown(target_market.no_token);
+                    self.mark_post_exit_cooldown_sl(target_market.no_token);
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
                         reason: format!("GBoost SL NO: loss={:.2}% ({}s)", profit_pct * 100.0, secs_held),

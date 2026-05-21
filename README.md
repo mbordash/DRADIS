@@ -49,7 +49,7 @@ curl -s http://<host>:11434/api/tags | python3 -m json.tool
 
 ---
 
-## 🛰️ Tactical Overview
+## ️ Tactical Overview
 
 DRADIS is not just a bot; it is a comprehensive trading automation platform for prediction markets like Polymarket. Built in Rust for maximum concurrency and memory safety, it evaluates the selected markets every 50ms, coordinating multiple autonomous strategies to preserve capital and place orders where it sees inefficiencies.
 
@@ -57,7 +57,7 @@ Unlike standard linear scripts, DRADIS uses a Tokio-powered orchestrator to mana
 
 ---
 
-## 🛠️ The Architecture (The CIC)
+## ️ The Architecture (The CIC)
 
 The core of DRADIS is the Orchestrator. It acts as the ship's brain, maintaining the primary data link to the Polymarket CLOB and Binance Oracles.
 
@@ -118,7 +118,7 @@ The core of DRADIS is the Orchestrator. It acts as the ship's brain, maintaining
 
 ---
 
-## 🚀 The Viper Squadrons (Strategies)
+##  The Viper Squadrons (Strategies)
 
 DRADIS currently deploys six specialized Viper strategy classes. Each Viper is an autonomous tactical unit with its own capital budget, position book, and entry/exit logic — no Viper can compromise another's fuel.
 
@@ -131,7 +131,7 @@ DRADIS currently deploys six specialized Viper strategy classes. Each Viper is a
 
 ---
 
-## 🛸 The Raptor Squadron (Oracles)
+##  The Raptor Squadron (Oracles)
 
 Raptors are DRADIS's recon layer — lightweight signal scouts that fly ahead of the Vipers and report external intelligence back to the CIC. Each Raptor polls a specific data source on its own schedule and publishes a normalized signal the Viper strategies consume.
 
@@ -146,7 +146,7 @@ When multiple Raptors are active for a profile, the GBoost and Basis strategies 
 
 ---
 
-## 🖥️ Control Tower — The Dashboard
+## ️ Control Tower — The Dashboard
 
 DRADIS ships with a real-time web dashboard called **Control Tower** built on Next.js 15 + Tailwind CSS.
 
@@ -176,7 +176,7 @@ CT_PASSWORD=your-strong-password
 ```
 ---
 
-## 🤖 LLM Advisor
+##  LLM Advisor
 
 The LLM Advisor is an optional background task that periodically analyzes your completed trades and sends **plain-English optimization recommendations** directly to your Telegram channel. It is powered by a locally-running [Ollama](https://ollama.com) instance — no data ever leaves your machine or server.
 
@@ -193,10 +193,10 @@ Every `LLM_ADVISOR_INTERVAL_SECS` (default: 30 minutes) the advisor:
 A typical message looks like:
 
 ```
-📊 DRADIS LLM ADVISOR
+ DRADIS LLM ADVISOR
 Session P&L: -$1.42  |  Trades analysed: 20
 
-🔍 OBSERVATIONS
+ OBSERVATIONS
 • 6 of 8 GBoost losses had entry_obi_y ≤ -0.80 — adversely stacked books at fill time
 • Momentum avg hold 3s — MomentumDecay exits firing immediately after entry
 • BasisStrategy win rate 0% over 4 trades — oracle flat but funding signal absent
@@ -207,8 +207,8 @@ Session P&L: -$1.42  |  Trades analysed: 20
 3. enable_basis: true → false — no confirming funding signal this session; reduces noise
 4. gboost_entry_threshold: 0.85 → 0.90 — raise conviction bar; borderline signals losing money
 
-🟢 KEEP ENABLED: Momentum, Arbitrage, TimeDecay
-🔴 CONSIDER DISABLING: GBoost, Basis
+ KEEP ENABLED: Momentum, Arbitrage, TimeDecay
+ CONSIDER DISABLING: GBoost, Basis
 ```
 
 ### Configuration
@@ -254,16 +254,16 @@ Point DRADIS at a remote Ollama instance (e.g. a GPU box on your LAN or a cloud 
 
 | Profile | `ENABLE_LLM_ADVISOR` | Interval | Lookback |
 |---|---|---|---|
-| 🔴 Aggressive | `true` | 20 min | 25 trades |
-| 🟡 Balanced | `true` | 30 min | 20 trades |
-| 🟢 Conservative | `true` | 45 min | 15 trades |
+|  Aggressive | `true` | 20 min | 25 trades |
+|  Balanced | `true` | 30 min | 20 trades |
+|  Conservative | `true` | 45 min | 15 trades |
 | `config.rs` (live) | `false` | 30 min | 20 trades |
 
 The live `config.rs` ships with the advisor **off by default** — flip `ENABLE_LLM_ADVISOR = true` when you have Ollama running.
 
 ---
 
-## 🛡️ Safety Systems
+## ️ Safety Systems
 
 - **Orphaned Position Detection**: Automatically "scuttles" one-sided hedged positions after 60s to prevent directional bleeding.
 - **Fee Gates**: Hard-coded protection to ensure Taker strategies don't enter high-fee (1000 bps) environments.
@@ -354,6 +354,8 @@ The bot automatically records every completed trade into a daily CSV file for ea
 
 The auto-settlement feature (merging/redeeming positions after market resolution) requires a **reliable, paid Polygon (EVM) RPC endpoint**. Free public RPCs (polygon-rpc.com, Ankr, PublicNode) are unsuitable — they will fail with API key or nonce errors during settlement.
 
+> ⚠️ **Helius is a Solana-only RPC — do not use it for DRADIS.** Using a Solana endpoint will result in `"Method not found"` errors.
+
 **Recommended providers** (all with free tiers, all support Polygon):
 - [Alchemy](https://www.alchemy.com/) — **recommended**; excellent free tier, easy Polygon mainnet setup
 - [QuickNode](https://www.quicknode.com/) — reliable, industry standard
@@ -377,9 +379,9 @@ Three ready-to-use starting profiles are provided. **You must copy one to `src/c
 
 | Profile | File | Wallet Size | Risk | Strategies Active |
 |---------|------|-------------|------|-------------------|
-| 🟢 Conservative | `src/config.conservative.rs.example` | < $100 | Low | Maker, Time Decay only |
-| 🟡 Balanced | `src/config.balanced.rs.example` | $100–$300 | Medium | All six, moderate sizing |
-| 🔴 Aggressive | `src/config.aggressive.rs.example` | $200+ | High | All six, maximum sizing |
+|  Conservative | `src/config.conservative.rs.example` | < $100 | Low | Maker, Time Decay only |
+|  Balanced | `src/config.balanced.rs.example` | $100–$300 | Medium | All six, moderate sizing |
+|  Aggressive | `src/config.aggressive.rs.example` | $200+ | High | All six, maximum sizing |
 
 ```bash
 # Pick a starting profile and copy it into place
@@ -492,7 +494,7 @@ ssh -i ~/.ssh/your-key.pem ubuntu@YOUR_SERVER_IP "docker logs control-tower --ta
 
 ---
 
-## 🗺️ Roadmap
+## ️ Roadmap
 
 The priority is consistent profitability first — abstractions and new features follow once the core strategies prove their edge.
 
@@ -514,9 +516,9 @@ The priority is consistent profitability first — abstractions and new features
 
 ---
 
-## 🔌 Integrations
+##  Integrations
 
-### 🐾 OpenClaw Integration (Live Natural-Language Control)
+###  OpenClaw Integration (Live Natural-Language Control)
 
 [OpenClaw](https://openclaw.ai) is a personal AI assistant that executes tasks from plain English via WhatsApp, Telegram, or any chat app. Because DRADIS exposes a clean REST API, it can be registered as an OpenClaw **skill** — giving you full voice/text control of your trading bot from your phone, no dashboard required.
 

@@ -30,6 +30,7 @@ use polymarket_client_sdk_v2::data::types::request::PositionsRequest;
 use alloy::primitives::address as alloy_address;
 
 use crate::helpers::{db, send_notification, PhantomCooldowns};
+use crate::helpers::balance::OrphanTombstones;
 use crate::state::{Position, PositionMap};
 use crate::strategies::time_decay_impl::TimeDecayPosition;
 
@@ -219,6 +220,7 @@ pub async fn reconcile_orphaned_positions(
     positions: Arc<Mutex<PositionMap>>,
     clob_client: &Arc<ClobClient<Authenticated<Normal>>>,
     phantom_cooldowns: &PhantomCooldowns,
+    orphan_tombstones: &OrphanTombstones,
     tg_token: &str,
     tg_chat_id: &str,
 ) -> anyhow::Result<()> {
@@ -268,6 +270,12 @@ pub async fn reconcile_orphaned_positions(
         }
 
         pos_map.remove(&(strategy_name.clone(), token_id));
+
+        // Tombstone this token so reconcile_orphaned_positions (balance.rs) never
+        // re-adopts it within the same session.  Without this, phantom_cooldowns are
+        // cleared on every hourly market switch and the reconcile loop immediately
+        // re-adopts the unhedged on-chain leg, restarting the detect→remove→re-adopt cycle.
+        orphan_tombstones.lock().await.insert(token_id);
 
         // Block re-entry into this token for PHANTOM_COOLDOWN_SECS so the strategy
         // cannot immediately open a new position on top of untracked on-chain shares.
