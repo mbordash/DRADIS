@@ -313,7 +313,21 @@ pub const GBOOST_MAX_HOURLY_YES_ASK: Decimal = dec!(0.95);
 /// before GBoost YES entries are suppressed. 3600s = 60 min sustained below-strike.
 pub const GBOOST_BELOW_STRIKE_SUPPRESS_SECS: i64 = 3600;
 
-/// Chi-squared concept-drift threshold.  When the live data distribution deviates
+// ── GBoost dynamic position sizing ───────────────────────────────────────────
+
+/// Conservative: very small floor — minimal capital on borderline signals.
+pub const GBOOST_MIN_EXPOSURE_USDC: Decimal = dec!(1.0);
+
+/// Conservative: lower vol threshold — reduce size earlier as oracle gets noisy.
+pub const GBOOST_HIGH_VOL_REGIME_THRESHOLD: f64 = 0.55;
+
+/// Conservative: more aggressive size reduction in elevated vol (40% of base).
+pub const GBOOST_HIGH_VOL_SIZE_SCALE: f64 = 0.40;
+
+/// Conservative: 30-minute SL cooldown — longest wait after an adverse stop.
+pub const GBOOST_SL_POST_EXIT_COOLDOWN_SECS: i64 = 1800;
+
+  When the live data distribution deviates
 /// significantly from the training distribution (as measured by perpetual's leaf-node
 /// chi-squared statistic), GBoost entries are suppressed until the next retrain.
 /// Conservative: 4.0 — slightly below p95 chi2(df=1)=3.84; blocks on moderate
