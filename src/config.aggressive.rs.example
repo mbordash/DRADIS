@@ -321,7 +321,7 @@ pub const GBOOST_HIGH_VOL_SIZE_SCALE: f64 = 0.65;
 /// Aggressive: SL cooldown matches standard POST_EXIT_COOLDOWN — faster re-entry allowed.
 pub const GBOOST_SL_POST_EXIT_COOLDOWN_SECS: i64 = 600;
 
-  When the live data distribution deviates
+///  When the live data distribution deviates
 /// significantly from the training distribution (as measured by perpetual's leaf-node
 /// chi-squared statistic), GBoost entries are suppressed until the next retrain.
 /// Aggressive: 7.0 — only blocks on very strong regime shifts (~p99 chi2 level).

@@ -295,7 +295,7 @@ pub const GBOOST_HIGH_VOL_SIZE_SCALE: f64 = 0.50;
 /// Balanced: 15-minute SL cooldown — longer than aggressive, shorter than conservative.
 pub const GBOOST_SL_POST_EXIT_COOLDOWN_SECS: i64 = 900;
 
-  When the live data distribution deviates
+/// When the live data distribution deviates
 /// significantly from the training distribution (as measured by perpetual's leaf-node
 /// chi-squared statistic), GBoost entries are suppressed until the next retrain.
 /// Balanced: 5.0 — chi2(df=1) between p95 (3.84) and p99 (6.63); catches real shifts
