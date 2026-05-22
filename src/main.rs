@@ -182,7 +182,7 @@ async fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("❌ POLYGON_RPC_URL not set in .env. Required for auto-settlement transactions. Use a paid RPC service like Helius (https://www.helius-rpc.com) or QuickNode. Example: POLYGON_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"))?;
 
     let wallet_provider = ProviderBuilder::new()
-        .with_nonce_management(alloy::providers::fillers::SimpleNonceManager)  // Auto-refresh nonce from chain; prevents "nonce too low" on auto-settle
+        .with_nonce_management(alloy::providers::fillers::SimpleNonceManager::default())  // Auto-refresh nonce from chain; prevents "nonce too low" on auto-settle
         .wallet(signer.clone())
         .connect(&polygon_rpc_url)
         .await?;
