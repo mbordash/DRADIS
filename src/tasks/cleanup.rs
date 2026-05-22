@@ -54,7 +54,21 @@ const CTF_ADDRESS: Address = alloy_address!("0x4D97DCd97eC945f40cF65F87097ACe5EA
 const NEG_RISK_ADAPTER_ADDRESS: Address = alloy_address!("0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296");
 
 /// Seconds to wait before re-submitting settlement for the same condition (indexer catch-up buffer).
-const SETTLEMENT_CONDITION_COOLDOWN_SECS: i64 = 120;
+///
+/// Raised from 120s → 3600s (1 hour) on 2026-05-21.
+///
+/// Root cause of the duplicate-redemption bug observed in production:
+/// After a successful CTF `redeemPositions` call, the Polymarket Data API
+/// (Alchemy/subgraph indexer) continues returning the position as `redeemable: true`
+/// for several minutes due to indexer lag.  With a 120s cooldown, every 5-minute
+/// settlement_ticker cycle retried the redemption, submitted a live blockchain TX,
+/// and "succeeded" (CTF burns 0 balance as a no-op) — wasting gas and advancing
+/// the wallet nonce 8+ times in one session.  A 1-hour cooldown is safe because:
+///   1. Settlement is fire-and-forget; a 1-hour retry window is more than enough
+///      for the indexer to catch up.
+///   2. If the first TX genuinely failed (dropped from mempool), the user will
+///      see the position still live in their wallet and can manually settle.
+const SETTLEMENT_CONDITION_COOLDOWN_SECS: i64 = 3600;
 
 /// Seconds to skip a condition after a non-retryable settlement error (e.g. GS013 inner revert,
 /// wrong parentCollectionId, zero Safe balance). 30 minutes — long enough to avoid endless spam
@@ -64,6 +78,18 @@ const SETTLEMENT_CONDITION_ERROR_COOLDOWN_SECS: i64 = 1800;
 /// Tracks when each condition_id was last successfully submitted for settlement.
 static RECENT_SETTLEMENT_SUBMITS: LazyLock<Mutex<HashMap<B256, DateTime<Utc>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Conditions that were successfully redeemed this session.
+///
+/// After a successful `redeemPositions` TX the Polymarket Data API can keep
+/// returning the position as `redeemable: true` for many minutes due to
+/// indexer lag.  We track confirmed-redeemed conditions here and skip them
+/// entirely in future auto_settle cycles — no cooldown expiry needed because
+/// once a market is fully settled it never un-settles.  The set lives in a
+/// LazyLock so it persists across hourly market rotations for the entire
+/// process lifetime.
+static PERMANENTLY_SETTLED_CONDITIONS: LazyLock<Mutex<HashSet<B256>>> =
+    LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Tracks conditions that produced a non-retryable error (GS013, inner revert, etc.).
 /// These are skipped for SETTLEMENT_CONDITION_ERROR_COOLDOWN_SECS before being retried.
@@ -441,6 +467,17 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
     let mut settled_any = false;
 
     for (condition_id, legs) in by_condition {
+        // ── Permanently-settled guard: skip if we already redeemed this condition ──
+        // After a successful redeemPositions TX the Data API can return the position
+        // as redeemable: true for many minutes (indexer lag).  Without this guard
+        // every settlement_ticker cycle would submit a new blockchain TX, burning
+        // gas and advancing the wallet nonce unnecessarily (observed 2026-05-21:
+        // 8 duplicate redeems of condition 0xd633214b within ~1 hour).
+        {
+            if PERMANENTLY_SETTLED_CONDITIONS.lock().await.contains(&condition_id) {
+                continue;
+            }
+        }
         // ── Success cooldown: skip if we submitted successfully recently ────────
         {
             let recent = RECENT_SETTLEMENT_SUBMITS.lock().await;
@@ -508,6 +545,9 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
                 Ok(tx_hash) => {
                     settled_any = true;
                     RECENT_SETTLEMENT_SUBMITS.lock().await.insert(condition_id, Utc::now());
+                    // Mark as permanently settled so we never re-attempt this condition
+                    // in the same session, regardless of Data API indexer lag.
+                    PERMANENTLY_SETTLED_CONDITIONS.lock().await.insert(condition_id);
                     info!("✅ Auto-settle: redeemed neg-risk condition {} (tx {})", condition_id, tx_hash);
                 }
                 Err(e) => {
@@ -539,6 +579,9 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
                 Ok(tx_hash) => {
                     settled_any = true;
                     RECENT_SETTLEMENT_SUBMITS.lock().await.insert(condition_id, Utc::now());
+                    // Mark as permanently settled so we never re-attempt this condition
+                    // in the same session, regardless of Data API indexer lag.
+                    PERMANENTLY_SETTLED_CONDITIONS.lock().await.insert(condition_id);
                     info!(
                         "✅ Auto-settle: redeemed condition {} (tx {}) — YES:{} NO:{} units",
                         condition_id, tx_hash, yes_units, no_units

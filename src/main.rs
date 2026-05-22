@@ -182,6 +182,7 @@ async fn main() -> Result<()> {
         .map_err(|_| anyhow::anyhow!("❌ POLYGON_RPC_URL not set in .env. Required for auto-settlement transactions. Use a paid RPC service like Helius (https://www.helius-rpc.com) or QuickNode. Example: POLYGON_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"))?;
 
     let wallet_provider = ProviderBuilder::new()
+        .with_nonce_management(alloy::providers::fillers::SimpleNonceManager)  // Auto-refresh nonce from chain; prevents "nonce too low" on auto-settle
         .wallet(signer.clone())
         .connect(&polygon_rpc_url)
         .await?;
@@ -925,7 +926,13 @@ async fn main() -> Result<()> {
                     }
                 }
                 _ = ticker.tick() => {
-                    if market_rx.has_changed().unwrap_or(false) { break; }
+                    // If the market has changed, skip strategy evaluation this tick and yield
+                    // back to the select! so the market_rx.changed() arm can process the switch
+                    // cleanly (with CID update + WS cancel).  A raw `break` here was the root
+                    // cause of the triple-restart loop: it exited WITHOUT updating
+                    // current_hourly_cid/current_maker_cid, so the very next market_rx.changed()
+                    // arm saw stale CIDs and fired another "switch" — repeating 3× on 2026-05-21.
+                    if market_rx.has_changed().unwrap_or(false) { continue; }
                     *last_heartbeat_at.lock().await = Instant::now();
 
                     // Get hourly market snapshot
