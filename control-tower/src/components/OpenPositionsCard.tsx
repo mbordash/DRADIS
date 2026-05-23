@@ -44,6 +44,12 @@ function TipCell({ full, maxChars, className = '' }: { full: string; maxChars: n
   );
 }
 
+/** Returns true for "long / bullish" outcomes: YES, UP, BUY, etc. */
+function isLongSide(side: string): boolean {
+  const s = side.toUpperCase();
+  return s === 'YES' || s === 'UP' || s === 'BUY' || s === 'LONG';
+}
+
 /** Estimate unrealised P&L direction from side label colour only (no live price here). */
 function strategyLabel(s: string) {
   return s.replace('Strategy', '');
@@ -100,12 +106,17 @@ export default function OpenPositionsCard({ positions, isLoading }: Props) {
                 key={i}
                 className="border-b border-[#1e1e32] hover:bg-[#1a1a2e] transition-colors"
               >
-                <td className="px-3 py-2 text-gray-400 whitespace-nowrap">{fmtTime(p.ts)}</td>
+                <td className="px-3 py-2 text-gray-400 whitespace-nowrap">
+                  {p.chain_adopted
+                    ? <span title="Re-adopted from on-chain wallet; original entry time unknown" className="text-amber-500/80 cursor-help">⛓ adopted</span>
+                    : fmtTime(p.ts)
+                  }
+                </td>
                 <td className="px-3 py-2 text-gray-300 whitespace-nowrap">{strategyLabel(p.strategy)}</td>
                 <td className="px-3 py-2 text-gray-400 max-w-[160px]">
                   <TipCell full={p.market} maxChars={26} />
                 </td>
-                <td className={`px-3 py-2 font-semibold ${p.side === 'YES' ? 'text-green-400' : 'text-red-400'}`}>
+                <td className={`px-3 py-2 font-semibold ${isLongSide(p.side) ? 'text-green-400' : 'text-red-400'}`}>
                   {p.side}
                 </td>
                 <td className="px-3 py-2 text-gray-300">{parseFloat(p.entry_price).toFixed(4)}</td>

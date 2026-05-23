@@ -76,14 +76,15 @@ export interface TradeRow {
 
 /** A position that has been entered but not yet exited (all strategies, ghost+live). */
 export interface OpenPositionRow {
-  ts:          string;  // entry timestamp (ISO 8601)
-  strategy:    string;
-  token_id:    string;
-  market:      string;
-  side:        string;  // "YES" | "NO"
-  entry_price: string;  // Decimal string
-  shares:      string;  // Decimal string
-  ghost_mode:  boolean;
+  ts:             string;  // entry timestamp (ISO 8601) — or adoption timestamp if chain_adopted
+  strategy:       string;
+  token_id:       string;
+  market:         string;
+  side:           string;  // "YES" | "NO" | "UP" | "DOWN" (varies by market type)
+  entry_price:    string;  // Decimal string
+  shares:         string;  // Decimal string
+  ghost_mode:     boolean;
+  chain_adopted:  boolean; // true when re-adopted from on-chain (ts = adoption time, not original entry)
 }
 
 export interface LlmRecommendationRow {

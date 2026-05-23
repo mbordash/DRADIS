@@ -404,7 +404,8 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
     let mut adopted = 0usize;
     for (token_str, pos) in &live_map {
         if !db_ids.contains(token_str) {
-            if db::adopt_chain_position(pool, token_str, &pos.title, pos.avg_price, pos.size).await {
+            let side = pos.outcome.to_uppercase();
+            if db::adopt_chain_position(pool, token_str, &pos.title, &side, pos.avg_price, pos.size).await {
                 adopted += 1;
                 info!("📥 Chain-sync: re-adopted on-chain position — token {} | {} shares @ ${:.4} | \"{}\"",
                     &token_str[..token_str.len().min(20)],

@@ -119,18 +119,26 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
     // positions that have not yet settled as a completed trade.
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS open_positions (
-            id          INTEGER PRIMARY KEY AUTOINCREMENT,
-            ts          TEXT    NOT NULL,
-            session_id  TEXT    NOT NULL,
-            strategy    TEXT    NOT NULL,
-            token_id    TEXT    NOT NULL,
-            market      TEXT    NOT NULL,
-            side        TEXT    NOT NULL,
-            entry_price TEXT    NOT NULL,
-            shares      TEXT    NOT NULL,
-            ghost_mode  INTEGER NOT NULL DEFAULT 0
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts             TEXT    NOT NULL,
+            session_id     TEXT    NOT NULL,
+            strategy       TEXT    NOT NULL,
+            token_id       TEXT    NOT NULL,
+            market         TEXT    NOT NULL,
+            side           TEXT    NOT NULL,
+            entry_price    TEXT    NOT NULL,
+            shares         TEXT    NOT NULL,
+            ghost_mode     INTEGER NOT NULL DEFAULT 0,
+            chain_adopted  INTEGER NOT NULL DEFAULT 0
         )"
     ).execute(pool).await?;
+
+    // Migration: add chain_adopted column to existing open_positions tables that pre-date this column.
+    // ALTER TABLE ADD COLUMN is a no-op-safe operation in SQLite; IF NOT EXISTS is not supported
+    // so we suppress the "duplicate column" error silently.
+    let _ = sqlx::query(
+        "ALTER TABLE open_positions ADD COLUMN chain_adopted INTEGER NOT NULL DEFAULT 0"
+    ).execute(pool).await;
 
     // llm_recommendations: LLM Advisor analysis results persisted for the dashboard
     sqlx::query(
@@ -704,21 +712,34 @@ pub async fn adopt_chain_position(
     pool: &SqlitePool,
     token_id: &str,
     market: &str,
+    side: &str,
     avg_price: rust_decimal::Decimal,
     shares: rust_decimal::Decimal,
 ) -> bool {
     let ts  = Utc::now().to_rfc3339();
     let sid = current_session_id();
+    // Patch any existing row that still has the legacy '?' placeholder side value.
+    // This handles rows written by older builds before the side bind was fixed.
+    // Also mark the row as chain_adopted so the UI can display accordingly.
+    let _ = sqlx::query(
+        "UPDATE open_positions SET side = ?, chain_adopted = 1 WHERE token_id = ? AND side = '?'"
+    )
+    .bind(side)
+    .bind(token_id)
+    .execute(pool)
+    .await;
+
     match sqlx::query(
         "INSERT INTO open_positions
-             (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode)
-         SELECT ?, ?, 'ArbitrageStrategy', ?, ?, '?', ?, ?, 0
+             (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted)
+         SELECT ?, ?, 'ArbitrageStrategy', ?, ?, ?, ?, ?, 0, 1
          WHERE NOT EXISTS (SELECT 1 FROM open_positions WHERE token_id = ?)"
     )
     .bind(&ts)
     .bind(sid)
     .bind(token_id)
     .bind(market)
+    .bind(side)
     .bind(avg_price.to_string())
     .bind(shares.to_string())
     .bind(token_id)
@@ -753,14 +774,15 @@ pub struct TradeRow {
 
 #[derive(Debug, Serialize)]
 pub struct OpenPositionRow {
-    pub ts:          String,
-    pub strategy:    String,
-    pub token_id:    String,
-    pub market:      String,
-    pub side:        String,
-    pub entry_price: String,
-    pub shares:      String,
-    pub ghost_mode:  bool,
+    pub ts:             String,
+    pub strategy:       String,
+    pub token_id:       String,
+    pub market:         String,
+    pub side:           String,
+    pub entry_price:    String,
+    pub shares:         String,
+    pub ghost_mode:     bool,
+    pub chain_adopted:  bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -821,20 +843,21 @@ pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
 /// Used by the API (/api/positions) and the LLM Advisor prompt.
 pub async fn get_open_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
     match sqlx::query(
-        "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode
+        "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted
          FROM open_positions ORDER BY ts ASC"
     )
     .fetch_all(pool)
     .await {
         Ok(rows) => rows.into_iter().filter_map(|r| Some(OpenPositionRow {
-            ts:          r.try_get::<String, _>(0).ok()?,
-            strategy:    r.try_get::<String, _>(1).ok()?,
-            token_id:    r.try_get::<String, _>(2).ok()?,
-            market:      r.try_get::<String, _>(3).ok()?,
-            side:        r.try_get::<String, _>(4).ok()?,
-            entry_price: r.try_get::<String, _>(5).ok()?,
-            shares:      r.try_get::<String, _>(6).ok()?,
-            ghost_mode:  r.try_get::<i64, _>(7).ok()? != 0,
+            ts:             r.try_get::<String, _>(0).ok()?,
+            strategy:       r.try_get::<String, _>(1).ok()?,
+            token_id:       r.try_get::<String, _>(2).ok()?,
+            market:         r.try_get::<String, _>(3).ok()?,
+            side:           r.try_get::<String, _>(4).ok()?,
+            entry_price:    r.try_get::<String, _>(5).ok()?,
+            shares:         r.try_get::<String, _>(6).ok()?,
+            ghost_mode:     r.try_get::<i64, _>(7).ok()? != 0,
+            chain_adopted:  r.try_get::<i64, _>(8).ok()? != 0,
         })).collect(),
         Err(e) => { error!("❌ DB get_open_positions failed: {}", e); vec![] }
     }
