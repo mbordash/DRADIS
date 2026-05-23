@@ -165,6 +165,10 @@ DRADIS ships with a real-time web dashboard called **Control Tower** built on Ne
 
 Every parameter shown in the Viper cards maps directly to the runtime `DynamicConfig`. Editing a value and pressing Enter (or toggling the switch) sends a `PATCH /api/config` request to the DRADIS engine — **no restart required**. Changes take effect on the next 50ms tick.
 
+> **Hot-Enable Design** — All six Viper strategies are **always instantiated** at startup, regardless of the compile-time `ENABLE_*` flags in `config.rs`. The `DynamicConfig` enable flags (`enable_gboost`, `enable_momentum`, etc.) are the **sole runtime gates** checked on every tick. This means you can toggle any strategy on or off from the Control Tower UI during a live session with immediate effect — no redeploy, no restart needed.
+>
+> The compile-time `ENABLE_*` constants (e.g. `ENABLE_GBOOST_TRADING`) in `config.rs` / `config-live.rs` now serve **only as default values** seeded into `DynamicConfig` on first startup. Changing them still sets the out-of-the-box defaults, but they no longer prevent a strategy from being hot-enabled via the UI.
+
 ### Authentication
 
 Control Tower is protected by HTTP Basic Auth in production. Set `CT_USERNAME` and `CT_PASSWORD` in your `.env` file. The middleware is skipped automatically in local dev when these vars are absent.
@@ -499,6 +503,7 @@ ssh -i ~/.ssh/your-key.pem ubuntu@YOUR_SERVER_IP "docker logs control-tower --ta
 The priority is consistent profitability first — abstractions and new features follow once the core strategies prove their edge.
 
 ### Recently shipped
+- **Strategy hot-enable** — All Viper strategies are now always instantiated at startup. The compile-time `ENABLE_*` constants in `config.rs` are no longer used to gate instantiation — they only set `DynamicConfig` defaults. This means the Control Tower UI's strategy on/off toggles take effect **immediately during a running session** without restarting or redeploying the engine.
 - **LLM Advisor** — periodic trade analysis via a local Ollama instance; optimization recommendations delivered to Telegram; bring-your-own model via `OLLAMA_URL` / `OLLAMA_MODEL` env vars (see [LLM Advisor](#-llm-advisor))
 
 ### Medium-term (deployment profiles)
@@ -647,6 +652,12 @@ If you pull an update and `NUM_FEATURES` in `src/strategies/gboost_impl.rs` has 
 3. Rebuild and restart. The model will cold-start, collect `GBOOST_MIN_TRAINING_SAMPLES` ticks (~16 seconds at 50 ms), then begin predicting.
 
 The safe pattern when adding a new feature: bump the suffix in `GBOOST_MODEL_PATH` (e.g. `v14f` → `v15f`).  The old file is ignored, no manual cleanup needed.
+
+**Can I enable a strategy from the Control Tower UI mid-session without restarting?**
+
+Yes. As of the hot-enable registry refactor, all six Viper strategies are always instantiated when the engine starts. Toggling a strategy on or off via the Control Tower dashboard (or via `PATCH /api/config`) takes effect on the very next 50ms tick — no rebuild or restart required.
+
+The compile-time `ENABLE_*` constants (`ENABLE_GBOOST_TRADING`, `ENABLE_MOMENTUM_TRADING`, etc.) in `config.rs` now only control the **default enabled state** seeded into `DynamicConfig` at startup. They no longer prevent a strategy from being hot-enabled during a session.
 
 **How do I tune strategy parameters without restarting?**
 
