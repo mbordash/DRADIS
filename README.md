@@ -411,8 +411,6 @@ DRADIS_API_KEY=replace-with-a-strong-random-secret
 
 **How do I adjust risk live?** Use the Control Tower Viper cards or `PATCH /api/config`. No restart needed.
 
-**Why no backtesting framework?** Ghost mode against live markets is a better substitute for prediction-market trading. See the [full explanation](#why-doesnt-dradis-include-a-backtesting-framework) below.
-
 **GBoost producing garbage after an update?** The model file is incompatible across feature vector changes. Delete old files and let it cold-start:
 ```bash
 rm -f logs/gboost_model_*.json
