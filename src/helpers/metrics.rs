@@ -180,16 +180,20 @@ pub async fn record_entry(
 }
 
 /// Scans the last two ET-days of entry logs for the given token_id (decimal string).
-/// Returns the most recent recorded entry_price, or None if no log entry exists.
+/// Returns `(entry_price, strategy_name)`, or None if no log entry exists.
 ///
 /// SQLite is checked first (O(log n) index lookup); falls back to CSV scan
 /// for entries made before the DB was introduced.
-pub async fn lookup_entry_price_from_csv(token_id_str: &str) -> Option<Decimal> {
+///
+/// Returning the originating strategy lets `reconcile_orphaned_positions` in balance.rs
+/// re-assign a restarted position to the CORRECT strategy instead of defaulting to
+/// whichever strategy happens to be first in the registry adoption order.
+pub async fn lookup_entry_from_csv(token_id_str: &str) -> Option<(Decimal, String)> {
     // ── SQLite fast path ─────────────────────────────────────────────────────
     if let Some(pool) = db::pool() {
-        if let Some(price) = db::lookup_entry_price_db(pool, token_id_str).await {
-            info!("📦 DB: found entry_price={} for token {}", price, token_id_str);
-            return Some(price);
+        if let Some((price, strategy)) = db::lookup_entry_db(pool, token_id_str).await {
+            info!("📦 DB: found entry_price={} strategy={} for token {}", price, strategy, token_id_str);
+            return Some((price, strategy));
         }
     }
 
@@ -205,6 +209,7 @@ pub async fn lookup_entry_price_from_csv(token_id_str: &str) -> Option<Decimal> 
 
     let mut best_ts: Option<String> = None;
     let mut best_price: Option<Decimal> = None;
+    let mut best_strategy: Option<String> = None;
 
     for date in &dates {
         let filename = format!("logs/{}-entries_{:04}-{:02}-{:02}.csv",
@@ -218,26 +223,35 @@ pub async fn lookup_entry_price_from_csv(token_id_str: &str) -> Option<Decimal> 
             // Fields are quoted; split on `","` to handle commas inside market names.
             let cols: Vec<&str> = line.splitn(7, ',').collect();
             if cols.len() < 6 { continue; }
-            let ts    = cols[0].trim_matches('"');
-            let tid   = cols[2].trim_matches('"');
-            let price_str = cols[5].trim_matches('"');
+            let ts           = cols[0].trim_matches('"');
+            let strategy_col = cols[1].trim_matches('"');
+            let tid          = cols[2].trim_matches('"');
+            let price_str    = cols[5].trim_matches('"');
             if tid == token_id_str {
                 if let Ok(price) = Decimal::from_str(price_str) {
                     // Keep the most recent timestamp (ISO 8601 string comparison works lexicographically).
                     if best_ts.is_none() || ts > best_ts.as_deref().unwrap_or("") {
                         best_ts = Some(ts.to_string());
                         best_price = Some(price);
+                        best_strategy = Some(strategy_col.to_string());
                     }
                 }
             }
         }
     }
 
-    if best_price.is_some() {
-        info!("📂 Entry log: found real entry_price={} for token {}", best_price.unwrap(), token_id_str);
+    if let Some(price) = best_price {
+        let strategy = best_strategy.unwrap_or_default();
+        info!("📂 Entry log: found entry_price={} strategy={} for token {}", price, strategy, token_id_str);
+        Some((price, strategy))
     } else {
         warn!("📂 Entry log: no record found for token {} — will use discount heuristic", token_id_str);
+        None
     }
-    best_price
+}
+
+/// Convenience wrapper — returns only the entry price (for callers that don't need the strategy).
+pub async fn lookup_entry_price_from_csv(token_id_str: &str) -> Option<Decimal> {
+    lookup_entry_from_csv(token_id_str).await.map(|(price, _)| price)
 }
 

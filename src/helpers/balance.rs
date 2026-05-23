@@ -243,41 +243,73 @@ pub async fn reconcile_orphaned_positions(
             if map.iter().any(|((_, tid), _)| *tid == token_id) { continue; }
         }
 
-        let mut adopted_strategy = None;
-        for s in adoption_order {
-            let map = positions.lock().await;
-            if !map.contains_key(&(s.clone(), token_id)) {
-                adopted_strategy = Some(s.clone());
-                break;
+        let current_bid = token_bids.iter().find(|(tid, _)| *tid == token_id)
+            .map(|(_, bid)| *bid)
+            .filter(|b| *b > dec!(0))
+            .unwrap_or(dec!(0.50));
+
+        // Try to recover real entry price AND originating strategy from the entry log
+        // written at order time.  This is the authoritative source — the bot writes a
+        // row to the entries DB immediately after each successful place_limit_order, so
+        // if the bot crashed mid-session both the cost basis and the strategy name are
+        // preserved.  Using the recorded strategy avoids misattributing ArbitrageStrategy
+        // or GboostStrategy orphans to MomentumStrategy simply because Momentum happens
+        // to be first in the registry's adoption_order list.
+        //
+        // If no log entry exists (e.g. entry predates this feature, or logs dir was wiped),
+        // fall back to the first available strategy in adoption_order and a discounted bid.
+        let db_entry = metrics::lookup_entry_from_csv(&token_id.to_string()).await;
+        let (avg_entry, logged_strategy) = match db_entry {
+            Some((real_entry, ref strat)) if !strat.is_empty() => {
+                warn!("🔁 RECONCILE: Recovered entry_price={:.4} strategy={} for token {} from entry log",
+                    real_entry, strat, token_id);
+                (real_entry, Some(strat.clone()))
             }
-        }
+            Some((real_entry, _)) => {
+                warn!("🔁 RECONCILE: Recovered entry_price={:.4} for token {} (no strategy in log)", real_entry, token_id);
+                (real_entry, None)
+            }
+            None => {
+                // No log found — credit an artificial entry below current bid so profit_margin
+                // is immediately above every strategy's take-profit threshold on the next tick.
+                (current_bid * (dec!(1) - crate::config::RECONCILE_ADOPTED_ENTRY_DISCOUNT), None)
+            }
+        };
+
+        // Determine which strategy should own this position.
+        // Priority: (1) strategy recorded in the entry log, (2) first in adoption_order.
+        let adopted_strategy = if let Some(ref logged) = logged_strategy {
+            // Verify the strategy isn't already tracking this token before using it.
+            let map = positions.lock().await;
+            if !map.contains_key(&(logged.clone(), token_id)) {
+                Some(logged.clone())
+            } else {
+                // Logged strategy already has this token — fall back to adoption_order.
+                drop(map);
+                let mut fallback = None;
+                for s in adoption_order {
+                    let map = positions.lock().await;
+                    if !map.contains_key(&(s.clone(), token_id)) {
+                        fallback = Some(s.clone());
+                        break;
+                    }
+                }
+                fallback
+            }
+        } else {
+            let mut fallback = None;
+            for s in adoption_order {
+                let map = positions.lock().await;
+                if !map.contains_key(&(s.clone(), token_id)) {
+                    fallback = Some(s.clone());
+                    break;
+                }
+            }
+            fallback
+        };
 
         if let Some(strategy_name) = adopted_strategy {
             let mut pos_map = positions.lock().await;
-            let current_bid = token_bids.iter().find(|(tid, _)| *tid == token_id)
-                .map(|(_, bid)| *bid)
-                .filter(|b| *b > dec!(0))
-                .unwrap_or(dec!(0.50));
-
-            // Try to recover the real entry price from the entry log written at order time.
-            // This is the authoritative source — the bot writes a row to {crypto}-entries_{date}.csv
-            // immediately after each successful place_limit_order, so if the bot crashed mid-session
-            // the entry is still on disk. Use the most recent matching record for this token_id.
-            //
-            // If no log entry exists (e.g. entry predates this feature, or logs dir was wiped),
-            // fall back to discounting the current bid so the position exits promptly.
-            let db_entry = metrics::lookup_entry_price_from_csv(&token_id.to_string()).await;
-            let avg_entry = match db_entry {
-                Some(real_entry) => {
-                    warn!("🔁 RECONCILE: Recovered real entry_price {:.4} for token {} from entry log", real_entry, token_id);
-                    real_entry
-                }
-                None => {
-                    // No log found — credit an artificial entry below current bid so profit_margin
-                    // is immediately above every strategy's take-profit threshold on the next tick.
-                    current_bid * (dec!(1) - crate::config::RECONCILE_ADOPTED_ENTRY_DISCOUNT)
-                }
-            };
 
             pos_map.insert((strategy_name.to_string(), token_id), Position {
                 shares: actual_shares,
@@ -289,16 +321,12 @@ pub async fn reconcile_orphaned_positions(
                 fill_confirmed_at: Some(Utc::now()),
                 paired_leg_token_id: None, // fixed up below
             });
-            // Log differs based on source so it's obvious whether avg_entry came from the
-            // DB (authoritative cost basis) or the discount heuristic (bid-derived fallback).
-            if db_entry.is_some() {
-                warn!("🔁 RECONCILE: Adopted {} {} shares for token {} under [{}] — avg_entry={:.4} (source=DB, current_bid={:.4})",
-                    actual_shares, side_label, token_id, strategy_name, avg_entry, current_bid);
-            } else {
-                warn!("🔁 RECONCILE: Adopted {} {} shares for token {} under [{}] — avg_entry={:.4} (source=discount@{:.0}%, bid={:.4})",
-                    actual_shares, side_label, token_id, strategy_name, avg_entry,
-                    crate::config::RECONCILE_ADOPTED_ENTRY_DISCOUNT * dec!(100), current_bid);
-            }
+
+            let source = if logged_strategy.is_some() { "DB" } else {
+                &format!("discount@{:.0}%", crate::config::RECONCILE_ADOPTED_ENTRY_DISCOUNT * dec!(100))
+            };
+            warn!("🔁 RECONCILE: Adopted {} {} shares for token {} under [{}] — avg_entry={:.4} (source={}, current_bid={:.4})",
+                actual_shares, side_label, token_id, strategy_name, avg_entry, source, current_bid);
         }
     }
 

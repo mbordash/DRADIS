@@ -324,8 +324,15 @@ pub async fn record_entry_db(
 /// Look up the most recent entry price for a token_id.
 /// Primary path for reconcile_orphaned_positions — faster than CSV scan.
 pub async fn lookup_entry_price_db(pool: &SqlitePool, token_id_str: &str) -> Option<Decimal> {
+    lookup_entry_db(pool, token_id_str).await.map(|(price, _)| price)
+}
+
+/// Like `lookup_entry_price_db` but also returns the originating strategy name.
+/// Used by the orphan-adoption reconciler so a restarted bot re-assigns positions
+/// to the strategy that originally opened them, not just the first in the registry.
+pub async fn lookup_entry_db(pool: &SqlitePool, token_id_str: &str) -> Option<(Decimal, String)> {
     let row = sqlx::query(
-        "SELECT entry_price FROM entries WHERE token_id = ? ORDER BY ts DESC LIMIT 1"
+        "SELECT entry_price, strategy FROM entries WHERE token_id = ? ORDER BY ts DESC LIMIT 1"
     )
     .bind(token_id_str)
     .fetch_optional(pool)
@@ -333,9 +340,9 @@ pub async fn lookup_entry_price_db(pool: &SqlitePool, token_id_str: &str) -> Opt
     .ok()
     .flatten()?;
 
-    row.try_get::<String, _>(0)
-        .ok()
-        .and_then(|s| s.parse::<Decimal>().ok())
+    let price = row.try_get::<String, _>(0).ok().and_then(|s| s.parse::<Decimal>().ok())?;
+    let strategy = row.try_get::<String, _>(1).ok().unwrap_or_default();
+    Some((price, strategy))
 }
 
 // ─── P&L snapshot ────────────────────────────────────────────────────────────

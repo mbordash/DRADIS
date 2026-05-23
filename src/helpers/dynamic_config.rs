@@ -184,6 +184,7 @@ impl DynamicConfig {
                             .min(config::TIME_DECAY_MAX_ENTRY_PRICE);
                         cfg.time_decay_stop_loss_pct = cfg.time_decay_stop_loss_pct
                             .min(config::TIME_DECAY_STOP_LOSS_PERCENT);
+
                         info!("⚙️  DynamicConfig loaded from SQLite (safety floors applied)");
 
                         // Record startup load in config_history so developers can see
