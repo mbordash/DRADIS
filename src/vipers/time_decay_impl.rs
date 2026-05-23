@@ -44,7 +44,7 @@ use alloy::primitives::U256;
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
-use crate::strategies::is_drawdown_limit_hit;
+use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
 use polymarket_client_sdk_v2::clob::types::OrderType;
 

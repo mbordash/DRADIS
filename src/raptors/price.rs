@@ -1,8 +1,16 @@
-/// Background task: Binance oracle WebSocket price feed.
+/// Price Raptor — Binance Spot WebSocket price feed.
 ///
-/// Connects to the Binance ticker stream for the configured crypto pair and
-/// broadcasts oracle price, velocity (5s + 1s), acceleration, and 60-minute
-/// drift via watch channels.  Reconnects automatically on disconnect.
+/// Connects to the Binance `<symbol>@ticker` stream for the configured crypto pair
+/// and broadcasts the following signals via `watch` channels:
+///
+/// │ Channel        │ Type                           │ Description                        │
+/// │────────────────│────────────────────────────────│────────────────────────────────────│
+/// │ oracle_tx      │ Decimal                        │ Current spot price                 │
+/// │ velocity_tx    │ (Decimal, Decimal, Decimal)    │ (5s velocity, 1s velocity, accel)  │
+/// │ drift_tx       │ (Decimal, Decimal)             │ (60-min drift, 10-min drift)       │
+///
+/// Reconnects automatically on disconnect or 30s tick silence.
+/// Consumers should treat a `dec!(0)` oracle price as "not yet connected".
 use std::str::FromStr;
 
 use futures::StreamExt as _;
@@ -16,7 +24,7 @@ use std::collections::VecDeque;
 
 use crate::config;
 
-pub async fn run_oracle(
+pub async fn run_price_raptor(
     crypto_filter: String,
     oracle_tx: watch::Sender<Decimal>,
     velocity_tx: watch::Sender<(Decimal, Decimal, Decimal)>,
@@ -37,7 +45,7 @@ pub async fn run_oracle(
 
     loop {
         if let Ok((mut ws_stream, _)) = connect_async(&url_str).await {
-            info!("📡 Connected to Binance Oracle for {}", binance_pair.to_uppercase());
+            info!("📡 Price Raptor connected to Binance for {}", binance_pair.to_uppercase());
             // 30s read timeout per message: if Binance stops sending ticks (silently dead
             // TCP connection / half-open socket), ws_stream.next().await would wait
             // indefinitely — parking this Tokio worker thread and contributing to runtime
@@ -122,13 +130,13 @@ pub async fn run_oracle(
                     Ok(None) | Ok(Some(Err(_))) => break 'ws,
                     // 30s elapsed with no message — silent stall; force reconnect.
                     Err(_) => {
-                        warn!("⚠️ Binance Oracle: no tick in 30s — reconnecting");
+                        warn!("⚠️ Price Raptor: no tick in 30s — reconnecting");
                         break 'ws;
                     }
                 }
             }
         }
-        warn!("⚠️ Binance Oracle disconnected. Reconnecting in 5s...");
+        warn!("⚠️ Price Raptor disconnected. Reconnecting in 5s...");
         prev_velocity = dec!(0);
         price_history_10m.clear();
         tokio::time::sleep(Duration::from_secs(5)).await;

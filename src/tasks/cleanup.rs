@@ -32,7 +32,7 @@ use alloy::primitives::address as alloy_address;
 use crate::helpers::{db, send_notification, PhantomCooldowns};
 use crate::helpers::balance::OrphanTombstones;
 use crate::state::{Position, PositionMap};
-use crate::strategies::time_decay_impl::TimeDecayPosition;
+use crate::vipers::time_decay_impl::TimeDecayPosition;
 
 // ── On-chain settlement contracts ────────────────────────────────────────────
 

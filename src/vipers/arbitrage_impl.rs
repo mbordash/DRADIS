@@ -28,7 +28,7 @@ use rust_decimal_macros::dec;
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
-use crate::strategies::is_drawdown_limit_hit;
+use crate::vipers::is_drawdown_limit_hit;
 use polymarket_client_sdk_v2::clob::types::OrderType;
 use tracing::debug;
 

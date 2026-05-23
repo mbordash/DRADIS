@@ -14,12 +14,12 @@
 /// only as the DEFAULT value seeded into DynamicConfig on first startup.
 
 use crate::orchestrator::Strategy;
-use crate::strategies::momentum_impl::MomentumStrategyImpl;
-use crate::strategies::arbitrage_impl::ArbitrageStrategyImpl;
-use crate::strategies::time_decay_impl::TimeDecayStrategyImpl;
-use crate::strategies::maker_impl::MakerStrategyImpl;
-use crate::strategies::basis_impl::BasisStrategyImpl;
-use crate::strategies::gboost_impl::GboostStrategyImpl;
+use crate::vipers::momentum_impl::MomentumStrategyImpl;
+use crate::vipers::arbitrage_impl::ArbitrageStrategyImpl;
+use crate::vipers::time_decay_impl::TimeDecayStrategyImpl;
+use crate::vipers::maker_impl::MakerStrategyImpl;
+use crate::vipers::basis_impl::BasisStrategyImpl;
+use crate::vipers::gboost_impl::GboostStrategyImpl;
 
 /// Registry for all available strategies
 pub struct StrategyRegistry;

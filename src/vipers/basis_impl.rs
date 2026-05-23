@@ -24,7 +24,7 @@ use chrono::Utc;
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
-use crate::strategies::is_drawdown_limit_hit;
+use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
 use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
 
@@ -119,7 +119,7 @@ impl Strategy for BasisStrategyImpl {
         // Kelly sizing — then back off by the taker fee so order_amount + fee never exceeds trade_size.
         // Without this, a $15 order at 1000 bps adds ~$0.67 in fees, pushing the required total
         // above the available pUSD balance and causing a 400 "not enough balance" rejection.
-        let trade_size = crate::strategies::basis_impl::basis_trade_size(skew.abs());
+        let trade_size = crate::vipers::basis_impl::basis_trade_size(skew.abs());
         let no_fee_headroom  = dec!(1) + Decimal::from(market.no_fee_bps)  / dec!(10000);
         let yes_fee_headroom = dec!(1) + Decimal::from(market.yes_fee_bps) / dec!(10000);
 

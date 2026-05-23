@@ -41,7 +41,9 @@ echo "🚀 Deploying DRADIS + Control Tower to $HOST..."
 # ── 1. Create remote directory structure ──────────────────────────────────────
 echo "📁 Creating remote directory structure..."
 ssh -i "$KEY" "$USER@$HOST" \
-  "mkdir -p $REMOTE_DIR/src/strategies \
+  "mkdir -p $REMOTE_DIR/src/vipers \
+            $REMOTE_DIR/src/raptors \
+            $REMOTE_DIR/src/squadron \
             $REMOTE_DIR/src/helpers \
             $REMOTE_DIR/src/orchestrator \
             $REMOTE_DIR/src/tasks \
@@ -56,14 +58,14 @@ scp -P "$SSH_PORT" -i "$KEY" src/config.rs  "$USER@$HOST:$REMOTE_DIR/src/config.
 scp -P "$SSH_PORT" -i "$KEY" src/lib.rs     "$USER@$HOST:$REMOTE_DIR/src/lib.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/state.rs   "$USER@$HOST:$REMOTE_DIR/src/state.rs"
 
-# Strategy modules
-scp -P "$SSH_PORT" -i "$KEY" src/strategies/mod.rs            "$USER@$HOST:$REMOTE_DIR/src/strategies/mod.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/strategies/momentum_impl.rs  "$USER@$HOST:$REMOTE_DIR/src/strategies/momentum_impl.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/strategies/arbitrage_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/arbitrage_impl.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/strategies/time_decay_impl.rs "$USER@$HOST:$REMOTE_DIR/src/strategies/time_decay_impl.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/strategies/maker_impl.rs     "$USER@$HOST:$REMOTE_DIR/src/strategies/maker_impl.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/strategies/basis_impl.rs     "$USER@$HOST:$REMOTE_DIR/src/strategies/basis_impl.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/strategies/gboost_impl.rs    "$USER@$HOST:$REMOTE_DIR/src/strategies/gboost_impl.rs"
+# Viper (strategy) modules
+scp -P "$SSH_PORT" -i "$KEY" src/vipers/mod.rs            "$USER@$HOST:$REMOTE_DIR/src/vipers/mod.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/vipers/momentum_impl.rs  "$USER@$HOST:$REMOTE_DIR/src/vipers/momentum_impl.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/vipers/arbitrage_impl.rs "$USER@$HOST:$REMOTE_DIR/src/vipers/arbitrage_impl.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/vipers/time_decay_impl.rs "$USER@$HOST:$REMOTE_DIR/src/vipers/time_decay_impl.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/vipers/maker_impl.rs     "$USER@$HOST:$REMOTE_DIR/src/vipers/maker_impl.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/vipers/basis_impl.rs     "$USER@$HOST:$REMOTE_DIR/src/vipers/basis_impl.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/vipers/gboost_impl.rs    "$USER@$HOST:$REMOTE_DIR/src/vipers/gboost_impl.rs"
 
 # Orchestrator modules
 scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/mod.rs          "$USER@$HOST:$REMOTE_DIR/src/orchestrator/mod.rs"
@@ -96,9 +98,17 @@ scp -P "$SSH_PORT" -i "$KEY" src/api/server.rs                "$USER@$HOST:$REMO
 # Task modules
 scp -P "$SSH_PORT" -i "$KEY" src/tasks/mod.rs                 "$USER@$HOST:$REMOTE_DIR/src/tasks/mod.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/tasks/cleanup.rs             "$USER@$HOST:$REMOTE_DIR/src/tasks/cleanup.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/tasks/funding.rs             "$USER@$HOST:$REMOTE_DIR/src/tasks/funding.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/tasks/market_monitor.rs      "$USER@$HOST:$REMOTE_DIR/src/tasks/market_monitor.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/tasks/oracle.rs              "$USER@$HOST:$REMOTE_DIR/src/tasks/oracle.rs"
+
+# Raptor (recon) modules
+scp -P "$SSH_PORT" -i "$KEY" src/raptors/mod.rs               "$USER@$HOST:$REMOTE_DIR/src/raptors/mod.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/raptors/price.rs             "$USER@$HOST:$REMOTE_DIR/src/raptors/price.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/raptors/funding.rs           "$USER@$HOST:$REMOTE_DIR/src/raptors/funding.rs"
+
+# Squadron modules
+scp -P "$SSH_PORT" -i "$KEY" src/squadron/mod.rs              "$USER@$HOST:$REMOTE_DIR/src/squadron/mod.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/squadron/raptors.rs          "$USER@$HOST:$REMOTE_DIR/src/squadron/raptors.rs"
+scp -P "$SSH_PORT" -i "$KEY" src/squadron/config.rs           "$USER@$HOST:$REMOTE_DIR/src/squadron/config.rs"
 
 # Test modules
 scp -P "$SSH_PORT" -i "$KEY" tests/toctou.rs                  "$USER@$HOST:$REMOTE_DIR/tests/toctou.rs"

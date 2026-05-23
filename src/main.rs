@@ -37,7 +37,8 @@ use tracing::{info, warn, error, debug};
 
 use dradis::config;
 use dradis::state::{Position, StrategySignal, MarketConfig, MarketSnapshot, PositionMap};
-use dradis::strategies::time_decay_impl::TimeDecayPosition;
+use dradis::vipers::time_decay_impl::TimeDecayPosition;
+use dradis::squadron::{Squadron, SquadronConfig, SquadronRaptors};
 use dradis::orchestrator::{StrategyRegistry, StrategyContext};
 use dradis::orchestrator::executor::{execute_strategies_concurrent, aggregate_and_resolve_signals};
 use dradis::helpers::dynamic_config::DynamicConfig;
@@ -276,18 +277,28 @@ async fn main() -> Result<()> {
     let (funding_tx, funding_rx) = watch::channel(dec!(0));
     let (drift_tx, drift_rx) = watch::channel((dec!(0), dec!(0)));
 
-    tokio::spawn(dradis::tasks::oracle::run_oracle(
+    tokio::spawn(dradis::raptors::price::run_price_raptor(
         crypto_filter.clone(),
         oracle_tx,
         velocity_tx,
         drift_tx,
     ));
 
-    tokio::spawn(dradis::tasks::funding::run_funding_poller(
+    tokio::spawn(dradis::raptors::funding::run_funding_raptor(
         Arc::clone(&shared_http),
         crypto_filter.clone(),
         funding_tx,
     ));
+
+    // ── Bundle Raptor signal receivers into a SquadronRaptors handle ─────────
+    // Cloned cheaply into each Squadron deployment so every market-loop
+    // iteration gets a typed signal bundle rather than naked watch::Receivers.
+    let raptor_signals = SquadronRaptors::full(
+        oracle_rx.clone(),
+        velocity_rx.clone(),
+        drift_rx.clone(),
+        funding_rx.clone(),
+    );
 
     let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(PositionMap::new()));
     // Local Pending Map to debounce rapid-fire orders (log flood protection)
@@ -484,6 +495,34 @@ async fn main() -> Result<()> {
         };
 
         let market_started_at = Utc::now(); // This timestamp is for the current trading session, not necessarily market creation
+
+        // ── Assemble the Squadron descriptor for this market deployment ───────
+        // Phase 2: Squadron is a named record that documents which Raptors and
+        // Vipers are deployed together to this battle location.  Phase 3 will
+        // promote this into an active run-unit owned by the CAG.
+        let hourly_market_config_for_squadron = dradis::state::MarketConfig {
+            yes_token:         hourly_yes_token,
+            no_token:          hourly_no_token,
+            market_name:       hourly_market_name.clone(),
+            market_close_time: hourly_market_close_time,
+            strike_price:      hourly_strike_price,
+            is_neg_risk:       hourly_is_neg_risk,
+            condition_id:      hourly_condition_id.clone(),
+            yes_fee_bps:       hourly_yes_fee_rate,
+            no_fee_bps:        hourly_no_fee_rate,
+        };
+        let mut squadron = Squadron::new(
+            SquadronConfig::full_wing(format!("Full Wing — {}", hourly_market_name)),
+            hourly_market_config_for_squadron,
+            SquadronRaptors::full(
+                raptor_signals.oracle.clone(),
+                raptor_signals.velocity.clone(),
+                raptor_signals.drift.clone(),
+                raptor_signals.funding.clone().expect("funding raptor always present"),
+            ),
+        );
+        squadron.start_patrol();
+        info!("🛩️  Squadron [{}] → state={}", squadron.id, squadron.state);
 
         // Cancellation flag for all WS tasks belonging to THIS market iteration.
         // When we rotate to a new market (inner loop break), we send `true` so old
@@ -825,6 +864,8 @@ async fn main() -> Result<()> {
                     { pending_orders.lock().await.clear(); } // Clear pending locks on market switch // Clear pending locks on market switch
                     current_hourly_cid = new_hourly_condition_id;
                     current_maker_cid = new_maker_cid;
+                    squadron.stand_down();
+                    info!("🛩️  Squadron [{}] → state={}", squadron.id, squadron.state);
                     let _ = ws_cancel_tx.send(true); // Stop WS tasks for the old market before rotating
                     break;
                 }

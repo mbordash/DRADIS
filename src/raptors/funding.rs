@@ -1,9 +1,17 @@
-/// Background task: Binance perpetual futures funding rate poller.
+/// Funding Raptor — Binance perpetual futures funding rate poller.
 ///
-/// Polls /fapi/v1/premiumIndex every BASIS_FUNDING_POLL_SECS (60s).
-/// Negative rate = shorts paying longs (bearish smart money).
-/// Positive rate = longs paying shorts (bullish smart money).
-/// Falls back to dec!(0) silently if Binance fapi is unreachable (e.g. geo-block on server).
+/// Polls `/fapi/v1/premiumIndex` every `BASIS_FUNDING_POLL_SECS` (60s) and
+/// broadcasts the current funding rate via a `watch` channel.
+///
+/// │ Signal        │ Interpretation                                     │
+/// │───────────────│────────────────────────────────────────────────────│
+/// │ rate < 0      │ Shorts paying longs — bearish smart-money lean     │
+/// │ rate > 0      │ Longs paying shorts — bullish smart-money lean     │
+/// │ rate = 0      │ Neutral, or Binance FAPI unreachable (geo-block)   │
+///
+/// Falls back to `dec!(0)` silently if Binance FAPI is unreachable (e.g.
+/// geo-block on the server).  Primary URL is `fapi.binance.com`; on failure
+/// retries against the regional mirror `fapi.binance.us`.
 use std::str::FromStr;
 use std::sync::Arc;
 
@@ -14,7 +22,7 @@ use tracing::{debug, warn};
 
 use crate::config;
 
-pub async fn run_funding_poller(
+pub async fn run_funding_raptor(
     http: Arc<reqwest::Client>,
     crypto_filter: String,
     funding_tx: watch::Sender<Decimal>,
@@ -38,16 +46,16 @@ pub async fn run_funding_poller(
             Some(rate) => {
                 consecutive_failures = 0;
                 let _ = funding_tx.send(rate);
-                debug!("📡 Funding rate {}: {:.6}%", symbol, rate * dec!(100));
+                debug!("📡 Funding Raptor {}: {:.6}%", symbol, rate * dec!(100));
             }
             None => {
                 consecutive_failures += 1;
                 // Warn on first failure so the operator knows; degrade to debug after that
                 // to avoid flooding logs if the server has a persistent geo-block.
                 if consecutive_failures == 1 {
-                    warn!("⚠️ Funding rate poll failed (will retry silently). Bot continues with rate=0.");
+                    warn!("⚠️ Funding Raptor poll failed (will retry silently). Bot continues with rate=0.");
                 } else {
-                    debug!("📡 Funding rate poll unavailable (attempt {}), using rate=0", consecutive_failures);
+                    debug!("📡 Funding Raptor unavailable (attempt {}), using rate=0", consecutive_failures);
                 }
             }
         }

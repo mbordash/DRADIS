@@ -81,7 +81,7 @@ use alloy::primitives::U256; // For token_id in pending_entries
 use crate::config;
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{MarketSnapshot, OrderParams, StrategySignal, StrategyStatus};
-use crate::strategies::is_drawdown_limit_hit;
+use crate::vipers::is_drawdown_limit_hit;
 use crate::helpers::price::floor_to_tick_size;
 use crate::helpers::dynamic_config::DynamicConfig; // Corrected import
 use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
