@@ -2,6 +2,16 @@
 ///
 /// Provides a central registry for creating and managing strategy instances.
 /// This enables uniform handling of all strategies through the Strategy trait.
+///
+/// ── Hot-Enable Design ────────────────────────────────────────────────────────
+/// ALL strategies are ALWAYS instantiated at startup, regardless of compile-time
+/// ENABLE_* flags.  The DynamicConfig enable flags (enable_gboost, enable_momentum,
+/// etc.) are the SOLE runtime gates — checked on every tick in each strategy's
+/// evaluate_entry().  This means the Control Tower UI's PATCH /api/config toggle
+/// takes effect immediately during a running session without a redeploy.
+///
+/// The compile-time ENABLE_* constants in config.rs / config-live.rs now serve
+/// only as the DEFAULT value seeded into DynamicConfig on first startup.
 
 use crate::orchestrator::Strategy;
 use crate::strategies::momentum_impl::MomentumStrategyImpl;
@@ -10,34 +20,23 @@ use crate::strategies::time_decay_impl::TimeDecayStrategyImpl;
 use crate::strategies::maker_impl::MakerStrategyImpl;
 use crate::strategies::basis_impl::BasisStrategyImpl;
 use crate::strategies::gboost_impl::GboostStrategyImpl;
-use crate::config;
 
 /// Registry for all available strategies
 pub struct StrategyRegistry;
 
 impl StrategyRegistry {
-    /// Create a vector of all enabled strategies
+    /// Create a vector of ALL strategy instances.
+    /// Every strategy is always instantiated so the DynamicConfig hot-patch can
+    /// enable or disable any of them during a running session via the Control Tower UI.
     pub fn create_all_strategies() -> Vec<Box<dyn Strategy>> {
-        let mut strategies: Vec<Box<dyn Strategy>> = Vec::new();
-        if config::ENABLE_MOMENTUM_TRADING {
-            strategies.push(Box::new(MomentumStrategyImpl));
-        }
-        if config::ENABLE_ARBITRAGE_TRADING {
-            strategies.push(Box::new(ArbitrageStrategyImpl));
-        }
-        if config::ENABLE_TIME_DECAY_TRADING {
-            strategies.push(Box::new(TimeDecayStrategyImpl));
-        }
-        if config::ENABLE_MAKER_TRADING {
-            strategies.push(Box::new(MakerStrategyImpl::new()));
-        }
-        if config::ENABLE_BASIS_TRADING {
-            strategies.push(Box::new(BasisStrategyImpl));
-        }
-        if config::ENABLE_GBOOST_TRADING {
-            strategies.push(Box::new(GboostStrategyImpl::default()));
-        }
-        strategies
+        vec![
+            Box::new(MomentumStrategyImpl)           as Box<dyn Strategy>,
+            Box::new(ArbitrageStrategyImpl)          as Box<dyn Strategy>,
+            Box::new(TimeDecayStrategyImpl)          as Box<dyn Strategy>,
+            Box::new(MakerStrategyImpl::new())       as Box<dyn Strategy>,
+            Box::new(BasisStrategyImpl)              as Box<dyn Strategy>,
+            Box::new(GboostStrategyImpl::default())  as Box<dyn Strategy>,
+        ]
     }
 
     /// Create only momentum strategy
@@ -60,24 +59,17 @@ impl StrategyRegistry {
         Box::new(MakerStrategyImpl::new())
     }
 
-    /// Return the names of all enabled strategies, in priority order for orphan adoption.
-    /// This is the single source of truth used by balance reconciliation so that
-    /// developers adding a new strategy only need to register it here — no other
-    /// file needs to be updated to ensure orphaned positions are adopted correctly.
-    ///
-    /// NOTE: Returns static names WITHOUT instantiating strategies.
-    /// Calling create_all_strategies() here would construct a second GboostStrategyImpl
-    /// (and trigger a second async model-load tokio::spawn) on every market switch —
-    /// doubling model-load I/O and retrain CPU for no benefit.
+    /// Return the names of all strategies, in priority order for orphan adoption.
+    /// All strategies are always registered — DynamicConfig controls whether they trade.
     pub fn strategy_names() -> Vec<String> {
-        let mut names: Vec<&str> = Vec::new();
-        if config::ENABLE_MOMENTUM_TRADING   { names.push("MomentumStrategy"); }
-        if config::ENABLE_ARBITRAGE_TRADING  { names.push("ArbitrageStrategy"); }
-        if config::ENABLE_TIME_DECAY_TRADING { names.push("TimeDecayStrategy"); }
-        if config::ENABLE_MAKER_TRADING      { names.push("MakerStrategy"); }
-        if config::ENABLE_BASIS_TRADING      { names.push("BasisStrategy"); }
-        if config::ENABLE_GBOOST_TRADING     { names.push("GboostStrategy"); }
-        names.into_iter().map(|s| s.to_string()).collect()
+        vec![
+            "MomentumStrategy",
+            "ArbitrageStrategy",
+            "TimeDecayStrategy",
+            "MakerStrategy",
+            "BasisStrategy",
+            "GboostStrategy",
+        ]
+        .into_iter().map(|s| s.to_string()).collect()
     }
 }
-
