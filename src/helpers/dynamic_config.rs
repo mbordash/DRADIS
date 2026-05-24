@@ -38,6 +38,14 @@ use std::sync::Arc;
 use crate::config;
 use crate::helpers::db;
 
+// ── serde default helpers ────────────────────────────────────────────────────
+// Required when adding new fields to DynamicConfig: old DB rows that were
+// serialized before the field existed will have it missing.  Without a default,
+// serde returns a deserialization error and load_or_default resets to factory
+// defaults — clobbering any operator customisation made in the previous session.
+fn default_arb_max_leg_price() -> Decimal { config::ARBITRAGE_MAX_LEG_PRICE }
+fn default_arb_max_leg_obi()   -> Decimal { config::ARBITRAGE_MAX_LEG_OBI   }
+
 // ─── Struct ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -61,11 +69,18 @@ pub struct DynamicConfig {
     /// Max gap (ask − safe_bid) allowed on each leg before skipping entry.
     /// Prevents one-sided fills when the other side of the book is far away.
     pub arbitrage_max_fill_gap:       Decimal,
-    /// Maximum price allowed for either leg (YES bid OR NO bid).
-    /// Blocks directional markets where fill rates are deeply asymmetric:
-    /// the expensive leg (>60¢) never fills while the cheap leg (<40¢) fills instantly.
-    /// See config::ARBITRAGE_MAX_LEG_PRICE for the full rationale.
+    /// LEGACY — hard price cap (0.60) used when order-book depth is unavailable.
+    /// Superseded by `arbitrage_max_leg_obi` for live sessions.
+    /// Kept in the struct for backward-compatible deserialization of old DB rows.
+    #[serde(default = "default_arb_max_leg_price")]
     pub arbitrage_max_leg_price:      Decimal,
+    /// Maximum order-book imbalance (OBI) on either leg before skipping entry.
+    /// OBI = (bid_depth − ask_depth) / total_depth.  High positive OBI on a leg
+    /// means few sellers exist → GTC bid unlikely to fill → one-sided orphan risk.
+    /// Falls back to price-cap check when depth data is unavailable (depth = 0).
+    /// Default 0.50 ≈ 3:1 bid/ask depth ratio ≈ >60% directional market.
+    #[serde(default = "default_arb_max_leg_obi")]
+    pub arbitrage_max_leg_obi:        Decimal,
 
     // ── TimeDecay Viper ───────────────────────────────────────────────────────
     pub time_decay_position_size_usdc:  Decimal,
@@ -125,6 +140,7 @@ impl Default for DynamicConfig {
             arbitrage_profit_threshold:   config::ARBITRAGE_PROFIT_THRESHOLD,
             arbitrage_max_fill_gap:       config::ARBITRAGE_MAX_FILL_GAP,
             arbitrage_max_leg_price:      config::ARBITRAGE_MAX_LEG_PRICE,
+            arbitrage_max_leg_obi:        config::ARBITRAGE_MAX_LEG_OBI,
 
             time_decay_position_size_usdc:  config::TIME_DECAY_POSITION_SIZE_USDC,
             time_decay_max_exposure_usdc:   config::TIME_DECAY_MAX_EXPOSURE_USDC,

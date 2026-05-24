@@ -528,7 +528,7 @@ async fn main() -> Result<()> {
             ),
         );
         squadron.start_patrol();
-        info!("🛩️  Squadron [{}] → state={}", squadron.id, squadron.state);
+        info!("️  Squadron [{}] → state={}", squadron.id, squadron.state);
 
         // Cancellation flag for all WS tasks belonging to THIS market iteration.
         // When we rotate to a new market (inner loop break), we send `true` so old
@@ -871,7 +871,7 @@ async fn main() -> Result<()> {
                     current_hourly_cid = new_hourly_condition_id;
                     current_maker_cid = new_maker_cid;
                     squadron.stand_down();
-                    info!("🛩️  Squadron [{}] → state={}", squadron.id, squadron.state);
+                    info!("️  Squadron [{}] → state={}", squadron.id, squadron.state);
                     let _ = ws_cancel_tx.send(true); // Stop WS tasks for the old market before rotating
                     break;
                 }
@@ -889,12 +889,10 @@ async fn main() -> Result<()> {
                     info!(" Network Pulse: {:?}", start.elapsed());
                 }
                 _ = cleanup_ticker.tick() => {
-                    // Wrap the entire cleanup arm in a 45s outer timeout.
-                    // Belt-and-suspenders guard: even if an individual CLOB call inside
-                    // reconcile_orphaned_positions gains a new unguarded .await in the future,
-                    // the select! loop cannot block longer than 45s.
-                    // (Individual calls already have their own 10s timeouts; this is the backstop.)
-                    match tokio::time::timeout(Duration::from_secs(45), async {
+                    // Wrap the cleanup work in a 45s outer timeout.
+                    // Returns the list of confirmed-fill orphans so we can attempt FAK sells
+                    // OUTSIDE the timeout — sell latency does not count against the 45s cap.
+                    let orphan_exits = match tokio::time::timeout(Duration::from_secs(45), async {
                         // Cleanup for hourly market if it exists
                         if hourly_yes_token != U256::ZERO {
                             dradis::tasks::cleanup::cleanup_expired_positions(Arc::clone(&positions), hourly_market_name.clone(), hourly_yes_token, hourly_no_token, hourly_market_close_time).await;
@@ -904,7 +902,9 @@ async fn main() -> Result<()> {
                             dradis::tasks::cleanup::cleanup_expired_positions(Arc::clone(&positions), mk_config.market_name.clone(), mk_config.yes_token, mk_config.no_token, mk_config.market_close_time).await;
                         }
 
-                        if let Err(e) = dradis::tasks::cleanup::reconcile_orphaned_positions(Arc::clone(&positions), &trading_client, &phantom_cooldowns, &orphan_tombstones, &tg_token, &tg_chat_id).await { warn!("⚠️ Orphan reconciliation error: {}", e); }
+                        let orphans = dradis::tasks::cleanup::reconcile_orphaned_positions(
+                            Arc::clone(&positions), &trading_client, &phantom_cooldowns, &orphan_tombstones, &tg_token, &tg_chat_id
+                        ).await.unwrap_or_else(|e| { warn!("⚠️ Orphan reconciliation error: {}", e); vec![] });
                         dradis::tasks::cleanup::cleanup_time_decay_positions(Arc::clone(&time_decay_positions)).await;
                         dradis::tasks::cleanup::sync_open_positions_with_chain(safe_address).await;
 
@@ -913,9 +913,159 @@ async fn main() -> Result<()> {
                             let mut pending = pending_orders.lock().await;
                             pending.retain(|_, &mut instant| instant > Instant::now());
                         }
+                        orphans
                     }).await {
-                        Ok(_) => {}
-                        Err(_) => warn!("⚠️ cleanup_ticker arm timed out (45s) — CLOB/Data API stall suspected; select! loop unblocked"),
+                        Ok(v) => v,
+                        Err(_) => { warn!("⚠️ cleanup_ticker arm timed out (45s) — CLOB/Data API stall suspected; select! loop unblocked"); vec![] }
+                    };
+
+                    // ── Re-hedge or exit each confirmed naked leg ─────────────────────
+                    //
+                    // Priority 1 — RE-HEDGE: buy the MISSING leg at its current ask (FAK).
+                    //   Completes the original arb with a minor price concession (ask vs bid).
+                    //   Condition: paired_ask + original_entry < RE_HEDGE_THRESHOLD (0.99).
+                    //   On success both legs are on-chain as a hedged pair; chain-sync will
+                    //   re-adopt them into the DB and auto_settle handles redemption at close.
+                    //
+                    // Priority 2 — BID-BASED EXIT: sell the orphan at (current_bid − offset).
+                    //   Used when re-hedge is uneconomical (market moved too far) or failed.
+                    //   Uses the same floor/offset as every other FAK sell in the bot — NOT $0.01.
+                    //
+                    // GHOST_MODE guard: neither path places live orders in ghost mode.
+                    if !config::GHOST_MODE {
+                        for orphan in orphan_exits {
+                            let vc = if orphan.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
+                            let mut rehedged = false;
+
+                            // ── Priority 1: Re-hedge by buying the missing leg ─────────────
+                            if let Some(paired_id) = orphan.paired_token_id {
+                                // Look up the current ask for the paired (never-filled) token
+                                // from the live WS price feeds — no CLOB round-trip needed.
+                                let paired_ask = if paired_id == hourly_yes_token {
+                                    yes_price_rx.borrow().2
+                                } else if paired_id == hourly_no_token {
+                                    no_price_rx.borrow().2
+                                } else {
+                                    maker_yes_price_rx.as_ref()
+                                        .and_then(|rx| {
+                                            let (_, _, ya, _, _) = *rx.borrow();
+                                            if maker_market_config.as_ref().map_or(false, |mkc| mkc.yes_token == paired_id) {
+                                                Some(ya)
+                                            } else { None }
+                                        })
+                                        .or_else(|| maker_no_price_rx.as_ref().and_then(|rx| {
+                                            let (_, _, na, _, _) = *rx.borrow();
+                                            if maker_market_config.as_ref().map_or(false, |mkc| mkc.no_token == paired_id) {
+                                                Some(na)
+                                            } else { None }
+                                        }))
+                                        .unwrap_or(dec!(1))   // unknown → assume at-par (too expensive)
+                                };
+
+                                // Round to tick size to avoid "minimum tick size" rejection
+                                let paired_ask_ticked = dradis::helpers::price::round_to_tick_size(paired_ask);
+                                let rehedge_cost = paired_ask_ticked + orphan.original_entry;
+
+                                // Re-hedge threshold: must still be profitable after paying ask
+                                // (0 fees on settlement, so cost must simply be < $1.00).
+                                // 0.99 leaves 1¢/share margin for slippage.
+                                const RE_HEDGE_THRESHOLD: rust_decimal::Decimal = dec!(0.99);
+
+                                if rehedge_cost < RE_HEDGE_THRESHOLD && paired_ask_ticked < dec!(0.99) {
+                                    let buy_price = (paired_ask_ticked + config::BUY_PRICE_OFFSET)
+                                        .min(config::MAX_BUY_LIMIT_PRICE);
+                                    warn!("♻️ ORPHAN RE-HEDGE [{}]: buying {} shares of missing leg {} @ ${:.4} ask \
+                                           (orphan entry ${:.4} → total cost ${:.4} < threshold $0.99)",
+                                          orphan.token_id, orphan.shares, paired_id,
+                                          paired_ask_ticked, orphan.original_entry, rehedge_cost);
+
+                                    match place_limit_order(
+                                        &trading_client, &nonce_manager, &signer,
+                                        safe_address, eoa_address,
+                                        vc, paired_id, Side::Buy, orphan.shares,
+                                        buy_price, 0, OrderType::FAK, false, 0, &shared_http,
+                                    ).await {
+                                        Ok(order_id) => {
+                                            rehedged = true;
+                                            info!("✅ ORPHAN RE-HEDGE: arb completed — both legs on-chain \
+                                                   (chain-sync will re-adopt; auto_settle handles redemption). \
+                                                   Buy order {}", order_id);
+                                            let tok_o = tg_token.clone(); let cid_o = tg_chat_id.clone();
+                                            let sh_o = orphan.shares; let cost_o = rehedge_cost;
+                                            tokio::spawn(async move {
+                                                let _ = send_notification(&tok_o, &cid_o, &format!(
+                                                    "♻️ Orphan re-hedged: bought {:.0} missing shares @ ${:.4} \
+                                                     (total arb cost ${:.4} → $1.00 payout at settle)",
+                                                    sh_o, paired_ask_ticked, cost_o
+                                                )).await;
+                                            });
+                                        }
+                                        Err(e) => warn!("⚠️ ORPHAN RE-HEDGE: FAK buy failed: {} — falling back to sell", e),
+                                    }
+                                } else {
+                                    warn!("⚠️ ORPHAN RE-HEDGE skipped — rehedge cost ${:.4} ≥ threshold $0.99 \
+                                           (paired_ask=${:.4}); will sell orphan at current bid",
+                                          rehedge_cost, paired_ask_ticked);
+                                }
+                            }
+
+                            // ── Priority 2: Bid-based FAK sell (re-hedge failed/skipped) ──
+                            if !rehedged {
+                                // Look up current bid for the orphaned token from live price feeds.
+                                let orphan_bid = if orphan.token_id == hourly_yes_token {
+                                    yes_price_rx.borrow().0
+                                } else if orphan.token_id == hourly_no_token {
+                                    no_price_rx.borrow().0
+                                } else {
+                                    maker_yes_price_rx.as_ref()
+                                        .and_then(|rx| {
+                                            let (yb, _, _, _, _) = *rx.borrow();
+                                            if maker_market_config.as_ref().map_or(false, |mkc| mkc.yes_token == orphan.token_id) {
+                                                Some(yb)
+                                            } else { None }
+                                        })
+                                        .or_else(|| maker_no_price_rx.as_ref().and_then(|rx| {
+                                            let (nb, _, _, _, _) = *rx.borrow();
+                                            if maker_market_config.as_ref().map_or(false, |mkc| mkc.no_token == orphan.token_id) {
+                                                Some(nb)
+                                            } else { None }
+                                        }))
+                                        .unwrap_or(dec!(0))
+                                };
+
+                                let sell_price = if orphan_bid > dec!(0) {
+                                    (orphan_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE)
+                                } else {
+                                    config::MIN_SELL_LIMIT_PRICE  // no bid data — accept any non-zero price
+                                };
+
+                                warn!("🛑 ORPHAN EXIT: selling {:.4} shares of token {} @ ${:.4} \
+                                       (current bid=${:.4})",
+                                      orphan.shares, orphan.token_id, sell_price, orphan_bid);
+
+                                match place_limit_order(
+                                    &trading_client, &nonce_manager, &signer,
+                                    safe_address, eoa_address,
+                                    vc, orphan.token_id, Side::Sell, orphan.shares,
+                                    sell_price, 0, OrderType::FAK, false, 0, &shared_http,
+                                ).await {
+                                    Ok(order_id) => {
+                                        info!("✅ ORPHAN EXIT: FAK sell submitted (order {})", order_id);
+                                        let tok_o = tg_token.clone(); let cid_o = tg_chat_id.clone();
+                                        let sh_o = orphan.shares;
+                                        tokio::spawn(async move {
+                                            let _ = send_notification(&tok_o, &cid_o, &format!(
+                                                "🛑 Orphan sold: {:.0} shares @ ${:.4} (bid-based FAK exit)",
+                                                sh_o, sell_price
+                                            )).await;
+                                        });
+                                    }
+                                    Err(e) => warn!("⚠️ ORPHAN EXIT: FAK sell failed for token {}: {} \
+                                                     — position remains on-chain until settlement",
+                                                    orphan.token_id, e),
+                                }
+                            }
+                        }
                     }
                 }
                 _ = settlement_ticker.tick() => {
@@ -1474,8 +1624,11 @@ async fn main() -> Result<()> {
                                             &shared_http,
                                         ).await {
                                             Err(e) => {
-                                                // Batch was rejected atomically — neither leg is live.
-                                                warn!("⚠️ Atomic arb entry FAILED [{}]: {} — no orders placed, no cleanup needed", sn, e);
+                                                // Batch HTTP call failed — neither leg was submitted.
+                                                // (POST /orders rejected the entire request before
+                                                //  reaching the matching engine, e.g. auth error,
+                                                //  malformed order, server 500.)
+                                                warn!("⚠️ Arb batch entry FAILED [{}]: {} — no orders placed", sn, e);
                                                 positions.lock().await.remove(&pos_key);
                                                 pending_orders.lock().await.remove(&pos_key);
                                                 last_trade_time.insert(sn.clone(), Instant::now());

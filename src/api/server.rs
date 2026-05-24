@@ -78,7 +78,7 @@ async fn require_api_key(
             .get("x-api-key")
             .and_then(|v| v.to_str().ok());
         if provided != Some(expected.as_str()) {
-            warn!("🔑 API key rejected — invalid or missing X-API-Key header");
+            warn!(" API key rejected — invalid or missing X-API-Key header");
             return (StatusCode::UNAUTHORIZED, "Unauthorized").into_response();
         }
     }
@@ -252,7 +252,7 @@ async fn delete_open_position(Path(token_id): Path<String>) -> Response {
         .await
     {
         Ok(r) if r.rows_affected() > 0 => {
-            info!("🗑️ Purged stale open_position row for token {}", &token_id[..token_id.len().min(20)]);
+            info!("️ Purged stale open_position row for token {}", &token_id[..token_id.len().min(20)]);
             (StatusCode::OK, format!("Deleted {} row(s)", r.rows_affected())).into_response()
         }
         Ok(_) => {
@@ -281,7 +281,7 @@ async fn delete_open_position(Path(token_id): Path<String>) -> Response {
 ///
 /// Returns: `{ "message": "Chain sync complete" }`
 async fn sync_positions(State(s): State<ApiState>) -> Response {
-    info!("🔄 Manual chain-sync triggered via POST /api/positions/sync");
+    info!(" Manual chain-sync triggered via POST /api/positions/sync");
     sync_open_positions_with_chain(s.safe_address).await;
     (StatusCode::OK, Json(serde_json::json!({ "message": "Chain sync complete" }))).into_response()
 }
@@ -324,9 +324,9 @@ pub async fn run_api_server(
 
     let api_key = std::env::var("DRADIS_API_KEY").ok();
     if api_key.is_some() {
-        tracing::info!("🔑 API key authentication enabled (DRADIS_API_KEY is set)");
+        tracing::info!(" API key authentication enabled (DRADIS_API_KEY is set)");
     } else {
-        tracing::info!("🔓 API key authentication disabled (set DRADIS_API_KEY to enable)");
+        tracing::info!(" API key authentication disabled (set DRADIS_API_KEY to enable)");
     }
 
     let state = ApiState { config_tx, config_rx, markets_rx, api_key, safe_address };
@@ -362,14 +362,14 @@ pub async fn run_api_server(
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l)  => l,
         Err(e) => {
-            tracing::error!("🌐 Control Tower API: failed to bind on {}: {}", addr, e);
+            tracing::error!(" Control Tower API: failed to bind on {}: {}", addr, e);
             return;
         }
     };
 
-    tracing::info!("🌐 Control Tower API listening on port {}", port);
+    tracing::info!(" Control Tower API listening on port {}", port);
 
     if let Err(e) = axum::serve(listener, app.into_make_service()).await {
-        tracing::error!("🌐 Control Tower API error: {}", e);
+        tracing::error!(" Control Tower API error: {}", e);
     }
 }

@@ -242,6 +242,35 @@ pub async fn cleanup_expired_positions(
 /// cancel any resting GTC order for that token on the Polymarket CLOB.  Without this,
 /// a GTC order that was "forgotten" by position-sync can later fill and create an
 /// untracked, unhedged position in the wallet.
+/// A confirmed-fill orphan that the cleanup cycle removed from tracking.
+///
+/// Returned to the caller (main.rs cleanup_ticker arm) so it can attempt:
+///   (1) Re-hedge — FAK buy the MISSING leg at its current ask.  Completes the
+///       original arb and locks in profit without selling the position at all.
+///   (2) Bid-based FAK sell — if re-hedge is uneconomical (market moved far).
+///
+/// Both paths use real market prices from the live price feeds available in
+/// the cleanup_ticker arm, not a fixed $0.01 panic-sell floor.
+pub struct OrphanExit {
+    /// The on-chain token ID of the orphaned (filled) leg.
+    pub token_id: U256,
+    /// Confirmed on-chain share count.
+    pub shares: Decimal,
+    /// True if this token belongs to a NegRisk market.
+    /// NB: ArbitrageStrategy only runs on standard binary markets so this is
+    /// currently always false; kept for future neg-risk arb support.
+    pub is_neg_risk: bool,
+    /// Token ID of the LEG THAT NEVER FILLED — the counterpart we must buy
+    /// to complete the hedge.  None if the position had no recorded pair
+    /// (e.g. reconcile-adopted position with paired_leg_token_id = None).
+    pub paired_token_id: Option<U256>,
+    /// Price we paid to enter the orphaned leg (avg_entry from Position).
+    /// Used to evaluate re-hedge profitability:
+    ///   re_hedge_cost = paired_ask + original_entry
+    /// If re_hedge_cost < RE_HEDGE_THRESHOLD the arb is still profitable.
+    pub original_entry: Decimal,
+}
+
 pub async fn reconcile_orphaned_positions(
     positions: Arc<Mutex<PositionMap>>,
     clob_client: &Arc<ClobClient<Authenticated<Normal>>>,
@@ -249,11 +278,12 @@ pub async fn reconcile_orphaned_positions(
     orphan_tombstones: &OrphanTombstones,
     tg_token: &str,
     tg_chat_id: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Vec<OrphanExit>> {
     let mut pos_map = positions.lock().await;
     let now = Utc::now();
 
     let mut orphans_to_exit: Vec<((String, U256), Position)> = Vec::new();
+    let mut exits_to_sell: Vec<OrphanExit> = Vec::new();
 
     for ((strategy_name, token_id), position) in pos_map.iter() {
         if strategy_name != "ArbitrageStrategy" && strategy_name != "TimeDecayStrategy" {
@@ -328,9 +358,23 @@ pub async fn reconcile_orphaned_positions(
                      if token_id == position.pair_token_id { "YES" } else { "NO" },
                      position.shares.trunc(),
                      position.avg_entry)).await;
+
+        // If the orphan had a confirmed on-chain fill (not a phantom/never-filled leg),
+        // If the orphan had a confirmed on-chain fill (not a phantom/never-filled leg),
+        // schedule a re-hedge or bid-based exit so the unhedged exposure is closed rather
+        // than silently riding to settlement.  Only confirmed fills have real shares on-chain.
+        if position.fill_confirmed_at.is_some() && position.shares > Decimal::ZERO {
+            exits_to_sell.push(OrphanExit {
+                token_id,
+                shares: position.shares,
+                is_neg_risk: false, // ArbitrageStrategy only runs on standard binary markets
+                paired_token_id: position.paired_leg_token_id,
+                original_entry: position.avg_entry,
+            });
+        }
     }
 
-    Ok(())
+    Ok(exits_to_sell)
 }
 
 /// Prune expired TimeDecay position metadata entries.

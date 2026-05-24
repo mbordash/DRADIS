@@ -58,6 +58,20 @@ impl Strategy for ArbitrageStrategyImpl {
         let yes_ask = snapshot.yes_ask;
         let no_ask  = snapshot.no_ask;
 
+        // ── Locked / inverted-spread guard ───────────────────────────────────
+        // If YES or NO bid ≥ ask, the WS snapshot is stale or the market is at
+        // an inflection.  We must NOT place a post-only bid at or above the ask
+        // (it would be rejected as "order crosses book").  Rather than silently
+        // lowering the bid (which can make the arb unprofitable), bail out early.
+        // Safe bids are computed below only for normal (bid < ask) books.
+        if yes_bid >= yes_ask || no_bid >= no_ask {
+            debug!(
+                "🚫 Arb skipped — locked/inverted spread: YES {:.3}/{:.3}  NO {:.3}/{:.3}",
+                yes_bid, yes_ask, no_bid, no_ask
+            );
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Maker arb profitability gate (0% fee on GTC fills) ───────────────
         if !is_maker_arb_profitable(yes_bid, no_bid, dc.arbitrage_profit_threshold) {
             return Ok(StrategySignal::NoSignal);
@@ -68,6 +82,8 @@ impl Strategy for ArbitrageStrategyImpl {
         // bid >= ask.  This can happen on tight markets where the WS snapshot
         // has bid == ask or a stale/inverted spread.  Cap each leg at
         // ask − 0.01 to guarantee the order rests on the book as a maker.
+        // The locked-spread guard above ensures yes_bid < yes_ask at this point,
+        // so the .min() only fires on the rare tight-but-not-locked case.
         let safe_yes_bid = yes_bid.min(yes_ask - dec!(0.01));
         let safe_no_bid  = no_bid.min(no_ask  - dec!(0.01));
 
@@ -93,26 +109,57 @@ impl Strategy for ArbitrageStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
-        // ── Price symmetry / fill-rate gate ─────────────────────────────────
-        // Root cause of the 2026-05-19 "10 YES / 40 NO" imbalance:
-        //   YES bid = 72¢ → holders are winning, have no urgency to sell →
-        //   GTC bid at 72¢ sits unfilled for MAX_WAIT_SECS then gets phantom-removed.
-        //   NO bid = 27¢  → sellers are losing, want out → fills in seconds.
+        // ── Order-book imbalance (OBI) fill-rate gate ────────────────────────
+        // Replaces the rigid "max leg price" cap with a dynamic, depth-based
+        // measurement.  We place GTC BIDS on both legs; fill probability falls
+        // when one side has few resting asks (sellers absent).
         //
-        // ARBITRAGE_MAX_FILL_GAP catches wide-spread books but NOT tight-spread
-        // directional markets (bid=72¢, ask=73¢ looks tight yet never fills).
+        // OBI = (bid_depth − ask_depth) / (bid_depth + ask_depth) ∈ [−1, +1]
+        //  +1.0 → all depth is bids, zero sellers → our bid will NOT fill
+        //  −1.0 → all depth is asks, abundant sellers → fast fill
         //
-        // Gate: if max(yes_bid, no_bid) > arbitrage_max_leg_price (0.60), the
-        // market is >60% directional and fill rates are inherently asymmetric.
-        // Require both legs to be in the genuine-uncertainty band [0.40, 0.60].
-        let max_leg_bid = safe_yes_bid.max(safe_no_bid);
-        if max_leg_bid > dc.arbitrage_max_leg_price {
-            debug!(
-                "🚫 Arb blocked — directional market fill asymmetry: \
-                 YES_bid={:.3} NO_bid={:.3} max={:.3} > limit {:.3} — skipping",
-                safe_yes_bid, safe_no_bid, max_leg_bid, dc.arbitrage_max_leg_price
-            );
-            return Ok(StrategySignal::NoSignal);
+        // Primary gate: if either leg OBI > arbitrage_max_leg_obi (default 0.50),
+        //   skip — too directional, fill asymmetry likely.
+        //
+        // Fallback gate: if BOTH legs have zero depth (snapshot unavailable),
+        //   fall back to the legacy price cap (arbitrage_max_leg_price = 0.60)
+        //   so entries are still guarded even without orderbook depth data.
+        let yes_total_depth = snapshot.yes_bid_depth + snapshot.yes_ask_depth;
+        let no_total_depth  = snapshot.no_bid_depth  + snapshot.no_ask_depth;
+
+        let depth_available = yes_total_depth > dec!(0) || no_total_depth > dec!(0);
+
+        if depth_available {
+            let yes_obi = if yes_total_depth > dec!(0) {
+                (snapshot.yes_bid_depth - snapshot.yes_ask_depth) / yes_total_depth
+            } else {
+                // One side has zero depth — treat as maximally directional to be safe.
+                dec!(1)
+            };
+            let no_obi = if no_total_depth > dec!(0) {
+                (snapshot.no_bid_depth - snapshot.no_ask_depth) / no_total_depth
+            } else {
+                dec!(1)
+            };
+            let max_obi = yes_obi.max(no_obi);
+            if max_obi > dc.arbitrage_max_leg_obi {
+                debug!(
+                    "🚫 Arb OBI gate — YES OBI {:.3} NO OBI {:.3} max {:.3} > limit {:.3} — skipping \
+                     (directional book; fill asymmetry likely)",
+                    yes_obi, no_obi, max_obi, dc.arbitrage_max_leg_obi
+                );
+                return Ok(StrategySignal::NoSignal);
+            }
+        } else {
+            // No orderbook depth data in snapshot — fall back to legacy price cap.
+            let max_leg_bid = safe_yes_bid.max(safe_no_bid);
+            if max_leg_bid > dc.arbitrage_max_leg_price {
+                debug!(
+                    "🚫 Arb price-cap fallback (no depth data) — max leg bid {:.3} > limit {:.3} — skipping",
+                    max_leg_bid, dc.arbitrage_max_leg_price
+                );
+                return Ok(StrategySignal::NoSignal);
+            }
         }
 
         // ── Strategy Exposure Check ──────────────────────────────────────────

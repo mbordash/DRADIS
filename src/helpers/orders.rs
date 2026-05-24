@@ -233,17 +233,28 @@ pub async fn place_limit_order(
 // Public: Atomic two-leg order placement
 // ─────────────────────────────────────────────────────────────────────────────
 
-/// Atomically places two orders (YES + NO legs) in a single API call.
+/// Places two orders (YES + NO legs) in a single HTTP request to `POST /orders`.
 ///
-/// Uses Polymarket's `POST /orders` batch endpoint which validates and processes
-/// all orders atomically — either **both** reach the book or **neither** does.
+/// Sending both orders in one round-trip minimises the latency gap between
+/// Leg A and Leg B arriving at Polymarket's matching engine — typically reducing
+/// the window from ~200-400 ms (two sequential calls) to < 5 ms (batch).
 ///
-/// This eliminates the window between sequential Leg A and Leg B placements
-/// where Leg A could be live on the book while Leg B fails, requiring a
-/// cancel + flash-exit safety net.  With atomic placement, on any batch error
-/// no orders are live, no cleanup is required, and we can retry cleanly.
+/// **Important — NOT server-side atomic:**
+/// Polymarket's `/orders` batch endpoint processes each order independently.
+/// If Leg A is accepted and Leg B is rejected, Leg A is live on the book.
+/// The orphan-accumulation guard in main.rs + the cleanup cycle in cleanup.rs
+/// detect and handle this case.  The "atomic" guarantee only holds at the
+/// NETWORK level (one TCP round-trip) — not at the matching-engine level.
+///
+/// **GTC / GTD only:**
+/// Only resting limit orders (GTC, GTD) may be submitted via this batch endpoint.
+/// FAK/FOK (immediate-or-cancel / fill-or-kill) orders must use the single-order
+/// `place_limit_order` → `POST /order` path.  This function enforces that
+/// constraint at runtime and returns `Err` if either leg is FAK/FOK.
 ///
 /// Returns `(leg_a_order_id, leg_b_order_id)` on success.
+/// Returns `Err` if the HTTP call itself fails (network, auth, server 500).
+/// A partial response (< 2 items) is also treated as an error.
 #[allow(clippy::too_many_arguments)]
 pub async fn place_limit_orders_atomic(
     client: &Arc<ClobClient<Authenticated<Normal>>>,
@@ -271,6 +282,21 @@ pub async fn place_limit_orders_atomic(
     expiration_b: u64,
     http: &reqwest::Client,
 ) -> Result<(String, String)> {
+    // ── GTC/GTD-only guard ─────────────────────────────────────────────────────
+    // POST /orders (batch) only accepts resting limit orders.  FAK/FOK are
+    // immediate orders that Polymarket routes through POST /order (single).
+    // Sending them through the batch endpoint would either be silently ignored
+    // or cause a server-side rejection that takes BOTH legs down.  Fail fast here
+    // so callers are forced to use place_limit_order for taker fills.
+    for (label, ot) in [("Leg A", &order_type_a), ("Leg B", &order_type_b)] {
+        if matches!(ot, OrderType::FAK | OrderType::FOK) {
+            return Err(anyhow::anyhow!(
+                "place_limit_orders_atomic: {} uses {:?} — only GTC/GTD orders \
+                 may be batched via POST /orders. Use place_limit_order instead.",
+                label, ot
+            ));
+        }
+    }
     for attempt in 0..2 {
         let _current_nonce = nonce_manager.load(Ordering::SeqCst);
 
