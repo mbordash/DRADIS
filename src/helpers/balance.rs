@@ -6,7 +6,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::str::FromStr;
-use alloy::primitives::{U256, B256, Address};
+use alloy::primitives::{U256, Address};
 use alloy::signers::local::LocalSigner;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
@@ -500,7 +500,10 @@ pub async fn arb_pair_fill_monitor(
                 });
             }
         }
-        // Remove any phantom cooldown set by the sync task during its phantom-removal pass.
+        // Drop the positions guard BEFORE acquiring phantom_cooldowns to prevent an ABBA
+        // deadlock: any task that holds phantom_cooldowns and then tries to acquire positions
+        // would cross-deadlock if we held positions here across the .await.
+        drop(map);
         phantom_cooldowns.lock().await
             .remove(&format!("{}:{}", strategy_name, missing_token));
         return;
@@ -525,21 +528,37 @@ pub async fn arb_pair_fill_monitor(
         }
     };
 
-    // FAK limit = ask + one tick, capped at $0.99 (never pay $1.00 for a binary outcome).
-    let fak_price = (ask_price + dec!(0.01)).min(dec!(0.99));
-    // Match the filled leg's confirmed share count so both legs stay balanced.
-    let filled_shares = positions.lock().await
+    // Match the filled leg's confirmed share count AND entry price so we can compute a
+    // breakeven ceiling — without this we'd cap at a fixed $0.99 and could lock in a loss.
+    let (filled_shares, filled_avg_entry) = positions.lock().await
         .get(&(strategy_name.clone(), filled_token))
-        .map(|p| p.shares)
-        .unwrap_or(dec!(0));
+        .map(|p| (p.shares, p.avg_entry))
+        .unwrap_or((dec!(0), dec!(0)));
     let fak_qty = if filled_shares >= crate::config::MIN_ORDER_SHARES {
         filled_shares
     } else {
         crate::config::MIN_ORDER_SHARES
     };
 
-    warn!("🎯 ARB ARBITER [{}]: Placing FAK taker buy — token={} qty={} limit={:.4} (ask={:.4})",
-          strategy_name, missing_token, fak_qty, fak_price, ask_price);
+    // Dynamic breakeven ceiling: the most we can pay for the missing leg without losing
+    // money on the combined position.  For a binary outcome paying exactly $1.00:
+    //   max_missing_price = $1.00 − filled_avg_entry − ARB_FAK_REHEDGE_BUFFER
+    // The buffer covers the taker-exit fee plus a small adverse-price cushion.
+    // If filled_avg_entry is unknown (0), fall back to the conservative hard $0.49 cap
+    // so we never automatically pay more than half the payout.
+    let dynamic_ceiling = if filled_avg_entry > dec!(0) {
+        (dec!(1.00) - filled_avg_entry - crate::config::ARB_FAK_REHEDGE_BUFFER)
+            .max(dec!(0.01)) // always allow at least a penny attempt
+    } else {
+        dec!(0.49) // conservative fallback when entry is unknown
+    };
+
+    // FAK limit = ask + one tick, capped at the dynamic breakeven ceiling.
+    // Using ask+1tick lets us cross the spread as a taker and get immediate fill.
+    let fak_price = (ask_price + dec!(0.01)).min(dynamic_ceiling);
+
+    warn!("🎯 ARB ARBITER [{}]: Placing FAK taker buy — token={} qty={} limit={:.4} (ask={:.4}, breakeven_ceil={:.4}, filled_entry={:.4})",
+          strategy_name, missing_token, fak_qty, fak_price, ask_price, dynamic_ceiling, filled_avg_entry);
 
     // Step 5: Place the FAK order — Immediate-or-Cancel, taker fill at current ask.
     match place_limit_order(
@@ -610,19 +629,16 @@ pub async fn quick_confirm_fill(
     strategy_name: &str,
     token_id: U256,
     positions: &Arc<Mutex<PositionMap>>,
-    condition_id: &str,
-    order_type: OrderType, // Added order_type parameter
+    _condition_id: &str, // retained for API compatibility; no longer used (FAK orders can't be cancelled)
+    order_type: OrderType,
 ) -> Result<bool> {
     // Only quick-confirm FAK orders. GTC orders need to wait for on-chain sync.
     if order_type != OrderType::FAK {
         return Ok(false);
     }
 
-    let market_hash = match B256::from_str(condition_id) { Ok(h) => h, Err(_) => return Ok(false) };
-    let req = polymarket_client_sdk_v2::clob::types::request::CancelMarketOrderRequest::builder().market(market_hash).build();
-    let _ = client.cancel_market_orders(&req).await;
-    // After cancelling all market orders, check if there are any remaining resting orders
-    // for this specific token (belt-and-suspenders: cancel_market_orders covers everything).
+    // FAK orders are self-cancelling at the exchange (evaluate-and-discard).
+    // There are no resting FAK orders to cancel, so skip straight to the fill check.
     let req2 = OrdersRequest::builder().asset_id(token_id).build();
     if !(match client.orders(&req2, None).await { Ok(p) => p.data.is_empty(), Err(_) => true }) {
         let mut pos_map = positions.lock().await;
