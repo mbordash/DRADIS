@@ -33,7 +33,7 @@ use crate::helpers::{db, send_notification, PhantomCooldowns};
 use crate::helpers::balance::OrphanTombstones;
 use crate::state::{Position, PositionMap};
 use crate::vipers::time_decay_impl::TimeDecayPosition;
-
+use sqlx;
 // ── On-chain settlement contracts ────────────────────────────────────────────
 
 /// pUSD (Polymarket USD) collateral token address on Polygon.
@@ -377,13 +377,27 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
         Err(_)     => { warn!("⚠️ Chain-sync: Polymarket Data API timed out (15s)"); return; }
     };
 
-    // Build map: decimal_token_id → &Position  (size > 0 only).
+    // Build map: decimal_token_id → &Position  (size > 0, NOT redeemable only).
     // MUST use p.asset.to_string() (decimal) — the DB stores token_id as decimal U256.
+    //
+    // Redeemable positions are EXCLUDED intentionally:
+    //   - A redeemable position means the market has resolved and the token is worth $0
+    //     (losing side) or $1 (winning side, already pending redemption by auto_settle).
+    //   - Including them in live_map would cause them to be re-adopted as active open
+    //     positions on every restart, showing phantom losing positions in the UI.
+    //   - By excluding them, purge_stale_open_positions removes any lingering DB rows,
+    //     and auto_settle_closed_positions handles the on-chain redemption separately.
+    //     This also covers the Data API indexer lag window after a manual "clear" on the
+    //     Polymarket UI: the token may still show size > 0 at the API while the indexer
+    //     catches up, but redeemable: true is set immediately at settlement.
     let live_map: std::collections::HashMap<String, &_> = live_positions
         .iter()
-        .filter(|p| p.size > rust_decimal::Decimal::ZERO)
+        .filter(|p| p.size > rust_decimal::Decimal::ZERO && !p.redeemable)
         .map(|p| (p.asset.to_string(), p))
         .collect();
+
+    // Count redeemable positions so operators can see them in logs.
+    let redeemable_count = live_positions.iter().filter(|p| p.redeemable).count();
 
     // ── Purge stale DB rows ───────────────────────────────────────────────────
     let live_ids: HashSet<String> = live_map.keys().cloned().collect();
@@ -417,8 +431,11 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
     if purged > 0 {
         info!("🧹 Chain-sync: purged {} stale open_positions row(s) (not found on-chain)", purged);
     }
+    if redeemable_count > 0 {
+        info!("⏳ Chain-sync: skipped {} redeemable (settled) position(s) — auto_settle will handle redemption", redeemable_count);
+    }
     if purged == 0 && adopted == 0 {
-        info!("✅ Chain-sync: open_positions DB is in sync with on-chain holdings ({} live)", live_map.len());
+        info!("✅ Chain-sync: open_positions DB is in sync with on-chain holdings ({} live, {} redeemable)", live_map.len(), redeemable_count);
     }
 }
 
@@ -546,10 +563,11 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
                 Ok(tx_hash) => {
                     settled_any = true;
                     RECENT_SETTLEMENT_SUBMITS.lock().await.insert(condition_id, Utc::now());
-                    // Mark as permanently settled so we never re-attempt this condition
-                    // in the same session, regardless of Data API indexer lag.
                     PERMANENTLY_SETTLED_CONDITIONS.lock().await.insert(condition_id);
                     info!("✅ Auto-settle: redeemed neg-risk condition {} (tx {})", condition_id, tx_hash);
+                    // Immediately purge open_positions DB rows for all legs in this condition
+                    // so they don't linger during Data API indexer lag after redemption.
+                    purge_settled_legs(&legs).await;
                 }
                 Err(e) => {
                     warn!("Auto-settle: neg-risk redeem failed for condition {}: {}", condition_id, e);
@@ -558,11 +576,6 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
             }
         } else {
             // Standard binary market redemption via CTF.
-            // indexSets=[1,2] redeems BOTH outcomes in one call:
-            //   - winning outcome pays $1.00 per token
-            //   - losing outcome pays $0.00 and is burned
-            // collateralToken MUST be pUSD — positions were minted with pUSD.
-            // We route through Safe.execTransaction so msg.sender == Safe (the token holder).
             let calldata = ICtfDirect::redeemPositionsCall {
                 collateralToken: PUSD_COLLATERAL,
                 parentCollectionId: B256::ZERO,
@@ -580,13 +593,14 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
                 Ok(tx_hash) => {
                     settled_any = true;
                     RECENT_SETTLEMENT_SUBMITS.lock().await.insert(condition_id, Utc::now());
-                    // Mark as permanently settled so we never re-attempt this condition
-                    // in the same session, regardless of Data API indexer lag.
                     PERMANENTLY_SETTLED_CONDITIONS.lock().await.insert(condition_id);
                     info!(
                         "✅ Auto-settle: redeemed condition {} (tx {}) — YES:{} NO:{} units",
                         condition_id, tx_hash, yes_units, no_units
                     );
+                    // Immediately purge open_positions DB rows for all legs in this condition
+                    // so they don't linger during Data API indexer lag after redemption.
+                    purge_settled_legs(&legs).await;
                 }
                 Err(e) => {
                     warn!("Auto-settle: redeem failed for condition {}: {}", condition_id, e);
@@ -597,6 +611,33 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
     }
 
     settled_any
+}
+
+/// Purge `open_positions` DB rows for all token_ids in a just-redeemed condition.
+///
+/// Called immediately after a successful `redeemPositions` on-chain transaction.
+/// Without this, the rows persist until the Polymarket Data API's indexer catches up
+/// (which can take minutes), and each chain-sync run during that window re-adopts
+/// them as active open positions — showing stale settled positions in the UI.
+async fn purge_settled_legs(legs: &[polymarket_client_sdk_v2::data::types::response::Position]) {
+    let pool = match db::pool() {
+        Some(p) => p,
+        None    => return,
+    };
+    for leg in legs {
+        let token_str = leg.asset.to_string();
+        match sqlx::query("DELETE FROM open_positions WHERE token_id = ?")
+            .bind(&token_str)
+            .execute(pool)
+            .await
+        {
+            Ok(r) if r.rows_affected() > 0 => {
+                info!("🗑️  Auto-settle: purged open_positions row for redeemed token {} ({})",
+                      &token_str[..token_str.len().min(20)], leg.title);
+            }
+            _ => {}
+        }
+    }
 }
 
 fn shares_to_base_units(shares: Decimal) -> u128 {

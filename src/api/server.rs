@@ -2,21 +2,23 @@
 ///
 /// Endpoints
 /// ─────────────────────────────────────────────────────────────────────────────
-///   GET  /api/health                — liveness check
-///   GET  /api/config                — current DynamicConfig as JSON
-///   PATCH /api/config               — JSON merge-patch; hot-reloads strategies
-///   GET  /api/pnl/history           — recent P&L snapshots  (?limit=200)
-///   GET  /api/trades                — recent completed trades (?limit=100)
-///   GET  /api/positions             — current open positions (all strategies, ghost+live)
-///   GET  /api/llm/recommendations   — recent LLM Advisor analyses (?limit=10)
+///   GET    /api/health                — liveness check
+///   GET    /api/config                — current DynamicConfig as JSON
+///   PATCH  /api/config               — JSON merge-patch; hot-reloads strategies
+///   GET    /api/pnl/history           — recent P&L snapshots  (?limit=200)
+///   GET    /api/trades                — recent completed trades (?limit=100)
+///   GET    /api/positions             — current open positions (all strategies, ghost+live)
+///   DELETE /api/positions/{token_id}  — purge a specific stale row from open_positions
+///   POST   /api/positions/sync        — trigger immediate chain-sync against Polymarket wallet
+///   GET    /api/llm/recommendations   — recent LLM Advisor analyses (?limit=10)
 ///
 /// The server binds to 0.0.0.0:$API_PORT (default 9000).
 /// CORS is open so the Next.js Control Tower on any port can reach it.
 
 use axum::{
     Router,
-    routing::get,
-    extract::{State, Query, Request},
+    routing::{get, post, delete},
+    extract::{State, Query, Path, Request},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -27,10 +29,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
-use tracing::{debug, error, warn};
+use tracing::{debug, error, info, warn};
+use alloy::primitives::Address;
 
 use crate::helpers::dynamic_config::DynamicConfig;
 use crate::helpers::db;
+use crate::tasks::cleanup::sync_open_positions_with_chain;
 
 // ─── Shared state ────────────────────────────────────────────────────────────
 
@@ -47,6 +51,9 @@ pub struct ApiState {
     /// When `Some`, every request must include `X-API-Key: <value>`.
     /// When `None`, no authentication is required (default for local dev).
     pub api_key: Option<String>,
+    /// Gnosis Safe wallet address — used by POST /api/positions/sync to fetch live
+    /// on-chain holdings and purge stale open_positions rows without a restart.
+    pub safe_address: Address,
 }
 
 // ─── API-key middleware ──────────────────────────────────────────────────────
@@ -220,6 +227,65 @@ async fn get_open_positions() -> Response {
     }
 }
 
+/// DELETE /api/positions/{token_id}
+///
+/// Purges a specific row from `open_positions` by token_id (decimal U256 string).
+/// Use this to clear stale DB rows for positions that were already closed/settled
+/// on-chain — e.g. when the bot was stopped before `sync_open_positions_with_chain`
+/// ran, leaving behind rows for expired or redeemed markets.
+///
+/// This only removes the DB row — it does NOT place a sell order on the CLOB.
+/// To also sell an active (not-yet-settled) position, use the Polymarket UI or
+/// wait for the bot's automated exit logic to trigger.
+async fn delete_open_position(Path(token_id): Path<String>) -> Response {
+    debug!("Received DELETE /api/positions/{}", token_id);
+    let pool = match db::pool() {
+        Some(p) => p,
+        None => {
+            error!("Database pool not available for DELETE /api/positions");
+            return (StatusCode::SERVICE_UNAVAILABLE, "DB unavailable").into_response();
+        }
+    };
+    match sqlx::query("DELETE FROM open_positions WHERE token_id = ?")
+        .bind(&token_id)
+        .execute(pool)
+        .await
+    {
+        Ok(r) if r.rows_affected() > 0 => {
+            info!("🗑️ Purged stale open_position row for token {}", &token_id[..token_id.len().min(20)]);
+            (StatusCode::OK, format!("Deleted {} row(s)", r.rows_affected())).into_response()
+        }
+        Ok(_) => {
+            warn!("DELETE /api/positions/{}: token_id not found in open_positions", token_id);
+            (StatusCode::NOT_FOUND, "token_id not found").into_response()
+        }
+        Err(e) => {
+            error!("DELETE /api/positions/{} DB error: {}", token_id, e);
+            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+        }
+    }
+}
+
+/// POST /api/positions/sync
+///
+/// Triggers an immediate two-way reconciliation of the `open_positions` DB table
+/// against the wallet's live on-chain holdings via the Polymarket Data API:
+///
+///   PURGE  — removes rows for tokens no longer held on-chain (settled, expired,
+///            redeemed, or sold externally on the Polymarket UI).
+///   ADOPT  — re-inserts on-chain positions that have no DB row.
+///
+/// Normally runs automatically at startup and every 300 s.  Call this endpoint
+/// after manually "clearing" settled losses in the Polymarket UI to immediately
+/// reflect the cleared state in DRADIS without waiting for a bot restart.
+///
+/// Returns: `{ "message": "Chain sync complete" }`
+async fn sync_positions(State(s): State<ApiState>) -> Response {
+    info!("🔄 Manual chain-sync triggered via POST /api/positions/sync");
+    sync_open_positions_with_chain(s.safe_address).await;
+    (StatusCode::OK, Json(serde_json::json!({ "message": "Chain sync complete" }))).into_response()
+}
+
 /// GET /api/llm/recommendations?limit=10
 ///
 /// Returns up to `limit` LLM Advisor analyses, newest first.
@@ -249,6 +315,7 @@ pub async fn run_api_server(
     config_tx: Arc<watch::Sender<Arc<DynamicConfig>>>,
     config_rx: watch::Receiver<Arc<DynamicConfig>>,
     markets_rx: watch::Receiver<HashMap<String, String>>,
+    safe_address: Address,
 ) {
     let port = std::env::var("API_PORT")
         .ok()
@@ -262,7 +329,7 @@ pub async fn run_api_server(
         tracing::info!("🔓 API key authentication disabled (set DRADIS_API_KEY to enable)");
     }
 
-    let state = ApiState { config_tx, config_rx, markets_rx, api_key };
+    let state = ApiState { config_tx, config_rx, markets_rx, api_key, safe_address };
 
     // /api/health is intentionally public — no API key required.
     // Docker HEALTHCHECK, load balancers, and uptime monitors all probe this
@@ -276,6 +343,8 @@ pub async fn run_api_server(
         .route("/api/pnl/history",           get(get_pnl_history))
         .route("/api/trades",                get(get_trades))
         .route("/api/positions",             get(get_open_positions))
+        .route("/api/positions/sync",        post(sync_positions))
+        .route("/api/positions/{token_id}",  delete(delete_open_position))
         .route("/api/status",                get(get_status))
         .route("/api/llm/recommendations",   get(get_llm_recommendations))
         // API-key check applied to all matched routes (inner layer — runs after CORS).

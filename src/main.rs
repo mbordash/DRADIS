@@ -164,12 +164,8 @@ async fn main() -> Result<()> {
     let (markets_tx, markets_rx) = watch::channel::<std::collections::HashMap<String, String>>(std::collections::HashMap::new());
     let markets_tx = Arc::new(markets_tx);
 
-    // ── Spawn Control Tower API server ───────────────────────────────────────
-    tokio::spawn(dradis::api::server::run_api_server(
-        Arc::clone(&config_tx),
-        config_rx.clone(),  // API server gets its own watch receiver
-        markets_rx,
-    ));
+    // NOTE: API server is spawned after safe_address is derived below so it can
+    // be passed in for the /api/positions/sync endpoint.
 
     let crypto_filter = env::var("CRYPTO_FILTER").unwrap_or_else(|_| "btc".to_string()).to_lowercase();
     let private_key = env::var(PRIVATE_KEY_VAR).expect("POLYMARKET_PRIVATE_KEY");
@@ -197,6 +193,16 @@ async fn main() -> Result<()> {
 
     let safe_address = derive_safe_wallet(eoa_address, POLYGON).expect("Safe derivation failed");
     info!("Authenticated on Polymarket CLOB. Safe (Maker) address: {}", safe_address);
+
+    // ── Spawn Control Tower API server ───────────────────────────────────────
+    // Spawned here (after safe_address is derived) so it can be passed to
+    // the /api/positions/sync endpoint for on-demand chain reconciliation.
+    tokio::spawn(dradis::api::server::run_api_server(
+        Arc::clone(&config_tx),
+        config_rx.clone(),
+        markets_rx,
+        safe_address,
+    ));
 
     let initial_nonce = fetch_next_nonce(&shared_http, safe_address).await.unwrap_or(0);
     info!(" Initialized Nonce from API (Maker/Safe): {}", initial_nonce);
