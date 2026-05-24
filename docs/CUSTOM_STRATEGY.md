@@ -29,6 +29,10 @@ pub trait Strategy: Send + Sync {
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal>;
     fn status(&self) -> StrategyStatus;
     fn name(&self) -> String;
+    // Optional — override to customize the startup attachment log:
+    fn venue(&self) -> &'static str { "Hourly" }        // e.g. "Window/Daily"
+    fn max_exposure(&self) -> Decimal { Decimal::ZERO } // USDC exposure budget
+    fn risk_model(&self) -> &'static str { "Unknown" }  // e.g. "Kelly", "Fixed"
 }
 ```
 
@@ -47,6 +51,8 @@ pub struct StrategyContext {
     pub market_started_at: DateTime<Utc>,
     pub maker_market: Option<MarketConfig>, // Optional Window/Daily venue
     pub maker_snapshot: Option<MarketSnapshot>, // Prices for the Window venue
+    pub available_collateral: Decimal,      // Live pUSD wallet balance (updated every 60s)
+    pub dynamic_config: Arc<DynamicConfig>, // Runtime-tunable params from SQLite/Control Tower
 }
 ```
 
@@ -143,6 +149,10 @@ impl Strategy for MyStrategyImpl {
     
     fn name(&self) -> String { "MyStrategy".to_string() }
     fn status(&self) -> StrategyStatus { StrategyStatus::Active }
+    // Optional overrides — defaults are fine for most strategies:
+    fn venue(&self) -> &'static str { "Hourly" }
+    fn max_exposure(&self) -> Decimal { dec!(50) }
+    fn risk_model(&self) -> &'static str { "Fixed" }
 }
 ```
 
@@ -202,6 +212,8 @@ mod tests {
                 no_bid: dec!(0.49), no_ask: dec!(0.5), no_bid_depth: dec!(100), no_ask_depth: dec!(100),
                 oracle_price: dec!(70000), velocity: dec!(0), velocity_1s: dec!(0),
                 acceleration: dec!(0), funding_rate: dec!(0), oracle_drift_60m: dec!(0),
+                oracle_drift_10m: dec!(0),
+                secs_to_expiry: 3600,
                 timestamp: Utc::now(),
             },
             positions: Arc::new(Mutex::new(PositionMap::new())),
@@ -211,6 +223,8 @@ mod tests {
             market_started_at: Utc::now(),
             maker_market: None,
             maker_snapshot: None,
+            available_collateral: dec!(100),
+            dynamic_config: Arc::new(DynamicConfig::default()),
         }
     }
 }
