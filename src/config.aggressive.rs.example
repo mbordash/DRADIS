@@ -43,7 +43,7 @@ pub const ARBITRAGE_MAX_FILL_GAP: Decimal = dec!(0.08);
 /// Aggressive: 0.65 — accepts mildly directional markets (up to 65/35 split).
 /// Tighten to 0.60 (balanced default) if you observe NO-accumulates-YES-never-fills orphans.
 pub const ARBITRAGE_MAX_LEG_PRICE: Decimal = dec!(0.65);
-
+pub const ARBITRAGE_MAX_LEG_OBI: Decimal = dec!(0.50);
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.98);
 pub const MIN_ORDER_SHARES: Decimal = dec!(1.0);
 pub const MIN_ORDER_USDC: Decimal = dec!(1.05);

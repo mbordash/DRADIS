@@ -43,7 +43,7 @@ pub const ARBITRAGE_MAX_FILL_GAP: Decimal = dec!(0.03);
 /// Conservative: 0.55 — tighter band than balanced; requires near-symmetric books.
 /// Root cause of the 2026-05-19 "10 YES / 40 NO" imbalance (YES=72¢, NO=27¢).
 pub const ARBITRAGE_MAX_LEG_PRICE: Decimal = dec!(0.55);
-
+pub const ARBITRAGE_MAX_LEG_OBI: Decimal = dec!(0.50);
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.96);
 
 /// Minimum shares and order size (exchange minimums — do not lower).

@@ -1680,6 +1680,39 @@ async fn main() -> Result<()> {
                                                 // entries table is for price-lookup history, not live-position display).
                                                 { let sn_e = sn.clone(); let tid_e = params.token_id.to_string(); let mn_e = params.market_name.clone(); let side_e = if params.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_e = actual_entry_price; let sh_e = params.shares; tokio::spawn(async move { metrics::record_entry(sn_e, tid_e, mn_e, side_e, ep_e, sh_e).await; }); }
                                                 { let sn_eb = sn.clone(); let tid_eb = pp.token_id.to_string(); let mn_eb = pp.market_name.clone(); let side_eb = if pp.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_eb = actual_pair_entry_price; let sh_eb = pp.shares; tokio::spawn(async move { metrics::record_entry(sn_eb, tid_eb, mn_eb, side_eb, ep_eb, sh_eb).await; }); }
+
+                                                // ── Orphan-leg cleanup arbiter ───────────────────────────────
+                                                // Enforces the invariant: if elapsed_time > MAX_WAIT_SECS and
+                                                // exactly one leg has confirmed fills, atomically cancel the
+                                                // stale GTC and place a FAK taker buy on the missing leg to
+                                                // close the delta exposure at the current market ask.
+                                                {
+                                                    let arb_cl  = Arc::clone(&trading_client);
+                                                    let arb_nm  = Arc::clone(&nonce_manager);
+                                                    let arb_sg  = signer.clone();
+                                                    let arb_ps  = Arc::clone(&positions);
+                                                    let arb_pc  = Arc::clone(&phantom_cooldowns);
+                                                    let arb_sn  = sn.clone();
+                                                    let arb_http = shared_http.clone();
+                                                    let arb_tok_a = params.token_id;
+                                                    let arb_tok_b = pp.token_id;
+                                                    let arb_base_a = primary_baseline;
+                                                    let arb_base_b = pair_baseline;
+                                                    let arb_side_a = if params.token_id == target_yes_token { "YES" } else { "NO" }.to_string();
+                                                    let arb_side_b = if pp.token_id == target_yes_token { "YES" } else { "NO" }.to_string();
+                                                    let arb_wait = primary_wait_secs.max(pair_wait_secs);
+                                                    tokio::spawn(async move {
+                                                        dradis::helpers::balance::arb_pair_fill_monitor(
+                                                            arb_cl, arb_nm, arb_sg,
+                                                            safe_address, eoa_address, vc, vc_p,
+                                                            arb_ps, arb_pc, arb_sn,
+                                                            arb_tok_a, arb_tok_b,
+                                                            arb_base_a, arb_base_b,
+                                                            arb_side_a, arb_side_b,
+                                                            arb_wait, arb_http,
+                                                        ).await;
+                                                    });
+                                                }
                                             }
                                         }
                                     } else {

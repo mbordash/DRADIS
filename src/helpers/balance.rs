@@ -4,9 +4,10 @@ use regex::Regex;
 use anyhow::Result;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::str::FromStr;
-use alloy::primitives::U256;
-use alloy::primitives::B256;
+use alloy::primitives::{U256, B256, Address};
+use alloy::signers::local::LocalSigner;
 use tokio::sync::Mutex;
 use tokio::time::{Duration, Instant};
 use chrono::Utc;
@@ -15,10 +16,11 @@ use tracing::{debug, error, info, warn};
 use polymarket_client_sdk_v2::clob::{Client as ClobClient};
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::Normal;
-use polymarket_client_sdk_v2::clob::types::request::{BalanceAllowanceRequest, OrdersRequest};
-use polymarket_client_sdk_v2::clob::types::{AssetType, OrderType}; // Import OrderType
+use polymarket_client_sdk_v2::clob::types::request::{BalanceAllowanceRequest, OrdersRequest, PriceRequest};
+use polymarket_client_sdk_v2::clob::types::{AssetType, OrderType, Side};
 
 use crate::helpers::metrics;
+use crate::helpers::orders::place_limit_order;
 
 pub use crate::state::{Position, PositionMap};
 
@@ -361,6 +363,244 @@ pub async fn reconcile_orphaned_positions(
             if let Some(p) = pos_map.get_mut(&(sb, tok_b)) {
                 p.paired_leg_token_id = Some(tok_a);
             }
+        }
+    }
+}
+
+/// Orphan-leg cleanup monitor spawned alongside every atomic two-leg arb entry.
+///
+/// Enforces the invariant:
+///   If elapsed_time > MAX_WAIT_SECS and positions[Leg_A].shares != positions[Leg_B].shares
+///   (i.e. exactly one leg confirmed, the other expired unfilled):
+///     1. POST /cancel — atomically cancels the remaining open GTC order on the missing leg.
+///     2. FAK (Immediate-or-Cancel) taker buy on the missing leg at current ask + one tick,
+///        capped at $0.99, to close the delta exposure at market price.
+///
+/// The monitor sleeps for `max_wait_secs + ARBITER_GRACE_SECS` to let individual
+/// `sync_position_balance` tasks reach their own timeout branches first, then checks
+/// the joint fill state and acts only on asymmetry.
+pub async fn arb_pair_fill_monitor(
+    client: Arc<ClobClient<Authenticated<Normal>>>,
+    nonce_manager: Arc<AtomicU64>,
+    signer: LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
+    safe_address: Address,
+    eoa_address: Address,
+    vc_a: Address,
+    vc_b: Address,
+    positions: Arc<Mutex<PositionMap>>,
+    phantom_cooldowns: PhantomCooldowns,
+    strategy_name: String,
+    leg_a_token: U256,
+    leg_b_token: U256,
+    leg_a_baseline: Decimal,
+    leg_b_baseline: Decimal,
+    leg_a_side_label: String,
+    leg_b_side_label: String,
+    max_wait_secs: i64,
+    http: Arc<reqwest::Client>,
+) {
+    /// Grace period added on top of the fill window so the individual `sync_position_balance`
+    /// tasks can run their own cancel + phantom-removal logic before the arbiter steps in.
+    const ARBITER_GRACE_SECS: u64 = 15;
+
+    let total_wait = Duration::from_secs((max_wait_secs as u64).saturating_add(ARBITER_GRACE_SECS));
+    tokio::time::sleep(total_wait).await;
+
+    let key_a = (strategy_name.clone(), leg_a_token);
+    let key_b = (strategy_name.clone(), leg_b_token);
+
+    // Snapshot fill-confirmation state for both legs.
+    let (a_confirmed, a_shares) = {
+        let map = positions.lock().await;
+        map.get(&key_a)
+            .map(|p| (p.fill_confirmed_at.is_some(), p.shares))
+            .unwrap_or((false, dec!(0)))
+    };
+    let (b_confirmed, b_shares) = {
+        let map = positions.lock().await;
+        map.get(&key_b)
+            .map(|p| (p.fill_confirmed_at.is_some(), p.shares))
+            .unwrap_or((false, dec!(0)))
+    };
+
+    match (a_confirmed, b_confirmed) {
+        (true, true) => {
+            // Symmetric fill — both legs confirmed. Nothing to do.
+            debug!("✅ ARB ARBITER [{}]: Both legs confirmed ({} / {}) — no orphan", strategy_name, leg_a_token, leg_b_token);
+            return;
+        }
+        (false, false) => {
+            // Neither leg filled — individual sync tasks already handle phantom-removal.
+            debug!("⏭️  ARB ARBITER [{}]: Neither leg confirmed — sync tasks own cleanup", strategy_name);
+            return;
+        }
+        _ => {} // Asymmetric — exactly one leg filled.
+    }
+
+    // ── Asymmetric fill: one leg confirmed, the other is missing ──────────────
+    let (filled_token, missing_token, missing_baseline, missing_vc, missing_side) =
+        if a_confirmed {
+            warn!("⚡ ARB ARBITER [{}]: Leg A ({}) filled ({} shares) but Leg B ({}) is MISSING — initiating orphan-leg cleanup",
+                  strategy_name, leg_a_token, a_shares, leg_b_token);
+            (leg_a_token, leg_b_token, leg_b_baseline, vc_b, leg_b_side_label.as_str())
+        } else {
+            warn!("⚡ ARB ARBITER [{}]: Leg B ({}) filled ({} shares) but Leg A ({}) is MISSING — initiating orphan-leg cleanup",
+                  strategy_name, leg_b_token, b_shares, leg_a_token);
+            (leg_b_token, leg_a_token, leg_a_baseline, vc_a, leg_a_side_label.as_str())
+        };
+
+    // Step 1: Cancel any remaining GTC on the missing leg (idempotent if already cancelled
+    //         by the individual sync task — the CLOB rejects cancels of non-existent orders
+    //         gracefully).
+    cancel_resting_orders(&client, missing_token).await;
+
+    // Step 2: Short settlement grace — the cancel may have raced against a taker fill
+    //         that was mid-settlement on-chain.
+    tokio::time::sleep(Duration::from_secs(10)).await;
+
+    // Step 3: Re-check the missing leg's on-chain balance (settle-lag race guard).
+    let settled_shares = {
+        let mut req = BalanceAllowanceRequest::default();
+        req.asset_type = AssetType::Conditional;
+        req.token_id = Some(missing_token);
+        match client.balance_allowance(req).await {
+            Ok(resp) => {
+                let raw = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
+                (raw - missing_baseline).max(dec!(0))
+            }
+            Err(e) => {
+                warn!("⚠️ ARB ARBITER [{}]: Balance re-check error for missing leg {}: {}", strategy_name, missing_token, e);
+                dec!(0)
+            }
+        }
+    };
+
+    if settled_shares >= crate::config::MIN_ORDER_SHARES {
+        // The missing leg actually filled during the cancel settle-lag window — recover it.
+        warn!("✅ ARB ARBITER [{}]: Missing leg {} RECOVERED post-cancel settle ({} shares)",
+              strategy_name, missing_token, settled_shares);
+        let key_m = (strategy_name.clone(), missing_token);
+        let mut map = positions.lock().await;
+        if let Some(pos) = map.get_mut(&key_m) {
+            pos.shares = settled_shares;
+            if pos.fill_confirmed_at.is_none() { pos.fill_confirmed_at = Some(Utc::now()); }
+        } else {
+            // Sync task already phantom-removed it; re-insert with data from the filled leg.
+            let reference = map.get(&(strategy_name.clone(), filled_token)).cloned();
+            if let Some(ref_pos) = reference {
+                map.insert(key_m, Position {
+                    shares: settled_shares,
+                    avg_entry: ref_pos.avg_entry,
+                    opened_at: Utc::now(),
+                    close_time: ref_pos.close_time,
+                    market_name: ref_pos.market_name.clone(),
+                    pair_token_id: missing_token,
+                    fill_confirmed_at: Some(Utc::now()),
+                    paired_leg_token_id: Some(filled_token),
+                });
+            }
+        }
+        // Remove any phantom cooldown set by the sync task during its phantom-removal pass.
+        phantom_cooldowns.lock().await
+            .remove(&format!("{}:{}", strategy_name, missing_token));
+        return;
+    }
+
+    // Step 4: Query the CLOB for the current best Buy price on the missing leg.
+    let ask_price = {
+        let req = PriceRequest::builder()
+            .token_id(missing_token)
+            .side(Side::Buy)
+            .build();
+        match client.price(&req).await {
+            Ok(resp) => {
+                info!("📊 ARB ARBITER [{}]: Current ask for missing leg {} = {:.4}", strategy_name, missing_token, resp.price);
+                resp.price
+            }
+            Err(e) => {
+                warn!("⚠️ ARB ARBITER [{}]: Could not fetch ask for {}: {} — using $0.99 ceiling",
+                      strategy_name, missing_token, e);
+                dec!(0.99)
+            }
+        }
+    };
+
+    // FAK limit = ask + one tick, capped at $0.99 (never pay $1.00 for a binary outcome).
+    let fak_price = (ask_price + dec!(0.01)).min(dec!(0.99));
+    // Match the filled leg's confirmed share count so both legs stay balanced.
+    let filled_shares = positions.lock().await
+        .get(&(strategy_name.clone(), filled_token))
+        .map(|p| p.shares)
+        .unwrap_or(dec!(0));
+    let fak_qty = if filled_shares >= crate::config::MIN_ORDER_SHARES {
+        filled_shares
+    } else {
+        crate::config::MIN_ORDER_SHARES
+    };
+
+    warn!("🎯 ARB ARBITER [{}]: Placing FAK taker buy — token={} qty={} limit={:.4} (ask={:.4})",
+          strategy_name, missing_token, fak_qty, fak_price, ask_price);
+
+    // Step 5: Place the FAK order — Immediate-or-Cancel, taker fill at current ask.
+    match place_limit_order(
+        &client, &nonce_manager, &signer,
+        safe_address, eoa_address, missing_vc,
+        missing_token, Side::Buy, fak_qty, fak_price,
+        0, OrderType::FAK, false, 0, &*http,
+    ).await {
+        Ok(order_id) => {
+            warn!("✅ ARB ARBITER [{}]: FAK re-hedge placed (order_id={}) — delta exposure closed",
+                  strategy_name, order_id);
+
+            // Re-insert the missing leg into the positions map (the sync task already
+            // phantom-removed it; we restore it with the FAK fill data).
+            let reference = positions.lock().await
+                .get(&(strategy_name.clone(), filled_token))
+                .cloned();
+            if let Some(ref_pos) = reference {
+                let key_m = (strategy_name.clone(), missing_token);
+                let mut map = positions.lock().await;
+                if !map.contains_key(&key_m) {
+                    map.insert(key_m.clone(), Position {
+                        shares: fak_qty,
+                        avg_entry: fak_price,
+                        opened_at: Utc::now(),
+                        close_time: ref_pos.close_time,
+                        market_name: ref_pos.market_name.clone(),
+                        pair_token_id: missing_token,
+                        fill_confirmed_at: Some(Utc::now()),
+                        paired_leg_token_id: Some(filled_token),
+                    });
+                }
+                drop(map);
+
+                // Clear phantom cooldown so a future cycle can enter this market again.
+                phantom_cooldowns.lock().await
+                    .remove(&format!("{}:{}", strategy_name, missing_token));
+
+                // Write the re-hedged fill to the DB.
+                if let Some(pool) = crate::helpers::db::pool() {
+                    crate::helpers::db::record_open_position(
+                        pool,
+                        &strategy_name,
+                        &missing_token.to_string(),
+                        &ref_pos.market_name,
+                        missing_side,
+                        fak_price,
+                        fak_qty,
+                        false,
+                    ).await;
+                }
+            }
+        }
+        Err(e) => {
+            warn!("❌ ARB ARBITER [{}]: FAK re-hedge FAILED for missing leg {}: {}",
+                  strategy_name, missing_token, e);
+            // Engage phantom cooldowns on BOTH legs so re-entry is blocked until the
+            // operator can inspect the exposure.
+            let mut cd = phantom_cooldowns.lock().await;
+            cd.insert(format!("{}:{}", strategy_name, leg_a_token), tokio::time::Instant::now());
+            cd.insert(format!("{}:{}", strategy_name, leg_b_token), tokio::time::Instant::now());
         }
     }
 }
