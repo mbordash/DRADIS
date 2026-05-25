@@ -227,10 +227,21 @@ pub async fn reconcile_orphaned_positions(
         let mut req = BalanceAllowanceRequest::default();
         req.asset_type = AssetType::Conditional;
         req.token_id = Some(token_id);
-        let actual_shares = match client.balance_allowance(req).await {
-            Ok(resp) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
-            Err(e) => {
+        // Hard 10s timeout — the outer 'market_loop calls this function BEFORE the inner
+        // select! loop starts, so the watchdog ticker cannot fire to break a stall here.
+        // Without this guard a CLOB API hang at market-switch time causes a permanent
+        // silent halt (root cause of the recurring ghost-mode production halt).
+        let actual_shares = match tokio::time::timeout(
+            Duration::from_secs(10),
+            client.balance_allowance(req),
+        ).await {
+            Ok(Ok(resp)) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
+            Ok(Err(e)) => {
                 warn!("⚠️ RECONCILE: balance query failed for token {} ({}): {}", token_id, side_label, e);
+                continue;
+            }
+            Err(_) => {
+                warn!("⚠️ RECONCILE: balance query timed out (10s) for token {} ({}) — skipping adopt", token_id, side_label);
                 continue;
             }
         };
