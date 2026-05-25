@@ -423,6 +423,8 @@ The safe pattern: bump the suffix in `GBOOST_MODEL_PATH` (e.g. `v14f` → `v15f`
 
 **Control Tower shows "Offline"?** Check: (1) DRADIS running? (2) `curl http://localhost:9000/api/health`? (3) Docker — same `dradis-net` network?
 
+**How can I tune my instance for maximum performance?** Please see our dedicated performance tuning guide: [PERFORMANCE_TUNING.md](docs/PERFORMANCE_TUNING.md).
+
 **How do I enable the LLM Advisor?**
 1. `ollama pull llama3.2`
 2. `ENABLE_LLM_ADVISOR = true` in `config.rs`

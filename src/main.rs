@@ -1039,7 +1039,7 @@ async fn main() -> Result<()> {
                                     config::MIN_SELL_LIMIT_PRICE  // no bid data — accept any non-zero price
                                 };
 
-                                warn!("🛑 ORPHAN EXIT: selling {:.4} shares of token {} @ ${:.4} \
+                                warn!(" ORPHAN EXIT: selling {:.4} shares of token {} @ ${:.4} \
                                        (current bid=${:.4})",
                                       orphan.shares, orphan.token_id, sell_price, orphan_bid);
 
@@ -1055,7 +1055,7 @@ async fn main() -> Result<()> {
                                         let sh_o = orphan.shares;
                                         tokio::spawn(async move {
                                             let _ = send_notification(&tok_o, &cid_o, &format!(
-                                                "🛑 Orphan sold: {:.0} shares @ ${:.4} (bid-based FAK exit)",
+                                                " Orphan sold: {:.0} shares @ ${:.4} (bid-based FAK exit)",
                                                 sh_o, sell_price
                                             )).await;
                                         });
