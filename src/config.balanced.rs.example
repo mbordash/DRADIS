@@ -112,6 +112,10 @@ pub const MOMENTUM_WINDOW_BULLISH_BLOCK: Decimal = dec!(0.70);
 /// OBI adverse veto: skip entries when the book is moderately stacked against the trade.
 pub const MOMENTUM_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.60);
 
+/// OBI exhaustion veto: block entries when the bid side dominates entirely (all buyers, no sellers).
+/// Balanced: 0.75 — between conservative (0.70) and aggressive (0.80).
+pub const MOMENTUM_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.75);
+
 /// Maximum combined ask sum (YES_ask + NO_ask) allowed for a Momentum entry.
 /// Balanced: 3-cent combined spread cap — allows some widening but blocks clearly broken books.
 pub const MOMENTUM_MAX_ENTRY_ASK_SUM: Decimal = dec!(1.030);

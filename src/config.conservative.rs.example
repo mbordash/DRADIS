@@ -126,6 +126,10 @@ pub const MOMENTUM_WINDOW_BULLISH_BLOCK: Decimal = dec!(0.65);
 /// book quality over fill rate.
 pub const MOMENTUM_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.50);
 
+/// OBI exhaustion veto: block entries when the bid side dominates entirely (all buyers, no sellers).
+/// Conservative: 0.70 — tightest gate; mirrors GBOOST_OBI_EXHAUSTION_BLOCK conservative setting.
+pub const MOMENTUM_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.70);
+
 /// Maximum combined ask sum (YES_ask + NO_ask) allowed for a Momentum entry.
 /// Conservative: tight 2-cent spread cap — only enter on near-perfect books.
 pub const MOMENTUM_MAX_ENTRY_ASK_SUM: Decimal = dec!(1.020);
@@ -258,7 +262,6 @@ pub const BASIS_MAKER_BUY_PRICE_ADJUSTMENT: Decimal = dec!(-0.01);
 
 pub const ENABLE_GBOOST_TRADING: bool = true;
 
-pub const GBOOST_MAX_ENTRY_PRICE: Decimal = dec!(0.55);
 pub const GBOOST_MAX_YES_ENTRY_PRICE: Decimal = dec!(0.55);
 pub const GBOOST_MAX_NO_ENTRY_PRICE: Decimal = dec!(0.45);
 pub const GBOOST_MIN_ENTRY_PRICE: Decimal = dec!(0.42); // Conservative: further from 50¢ coin-flip zone

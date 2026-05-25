@@ -120,6 +120,10 @@ pub const MOMENTUM_WINDOW_BULLISH_BLOCK: Decimal = dec!(0.78);
 /// accepts more adverse-selection risk in exchange for higher fill rates.
 pub const MOMENTUM_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.75);
 
+/// OBI exhaustion veto: block entries when the bid side dominates entirely (all buyers, no sellers).
+/// Aggressive: 0.80 — looser than balanced/conservative; only blocks near-fully exhausted books.
+pub const MOMENTUM_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.80);
+
 /// Maximum combined ask sum (YES_ask + NO_ask) allowed for a Momentum entry.
 /// Aggressive: tolerates a wider spread (4-cent combined cap) to maximize fill opportunities.
 pub const MOMENTUM_MAX_ENTRY_ASK_SUM: Decimal = dec!(1.040);
@@ -287,7 +291,6 @@ pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.080); // aggressive: 8% —
 pub const GBOOST_MIN_HOLD_SECS: i64 = 180;
 pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 10;
 pub const GBOOST_MIN_USABLE_TREES: usize = 30;
-pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v22f.json";
 pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v22f.json";
 /// Max fraction of identical labels before skipping a retrain cycle (avoids degenerate storms).
 /// Aggressive: same threshold — label imbalance is a hard data quality issue, not a risk preference.

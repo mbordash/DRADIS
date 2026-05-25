@@ -1194,6 +1194,20 @@ impl Strategy for GboostStrategyImpl {
                     );
                     return Ok(StrategySignal::NoSignal);
                 }
+                // ── Hourly OBI exhaustion check ───────────────────────────────
+                // When the hourly book is overwhelmingly bid-dominated (OBI > +threshold)
+                // the momentum move on the hourly venue is exhausted — all buyers are in,
+                // sellers haven't arrived yet.  The subsequent flush propagates to the daily
+                // market, dragging daily YES down with it.
+                // 2026-05-24 11:39: hourly YES OBI=0.85 at entry → price fell from $0.54
+                // to $0.49 in 45 s (-$0.26 loss).  Blocked at OBI_EXHAUSTION_BLOCK=0.80.
+                if hourly_yes_obi.abs() > config::GBOOST_OBI_EXHAUSTION_BLOCK {
+                    tracing::debug!(
+                        "🚫 GBoost YES entry veto: hourly OBI exhausted | hourly_obi={:.3} > {:.3}",
+                        hourly_yes_obi, config::GBOOST_OBI_EXHAUSTION_BLOCK
+                    );
+                    return Ok(StrategySignal::NoSignal);
+                }
             }
             let price  = floor_to_tick_size(target_snapshot.yes_ask);
             if price >= config::GBOOST_MAX_YES_ENTRY_PRICE
@@ -1299,6 +1313,18 @@ impl Strategy for GboostStrategyImpl {
                     tracing::debug!(
                         "🚫 GBoost NO entry veto: hourly NO OBI adverse | obi={:.3} block={:.3}",
                         hourly_no_obi, config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK
+                    );
+                    return Ok(StrategySignal::NoSignal);
+                }
+                // ── Hourly OBI exhaustion check ───────────────────────────────
+                // Mirrors the YES exhaustion check: when hourly NO book is overwhelmingly
+                // bid-dominated (OBI > +threshold), the NO-side momentum is exhausted and
+                // a reversal is imminent.  Entering daily NO at this point means buying
+                // into the last ticks of a NO surge — adverse selection is at its peak.
+                if hourly_no_obi.abs() > config::GBOOST_OBI_EXHAUSTION_BLOCK {
+                    tracing::debug!(
+                        "🚫 GBoost NO entry veto: hourly OBI exhausted | hourly_obi={:.3} > {:.3}",
+                        hourly_no_obi, config::GBOOST_OBI_EXHAUSTION_BLOCK
                     );
                     return Ok(StrategySignal::NoSignal);
                 }
