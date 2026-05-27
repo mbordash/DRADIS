@@ -179,6 +179,23 @@ impl Strategy for ArbitrageStrategyImpl {
         }
         let current_exposure = {
             let pos_map = ctx.positions.lock().await;
+
+            // ── Per-token existence guard ─────────────────────────────────────
+            // If we already hold either leg of THIS specific market, skip entry.
+            // Without this check the strategy returns an Entry signal on every
+            // 50ms tick (because total exposure < max_exposure_usdc) even though
+            // main.rs would silently block it at the positions-map check; the
+            // repeated evaluate_entry calls waste CPU and flood the executor INFO
+            // line with spurious 🟩 on every tick.
+            // This guards against both re-adopted on-chain positions and live GTC
+            // orders waiting for confirmation (fill_confirmed_at == None).
+            if pos_map.contains_key(&(STRATEGY_NAME.to_string(), market.yes_token))
+                || pos_map.contains_key(&(STRATEGY_NAME.to_string(), market.no_token))
+            {
+                debug!("🚫 Arb skipped — already hold YES or NO leg for this market");
+                return Ok(StrategySignal::NoSignal);
+            }
+
             pos_map.iter()
                 .filter(|((s, _), _)| s == STRATEGY_NAME)
                 .map(|(_, p)| p.shares * p.avg_entry)
@@ -197,11 +214,40 @@ impl Strategy for ArbitrageStrategyImpl {
         // so YES_cost + NO_cost = trade_size and every YES share has one NO share.
         let pair_shares = trade_size / (safe_yes_bid + safe_no_bid);
 
+        // ── Expensive-leg-first ordering ──────────────────────────────────────
+        // Assign Leg A (params) = the higher-bid (more expensive) leg,
+        // Leg B (pair_params) = the lower-bid (cheaper) leg.
+        //
+        // Rationale: The ARB ARBITER fires when "Leg A filled, Leg B missing"
+        // and attempts a FAK taker-buy for the missing Leg B.  If Leg B is the
+        // cheap leg (small ask), its current ask ≈ bid + 1 tick — very close to
+        // our breakeven ceiling — giving the emergency FAK the best possible
+        // chance of succeeding.
+        //
+        // The opposite ordering (cheap-first) caused the May-27 orphan loss:
+        //   - YES (cheap, $0.18 bid) filled immediately as sellers unloaded
+        //   - NO  (expensive, $0.81 bid) never filled as the directional move
+        //     drove NO ask to $0.83
+        //   - FAK re-hedge for NO needed limit ≥ $0.80 but ask was $0.83 → failed
+        //   - Orphan exit: sold YES at $0.15 → −$0.29 realized loss
+        //
+        // With expensive-first, if NO (Leg A) fills and YES (Leg B) orphans, the
+        // FAK gap for cheap YES is ≈ 1–2 ticks instead of 3–4, substantially
+        // improving re-hedge success when markets have shifted slightly.
+        let (leg_a_token, leg_a_price, leg_b_token, leg_b_price) =
+            if safe_yes_bid >= safe_no_bid {
+                // YES is the expensive leg — place it first
+                (market.yes_token, safe_yes_bid, market.no_token, safe_no_bid)
+            } else {
+                // NO is the expensive leg — place it first
+                (market.no_token, safe_no_bid, market.yes_token, safe_yes_bid)
+            };
+
         return Ok(StrategySignal::Entry {
             params: OrderParams {
-                token_id: market.yes_token,
-                price: safe_yes_bid,                   // capped one tick below ask — guaranteed maker
-                shares: pair_shares,                   // balanced — same count as NO leg
+                token_id: leg_a_token,
+                price: leg_a_price,                    // expensive leg — capped one tick below ask
+                shares: pair_shares,                   // balanced — same count as cheap leg
                 fee_bps: 0,                            // maker = 0 fees
                 is_neg_risk: market.is_neg_risk,
                 market_name: market.market_name.clone(),
@@ -211,9 +257,9 @@ impl Strategy for ArbitrageStrategyImpl {
                 ghost_mode: dc.ghost_mode,
             },
             pair_params: Some(OrderParams {
-                token_id: market.no_token,
-                price: safe_no_bid,                    // capped one tick below ask — guaranteed maker
-                shares: pair_shares,                   // same count as YES leg
+                token_id: leg_b_token,
+                price: leg_b_price,                    // cheap leg — capped one tick below ask
+                shares: pair_shares,                   // same count as expensive leg
                 fee_bps: 0,
                 is_neg_risk: market.is_neg_risk,
                 market_name: market.market_name.clone(),
@@ -265,9 +311,9 @@ impl Strategy for ArbitrageStrategyImpl {
                         is_neg_risk: market.is_neg_risk,
                         market_name: market.market_name.clone(),
                         condition_id: market.condition_id.clone(),
-                order_type: OrderType::FAK,   // guaranteed exit before close
-                post_only: false,
-                ghost_mode: dc.ghost_mode,
+                        order_type: OrderType::FAK,   // guaranteed exit before close
+                        post_only: false,
+                        ghost_mode: dc.ghost_mode,
                     },
                     reason: "Arbitrage convergence".to_string(),
                     exit_pair: true,

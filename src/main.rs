@@ -1203,6 +1203,22 @@ async fn main() -> Result<()> {
                     let (resolved_signals, _) = aggregate_and_resolve_signals(&eval_result);
                     if resolved_signals.is_empty() { continue; }
 
+                    // ── Signal-processing timeout guard ──────────────────────────────────
+                    // The signal processing loop can block the entire tokio::select! for up
+                    // to ~50 s when a real entry fires (2×10 s balance checks + 15 s order
+                    // placement × 2 retries).  While blocked, the watchdog_ticker, status_ticker,
+                    // and market_rx.changed() arms cannot run — the watchdog is completely blind
+                    // to this stall.  Wrapping in a 45 s timeout ensures select! is always freed
+                    // within a bounded window so the watchdog, heartbeat, and market-switch arms
+                    // resume.  The 45 s cap is chosen as slightly less than the watchdog period
+                    // (120 s tick) to guarantee at least one free select! poll per watchdog cycle.
+                    //
+                    // ROOT CAUSE NOTE (2026-05-26 session halt at 01:38:44):
+                    //   The process was externally killed (likely OOM on t2.small), but this
+                    //   timeout prevents ANY future silent-freeze scenario where a stalled order
+                    //   placement call would make the bot appear dead without a watchdog alarm.
+                    let signal_processing_result = tokio::time::timeout(Duration::from_secs(45), async {
+
                     for (strategy_name, signal) in resolved_signals {
 
                         let sn = strategy_name.clone();
@@ -1805,6 +1821,11 @@ async fn main() -> Result<()> {
                             }
                             StrategySignal::NoSignal => {}
                         }
+                    }
+                    Ok::<(), ()>(())
+                    }).await; // end signal_processing_result timeout(45s)
+                    if signal_processing_result.is_err() {
+                        warn!("⚠️ Signal processing timed out (45s) — select! loop unblocked, watchdog/heartbeat resume");
                     }
                 }
                 _ = watchdog_ticker.tick() => {

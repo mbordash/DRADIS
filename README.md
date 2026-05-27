@@ -63,8 +63,8 @@ The system is organised around three BSG-inspired tactical layers:
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         src/ layout                                 │
 │                                                                     │
-│  raptors/          ← Signal scouts (Binance WS + FAPI REST)        │
-│  vipers/           ← Trading strategies (6 Vipers)                 │
+│  raptors/          ← Signal scouts (Binance WS + FAPI REST)         │
+│  vipers/           ← Trading strategies (6 Vipers)                  │
 │  squadron/         ← Deployment layer (Raptor+Viper+Market bundle)  │
 │  orchestrator/     ← Strategy trait, registry, executor             │
 │  tasks/            ← Market monitor, cleanup, chain-sync            │
