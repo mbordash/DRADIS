@@ -124,6 +124,17 @@ pub const MOMENTUM_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.75);
 /// Aggressive: 0.80 — looser than balanced/conservative; only blocks near-fully exhausted books.
 pub const MOMENTUM_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.80);
 
+/// 10-minute oracle drift alignment gate — blocks momentum entries that contradict the
+/// medium-term BTC trend (dead-cat bounce / relief-rally filter).
+/// Aggressive: 3× threshold (-75/+75) — only vetoes extreme contra-trend moves.
+/// Set to dec!(-9999) / dec!(9999) to disable.
+pub const MOMENTUM_BULL_DRIFT_10M_BLOCK_BTC: Decimal = dec!(-75.0);
+pub const MOMENTUM_BULL_DRIFT_10M_BLOCK_ETH: Decimal = dec!(-3.0);
+pub const MOMENTUM_BULL_DRIFT_10M_BLOCK_SOL: Decimal = dec!(-0.30);
+pub const MOMENTUM_BEAR_DRIFT_10M_BLOCK_BTC: Decimal = dec!(75.0);
+pub const MOMENTUM_BEAR_DRIFT_10M_BLOCK_ETH: Decimal = dec!(3.0);
+pub const MOMENTUM_BEAR_DRIFT_10M_BLOCK_SOL: Decimal = dec!(0.30);
+
 /// Maximum combined ask sum (YES_ask + NO_ask) allowed for a Momentum entry.
 /// Aggressive: tolerates a wider spread (4-cent combined cap) to maximize fill opportunities.
 pub const MOMENTUM_MAX_ENTRY_ASK_SUM: Decimal = dec!(1.040);
@@ -185,6 +196,11 @@ pub const MAKER_MIN_MARKET_AGE_SECS: i64 = 180;
 pub const MOMENTUM_MIN_MARKET_AGE_SECS: i64 = 180;
 /// Must be strictly > MOMENTUM_EXPIRY_EXIT_SECS (600s); gives 5 min breathing room.
 pub const MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY: i64 = 900;
+
+/// Minimum seconds since market switch before MomentumStrategy is allowed to enter.
+/// Aggressive: 30s — shorter warmup to capture more of the initial market move.
+/// Root cause fix for 2026-05-27 20:11 loss (−$0.73): entry fired 6s after switch.
+pub const MOMENTUM_MARKET_WARMUP_SECS: i64 = 30;
 
 
 // ============================================================================

@@ -109,8 +109,32 @@ impl Strategy for ArbitrageStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── Hard ask-price ceiling (always active) ───────────────────────────
+        // When either leg's current ask exceeds the ceiling the market is
+        // directional: sellers on that leg are priced above our acceptable
+        // level and a GTC maker bid is very unlikely to fill within
+        // MAX_WAIT_SECS, leaving a one-sided orphan.
+        //
+        // Checking the *ask* (not the bid) is critical.  The original legacy
+        // price cap used safe_yes_bid (bid ≤ ask − 0.01) which passed silently
+        // when YES bid = $0.60 but YES ask had marched to $0.63–$0.68 on a
+        // strongly-directional underlying move (root cause of the May-28
+        // orphan episode — 11 failed attempts, 8 YES shares left on-chain).
+        //
+        // This gate always fires regardless of whether orderbook depth data is
+        // present, complementing the OBI gate that follows.
+        let max_leg_ask = yes_ask.max(no_ask);
+        if max_leg_ask > dc.arbitrage_max_leg_price {
+            debug!(
+                "🚫 Arb ask ceiling — max leg ask {:.3} > limit {:.3} — skipping \
+                 (directional market; seller prices above cap)",
+                max_leg_ask, dc.arbitrage_max_leg_price
+            );
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Order-book imbalance (OBI) fill-rate gate ────────────────────────
-        // Replaces the rigid "max leg price" cap with a dynamic, depth-based
+        // Complements the ask-price ceiling above with a dynamic, depth-based
         // measurement.  We place GTC BIDS on both legs; fill probability falls
         // when one side has few resting asks (sellers absent).
         //
@@ -122,8 +146,8 @@ impl Strategy for ArbitrageStrategyImpl {
         //   skip — too directional, fill asymmetry likely.
         //
         // Fallback gate: if BOTH legs have zero depth (snapshot unavailable),
-        //   fall back to the legacy price cap (arbitrage_max_leg_price = 0.60)
-        //   so entries are still guarded even without orderbook depth data.
+        //   fall back to a bid-price cap (arbitrage_max_leg_price = 0.60)
+        //   as a secondary backstop (ask ceiling above already guards this case).
         let yes_total_depth = snapshot.yes_bid_depth + snapshot.yes_ask_depth;
         let no_total_depth  = snapshot.no_bid_depth  + snapshot.no_ask_depth;
 

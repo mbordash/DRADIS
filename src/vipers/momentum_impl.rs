@@ -113,6 +113,25 @@ impl Strategy for MomentumStrategyImpl {
             }
         }
 
+        // ── Market warmup gate ────────────────────────────────────────────────
+        // After a market switch the WS orderbook subscription has only had a few
+        // ticks to populate depth data.  The first evaluation fires within 1–2
+        // seconds of the switch: OBI / velocity readings are unreliable, and
+        // entries on that first tick reverse immediately (the book is still
+        // repricing from the prior market context).
+        //
+        // Root cause of 2026-05-27 20:11 loss (−$0.7346):
+        //   Switch at 20:11:33, entry at 20:11:39 ([0ms] first tick), SL −10%.
+        //   Heartbeat showed YES OBI=−0.94 (strongly adverse) but evaluation used
+        //   the very first WS depth tick on the new subscription — book hadn't
+        //   settled to its equilibrium state yet.
+        let secs_since_market_start = (chrono::Utc::now() - ctx.market_started_at).num_seconds();
+        if secs_since_market_start < config::MOMENTUM_MARKET_WARMUP_SECS {
+            debug!("🚫 Momentum entry blocked: market warmup period ({}s < {}s min)",
+                secs_since_market_start, config::MOMENTUM_MARKET_WARMUP_SECS);
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Snapshot staleness gate ───────────────────────────────────────────
         let snap_age = (chrono::Utc::now() - ctx.snapshot.timestamp).num_seconds();
         if snap_age > config::MOMENTUM_MAX_SNAPSHOT_AGE_SECS {
@@ -182,6 +201,32 @@ impl Strategy for MomentumStrategyImpl {
                 no_obi, config::MOMENTUM_OBI_EXHAUSTION_BLOCK);
         }
 
+        // ── 10-minute oracle drift alignment gate ─────────────────────────────
+        // A 5-second velocity spike that contradicts the 10-minute oracle trend
+        // is a dead-cat bounce / relief rally, not a new directional move.
+        // Root cause: 2026-05-27 15:24 loss — BTC had been declining for 10m
+        // before the 5s spike that triggered a YES entry at $0.64; the market
+        // reversed $0.64→$0.61 in 30 seconds.
+        // Threshold = 2× primary velocity threshold (BTC: 2 × $25 = $50/10m).
+        let (drift_bull_block, drift_bear_block) = match crypto_filter.as_str() {
+            "eth" => (config::MOMENTUM_BULL_DRIFT_10M_BLOCK_ETH, config::MOMENTUM_BEAR_DRIFT_10M_BLOCK_ETH),
+            "sol" => (config::MOMENTUM_BULL_DRIFT_10M_BLOCK_SOL, config::MOMENTUM_BEAR_DRIFT_10M_BLOCK_SOL),
+            _     => (config::MOMENTUM_BULL_DRIFT_10M_BLOCK_BTC, config::MOMENTUM_BEAR_DRIFT_10M_BLOCK_BTC),
+        };
+        let drift_10m = ctx.snapshot.oracle_drift_10m;
+        // drift_bull_block is negative; block BULL entries when drift < this (BTC declining in last 10m)
+        let drift_blocks_bull = drift_bull_block < dec!(0) && drift_10m < drift_bull_block;
+        // drift_bear_block is positive; block BEAR entries when drift > this (BTC rising in last 10m)
+        let drift_blocks_bear = drift_bear_block > dec!(0) && drift_10m > drift_bear_block;
+        if drift_blocks_bull {
+            debug!("🚫 Momentum 10m-drift veto (BULL): drift_10m={:.2} < block {:.2} — BTC declining medium-term",
+                drift_10m, drift_bull_block);
+        }
+        if drift_blocks_bear {
+            debug!("🚫 Momentum 10m-drift veto (BEAR): drift_10m={:.2} > block {:.2} — BTC rising medium-term",
+                drift_10m, drift_bear_block);
+        }
+
         if let Some(strike) = strike_price {
             // ── Window/Daily trend filter ─────────────────────────────────────
             let window_blocks_bull;
@@ -209,7 +254,7 @@ impl Strategy for MomentumStrategyImpl {
             if velocity > threshold && binance_price > (strike + strike_buffer)
                 && yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
                 && yes_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
-                && short_ok_bull && accel_ok_bull && !window_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull
+                && short_ok_bull && accel_ok_bull && !window_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !drift_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.yes_token, yes_ask, ctx.market.yes_fee_bps as u16),
@@ -218,7 +263,7 @@ impl Strategy for MomentumStrategyImpl {
             } else if velocity < -threshold && binance_price < (strike - strike_buffer)
                 && no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
                 && no_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
-                && short_ok_bear && accel_ok_bear && !window_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear
+                && short_ok_bear && accel_ok_bear && !window_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !drift_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.no_token, no_ask, ctx.market.no_fee_bps as u16),
@@ -230,7 +275,7 @@ impl Strategy for MomentumStrategyImpl {
             if velocity > threshold && binance_price > strike
                 && yes_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE
                 && yes_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
-                && short_ok_bull && accel_ok_bull && !window_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull
+                && short_ok_bull && accel_ok_bull && !window_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !drift_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.yes_token, yes_ask, ctx.market.yes_fee_bps as u16),
@@ -239,7 +284,7 @@ impl Strategy for MomentumStrategyImpl {
             } else if velocity < -threshold && binance_price < strike
                 && no_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE
                 && no_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
-                && short_ok_bear && accel_ok_bear && !window_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear
+                && short_ok_bear && accel_ok_bear && !window_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !drift_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.no_token, no_ask, ctx.market.no_fee_bps as u16),
@@ -248,11 +293,11 @@ impl Strategy for MomentumStrategyImpl {
             }
         } else {
             // Without strike — universal gates already applied above; only
-            // velocity + price bounds needed here.
+            // velocity + price bounds + drift alignment needed here.
             if velocity > threshold
                 && yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
                 && yes_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
-                && short_ok_bull && accel_ok_bull && !obi_blocks_bull && !obi_exhausted_bull
+                && short_ok_bull && accel_ok_bull && !obi_blocks_bull && !obi_exhausted_bull && !drift_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.yes_token, yes_ask, ctx.market.yes_fee_bps as u16),
@@ -261,7 +306,7 @@ impl Strategy for MomentumStrategyImpl {
             } else if velocity < -threshold
                 && no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
                 && no_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
-                && short_ok_bear && accel_ok_bear && !obi_blocks_bear && !obi_exhausted_bear
+                && short_ok_bear && accel_ok_bear && !obi_blocks_bear && !obi_exhausted_bear && !drift_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.no_token, no_ask, ctx.market.no_fee_bps as u16),

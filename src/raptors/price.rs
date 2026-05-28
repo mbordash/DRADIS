@@ -106,17 +106,24 @@ pub async fn run_price_raptor(
 
                                         // 10-minute drift — fills the 5s–60m gap for GBoost feature [18].
                                         // Captures the medium-term trend where profitable binary moves develop.
+                                        //
+                                        // Previously returned dec!(0) unless exactly 10 minutes of history
+                                        // were available.  Fixed: if at least 60 seconds of data exists,
+                                        // return the drift over whatever window IS available.  This ensures
+                                        // the momentum 10m-drift gate is active from the second minute
+                                        // rather than silent for the entire first 10 minutes of a session.
                                         price_history_10m.push_back((now, price));
                                         while let Some((t, _)) = price_history_10m.front() {
                                             if now.duration_since(*t).as_secs() > 600 {
                                                 price_history_10m.pop_front();
                                             } else { break; }
                                         }
-                                        let drift_10m = if price_history_10m.len() > 1 {
-                                            if let Some((oldest_t, oldest_p)) = price_history_10m.front() {
-                                                if now.duration_since(*oldest_t).as_secs() >= 600 {
-                                                    price - oldest_p
-                                                } else { dec!(0) }
+                                        let drift_10m = if let Some((oldest_t, oldest_p)) = price_history_10m.front() {
+                                            let window_secs = now.duration_since(*oldest_t).as_secs();
+                                            // Require at least 60s of history before trusting the drift.
+                                            // Below that, the window is too short to distinguish noise from trend.
+                                            if window_secs >= 60 {
+                                                price - oldest_p
                                             } else { dec!(0) }
                                         } else { dec!(0) };
 
