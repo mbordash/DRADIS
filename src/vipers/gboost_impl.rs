@@ -458,11 +458,19 @@ impl GboostStrategyImpl {
         // Override the path at runtime via the GBOOST_MODEL_PATH env var, e.g.:
         //   GBOOST_MODEL_PATH=/path/to/gboost_model_v19f.json cargo run
         // This is the recommended way to seed a local instance with a model trained on prod.
+        // When not overridden the path is namespaced by CRYPTO_FILTER so that each
+        // container in a shared-volume multi-instance deploy writes its own file:
+        //   logs/btc-gboost_model_v22f.json, logs/eth-gboost_model_v22f.json, etc.
         let model_clone = Arc::clone(&model_arc);
         tokio::spawn(async move {
-            // Env var takes precedence over the compiled-in path.
+            // Env var takes precedence; fall back to CRYPTO_FILTER-namespaced default.
             let model_path = std::env::var("GBOOST_MODEL_PATH")
-                .unwrap_or_else(|_| config::GBOOST_MODEL_PATH.to_string());
+                .unwrap_or_else(|_| {
+                    let crypto = std::env::var("CRYPTO_FILTER")
+                        .unwrap_or_else(|_| "btc".to_string())
+                        .to_lowercase();
+                    format!("logs/{}-{}", crypto, config::GBOOST_MODEL_FILENAME)
+                });
 
             match tokio::fs::read_to_string(&model_path).await {
                 Ok(json) => match PerpetualBooster::from_json(&json) {
@@ -659,10 +667,16 @@ impl GboostStrategyImpl {
                 Ok(Ok((new_model, drift_score))) => {
                     let n = new_model.trees.len();
                     // Persist to disk first so a crash doesn't lose the trained weights.
-                    // Use the same path resolution as startup load (env var override first).
+                    // Use the same path resolution as startup load (env var override first,
+                    // then CRYPTO_FILTER-namespaced default so containers don't stomp each other).
                     if let Ok(json) = new_model.json_dump() {
                         let model_path = std::env::var("GBOOST_MODEL_PATH")
-                            .unwrap_or_else(|_| config::GBOOST_MODEL_PATH.to_string());
+                            .unwrap_or_else(|_| {
+                                let crypto = std::env::var("CRYPTO_FILTER")
+                                    .unwrap_or_else(|_| "btc".to_string())
+                                    .to_lowercase();
+                                format!("logs/{}-{}", crypto, config::GBOOST_MODEL_FILENAME)
+                            });
                         if let Err(e) = tokio::fs::write(&model_path, &json).await {
                             tracing::warn!("🤖 GboostStrategy: model save failed [{}]: {}", model_path, e);
                         }

@@ -284,6 +284,7 @@ pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.075); // balanced: 7.5% —
 pub const GBOOST_MIN_HOLD_SECS: i64 = 180;
 pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 10;
 pub const GBOOST_MIN_USABLE_TREES: usize = 30;
+pub const GBOOST_MODEL_FILENAME: &str = "gboost_model_v22f.json";
 pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v22f.json";
 /// Max fraction of identical labels before skipping a retrain cycle (avoids degenerate storms).
 pub const GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX: f64 = 0.80;

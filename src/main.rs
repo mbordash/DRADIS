@@ -184,7 +184,12 @@ async fn main() -> Result<()> {
 
     // ── SQLite + DynamicConfig ────────────────────────────────────────────────
     // Init DB first so DynamicConfig::load_or_default can read from it.
-    if let Err(e) = db::init("logs/dradis.db").await {
+    // DB filename is namespaced by CRYPTO_FILTER so each container in a
+    // shared-volume multi-instance deploy owns its own SQLite file
+    // (e.g. logs/btc-dradis.db, logs/eth-dradis.db).
+    let db_crypto = std::env::var("CRYPTO_FILTER").unwrap_or_else(|_| "btc".to_string()).to_lowercase();
+    let db_path   = format!("logs/{}-dradis.db", db_crypto);
+    if let Err(e) = db::init(&db_path).await {
         tracing::warn!("⚠️  SQLite init failed (metrics will CSV-only): {}", e);
     }
     // Register this process start as a new session.  Every restart is a clean

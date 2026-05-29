@@ -314,6 +314,7 @@ pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.070); // conservative: 7.0%
 pub const GBOOST_MIN_HOLD_SECS: i64 = 180;
 pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 10;
 pub const GBOOST_MIN_USABLE_TREES: usize = 30;
+pub const GBOOST_MODEL_FILENAME: &str = "gboost_model_v22f.json";
 pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v22f.json";
 /// Max fraction of identical labels before skipping a retrain cycle (avoids degenerate storms).
 /// Conservative: same threshold — label imbalance is a data quality issue, not a risk preference.
