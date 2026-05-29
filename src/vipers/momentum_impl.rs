@@ -107,7 +107,7 @@ impl Strategy for MomentumStrategyImpl {
         if let Some(close_time) = ctx.market.market_close_time {
             let secs_left = (close_time - chrono::Utc::now()).num_seconds();
             if secs_left < config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY {
-                debug!("🚫 Momentum entry blocked: only {}s to expiry (min {}s)",
+                debug!(" Momentum entry blocked: only {}s to expiry (min {}s)",
                     secs_left, config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY);
                 return Ok(StrategySignal::NoSignal);
             }
@@ -127,7 +127,7 @@ impl Strategy for MomentumStrategyImpl {
         //   settled to its equilibrium state yet.
         let secs_since_market_start = (chrono::Utc::now() - ctx.market_started_at).num_seconds();
         if secs_since_market_start < config::MOMENTUM_MARKET_WARMUP_SECS {
-            debug!("🚫 Momentum entry blocked: market warmup period ({}s < {}s min)",
+            debug!(" Momentum entry blocked: market warmup period ({}s < {}s min)",
                 secs_since_market_start, config::MOMENTUM_MARKET_WARMUP_SECS);
             return Ok(StrategySignal::NoSignal);
         }
@@ -135,7 +135,7 @@ impl Strategy for MomentumStrategyImpl {
         // ── Snapshot staleness gate ───────────────────────────────────────────
         let snap_age = (chrono::Utc::now() - ctx.snapshot.timestamp).num_seconds();
         if snap_age > config::MOMENTUM_MAX_SNAPSHOT_AGE_SECS {
-            debug!("🚫 Momentum entry blocked: snapshot too stale ({}s > max {}s)",
+            debug!(" Momentum entry blocked: snapshot too stale ({}s > max {}s)",
                 snap_age, config::MOMENTUM_MAX_SNAPSHOT_AGE_SECS);
             return Ok(StrategySignal::NoSignal);
         }
@@ -143,7 +143,7 @@ impl Strategy for MomentumStrategyImpl {
         // ── Spread gate: block wide-book entries ──────────────────────────────
         let ask_sum = ctx.snapshot.yes_ask + ctx.snapshot.no_ask;
         if ask_sum > config::MOMENTUM_MAX_ENTRY_ASK_SUM {
-            debug!("🚫 Momentum spread gate: ask_sum={:.3} > max {:.3} — book too wide",
+            debug!(" Momentum spread gate: ask_sum={:.3} > max {:.3} — book too wide",
                 ask_sum, config::MOMENTUM_MAX_ENTRY_ASK_SUM);
             return Ok(StrategySignal::NoSignal);
         }
@@ -157,7 +157,7 @@ impl Strategy for MomentumStrategyImpl {
         let yes_ask = ctx.snapshot.yes_ask;
         let no_ask  = ctx.snapshot.no_ask;
         if yes_ask < config::MOMENTUM_MIN_ENTRY_PRICE && no_ask < config::MOMENTUM_MIN_ENTRY_PRICE {
-            debug!("🚫 Momentum min-price blocked: yes_ask={:.3} no_ask={:.3} both below floor {:.3}",
+            debug!(" Momentum min-price blocked: yes_ask={:.3} no_ask={:.3} both below floor {:.3}",
                 yes_ask, no_ask, config::MOMENTUM_MIN_ENTRY_PRICE);
             return Ok(StrategySignal::NoSignal);
         }
@@ -175,11 +175,11 @@ impl Strategy for MomentumStrategyImpl {
         let obi_blocks_bull = yes_obi < config::MOMENTUM_OBI_ADVERSE_BLOCK;
         let obi_blocks_bear = no_obi  < config::MOMENTUM_OBI_ADVERSE_BLOCK;
         if obi_blocks_bull {
-            debug!("🚫 Momentum OBI veto (BULL): YES OBI={:.3} < block {:.3} — book fading the pump",
+            debug!(" Momentum OBI veto (BULL): YES OBI={:.3} < block {:.3} — book fading the pump",
                 yes_obi, config::MOMENTUM_OBI_ADVERSE_BLOCK);
         }
         if obi_blocks_bear {
-            debug!("🚫 Momentum OBI veto (BEAR): NO OBI={:.3} < block {:.3} — book fading the dump",
+            debug!(" Momentum OBI veto (BEAR): NO OBI={:.3} < block {:.3} — book fading the dump",
                 no_obi, config::MOMENTUM_OBI_ADVERSE_BLOCK);
         }
 
@@ -193,11 +193,11 @@ impl Strategy for MomentumStrategyImpl {
         let obi_exhausted_bull = yes_obi > config::MOMENTUM_OBI_EXHAUSTION_BLOCK;
         let obi_exhausted_bear = no_obi  > config::MOMENTUM_OBI_EXHAUSTION_BLOCK;
         if obi_exhausted_bull {
-            debug!("🚫 Momentum OBI exhaustion (BULL): YES OBI={:.3} > threshold {:.3} — buyers exhausted",
+            debug!(" Momentum OBI exhaustion (BULL): YES OBI={:.3} > threshold {:.3} — buyers exhausted",
                 yes_obi, config::MOMENTUM_OBI_EXHAUSTION_BLOCK);
         }
         if obi_exhausted_bear {
-            debug!("🚫 Momentum OBI exhaustion (BEAR): NO OBI={:.3} > threshold {:.3} — sellers exhausted",
+            debug!(" Momentum OBI exhaustion (BEAR): NO OBI={:.3} > threshold {:.3} — sellers exhausted",
                 no_obi, config::MOMENTUM_OBI_EXHAUSTION_BLOCK);
         }
 
@@ -219,11 +219,11 @@ impl Strategy for MomentumStrategyImpl {
         // drift_bear_block is positive; block BEAR entries when drift > this (BTC rising in last 10m)
         let drift_blocks_bear = drift_bear_block > dec!(0) && drift_10m > drift_bear_block;
         if drift_blocks_bull {
-            debug!("🚫 Momentum 10m-drift veto (BULL): drift_10m={:.2} < block {:.2} — BTC declining medium-term",
+            debug!(" Momentum 10m-drift veto (BULL): drift_10m={:.2} < block {:.2} — BTC declining medium-term",
                 drift_10m, drift_bull_block);
         }
         if drift_blocks_bear {
-            debug!("🚫 Momentum 10m-drift veto (BEAR): drift_10m={:.2} > block {:.2} — BTC rising medium-term",
+            debug!(" Momentum 10m-drift veto (BEAR): drift_10m={:.2} > block {:.2} — BTC rising medium-term",
                 drift_10m, drift_bear_block);
         }
 
@@ -242,7 +242,7 @@ impl Strategy for MomentumStrategyImpl {
                 window_blocks_bear = config::MOMENTUM_WINDOW_BULLISH_BLOCK > dec!(0)
                     && w_yes_mid > config::MOMENTUM_WINDOW_BULLISH_BLOCK;
                 if window_blocks_bull || window_blocks_bear {
-                    debug!("📉 Momentum window filter: YES_mid={:.3} blocks {}",
+                    debug!(" Momentum window filter: YES_mid={:.3} blocks {}",
                         w_yes_mid, if window_blocks_bull { "BULL" } else { "BEAR" });
                 }
             } else {

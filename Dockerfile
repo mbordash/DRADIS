@@ -40,7 +40,9 @@ COPY --from=builder /dradis-bin ./dradis
 # Liveness check: /api/health must respond within 10s.
 # Docker will mark the container unhealthy after 3 consecutive failures
 # (~90 s of silence) so an operator / restart policy can act on it.
+# Use 127.0.0.1 instead of localhost: Alpine containers may not have localhost
+# in /etc/hosts, causing "can't connect" failures even when the API is running.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-    CMD wget -qO- http://localhost:9000/api/health || exit 1
+    CMD wget -qO- http://127.0.0.1:9000/api/health || exit 1
 ENTRYPOINT ["./dradis"]
 

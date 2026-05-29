@@ -45,7 +45,7 @@ pub async fn run_price_raptor(
 
     loop {
         if let Ok((mut ws_stream, _)) = connect_async(&url_str).await {
-            info!("📡 Price Raptor connected to Binance for {}", binance_pair.to_uppercase());
+            info!(" Price Raptor connected to Binance for {}", binance_pair.to_uppercase());
             // 30s read timeout per message: if Binance stops sending ticks (silently dead
             // TCP connection / half-open socket), ws_stream.next().await would wait
             // indefinitely — parking this Tokio worker thread and contributing to runtime

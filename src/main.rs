@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::env;
 use std::str::FromStr as _;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use tokio::sync::{watch, Mutex};
 use tokio::time::{interval, Instant, Duration};
 
@@ -108,7 +108,10 @@ const EXCHANGE_NEG_RISK: Address = address!("0xe2222d279d744050d28e0052001052000
 const MAX_CANCEL_RETRIES: u32 = 5;
 const BASE_CANCEL_RETRY_DELAY_MS: u64 = 200; // Start with 200ms
 
-#[tokio::main]
+// Force at least 4 worker threads so a single blocking call (GBoost retrain,
+// CLOB API stall, std::sync::Mutex contention) cannot deadlock the entire
+// runtime on a single-core t2.small where the default is 1 worker thread.
+#[tokio::main(flavor = "multi_thread", worker_threads = 4)]
 async fn main() -> Result<()> {
     let clob_host = "clob.polymarket.com";
     let gamma_host = "gamma-api.polymarket.com";
@@ -135,6 +138,49 @@ async fn main() -> Result<()> {
         .init();
     ring::default_provider().install_default().expect("rustls provider");
     print_banner();
+
+    // ── OS-thread watchdog — immune to tokio runtime deadlocks ───────────────
+    // Root cause of the May 28 overnight freeze: the tokio runtime ran with 1
+    // worker thread on a single-core t2.small.  Any call that blocked that thread
+    // synchronously (TCP stall, std::sync::Mutex contention during GBoost retrain,
+    // Polymarket WS reconnect loop) froze the ENTIRE runtime — watchdog_ticker,
+    // timeouts, heartbeat, select! arms, all silenced.  The container became
+    // (unhealthy) but `--restart unless-stopped` only restarts on process exit
+    // (not on health-check failure), so it sat dead for 10+ hours.
+    //
+    // This watchdog runs on a native OS thread, completely outside tokio.
+    // It checks an AtomicU64 wall-clock heartbeat every 60 s.  If the trading
+    // loop hasn't updated it in 300 s (5 min) the watchdog calls process::exit(1),
+    // which DOES trigger Docker's `--restart unless-stopped` restart policy.
+    let process_heartbeat_secs = Arc::new(AtomicU64::new(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs(),
+    ));
+    {
+        let hb = Arc::clone(&process_heartbeat_secs);
+        std::thread::spawn(move || {
+            const PROCESS_WATCHDOG_TIMEOUT_SECS: u64 = 300; // 5 minutes
+            loop {
+                std::thread::sleep(std::time::Duration::from_secs(60));
+                let last_beat = hb.load(AtomicOrdering::Relaxed);
+                let now_secs = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs();
+                let silent_secs = now_secs.saturating_sub(last_beat);
+                if silent_secs > PROCESS_WATCHDOG_TIMEOUT_SECS {
+                    eprintln!(
+                        "🚨 OS WATCHDOG: trading loop silent for {}s (limit={}s) \
+                         — calling process::exit(1) to trigger Docker restart",
+                        silent_secs, PROCESS_WATCHDOG_TIMEOUT_SECS
+                    );
+                    std::process::exit(1);
+                }
+            }
+        });
+    }
 
     // ── SQLite + DynamicConfig ────────────────────────────────────────────────
     // Init DB first so DynamicConfig::load_or_default can read from it.
@@ -710,7 +756,14 @@ async fn main() -> Result<()> {
 
         let mut watchdog_ticker = interval(std::time::Duration::from_secs(120));
         watchdog_ticker.tick().await; // consume the immediate first tick
-        *last_heartbeat_at.lock().await = Instant::now(); // reset watchdog on market start
+        *last_heartbeat_at.lock().await = Instant::now(); // reset tokio watchdog on market start
+        process_heartbeat_secs.store(                      // reset OS watchdog on market start
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_secs(),
+            AtomicOrdering::Relaxed,
+        );
 
         let strategies = StrategyRegistry::create_all_strategies();
         let adoption_order = StrategyRegistry::strategy_names();
@@ -1087,6 +1140,14 @@ async fn main() -> Result<()> {
                 }
                 _ = status_ticker.tick() => {
                     *last_heartbeat_at.lock().await = Instant::now();
+                    // Pulse the OS-thread watchdog so it knows the runtime is alive.
+                    process_heartbeat_secs.store(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        AtomicOrdering::Relaxed,
+                    );
                     let (yb, ybd, ya, yad, _) = *yes_price_rx.borrow();
                     let (nb, nbd, na, nad, _) = *no_price_rx.borrow();
                     // Compute OBI for heartbeat visibility so thresholds can be tuned empirically.
@@ -1131,6 +1192,15 @@ async fn main() -> Result<()> {
                     // arm saw stale CIDs and fired another "switch" — repeating 3× on 2026-05-21.
                     if market_rx.has_changed().unwrap_or(false) { continue; }
                     *last_heartbeat_at.lock().await = Instant::now();
+                    // Pulse the OS-thread watchdog from the strategy ticker too, so
+                    // a status_ticker stall alone doesn't trigger a false-positive exit.
+                    process_heartbeat_secs.store(
+                        std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .unwrap_or_default()
+                            .as_secs(),
+                        AtomicOrdering::Relaxed,
+                    );
 
                     // Get hourly market snapshot
                     let (hourly_yb, hourly_ybd, hourly_ya, hourly_yad, hourly_yes_ws_ts) = *yes_price_rx.borrow();

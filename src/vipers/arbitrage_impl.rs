@@ -66,7 +66,7 @@ impl Strategy for ArbitrageStrategyImpl {
         // Safe bids are computed below only for normal (bid < ask) books.
         if yes_bid >= yes_ask || no_bid >= no_ask {
             debug!(
-                "🚫 Arb skipped — locked/inverted spread: YES {:.3}/{:.3}  NO {:.3}/{:.3}",
+                " Arb skipped — locked/inverted spread: YES {:.3}/{:.3}  NO {:.3}/{:.3}",
                 yes_bid, yes_ask, no_bid, no_ask
             );
             return Ok(StrategySignal::NoSignal);
@@ -103,7 +103,7 @@ impl Strategy for ArbitrageStrategyImpl {
         let no_fill_gap  = no_ask  - safe_no_bid;
         if yes_fill_gap > dc.arbitrage_max_fill_gap || no_fill_gap > dc.arbitrage_max_fill_gap {
             debug!(
-                "🚫 Arb liquidity gap too wide — YES gap {:.3} NO gap {:.3} (max {:.3}) — skipping",
+                " Arb liquidity gap too wide — YES gap {:.3} NO gap {:.3} (max {:.3}) — skipping",
                 yes_fill_gap, no_fill_gap, dc.arbitrage_max_fill_gap
             );
             return Ok(StrategySignal::NoSignal);
@@ -126,7 +126,7 @@ impl Strategy for ArbitrageStrategyImpl {
         let max_leg_ask = yes_ask.max(no_ask);
         if max_leg_ask > dc.arbitrage_max_leg_price {
             debug!(
-                "🚫 Arb ask ceiling — max leg ask {:.3} > limit {:.3} — skipping \
+                " Arb ask ceiling — max leg ask {:.3} > limit {:.3} — skipping \
                  (directional market; seller prices above cap)",
                 max_leg_ask, dc.arbitrage_max_leg_price
             );
@@ -168,7 +168,7 @@ impl Strategy for ArbitrageStrategyImpl {
             let max_obi = yes_obi.max(no_obi);
             if max_obi > dc.arbitrage_max_leg_obi {
                 debug!(
-                    "🚫 Arb OBI gate — YES OBI {:.3} NO OBI {:.3} max {:.3} > limit {:.3} — skipping \
+                    " Arb OBI gate — YES OBI {:.3} NO OBI {:.3} max {:.3} > limit {:.3} — skipping \
                      (directional book; fill asymmetry likely)",
                     yes_obi, no_obi, max_obi, dc.arbitrage_max_leg_obi
                 );
@@ -179,7 +179,7 @@ impl Strategy for ArbitrageStrategyImpl {
             let max_leg_bid = safe_yes_bid.max(safe_no_bid);
             if max_leg_bid > dc.arbitrage_max_leg_price {
                 debug!(
-                    "🚫 Arb price-cap fallback (no depth data) — max leg bid {:.3} > limit {:.3} — skipping",
+                    " Arb price-cap fallback (no depth data) — max leg bid {:.3} > limit {:.3} — skipping",
                     max_leg_bid, dc.arbitrage_max_leg_price
                 );
                 return Ok(StrategySignal::NoSignal);
@@ -196,7 +196,7 @@ impl Strategy for ArbitrageStrategyImpl {
         // A 5% buffer covers rounding and any open-order holds against the balance.
         if ctx.available_collateral < trade_size * dec!(1.05) {
             debug!(
-                "🚫 Arb skipped — available collateral ${:.2} < required ${:.2}",
+                " Arb skipped — available collateral ${:.2} < required ${:.2}",
                 ctx.available_collateral, trade_size * dec!(1.05)
             );
             return Ok(StrategySignal::NoSignal);
@@ -210,13 +210,13 @@ impl Strategy for ArbitrageStrategyImpl {
             // 50ms tick (because total exposure < max_exposure_usdc) even though
             // main.rs would silently block it at the positions-map check; the
             // repeated evaluate_entry calls waste CPU and flood the executor INFO
-            // line with spurious 🟩 on every tick.
+            // line with spurious  on every tick.
             // This guards against both re-adopted on-chain positions and live GTC
             // orders waiting for confirmation (fill_confirmed_at == None).
             if pos_map.contains_key(&(STRATEGY_NAME.to_string(), market.yes_token))
                 || pos_map.contains_key(&(STRATEGY_NAME.to_string(), market.no_token))
             {
-                debug!("🚫 Arb skipped — already hold YES or NO leg for this market");
+                debug!(" Arb skipped — already hold YES or NO leg for this market");
                 return Ok(StrategySignal::NoSignal);
             }
 
