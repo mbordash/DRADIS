@@ -342,6 +342,14 @@ pub const GBOOST_HIGH_VOL_SIZE_SCALE: f64 = 0.65;
 /// Aggressive: SL cooldown matches standard POST_EXIT_COOLDOWN — faster re-entry allowed.
 pub const GBOOST_SL_POST_EXIT_COOLDOWN_SECS: i64 = 600;
 
+/// Minimum expected net profit (USDC) after round-trip fees required to place a GBoost entry.
+/// Aggressive: $0.10 — lower bar to allow more entries; higher trade frequency.
+pub const GBOOST_MIN_NET_PROFIT_USDC: Decimal = dec!(0.10);
+
+/// Market-level entry hold lock (seconds) before GBoost may flip direction on a market.
+/// Aggressive: 120s — shorter lock allows faster direction changes on strong signals.
+pub const GBOOST_MIN_HOLDING_LOCK_SECS: i64 = 120;
+
 ///  When the live data distribution deviates
 /// significantly from the training distribution (as measured by perpetual's leaf-node
 /// chi-squared statistic), GBoost entries are suppressed until the next retrain.
@@ -357,6 +365,11 @@ pub const GBOOST_DRIFT_WINDOW: usize = 200;
 /// resets the counter and clears suppression.
 /// Aggressive: 2 — allows one transient spike before suppressing.
 pub const GBOOST_DRIFT_CONSECUTIVE_REQUIRED: usize = 2;
+
+/// Number of consecutive BELOW-threshold retrains to clear drift suppression.
+/// Aggressive: 2 — clear suppression faster to allow more entries after brief regime shifts.
+pub const GBOOST_DRIFT_STABLE_CLEAR_REQUIRED: usize = 2;
+
 // ============================================================================
 
 pub const MERGE_SCAN_INTERVAL_SECS: u64 = 300;

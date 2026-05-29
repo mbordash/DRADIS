@@ -349,6 +349,14 @@ pub const GBOOST_HIGH_VOL_SIZE_SCALE: f64 = 0.40;
 /// Conservative: 30-minute SL cooldown — longest wait after an adverse stop.
 pub const GBOOST_SL_POST_EXIT_COOLDOWN_SECS: i64 = 1800;
 
+/// Minimum expected net profit (USDC) after round-trip fees required to place a GBoost entry.
+/// Conservative: $0.20 — higher bar; only high-conviction signals with meaningful net edge.
+pub const GBOOST_MIN_NET_PROFIT_USDC: Decimal = dec!(0.20);
+
+/// Market-level entry hold lock (seconds) before GBoost may flip direction on a market.
+/// Conservative: 300s — five minutes; requires strong new signal before reversing direction.
+pub const GBOOST_MIN_HOLDING_LOCK_SECS: i64 = 300;
+
 ///  When the live data distribution deviates
 /// significantly from the training distribution (as measured by perpetual's leaf-node
 /// chi-squared statistic), GBoost entries are suppressed until the next retrain.
@@ -366,6 +374,10 @@ pub const GBOOST_DRIFT_WINDOW: usize = 300;
 /// Conservative: 4 — very patient; suppresses only on sustained regime shifts to
 /// avoid locking out GBoost during brief liquidity events.
 pub const GBOOST_DRIFT_CONSECUTIVE_REQUIRED: usize = 4;
+
+/// Number of consecutive BELOW-threshold retrains to clear drift suppression.
+/// Conservative: 5 — requires extended stability before re-enabling entries after drift.
+pub const GBOOST_DRIFT_STABLE_CLEAR_REQUIRED: usize = 5;
 
 // ============================================================================
 // POSITION MERGE SETTINGS

@@ -318,6 +318,14 @@ pub const GBOOST_HIGH_VOL_SIZE_SCALE: f64 = 0.50;
 /// Balanced: 15-minute SL cooldown — longer than aggressive, shorter than conservative.
 pub const GBOOST_SL_POST_EXIT_COOLDOWN_SECS: i64 = 900;
 
+/// Minimum expected net profit (USDC) after round-trip fees required to place a GBoost entry.
+/// Balanced: $0.15 — standard threshold; filters marginal minimum-size signals near fee break-even.
+pub const GBOOST_MIN_NET_PROFIT_USDC: Decimal = dec!(0.15);
+
+/// Market-level entry hold lock (seconds) before GBoost may flip direction on a market.
+/// Balanced: 180s — two retrain windows; absorbs first post-entry signal oscillation.
+pub const GBOOST_MIN_HOLDING_LOCK_SECS: i64 = 180;
+
 /// When the live data distribution deviates
 /// significantly from the training distribution (as measured by perpetual's leaf-node
 /// chi-squared statistic), GBoost entries are suppressed until the next retrain.
@@ -335,6 +343,10 @@ pub const GBOOST_DRIFT_WINDOW: usize = 200;
 /// Balanced: 3 — requires three consecutive drift triggers, avoiding false positives
 /// from short-lived intra-session variance.
 pub const GBOOST_DRIFT_CONSECUTIVE_REQUIRED: usize = 3;
+
+/// Number of consecutive BELOW-threshold retrains to clear drift suppression.
+/// Balanced: 3 — matches the standard config; confirms regime stability before re-enabling entries.
+pub const GBOOST_DRIFT_STABLE_CLEAR_REQUIRED: usize = 3;
 
 // ============================================================================
 // POSITION MERGE SETTINGS

@@ -422,15 +422,25 @@ pub struct GboostStrategyImpl {
     /// Set to `true` after TWO CONSECUTIVE retrains where concept drift exceeded
     /// GBOOST_CONCEPT_DRIFT_THRESHOLD.  A single spike is not suppressed — it could
     /// be a transient liquidity shock.  Two in a row implies a genuine regime change.
-    /// Cleared when any retrain scores at or below the threshold.
+    /// Cleared only after GBOOST_DRIFT_STABLE_CLEAR_REQUIRED consecutive below-threshold
+    /// retrains confirm the regime has been genuinely recaptured.
     concept_drift_suppressed: Arc<AtomicBool>,
     /// Most recent concept drift score from `perpetual::drift::calculate_drift`.
     /// Logged at DEBUG level in the entry gate; exposed here for diagnostics.
     last_concept_drift_score: Arc<StdMutex<f32>>,
     /// Count of consecutive retrains where drift_score > GBOOST_CONCEPT_DRIFT_THRESHOLD.
-    /// Suppression only activates when this reaches 2 — prevents single spikes from
-    /// permanently blocking entries.  Resets to 0 on any below-threshold retrain.
+    /// Suppression only activates when this reaches GBOOST_DRIFT_CONSECUTIVE_REQUIRED.
+    /// Resets to 0 on any below-threshold retrain.
     consecutive_drift_above_threshold: Arc<StdMutex<usize>>,
+    /// Count of consecutive retrains where drift_score ≤ GBOOST_CONCEPT_DRIFT_THRESHOLD.
+    /// Suppression is only CLEARED when this reaches GBOOST_DRIFT_STABLE_CLEAR_REQUIRED.
+    /// Prevents a single below-threshold "blink" from unlocking entries mid regime-change.
+    consecutive_stable_retrains: Arc<StdMutex<usize>>,
+    /// Market-level entry hold lock: keyed by condition_id, stores the Instant when the
+    /// last entry (YES or NO) was placed on that market.  Prevents rapid signal-flip chop
+    /// where the model enters YES, exits quickly, then immediately enters NO (or vice versa).
+    /// Both YES and NO entries check this lock; it is set whenever either fires.
+    market_hold_locks: Arc<StdMutex<std::collections::HashMap<String, Instant>>>,
 }
 
 impl GboostStrategyImpl {
@@ -507,6 +517,8 @@ impl GboostStrategyImpl {
             concept_drift_suppressed: Arc::new(AtomicBool::new(false)),
             last_concept_drift_score: Arc::new(StdMutex::new(0.0_f32)),
             consecutive_drift_above_threshold: Arc::new(StdMutex::new(0)),
+            consecutive_stable_retrains: Arc::new(StdMutex::new(0)),
+            market_hold_locks: Arc::new(StdMutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -626,6 +638,7 @@ impl GboostStrategyImpl {
         let concept_drift_suppressed  = Arc::clone(&self.concept_drift_suppressed);
         let last_concept_drift_score  = Arc::clone(&self.last_concept_drift_score);
         let consecutive_drift_counter = Arc::clone(&self.consecutive_drift_above_threshold);
+        let consecutive_stable_counter = Arc::clone(&self.consecutive_stable_retrains);
 
         // Capture a window of recent snapshots for concept-drift evaluation.
         // Oldest-first order (same as extract_features expects for prev_s).
@@ -682,20 +695,28 @@ impl GboostStrategyImpl {
                     // vs. the training distribution.  A high chi-squared score means the
                     // current market regime is outside what the model was trained on.
                     //
-                    // Dampening: a SINGLE spike is insufficient for suppression — it could
-                    // be a transient liquidity shock or the temporal mismatch between the
-                    // training window (oldest ticks) and drift window (newest ticks).
-                    // Only suppress after TWO CONSECUTIVE retrains above threshold.
+                    // Suppression: requires GBOOST_DRIFT_CONSECUTIVE_REQUIRED consecutive
+                    // above-threshold retrains to activate.
+                    //
+                    // Clearing: requires GBOOST_DRIFT_STABLE_CLEAR_REQUIRED consecutive
+                    // BELOW-threshold retrains before suppression is lifted.  A single
+                    // below-threshold "blink" during a genuine regime change used to
+                    // unlock entries prematurely; the stable-retrain requirement ensures
+                    // the model has genuinely recaptured the distribution.
                     *last_concept_drift_score.lock().unwrap() = drift_score;
                     if drift_score > config::GBOOST_CONCEPT_DRIFT_THRESHOLD {
+                        // Above threshold: increment drift counter, reset stable counter.
                         let mut count = consecutive_drift_counter.lock().unwrap();
+                        let mut stable = consecutive_stable_counter.lock().unwrap();
                         *count += 1;
+                        *stable = 0; // any above-threshold retrain resets the stable streak
                         if *count >= config::GBOOST_DRIFT_CONSECUTIVE_REQUIRED {
                             tracing::warn!(
                                 "⚠️ GBoost: concept drift confirmed ({} consecutive retrains, \
                                  latest score={:.2} > threshold {:.2}) — suppressing entries \
-                                 until next retrain recaptures regime",
-                                *count, drift_score, config::GBOOST_CONCEPT_DRIFT_THRESHOLD
+                                 until {} consecutive stable retrains recapture regime",
+                                *count, drift_score, config::GBOOST_CONCEPT_DRIFT_THRESHOLD,
+                                config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED
                             );
                             concept_drift_suppressed.store(true, Ordering::Relaxed);
                         } else {
@@ -707,17 +728,36 @@ impl GboostStrategyImpl {
                             );
                         }
                     } else {
-                        // Below threshold → reset consecutive counter and clear suppression
-                        let mut count = consecutive_drift_counter.lock().unwrap();
-                        if *count > 0 || concept_drift_suppressed.load(Ordering::Relaxed) {
-                            tracing::info!(
-                                "✅ GBoost: concept drift cleared (score={:.2} ≤ threshold {:.2}, \
-                                 consecutive counter was {}) — resuming entries",
-                                drift_score, config::GBOOST_CONCEPT_DRIFT_THRESHOLD, *count
+                        // Below threshold: reset drift counter, increment stable counter.
+                        // Only clear suppression after GBOOST_DRIFT_STABLE_CLEAR_REQUIRED
+                        // consecutive stable retrains — prevents premature unlock on a
+                        // single below-threshold tick during a sustained regime change.
+                        let mut drift_count = consecutive_drift_counter.lock().unwrap();
+                        let mut stable = consecutive_stable_counter.lock().unwrap();
+                        *drift_count = 0;
+                        *stable += 1;
+                        if concept_drift_suppressed.load(Ordering::Relaxed) {
+                            if *stable >= config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED {
+                                tracing::info!(
+                                    "✅ GBoost: concept drift cleared after {} consecutive stable \
+                                     retrains (latest score={:.2} ≤ threshold {:.2}) — resuming entries",
+                                    *stable, drift_score, config::GBOOST_CONCEPT_DRIFT_THRESHOLD
+                                );
+                                concept_drift_suppressed.store(false, Ordering::Relaxed);
+                            } else {
+                                tracing::info!(
+                                    "⏳ GBoost: drift below threshold (score={:.2} ≤ {:.2}) but \
+                                     suppression held — {}/{} stable retrains required",
+                                    drift_score, config::GBOOST_CONCEPT_DRIFT_THRESHOLD,
+                                    *stable, config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED
+                                );
+                            }
+                        } else {
+                            tracing::debug!(
+                                "📉 GBoost: drift below threshold (score={:.2}), stable streak: {}/{}",
+                                drift_score, *stable, config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED
                             );
                         }
-                        *count = 0;
-                        concept_drift_suppressed.store(false, Ordering::Relaxed);
                     }
 
                     let old_tree_count = {
@@ -1139,6 +1179,26 @@ impl Strategy for GboostStrategyImpl {
                 );
                 return Ok(StrategySignal::NoSignal);
             }
+            // ── Market-level holding lock ─────────────────────────────────────
+            // After any position (YES or NO) was placed on this market, prevent
+            // new entries on EITHER side for GBOOST_MIN_HOLDING_LOCK_SECS.
+            // This stops rapid YES→NO flip chop where the model oscillates within
+            // seconds of a quick SL exit.
+            {
+                let lock_map = self.market_hold_locks.lock().unwrap();
+                if let Some(&lock_since) = lock_map.get(&target_market.condition_id) {
+                    let elapsed = lock_since.elapsed().as_secs() as i64;
+                    if elapsed < config::GBOOST_MIN_HOLDING_LOCK_SECS {
+                        tracing::debug!(
+                            "🚫 GBoost YES entry veto: market hold lock active | market='{}' \
+                             elapsed={}s < lock={}s",
+                            target_market.market_name, elapsed,
+                            config::GBOOST_MIN_HOLDING_LOCK_SECS
+                        );
+                        return Ok(StrategySignal::NoSignal);
+                    }
+                }
+            }
             // ── Entry latch: skip if an entry for this token is already in-flight ──
             // Between emitting an Entry signal and the position being confirmed in
             // pos_map (can be several seconds), evaluate_entry fires every tick.
@@ -1232,6 +1292,31 @@ impl Strategy for GboostStrategyImpl {
             // Confidence-proportional sizing: more capital for higher-conviction signals.
             // Volatility-scaled: reduce size when oracle hist_vol_regime is elevated.
             let trade_usdc = scale_trade_size(p_yes_up, entry_thresh, precomp_hist_vol, dc.gboost_max_exposure_usdc);
+            // ── Minimum net profit gate ───────────────────────────────────────
+            // Ensure expected TP gain after round-trip fees exceeds the minimum
+            // viable profit threshold.  Prevents marginal bets where fee cost
+            // consumes the majority of the expected gain (e.g. low-confidence
+            // minimum-size entries near $0.45 with 3.5% round-trip fees).
+            {
+                let tp_pct = dc.gboost_target_profit_pct;
+                // Dynamic Polymarket fee formula: fee = CRYPTO_FEE_RATE × p × (1-p)
+                let price_f = price;
+                let fee_rate_one_side = config::CRYPTO_FEE_RATE * price_f * (dec!(1) - price_f);
+                let fee_roundtrip = fee_rate_one_side * dec!(2); // entry + exit
+                let expected_gross = trade_usdc * tp_pct;
+                let estimated_fee  = trade_usdc * fee_roundtrip;
+                let net_expected   = expected_gross - estimated_fee;
+                if net_expected < config::GBOOST_MIN_NET_PROFIT_USDC {
+                    tracing::debug!(
+                        "🚫 GBoost YES entry veto: net profit too low | \
+                         gross=${:.3} fee=${:.3} net=${:.3} < min=${:.3} \
+                         (trade=${:.2} price={:.3})",
+                        expected_gross, estimated_fee, net_expected,
+                        config::GBOOST_MIN_NET_PROFIT_USDC, trade_usdc, price
+                    );
+                    return Ok(StrategySignal::NoSignal);
+                }
+            }
             let shares = trade_usdc / price;
             tracing::info!(
                 "🔮 GBoost YES entry: P(UP)={:.3} | ask=${:.4} shares={:.2} usdc={:.2} vol={:.2}",
@@ -1243,6 +1328,9 @@ impl Strategy for GboostStrategyImpl {
                 target_market.yes_token,
                 (target_snapshot.clone(), entry_prev_snap, price, entry_hist_vol, entry_tick_momentum)
             );
+            // Record market-level hold lock to prevent rapid flip chop.
+            self.market_hold_locks.lock().unwrap()
+                .insert(target_market.condition_id.clone(), Instant::now());
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
                     token_id: target_market.yes_token,
@@ -1268,6 +1356,22 @@ impl Strategy for GboostStrategyImpl {
                     drift_60m, trend_block
                 );
                 return Ok(StrategySignal::NoSignal);
+            }
+            // ── Market-level holding lock ─────────────────────────────────────
+            {
+                let lock_map = self.market_hold_locks.lock().unwrap();
+                if let Some(&lock_since) = lock_map.get(&target_market.condition_id) {
+                    let elapsed = lock_since.elapsed().as_secs() as i64;
+                    if elapsed < config::GBOOST_MIN_HOLDING_LOCK_SECS {
+                        tracing::debug!(
+                            "🚫 GBoost NO entry veto: market hold lock active | market='{}' \
+                             elapsed={}s < lock={}s",
+                            target_market.market_name, elapsed,
+                            config::GBOOST_MIN_HOLDING_LOCK_SECS
+                        );
+                        return Ok(StrategySignal::NoSignal);
+                    }
+                }
             }
             // ── Entry latch ──────────────────────────────────────────────────
             if self.pending_entries.lock().unwrap().contains_key(&target_market.no_token) {
@@ -1348,6 +1452,26 @@ impl Strategy for GboostStrategyImpl {
             }
             // Confidence for NO direction is (1 - p_yes_up); scale size accordingly.
             let trade_usdc = scale_trade_size(1.0 - p_yes_up, entry_thresh, precomp_hist_vol, dc.gboost_max_exposure_usdc);
+            // ── Minimum net profit gate ───────────────────────────────────────
+            {
+                let tp_pct = dc.gboost_target_profit_pct;
+                let price_f = price;
+                let fee_rate_one_side = config::CRYPTO_FEE_RATE * price_f * (dec!(1) - price_f);
+                let fee_roundtrip = fee_rate_one_side * dec!(2);
+                let expected_gross = trade_usdc * tp_pct;
+                let estimated_fee  = trade_usdc * fee_roundtrip;
+                let net_expected   = expected_gross - estimated_fee;
+                if net_expected < config::GBOOST_MIN_NET_PROFIT_USDC {
+                    tracing::debug!(
+                        "🚫 GBoost NO entry veto: net profit too low | \
+                         gross=${:.3} fee=${:.3} net=${:.3} < min=${:.3} \
+                         (trade=${:.2} price={:.3})",
+                        expected_gross, estimated_fee, net_expected,
+                        config::GBOOST_MIN_NET_PROFIT_USDC, trade_usdc, price
+                    );
+                    return Ok(StrategySignal::NoSignal);
+                }
+            }
             let shares = trade_usdc / price;
             tracing::info!(
                 "🔮 GBoost NO entry: P(UP)={:.3} | ask=${:.4} shares={:.2} usdc={:.2} vol={:.2}",
@@ -1359,6 +1483,9 @@ impl Strategy for GboostStrategyImpl {
                 target_market.no_token,
                 (target_snapshot.clone(), entry_prev_snap, price, entry_hist_vol, entry_tick_momentum)
             );
+            // Record market-level hold lock to prevent rapid flip chop.
+            self.market_hold_locks.lock().unwrap()
+                .insert(target_market.condition_id.clone(), Instant::now());
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
                     token_id: target_market.no_token,
