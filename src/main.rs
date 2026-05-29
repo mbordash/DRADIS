@@ -1390,18 +1390,41 @@ async fn main() -> Result<()> {
                                             tokio::time::sleep(Duration::from_millis(2500)).await;
                                             let mut req = BalanceAllowanceRequest::default(); req.asset_type = AssetType::Conditional; req.token_id = Some(tid);
                                             let rem = match cl.balance_allowance(req).await { Ok(r) => Decimal::from_str(&r.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000), Err(_) => return };
-                                            if rem >= config::MIN_ORDER_SHARES {
-                                                let fill = (rs_m - rem).max(dec!(0)); let aep2 = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnlc = -((aep2 - re_m) * rem.min(rs_m)); *tp.lock().await += pnlc;
+
+                                            // ── Cross-strategy isolation fix ──────────────────────────────────────
+                                            // The on-chain balance for `tid` is shared by ALL strategies that traded
+                                            // this token (e.g. GBoost AND Arbitrage both hold the same NO token).
+                                            // `rem` is the TOTAL wallet balance — it includes shares belonging to
+                                            // other strategies that are NOT part of this exit.
+                                            //
+                                            // Bug (2026-05-29): GBoost exited 3.06 NO shares via FAK miss at $0.39;
+                                            // balance check found 10 shares remaining (3.06 GBoost + 6.94 Arb), so
+                                            // fill=0 → re-inserted GBoost with 10 shares → next SL sold Arb's 10
+                                            // shares, liquidating the arbitrage hedge.
+                                            //
+                                            // Fix: subtract shares owned by OTHER strategies for this token so that
+                                            // `our_rem` reflects only shares that belong to THIS strategy exit.
+                                            let other_strats_shares = {
+                                                let map = ps.lock().await;
+                                                map.iter()
+                                                    .filter(|((s, t), _)| *t == tid && s != &sn_async)
+                                                    .map(|(_, p)| p.shares)
+                                                    .fold(dec!(0), |a, b| a + b)
+                                            };
+                                            let our_rem = (rem - other_strats_shares).max(dec!(0));
+
+                                            if our_rem >= config::MIN_ORDER_SHARES {
+                                                let fill = (rs_m - our_rem).max(dec!(0)); let aep2 = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnlc = -((aep2 - re_m) * our_rem.min(rs_m)); *tp.lock().await += pnlc;
                                                 // FAK filled 0: re-insert the FULL position so the exit retries next heartbeat.
                                                 // Previously this logged and moved on, leaving shares orphaned on-chain — the
                                                 // strategy would believe it was flat and open a new position on top of them.
                                                 if fill < config::MIN_ORDER_SHARES {
-                                                    warn!("⚠️ PARTIAL EXIT [{}]: FAK filled 0/{:.4} shares — re-inserting for retry.", sn_async, rs_m);
+                                                    warn!("⚠️ PARTIAL EXIT [{}]: FAK filled 0/{:.4} shares (our_rem={:.4}, other_strats={:.4}) — re-inserting for retry.", sn_async, rs_m, our_rem, other_strats_shares);
                                                     let mut map = ps.lock().await;
                                                     if !map.contains_key(&(sn_async.clone(), tid)) {
-                                                        map.insert((sn_async.clone(), tid), Position { shares: rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
+                                                        map.insert((sn_async.clone(), tid), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
                                                     }
-                                                } else { warn!("⚠️ PARTIAL EXIT [{}]: sold {:.4}/{:.4} — re-inserting.", sn_async, fill, rs_m); let mut map = ps.lock().await; if !map.contains_key(&(sn_async.clone(), tid)) { map.insert((sn_async.clone(), tid), Position { shares: rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None }); } }
+                                                } else { warn!("⚠️ PARTIAL EXIT [{}]: sold {:.4}/{:.4} (our_rem={:.4}, other_strats={:.4}) — re-inserting.", sn_async, fill, rs_m, our_rem, other_strats_shares); let mut map = ps.lock().await; if !map.contains_key(&(sn_async.clone(), tid)) { map.insert((sn_async.clone(), tid), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None }); } }
                                             }
                                         });
                                     }
