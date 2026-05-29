@@ -47,7 +47,7 @@ After ~5 minutes the stack is live:
 
 DRADIS is a comprehensive trading automation platform for prediction markets. Built in Rust for maximum concurrency and memory safety, it evaluates selected markets every 50ms, coordinating multiple autonomous strategies to preserve capital and place orders where it sees inefficiencies.
 
-The system is organised around three BSG-inspired tactical layers:
+The system is organized around three BSG-inspired tactical layers:
 
 | Layer | Folder | Role |
 |---|---|---|
@@ -75,12 +75,12 @@ The system is organised around three BSG-inspired tactical layers:
 
 ```
 ┌──────────────────────┐   ┌──────────────────────┐
-│    src/raptors/      │   │  Polymarket CLOB      │
-│  Price Raptor        │   │  (WebSocket Feed)     │
-│  (Binance Spot WS)   │   │                       │
-│  Funding Raptor      │   │                       │
-│  (Binance FAPI REST) │   │                       │
-└──────────┬───────────┘   └───────────┬───────────┘
+│    src/raptors/      │   │  Polymarket CLOB     │
+│  Price Raptor        │   │  (WebSocket Feed)    │
+│  (Binance Spot WS)   │   │                      │
+│  Funding Raptor      │   │                      │
+│  (Binance FAPI REST) │   │                      │
+└──────────┬───────────┘   └───────────┬──────────┘
            │  watch channels           │ orderbook WS
            └─────────────┬─────────────┘
                          ▼
@@ -141,7 +141,7 @@ The system is organised around three BSG-inspired tactical layers:
 
 ## 🦅 Raptor Wing (`src/raptors/`)
 
-Raptors are DRADIS's recon layer — lightweight signal scouts that fly ahead of the Vipers and report external intelligence back to the CIC. Each Raptor polls a specific data source on its own schedule and publishes a normalised signal via `watch` channels.
+Raptors are DRADIS's recon layer — lightweight signal scouts that fly ahead of the Vipers and report external intelligence back to the CIC. Each Raptor polls a specific data source on its own schedule and publishes a normalized signal via `watch` channels.
 
 Raptors are intentionally dumb: **fetch, normalise, broadcast** — no trading logic, no position awareness, no side effects.
 
@@ -158,7 +158,7 @@ When multiple Raptors are active, GBoost and Basis Vipers fuse their signals as 
 
 ## ✈️ Viper Wing (`src/vipers/`)
 
-Six specialised Viper strategy classes. Each Viper is an autonomous tactical unit with its own capital budget, position book, and entry/exit logic.
+Six specialized Viper strategy classes. Each Viper is an autonomous tactical unit with its own capital budget, position book, and entry/exit logic.
 
 | Viper | Venue | Description |
 |---|---|---|
