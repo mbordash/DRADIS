@@ -120,12 +120,13 @@ export type SquadronState = 'STAGED' | 'DEPLOYED' | 'PATROLLING' | 'RTB' | 'STOO
 
 /** Summary of one active squadron — returned by GET /api/squadrons and GET /api/squadrons/{id}. */
 export interface SquadronSummary {
-  id:          string;        // e.g. "btc-hourly-2026-05-29T14:00:00Z"
-  asset:       string;        // "BTC" | "ETH" | "SOL" | …
-  name:        string;        // SquadronConfig::name
-  state:       SquadronState;
-  market_name: string;        // human-readable Polymarket market name
-  deployed_at: string;        // ISO 8601
+  id:                string;        // e.g. "btc-hourly-2026-05-29T14:00:00Z"
+  asset:             string;        // "BTC" | "ETH" | "SOL" | …
+  name:              string;        // SquadronConfig::name
+  state:             SquadronState;
+  market_name:       string;        // primary (hourly) Polymarket market name
+  maker_market_name?: string;       // window/daily maker venue name (present once fee-rate fetch completes)
+  deployed_at:       string;        // ISO 8601
 }
 
 // ── Field descriptor for ViperCard ───────────────────────────────────────────

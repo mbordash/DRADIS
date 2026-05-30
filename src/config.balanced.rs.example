@@ -276,6 +276,9 @@ pub const GBOOST_HOURLY_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.65);
 /// OBI momentum-exhaustion gate: block entries when |obi| exceeds threshold.
 /// Balanced: 0.80 — blocks ≥80% depth imbalance; confirmed 2026-05-08.
 pub const GBOOST_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.80);
+/// Minimum historical volatility regime required for a GBoost entry.
+/// Balanced: 0.002 — default value; blocks entries when the oracle is completely flat.
+pub const GBOOST_MIN_HIST_VOL: f64 = 0.002;
 pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.40);
 pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(4.0);
 pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300;

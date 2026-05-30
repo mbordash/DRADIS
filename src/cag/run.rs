@@ -333,17 +333,9 @@ where
         };
         let mut squadron = Squadron::new(
             patrol_ctx.crypto_filter.parse::<CryptoAsset>().unwrap_or(CryptoAsset::Btc),
-            SquadronConfig::full_wing({
-                let label = if !hourly_market_name.is_empty() {
-                    hourly_market_name.clone()
-                } else {
-                    maker_market_candidate_from_channel
-                        .as_ref()
-                        .map(|m| m.name.clone())
-                        .unwrap_or_else(|| "No market".to_string())
-                };
-                format!("Full Wing — {}", label)
-            }),
+            SquadronConfig::full_wing(
+                format!("Full Wing — {}", patrol_ctx.crypto_filter.to_uppercase())
+            ),
             hourly_market_config_for_squadron,
             SquadronRaptors::full(
                 raptor_signals.oracle.clone(),
@@ -411,6 +403,12 @@ where
         // Finalise per-market PatrolContext fields.
         patrol_ctx.maker_market_config = maker_market_config;
         patrol_ctx.market_started_at   = Utc::now();
+
+        // Now that the maker venue is resolved, update the CAG registry so the
+        // Control Tower shows both the hourly AND the window/daily market name.
+        if let Some(ref mk) = patrol_ctx.maker_market_config {
+            patrol_ctx.cag.update_maker_market(&_squadron_id, mk.market_name.clone());
+        }
 
         // Delegate the inner tick loop to Squadron::patrol().
         // Returns when market_rx.changed() fires (rotation) or the watchdog

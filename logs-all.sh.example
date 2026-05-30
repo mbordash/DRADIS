@@ -1,34 +1,42 @@
 #!/usr/bin/env bash
 # =============================================================================
 # logs-all.sh TEMPLATE
-# Streams live logs from all 3 dradis containers with color-coded prefixes
-# 
+# Streams live logs from the DRADIS container with optional per-asset filtering.
+#
+# Phase 3f-6: all assets run concurrently inside ONE container.
+# There are no separate dradis-btc / dradis-eth / dradis-sol containers.
+#
 # SETUP:
-# 1. Copy this file and update HOST, USER, and KEY variables
-# 2. Run: chmod +x logs-all.sh.example && ./logs-all.sh.example
-# 3. Press Ctrl+C to stop streaming logs
+# 1. Copy this file: cp logs-all.sh.example logs-all.sh
+# 2. Fill in HOST, USER, KEY below
+# 3. chmod +x logs-all.sh && ./logs-all.sh
+#
+# USAGE:
+#   ./logs-all.sh              # all output from the container
+#   ./logs-all.sh btc          # BTC-only lines
+#   ./logs-all.sh eth          # ETH-only lines
+#   ./logs-all.sh sol          # SOL-only lines
 # =============================================================================
 
 # ⚙️  CUSTOMIZE THESE VALUES FOR YOUR SERVER
-HOST="<YOUR_SERVER_IP>"              # e.g., "192.168.1.100" or "example.com"
-USER="<YOUR_USERNAME>"               # e.g., "ubuntu", "root", "ec2-user"
-KEY="<PATH_TO_SSH_KEY>"              # e.g., "~/.ssh/id_rsa"
-SSH_PORT="22"                        # SSH port (usually 22)
+HOST="<YOUR_SERVER_IP>"              # e.g. "192.168.1.100"
+USER="<YOUR_USERNAME>"               # e.g. "ubuntu"
+KEY="<PATH_TO_SSH_KEY>"              # e.g. "~/.ssh/id_rsa"
+CONTAINER="dradis-live"              # container name on the target server
+SSH_PORT="22"
 
-echo "📡 Live logs from BTC + ETH + SOL dradis(Ctrl+C to stop)"
+FILTER="${1:-}"
+
+echo "📡 Live logs from ${CONTAINER} (Ctrl+C to stop)"
+if [ -n "$FILTER" ]; then
+    echo "   🔍 Filtering for: ${FILTER^^}"
+fi
 echo "───────────────────────────────────────────────────────────────"
 
-ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" '
-    trap "kill 0" EXIT
-
-    echo "=== BTC ==="
-    docker logs -f dradis-btc | sed "s/^/[BTC] /" &
-
-    echo "=== ETH ==="
-    docker logs -f dradis-eth | sed "s/^/[ETH] /" &
-
-    echo "=== SOL ==="
-    docker logs -f dradis-sol | sed "s/^/[SOL] /" &
-
-    wait
-'
+if [ -n "$FILTER" ]; then
+    ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" \
+        "docker logs -f ${CONTAINER} 2>&1 | grep -i --line-buffered '${FILTER}'"
+else
+    ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" \
+        "docker logs -f ${CONTAINER} 2>&1"
+fi

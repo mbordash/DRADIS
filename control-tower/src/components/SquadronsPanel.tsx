@@ -64,6 +64,11 @@ function SquadronRow({ sq }: { sq: SquadronSummary }) {
           <p className="text-[10px] font-mono text-gray-500 truncate mt-0.5" title={sq.market_name}>
             ⚔️ {sq.market_name}
           </p>
+          {sq.maker_market_name && (
+            <p className="text-[10px] font-mono text-gray-600 truncate mt-0.5" title={sq.maker_market_name}>
+              🗓 {sq.maker_market_name}
+            </p>
+          )}
         </div>
       </div>
 
@@ -130,7 +135,7 @@ export default function SquadronsPanel({ squadrons, isLoading }: Props) {
         </div>
         {/* Phase badge */}
         <span className="text-[9px] font-mono text-gray-700 border border-[#1e1e32] rounded px-1.5 py-0.5">
-          Phase 3d
+          Phase 3f
         </span>
       </div>
 

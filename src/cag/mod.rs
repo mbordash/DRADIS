@@ -44,24 +44,29 @@ use crate::squadron::config::SquadronConfig;
 /// Lightweight, serialisable summary of a squadron — sent to the Control Tower UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SquadronSummary {
-    pub id:          SquadronId,
-    pub asset:       String,          // CryptoAsset::symbol()
-    pub name:        String,          // SquadronConfig::name
-    pub state:       String,          // SquadronState::Display
-    pub market_name: String,
-    pub deployed_at: DateTime<Utc>,
+    pub id:                SquadronId,
+    pub asset:             String,           // CryptoAsset::symbol()
+    pub name:              String,           // SquadronConfig::name
+    pub state:             String,           // SquadronState::Display
+    /// Primary (hourly) battle location.
+    pub market_name:       String,
+    /// Window/daily maker venue — `None` until the fee-rate fetch resolves it,
+    /// a few seconds after the squadron is first registered.
+    pub maker_market_name: Option<String>,
+    pub deployed_at:       DateTime<Utc>,
 }
 
 impl SquadronSummary {
     /// Build a summary by borrowing an active Squadron.
     pub fn from_squadron(s: &Squadron) -> Self {
         Self {
-            id:          s.id.clone(),
-            asset:       s.asset.symbol(),
-            name:        s.config.name.clone(),
-            state:       s.state.to_string(),
-            market_name: s.market.market_name.clone(),
-            deployed_at: s.deployed_at,
+            id:                s.id.clone(),
+            asset:             s.asset.symbol(),
+            name:              s.config.name.clone(),
+            state:             s.state.to_string(),
+            market_name:       s.market.market_name.clone(),
+            maker_market_name: None,
+            deployed_at:       s.deployed_at,
         }
     }
 }
@@ -203,6 +208,16 @@ impl Cag {
     pub fn update_state(&self, id: &SquadronId, state: SquadronState) {
         if let Some(mut entry) = self.inner.registry.get_mut(id) {
             entry.summary.state = state.to_string();
+        }
+    }
+
+    /// Record the window/daily maker venue name for a registered squadron.
+    ///
+    /// Called from `run_market_loop` once the maker market fee-rate fetch
+    /// completes — a few seconds after the squadron is first registered.
+    pub fn update_maker_market(&self, id: &SquadronId, maker_market_name: String) {
+        if let Some(mut entry) = self.inner.registry.get_mut(id) {
+            entry.summary.maker_market_name = Some(maker_market_name);
         }
     }
 

@@ -1108,6 +1108,21 @@ impl Strategy for GboostStrategyImpl {
             (ps, hv, tm)
         };
 
+        // ── Gate: minimum historical volatility ──────────────────────────────
+        // When the oracle has been completely flat (hist_vol_regime == 0.0) the
+        // model's velocity, acceleration, and volatility features carry no signal.
+        // Any high-confidence prediction in a frozen oracle is unreliable and tends
+        // to flip hard on the next retrain once the price finally moves.
+        // Diagnosed from 2026-05-30 T1: vol=0.00 at entry → P(UP) flipped from
+        // 0.087 → 0.779 in 12 min → SignalRev exit for -$0.1636.
+        if precomp_hist_vol < config::GBOOST_MIN_HIST_VOL {
+            tracing::debug!(
+                "🚫 GBoost entry veto: oracle too flat | hist_vol={:.4} < min {:.4}",
+                precomp_hist_vol, config::GBOOST_MIN_HIST_VOL
+            );
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Gate: trend-alignment ─────────────────────────────────────────────
         // If BTC has drifted strongly in one direction over the past 60 minutes,
         // entering counter-trend is systematically unprofitable.
