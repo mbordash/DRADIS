@@ -52,81 +52,19 @@ echo "🚀 Deploying DRADIS + Control Tower to $HOST..."
 # ── 1. Create remote directory structure ──────────────────────────────────────
 echo "📁 Creating remote directory structure..."
 ssh -i "$KEY" "$USER@$HOST" \
-  "mkdir -p $REMOTE_DIR/src/vipers \
-            $REMOTE_DIR/src/raptors \
-            $REMOTE_DIR/src/squadron \
-            $REMOTE_DIR/src/cag \
-            $REMOTE_DIR/src/helpers \
-            $REMOTE_DIR/src/orchestrator \
-            $REMOTE_DIR/src/tasks \
-            $REMOTE_DIR/src/api \
+  "mkdir -p $REMOTE_DIR/src \
             $REMOTE_DIR/tests \
             $REMOTE_DIR/control-tower"
 
 # ── 2. Copy Rust source ───────────────────────────────────────────────────────
-echo "📤 Copying Rust source..."
-scp -P "$SSH_PORT" -i "$KEY" src/main.rs    "$USER@$HOST:$REMOTE_DIR/src/main.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/config.rs  "$USER@$HOST:$REMOTE_DIR/src/config.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/lib.rs     "$USER@$HOST:$REMOTE_DIR/src/lib.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/state.rs   "$USER@$HOST:$REMOTE_DIR/src/state.rs"
-
-# Viper (strategy) modules
-scp -P "$SSH_PORT" -i "$KEY" src/vipers/mod.rs            "$USER@$HOST:$REMOTE_DIR/src/vipers/mod.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/vipers/momentum_impl.rs  "$USER@$HOST:$REMOTE_DIR/src/vipers/momentum_impl.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/vipers/arbitrage_impl.rs "$USER@$HOST:$REMOTE_DIR/src/vipers/arbitrage_impl.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/vipers/time_decay_impl.rs "$USER@$HOST:$REMOTE_DIR/src/vipers/time_decay_impl.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/vipers/maker_impl.rs     "$USER@$HOST:$REMOTE_DIR/src/vipers/maker_impl.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/vipers/basis_impl.rs     "$USER@$HOST:$REMOTE_DIR/src/vipers/basis_impl.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/vipers/gboost_impl.rs    "$USER@$HOST:$REMOTE_DIR/src/vipers/gboost_impl.rs"
-
-# Orchestrator modules
-scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/mod.rs          "$USER@$HOST:$REMOTE_DIR/src/orchestrator/mod.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/strategy.rs     "$USER@$HOST:$REMOTE_DIR/src/orchestrator/strategy.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/registry.rs     "$USER@$HOST:$REMOTE_DIR/src/orchestrator/registry.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/executor.rs     "$USER@$HOST:$REMOTE_DIR/src/orchestrator/executor.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/orchestrator/market_data.rs  "$USER@$HOST:$REMOTE_DIR/src/orchestrator/market_data.rs"
-
-# Helper modules
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/mod.rs               "$USER@$HOST:$REMOTE_DIR/src/helpers/mod.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/config_helpers.rs    "$USER@$HOST:$REMOTE_DIR/src/helpers/config_helpers.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/price.rs             "$USER@$HOST:$REMOTE_DIR/src/helpers/price.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/json.rs              "$USER@$HOST:$REMOTE_DIR/src/helpers/json.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/time.rs              "$USER@$HOST:$REMOTE_DIR/src/helpers/time.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/balance.rs           "$USER@$HOST:$REMOTE_DIR/src/helpers/balance.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/nonce.rs             "$USER@$HOST:$REMOTE_DIR/src/helpers/nonce.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/orders.rs            "$USER@$HOST:$REMOTE_DIR/src/helpers/orders.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/market.rs            "$USER@$HOST:$REMOTE_DIR/src/helpers/market.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/volatility.rs        "$USER@$HOST:$REMOTE_DIR/src/helpers/volatility.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/notifications.rs     "$USER@$HOST:$REMOTE_DIR/src/helpers/notifications.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/metrics.rs           "$USER@$HOST:$REMOTE_DIR/src/helpers/metrics.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/db.rs                "$USER@$HOST:$REMOTE_DIR/src/helpers/db.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/dynamic_config.rs    "$USER@$HOST:$REMOTE_DIR/src/helpers/dynamic_config.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/helpers/llm_advisor.rs       "$USER@$HOST:$REMOTE_DIR/src/helpers/llm_advisor.rs"
-
-# API modules (Control Tower REST server)
-scp -P "$SSH_PORT" -i "$KEY" src/api/mod.rs                   "$USER@$HOST:$REMOTE_DIR/src/api/mod.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/api/server.rs                "$USER@$HOST:$REMOTE_DIR/src/api/server.rs"
-
-# Task modules
-scp -P "$SSH_PORT" -i "$KEY" src/tasks/mod.rs                 "$USER@$HOST:$REMOTE_DIR/src/tasks/mod.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/tasks/cleanup.rs             "$USER@$HOST:$REMOTE_DIR/src/tasks/cleanup.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/tasks/market_monitor.rs      "$USER@$HOST:$REMOTE_DIR/src/tasks/market_monitor.rs"
-
-# Raptor (recon) modules
-scp -P "$SSH_PORT" -i "$KEY" src/raptors/mod.rs               "$USER@$HOST:$REMOTE_DIR/src/raptors/mod.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/raptors/price.rs             "$USER@$HOST:$REMOTE_DIR/src/raptors/price.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/raptors/funding.rs           "$USER@$HOST:$REMOTE_DIR/src/raptors/funding.rs"
-
-# Squadron modules
-scp -P "$SSH_PORT" -i "$KEY" src/squadron/mod.rs              "$USER@$HOST:$REMOTE_DIR/src/squadron/mod.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/squadron/raptors.rs          "$USER@$HOST:$REMOTE_DIR/src/squadron/raptors.rs"
-scp -P "$SSH_PORT" -i "$KEY" src/squadron/config.rs           "$USER@$HOST:$REMOTE_DIR/src/squadron/config.rs"
-
-# CAG (Carrier Air Group) modules
-scp -P "$SSH_PORT" -i "$KEY" src/cag/mod.rs                   "$USER@$HOST:$REMOTE_DIR/src/cag/mod.rs"
+# Use scp -r so every module file is picked up automatically — no manual list
+# to maintain.  New files added during refactoring are included without any
+# change to this script.
+echo "📤 Copying Rust source (src/ → remote)..."
+scp -r -P "$SSH_PORT" -i "$KEY" src "$USER@$HOST:$REMOTE_DIR/"
 
 # Test modules
-scp -P "$SSH_PORT" -i "$KEY" tests/toctou.rs                  "$USER@$HOST:$REMOTE_DIR/tests/toctou.rs"
+scp -P "$SSH_PORT" -i "$KEY" tests/toctou.rs   "$USER@$HOST:$REMOTE_DIR/tests/toctou.rs"
 
 # Root files
 scp -P "$SSH_PORT" -i "$KEY" .env           "$USER@$HOST:$REMOTE_DIR/.env"
