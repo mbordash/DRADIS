@@ -12,24 +12,52 @@
 /// │  Raptors          ──►  SquadronRaptors (watch signal feeds)  │
 /// │  Vipers           ──►  Vec<Box<dyn Strategy>>                │
 /// │  State            ──►  SquadronState lifecycle FSM           │
+/// │  ws_cancel        ──►  CancellationToken for WS tasks        │
 /// └──────────────────────────────────────────────────────────────┘
 ///
-/// Phase 2 (current): types are defined and wired into the CIC (main.rs).
-///                    The existing `'market_loop` constructs a SquadronRaptors
-///                    and Squadron descriptor for each deployment.
-/// Phase 3 (next):    The CAG replaces the manual market-rotation loop with
-///                    `Squadron::patrol()` — a proper async run method that
-///                    owns the tick loop and can be independently cancelled.
+/// Phase 2:   types defined, wired into the CIC (main.rs).
+/// Phase 3f-2: Squadron owns WS subscriptions.
+///            `subscribe_markets()` spawns the 4 orderbook tasks and returns
+///            `MarketPriceFeeds`.  `cancel_ws()` cleans them up on rotation.
+/// Phase 3f-3 (current): `patrol()` drives the full inner tick loop.
+///            main.rs creates a `PatrolContext` and calls
+///            `squadron.patrol(cancel, &mut ctx).await` instead of running
+///            the select! loop directly.
 
 pub mod raptors;
 pub mod config;
+/// `PatrolContext` — all infrastructure `patrol()` needs.  Re-exported at
+/// crate level so `main.rs` can construct it without reaching into sub-modules.
+pub mod context;
+pub use context::PatrolContext;
+
+/// Inner tick-loop implementation for `Squadron::patrol()`.
+/// Kept in a separate file to avoid bloating mod.rs.
+mod patrol_impl;
+
+/// Peripheral tasks spawned by `patrol()` — Phase 3f-4.
+/// Kept in a separate file for clarity; each function spawns one Tokio task.
+mod patrol_tasks;
+pub use patrol_tasks::{
+    spawn_pulse_task, spawn_settlement_task, spawn_cleanup_task,
+    spawn_status_task, spawn_watchdog_task,
+};
 
 pub use raptors::SquadronRaptors;
 pub use config::{SquadronConfig, RaptorProfile, ViperProfile};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use crate::state::MarketConfig;
+use alloy::primitives::U256;
+use futures::StreamExt as _;
+use rust_decimal_macros::dec;
+use tokio::sync::watch;
+use tokio_util::sync::CancellationToken;
+use tracing::{info, warn};
+
+use polymarket_client_sdk_v2::clob::ws::Client as WsClient;
+
+use crate::state::{MarketConfig, PriceState};
 
 // ─── CryptoAsset ─────────────────────────────────────────────────────────────
 
@@ -126,10 +154,38 @@ impl std::fmt::Display for SquadronState {
     }
 }
 
+// ─── MarketPriceFeeds ─────────────────────────────────────────────────────────
+
+/// Live orderbook price receivers returned by `Squadron::subscribe_markets()`.
+///
+/// Holds one `watch::Receiver<PriceState>` per active token.  The squadron
+/// keeps the corresponding senders internally; this struct is handed to the
+/// caller (currently `main.rs`'s market loop, eventually `patrol()`) so it
+/// can snapshot prices on every tick without any lock contention.
+///
+/// Maker receivers are `Option` because a maker venue may not be available on
+/// every market rotation.
+pub struct MarketPriceFeeds {
+    /// Live bid/ask for the hourly market YES token.
+    pub hourly_yes: watch::Receiver<PriceState>,
+    /// Live bid/ask for the hourly market NO token.
+    pub hourly_no:  watch::Receiver<PriceState>,
+    /// Live bid/ask for the window/daily maker YES token (if present).
+    pub maker_yes:  Option<watch::Receiver<PriceState>>,
+    /// Live bid/ask for the window/daily maker NO token (if present).
+    pub maker_no:   Option<watch::Receiver<PriceState>>,
+}
+
+// ─── SquadronId / SquadronState ───────────────────────────────────────────────
+
+// ...existing code...
+
+// ─── Squadron ────────────────────────────────────────────────────────────────
+
 /// A fully-described squadron deployment.
 ///
 /// In Phase 2 this is a descriptor/record type — owned by the CIC's market
-/// loop at runtime.  In Phase 3 it will grow a `patrol()` async method that
+/// loop at runtime.  In Phase 3f-3 it will grow a `patrol()` async method that
 /// runs the tick loop so the CAG can spawn multiple concurrent squadrons.
 pub struct Squadron {
     pub id:      SquadronId,
@@ -140,6 +196,13 @@ pub struct Squadron {
     pub raptors: SquadronRaptors,
     pub state:   SquadronState,
     pub deployed_at: DateTime<Utc>,
+
+    /// Cancellation token used to stop WS reconnect loops on market rotation.
+    ///
+    /// A fresh token is created on each `subscribe_markets()` call; the
+    /// previous generation of tasks drains when they observe cancellation.
+    /// `cancel_ws()` fires it; `patrol()` fires it on stand-down.
+    ws_cancel: CancellationToken,
 }
 
 impl Squadron {
@@ -165,6 +228,7 @@ impl Squadron {
             raptors,
             state: SquadronState::Deployed,
             deployed_at,
+            ws_cancel: CancellationToken::new(),
         }
     }
 
@@ -188,33 +252,161 @@ impl Squadron {
         matches!(self.state, SquadronState::Rtb | SquadronState::StoodDown)
     }
 
-    // ─── Phase 3 stub ────────────────────────────────────────────────────────
+    // ─── WS subscription ─────────────────────────────────────────────────────
 
-    /// Run the squadron's full patrol lifecycle as an independent async task.
+    /// Subscribe to Polymarket WebSocket orderbook feeds for this squadron's
+    /// battle location.
     ///
-    /// **Phase 3 entry point** — when fully implemented this method will:
-    ///   1. Transition state to `Patrolling`.
-    ///   2. Drive the tick loop (currently in `main.rs`'s `'market_loop`) until the
-    ///      market expires or a cancellation token fires.
-    ///   3. Wind down open positions (RTB phase).
-    ///   4. Transition to `StoodDown` and return.
+    /// Spawns one independent Tokio task per token (up to 4 total).  Each task
+    /// maintains an auto-reconnecting WS stream and pushes
+    /// `(bid, bid_depth, ask, ask_depth, timestamp)` updates into a
+    /// `watch::Sender`.  Tasks stop when the WS cancel token fires.
     ///
-    /// The CAG calls `tokio::spawn(squadron.patrol(cancel_token))` for each
-    /// squadron so they run concurrently without blocking one another.
+    /// **Calling this a second time** (e.g. on market rotation) automatically
+    /// cancels the previous generation of tasks before spawning new ones —
+    /// no task leak, no stale price data.
     ///
-    /// **Currently a stub** — wiring to the CIC tick-loop happens in Phase 3f.
-    pub async fn patrol(mut self, cancel: tokio_util::sync::CancellationToken) -> Self {
-        self.start_patrol();
-        tracing::info!(
+    /// Returns `MarketPriceFeeds` — the caller holds these receivers for the
+    /// duration of the patrol to drive strategy snapshots.
+    ///
+    /// Phase 3f-2: called by `main.rs` to replace the two inline WS blocks.
+    /// Phase 3f-3: called internally by `patrol()`.
+    pub fn subscribe_markets(
+        &mut self,
+        hourly_yes_token: U256,
+        hourly_no_token:  U256,
+        maker:            Option<(U256, U256)>,  // (yes_token, no_token)
+    ) -> MarketPriceFeeds {
+        // Cancel any WS tasks from a previous call (e.g. prior market rotation).
+        self.ws_cancel.cancel();
+
+        // Fresh token for this generation of WS tasks.
+        let cancel = CancellationToken::new();
+        self.ws_cancel = cancel.clone();
+
+        let default_feed: PriceState = (dec!(0), dec!(0), dec!(1), dec!(0), Utc::now());
+
+        // ── Hourly market feeds ───────────────────────────────────────────────
+        let (yes_tx, yes_rx) = watch::channel(default_feed);
+        let (no_tx,  no_rx)  = watch::channel(default_feed);
+
+        if hourly_yes_token != U256::ZERO {
+            spawn_ws_task(hourly_yes_token, yes_tx, cancel.clone(), "hourly");
+            spawn_ws_task(hourly_no_token,  no_tx,  cancel.clone(), "hourly");
+        }
+
+        // ── Maker/window market feeds (optional) ─────────────────────────────
+        let (maker_yes, maker_no) = if let Some((mk_yes, mk_no)) = maker {
+            let (mk_yes_tx, mk_yes_rx) = watch::channel(default_feed);
+            let (mk_no_tx,  mk_no_rx)  = watch::channel(default_feed);
+            spawn_ws_task(mk_yes, mk_yes_tx, cancel.clone(), "maker");
+            spawn_ws_task(mk_no,  mk_no_tx,  cancel.clone(), "maker");
+            (Some(mk_yes_rx), Some(mk_no_rx))
+        } else {
+            (None, None)
+        };
+
+        info!(
             squadron = %self.id,
-            asset    = %self.asset,
-            market   = %self.market.market_name,
-            "⚔️  Squadron patrol() stub — tick-loop wiring pending Phase 3f",
+            hourly_has_market = (hourly_yes_token != U256::ZERO),
+            has_maker = maker.is_some(),
+            "📡  Squadron: WS subscriptions spawned",
         );
-        // Await cancellation — real implementation replaces this with the tick loop.
-        cancel.cancelled().await;
-        self.stand_down();
-        self
-    }
-}
 
+        MarketPriceFeeds {
+            hourly_yes: yes_rx,
+            hourly_no:  no_rx,
+            maker_yes,
+            maker_no,
+        }
+    }
+
+    /// Signal all WS reconnect tasks for this squadron to stop.
+    ///
+    /// Called on market rotation (before the old squadron is stood down) to
+    /// prevent task accumulation: without this, each rotation leaks 4 tasks
+    /// that loop-reconnect forever, gradually exhausting heap.
+    ///
+    /// Safe to call multiple times — a cancelled token is a no-op on
+    /// subsequent cancellations.
+    pub fn cancel_ws(&self) {
+        self.ws_cancel.cancel();
+        info!(squadron = %self.id, "📡  Squadron: WS cancel signal sent");
+    }
+
+}
+// patrol() is implemented in patrol_impl.rs (Phase 3f-3)
+
+// ─── Private helpers ─────────────────────────────────────────────────────────
+
+/// Spawn one auto-reconnecting WebSocket orderbook subscriber task.
+///
+/// Pushes `PriceState` updates into `tx`.  Stops cleanly when `cancel` fires.
+/// The `venue` label is used only for log messages.
+fn spawn_ws_task(
+    token:  U256,
+    tx:     watch::Sender<PriceState>,
+    cancel: CancellationToken,
+    venue:  &'static str,
+) {
+    tokio::spawn(async move {
+        loop {
+            if cancel.is_cancelled() { return; }
+
+            let client = WsClient::default();
+            let stream = match client.subscribe_orderbook(vec![token]) {
+                Ok(s)  => s,
+                Err(e) => {
+                    warn!(
+                        "⚠️ WS subscribe failed for {} token {}: {}. Retrying in 5s…",
+                        venue, token, e
+                    );
+                    tokio::select! {
+                        _ = cancel.cancelled() => return,
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                    }
+                    continue;
+                }
+            };
+
+            let mut stream = Box::pin(stream);
+            info!("✅ WS orderbook subscribed for {} token {}", venue, token);
+
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => { return; }
+                    result = stream.next() => {
+                        match result {
+                            Some(Ok(book)) => {
+                                let (bid, bid_depth) = book.bids.iter()
+                                    .max_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
+                                    .map(|l| (l.price, l.size))
+                                    .unwrap_or((dec!(0), dec!(0)));
+                                let (ask, ask_depth) = book.asks.iter()
+                                    .min_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
+                                    .map(|l| (l.price, l.size))
+                                    .unwrap_or((dec!(1), dec!(0)));
+                                // Stamp the WS update time at receipt, NOT at tick time.
+                                let _ = tx.send((bid, bid_depth, ask, ask_depth, Utc::now()));
+                            }
+                            Some(Err(_)) | None => {
+                                warn!(
+                                    "⚠️ WS stream error for {} token {}. Restarting…",
+                                    venue, token
+                                );
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Brief pause before reconnecting; respect cancel during the wait.
+            tokio::select! {
+                _ = cancel.cancelled() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+            }
+        }
+    });
+}

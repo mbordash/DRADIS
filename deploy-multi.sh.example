@@ -8,13 +8,24 @@
 # 2. Ensure Docker is installed on the remote server
 # 3. Run: chmod +x deploy-multi.sh && ./deploy-multi.sh
 #
-# Containers started:
-#   dradis-btc       — Rust trading engine (BTC filter) + axum API on :9000
-#   control-tower    — Next.js dashboard on :3002
-#   dradis-eth/sol   — Uncomment blocks below to enable additional filters
+# Phase 3f-6: Two deployment models are now supported:
+#
+#   MODEL A — Single container, multi-asset (recommended):
+#     One dradis container with ASSETS=btc,eth,sol runs all three market loops
+#     concurrently in a single process.  Simpler operations, lower memory.
+#     DB covers the primary asset (btc); all assets write CSV metrics.
+#
+#   MODEL B — Separate containers per asset (legacy, still works):
+#     dradis-btc, dradis-eth, dradis-sol each run with CRYPTO_FILTER=<asset>.
+#     Full DB persistence per asset, easier per-asset restart.
+#     Uncomment the individual docker run blocks below to use this model.
+#
+# Containers started (Model A):
+#   dradis          — Rust trading engine (all assets) + axum API on :9000
+#   control-tower   — Next.js dashboard on :3002
 #
 # All containers share the 'dradis-net' Docker network so the UI can reach
-# the API at http://dradis-btc:9000 without exposing it on the host.
+# the API at http://dradis:9000 without exposing it on the host.
 # =============================================================================
 
 set -euo pipefail
@@ -206,13 +217,16 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" "${CT_USERNA
     echo "🔨 Building Control Tower image..."
     docker build -t dradis-ui control-tower/
 
-    echo "🚀 Starting dradis-btc (BTC filter, API on :9000)..."
+    # ── MODEL A: Single container, multi-asset (Phase 3f-6 — recommended) ───────
+    # ASSETS=btc,eth,sol runs all three market loops concurrently in one process.
+    # DB persists the primary asset (btc); secondary assets use CSV-only metrics.
+    echo "🚀 Starting dradis (BTC+ETH+SOL concurrent, API on :9000)..."
     docker run -d \
         --restart unless-stopped \
-        --name dradis-btc \
+        --name dradis \
         --network dradis-net \
         --env-file .env \
-        -e CRYPTO_FILTER=btc \
+        -e ASSETS=btc,eth,sol \
         -e API_PORT=9000 \
         -e OLLAMA_URL=http://ollama:11434 \
         -e OLLAMA_MODEL=qwen2.5:3b-instruct-q4_K_M \
@@ -220,31 +234,21 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" "${CT_USERNA
         -v $(pwd)/logs:/app/logs \
         dradis
 
-#    echo "🚀 Starting dradis-eth..."
+#    # ── MODEL B: Separate containers per asset (legacy — full DB per asset) ────
+#    echo "🚀 Starting dradis-btc (BTC filter, API on :9000)..."
 #    docker run -d \
 #        --restart unless-stopped \
-#        --name dradis-eth \
+#        --name dradis-btc \
 #        --network dradis-net \
 #        --env-file .env \
-#        -e CRYPTO_FILTER=eth \
+#        -e CRYPTO_FILTER=btc \
 #        -e API_PORT=9000 \
 #        -e OLLAMA_URL=http://ollama:11434 \
 #        -e OLLAMA_MODEL=qwen2.5:3b-instruct-q4_K_M \
+#        -p 9000:9000 \
 #        -v $(pwd)/logs:/app/logs \
 #        dradis
 #
-#    echo "🚀 Starting dradis-sol..."
-#    docker run -d \
-#        --restart unless-stopped \
-#        --name dradis-sol \
-#        --network dradis-net \
-#        --env-file .env \
-#        -e CRYPTO_FILTER=sol \
-#        -e API_PORT=9000 \
-#        -e OLLAMA_URL=http://ollama:11434 \
-#        -e OLLAMA_MODEL=qwen2.5:3b-instruct-q4_K_M \
-#        -v $(pwd)/logs:/app/logs \
-#        dradis
 
     echo "🌐 Starting Control Tower UI (port :3002)..."
     docker run -d \

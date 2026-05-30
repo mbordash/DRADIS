@@ -1,6 +1,6 @@
 # DRADIS
 
-> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Polymarket. Six autonomous Viper strategies, a Raptor recon layer, a Squadron deployment framework, a real-time Next.js Control Tower, and an LLM Advisor that delivers optimization recommendations via Ollama (local or remote) + Telegram & OpenClaw.
+> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Polymarket. Six autonomous Viper strategies, a Raptor recon layer, a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor that delivers optimization recommendations via Ollama (local or remote) + Telegram & OpenClaw.
 
 ![Rust](https://img.shields.io/badge/Rust-1.95+-orange?logo=rust&logoColor=white)
 ![Tokio](https://img.shields.io/badge/Tokio-async%20runtime-darkgreen?logo=rust&logoColor=white)
@@ -47,13 +47,14 @@ After ~5 minutes the stack is live:
 
 DRADIS is a comprehensive trading automation platform for prediction markets. Built in Rust for maximum concurrency and memory safety, it evaluates selected markets every 50ms, coordinating multiple autonomous strategies to preserve capital and place orders where it sees inefficiencies.
 
-The system is organized around three BSG-inspired tactical layers:
+The system is organized around four BSG-inspired tactical layers:
 
 | Layer | Folder | Role |
 |---|---|---|
 | **Raptors** | `src/raptors/` | Signal scouts — fetch, normalise, broadcast external data |
 | **Vipers** | `src/vipers/` | Trading strategies — evaluate signals and place orders |
 | **Squadron** | `src/squadron/` | Deployment unit — bundles Raptors + Vipers onto a battle location |
+| **CAG** | `src/cag/` | Commander Air Group — async dispatch, session state, multi-asset orchestration |
 
 ---
 
@@ -66,6 +67,7 @@ The system is organized around three BSG-inspired tactical layers:
 │  raptors/          ← Signal scouts (Binance WS + FAPI REST)         │
 │  vipers/           ← Trading strategies (6 Vipers)                  │
 │  squadron/         ← Deployment layer (Raptor+Viper+Market bundle)  │
+│  cag/              ← Commander Air Group (async dispatch, multi-asset)│
 │  orchestrator/     ← Strategy trait, registry, executor             │
 │  tasks/            ← Market monitor, cleanup, chain-sync            │
 │  helpers/          ← DB, orders, balance, metrics, notifications    │
@@ -83,6 +85,13 @@ The system is organized around three BSG-inspired tactical layers:
 └──────────┬───────────┘   └───────────┬──────────┘
            │  watch channels           │ orderbook WS
            └─────────────┬─────────────┘
+                         ▼
+           ┌─────────────────────────┐
+           │   src/cag/              │  ← CAG (Commander Air Group)
+           │   run_market_loop()     │  ← one tokio task per asset
+           │   SessionState          │  ← per-asset P&L + collateral
+           └─────────────┬───────────┘
+                         │  (BTC task) (ETH task) (SOL task) …
                          ▼
            ┌─────────────────────────┐
            │   src/squadron/         │
@@ -133,6 +142,8 @@ The system is organized around three BSG-inspired tactical layers:
 
 - **Parallel Dispatch**: Every 50ms heartbeat, the CIC evaluates all registered Vipers concurrently.
 - **Isolated budgets**: Each Viper has its own independent capital budget and position book — a loss in one sector can't drain another's fuel.
+- **Multi-asset concurrency**: Each asset runs in its own `tokio::spawn`ed task with independent raptors and session state. The runtime uses 8 worker threads to cover BTC + ETH + SOL comfortably.
+- **OS-thread watchdog**: A native OS thread (outside the tokio runtime) checks an atomic heartbeat every 60 s. If the trading loop goes silent for 5 minutes, it calls `process::exit(1)` to trigger Docker's restart policy — immune to tokio runtime deadlocks.
 - **OBI Veto**: Built-in Order Book Imbalance gate at −0.60 blocks entries into toxic flow / distribution walls.
 - **Strategy Timeout**: Each Viper evaluation is hard-capped at 500ms. A hung Viper is skipped for that tick — the engine never freezes.
 - **REST API**: axum server on `:9000` exposes live config, P&L, positions, and trade history to the Control Tower.
@@ -205,7 +216,39 @@ Squadron
 
 Each market rotation logs: `🛩️ Squadron [btc-hourly-2026-05-23T14:00:00Z] → state=PATROLLING`
 
-> **Phase 2 (current):** Squadron is a typed deployment descriptor constructed at each market rotation. **Phase 3 (CAG)** will promote it into a full async run-unit so multiple Squadrons can patrol different markets concurrently.
+---
+
+## 🛸 CAG Layer (`src/cag/`)
+
+The **Commander Air Group** is the async orchestration layer that sits between `main.rs` and the Squadron/Orchestrator. It owns the market rotation loop for each asset and manages session-level state.
+
+```
+CAG
+├── Cag              →  global registry (shared across all asset tasks)
+├── SessionState     →  per-asset P&L, starting/live collateral, position tracking
+├── RunArgs<P>       →  typed bundle passed into each concurrent market-loop task
+└── run_market_loop  →  async fn — the full patrol loop for one asset
+```
+
+### Multi-asset concurrency
+
+Set `ASSETS=btc,eth,sol` to run three independent patrol loops in parallel. Each asset gets its own:
+- Price Raptor + Funding Raptor (watch channels)
+- `SessionState` (isolated P&L and collateral tracking)
+- LLM Advisor background task
+- `tokio::spawn`ed `run_market_loop` task
+
+**Shared** across all assets: `trading_client`, `nonce_manager`, `wallet_provider`, CAG registry, `DynamicConfig` watch channel, axum API server.
+
+```bash
+# .env — multi-asset (BTC + ETH + SOL in parallel)
+ASSETS=btc,eth,sol
+
+# .env — single-asset fallback (backward-compatible)
+CRYPTO_FILTER=btc
+```
+
+> The **primary asset** (first in `ASSETS`) owns the SQLite DB pool and the CAG session exposed by the REST API. Additional assets write metrics to per-asset CSV files. Per-asset DB pools are planned for a future phase.
 
 ---
 
@@ -327,10 +370,23 @@ tail -f logs/dradis-local.log
 ./stop-local.sh
 ```
 
+#### Multi-asset mode
+
+```bash
+# .env — run BTC, ETH, and SOL loops concurrently
+ASSETS=btc,eth,sol
+
+# Each asset gets its own DB file:
+#   logs/btc-dradis.db  (primary — also feeds the REST API / Control Tower)
+#   logs/eth-*.csv      (secondary assets — CSV metrics until Phase 3f-7)
+#   logs/sol-*.csv
+```
+
 Log filtering:
 ```bash
 tail -f logs/dradis-local.log | grep -i "trade\|entry\|exit"   # trades
 tail -f logs/dradis-local.log | grep "Squadron"                  # deployment lifecycle
+tail -f logs/dradis-local.log | grep "btc\|eth\|sol"             # per-asset activity
 tail -f logs/dradis-local.log | grep -E "WARN|ERROR"             # problems
 ```
 
@@ -349,6 +405,12 @@ API health: `http://YOUR_SERVER_IP:9000/api/health`
 
 ### Recently shipped
 
+- **Phase 3 — CAG (Commander Air Group)** — Async dispatch layer replacing the manual market-rotation loop:
+  - `src/cag/` — `Cag`, `SessionState`, `RunArgs<P>`, `run_market_loop()`
+  - `main.rs` reduced from ~730 lines to ~415 lines; full market loop lives in `cag/run.rs`
+  - **Multi-asset**: `ASSETS=btc,eth,sol` spawns one concurrent patrol loop per asset (independent raptors, session state, LLM advisor)
+  - Tokio runtime bumped to 8 worker threads; OS-thread watchdog added (5-minute silence → `process::exit(1)`)
+  - Backward-compatible: `CRYPTO_FILTER=btc` (single-asset) still works unchanged
 - **Raptor / Viper / Squadron architecture** — Three-layer BSG tactical separation of concerns:
   - `src/raptors/` — Price Raptor (Binance WS) + Funding Raptor (Binance FAPI)
   - `src/vipers/` — six Viper trading strategies
@@ -358,13 +420,9 @@ API health: `http://YOUR_SERVER_IP:9000/api/health`
 - **Side label fix** — `adopt_chain_position` correctly binds the Polymarket outcome string (was storing literal `?`)
 - **Viper hot-enable** — All Vipers always instantiated at startup; toggle any live from Control Tower with no restart
 
-### Phase 3 — CAG (next)
-
-The **Commander Air Group** replaces the manual market-rotation loop with a proper async dispatch layer:
-- `Squadron::patrol()` — async run-method, independently cancellable
-- `Cag::dispatch(market)` — assembles the right Viper/Raptor mix for each market type
-- `Cag::rtb(squadron_id)` — clean Squadron teardown on market expiry
-- **Multi-Squadron** — two or more Squadrons patrolling different markets concurrently
+### Phase 3f-7 (next)
+- Per-asset SQLite DB pools (secondary assets currently write CSV-only metrics)
+- Control Tower multi-asset selector (switch between BTC / ETH / SOL session views)
 
 ### Medium-term
 - Static deployment profiles (`profiles.toml`) with per-profile P&L tracking
@@ -404,6 +462,8 @@ DRADIS_API_KEY=replace-with-a-strong-random-secret
 ## FAQ
 
 **Why Rust?** Fearless concurrency — evaluating six Vipers every 50ms needs a multi-threaded runtime with no GIL or GC pauses.
+
+**Can I trade multiple assets at once?** Yes — set `ASSETS=btc,eth,sol` in `.env`. Each asset runs its own independent patrol loop (raptors, session state, LLM advisor) inside a `tokio::spawn`ed task. The wallet, CLOB client, and API server are shared. The primary asset (first in the list) owns the SQLite DB and the Control Tower view; secondary assets write to per-asset CSV files until per-asset DB pools land in Phase 3f-7.
 
 **Why isn't the bot trading?** Check: (1) `GHOST_MODE` true? (2) High-fee market? (3) Thresholds too tight in `config.rs`? (4) No Window/Daily market for Maker/Arb/Basis?
 

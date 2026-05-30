@@ -7,6 +7,16 @@ use rust_decimal::Decimal;
 use std::collections::HashMap;
 use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
 
+// ─── WebSocket price feed ─────────────────────────────────────────────────────
+
+/// Live orderbook price snapshot from the Polymarket WebSocket.
+///
+/// Tuple layout: `(best_bid, bid_depth, best_ask, ask_depth, ws_update_timestamp)`
+///
+/// Previously a `type` alias private to `main.rs`.  Promoted here in Phase 3f-2
+/// so `Squadron::subscribe_markets()` and the tick loop share a single definition.
+pub type PriceState = (Decimal, Decimal, Decimal, Decimal, DateTime<Utc>);
+
 /// Represents a single position held in the trading system.
 /// Shared across strategies and the main orchestrator.
 #[derive(Debug, Clone)]
