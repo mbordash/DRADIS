@@ -113,6 +113,21 @@ export interface PortfolioValue {
   prices_live:     boolean; // false when Polymarket CLOB was unreachable
 }
 
+// ── Squadron / CAG types (Phase 3d) ──────────────────────────────────────────
+
+/** Lifecycle state string returned by the CAG registry. */
+export type SquadronState = 'STAGED' | 'DEPLOYED' | 'PATROLLING' | 'RTB' | 'STOOD_DOWN';
+
+/** Summary of one active squadron — returned by GET /api/squadrons and GET /api/squadrons/{id}. */
+export interface SquadronSummary {
+  id:          string;        // e.g. "btc-hourly-2026-05-29T14:00:00Z"
+  asset:       string;        // "BTC" | "ETH" | "SOL" | …
+  name:        string;        // SquadronConfig::name
+  state:       SquadronState;
+  market_name: string;        // human-readable Polymarket market name
+  deployed_at: string;        // ISO 8601
+}
+
 // ── Field descriptor for ViperCard ───────────────────────────────────────────
 
 export type FieldType = 'usd' | 'pct' | 'price' | 'decimal';

@@ -83,7 +83,6 @@ use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{MarketSnapshot, OrderParams, StrategySignal, StrategyStatus};
 use crate::vipers::is_drawdown_limit_hit;
 use crate::helpers::price::floor_to_tick_size;
-use crate::helpers::dynamic_config::DynamicConfig; // Corrected import
 use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
 
 /// Number of f64 features per snapshot row fed into the booster.
@@ -1696,6 +1695,7 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use crate::state::{MarketConfig, Position, PositionMap};
+    use crate::helpers::dynamic_config::DynamicConfig;
     // use alloy::primitives::U256; // Already imported by the main file
 
     fn make_snapshot() -> MarketSnapshot {

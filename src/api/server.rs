@@ -11,6 +11,8 @@
 ///   DELETE /api/positions/{token_id}  — purge a specific stale row from open_positions
 ///   POST   /api/positions/sync        — trigger immediate chain-sync against Polymarket wallet
 ///   GET    /api/llm/recommendations   — recent LLM Advisor analyses (?limit=10)
+///   GET    /api/squadrons             — list all active squadrons (Phase 3d)
+///   GET    /api/squadrons/{id}        — get one squadron by id    (Phase 3d)
 ///
 /// The server binds to 0.0.0.0:$API_PORT (default 9000).
 /// CORS is open so the Next.js Control Tower on any port can reach it.
@@ -35,6 +37,7 @@ use alloy::primitives::Address;
 use crate::helpers::dynamic_config::DynamicConfig;
 use crate::helpers::db;
 use crate::tasks::cleanup::sync_open_positions_with_chain;
+use crate::cag::Cag;
 
 // ─── Shared state ────────────────────────────────────────────────────────────
 
@@ -54,6 +57,10 @@ pub struct ApiState {
     /// Gnosis Safe wallet address — used by POST /api/positions/sync to fetch live
     /// on-chain holdings and purge stale open_positions rows without a restart.
     pub safe_address: Address,
+    /// CAG (Carrier Air Group) — squadron registry.
+    /// Phase 3d: exposes GET /api/squadrons and GET /api/squadrons/{id}.
+    /// Phase 3f: will also handle POST/DELETE once patrol() is fully wired.
+    pub cag: Cag,
 }
 
 // ─── API-key middleware ──────────────────────────────────────────────────────
@@ -305,6 +312,47 @@ async fn get_llm_recommendations(Query(q): Query<LimitQuery>) -> Response {    d
     }
 }
 
+// ─── Squadron handlers (Phase 3d) ────────────────────────────────────────────
+
+/// GET /api/squadrons
+///
+/// Returns a JSON array of all currently registered squadrons, sorted by
+/// deployment time (oldest first).  Each entry is a `SquadronSummary`:
+///
+/// ```json
+/// [
+///   {
+///     "id":          "btc-hourly-2026-05-29T14:00:00Z",
+///     "asset":       "BTC",
+///     "name":        "Full Wing — Will BTC …",
+///     "state":       "PATROLLING",
+///     "market_name": "Will BTC exceed $70,000 at 3 PM ET?",
+///     "deployed_at": "2026-05-29T14:00:01Z"
+///   }
+/// ]
+/// ```
+async fn get_squadrons(State(s): State<ApiState>) -> Response {
+    debug!("Received GET /api/squadrons");
+    Json(s.cag.list_squadrons()).into_response()
+}
+
+/// GET /api/squadrons/{id}
+///
+/// Returns the `SquadronSummary` for a single squadron, or 404 if unknown.
+async fn get_squadron_by_id(
+    State(s): State<ApiState>,
+    Path(id): Path<String>,
+) -> Response {
+    debug!("Received GET /api/squadrons/{}", id);
+    match s.cag.get_squadron(&id) {
+        Some(summary) => Json(summary).into_response(),
+        None => {
+            warn!("GET /api/squadrons/{}: not found", id);
+            (StatusCode::NOT_FOUND, format!("squadron '{}' not found", id)).into_response()
+        }
+    }
+}
+
 // ─── Server startup ──────────────────────────────────────────────────────────
 
 /// Spawn the Control Tower axum server.
@@ -316,6 +364,7 @@ pub async fn run_api_server(
     config_rx: watch::Receiver<Arc<DynamicConfig>>,
     markets_rx: watch::Receiver<HashMap<String, String>>,
     safe_address: Address,
+    cag: Cag,
 ) {
     let port = std::env::var("API_PORT")
         .ok()
@@ -329,7 +378,7 @@ pub async fn run_api_server(
         tracing::info!(" API key authentication disabled (set DRADIS_API_KEY to enable)");
     }
 
-    let state = ApiState { config_tx, config_rx, markets_rx, api_key, safe_address };
+    let state = ApiState { config_tx, config_rx, markets_rx, api_key, safe_address, cag };
 
     // /api/health is intentionally public — no API key required.
     // Docker HEALTHCHECK, load balancers, and uptime monitors all probe this
@@ -347,6 +396,9 @@ pub async fn run_api_server(
         .route("/api/positions/{token_id}",  delete(delete_open_position))
         .route("/api/status",                get(get_status))
         .route("/api/llm/recommendations",   get(get_llm_recommendations))
+        // ── Phase 3d: Squadron registry endpoints ──────────────────────────
+        .route("/api/squadrons",             get(get_squadrons))
+        .route("/api/squadrons/{id}",        get(get_squadron_by_id))
         // API-key check applied to all matched routes (inner layer — runs after CORS).
         // No-op when DRADIS_API_KEY is unset so local-dev workflow is unchanged.
         .layer(axum::middleware::from_fn_with_state(state.clone(), require_api_key))

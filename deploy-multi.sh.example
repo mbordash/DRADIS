@@ -44,6 +44,7 @@ ssh -i "$KEY" "$USER@$HOST" \
   "mkdir -p $REMOTE_DIR/src/vipers \
             $REMOTE_DIR/src/raptors \
             $REMOTE_DIR/src/squadron \
+            $REMOTE_DIR/src/cag \
             $REMOTE_DIR/src/helpers \
             $REMOTE_DIR/src/orchestrator \
             $REMOTE_DIR/src/tasks \
@@ -109,6 +110,9 @@ scp -P "$SSH_PORT" -i "$KEY" src/raptors/funding.rs           "$USER@$HOST:$REMO
 scp -P "$SSH_PORT" -i "$KEY" src/squadron/mod.rs              "$USER@$HOST:$REMOTE_DIR/src/squadron/mod.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/squadron/raptors.rs          "$USER@$HOST:$REMOTE_DIR/src/squadron/raptors.rs"
 scp -P "$SSH_PORT" -i "$KEY" src/squadron/config.rs           "$USER@$HOST:$REMOTE_DIR/src/squadron/config.rs"
+
+# CAG (Carrier Air Group) modules
+scp -P "$SSH_PORT" -i "$KEY" src/cag/mod.rs                   "$USER@$HOST:$REMOTE_DIR/src/cag/mod.rs"
 
 # Test modules
 scp -P "$SSH_PORT" -i "$KEY" tests/toctou.rs                  "$USER@$HOST:$REMOTE_DIR/tests/toctou.rs"

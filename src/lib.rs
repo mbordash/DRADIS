@@ -6,4 +6,5 @@ pub mod orchestrator;
 pub mod tasks;
 pub mod raptors;
 pub mod squadron;
+pub mod cag;
 pub mod api;

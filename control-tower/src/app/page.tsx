@@ -8,7 +8,8 @@ import ViperCard       from '@/components/ViperCard';
 import TradesTable     from '@/components/TradesTable';
 import LlmAdvisorCard  from '@/components/LlmAdvisorCard';
 import OpenPositionsCard from '@/components/OpenPositionsCard';
-import { getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getPortfolioValue } from '@/lib/api';
+import SquadronsPanel  from '@/components/SquadronsPanel';
+import { getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getPortfolioValue, getSquadrons } from '@/lib/api';
 import type { DynamicConfig } from '@/lib/types';
 
 // Recharts must be loaded client-side only
@@ -143,6 +144,10 @@ export default function DashboardPage() {
   // Refresh every 30 s so the number stays fresh without hammering Polymarket CLOB.
   const { data: portfolio, isLoading: portfolioLoading } =
     useSWR('portfolio', getPortfolioValue, { refreshInterval: 30_000 });
+
+  // CAG squadron registry — refresh every 10 s to catch state transitions quickly.
+  const { data: squadrons, isLoading: squadronsLoading } =
+    useSWR('squadrons', getSquadrons, { refreshInterval: 10_000 });
 
   // ── Stats derived from P&L history ──────────────────────────────────────────
   const latestSnap  = pnl?.[0];
@@ -328,6 +333,15 @@ export default function DashboardPage() {
               {isConnected ? 'Loading config…' : 'API offline — start DRADIS first.'}
             </div>
           )}
+        </section>
+
+        {/* ── CAG Squadron Registry ─────────────────────────────────────── */}
+        <section>
+          <p className="label-muted mb-3">Squadron Registry</p>
+          <SquadronsPanel
+            squadrons={squadrons ?? []}
+            isLoading={squadronsLoading}
+          />
         </section>
 
         {/* ── Open Positions ────────────────────────────────────────────── */}

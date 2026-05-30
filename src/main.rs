@@ -38,7 +38,8 @@ use tracing::{info, warn, error, debug};
 use dradis::config;
 use dradis::state::{Position, StrategySignal, MarketConfig, MarketSnapshot, PositionMap};
 use dradis::vipers::time_decay_impl::TimeDecayPosition;
-use dradis::squadron::{Squadron, SquadronConfig, SquadronRaptors};
+use dradis::squadron::{Squadron, SquadronConfig, SquadronRaptors, CryptoAsset};
+use dradis::cag::Cag;
 use dradis::orchestrator::{StrategyRegistry, StrategyContext};
 use dradis::orchestrator::executor::{execute_strategies_concurrent, aggregate_and_resolve_signals};
 use dradis::helpers::dynamic_config::DynamicConfig;
@@ -245,6 +246,13 @@ async fn main() -> Result<()> {
     let safe_address = derive_safe_wallet(eoa_address, POLYGON).expect("Safe derivation failed");
     info!("Authenticated on Polymarket CLOB. Safe (Maker) address: {}", safe_address);
 
+    // ── Instantiate CAG (Phase 3e stub) ─────────────────────────────────────
+    // The CAG registry is created here and passed to the API server so
+    // GET /api/squadrons is live immediately.  Squadrons are registered into
+    // it via `cag.spawn_squadron(…, false)` inside the market_loop below
+    // (spawn_task=false: the existing loop still drives execution).
+    let cag = Cag::new();
+
     // ── Spawn Control Tower API server ───────────────────────────────────────
     // Spawned here (after safe_address is derived) so it can be passed to
     // the /api/positions/sync endpoint for on-demand chain reconciliation.
@@ -253,6 +261,7 @@ async fn main() -> Result<()> {
         config_rx.clone(),
         markets_rx,
         safe_address,
+        cag.clone(),
     ));
 
     let initial_nonce = fetch_next_nonce(&shared_http, safe_address).await.unwrap_or(0);
@@ -569,6 +578,7 @@ async fn main() -> Result<()> {
             no_fee_bps:        hourly_no_fee_rate,
         };
         let mut squadron = Squadron::new(
+            crypto_filter.parse::<CryptoAsset>().unwrap_or(CryptoAsset::Btc),
             SquadronConfig::full_wing(format!("Full Wing — {}", hourly_market_name)),
             hourly_market_config_for_squadron,
             SquadronRaptors::full(
@@ -580,6 +590,11 @@ async fn main() -> Result<()> {
         );
         squadron.start_patrol();
         info!("️  Squadron [{}] → state={}", squadron.id, squadron.state);
+
+        // ── Register with CAG (Phase 3e stub) ───────────────────────────────
+        // register() borrows — market_loop retains ownership and drives execution.
+        // The CAG tracks the squadron so GET /api/squadrons is live immediately.
+        let _squadron_id = cag.register(&squadron);
 
         // Cancellation flag for all WS tasks belonging to THIS market iteration.
         // When we rotate to a new market (inner loop break), we send `true` so old
