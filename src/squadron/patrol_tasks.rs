@@ -43,7 +43,7 @@ use crate::config;
 use crate::state::{MarketConfig, PriceState};
 use crate::helpers::{
     balance::*, orders::*,
-    notifications::send_notification, db,
+    notifications::send_notification, db, metrics,
 };
 
 // V2 CTF Exchange contracts — duplicated here so patrol_tasks is self-contained.
@@ -355,26 +355,62 @@ pub fn spawn_cleanup_task(
                                         vc, paired_id, Side::Buy, orphan.shares,
                                         buy_price, 0, OrderType::FAK, false, 0, &shared_http,
                                     ).await {
-                                        Ok(order_id) => {
-                                            rehedged = true;
-                                            info!(
-                                                "✅ ORPHAN RE-HEDGE: arb completed — both legs on-chain \
-                                                 (chain-sync will re-adopt; auto_settle handles redemption). \
-                                                 Buy order {}",
-                                                order_id,
-                                            );
-                                            let tok_o = tg_token.clone();
-                                            let cid_o = tg_chat_id.clone();
-                                            let sh_o = orphan.shares;
-                                            let cost_o = rehedge_cost;
-                                            tokio::spawn(async move {
-                                                let _ = send_notification(&tok_o, &cid_o, &format!(
-                                                    "♻️ Orphan re-hedged: bought {:.0} missing shares @ ${:.4} \
-                                                     (total arb cost ${:.4} → $1.00 payout at settle)",
-                                                    sh_o, paired_ask_ticked, cost_o,
-                                                )).await;
-                                            });
-                                        }
+                                                        Ok(order_id) => {
+                                                            rehedged = true;
+                                                            info!(
+                                                                "✅ ORPHAN RE-HEDGE: arb completed — both legs on-chain \
+                                                                 (chain-sync will re-adopt; auto_settle handles redemption). \
+                                                                 Buy order {}",
+                                                                order_id,
+                                                            );
+                                                            let tok_o = tg_token.clone();
+                                                            let cid_o = tg_chat_id.clone();
+                                                            let sh_o = orphan.shares;
+                                                            let cost_o = rehedge_cost;
+                                                            tokio::spawn(async move {
+                                                                let _ = send_notification(&tok_o, &cid_o, &format!(
+                                                                    "♻️ Orphan re-hedged: bought {:.0} missing shares @ ${:.4} \
+                                                                     (total arb cost ${:.4} → $1.00 payout at settle)",
+                                                                    sh_o, paired_ask_ticked, cost_o,
+                                                                )).await;
+                                                            });
+
+                                                            // Record the re-hedged fill to the entries log and open_positions
+                                                            // DB so that restarts correctly re-adopt the new leg as
+                                                            // ArbitrageStrategy instead of falling back to the stale
+                                                            // entries-table row from a prior GBoost/other trade.
+                                                            let rh_market = if paired_id == hourly_yes_token || paired_id == hourly_no_token {
+                                                                hourly_market_name.clone()
+                                                            } else {
+                                                                maker_market_config.as_ref()
+                                                                    .map(|mkc| mkc.market_name.clone())
+                                                                    .unwrap_or_else(|| hourly_market_name.clone())
+                                                            };
+                                                            let rh_side = if paired_id == hourly_yes_token
+                                                                || maker_market_config.as_ref().map_or(false, |mkc| mkc.yes_token == paired_id)
+                                                            { "YES" } else { "NO" };
+                                                            {
+                                                                let rh_tid = paired_id.to_string();
+                                                                let rh_mkt = rh_market.clone();
+                                                                let rh_sd  = rh_side.to_string();
+                                                                let rh_ep  = paired_ask_ticked;
+                                                                let rh_sh  = orphan.shares;
+                                                                tokio::spawn(async move {
+                                                                    metrics::record_entry(
+                                                                        "ArbitrageStrategy".to_string(),
+                                                                        rh_tid.clone(), rh_mkt.clone(), rh_sd.clone(),
+                                                                        rh_ep, rh_sh,
+                                                                    ).await;
+                                                                    if let Some(pool) = db::pool() {
+                                                                        db::record_open_position(
+                                                                            pool, "ArbitrageStrategy",
+                                                                            &rh_tid, &rh_mkt, &rh_sd,
+                                                                            rh_ep, rh_sh, false,
+                                                                        ).await;
+                                                                    }
+                                                                });
+                                                            }
+                                                        }
                                         Err(e) => warn!(
                                             "⚠️ ORPHAN RE-HEDGE: FAK buy failed: {} — falling back to sell", e
                                         ),

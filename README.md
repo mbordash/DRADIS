@@ -67,7 +67,7 @@ The system is organized around four BSG-inspired tactical layers:
 │  raptors/          ← Signal scouts (Binance WS + FAPI REST)         │
 │  vipers/           ← Trading strategies (6 Vipers)                  │
 │  squadron/         ← Deployment layer (Raptor+Viper+Market bundle)  │
-│  cag/              ← Commander Air Group (async dispatch, multi-asset)│
+│  cag/              ← Commander (async dispatch, multi-asset)        │
 │  orchestrator/     ← Strategy trait, registry, executor             │
 │  tasks/            ← Market monitor, cleanup, chain-sync            │
 │  helpers/          ← DB, orders, balance, metrics, notifications    │

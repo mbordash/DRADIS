@@ -91,7 +91,8 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
             market      TEXT    NOT NULL,
             side        TEXT    NOT NULL,
             entry_price TEXT    NOT NULL,
-            shares      TEXT    NOT NULL
+            shares      TEXT    NOT NULL,
+            session_id  TEXT    NOT NULL DEFAULT ''
         )"
     ).execute(pool).await?;
 
@@ -133,11 +134,25 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
         )"
     ).execute(pool).await?;
 
-    // Migration: add chain_adopted column to existing open_positions tables that pre-date this column.
+    // Migrations: add columns to existing open_positions tables that pre-date them.
     // ALTER TABLE ADD COLUMN is a no-op-safe operation in SQLite; IF NOT EXISTS is not supported
     // so we suppress the "duplicate column" error silently.
     let _ = sqlx::query(
         "ALTER TABLE open_positions ADD COLUMN chain_adopted INTEGER NOT NULL DEFAULT 0"
+    ).execute(pool).await;
+
+    // strategy: records which strategy owns the position (ArbitrageStrategy, GboostStrategy, etc.).
+    // Critical for correct restart reconciliation — without this column, lookup_open_position_strategy
+    // fails silently, causing the entries-table fallback to return the wrong strategy (cross-strategy
+    // interference bug where the arb NO leg gets mis-adopted under GboostStrategy on restart).
+    let _ = sqlx::query(
+        "ALTER TABLE open_positions ADD COLUMN strategy TEXT NOT NULL DEFAULT ''"
+    ).execute(pool).await;
+
+    // session_id: ties each row to the session that created it.
+    // Needed by adopt_chain_position (INSERT binds session_id) and by session-scoped queries.
+    let _ = sqlx::query(
+        "ALTER TABLE open_positions ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"
     ).execute(pool).await;
 
     // llm_recommendations: LLM Advisor analysis results persisted for the dashboard
@@ -196,6 +211,11 @@ async fn run_migrations(pool: &SqlitePool) {
         .execute(pool).await;
     // Add session_id to llm_recommendations
     let _ = sqlx::query("ALTER TABLE llm_recommendations ADD COLUMN session_id TEXT")
+        .execute(pool).await;
+
+    // Add session_id to entries so lookup_entry_db can prefer current-session rows,
+    // preventing cross-session strategy misattribution on restart reconciliation.
+    let _ = sqlx::query("ALTER TABLE entries ADD COLUMN session_id TEXT NOT NULL DEFAULT ''")
         .execute(pool).await;
 
     // Index for fast session-scoped queries
@@ -304,9 +324,10 @@ pub async fn record_entry_db(
     shares: Decimal,
 ) {
     let ts = Utc::now().to_rfc3339();
+    let sid = current_session_id();
     if let Err(e) = sqlx::query(
-        "INSERT INTO entries (ts, strategy, token_id, market, side, entry_price, shares)
-         VALUES (?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO entries (ts, strategy, token_id, market, side, entry_price, shares, session_id)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&ts)
     .bind(strategy)
@@ -315,6 +336,7 @@ pub async fn record_entry_db(
     .bind(side)
     .bind(entry_price.to_string())
     .bind(shares.to_string())
+    .bind(sid)
     .execute(pool)
     .await {
         error!("❌ DB entry write failed: {}", e);
@@ -330,9 +352,57 @@ pub async fn lookup_entry_price_db(pool: &SqlitePool, token_id_str: &str) -> Opt
 /// Like `lookup_entry_price_db` but also returns the originating strategy name.
 /// Used by the orphan-adoption reconciler so a restarted bot re-assigns positions
 /// to the strategy that originally opened them, not just the first in the registry.
+///
+/// Prefers entries from the **current session** to avoid cross-session strategy
+/// misattribution: if GboostStrategy traded a token in a prior session and
+/// ArbitrageStrategy bought the same token in the current session, the current-session
+/// entry (ArbitrageStrategy) is returned rather than the stale GboostStrategy row.
 pub async fn lookup_entry_db(pool: &SqlitePool, token_id_str: &str) -> Option<(Decimal, String)> {
+    let sid = current_session_id();
+
+    // 1. Try current session first — most authoritative, prevents cross-session contamination.
     let row = sqlx::query(
-        "SELECT entry_price, strategy FROM entries WHERE token_id = ? ORDER BY ts DESC LIMIT 1"
+        "SELECT entry_price, strategy FROM entries WHERE token_id = ? AND session_id = ? ORDER BY ts DESC LIMIT 1"
+    )
+    .bind(token_id_str)
+    .bind(sid)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten();
+
+    // 2. Fall back to any session (e.g. restart in the same session window, or entries
+    //    written before session_id column was added and have session_id = '').
+    let row = if row.is_some() { row } else {
+        sqlx::query(
+            "SELECT entry_price, strategy FROM entries WHERE token_id = ? ORDER BY ts DESC LIMIT 1"
+        )
+        .bind(token_id_str)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+    };
+
+    let row = row?;
+    let price = row.try_get::<String, _>(0).ok().and_then(|s| s.parse::<Decimal>().ok())?;
+    let strategy = row.try_get::<String, _>(1).ok().unwrap_or_default();
+    Some((price, strategy))
+}
+
+/// Look up the strategy and entry price for a token from the `open_positions` table.
+///
+/// This is the MOST AUTHORITATIVE source for restart reconciliation:
+///   - Written at position entry time with the exact strategy that owns the position.
+///   - NOT contaminated by prior-session trades on the same token by a different strategy.
+///   - Must be checked BEFORE the `entries` table in `lookup_entry_from_csv` to prevent
+///     cross-strategy misattribution (e.g. GboostStrategy's newer entry overriding an
+///     existing ArbitrageStrategy arb pair's NO leg).
+///
+/// Returns `None` if no row exists or the strategy field is empty.
+pub async fn lookup_open_position_strategy(pool: &SqlitePool, token_id_str: &str) -> Option<(Decimal, String)> {
+    let row = sqlx::query(
+        "SELECT entry_price, strategy FROM open_positions WHERE token_id = ? ORDER BY ts DESC LIMIT 1"
     )
     .bind(token_id_str)
     .fetch_optional(pool)
@@ -342,6 +412,7 @@ pub async fn lookup_entry_db(pool: &SqlitePool, token_id_str: &str) -> Option<(D
 
     let price = row.try_get::<String, _>(0).ok().and_then(|s| s.parse::<Decimal>().ok())?;
     let strategy = row.try_get::<String, _>(1).ok().unwrap_or_default();
+    if strategy.is_empty() { return None; }
     Some((price, strategy))
 }
 

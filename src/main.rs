@@ -296,15 +296,17 @@ async fn main() -> Result<()> {
         }
     }
 
-    // ── Startup: rebuild open_positions DB from on-chain state (LIVE mode only) ──
-    if !config::GHOST_MODE {
-        if let Some(pool) = db::pool() {
-            let purged = db::purge_all_live_open_positions(pool).await;
-            if purged > 0 {
-                info!("🗑️  Cleared {} stale live open_position row(s) from prior session(s)", purged);
-            }
-        }
-    }
+    // ── Startup: sync open_positions DB with on-chain state (LIVE mode only) ──
+    // NOTE: We intentionally do NOT call purge_all_live_open_positions here.
+    //
+    // The open_positions table is the authoritative source for strategy→token
+    // assignments during reconcile_orphaned_positions.  Wiping it before
+    // sync_open_positions_with_chain destroys the exact data needed to correctly
+    // re-assign a restarted position to the strategy that opened it.
+    //
+    // purge_stale_open_positions (called inside sync_open_positions_with_chain)
+    // already removes any rows whose tokens are no longer on-chain, which covers
+    // all the crash/orphan cases the blanket purge was originally intended to handle.
     info!("🔗 Syncing open_positions DB with on-chain holdings...");
     dradis::tasks::cleanup::sync_open_positions_with_chain(safe_address).await;
 

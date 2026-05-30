@@ -635,6 +635,23 @@ impl Squadron {
                                     if pm.contains_key(&(sn.clone(), other_token)) { debug!("⏳ ENTRY blocked — already hold opposite leg in same market [{}] — must exit first", sn); continue; }
                                 }
 
+                                // ── Cross-strategy token exclusion guard ──────────────────────────
+                                // Block entry if ANY other strategy already holds this token.
+                                // Prevents GboostStrategy (and other one-sided strategies) from
+                                // entering a token that ArbitrageStrategy holds as a hedged leg.
+                                // Without this guard:
+                                //   1. GboostStrategy enters NO while ArbitrageStrategy holds NO.
+                                //   2. GboostStrategy's entry is newer in the entries table.
+                                //   3. On restart, reconcile misattributes the NO leg to GboostStrategy.
+                                //   4. ArbitrageStrategy orphan-detection fires → re-hedge loop.
+                                {
+                                    let pm = positions.lock().await;
+                                    if pm.iter().any(|((other_sn, tid), _)| *tid == params.token_id && other_sn != &sn) {
+                                        debug!("⏳ ENTRY blocked [{}] — token {} already held by another strategy — cross-strategy interference guard", sn, params.token_id);
+                                        continue;
+                                    }
+                                }
+
                                 let pos_key = (sn.clone(), params.token_id);
 
                                 {

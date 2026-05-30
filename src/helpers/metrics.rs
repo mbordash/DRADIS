@@ -189,7 +189,26 @@ pub async fn record_entry(
 /// re-assign a restarted position to the CORRECT strategy instead of defaulting to
 /// whichever strategy happens to be first in the registry adoption order.
 pub async fn lookup_entry_from_csv(token_id_str: &str) -> Option<(Decimal, String)> {
-    // ── SQLite fast path ─────────────────────────────────────────────────────
+    // ── open_positions table (highest authority) ──────────────────────────────
+    // The open_positions table records the exact strategy that owns a position at
+    // entry time.  It is MORE authoritative than the entries table, which is an
+    // append-only log and can be contaminated by prior-session trades on the same
+    // token by a different strategy (e.g. GboostStrategy's newer entry overriding
+    // an ArbitrageStrategy arb pair's NO leg on restart).
+    //
+    // This check prevents the misattribution loop:
+    //   1. GboostStrategy enters NO token while ArbitrageStrategy holds it.
+    //   2. Bot restarts → entries table returns GboostStrategy (newer ts).
+    //   3. Arb YES is declared orphaned → re-hedge buys new NO.
+    //   4. GboostStrategy exits the new NO → naked YES exposure remains.
+    if let Some(pool) = db::pool() {
+        if let Some((price, strategy)) = db::lookup_open_position_strategy(pool, token_id_str).await {
+            info!("📦 DB: found open_position strategy={} entry_price={} for token {}", strategy, price, token_id_str);
+            return Some((price, strategy));
+        }
+    }
+
+    // ── entries table (secondary / fallback) ─────────────────────────────────
     if let Some(pool) = db::pool() {
         if let Some((price, strategy)) = db::lookup_entry_db(pool, token_id_str).await {
             info!("📦 DB: found entry_price={} strategy={} for token {}", price, strategy, token_id_str);
