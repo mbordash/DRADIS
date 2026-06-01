@@ -36,6 +36,7 @@ use dradis::config;
 use dradis::squadron::{SquadronRaptors};
 use dradis::cag::{Cag, SessionState, RunArgs, run_market_loop};
 use dradis::helpers::dynamic_config::DynamicConfig;
+use tokio_util::sync::CancellationToken;
 
 use dradis::helpers::{
     nonce::*,
@@ -379,6 +380,7 @@ async fn main() -> Result<()> {
         ));
 
         // ── Build RunArgs and spawn the market loop ───────────────────────────
+        let loop_cancel = CancellationToken::new();
         let args = RunArgs {
             cag:            cag.clone(),
             trading_client: Arc::clone(&trading_client),
@@ -400,16 +402,24 @@ async fn main() -> Result<()> {
             tw_access_token:       env::var("X_ACCESS_TOKEN").unwrap_or_default(),
             tw_access_token_secret: env::var("X_ACCESS_TOKEN_SECRET").unwrap_or_default(),
             process_heartbeat_secs: Arc::clone(&process_heartbeat_secs),
+            cancel:         loop_cancel.clone(),
         };
 
         info!("🚀 Spawning market loop for asset: {}", asset.to_uppercase());
-        loop_tasks.push(tokio::spawn(run_market_loop(args)));
+        let handle = tokio::spawn(run_market_loop(args));
+
+        // Register the AbortHandle + cancel token with the CAG so stand_down_asset()
+        // can gracefully exit or forcibly abort this loop at any time.
+        // main.rs retains the JoinHandle for awaiting; the CAG holds the AbortHandle.
+        cag.register_loop_task(asset, handle.abort_handle(), loop_cancel);
+        loop_tasks.push(handle);
     }
 
     // Block until ALL market loops exit (expected: never — each loops forever).
-    // If a loop task panics (e.g. unrecoverable error), log it and let the
-    // remaining assets continue.  The OS-thread watchdog will restart the
-    // entire process if the heartbeat goes silent for >300 s.
+    // The CAG owns AbortHandles for control; main.rs retains JoinHandles here
+    // for awaiting.  If a loop task panics, log it and let the remaining assets
+    // continue.  The OS-thread watchdog will restart the entire process if the
+    // heartbeat goes silent for >300 s.
     for task in loop_tasks {
         if let Err(e) = task.await {
             tracing::error!("❌ Market loop task exited unexpectedly: {:?}", e);

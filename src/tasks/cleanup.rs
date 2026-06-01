@@ -404,10 +404,14 @@ pub async fn cleanup_time_decay_positions(
 /// building the live-ID set; the hex format would never match and would cause
 /// every valid DB row to be wrongly purged on every tick.
 pub async fn sync_open_positions_with_chain(safe_address: Address) {
-    let pool = match db::pool() {
-        Some(p) => p,
-        None => { warn!("⚠️ Chain-sync: DB pool not available, skipping"); return; }
-    };
+    // Collect all per-asset pools.  The Data API returns wallet-wide positions
+    // regardless of which asset opened them, so we must sync EVERY asset DB —
+    // not just the primary — to keep secondary asset open_positions tables in sync.
+    let all_assets = db::available_assets();
+    if all_assets.is_empty() {
+        warn!("⚠️ Chain-sync: no DB pools available, skipping");
+        return;
+    }
 
     let data_client = DataClient::default();
     let req = PositionsRequest::builder().user(safe_address).build();
@@ -443,43 +447,56 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
     // Count redeemable positions so operators can see them in logs.
     let redeemable_count = live_positions.iter().filter(|p| p.redeemable).count();
 
-    // ── Purge stale DB rows ───────────────────────────────────────────────────
     let live_ids: HashSet<String> = live_map.keys().cloned().collect();
-    let purged = db::purge_stale_open_positions(pool, &live_ids).await;
 
-    // ── Re-adopt on-chain positions missing from DB ───────────────────────────
-    // Query current DB token_ids AFTER the purge so we don't re-adopt something
-    // that was just correctly removed.
-    let db_ids: HashSet<String> = sqlx::query_scalar::<_, String>(
-        "SELECT DISTINCT token_id FROM open_positions"
-    )
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default()
-    .into_iter()
-    .collect();
+    // ── Sync EVERY per-asset pool ─────────────────────────────────────────────
+    // Each asset stores its own open_positions rows in its own SQLite file.
+    // Fetch live_ids once (wallet-wide) and apply purge + adopt to every pool.
+    let mut total_purged = 0usize;
+    let mut total_adopted = 0usize;
+    for asset in &all_assets {
+        let pool = match db::pool_for(asset) {
+            Some(p) => p,
+            None    => continue,
+        };
 
-    let mut adopted = 0usize;
-    for (token_str, pos) in &live_map {
-        if !db_ids.contains(token_str) {
-            let side = pos.outcome.to_uppercase();
-            if db::adopt_chain_position(pool, token_str, &pos.title, &side, pos.avg_price, pos.size).await {
-                adopted += 1;
-                info!("📥 Chain-sync: re-adopted on-chain position — token {} | {} shares @ ${:.4} | \"{}\"",
-                    &token_str[..token_str.len().min(20)],
-                    pos.size, pos.avg_price, pos.title);
+        // Purge stale rows in this asset's DB.
+        total_purged += db::purge_stale_open_positions(&pool, &live_ids).await;
+
+        // Re-adopt on-chain positions missing from this asset's DB.
+        // Query AFTER the purge so we don't re-adopt something just removed.
+        let db_ids: HashSet<String> = sqlx::query_scalar::<_, String>(
+            "SELECT DISTINCT token_id FROM open_positions"
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+
+        for (token_str, pos) in &live_map {
+            if !db_ids.contains(token_str) {
+                let side = pos.outcome.to_uppercase();
+                if db::adopt_chain_position(&pool, token_str, &pos.title, &side, pos.avg_price, pos.size).await {
+                    total_adopted += 1;
+                    info!("📥 Chain-sync [{}]: re-adopted on-chain position — token {} | {} shares @ ${:.4} | \"{}\"",
+                        asset.to_uppercase(),
+                        &token_str[..token_str.len().min(20)],
+                        pos.size, pos.avg_price, pos.title);
+                }
             }
         }
     }
 
-    if purged > 0 {
-        info!("🧹 Chain-sync: purged {} stale open_positions row(s) (not found on-chain)", purged);
+    if total_purged > 0 {
+        info!("🧹 Chain-sync: purged {} stale open_positions row(s) across {} asset DB(s)", total_purged, all_assets.len());
     }
     if redeemable_count > 0 {
         info!("⏳ Chain-sync: skipped {} redeemable (settled) position(s) — auto_settle will handle redemption", redeemable_count);
     }
-    if purged == 0 && adopted == 0 {
-        info!("✅ Chain-sync: open_positions DB is in sync with on-chain holdings ({} live, {} redeemable)", live_map.len(), redeemable_count);
+    if total_purged == 0 && total_adopted == 0 {
+        info!("✅ Chain-sync: open_positions DB(s) in sync with on-chain holdings ({} live, {} redeemable, {} asset DB(s))",
+            live_map.len(), redeemable_count, all_assets.len());
     }
 }
 
@@ -736,23 +753,33 @@ async fn record_settled_arb_trade(
 /// Without this, the rows persist until the Polymarket Data API's indexer catches up
 /// (which can take minutes), and each chain-sync run during that window re-adopts
 /// them as active open positions — showing stale settled positions in the UI.
+///
+/// Iterates ALL per-asset pools so secondary assets (ETH, SOL, …) are also purged —
+/// a settled position originally entered via a non-primary asset loop would otherwise
+/// survive in its own DB file until the next chain-sync window.
 async fn purge_settled_legs(legs: &[polymarket_client_sdk_v2::data::types::response::Position]) {
-    let pool = match db::pool() {
-        Some(p) => p,
-        None    => return,
-    };
+    let all_assets = db::available_assets();
+    if all_assets.is_empty() { return; }
+
     for leg in legs {
         let token_str = leg.asset.to_string();
-        match sqlx::query("DELETE FROM open_positions WHERE token_id = ?")
-            .bind(&token_str)
-            .execute(pool)
-            .await
-        {
-            Ok(r) if r.rows_affected() > 0 => {
-                info!("🗑️  Auto-settle: purged open_positions row for redeemed token {} ({})",
-                      &token_str[..token_str.len().min(20)], leg.title);
+        for asset in &all_assets {
+            let pool = match db::pool_for(asset) {
+                Some(p) => p,
+                None    => continue,
+            };
+            match sqlx::query("DELETE FROM open_positions WHERE token_id = ?")
+                .bind(&token_str)
+                .execute(&pool)
+                .await
+            {
+                Ok(r) if r.rows_affected() > 0 => {
+                    info!("🗑️  Auto-settle [{}]: purged open_positions row for redeemed token {} ({})",
+                          asset.to_uppercase(),
+                          &token_str[..token_str.len().min(20)], leg.title);
+                }
+                _ => {}
             }
-            _ => {}
         }
     }
 }

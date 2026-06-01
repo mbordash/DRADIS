@@ -248,7 +248,7 @@ ASSETS=btc,eth,sol
 CRYPTO_FILTER=btc
 ```
 
-> The **primary asset** (first in `ASSETS`) owns the SQLite DB pool and the CAG session exposed by the REST API. Additional assets write metrics to per-asset CSV files. Per-asset DB pools are planned for a future phase.
+> Each asset owns its own SQLite DB file (`logs/btc-dradis.db`, `logs/eth-dradis.db`, etc.). The primary asset (first in `ASSETS`) also backs the default REST API view; pass `?asset=eth` query params to scope API responses to a specific asset pool.
 
 ---
 
@@ -376,10 +376,11 @@ tail -f logs/dradis-local.log
 # .env — run BTC, ETH, and SOL loops concurrently
 ASSETS=btc,eth,sol
 
-# Each asset gets its own DB file:
-#   logs/btc-dradis.db  (primary — also feeds the REST API / Control Tower)
-#   logs/eth-*.csv      (secondary assets — CSV metrics until Phase 3f-7)
-#   logs/sol-*.csv
+# Each asset gets its own SQLite DB file:
+#   logs/btc-dradis.db  (primary — default REST API / Control Tower view)
+#   logs/eth-dradis.db
+#   logs/sol-dradis.db
+# Use ?asset=eth on API endpoints to scope responses to a specific asset.
 ```
 
 Log filtering:
@@ -405,10 +406,21 @@ API health: `http://YOUR_SERVER_IP:9000/api/health`
 
 ### Recently shipped
 
+- **Phase 3f-7 — Per-asset SQLite DB pools** — Each asset in the fleet now owns its own SQLite file (`logs/btc-dradis.db`, `logs/eth-dradis.db`, etc.):
+  - `db::init_for_asset()` / `db::pool_for()` / `db::pool_for_opt()` replace the single global pool
+  - All hot-path writes (`record_open_position`, `close_open_position`, `record_trade_db`, etc.) scoped to the correct per-asset pool via `pool_for(&asset_lc)`
+  - `sync_open_positions_with_chain` and `purge_settled_legs` iterate ALL registered pools — secondary-asset DBs are fully reconciled on startup and after settlement
+  - API endpoints accept `?asset=` query param to scope trades, positions, P&L, and recommendations to any active asset pool
+- **Phase 3f-6 — CAG task ownership** — Per-asset `AssetTask { AbortHandle, CancellationToken }` registered in `CagInner`:
+  - `register_loop_task()`, `stand_down_asset()`, `loop_asset_names()` wired end-to-end
+  - `stand_down_all()` cancels + aborts every running asset loop
+  - `RunArgs.cancel` checked at the top of every `'market_loop` iteration
+  - `Cag::run()` stub deleted; `src/cag/mod.rs` carries accurate architecture docs
+- **OBI Swing Block gate** — `MOMENTUM_OBI_SWING_BLOCK` config constant now wired into all 6 Momentum entry paths (primary, strike-crossing, and no-strike for both bull and bear). Previously computed but never applied.
 - **Phase 3 — CAG (Commander Air Group)** — Async dispatch layer replacing the manual market-rotation loop:
   - `src/cag/` — `Cag`, `SessionState`, `RunArgs<P>`, `run_market_loop()`
   - `main.rs` reduced from ~730 lines to ~415 lines; full market loop lives in `cag/run.rs`
-  - **Multi-asset**: `ASSETS=btc,eth,sol` spawns one concurrent patrol loop per asset (independent raptors, session state, LLM advisor)
+  - **Multi-asset**: `ASSETS=btc,eth,sol` spawns one concurrent patrol loop per asset (independent raptors, session state, LLM advisor, SQLite DB)
   - Tokio runtime bumped to 8 worker threads; OS-thread watchdog added (5-minute silence → `process::exit(1)`)
   - Backward-compatible: `CRYPTO_FILTER=btc` (single-asset) still works unchanged
 - **Raptor / Viper / Squadron architecture** — Three-layer BSG tactical separation of concerns:
@@ -420,9 +432,8 @@ API health: `http://YOUR_SERVER_IP:9000/api/health`
 - **Side label fix** — `adopt_chain_position` correctly binds the Polymarket outcome string (was storing literal `?`)
 - **Viper hot-enable** — All Vipers always instantiated at startup; toggle any live from Control Tower with no restart
 
-### Phase 3f-7 (next)
-- Per-asset SQLite DB pools (secondary assets currently write CSV-only metrics)
-- Control Tower multi-asset selector (switch between BTC / ETH / SOL session views)
+### Next up
+- Control Tower multi-asset selector (switch between BTC / ETH / SOL session views in the dashboard)
 
 ### Medium-term
 - Static deployment profiles (`profiles.toml`) with per-profile P&L tracking
@@ -463,7 +474,7 @@ DRADIS_API_KEY=replace-with-a-strong-random-secret
 
 **Why Rust?** Fearless concurrency — evaluating six Vipers every 50ms needs a multi-threaded runtime with no GIL or GC pauses.
 
-**Can I trade multiple assets at once?** Yes — set `ASSETS=btc,eth,sol` in `.env`. Each asset runs its own independent patrol loop (raptors, session state, LLM advisor) inside a `tokio::spawn`ed task. The wallet, CLOB client, and API server are shared. The primary asset (first in the list) owns the SQLite DB and the Control Tower view; secondary assets write to per-asset CSV files until per-asset DB pools land in Phase 3f-7.
+**Can I trade multiple assets at once?** Yes — set `ASSETS=btc,eth,sol` in `.env`. Each asset runs its own independent patrol loop (raptors, session state, LLM advisor, SQLite DB) inside a `tokio::spawn`ed task. The wallet, CLOB client, and API server are shared. Each asset writes to its own DB file (`logs/btc-dradis.db`, `logs/eth-dradis.db`, etc.); pass `?asset=eth` to any API endpoint to scope results to that asset.
 
 **Why isn't the bot trading?** Check: (1) `GHOST_MODE` true? (2) High-fee market? (3) Thresholds too tight in `config.rs`? (4) No Window/Daily market for Maker/Arb/Basis?
 

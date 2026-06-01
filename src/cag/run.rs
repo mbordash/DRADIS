@@ -31,6 +31,7 @@ use crate::helpers::time::fetch_historical_strike_price;
 use crate::state::{MarketConfig, PriceState};
 use crate::tasks::market_monitor::{run_market_monitor, MarketState};
 use crate::squadron::{Squadron, SquadronConfig, SquadronRaptors, CryptoAsset, PatrolContext, MarketPriceFeeds};
+use tokio_util::sync::CancellationToken;
 
 // ─── RunArgs ──────────────────────────────────────────────────────────────────
 
@@ -75,6 +76,10 @@ pub struct RunArgs<P> {
     pub tw_access_token_secret: String,
     /// UNIX epoch seconds updated by the status task — read by the OS-thread watchdog.
     pub process_heartbeat_secs: Arc<AtomicU64>,
+    /// External cancellation token — fired by `Cag::stand_down_asset()` to
+    /// request a graceful exit of this asset's entire market-rotation loop.
+    /// Checked at the top of every `'market_loop` iteration before any I/O.
+    pub cancel: CancellationToken,
 }
 
 // ─── run_market_loop ──────────────────────────────────────────────────────────
@@ -120,6 +125,7 @@ where
         tw_access_token,
         tw_access_token_secret,
         process_heartbeat_secs,
+        cancel,
     } = args;
 
     // ── Sentinel price feeds — replaced on first WS subscription ─────────────
@@ -255,6 +261,14 @@ where
     // Restarts on every market rotation (market_rx.changed() fires inside
     // patrol()) or when the loop-watchdog forces a restart via patrol_cancel.
     'market_loop: loop {
+        // Check external cancellation token — fired by Cag::stand_down_asset().
+        // Checked first so a stand-down during bootstrap or fee-rate fetch is
+        // honoured immediately without waiting for the next I/O timeout.
+        if cancel.is_cancelled() {
+            info!("🛬  run_market_loop [{}]: cancellation token fired — exiting loop", crypto_filter.to_uppercase());
+            break 'market_loop;
+        }
+
         let (
             hourly_yes_token,
             hourly_no_token,

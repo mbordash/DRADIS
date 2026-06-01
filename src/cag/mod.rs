@@ -5,22 +5,40 @@
 /// separate async task; the CAG owns the registry and can spawn, query, and
 /// stand down individual squadrons at runtime.
 ///
-/// ┌────────────────────────────────────────────────────────────────┐
-/// │                           CAG                                  │
-/// │                                                                │
-/// │  Squadron registry  ──►  DashMap<SquadronId, CagEntry>        │
-/// │  sessions           ──►  HashMap<asset, SessionState> 3f-7    │
-/// │  run_market_loop()  ──►  register() + squadron.patrol()       │
-/// │  list_squadrons()   ──►  Vec<SquadronSummary> (for API/UI)     │
-/// │  stand_down()       ──►  fire CancellationToken for one squad  │
-/// └────────────────────────────────────────────────────────────────┘
+/// ┌──────────────────────────────────────────────────────────────────────┐
+/// │                              CAG                                     │
+/// │                                                                      │
+/// │  asset_tasks  ──►  DashMap<asset, AssetTask>                        │
+/// │                     • AbortHandle     — force-terminate the loop    │
+/// │                     • CancellationToken — graceful exit signal       │
+/// │                                                                      │
+/// │  registry     ──►  DashMap<SquadronId, CagEntry>                    │
+/// │                     squadron summaries (new entry each rotation)     │
+/// │                                                                      │
+/// │  sessions     ──►  HashMap<asset, SessionState>                     │
+/// │                     positions / P&L / collateral per asset           │
+/// │                                                                      │
+/// │  stand_down_asset()  ──►  cancel token + abort handle               │
+/// │  stand_down_all()    ──►  cancels every asset loop                  │
+/// └──────────────────────────────────────────────────────────────────────┘
 ///
-/// Phase 3f-7 (current):
-///   • `run_market_loop` in `run.rs` drives the full patrol lifecycle:
-///     it calls `cag.register(&squadron)` then loops calling
-///     `squadron.patrol(cancel, &mut ctx)` on each market rotation.
-///   • The CAG holds one `SessionState` per asset (keyed by slug).
-///   • All API data endpoints accept `?asset=` to query per-asset DBs.
+/// ## Architecture — asset vs. squadron ownership
+///
+/// `run_market_loop` (`run.rs`) is the real top-level lifecycle driver.
+/// `main.rs` is a thin bootstrapper that:
+///   1. Assembles `RunArgs` (clients, raptors, session state, cancel token).
+///   2. Calls `tokio::spawn(run_market_loop(args))` once per asset.
+///   3. Calls `cag.register_loop_task(asset, handle.abort_handle(), cancel)`
+///      so the CAG can gracefully or forcibly terminate any asset loop.
+///
+/// `run_market_loop` creates a fresh `Squadron` (new `SquadronId`) on every
+/// market rotation, so one loop task outlives many squadron IDs.  The
+/// `AbortHandle` therefore lives in `asset_tasks`, keyed by asset, not in
+/// any individual `CagEntry`.
+///
+/// `CagEntry._handle` is reserved for the Admiral Adama extension, where the
+/// CAG will directly spawn individual one-shot patrol tasks into user-chosen
+/// markets.  It is always `None` in the current architecture.
 
 pub mod session;
 pub use session::SessionState;
@@ -33,7 +51,7 @@ use std::sync::{Arc, RwLock};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use serde::{Deserialize, Serialize};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, AbortHandle};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -41,6 +59,20 @@ use crate::squadron::{Squadron, SquadronId, SquadronState, CryptoAsset};
 use crate::squadron::config::SquadronConfig;
 
 // ─── Types ────────────────────────────────────────────────────────────────────
+
+/// Per-asset loop task owned by the CAG.
+///
+/// One `AssetTask` is stored for every asset in the fleet (btc, eth, sol, …).
+/// It gives the CAG the ability to signal a graceful exit (via `cancel`) and,
+/// if the task has not exited, abort it outright (via `abort_handle.abort()`).
+///
+/// `AbortHandle` is used instead of `JoinHandle` because it is cheaply cloneable
+/// and does not require ownership of the task future.  `main.rs` retains the
+/// `JoinHandle` for awaiting; the CAG holds the `AbortHandle` for control.
+struct AssetTask {
+    abort_handle: AbortHandle,
+    cancel:       CancellationToken,
+}
 
 /// Lightweight, serialisable summary of a squadron — sent to the Control Tower UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,7 +127,12 @@ pub struct Cag {
 
 struct CagInner {
     registry: DashMap<SquadronId, CagEntry>,
-    /// Phase 3f-7: per-asset session map.  Key = lowercase asset symbol ("btc", "eth", …).
+    /// Per-asset loop tasks.  Key = lowercase asset symbol ("btc", "eth", …).
+    /// Populated by `register_loop_task()` immediately after `main.rs` spawns
+    /// each `run_market_loop` task.  Gives the CAG hard ownership of every
+    /// long-running patrol task for graceful/forced stand-down.
+    asset_tasks: DashMap<String, AssetTask>,
+    /// Per-asset session map.  Key = lowercase asset symbol ("btc", "eth", …).
     /// The first asset registered is the "primary" for backward-compat callers.
     /// `RwLock` allows concurrent reads from API handlers without blocking.
     sessions: RwLock<HashMap<String, SessionState>>,
@@ -106,8 +143,9 @@ impl Cag {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(CagInner {
-                registry: DashMap::new(),
-                sessions: RwLock::new(HashMap::new()),
+                registry:    DashMap::new(),
+                asset_tasks: DashMap::new(),
+                sessions:    RwLock::new(HashMap::new()),
             }),
         }
     }
@@ -123,7 +161,7 @@ impl Cag {
         let key = session.asset.clone();
         self.inner.sessions.write().expect("CAG sessions RwLock poisoned")
             .insert(key.clone(), session);
-        info!("🗄️  CAG: session state registered for asset {} (Phase 3f-7)", key);
+        info!("🗄️  CAG: session state registered for asset {}", key.to_uppercase());
     }
 
     /// Return a clone of the session for the given asset, or `None` if not yet set.
@@ -148,18 +186,62 @@ impl Cag {
         v
     }
 
+    // ── Asset loop task ownership ────────────────────────────────────────────
+
+    /// Register the `AbortHandle` and `CancellationToken` for a per-asset
+    /// `run_market_loop` task.
+    ///
+    /// Called from `main.rs` immediately after `tokio::spawn(run_market_loop(args))`.
+    /// `main.rs` retains the `JoinHandle` for awaiting; the CAG holds the
+    /// `AbortHandle` (cloneable, no ownership required) for control operations.
+    pub fn register_loop_task(&self, asset: &str, abort_handle: AbortHandle, cancel: CancellationToken) {
+        let key = asset.to_lowercase();
+        self.inner.asset_tasks.insert(key.clone(), AssetTask { abort_handle, cancel });
+        info!("✈️  CAG: loop task registered for asset {}", key.to_uppercase());
+    }
+
+    /// Stand down a single asset's market loop.
+    ///
+    /// Fires the `CancellationToken` first (gives `run_market_loop` a chance to
+    /// exit cleanly at the next `'market_loop` iteration boundary), then calls
+    /// `abort_handle.abort()` to guarantee termination even if the loop is
+    /// blocked on an I/O await.
+    ///
+    /// Returns `true` if the asset was found, `false` if unknown.
+    pub fn stand_down_asset(&self, asset: &str) -> bool {
+        let key = asset.to_lowercase();
+        if let Some(entry) = self.inner.asset_tasks.get(&key) {
+            entry.cancel.cancel();
+            entry.abort_handle.abort();
+            info!("🛬  CAG: stand-down signal + abort sent for asset {}", key.to_uppercase());
+            true
+        } else {
+            warn!("CAG: unknown asset '{}' — stand-down ignored", key);
+            false
+        }
+    }
+
+    /// Return the lowercase asset names of all registered loop tasks, sorted.
+    pub fn loop_asset_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.inner.asset_tasks.iter()
+            .map(|e| e.key().clone())
+            .collect();
+        v.sort();
+        v
+    }
+
     // ── Squadron management ──────────────────────────────────────────────────
 
-    /// **Phase 3e** — Register a squadron that is still owned and driven by the
-    /// existing `market_loop` in `main.rs`.  Borrows the squadron to build the
-    /// summary; the caller retains ownership so the loop can continue using it.
+    /// Register a squadron in the CAG summary registry.
     ///
-    /// The returned `SquadronId` can be used with `update_state()` and `remove()`
-    /// to keep the registry in sync as the market_loop transitions the squadron.
+    /// Borrows the squadron to build the summary; the caller (`run_market_loop`)
+    /// retains ownership so the patrol loop can continue using it.  The returned
+    /// `SquadronId` can be used with `update_state()`, `update_maker_market()`,
+    /// and `remove()` to keep the registry in sync across market rotations.
     pub fn register(&self, squadron: &Squadron) -> SquadronId {
         let id      = squadron.id.clone();
         let summary = SquadronSummary::from_squadron(squadron);
-        let cancel_token = CancellationToken::new(); // unused in Phase 3e but kept for API symmetry
+        let cancel_token = CancellationToken::new(); // reserved for Admiral Adama extension
 
         self.inner.registry.insert(id.clone(), CagEntry {
             summary,
@@ -167,19 +249,14 @@ impl Cag {
             _handle: None,
         });
 
-        info!(squadron = %id, "✈️  CAG: squadron registered (Phase 3e stub)");
+        info!(squadron = %id, "✈️  CAG: squadron registered");
         id
     }
 
-    /// **Reserved** — Take ownership of a Squadron and register it in the CAG.
-    ///
-    /// Currently behaves identically to `register()`: it adds the squadron to
-    /// the summary registry but does NOT spawn a patrol task.  The patrol
-    /// lifecycle is driven by `run_market_loop` in `run.rs`, which calls
-    /// `cag.register(&squadron)` then loops calling `squadron.patrol(…)`.
-    ///
-    /// A future phase may move task ownership here so the CAG can independently
-    /// restart or stand down individual squadrons via the cancellation token.
+    /// Reserved for the Admiral Adama extension — will spawn an individual
+    /// patrol task for a user-chosen market.  Currently behaves identically to
+    /// `register()`: adds the squadron to the summary registry but does NOT
+    /// spawn a patrol task.  The patrol lifecycle is driven by `run_market_loop`.
     pub fn spawn_squadron(&self, squadron: Squadron) -> SquadronId {
         let id      = squadron.id.clone();
         let summary = SquadronSummary::from_squadron(&squadron);
@@ -209,17 +286,27 @@ impl Cag {
         }
     }
 
-    /// Stand down ALL active squadrons (e.g. on SIGTERM).
+    /// Stand down ALL active squadrons and asset loops (e.g. on SIGTERM).
+    ///
+    /// Fires cancellation tokens on every registered squadron entry AND every
+    /// per-asset `run_market_loop` task, then aborts each loop task handle to
+    /// guarantee termination even if a loop is blocked on I/O.
     pub fn stand_down_all(&self) {
+        // Signal squadron-level cancel tokens (patrol watchdog path).
         for entry in self.inner.registry.iter() {
             entry.cancel_token.cancel();
         }
-        info!("🛬  CAG: stand-down signal broadcast to all squadrons");
+        // Cancel + abort every asset loop task.
+        for entry in self.inner.asset_tasks.iter() {
+            entry.cancel.cancel();
+            entry.abort_handle.abort();
+        }
+        info!("🛬  CAG: stand-down signal broadcast to all squadrons and asset loops");
     }
 
     /// Update the persisted state of a squadron in the registry summary.
     ///
-    /// Called by the tick-loop (Phase 3f) when a squadron transitions states.
+    /// Called by `run_market_loop` when a squadron transitions states.
     pub fn update_state(&self, id: &SquadronId, state: SquadronState) {
         if let Some(mut entry) = self.inner.registry.get_mut(id) {
             entry.summary.state = state.to_string();
@@ -264,17 +351,6 @@ impl Cag {
         self.inner.registry.len()
     }
 
-    // ── Phase 3f stub ────────────────────────────────────────────────────────
-
-    /// Drive the full CAG lifecycle: spawn all configured squadrons and wait
-    /// until a global cancellation token fires, then stand down all squadrons.
-    ///
-    /// **Phase 3f** — this replaces `main.rs`'s `'market_loop`.
-    /// Currently a stub that immediately returns.
-    pub async fn run(&self, _cancel: CancellationToken) {
-        // Phase 3f wiring pending — market_loop in main.rs still drives execution.
-        tracing::info!("🗼  CAG::run() stub — Phase 3f wiring pending");
-    }
 }
 
 impl Default for Cag {
@@ -286,8 +362,8 @@ impl Default for Cag {
 // ─── Builder ─────────────────────────────────────────────────────────────────
 
 /// Convenience builder for constructing a squadron config before handing it to
-/// the CAG.  Intended for use by both main.rs (Phase 3e) and the Control Tower
-/// API's `POST /api/squadrons` handler (Phase 3d).
+/// the CAG.  Used by `main.rs` and reserved for the future
+/// `POST /api/squadrons` handler (Admiral Adama extension).
 pub struct SquadronBuilder {
     pub asset:  CryptoAsset,
     pub config: SquadronConfig,

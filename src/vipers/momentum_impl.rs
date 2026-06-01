@@ -323,7 +323,7 @@ impl Strategy for MomentumStrategyImpl {
             if velocity > threshold && binance_price > (strike + strike_buffer)
                 && yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
                 && yes_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
-                && short_ok_bull && accel_ok_bull && !window_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !drift_blocks_bull
+                && short_ok_bull && accel_ok_bull && !window_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.yes_token, yes_ask, ctx.market.yes_fee_bps as u16),
@@ -332,7 +332,7 @@ impl Strategy for MomentumStrategyImpl {
             } else if velocity < -threshold && binance_price < (strike - strike_buffer)
                 && no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
                 && no_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
-                && short_ok_bear && accel_ok_bear && !window_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !drift_blocks_bear
+                && short_ok_bear && accel_ok_bear && !window_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.no_token, no_ask, ctx.market.no_fee_bps as u16),
@@ -344,7 +344,7 @@ impl Strategy for MomentumStrategyImpl {
             if velocity > threshold && binance_price > strike
                 && yes_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE
                 && yes_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
-                && short_ok_bull && accel_ok_bull && !window_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !drift_blocks_bull
+                && short_ok_bull && accel_ok_bull && !window_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.yes_token, yes_ask, ctx.market.yes_fee_bps as u16),
@@ -353,7 +353,7 @@ impl Strategy for MomentumStrategyImpl {
             } else if velocity < -threshold && binance_price < strike
                 && no_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE
                 && no_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
-                && short_ok_bear && accel_ok_bear && !window_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !drift_blocks_bear
+                && short_ok_bear && accel_ok_bear && !window_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.no_token, no_ask, ctx.market.no_fee_bps as u16),
@@ -366,7 +366,7 @@ impl Strategy for MomentumStrategyImpl {
             if velocity > threshold
                 && yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
                 && yes_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
-                && short_ok_bull && accel_ok_bull && !obi_blocks_bull && !obi_exhausted_bull && !drift_blocks_bull
+                && short_ok_bull && accel_ok_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.yes_token, yes_ask, ctx.market.yes_fee_bps as u16),
@@ -375,7 +375,7 @@ impl Strategy for MomentumStrategyImpl {
             } else if velocity < -threshold
                 && no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
                 && no_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
-                && short_ok_bear && accel_ok_bear && !obi_blocks_bear && !obi_exhausted_bear && !drift_blocks_bear
+                && short_ok_bear && accel_ok_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.no_token, no_ask, ctx.market.no_fee_bps as u16),
