@@ -29,7 +29,7 @@ use polymarket_client_sdk_v2::data::Client as DataClient;
 use polymarket_client_sdk_v2::data::types::request::PositionsRequest;
 use alloy::primitives::address as alloy_address;
 
-use crate::helpers::{db, send_notification, PhantomCooldowns};
+use crate::helpers::{db, metrics, send_notification, PhantomCooldowns};
 use crate::helpers::balance::OrphanTombstones;
 use crate::state::{Position, PositionMap};
 use crate::vipers::time_decay_impl::TimeDecayPosition;
@@ -612,6 +612,8 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
                     // Immediately purge open_positions DB rows for all legs in this condition
                     // so they don't linger during Data API indexer lag after redemption.
                     purge_settled_legs(&legs).await;
+                    // Record the settled arb trade so it appears in the Recent Trades card.
+                    record_settled_arb_trade(&legs).await;
                 }
                 Err(e) => {
                     warn!("Auto-settle: neg-risk redeem failed for condition {}: {}", condition_id, e);
@@ -645,6 +647,8 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
                     // Immediately purge open_positions DB rows for all legs in this condition
                     // so they don't linger during Data API indexer lag after redemption.
                     purge_settled_legs(&legs).await;
+                    // Record the settled arb trade so it appears in the Recent Trades card.
+                    record_settled_arb_trade(&legs).await;
                 }
                 Err(e) => {
                     warn!("Auto-settle: redeem failed for condition {}: {}", condition_id, e);
@@ -655,6 +659,75 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
     }
 
     settled_any
+}
+
+/// Record a combined settlement trade for an ArbitrageStrategy pair so it appears
+/// in the Recent Trades card.
+///
+/// Arb always holds equal YES + NO shares and collects $1.00 per pair at settlement
+/// regardless of which side wins.  We therefore record ONE combined row per condition:
+///
+///   entry_price = YES_avg_price + NO_avg_price  (total cost per YES+NO pair, in $)
+///   exit_price  = $1.00                          (guaranteed CTF payout per pair)
+///   shares      = min(YES_size, NO_size)          (number of complete pairs)
+///   pnl         = (1.00 − entry_price) × shares
+///   side        = "YES"                           (renders green in the UI)
+///   reason      = "Settlement (YES+NO → $1.00)"
+///
+/// If the condition has only one leg (e.g. an orphaned single-leg position that was
+/// adopted back in), we skip combined recording — there is no pair to settle.
+/// Single-leg positions settled by auto_settle are edge-cases handled by the orphan
+/// cleanup path instead.
+async fn record_settled_arb_trade(
+    legs: &[polymarket_client_sdk_v2::data::types::response::Position],
+) {
+    // Separate YES (outcome_index = 0) and NO (outcome_index = 1) legs.
+    let yes_leg = legs.iter().find(|p| p.outcome_index == 0);
+    let no_leg  = legs.iter().find(|p| p.outcome_index == 1);
+
+    let (yes_leg, no_leg) = match (yes_leg, no_leg) {
+        (Some(y), Some(n)) => (y, n),
+        _ => return, // single-leg — skip; not a complete arb pair
+    };
+
+    let yes_avg   = yes_leg.avg_price;
+    let no_avg    = no_leg.avg_price;
+    let yes_size  = yes_leg.size;
+    let no_size   = no_leg.size;
+    let pairs     = yes_size.min(no_size);
+
+    if pairs <= Decimal::ZERO || (yes_avg <= Decimal::ZERO && no_avg <= Decimal::ZERO) {
+        return; // nothing meaningful to record
+    }
+
+    let entry_per_pair = yes_avg + no_avg;
+    let pnl = (Decimal::ONE - entry_per_pair) * pairs;
+    let market_title = yes_leg.title.clone();
+
+    // Use the primary asset pool for the trade record.
+    // In a multi-asset setup this will always be the first-initialised asset (BTC),
+    // which is fine: arb currently only runs on the primary asset's markets.
+    let asset_str = db::available_assets()
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| "btc".to_string());
+
+    info!(
+        "📊 ArbitrageStrategy settlement recorded: \"{}\" | {} pairs @ entry ${:.4}/pair → pnl ${:.4}",
+        market_title, pairs, entry_per_pair, pnl
+    );
+
+    metrics::record_trade(
+        &asset_str,
+        "ArbitrageStrategy".to_string(),
+        market_title,
+        "YES".to_string(),      // renders green; arb is always long YES+NO → always a "win"
+        entry_per_pair,         // combined cost per YES+NO pair
+        Decimal::ONE,           // guaranteed $1.00 payout per pair at CTF settlement
+        pairs,
+        pnl,
+        "Settlement (YES+NO → $1.00)".to_string(),
+    ).await;
 }
 
 /// Purge `open_positions` DB rows for all token_ids in a just-redeemed condition.
