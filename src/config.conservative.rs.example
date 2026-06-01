@@ -130,6 +130,10 @@ pub const MOMENTUM_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.50);
 /// Conservative: 0.70 — tightest gate; mirrors GBOOST_OBI_EXHAUSTION_BLOCK conservative setting.
 pub const MOMENTUM_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.70);
 
+/// Maximum OBI swing allowed at Momentum entry.
+/// Conservative: 0.65 — strictest gate; blocks any significant book-side oscillation.
+pub const MOMENTUM_OBI_SWING_BLOCK: Decimal = dec!(0.65);
+
 /// 10-minute oracle drift alignment gate — blocks momentum entries that contradict the
 /// medium-term BTC trend (dead-cat bounce / relief-rally filter).
 /// Conservative: 1× threshold (-25/+25) — stricter; any contra-trend 5s spike is vetoed

@@ -124,6 +124,10 @@ pub const MOMENTUM_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.75);
 /// Aggressive: 0.80 — looser than balanced/conservative; only blocks near-fully exhausted books.
 pub const MOMENTUM_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.80);
 
+/// Maximum OBI swing allowed at Momentum entry.
+/// Aggressive: 0.95 — only blocks near-total book flips; allows higher-volatility entries.
+pub const MOMENTUM_OBI_SWING_BLOCK: Decimal = dec!(0.95);
+
 /// 10-minute oracle drift alignment gate — blocks momentum entries that contradict the
 /// medium-term BTC trend (dead-cat bounce / relief-rally filter).
 /// Aggressive: 3× threshold (-75/+75) — only vetoes extreme contra-trend moves.

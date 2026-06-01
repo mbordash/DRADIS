@@ -30,7 +30,7 @@ impl StrategyRegistry {
     /// enable or disable any of them during a running session via the Control Tower UI.
     pub fn create_all_strategies() -> Vec<Box<dyn Strategy>> {
         vec![
-            Box::new(MomentumStrategyImpl)           as Box<dyn Strategy>,
+            Box::new(MomentumStrategyImpl::new())      as Box<dyn Strategy>,
             Box::new(ArbitrageStrategyImpl)          as Box<dyn Strategy>,
             Box::new(TimeDecayStrategyImpl)          as Box<dyn Strategy>,
             Box::new(MakerStrategyImpl::new())       as Box<dyn Strategy>,
@@ -41,7 +41,7 @@ impl StrategyRegistry {
 
     /// Create only momentum strategy
     pub fn create_momentum() -> Box<dyn Strategy> {
-        Box::new(MomentumStrategyImpl)
+        Box::new(MomentumStrategyImpl::new())
     }
 
     /// Create only arbitrage strategy

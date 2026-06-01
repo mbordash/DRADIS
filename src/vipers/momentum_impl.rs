@@ -9,6 +9,7 @@ use anyhow::Result;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tracing::debug;
+use std::sync::Mutex;
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
@@ -16,7 +17,29 @@ use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
 use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
 
-pub struct MomentumStrategyImpl;
+/// Stateful Momentum strategy implementation.
+///
+/// `prev_yes_obi` / `prev_no_obi` track the previous tick's computed OBI so that
+/// the OBI-swing gate can detect sudden book-flip events between consecutive evaluations.
+/// Uses `std::sync::Mutex` (non-async) because the values are read/written atomically
+/// without any await points between lock acquisition and release.
+pub struct MomentumStrategyImpl {
+    prev_yes_obi: Mutex<Decimal>,
+    prev_no_obi:  Mutex<Decimal>,
+}
+
+impl MomentumStrategyImpl {
+    pub fn new() -> Self {
+        Self {
+            prev_yes_obi: Mutex::new(dec!(0)),
+            prev_no_obi:  Mutex::new(dec!(0)),
+        }
+    }
+}
+
+impl Default for MomentumStrategyImpl {
+    fn default() -> Self { Self::new() }
+}
 
 #[async_trait]
 impl Strategy for MomentumStrategyImpl {
@@ -201,7 +224,53 @@ impl Strategy for MomentumStrategyImpl {
                 no_obi, config::MOMENTUM_OBI_EXHAUSTION_BLOCK);
         }
 
-        // ── 10-minute oracle drift alignment gate ─────────────────────────────
+        // ── OBI oscillation gate ─────────────────────────────────────────────────
+        // When the YES OBI has been swinging wildly over the recent book ticks it
+        // means informed traders are actively sweeping both sides — an extremely
+        // unstable microstructure where momentum entries consistently reverse.
+        //
+        // Root cause of 2026-06-01 13:39 loss: 6 heartbeats before entry showed
+        // OBI_Y cycling: −0.82 → −0.88 → +0.57 → +0.61 → −0.42 → +0.52.
+        // The WS snapshot at entry had OBI_Y≈0.70+ (exhaustion) but the last
+        // heartbeat recorded only 0.52 — the rapid oscillation masked the true state.
+        //
+        // Gate: block entry when the absolute difference between the current OBI
+        // and the previous OBI snapshot exceeds MOMENTUM_OBI_SWING_BLOCK.  This
+        // detects in-progress sweep events where the book is repricing too fast
+        // for a safe directional entry.
+        let yes_total_depth_check = ctx.snapshot.yes_bid_depth + ctx.snapshot.yes_ask_depth;
+        let no_total_depth_check  = ctx.snapshot.no_bid_depth  + ctx.snapshot.no_ask_depth;
+        let cur_yes_obi = if yes_total_depth_check > dec!(0) {
+            (ctx.snapshot.yes_bid_depth - ctx.snapshot.yes_ask_depth) / yes_total_depth_check
+        } else { dec!(-1.0) };
+        let cur_no_obi = if no_total_depth_check > dec!(0) {
+            (ctx.snapshot.no_bid_depth - ctx.snapshot.no_ask_depth) / no_total_depth_check
+        } else { dec!(-1.0) };
+
+        // Read previous OBI and update atomically (non-async Mutex, no await held)
+        let (prev_yes_obi_val, prev_no_obi_val) = {
+            let mut py = self.prev_yes_obi.lock().unwrap();
+            let mut pn = self.prev_no_obi.lock().unwrap();
+            let old = (*py, *pn);
+            *py = cur_yes_obi;
+            *pn = cur_no_obi;
+            old
+        };
+
+        let yes_obi_swing = (cur_yes_obi - prev_yes_obi_val).abs();
+        let no_obi_swing  = (cur_no_obi  - prev_no_obi_val).abs();
+        if yes_obi_swing > config::MOMENTUM_OBI_SWING_BLOCK {
+            debug!(" Momentum OBI swing gate (BULL): swing={:.3} > block {:.3} — book unstable",
+                yes_obi_swing, config::MOMENTUM_OBI_SWING_BLOCK);
+        }
+        if no_obi_swing > config::MOMENTUM_OBI_SWING_BLOCK {
+            debug!(" Momentum OBI swing gate (BEAR): swing={:.3} > block {:.3} — book unstable",
+                no_obi_swing, config::MOMENTUM_OBI_SWING_BLOCK);
+        }
+        let obi_swing_blocks_bull = yes_obi_swing > config::MOMENTUM_OBI_SWING_BLOCK;
+        let obi_swing_blocks_bear = no_obi_swing  > config::MOMENTUM_OBI_SWING_BLOCK;
+
+        // ── 10-minute oracle drift alignment gate ─────────────────────────────────
         // A 5-second velocity spike that contradicts the 10-minute oracle trend
         // is a dead-cat bounce / relief rally, not a new directional move.
         // Root cause: 2026-05-27 15:24 loss — BTC had been declining for 10m
@@ -425,6 +494,45 @@ impl Strategy for MomentumStrategyImpl {
             {
                 let reason = format!("MomentumReversal: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100));
                 return Ok(StrategySignal::Exit { params: exit_params!(), reason, exit_pair: false });
+            }
+
+            // OBI exhaustion in-position exit
+            //
+            // When the book flips to exhaustion AFTER we enter (OBI > exhaustion_block
+            // for a YES position, or < −exhaustion_block for a NO position) it means
+            // all buyers have accumulated and a selling reversal is imminent.  If we
+            // are at or below breakeven, exit immediately rather than wait for the
+            // full stop-loss to hit.
+            //
+            // Root cause of 2026-06-01 13:39 loss: entry at $0.49 avg, 14 s later
+            // OBI_Y=0.85 (above exhaustion=0.70) at bid=$0.48 (−4%), but no exit
+            // path existed for this scenario.  The SL eventually fired at −8%
+            // ($0.06 worse than the OBI-detected reversal signal).
+            //
+            // Gate: only fires after fill_confirmed_at to avoid false exits during
+            // the 30s indexer-settle window.
+            if position.fill_confirmed_at.is_some() && profit_margin <= dec!(0) {
+                let yes_total_depth = ctx.snapshot.yes_bid_depth + ctx.snapshot.yes_ask_depth;
+                let no_total_depth  = ctx.snapshot.no_bid_depth  + ctx.snapshot.no_ask_depth;
+                let yes_obi = if yes_total_depth > dec!(0) {
+                    (ctx.snapshot.yes_bid_depth - ctx.snapshot.yes_ask_depth) / yes_total_depth
+                } else { dec!(-1.0) };
+                let no_obi = if no_total_depth > dec!(0) {
+                    (ctx.snapshot.no_bid_depth - ctx.snapshot.no_ask_depth) / no_total_depth
+                } else { dec!(-1.0) };
+
+                let obi_exhausted_in_pos =
+                    (is_yes  && yes_obi > config::MOMENTUM_OBI_EXHAUSTION_BLOCK) ||
+                    (!is_yes && no_obi  > config::MOMENTUM_OBI_EXHAUSTION_BLOCK);
+
+                if obi_exhausted_in_pos {
+                    let obi_val = if is_yes { yes_obi } else { no_obi };
+                    let reason = format!(
+                        "MomentumOBIExhaust: bid=${:.4}, obi={:.3}, profit={:.2}%",
+                        bid, obi_val, profit_margin * dec!(100)
+                    );
+                    return Ok(StrategySignal::Exit { params: exit_params!(), reason, exit_pair: false });
+                }
             }
         }
         Ok(StrategySignal::NoSignal)

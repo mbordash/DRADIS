@@ -201,6 +201,15 @@ impl DynamicConfig {
                         cfg.time_decay_stop_loss_pct = cfg.time_decay_stop_loss_pct
                             .min(config::TIME_DECAY_STOP_LOSS_PERCENT);
 
+                        // Momentum SL safety floor: a stale DB row (e.g. from when
+                        // MOMENTUM_STOP_LOSS_PERCENT was 8%) must never override a
+                        // code-tightened constant.  Root cause of 2026-06-01 13:39 loss
+                        // (-$0.6122): DB had 0.08 persisted while config.rs was 0.05 —
+                        // no safety floor let the old value survive, causing exits at
+                        // -8% instead of -5%.
+                        cfg.momentum_stop_loss_pct = cfg.momentum_stop_loss_pct
+                            .min(config::MOMENTUM_STOP_LOSS_PERCENT);
+
                         info!("⚙️  DynamicConfig loaded from SQLite (safety floors applied)");
 
                         // Record startup load in config_history so developers can see
