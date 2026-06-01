@@ -97,15 +97,21 @@ function AssetTabs({
 
 function PortfolioValueBanner({
   totalValue, collateral, positionsValue, unrealizedPnl,
-  positionCount, startingBal, ghostMode, pricesLive, isLoading,
+  positionCount, sessionPnl, ghostMode, pricesLive, isLoading,
 }: {
   totalValue: number; collateral: number; positionsValue: number;
-  unrealizedPnl: number; positionCount: number; startingBal: number;
+  unrealizedPnl: number; positionCount: number; sessionPnl: number;
   ghostMode?: boolean; pricesLive: boolean; isLoading: boolean;
 }) {
-  const delta      = totalValue - startingBal;
-  const deltaPct   = startingBal > 0 ? delta / startingBal : 0;
-  const isPositive = delta >= 0;
+  // The true session delta is realized P&L + unrealized P&L.
+  // This is correct whether or not positions were carried in from a prior session,
+  // because it does NOT assume the starting portfolio was just cash — it derives
+  // the starting portfolio value as (totalValue - delta) rather than using the
+  // raw collateral snapshot which omits the cost basis of any open positions.
+  const delta                = sessionPnl + unrealizedPnl;
+  const startingPortfolioVal = totalValue - delta;
+  const deltaPct             = startingPortfolioVal > 0 ? delta / startingPortfolioVal : 0;
+  const isPositive           = delta >= 0;
 
   return (
     <div className="card px-5 py-4 flex flex-col sm:flex-row sm:items-center gap-3 border border-indigo-500/20 bg-[#0d0d1a]">
@@ -127,7 +133,7 @@ function PortfolioValueBanner({
         <span className={`text-3xl font-mono font-bold tracking-tight ${isLoading ? 'text-gray-600' : 'text-white'}`}>
           {isLoading ? '——' : fmt$(totalValue)}
         </span>
-        {!isLoading && startingBal > 0 && (
+        {!isLoading && startingPortfolioVal > 0 && (
           <span className={`text-sm font-mono mt-0.5 ${isPositive ? 'text-green-400' : 'text-red-400'}`}>
             {isPositive ? '▲' : '▼'} {fmt$(Math.abs(delta))} ({fmtPct(Math.abs(deltaPct))}) vs session start
           </span>
@@ -311,7 +317,7 @@ export default function DashboardPage() {
           positionsValue={portfolioLoading ? 0 : parseFloat(portfolio?.positions_value ?? '0')}
           unrealizedPnl={portfolioLoading ? 0 : parseFloat(portfolio?.unrealized_pnl ?? '0')}
           positionCount={portfolio?.position_count ?? 0}
-          startingBal={startingBal}
+          sessionPnl={pnlLoading ? 0 : sessionPnl}
           ghostMode={config?.ghost_mode}
           pricesLive={portfolio?.prices_live ?? true}
           isLoading={portfolioLoading}
