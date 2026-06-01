@@ -3,16 +3,20 @@
 /// Endpoints
 /// ─────────────────────────────────────────────────────────────────────────────
 ///   GET    /api/health                — liveness check
+///   GET    /api/assets                — list of initialised asset pools (Phase 3f-7)
 ///   GET    /api/config                — current DynamicConfig as JSON
 ///   PATCH  /api/config               — JSON merge-patch; hot-reloads strategies
-///   GET    /api/pnl/history           — recent P&L snapshots  (?limit=200)
-///   GET    /api/trades                — recent completed trades (?limit=100)
-///   GET    /api/positions             — current open positions (all strategies, ghost+live)
+///   GET    /api/pnl/history           — recent P&L snapshots  (?limit=200&asset=btc)
+///   GET    /api/trades                — recent completed trades (?limit=100&asset=btc)
+///   GET    /api/positions             — current open positions (?asset=btc)
 ///   DELETE /api/positions/{token_id}  — purge a specific stale row from open_positions
 ///   POST   /api/positions/sync        — trigger immediate chain-sync against Polymarket wallet
-///   GET    /api/llm/recommendations   — recent LLM Advisor analyses (?limit=10)
+///   GET    /api/llm/recommendations   — recent LLM Advisor analyses (?limit=10&asset=btc)
 ///   GET    /api/squadrons             — list all active squadrons (Phase 3d)
 ///   GET    /api/squadrons/{id}        — get one squadron by id    (Phase 3d)
+///
+/// All data endpoints accept an optional `?asset=btc` query param (Phase 3f-7).
+/// When absent, the primary (first initialised) asset pool is used.
 ///
 /// The server binds to 0.0.0.0:$API_PORT (default 9000).
 /// CORS is open so the Next.js Control Tower on any port can reach it.
@@ -94,8 +98,11 @@ async fn require_api_key(
 
 // ─── Query params ─────────────────────────────────────────────────────────────
 
+
+/// Query params accepted by all data endpoints that support multi-asset views.
 #[derive(Deserialize)]
-struct LimitQuery {
+struct AssetQuery {
+    asset: Option<String>,
     limit: Option<i64>,
 }
 
@@ -105,6 +112,18 @@ struct LimitQuery {
 async fn health() -> &'static str {
     debug!("Received GET /api/health request");
     "ok"
+}
+
+/// GET /api/assets
+///
+/// Returns the list of asset symbols for which a SQLite pool has been
+/// initialised, sorted alphabetically.  The Control Tower uses this to
+/// populate the asset selector tabs.
+///
+/// Response: `["btc", "eth", "sol"]`
+async fn get_assets() -> Response {
+    debug!("Received GET /api/assets request");
+    Json(db::available_assets()).into_response()
 }
 
 /// GET /api/config
@@ -159,16 +178,16 @@ async fn patch_config(State(s): State<ApiState>, body: String) -> Response {
     }
 }
 
-/// GET /api/pnl/history?limit=200
+/// GET /api/pnl/history?limit=200&asset=btc
 ///
 /// Returns up to `limit` P&L snapshots, newest first.
 /// Each row: { ts, session_pnl, collateral }
-async fn get_pnl_history(Query(q): Query<LimitQuery>) -> Response {
+async fn get_pnl_history(Query(q): Query<AssetQuery>) -> Response {
     debug!("Received GET /api/pnl/history request with limit: {:?}", q.limit);
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
-    match db::pool() {
+    match db::pool_for_opt(q.asset.as_deref()) {
         Some(pool) => {
-            let history = db::get_pnl_history(pool, limit).await;
+            let history = db::get_pnl_history(&pool, limit).await;
             debug!("Successfully retrieved PNL history");
             Json(history).into_response()
         },
@@ -195,16 +214,16 @@ async fn get_status(State(s): State<ApiState>) -> Response {
     Json(StatusResponse { strategy_markets: markets }).into_response()
 }
 
-/// GET /api/trades?limit=100
+/// GET /api/trades?limit=100&asset=btc
 ///
 /// Returns up to `limit` completed trades, newest first.
 /// Each row: { ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason }
-async fn get_trades(Query(q): Query<LimitQuery>) -> Response {
+async fn get_trades(Query(q): Query<AssetQuery>) -> Response {
     debug!("Received GET /api/trades request with limit: {:?}", q.limit);
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
-    match db::pool() {
+    match db::pool_for_opt(q.asset.as_deref()) {
         Some(pool) => {
-            let trades = db::get_recent_trades(pool, limit).await;
+            let trades = db::get_recent_trades(&pool, limit).await;
             debug!("Successfully retrieved trades");
             Json(trades).into_response()
         },
@@ -215,16 +234,16 @@ async fn get_trades(Query(q): Query<LimitQuery>) -> Response {
     }
 }
 
-/// GET /api/positions
+/// GET /api/positions?asset=btc
 ///
 /// Returns all currently open positions for this session (inserted on entry, removed on exit).
 /// Covers all strategies and both ghost/live modes so the UI always has a complete picture
 /// of in-flight positions even before they appear as completed trades.
-async fn get_open_positions() -> Response {
+async fn get_open_positions(Query(q): Query<AssetQuery>) -> Response {
     debug!("Received GET /api/positions request");
-    match db::pool() {
+    match db::pool_for_opt(q.asset.as_deref()) {
         Some(pool) => {
-            let positions = db::get_open_positions(pool).await;
+            let positions = db::get_open_positions(&pool).await;
             Json(positions).into_response()
         },
         None => {
@@ -234,19 +253,12 @@ async fn get_open_positions() -> Response {
     }
 }
 
-/// DELETE /api/positions/{token_id}
+/// DELETE /api/positions/{token_id}?asset=btc
 ///
 /// Purges a specific row from `open_positions` by token_id (decimal U256 string).
-/// Use this to clear stale DB rows for positions that were already closed/settled
-/// on-chain — e.g. when the bot was stopped before `sync_open_positions_with_chain`
-/// ran, leaving behind rows for expired or redeemed markets.
-///
-/// This only removes the DB row — it does NOT place a sell order on the CLOB.
-/// To also sell an active (not-yet-settled) position, use the Polymarket UI or
-/// wait for the bot's automated exit logic to trigger.
-async fn delete_open_position(Path(token_id): Path<String>) -> Response {
+async fn delete_open_position(Path(token_id): Path<String>, Query(q): Query<AssetQuery>) -> Response {
     debug!("Received DELETE /api/positions/{}", token_id);
-    let pool = match db::pool() {
+    let pool = match db::pool_for_opt(q.asset.as_deref()) {
         Some(p) => p,
         None => {
             error!("Database pool not available for DELETE /api/positions");
@@ -255,7 +267,7 @@ async fn delete_open_position(Path(token_id): Path<String>) -> Response {
     };
     match sqlx::query("DELETE FROM open_positions WHERE token_id = ?")
         .bind(&token_id)
-        .execute(pool)
+        .execute(&pool)
         .await
     {
         Ok(r) if r.rows_affected() > 0 => {
@@ -293,15 +305,15 @@ async fn sync_positions(State(s): State<ApiState>) -> Response {
     (StatusCode::OK, Json(serde_json::json!({ "message": "Chain sync complete" }))).into_response()
 }
 
-/// GET /api/llm/recommendations?limit=10
+/// GET /api/llm/recommendations?limit=10&asset=btc
 ///
 /// Returns up to `limit` LLM Advisor analyses, newest first.
 /// Each row: { id, ts, model, trade_count, session_pnl, analysis }
-async fn get_llm_recommendations(Query(q): Query<LimitQuery>) -> Response {    debug!("Received GET /api/llm/recommendations request with limit: {:?}", q.limit);
+async fn get_llm_recommendations(Query(q): Query<AssetQuery>) -> Response {    debug!("Received GET /api/llm/recommendations request with limit: {:?}", q.limit);
     let limit = q.limit.unwrap_or(10).clamp(1, 50);
-    match db::pool() {
+    match db::pool_for_opt(q.asset.as_deref()) {
         Some(pool) => {
-            let recs = db::get_recent_llm_recommendations(pool, limit).await;
+            let recs = db::get_recent_llm_recommendations(&pool, limit).await;
             debug!("Successfully retrieved {} LLM recommendations", recs.len());
             Json(recs).into_response()
         },
@@ -383,8 +395,11 @@ pub async fn run_api_server(
     // /api/health is intentionally public — no API key required.
     // Docker HEALTHCHECK, load balancers, and uptime monitors all probe this
     // endpoint without credentials; gating it would mark every container unhealthy.
+    // /api/assets is also public — it contains no sensitive data and is queried
+    // by the Control Tower before authentication is established.
     let public_routes = Router::new()
-        .route("/api/health", get(health));
+        .route("/api/health", get(health))
+        .route("/api/assets", get(get_assets));
 
     // All other routes require X-API-Key when DRADIS_API_KEY is set.
     let protected_routes = Router::new()

@@ -28,8 +28,12 @@ pub struct TradeRecord {
 }
 
 /// Records a completed trade to a daily CSV file asynchronously in a 'logs' directory.
-/// Prefixes filename with CRYPTO_FILTER to avoid collision in multi-container setups.
+/// Prefixes filename with the asset symbol to avoid collision in multi-asset setups.
+///
+/// `asset` — lowercase crypto symbol, e.g. `"btc"`.  Drives both the CSV filename
+/// prefix and the SQLite pool selection so trades land in the correct asset DB.
 pub async fn record_trade(
+    asset: &str,
     strategy: String,
     market: String,
     side: String,
@@ -39,17 +43,16 @@ pub async fn record_trade(
     profit_usdc: Decimal,
     reason: String,
 ) {
-    // Pre-clone for SQLite dual-write — the CSV path moves these into TradeRecord
-    // inside the match arm so they are no longer accessible after the match.
     let db_strategy = strategy.clone();
     let db_market   = market.clone();
     let db_side     = side.clone();
     let db_reason   = reason.clone();
+    let db_asset    = asset.to_string();
     let now = Utc::now();
     // Use Eastern date for the filename so the daily log file matches
     // Polymarket's ET-based trading day (avoids the file rolling at 8PM ET / midnight UTC).
     let now_et = now.with_timezone(&Eastern);
-    let crypto = env::var("CRYPTO_FILTER").unwrap_or_else(|_| "unknown".to_string()).to_lowercase();
+    let crypto = asset.to_lowercase();
 
     // Ensure logs directory exists
     let log_dir = "logs";
@@ -116,19 +119,23 @@ pub async fn record_trade(
     }
 
     // ── SQLite dual-write ────────────────────────────────────────────────────
-    if let Some(pool) = db::pool() {
-        db::record_trade_db(pool, &db_strategy, &db_market, &db_side, entry_price, exit_price, shares, profit_usdc, &db_reason).await;
+    if let Some(pool) = db::pool_for(&db_asset) {
+        db::record_trade_db(&pool, &db_strategy, &db_market, &db_side, entry_price, exit_price, shares, profit_usdc, &db_reason).await;
     }
 }
 
 /// Records a position entry event to a daily entry-log CSV so that `reconcile_orphaned_positions`
 /// can recover real entry prices after a bot restart instead of falling back to the discount heuristic.
 ///
-/// File: logs/{crypto}-entries_{ET-date}.csv
+/// `asset` — lowercase crypto symbol, e.g. `"btc"`.  Drives CSV filename prefix
+/// and SQLite pool selection.
+///
+/// File: logs/{asset}-entries_{ET-date}.csv
 /// Columns: timestamp, strategy, token_id, market, side, entry_price, shares
 ///
 /// token_id is stored as its decimal string representation (same as U256::to_string()).
 pub async fn record_entry(
+    asset: &str,
     strategy: String,
     token_id: String,
     market: String,
@@ -138,7 +145,8 @@ pub async fn record_entry(
 ) {
     let now = Utc::now();
     let now_et = now.with_timezone(&Eastern);
-    let crypto = env::var("CRYPTO_FILTER").unwrap_or_else(|_| "unknown".to_string()).to_lowercase();
+    let crypto = asset.to_lowercase();
+    let db_asset_e = asset.to_string();
 
     let log_dir = "logs";
     if let Err(e) = create_dir_all(log_dir).await {
@@ -174,8 +182,8 @@ pub async fn record_entry(
     }
 
     // ── SQLite dual-write ────────────────────────────────────────────────────
-    if let Some(pool) = db::pool() {
-        db::record_entry_db(pool, &strategy, &token_id, &market, &side, entry_price, shares).await;
+    if let Some(pool) = db::pool_for(&db_asset_e) {
+        db::record_entry_db(&pool, &strategy, &token_id, &market, &side, entry_price, shares).await;
     }
 }
 
@@ -190,17 +198,8 @@ pub async fn record_entry(
 /// whichever strategy happens to be first in the registry adoption order.
 pub async fn lookup_entry_from_csv(token_id_str: &str) -> Option<(Decimal, String)> {
     // ── open_positions table (highest authority) ──────────────────────────────
-    // The open_positions table records the exact strategy that owns a position at
-    // entry time.  It is MORE authoritative than the entries table, which is an
-    // append-only log and can be contaminated by prior-session trades on the same
-    // token by a different strategy (e.g. GboostStrategy's newer entry overriding
-    // an ArbitrageStrategy arb pair's NO leg on restart).
-    //
-    // This check prevents the misattribution loop:
-    //   1. GboostStrategy enters NO token while ArbitrageStrategy holds it.
-    //   2. Bot restarts → entries table returns GboostStrategy (newer ts).
-    //   3. Arb YES is declared orphaned → re-hedge buys new NO.
-    //   4. GboostStrategy exits the new NO → naked YES exposure remains.
+    // Try the primary pool; for multi-asset the cleanup task routes DB reads
+    // through the asset-specific pool, but startup reconciliation uses the primary.
     if let Some(pool) = db::pool() {
         if let Some((price, strategy)) = db::lookup_open_position_strategy(pool, token_id_str).await {
             info!("📦 DB: found open_position strategy={} entry_price={} for token {}", strategy, price, token_id_str);
@@ -217,7 +216,11 @@ pub async fn lookup_entry_from_csv(token_id_str: &str) -> Option<(Decimal, Strin
     }
 
     // ── CSV fallback (legacy entries pre-SQLite) ──────────────────────────────
-    let crypto = env::var("CRYPTO_FILTER").unwrap_or_else(|_| "unknown".to_string()).to_lowercase();
+    // Use the primary asset name from available_assets() or fall back to CRYPTO_FILTER.
+    let crypto = db::available_assets().into_iter().next()
+        .or_else(|| env::var("CRYPTO_FILTER").ok())
+        .unwrap_or_else(|| "unknown".to_string())
+        .to_lowercase();
     let now_et = Utc::now().with_timezone(&Eastern);
 
     // Check today and yesterday in ET so a restart around midnight doesn't miss the entry.

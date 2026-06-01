@@ -9,18 +9,18 @@
 /// │                           CAG                                  │
 /// │                                                                │
 /// │  Squadron registry  ──►  DashMap<SquadronId, CagEntry>        │
-/// │  session            ──►  SessionState (Phase 3f-1)             │
-/// │  spawn_squadron()   ──►  tokio::spawn(Squadron::patrol())      │
+/// │  sessions           ──►  HashMap<asset, SessionState> 3f-7    │
+/// │  run_market_loop()  ──►  register() + squadron.patrol()       │
 /// │  list_squadrons()   ──►  Vec<SquadronSummary> (for API/UI)     │
 /// │  stand_down()       ──►  fire CancellationToken for one squad  │
-/// │  run()              ──►  Phase 3f — replaces market_loop       │
 /// └────────────────────────────────────────────────────────────────┘
 ///
-/// Phase 3e (current):  main.rs registers the single active squadron into
-///                      the CAG (market_loop still runs).
-/// Phase 3f-1:          CAG gains a `SessionState` field — all Arc-wrapped
-///                      session-scoped mutable state lives here.
-/// Phase 3f (cutover):  market_loop is removed; `Cag::run()` drives everything.
+/// Phase 3f-7 (current):
+///   • `run_market_loop` in `run.rs` drives the full patrol lifecycle:
+///     it calls `cag.register(&squadron)` then loops calling
+///     `squadron.patrol(cancel, &mut ctx)` on each market rotation.
+///   • The CAG holds one `SessionState` per asset (keyed by slug).
+///   • All API data endpoints accept `?asset=` to query per-asset DBs.
 
 pub mod session;
 pub use session::SessionState;
@@ -28,6 +28,7 @@ pub use session::SessionState;
 pub mod run;
 pub use run::{RunArgs, run_market_loop};
 
+use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -75,8 +76,9 @@ impl SquadronSummary {
 struct CagEntry {
     summary:      SquadronSummary,
     cancel_token: CancellationToken,
-    /// The join handle for the `Squadron::patrol()` task.
-    /// `None` until Phase 3f-5 wires PatrolContext into spawn_squadron().
+    /// Reserved for a future phase where the CAG directly owns and spawns the
+    /// patrol task.  Currently `None` — `run_market_loop` in `run.rs` drives
+    /// `squadron.patrol()` directly and manages task lifetime itself.
     _handle:      Option<JoinHandle<()>>,
 }
 
@@ -93,12 +95,10 @@ pub struct Cag {
 
 struct CagInner {
     registry: DashMap<SquadronId, CagEntry>,
-    /// Phase 3f-1: session-scoped mutable state bundle.
-    ///
-    /// `None` until `set_session()` is called from `main.rs` (after startup
-    /// balance is confirmed).  `Some` for the rest of the process lifetime.
+    /// Phase 3f-7: per-asset session map.  Key = lowercase asset symbol ("btc", "eth", …).
+    /// The first asset registered is the "primary" for backward-compat callers.
     /// `RwLock` allows concurrent reads from API handlers without blocking.
-    session: RwLock<Option<SessionState>>,
+    sessions: RwLock<HashMap<String, SessionState>>,
 }
 
 impl Cag {
@@ -107,30 +107,45 @@ impl Cag {
         Self {
             inner: Arc::new(CagInner {
                 registry: DashMap::new(),
-                session:  RwLock::new(None),
+                sessions: RwLock::new(HashMap::new()),
             }),
         }
     }
 
     // ── Session state ────────────────────────────────────────────────────────
 
-    /// Store the session state bundle in the CAG.
+    /// Store a session state bundle in the CAG, keyed by `session.asset`.
     ///
-    /// Called once from `main.rs` after `SessionState` is constructed.
-    /// The CAG then holds the canonical reference that API handlers and
-    /// (Phase 3f-3) squadron patrol tasks can clone from.
+    /// Called from `main.rs` for each asset in the fleet after `SessionState`
+    /// is constructed.  The CAG holds the canonical reference that API handlers
+    /// can clone from via `session_for_asset()`.
     pub fn set_session(&self, session: SessionState) {
-        *self.inner.session.write().expect("CAG session RwLock poisoned") = Some(session);
-        info!("🗄️  CAG: session state registered (Phase 3f-1)");
+        let key = session.asset.clone();
+        self.inner.sessions.write().expect("CAG sessions RwLock poisoned")
+            .insert(key.clone(), session);
+        info!("🗄️  CAG: session state registered for asset {} (Phase 3f-7)", key);
     }
 
-    /// Return a clone of the current session state, if one has been set.
+    /// Return a clone of the session for the given asset, or `None` if not yet set.
+    pub fn session_for_asset(&self, asset: &str) -> Option<SessionState> {
+        self.inner.sessions.read().expect("CAG sessions RwLock poisoned")
+            .get(&asset.to_lowercase()).cloned()
+    }
+
+    /// Return a clone of the **primary** (first registered) session, or `None`.
     ///
-    /// Returns `None` only during the brief startup window before
-    /// `set_session()` is called.  All long-running callers can safely
-    /// `.unwrap()` after startup completes.
+    /// Backward-compat accessor — callers that predate multi-asset support.
     pub fn session(&self) -> Option<SessionState> {
-        self.inner.session.read().expect("CAG session RwLock poisoned").clone()
+        self.inner.sessions.read().expect("CAG sessions RwLock poisoned")
+            .values().next().cloned()
+    }
+
+    /// Return the lowercase asset names of all registered sessions, sorted.
+    pub fn asset_names(&self) -> Vec<String> {
+        let guard = self.inner.sessions.read().expect("CAG sessions RwLock poisoned");
+        let mut v: Vec<String> = guard.keys().cloned().collect();
+        v.sort();
+        v
     }
 
     // ── Squadron management ──────────────────────────────────────────────────
@@ -156,27 +171,27 @@ impl Cag {
         id
     }
 
-    /// **Phase 3f** — Take ownership of a Squadron and register it in the CAG.
+    /// **Reserved** — Take ownership of a Squadron and register it in the CAG.
     ///
-    /// Phase 3f-5 will complete the wiring: pass a `PatrolContext` here and
-    /// `tokio::spawn(squadron.patrol(token, ctx))` as an independent task.
-    /// For now, this just registers without spawning (same as `register()`).
+    /// Currently behaves identically to `register()`: it adds the squadron to
+    /// the summary registry but does NOT spawn a patrol task.  The patrol
+    /// lifecycle is driven by `run_market_loop` in `run.rs`, which calls
+    /// `cag.register(&squadron)` then loops calling `squadron.patrol(…)`.
     ///
-    /// Returns the `SquadronId` assigned to this squadron.
+    /// A future phase may move task ownership here so the CAG can independently
+    /// restart or stand down individual squadrons via the cancellation token.
     pub fn spawn_squadron(&self, squadron: Squadron) -> SquadronId {
         let id      = squadron.id.clone();
         let summary = SquadronSummary::from_squadron(&squadron);
         let cancel_token = CancellationToken::new();
 
-        // Phase 3f-5: pass PatrolContext here and spawn squadron.patrol(token, ctx).
-        // For now: register only; main.rs drives patrol() via .await directly.
         self.inner.registry.insert(id.clone(), CagEntry {
             summary,
             cancel_token,
             _handle: None,
         });
 
-        info!(squadron = %id, "✈️  CAG: squadron registered via spawn_squadron (Phase 3f-5 wiring pending)");
+        info!(squadron = %id, "✈️  CAG: squadron registered via spawn_squadron");
         id
     }
 

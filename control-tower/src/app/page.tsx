@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback } from 'react';
+import { useCallback, useState } from 'react';
 import useSWR from 'swr';
 import dynamic from 'next/dynamic';
 
@@ -9,7 +9,7 @@ import TradesTable     from '@/components/TradesTable';
 import LlmAdvisorCard  from '@/components/LlmAdvisorCard';
 import OpenPositionsCard from '@/components/OpenPositionsCard';
 import SquadronsPanel  from '@/components/SquadronsPanel';
-import { getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getPortfolioValue, getSquadrons } from '@/lib/api';
+import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getPortfolioValue, getSquadrons } from '@/lib/api';
 import type { DynamicConfig } from '@/lib/types';
 
 // Recharts must be loaded client-side only
@@ -49,6 +49,48 @@ function GhostBanner({ ghost }: { ghost: boolean }) {
       <span><strong>GHOST MODE ACTIVE</strong> — orders are simulated, no real CLOB calls.</span>
     </div>
   ) : null;
+}
+
+// ── Asset selector tabs ───────────────────────────────────────────────────────
+
+const ASSET_EMOJI: Record<string, string> = {
+  btc: '₿',
+  eth: 'Ξ',
+  sol: '◎',
+};
+
+function AssetTabs({
+  assets,
+  selected,
+  onChange,
+}: {
+  assets: string[];
+  selected: string;
+  onChange: (a: string) => void;
+}) {
+  if (assets.length <= 1) return null;
+  return (
+    <div className="flex items-center gap-1">
+      {assets.map((a) => {
+        const active = a === selected;
+        return (
+          <button
+            key={a}
+            onClick={() => onChange(a)}
+            className={[
+              'flex items-center gap-1.5 text-xs font-mono px-3 py-1.5 rounded-lg border transition-colors',
+              active
+                ? 'bg-indigo-500/20 border-indigo-500/40 text-indigo-300'
+                : 'bg-[#13131f] border-[#1e1e32] text-gray-500 hover:border-gray-600 hover:text-gray-300',
+            ].join(' ')}
+          >
+            <span>{ASSET_EMOJI[a] ?? '◈'}</span>
+            <span>{a.toUpperCase()}</span>
+          </button>
+        );
+      })}
+    </div>
+  );
 }
 
 // ── Portfolio value banner ────────────────────────────────────────────────────
@@ -117,18 +159,31 @@ function PortfolioValueBanner({
 // ── Main page ─────────────────────────────────────────────────────────────────
 
 export default function DashboardPage() {
+  // ── Asset selector — populated from GET /api/assets on first load ───────────
+  const { data: availableAssets = [] } = useSWR('assets', getAssets, {
+    refreshInterval: 0,
+    revalidateOnFocus: false,
+    // Seed a sensible default while the request is in-flight
+    fallbackData: [],
+  });
+
+  // Active asset: default to first available or 'btc'.
+  const [selectedAsset, setSelectedAsset] = useState<string>('');
+  // Resolve the effective asset for API calls (empty string → primary pool).
+  const asset = selectedAsset || availableAssets[0] || '';
+
   const { data: config, mutate: refreshConfig, isLoading: configLoading } =
     useSWR('config', getConfig, { refreshInterval: 0, revalidateOnFocus: false });
 
   const { data: pnl, isLoading: pnlLoading } =
-    useSWR('pnl', () => getPnlHistory(200), { refreshInterval: 60_000 });
+    useSWR(['pnl', asset], () => getPnlHistory(200, asset), { refreshInterval: 60_000 });
 
   const { data: trades, isLoading: tradesLoading } =
-    useSWR('trades', () => getTrades(60), { refreshInterval: 15_000 });
+    useSWR(['trades', asset], () => getTrades(60, asset), { refreshInterval: 15_000 });
 
   // Open positions polled every 15s — same cadence as trades so the activity log stays fresh.
   const { data: openPositions, isLoading: positionsLoading } =
-    useSWR('positions', getOpenPositions, { refreshInterval: 15_000 });
+    useSWR(['positions', asset], () => getOpenPositions(asset), { refreshInterval: 15_000 });
 
   const { data: health } =
     useSWR('health', getHealth, { refreshInterval: 10_000 });
@@ -138,7 +193,7 @@ export default function DashboardPage() {
 
   // Poll every 5 minutes — recommendations only arrive every 30 min at most.
   const { data: llmRecs, isLoading: llmLoading } =
-    useSWR('llmRecs', () => getLlmRecommendations(10), { refreshInterval: 300_000 });
+    useSWR(['llmRecs', asset], () => getLlmRecommendations(10, asset), { refreshInterval: 300_000 });
 
   // Portfolio value: collateral + live mark-to-market on open positions.
   // Refresh every 30 s so the number stays fresh without hammering Polymarket CLOB.
@@ -183,7 +238,7 @@ export default function DashboardPage() {
               <span className="text-gray-400 text-sm font-medium">Control Tower</span>
             </div>
             <span className="hidden sm:inline text-xs bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 rounded px-2 py-0.5 font-mono">
-              v0.2.0
+              v0.3.0
             </span>
           </div>
 
@@ -193,7 +248,14 @@ export default function DashboardPage() {
           </div>
 
           {/* Right cluster */}
-          <div className="flex items-center gap-4">
+          <div className="flex items-center gap-3">
+            {/* Asset selector tabs (hidden when only one asset) */}
+            <AssetTabs
+              assets={availableAssets}
+              selected={asset}
+              onChange={setSelectedAsset}
+            />
+
             {/* API status */}
             <div className="flex items-center gap-1.5">
               <span className={`h-2 w-2 rounded-full ${isConnected ? 'bg-green-400 animate-pulse' : 'bg-red-500'}`} />
@@ -226,6 +288,21 @@ export default function DashboardPage() {
 
         {/* Ghost mode banner */}
         {config?.ghost_mode && <GhostBanner ghost />}
+
+        {/* Asset badge — shown when multi-asset mode is active */}
+        {availableAssets.length > 1 && (
+          <div className="flex items-center gap-2 text-xs font-mono text-indigo-400">
+            <span className="text-indigo-500/60">Viewing asset:</span>
+            <span className="bg-indigo-500/10 border border-indigo-500/20 rounded px-2 py-0.5">
+              {(ASSET_EMOJI[asset] ?? '◈') + ' ' + asset.toUpperCase()}
+            </span>
+            {availableAssets.length > 1 && (
+              <span className="text-gray-600">
+                ({availableAssets.length} assets active: {availableAssets.map(a => a.toUpperCase()).join(', ')})
+              </span>
+            )}
+          </div>
+        )}
 
         {/* ── Portfolio Value Banner ─────────────────────────────────── */}
         <PortfolioValueBanner
@@ -375,4 +452,3 @@ export default function DashboardPage() {
     </div>
   );
 }
-

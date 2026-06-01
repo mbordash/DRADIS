@@ -30,7 +30,19 @@ use crate::config;
 
 // ─── Shared pool ────────────────────────────────────────────────────────────
 
+/// Primary-asset pool — the first asset initialised owns this slot.
+/// Kept for backward-compat callers that use `pool()` without an asset key.
 static DB_POOL: OnceLock<SqlitePool> = OnceLock::new();
+
+/// Per-asset pool registry.  Key = lowercase asset symbol (e.g. "btc", "eth").
+/// Populated by `init_for_asset()` at startup; readable thereafter.
+static DB_POOLS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, SqlitePool>>> =
+    OnceLock::new();
+
+/// Convenience accessor for the per-asset pool map (lazy-initialised on first call).
+fn pools_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, SqlitePool>> {
+    DB_POOLS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
 
 /// The session ID for the current process lifetime.  Set once by `init_session()`
 /// and remains stable for the entire run.  Format: RFC-3339 timestamp so it is
@@ -42,9 +54,15 @@ pub fn current_session_id() -> &'static str {
     CURRENT_SESSION_ID.get().map(|s| s.as_str()).unwrap_or("unknown")
 }
 
-/// Initialize the SQLite connection pool and create schema.
-/// Must be called once at startup; subsequent calls are ignored.
-pub async fn init(path: &str) -> Result<()> {
+/// Initialize the SQLite connection pool for a specific asset and register it
+/// in the per-asset registry.
+///
+/// The **first** call designates that asset as the "primary" — `pool()` returns
+/// its pool for backward-compat callers (API handlers, cleanup tasks, etc.).
+/// Subsequent calls add additional asset pools without overwriting the primary.
+///
+/// `asset` should be a lowercase symbol, e.g. `"btc"`, `"eth"`, `"sol"`.
+pub async fn init_for_asset(asset: &str, path: &str) -> Result<()> {
     let url = format!("sqlite://{}?mode=rwc", path);
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
@@ -52,14 +70,65 @@ pub async fn init(path: &str) -> Result<()> {
         .await?;
     init_schema(&pool).await?;
     run_migrations(&pool).await;
-    DB_POOL.set(pool).map_err(|_| anyhow::anyhow!("DB pool already initialized"))?;
-    info!("📦 SQLite initialized: {}", path);
+
+    // Register in per-asset map.
+    pools_map().lock().unwrap().insert(asset.to_string(), pool.clone());
+
+    // First successful call → claim the primary-pool slot (subsequent calls
+    // return Err from OnceLock::set which we intentionally discard).
+    let _ = DB_POOL.set(pool);
+
+    info!("📦 SQLite initialized [{}]: {}", asset, path);
     Ok(())
 }
 
-/// Returns a reference to the shared pool, or None if not yet initialized.
+/// Backward-compat wrapper: initialises for a single asset, deriving the asset
+/// name from the file stem (e.g. `"logs/btc-dradis.db"` → `"btc"`).
+/// New code should call `init_for_asset` directly.
+pub async fn init(path: &str) -> Result<()> {
+    let asset = std::path::Path::new(path)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("primary")
+        .trim_end_matches("-dradis");
+    init_for_asset(asset, path).await
+}
+
+/// Returns a reference to the **primary** asset's pool (first initialised),
+/// or `None` if no pool has been initialised yet.
+///
+/// Use `pool_for(asset)` to retrieve a specific asset's pool.
 pub fn pool() -> Option<&'static SqlitePool> {
     DB_POOL.get()
+}
+
+/// Returns a clone of the pool for `asset`, or `None` if that asset has not
+/// been initialised.  `SqlitePool` is cheaply cloneable (Arc-backed).
+pub fn pool_for(asset: &str) -> Option<SqlitePool> {
+    pools_map().lock().ok()?.get(asset).cloned()
+}
+
+/// Resolve a pool by optional asset name.
+///
+/// * `Some(asset)` → look up the asset-specific pool.
+/// * `None` / empty string → return the primary pool (same as `pool()`).
+///
+/// Used by API handlers that accept an `?asset=` query parameter.
+pub fn pool_for_opt(asset: Option<&str>) -> Option<SqlitePool> {
+    match asset.filter(|s| !s.is_empty()) {
+        Some(a) => pool_for(a),
+        None    => DB_POOL.get().cloned(),
+    }
+}
+
+/// Return the lowercase asset names for all initialised pools, sorted
+/// alphabetically.  Used by `GET /api/assets` to tell the Control Tower
+/// which asset views are available.
+pub fn available_assets() -> Vec<String> {
+    let guard = pools_map().lock().unwrap();
+    let mut v: Vec<String> = guard.keys().cloned().collect();
+    v.sort();
+    v
 }
 
 // ─── Schema ─────────────────────────────────────────────────────────────────
@@ -232,18 +301,24 @@ async fn run_migrations(pool: &SqlitePool) {
 
 // ─── Session lifecycle ───────────────────────────────────────────────────────
 
-/// Create a new session row and set the process-lifetime session ID.
+/// Create a new session row in **all** initialised asset pools and set the
+/// process-lifetime session ID.
 ///
-/// Call once immediately after `db::init()`.  The session ID is the RFC-3339
-/// startup timestamp, making sessions human-readable and lexicographically
-/// sortable in any SQL query.
+/// Call once immediately after all `init_for_asset()` calls complete so every
+/// asset DB gets a session row for the same RFC-3339 startup timestamp.
 ///
 /// Returns the new session_id string.
 pub async fn init_session(note: Option<&str>) -> String {
     let session_id = Utc::now().to_rfc3339();
     let _ = CURRENT_SESSION_ID.set(session_id.clone());
 
-    if let Some(pool) = pool() {
+    // Collect all initialised pools so we can write a session row to each.
+    let all_pools: Vec<SqlitePool> = {
+        let guard = pools_map().lock().unwrap();
+        guard.values().cloned().collect()
+    };
+
+    for pool in &all_pools {
         let ts = session_id.clone();
         if let Err(e) = sqlx::query(
             "INSERT INTO sessions (session_id, started_at, note) VALUES (?, ?, ?)"
@@ -254,12 +329,14 @@ pub async fn init_session(note: Option<&str>) -> String {
         .execute(pool)
         .await {
             error!("❌ DB session init failed: {}", e);
-        } else {
-            info!("📅 Session started: {}", session_id);
         }
 
         // Also persist to config KV for easy lookup by UI components
         config_set(pool, "current_session_id", &session_id).await;
+    }
+
+    if !all_pools.is_empty() {
+        info!("📅 Session started: {} ({} asset DB(s))", session_id, all_pools.len());
     }
 
     session_id

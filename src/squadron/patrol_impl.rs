@@ -81,6 +81,7 @@ impl Squadron {
         let phantom_cooldowns     = ctx.session.phantom_cooldowns.clone();
         let orphan_tombstones     = ctx.session.orphan_tombstones.clone();
         let time_decay_positions  = ctx.session.time_decay_positions.clone();
+        let token_ownership       = ctx.session.token_ownership.clone();
 
         // Trading infrastructure
         let trading_client  = Arc::clone(&ctx.trading_client);
@@ -95,6 +96,8 @@ impl Squadron {
         let config_rx  = ctx.config_rx.clone();
         let markets_tx = Arc::clone(&ctx.markets_tx);
         let crypto_filter = ctx.crypto_filter.clone();
+        // Lowercase asset slug — used for per-asset DB pool lookups and metrics CSV naming.
+        let asset_lc = crypto_filter.to_lowercase();
 
         // Notification credentials
         let tg_token             = ctx.tg_token.clone();
@@ -203,6 +206,7 @@ impl Squadron {
             maker_market_config.clone(),
             tg_token.clone(),
             tg_chat_id.clone(),
+            asset_lc.clone(),
             peripheral_cancel.clone(),
         );
 
@@ -214,6 +218,7 @@ impl Squadron {
             no_price_rx.clone(),
             oracle_rx.clone(),
             Arc::clone(&process_heartbeat_secs),
+            asset_lc.clone(),
             peripheral_cancel.clone(),
         );
 
@@ -263,6 +268,33 @@ impl Squadron {
                 &mk_config.market_name, mk_config.market_close_time, &maker_token_bids, &adoption_order,
                 Some(&orphan_tombstones),
             ).await;
+        }
+
+        // ── Rebuild token ownership registry from the (now-reconciled) positions.
+        //
+        // This is the authoritative startup snapshot: any positions that were
+        // re-adopted by `reconcile_orphaned_positions` above are immediately
+        // reflected in the registry so the first strategy tick sees correct
+        // ownership information and cannot double-enter a reconciled token.
+        {
+            let map = positions.lock().await;
+            let mut ownership = token_ownership.lock().await;
+            ownership.clear();
+            for ((sn, tid), _) in map.iter() {
+                // first-write wins: if two entries disagree, the first one (by
+                // HashMap iteration order) is kept — reconcile already resolved
+                // priority so this is consistent.
+                ownership.entry(*tid).or_insert_with(|| sn.clone());
+            }
+            if !ownership.is_empty() {
+                info!(
+                    "🗺️  Token ownership registry rebuilt from {} reconciled position(s):",
+                    ownership.len()
+                );
+                for (tid, sn) in ownership.iter() {
+                    info!("     {} → {}", &tid.to_string()[..16], sn);
+                }
+            }
         }
 
         let mut consecutive_failures: u32 = 0;
@@ -508,34 +540,36 @@ impl Squadron {
                                     }
                                 }
 
-                                {
-                                    let re_m;
-                                    let rs_m;
-                                    let rc_m;
-                                    let pnl_m;
-
                                     {
-                                        let mut map = positions.lock().await;
-                                        if let Some(p) = map.remove(&pos_key) {
-                                            let actual_exit_price = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
-                                            let pnl = (actual_exit_price - p.avg_entry) * p.shares;
-                                            *total_pnl.lock().await += pnl;
+                                        let re_m;
+                                        let rs_m;
+                                        let rc_m;
+                                        let pnl_m;
 
-                                            re_m = p.avg_entry;
-                                            rs_m = p.shares;
-                                            rc_m = p.close_time;
-                                            pnl_m = pnl;
+                                        {
+                                            let mut map = positions.lock().await;
+                                            if let Some(p) = map.remove(&pos_key) {
+                                                let actual_exit_price = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
+                                                let pnl = (actual_exit_price - p.avg_entry) * p.shares;
+                                                *total_pnl.lock().await += pnl;
 
-                                            {
-                                                let sn_task = sn.clone(); let m_name = params.market_name.clone(); let sid = if tid == target_yes_token { "YES".to_string() } else { "NO".to_string() }; let rp = actual_exit_price; let r_m = reason.clone();
-                                                tokio::spawn(async move { metrics::record_trade(sn_task, m_name, sid, re_m, rp, rs_m, pnl_m, r_m).await; });
-                                            }
-                                            {
-                                                let sn_close = sn.clone(); let tid_close = tid.to_string();
-                                                tokio::spawn(async move { if let Some(pool) = db::pool() { db::close_open_position(pool, &sn_close, &tid_close).await; } });
-                                            }
-                                        } else { continue; }
-                                    }
+                                                re_m = p.avg_entry;
+                                                rs_m = p.shares;
+                                                rc_m = p.close_time;
+                                                pnl_m = pnl;
+
+                                                {
+                                                    let sn_task = sn.clone(); let m_name = params.market_name.clone(); let sid = if tid == target_yes_token { "YES".to_string() } else { "NO".to_string() }; let rp = actual_exit_price; let r_m = reason.clone(); let asset_t = asset_lc.clone();
+                                                    tokio::spawn(async move { metrics::record_trade(&asset_t, sn_task, m_name, sid, re_m, rp, rs_m, pnl_m, r_m).await; });
+                                                }
+                                                {
+                                                    let sn_close = sn.clone(); let tid_close = tid.to_string(); let asset_c = asset_lc.clone();
+                                                    tokio::spawn(async move { if let Some(pool) = db::pool_for(&asset_c) { db::close_open_position(&pool, &sn_close, &tid_close).await; } });
+                                                }
+                                            } else { continue; }
+                                        }
+                                        // Release token claim — position is fully closed.
+                                        token_ownership.lock().await.remove(&tid);
 
                                     if rs_m > dec!(0) && !config::GHOST_MODE {
                                         let ps = Arc::clone(&positions); let cl = Arc::clone(&trading_client); let tp = Arc::clone(&total_pnl); let m_name = params.market_name.clone();
@@ -579,15 +613,17 @@ impl Squadron {
                                             let other_bid = if other_tid == target_yes_token { exit_snap.yes_bid } else { exit_snap.no_bid };
                                             let other_fee_bps = if other_tid == target_yes_token { target_yes_fee_bps as u16 } else { target_no_fee_bps as u16 };
                                             let other_vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
-                                            if !config::GHOST_MODE { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, other_tid, Side::Sell, s, (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), other_fee_bps, OrderType::FAK, false, 0, &shared_http).await; }
-                                                let mut map = positions.lock().await; if let Some(p) = map.remove(&pk) { let actual_other_exit = (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnl = (actual_other_exit - p.avg_entry) * p.shares; paired_pnl = pnl; *total_pnl.lock().await += pnl;
+                                                if !config::GHOST_MODE { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, other_tid, Side::Sell, s, (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), other_fee_bps, OrderType::FAK, false, 0, &shared_http).await; }
+                                                    let mut map = positions.lock().await; if let Some(p) = map.remove(&pk) { let actual_other_exit = (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnl = (actual_other_exit - p.avg_entry) * p.shares; paired_pnl = pnl; *total_pnl.lock().await += pnl;
+                                                // Release paired token claim.
+                                                token_ownership.lock().await.remove(&other_tid);
                                                 {
-                                                    let sn_pm = sn.clone(); let m_name = params.market_name.clone(); let sid = if other_tid == target_yes_token { "YES".to_string() } else { "NO".to_string() }; let p_avg = p.avg_entry; let o_bid = actual_other_exit; let p_shares = p.shares; let pn = pnl;
-                                                    tokio::spawn(async move { metrics::record_trade(sn_pm, m_name, sid, p_avg, o_bid, p_shares, pn, "Convergence/PairedExit".to_string()).await; });
+                                                    let sn_pm = sn.clone(); let m_name = params.market_name.clone(); let sid = if other_tid == target_yes_token { "YES".to_string() } else { "NO".to_string() }; let p_avg = p.avg_entry; let o_bid = actual_other_exit; let p_shares = p.shares; let pn = pnl; let asset_t = asset_lc.clone();
+                                                    tokio::spawn(async move { metrics::record_trade(&asset_t, sn_pm, m_name, sid, p_avg, o_bid, p_shares, pn, "Convergence/PairedExit".to_string()).await; });
                                                 }
                                                 {
-                                                    let sn_cp = sn.clone(); let tid_cp = other_tid.to_string();
-                                                    tokio::spawn(async move { if let Some(pool) = db::pool() { db::close_open_position(pool, &sn_cp, &tid_cp).await; } });
+                                                    let sn_cp = sn.clone(); let tid_cp = other_tid.to_string(); let asset_c = asset_lc.clone();
+                                                    tokio::spawn(async move { if let Some(pool) = db::pool_for(&asset_c) { db::close_open_position(&pool, &sn_cp, &tid_cp).await; } });
                                                 }
                                             }
                                         }
@@ -635,19 +671,37 @@ impl Squadron {
                                     if pm.contains_key(&(sn.clone(), other_token)) { debug!("⏳ ENTRY blocked — already hold opposite leg in same market [{}] — must exit first", sn); continue; }
                                 }
 
-                                // ── Cross-strategy token exclusion guard ──────────────────────────
-                                // Block entry if ANY other strategy already holds this token.
-                                // Prevents GboostStrategy (and other one-sided strategies) from
-                                // entering a token that ArbitrageStrategy holds as a hedged leg.
-                                // Without this guard:
-                                //   1. GboostStrategy enters NO while ArbitrageStrategy holds NO.
-                                //   2. GboostStrategy's entry is newer in the entries table.
-                                //   3. On restart, reconcile misattributes the NO leg to GboostStrategy.
-                                //   4. ArbitrageStrategy orphan-detection fires → re-hedge loop.
+                                // ── Token sovereignty check ───────────────────────────────────────
+                                // O(1) registry lookup first; secondary positions scan as a
+                                // consistency guard in case the registry is momentarily behind.
+                                // Upgraded to WARN so cross-strategy interference is always visible
+                                // in production logs — previously this was a silent debug! drop.
+                                {
+                                    let ownership = token_ownership.lock().await;
+                                    if let Some(existing_owner) = ownership.get(&params.token_id) {
+                                        if existing_owner != &sn {
+                                            warn!(
+                                                "🚫 TOKEN SOVEREIGNTY [{}]: token {} already claimed by {} \
+                                                 — entry rejected (registry hit)",
+                                                sn, &params.token_id.to_string()[..16], existing_owner,
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
+                                // Secondary scan: catches the rare case where the registry hasn't
+                                // been updated yet (e.g. a position was just inserted by a paired
+                                // entry in the same tick) and another strategy is scanning the same
+                                // positions map concurrently (shouldn't happen in the single-threaded
+                                // tick loop, but belt-and-suspenders).
                                 {
                                     let pm = positions.lock().await;
                                     if pm.iter().any(|((other_sn, tid), _)| *tid == params.token_id && other_sn != &sn) {
-                                        debug!("⏳ ENTRY blocked [{}] — token {} already held by another strategy — cross-strategy interference guard", sn, params.token_id);
+                                        warn!(
+                                            "🚫 TOKEN SOVEREIGNTY [{}]: token {} held by another strategy \
+                                             (registry miss — positions scan fallback)",
+                                            sn, params.token_id,
+                                        );
                                         continue;
                                     }
                                 }
@@ -659,15 +713,16 @@ impl Squadron {
                                     if let Some(expiry) = pending.get(&pos_key) { if expiry > &Instant::now() { continue; } }
                                 }
 
-                                if config::GHOST_MODE {
+                                    if config::GHOST_MODE {
                                     if positions.lock().await.contains_key(&pos_key) { continue; }
                                     let pos_close_time = target_market_close_time;
                                     let actual_entry_price = if params.post_only { params.price } else { (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE) };
                                     positions.lock().await.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: params.token_id, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id) });
+                                    token_ownership.lock().await.insert(params.token_id, sn.clone());
                                     let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" };
                                     info!("👻 GHOST_MODE ENTRY {} [{}]: {} | ${:.4} x {:.1} (simulated)", side_g, sn, params.market_name, params.price, params.shares);
-                                    { let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" }; let sn_g = sn.clone(); let tid_g = params.token_id.to_string(); let mn_g = params.market_name.clone(); let side_gs = side_g.to_string(); let ep_g = actual_entry_price; let sh_g = params.shares; tokio::spawn(async move { metrics::record_entry(sn_g, tid_g, mn_g, side_gs, ep_g, sh_g).await; }); }
-                                    if let Some(pool) = db::pool() { let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" }; db::record_open_position(pool, &sn, &params.token_id.to_string(), &params.market_name, side_g, actual_entry_price, params.shares, true).await; }
+                                    { let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" }; let sn_g = sn.clone(); let tid_g = params.token_id.to_string(); let mn_g = params.market_name.clone(); let side_gs = side_g.to_string(); let ep_g = actual_entry_price; let sh_g = params.shares; let asset_g = asset_lc.clone(); tokio::spawn(async move { metrics::record_entry(&asset_g, sn_g, tid_g, mn_g, side_gs, ep_g, sh_g).await; }); }
+                                    if let Some(pool) = db::pool_for(&asset_lc) { let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" }; db::record_open_position(&pool, &sn, &params.token_id.to_string(), &params.market_name, side_g, actual_entry_price, params.shares, true).await; }
                                     if let Some(pp) = pair_params {
                                         let pp_close_time = target_market_close_time;
                                         let actual_paired_entry_price = if pp.post_only {
@@ -676,10 +731,11 @@ impl Squadron {
                                             (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE)
                                         };
                                         positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: actual_paired_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: Some(params.token_id) });
+                                        token_ownership.lock().await.insert(pp.token_id, sn.clone());
                                         let side_gp = if pp.token_id == target_yes_token { "YES" } else { "NO" };
                                         info!("👻 GHOST_MODE ENTRY {} (paired) [{}]: {} | ${:.4} x {:.1} (simulated)", side_gp, sn, pp.market_name, pp.price, pp.shares);
-                                        { let side_gp = if pp.token_id == target_yes_token { "YES" } else { "NO" }; let sn_gp = sn.clone(); let tid_gp = pp.token_id.to_string(); let mn_gp = pp.market_name.clone(); let side_gps = side_gp.to_string(); let ep_gp = actual_paired_entry_price; let sh_gp = pp.shares; tokio::spawn(async move { metrics::record_entry(sn_gp, tid_gp, mn_gp, side_gps, ep_gp, sh_gp).await; }); }
-                                        if let Some(pool) = db::pool() { let side_gp = if pp.token_id == target_yes_token { "YES" } else { "NO" }; db::record_open_position(pool, &sn, &pp.token_id.to_string(), &pp.market_name, side_gp, actual_paired_entry_price, pp.shares, true).await; }
+                                        { let side_gp = if pp.token_id == target_yes_token { "YES" } else { "NO" }; let sn_gp = sn.clone(); let tid_gp = pp.token_id.to_string(); let mn_gp = pp.market_name.clone(); let side_gps = side_gp.to_string(); let ep_gp = actual_paired_entry_price; let sh_gp = pp.shares; let asset_gp = asset_lc.clone(); tokio::spawn(async move { metrics::record_entry(&asset_gp, sn_gp, tid_gp, mn_gp, side_gps, ep_gp, sh_gp).await; }); }
+                                        if let Some(pool) = db::pool_for(&asset_lc) { let side_gp = if pp.token_id == target_yes_token { "YES" } else { "NO" }; db::record_open_position(&pool, &sn, &pp.token_id.to_string(), &pp.market_name, side_gp, actual_paired_entry_price, pp.shares, true).await; }
                                     }
                                     last_trade_time.insert(sn.clone(), Instant::now());
                                 } else {
@@ -689,6 +745,10 @@ impl Squadron {
                                         let pos_close_time = target_market_close_time;
                                         map.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: params.token_id, fill_confirmed_at: None, paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id) });
                                     }
+                                    // Claim token in ownership registry immediately — prevents any
+                                    // concurrent strategy tick from racing into the same token
+                                    // between this insert and the order placement below.
+                                    token_ownership.lock().await.insert(params.token_id, sn.clone());
                                     { pending_orders.lock().await.insert(pos_key.clone(), Instant::now() + Duration::from_secs(3)); }
                                     info!("🟢 ENTRY [{}]: {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares);
                                     let primary_baseline = {
@@ -733,6 +793,12 @@ impl Squadron {
                                                 warn!("⚠️ Arb batch entry FAILED [{}]: {} — no orders placed", sn, e);
                                                 positions.lock().await.remove(&pos_key);
                                                 pending_orders.lock().await.remove(&pos_key);
+                                                // Release both token claims — order was never sent.
+                                                {
+                                                    let mut own = token_ownership.lock().await;
+                                                    own.remove(&params.token_id);
+                                                    own.remove(&pp.token_id);
+                                                }
                                                 last_trade_time.insert(sn.clone(), Instant::now());
                                                 consecutive_failures += 1; continue;
                                             }
@@ -740,28 +806,30 @@ impl Squadron {
                                                 let primary_wait_secs = if target_yes_token == hourly_yes_token { crate::helpers::balance::MAX_WAIT_SECS_HOURLY } else { crate::helpers::balance::MAX_WAIT_SECS_WINDOW };
                                                 let cl_s = Arc::clone(&trading_client); let ps_s = Arc::clone(&positions); let pc_s = Arc::clone(&phantom_cooldowns); let sn_s = sn.clone(); let tn_s = params.token_id;
                                                 let db_sn_a = sn.clone(); let db_tid_a = params.token_id.to_string(); let db_mn_a = params.market_name.clone();
-                                                let db_side_a = if params.token_id == target_yes_token { "YES" } else { "NO" }; let db_ep_a = actual_entry_price; let db_sh_a = params.shares;
+                                                let db_side_a = if params.token_id == target_yes_token { "YES" } else { "NO" }; let db_ep_a = actual_entry_price; let db_sh_a = params.shares; let asset_a = asset_lc.clone();
                                                 tokio::spawn(async move {
                                                     if sync_position_balance(&cl_s, &ps_s, &sn_s, tn_s, Some(&pc_s), primary_baseline, primary_wait_secs).await.is_ok() {
-                                                        if let Some(pool) = db::pool() { db::record_open_position(pool, &db_sn_a, &db_tid_a, &db_mn_a, db_side_a, db_ep_a, db_sh_a, false).await; }
+                                                        if let Some(pool) = db::pool_for(&asset_a) { db::record_open_position(&pool, &db_sn_a, &db_tid_a, &db_mn_a, db_side_a, db_ep_a, db_sh_a, false).await; }
                                                     }
                                                 });
 
-                                                let pp_close_time = target_market_close_time;
-                                                positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: actual_pair_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: None, paired_leg_token_id: Some(params.token_id) });
+                                        let pp_close_time = target_market_close_time;
+                                        positions.lock().await.insert((sn.clone(), pp.token_id), Position { shares: pp.shares, avg_entry: actual_pair_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id, fill_confirmed_at: None, paired_leg_token_id: Some(params.token_id) });
+                                        // Claim paired token in registry.
+                                        token_ownership.lock().await.insert(pp.token_id, sn.clone());
 
                                                 let pair_wait_secs = if pp.token_id == hourly_yes_token || pp.token_id == hourly_no_token { crate::helpers::balance::MAX_WAIT_SECS_HOURLY } else { crate::helpers::balance::MAX_WAIT_SECS_WINDOW };
                                                 let sn_p = sn.clone(); let tn_p = pp.token_id; let ps_p = Arc::clone(&positions); let cl_p = Arc::clone(&trading_client); let pc_p = Arc::clone(&phantom_cooldowns);
                                                 let db_sn_b = sn.clone(); let db_tid_b = pp.token_id.to_string(); let db_mn_b = pp.market_name.clone();
-                                                let db_side_b = if pp.token_id == target_yes_token { "YES" } else { "NO" }; let db_ep_b = actual_pair_entry_price; let db_sh_b = pp.shares;
+                                                let db_side_b = if pp.token_id == target_yes_token { "YES" } else { "NO" }; let db_ep_b = actual_pair_entry_price; let db_sh_b = pp.shares; let asset_b = asset_lc.clone();
                                                 tokio::spawn(async move {
                                                     if sync_position_balance(&cl_p, &ps_p, &sn_p, tn_p, Some(&pc_p), pair_baseline, pair_wait_secs).await.is_ok() {
-                                                        if let Some(pool) = db::pool() { db::record_open_position(pool, &db_sn_b, &db_tid_b, &db_mn_b, db_side_b, db_ep_b, db_sh_b, false).await; }
+                                                        if let Some(pool) = db::pool_for(&asset_b) { db::record_open_position(&pool, &db_sn_b, &db_tid_b, &db_mn_b, db_side_b, db_ep_b, db_sh_b, false).await; }
                                                     }
                                                 });
 
-                                                { let sn_e = sn.clone(); let tid_e = params.token_id.to_string(); let mn_e = params.market_name.clone(); let side_e = if params.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_e = actual_entry_price; let sh_e = params.shares; tokio::spawn(async move { metrics::record_entry(sn_e, tid_e, mn_e, side_e, ep_e, sh_e).await; }); }
-                                                { let sn_eb = sn.clone(); let tid_eb = pp.token_id.to_string(); let mn_eb = pp.market_name.clone(); let side_eb = if pp.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_eb = actual_pair_entry_price; let sh_eb = pp.shares; tokio::spawn(async move { metrics::record_entry(sn_eb, tid_eb, mn_eb, side_eb, ep_eb, sh_eb).await; }); }
+                                                { let sn_e = sn.clone(); let tid_e = params.token_id.to_string(); let mn_e = params.market_name.clone(); let side_e = if params.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_e = actual_entry_price; let sh_e = params.shares; let asset_e = asset_lc.clone(); tokio::spawn(async move { metrics::record_entry(&asset_e, sn_e, tid_e, mn_e, side_e, ep_e, sh_e).await; }); }
+                                                { let sn_eb = sn.clone(); let tid_eb = pp.token_id.to_string(); let mn_eb = pp.market_name.clone(); let side_eb = if pp.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_eb = actual_pair_entry_price; let sh_eb = pp.shares; let asset_eb = asset_lc.clone(); tokio::spawn(async move { metrics::record_entry(&asset_eb, sn_eb, tid_eb, mn_eb, side_eb, ep_eb, sh_eb).await; }); }
 
                                                 {
                                                     let arb_cl = Arc::clone(&trading_client); let arb_nm = Arc::clone(&nonce_manager); let arb_sg = signer.clone(); let arb_ps = Arc::clone(&positions); let arb_pc = Arc::clone(&phantom_cooldowns); let arb_sn = sn.clone(); let arb_http = shared_http.clone();
@@ -769,11 +837,12 @@ impl Squadron {
                                                     let arb_side_a = if params.token_id == target_yes_token { "YES" } else { "NO" }.to_string();
                                                     let arb_side_b = if pp.token_id == target_yes_token { "YES" } else { "NO" }.to_string();
                                                     let arb_wait = primary_wait_secs.max(pair_wait_secs);
+                                                    let arb_asset = asset_lc.clone();
                                                     tokio::spawn(async move {
                                                         crate::helpers::balance::arb_pair_fill_monitor(
                                                             arb_cl, arb_nm, arb_sg, safe_address, eoa_address, vc, vc_p,
                                                             arb_ps, arb_pc, arb_sn, arb_tok_a, arb_tok_b,
-                                                            arb_base_a, arb_base_b, arb_side_a, arb_side_b, arb_wait, arb_http,
+                                                            arb_base_a, arb_base_b, arb_side_a, arb_side_b, arb_wait, arb_http, arb_asset,
                                                         ).await;
                                                     });
                                                 }
@@ -781,20 +850,20 @@ impl Squadron {
                                         }
                                     } else {
                                         let leg_a_order_id = match place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, params.token_id, Side::Buy, params.shares, actual_entry_price, target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await {
-                                            Err(e) => { warn!("⚠️ ENTRY order failed [{}]: {}", sn, e); positions.lock().await.remove(&pos_key); pending_orders.lock().await.remove(&pos_key); last_trade_time.insert(sn.clone(), Instant::now()); consecutive_failures += 1; continue; }
+                                            Err(e) => { warn!("⚠️ ENTRY order failed [{}]: {}", sn, e); positions.lock().await.remove(&pos_key); pending_orders.lock().await.remove(&pos_key); token_ownership.lock().await.remove(&params.token_id); last_trade_time.insert(sn.clone(), Instant::now()); consecutive_failures += 1; continue; }
                                             Ok(id) => id,
                                         };
                                         let _ = leg_a_order_id;
                                         let cl_s = Arc::clone(&trading_client); let ps_s = Arc::clone(&positions); let pc_s = Arc::clone(&phantom_cooldowns); let sn_s = sn.clone(); let tn_s = params.token_id;
                                         let primary_wait_secs = if target_yes_token == hourly_yes_token { crate::helpers::balance::MAX_WAIT_SECS_HOURLY } else { crate::helpers::balance::MAX_WAIT_SECS_WINDOW };
                                         let db_sn_s = sn.clone(); let db_tid_s = params.token_id.to_string(); let db_mn_s = params.market_name.clone();
-                                        let db_side_s = if params.token_id == target_yes_token { "YES" } else { "NO" }; let db_ep_s = actual_entry_price; let db_sh_s = params.shares;
+                                        let db_side_s = if params.token_id == target_yes_token { "YES" } else { "NO" }; let db_ep_s = actual_entry_price; let db_sh_s = params.shares; let asset_s = asset_lc.clone();
                                         tokio::spawn(async move {
                                             if sync_position_balance(&cl_s, &ps_s, &sn_s, tn_s, Some(&pc_s), primary_baseline, primary_wait_secs).await.is_ok() {
-                                                if let Some(pool) = db::pool() { db::record_open_position(pool, &db_sn_s, &db_tid_s, &db_mn_s, db_side_s, db_ep_s, db_sh_s, false).await; }
+                                                if let Some(pool) = db::pool_for(&asset_s) { db::record_open_position(&pool, &db_sn_s, &db_tid_s, &db_mn_s, db_side_s, db_ep_s, db_sh_s, false).await; }
                                             }
                                         });
-                                        { let sn_e = sn.clone(); let tid_e = params.token_id.to_string(); let mn_e = params.market_name.clone(); let side_e = if params.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_e = actual_entry_price; let sh_e = params.shares; tokio::spawn(async move { metrics::record_entry(sn_e, tid_e, mn_e, side_e, ep_e, sh_e).await; }); }
+                                        { let sn_e = sn.clone(); let tid_e = params.token_id.to_string(); let mn_e = params.market_name.clone(); let side_e = if params.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_e = actual_entry_price; let sh_e = params.shares; let asset_e = asset_lc.clone(); tokio::spawn(async move { metrics::record_entry(&asset_e, sn_e, tid_e, mn_e, side_e, ep_e, sh_e).await; }); }
                                     }
                                     last_trade_time.insert(sn.clone(), Instant::now());
                                     { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = format!("🟢 ENTRY [{}] {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
@@ -816,6 +885,7 @@ impl Squadron {
                                         if !positions.lock().await.contains_key(&pk) {
                                             info!("📝 MakerQuote [{}]: {} | shares={:.2}, bid=${:.4}", sn, p.market_name, p.shares, p.price);
                                             positions.lock().await.insert(pk.clone(), Position { shares: p.shares, avg_entry: p.price, opened_at: Utc::now(), close_time: None, market_name: p.market_name.clone(), pair_token_id: p.token_id, fill_confirmed_at: None, paired_leg_token_id: None });
+                                            token_ownership.lock().await.insert(p.token_id, sn.clone());
                                             { pending_orders.lock().await.insert(pk.clone(), Instant::now() + Duration::from_secs(3)); }
                                             let _ = tokio::time::timeout(Duration::from_secs(10), crate::helpers::balance::quick_confirm_fill(&trading_client, &sn, p.token_id, &positions, &p.condition_id, p.order_type.clone())).await;
                                             let vc = if p.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
@@ -825,7 +895,7 @@ impl Squadron {
                                             }
                                             let cl_m = Arc::clone(&trading_client); let ps_m = Arc::clone(&positions); let pc_m = Arc::clone(&phantom_cooldowns); let sn_m = sn.clone();
                                             tokio::spawn(async move { let _ = sync_position_balance(&cl_m, &ps_m, &sn_m, p.token_id, Some(&pc_m), dec!(0), crate::helpers::balance::MAX_WAIT_SECS_WINDOW).await; });
-                                            { let sn_em = sn.clone(); let tid_em = p.token_id.to_string(); let mn_em = p.market_name.clone(); let side_em = if p.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_em = p.price; let sh_em = p.shares; tokio::spawn(async move { metrics::record_entry(sn_em, tid_em, mn_em, side_em, ep_em, sh_em).await; }); }
+                                            { let sn_em = sn.clone(); let tid_em = p.token_id.to_string(); let mn_em = p.market_name.clone(); let side_em = if p.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_em = p.price; let sh_em = p.shares; let asset_em = asset_lc.clone(); tokio::spawn(async move { metrics::record_entry(&asset_em, sn_em, tid_em, mn_em, side_em, ep_em, sh_em).await; }); }
                                         }
                                         placed = true;
                                     }

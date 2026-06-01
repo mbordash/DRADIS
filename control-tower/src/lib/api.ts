@@ -8,7 +8,22 @@ import type { DynamicConfig, PnlSnapshotRow, TradeRow, OpenPositionRow, LlmRecom
 //   DRADIS_API_URL (http://dradis-btc:9000) inside the Docker network.
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
 
+// ── Helpers ───────────────────────────────────────────────────────────────────
+
+/** Append ?asset=<a> to a URL if `asset` is non-empty. */
+function withAsset(url: string, asset?: string): string {
+  if (!asset) return url;
+  const sep = url.includes('?') ? '&' : '?';
+  return `${url}${sep}asset=${encodeURIComponent(asset.toLowerCase())}`;
+}
+
 // ── Fetchers (used as SWR keys + fetch functions) ────────────────────────────
+
+export async function getAssets(): Promise<string[]> {
+  const res = await fetch(`${BASE}/api/assets`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/assets → ${res.status}`);
+  return res.json();
+}
 
 export async function getConfig(): Promise<DynamicConfig> {
   const res = await fetch(`${BASE}/api/config`, { cache: 'no-store' });
@@ -27,20 +42,23 @@ export async function patchConfig(patch: Partial<DynamicConfig>): Promise<Dynami
   return res.json();
 }
 
-export async function getPnlHistory(limit = 200): Promise<PnlSnapshotRow[]> {
-  const res = await fetch(`${BASE}/api/pnl/history?limit=${limit}`, { cache: 'no-store' });
+export async function getPnlHistory(limit = 200, asset?: string): Promise<PnlSnapshotRow[]> {
+  const url = withAsset(`${BASE}/api/pnl/history?limit=${limit}`, asset);
+  const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/pnl/history → ${res.status}`);
   return res.json();
 }
 
-export async function getTrades(limit = 60): Promise<TradeRow[]> {
-  const res = await fetch(`${BASE}/api/trades?limit=${limit}`, { cache: 'no-store' });
+export async function getTrades(limit = 60, asset?: string): Promise<TradeRow[]> {
+  const url = withAsset(`${BASE}/api/trades?limit=${limit}`, asset);
+  const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/trades → ${res.status}`);
   return res.json();
 }
 
-export async function getOpenPositions(): Promise<OpenPositionRow[]> {
-  const res = await fetch(`${BASE}/api/positions`, { cache: 'no-store' });
+export async function getOpenPositions(asset?: string): Promise<OpenPositionRow[]> {
+  const url = withAsset(`${BASE}/api/positions`, asset);
+  const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/positions → ${res.status}`);
   return res.json();
 }
@@ -56,8 +74,9 @@ export async function getStatus(): Promise<StatusResponse> {
   return res.json();
 }
 
-export async function getLlmRecommendations(limit = 10): Promise<LlmRecommendationRow[]> {
-  const res = await fetch(`${BASE}/api/llm/recommendations?limit=${limit}`, { cache: 'no-store' });
+export async function getLlmRecommendations(limit = 10, asset?: string): Promise<LlmRecommendationRow[]> {
+  const url = withAsset(`${BASE}/api/llm/recommendations?limit=${limit}`, asset);
+  const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/llm/recommendations → ${res.status}`);
   return res.json();
 }

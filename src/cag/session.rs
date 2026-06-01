@@ -42,6 +42,9 @@ use crate::vipers::time_decay_impl::TimeDecayPosition;
 /// underlying `Mutex`-guarded data is shared, never duplicated.
 #[derive(Clone)]
 pub struct SessionState {
+    /// Lowercase asset symbol for this session, e.g. `"btc"`, `"eth"`, `"sol"`.
+    /// Used to select the correct per-asset SQLite pool for all DB writes.
+    pub asset: String,
     /// Open positions tracked across all strategies.
     ///
     /// Key: `(strategy_name, token_id)` — each strategy owns its own slot
@@ -87,6 +90,22 @@ pub struct SessionState {
     /// TimeDecay strategy's per-token position metadata used by the cleanup
     /// worker to detect expired theta positions that need forced closure.
     pub time_decay_positions: Arc<Mutex<HashMap<U256, TimeDecayPosition>>>,
+
+    /// Token ownership registry — maps `token_id` → `strategy_name`.
+    ///
+    /// The canonical, O(1) source of truth for which strategy owns each token.
+    ///
+    /// Populated at session startup by rebuilding from the positions map after
+    /// `reconcile_orphaned_positions` runs.  Updated on every entry (insert) and
+    /// exit (remove) in `patrol_impl.rs`.
+    ///
+    /// Enforces token sovereignty: before any strategy places an entry order the
+    /// registry is checked.  If another strategy already claims the token the
+    /// entry is rejected with a `WARN`-level log.  This prevents the class of
+    /// cross-strategy interference bugs where (e.g.) GBoost re-enters a token
+    /// that ArbitrageStrategy holds as a hedged leg, causing post-restart
+    /// misattribution via the entries table.
+    pub token_ownership: Arc<Mutex<HashMap<U256, String>>>,
 }
 
 impl SessionState {
@@ -99,8 +118,9 @@ impl SessionState {
     /// Used by Phase 3f-5 when `main.rs` is reduced to a thin bootstrapper.
     /// In Phase 3f-1/3f-3, `main.rs` builds `SessionState` from already-
     /// declared individual Arc vars via the public fields directly.
-    pub fn new(startup_balance: Decimal) -> Self {
+    pub fn new(startup_balance: Decimal, asset: impl Into<String>) -> Self {
         Self {
+            asset:                asset.into().to_lowercase(),
             positions:            Arc::new(Mutex::new(PositionMap::new())),
             pending_orders:       Arc::new(Mutex::new(HashMap::new())),
             total_pnl:            Arc::new(Mutex::new(dec!(0))),
@@ -109,6 +129,7 @@ impl SessionState {
             phantom_cooldowns:    Arc::new(Mutex::new(HashMap::new())),
             orphan_tombstones:    Arc::new(Mutex::new(HashSet::new())),
             time_decay_positions: Arc::new(Mutex::new(HashMap::new())),
+            token_ownership:      Arc::new(Mutex::new(HashMap::new())),
         }
     }
 }

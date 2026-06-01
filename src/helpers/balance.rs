@@ -409,6 +409,7 @@ pub async fn arb_pair_fill_monitor(
     leg_b_side_label: String,
     max_wait_secs: i64,
     http: Arc<reqwest::Client>,
+    asset: String,
 ) {
     /// Grace period added on top of the fill window so the individual `sync_position_balance`
     /// tasks can run their own cancel + phantom-removal logic before the arbiter steps in.
@@ -609,9 +610,9 @@ pub async fn arb_pair_fill_monitor(
                     .remove(&format!("{}:{}", strategy_name, missing_token));
 
                 // Write the re-hedged fill to the DB.
-                if let Some(pool) = crate::helpers::db::pool() {
+                if let Some(pool) = crate::helpers::db::pool_for(&asset) {
                     crate::helpers::db::record_open_position(
-                        pool,
+                        &pool,
                         &strategy_name,
                         &missing_token.to_string(),
                         &ref_pos.market_name,

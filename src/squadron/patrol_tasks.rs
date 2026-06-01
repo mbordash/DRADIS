@@ -147,6 +147,7 @@ pub fn spawn_status_task(
     no_price_rx:     watch::Receiver<PriceState>,
     oracle_rx:       watch::Receiver<Decimal>,
     process_heartbeat_secs: Arc<AtomicU64>,
+    asset:  String,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -192,11 +193,11 @@ pub fn spawn_status_task(
                                 .unwrap_or(dec!(0)) / dec!(1_000_000);
                             *live_collateral.lock().await = bal;
                             debug!("💰 Live pUSD balance: ${:.4}", bal);
-                            if let Some(pool) = db::pool() {
+                            if let Some(pool) = db::pool_for(&asset) {
                                 let pnl_snap = *total_pnl.lock().await;
                                 if tokio::time::timeout(
                                     Duration::from_secs(3),
-                                    db::record_pnl_snapshot(pool, pnl_snap, bal),
+                                    db::record_pnl_snapshot(&pool, pnl_snap, bal),
                                 ).await.is_err() {
                                     warn!("⚠️ record_pnl_snapshot timed out (3s) — skipping this checkpoint");
                                 }
@@ -242,6 +243,7 @@ pub fn spawn_cleanup_task(
     maker_market_config:  Option<MarketConfig>,
     tg_token:             String,
     tg_chat_id:           String,
+    asset:                String,
     cancel:               CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -395,15 +397,17 @@ pub fn spawn_cleanup_task(
                                                                 let rh_sd  = rh_side.to_string();
                                                                 let rh_ep  = paired_ask_ticked;
                                                                 let rh_sh  = orphan.shares;
+                                                                let rh_asset = asset.clone();
                                                                 tokio::spawn(async move {
                                                                     metrics::record_entry(
+                                                                        &rh_asset,
                                                                         "ArbitrageStrategy".to_string(),
                                                                         rh_tid.clone(), rh_mkt.clone(), rh_sd.clone(),
                                                                         rh_ep, rh_sh,
                                                                     ).await;
-                                                                    if let Some(pool) = db::pool() {
+                                                                    if let Some(pool) = db::pool_for(&rh_asset) {
                                                                         db::record_open_position(
-                                                                            pool, "ArbitrageStrategy",
+                                                                            &pool, "ArbitrageStrategy",
                                                                             &rh_tid, &rh_mkt, &rh_sd,
                                                                             rh_ep, rh_sh, false,
                                                                         ).await;

@@ -1,8 +1,8 @@
 /// dradis - Multi-Strategy Orchestrator Trading Bot
 ///
-/// Phase 3f-6: Multi-asset support — one concurrent market loop per asset.
+/// Phase 3f-7: Per-asset SQLite DB pools + Control Tower multi-asset selector.
 /// Set ASSETS=btc,eth,sol (or just CRYPTO_FILTER=btc for single-asset mode).
-/// Each asset gets its own raptors, session state, and patrol loop.
+/// Each asset gets its own raptors, session state, SQLite pool, and patrol loop.
 /// Shared: wallet/nonce, CLOB client, CAG registry, API server.
 
 use anyhow::Result;
@@ -185,10 +185,17 @@ async fn main() -> Result<()> {
         .collect();
     let primary_asset = assets.first().cloned().unwrap_or_else(|| crypto_filter.clone());
 
-    let db_path = format!("logs/{}-dradis.db", primary_asset);
-    if let Err(e) = db::init(&db_path).await {
-        tracing::warn!("⚠️  SQLite init failed (metrics will CSV-only): {}", e);
+    // Phase 3f-7: initialise a per-asset SQLite pool for EVERY asset in the fleet.
+    // The first call claims the global "primary" pool slot for backward-compat
+    // callers that use db::pool() (API handlers, LLM advisor, etc.).
+    for asset in &assets {
+        let db_path = format!("logs/{}-dradis.db", asset);
+        if let Err(e) = db::init_for_asset(asset, &db_path).await {
+            tracing::warn!("⚠️  SQLite init failed for {} (metrics will CSV-only): {}", asset, e);
+        }
     }
+    // Keep a reference to the primary DB path for the session init call below.
+    let _db_path = format!("logs/{}-dradis.db", primary_asset);
     // Register this process start as a new session.  Every restart is a clean
     // session boundary: session-scoped P&L, LLM analysis, and config snapshots
     // are all anchored to this ID for the lifetime of the process.
@@ -325,8 +332,9 @@ async fn main() -> Result<()> {
     //   • config_rx / markets_tx    (shared dynamic config + status broadcast)
     //   • process_heartbeat_secs    (process-level OS watchdog — ANY asset tick counts)
     //
-    // ⚠️  DB: the global SQLite pool is initialised once (primary asset above).
-    //     Secondary assets record trades via CSV only.  Per-asset pools: Phase 3f-7.
+    // ⚠️  DB: Phase 3f-7 — each asset has its own SQLite pool initialised above.
+    //     The pools are looked up by asset slug in patrol_impl / patrol_tasks
+    //     via db::pool_for(&asset_lc) so secondary assets write to their own DB.
     info!("🗺️  Asset fleet: [{}] ({} asset{})",
         assets.join(", ").to_uppercase(),
         assets.len(),
@@ -334,7 +342,7 @@ async fn main() -> Result<()> {
 
     let mut loop_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(assets.len());
 
-    for (idx, asset) in assets.iter().enumerate() {
+    for asset in assets.iter() {
         // ── Per-asset raptor signal feeds ─────────────────────────────────────
         let (oracle_tx, oracle_rx)     = watch::channel(dec!(0));
         let (velocity_tx, velocity_rx) = watch::channel((dec!(0), dec!(0), dec!(0)));
@@ -354,14 +362,11 @@ async fn main() -> Result<()> {
         // the starting-collateral reference for drawdown calculations per asset.
         // live_collateral is refreshed from the CLOB every ~60 s so strategies
         // gate on actual available balance regardless of how many assets are active.
-        let asset_session = SessionState::new(startup_balance);
+        let asset_session = SessionState::new(startup_balance, asset.as_str());
 
-        // Register the primary asset's session with the CAG so API handlers
-        // (GET /api/positions, GET /api/trades) reflect the first-listed asset.
-        // Multi-session federation for the API is a Phase 3f-7 concern.
-        if idx == 0 {
-            cag.set_session(asset_session.clone());
-        }
+        // Register EVERY asset's session with the CAG so API handlers can
+        // query per-asset data via ?asset= query params.
+        cag.set_session(asset_session.clone());
 
         // ── Per-asset LLM Advisor ─────────────────────────────────────────────
         // Spawned unconditionally; exits immediately when ENABLE_LLM_ADVISOR=false.
