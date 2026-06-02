@@ -9,7 +9,12 @@
 /// │ velocity_tx    │ (Decimal, Decimal, Decimal)    │ (5s velocity, 1s velocity, accel)  │
 /// │ drift_tx       │ (Decimal, Decimal)             │ (60-min drift, 10-min drift)       │
 ///
-/// Reconnects automatically on disconnect or 30s tick silence.
+/// Reconnects automatically on:
+///   • Disconnect or WS error
+///   • 30s with no message at all (dead TCP / half-open socket)
+///   • 60s with no *price tick* — catches "zombie" connections where Binance
+///     keepalive pings reset the 30s timer but ticker text has silently stopped
+///
 /// Consumers should treat a `dec!(0)` oracle price as "not yet connected".
 use std::str::FromStr;
 
@@ -46,11 +51,21 @@ pub async fn run_price_raptor(
     loop {
         if let Ok((mut ws_stream, _)) = connect_async(&url_str).await {
             info!(" Price Raptor connected to Binance for {}", binance_pair.to_uppercase());
-            // 30s read timeout per message: if Binance stops sending ticks (silently dead
-            // TCP connection / half-open socket), ws_stream.next().await would wait
-            // indefinitely — parking this Tokio worker thread and contributing to runtime
-            // starvation.  A 30s ceiling forces a reconnect on any silent stream stall.
+            // last_price_tick tracks when we last received an actual ticker text
+            // message with a valid price.  Binance sends periodic WS ping frames
+            // that reset the 30s tokio_timeout below but carry no price data.  A
+            // "zombie" connection — alive at the TCP level but delivering no ticker
+            // updates — would otherwise be invisible forever.  If 60s elapse with
+            // no real price tick we force a reconnect regardless of ping activity.
+            let mut last_price_tick = Instant::now();
+
             'ws: loop {
+                // Staleness guard: independent of WS keepalive pings.
+                if last_price_tick.elapsed() >= Duration::from_secs(60) {
+                    warn!("⚠️ Price Raptor: no price tick in 60s (zombie WS — pings alive but ticker silent) — reconnecting");
+                    break 'ws;
+                }
+
                 match tokio_timeout(Duration::from_secs(30), ws_stream.next()).await {
                     Ok(Some(Ok(msg))) => {
                         if let Message::Text(text) = msg {
@@ -58,6 +73,7 @@ pub async fn run_price_raptor(
                                 if let Some(price_str) = v.get("c").and_then(|p| p.as_str()) {
                                     if let Ok(price) = Decimal::from_str(price_str) {
                                         let now = Instant::now();
+                                        last_price_tick = now; // reset staleness clock
                                         let _ = oracle_tx.send(price);
                                         price_history.push_back((now, price));
 

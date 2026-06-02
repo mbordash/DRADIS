@@ -218,7 +218,7 @@ pub async fn cleanup_expired_positions(
             let removed = before - pos_map.len();
 
             if removed > 0 {
-                warn!("🧹 Cleaned up {} position(s) for market \"{}\" (expires {})",
+                warn!(" Cleaned up {} position(s) for market \"{}\" (expires {})",
                     removed,
                     market_name,
                     if is_expired { "NOW" } else { "in <60s" }
@@ -300,7 +300,7 @@ pub async fn reconcile_orphaned_positions(
     }
 
     for ((strategy_name, token_id), position) in orphans_to_exit {
-        warn!("🚨 ORPHANED PAIR DETECTED [{}]: {} shares at ${:.4} ({}s old) — cancelling GTC + removing",
+        warn!(" ORPHANED PAIR DETECTED [{}]: {} shares at ${:.4} ({}s old) — cancelling GTC + removing",
               strategy_name, position.shares, position.avg_entry,
               (now - position.opened_at).num_seconds());
 
@@ -314,7 +314,7 @@ pub async fn reconcile_orphaned_positions(
                 let ids: Vec<String> = page.data.into_iter().map(|o| o.id).collect();
                 if !ids.is_empty() {
                     let id_refs: Vec<&str> = ids.iter().map(|s| s.as_str()).collect();
-                    warn!("🛑 Cancelling {} resting order(s) for orphaned token {}", id_refs.len(), token_id);
+                    warn!(" Cancelling {} resting order(s) for orphaned token {}", id_refs.len(), token_id);
                     match tokio_timeout(std::time::Duration::from_secs(10), clob_client.cancel_orders(&id_refs)).await {
                         Ok(_) => {}
                         Err(_) => warn!("⚠️ Orphan cleanup: cancel_orders timed out (10s) for token {} — skipping cancel", token_id),
@@ -353,7 +353,7 @@ pub async fn reconcile_orphaned_positions(
         }
 
         let _ = send_notification(tg_token, tg_chat_id,
-            &format!("🚨 Orphaned pair exited [{}]: {} {} shares @ ${:.4}",
+            &format!(" Orphaned pair exited [{}]: {} {} shares @ ${:.4}",
                      strategy_name,
                      if token_id == position.pair_token_id { "YES" } else { "NO" },
                      position.shares.trunc(),
@@ -479,7 +479,7 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
                 let side = pos.outcome.to_uppercase();
                 if db::adopt_chain_position(&pool, token_str, &pos.title, &side, pos.avg_price, pos.size).await {
                     total_adopted += 1;
-                    info!("📥 Chain-sync [{}]: re-adopted on-chain position — token {} | {} shares @ ${:.4} | \"{}\"",
+                    info!(" Chain-sync [{}]: re-adopted on-chain position — token {} | {} shares @ ${:.4} | \"{}\"",
                         asset.to_uppercase(),
                         &token_str[..token_str.len().min(20)],
                         pos.size, pos.avg_price, pos.title);
@@ -489,7 +489,7 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
     }
 
     if total_purged > 0 {
-        info!("🧹 Chain-sync: purged {} stale open_positions row(s) across {} asset DB(s)", total_purged, all_assets.len());
+        info!(" Chain-sync: purged {} stale open_positions row(s) across {} asset DB(s)", total_purged, all_assets.len());
     }
     if redeemable_count > 0 {
         info!("⏳ Chain-sync: skipped {} redeemable (settled) position(s) — auto_settle will handle redemption", redeemable_count);
@@ -730,7 +730,7 @@ async fn record_settled_arb_trade(
         .unwrap_or_else(|| "btc".to_string());
 
     info!(
-        "📊 ArbitrageStrategy settlement recorded: \"{}\" | {} pairs @ entry ${:.4}/pair → pnl ${:.4}",
+        " ArbitrageStrategy settlement recorded: \"{}\" | {} pairs @ entry ${:.4}/pair → pnl ${:.4}",
         market_title, pairs, entry_per_pair, pnl
     );
 
@@ -774,7 +774,7 @@ async fn purge_settled_legs(legs: &[polymarket_client_sdk_v2::data::types::respo
                 .await
             {
                 Ok(r) if r.rows_affected() > 0 => {
-                    info!("🗑️  Auto-settle [{}]: purged open_positions row for redeemed token {} ({})",
+                    info!("️  Auto-settle [{}]: purged open_positions row for redeemed token {} ({})",
                           asset.to_uppercase(),
                           &token_str[..token_str.len().min(20)], leg.title);
                 }

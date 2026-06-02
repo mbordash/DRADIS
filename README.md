@@ -150,7 +150,7 @@ The system is organized around four BSG-inspired tactical layers:
 
 ---
 
-## 🦅 Raptor Wing (`src/raptors/`)
+##  Raptor Wing (`src/raptors/`)
 
 Raptors are DRADIS's recon layer — lightweight signal scouts that fly ahead of the Vipers and report external intelligence back to the CIC. Each Raptor polls a specific data source on its own schedule and publishes a normalized signal via `watch` channels.
 
@@ -184,7 +184,7 @@ Build your own: [CUSTOM_STRATEGY.md](docs/CUSTOM_STRATEGY.md).
 
 ---
 
-## 🛩️ Squadron Layer (`src/squadron/`)
+## ️ Squadron Layer (`src/squadron/`)
 
 A **Squadron** is the core deployable unit — it bundles Raptors with Vipers and sends them to a specific Polymarket market (the **battle location**).
 
@@ -214,11 +214,11 @@ Squadron
 | `RTB` | Returning to base — no new entries, winding down |
 | `STOOD_DOWN` | Market expired or manually stood down |
 
-Each market rotation logs: `🛩️ Squadron [btc-hourly-2026-05-23T14:00:00Z] → state=PATROLLING`
+Each market rotation logs: `️ Squadron [btc-hourly-2026-05-23T14:00:00Z] → state=PATROLLING`
 
 ---
 
-## 🛸 CAG Layer (`src/cag/`)
+##  CAG Layer (`src/cag/`)
 
 The **Commander Air Group** is the async orchestration layer that sits between `main.rs` and the Squadron/Orchestrator. It owns the market rotation loop for each asset and manages session-level state.
 
@@ -427,7 +427,7 @@ API health: `http://YOUR_SERVER_IP:9000/api/health`
   - `src/raptors/` — Price Raptor (Binance WS) + Funding Raptor (Binance FAPI)
   - `src/vipers/` — six Viper trading strategies
   - `src/squadron/` — `Squadron`, `SquadronRaptors`, `SquadronConfig`, `SquadronState`
-  - Each market rotation logs `🛩️ Squadron [...] → state=PATROLLING`
+  - Each market rotation logs `️ Squadron [...] → state=PATROLLING`
 - **Open Positions improvements** — Side column colors YES/UP green and NO/DOWN red; chain-adopted positions show `⛓ adopted`; `chain_adopted` DB column with live migration
 - **Side label fix** — `adopt_chain_position` correctly binds the Polymarket outcome string (was storing literal `?`)
 - **Viper hot-enable** — All Vipers always instantiated at startup; toggle any live from Control Tower with no restart
