@@ -173,5 +173,20 @@ export const VIPER_DEFS: ViperDef[] = [
       { key: 'gboost_max_exposure_usdc', label: 'Max Exposure',    type: 'usd'     },
     ],
   },
+  {
+    name: 'TrendCapture',
+    enableKey: 'enable_trendcapture',
+    accentColor: 'rose',
+    statusKey: 'trendcapture',
+    description: 'Rides sustained multi-minute oracle drift on Window/Daily markets',
+    fields: [
+      { key: 'trendcapture_min_trade_size_usdc', label: 'Min Size',    type: 'usd'   },
+      { key: 'trendcapture_max_trade_size_usdc', label: 'Max Size',    type: 'usd'   },
+      { key: 'trendcapture_stop_loss_pct',       label: 'Stop Loss',   type: 'pct'   },
+      { key: 'trendcapture_target_profit_pct',   label: 'Take Profit', type: 'pct'   },
+      { key: 'trendcapture_max_exposure_usdc',   label: 'Max Exposure',type: 'usd'   },
+      { key: 'trendcapture_max_entry_price',     label: 'Max Entry',   type: 'price' },
+    ],
+  },
 ];
 

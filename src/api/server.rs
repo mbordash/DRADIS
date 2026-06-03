@@ -43,6 +43,20 @@ use crate::helpers::db;
 use crate::tasks::cleanup::sync_open_positions_with_chain;
 use crate::cag::Cag;
 
+// ─── Raptor health types ──────────────────────────────────────────────────────
+
+/// Connection health for a single asset's pair of Binance Raptors.
+///
+/// `price_connected`   — true when the Price Raptor WebSocket is live and
+///                       delivering ticker messages from Binance Spot.
+/// `funding_connected` — true when the Funding Raptor last polled
+///                       Binance FAPI successfully.
+#[derive(Serialize, Clone, Default, Debug)]
+pub struct AssetRaptorHealth {
+    pub price_connected:   bool,
+    pub funding_connected: bool,
+}
+
 // ─── Shared state ────────────────────────────────────────────────────────────
 
 /// Cloneable handle passed to every axum handler via `State<ApiState>`.
@@ -54,6 +68,9 @@ pub struct ApiState {
     pub config_rx: watch::Receiver<Arc<DynamicConfig>>,
     /// Receiver — maps strategy key ("time_decay", "momentum", …) to current market name.
     pub markets_rx: watch::Receiver<HashMap<String, String>>,
+    /// Receiver — maps asset symbol (e.g. "btc") to its pair of Raptor health flags.
+    /// Updated by the Price and Funding Raptors in real-time.
+    pub raptor_health_rx: watch::Receiver<HashMap<String, AssetRaptorHealth>>,
     /// Optional API key read from `DRADIS_API_KEY` env var at startup.
     /// When `Some`, every request must include `X-API-Key: <value>`.
     /// When `None`, no authentication is required (default for local dev).
@@ -200,18 +217,35 @@ async fn get_pnl_history(Query(q): Query<AssetQuery>) -> Response {
 
 /// GET /api/status
 ///
-/// Returns the current market name each strategy is attached to.
-/// Response: `{ "strategy_markets": { "time_decay", "momentum", … } }`
+/// Returns the current market name each strategy is attached to, the session
+/// start timestamp (RFC-3339), and per-asset Raptor connection health.
+///
+/// Response:
+/// ```json
+/// {
+///   "strategy_markets": { "time_decay": "Will BTC…", … },
+///   "session_started_at": "2026-06-02T14:32:01Z",
+///   "raptors": {
+///     "btc": { "price_connected": true, "funding_connected": true }
+///   }
+/// }
+/// ```
 #[derive(Serialize)]
 struct StatusResponse {
     strategy_markets: HashMap<String, String>,
+    /// RFC-3339 timestamp of the current session start (= process startup).
+    session_started_at: String,
+    /// Per-asset Binance Raptor connection health.
+    raptors: HashMap<String, AssetRaptorHealth>,
 }
 
 async fn get_status(State(s): State<ApiState>) -> Response {
     debug!("Received GET /api/status request");
     let markets = s.markets_rx.borrow().clone();
+    let raptors = s.raptor_health_rx.borrow().clone();
+    let session_started_at = db::current_session_id().to_string();
     debug!("Successfully retrieved status");
-    Json(StatusResponse { strategy_markets: markets }).into_response()
+    Json(StatusResponse { strategy_markets: markets, session_started_at, raptors }).into_response()
 }
 
 /// GET /api/trades?limit=100&asset=btc
@@ -375,6 +409,7 @@ pub async fn run_api_server(
     config_tx: Arc<watch::Sender<Arc<DynamicConfig>>>,
     config_rx: watch::Receiver<Arc<DynamicConfig>>,
     markets_rx: watch::Receiver<HashMap<String, String>>,
+    raptor_health_rx: watch::Receiver<HashMap<String, AssetRaptorHealth>>,
     safe_address: Address,
     cag: Cag,
 ) {
@@ -390,7 +425,7 @@ pub async fn run_api_server(
         tracing::info!(" API key authentication disabled (set DRADIS_API_KEY to enable)");
     }
 
-    let state = ApiState { config_tx, config_rx, markets_rx, api_key, safe_address, cag };
+    let state = ApiState { config_tx, config_rx, markets_rx, raptor_health_rx, api_key, safe_address, cag };
 
     // /api/health is intentionally public — no API key required.
     // Docker HEALTHCHECK, load balancers, and uptime monitors all probe this

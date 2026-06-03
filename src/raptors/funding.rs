@@ -14,6 +14,7 @@
 /// retries against the regional mirror `fapi.binance.us`.
 use std::str::FromStr;
 use std::sync::Arc;
+use std::collections::HashMap;
 
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
@@ -21,11 +22,13 @@ use tokio::sync::watch;
 use tracing::{debug, warn};
 
 use crate::config;
+use crate::api::server::AssetRaptorHealth;
 
 pub async fn run_funding_raptor(
     http: Arc<reqwest::Client>,
     crypto_filter: String,
     funding_tx: watch::Sender<Decimal>,
+    raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
 ) {
     let symbol = match crypto_filter.as_str() {
         "eth" => "ETHUSDT",
@@ -46,10 +49,18 @@ pub async fn run_funding_raptor(
             Some(rate) => {
                 consecutive_failures = 0;
                 let _ = funding_tx.send(rate);
+                // Mark funding raptor healthy on successful poll.
+                raptor_health_tx.send_modify(|map| {
+                    map.entry(crypto_filter.clone()).or_default().funding_connected = true;
+                });
                 debug!("📡 Funding Raptor {}: {:.6}%", symbol, rate * dec!(100));
             }
             None => {
                 consecutive_failures += 1;
+                // Mark funding raptor unhealthy when poll fails.
+                raptor_health_tx.send_modify(|map| {
+                    map.entry(crypto_filter.clone()).or_default().funding_connected = false;
+                });
                 // Warn on first failure so the operator knows; degrade to debug after that
                 // to avoid flooding logs if the server has a persistent geo-block.
                 if consecutive_failures == 1 {

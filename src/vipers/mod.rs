@@ -9,6 +9,7 @@ pub mod time_decay_impl;
 pub mod maker_impl;
 pub mod basis_impl;
 pub mod gboost_impl;
+pub mod trendcapture_impl;
 
 use rust_decimal::Decimal;
 use crate::config;

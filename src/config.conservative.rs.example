@@ -389,6 +389,67 @@ pub const GBOOST_DRIFT_CONSECUTIVE_REQUIRED: usize = 4;
 pub const GBOOST_DRIFT_STABLE_CLEAR_REQUIRED: usize = 5;
 
 // ============================================================================
+// TRENDCAPTURE STRATEGY PARAMETERS
+// ============================================================================
+
+/// Conservative: disabled — new strategy with limited live trading history.
+/// Enable only after confirming positive P&L in ghost mode.
+pub const ENABLE_TRENDCAPTURE_TRADING: bool = false;
+pub const TRENDCAPTURE_MAX_EXPOSURE_USDC: Decimal = dec!(10.0);
+
+// 10m drift entry thresholds — conservative: higher threshold, requires a very
+// strong and clear directional move before entering.
+pub const TRENDCAPTURE_BULL_DRIFT_10M_BTC: Decimal = dec!(200.0);
+pub const TRENDCAPTURE_BEAR_DRIFT_10M_BTC: Decimal = dec!(-200.0);
+pub const TRENDCAPTURE_BULL_DRIFT_10M_ETH: Decimal = dec!(8.0);
+pub const TRENDCAPTURE_BEAR_DRIFT_10M_ETH: Decimal = dec!(-8.0);
+pub const TRENDCAPTURE_BULL_DRIFT_10M_SOL: Decimal = dec!(0.80);
+pub const TRENDCAPTURE_BEAR_DRIFT_10M_SOL: Decimal = dec!(-0.80);
+
+// 60m confirmation thresholds — conservative: stronger confirmation required.
+pub const TRENDCAPTURE_BULL_DRIFT_60M_BTC: Decimal = dec!(300.0);
+pub const TRENDCAPTURE_BEAR_DRIFT_60M_BTC: Decimal = dec!(-300.0);
+pub const TRENDCAPTURE_BULL_DRIFT_60M_ETH: Decimal = dec!(12.0);
+pub const TRENDCAPTURE_BEAR_DRIFT_60M_ETH: Decimal = dec!(-12.0);
+pub const TRENDCAPTURE_BULL_DRIFT_60M_SOL: Decimal = dec!(1.20);
+pub const TRENDCAPTURE_BEAR_DRIFT_60M_SOL: Decimal = dec!(-1.20);
+
+// Strike gap requirements — conservative: larger gap; only enter on established moves.
+pub const TRENDCAPTURE_BULL_STRIKE_GAP_BTC: Decimal = dec!(500.0);
+pub const TRENDCAPTURE_BEAR_STRIKE_GAP_BTC: Decimal = dec!(500.0);
+pub const TRENDCAPTURE_BULL_STRIKE_GAP_ETH: Decimal = dec!(20.0);
+pub const TRENDCAPTURE_BEAR_STRIKE_GAP_ETH: Decimal = dec!(20.0);
+pub const TRENDCAPTURE_BULL_STRIKE_GAP_SOL: Decimal = dec!(2.0);
+pub const TRENDCAPTURE_BEAR_STRIKE_GAP_SOL: Decimal = dec!(2.0);
+
+// Reversal thresholds — conservative: exit on smaller counter-drift.
+pub const TRENDCAPTURE_REVERSAL_DRIFT_BTC: Decimal = dec!(50.0);
+pub const TRENDCAPTURE_REVERSAL_DRIFT_ETH: Decimal = dec!(2.0);
+pub const TRENDCAPTURE_REVERSAL_DRIFT_SOL: Decimal = dec!(0.20);
+
+pub const TRENDCAPTURE_MAX_SNAPSHOT_AGE_SECS: i64 = 15;
+/// Conservative: 45 min minimum expiry — needs more time buffer than other profiles.
+pub const TRENDCAPTURE_MIN_SECS_TO_EXPIRY: i64 = 2700;
+/// Conservative: 3-minute warmup for fully stable orderbook readings.
+pub const TRENDCAPTURE_MARKET_WARMUP_SECS: i64 = 180;
+/// Conservative: tight 3-cent combined spread cap.
+pub const TRENDCAPTURE_MAX_ENTRY_ASK_SUM: Decimal = dec!(1.03);
+pub const TRENDCAPTURE_MIN_ENTRY_PRICE: Decimal = dec!(0.22);
+pub const TRENDCAPTURE_POST_EXIT_COOLDOWN_SECS: i64 = 900;
+
+/// Conservative: tight OBI gates — only enter on near-neutral or favorable books.
+pub const TRENDCAPTURE_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.25);
+pub const TRENDCAPTURE_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.70);
+
+pub const TRENDCAPTURE_KELLY_MAX_MULTIPLIER: Decimal = dec!(2.5);
+pub const TRENDCAPTURE_CATASTROPHIC_SL_PCT: Decimal = dec!(0.06);
+pub const TRENDCAPTURE_EXPIRY_EXIT_SECS: i64 = 1200;
+pub const TRENDCAPTURE_EXPIRY_MIN_PROFIT_TO_HOLD: Decimal = dec!(0.03);
+pub const TRENDCAPTURE_TAKE_PROFIT_CEILING: Decimal = dec!(0.90);
+pub const TRENDCAPTURE_FILL_CONFIRM_MIN_HOLD_SECS: i64 = 45;
+pub const TRENDCAPTURE_MIN_HOLD_BEFORE_REVERSAL_SECS: i64 = 180;
+
+// ============================================================================
 // POSITION MERGE SETTINGS
 // ============================================================================
 

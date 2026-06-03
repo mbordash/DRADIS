@@ -20,6 +20,7 @@ use crate::vipers::time_decay_impl::TimeDecayStrategyImpl;
 use crate::vipers::maker_impl::MakerStrategyImpl;
 use crate::vipers::basis_impl::BasisStrategyImpl;
 use crate::vipers::gboost_impl::GboostStrategyImpl;
+use crate::vipers::trendcapture_impl::TrendCaptureStrategyImpl;
 
 /// Registry for all available strategies
 pub struct StrategyRegistry;
@@ -30,12 +31,13 @@ impl StrategyRegistry {
     /// enable or disable any of them during a running session via the Control Tower UI.
     pub fn create_all_strategies() -> Vec<Box<dyn Strategy>> {
         vec![
-            Box::new(MomentumStrategyImpl::new())      as Box<dyn Strategy>,
-            Box::new(ArbitrageStrategyImpl)          as Box<dyn Strategy>,
-            Box::new(TimeDecayStrategyImpl)          as Box<dyn Strategy>,
-            Box::new(MakerStrategyImpl::new())       as Box<dyn Strategy>,
-            Box::new(BasisStrategyImpl)              as Box<dyn Strategy>,
-            Box::new(GboostStrategyImpl::default())  as Box<dyn Strategy>,
+            Box::new(MomentumStrategyImpl::new())          as Box<dyn Strategy>,
+            Box::new(ArbitrageStrategyImpl)                as Box<dyn Strategy>,
+            Box::new(TimeDecayStrategyImpl)                as Box<dyn Strategy>,
+            Box::new(MakerStrategyImpl::new())             as Box<dyn Strategy>,
+            Box::new(BasisStrategyImpl)                    as Box<dyn Strategy>,
+            Box::new(GboostStrategyImpl::default())        as Box<dyn Strategy>,
+            Box::new(TrendCaptureStrategyImpl::new())      as Box<dyn Strategy>,
         ]
     }
 
@@ -69,6 +71,7 @@ impl StrategyRegistry {
             "MakerStrategy",
             "BasisStrategy",
             "GboostStrategy",
+            "TrendCaptureStrategy",
         ]
         .into_iter().map(|s| s.to_string()).collect()
     }

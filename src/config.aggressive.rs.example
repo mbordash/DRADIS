@@ -380,6 +380,66 @@ pub const GBOOST_DRIFT_CONSECUTIVE_REQUIRED: usize = 2;
 pub const GBOOST_DRIFT_STABLE_CLEAR_REQUIRED: usize = 2;
 
 // ============================================================================
+// TRENDCAPTURE STRATEGY PARAMETERS
+// ============================================================================
+
+/// Aggressive: enabled — TrendCapture exploits sustained multi-minute oracle drift
+/// on Window/Daily markets.  Aggressive profile lowers the drift thresholds to
+/// catch earlier entries and accepts a looser OBI / spread environment.
+pub const ENABLE_TRENDCAPTURE_TRADING: bool = true;
+pub const TRENDCAPTURE_MAX_EXPOSURE_USDC: Decimal = dec!(25.0);
+
+// 10m drift entry thresholds — aggressive: lower bar to catch more moves earlier.
+pub const TRENDCAPTURE_BULL_DRIFT_10M_BTC: Decimal = dec!(100.0);
+pub const TRENDCAPTURE_BEAR_DRIFT_10M_BTC: Decimal = dec!(-100.0);
+pub const TRENDCAPTURE_BULL_DRIFT_10M_ETH: Decimal = dec!(4.0);
+pub const TRENDCAPTURE_BEAR_DRIFT_10M_ETH: Decimal = dec!(-4.0);
+pub const TRENDCAPTURE_BULL_DRIFT_10M_SOL: Decimal = dec!(0.40);
+pub const TRENDCAPTURE_BEAR_DRIFT_10M_SOL: Decimal = dec!(-0.40);
+
+// 60m confirmation thresholds — aggressive: lower bar; trend confirmation still required.
+pub const TRENDCAPTURE_BULL_DRIFT_60M_BTC: Decimal = dec!(150.0);
+pub const TRENDCAPTURE_BEAR_DRIFT_60M_BTC: Decimal = dec!(-150.0);
+pub const TRENDCAPTURE_BULL_DRIFT_60M_ETH: Decimal = dec!(6.0);
+pub const TRENDCAPTURE_BEAR_DRIFT_60M_ETH: Decimal = dec!(-6.0);
+pub const TRENDCAPTURE_BULL_DRIFT_60M_SOL: Decimal = dec!(0.60);
+pub const TRENDCAPTURE_BEAR_DRIFT_60M_SOL: Decimal = dec!(-0.60);
+
+// Strike gap requirements — aggressive: smaller gap allowed; enter earlier in move.
+pub const TRENDCAPTURE_BULL_STRIKE_GAP_BTC: Decimal = dec!(200.0);
+pub const TRENDCAPTURE_BEAR_STRIKE_GAP_BTC: Decimal = dec!(200.0);
+pub const TRENDCAPTURE_BULL_STRIKE_GAP_ETH: Decimal = dec!(8.0);
+pub const TRENDCAPTURE_BEAR_STRIKE_GAP_ETH: Decimal = dec!(8.0);
+pub const TRENDCAPTURE_BULL_STRIKE_GAP_SOL: Decimal = dec!(0.6);
+pub const TRENDCAPTURE_BEAR_STRIKE_GAP_SOL: Decimal = dec!(0.6);
+
+// Reversal thresholds — aggressive: looser; only exit on strong counter-drift.
+pub const TRENDCAPTURE_REVERSAL_DRIFT_BTC: Decimal = dec!(100.0);
+pub const TRENDCAPTURE_REVERSAL_DRIFT_ETH: Decimal = dec!(4.0);
+pub const TRENDCAPTURE_REVERSAL_DRIFT_SOL: Decimal = dec!(0.40);
+
+pub const TRENDCAPTURE_MAX_SNAPSHOT_AGE_SECS: i64 = 15;
+pub const TRENDCAPTURE_MIN_SECS_TO_EXPIRY: i64 = 1200;  // 20 min — enter closer to expiry
+pub const TRENDCAPTURE_MARKET_WARMUP_SECS: i64 = 60;
+
+/// Aggressive: wider spread tolerance — 5-cent combined cap.
+pub const TRENDCAPTURE_MAX_ENTRY_ASK_SUM: Decimal = dec!(1.05);
+pub const TRENDCAPTURE_MIN_ENTRY_PRICE: Decimal = dec!(0.18);
+pub const TRENDCAPTURE_POST_EXIT_COOLDOWN_SECS: i64 = 300;
+
+/// Aggressive: looser OBI gates — accepts more adverse-selection risk.
+pub const TRENDCAPTURE_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.60);
+pub const TRENDCAPTURE_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.85);
+
+pub const TRENDCAPTURE_KELLY_MAX_MULTIPLIER: Decimal = dec!(4.0);
+pub const TRENDCAPTURE_CATASTROPHIC_SL_PCT: Decimal = dec!(0.10);
+pub const TRENDCAPTURE_EXPIRY_EXIT_SECS: i64 = 600;
+pub const TRENDCAPTURE_EXPIRY_MIN_PROFIT_TO_HOLD: Decimal = dec!(0.01);
+pub const TRENDCAPTURE_TAKE_PROFIT_CEILING: Decimal = dec!(0.90);
+pub const TRENDCAPTURE_FILL_CONFIRM_MIN_HOLD_SECS: i64 = 20;
+pub const TRENDCAPTURE_MIN_HOLD_BEFORE_REVERSAL_SECS: i64 = 60;
+
+// ============================================================================
 
 pub const MERGE_SCAN_INTERVAL_SECS: u64 = 300;
 pub const MERGE_COOLDOWN_SECS: u64 = 120;

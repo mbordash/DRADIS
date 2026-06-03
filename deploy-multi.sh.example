@@ -20,6 +20,10 @@
 #     Full DB persistence per asset, easier per-asset restart.
 #     Uncomment the individual docker run blocks below to use this model.
 #
+# Vipers (seven total): Arbitrage, Momentum, Maker, Basis, TimeDecay, GBoost,
+#   TrendCapture.  All are enabled when using config.balanced.rs.example or
+#   config.aggressive.rs.example.  Disable individually via Control Tower UI.
+#
 # Containers started (Model A):
 #   dradis          — Rust trading engine (all assets) + axum API on :9000
 #   control-tower   — Next.js dashboard on :3002

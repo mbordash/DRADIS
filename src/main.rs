@@ -36,6 +36,7 @@ use dradis::config;
 use dradis::squadron::{SquadronRaptors};
 use dradis::cag::{Cag, SessionState, RunArgs, run_market_loop};
 use dradis::helpers::dynamic_config::DynamicConfig;
+use dradis::api::server::AssetRaptorHealth;
 use tokio_util::sync::CancellationToken;
 
 use dradis::helpers::{
@@ -220,6 +221,13 @@ async fn main() -> Result<()> {
     let (markets_tx, markets_rx) = watch::channel::<std::collections::HashMap<String, String>>(std::collections::HashMap::new());
     let markets_tx = Arc::new(markets_tx);
 
+    // ── Raptor health channel (feeds /api/status raptors field) ──────────────
+    // Populated by the Price and Funding Raptors for every active asset.
+    let (raptor_health_tx, raptor_health_rx) = watch::channel::<std::collections::HashMap<String, AssetRaptorHealth>>(
+        std::collections::HashMap::new(),
+    );
+    let raptor_health_tx = Arc::new(raptor_health_tx);
+
     // NOTE: API server is spawned after safe_address is derived below so it can
     // be passed in for the /api/positions/sync endpoint.
 
@@ -263,6 +271,7 @@ async fn main() -> Result<()> {
         Arc::clone(&config_tx),
         config_rx.clone(),
         markets_rx,
+        raptor_health_rx,
         safe_address,
         cag.clone(),
     ));
@@ -352,9 +361,11 @@ async fn main() -> Result<()> {
 
         tokio::spawn(dradis::raptors::price::run_price_raptor(
             asset.clone(), oracle_tx, velocity_tx, drift_tx,
+            Arc::clone(&raptor_health_tx),
         ));
         tokio::spawn(dradis::raptors::funding::run_funding_raptor(
             Arc::clone(&shared_http), asset.clone(), funding_tx,
+            Arc::clone(&raptor_health_tx),
         ));
         let raptor_signals = SquadronRaptors::full(oracle_rx, velocity_rx, drift_rx, funding_rx);
 

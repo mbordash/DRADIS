@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import useSWR from 'swr';
 import dynamic from 'next/dynamic';
 
@@ -24,6 +24,118 @@ function fmt$(n: number) {
 function fmtPct(n: number) {
   const sign = n >= 0 ? '+' : '';
   return `${sign}${(n * 100).toFixed(2)}%`;
+}
+
+// ── Session time helpers ──────────────────────────────────────────────────────
+
+/** Format an ISO-8601 session start as a short "HH:MM" local-time string. */
+function fmtSessionTime(iso: string): string {
+  try {
+    return new Date(iso).toLocaleTimeString(undefined, {
+      hour: '2-digit',
+      minute: '2-digit',
+    });
+  } catch {
+    return '—';
+  }
+}
+
+/** Return a human-readable "Xh Ym" uptime string from an ISO-8601 start. */
+function fmtUptime(iso: string): string {
+  try {
+    const secs = Math.floor((Date.now() - new Date(iso).getTime()) / 1000);
+    if (secs < 60) return `${secs}s`;
+    const mins = Math.floor(secs / 60);
+    if (mins < 60) return `${mins}m`;
+    const h = Math.floor(mins / 60);
+    const m = mins % 60;
+    return m > 0 ? `${h}h ${m}m` : `${h}h`;
+  } catch {
+    return '—';
+  }
+}
+
+// ── Session badge ─────────────────────────────────────────────────────────────
+
+function SessionBadge({ startedAt }: { startedAt?: string }) {
+  // Re-render every minute so the uptime counter stays current.
+  const [, setTick] = useState(0);
+  useEffect(() => {
+    const id = setInterval(() => setTick(t => t + 1), 60_000);
+    return () => clearInterval(id);
+  }, []);
+
+  if (!startedAt) return null;
+  const uptime = fmtUptime(startedAt);
+  const startTime = fmtSessionTime(startedAt);
+  return (
+    <div
+      className="hidden sm:flex items-center gap-1.5 text-xs font-mono text-gray-500 cursor-default"
+      title={`Session started: ${startedAt}`}
+    >
+      <span className="text-gray-600">⏱</span>
+      <span>
+        <span className="text-gray-500">Session</span>
+        <span className="text-gray-400 ml-1">{startTime}</span>
+        <span className="text-gray-600 ml-1">({uptime})</span>
+      </span>
+    </div>
+  );
+}
+
+// ── Raptor health indicators ──────────────────────────────────────────────────
+
+function RaptorHealthBadges({
+  raptors,
+  asset,
+}: {
+  raptors?: Record<string, { price_connected: boolean; funding_connected: boolean }>;
+  asset: string;
+}) {
+  const h = asset ? raptors?.[asset] : undefined;
+
+  // When the health map hasn't arrived yet (first load), render placeholder dots.
+  const priceOk    = h?.price_connected   ?? false;
+  const fundingOk  = h?.funding_connected ?? false;
+  const hasData    = h !== undefined;
+
+  return (
+    <div className="hidden sm:flex items-center gap-2 text-xs font-mono">
+      {/* Price Raptor */}
+      <div
+        className="flex items-center gap-1 cursor-default"
+        title={`Price Raptor (Binance Spot WS): ${priceOk ? 'connected' : 'reconnecting…'}`}
+      >
+        <span
+          className={[
+            'h-2 w-2 rounded-full transition-colors',
+            !hasData  ? 'bg-gray-600' :
+            priceOk   ? 'bg-cyan-400 animate-pulse' : 'bg-red-500',
+          ].join(' ')}
+        />
+        <span className={!hasData ? 'text-gray-600' : priceOk ? 'text-cyan-400' : 'text-red-400'}>
+          Price
+        </span>
+      </div>
+
+      {/* Funding Raptor */}
+      <div
+        className="flex items-center gap-1 cursor-default"
+        title={`Funding Raptor (Binance FAPI): ${fundingOk ? 'connected' : 'reconnecting…'}`}
+      >
+        <span
+          className={[
+            'h-2 w-2 rounded-full transition-colors',
+            !hasData   ? 'bg-gray-600' :
+            fundingOk  ? 'bg-teal-400 animate-pulse' : 'bg-red-500',
+          ].join(' ')}
+        />
+        <span className={!hasData ? 'text-gray-600' : fundingOk ? 'text-teal-400' : 'text-red-400'}>
+          Funding
+        </span>
+      </div>
+    </div>
+  );
 }
 
 // ── Stat card ─────────────────────────────────────────────────────────────────
@@ -261,6 +373,12 @@ export default function DashboardPage() {
               selected={asset}
               onChange={setSelectedAsset}
             />
+
+            {/* Session start time */}
+            <SessionBadge startedAt={status?.session_started_at} />
+
+            {/* Raptor health (Price + Funding) */}
+            <RaptorHealthBadges raptors={status?.raptors} asset={asset} />
 
             {/* API status */}
             <div className="flex items-center gap-1.5">

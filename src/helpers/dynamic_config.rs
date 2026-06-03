@@ -43,8 +43,15 @@ use crate::helpers::db;
 // serialized before the field existed will have it missing.  Without a default,
 // serde returns a deserialization error and load_or_default resets to factory
 // defaults — clobbering any operator customisation made in the previous session.
-fn default_arb_max_leg_price() -> Decimal { config::ARBITRAGE_MAX_LEG_PRICE }
-fn default_arb_max_leg_obi()   -> Decimal { config::ARBITRAGE_MAX_LEG_OBI   }
+fn default_arb_max_leg_price()             -> Decimal { config::ARBITRAGE_MAX_LEG_PRICE             }
+fn default_arb_max_leg_obi()               -> Decimal { config::ARBITRAGE_MAX_LEG_OBI               }
+fn default_trendcapture_enable()           -> bool    { config::ENABLE_TRENDCAPTURE_TRADING          }
+fn default_trendcapture_min_trade_size()   -> Decimal { config::TRENDCAPTURE_MIN_TRADE_SIZE_USDC     }
+fn default_trendcapture_max_trade_size()   -> Decimal { config::TRENDCAPTURE_MAX_TRADE_SIZE_USDC     }
+fn default_trendcapture_max_exposure()     -> Decimal { config::TRENDCAPTURE_MAX_EXPOSURE_USDC       }
+fn default_trendcapture_stop_loss()        -> Decimal { config::TRENDCAPTURE_STOP_LOSS_PERCENT       }
+fn default_trendcapture_target_profit()    -> Decimal { config::TRENDCAPTURE_TARGET_PROFIT_PERCENT   }
+fn default_trendcapture_max_entry_price()  -> Decimal { config::TRENDCAPTURE_MAX_ENTRY_PRICE         }
 
 // ─── Struct ──────────────────────────────────────────────────────────────────
 
@@ -55,12 +62,14 @@ pub struct DynamicConfig {
     pub ghost_mode: bool,
 
     // ── Viper (strategy) enable flags ─────────────────────────────────────────
-    pub enable_arbitrage:  bool,
-    pub enable_time_decay: bool,
-    pub enable_momentum:   bool,
-    pub enable_maker:      bool,
-    pub enable_basis:      bool,
-    pub enable_gboost:     bool,
+    pub enable_arbitrage:     bool,
+    pub enable_time_decay:    bool,
+    pub enable_momentum:      bool,
+    pub enable_maker:         bool,
+    pub enable_basis:         bool,
+    pub enable_gboost:        bool,
+    #[serde(default = "default_trendcapture_enable")]
+    pub enable_trendcapture:  bool,
 
     // ── Arbitrage Viper ───────────────────────────────────────────────────────
     pub arbitrage_position_size_usdc: Decimal,
@@ -118,6 +127,20 @@ pub struct DynamicConfig {
     pub gboost_stop_loss_pct:     Decimal,
     pub gboost_target_profit_pct: Decimal,
     pub gboost_max_exposure_usdc: Decimal,
+
+    // ── TrendCapture Viper ────────────────────────────────────────────────────
+    #[serde(default = "default_trendcapture_min_trade_size")]
+    pub trendcapture_min_trade_size_usdc: Decimal,
+    #[serde(default = "default_trendcapture_max_trade_size")]
+    pub trendcapture_max_trade_size_usdc: Decimal,
+    #[serde(default = "default_trendcapture_max_exposure")]
+    pub trendcapture_max_exposure_usdc:   Decimal,
+    #[serde(default = "default_trendcapture_stop_loss")]
+    pub trendcapture_stop_loss_pct:       Decimal,
+    #[serde(default = "default_trendcapture_target_profit")]
+    pub trendcapture_target_profit_pct:   Decimal,
+    #[serde(default = "default_trendcapture_max_entry_price")]
+    pub trendcapture_max_entry_price:     Decimal,
 }
 
 impl Default for DynamicConfig {
@@ -128,12 +151,13 @@ impl Default for DynamicConfig {
         Self {
             ghost_mode: config::GHOST_MODE,
 
-            enable_arbitrage:  config::ENABLE_ARBITRAGE_TRADING,
-            enable_time_decay: config::ENABLE_TIME_DECAY_TRADING,
-            enable_momentum:   config::ENABLE_MOMENTUM_TRADING,
-            enable_maker:      config::ENABLE_MAKER_TRADING,
-            enable_basis:      config::ENABLE_BASIS_TRADING,
-            enable_gboost:     config::ENABLE_GBOOST_TRADING,
+            enable_arbitrage:     config::ENABLE_ARBITRAGE_TRADING,
+            enable_time_decay:    config::ENABLE_TIME_DECAY_TRADING,
+            enable_momentum:      config::ENABLE_MOMENTUM_TRADING,
+            enable_maker:         config::ENABLE_MAKER_TRADING,
+            enable_basis:         config::ENABLE_BASIS_TRADING,
+            enable_gboost:        config::ENABLE_GBOOST_TRADING,
+            enable_trendcapture:  config::ENABLE_TRENDCAPTURE_TRADING,
 
             arbitrage_position_size_usdc: config::ARBITRAGE_POSITION_SIZE_USDC,
             arbitrage_max_exposure_usdc:  config::ARBITRAGE_MAX_EXPOSURE_USDC,
@@ -173,6 +197,13 @@ impl Default for DynamicConfig {
             gboost_stop_loss_pct:     config::GBOOST_STOP_LOSS_PERCENT,
             gboost_target_profit_pct: config::GBOOST_TARGET_PROFIT_PERCENT,
             gboost_max_exposure_usdc: config::GBOOST_MAX_EXPOSURE_USDC,
+
+            trendcapture_min_trade_size_usdc: config::TRENDCAPTURE_MIN_TRADE_SIZE_USDC,
+            trendcapture_max_trade_size_usdc: config::TRENDCAPTURE_MAX_TRADE_SIZE_USDC,
+            trendcapture_max_exposure_usdc:   config::TRENDCAPTURE_MAX_EXPOSURE_USDC,
+            trendcapture_stop_loss_pct:       config::TRENDCAPTURE_STOP_LOSS_PERCENT,
+            trendcapture_target_profit_pct:   config::TRENDCAPTURE_TARGET_PROFIT_PERCENT,
+            trendcapture_max_entry_price:     config::TRENDCAPTURE_MAX_ENTRY_PRICE,
         }
     }
 }

@@ -6,12 +6,13 @@ export interface DynamicConfig {
   ghost_mode: boolean;
 
   // Viper enable flags
-  enable_arbitrage:  boolean;
-  enable_time_decay: boolean;
-  enable_momentum:   boolean;
-  enable_maker:      boolean;
-  enable_basis:      boolean;
-  enable_gboost:     boolean;
+  enable_arbitrage:    boolean;
+  enable_time_decay:   boolean;
+  enable_momentum:     boolean;
+  enable_maker:        boolean;
+  enable_basis:        boolean;
+  enable_gboost:       boolean;
+  enable_trendcapture: boolean;
 
   // Arbitrage Viper
   arbitrage_position_size_usdc: string;
@@ -54,6 +55,14 @@ export interface DynamicConfig {
   gboost_stop_loss_pct:     string;
   gboost_target_profit_pct: string;
   gboost_max_exposure_usdc: string;
+
+  // TrendCapture Viper
+  trendcapture_min_trade_size_usdc: string;
+  trendcapture_max_trade_size_usdc: string;
+  trendcapture_max_exposure_usdc:   string;
+  trendcapture_stop_loss_pct:       string;
+  trendcapture_target_profit_pct:   string;
+  trendcapture_max_entry_price:     string;
 }
 
 export interface PnlSnapshotRow {
@@ -98,9 +107,19 @@ export interface LlmRecommendationRow {
   is_current_session: boolean;  // true when generated in the currently-running session
 }
 
+/** Connection health for one asset's pair of Binance Raptors. */
+export interface AssetRaptorHealth {
+  price_connected:   boolean;  // Price Raptor (Binance Spot WS) is live
+  funding_connected: boolean;  // Funding Raptor (Binance FAPI REST) last polled OK
+}
+
 /** Response from GET /api/status — maps strategy key to active market name. */
 export interface StatusResponse {
   strategy_markets: Record<string, string>;
+  /** RFC-3339 timestamp of the current bot session start (= process startup). */
+  session_started_at?: string;
+  /** Per-asset Binance Raptor connection health. Key = asset symbol (e.g. "btc"). */
+  raptors?: Record<string, AssetRaptorHealth>;
 }
 
 /** Portfolio value response from /api/portfolio — cash + open positions at live prices. */

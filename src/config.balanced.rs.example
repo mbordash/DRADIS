@@ -357,6 +357,63 @@ pub const GBOOST_DRIFT_CONSECUTIVE_REQUIRED: usize = 3;
 pub const GBOOST_DRIFT_STABLE_CLEAR_REQUIRED: usize = 3;
 
 // ============================================================================
+// TRENDCAPTURE STRATEGY PARAMETERS
+// ============================================================================
+
+/// Balanced: enabled — provides a multi-minute drift signal to complement
+/// the shorter-horizon Momentum strategy on window/daily markets.
+pub const ENABLE_TRENDCAPTURE_TRADING: bool = true;
+pub const TRENDCAPTURE_MAX_EXPOSURE_USDC: Decimal = dec!(15.0);
+
+// 10m drift entry thresholds — balanced: standard thresholds.
+pub const TRENDCAPTURE_BULL_DRIFT_10M_BTC: Decimal = dec!(150.0);
+pub const TRENDCAPTURE_BEAR_DRIFT_10M_BTC: Decimal = dec!(-150.0);
+pub const TRENDCAPTURE_BULL_DRIFT_10M_ETH: Decimal = dec!(6.0);
+pub const TRENDCAPTURE_BEAR_DRIFT_10M_ETH: Decimal = dec!(-6.0);
+pub const TRENDCAPTURE_BULL_DRIFT_10M_SOL: Decimal = dec!(0.60);
+pub const TRENDCAPTURE_BEAR_DRIFT_10M_SOL: Decimal = dec!(-0.60);
+
+// 60m confirmation thresholds — balanced: standard confirmation.
+pub const TRENDCAPTURE_BULL_DRIFT_60M_BTC: Decimal = dec!(200.0);
+pub const TRENDCAPTURE_BEAR_DRIFT_60M_BTC: Decimal = dec!(-200.0);
+pub const TRENDCAPTURE_BULL_DRIFT_60M_ETH: Decimal = dec!(8.0);
+pub const TRENDCAPTURE_BEAR_DRIFT_60M_ETH: Decimal = dec!(-8.0);
+pub const TRENDCAPTURE_BULL_DRIFT_60M_SOL: Decimal = dec!(0.80);
+pub const TRENDCAPTURE_BEAR_DRIFT_60M_SOL: Decimal = dec!(-0.80);
+
+// Strike gap requirements — balanced: standard gap.
+pub const TRENDCAPTURE_BULL_STRIKE_GAP_BTC: Decimal = dec!(300.0);
+pub const TRENDCAPTURE_BEAR_STRIKE_GAP_BTC: Decimal = dec!(300.0);
+pub const TRENDCAPTURE_BULL_STRIKE_GAP_ETH: Decimal = dec!(12.0);
+pub const TRENDCAPTURE_BEAR_STRIKE_GAP_ETH: Decimal = dec!(12.0);
+pub const TRENDCAPTURE_BULL_STRIKE_GAP_SOL: Decimal = dec!(1.0);
+pub const TRENDCAPTURE_BEAR_STRIKE_GAP_SOL: Decimal = dec!(1.0);
+
+// Reversal thresholds — balanced: moderate counter-drift required to exit.
+pub const TRENDCAPTURE_REVERSAL_DRIFT_BTC: Decimal = dec!(75.0);
+pub const TRENDCAPTURE_REVERSAL_DRIFT_ETH: Decimal = dec!(3.0);
+pub const TRENDCAPTURE_REVERSAL_DRIFT_SOL: Decimal = dec!(0.30);
+
+pub const TRENDCAPTURE_MAX_SNAPSHOT_AGE_SECS: i64 = 15;
+pub const TRENDCAPTURE_MIN_SECS_TO_EXPIRY: i64 = 1800;  // 30 min minimum
+pub const TRENDCAPTURE_MARKET_WARMUP_SECS: i64 = 120;
+pub const TRENDCAPTURE_MAX_ENTRY_ASK_SUM: Decimal = dec!(1.04);
+pub const TRENDCAPTURE_MIN_ENTRY_PRICE: Decimal = dec!(0.20);
+pub const TRENDCAPTURE_POST_EXIT_COOLDOWN_SECS: i64 = 600;
+
+/// Balanced: standard OBI gates — same as default config.rs.
+pub const TRENDCAPTURE_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.35);
+pub const TRENDCAPTURE_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.75);
+
+pub const TRENDCAPTURE_KELLY_MAX_MULTIPLIER: Decimal = dec!(3.0);
+pub const TRENDCAPTURE_CATASTROPHIC_SL_PCT: Decimal = dec!(0.08);
+pub const TRENDCAPTURE_EXPIRY_EXIT_SECS: i64 = 900;
+pub const TRENDCAPTURE_EXPIRY_MIN_PROFIT_TO_HOLD: Decimal = dec!(0.02);
+pub const TRENDCAPTURE_TAKE_PROFIT_CEILING: Decimal = dec!(0.90);
+pub const TRENDCAPTURE_FILL_CONFIRM_MIN_HOLD_SECS: i64 = 30;
+pub const TRENDCAPTURE_MIN_HOLD_BEFORE_REVERSAL_SECS: i64 = 120;
+
+// ============================================================================
 // POSITION MERGE SETTINGS
 // ============================================================================
 

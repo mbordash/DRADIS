@@ -17,6 +17,7 @@
 ///
 /// Consumers should treat a `dec!(0)` oracle price as "not yet connected".
 use std::str::FromStr;
+use std::collections::HashMap;
 
 use futures::StreamExt as _;
 use rust_decimal::Decimal;
@@ -26,8 +27,10 @@ use tokio::time::{Duration, Instant, timeout as tokio_timeout};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use tracing::{info, warn};
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use crate::config;
+use crate::api::server::AssetRaptorHealth;
 
 pub async fn run_price_raptor(
     crypto_filter: String,
@@ -36,6 +39,7 @@ pub async fn run_price_raptor(
     // Sends (drift_60m, drift_10m) — both raw USD Decimal values.
     // drift_10m fills the 5s–60m temporal gap for GBoost feature [18].
     drift_tx: watch::Sender<(Decimal, Decimal)>,
+    raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
 ) {
     let binance_pair = match crypto_filter.as_str() {
         "eth" => "ethusdt",
@@ -51,6 +55,10 @@ pub async fn run_price_raptor(
     loop {
         if let Ok((mut ws_stream, _)) = connect_async(&url_str).await {
             info!(" Price Raptor connected to Binance for {}", binance_pair.to_uppercase());
+            // Mark price raptor as healthy for this asset.
+            raptor_health_tx.send_modify(|map| {
+                map.entry(crypto_filter.clone()).or_default().price_connected = true;
+            });
             // last_price_tick tracks when we last received an actual ticker text
             // message with a valid price.  Binance sends periodic WS ping frames
             // that reset the 30s tokio_timeout below but carry no price data.  A
@@ -160,6 +168,10 @@ pub async fn run_price_raptor(
             }
         }
         warn!("⚠️ Price Raptor disconnected. Reconnecting in 5s...");
+        // Mark price raptor as offline while reconnecting.
+        raptor_health_tx.send_modify(|map| {
+            map.entry(crypto_filter.clone()).or_default().price_connected = false;
+        });
         prev_velocity = dec!(0);
         price_history_10m.clear();
         tokio::time::sleep(Duration::from_secs(5)).await;
