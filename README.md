@@ -24,6 +24,8 @@
 git clone https://github.com/youruser/dradis.git && cd dradis
 cp .env.example .env          # fill in POLYMARKET_PRIVATE_KEY, POLYGON_RPC_URL, TELEGRAM tokens, etc.
 cp deploy-multi.sh.example deploy-multi.sh  # fill in HOST, USER, KEY
+# choose one config profile and copy it into src/config.rs before building
+cp src/config.balanced.rs.example src/config.rs   # or conservative/aggressive
 ```
 
 ```bash

@@ -387,7 +387,12 @@ pub const GBOOST_DRIFT_STABLE_CLEAR_REQUIRED: usize = 2;
 /// on Window/Daily markets.  Aggressive profile lowers the drift thresholds to
 /// catch earlier entries and accepts a looser OBI / spread environment.
 pub const ENABLE_TRENDCAPTURE_TRADING: bool = true;
+pub const TRENDCAPTURE_MIN_TRADE_SIZE_USDC: Decimal = dec!(6.0);
+pub const TRENDCAPTURE_MAX_TRADE_SIZE_USDC: Decimal = dec!(25.0);
 pub const TRENDCAPTURE_MAX_EXPOSURE_USDC: Decimal = dec!(25.0);
+pub const TRENDCAPTURE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.18);
+pub const TRENDCAPTURE_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
+pub const TRENDCAPTURE_MAX_ENTRY_PRICE: Decimal = dec!(0.78);
 
 // 10m drift entry thresholds — aggressive: lower bar to catch more moves earlier.
 pub const TRENDCAPTURE_BULL_DRIFT_10M_BTC: Decimal = dec!(100.0);

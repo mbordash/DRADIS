@@ -363,7 +363,12 @@ pub const GBOOST_DRIFT_STABLE_CLEAR_REQUIRED: usize = 3;
 /// Balanced: enabled — provides a multi-minute drift signal to complement
 /// the shorter-horizon Momentum strategy on window/daily markets.
 pub const ENABLE_TRENDCAPTURE_TRADING: bool = true;
+pub const TRENDCAPTURE_MIN_TRADE_SIZE_USDC: Decimal = dec!(5.0);
+pub const TRENDCAPTURE_MAX_TRADE_SIZE_USDC: Decimal = dec!(15.0);
 pub const TRENDCAPTURE_MAX_EXPOSURE_USDC: Decimal = dec!(15.0);
+pub const TRENDCAPTURE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.20);
+pub const TRENDCAPTURE_STOP_LOSS_PERCENT: Decimal = dec!(0.08);
+pub const TRENDCAPTURE_MAX_ENTRY_PRICE: Decimal = dec!(0.72);
 
 // 10m drift entry thresholds — balanced: standard thresholds.
 pub const TRENDCAPTURE_BULL_DRIFT_10M_BTC: Decimal = dec!(150.0);

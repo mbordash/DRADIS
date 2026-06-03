@@ -395,7 +395,12 @@ pub const GBOOST_DRIFT_STABLE_CLEAR_REQUIRED: usize = 5;
 /// Conservative: disabled — new strategy with limited live trading history.
 /// Enable only after confirming positive P&L in ghost mode.
 pub const ENABLE_TRENDCAPTURE_TRADING: bool = false;
+pub const TRENDCAPTURE_MIN_TRADE_SIZE_USDC: Decimal = dec!(3.0);
+pub const TRENDCAPTURE_MAX_TRADE_SIZE_USDC: Decimal = dec!(10.0);
 pub const TRENDCAPTURE_MAX_EXPOSURE_USDC: Decimal = dec!(10.0);
+pub const TRENDCAPTURE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.22);
+pub const TRENDCAPTURE_STOP_LOSS_PERCENT: Decimal = dec!(0.06);
+pub const TRENDCAPTURE_MAX_ENTRY_PRICE: Decimal = dec!(0.68);
 
 // 10m drift entry thresholds — conservative: higher threshold, requires a very
 // strong and clear directional move before entering.
