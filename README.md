@@ -349,8 +349,8 @@ POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_API_KEY
 | Profile | File | Wallet | Risk | Vipers |
 |---|---|---|---|---|
 | Conservative | `src/config.conservative.rs.example` | < $100 | Low | Maker, Time Decay |
-| Balanced | `src/config.balanced.rs.example` | $100–$300 | Medium | All six |
-| Aggressive | `src/config.aggressive.rs.example` | $200+ | High | All six |
+| Balanced | `src/config.balanced.rs.example` | $100–$300 | Medium | All seven |
+| Aggressive | `src/config.aggressive.rs.example` | $200+ | High | All seven |
 
 ```bash
 cp src/config.balanced.rs.example src/config.rs
@@ -426,7 +426,7 @@ API health: `http://YOUR_SERVER_IP:9000/api/health`
   - Backward-compatible: `CRYPTO_FILTER=btc` (single-asset) still works unchanged
 - **Raptor / Viper / Squadron architecture** — Three-layer BSG tactical separation of concerns:
   - `src/raptors/` — Price Raptor (Binance WS) + Funding Raptor (Binance FAPI)
-  - `src/vipers/` — six Viper trading strategies
+  - `src/vipers/` — seven Viper trading strategies (Momentum, Maker, Arbitrage, Time Decay, Basis, GBoost, TrendCapture)
   - `src/squadron/` — `Squadron`, `SquadronRaptors`, `SquadronConfig`, `SquadronState`
   - Each market rotation logs `️ Squadron [...] → state=PATROLLING`
 - **Open Positions improvements** — Side column colors YES/UP green and NO/DOWN red; chain-adopted positions show `⛓ adopted`; `chain_adopted` DB column with live migration
