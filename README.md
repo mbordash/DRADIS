@@ -104,16 +104,16 @@ The system is organized around four BSG-inspired tactical layers:
            │   Orchestrator (CIC)    │◄──── axum REST API (:9000)
            │     50ms Heartbeat      │
            └─────────────┬───────────┘
-                          │  parallel dispatch
-           ┌──────────────┼───────────────┬───────────────┬──────────────┐
-           ▼              ▼               ▼               ▼              ▼
+                         │  parallel dispatch
+           ┌─────────────┼───────────────┬───────────────┬──────────────┐
+           ▼             ▼               ▼               ▼              ▼
     ┌────────────┐ ┌──────────┐ ┌───────────────┐ ┌────────────┐ ┌──────────────┐
     │ Momentum   │ │  Maker   │ │  Arbitrage /  │ │   GBoost   │ │ TrendCapture │
     │   Viper    │ │  Viper   │ │  TimeDecay /  │ │    Viper   │ │    Viper     │
     │            │ │          │ │  Basis Vipers │ │   (ML)     │ │ (drift/trend)│
     └──────┬─────┘ └────┬─────┘ └──────┬────────┘ └─────┬──────┘ └──────┬───────┘
-           └────────────┼──────────────┴─────────────────┴───────────────┘
-                       ▼
+           └────────────┼──────────────┴────────────────┴───────────────┘
+                        ▼
            ┌───────────────────────┐
            │    Execution Layer    │
            │  OBI Gate · Fee Gate  │
