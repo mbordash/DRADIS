@@ -419,10 +419,16 @@ impl Strategy for TrendCaptureStrategyImpl {
                 // Trend-reversal exit
                 if secs_held >= config::TRENDCAPTURE_MIN_HOLD_BEFORE_REVERSAL_SECS {
                     let is_yes = token_id == &market.yes_token;
-                    let reversal = if is_yes { drift_10m <= -reversal_thr } else { drift_10m >= reversal_thr };
+                    let reversal = if is_yes {
+                        drift_10m <= -reversal_thr
+                    } else {
+                        drift_10m >= reversal_thr
+                    };
+
                     if reversal {
                         let net_profit = (bid - config::SELL_PRICE_OFFSET - avg_entry) / avg_entry;
-                        if net_profit <= dec!(0.02) {
+
+                        if net_profit <= dec!(0.06) || profit_margin <= dec!(-0.03) {
                             found = Some(make_exit(format!(
                                 "TrendCaptureRev: bid=${:.4}, drift_10m={:.0}, profit={:.2}%",
                                 bid, drift_10m, profit_margin * dec!(100)
@@ -493,7 +499,3 @@ pub fn kelly_trendcapture_size(
         / (config::TRENDCAPTURE_KELLY_MAX_MULTIPLIER - Decimal::ONE);
     min_size + fraction * (max_size - min_size)
 }
-
-
-
-

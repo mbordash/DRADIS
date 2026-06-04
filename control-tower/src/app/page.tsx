@@ -294,7 +294,7 @@ export default function DashboardPage() {
     useSWR('config', getConfig, { refreshInterval: 0, revalidateOnFocus: false });
 
   const { data: pnl, isLoading: pnlLoading } =
-    useSWR(['pnl', asset], () => getPnlHistory(200, asset), { refreshInterval: 60_000 });
+    useSWR(['pnl', asset], () => getPnlHistory(1440, asset), { refreshInterval: 60_000 });
 
   const { data: trades, isLoading: tradesLoading } =
     useSWR(['trades', asset], () => getTrades(60, asset), { refreshInterval: 15_000 });
