@@ -523,15 +523,31 @@ impl Strategy for MomentumStrategyImpl {
 
                 let obi_exhausted_in_pos =
                     (is_yes  && yes_obi > config::MOMENTUM_OBI_EXHAUSTION_BLOCK) ||
-                    (!is_yes && no_obi  > config::MOMENTUM_OBI_EXHAUSTION_BLOCK);
+                        (!is_yes && no_obi  > config::MOMENTUM_OBI_EXHAUSTION_BLOCK);
 
                 if obi_exhausted_in_pos {
-                    let obi_val = if is_yes { yes_obi } else { no_obi };
-                    let reason = format!(
-                        "MomentumOBIExhaust: bid=${:.4}, obi={:.3}, profit={:.2}%",
-                        bid, obi_val, profit_margin * dec!(100)
-                    );
-                    return Ok(StrategySignal::Exit { params: exit_params!(), reason, exit_pair: false });
+                    // ── Max adverse move guard for OBI exhaustion exit ─────────────────────
+                    // OBIExhaust is intended as an *early* reversal detector (exit before
+                    // hitting the normal stop-loss). Without this guard, a late OBI spike
+                    // after a large adverse move (e.g. -23% on 2026-06-03 Trade 4) will
+                    // still trigger an exit — turning the mechanism into a "we're already
+                    // wrecked" exit rather than a protective early one.
+                    //
+                    // We allow the OBI exit only if the position is not too far underwater.
+                    // Using 1.6× the configured stop-loss gives a small buffer past normal
+                    // SL while still protecting against deep late-signal losses.
+                    let max_adverse_for_obi_exit = config::MOMENTUM_OBI_EXHAUST_MAX_ADVERSE_PCT;
+
+                    if profit_margin >= max_adverse_for_obi_exit {
+                        let obi_val = if is_yes { yes_obi } else { no_obi };
+                        let reason = format!(
+                            "MomentumOBIExhaust: bid=${:.4}, obi={:.3}, profit={:.2}%",
+                            bid, obi_val, profit_margin * dec!(100)
+                        );
+                        return Ok(StrategySignal::Exit { params: exit_params!(), reason, exit_pair: false });
+                    }
+                    // If we reach here: OBI is exhausted but we're already deep underwater.
+                    // Let the normal stop-loss (or catastrophic SL) handle it instead.
                 }
             }
         }

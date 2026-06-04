@@ -35,11 +35,11 @@ chmod +x deploy-multi.sh && ./deploy-multi.sh
 
 After ~5 minutes the stack is live:
 
-| Service | URL |
-|---|---|
-| **Control Tower** | `http://<host>:3002` |
-| **DRADIS REST API** | `http://<host>:9000/api/health` |
-| **Ollama** | `http://<host>:11434/api/tags` (internal) |
+| Service             | URL                                       |
+|---------------------|-------------------------------------------|
+| **Control Tower**   | `http://<host>:3002`                      |
+| **DRADIS REST API** | `http://<host>:9000/api/health`           |
+| **Ollama**          | `http://<host>:11434/api/tags` (internal) |
 
 > **Prerequisites:** Docker on the remote host, Rust 1.95+ only needed for local builds.
 
@@ -51,12 +51,12 @@ DRADIS is a comprehensive trading automation platform for prediction markets. Bu
 
 The system is organized around four BSG-inspired tactical layers:
 
-| Layer | Folder | Role |
-|---|---|---|
-| **Raptors** | `src/raptors/` | Signal scouts — fetch, normalise, broadcast external data |
-| **Vipers** | `src/vipers/` | Trading strategies — evaluate signals and place orders |
-| **Squadron** | `src/squadron/` | Deployment unit — bundles Raptors + Vipers onto a battle location |
-| **CAG** | `src/cag/` | Commander Air Group — async dispatch, session state, multi-asset orchestration |
+| Layer        | Folder          | Role                                                                           |
+|--------------|-----------------|--------------------------------------------------------------------------------|
+| **Raptors**  | `src/raptors/`  | Signal scouts — fetch, normalise, broadcast external data                      |
+| **Vipers**   | `src/vipers/`   | Trading strategies — evaluate signals and place orders                         |
+| **Squadron** | `src/squadron/` | Deployment unit — bundles Raptors + Vipers onto a battle location              |
+| **CAG**      | `src/cag/`      | Commander Air Group — async dispatch, session state, multi-asset orchestration |
 
 ---
 
@@ -146,7 +146,7 @@ The system is organized around four BSG-inspired tactical layers:
 - **Isolated budgets**: Each Viper has its own independent capital budget and position book — a loss in one sector can't drain another's fuel.
 - **Multi-asset concurrency**: Each asset runs in its own `tokio::spawn`ed task with independent raptors and session state. The runtime uses 8 worker threads to cover BTC + ETH + SOL comfortably.
 - **OS-thread watchdog**: A native OS thread (outside the tokio runtime) checks an atomic heartbeat every 60 s. If the trading loop goes silent for 5 minutes, it calls `process::exit(1)` to trigger Docker's restart policy — immune to tokio runtime deadlocks.
-- **OBI Veto**: Built-in Order Book Imbalance gate at −0.60 blocks entries into toxic flow / distribution walls.
+- **OBI Veto**: A built-in Order Book Imbalance gate at −0.60 blocks entries into toxic flow / distribution walls.
 - **Strategy Timeout**: Each Viper evaluation is hard-capped at 500ms. A hung Viper is skipped for that tick — the engine never freezes.
 - **REST API**: axum server on `:9000` exposes live config, P&L, positions, and trade history to the Control Tower.
 
@@ -156,14 +156,14 @@ The system is organized around four BSG-inspired tactical layers:
 
 Raptors are DRADIS's recon layer — lightweight signal scouts that fly ahead of the Vipers and report external intelligence back to the CIC. Each Raptor polls a specific data source on its own schedule and publishes a normalized signal via `watch` channels.
 
-Raptors are intentionally dumb: **fetch, normalise, broadcast** — no trading logic, no position awareness, no side effects.
+Raptors are intentionally dumb: **fetch, normalize, broadcast** — no trading logic, no position awareness, no side effects.
 
-| Raptor | Source | Signal | Module |
-|---|---|---|---|
-| **Price Raptor** | Binance Spot WS | spot price, 5s/1s velocity, acceleration, 10m/60m drift | `src/raptors/price.rs` |
-| **Funding Raptor** | Binance Perpetuals FAPI | Perpetual funding rate (smart-money sentiment) | `src/raptors/funding.rs` |
-| *(future)* **Sports Raptor** | Line movement APIs | Betting line drift, public money % | — |
-| *(future)* **Politics Raptor** | Polling aggregators | Approval drift, event probability shifts | — |
+| Raptor                         | Source                  | Signal                                                  | Module                   |
+|--------------------------------|-------------------------|---------------------------------------------------------|--------------------------|
+| **Price Raptor**               | Binance Spot WS         | spot price, 5s/1s velocity, acceleration, 10m/60m drift | `src/raptors/price.rs`   |
+| **Funding Raptor**             | Binance Perpetuals FAPI | Perpetual funding rate (smart-money sentiment)          | `src/raptors/funding.rs` |
+| *(future)* **Sports Raptor**   | Line movement APIs      | Betting line drift, public money %                      | —                        |
+| *(future)* **Politics Raptor** | Polling aggregators     | Approval drift, event probability shifts                | —                        |
 
 When multiple Raptors are active, GBoost and Basis Vipers fuse their signals as features — no single Raptor has veto power alone.
 
@@ -173,14 +173,14 @@ When multiple Raptors are active, GBoost and Basis Vipers fuse their signals as 
 
 Seven specialized Viper strategy classes. Each Viper is an autonomous tactical unit with its own capital budget, position book, and entry/exit logic.
 
-| Viper | Venue | Description |
-|---|---|---|
-| **Momentum** | Hourly | Detects high-velocity Binance moves and strikes Polymarket before it reprices |
-| **Maker** | Window | Dual-sided passive bids on YES+NO, capturing the spread while managing net exposure |
-| **Arbitrage** | Window/Daily | Buys both YES+NO when combined asks are < $1.00 (net of fees) |
-| **Time Decay** | Hourly | Posts resting GTC maker bids during the theta window; settles at $1.00 at 0% fee |
-| **Basis** | Window | Fades retail skew using Binance funding rates as smart-money confirmation |
-| **GBoost** | Window/Daily | Online gradient-boosted ML model retraining continuously on live orderbook + Raptor features |
+| Viper            | Venue        | Description                                                                                                                                 |
+|------------------|--------------|---------------------------------------------------------------------------------------------------------------------------------------------|
+| **Momentum**     | Hourly       | Detects high-velocity Binance moves and strikes Polymarket before it reprices                                                               |
+| **Maker**        | Window       | Dual-sided passive bids on YES+NO, capturing the spread while managing net exposure                                                         |
+| **Arbitrage**    | Window/Daily | Buys both YES+NO when combined asks are < $1.00 (net of fees)                                                                               |
+| **Time Decay**   | Hourly       | Posts resting GTC maker bids during the theta window; settles at $1.00 at 0% fee                                                            |
+| **Basis**        | Window       | Fades retail skew using Binance funding rates as smart-money confirmation                                                                   |
+| **GBoost**       | Window/Daily | Online gradient-boosted ML model retraining continuously on live orderbook + Raptor features                                                |
 | **TrendCapture** | Window/Daily | Exploits sustained multi-minute oracle drift (10m + 60m) before Polymarket reprices; Kelly-fractional sizing, OBI veto, trend-reversal exit |
 
 Build your own: [CUSTOM_STRATEGY.md](docs/CUSTOM_STRATEGY.md).
@@ -201,21 +201,21 @@ Squadron
 
 ### Composition presets
 
-| Preset | Raptors | Vipers |
-|---|---|---|
-| `full_wing` | Price + Funding | All seven Vipers (current default) |
-| `momentum_only` | Price only | Momentum + GBoost |
-| `arb_wing` | Price + Funding | Arbitrage + Basis |
+| Preset          | Raptors         | Vipers                             |
+|-----------------|-----------------|------------------------------------|
+| `full_wing`     | Price + Funding | All seven Vipers (current default) |
+| `momentum_only` | Price only      | Momentum + GBoost                  |
+| `arb_wing`      | Price + Funding | Arbitrage + Basis                  |
 
 ### Lifecycle states
 
-| State | Meaning |
-|---|---|
-| `STAGED` | Assembled, waiting for a battle location |
-| `DEPLOYED` | Market acquired, WS subscriptions live |
-| `PATROLLING` | Active trading tick loop running |
-| `RTB` | Returning to base — no new entries, winding down |
-| `STOOD_DOWN` | Market expired or manually stood down |
+| State        | Meaning                                          |
+|--------------|--------------------------------------------------|
+| `STAGED`     | Assembled, waiting for a battle location         |
+| `DEPLOYED`   | Market acquired, WS subscriptions live           |
+| `PATROLLING` | Active trading tick loop running                 |
+| `RTB`        | Returning to base — no new entries, winding down |
+| `STOOD_DOWN` | Market expired or manually stood down            |
 
 Each market rotation logs: `️ Squadron [btc-hourly-2026-05-23T14:00:00Z] → state=PATROLLING`
 
@@ -261,13 +261,13 @@ DRADIS ships with a real-time web dashboard called **Control Tower** built on Ne
 
 ![Control Tower Dashboard](docs/ui-screenshot.png)
 
-| Panel | What it shows |
-|---|---|
-| **Status Bar** | Engine online/offline, GHOST mode badge, active market, current BTC price, session P&L |
-| **P&L Chart** | Rolling equity curve across recent snapshots |
-| **Viper Cards** | Live enabled/disabled toggle + all parameters editable inline without a restart |
+| Panel              | What it shows                                                                                    |
+|--------------------|--------------------------------------------------------------------------------------------------|
+| **Status Bar**     | Engine online/offline, GHOST mode badge, active market, current BTC price, session P&L           |
+| **P&L Chart**      | Rolling equity curve across recent snapshots                                                     |
+| **Viper Cards**    | Live enabled/disabled toggle + all parameters editable inline without a restart                  |
 | **Open Positions** | In-flight positions with entry time, side (YES/NO/UP/DOWN in correct color), entry price, shares |
-| **Trade Log** | Last N completed trades with strategy, side, entry/exit prices, shares, P&L, exit reason |
+| **Trade Log**      | Last N completed trades with strategy, side, entry/exit prices, shares, P&L, exit reason         |
 
 ### Live Config Editing
 
@@ -287,7 +287,7 @@ CT_PASSWORD=your-strong-password
 
 ## LLM Advisor
 
-Optional background task. Every `LLM_ADVISOR_INTERVAL_SECS` (default: 30 min) it fetches recent trades from SQLite, analyses them with a local Ollama model, and posts plain-English optimisation recommendations to Telegram.
+Optional background task. Every `LLM_ADVISOR_INTERVAL_SECS` (default: 30 min) it fetches recent trades from SQLite, analyzes them with a local Ollama model, and posts plain-English optimization recommendations to Telegram.
 
 ```rust
 // src/config.rs
@@ -348,11 +348,11 @@ POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_API_KEY
 
 `src/config.rs` is gitignored. Copy one of the provided examples before building:
 
-| Profile | File | Wallet | Risk | Vipers |
-|---|---|---|---|---|
-| Conservative | `src/config.conservative.rs.example` | < $100 | Low | Maker, Time Decay |
-| Balanced | `src/config.balanced.rs.example` | $100–$300 | Medium | All seven |
-| Aggressive | `src/config.aggressive.rs.example` | $200+ | High | All seven |
+| Profile      | File                                 | Wallet    | Risk   | Vipers            |
+|--------------|--------------------------------------|-----------|--------|-------------------|
+| Conservative | `src/config.conservative.rs.example` | < $100    | Low    | Maker, Time Decay |
+| Balanced     | `src/config.balanced.rs.example`     | $100–$300 | Medium | All seven         |
+| Aggressive   | `src/config.aggressive.rs.example`   | $200+     | High   | All seven         |
 
 ```bash
 cp src/config.balanced.rs.example src/config.rs
@@ -458,13 +458,13 @@ API health: `http://YOUR_SERVER_IP:9000/api/health`
 openclaw skills install dradis-tactical-command
 ```
 
-| You say | Effect |
-|---|---|
-| *"Pause GBoost"* | Stops GBoost entries on next tick |
-| *"Enable ghost mode"* | Switches to paper trading instantly |
-| *"What's my P&L today?"* | Returns session profit/loss |
-| *"Show open positions"* | Lists all in-flight positions |
-| *"Tighten GBoost stop loss to 8%"* | Updates risk parameter live |
+| You say                            | Effect                              |
+|------------------------------------|-------------------------------------|
+| *"Pause GBoost"*                   | Stops GBoost entries on next tick   |
+| *"Enable ghost mode"*              | Switches to paper trading instantly |
+| *"What's my P&L today?"*           | Returns session profit/loss         |
+| *"Show open positions"*            | Lists all in-flight positions       |
+| *"Tighten GBoost stop loss to 8%"* | Updates risk parameter live         |
 
 ```bash
 # .env — enables API key enforcement for OpenClaw
@@ -507,11 +507,11 @@ The safe pattern: bump the suffix in `GBOOST_MODEL_PATH` (e.g. `v14f` → `v15f`
 
 **Why doesn't DRADIS include a backtesting framework?**
 
-| Concern | Backtester | Ghost Mode |
-|---|---|---|
-| Market data fidelity | Requires storing full L2 orderbook snapshots | Real-time Polymarket CLOB — 100% authentic |
-| Strategy fidelity | Must mock async execution, cooldown maps, drawdown guards | Full production code path runs unchanged |
-| Fill simulation | Assumes fills that may never occur in thin markets | No fills in ghost — no wishful thinking |
-| Build/maintain cost | Significant | Zero — `GHOST_MODE = true` in `config.rs` |
+| Concern              | Backtester                                                | Ghost Mode                                 |
+|----------------------|-----------------------------------------------------------|--------------------------------------------|
+| Market data fidelity | Requires storing full L2 orderbook snapshots              | Real-time Polymarket CLOB — 100% authentic |
+| Strategy fidelity    | Must mock async execution, cooldown maps, drawdown guards | Full production code path runs unchanged   |
+| Fill simulation      | Assumes fills that may never occur in thin markets        | No fills in ghost — no wishful thinking    |
+| Build/maintain cost  | Significant                                               | Zero — `GHOST_MODE = true` in `config.rs`  |
 
 Workflow: ghost overnight → `tools/session_parser.py` → tune `config.rs` → repeat until positive expectancy.

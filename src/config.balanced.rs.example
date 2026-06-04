@@ -116,6 +116,8 @@ pub const MOMENTUM_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.60);
 /// Balanced: 0.75 — between conservative (0.70) and aggressive (0.80).
 pub const MOMENTUM_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.75);
 
+pub const MOMENTUM_OBI_EXHAUST_MAX_ADVERSE_PCT: Decimal = dec!(-0.08);
+
 /// Maximum OBI swing allowed at Momentum entry.
 /// Balanced: 0.80 — standard protection against book-sweep entries.
 pub const MOMENTUM_OBI_SWING_BLOCK: Decimal = dec!(0.80);
@@ -368,7 +370,7 @@ pub const TRENDCAPTURE_MAX_TRADE_SIZE_USDC: Decimal = dec!(15.0);
 pub const TRENDCAPTURE_MAX_EXPOSURE_USDC: Decimal = dec!(15.0);
 pub const TRENDCAPTURE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.20);
 pub const TRENDCAPTURE_STOP_LOSS_PERCENT: Decimal = dec!(0.08);
-pub const TRENDCAPTURE_MAX_ENTRY_PRICE: Decimal = dec!(0.72);
+pub const TRENDCAPTURE_MAX_ENTRY_PRICE: Decimal = dec!(0.65);
 
 // 10m drift entry thresholds — balanced: standard thresholds.
 pub const TRENDCAPTURE_BULL_DRIFT_10M_BTC: Decimal = dec!(150.0);
@@ -416,7 +418,7 @@ pub const TRENDCAPTURE_EXPIRY_EXIT_SECS: i64 = 900;
 pub const TRENDCAPTURE_EXPIRY_MIN_PROFIT_TO_HOLD: Decimal = dec!(0.02);
 pub const TRENDCAPTURE_TAKE_PROFIT_CEILING: Decimal = dec!(0.90);
 pub const TRENDCAPTURE_FILL_CONFIRM_MIN_HOLD_SECS: i64 = 30;
-pub const TRENDCAPTURE_MIN_HOLD_BEFORE_REVERSAL_SECS: i64 = 120;
+pub const TRENDCAPTURE_MIN_HOLD_BEFORE_REVERSAL_SECS: i64 = 90;
 
 // ============================================================================
 // POSITION MERGE SETTINGS

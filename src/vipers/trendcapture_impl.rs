@@ -183,11 +183,12 @@ impl Strategy for TrendCaptureStrategyImpl {
         let _ = (bull_reversal_thr, bear_reversal_thr); // used only in exit
 
         // ── 60m drift alignment gate ──────────────────────────────────────────
-        // When 60m history exists, it must confirm the 10m direction.
+        // REQUIREMENT: 60m drift MUST confirm the 10m direction.
+        // We require at least 10 minutes of oracle history (drift_60m != 0) before entry.
         // A 10m spike that contradicts the 60m trend is a counter-trend bounce — skip.
-        // When drift_60m = 0 (no history yet) we skip this check and rely on 10m alone.
-        let drift_60m_blocks_bull = drift_60m != dec!(0) && drift_60m < bull_drift_60m_thr;
-        let drift_60m_blocks_bear = drift_60m != dec!(0) && drift_60m > bear_drift_60m_thr;
+        // Changed from optional to mandatory: no trades until 10+ minutes of history exists.
+        let drift_60m_blocks_bull = drift_60m == dec!(0) || drift_60m < bull_drift_60m_thr;
+        let drift_60m_blocks_bear = drift_60m == dec!(0) || drift_60m > bear_drift_60m_thr;
 
         // ── OBI adverse-direction veto ────────────────────────────────────────
         let yes_total_depth = snap.yes_bid_depth + snap.yes_ask_depth;
