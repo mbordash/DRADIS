@@ -53,9 +53,12 @@ function timeAgo(iso: string): string {
 
 // ── Squadron row ──────────────────────────────────────────────────────────────
 
-function SquadronRow({ sq }: { sq: SquadronSummary }) {
+function SquadronRow({ sq, onClick }: { sq: SquadronSummary; onClick?: (sq: SquadronSummary) => void }) {
   return (
-    <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4 px-4 py-3 border-b border-[#1e1e32] last:border-0 hover:bg-white/[0.02] transition-colors">
+    <button
+      onClick={() => onClick?.(sq)}
+      className="w-full flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4 px-4 py-3 border-b border-[#1e1e32] last:border-0 hover:bg-white/[0.02] transition-colors text-left cursor-pointer"
+    >
       {/* Left — asset + name */}
       <div className="flex items-center gap-2 min-w-0 flex-1">
         <AssetChip asset={sq.asset} />
@@ -85,7 +88,7 @@ function SquadronRow({ sq }: { sq: SquadronSummary }) {
           {sq.id}
         </span>
       </div>
-    </div>
+    </button>
   );
 }
 
@@ -115,9 +118,10 @@ function EmptyState({ isLoading }: { isLoading: boolean }) {
 interface Props {
   squadrons: SquadronSummary[];
   isLoading: boolean;
+  onSquadronClick?: (sq: SquadronSummary) => void;
 }
 
-export default function SquadronsPanel({ squadrons, isLoading }: Props) {
+export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick }: Props) {
   const active   = squadrons.filter(s => s.state === 'PATROLLING' || s.state === 'DEPLOYED');
   const inactive = squadrons.filter(s => s.state !== 'PATROLLING' && s.state !== 'DEPLOYED');
 
@@ -147,7 +151,7 @@ export default function SquadronsPanel({ squadrons, isLoading }: Props) {
           {/* Active squadrons */}
           {active.length > 0 && (
             <div>
-              {active.map(sq => <SquadronRow key={sq.id} sq={sq} />)}
+              {active.map(sq => <SquadronRow key={sq.id} sq={sq} onClick={onSquadronClick} />)}
             </div>
           )}
 
@@ -158,7 +162,7 @@ export default function SquadronsPanel({ squadrons, isLoading }: Props) {
                 <span className="group-open:rotate-90 transition-transform inline-block">▶</span>
                 {inactive.length} stood-down / RTB
               </summary>
-              {inactive.map(sq => <SquadronRow key={sq.id} sq={sq} />)}
+              {inactive.map(sq => <SquadronRow key={sq.id} sq={sq} onClick={onSquadronClick} />)}
             </details>
           )}
         </>
