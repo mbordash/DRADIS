@@ -569,6 +569,9 @@ pub async fn arb_pair_fill_monitor(
     // Using ask+1tick lets us cross the spread as a taker and get immediate fill.
     let fak_price = (ask_price + dec!(0.01)).min(dynamic_ceiling);
 
+    debug!("DEBUG ARB ARBITER [{}]: FAK re-hedge attempt details: ask_price={:.4}, dynamic_ceiling={:.4}, fak_price={:.4}",
+           strategy_name, ask_price, dynamic_ceiling, fak_price);
+
     warn!("🎯 ARB ARBITER [{}]: Placing FAK taker buy — token={} qty={} limit={:.4} (ask={:.4}, breakeven_ceil={:.4}, filled_entry={:.4})",
           strategy_name, missing_token, fak_qty, fak_price, ask_price, dynamic_ceiling, filled_avg_entry);
 
