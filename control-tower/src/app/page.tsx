@@ -367,12 +367,6 @@ export default function DashboardPage() {
 
           {/* Right cluster */}
           <div className="flex items-center gap-3">
-            {/* Asset selector tabs (hidden when only one asset) */}
-            <AssetTabs
-              assets={availableAssets}
-              selected={asset}
-              onChange={setSelectedAsset}
-            />
 
             {/* Session start time */}
             <SessionBadge startedAt={status?.session_started_at} />
@@ -427,6 +421,13 @@ export default function DashboardPage() {
             )}
           </div>
         )}
+
+        {/* Asset selector tabs (hidden when only one asset) */}
+        <AssetTabs
+            assets={availableAssets}
+            selected={asset}
+            onChange={setSelectedAsset}
+        />
 
         {/* ── Portfolio Value Banner ─────────────────────────────────── */}
         <PortfolioValueBanner

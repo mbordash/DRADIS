@@ -30,7 +30,9 @@ cp src/config.balanced.rs.example src/config.rs   # or conservative/aggressive
 
 ```bash
 # 2. Deploy (builds Rust engine + Control Tower, starts Ollama, pulls model)
-chmod +x deploy-multi.sh && ./deploy-multi.sh
+./start-local.sh
+tail -f logs/dradis-local.log
+./stop-local.sh
 ```
 
 After ~5 minutes the stack is live:

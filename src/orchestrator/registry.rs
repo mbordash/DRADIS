@@ -1,18 +1,3 @@
-/// Strategy Registry - Manages instantiation and lifecycle of all trading strategies
-///
-/// Provides a central registry for creating and managing strategy instances.
-/// This enables uniform handling of all strategies through the Strategy trait.
-///
-/// ── Hot-Enable Design ────────────────────────────────────────────────────────
-/// ALL strategies are ALWAYS instantiated at startup, regardless of compile-time
-/// ENABLE_* flags.  The DynamicConfig enable flags (enable_gboost, enable_momentum,
-/// etc.) are the SOLE runtime gates — checked on every tick in each strategy's
-/// evaluate_entry().  This means the Control Tower UI's PATCH /api/config toggle
-/// takes effect immediately during a running session without a redeploy.
-///
-/// The compile-time ENABLE_* constants in config.rs / config-live.rs now serve
-/// only as the DEFAULT value seeded into DynamicConfig on first startup.
-
 use crate::orchestrator::Strategy;
 use crate::vipers::momentum_impl::MomentumStrategyImpl;
 use crate::vipers::arbitrage_impl::ArbitrageStrategyImpl;
@@ -74,5 +59,11 @@ impl StrategyRegistry {
             "TrendCaptureStrategy",
         ]
         .into_iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Returns the priority of a strategy (lower number = higher priority).
+    /// Returns None if the strategy name is not found.
+    pub fn get_strategy_priority(strategy_name: &str) -> Option<usize> {
+        Self::strategy_names().iter().position(|s| s == strategy_name)
     }
 }

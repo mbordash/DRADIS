@@ -281,10 +281,14 @@ impl Squadron {
             let mut ownership = token_ownership.lock().await;
             ownership.clear();
             for ((sn, tid), _) in map.iter() {
-                // first-write wins: if two entries disagree, the first one (by
-                // HashMap iteration order) is kept — reconcile already resolved
-                // priority so this is consistent.
-                ownership.entry(*tid).or_insert_with(|| sn.clone());
+                let current_priority = StrategyRegistry::get_strategy_priority(sn).unwrap_or(usize::MAX);
+                let entry = ownership.entry(*tid).or_insert_with(|| sn.clone());
+                let existing_priority = StrategyRegistry::get_strategy_priority(entry).unwrap_or(usize::MAX);
+
+                if current_priority < existing_priority {
+                    // Current strategy has higher priority, claim the token
+                    *entry = sn.clone();
+                }
             }
             if !ownership.is_empty() {
                 info!(
@@ -677,15 +681,29 @@ impl Squadron {
                                 // Upgraded to WARN so cross-strategy interference is always visible
                                 // in production logs — previously this was a silent debug! drop.
                                 {
-                                    let ownership = token_ownership.lock().await;
+                                    let mut ownership = token_ownership.lock().await;
                                     if let Some(existing_owner) = ownership.get(&params.token_id) {
                                         if existing_owner != &sn {
-                                            warn!(
-                                                "🚫 TOKEN SOVEREIGNTY [{}]: token {} already claimed by {} \
-                                                 — entry rejected (registry hit)",
-                                                sn, &params.token_id.to_string()[..16], existing_owner,
-                                            );
-                                            continue;
+                                            let current_priority = StrategyRegistry::get_strategy_priority(&sn).unwrap_or(usize::MAX);
+                                            let existing_priority = StrategyRegistry::get_strategy_priority(existing_owner).unwrap_or(usize::MAX);
+
+                                            if current_priority < existing_priority {
+                                                // Current strategy has higher priority, allow it to claim
+                                                warn!(
+                                                    "⚠️ TOKEN SOVEREIGNTY OVERRIDE [{}]: token {} previously claimed by {} (P={}) \
+                                                     — now claimed by {} (P={})",
+                                                    sn, &params.token_id.to_string()[..16], existing_owner, existing_priority, sn, current_priority,
+                                                );
+                                                ownership.insert(params.token_id, sn.clone());
+                                            } else {
+                                                // Current strategy has lower or equal priority, reject entry
+                                                warn!(
+                                                    "🚫 TOKEN SOVEREIGNTY [{}]: token {} already claimed by {} (P={}) \
+                                                     — entry rejected (registry hit) for {} (P={})",
+                                                    sn, &params.token_id.to_string()[..16], existing_owner, existing_priority, sn, current_priority,
+                                                );
+                                                continue;
+                                            }
                                         }
                                     }
                                 }
