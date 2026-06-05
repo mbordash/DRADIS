@@ -118,6 +118,8 @@ pub const MOMENTUM_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.60);
 /// Balanced: 0.75 — between conservative (0.70) and aggressive (0.80).
 pub const MOMENTUM_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.75);
 
+pub const MOMENTUM_OBI_EXHAUST_MAX_ADVERSE_PCT: Decimal = dec!(-0.08);
+
 /// Maximum OBI swing allowed at Momentum entry.
 /// Balanced: 0.80 — standard protection against book-sweep entries.
 pub const MOMENTUM_OBI_SWING_BLOCK: Decimal = dec!(0.80);
