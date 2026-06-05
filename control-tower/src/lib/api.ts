@@ -93,6 +93,23 @@ export async function getSquadrons(): Promise<SquadronSummary[]> {
   return res.json();
 }
 
+export async function getSquadronConfig(squadronId: string): Promise<DynamicConfig> {
+  const res = await fetch(`${BASE}/api/squadrons/${encodeURIComponent(squadronId)}/config`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/squadrons/${squadronId}/config → ${res.status}`);
+  return res.json();
+}
+
+export async function patchSquadronConfig(squadronId: string, patch: Partial<DynamicConfig>): Promise<DynamicConfig> {
+  const res = await fetch(`${BASE}/api/squadrons/${encodeURIComponent(squadronId)}/config`, {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch),
+    cache: 'no-store',
+  });
+  if (!res.ok) throw new Error(`PATCH /api/squadrons/${squadronId}/config → ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
 // ── Viper metadata ────────────────────────────────────────────────────────────
 
 export const VIPER_DEFS: ViperDef[] = [

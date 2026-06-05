@@ -25,6 +25,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::sync::RwLock;
 
 use alloy::primitives::Address;
 use alloy::signers::local::LocalSigner;
@@ -70,8 +71,8 @@ pub struct PatrolContext<P> {
     pub market_rx: watch::Receiver<MarketState>,
 
     // ── Configuration ────────────────────────────────────────────────────────
-    /// Dynamic runtime config (strategy parameters tunable without restart).
-    pub config_rx:  watch::Receiver<Arc<DynamicConfig>>,
+    /// Squadron-scoped dynamic config (each squadron has its own independent config).
+    pub dynamic_config: Arc<RwLock<DynamicConfig>>,
     /// Broadcasts the strategy→market mapping to the Control Tower status feed.
     pub markets_tx: Arc<watch::Sender<HashMap<String, String>>>,
     /// Upper-case crypto symbol (e.g. `"BTC"`) for oracle price filtering.

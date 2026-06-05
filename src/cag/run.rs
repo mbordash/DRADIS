@@ -9,7 +9,7 @@
 /// It is expected to loop for the lifetime of the process.
 
 use std::collections::HashMap;
-use std::sync::{Arc, atomic::AtomicU64};
+use std::sync::{Arc, atomic::AtomicU64, RwLock};
 
 use alloy::primitives::{Address, U256};
 use alloy::providers::Provider;
@@ -63,8 +63,8 @@ pub struct RunArgs<P> {
     pub raptor_signals: SquadronRaptors,
     /// Session-scoped shared state (positions, PnL, collateral, etc.).
     pub session: SessionState,
-    /// Dynamic runtime config channel (strategy parameter tuning).
-    pub config_rx: watch::Receiver<Arc<DynamicConfig>>,
+    // Note: Squadron configs are now per-squadron, loaded from DB on deployment.
+    // Global config_tx/config_rx removed in favor of squadron-scoped DynamicConfig.
     /// Broadcasts the strategy→market mapping to the Control Tower status feed.
     pub markets_tx: Arc<watch::Sender<HashMap<String, String>>>,
     // ── Notification credentials ─────────────────────────────────────────────
@@ -116,7 +116,6 @@ where
         crypto_filter,
         raptor_signals,
         session,
-        config_rx,
         markets_tx,
         tg_token,
         tg_chat_id,
@@ -228,7 +227,7 @@ where
         shared_http:    Arc::clone(&shared_http),
         wallet_provider: wallet_provider.clone(),
         market_rx:       market_rx.clone(),
-        config_rx:       config_rx.clone(),
+        dynamic_config:  Arc::new(RwLock::new(DynamicConfig::default())), // placeholder, set per squadron
         markets_tx:      Arc::clone(&markets_tx),
         crypto_filter:   crypto_filter.clone(),
         tg_token:              tg_token.clone(),
@@ -358,6 +357,11 @@ where
                 raptor_signals.funding.clone().expect("funding raptor always present"),
             ),
         );
+
+        // Initialize squadron-scoped config (copy from config.rs defaults)
+        let squadron_config = DynamicConfig::init_for_squadron(&squadron.id).await;
+        patrol_ctx.dynamic_config = Arc::new(RwLock::new((*squadron_config).clone()));
+
         squadron.start_patrol();
         info!("🛫  Squadron [{}] → state={}", squadron.id, squadron.state);
 

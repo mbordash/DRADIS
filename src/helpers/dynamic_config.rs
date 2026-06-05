@@ -322,5 +322,75 @@ impl DynamicConfig {
         info!("⚙️  DynamicConfig hot-patched and persisted");
         Ok(Arc::new(updated))
     }
+
+    // ── Squadron-scoped config methods ─────────────────────────────────────────
+
+    /// Load a squadron's config from the squadron_configs table.
+    /// If none exists, returns a fresh copy of compile-time defaults (does NOT persist yet).
+    /// Caller is responsible for persisting via save_for_squadron() if needed.
+    pub async fn load_for_squadron(squadron_id: &str) -> Arc<Self> {
+        if let Some(pool) = db::pool() {
+            if let Some(json) = db::squadron_config_get(pool, squadron_id).await {
+                match serde_json::from_str::<DynamicConfig>(&json) {
+                    Ok(mut cfg) => {
+                        // Apply safety floors (same as global config)
+                        cfg.time_decay_max_entry_price = cfg.time_decay_max_entry_price
+                            .min(config::TIME_DECAY_MAX_ENTRY_PRICE);
+                        cfg.time_decay_stop_loss_pct = cfg.time_decay_stop_loss_pct
+                            .min(config::TIME_DECAY_STOP_LOSS_PERCENT);
+                        cfg.momentum_stop_loss_pct = cfg.momentum_stop_loss_pct
+                            .min(config::MOMENTUM_STOP_LOSS_PERCENT);
+
+                        info!("⚙️  Squadron config loaded from DB: {}", squadron_id);
+                        return Arc::new(cfg);
+                    }
+                    Err(e) => {
+                        warn!("⚠️  Squadron config parse error [{}]: {} — using defaults", squadron_id, e);
+                    }
+                }
+            }
+        }
+        // No existing config → return defaults (caller decides whether to persist)
+        Arc::new(DynamicConfig::default())
+    }
+
+    /// Initialize a squadron's config by copying compile-time defaults to its DB row.
+    /// Call this when deploying a new squadron.
+    pub async fn init_for_squadron(squadron_id: &str) -> Arc<Self> {
+        let cfg = Arc::new(DynamicConfig::default());
+        cfg.save_for_squadron(squadron_id).await;
+        info!("⚙️  Squadron config initialized: {}", squadron_id);
+        cfg
+    }
+
+    /// Persist this config for a specific squadron.
+    pub async fn save_for_squadron(&self, squadron_id: &str) {
+        if let Some(pool) = db::pool() {
+            match serde_json::to_string(self) {
+                Ok(json) => {
+                    db::squadron_config_set(pool, squadron_id, &json).await;
+                }
+                Err(e) => warn!("⚠️  Squadron config serialize error [{}]: {}", squadron_id, e),
+            }
+        }
+    }
+
+    /// Apply a partial JSON patch to a squadron's config and persist.
+    pub async fn apply_squadron_patch(squadron_id: &str, patch_json: &str) -> Result<Arc<Self>> {
+        let current = Self::load_for_squadron(squadron_id).await;
+        let mut value = serde_json::to_value(current.as_ref())?;
+        let patch: serde_json::Value = serde_json::from_str(patch_json)?;
+
+        if let (Some(obj), Some(patch_obj)) = (value.as_object_mut(), patch.as_object()) {
+            for (k, v) in patch_obj {
+                obj.insert(k.clone(), v.clone());
+            }
+        }
+
+        let updated: DynamicConfig = serde_json::from_value(value)?;
+        updated.save_for_squadron(squadron_id).await;
+        info!("⚙️  Squadron config hot-patched: {}", squadron_id);
+        Ok(Arc::new(updated))
+    }
 }
 

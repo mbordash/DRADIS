@@ -93,7 +93,7 @@ impl Squadron {
         let wallet_provider = ctx.wallet_provider.clone();
 
         // Config / channels
-        let config_rx  = ctx.config_rx.clone();
+        let dynamic_config = Arc::clone(&ctx.dynamic_config);
         let markets_tx = Arc::clone(&ctx.markets_tx);
         let crypto_filter = ctx.crypto_filter.clone();
         // Lowercase asset slug — used for per-asset DB pool lookups and metrics CSV naming.
@@ -435,7 +435,7 @@ impl Squadron {
 
                     let maker_market_config_for_ctx = maker_market_config.clone();
 
-                    let dyn_cfg = config_rx.borrow().clone();
+                    let dyn_cfg = Arc::new(dynamic_config.read().unwrap().clone());
 
                     // Hoist mutex-await calls OUT of the struct literal so that
                     // borrow() Ref guards (oracle_rx, velocity_rx, etc.) in the

@@ -11,6 +11,8 @@ import {
   getOpenPositions,
   getStatus,
   patchConfig,
+  getSquadronConfig,
+  patchSquadronConfig,
   VIPER_DEFS,
 } from '@/lib/api';
 import ViperCard from '@/components/ViperCard';
@@ -138,10 +140,12 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
   const asset = squadron.asset.toLowerCase();
 
   // ── Data fetching ──────────────────────────────────────────────────────────
-  const { data: config, mutate: refreshConfig } = useSWR('config', getConfig, {
-    refreshInterval: 0,
-    revalidateOnFocus: false,
-  });
+  // Load squadron-specific config instead of global config
+  const { data: config, mutate: refreshConfig } = useSWR(
+    ['squadron-config', squadron.id],
+    () => getSquadronConfig(squadron.id),
+    { refreshInterval: 0, revalidateOnFocus: false }
+  );
 
   const { data: pnl, isLoading: pnlLoading } = useSWR(
     ['pnl', asset],
@@ -178,10 +182,10 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
   // ── Handlers ───────────────────────────────────────────────────────────────
   const handlePatch = useCallback(
     async (patch: Partial<DynamicConfig>) => {
-      await patchConfig(patch);
+      await patchSquadronConfig(squadron.id, patch);
       await refreshConfig();
     },
-    [refreshConfig]
+    [squadron.id, refreshConfig]
   );
 
   return (
@@ -253,9 +257,20 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
       <section>
         <div className="flex items-center justify-between mb-3">
           <p className="label-muted">Viper Layer (Active Strategies)</p>
-          <span className="text-xs text-gray-600 font-mono">
-            {asset.toUpperCase()} execution configs
-          </span>
+          <div className="flex items-center gap-2">
+            <span className="text-[10px] font-mono bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 rounded px-2 py-0.5">
+              🎯 Squadron-Scoped Config
+            </span>
+            <span className="text-xs text-gray-600 font-mono">
+              {asset.toUpperCase()} execution configs
+            </span>
+          </div>
+        </div>
+
+        {/* Info banner explaining squadron configs */}
+        <div className="mb-3 px-4 py-2 bg-indigo-500/5 border border-indigo-500/20 rounded-lg text-xs font-mono text-indigo-300">
+          <span className="font-semibold">Squadron Config:</span> Changes here only affect this squadron.
+          Each squadron has independent viper parameters.
         </div>
 
         {/* Active markets banner */}

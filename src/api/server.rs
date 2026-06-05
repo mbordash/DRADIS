@@ -399,6 +399,75 @@ async fn get_squadron_by_id(
     }
 }
 
+/// GET /api/squadrons/{id}/config
+///
+/// Returns the squadron's DynamicConfig as JSON, or 404 if squadron not found.
+async fn get_squadron_config(
+    Path(id): Path<String>,
+) -> Response {
+    debug!("Received GET /api/squadrons/{}/config", id);
+    match db::pool() {
+        Some(pool) => {
+            if let Some(json) = db::squadron_config_get(&pool, &id).await {
+                match serde_json::from_str::<DynamicConfig>(&json) {
+                    Ok(cfg) => match serde_json::to_value(&cfg) {
+                        Ok(val) => {
+                            debug!("Successfully retrieved squadron config for {}", id);
+                            (StatusCode::OK, Json(val)).into_response()
+                        },
+                        Err(e) => {
+                            error!("Error serializing squadron config for {}: {}", id, e);
+                            (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                        },
+                    },
+                    Err(e) => {
+                        error!("Error parsing squadron config for {}: {}", id, e);
+                        (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                    },
+                }
+            } else {
+                warn!("GET /api/squadrons/{}/config: not found", id);
+                (StatusCode::NOT_FOUND, format!("squadron '{}' config not found", id)).into_response()
+            }
+        },
+        None => {
+            error!("Database pool not available for GET /api/squadrons/{}/config", id);
+            (StatusCode::INTERNAL_SERVER_ERROR, "database unavailable").into_response()
+        },
+    }
+}
+
+/// PATCH /api/squadrons/{id}/config
+///
+/// Body: a partial JSON object with only the fields to change, e.g.
+///   `{"time_decay_position_size_usdc": "8.0"}`
+///
+/// Applies squadron-specific config changes.
+async fn patch_squadron_config(
+    Path(id): Path<String>,
+    body: String,
+) -> Response {
+    debug!("Received PATCH /api/squadrons/{}/config with body: {}", id, body);
+    match DynamicConfig::apply_squadron_patch(&id, &body).await {
+        Ok(new_cfg) => {
+            match serde_json::to_value(new_cfg.as_ref()) {
+                Ok(val) => {
+                    debug!("Successfully patched squadron config for {}", id);
+                    (StatusCode::OK, Json(val)).into_response()
+                },
+                Err(e) => {
+                    error!("Error serializing new squadron config for {}: {}", id, e);
+                    (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response()
+                },
+            }
+        },
+        Err(e) => {
+            error!("Error applying patch for squadron {}: {}", id, e);
+            (StatusCode::BAD_REQUEST, e.to_string()).into_response()
+        },
+    }
+}
+
 // ─── Server startup ──────────────────────────────────────────────────────────
 
 /// Spawn the Control Tower axum server.
@@ -449,6 +518,7 @@ pub async fn run_api_server(
         // ── Phase 3d: Squadron registry endpoints ──────────────────────────
         .route("/api/squadrons",             get(get_squadrons))
         .route("/api/squadrons/{id}",        get(get_squadron_by_id))
+        .route("/api/squadrons/{id}/config", get(get_squadron_config).patch(patch_squadron_config))
         // API-key check applied to all matched routes (inner layer — runs after CORS).
         // No-op when DRADIS_API_KEY is unset so local-dev workflow is unchanged.
         .layer(axum::middleware::from_fn_with_state(state.clone(), require_api_key))

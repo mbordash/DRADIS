@@ -404,7 +404,6 @@ async fn main() -> Result<()> {
             crypto_filter:  asset.clone(),
             raptor_signals,
             session:        asset_session,
-            config_rx:      config_rx.clone(),
             markets_tx:     Arc::clone(&markets_tx),
             tg_token:              env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
             tg_chat_id:            env::var("TELEGRAM_CHAT_ID").unwrap_or_default(),

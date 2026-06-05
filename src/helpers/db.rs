@@ -269,6 +269,18 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
         )"
     ).execute(pool).await?;
 
+    // squadron_configs: per-squadron configuration storage.
+    // Each squadron gets a full copy of DynamicConfig on deployment, allowing
+    // independent tuning of viper parameters per asset/squadron.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS squadron_configs (
+            squadron_id  TEXT    PRIMARY KEY,
+            config_json  TEXT    NOT NULL,
+            created_at   TEXT    NOT NULL,
+            updated_at   TEXT    NOT NULL
+        )"
+    ).execute(pool).await?;
+
     Ok(())
 }
 
@@ -539,6 +551,55 @@ pub async fn config_set(pool: &SqlitePool, key: &str, value: &str) {
     .await {
         error!("❌ DB config_set failed [{}]: {}", key, e);
     }
+}
+
+// ─── Squadron config helpers ─────────────────────────────────────────────────
+
+/// Load a squadron's config from the `squadron_configs` table.
+/// Returns None if the squadron has no stored config yet.
+pub async fn squadron_config_get(pool: &SqlitePool, squadron_id: &str) -> Option<String> {
+    let row = sqlx::query("SELECT config_json FROM squadron_configs WHERE squadron_id = ?")
+        .bind(squadron_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()?;
+
+    row.try_get::<String, _>(0).ok()
+}
+
+/// Save or update a squadron's config in the `squadron_configs` table.
+pub async fn squadron_config_set(pool: &SqlitePool, squadron_id: &str, config_json: &str) {
+    let ts = Utc::now().to_rfc3339();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO squadron_configs (squadron_id, config_json, created_at, updated_at)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(squadron_id) DO UPDATE SET
+            config_json = excluded.config_json,
+            updated_at = excluded.updated_at"
+    )
+    .bind(squadron_id)
+    .bind(config_json)
+    .bind(&ts)
+    .bind(&ts)
+    .execute(pool)
+    .await {
+        error!("❌ DB squadron_config_set failed [{}]: {}", squadron_id, e);
+    }
+}
+
+/// List all squadron IDs that have stored configs.
+pub async fn squadron_config_list(pool: &SqlitePool) -> Vec<String> {
+    sqlx::query("SELECT squadron_id FROM squadron_configs ORDER BY created_at DESC")
+        .fetch_all(pool)
+        .await
+        .ok()
+        .map(|rows| {
+            rows.into_iter()
+                .filter_map(|row| row.try_get::<String, _>(0).ok())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 // ─── Config history (audit log) ──────────────────────────────────────────────
