@@ -91,6 +91,7 @@ pub const MOMENTUM_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
 pub const MOMENTUM_REVERSAL_RATIO: Decimal = dec!(1.00);
 pub const MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL: i64 = 60;
 pub const MOMENTUM_FILL_CONFIRM_MIN_HOLD_SECS: i64 = 45;
+pub const MOMENTUM_MIN_HOLD_BEFORE_SL_SECS: i64 = 120;
 pub const LATE_MARKET_SIZE_THRESHOLD_SECS: i64 = 2400;
 pub const MOMENTUM_EXPIRY_EXIT_SECS: i64 = 1200;
 pub const MOMENTUM_EXPIRY_MIN_PROFIT_TO_HOLD: Decimal = dec!(0.03);
@@ -109,7 +110,7 @@ pub const MOMENTUM_CATASTROPHIC_SL_PCT: Decimal = dec!(0.06); // Conservative: t
 
 pub const MOMENTUM_WINDOW_SECS: u64 = 5;
 pub const MOMENTUM_SHORT_WINDOW_SECS: u64 = 1;
-pub const MOMENTUM_SHORT_WINDOW_FRACTION: Decimal = dec!(0.50);
+pub const MOMENTUM_SHORT_WINDOW_FRACTION: Decimal = dec!(0.60);
 pub const MOMENTUM_ACCELERATION_BYPASS_MULTIPLIER: Decimal = dec!(3.5);
 pub const MOMENTUM_DECAY_EXIT_FRACTION: Decimal = dec!(0.30);
 

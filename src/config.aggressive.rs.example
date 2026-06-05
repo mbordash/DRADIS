@@ -76,9 +76,9 @@ pub const MOMENTUM_KELLY_MAX_MULTIPLIER: Decimal = dec!(4.0);
 pub const MOMENTUM_MIN_TRADE_SIZE_USDC: Decimal = dec!(5.0);
 pub const MOMENTUM_MAX_TRADE_SIZE_USDC: Decimal = dec!(30.0);
 
-/// Single tick — fires immediately on the first confirming signal.
-/// Higher fakeout risk; compensate with a tighter stop-loss.
-pub const MOMENTUM_CONFIRMATION_TICKS: u32 = 1;
+/// Raised from 1 → 3 ticks: root cause fix for 2026-06-05 instant stop-outs.
+/// Higher confirmation required to filter weak entries even in aggressive mode.
+pub const MOMENTUM_CONFIRMATION_TICKS: u32 = 3;
 
 /// Wider TP target — rides larger moves to maximize R:R on aggressive entries.
 pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.15);
@@ -86,6 +86,7 @@ pub const MOMENTUM_STOP_LOSS_PERCENT: Decimal = dec!(0.12);
 pub const MOMENTUM_REVERSAL_RATIO: Decimal = dec!(0.60);
 pub const MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL: i64 = 20;
 pub const MOMENTUM_FILL_CONFIRM_MIN_HOLD_SECS: i64 = 20;
+pub const MOMENTUM_MIN_HOLD_BEFORE_SL_SECS: i64 = 120;
 pub const LATE_MARKET_SIZE_THRESHOLD_SECS: i64 = 1200;
 pub const MOMENTUM_EXPIRY_EXIT_SECS: i64 = 600;
 pub const MOMENTUM_EXPIRY_MIN_PROFIT_TO_HOLD: Decimal = dec!(0.01);
@@ -102,14 +103,15 @@ pub const MOMENTUM_CATASTROPHIC_SL_PCT: Decimal = dec!(0.10); // Aggressive: wid
 
 pub const MOMENTUM_WINDOW_SECS: u64 = 5;
 pub const MOMENTUM_SHORT_WINDOW_SECS: u64 = 1;
-pub const MOMENTUM_SHORT_WINDOW_FRACTION: Decimal = dec!(0.30);
+pub const MOMENTUM_SHORT_WINDOW_FRACTION: Decimal = dec!(0.60);
 pub const MOMENTUM_ACCELERATION_BYPASS_MULTIPLIER: Decimal = dec!(2.0);
 pub const MOMENTUM_DECAY_EXIT_FRACTION: Decimal = dec!(0.15);
 
-/// Lower threshold — catches moves earlier but with more false positives.
-pub const BTC_MOMENTUM_THRESHOLD: Decimal = dec!(60.0);
-pub const ETH_MOMENTUM_THRESHOLD: Decimal = dec!(2.5);
-pub const SOL_MOMENTUM_THRESHOLD: Decimal = dec!(0.25);
+/// Raised from $60 → $100: requires stronger velocity confirmation even in aggressive mode.
+/// Root cause fix for 2026-06-05 losses.
+pub const BTC_MOMENTUM_THRESHOLD: Decimal = dec!(100.0);
+pub const ETH_MOMENTUM_THRESHOLD: Decimal = dec!(4.0);
+pub const SOL_MOMENTUM_THRESHOLD: Decimal = dec!(0.40);
 
 /// Wider window market consensus filter — allows entries even when longer-horizon
 /// market is modestly directional.  Set tighter in balanced/conservative profiles.
@@ -121,8 +123,8 @@ pub const MOMENTUM_WINDOW_BULLISH_BLOCK: Decimal = dec!(0.78);
 pub const MOMENTUM_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.75);
 
 /// OBI exhaustion veto: block entries when the bid side dominates entirely (all buyers, no sellers).
-/// Aggressive: 0.80 — looser than balanced/conservative; only blocks near-fully exhausted books.
-pub const MOMENTUM_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.80);
+/// Aggressive: 0.70 — tightened from 0.80 to avoid buying exhausted rallies.
+pub const MOMENTUM_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.70);
 
 pub const MOMENTUM_OBI_EXHAUST_MAX_ADVERSE_PCT: Decimal = dec!(-0.08);
 
@@ -396,29 +398,30 @@ pub const TRENDCAPTURE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.18);
 pub const TRENDCAPTURE_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
 pub const TRENDCAPTURE_MAX_ENTRY_PRICE: Decimal = dec!(0.78);
 
-// 10m drift entry thresholds — aggressive: lower bar to catch more moves earlier.
-pub const TRENDCAPTURE_BULL_DRIFT_10M_BTC: Decimal = dec!(100.0);
-pub const TRENDCAPTURE_BEAR_DRIFT_10M_BTC: Decimal = dec!(-100.0);
-pub const TRENDCAPTURE_BULL_DRIFT_10M_ETH: Decimal = dec!(4.0);
-pub const TRENDCAPTURE_BEAR_DRIFT_10M_ETH: Decimal = dec!(-4.0);
-pub const TRENDCAPTURE_BULL_DRIFT_10M_SOL: Decimal = dec!(0.40);
-pub const TRENDCAPTURE_BEAR_DRIFT_10M_SOL: Decimal = dec!(-0.40);
+// 10m drift entry thresholds — raised from $100 → $200 to filter weak entries.
+// Root cause fix for 2026-06-05 losses.
+pub const TRENDCAPTURE_BULL_DRIFT_10M_BTC: Decimal = dec!(200.0);
+pub const TRENDCAPTURE_BEAR_DRIFT_10M_BTC: Decimal = dec!(-200.0);
+pub const TRENDCAPTURE_BULL_DRIFT_10M_ETH: Decimal = dec!(8.0);
+pub const TRENDCAPTURE_BEAR_DRIFT_10M_ETH: Decimal = dec!(-8.0);
+pub const TRENDCAPTURE_BULL_DRIFT_10M_SOL: Decimal = dec!(0.80);
+pub const TRENDCAPTURE_BEAR_DRIFT_10M_SOL: Decimal = dec!(-0.80);
 
-// 60m confirmation thresholds — aggressive: lower bar; trend confirmation still required.
-pub const TRENDCAPTURE_BULL_DRIFT_60M_BTC: Decimal = dec!(150.0);
-pub const TRENDCAPTURE_BEAR_DRIFT_60M_BTC: Decimal = dec!(-150.0);
-pub const TRENDCAPTURE_BULL_DRIFT_60M_ETH: Decimal = dec!(6.0);
-pub const TRENDCAPTURE_BEAR_DRIFT_60M_ETH: Decimal = dec!(-6.0);
-pub const TRENDCAPTURE_BULL_DRIFT_60M_SOL: Decimal = dec!(0.60);
-pub const TRENDCAPTURE_BEAR_DRIFT_60M_SOL: Decimal = dec!(-0.60);
+// 60m confirmation thresholds — raised from $150 → $300 to require sustained trends.
+pub const TRENDCAPTURE_BULL_DRIFT_60M_BTC: Decimal = dec!(300.0);
+pub const TRENDCAPTURE_BEAR_DRIFT_60M_BTC: Decimal = dec!(-300.0);
+pub const TRENDCAPTURE_BULL_DRIFT_60M_ETH: Decimal = dec!(12.0);
+pub const TRENDCAPTURE_BEAR_DRIFT_60M_ETH: Decimal = dec!(-12.0);
+pub const TRENDCAPTURE_BULL_DRIFT_60M_SOL: Decimal = dec!(1.20);
+pub const TRENDCAPTURE_BEAR_DRIFT_60M_SOL: Decimal = dec!(-1.20);
 
-// Strike gap requirements — aggressive: smaller gap allowed; enter earlier in move.
-pub const TRENDCAPTURE_BULL_STRIKE_GAP_BTC: Decimal = dec!(200.0);
-pub const TRENDCAPTURE_BEAR_STRIKE_GAP_BTC: Decimal = dec!(200.0);
-pub const TRENDCAPTURE_BULL_STRIKE_GAP_ETH: Decimal = dec!(8.0);
-pub const TRENDCAPTURE_BEAR_STRIKE_GAP_ETH: Decimal = dec!(8.0);
-pub const TRENDCAPTURE_BULL_STRIKE_GAP_SOL: Decimal = dec!(0.6);
-pub const TRENDCAPTURE_BEAR_STRIKE_GAP_SOL: Decimal = dec!(0.6);
+// Strike gap requirements — raised from $200 → $400 to avoid chop near strike.
+pub const TRENDCAPTURE_BULL_STRIKE_GAP_BTC: Decimal = dec!(400.0);
+pub const TRENDCAPTURE_BEAR_STRIKE_GAP_BTC: Decimal = dec!(400.0);
+pub const TRENDCAPTURE_BULL_STRIKE_GAP_ETH: Decimal = dec!(16.0);
+pub const TRENDCAPTURE_BEAR_STRIKE_GAP_ETH: Decimal = dec!(16.0);
+pub const TRENDCAPTURE_BULL_STRIKE_GAP_SOL: Decimal = dec!(1.30);
+pub const TRENDCAPTURE_BEAR_STRIKE_GAP_SOL: Decimal = dec!(1.30);
 
 // Reversal thresholds — aggressive: looser; only exit on strong counter-drift.
 pub const TRENDCAPTURE_REVERSAL_DRIFT_BTC: Decimal = dec!(100.0);

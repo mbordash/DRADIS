@@ -468,7 +468,10 @@ impl Strategy for MomentumStrategyImpl {
                 return Ok(StrategySignal::Exit { params: exit_params!(), reason, exit_pair: false });
             }
 
-            if secs_held >= config::MOMENTUM_FILL_CONFIRM_MIN_HOLD_SECS && profit_margin <= stop_loss {
+            // Stop-loss: Requires MOMENTUM_MIN_HOLD_BEFORE_SL_SECS (120s) hold time before SL can trigger.
+            // Root cause fix for 2026-06-05 instant stop-outs (30s exits at -$1.12, -$0.90).
+            // Prevents timing-related stop-outs from brief adverse price swings immediately after entry.
+            if secs_held >= config::MOMENTUM_MIN_HOLD_BEFORE_SL_SECS && profit_margin <= stop_loss {
                 let reason = format!("MomentumSL: bid=${:.4}, loss={:.2}%", bid, profit_margin * dec!(100));
                 return Ok(StrategySignal::Exit { params: exit_params!(), reason, exit_pair: false });
             }
