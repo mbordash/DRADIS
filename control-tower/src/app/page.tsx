@@ -84,61 +84,6 @@ function SessionBadge({ startedAt }: { startedAt?: string }) {
   );
 }
 
-// ── Raptor health indicators ──────────────────────────────────────────────────
-
-function RaptorHealthBadges({
-  raptors,
-  asset,
-}: {
-  raptors?: Record<string, { price_connected: boolean; funding_connected: boolean }>;
-  asset: string;
-}) {
-  const h = asset ? raptors?.[asset] : undefined;
-
-  // When the health map hasn't arrived yet (first load), render placeholder dots.
-  const priceOk    = h?.price_connected   ?? false;
-  const fundingOk  = h?.funding_connected ?? false;
-  const hasData    = h !== undefined;
-
-  return (
-    <div className="hidden sm:flex items-center gap-2 text-xs font-mono">
-      {/* Price Raptor */}
-      <div
-        className="flex items-center gap-1 cursor-default"
-        title={`Price Raptor (Binance Spot WS): ${priceOk ? 'connected' : 'reconnecting…'}`}
-      >
-        <span
-          className={[
-            'h-2 w-2 rounded-full transition-colors',
-            !hasData  ? 'bg-gray-600' :
-            priceOk   ? 'bg-cyan-400 animate-pulse' : 'bg-red-500',
-          ].join(' ')}
-        />
-        <span className={!hasData ? 'text-gray-600' : priceOk ? 'text-cyan-400' : 'text-red-400'}>
-          Price
-        </span>
-      </div>
-
-      {/* Funding Raptor */}
-      <div
-        className="flex items-center gap-1 cursor-default"
-        title={`Funding Raptor (Binance FAPI): ${fundingOk ? 'connected' : 'reconnecting…'}`}
-      >
-        <span
-          className={[
-            'h-2 w-2 rounded-full transition-colors',
-            !hasData   ? 'bg-gray-600' :
-            fundingOk  ? 'bg-teal-400 animate-pulse' : 'bg-red-500',
-          ].join(' ')}
-        />
-        <span className={!hasData ? 'text-gray-600' : fundingOk ? 'text-teal-400' : 'text-red-400'}>
-          Funding
-        </span>
-      </div>
-    </div>
-  );
-}
-
 // ── Stat card ─────────────────────────────────────────────────────────────────
 
 function StatCard({ label, value, sub, valueClass = '' }: {
@@ -373,7 +318,7 @@ export default function DashboardPage() {
                 <span className="text-gray-400 text-sm font-medium">Squadron Detail</span>
               </div>
               <span className="hidden sm:inline text-xs bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 rounded px-2 py-0.5 font-mono">
-                v0.3.0
+                v0.4.0
               </span>
             </div>
 
@@ -452,9 +397,6 @@ export default function DashboardPage() {
             {/* Session start time */}
             <SessionBadge startedAt={status?.session_started_at} />
 
-            {/* Raptor health (Price + Funding) */}
-            <RaptorHealthBadges raptors={status?.raptors} asset={asset} />
-
             {/* API status */}
             <div className="flex items-center gap-1.5">
               <span className={`h-2 w-2 rounded-full ${isConnected ? 'bg-green-400 animate-pulse' : 'bg-red-500'}`} />
@@ -500,6 +442,20 @@ export default function DashboardPage() {
           pricesLive={portfolio?.prices_live ?? true}
           isLoading={portfolioLoading}
         />
+
+        {/* ── Portfolio History Chart (CAG-level) ───────────────────────── */}
+        {pnlLoading ? (
+          <div className="card p-6 flex items-center justify-center h-64 text-gray-600 text-sm">
+            Loading portfolio history…
+          </div>
+        ) : (
+          <PnlChart
+            data={pnl ?? []}
+            startingBalance={startingBal}
+            ghostMode={config?.ghost_mode}
+            currentPortfolio={portfolio}
+          />
+        )}
 
         {/* ── CAG-level stats ───────────────────────────────────────────── */}
         <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">

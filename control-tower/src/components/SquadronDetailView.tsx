@@ -2,15 +2,11 @@
 
 import { useCallback } from 'react';
 import useSWR from 'swr';
-import dynamic from 'next/dynamic';
 import type { SquadronSummary, DynamicConfig } from '@/lib/types';
 import {
-  getConfig,
-  getPnlHistory,
   getTrades,
   getOpenPositions,
   getStatus,
-  patchConfig,
   getSquadronConfig,
   patchSquadronConfig,
   VIPER_DEFS,
@@ -18,19 +14,6 @@ import {
 import ViperCard from '@/components/ViperCard';
 import TradesTable from '@/components/TradesTable';
 import OpenPositionsCard from '@/components/OpenPositionsCard';
-
-const PnlChart = dynamic(() => import('@/components/PnlChart'), { ssr: false });
-
-// ── Helpers ───────────────────────────────────────────────────────────────────
-
-function fmt$(n: number) {
-  return n.toLocaleString('en-US', { style: 'currency', currency: 'USD', minimumFractionDigits: 2 });
-}
-
-function fmtPct(n: number) {
-  const sign = n >= 0 ? '+' : '';
-  return `${sign}${(n * 100).toFixed(2)}%`;
-}
 
 // ── Raptor health panel ───────────────────────────────────────────────────────
 
@@ -147,11 +130,6 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
     { refreshInterval: 0, revalidateOnFocus: false }
   );
 
-  const { data: pnl, isLoading: pnlLoading } = useSWR(
-    ['pnl', asset],
-    () => getPnlHistory(1440, asset),
-    { refreshInterval: 60_000 }
-  );
 
   const { data: trades, isLoading: tradesLoading } = useSWR(
     ['trades', asset],
@@ -167,17 +145,6 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
 
   const { data: status } = useSWR('status', getStatus, { refreshInterval: 30_000 });
 
-  // ── Derived stats ──────────────────────────────────────────────────────────
-  const latestSnap = pnl?.[0];
-  const oldestSnap = pnl?.[pnl.length - 1];
-  const startingBal = oldestSnap ? parseFloat(oldestSnap.collateral) : 0;
-  const sessionPnl = latestSnap ? parseFloat(latestSnap.session_pnl) : 0;
-  const sessionPct = startingBal > 0 ? sessionPnl / startingBal : 0;
-  const currentBal = config?.ghost_mode
-    ? startingBal + sessionPnl
-    : latestSnap
-    ? parseFloat(latestSnap.collateral)
-    : 0;
 
   // ── Handlers ───────────────────────────────────────────────────────────────
   const handlePatch = useCallback(
@@ -218,40 +185,29 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
         <RaptorHealthPanel raptors={status?.raptors} asset={asset} />
       </div>
 
-      {/* ── P&L stats for this asset ──────────────────────────────────────── */}
+      {/* ── Performance stats for this squadron/asset ─────────────────────── */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <div className="card px-4 py-3">
-          <span className="label-muted">Session P&L</span>
-          <span className={`stat-value ${sessionPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
-            {fmt$(sessionPnl)}
-          </span>
-          <span className="text-xs text-gray-500">{fmtPct(sessionPct)}</span>
-        </div>
-        <div className="card px-4 py-3">
-          <span className="label-muted">Current Balance</span>
-          <span className="stat-value">{pnlLoading ? '—' : fmt$(currentBal)}</span>
-          <span className="text-xs text-gray-500">{config?.ghost_mode ? 'virtual' : 'pUSD'}</span>
-        </div>
-        <div className="card px-4 py-3">
+        <div className="card px-4 py-3 flex flex-col gap-1">
           <span className="label-muted">Completed Trades</span>
           <span className="stat-value">{tradesLoading ? '—' : String(trades?.length ?? 0)}</span>
           <span className="text-xs text-gray-500">this session</span>
         </div>
-        <div className="card px-4 py-3">
+        <div className="card px-4 py-3 flex flex-col gap-1">
           <span className="label-muted">Open Positions</span>
           <span className="stat-value">{positionsLoading ? '—' : String(openPositions?.length ?? 0)}</span>
-          <span className="text-xs text-gray-500">active</span>
+          <span className="text-xs text-gray-500">active now</span>
+        </div>
+        <div className="card px-4 py-3 flex flex-col gap-1">
+          <span className="label-muted">Win Rate</span>
+          <span className="stat-value text-gray-600">—</span>
+          <span className="text-xs text-gray-500">coming soon</span>
+        </div>
+        <div className="card px-4 py-3 flex flex-col gap-1">
+          <span className="label-muted">Avg Trade P&L</span>
+          <span className="stat-value text-gray-600">—</span>
+          <span className="text-xs text-gray-500">coming soon</span>
         </div>
       </div>
-
-      {/* ── P&L Chart ─────────────────────────────────────────────────────── */}
-      {pnlLoading ? (
-        <div className="card p-6 flex items-center justify-center h-48 text-gray-600 text-sm">
-          Loading balance history…
-        </div>
-      ) : (
-        <PnlChart data={pnl ?? []} startingBalance={startingBal} ghostMode={config?.ghost_mode} />
-      )}
 
       {/* ── Viper Strategies ──────────────────────────────────────────────── */}
       <section>
@@ -272,29 +228,6 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
           <span className="font-semibold">Squadron Config:</span> Changes here only affect this squadron.
           Each squadron has independent viper parameters.
         </div>
-
-        {/* Active markets banner */}
-        {status && (
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 mb-3">
-            {[
-              { label: '⏰ Hourly', key: 'time_decay' },
-              { label: '🗓 Window / Daily', key: 'maker' },
-            ].map(({ label, key }) => {
-              const mkt = status.strategy_markets[key];
-              return (
-                <div
-                  key={key}
-                  className="flex items-start gap-2 bg-[#0d0d1a] border border-[#1e1e32] rounded-lg px-3 py-2"
-                >
-                  <span className="text-xs font-mono text-gray-500 whitespace-nowrap mt-0.5">{label}</span>
-                  <span className="text-xs font-mono text-gray-300 truncate" title={mkt || undefined}>
-                    {mkt || <span className="text-gray-700 italic">none</span>}
-                  </span>
-                </div>
-              );
-            })}
-          </div>
-        )}
 
         {config ? (
           <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
