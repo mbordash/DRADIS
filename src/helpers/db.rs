@@ -171,7 +171,8 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
             id          INTEGER PRIMARY KEY AUTOINCREMENT,
             ts          TEXT    NOT NULL,
             session_pnl TEXT    NOT NULL,
-            collateral  TEXT    NOT NULL
+            collateral  TEXT    NOT NULL,
+            total_value TEXT
         )"
     ).execute(pool).await?;
 
@@ -308,6 +309,10 @@ async fn run_migrations(pool: &SqlitePool) {
         .execute(pool).await;
     // Migrate open_positions table for existing DBs
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_open_positions_session ON open_positions(session_id)")
+        .execute(pool).await;
+
+    // Add total_value to pnl_snapshots (Phase 3f-7: proper portfolio value tracking)
+    let _ = sqlx::query("ALTER TABLE pnl_snapshots ADD COLUMN total_value TEXT")
         .execute(pool).await;
 }
 
@@ -509,14 +514,15 @@ pub async fn lookup_open_position_strategy(pool: &SqlitePool, token_id_str: &str
 
 /// Persist a P&L checkpoint (called by the status ticker in main.rs).
 /// Provides the time-series data the Control Tower chart will query.
-pub async fn record_pnl_snapshot(pool: &SqlitePool, session_pnl: Decimal, collateral: Decimal) {
+pub async fn record_pnl_snapshot(pool: &SqlitePool, session_pnl: Decimal, collateral: Decimal, total_value: Decimal) {
     let ts = Utc::now().to_rfc3339();
     if let Err(e) = sqlx::query(
-        "INSERT INTO pnl_snapshots (ts, session_pnl, collateral) VALUES (?, ?, ?)"
+        "INSERT INTO pnl_snapshots (ts, session_pnl, collateral, total_value) VALUES (?, ?, ?, ?)"
     )
     .bind(&ts)
     .bind(session_pnl.to_string())
     .bind(collateral.to_string())
+    .bind(total_value.to_string())
     .execute(pool)
     .await {
         error!("❌ DB pnl_snapshot write failed: {}", e);
@@ -973,6 +979,7 @@ pub struct PnlSnapshotRow {
     pub ts: String,
     pub session_pnl: String,
     pub collateral: String,
+    pub total_value: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1015,7 +1022,7 @@ pub struct ConfigHistoryRow {
 /// Return the most recent `limit` P&L snapshots, newest first.
 pub async fn get_pnl_history(pool: &SqlitePool, limit: i64) -> Vec<PnlSnapshotRow> {
     match sqlx::query(
-        "SELECT ts, session_pnl, collateral FROM pnl_snapshots ORDER BY ts DESC LIMIT ?"
+        "SELECT ts, session_pnl, collateral, total_value FROM pnl_snapshots ORDER BY ts DESC LIMIT ?"
     )
     .bind(limit)
     .fetch_all(pool)
@@ -1024,6 +1031,7 @@ pub async fn get_pnl_history(pool: &SqlitePool, limit: i64) -> Vec<PnlSnapshotRo
             ts:          r.try_get::<String, _>(0).ok()?,
             session_pnl: r.try_get::<String, _>(1).ok()?,
             collateral:  r.try_get::<String, _>(2).ok()?,
+            total_value: r.try_get::<String, _>(3).ok(),
         })).collect(),
         Err(e) => { error!("❌ DB get_pnl_history failed: {}", e); vec![] }
     }

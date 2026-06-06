@@ -126,6 +126,15 @@ pub fn spawn_settlement_task<P>(
                         Ok(_) => {}
                         Err(_) => warn!("⚠️ settlement task timed out (60s) — skipping this cycle"),
                     }
+
+                    // After processing explicit settlements, scan for positions that were
+                    // auto-settled by Polymarket (outside our settlement ticker).
+                    match tokio::time::timeout(Duration::from_secs(30),
+                        crate::tasks::cleanup::detect_orphaned_arb_settlements(safe_address)
+                    ).await {
+                        Ok(_) => {}
+                        Err(_) => warn!("⚠️ orphan detection task timed out (30s) — skipping this cycle"),
+                    }
                 }
             }
         }
@@ -133,6 +142,72 @@ pub fn spawn_settlement_task<P>(
 }
 
 // ─── Status task ─────────────────────────────────────────────────────────────
+
+/// Calculate the mark-to-market value of all open positions using current prices.
+/// Returns the sum of (shares × current_mid_price) for each position.
+async fn calculate_positions_value(
+    pool: &sqlx::SqlitePool,
+    yes_price_rx: &watch::Receiver<PriceState>,
+    no_price_rx: &watch::Receiver<PriceState>,
+) -> Decimal {
+    // Fetch all open positions
+    let positions = db::get_open_positions(pool).await;
+    if positions.is_empty() {
+        return dec!(0);
+    }
+
+    // Get current mid prices
+    let (yes_bid, _, yes_ask, _, _) = *yes_price_rx.borrow();
+    let (no_bid, _, no_ask, _, _) = *no_price_rx.borrow();
+
+    let yes_mid = if yes_bid > dec!(0) && yes_ask > dec!(0) {
+        (yes_bid + yes_ask) / dec!(2)
+    } else {
+        dec!(0)
+    };
+
+    let no_mid = if no_bid > dec!(0) && no_ask > dec!(0) {
+        (no_bid + no_ask) / dec!(2)
+    } else {
+        dec!(0)
+    };
+
+    let mut total_value = dec!(0);
+    for pos in positions {
+        // Parse shares
+        let shares = match pos.shares.parse::<Decimal>() {
+            Ok(s) => s,
+            Err(_) => continue,
+        };
+
+        // Determine current price based on side
+        let current_price = if pos.side == "YES" || pos.side == "UP" {
+            yes_mid
+        } else if pos.side == "NO" || pos.side == "DOWN" {
+            no_mid
+        } else {
+            // Fallback to entry price if side is unknown
+            match pos.entry_price.parse::<Decimal>() {
+                Ok(p) => p,
+                Err(_) => continue,
+            }
+        };
+
+        // If we don't have a live price, use entry price
+        let price_to_use = if current_price > dec!(0) {
+            current_price
+        } else {
+            match pos.entry_price.parse::<Decimal>() {
+                Ok(p) => p,
+                Err(_) => continue,
+            }
+        };
+
+        total_value += shares * price_to_use;
+    }
+
+    total_value
+}
 
 /// Periodic status heartbeat: logs prices/OBI, refreshes live collateral, and
 /// records a PnL checkpoint to SQLite.
@@ -195,9 +270,14 @@ pub fn spawn_status_task(
                             debug!("💰 Live pUSD balance: ${:.4}", bal);
                             if let Some(pool) = db::pool_for(&asset) {
                                 let pnl_snap = *total_pnl.lock().await;
+
+                                // Calculate total portfolio value: cash + mark-to-market positions
+                                let positions_value = calculate_positions_value(&pool, &yes_price_rx, &no_price_rx).await;
+                           let total_value = bal + positions_value;
+
                                 if tokio::time::timeout(
                                     Duration::from_secs(3),
-                                    db::record_pnl_snapshot(&pool, pnl_snap, bal),
+                                    db::record_pnl_snapshot(&pool, pnl_snap, bal, total_value),
                                 ).await.is_err() {
                                     warn!("⚠️ record_pnl_snapshot timed out (3s) — skipping this checkpoint");
                                 }

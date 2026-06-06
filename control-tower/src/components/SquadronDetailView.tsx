@@ -215,7 +215,7 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
           <p className="label-muted">Viper Layer (Active Strategies)</p>
           <div className="flex items-center gap-2">
             <span className="text-[10px] font-mono bg-indigo-500/10 text-indigo-300 border border-indigo-500/20 rounded px-2 py-0.5">
-              🎯 Squadron-Scoped Config
+               Squadron-Scoped Config
             </span>
             <span className="text-xs text-gray-600 font-mono">
               {asset.toUpperCase()} execution configs

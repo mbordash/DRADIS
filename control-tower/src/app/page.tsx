@@ -454,6 +454,8 @@ export default function DashboardPage() {
             startingBalance={startingBal}
             ghostMode={config?.ghost_mode}
             currentPortfolio={portfolio}
+            trades={trades ?? []}
+            openPositions={openPositions ?? []}
           />
         )}
 

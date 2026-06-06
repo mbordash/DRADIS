@@ -69,6 +69,7 @@ export interface PnlSnapshotRow {
   ts:          string; // ISO 8601
   session_pnl: string; // Decimal string
   collateral:  string; // Decimal string
+  total_value?: string; // Decimal string (Phase 3f-7: cash + positions)
 }
 
 export interface TradeRow {

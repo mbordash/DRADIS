@@ -692,59 +692,95 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
 ///   reason      = "Settlement (YES+NO → $1.00)"
 ///
 /// If the condition has only one leg (e.g. an orphaned single-leg position that was
-/// adopted back in), we skip combined recording — there is no pair to settle.
-/// Single-leg positions settled by auto_settle are edge-cases handled by the orphan
-/// cleanup path instead.
+/// adopted back in), we record it as a single-leg settlement with appropriate PNL.
 async fn record_settled_arb_trade(
     legs: &[polymarket_client_sdk_v2::data::types::response::Position],
 ) {
+    if legs.is_empty() {
+        return;
+    }
+
     // Separate YES (outcome_index = 0) and NO (outcome_index = 1) legs.
     let yes_leg = legs.iter().find(|p| p.outcome_index == 0);
     let no_leg  = legs.iter().find(|p| p.outcome_index == 1);
 
-    let (yes_leg, no_leg) = match (yes_leg, no_leg) {
-        (Some(y), Some(n)) => (y, n),
-        _ => return, // single-leg — skip; not a complete arb pair
-    };
-
-    let yes_avg   = yes_leg.avg_price;
-    let no_avg    = no_leg.avg_price;
-    let yes_size  = yes_leg.size;
-    let no_size   = no_leg.size;
-    let pairs     = yes_size.min(no_size);
-
-    if pairs <= Decimal::ZERO || (yes_avg <= Decimal::ZERO && no_avg <= Decimal::ZERO) {
-        return; // nothing meaningful to record
-    }
-
-    let entry_per_pair = yes_avg + no_avg;
-    let pnl = (Decimal::ONE - entry_per_pair) * pairs;
-    let market_title = yes_leg.title.clone();
-
     // Use the primary asset pool for the trade record.
-    // In a multi-asset setup this will always be the first-initialised asset (BTC),
-    // which is fine: arb currently only runs on the primary asset's markets.
     let asset_str = db::available_assets()
         .into_iter()
         .next()
         .unwrap_or_else(|| "btc".to_string());
 
-    info!(
-        " ArbitrageStrategy settlement recorded: \"{}\" | {} pairs @ entry ${:.4}/pair → pnl ${:.4}",
-        market_title, pairs, entry_per_pair, pnl
-    );
+    match (yes_leg, no_leg) {
+        (Some(yes_leg), Some(no_leg)) => {
+            // Complete YES+NO pair settlement
+            let yes_avg   = yes_leg.avg_price;
+            let no_avg    = no_leg.avg_price;
+            let yes_size  = yes_leg.size;
+            let no_size   = no_leg.size;
+            let pairs     = yes_size.min(no_size);
 
-    metrics::record_trade(
-        &asset_str,
-        "ArbitrageStrategy".to_string(),
-        market_title,
-        "YES".to_string(),      // renders green; arb is always long YES+NO → always a "win"
-        entry_per_pair,         // combined cost per YES+NO pair
-        Decimal::ONE,           // guaranteed $1.00 payout per pair at CTF settlement
-        pairs,
-        pnl,
-        "Settlement (YES+NO → $1.00)".to_string(),
-    ).await;
+            if pairs <= Decimal::ZERO || (yes_avg <= Decimal::ZERO && no_avg <= Decimal::ZERO) {
+                return;
+            }
+
+            let entry_per_pair = yes_avg + no_avg;
+            let pnl = (Decimal::ONE - entry_per_pair) * pairs;
+            let market_title = yes_leg.title.clone();
+
+            info!(
+                " ArbitrageStrategy settlement recorded: \"{}\" | {} pairs @ entry ${:.4}/pair → pnl ${:.4}",
+                market_title, pairs, entry_per_pair, pnl
+            );
+
+            metrics::record_trade(
+                &asset_str,
+                "ArbitrageStrategy".to_string(),
+                market_title,
+                "YES".to_string(),
+                entry_per_pair,
+                Decimal::ONE,
+                pairs,
+                pnl,
+                "Settlement (YES+NO → $1.00)".to_string(),
+            ).await;
+        }
+        (Some(leg), None) | (None, Some(leg)) => {
+            // Single-leg settlement (orphaned position)
+            let side = if leg.outcome_index == 0 { "YES" } else { "NO" };
+            let avg_price = leg.avg_price;
+            let size = leg.size;
+
+            if size <= Decimal::ZERO || avg_price <= Decimal::ZERO {
+                return;
+            }
+
+            // Single-leg settled: if we held the winning side, we get full payout
+            // For now, assume it settled (otherwise we wouldn't be here), so payout = $1/share
+            let pnl = (Decimal::ONE - avg_price) * size;
+            let market_title = leg.title.clone();
+
+            info!(
+                " ArbitrageStrategy single-leg settlement: \"{}\" | {} {} @ ${:.4} → pnl ${:.4}",
+                market_title, size, side, avg_price, pnl
+            );
+
+            metrics::record_trade(
+                &asset_str,
+                "ArbitrageStrategy".to_string(),
+                market_title,
+                side.to_string(),
+                avg_price,
+                Decimal::ONE,
+                size,
+                pnl,
+                format!("Settlement (single-leg {})", side),
+            ).await;
+        }
+        (None, None) => {
+            // No legs to record
+            return;
+        }
+    }
 }
 
 /// Purge `open_positions` DB rows for all token_ids in a just-redeemed condition.
@@ -790,6 +826,230 @@ fn shares_to_base_units(shares: Decimal) -> u128 {
         .trunc()
         .to_u128()
         .unwrap_or(0)
+}
+
+/// Detect and record arbitrage settlements that occurred outside our settlement ticker.
+///
+/// **Why needed**: Polymarket may auto-settle positions before our ticker detects them.
+/// This function scans for "orphaned" arbitrage entries (positions entered but never
+/// exited in the trades table) and records them as settled trades if they:
+/// 1. Are no longer present in the Polymarket positions API (auto-settled)
+/// 2. Appear in both YES and NO legs (complete arbitrage pair)
+///
+/// Runs after `auto_settle_closed_positions` to catch any positions that were settled
+/// by Polymarket's auto-redemption system rather than our explicit on-chain TX.
+pub async fn detect_orphaned_arb_settlements(safe_address: Address) {
+    use std::collections::HashMap;
+
+    // Get all available asset pools
+    let all_assets = db::available_assets();
+    if all_assets.is_empty() {
+        return;
+    }
+
+    // Query Polymarket for current positions to compare against entries
+    let data_client = DataClient::default();
+    let req = PositionsRequest::builder().user(safe_address).build();
+
+    let current_positions = match tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        data_client.positions(&req),
+    ).await {
+        Ok(Ok(p)) => p,
+        Ok(Err(e)) => {
+            warn!("Orphan detection: Data API positions() error: {}", e);
+            return;
+        }
+        Err(_) => {
+            warn!("Orphan detection: Data API positions() timed out (20s)");
+            return;
+        }
+    };
+
+    // Build a set of token_ids that currently exist on-chain
+    let mut active_tokens: HashSet<String> = HashSet::new();
+    for p in &current_positions {
+        if p.size > Decimal::ZERO {
+            active_tokens.insert(p.asset.to_string());
+        }
+    }
+
+    // For each asset pool, scan for orphaned arbitrage entries
+    for asset in &all_assets {
+        let pool = match db::pool_for(asset) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Query all arbitrage entries from the last 14 days (markets typically resolve daily)
+        let cutoff = Utc::now() - chrono::Duration::days(14);
+        let cutoff_str = cutoff.to_rfc3339();
+
+        #[derive(sqlx::FromRow)]
+        struct EntryRow {
+            token_id: String,
+            market: String,
+            side: String,
+            entry_price: String,
+            shares: String,
+            ts: String,
+        }
+
+        let entries_result = sqlx::query_as::<_, EntryRow>(
+            r#"
+            SELECT token_id, market, side, entry_price, shares, ts
+            FROM entries
+            WHERE strategy = 'ArbitrageStrategy'
+              AND ts > ?
+            ORDER BY market, ts
+            "#
+        )
+        .bind(&cutoff_str)
+        .fetch_all(&pool)
+        .await;
+
+        let entries = match entries_result {
+            Ok(e) => e,
+            Err(e) => {
+                warn!("Orphan detection [{}]: failed to query entries: {}", asset, e);
+                continue;
+            }
+        };
+
+        // Group entries by market to find complete YES+NO pairs
+        let mut by_market: HashMap<String, Vec<_>> = HashMap::new();
+        for entry in entries {
+            by_market.entry(entry.market.clone()).or_default().push(entry);
+        }
+
+        // Check each market for orphaned pairs
+        for (market_name, market_entries) in by_market {
+            // Find YES and NO legs
+            let yes_legs: Vec<_> = market_entries.iter()
+                .filter(|e| e.side == "YES")
+                .collect();
+            let no_legs: Vec<_> = market_entries.iter()
+                .filter(|e| e.side == "NO")
+                .collect();
+
+            if yes_legs.is_empty() || no_legs.is_empty() {
+                // Single-leg entries (not a complete arbitrage pair) - skip for now
+                continue;
+            }
+
+            // Match YES and NO legs for the same entry time (within 1 second)
+            for yes_leg in &yes_legs {
+                for no_leg in &no_legs {
+                    // Parse timestamps
+                    let yes_ts = match DateTime::parse_from_rfc3339(&yes_leg.ts) {
+                        Ok(t) => t.with_timezone(&Utc),
+                        Err(_) => continue,
+                    };
+                    let no_ts = match DateTime::parse_from_rfc3339(&no_leg.ts) {
+                        Ok(t) => t.with_timezone(&Utc),
+                        Err(_) => continue,
+                    };
+
+                    // Check if they're within 1 second of each other (same entry)
+                    let time_diff = (yes_ts - no_ts).num_milliseconds().abs();
+                    if time_diff > 1000 {
+                        continue;
+                    }
+
+                    // Check if both tokens are no longer active (settled)
+                    let yes_token_gone = !active_tokens.contains(&yes_leg.token_id);
+                    let no_token_gone = !active_tokens.contains(&no_leg.token_id);
+
+                    if !yes_token_gone || !no_token_gone {
+                        // Position still exists, not settled yet
+                        continue;
+                    }
+
+                    // Check if we already recorded this trade
+                    #[derive(sqlx::FromRow)]
+                    struct CountRow {
+                        count: i64,
+                    }
+
+                    let trade_exists = sqlx::query_as::<_, CountRow>(
+                        r#"
+                        SELECT COUNT(*) as count
+                        FROM trades
+                        WHERE strategy = 'ArbitrageStrategy'
+                          AND market = ?
+                          AND ts >= ?
+                          AND ts <= ?
+                        "#
+                    )
+                    .bind(&market_name)
+                    .bind(&yes_leg.ts)
+                    .bind(&no_leg.ts)
+                    .fetch_one(&pool)
+                    .await
+                    .ok()
+                    .map(|r| r.count)
+                    .unwrap_or(0) > 0;
+
+                    if trade_exists {
+                        // Already recorded, skip
+                        continue;
+                    }
+
+                    // Parse entry prices and shares
+                    let yes_price = match yes_leg.entry_price.parse::<Decimal>() {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    let no_price = match no_leg.entry_price.parse::<Decimal>() {
+                        Ok(p) => p,
+                        Err(_) => continue,
+                    };
+                    let yes_shares = match yes_leg.shares.parse::<Decimal>() {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+                    let no_shares = match no_leg.shares.parse::<Decimal>() {
+                        Ok(s) => s,
+                        Err(_) => continue,
+                    };
+
+                    // Calculate settlement P&L
+                    let pairs = yes_shares.min(no_shares);
+                    if pairs <= Decimal::ZERO {
+                        continue;
+                    }
+
+                    let entry_per_pair = yes_price + no_price;
+                    let pnl = (Decimal::ONE - entry_per_pair) * pairs;
+
+                    info!(
+                        "🔍 Orphan detection [{}]: Found auto-settled arbitrage: \"{}\" | {} pairs @ entry ${:.4}/pair → pnl ${:.4}",
+                        asset.to_uppercase(), market_name, pairs, entry_per_pair, pnl
+                    );
+
+                    // Record the settlement trade (use the YES entry timestamp as the settlement time)
+                    metrics::record_trade(
+                        asset,
+                        "ArbitrageStrategy".to_string(),
+                        market_name.clone(),
+                        "YES".to_string(),
+                        entry_per_pair,
+                        Decimal::ONE,
+                        pairs,
+                        pnl,
+                        "Settlement (auto-redeemed by Polymarket)".to_string(),
+                    ).await;
+
+                    // Also purge any lingering open_positions rows
+                    let _ = sqlx::query("DELETE FROM open_positions WHERE token_id = ? OR token_id = ?")
+                        .bind(&yes_leg.token_id)
+                        .bind(&no_leg.token_id)
+                        .execute(&pool)
+                        .await;
+                }
+            }
+        }
+    }
 }
 
 
