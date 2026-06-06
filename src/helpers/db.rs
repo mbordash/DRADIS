@@ -21,7 +21,7 @@
 use std::sync::OnceLock;
 use sqlx::{SqlitePool, sqlite::SqlitePoolOptions, Row};
 use rust_decimal::Decimal;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use anyhow::Result;
 use serde::Serialize;
 use tracing::{error, info};
@@ -385,8 +385,9 @@ pub async fn record_trade_db(
     shares: Decimal,
     pnl: Decimal,
     reason: &str,
+    timestamp: Option<DateTime<Utc>>,
 ) {
-    let ts = Utc::now().to_rfc3339();
+    let ts = timestamp.unwrap_or_else(|| Utc::now()).to_rfc3339();
     let sid = current_session_id();
     if let Err(e) = sqlx::query(
         "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id)

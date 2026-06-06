@@ -87,7 +87,7 @@ function CustomTooltip({ active, payload, label }: any) {
     return (
       <div className="card px-3 py-2 text-xs font-mono space-y-1.5 shadow-xl border-2 border-indigo-500/30">
         <div className="text-indigo-300 font-semibold flex items-center gap-1.5">
-          <span>📍</span>
+          <span></span>
           <span>Position Entry</span>
         </div>
         <div className="text-gray-400 text-[10px] border-t border-gray-700 pt-1">{label}</div>
@@ -119,7 +119,7 @@ function CustomTooltip({ active, payload, label }: any) {
           {position.ghost_mode && (
             <div className="flex justify-between gap-3">
               <span className="text-gray-500">Mode</span>
-              <span className="text-amber-400 text-[10px]">👻 ghost</span>
+              <span className="text-amber-400 text-[10px]"> ghost</span>
             </div>
           )}
         </div>
@@ -191,6 +191,12 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
     };
   });
 
+  // Calculate domain to determine marker offsets
+  const allValues = chartData.flatMap(d => [d.cash, d.totalValue]);
+  const minVal = Math.min(...allValues);
+  const maxVal = Math.max(...allValues);
+  const yRange = maxVal - minVal;
+
   // Process trades (exits) into scatter plot data
   // Filter trades to only those within the P&L chart's time range
   const oldestSnapshotTime = reversedData[0] ? new Date(reversedData[0].ts).getTime() : 0;
@@ -220,8 +226,8 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
 
     return {
       time: chartPoint?.time || fmt(trade.ts),
-      // Position markers slightly above the total value line
-      tradeValue: chartPoint ? chartPoint.totalValue + 2 : base,
+      // Position markers clearly above the total value line
+      tradeValue: chartPoint ? chartPoint.totalValue + yRange * 0.08 : base,
       pnl,
       trade, // Store full trade for tooltip
       color: pnl > 0 ? '#10b981' : pnl < 0 ? '#ef4444' : '#6b7280',
@@ -250,8 +256,8 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
 
     return {
       time: chartPoint?.time || fmt(position.ts),
-      // Position markers slightly above the total value line (but below trade markers)
-      positionValue: chartPoint ? chartPoint.totalValue + 1 : base,
+      // Position markers clearly above the total value line (but below trade markers)
+      positionValue: chartPoint ? chartPoint.totalValue + yRange * 0.04 : base,
       position, // Store full position for tooltip
       color: '#6366f1', // Indigo for position entries
     };
@@ -265,11 +271,8 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
     );
   }
 
-  // Calculate domain to fit both lines
-  const allValues = chartData.flatMap(d => [d.cash, d.totalValue]);
-  const minVal = Math.min(...allValues);
-  const maxVal = Math.max(...allValues);
-  const pad = (maxVal - minVal) * 0.15 || 5;
+  // Calculate Y-axis domain with padding to fit both lines and markers
+  const pad = yRange * 0.15 || 5;
   const domain = [Math.floor(minVal - pad), Math.ceil(maxVal + pad)];
 
   return (
@@ -370,16 +373,16 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
                     <circle
                       cx={cx}
                       cy={cy}
-                      r={5}
+                      r={6}
                       fill="#6366f1"
                       stroke="#0a0a12"
                       strokeWidth={2}
-                      opacity={0.8}
+                      opacity={0.9}
                     />
                     <circle
                       cx={cx}
                       cy={cy}
-                      r={2}
+                      r={3}
                       fill="#818cf8"
                       opacity={1}
                     />
@@ -403,7 +406,7 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
                     <circle
                       cx={cx}
                       cy={cy}
-                      r={5}
+                      r={6}
                       fill={color}
                       stroke="#0a0a12"
                       strokeWidth={2}
@@ -412,7 +415,7 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
                     <circle
                       cx={cx}
                       cy={cy}
-                      r={3}
+                      r={3.5}
                       fill={color}
                       opacity={1}
                     />
