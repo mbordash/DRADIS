@@ -1027,8 +1027,8 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address) {
                         asset.to_uppercase(), market_name, pairs, entry_per_pair, pnl
                     );
 
-                    // Record the settlement trade (use the YES entry timestamp as the settlement time)
-                    metrics::record_trade(
+                    // Record the settlement trade using the original entry timestamp
+                    metrics::record_trade_with_timestamp(
                         asset,
                         "ArbitrageStrategy".to_string(),
                         market_name.clone(),
@@ -1038,6 +1038,7 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address) {
                         pairs,
                         pnl,
                         "Settlement (auto-redeemed by Polymarket)".to_string(),
+                        Some(yes_ts),
                     ).await;
 
                     // Also purge any lingering open_positions rows

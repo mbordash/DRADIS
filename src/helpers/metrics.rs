@@ -7,7 +7,7 @@ use tokio::io::AsyncWriteExt;
 use std::path::Path;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::FromStr;
-use chrono::{Utc, Datelike, Duration as ChronoDuration};
+use chrono::{Utc, DateTime, Datelike, Duration as ChronoDuration};
 use chrono_tz::US::Eastern;
 use tracing::{error, info, warn};
 use serde::Serialize;
@@ -43,12 +43,29 @@ pub async fn record_trade(
     profit_usdc: Decimal,
     reason: String,
 ) {
+    record_trade_with_timestamp(asset, strategy, market, side, entry_price, exit_price, shares, profit_usdc, reason, None).await;
+}
+
+/// Record a trade with an explicit timestamp (for retrospective settlements).
+/// If `timestamp` is None, uses current time.
+pub async fn record_trade_with_timestamp(
+    asset: &str,
+    strategy: String,
+    market: String,
+    side: String,
+    entry_price: Decimal,
+    exit_price: Decimal,
+    shares: Decimal,
+    profit_usdc: Decimal,
+    reason: String,
+    timestamp: Option<DateTime<Utc>>,
+) {
     let db_strategy = strategy.clone();
     let db_market   = market.clone();
     let db_side     = side.clone();
     let db_reason   = reason.clone();
     let db_asset    = asset.to_string();
-    let now = Utc::now();
+    let now = timestamp.unwrap_or_else(|| Utc::now());
     // Use Eastern date for the filename so the daily log file matches
     // Polymarket's ET-based trading day (avoids the file rolling at 8PM ET / midnight UTC).
     let now_et = now.with_timezone(&Eastern);
