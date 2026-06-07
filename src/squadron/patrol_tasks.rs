@@ -440,27 +440,15 @@ pub fn spawn_cleanup_task(
                                                         Ok(order_id) => {
                                                             rehedged = true;
                                                             info!(
-                                                                "✅ ORPHAN RE-HEDGE: arb completed — both legs on-chain \
-                                                                 (chain-sync will re-adopt; auto_settle handles redemption). \
-                                                                 Buy order {}",
+                                                                "✅ ORPHAN RE-HEDGE: FAK order placed {} — verifying fill...",
                                                                 order_id,
                                                             );
                                                             let tok_o = tg_token.clone();
                                                             let cid_o = tg_chat_id.clone();
                                                             let sh_o = orphan.shares;
                                                             let cost_o = rehedge_cost;
-                                                            tokio::spawn(async move {
-                                                                let _ = send_notification(&tok_o, &cid_o, &format!(
-                                                                    "♻️ Orphan re-hedged: bought {:.0} missing shares @ ${:.4} \
-                                                                     (total arb cost ${:.4} → $1.00 payout at settle)",
-                                                                    sh_o, paired_ask_ticked, cost_o,
-                                                                )).await;
-                                                            });
 
-                                                            // Record the re-hedged fill to the entries log and open_positions
-                                                            // DB so that restarts correctly re-adopt the new leg as
-                                                            // ArbitrageStrategy instead of falling back to the stale
-                                                            // entries-table row from a prior GBoost/other trade.
+                                                            // Get market and side info
                                                             let rh_market = if paired_id == hourly_yes_token || paired_id == hourly_no_token {
                                                                 hourly_market_name.clone()
                                                             } else {
@@ -471,29 +459,69 @@ pub fn spawn_cleanup_task(
                                                             let rh_side = if paired_id == hourly_yes_token
                                                                 || maker_market_config.as_ref().map_or(false, |mkc| mkc.yes_token == paired_id)
                                                             { "YES" } else { "NO" };
-                                                            {
-                                                                let rh_tid = paired_id.to_string();
-                                                                let rh_mkt = rh_market.clone();
-                                                                let rh_sd  = rh_side.to_string();
-                                                                let rh_ep  = paired_ask_ticked;
-                                                                let rh_sh  = orphan.shares;
-                                                                let rh_asset = asset.clone();
-                                                                tokio::spawn(async move {
+
+                                                            let rh_tid = paired_id.to_string();
+                                                            let rh_mkt = rh_market.clone();
+                                                            let rh_sd  = rh_side.to_string();
+                                                            let rh_ep  = paired_ask_ticked;
+                                                            let rh_sh  = orphan.shares;
+                                                            let rh_asset = asset.clone();
+                                                            let rh_tc = Arc::clone(&trading_client);
+
+                                                            // Write pending position immediately (Viper Launch)
+                                                            if let Some(pool) = db::pool_for(&rh_asset) {
+                                                                db::record_open_position_with_status(
+                                                                    &pool, "ArbitrageStrategy",
+                                                                    &rh_tid, &rh_mkt, &rh_sd,
+                                                                    rh_ep, rh_sh, false, "pending",
+                                                                ).await;
+                                                            }
+
+                                                            tokio::spawn(async move {
+                                                                // Wait 3s then verify fill on-chain
+                                                                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+
+                                                                let mut req = BalanceAllowanceRequest::default();
+                                                                req.asset_type = AssetType::Conditional;
+                                                                req.token_id = Some(paired_id);
+
+                                                                let balance_ok = match tokio::time::timeout(
+                                                                    std::time::Duration::from_secs(10),
+                                                                    rh_tc.balance_allowance(req)
+                                                                ).await {
+                                                                    Ok(Ok(resp)) => {
+                                                                        let balance = Decimal::from_str(&resp.balance.to_string())
+                                                                            .unwrap_or(dec!(0)) / dec!(1_000_000);
+                                                                        balance >= rh_sh * dec!(0.95) // Allow 5% tolerance
+                                                                    }
+                                                                    _ => false
+                                                                };
+
+                                                                if balance_ok {
+                                                                    info!("✅ ORPHAN RE-HEDGE: confirmed on-chain — arb completed");
+                                                                    let _ = send_notification(&tok_o, &cid_o, &format!(
+                                                                        "♻️ Orphan re-hedged: bought {:.0} missing shares @ ${:.4} \
+                                                                         (total arb cost ${:.4} → $1.00 payout at settle)",
+                                                                        sh_o, paired_ask_ticked, cost_o,
+                                                                    )).await;
+
+                                                                    // Update to confirmed (Mission In-Flight) + record entry
+                                                                    if let Some(pool) = db::pool_for(&rh_asset) {
+                                                                        db::confirm_position_status(&pool, "ArbitrageStrategy", &rh_tid).await;
+                                                                    }
                                                                     metrics::record_entry(
                                                                         &rh_asset,
                                                                         "ArbitrageStrategy".to_string(),
                                                                         rh_tid.clone(), rh_mkt.clone(), rh_sd.clone(),
                                                                         rh_ep, rh_sh,
                                                                     ).await;
+                                                                } else {
+                                                                    warn!("⚠️ ORPHAN RE-HEDGE: FAK order accepted but fill not confirmed on-chain — removing pending position");
                                                                     if let Some(pool) = db::pool_for(&rh_asset) {
-                                                                        db::record_open_position(
-                                                                            &pool, "ArbitrageStrategy",
-                                                                            &rh_tid, &rh_mkt, &rh_sd,
-                                                                            rh_ep, rh_sh, false,
-                                                                        ).await;
+                                                                        db::close_open_position(&pool, "ArbitrageStrategy", &rh_tid).await;
                                                                     }
-                                                                });
-                                                            }
+                                                                }
+                                                            });
                                                         }
                                         Err(e) => warn!(
                                             "⚠️ ORPHAN RE-HEDGE: FAK buy failed: {} — falling back to sell", e

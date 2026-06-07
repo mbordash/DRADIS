@@ -385,6 +385,29 @@ pub async fn cleanup_time_decay_positions(
     td_map.retain(|_, pos| !pos.is_expired());
 }
 
+/// Infer the underlying asset from a Polymarket market title.
+///
+/// Examples:
+/// - "Bitcoin Up or Down on June 7?" -> "btc"
+/// - "Will ETH exceed ..." -> "eth"
+fn infer_asset_from_title(title: &str) -> Option<&'static str> {
+    let normalized: String = title
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_lowercase() } else { ' ' })
+        .collect();
+    let has_word = |needle: &str| normalized.split_whitespace().any(|w| w == needle);
+
+    if has_word("btc") || has_word("bitcoin") {
+        Some("btc")
+    } else if has_word("eth") || has_word("ethereum") {
+        Some("eth")
+    } else if has_word("sol") || has_word("solana") {
+        Some("sol")
+    } else {
+        None
+    }
+}
+
 /// Sync the `open_positions` DB table against the wallet's actual live holdings on
 /// Polymarket.  Runs at startup and every 300 s.
 ///
@@ -438,20 +461,33 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
     //     This also covers the Data API indexer lag window after a manual "clear" on the
     //     Polymarket UI: the token may still show size > 0 at the API while the indexer
     //     catches up, but redeemable: true is set immediately at settlement.
-    let live_map: std::collections::HashMap<String, &_> = live_positions
+    let filtered_live_positions: Vec<_> = live_positions
         .iter()
         .filter(|p| p.size > rust_decimal::Decimal::ZERO && !p.redeemable)
-        .map(|p| (p.asset.to_string(), p))
         .collect();
+
+    // Build per-asset live maps so each SQLite pool only receives positions for
+    // its own asset. Without this, wallet-wide chain adoption leaks BTC rows
+    // into ETH/SOL DBs (and vice versa), causing cross-asset UI contamination.
+    let mut live_by_asset: HashMap<String, HashMap<String, _>> = HashMap::new();
+    let mut unmatched_titles = 0usize;
+    for pos in &filtered_live_positions {
+        if let Some(asset) = infer_asset_from_title(&pos.title) {
+            live_by_asset
+                .entry(asset.to_string())
+                .or_default()
+                .insert(pos.asset.to_string(), *pos);
+        } else {
+            unmatched_titles += 1;
+        }
+    }
 
     // Count redeemable positions so operators can see them in logs.
     let redeemable_count = live_positions.iter().filter(|p| p.redeemable).count();
 
-    let live_ids: HashSet<String> = live_map.keys().cloned().collect();
-
     // ── Sync EVERY per-asset pool ─────────────────────────────────────────────
     // Each asset stores its own open_positions rows in its own SQLite file.
-    // Fetch live_ids once (wallet-wide) and apply purge + adopt to every pool.
+    // Apply purge + adopt with asset-filtered live IDs for each pool.
     let mut total_purged = 0usize;
     let mut total_adopted = 0usize;
     for asset in &all_assets {
@@ -459,6 +495,11 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
             Some(p) => p,
             None    => continue,
         };
+
+        let live_map = live_by_asset.get(asset);
+        let live_ids: HashSet<String> = live_map
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default();
 
         // Purge stale rows in this asset's DB.
         total_purged += db::purge_stale_open_positions(&pool, &live_ids).await;
@@ -474,15 +515,24 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
         .into_iter()
         .collect();
 
-        for (token_str, pos) in &live_map {
-            if !db_ids.contains(token_str) {
-                let side = pos.outcome.to_uppercase();
-                if db::adopt_chain_position(&pool, token_str, &pos.title, &side, pos.avg_price, pos.size).await {
-                    total_adopted += 1;
-                    info!(" Chain-sync [{}]: re-adopted on-chain position — token {} | {} shares @ ${:.4} | \"{}\"",
-                        asset.to_uppercase(),
-                        &token_str[..token_str.len().min(20)],
-                        pos.size, pos.avg_price, pos.title);
+        if let Some(asset_live_map) = live_map {
+            for (token_str, pos) in asset_live_map {
+                if !db_ids.contains(token_str) {
+                    // Normalize binary market outcomes to YES/NO for consistency.
+                    // Polymarket API sometimes returns "up"/"down" which must be mapped.
+                    let raw_outcome = pos.outcome.to_uppercase();
+                    let side = match raw_outcome.as_str() {
+                        "UP"   => "YES",
+                        "DOWN" => "NO",
+                        _      => raw_outcome.as_str(),
+                    };
+                    if db::adopt_chain_position(&pool, token_str, &pos.title, side, pos.avg_price, pos.size).await {
+                        total_adopted += 1;
+                        info!(" Chain-sync [{}]: re-adopted on-chain position — token {} | {} shares @ ${:.4} | \"{}\"",
+                            asset.to_uppercase(),
+                            &token_str[..token_str.len().min(20)],
+                            pos.size, pos.avg_price, pos.title);
+                    }
                 }
             }
         }
@@ -494,9 +544,12 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
     if redeemable_count > 0 {
         info!("⏳ Chain-sync: skipped {} redeemable (settled) position(s) — auto_settle will handle redemption", redeemable_count);
     }
+    if unmatched_titles > 0 {
+        warn!("⚠️ Chain-sync: {} live position(s) had unknown market-asset title and were not mapped to an asset DB", unmatched_titles);
+    }
     if total_purged == 0 && total_adopted == 0 {
         info!("✅ Chain-sync: open_positions DB(s) in sync with on-chain holdings ({} live, {} redeemable, {} asset DB(s))",
-            live_map.len(), redeemable_count, all_assets.len());
+            filtered_live_positions.len(), redeemable_count, all_assets.len());
     }
 }
 

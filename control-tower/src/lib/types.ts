@@ -95,6 +95,7 @@ export interface OpenPositionRow {
   shares:         string;  // Decimal string
   ghost_mode:     boolean;
   chain_adopted:  boolean; // true when re-adopted from on-chain (ts = adoption time, not original entry)
+  status:         string;  // "pending" (Viper Launch) | "confirmed" (Mission In-Flight)
 }
 
 export interface LlmRecommendationRow {

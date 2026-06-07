@@ -63,6 +63,20 @@ export async function getOpenPositions(asset?: string): Promise<OpenPositionRow[
   return res.json();
 }
 
+export async function getPendingPositions(asset?: string): Promise<OpenPositionRow[]> {
+  const url = withAsset(`${BASE}/api/positions/pending`, asset);
+  const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/positions/pending → ${res.status}`);
+  return res.json();
+}
+
+export async function getConfirmedPositions(asset?: string): Promise<OpenPositionRow[]> {
+  const url = withAsset(`${BASE}/api/positions/confirmed`, asset);
+  const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/positions/confirmed → ${res.status}`);
+  return res.json();
+}
+
 export async function getHealth(): Promise<string> {
   const res = await fetch(`${BASE}/api/health`, { cache: 'no-store' });
   return res.ok ? 'ok' : 'error';

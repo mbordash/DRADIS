@@ -219,6 +219,12 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE open_positions ADD COLUMN strategy TEXT NOT NULL DEFAULT ''"
     ).execute(pool).await;
 
+    // status: tracks order lifecycle — 'pending' (Viper Launch) vs 'confirmed' (Mission In-Flight).
+    // Prevents showing phantom positions in UI before blockchain confirmation.
+    let _ = sqlx::query(
+        "ALTER TABLE open_positions ADD COLUMN status TEXT NOT NULL DEFAULT 'confirmed'"
+    ).execute(pool).await;
+
     // session_id: ties each row to the session that created it.
     // Needed by adopt_chain_position (INSERT binds session_id) and by session-scoped queries.
     let _ = sqlx::query(
@@ -828,12 +834,29 @@ pub async fn record_open_position(
     shares: Decimal,
     ghost_mode: bool,
 ) {
+    record_open_position_with_status(pool, strategy, token_id, market, side, entry_price, shares, ghost_mode, "confirmed").await;
+}
+
+/// Record an open position with explicit status.
+/// status: "pending" = Viper Launch (order placed, waiting chain confirmation)
+///         "confirmed" = Mission In-Flight (on-chain confirmed)
+pub async fn record_open_position_with_status(
+    pool: &SqlitePool,
+    strategy: &str,
+    token_id: &str,
+    market: &str,
+    side: &str,
+    entry_price: Decimal,
+    shares: Decimal,
+    ghost_mode: bool,
+    status: &str,
+) {
     let ts = Utc::now().to_rfc3339();
     let sid = current_session_id();
     if let Err(e) = sqlx::query(
         "INSERT OR REPLACE INTO open_positions
-         (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
+         (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, status)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&ts)
     .bind(sid)
@@ -844,9 +867,27 @@ pub async fn record_open_position(
     .bind(entry_price.to_string())
     .bind(shares.to_string())
     .bind(ghost_mode as i32)
+    .bind(status)
     .execute(pool)
     .await {
         error!("❌ DB record_open_position failed: {}", e);
+    }
+}
+
+/// Update a pending position to confirmed status after blockchain confirmation.
+pub async fn confirm_position_status(
+    pool: &SqlitePool,
+    strategy: &str,
+    token_id: &str,
+) {
+    if let Err(e) = sqlx::query(
+        "UPDATE open_positions SET status = 'confirmed' WHERE strategy = ? AND token_id = ?"
+    )
+    .bind(strategy)
+    .bind(token_id)
+    .execute(pool)
+    .await {
+        error!("❌ DB confirm_position_status failed: {}", e);
     }
 }
 
@@ -1007,6 +1048,7 @@ pub struct OpenPositionRow {
     pub shares:         String,
     pub ghost_mode:     bool,
     pub chain_adopted:  bool,
+    pub status:         String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1068,7 +1110,8 @@ pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
 /// Used by the API (/api/positions) and the LLM Advisor prompt.
 pub async fn get_open_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
     match sqlx::query(
-        "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted
+        "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted,
+         COALESCE(status, 'confirmed') as status
          FROM open_positions ORDER BY ts ASC"
     )
     .fetch_all(pool)
@@ -1083,10 +1126,61 @@ pub async fn get_open_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
             shares:         r.try_get::<String, _>(6).ok()?,
             ghost_mode:     r.try_get::<i64, _>(7).ok()? != 0,
             chain_adopted:  r.try_get::<i64, _>(8).ok()? != 0,
+            status:         r.try_get::<String, _>(9).ok()?,
         })).collect(),
         Err(e) => { error!("❌ DB get_open_positions failed: {}", e); vec![] }
     }
 }
+
+/// Return only pending positions (Viper Launches) - orders placed but not yet confirmed on-chain.
+pub async fn get_pending_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
+    match sqlx::query(
+        "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted, status
+         FROM open_positions WHERE status = 'pending' ORDER BY ts ASC"
+    )
+    .fetch_all(pool)
+    .await {
+        Ok(rows) => rows.into_iter().filter_map(|r| Some(OpenPositionRow {
+            ts:             r.try_get::<String, _>(0).ok()?,
+            strategy:       r.try_get::<String, _>(1).ok()?,
+            token_id:       r.try_get::<String, _>(2).ok()?,
+            market:         r.try_get::<String, _>(3).ok()?,
+            side:           r.try_get::<String, _>(4).ok()?,
+            entry_price:    r.try_get::<String, _>(5).ok()?,
+            shares:         r.try_get::<String, _>(6).ok()?,
+            ghost_mode:     r.try_get::<i64, _>(7).ok()? != 0,
+            chain_adopted:  r.try_get::<i64, _>(8).ok()? != 0,
+            status:         r.try_get::<String, _>(9).ok()?,
+        })).collect(),
+        Err(e) => { error!("❌ DB get_pending_positions failed: {}", e); vec![] }
+    }
+}
+
+/// Return only confirmed positions (Viper Missions In-Flight) - verified on-chain.
+pub async fn get_confirmed_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
+    match sqlx::query(
+        "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted,
+         COALESCE(status, 'confirmed') as status
+         FROM open_positions WHERE COALESCE(status, 'confirmed') = 'confirmed' ORDER BY ts ASC"
+    )
+    .fetch_all(pool)
+    .await {
+        Ok(rows) => rows.into_iter().filter_map(|r| Some(OpenPositionRow {
+            ts:             r.try_get::<String, _>(0).ok()?,
+            strategy:       r.try_get::<String, _>(1).ok()?,
+            token_id:       r.try_get::<String, _>(2).ok()?,
+            market:         r.try_get::<String, _>(3).ok()?,
+            side:           r.try_get::<String, _>(4).ok()?,
+            entry_price:    r.try_get::<String, _>(5).ok()?,
+            shares:         r.try_get::<String, _>(6).ok()?,
+            ghost_mode:     r.try_get::<i64, _>(7).ok()? != 0,
+            chain_adopted:  r.try_get::<i64, _>(8).ok()? != 0,
+            status:         r.try_get::<String, _>(9).ok()?,
+        })).collect(),
+        Err(e) => { error!("❌ DB get_confirmed_positions failed: {}", e); vec![] }
+    }
+}
+
 
 /// Return all completed trades for the current session, newest first.
 ///

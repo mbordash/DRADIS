@@ -12,7 +12,6 @@ import {
   VIPER_DEFS,
 } from '@/lib/api';
 import ViperCard from '@/components/ViperCard';
-import TradesTable from '@/components/TradesTable';
 import OpenPositionsCard from '@/components/OpenPositionsCard';
 
 // ── Raptor health panel ───────────────────────────────────────────────────────
@@ -248,22 +247,15 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
         )}
       </section>
 
-      {/* ── Open Positions ────────────────────────────────────────────────── */}
+      {/* ── Open Positions & Trades ───────────────────────────────────────── */}
       <section>
-        <p className="label-muted mb-3">Open Positions ({asset.toUpperCase()})</p>
-        <OpenPositionsCard positions={openPositions ?? []} isLoading={positionsLoading} />
-      </section>
-
-      {/* ── Recent Trades ─────────────────────────────────────────────────── */}
-      <section>
-        <p className="label-muted mb-3">Recent Trades ({asset.toUpperCase()})</p>
-        {tradesLoading ? (
-          <div className="card p-6 flex items-center justify-center h-32 text-gray-600 text-sm">
-            Loading trades…
-          </div>
-        ) : (
-          <TradesTable trades={trades ?? []} />
-        )}
+        <p className="label-muted mb-3">Mission Activity ({asset.toUpperCase()})</p>
+        <OpenPositionsCard
+          positions={openPositions ?? []}
+          trades={trades ?? []}
+          isLoading={positionsLoading || tradesLoading}
+          asset={asset}
+        />
       </section>
     </div>
   );

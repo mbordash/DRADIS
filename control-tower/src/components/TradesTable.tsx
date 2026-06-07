@@ -75,8 +75,9 @@ export default function TradesTable({ trades }: Props) {
 
   return (
     <div className="card overflow-hidden">
-      <div className="px-4 pt-4 pb-2">
-        <p className="label-muted">Recent Trades</p>
+      <div className="px-4 pt-4 pb-2 flex items-center gap-2">
+        <span className="text-blue-400 text-base">🎯</span>
+        <p className="label-muted">Completed Viper Missions</p>
       </div>
       <div className="overflow-x-auto">
         <table className="w-full text-xs font-mono">

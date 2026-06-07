@@ -374,7 +374,17 @@ async fn main() -> Result<()> {
         // the starting-collateral reference for drawdown calculations per asset.
         // live_collateral is refreshed from the CLOB every ~60 s so strategies
         // gate on actual available balance regardless of how many assets are active.
-        let asset_session = SessionState::new(startup_balance, asset.as_str());
+        //
+        // Phase 3f-8: SessionState now stores trading credentials so the API
+        // can execute manual "Return to Base" exits via authenticated orders.
+        let asset_session = SessionState::new(
+            startup_balance,
+            asset.as_str(),
+            Arc::clone(&trading_client),
+            signer.clone(),
+            Arc::clone(&nonce_manager),
+            Arc::clone(&shared_http),
+        );
 
         // Register EVERY asset's session with the CAG so API handlers can
         // query per-asset data via ?asset= query params.

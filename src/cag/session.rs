@@ -23,12 +23,17 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use alloy::primitives::U256;
+use alloy::signers::local::LocalSigner;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
+use polymarket_client_sdk_v2::clob::Client as ClobClient;
+use polymarket_client_sdk_v2::auth::state::Authenticated;
+use polymarket_client_sdk_v2::auth::Normal;
 
 use crate::state::PositionMap;
 use crate::helpers::balance::{PhantomCooldowns, OrphanTombstones};
@@ -106,6 +111,16 @@ pub struct SessionState {
     /// that ArbitrageStrategy holds as a hedged leg, causing post-restart
     /// misattribution via the entries table.
     pub token_ownership: Arc<Mutex<HashMap<U256, String>>>,
+
+    // ── Trading infrastructure (Phase 3f-8: manual RTB) ──────────────────────
+    /// Authenticated CLOB REST client for manual exit orders via API.
+    pub trading_client: Arc<ClobClient<Authenticated<Normal>>>,
+    /// EOA signing key for manual exit order signatures.
+    pub signer: LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
+    /// Session-scoped nonce manager for manual exit orders.
+    pub nonce_manager: Arc<AtomicU64>,
+    /// Shared HTTP client for manual exit order placement.
+    pub shared_http: Arc<reqwest::Client>,
 }
 
 impl SessionState {
@@ -115,10 +130,18 @@ impl SessionState {
     /// `starting_collateral` so strategies have an accurate budget from
     /// the very first tick.
     ///
-    /// Used by Phase 3f-5 when `main.rs` is reduced to a thin bootstrapper.
-    /// In Phase 3f-1/3f-3, `main.rs` builds `SessionState` from already-
-    /// declared individual Arc vars via the public fields directly.
-    pub fn new(startup_balance: Decimal, asset: impl Into<String>) -> Self {
+    /// Phase 3f-8: Now also stores trading infrastructure (client, signer, etc.)
+    /// so the API server can execute manual "Return to Base" exits via authenticated
+    /// order placement.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        startup_balance: Decimal,
+        asset: impl Into<String>,
+        trading_client: Arc<ClobClient<Authenticated<Normal>>>,
+        signer: LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
+        nonce_manager: Arc<AtomicU64>,
+        shared_http: Arc<reqwest::Client>,
+    ) -> Self {
         Self {
             asset:                asset.into().to_lowercase(),
             positions:            Arc::new(Mutex::new(PositionMap::new())),
@@ -130,6 +153,10 @@ impl SessionState {
             orphan_tombstones:    Arc::new(Mutex::new(HashSet::new())),
             time_decay_positions: Arc::new(Mutex::new(HashMap::new())),
             token_ownership:      Arc::new(Mutex::new(HashMap::new())),
+            trading_client,
+            signer,
+            nonce_manager,
+            shared_http,
         }
     }
 }

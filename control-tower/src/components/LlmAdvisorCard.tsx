@@ -118,8 +118,7 @@ export default function LlmAdvisorCard({ recommendations, isLoading, advisorEnab
                 ? <>All recommendations dismissed. <button onClick={() => { setDismissed(new Set()); setIdx(0); }} className="text-gray-400 underline underline-offset-2 hover:text-gray-200 transition-colors">Restore</button>.</>
                 : advisorEnabled
                   ? <>
-                      Awaiting first analysis — fires every{' '}
-                      <span className="text-gray-400 font-mono">30 min</span>.
+                      Awaiting first analysis (if enabled in config).
                       Analyses run regardless of trade count — even zero trades triggers a
                       settings-stringency review.
                       Check logs for{' '}

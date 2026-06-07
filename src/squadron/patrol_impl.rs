@@ -825,9 +825,17 @@ impl Squadron {
                                                 let cl_s = Arc::clone(&trading_client); let ps_s = Arc::clone(&positions); let pc_s = Arc::clone(&phantom_cooldowns); let sn_s = sn.clone(); let tn_s = params.token_id;
                                                 let db_sn_a = sn.clone(); let db_tid_a = params.token_id.to_string(); let db_mn_a = params.market_name.clone();
                                                 let db_side_a = if params.token_id == target_yes_token { "YES" } else { "NO" }; let db_ep_a = actual_entry_price; let db_sh_a = params.shares; let asset_a = asset_lc.clone();
+                                                // Write pending position immediately (Viper Launch)
+                                                if let Some(pool) = db::pool_for(&asset_a) {
+                                                    db::record_open_position_with_status(&pool, &sn, &db_tid_a, &db_mn_a, db_side_a, db_ep_a, db_sh_a, false, "pending").await;
+                                                }
                                                 tokio::spawn(async move {
                                                     if sync_position_balance(&cl_s, &ps_s, &sn_s, tn_s, Some(&pc_s), primary_baseline, primary_wait_secs).await.is_ok() {
-                                                        if let Some(pool) = db::pool_for(&asset_a) { db::record_open_position(&pool, &db_sn_a, &db_tid_a, &db_mn_a, db_side_a, db_ep_a, db_sh_a, false).await; }
+                                                        // Update to confirmed (Mission In-Flight) + record entry
+                                                        if let Some(pool) = db::pool_for(&asset_a) {
+                                                            db::confirm_position_status(&pool, &db_sn_a, &db_tid_a).await;
+                                                        }
+                                                        metrics::record_entry(&asset_a, db_sn_a, db_tid_a, db_mn_a, db_side_a.to_string(), db_ep_a, db_sh_a).await;
                                                     }
                                                 });
 
@@ -840,14 +848,19 @@ impl Squadron {
                                                 let sn_p = sn.clone(); let tn_p = pp.token_id; let ps_p = Arc::clone(&positions); let cl_p = Arc::clone(&trading_client); let pc_p = Arc::clone(&phantom_cooldowns);
                                                 let db_sn_b = sn.clone(); let db_tid_b = pp.token_id.to_string(); let db_mn_b = pp.market_name.clone();
                                                 let db_side_b = if pp.token_id == target_yes_token { "YES" } else { "NO" }; let db_ep_b = actual_pair_entry_price; let db_sh_b = pp.shares; let asset_b = asset_lc.clone();
+                                                // Write pending position immediately (Viper Launch)
+                                                if let Some(pool) = db::pool_for(&asset_b) {
+                                                    db::record_open_position_with_status(&pool, &sn, &db_tid_b, &db_mn_b, db_side_b, db_ep_b, db_sh_b, false, "pending").await;
+                                                }
                                                 tokio::spawn(async move {
                                                     if sync_position_balance(&cl_p, &ps_p, &sn_p, tn_p, Some(&pc_p), pair_baseline, pair_wait_secs).await.is_ok() {
-                                                        if let Some(pool) = db::pool_for(&asset_b) { db::record_open_position(&pool, &db_sn_b, &db_tid_b, &db_mn_b, db_side_b, db_ep_b, db_sh_b, false).await; }
+                                                        // Update to confirmed (Mission In-Flight) + record entry
+                                                        if let Some(pool) = db::pool_for(&asset_b) {
+                                                            db::confirm_position_status(&pool, &db_sn_b, &db_tid_b).await;
+                                                        }
+                                                        metrics::record_entry(&asset_b, db_sn_b, db_tid_b, db_mn_b, db_side_b.to_string(), db_ep_b, db_sh_b).await;
                                                     }
                                                 });
-
-                                                { let sn_e = sn.clone(); let tid_e = params.token_id.to_string(); let mn_e = params.market_name.clone(); let side_e = if params.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_e = actual_entry_price; let sh_e = params.shares; let asset_e = asset_lc.clone(); tokio::spawn(async move { metrics::record_entry(&asset_e, sn_e, tid_e, mn_e, side_e, ep_e, sh_e).await; }); }
-                                                { let sn_eb = sn.clone(); let tid_eb = pp.token_id.to_string(); let mn_eb = pp.market_name.clone(); let side_eb = if pp.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_eb = actual_pair_entry_price; let sh_eb = pp.shares; let asset_eb = asset_lc.clone(); tokio::spawn(async move { metrics::record_entry(&asset_eb, sn_eb, tid_eb, mn_eb, side_eb, ep_eb, sh_eb).await; }); }
 
                                                 {
                                                     let arb_cl = Arc::clone(&trading_client); let arb_nm = Arc::clone(&nonce_manager); let arb_sg = signer.clone(); let arb_ps = Arc::clone(&positions); let arb_pc = Arc::clone(&phantom_cooldowns); let arb_sn = sn.clone(); let arb_http = shared_http.clone();
@@ -876,12 +889,19 @@ impl Squadron {
                                         let primary_wait_secs = if target_yes_token == hourly_yes_token { crate::helpers::balance::MAX_WAIT_SECS_HOURLY } else { crate::helpers::balance::MAX_WAIT_SECS_WINDOW };
                                         let db_sn_s = sn.clone(); let db_tid_s = params.token_id.to_string(); let db_mn_s = params.market_name.clone();
                                         let db_side_s = if params.token_id == target_yes_token { "YES" } else { "NO" }; let db_ep_s = actual_entry_price; let db_sh_s = params.shares; let asset_s = asset_lc.clone();
+                                        // Write pending position immediately (Viper Launch)
+                                        if let Some(pool) = db::pool_for(&asset_s) {
+                                            db::record_open_position_with_status(&pool, &sn, &db_tid_s, &db_mn_s, db_side_s, db_ep_s, db_sh_s, false, "pending").await;
+                                        }
                                         tokio::spawn(async move {
                                             if sync_position_balance(&cl_s, &ps_s, &sn_s, tn_s, Some(&pc_s), primary_baseline, primary_wait_secs).await.is_ok() {
-                                                if let Some(pool) = db::pool_for(&asset_s) { db::record_open_position(&pool, &db_sn_s, &db_tid_s, &db_mn_s, db_side_s, db_ep_s, db_sh_s, false).await; }
+                                                // Update to confirmed (Mission In-Flight) + record entry
+                                                if let Some(pool) = db::pool_for(&asset_s) {
+                                                    db::confirm_position_status(&pool, &db_sn_s, &db_tid_s).await;
+                                                }
+                                                metrics::record_entry(&asset_s, db_sn_s, db_tid_s, db_mn_s, db_side_s.to_string(), db_ep_s, db_sh_s).await;
                                             }
                                         });
-                                        { let sn_e = sn.clone(); let tid_e = params.token_id.to_string(); let mn_e = params.market_name.clone(); let side_e = if params.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_e = actual_entry_price; let sh_e = params.shares; let asset_e = asset_lc.clone(); tokio::spawn(async move { metrics::record_entry(&asset_e, sn_e, tid_e, mn_e, side_e, ep_e, sh_e).await; }); }
                                     }
                                     last_trade_time.insert(sn.clone(), Instant::now());
                                     { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = format!("🟢 ENTRY [{}] {} | ${:.4} x {:.1}", sn, params.market_name, params.price, params.shares); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
@@ -912,8 +932,22 @@ impl Squadron {
                                                 if !e.to_string().contains("crosses book") { consecutive_failures += 1; } continue;
                                             }
                                             let cl_m = Arc::clone(&trading_client); let ps_m = Arc::clone(&positions); let pc_m = Arc::clone(&phantom_cooldowns); let sn_m = sn.clone();
-                                            tokio::spawn(async move { let _ = sync_position_balance(&cl_m, &ps_m, &sn_m, p.token_id, Some(&pc_m), dec!(0), crate::helpers::balance::MAX_WAIT_SECS_WINDOW).await; });
-                                            { let sn_em = sn.clone(); let tid_em = p.token_id.to_string(); let mn_em = p.market_name.clone(); let side_em = if p.token_id == target_yes_token { "YES" } else { "NO" }.to_string(); let ep_em = p.price; let sh_em = p.shares; let asset_em = asset_lc.clone(); tokio::spawn(async move { metrics::record_entry(&asset_em, sn_em, tid_em, mn_em, side_em, ep_em, sh_em).await; }); }
+                                            let tid_em = p.token_id.to_string(); let mn_em = p.market_name.clone();
+                                            let side_em = if p.token_id == target_yes_token { "YES" } else { "NO" }.to_string();
+                                            let ep_em = p.price; let sh_em = p.shares; let asset_em = asset_lc.clone();
+                                            // Write pending position immediately (Viper Launch)
+                                            if let Some(pool) = db::pool_for(&asset_em) {
+                                                db::record_open_position_with_status(&pool, &sn, &tid_em, &mn_em, &side_em, ep_em, sh_em, false, "pending").await;
+                                            }
+                                            tokio::spawn(async move {
+                                                if sync_position_balance(&cl_m, &ps_m, &sn_m, p.token_id, Some(&pc_m), dec!(0), crate::helpers::balance::MAX_WAIT_SECS_WINDOW).await.is_ok() {
+                                                    // Update to confirmed (Mission In-Flight) + record entry
+                                                    if let Some(pool) = db::pool_for(&asset_em) {
+                                                        db::confirm_position_status(&pool, &sn_m, &tid_em).await;
+                                                    }
+                                                    metrics::record_entry(&asset_em, sn_m, tid_em, mn_em, side_em, ep_em, sh_em).await;
+                                                }
+                                            });
                                         }
                                         placed = true;
                                     }

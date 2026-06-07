@@ -5,7 +5,6 @@ import useSWR from 'swr';
 import dynamic from 'next/dynamic';
 
 import ViperCard       from '@/components/ViperCard';
-import TradesTable     from '@/components/TradesTable';
 import LlmAdvisorCard  from '@/components/LlmAdvisorCard';
 import OpenPositionsCard from '@/components/OpenPositionsCard';
 import SquadronsPanel  from '@/components/SquadronsPanel';

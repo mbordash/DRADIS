@@ -11,6 +11,7 @@
 ///   GET    /api/positions             — current open positions (?asset=btc)
 ///   DELETE /api/positions/{token_id}  — purge a specific stale row from open_positions
 ///   POST   /api/positions/sync        — trigger immediate chain-sync against Polymarket wallet
+///   POST   /api/positions/manual-exit — manual "Return to Base" exit (FAK market sell)
 ///   GET    /api/llm/recommendations   — recent LLM Advisor analyses (?limit=10&asset=btc)
 ///   GET    /api/squadrons             — list all active squadrons (Phase 3d)
 ///   GET    /api/squadrons/{id}        — get one squadron by id    (Phase 3d)
@@ -36,10 +37,16 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
-use alloy::primitives::Address;
+use alloy::primitives::{Address, U256};
+use polymarket_client_sdk_v2::clob::types::{OrderType, Side};
+use rust_decimal::Decimal;
+use rust_decimal::prelude::FromStr;
 
 use crate::helpers::dynamic_config::DynamicConfig;
 use crate::helpers::db;
+use crate::helpers::orders::place_limit_order;
+use crate::helpers::price::round_to_tick_size;
+use crate::helpers::metrics;
 use crate::tasks::cleanup::sync_open_positions_with_chain;
 use crate::cag::Cag;
 
@@ -116,11 +123,36 @@ async fn require_api_key(
 // ─── Query params ─────────────────────────────────────────────────────────────
 
 
-/// Query params accepted by all data endpoints that support multi-asset views.
+/// Query params for asset-scoped endpoints.
 #[derive(Deserialize)]
 struct AssetQuery {
     asset: Option<String>,
     limit: Option<i64>,
+}
+
+/// Request body for manual "Return to Base" exit.
+///
+/// POST /api/positions/manual-exit
+///
+/// Executes an immediate FAK (Fill-And-Kill) market sell order for the
+/// specified position, records the trade with actual exit price and P&L,
+/// and closes the position in the database.
+#[derive(Deserialize)]
+struct ManualExitRequest {
+    /// Token ID (decimal U256 string)
+    token_id: String,
+    /// Asset symbol (e.g. "btc") for DB pool selection
+    asset: String,
+    /// Strategy name for position lookup
+    strategy: String,
+    /// Market name for trade recording
+    market: String,
+    /// Side (YES/NO) for trade recording
+    side: String,
+    /// Current bid price (for FAK sell order)
+    current_bid: String,
+    /// Verifying contract address (exchange address)
+    verifying_contract: String,
 }
 
 // ─── Handlers ────────────────────────────────────────────────────────────────
@@ -287,6 +319,40 @@ async fn get_open_positions(Query(q): Query<AssetQuery>) -> Response {
     }
 }
 
+/// GET /api/positions/pending?asset=btc
+///
+/// Returns only pending positions (Viper Launches) - orders placed but not yet confirmed on-chain.
+async fn get_pending_positions(Query(q): Query<AssetQuery>) -> Response {
+    debug!("Received GET /api/positions/pending request");
+    match db::pool_for_opt(q.asset.as_deref()) {
+        Some(pool) => {
+            let positions = db::get_pending_positions(&pool).await;
+            Json(positions).into_response()
+        },
+        None => {
+            error!("Database pool not available for GET /api/positions/pending");
+            Json(Vec::<db::OpenPositionRow>::new()).into_response()
+        },
+    }
+}
+
+/// GET /api/positions/confirmed?asset=btc
+///
+/// Returns only confirmed positions (Viper Missions In-Flight) - verified on-chain.
+async fn get_confirmed_positions(Query(q): Query<AssetQuery>) -> Response {
+    debug!("Received GET /api/positions/confirmed request");
+    match db::pool_for_opt(q.asset.as_deref()) {
+        Some(pool) => {
+            let positions = db::get_confirmed_positions(&pool).await;
+            Json(positions).into_response()
+        },
+        None => {
+            error!("Database pool not available for GET /api/positions/confirmed");
+            Json(Vec::<db::OpenPositionRow>::new()).into_response()
+        },
+    }
+}
+
 /// DELETE /api/positions/{token_id}?asset=btc
 ///
 /// Purges a specific row from `open_positions` by token_id (decimal U256 string).
@@ -337,6 +403,192 @@ async fn sync_positions(State(s): State<ApiState>) -> Response {
     info!(" Manual chain-sync triggered via POST /api/positions/sync");
     sync_open_positions_with_chain(s.safe_address).await;
     (StatusCode::OK, Json(serde_json::json!({ "message": "Chain sync complete" }))).into_response()
+}
+
+/// POST /api/positions/manual-exit
+///
+/// Execute a manual "Return to Base" exit for a specific position.
+///
+/// Flow:
+///  1. Lookup position in DB to get entry price and shares
+///  2. Place FAK (Fill-And-Kill) market sell order at current bid
+///  3. Wait up to 10s for order to fill
+///  4. Record trade with actual exit price and P&L
+///  5. Close position in DB
+///
+/// Returns 200 with trade details on success, 4xx/5xx on failure.
+async fn manual_exit(
+    State(s): State<ApiState>,
+    Json(req): Json<ManualExitRequest>,
+) -> Response {
+    info!("🎯 RTB: Manual exit request for token {} [{}]", &req.token_id[..req.token_id.len().min(20)], req.strategy);
+
+    // ── Step 1: Get session for this asset ────────────────────────────────────
+    let session = match s.cag.session_for_asset(&req.asset) {
+        Some(sess) => sess,
+        None => {
+            warn!("RTB: Asset '{}' not found in CAG sessions", req.asset);
+            return (StatusCode::BAD_REQUEST, "Asset not found").into_response();
+        }
+    };
+
+    // ── Step 2: Lookup position in DB to get entry price and shares ───────────
+    let pool = match db::pool_for(&req.asset) {
+        Some(p) => p,
+        None => {
+            error!("RTB: Database pool not available for asset {}", req.asset);
+            return (StatusCode::SERVICE_UNAVAILABLE, "DB unavailable").into_response();
+        }
+    };
+
+    #[derive(sqlx::FromRow)]
+    struct PositionRow {
+        entry_price: String,
+        shares: String,
+    }
+
+    let pos_result = sqlx::query_as::<_, PositionRow>(
+        "SELECT entry_price, shares FROM open_positions WHERE token_id = ? AND strategy = ?"
+    )
+    .bind(&req.token_id)
+    .bind(&req.strategy)
+    .fetch_one(&pool)
+    .await;
+
+    let (entry_price, shares) = match pos_result {
+        Ok(row) => {
+            let entry = match Decimal::from_str(&row.entry_price) {
+                Ok(p) => p,
+                Err(e) => {
+                    error!("RTB: Invalid entry_price in DB: {}", e);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid entry price").into_response();
+                }
+            };
+            let shares = match Decimal::from_str(&row.shares) {
+                Ok(s) => s,
+                Err(e) => {
+                    error!("RTB: Invalid shares in DB: {}", e);
+                    return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid shares").into_response();
+                }
+            };
+            (entry, shares)
+        }
+        Err(sqlx::Error::RowNotFound) => {
+            warn!("RTB: Position not found in DB (token={}, strategy={})", req.token_id, req.strategy);
+            return (StatusCode::NOT_FOUND, "Position not found").into_response();
+        }
+        Err(e) => {
+            error!("RTB: Database error: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, "Database error").into_response();
+        }
+    };
+
+    // ── Step 3: Parse inputs ───────────────────────────────────────────────────
+    let token_id = match U256::from_str(&req.token_id) {
+        Ok(t) => t,
+        Err(e) => {
+            error!("RTB: Invalid token_id: {}", e);
+            return (StatusCode::BAD_REQUEST, "Invalid token_id").into_response();
+        }
+    };
+
+    let current_bid = match Decimal::from_str(&req.current_bid) {
+        Ok(b) => b,
+        Err(e) => {
+            error!("RTB: Invalid current_bid: {}", e);
+            return (StatusCode::BAD_REQUEST, "Invalid current_bid").into_response();
+        }
+    };
+
+    let verifying_contract = match req.verifying_contract.parse::<Address>() {
+        Ok(a) => a,
+        Err(e) => {
+            error!("RTB: Invalid verifying_contract: {}", e);
+            return (StatusCode::BAD_REQUEST, "Invalid verifying_contract").into_response();
+        }
+    };
+
+    // ── Step 4: Place FAK market sell order ────────────────────────────────────
+    let sell_price = round_to_tick_size(current_bid);
+    info!("🎯 RTB: Placing FAK sell order — {} shares @ ${:.4}", shares, sell_price);
+
+    let order_result = place_limit_order(
+        &session.trading_client,
+        &session.nonce_manager,
+        &session.signer,
+        s.safe_address,
+        s.safe_address, // eoa_address = safe_address for this context
+        verifying_contract,
+        token_id,
+        Side::Sell,
+        shares,
+        sell_price,
+        0, // fee_rate_bps (unused in V2)
+        OrderType::FAK,
+        false, // not post-only
+        0, // expiration_secs (FAK doesn't need expiration)
+        &session.shared_http,
+    ).await;
+
+    let order_id = match order_result {
+        Ok(id) => {
+            info!("✅ RTB: FAK sell order placed (order_id={})", id);
+            id
+        }
+        Err(e) => {
+            error!("RTB: Order placement failed: {}", e);
+            return (StatusCode::INTERNAL_SERVER_ERROR, format!("Order failed: {}", e)).into_response();
+        }
+    };
+
+    // ── Step 5: Wait for fill confirmation ─────────────────────────────────────
+    // FAK orders fill immediately or cancel. Give it 10s to confirm on-chain.
+    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+
+    // ── Step 6: Calculate P&L and record trade ────────────────────────────────
+    let pnl = (sell_price - entry_price) * shares;
+    info!("📊 RTB: Trade recorded — {} shares | entry ${:.4} → exit ${:.4} | P&L ${:.4}",
+          shares, entry_price, sell_price, pnl);
+
+    metrics::record_trade(
+        &req.asset,
+        req.strategy.clone(),
+        req.market.clone(),
+        req.side.clone(),
+        entry_price,
+        sell_price,
+        shares,
+        pnl,
+        "Manual RTB (Return to Base)".to_string(),
+    ).await;
+
+    // ── Step 7: Close position in DB ───────────────────────────────────────────
+    db::close_open_position(&pool, &req.strategy, &req.token_id).await;
+
+    // ── Step 8: Remove from in-memory positions map ────────────────────────────
+    {
+        let mut pos_map = session.positions.lock().await;
+        pos_map.remove(&(req.strategy.clone(), token_id));
+    }
+
+    info!("✅ RTB: Manual exit complete — order_id={}", order_id);
+
+    #[derive(Serialize)]
+    struct ExitResponse {
+        success: bool,
+        order_id: String,
+        exit_price: String,
+        shares: String,
+        pnl: String,
+    }
+
+    Json(ExitResponse {
+        success: true,
+        order_id,
+        exit_price: sell_price.to_string(),
+        shares: shares.to_string(),
+        pnl: pnl.to_string(),
+    }).into_response()
 }
 
 /// GET /api/llm/recommendations?limit=10&asset=btc
@@ -511,7 +763,10 @@ pub async fn run_api_server(
         .route("/api/pnl/history",           get(get_pnl_history))
         .route("/api/trades",                get(get_trades))
         .route("/api/positions",             get(get_open_positions))
+        .route("/api/positions/pending",     get(get_pending_positions))
+        .route("/api/positions/confirmed",   get(get_confirmed_positions))
         .route("/api/positions/sync",        post(sync_positions))
+        .route("/api/positions/manual-exit", post(manual_exit))
         .route("/api/positions/{token_id}",  delete(delete_open_position))
         .route("/api/status",                get(get_status))
         .route("/api/llm/recommendations",   get(get_llm_recommendations))
