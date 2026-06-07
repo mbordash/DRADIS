@@ -640,7 +640,7 @@ async fn get_portfolio_value() -> Response {
     let assets = db::available_assets();
     let mut total_collateral = Decimal::ZERO;
     let mut total_positions_value = Decimal::ZERO;
-    let mut total_unrealized_pnl = Decimal::ZERO;
+    let total_unrealized_pnl = Decimal::ZERO;  // TODO: Calculate when live prices are added
     let mut total_position_count = 0;
     let all_prices_live = true;
 

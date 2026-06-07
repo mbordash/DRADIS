@@ -180,6 +180,7 @@ impl Squadron {
             wallet_provider.clone(),
             safe_address,
             eoa_address,
+            asset_lc.clone(),
             peripheral_cancel.clone(),
         );
 

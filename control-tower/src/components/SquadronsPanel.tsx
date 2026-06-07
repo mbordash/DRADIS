@@ -1,6 +1,8 @@
 'use client';
 
+import useSWR from 'swr';
 import type { SquadronSummary, SquadronState } from '@/lib/types';
+import { getOpenPositions } from '@/lib/api';
 
 // ── State badge ───────────────────────────────────────────────────────────────
 
@@ -53,7 +55,15 @@ function timeAgo(iso: string): string {
 
 // ── Squadron row ──────────────────────────────────────────────────────────────
 
-function SquadronRow({ sq, onClick }: { sq: SquadronSummary; onClick?: (sq: SquadronSummary) => void }) {
+function SquadronRow({
+  sq,
+  onClick,
+  missionCount
+}: {
+  sq: SquadronSummary;
+  onClick?: (sq: SquadronSummary) => void;
+  missionCount?: number;
+}) {
   return (
     <button
       onClick={() => onClick?.(sq)}
@@ -75,8 +85,13 @@ function SquadronRow({ sq, onClick }: { sq: SquadronSummary; onClick?: (sq: Squa
         </div>
       </div>
 
-      {/* Right — state + deployed time + id */}
+      {/* Right — mission count + state + deployed time + id */}
       <div className="flex items-center gap-3 shrink-0">
+        {missionCount !== undefined && missionCount > 0 && (
+          <span className="text-[10px] font-mono bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 rounded px-2 py-0.5" title={`${missionCount} active mission${missionCount === 1 ? '' : 's'}`}>
+            ✈️ {missionCount}
+          </span>
+        )}
         <StateBadge state={sq.state} />
         <span className="text-[10px] font-mono text-gray-600" title={sq.deployed_at}>
           {timeAgo(sq.deployed_at)}
@@ -125,6 +140,24 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick }
   const active   = squadrons.filter(s => s.state === 'PATROLLING' || s.state === 'DEPLOYED');
   const inactive = squadrons.filter(s => s.state !== 'PATROLLING' && s.state !== 'DEPLOYED');
 
+  // Get unique assets from squadrons
+  const assets = [...new Set(squadrons.map(s => s.asset.toLowerCase()))];
+
+  // Fetch positions for all assets concurrently
+  const { data: allPositions } = useSWR(
+    assets.length > 0 ? ['squadron-missions', ...assets] : null,
+    async () => await Promise.all(assets.map(asset => getOpenPositions(asset))),
+    { refreshInterval: 15_000 }
+  );
+
+  // Build mission count map: asset -> count
+  const missionCounts: Record<string, number> = {};
+  if (allPositions) {
+    assets.forEach((asset, i) => {
+      missionCounts[asset] = allPositions[i]?.length ?? 0;
+    });
+  }
+
   return (
     <div className="rounded-xl border border-[#1e1e32] bg-[#0d0d1a] overflow-hidden">
       {/* Header */}
@@ -151,7 +184,14 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick }
           {/* Active squadrons */}
           {active.length > 0 && (
             <div>
-              {active.map(sq => <SquadronRow key={sq.id} sq={sq} onClick={onSquadronClick} />)}
+              {active.map(sq => (
+                <SquadronRow
+                  key={sq.id}
+                  sq={sq}
+                  onClick={onSquadronClick}
+                  missionCount={missionCounts[sq.asset.toLowerCase()]}
+                />
+              ))}
             </div>
           )}
 
@@ -162,7 +202,14 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick }
                 <span className="group-open:rotate-90 transition-transform inline-block">▶</span>
                 {inactive.length} stood-down / RTB
               </summary>
-              {inactive.map(sq => <SquadronRow key={sq.id} sq={sq} onClick={onSquadronClick} />)}
+              {inactive.map(sq => (
+                <SquadronRow
+                  key={sq.id}
+                  sq={sq}
+                  onClick={onSquadronClick}
+                  missionCount={missionCounts[sq.asset.toLowerCase()]}
+                />
+              ))}
             </details>
           )}
         </>

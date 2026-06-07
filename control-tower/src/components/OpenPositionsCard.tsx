@@ -195,7 +195,7 @@ export default function OpenPositionsCard({ positions, trades, isLoading, asset 
               <table className="w-full text-xs font-mono">
                 <thead>
                   <tr className="border-b border-[#1e1e32]">
-                    {['Launched', 'Strategy', 'Market', 'Side', 'Entry', 'Shares', 'Mode'].map(h => (
+                    {['Launched', 'Asset', 'Strategy', 'Market', 'Side', 'Entry', 'Shares', 'Mode'].map(h => (
                       <th key={h} className="px-3 py-2 text-left text-gray-500 font-normal whitespace-nowrap">
                         {h}
                       </th>
@@ -209,6 +209,11 @@ export default function OpenPositionsCard({ positions, trades, isLoading, asset 
                       className="border-b border-[#1e1e32] hover:bg-[#1a1a2e] transition-colors"
                     >
                       <td className="px-3 py-2 text-gray-400 whitespace-nowrap">{fmtTime(p.ts)}</td>
+                      <td className="px-3 py-2">
+                        <span className="inline-block px-1.5 py-0.5 text-[10px] font-bold rounded bg-indigo-500/10 text-indigo-300 border border-indigo-500/20">
+                          {asset.toUpperCase()}
+                        </span>
+                      </td>
                       <td className="px-3 py-2 text-gray-300 whitespace-nowrap">{strategyLabel(p.strategy)}</td>
                       <td className="px-3 py-2 text-gray-400 max-w-[160px]">
                         <TipCell full={p.market} maxChars={26} />
@@ -243,7 +248,7 @@ export default function OpenPositionsCard({ positions, trades, isLoading, asset 
               <table className="w-full text-xs font-mono">
                 <thead>
                   <tr className="border-b border-[#1e1e32]">
-                    {['Entered', 'Strategy', 'Market', 'Side', 'Entry', 'Shares', 'Mode', 'Actions'].map(h => (
+                    {['Entered', 'Asset', 'Strategy', 'Market', 'Side', 'Entry', 'Shares', 'Mode', 'Actions'].map(h => (
                       <th key={h} className="px-3 py-2 text-left text-gray-500 font-normal whitespace-nowrap">
                         {h}
                       </th>
@@ -261,6 +266,11 @@ export default function OpenPositionsCard({ positions, trades, isLoading, asset 
                           ? <span title="Re-adopted from on-chain wallet; original entry time unknown" className="text-amber-500/80 cursor-help">⛓ adopted</span>
                           : fmtTime(p.ts)
                         }
+                      </td>
+                      <td className="px-3 py-2">
+                        <span className="inline-block px-1.5 py-0.5 text-[10px] font-bold rounded bg-indigo-500/10 text-indigo-300 border border-indigo-500/20">
+                          {asset.toUpperCase()}
+                        </span>
                       </td>
                       <td className="px-3 py-2 text-gray-300 whitespace-nowrap">{strategyLabel(p.strategy)}</td>
                       <td className="px-3 py-2 text-gray-400 max-w-[160px]">

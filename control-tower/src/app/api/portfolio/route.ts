@@ -89,6 +89,7 @@ export async function GET(): Promise<NextResponse> {
     }> = [];
 
     let totalCollateral = 0;
+    let collateralSet = false;
 
     for (let i = 0; i < assets.length; i++) {
       const posRes = responses[i * 2];
@@ -99,8 +100,10 @@ export async function GET(): Promise<NextResponse> {
 
       allPositions.push(...positions);
 
-      if (pnlHistory.length > 0) {
-        totalCollateral += parseFloat(pnlHistory[0].collateral);
+      // Collateral is shared across all assets — only count once (from first asset)
+      if (!collateralSet && pnlHistory.length > 0) {
+        totalCollateral = parseFloat(pnlHistory[0].collateral);
+        collateralSet = true;
       }
     }
 

@@ -100,6 +100,7 @@ pub fn spawn_settlement_task<P>(
     wallet_provider: P,
     safe_address: Address,
     eoa_address: Address,
+    asset: String,
     cancel: CancellationToken,
 ) where
     P: Provider + Clone + Send + Sync + 'static,
@@ -129,8 +130,9 @@ pub fn spawn_settlement_task<P>(
 
                     // After processing explicit settlements, scan for positions that were
                     // auto-settled by Polymarket (outside our settlement ticker).
+                    // Pass the squadron's asset so it only scans its own database pool.
                     match tokio::time::timeout(Duration::from_secs(30),
-                        crate::tasks::cleanup::detect_orphaned_arb_settlements(safe_address)
+                        crate::tasks::cleanup::detect_orphaned_arb_settlements(safe_address, &asset)
                     ).await {
                         Ok(_) => {}
                         Err(_) => warn!("⚠️ orphan detection task timed out (30s) — skipping this cycle"),

@@ -251,6 +251,21 @@ export default function DashboardPage() {
   const { data: openPositions, isLoading: positionsLoading } =
     useSWR(['positions', asset], () => getOpenPositions(asset), { refreshInterval: 15_000 });
 
+  // For chart markers: fetch ALL trades/positions across all assets (not filtered by selected asset)
+  const { data: allTrades } =
+    useSWR('trades-all', async () => {
+      if (availableAssets.length === 0) return [];
+      const results = await Promise.all(availableAssets.map(a => getTrades(60, a)));
+      return results.flat();
+    }, { refreshInterval: 15_000 });
+
+  const { data: allOpenPositions } =
+    useSWR('positions-all', async () => {
+      if (availableAssets.length === 0) return [];
+      const results = await Promise.all(availableAssets.map(a => getOpenPositions(a)));
+      return results.flat();
+    }, { refreshInterval: 15_000 });
+
   const { data: health } =
     useSWR('health', getHealth, { refreshInterval: 10_000 });
 
@@ -455,8 +470,8 @@ export default function DashboardPage() {
             startingBalance={startingBal}
             ghostMode={config?.ghost_mode}
             currentPortfolio={portfolio}
-            trades={trades ?? []}
-            openPositions={openPositions ?? []}
+            trades={allTrades ?? []}
+            openPositions={allOpenPositions ?? []}
           />
         )}
 
