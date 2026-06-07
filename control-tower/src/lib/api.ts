@@ -8,6 +8,9 @@ import type { DynamicConfig, PnlSnapshotRow, TradeRow, OpenPositionRow, LlmRecom
 //   DRADIS_API_URL (http://dradis-btc:9000) inside the Docker network.
 const BASE = process.env.NEXT_PUBLIC_API_URL ?? '';
 
+// API key for authenticated requests (server-side only)
+const API_KEY = process.env.DRADIS_API_KEY;
+
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 /** Append ?asset=<a> to a URL if `asset` is non-empty. */
@@ -15,6 +18,15 @@ function withAsset(url: string, asset?: string): string {
   if (!asset) return url;
   const sep = url.includes('?') ? '&' : '?';
   return `${url}${sep}asset=${encodeURIComponent(asset.toLowerCase())}`;
+}
+
+/** Build headers with optional API key (when server-side). */
+function buildHeaders(): HeadersInit {
+  const headers: HeadersInit = {};
+  if (API_KEY) {
+    headers['X-API-Key'] = API_KEY;
+  }
+  return headers;
 }
 
 // ── Fetchers (used as SWR keys + fetch functions) ────────────────────────────

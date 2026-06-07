@@ -331,7 +331,6 @@ async fn main() -> Result<()> {
     // Each asset gets its own:
     //   • Price + funding raptors   (different Binance WS symbols)
     //   • SessionState              (positions, PnL, collateral tracked independently)
-    //   • LLM Advisor instance      (reports per-asset P&L)
     //   • run_market_loop task      (independent market bootstrap + patrol loop)
     //
     // Shared across all assets:
@@ -341,6 +340,7 @@ async fn main() -> Result<()> {
     //   • cag                       (unified CAG registry — all squadrons visible in UI)
     //   • config_rx / markets_tx    (shared dynamic config + status broadcast)
     //   • process_heartbeat_secs    (process-level OS watchdog — ANY asset tick counts)
+    //   • LLM Advisor               (ONE global loop reading all asset DBs — spawned after this loop)
     //
     // ⚠️  DB: Phase 3f-7 — each asset has its own SQLite pool initialised above.
     //     The pools are looked up by asset slug in patrol_impl / patrol_tasks
@@ -351,6 +351,9 @@ async fn main() -> Result<()> {
         if assets.len() == 1 { "" } else { "s" });
 
     let mut loop_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::with_capacity(assets.len());
+
+    // Store first asset's session for LLM Advisor (P&L tracking reference)
+    let mut primary_session: Option<SessionState> = None;
 
     for asset in assets.iter() {
         // ── Per-asset raptor signal feeds ─────────────────────────────────────
@@ -390,15 +393,10 @@ async fn main() -> Result<()> {
         // query per-asset data via ?asset= query params.
         cag.set_session(asset_session.clone());
 
-        // ── Per-asset LLM Advisor ─────────────────────────────────────────────
-        // Spawned unconditionally; exits immediately when ENABLE_LLM_ADVISOR=false.
-        tokio::spawn(dradis::helpers::llm_advisor::run_llm_advisor_loop(
-            env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
-            env::var("TELEGRAM_CHAT_ID").unwrap_or_default(),
-            asset_session.total_pnl.clone(),
-            asset_session.starting_collateral.clone(),
-            config_rx.clone(),
-        ));
+        // Capture first asset's session as the primary reference for global LLM advisor P&L
+        if primary_session.is_none() {
+            primary_session = Some(asset_session.clone());
+        }
 
         // ── Build RunArgs and spawn the market loop ───────────────────────────
         let loop_cancel = CancellationToken::new();
@@ -433,6 +431,20 @@ async fn main() -> Result<()> {
         // main.rs retains the JoinHandle for awaiting; the CAG holds the AbortHandle.
         cag.register_loop_task(asset, handle.abort_handle(), loop_cancel);
         loop_tasks.push(handle);
+    }
+
+    // ── Spawn global LLM Advisor (reads all asset DBs, writes to primary) ────
+    // Spawned once after all assets are initialised so it can iterate over
+    // db::available_assets().  Uses the first asset's SessionState as the P&L
+    // reference for combined portfolio analysis.
+    if let Some(ref session) = primary_session {
+        tokio::spawn(dradis::helpers::llm_advisor::run_llm_advisor_loop(
+            env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
+            env::var("TELEGRAM_CHAT_ID").unwrap_or_default(),
+            session.total_pnl.clone(),
+            session.starting_collateral.clone(),
+            config_rx.clone(),
+        ));
     }
 
     // Block until ALL market loops exit (expected: never — each loops forever).

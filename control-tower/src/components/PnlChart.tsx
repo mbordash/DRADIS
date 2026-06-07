@@ -290,13 +290,13 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
           </div>
           {positionEvents.length > 0 && (
             <div className="flex items-center gap-1.5">
-              <div className="w-2 h-2 rounded-full bg-indigo-400" />
+              <div className="w-4 h-4 rounded-full bg-indigo-400 flex items-center justify-center text-white text-[8px] font-bold">B</div>
               <span className="text-gray-500">Entries ({positionEvents.length})</span>
             </div>
           )}
           {tradeEvents.length > 0 && (
             <div className="flex items-center gap-1.5">
-              <div className="w-2 h-2 rounded-full bg-emerald-400" />
+              <div className="w-4 h-4 rounded-full bg-emerald-400 flex items-center justify-center text-white text-[8px] font-bold">S</div>
               <span className="text-gray-500">Exits ({tradeEvents.length})</span>
             </div>
           )}
@@ -360,7 +360,7 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
             dot={false}
             activeDot={{ r: 4, fill: '#6366f1', stroke: '#0a0a12', strokeWidth: 2 }}
           />
-          {/* Position entry markers (blue) - render before trade exits */}
+          {/* Position entry markers (B for buy) - render before trade exits */}
           {positionEvents.length > 0 && (
             <Scatter
               data={positionEvents}
@@ -373,25 +373,30 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
                     <circle
                       cx={cx}
                       cy={cy}
-                      r={6}
+                      r={8}
                       fill="#6366f1"
                       stroke="#0a0a12"
-                      strokeWidth={2}
-                      opacity={0.9}
+                      strokeWidth={1.5}
+                      opacity={0.95}
                     />
-                    <circle
-                      cx={cx}
-                      cy={cy}
-                      r={3}
-                      fill="#818cf8"
-                      opacity={1}
-                    />
+                    <text
+                      x={cx}
+                      y={cy}
+                      textAnchor="middle"
+                      dominantBaseline="central"
+                      fill="#ffffff"
+                      fontSize="10"
+                      fontWeight="600"
+                      fontFamily="monospace"
+                    >
+                      B
+                    </text>
                   </g>
                 );
               }}
             />
           )}
-          {/* Trade exit markers (green/red) */}
+          {/* Trade exit markers (S for sell with green/red colors) */}
           {tradeEvents.length > 0 && (
             <Scatter
               data={tradeEvents}
@@ -406,19 +411,24 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
                     <circle
                       cx={cx}
                       cy={cy}
-                      r={6}
+                      r={8}
                       fill={color}
                       stroke="#0a0a12"
-                      strokeWidth={2}
-                      opacity={0.9}
+                      strokeWidth={1.5}
+                      opacity={0.95}
                     />
-                    <circle
-                      cx={cx}
-                      cy={cy}
-                      r={3.5}
-                      fill={color}
-                      opacity={1}
-                    />
+                    <text
+                      x={cx}
+                      y={cy}
+                      textAnchor="middle"
+                      dominantBaseline="central"
+                      fill="#ffffff"
+                      fontSize="10"
+                      fontWeight="600"
+                      fontFamily="monospace"
+                    >
+                      S
+                    </text>
                   </g>
                 );
               }}
@@ -432,12 +442,16 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
           <>
             {' · '}
             <span className="text-gray-500">Markers</span>:
-            {positionEvents.length > 0 && <span className="text-indigo-400"> ●</span>} entry
+            {positionEvents.length > 0 && (
+              <span>
+                {' '}<span className="inline-block w-4 h-4 rounded-full bg-indigo-400 text-white text-[8px] font-semibold leading-4 text-center align-middle">B</span> buy
+              </span>
+            )}
             {positionEvents.length > 0 && tradeEvents.length > 0 && ' / '}
             {tradeEvents.length > 0 && (
-              <>
-                <span className="text-emerald-400"> ●</span> profit exit / <span className="text-red-400">●</span> loss exit
-              </>
+              <span>
+                <span className="inline-block w-4 h-4 rounded-full bg-emerald-400 text-white text-[8px] font-semibold leading-4 text-center align-middle">S</span> sell (profit) / <span className="inline-block w-4 h-4 rounded-full bg-red-400 text-white text-[8px] font-semibold leading-4 text-center align-middle">S</span> sell (loss)
+              </span>
             )}
             {(tradesInRange.length < (trades?.length ?? 0) || positionsInRange.length < (openPositions?.length ?? 0)) && (
               <span className="text-gray-700">

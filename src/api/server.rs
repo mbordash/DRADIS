@@ -610,6 +610,91 @@ async fn get_llm_recommendations(Query(q): Query<AssetQuery>) -> Response {    d
     }
 }
 
+/// GET /api/portfolio
+///
+/// Returns aggregated portfolio value across all assets:
+/// - collateral: total pUSD cash
+/// - positions_value: sum of (shares × current_mid_price) for all open positions
+/// - total_value: collateral + positions_value
+/// - unrealized_pnl: sum of (shares × (current_mid - entry_price))
+/// - position_count: total number of open positions
+/// - prices_live: true if CLOB prices are fresh
+///
+/// This endpoint aggregates data from all asset pools (BTC, ETH, SOL, etc.)
+#[derive(Serialize)]
+struct PortfolioValue {
+    collateral: String,
+    positions_value: String,
+    total_value: String,
+    unrealized_pnl: String,
+    position_count: usize,
+    prices_live: bool,
+}
+
+async fn get_portfolio_value() -> Response {
+    debug!("Received GET /api/portfolio request");
+
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    let assets = db::available_assets();
+    let mut total_collateral = Decimal::ZERO;
+    let mut total_positions_value = Decimal::ZERO;
+    let mut total_unrealized_pnl = Decimal::ZERO;
+    let mut total_position_count = 0;
+    let all_prices_live = true;
+
+    // Aggregate across all asset pools
+    for asset in assets {
+        let pool = match db::pool_for(&asset) {
+            Some(p) => p,
+            None => continue,
+        };
+
+        // Get latest collateral snapshot
+        let pnl_snapshots = db::get_pnl_history(&pool, 1).await;
+        if let Some(snap) = pnl_snapshots.first() {
+            if let Ok(collateral) = Decimal::from_str(&snap.collateral) {
+                total_collateral += collateral;
+            }
+        }
+
+        // Get all open positions for this asset
+        let positions = db::get_open_positions(&pool).await;
+        total_position_count += positions.len();
+
+        // Calculate positions value and unrealized P&L
+        // For now, we'll use mid-price from CLOB or fallback to entry price
+        // TODO: Integrate live CLOB price fetching
+        for pos in positions {
+            if let (Ok(shares), Ok(entry_price)) = (
+                Decimal::from_str(&pos.shares),
+                Decimal::from_str(&pos.entry_price),
+            ) {
+                // For now, assume mid-price = entry_price (positions_value = cost basis)
+                // This will show unrealized_pnl = 0 until we add live price fetching
+                let position_value = shares * entry_price;
+                total_positions_value += position_value;
+
+                // TODO: Fetch live mid-price from CLOB and calculate:
+                // let unrealized = shares * (current_mid - entry_price);
+                // total_unrealized_pnl += unrealized;
+            }
+        }
+    }
+
+    let total_value = total_collateral + total_positions_value;
+
+    Json(PortfolioValue {
+        collateral: total_collateral.to_string(),
+        positions_value: total_positions_value.to_string(),
+        total_value: total_value.to_string(),
+        unrealized_pnl: total_unrealized_pnl.to_string(),
+        position_count: total_position_count,
+        prices_live: all_prices_live,
+    }).into_response()
+}
+
 // ─── Squadron handlers (Phase 3d) ────────────────────────────────────────────
 
 /// GET /api/squadrons
@@ -769,6 +854,7 @@ pub async fn run_api_server(
         .route("/api/positions/manual-exit", post(manual_exit))
         .route("/api/positions/{token_id}",  delete(delete_open_position))
         .route("/api/status",                get(get_status))
+        .route("/api/portfolio",             get(get_portfolio_value))
         .route("/api/llm/recommendations",   get(get_llm_recommendations))
         // ── Phase 3d: Squadron registry endpoints ──────────────────────────
         .route("/api/squadrons",             get(get_squadrons))

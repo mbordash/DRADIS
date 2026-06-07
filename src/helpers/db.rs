@@ -1063,10 +1063,16 @@ pub struct ConfigHistoryRow {
 }
 
 /// Return the most recent `limit` P&L snapshots, newest first.
+/// Now also filters to only include data from the last 24 hours.
 pub async fn get_pnl_history(pool: &SqlitePool, limit: i64) -> Vec<PnlSnapshotRow> {
+    // Calculate timestamp for 24 hours ago
+    let cutoff = Utc::now() - chrono::Duration::hours(24);
+    let cutoff_str = cutoff.to_rfc3339();
+
     match sqlx::query(
-        "SELECT ts, session_pnl, collateral, total_value FROM pnl_snapshots ORDER BY ts DESC LIMIT ?"
+        "SELECT ts, session_pnl, collateral, total_value FROM pnl_snapshots WHERE ts >= ? ORDER BY ts DESC LIMIT ?"
     )
+    .bind(&cutoff_str)
     .bind(limit)
     .fetch_all(pool)
     .await {

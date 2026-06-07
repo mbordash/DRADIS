@@ -53,28 +53,59 @@ export interface PortfolioValueResponse {
 
 export async function GET(): Promise<NextResponse> {
   try {
-    // ── 1. Fetch DRADIS data concurrently ──────────────────────────────────
-    const [posRes, pnlRes] = await Promise.all([
-      fetch(`${DRADIS_API}/api/positions`,            { cache: 'no-store', headers: dradisHeaders() }),
-      fetch(`${DRADIS_API}/api/pnl/history?limit=1`,  { cache: 'no-store', headers: dradisHeaders() }),
+    // ── 1. Fetch available assets first ────────────────────────────────────
+    const assetsRes = await fetch(`${DRADIS_API}/api/assets`, {
+      cache: 'no-store',
+      headers: dradisHeaders(),
+    });
+    if (!assetsRes.ok) {
+      return NextResponse.json({ error: 'DRADIS engine unreachable' }, { status: 502 });
+    }
+    const assets: string[] = await assetsRes.json();
+
+    // ── 2. Fetch positions and PNL for ALL assets concurrently ─────────────
+    const fetchPromises = assets.flatMap(asset => [
+      fetch(`${DRADIS_API}/api/positions?asset=${asset}`, {
+        cache: 'no-store',
+        headers: dradisHeaders(),
+      }),
+      fetch(`${DRADIS_API}/api/pnl/history?limit=1&asset=${asset}`, {
+        cache: 'no-store',
+        headers: dradisHeaders(),
+      }),
     ]);
 
-    if (!posRes.ok || !pnlRes.ok) {
+    const responses = await Promise.all(fetchPromises);
+
+    // Check if any request failed
+    if (responses.some(r => !r.ok)) {
       return NextResponse.json({ error: 'DRADIS engine unreachable' }, { status: 502 });
     }
 
-    const positions: Array<{
+    // Parse responses
+    const allPositions: Array<{
       ts: string; strategy: string; token_id: string; market: string;
       side: string; entry_price: string; shares: string; ghost_mode: boolean;
-    }> = await posRes.json();
+    }> = [];
 
-    const pnlHistory: Array<{ ts: string; session_pnl: string; collateral: string }> =
-      await pnlRes.json();
+    let totalCollateral = 0;
 
-    const collateral = pnlHistory.length > 0 ? parseFloat(pnlHistory[0].collateral) : 0;
+    for (let i = 0; i < assets.length; i++) {
+      const posRes = responses[i * 2];
+      const pnlRes = responses[i * 2 + 1];
 
-    // ── 2. Fetch live midpoint prices from Polymarket public CLOB ──────────
-    const uniqueTokens = [...new Set(positions.map(p => p.token_id))];
+      const positions = await posRes.json();
+      const pnlHistory = await pnlRes.json();
+
+      allPositions.push(...positions);
+
+      if (pnlHistory.length > 0) {
+        totalCollateral += parseFloat(pnlHistory[0].collateral);
+      }
+    }
+
+    // ── 3. Fetch live midpoint prices from Polymarket public CLOB ──────────
+    const uniqueTokens = [...new Set(allPositions.map(p => p.token_id))];
     const priceMap: Record<string, number> = {};
     let pricesLive = true;
 
@@ -96,11 +127,11 @@ export async function GET(): Promise<NextResponse> {
       }
     }
 
-    // ── 3. Compute totals ──────────────────────────────────────────────────
+    // ── 4. Compute totals ──────────────────────────────────────────────────
     let positionsValue = 0;
     let unrealizedPnl  = 0;
 
-    const enriched: EnrichedPosition[] = positions.map(p => {
+    const enriched: EnrichedPosition[] = allPositions.map(p => {
       const shares      = parseFloat(p.shares);
       const entryPrice  = parseFloat(p.entry_price);
       const currentPrice = priceMap[p.token_id] ?? entryPrice; // fallback to entry
@@ -119,14 +150,14 @@ export async function GET(): Promise<NextResponse> {
       };
     });
 
-    const totalValue = collateral + positionsValue;
+    const totalValue = totalCollateral + positionsValue;
 
     const payload: PortfolioValueResponse = {
-      collateral:      collateral.toFixed(2),
+      collateral:      totalCollateral.toFixed(2),
       positions_value: positionsValue.toFixed(2),
       total_value:     totalValue.toFixed(2),
       unrealized_pnl:  unrealizedPnl.toFixed(2),
-      position_count:  positions.length,
+      position_count:  allPositions.length,
       positions:       enriched,
       prices_live:     pricesLive,
     };

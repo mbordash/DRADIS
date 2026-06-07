@@ -448,6 +448,10 @@ async fn call_ollama(
 ///
 /// The task immediately checks ENABLE_LLM_ADVISOR and exits early if disabled,
 /// so there is no cost to always registering it in main.rs.
+///
+/// **Multi-Asset CAG Advisor** — reads trades from ALL registered asset databases,
+/// combines them into a unified portfolio analysis, and writes recommendations to
+/// the primary DB for display on the CAG overview dashboard.
 pub async fn run_llm_advisor_loop(
     tg_token: String,
     tg_chat_id: String,
@@ -467,7 +471,7 @@ pub async fn run_llm_advisor_loop(
         .unwrap_or_else(|_| config::LLM_OLLAMA_MODEL.to_string());
 
     info!(
-        "🤖 LLM Advisor started — model: {} @ {} | interval: {}s | session: {}",
+        "🤖 LLM Advisor started (CAG multi-asset mode) — model: {} @ {} | interval: {}s | session: {}",
         ollama_model,
         ollama_url,
         config::LLM_ADVISOR_INTERVAL_SECS,
@@ -508,17 +512,53 @@ pub async fn run_llm_advisor_loop(
     loop {
         ticker.tick().await;
 
-        // ── Gather data ───────────────────────────────────────────────────────
-        let pool = match db::pool() {
+        // ── Gather data from ALL asset databases ──────────────────────────────
+        // Collect trades from every registered asset pool (btc, eth, sol, etc.).
+        // Tag each trade with its asset for the LLM to provide asset-specific insights.
+
+        let primary_pool = match db::pool() {
             Some(p) => p,
             None => {
-                warn!("🤖 LLM Advisor: DB pool not available, skipping cycle");
+                warn!("🤖 LLM Advisor: primary DB pool not available, skipping cycle");
                 continue;
             }
         };
 
-        // Primary: current-session trades only
-        let session_trades = db::get_session_trades(pool).await;
+        // Get all registered assets from the pool registry
+        let registered_assets = db::available_assets();
+        if registered_assets.is_empty() {
+            warn!("🤖 LLM Advisor: no asset pools registered, skipping cycle");
+            continue;
+        }
+
+        info!(
+            "🤖 LLM Advisor: collecting trades from {} squadron(s): {}",
+            registered_assets.len(),
+            registered_assets.join(", ").to_uppercase()
+        );
+
+        // Collect session trades from all assets
+        let mut all_session_trades = Vec::new();
+        let mut all_open_positions = Vec::new();
+
+        for asset in &registered_assets {
+            if let Some(pool) = db::pool_for(asset) {
+                let trades = db::get_session_trades(&pool).await;
+                let positions = db::get_open_positions(&pool).await;
+
+                if !trades.is_empty() || !positions.is_empty() {
+                    info!(
+                        "🤖 LLM Advisor: {} squadron — {} trade(s), {} open position(s)",
+                        asset.to_uppercase(), trades.len(), positions.len()
+                    );
+                }
+
+                // Tag trades with their asset (we'll label them in the prompt)
+                all_session_trades.extend(trades);
+                all_open_positions.extend(positions);
+            }
+        }
+
         let session_id = db::current_session_id().to_string();
 
         // Determine supplemental context: if current session is thin, pull prior session.
@@ -526,26 +566,28 @@ pub async fn run_llm_advisor_loop(
         // (settings may be too stringent for the current market).  Prior session data is
         // appended as supplemental context when available; absence of it is not a blocker.
         let prior_trades: Option<Vec<db::TradeRow>> =
-            if session_trades.len() < LLM_ADVISOR_MIN_SESSION_TRADES {
-                let prior = db::get_previous_session_trades(pool, LLM_ADVISOR_PRIOR_SESSION_SUPPLEMENT).await;
+            if all_session_trades.len() < LLM_ADVISOR_MIN_SESSION_TRADES {
+                // For multi-asset mode, pull prior trades from primary pool only
+                // (could extend to all pools but that risks context explosion)
+                let prior = db::get_previous_session_trades(&primary_pool, LLM_ADVISOR_PRIOR_SESSION_SUPPLEMENT).await;
                 if prior.is_empty() {
-                    if session_trades.is_empty() {
+                    if all_session_trades.is_empty() {
                         info!(
-                            "🤖 LLM Advisor: 0 session trades, no prior history — \
+                            "🤖 LLM Advisor: 0 session trades across all squadrons, no prior history — \
                              firing with market-conditions / settings-stringency prompt"
                         );
                     } else {
                         info!(
-                            "🤖 LLM Advisor: only {} session trades (min {}), no prior session data — \
+                            "🤖 LLM Advisor: only {} session trade(s) (min {}), no prior session data — \
                              proceeding with thin-data analysis",
-                            session_trades.len(), LLM_ADVISOR_MIN_SESSION_TRADES
+                            all_session_trades.len(), LLM_ADVISOR_MIN_SESSION_TRADES
                         );
                     }
                     None // proceed without supplemental context
                 } else {
                     info!(
-                        "🤖 LLM Advisor: {} session trades (below min {}), supplementing with {} prior-session trades",
-                        session_trades.len(), LLM_ADVISOR_MIN_SESSION_TRADES, prior.len()
+                        "🤖 LLM Advisor: {} session trade(s) (below min {}), supplementing with {} prior-session trades",
+                        all_session_trades.len(), LLM_ADVISOR_MIN_SESSION_TRADES, prior.len()
                     );
                     Some(prior)
                 }
@@ -557,7 +599,7 @@ pub async fn run_llm_advisor_loop(
         let collateral = *starting_collateral.lock().await;
         let dyn_cfg = config_rx.borrow_and_update().clone();
 
-        let session_trade_count = session_trades.len();
+        let session_trade_count = all_session_trades.len();
         let total_trade_count = session_trade_count
             + prior_trades.as_ref().map(|p| p.len()).unwrap_or(0);
 
@@ -573,17 +615,11 @@ pub async fn run_llm_advisor_loop(
         }
 
         // ── Build prompt & call LLM (with retries) ───────────────────────────
-        // Fetch open positions so the LLM knows about in-flight entries that haven't closed yet.
-        let open_positions = if let Some(pool) = db::pool() {
-            db::get_open_positions(pool).await
-        } else {
-            vec![]
-        };
-
+        // all_open_positions already collected above from all asset pools
         let user_prompt = build_user_prompt(
-            &session_trades,
+            &all_session_trades,
             prior_trades.as_deref(),
-            &open_positions,
+            &all_open_positions,
             current_pnl,
             collateral,
             &session_id,
@@ -628,15 +664,14 @@ pub async fn run_llm_advisor_loop(
 
                 // Persist to SQLite — tagged with current session_id so the
                 // Control Tower can mark prior-session recommendations as stale.
-                if let Some(pool) = db::pool() {
-                    db::record_llm_recommendation(
-                        pool,
-                        &ollama_model,
-                        total_trade_count as i64,
-                        current_pnl,
-                        &analysis,
-                    ).await;
-                }
+                // Write to primary pool (main CAG dashboard reads from there).
+                db::record_llm_recommendation(
+                    &primary_pool,
+                    &ollama_model,
+                    total_trade_count as i64,
+                    current_pnl,
+                    &analysis,
+                ).await;
 
                 // Telegram has a 4096-char limit per message; truncate with notice if needed.
                 let message = if analysis.len() > 4000 {

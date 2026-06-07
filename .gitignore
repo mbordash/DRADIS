@@ -10,7 +10,7 @@ Cargo.lock
 !.env.example
 
 # Personal config — users must copy an example to create their own
-src/config.rs
+#src/config.rs
 
 # Example scripts (don't commit, use .example versions for public repo)
 deploy-multi.sh
@@ -34,7 +34,8 @@ control-tower/Dockerfile
 # Logs & temp
 logs/
 *.tmp
-session.file
+# session.file <-- Temporarily removed this line to allow access
+!session.file
 
 # Control Tower (Next.js)
 control-tower/.next/
@@ -66,3 +67,12 @@ CONFIG_CHANGES_APPLIED.md
 start-local.sh
 stop-local.sh
 /control-tower/tsconfig.tsbuildinfo
+deploy-live.sh
+deploy-test.sh
+logs-all-live.sh
+logs-test.sh
+session.file
+#session.live
+session.test
+#src/config-live.rs
+src/config.rs

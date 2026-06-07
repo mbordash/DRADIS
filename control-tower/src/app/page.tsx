@@ -258,8 +258,10 @@ export default function DashboardPage() {
     useSWR('status', getStatus, { refreshInterval: 30_000 });
 
   // Poll every 5 minutes — recommendations only arrive every 30 min at most.
+  // Global LLM Advisor reads ALL asset databases and writes to primary pool,
+  // so we fetch without an asset filter (always reads from primary).
   const { data: llmRecs, isLoading: llmLoading } =
-    useSWR(['llmRecs', asset], () => getLlmRecommendations(10, asset), { refreshInterval: 300_000 });
+    useSWR('llmRecs', () => getLlmRecommendations(10), { refreshInterval: 300_000 });
 
   // Portfolio value: collateral + live mark-to-market on open positions.
   // Refresh every 30 s so the number stays fresh without hammering Polymarket CLOB.
