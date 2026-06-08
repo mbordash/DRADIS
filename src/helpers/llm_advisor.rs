@@ -117,11 +117,18 @@ Maker (GTC/post-only) orders pay 0% fee; taker (FAK) orders pay the dynamic fee.
 4. TIME DECAY  — Buys YES+NO pairs near expiry at sub-$1.00 combined ask
                  (short-gamma / theta strategy).  Needs flat oracle and calm book.
 5. BASIS       — Fades retail-skewed binary probabilities using Binance funding rate
-                 as a smart-money confirmation signal.
-5. GBOOST      — Online gradient-boosted ML classifier predicts YES price direction
-                 from 19 orderbook + oracle features.  Retrained every 30s.
-                 Has concept-drift suppression: if market regime shifts significantly,
-                 entries are blocked until the next retrain clears the drift flag.
+                  as a smart-money confirmation signal.
+6. GBOOST      — Online gradient-boosted ML classifier predicts YES price direction
+                  from 19 orderbook + oracle features.  Retrained every 30s.
+                  Has concept-drift suppression: if market regime shifts significantly,
+                  entries are blocked until the next retrain clears the drift flag.
+7. TRENDCAPTURE — Exploits sustained oracle drift on Window/Daily markets.
+                  Buys YES (BULL) or NO (BEAR) when 10-min and 60-min drift both
+                  exceed asset-specific thresholds.  One-sided, maker venue, uses
+                  Kelly-fractional sizing.  Exits via TP, dynamic SL (tighter near
+                  expiry), trend-reversal signal, or near-expiry forced exit.
+                  Common failure: drift reversal before TP; adverse OBI at entry;
+                  position held too long on ranging/sideways oracle.
 
 == Key OBI Concept ==
 OBI (Order Book Imbalance) = (bid_depth − ask_depth) / total_depth  ∈ [−1, +1]
@@ -130,11 +137,12 @@ Entering YES when OBI_y is strongly negative is entering against the book.
 
 == Tunable Parameters (DynamicConfig) ==
 These can be adjusted live without restarting the bot:
-  Momentum: stop_loss_pct, target_profit_pct, min/max_trade_size_usdc, max_exposure
-  Maker:     max_entry_price, stop_loss_pct, target_profit_pct, max_exposure
-  Basis:     stop_loss_pct, target_profit_pct, max_exposure
-  GBoost:    entry_threshold (0–1), stop_loss_pct, target_profit_pct, max_exposure
-  TimeDecay: position_size_usdc, stop_loss_pct, max_entry_price, obi_adverse_block
+  Momentum:     stop_loss_pct, target_profit_pct, min/max_trade_size_usdc, max_exposure
+  Maker:        max_entry_price, stop_loss_pct, target_profit_pct, max_exposure
+  Basis:        stop_loss_pct, target_profit_pct, max_exposure
+  GBoost:       entry_threshold (0–1), stop_loss_pct, target_profit_pct, max_exposure
+  TimeDecay:    position_size_usdc, stop_loss_pct, max_entry_price, obi_adverse_block
+  TrendCapture: stop_loss_pct, target_profit_pct, min/max_trade_size_usdc, max_entry_price, max_exposure
   Global:    ghost_mode (true = paper trading, no real orders)
   Enable flags: enable_momentum, enable_maker, enable_basis, enable_gboost,
                 enable_time_decay, enable_arbitrage
@@ -310,10 +318,11 @@ fn build_user_prompt(
     lines.push(String::new());
     lines.push("== Current Live Configuration ==".to_string());
     lines.push(format!(
-        "Ghost mode: {} | Strategies enabled: Momentum={}, Maker={}, Basis={}, GBoost={}, TimeDecay={}, Arbitrage={}",
+        "Ghost mode: {} | Strategies enabled: Momentum={}, Maker={}, Basis={}, GBoost={}, TimeDecay={}, Arbitrage={}, TrendCapture={}",
         dyn_cfg.ghost_mode,
         dyn_cfg.enable_momentum, dyn_cfg.enable_maker, dyn_cfg.enable_basis,
         dyn_cfg.enable_gboost, dyn_cfg.enable_time_decay, dyn_cfg.enable_arbitrage,
+        dyn_cfg.enable_trendcapture,
     ));
     lines.push(format!(
         "Momentum: stop_loss={:.0}%, target_profit={:.0}%, min_trade=${}, max_trade=${}, max_exposure=${}",
@@ -357,6 +366,15 @@ fn build_user_prompt(
         dyn_cfg.time_decay_stop_loss_pct * rust_decimal::Decimal::ONE_HUNDRED,
         dyn_cfg.time_decay_max_entry_price,
         dyn_cfg.time_decay_max_exposure_usdc,
+    ));
+    lines.push(format!(
+        "TrendCapture: stop_loss={:.0}%, target_profit={:.0}%, min_trade=${}, max_trade=${}, max_entry=${}, max_exposure=${}",
+        dyn_cfg.trendcapture_stop_loss_pct * rust_decimal::Decimal::ONE_HUNDRED,
+        dyn_cfg.trendcapture_target_profit_pct * rust_decimal::Decimal::ONE_HUNDRED,
+        dyn_cfg.trendcapture_min_trade_size_usdc,
+        dyn_cfg.trendcapture_max_trade_size_usdc,
+        dyn_cfg.trendcapture_max_entry_price,
+        dyn_cfg.trendcapture_max_exposure_usdc,
     ));
 
     lines.push(String::new());
