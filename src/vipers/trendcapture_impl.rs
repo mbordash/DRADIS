@@ -58,12 +58,21 @@ pub struct TrendCaptureStrategyImpl {
     /// Per-token cooldown after any exit.
     /// Key: token_id, Value: Instant of last exit.
     post_exit_cooldown: Mutex<HashMap<U256, Instant>>,
+    /// Consecutive SL loss count per market condition_id.
+    /// Resets to 0 on a TP exit; increments on every SL/forced exit.
+    consecutive_losses: Mutex<HashMap<String, u32>>,
+    /// Viper-level exit signal cooldown.
+    /// After evaluate_exit emits an Exit, this is set to now().
+    /// Further Exit signals are suppressed for TRENDCAPTURE_EXIT_SIGNAL_COOLDOWN_SECS.
+    last_exit_signal_at: Mutex<Option<Instant>>,
 }
 
 impl TrendCaptureStrategyImpl {
     pub fn new() -> Self {
         Self {
-            post_exit_cooldown: Mutex::new(HashMap::new()),
+            post_exit_cooldown:  Mutex::new(HashMap::new()),
+            consecutive_losses:  Mutex::new(HashMap::new()),
+            last_exit_signal_at: Mutex::new(None),
         }
     }
 }
@@ -113,14 +122,26 @@ impl Strategy for TrendCaptureStrategyImpl {
         }
 
         // ── Expiry guard ──────────────────────────────────────────────────────
-        if let Some(close_time) = market.market_close_time {
-            let secs_left = (close_time - Utc::now()).num_seconds();
-            if secs_left < config::TRENDCAPTURE_MIN_SECS_TO_EXPIRY {
+        let secs_left = if let Some(close_time) = market.market_close_time {
+            let s = (close_time - Utc::now()).num_seconds();
+            if s < config::TRENDCAPTURE_MIN_SECS_TO_EXPIRY {
                 debug!("🦅 TrendCapture blocked: only {}s to expiry (min {}s)",
-                    secs_left, config::TRENDCAPTURE_MIN_SECS_TO_EXPIRY);
+                    s, config::TRENDCAPTURE_MIN_SECS_TO_EXPIRY);
                 return Ok(StrategySignal::NoSignal);
             }
-        }
+            Some(s)
+        } else {
+            None
+        };
+
+        // ── Late-market min price floor ───────────────────────────────────────
+        // In the last 2h before close, markets are near-resolved; require higher
+        // price floor to avoid buying into decided outcomes.
+        let effective_min_price = match secs_left {
+            Some(s) if s < config::TRENDCAPTURE_LATE_MARKET_SECS =>
+                config::TRENDCAPTURE_LATE_MARKET_MIN_ENTRY_PRICE,
+            _ => config::TRENDCAPTURE_MIN_ENTRY_PRICE,
+        };
 
         // ── Market warmup gate ────────────────────────────────────────────────
         let secs_since_market_start = (Utc::now() - ctx.market_started_at).num_seconds();
@@ -139,7 +160,7 @@ impl Strategy for TrendCaptureStrategyImpl {
         // ── Minimum price floor ───────────────────────────────────────────────
         let yes_ask = snap.yes_ask;
         let no_ask  = snap.no_ask;
-        if yes_ask < config::TRENDCAPTURE_MIN_ENTRY_PRICE && no_ask < config::TRENDCAPTURE_MIN_ENTRY_PRICE {
+        if yes_ask < effective_min_price && no_ask < effective_min_price {
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -212,6 +233,17 @@ impl Strategy for TrendCaptureStrategyImpl {
         // ── Per-token post-exit cooldown ──────────────────────────────────────
         // Checked inside each entry path below.
         let cooldowns = self.post_exit_cooldown.lock().unwrap();
+        let consec    = self.consecutive_losses.lock().unwrap();
+
+        // Helper: effective cooldown for a token — extended after consecutive losses
+        let effective_cooldown = |condition_id: &str| -> u64 {
+            let losses = consec.get(condition_id).copied().unwrap_or(0);
+            if losses >= config::TRENDCAPTURE_CONSECUTIVE_LOSS_THRESHOLD {
+                config::TRENDCAPTURE_CONSECUTIVE_LOSS_COOLDOWN_SECS as u64
+            } else {
+                config::TRENDCAPTURE_POST_EXIT_COOLDOWN_SECS as u64
+            }
+        };
 
         // ── Kelly-fractional position sizing ──────────────────────────────────
         let trade_size = |drift_abs: Decimal| -> Decimal {
@@ -256,19 +288,21 @@ impl Strategy for TrendCaptureStrategyImpl {
             };
 
             if passes_gap
-                && yes_ask >= config::TRENDCAPTURE_MIN_ENTRY_PRICE
+                && yes_ask >= effective_min_price
                 && yes_ask <= dc.trendcapture_max_entry_price
             {
                 // Cooldown check
                 let token_id = market.yes_token;
+                let cdl = effective_cooldown(&market.condition_id);
                 let in_cooldown = cooldowns.get(&token_id)
-                    .map(|t| t.elapsed().as_secs() < config::TRENDCAPTURE_POST_EXIT_COOLDOWN_SECS as u64)
+                    .map(|t| t.elapsed().as_secs() < cdl)
                     .unwrap_or(false);
                 if !in_cooldown {
                     let size = trade_size(drift_10m.abs());
                     debug!("🦅 TrendCapture BULL entry: drift_10m={:.0} drift_60m={:.0} yes_ask={:.3} size={:.2}",
                         drift_10m, drift_60m, yes_ask, size);
                     drop(cooldowns);
+                    drop(consec);
                     return Ok(StrategySignal::Entry {
                         params: entry_params!(token_id, yes_ask, market.yes_fee_bps as u16, size),
                         pair_params: None,
@@ -289,18 +323,20 @@ impl Strategy for TrendCaptureStrategyImpl {
             };
 
             if passes_gap
-                && no_ask >= config::TRENDCAPTURE_MIN_ENTRY_PRICE
+                && no_ask >= effective_min_price
                 && no_ask <= dc.trendcapture_max_entry_price
             {
                 let token_id = market.no_token;
+                let cdl = effective_cooldown(&market.condition_id);
                 let in_cooldown = cooldowns.get(&token_id)
-                    .map(|t| t.elapsed().as_secs() < config::TRENDCAPTURE_POST_EXIT_COOLDOWN_SECS as u64)
+                    .map(|t| t.elapsed().as_secs() < cdl)
                     .unwrap_or(false);
                 if !in_cooldown {
                     let size = trade_size(drift_10m.abs());
                     debug!("🦅 TrendCapture BEAR entry: drift_10m={:.0} drift_60m={:.0} no_ask={:.3} size={:.2}",
                         drift_10m, drift_60m, no_ask, size);
                     drop(cooldowns);
+                    drop(consec);
                     return Ok(StrategySignal::Entry {
                         params: entry_params!(token_id, no_ask, market.no_fee_bps as u16, size),
                         pair_params: None,
@@ -310,6 +346,7 @@ impl Strategy for TrendCaptureStrategyImpl {
         }
 
         drop(cooldowns);
+        drop(consec);
         Ok(StrategySignal::NoSignal)
     }
 
@@ -317,6 +354,18 @@ impl Strategy for TrendCaptureStrategyImpl {
 
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
+
+        // ── Viper-level exit signal cooldown ──────────────────────────────────
+        // Prevents FAK-miss storms: after we emit an Exit signal, suppress for
+        // EXIT_SIGNAL_COOLDOWN_SECS so patrol has time to execute before we re-fire.
+        {
+            let last = self.last_exit_signal_at.lock().unwrap();
+            if let Some(t) = *last {
+                if t.elapsed().as_secs() < config::TRENDCAPTURE_EXIT_SIGNAL_COOLDOWN_SECS {
+                    return Ok(StrategySignal::NoSignal);
+                }
+            }
+        }
 
         // TrendCapture operates on the maker venue — resolve market/snap for exit checks
         let (market, snap) = if let (Some(mk), Some(ms)) = (&ctx.maker_market, &ctx.maker_snapshot) {
@@ -334,6 +383,15 @@ impl Strategy for TrendCaptureStrategyImpl {
             _     => config::TRENDCAPTURE_REVERSAL_DRIFT_BTC,
         };
 
+        // Dynamic SL: tighter in the last hour before expiry
+        let secs_left_opt = market.market_close_time
+            .map(|ct| (ct - Utc::now()).num_seconds());
+        let stop_loss_pct = match secs_left_opt {
+            Some(s) if s < config::TRENDCAPTURE_LATE_MARKET_SL_SECS =>
+                config::TRENDCAPTURE_LATE_MARKET_STOP_LOSS_PERCENT,
+            _ => dc.trendcapture_stop_loss_pct,
+        };
+
         // Collect exit decision inside the lock scope, then act outside it.
         struct PendingExit {
             token_id:     alloy::primitives::U256,
@@ -345,6 +403,8 @@ impl Strategy for TrendCaptureStrategyImpl {
             condition_id: String,
             ghost_mode:   bool,
             reason:       String,
+            /// true for SL/forced exits — increments consecutive loss counter
+            is_sl:        bool,
         }
 
         let pending: Option<PendingExit> = {
@@ -376,7 +436,7 @@ impl Strategy for TrendCaptureStrategyImpl {
                               else { market.no_fee_bps as u16 };
 
                 // Helper closure to build the pending exit
-                let make_exit = |reason: String| PendingExit {
+                let make_exit = |reason: String, is_sl: bool| PendingExit {
                     token_id:     *token_id,
                     bid,
                     shares:       position.shares,
@@ -386,6 +446,7 @@ impl Strategy for TrendCaptureStrategyImpl {
                     condition_id: market.condition_id.clone(),
                     ghost_mode:   dc.ghost_mode,
                     reason,
+                    is_sl,
                 };
 
                 // Near-expiry forced exit
@@ -395,7 +456,7 @@ impl Strategy for TrendCaptureStrategyImpl {
                     if secs_left <= config::TRENDCAPTURE_EXPIRY_EXIT_SECS
                         && net_profit < config::TRENDCAPTURE_EXPIRY_MIN_PROFIT_TO_HOLD
                     {
-                        found = Some(make_exit(format!("TrendCaptureNearExpiry: bid=${:.4}, net={:.2}%", bid, net_profit * dec!(100))));
+                        found = Some(make_exit(format!("TrendCaptureNearExpiry: bid=${:.4}, net={:.2}%", bid, net_profit * dec!(100)), true));
                         break 'outer;
                     }
                 }
@@ -404,15 +465,15 @@ impl Strategy for TrendCaptureStrategyImpl {
                 if profit_margin >= dc.trendcapture_target_profit_pct
                     || bid >= config::TRENDCAPTURE_TAKE_PROFIT_CEILING
                 {
-                    found = Some(make_exit(format!("TrendCaptureTP: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100))));
+                    found = Some(make_exit(format!("TrendCaptureTP: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100)), false));
                     break 'outer;
                 }
 
                 // Stop-loss (only after minimum hold)
                 if secs_held >= config::TRENDCAPTURE_FILL_CONFIRM_MIN_HOLD_SECS
-                    && profit_margin <= -dc.trendcapture_stop_loss_pct
+                    && profit_margin <= -stop_loss_pct
                 {
-                    found = Some(make_exit(format!("TrendCaptureSL: bid=${:.4}, loss={:.2}%", bid, profit_margin * dec!(100))));
+                    found = Some(make_exit(format!("TrendCaptureSL: bid=${:.4}, loss={:.2}%", bid, profit_margin * dec!(100)), true));
                     break 'outer;
                 }
 
@@ -432,7 +493,7 @@ impl Strategy for TrendCaptureStrategyImpl {
                             found = Some(make_exit(format!(
                                 "TrendCaptureRev: bid=${:.4}, drift_10m={:.0}, profit={:.2}%",
                                 bid, drift_10m, profit_margin * dec!(100)
-                            )));
+                            ), profit_margin < dec!(0)));
                             break 'outer;
                         }
                     }
@@ -443,7 +504,11 @@ impl Strategy for TrendCaptureStrategyImpl {
         };
 
         if let Some(p) = pending {
-            self.record_exit(&p.token_id);
+            self.record_exit(&p.token_id, &p.condition_id, p.is_sl);
+            // Stamp the exit signal cooldown to prevent FAK-miss re-fire storm
+            if let Ok(mut last) = self.last_exit_signal_at.lock() {
+                *last = Some(Instant::now());
+            }
             return Ok(StrategySignal::Exit {
                 params: OrderParams {
                     token_id:     p.token_id,
@@ -474,9 +539,20 @@ impl Strategy for TrendCaptureStrategyImpl {
 
 impl TrendCaptureStrategyImpl {
     /// Record exit time for post-exit cooldown tracking.
-    fn record_exit(&self, token_id: &U256) {
+    /// If `is_sl` is true, increments the consecutive-loss counter for the
+    /// given condition_id; a TP exit resets it.
+    fn record_exit(&self, token_id: &U256, condition_id: &str, is_sl: bool) {
         if let Ok(mut map) = self.post_exit_cooldown.lock() {
             map.insert(*token_id, Instant::now());
+        }
+        if let Ok(mut losses) = self.consecutive_losses.lock() {
+            if is_sl {
+                let count = losses.entry(condition_id.to_string()).or_insert(0);
+                *count += 1;
+            } else {
+                // TP or reversal with profit resets the streak
+                losses.remove(condition_id);
+            }
         }
     }
 }

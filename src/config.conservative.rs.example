@@ -442,8 +442,19 @@ pub const TRENDCAPTURE_MIN_SECS_TO_EXPIRY: i64 = 2700;
 pub const TRENDCAPTURE_MARKET_WARMUP_SECS: i64 = 180;
 /// Conservative: tight 3-cent combined spread cap.
 pub const TRENDCAPTURE_MAX_ENTRY_ASK_SUM: Decimal = dec!(1.03);
-pub const TRENDCAPTURE_MIN_ENTRY_PRICE: Decimal = dec!(0.22);
-pub const TRENDCAPTURE_POST_EXIT_COOLDOWN_SECS: i64 = 900;
+pub const TRENDCAPTURE_MIN_ENTRY_PRICE: Decimal = dec!(0.32);
+pub const TRENDCAPTURE_POST_EXIT_COOLDOWN_SECS: i64 = 2700;
+/// Late-market entry/exit tightening — applied in the last N seconds before close.
+/// Conservative: 3h window, $0.42 floor, long exit re-fire suppress.
+pub const TRENDCAPTURE_LATE_MARKET_SECS: i64 = 10800;
+pub const TRENDCAPTURE_LATE_MARKET_MIN_ENTRY_PRICE: Decimal = dec!(0.42);
+pub const TRENDCAPTURE_LATE_MARKET_SL_SECS: i64 = 3600;
+pub const TRENDCAPTURE_LATE_MARKET_STOP_LOSS_PERCENT: Decimal = dec!(0.05);
+/// Consecutive-loss protection: after N SL exits on the same market, extend cooldown.
+pub const TRENDCAPTURE_CONSECUTIVE_LOSS_COOLDOWN_SECS: i64 = 7200;
+pub const TRENDCAPTURE_CONSECUTIVE_LOSS_THRESHOLD: u32 = 2;
+/// Viper-level exit signal cooldown: suppress re-fire for N seconds after an exit fires.
+pub const TRENDCAPTURE_EXIT_SIGNAL_COOLDOWN_SECS: u64 = 240;
 
 /// Conservative: tight OBI gates — only enter on near-neutral or favorable books.
 pub const TRENDCAPTURE_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.25);

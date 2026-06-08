@@ -434,8 +434,19 @@ pub const TRENDCAPTURE_MARKET_WARMUP_SECS: i64 = 60;
 
 /// Aggressive: wider spread tolerance — 5-cent combined cap.
 pub const TRENDCAPTURE_MAX_ENTRY_ASK_SUM: Decimal = dec!(1.05);
-pub const TRENDCAPTURE_MIN_ENTRY_PRICE: Decimal = dec!(0.18);
-pub const TRENDCAPTURE_POST_EXIT_COOLDOWN_SECS: i64 = 300;
+pub const TRENDCAPTURE_MIN_ENTRY_PRICE: Decimal = dec!(0.25);
+pub const TRENDCAPTURE_POST_EXIT_COOLDOWN_SECS: i64 = 600;
+/// Late-market entry/exit tightening — applied in the last N seconds before close.
+/// Aggressive: smaller window (1.5h), lower min price floor, faster re-fire.
+pub const TRENDCAPTURE_LATE_MARKET_SECS: i64 = 5400;
+pub const TRENDCAPTURE_LATE_MARKET_MIN_ENTRY_PRICE: Decimal = dec!(0.35);
+pub const TRENDCAPTURE_LATE_MARKET_SL_SECS: i64 = 3600;
+pub const TRENDCAPTURE_LATE_MARKET_STOP_LOSS_PERCENT: Decimal = dec!(0.08);
+/// Consecutive-loss protection: after N SL exits on the same market, extend cooldown.
+pub const TRENDCAPTURE_CONSECUTIVE_LOSS_COOLDOWN_SECS: i64 = 1800;
+pub const TRENDCAPTURE_CONSECUTIVE_LOSS_THRESHOLD: u32 = 3;
+/// Viper-level exit signal cooldown: suppress re-fire for N seconds after an exit fires.
+pub const TRENDCAPTURE_EXIT_SIGNAL_COOLDOWN_SECS: u64 = 120;
 
 /// Aggressive: looser OBI gates — accepts more adverse-selection risk.
 pub const TRENDCAPTURE_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.60);
