@@ -49,7 +49,7 @@ pub async fn run_market_monitor(
         // Hard cap on market scan — see MARKET_SCAN_TIMEOUT_SECS comment above.
         let scan_result = tokio::time::timeout(
             std::time::Duration::from_secs(MARKET_SCAN_TIMEOUT_SECS),
-            get_market_pair(&http),
+            get_market_pair(&http, &crypto_filter),
         ).await;
         let (candidate, maker_candidate) = match scan_result {
             Ok(pair) => pair,

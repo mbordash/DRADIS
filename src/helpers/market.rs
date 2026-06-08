@@ -263,8 +263,14 @@ pub async fn fetch_specific_window_daily_market(
     None
 }
 
-pub async fn get_market_pair(http: &reqwest::Client) -> (MarketCandidate, Option<MarketCandidate>) {
-    let filter = env::var("CRYPTO_FILTER").unwrap_or_else(|_| "all".to_string()).to_lowercase();
+pub async fn get_market_pair(http: &reqwest::Client, asset_filter: &str) -> (MarketCandidate, Option<MarketCandidate>) {
+    // Use the per-squadron asset filter passed in. Fall back to CRYPTO_FILTER env var
+    // only if the passed filter is empty (backward-compat for single-asset mode).
+    let filter = if !asset_filter.is_empty() {
+        asset_filter.to_lowercase()
+    } else {
+        env::var("CRYPTO_FILTER").unwrap_or_else(|_| "all".to_string()).to_lowercase()
+    };
     let now = Utc::now();
 
     // Primary scan: volume-sorted (good for established markets with accumulated volume).

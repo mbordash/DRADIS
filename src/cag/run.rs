@@ -137,7 +137,7 @@ where
     // ── Bootstrap: poll Gamma API until we have a valid initial market ────────
     let mut bootstrap_attempts = 0u32;
     let (mut initial_hourly_candidate, mut initial_maker_candidate) = loop {
-        let (hourly_cand, maker_cand) = get_market_pair(&shared_http).await;
+        let (hourly_cand, maker_cand) = get_market_pair(&shared_http, &crypto_filter).await;
 
         if hourly_cand.yes_token != U256::ZERO {
             info!("✅ Found initial hourly market: \"{}\"", hourly_cand.name);

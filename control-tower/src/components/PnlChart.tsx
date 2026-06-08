@@ -1,8 +1,9 @@
 'use client';
 
+import { useState, useCallback, useRef } from 'react';
 import {
-  AreaChart, Area, XAxis, YAxis, CartesianGrid, Tooltip,
-  ResponsiveContainer, ReferenceLine, Scatter,
+  ComposedChart, Area, Line, XAxis, YAxis, CartesianGrid, Tooltip,
+  ResponsiveContainer, ReferenceLine,
 } from 'recharts';
 import type { PnlSnapshotRow, PortfolioValue, TradeRow, OpenPositionRow } from '@/lib/types';
 
@@ -26,137 +27,98 @@ function fmt(iso: string) {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function CustomTooltip({ active, payload, label }: any) {
+function MarkerTooltip({ active, payload, label }: any) {
   if (!active || !payload?.length) return null;
 
-  // Check if hovering over a trade exit marker
-  const tradeData = payload.find((p: any) => p.dataKey === 'tradeValue');
-  if (tradeData?.payload?.trade) {
-    const trade = tradeData.payload.trade as TradeRow;
-    const pnl = parseFloat(trade.pnl);
-    const pnlColor = pnl > 0 ? 'text-emerald-400' : pnl < 0 ? 'text-red-400' : 'text-gray-400';
-    const symbol = trade.market.split(' ')[0]; // Extract symbol from market name
+  // Only show tooltip when hovering over a B/S marker point
+  const tradeEntry = payload.find((p: any) => p.dataKey === 'tradeDot' && p.payload?._tradeMarker);
+  const posEntry   = payload.find((p: any) => p.dataKey === 'positionDot' && p.payload?._positionMarker);
 
+  if (tradeEntry) {
+    const { trade, pnl } = tradeEntry.payload._tradeMarker as { trade: TradeRow; pnl: number };
+    const pnlColor = pnl > 0 ? 'text-emerald-400' : pnl < 0 ? 'text-red-400' : 'text-gray-400';
+    const symbol = trade.market.split(' ')[0];
     return (
       <div className="card px-3 py-2 text-xs font-mono space-y-1.5 shadow-xl border-2 border-emerald-500/30">
         <div className="text-emerald-300 font-semibold flex items-center gap-1.5">
-          <span>✅</span>
-          <span>Trade Close</span>
+          <span>✅</span><span>Trade Close</span>
         </div>
         <div className="text-gray-400 text-[10px] border-t border-gray-700 pt-1">{label}</div>
         <div className="space-y-0.5 pt-1">
-          <div className="flex justify-between gap-3">
-            <span className="text-gray-500">Strategy</span>
-            <span className="text-white">{trade.strategy}</span>
-          </div>
-          <div className="flex justify-between gap-3">
-            <span className="text-gray-500">Symbol</span>
-            <span className="text-white">{symbol}</span>
-          </div>
-          <div className="flex justify-between gap-3">
-            <span className="text-gray-500">Side</span>
-            <span className="text-cyan-300">{trade.side}</span>
-          </div>
-          <div className="flex justify-between gap-3">
-            <span className="text-gray-500">Shares</span>
-            <span className="text-white">{parseFloat(trade.shares).toFixed(2)}</span>
-          </div>
+          <div className="flex justify-between gap-3"><span className="text-gray-500">Strategy</span><span className="text-white">{trade.strategy}</span></div>
+          <div className="flex justify-between gap-3"><span className="text-gray-500">Symbol</span><span className="text-white">{symbol}</span></div>
+          <div className="flex justify-between gap-3"><span className="text-gray-500">Side</span><span className="text-cyan-300">{trade.side}</span></div>
+          <div className="flex justify-between gap-3"><span className="text-gray-500">Shares</span><span className="text-white">{parseFloat(trade.shares).toFixed(2)}</span></div>
           <div className="flex justify-between gap-3 pt-1 border-t border-gray-700">
             <span className="text-gray-500">P&L</span>
-            <span className={`font-semibold ${pnlColor}`}>
-              {pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}
-            </span>
+            <span className={`font-semibold ${pnlColor}`}>{pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}</span>
           </div>
-          <div className="flex justify-between gap-3">
-            <span className="text-gray-500">Reason</span>
-            <span className="text-gray-400 text-[10px]">{trade.reason}</span>
-          </div>
+          <div className="flex justify-between gap-3"><span className="text-gray-500">Reason</span><span className="text-gray-400 text-[10px]">{trade.reason}</span></div>
         </div>
       </div>
     );
   }
 
-  // Check if hovering over a position entry marker
-  const positionData = payload.find((p: any) => p.dataKey === 'positionValue');
-  if (positionData?.payload?.position) {
-    const position = positionData.payload.position as OpenPositionRow;
+  if (posEntry) {
+    const { position } = posEntry.payload._positionMarker as { position: OpenPositionRow };
     const entryPrice = parseFloat(position.entry_price);
     const shares = parseFloat(position.shares);
-    const symbol = position.market.split(' ')[0]; // Extract symbol from market name
-
+    const symbol = position.market.split(' ')[0];
     return (
       <div className="card px-3 py-2 text-xs font-mono space-y-1.5 shadow-xl border-2 border-indigo-500/30">
         <div className="text-indigo-300 font-semibold flex items-center gap-1.5">
-          <span></span>
-          <span>Position Entry</span>
+          <span>🎯</span><span>Position Entry</span>
         </div>
         <div className="text-gray-400 text-[10px] border-t border-gray-700 pt-1">{label}</div>
         <div className="space-y-0.5 pt-1">
-          <div className="flex justify-between gap-3">
-            <span className="text-gray-500">Strategy</span>
-            <span className="text-white">{position.strategy}</span>
-          </div>
-          <div className="flex justify-between gap-3">
-            <span className="text-gray-500">Symbol</span>
-            <span className="text-white">{symbol}</span>
-          </div>
-          <div className="flex justify-between gap-3">
-            <span className="text-gray-500">Side</span>
-            <span className="text-cyan-300">{position.side}</span>
-          </div>
-          <div className="flex justify-between gap-3">
-            <span className="text-gray-500">Entry Price</span>
-            <span className="text-white">{entryPrice.toFixed(4)}</span>
-          </div>
-          <div className="flex justify-between gap-3">
-            <span className="text-gray-500">Shares</span>
-            <span className="text-white">{shares.toFixed(2)}</span>
-          </div>
+          <div className="flex justify-between gap-3"><span className="text-gray-500">Strategy</span><span className="text-white">{position.strategy}</span></div>
+          <div className="flex justify-between gap-3"><span className="text-gray-500">Symbol</span><span className="text-white">{symbol}</span></div>
+          <div className="flex justify-between gap-3"><span className="text-gray-500">Side</span><span className="text-cyan-300">{position.side}</span></div>
+          <div className="flex justify-between gap-3"><span className="text-gray-500">Entry Price</span><span className="text-white">{entryPrice.toFixed(4)}</span></div>
+          <div className="flex justify-between gap-3"><span className="text-gray-500">Shares</span><span className="text-white">{shares.toFixed(2)}</span></div>
           <div className="flex justify-between gap-3 pt-1 border-t border-gray-700">
-            <span className="text-gray-500">Status</span>
-            <span className="text-yellow-400">Open</span>
+            <span className="text-gray-500">Status</span><span className="text-yellow-400">Open</span>
           </div>
           {position.ghost_mode && (
-            <div className="flex justify-between gap-3">
-              <span className="text-gray-500">Mode</span>
-              <span className="text-amber-400 text-[10px]"> ghost</span>
-            </div>
+            <div className="flex justify-between gap-3"><span className="text-gray-500">Mode</span><span className="text-amber-400 text-[10px]">👻 ghost</span></div>
           )}
         </div>
       </div>
     );
   }
 
-  // Default tooltip for portfolio value
-  const cashData = payload.find((p: any) => p.dataKey === 'cash');
-  const totalData = payload.find((p: any) => p.dataKey === 'totalValue');
-
-  const cash = cashData?.value as number;
-  const total = totalData?.value as number;
-  const inPositions = total - cash;
-
-  return (
-    <div className="card px-3 py-2 text-xs font-mono space-y-1 shadow-xl">
-      <div className="text-gray-400">{label}</div>
-      <div className="text-white">
-        Total Value <span className="text-emerald-300 font-semibold">${total?.toFixed(2)}</span>
-      </div>
-      <div className="text-indigo-300">
-        Cash <span className="text-white">${cash?.toFixed(2)}</span>
-      </div>
-      {inPositions > 0 && (
-        <div className="text-gray-500">
-          In Positions <span className="text-white">${inPositions?.toFixed(2)}</span>
-        </div>
-      )}
-    </div>
-  );
+  // No marker at this point — render nothing (value is shown in the top display)
+  return null;
 }
 
 export default function PnlChart({ data, startingBalance, ghostMode, currentPortfolio, trades, openPositions }: Props) {
   // API returns newest-first — reverse for chronological chart display
   const base = startingBalance ?? 0;
   const reversedData = [...data].reverse();
+
+  // Birdeye-style: track hovered point to show value in header area
+  const [hoveredPoint, setHoveredPoint] = useState<{ time: string; totalValue: number; cash: number } | null>(null);
+  // Custom marker tooltip — bypasses Recharts hit-area limitations
+  type MarkerTipState = {
+    kind: 'trade';
+    data: { trade: TradeRow; pnl: number };
+    x: number; y: number;
+  } | {
+    kind: 'position';
+    data: { position: OpenPositionRow };
+    x: number; y: number;
+  } | null;
+  const [markerTip, setMarkerTip] = useState<MarkerTipState>(null);
+  const chartContainerRef = useRef<HTMLDivElement>(null);
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const handleMouseMove = useCallback((state: any) => {
+    if (state?.activePayload?.length) {
+      const p = state.activePayload[0]?.payload;
+      if (p?.totalValue !== undefined) setHoveredPoint({ time: p.time, totalValue: p.totalValue, cash: p.cash });
+    }
+  }, []);
+  const handleMouseLeave = useCallback(() => setHoveredPoint(null), []);
 
   const chartData = reversedData.map((row, index) => {
     const sessionPnl = parseFloat(row.session_pnl);
@@ -185,20 +147,20 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
 
     return {
       time: fmt(row.ts),
+      ts: row.ts, // Keep raw timestamp for marker matching
       cash,
       totalValue,
       pnl: sessionPnl,
     };
   });
 
-  // Calculate domain to determine marker offsets
+  // Calculate basic domain first
   const allValues = chartData.flatMap(d => [d.cash, d.totalValue]);
   const minVal = Math.min(...allValues);
   const maxVal = Math.max(...allValues);
-  const yRange = maxVal - minVal;
+  const yRange = Math.max(maxVal - minVal, 10); // Ensure minimum range of 10 for marker visibility
 
-  // Process trades (exits) into scatter plot data
-  // Filter trades to only those within the P&L chart's time range
+  // Filter trades and positions to only those within the chart's time range
   const oldestSnapshotTime = reversedData[0] ? new Date(reversedData[0].ts).getTime() : 0;
   const newestSnapshotTime = reversedData[reversedData.length - 1]
     ? new Date(reversedData[reversedData.length - 1].ts).getTime()
@@ -209,59 +171,52 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
     return tradeTime >= oldestSnapshotTime && tradeTime <= newestSnapshotTime;
   });
 
-  const tradeEvents = tradesInRange.map(trade => {
-    const tradeTime = new Date(trade.ts);
-    const pnl = parseFloat(trade.pnl);
-    
-    // Find the closest snapshot time to position the marker
-    const closestSnapshot = reversedData.reduce((closest, snap) => {
-      const snapTime = new Date(snap.ts);
-      const closestTime = new Date(closest.ts);
-      return Math.abs(snapTime.getTime() - tradeTime.getTime()) < 
-             Math.abs(closestTime.getTime() - tradeTime.getTime()) ? snap : closest;
-    }, reversedData[0]);
-
-    const snapIndex = reversedData.findIndex(s => s.ts === closestSnapshot?.ts);
-    const chartPoint = chartData[snapIndex];
-
-    return {
-      time: chartPoint?.time || fmt(trade.ts),
-      // Position markers clearly above the total value line
-      tradeValue: chartPoint ? chartPoint.totalValue + yRange * 0.08 : base,
-      pnl,
-      trade, // Store full trade for tooltip
-      color: pnl > 0 ? '#10b981' : pnl < 0 ? '#ef4444' : '#6b7280',
-    };
-  });
-
-  // Process open positions (entries) into scatter plot data
   const positionsInRange = (openPositions ?? []).filter(position => {
     const positionTime = new Date(position.ts).getTime();
     return positionTime >= oldestSnapshotTime && positionTime <= newestSnapshotTime;
   });
 
-  const positionEvents = positionsInRange.map(position => {
-    const positionTime = new Date(position.ts);
+  // Build marker lookup maps keyed by chart point's time string
+  const tradeMarkerMap = new Map<string, { pnl: number; trade: TradeRow }>();
+  const positionMarkerMap = new Map<string, { position: OpenPositionRow }>();
 
-    // Find the closest snapshot time to position the marker
-    const closestSnapshot = reversedData.reduce((closest, snap) => {
-      const snapTime = new Date(snap.ts);
-      const closestTime = new Date(closest.ts);
-      return Math.abs(snapTime.getTime() - positionTime.getTime()) <
-             Math.abs(closestTime.getTime() - positionTime.getTime()) ? snap : closest;
-    }, reversedData[0]);
-
-    const snapIndex = reversedData.findIndex(s => s.ts === closestSnapshot?.ts);
-    const chartPoint = chartData[snapIndex];
-
-    return {
-      time: chartPoint?.time || fmt(position.ts),
-      // Position markers clearly above the total value line (but below trade markers)
-      positionValue: chartPoint ? chartPoint.totalValue + yRange * 0.04 : base,
-      position, // Store full position for tooltip
-      color: '#6366f1', // Indigo for position entries
-    };
+  tradesInRange.forEach(trade => {
+    const tradeTime = new Date(trade.ts).getTime();
+    const closestPoint = chartData.reduce((closest, point) => {
+      const pointTime = new Date(point.ts).getTime();
+      const closestTime = new Date(closest.ts).getTime();
+      return Math.abs(pointTime - tradeTime) < Math.abs(closestTime - tradeTime) ? point : closest;
+    }, chartData[0]);
+    if (closestPoint) {
+      tradeMarkerMap.set(closestPoint.time, { pnl: parseFloat(trade.pnl), trade });
+    }
   });
+
+  positionsInRange.forEach(position => {
+    const positionTime = new Date(position.ts).getTime();
+    const closestPoint = chartData.reduce((closest, point) => {
+      const pointTime = new Date(point.ts).getTime();
+      const closestTime = new Date(closest.ts).getTime();
+      return Math.abs(pointTime - positionTime) < Math.abs(closestTime - positionTime) ? point : closest;
+    }, chartData[0]);
+    if (closestPoint) {
+      positionMarkerMap.set(closestPoint.time, { position });
+    }
+  });
+
+  // Merge marker flags into chartData so Line components can render custom dots
+  // on the categorical XAxis (Scatter doesn't support categorical axes reliably)
+  const chartDataWithMarkers = chartData.map(point => ({
+    ...point,
+    tradeDot:    tradeMarkerMap.has(point.time)    ? point.totalValue + yRange * 0.15 : undefined,
+    positionDot: positionMarkerMap.has(point.time) ? point.totalValue + yRange * 0.08 : undefined,
+    _tradeMarker:    tradeMarkerMap.get(point.time),
+    _positionMarker: positionMarkerMap.get(point.time),
+  }));
+
+  // For legend display (count)
+  const tradeEvents = tradesInRange;
+  const positionEvents = positionsInRange;
 
   if (chartData.length === 0) {
     return (
@@ -272,14 +227,59 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
   }
 
   // Calculate Y-axis domain with padding to fit both lines and markers
-  const pad = yRange * 0.15 || 5;
-  const domain = [Math.floor(minVal - pad), Math.ceil(maxVal + pad)];
+  // Add extra padding at top for markers positioned at totalValue + yRange * 0.15
+  const topPad = yRange * 0.25; // Increased to ensure markers are visible
+  const bottomPad = yRange * 0.05;
+  const domain = [
+    Math.floor(minVal - bottomPad),
+    Math.ceil(maxVal + topPad)
+  ];
 
   return (
     <div className="card p-4">
-      <div className="flex items-center justify-between mb-3">
-        <p className="label-muted">Portfolio Overview</p>
-        <div className="flex items-center gap-3 text-[10px] font-mono">
+      {/* Birdeye-style header: static legend + live hovered value display */}
+      <div className="flex items-start justify-between mb-3">
+        <div>
+          <p className="label-muted text-[10px]">Portfolio Overview</p>
+          {/* Live value display — updates as cursor moves over chart */}
+          <div className="mt-0.5 font-mono">
+            {hoveredPoint ? (
+              <div className="flex items-baseline gap-3">
+                <span className="text-lg font-semibold text-emerald-300">${hoveredPoint.totalValue.toFixed(2)}</span>
+                <span className="text-xs text-gray-500">total</span>
+                <span className="text-sm text-indigo-300">${hoveredPoint.cash.toFixed(2)}</span>
+                <span className="text-xs text-gray-500">cash</span>
+                {hoveredPoint.totalValue - hoveredPoint.cash > 0 && (
+                  <>
+                    <span className="text-sm text-gray-400">${(hoveredPoint.totalValue - hoveredPoint.cash).toFixed(2)}</span>
+                    <span className="text-xs text-gray-500">in positions</span>
+                  </>
+                )}
+                <span className="text-[10px] text-gray-600">{hoveredPoint.time}</span>
+              </div>
+            ) : (
+              (() => {
+                const latest = chartDataWithMarkers[chartDataWithMarkers.length - 1];
+                const inPos = latest ? latest.totalValue - latest.cash : 0;
+                return latest ? (
+                  <div className="flex items-baseline gap-3">
+                    <span className="text-lg font-semibold text-emerald-300">${latest.totalValue.toFixed(2)}</span>
+                    <span className="text-xs text-gray-500">total</span>
+                    <span className="text-sm text-indigo-300">${latest.cash.toFixed(2)}</span>
+                    <span className="text-xs text-gray-500">cash</span>
+                    {inPos > 0 && (
+                      <>
+                        <span className="text-sm text-gray-400">${inPos.toFixed(2)}</span>
+                        <span className="text-xs text-gray-500">in positions</span>
+                      </>
+                    )}
+                  </div>
+                ) : null;
+              })()
+            )}
+          </div>
+        </div>
+        <div className="flex items-center gap-3 text-[10px] font-mono mt-1">
           <div className="flex items-center gap-1.5">
             <div className="w-3 h-0.5 bg-emerald-400" />
             <span className="text-gray-500">Total Value</span>
@@ -302,140 +302,191 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
           )}
         </div>
       </div>
-      <ResponsiveContainer width="100%" height={240}>
-        <AreaChart data={chartData} margin={{ top: 4, right: 12, bottom: 0, left: 0 }}>
-          <defs>
-            <linearGradient id="totalGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%"  stopColor="#10b981" stopOpacity={0.2} />
-              <stop offset="95%" stopColor="#10b981" stopOpacity={0} />
-            </linearGradient>
-            <linearGradient id="cashGrad" x1="0" y1="0" x2="0" y2="1">
-              <stop offset="5%"  stopColor="#6366f1" stopOpacity={0.15} />
-              <stop offset="95%" stopColor="#6366f1" stopOpacity={0} />
-            </linearGradient>
-          </defs>
-          <CartesianGrid strokeDasharray="3 3" stroke="#1e1e32" vertical={false} />
-          <XAxis
-            dataKey="time"
-            tick={{ fill: '#6b7280', fontSize: 11, fontFamily: 'monospace' }}
-            tickLine={false}
-            axisLine={{ stroke: '#1e1e32' }}
-            interval="preserveStartEnd"
-            minTickGap={20}
-          />
-          <YAxis
-            domain={domain}
-            tick={{ fill: '#6b7280', fontSize: 11, fontFamily: 'monospace' }}
-            tickLine={false}
-            axisLine={false}
-            tickFormatter={v => `$${v}`}
-            width={60}
-          />
-          <Tooltip content={<CustomTooltip />} />
-          {startingBalance !== undefined && (
-            <ReferenceLine
-              y={startingBalance}
-              stroke="#374151"
-              strokeDasharray="4 4"
-              label={{ value: 'Session Start', position: 'insideTopRight', fill: '#6b7280', fontSize: 10 }}
+      
+      {/* Stacked chart containers: Portfolio chart + Marker overlay */}
+      <div ref={chartContainerRef} className="relative" style={{ height: 320 }}>
+        {/* Custom marker tooltip overlay — positioned absolutely over chart */}
+        {markerTip && (
+          <div
+            className="absolute z-50 pointer-events-none"
+            style={{
+              left: Math.min(markerTip.x + 14, (chartContainerRef.current?.clientWidth ?? 600) - 220),
+              top: Math.max(markerTip.y - 10, 0),
+            }}
+          >
+            {markerTip.kind === 'trade' ? (() => {
+              const { trade, pnl } = markerTip.data;
+              const pnlColor = pnl > 0 ? 'text-emerald-400' : pnl < 0 ? 'text-red-400' : 'text-gray-400';
+              return (
+                <div className="card px-3 py-2 text-xs font-mono space-y-1.5 shadow-xl border-2 border-emerald-500/30 w-48">
+                  <div className="text-emerald-300 font-semibold flex items-center gap-1.5"><span>✅</span><span>Trade Close</span></div>
+                  <div className="space-y-0.5 pt-1">
+                    <div className="flex justify-between gap-3"><span className="text-gray-500">Strategy</span><span className="text-white truncate">{trade.strategy}</span></div>
+                    <div className="flex justify-between gap-3"><span className="text-gray-500">Market</span><span className="text-white text-[10px] truncate max-w-[110px]">{trade.market.split(' ').slice(0,3).join(' ')}</span></div>
+                    <div className="flex justify-between gap-3"><span className="text-gray-500">Side</span><span className="text-cyan-300">{trade.side}</span></div>
+                    <div className="flex justify-between gap-3"><span className="text-gray-500">Shares</span><span className="text-white">{parseFloat(trade.shares).toFixed(2)}</span></div>
+                    <div className="flex justify-between gap-3 pt-1 border-t border-gray-700">
+                      <span className="text-gray-500">P&L</span>
+                      <span className={`font-semibold ${pnlColor}`}>{pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}</span>
+                    </div>
+                    <div className="flex justify-between gap-3"><span className="text-gray-500">Reason</span><span className="text-gray-400 text-[10px] truncate max-w-[110px]">{trade.reason}</span></div>
+                  </div>
+                </div>
+              );
+            })() : (() => {
+              const { position } = markerTip.data;
+              return (
+                <div className="card px-3 py-2 text-xs font-mono space-y-1.5 shadow-xl border-2 border-indigo-500/30 w-48">
+                  <div className="text-indigo-300 font-semibold flex items-center gap-1.5"><span>🎯</span><span>Position Entry</span></div>
+                  <div className="space-y-0.5 pt-1">
+                    <div className="flex justify-between gap-3"><span className="text-gray-500">Strategy</span><span className="text-white truncate">{position.strategy}</span></div>
+                    <div className="flex justify-between gap-3"><span className="text-gray-500">Market</span><span className="text-white text-[10px] truncate max-w-[110px]">{position.market.split(' ').slice(0,3).join(' ')}</span></div>
+                    <div className="flex justify-between gap-3"><span className="text-gray-500">Side</span><span className="text-cyan-300">{position.side}</span></div>
+                    <div className="flex justify-between gap-3"><span className="text-gray-500">Entry Price</span><span className="text-white">{parseFloat(position.entry_price).toFixed(4)}</span></div>
+                    <div className="flex justify-between gap-3"><span className="text-gray-500">Shares</span><span className="text-white">{parseFloat(position.shares).toFixed(2)}</span></div>
+                    <div className="flex justify-between gap-3 pt-1 border-t border-gray-700"><span className="text-gray-500">Status</span><span className="text-yellow-400">Open</span></div>
+                    {position.ghost_mode && <div className="flex justify-between gap-3"><span className="text-gray-500">Mode</span><span className="text-amber-400 text-[10px]">👻 ghost</span></div>}
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+        )}
+
+        <ResponsiveContainer width="100%" height={320}>
+          <ComposedChart
+            data={chartDataWithMarkers}
+            margin={{ top: 20, right: 12, bottom: 0, left: 0 }}
+            onMouseMove={handleMouseMove}
+            onMouseLeave={handleMouseLeave}
+          >
+            <defs>
+              <linearGradient id="totalGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%"  stopColor="#10b981" stopOpacity={0.2} />
+                <stop offset="95%" stopColor="#10b981" stopOpacity={0} />
+              </linearGradient>
+              <linearGradient id="cashGrad" x1="0" y1="0" x2="0" y2="1">
+                <stop offset="5%"  stopColor="#6366f1" stopOpacity={0.15} />
+                <stop offset="95%" stopColor="#6366f1" stopOpacity={0} />
+              </linearGradient>
+            </defs>
+            <CartesianGrid strokeDasharray="3 3" stroke="#1e1e32" vertical={false} />
+            <XAxis
+              dataKey="time"
+              tick={{ fill: '#6b7280', fontSize: 11, fontFamily: 'monospace' }}
+              tickLine={false}
+              axisLine={{ stroke: '#1e1e32' }}
+              interval="preserveStartEnd"
+              minTickGap={20}
             />
-          )}
-          {/* Total Value - render first so it's behind */}
-          <Area
-            type="monotone"
-            dataKey="totalValue"
-            stroke="#10b981"
-            strokeWidth={2.5}
-            fill="url(#totalGrad)"
-            dot={false}
-            activeDot={{ r: 4, fill: '#10b981', stroke: '#0a0a12', strokeWidth: 2 }}
-          />
-          {/* Cash - render second so it's in front */}
-          <Area
-            type="monotone"
-            dataKey="cash"
-            stroke="#6366f1"
-            strokeWidth={2}
-            fill="url(#cashGrad)"
-            dot={false}
-            activeDot={{ r: 4, fill: '#6366f1', stroke: '#0a0a12', strokeWidth: 2 }}
-          />
-          {/* Position entry markers (B for buy) - render before trade exits */}
-          {positionEvents.length > 0 && (
-            <Scatter
-              data={positionEvents}
-              dataKey="positionValue"
-              fill="#6366f1"
-              shape={(props: any) => {
-                const { cx, cy } = props;
-                return (
-                  <g>
-                    <circle
-                      cx={cx}
-                      cy={cy}
-                      r={8}
-                      fill="#6366f1"
-                      stroke="#0a0a12"
-                      strokeWidth={1.5}
-                      opacity={0.95}
-                    />
-                    <text
-                      x={cx}
-                      y={cy}
-                      textAnchor="middle"
-                      dominantBaseline="central"
-                      fill="#ffffff"
-                      fontSize="10"
-                      fontWeight="600"
-                      fontFamily="monospace"
-                    >
-                      B
-                    </text>
-                  </g>
-                );
-              }}
+            <YAxis
+              domain={domain}
+              tick={{ fill: '#6b7280', fontSize: 11, fontFamily: 'monospace' }}
+              tickLine={false}
+              axisLine={false}
+              tickFormatter={v => `$${v}`}
+              width={60}
             />
-          )}
-          {/* Trade exit markers (S for sell with green/red colors) */}
-          {tradeEvents.length > 0 && (
-            <Scatter
-              data={tradeEvents}
-              dataKey="tradeValue"
-              fill="#fbbf24"
-              shape={(props: any) => {
+            {/* No Recharts Tooltip — value shown in header, markers use custom SVG overlay */}
+            <Tooltip content={() => null} />
+            {startingBalance !== undefined && (
+              <ReferenceLine
+                y={startingBalance}
+                stroke="#374151"
+                strokeDasharray="4 4"
+                label={{ value: 'Session Start', position: 'insideTopRight', fill: '#6b7280', fontSize: 10 }}
+              />
+            )}
+            {/* Total Value - render first so it's behind */}
+            <Area
+              type="monotone"
+              dataKey="totalValue"
+              stroke="#10b981"
+              strokeWidth={2.5}
+              fill="url(#totalGrad)"
+              dot={false}
+              activeDot={{ r: 4, fill: '#10b981', stroke: '#0a0a12', strokeWidth: 2 }}
+            />
+            {/* Cash - render second so it's in front */}
+            <Area
+              type="monotone"
+              dataKey="cash"
+              stroke="#6366f1"
+              strokeWidth={2}
+              fill="url(#cashGrad)"
+              dot={false}
+              activeDot={{ r: 4, fill: '#6366f1', stroke: '#0a0a12', strokeWidth: 2 }}
+            />
+
+            {/* Position entry markers — large transparent hit circle captures hover via SVG events */}
+            <Line
+              dataKey="positionDot"
+              stroke="none"
+              strokeWidth={0}
+              isAnimationActive={false}
+              dot={(props: any) => {
+                if (props.payload.positionDot === undefined) return <g />;
                 const { cx, cy, payload } = props;
-                const pnl = payload.pnl;
-                const color = pnl > 0 ? '#10b981' : pnl < 0 ? '#ef4444' : '#6b7280';
+                const isActive = markerTip?.kind === 'position' &&
+                  markerTip.data.position === payload._positionMarker?.position;
                 return (
-                  <g>
-                    <circle
-                      cx={cx}
-                      cy={cy}
-                      r={8}
-                      fill={color}
-                      stroke="#0a0a12"
-                      strokeWidth={1.5}
-                      opacity={0.95}
-                    />
-                    <text
-                      x={cx}
-                      y={cy}
-                      textAnchor="middle"
-                      dominantBaseline="central"
-                      fill="#ffffff"
-                      fontSize="10"
-                      fontWeight="600"
-                      fontFamily="monospace"
-                    >
-                      S
-                    </text>
+                  <g
+                    key={`pos-${cx}-${cy}`}
+                    style={{ cursor: 'pointer' }}
+                    onMouseEnter={(e) => {
+                      const rect = chartContainerRef.current?.getBoundingClientRect();
+                      if (rect) setMarkerTip({ kind: 'position', data: payload._positionMarker, x: e.clientX - rect.left, y: e.clientY - rect.top });
+                    }}
+                    onMouseLeave={() => setMarkerTip(null)}
+                  >
+                    {/* Large transparent hit area */}
+                    <circle cx={cx} cy={cy} r={18} fill="transparent" />
+                    {isActive && <circle cx={cx} cy={cy} r={14} fill="#6366f1" fillOpacity={0.2} stroke="#6366f1" strokeWidth={1.5} strokeDasharray="3 2" />}
+                    <circle cx={cx} cy={cy} r={8} fill="#6366f1" stroke="#0a0a12" strokeWidth={1.5} opacity={0.95} />
+                    <text x={cx} y={cy} textAnchor="middle" dominantBaseline="central" fill="#ffffff" fontSize="10" fontWeight="600" fontFamily="monospace" pointerEvents="none">B</text>
                   </g>
                 );
               }}
+              activeDot={false}
             />
-          )}
-        </AreaChart>
-      </ResponsiveContainer>
+
+            {/* Trade exit markers — large transparent hit circle captures hover via SVG events */}
+            <Line
+              dataKey="tradeDot"
+              stroke="none"
+              strokeWidth={0}
+              isAnimationActive={false}
+              dot={(props: any) => {
+                if (props.payload.tradeDot === undefined) return <g />;
+                const { cx, cy, payload } = props;
+                const pnl = payload._tradeMarker?.pnl ?? 0;
+                const color = pnl > 0 ? '#10b981' : pnl < 0 ? '#ef4444' : '#6b7280';
+                const isActive = markerTip?.kind === 'trade' &&
+                  markerTip.data.trade === payload._tradeMarker?.trade;
+                return (
+                  <g
+                    key={`trade-${cx}-${cy}`}
+                    style={{ cursor: 'pointer' }}
+                    onMouseEnter={(e) => {
+                      const rect = chartContainerRef.current?.getBoundingClientRect();
+                      if (rect) setMarkerTip({ kind: 'trade', data: payload._tradeMarker, x: e.clientX - rect.left, y: e.clientY - rect.top });
+                    }}
+                    onMouseLeave={() => setMarkerTip(null)}
+                  >
+                    {/* Large transparent hit area */}
+                    <circle cx={cx} cy={cy} r={18} fill="transparent" />
+                    {isActive && <circle cx={cx} cy={cy} r={14} fill={color} fillOpacity={0.2} stroke={color} strokeWidth={1.5} strokeDasharray="3 2" />}
+                    <circle cx={cx} cy={cy} r={8} fill={color} stroke="#0a0a12" strokeWidth={1.5} opacity={0.95} />
+                    <text x={cx} y={cy} textAnchor="middle" dominantBaseline="central" fill="#ffffff" fontSize="10" fontWeight="600" fontFamily="monospace" pointerEvents="none">S</text>
+                  </g>
+                );
+              }}
+              activeDot={false}
+            />
+          </ComposedChart>
+        </ResponsiveContainer>
+      </div>
+      
       <div className="mt-2 text-[10px] font-mono text-gray-600">
         <span className="text-gray-500">Cash</span> = liquid funds · <span className="text-gray-500">Total Value</span> = cash + positions (current point uses live data; historical points approximate)
         {(positionEvents.length > 0 || tradeEvents.length > 0) && (
