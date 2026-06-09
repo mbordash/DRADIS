@@ -1014,36 +1014,6 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address, squadron_ass
                     continue;
                 }
 
-                // Check if we already recorded this trade
-                #[derive(sqlx::FromRow)]
-                struct CountRow {
-                    count: i64,
-                }
-
-                let trade_exists = sqlx::query_as::<_, CountRow>(
-                    r#"
-                    SELECT COUNT(*) as count
-                    FROM trades
-                    WHERE strategy = 'ArbitrageStrategy'
-                      AND market = ?
-                      AND ts >= ?
-                      AND ts <= ?
-                    "#
-                )
-                .bind(&market_name)
-                .bind(&yes_leg.ts)
-                .bind(&no_leg.ts)
-                .fetch_one(&pool)
-                .await
-                .ok()
-                .map(|r| r.count)
-                .unwrap_or(0) > 0;
-
-                if trade_exists {
-                    // Already recorded, skip
-                    continue;
-                }
-
                 // Parse entry prices and shares
                 let yes_price = match yes_leg.entry_price.parse::<Decimal>() {
                     Ok(p) => p,
@@ -1070,6 +1040,51 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address, squadron_ass
 
                 let entry_per_pair = yes_price + no_price;
                 let pnl = (Decimal::ONE - entry_per_pair) * pairs;
+
+                // Dedupe guard: only one synthetic settlement row per matched YES/NO pair.
+                // Use an order-safe timestamp window plus exact trade fingerprint fields.
+                #[derive(sqlx::FromRow)]
+                struct CountRow {
+                    count: i64,
+                }
+
+                let (ts_start, ts_end) = if yes_leg.ts <= no_leg.ts {
+                    (&yes_leg.ts, &no_leg.ts)
+                } else {
+                    (&no_leg.ts, &yes_leg.ts)
+                };
+
+                let trade_exists = sqlx::query_as::<_, CountRow>(
+                    r#"
+                    SELECT COUNT(*) as count
+                    FROM trades
+                    WHERE strategy = 'ArbitrageStrategy'
+                      AND reason = 'Settlement (auto-redeemed by Polymarket)'
+                      AND market = ?
+                      AND side = 'YES'
+                      AND entry_price = ?
+                      AND exit_price = '1'
+                      AND shares = ?
+                      AND pnl = ?
+                      AND ts >= ?
+                      AND ts <= ?
+                    "#
+                )
+                .bind(&market_name)
+                .bind(entry_per_pair.to_string())
+                .bind(pairs.to_string())
+                .bind(pnl.to_string())
+                .bind(ts_start)
+                .bind(ts_end)
+                .fetch_one(&pool)
+                .await
+                .ok()
+                .map(|r| r.count)
+                .unwrap_or(0) > 0;
+
+                if trade_exists {
+                    continue;
+                }
 
                 info!(
                     "🔍 Orphan detection [{}]: Found auto-settled arbitrage: \"{}\" | {} pairs @ entry ${:.4}/pair → pnl ${:.4}",

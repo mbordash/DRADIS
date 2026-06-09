@@ -638,7 +638,7 @@ async fn get_portfolio_value() -> Response {
     use std::str::FromStr;
 
     let assets = db::available_assets();
-    let mut total_collateral = Decimal::ZERO;
+    let mut latest_collateral: Option<(String, Decimal)> = None;
     let mut total_positions_value = Decimal::ZERO;
     let total_unrealized_pnl = Decimal::ZERO;  // TODO: Calculate when live prices are added
     let mut total_position_count = 0;
@@ -651,11 +651,15 @@ async fn get_portfolio_value() -> Response {
             None => continue,
         };
 
-        // Get latest collateral snapshot
+        // Collateral is wallet-global, not asset-scoped. Each asset DB stores the
+        // same wallet cash snapshot, so we keep only the freshest one.
         let pnl_snapshots = db::get_pnl_history(&pool, 1).await;
         if let Some(snap) = pnl_snapshots.first() {
             if let Ok(collateral) = Decimal::from_str(&snap.collateral) {
-                total_collateral += collateral;
+                match &latest_collateral {
+                    Some((ts, _)) if ts >= &snap.ts => {}
+                    _ => latest_collateral = Some((snap.ts.clone(), collateral)),
+                }
             }
         }
 
@@ -683,6 +687,9 @@ async fn get_portfolio_value() -> Response {
         }
     }
 
+    let total_collateral = latest_collateral
+        .map(|(_, c)| c)
+        .unwrap_or(Decimal::ZERO);
     let total_value = total_collateral + total_positions_value;
 
     Json(PortfolioValue {
