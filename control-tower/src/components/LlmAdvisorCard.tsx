@@ -25,6 +25,7 @@ function fmtTs(iso: string): string {
 export default function LlmAdvisorCard({ recommendations, isLoading, advisorEnabled }: Props) {
   const [idx, setIdx] = useState(0);
   const [dismissed, setDismissed] = useState<Set<number>>(new Set());
+  const [expanded, setExpanded] = useState(false);
 
   // Filter out dismissed recommendations
   const visible = recommendations.filter(r => !dismissed.has(r.id));
@@ -39,7 +40,10 @@ export default function LlmAdvisorCard({ recommendations, isLoading, advisorEnab
     setDismissed(prev => new Set(prev).add(id));
     // If we dismissed the last item, step back
     setIdx(i => (total > 1 ? Math.min(i, total - 2) : 0));
+    setExpanded(false);
   };
+
+  const showExpand = !!rec && rec.analysis.length > 700;
 
   return (
     <section>
@@ -73,7 +77,7 @@ export default function LlmAdvisorCard({ recommendations, isLoading, advisorEnab
                   {safeIdx + 1} / {total}
                 </span>
                 <button
-                  onClick={() => setIdx(i => Math.min(i + 1, total - 1))}
+                  onClick={() => { setIdx(i => Math.min(i + 1, total - 1)); setExpanded(false); }}
                   disabled={safeIdx >= total - 1}
                   className="text-xs px-2 py-0.5 rounded bg-[#13131f] border border-[#1e1e32] text-gray-400 hover:text-gray-200 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
                   title="Older"
@@ -81,7 +85,7 @@ export default function LlmAdvisorCard({ recommendations, isLoading, advisorEnab
                   ←
                 </button>
                 <button
-                  onClick={() => setIdx(i => Math.max(i - 1, 0))}
+                  onClick={() => { setIdx(i => Math.max(i - 1, 0)); setExpanded(false); }}
                   disabled={safeIdx === 0}
                   className="text-xs px-2 py-0.5 rounded bg-[#13131f] border border-[#1e1e32] text-gray-400 hover:text-gray-200 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
                   title="Newer"
@@ -89,6 +93,15 @@ export default function LlmAdvisorCard({ recommendations, isLoading, advisorEnab
                   →
                 </button>
               </>
+            )}
+            {showExpand && (
+              <button
+                onClick={() => setExpanded(v => !v)}
+                className="text-xs px-2 py-0.5 rounded bg-[#13131f] border border-[#1e1e32] text-gray-400 hover:text-gray-200 transition-colors"
+                title={expanded ? 'Collapse analysis' : 'Expand analysis'}
+              >
+                {expanded ? 'collapse' : 'expand'}
+              </button>
             )}
             {rec && (
               <button
@@ -153,9 +166,17 @@ export default function LlmAdvisorCard({ recommendations, isLoading, advisorEnab
             </div>
 
             {/* Analysis text — preserve the LLM's formatting */}
-            <pre className="text-xs text-gray-300 font-mono whitespace-pre-wrap leading-relaxed overflow-y-auto max-h-96 scrollbar-thin">
+            <pre className={[
+              'text-xs text-gray-300 font-mono whitespace-pre-wrap leading-relaxed scrollbar-thin',
+              expanded ? 'overflow-visible max-h-none' : 'overflow-y-auto max-h-64',
+            ].join(' ')}>
               {rec.analysis}
             </pre>
+            {showExpand && !expanded && (
+              <p className="mt-2 text-[10px] font-mono text-gray-600">
+                Showing a scrollable preview — click <span className="text-gray-500">expand</span> to view the full analysis inline.
+              </p>
+            )}
           </>
         )}
       </div>

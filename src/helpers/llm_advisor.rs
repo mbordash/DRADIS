@@ -71,11 +71,12 @@ struct OllamaRequest {
 
 #[derive(Serialize)]
 struct OllamaOptions {
-    /// Limit output tokens so Telegram messages stay readable.
+    /// Allow fuller recommendations to be persisted to SQLite and shown in Control Tower.
+    /// Telegram truncation is handled separately after generation.
     num_predict: u32,
     temperature: f32,
     /// Cap the KV-cache context window.  Smaller = faster prefill on CPU.
-    /// 2048 is sufficient for our prompt (~600 input tokens + 280 output).
+    /// 3072 leaves room for the prompt plus a longer recommendation.
     num_ctx: u32,
 }
 
@@ -88,6 +89,7 @@ struct OllamaMessage {
 #[derive(Deserialize)]
 struct OllamaResponse {
     message: OllamaMessage,
+    done_reason: Option<String>,
 }
 
 // ── System prompt ─────────────────────────────────────────────────────────────
@@ -421,7 +423,7 @@ async fn call_ollama(
     ollama_base_url: &str,
     model: &str,
     user_prompt: &str,
-) -> anyhow::Result<String> {
+) -> anyhow::Result<OllamaResponse> {
     let url = format!("{}/api/chat", ollama_base_url.trim_end_matches('/'));
 
     let request = OllamaRequest {
@@ -438,9 +440,9 @@ async fn call_ollama(
         ],
         stream: false,
         options: OllamaOptions {
-            num_predict: 280,
+            num_predict: 900,
             temperature: 0.3, // Low temperature: consistent, factual recommendations
-            num_ctx: 2048,     // Cap KV-cache; keeps CPU inference under ~90s on t3.large
+            num_ctx: 3072,     // Room for prompt + full recommendation without frequent length stops
         },
     };
 
@@ -456,8 +458,9 @@ async fn call_ollama(
         return Err(anyhow::anyhow!("Ollama HTTP {}: {}", status, body));
     }
 
-    let ollama_resp: OllamaResponse = resp.json().await?;
-    Ok(ollama_resp.message.content.trim().to_string())
+    let mut ollama_resp: OllamaResponse = resp.json().await?;
+    ollama_resp.message.content = ollama_resp.message.content.trim().to_string();
+    Ok(ollama_resp)
 }
 
 // ── Main advisor loop ─────────────────────────────────────────────────────────
@@ -666,8 +669,14 @@ pub async fn run_llm_advisor_loop(
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
             match call_ollama(&http_client, &ollama_url, &ollama_model, &user_prompt).await {
-                Ok(text) => {
-                    analysis_opt = Some(text);
+                Ok(resp) => {
+                    if matches!(resp.done_reason.as_deref(), Some("length")) {
+                        warn!(
+                            "🤖 LLM Advisor: output hit Ollama length cap (num_predict={}) — consider increasing if recommendations still end mid-thought",
+                            900,
+                        );
+                    }
+                    analysis_opt = Some(resp.message.content);
                     break;
                 }
                 Err(e) => {

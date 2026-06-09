@@ -230,21 +230,110 @@ async fn patch_config(State(s): State<ApiState>, body: String) -> Response {
 /// GET /api/pnl/history?limit=200&asset=btc
 ///
 /// Returns up to `limit` P&L snapshots, newest first.
-/// Each row: { ts, session_pnl, collateral }
+/// Each row: { ts, session_pnl, collateral, total_value }
+///
+/// When `asset` query param is omitted, returns aggregated global P&L history
+/// (collateral + sum of all assets' positions_value per timestamp).
 async fn get_pnl_history(Query(q): Query<AssetQuery>) -> Response {
-    debug!("Received GET /api/pnl/history request with limit: {:?}", q.limit);
+    debug!("Received GET /api/pnl/history request with limit: {:?}, asset: {:?}", q.limit, q.asset);
     let limit = q.limit.unwrap_or(200).clamp(1, 1000);
-    match db::pool_for_opt(q.asset.as_deref()) {
-        Some(pool) => {
-            let history = db::get_pnl_history(&pool, limit).await;
-            debug!("Successfully retrieved PNL history");
-            Json(history).into_response()
-        },
-        None       => {
-            error!("Database pool not available for GET /api/pnl/history");
-            Json(Vec::<db::PnlSnapshotRow>::new()).into_response()
-        },
+
+    // If asset is specified, return single-asset history (legacy behavior)
+    if let Some(asset_name) = q.asset.as_deref() {
+        match db::pool_for_opt(Some(asset_name)) {
+            Some(pool) => {
+                let history = db::get_pnl_history(&pool, limit).await;
+                debug!("Successfully retrieved PNL history for asset: {}", asset_name);
+                return Json(history).into_response();
+            },
+            None => {
+                error!("Database pool not available for asset: {}", asset_name);
+                return Json(Vec::<db::PnlSnapshotRow>::new()).into_response();
+            },
+        }
     }
+
+    // No asset specified → return aggregated global P&L history
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    let assets = db::available_assets();
+    if assets.is_empty() {
+        warn!("GET /api/pnl/history (global): no assets available");
+        return Json(Vec::<db::PnlSnapshotRow>::new()).into_response();
+    }
+
+    // Fetch snapshots from all assets
+    let mut all_snapshots: Vec<(String, Vec<db::PnlSnapshotRow>)> = vec![];
+    for asset in &assets {
+        if let Some(pool) = db::pool_for(asset) {
+            let snaps = db::get_pnl_history(&pool, limit).await;
+            all_snapshots.push((asset.clone(), snaps));
+        }
+    }
+
+    if all_snapshots.is_empty() {
+        warn!("GET /api/pnl/history (global): no snapshots from any asset");
+        return Json(Vec::<db::PnlSnapshotRow>::new()).into_response();
+    }
+
+    // Use primary asset's timestamps as the base timeline
+    let primary_snaps = &all_snapshots[0].1;
+
+    // For each primary timestamp, aggregate positions_value from all assets
+    let aggregated: Vec<db::PnlSnapshotRow> = primary_snaps.iter().map(|primary| {
+        let ts = &primary.ts;
+        let collateral = &primary.collateral;
+
+        // Find nearest snapshot from each asset within ±2 minutes of this timestamp
+        let window_secs = 120;
+        let primary_time = chrono::DateTime::parse_from_rfc3339(ts)
+            .map(|dt| dt.timestamp())
+            .unwrap_or(0);
+
+        let mut total_positions_value = Decimal::ZERO;
+        let mut total_session_pnl = Decimal::ZERO;
+
+        for (asset, snaps) in &all_snapshots {
+            // Find closest snapshot within window
+            if let Some(snap) = snaps.iter().find(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s.ts)
+                    .map(|dt| (dt.timestamp() - primary_time).abs() <= window_secs)
+                    .unwrap_or(false)
+            }) {
+                // Extract positions_value = total_value - collateral
+                if let (Some(tv_str), Ok(coll)) = (
+                    snap.total_value.as_ref(),
+                    Decimal::from_str(&snap.collateral),
+                ) {
+                    if let Ok(tv) = Decimal::from_str(tv_str) {
+                        let pos_val = (tv - coll).max(Decimal::ZERO);
+                        total_positions_value += pos_val;
+                        debug!("[{}] @ {} positions_value={}", asset, ts, pos_val);
+                    }
+                }
+
+                // Sum session P&L from each asset
+                if let Ok(pnl) = Decimal::from_str(&snap.session_pnl) {
+                    total_session_pnl += pnl;
+                }
+            }
+        }
+
+        // Global total = collateral + sum(positions across all assets)
+        let coll_dec = Decimal::from_str(collateral).unwrap_or(Decimal::ZERO);
+        let global_total = coll_dec + total_positions_value;
+
+        db::PnlSnapshotRow {
+            ts: ts.clone(),
+            session_pnl: total_session_pnl.to_string(),
+            collateral: collateral.clone(),
+            total_value: Some(global_total.to_string()),
+        }
+    }).collect();
+
+    debug!("Successfully retrieved global aggregated PNL history ({} points)", aggregated.len());
+    Json(aggregated).into_response()
 }
 
 /// GET /api/status
@@ -631,28 +720,70 @@ struct PortfolioValue {
     prices_live: bool,
 }
 
-async fn get_portfolio_value() -> Response {
+async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
     debug!("Received GET /api/portfolio request");
 
     use rust_decimal::Decimal;
     use std::str::FromStr;
+    use chrono::{Utc, Duration};
 
     let assets = db::available_assets();
+
+    // Fetch live wallet collateral as ground truth (10s timeout)
+    let live_collateral = {
+        use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
+        use polymarket_client_sdk_v2::clob::types::AssetType;
+
+        // Get first available session to access trading_client
+        let session = assets.iter().find_map(|a| s.cag.session_for_asset(a));
+
+        if let Some(sess) = session {
+            let mut req = BalanceAllowanceRequest::default();
+            req.asset_type = AssetType::Collateral;
+
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(10),
+                sess.trading_client.balance_allowance(req),
+            ).await {
+                Ok(Ok(resp)) => {
+                    let balance = Decimal::from_str(&resp.balance.to_string())
+                        .unwrap_or(Decimal::ZERO) / Decimal::from_str("1000000").unwrap();
+                    debug!("💰 Live wallet collateral from CLOB: ${:.4}", balance);
+                    Some(balance)
+                }
+                Ok(Err(e)) => {
+                    warn!("⚠️ CLOB balance fetch failed in /api/portfolio: {}", e);
+                    None
+                }
+                Err(_) => {
+                    warn!("⚠️ CLOB balance fetch timed out (10s) in /api/portfolio");
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+
     let mut latest_collateral: Option<(String, Decimal)> = None;
     let mut total_positions_value = Decimal::ZERO;
     let total_unrealized_pnl = Decimal::ZERO;  // TODO: Calculate when live prices are added
     let mut total_position_count = 0;
-    let all_prices_live = true;
+    let mut all_prices_live = true;
+
+    // Freshness threshold: snapshots older than this are considered stale
+    let freshness_threshold = Utc::now() - Duration::minutes(5);
 
     // Aggregate across all asset pools
-    for asset in assets {
-        let pool = match db::pool_for(&asset) {
+    for asset in &assets {
+        let pool = match db::pool_for(asset) {
             Some(p) => p,
             None => continue,
         };
 
         // Collateral is wallet-global, not asset-scoped. Each asset DB stores the
-        // same wallet cash snapshot, so we keep only the freshest one.
+        // same wallet cash snapshot, so we keep only the freshest one (but we'll
+        // prefer live_collateral from CLOB if available).
         let pnl_snapshots = db::get_pnl_history(&pool, 1).await;
         if let Some(snap) = pnl_snapshots.first() {
             if let Ok(collateral) = Decimal::from_str(&snap.collateral) {
@@ -685,32 +816,66 @@ async fn get_portfolio_value() -> Response {
         }
         total_position_count += deduped_positions.len();
 
-        // Primary valuation source: latest snapshot per asset (uses strategy task's
-        // mark-to-market pricing).  Fallback: cost basis from deduped open positions.
-        if let Some(snap) = pnl_snapshots.first() {
-            if let (Some(tv), Ok(collateral)) = (
-                snap.total_value.as_ref().and_then(|v| Decimal::from_str(v).ok()),
-                Decimal::from_str(&snap.collateral),
-            ) {
-                total_positions_value += (tv - collateral).max(Decimal::ZERO);
-                continue;
+        // Check snapshot freshness before trusting mark-to-market valuation
+        let snapshot_is_fresh = pnl_snapshots.first().and_then(|snap| {
+            chrono::DateTime::parse_from_rfc3339(&snap.ts)
+                .ok()
+                .map(|dt| dt.with_timezone(&Utc) > freshness_threshold)
+        }).unwrap_or(false);
+
+        if snapshot_is_fresh {
+            // Use fresh mark-to-market from snapshot (live prices within 5 min)
+            if let Some(snap) = pnl_snapshots.first() {
+                if let (Some(tv), Ok(collateral)) = (
+                    snap.total_value.as_ref().and_then(|v| Decimal::from_str(v).ok()),
+                    Decimal::from_str(&snap.collateral),
+                ) {
+                    let positions_contrib = (tv - collateral).max(Decimal::ZERO);
+                    total_positions_value += positions_contrib;
+                    debug!("✅ [{}] Fresh snapshot: positions_value = ${:.4}",
+                           asset.to_uppercase(), positions_contrib);
+                    continue;
+                }
             }
+        } else {
+            // Stale or missing snapshot — fallback to cost basis
+            all_prices_live = false;
+            let snap_age = pnl_snapshots.first().and_then(|s| {
+                chrono::DateTime::parse_from_rfc3339(&s.ts).ok()
+                    .map(|dt| Utc::now().signed_duration_since(dt.with_timezone(&Utc)))
+            });
+            warn!("⚠️ [{}] Stale/missing snapshot (age: {:?}), using cost basis fallback",
+                  asset.to_uppercase(), snap_age);
         }
 
+        // Fallback: value positions at cost basis (entry_price × shares)
+        let mut fallback_value = Decimal::ZERO;
         for (_, pos) in deduped_positions {
             if let (Ok(shares), Ok(entry_price)) = (
                 Decimal::from_str(&pos.shares),
                 Decimal::from_str(&pos.entry_price),
             ) {
-                total_positions_value += shares * entry_price;
+                fallback_value += shares * entry_price;
             }
         }
+        total_positions_value += fallback_value;
+        debug!("📦 [{}] Fallback cost basis: ${:.4}", asset.to_uppercase(), fallback_value);
     }
 
-    let total_collateral = latest_collateral
-        .map(|(_, c)| c)
-        .unwrap_or(Decimal::ZERO);
+    // Use live CLOB collateral if available, otherwise fall back to latest snapshot
+    let total_collateral = if let Some(live_bal) = live_collateral {
+        live_bal
+    } else {
+        all_prices_live = false;
+        latest_collateral
+            .map(|(_, c)| c)
+            .unwrap_or(Decimal::ZERO)
+    };
+
     let total_value = total_collateral + total_positions_value;
+
+    debug!("📊 Portfolio summary: collateral=${:.4} positions=${:.4} total=${:.4} count={} live={}",
+           total_collateral, total_positions_value, total_value, total_position_count, all_prices_live);
 
     Json(PortfolioValue {
         collateral: total_collateral.to_string(),

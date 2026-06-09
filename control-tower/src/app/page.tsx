@@ -241,8 +241,9 @@ export default function DashboardPage() {
   const { data: config, mutate: refreshConfig, isLoading: configLoading } =
     useSWR('config', getConfig, { refreshInterval: 0, revalidateOnFocus: false });
 
+  // CAG-level P&L history: fetch global aggregated history (all assets) for main dashboard
   const { data: pnl, isLoading: pnlLoading } =
-    useSWR(['pnl', asset], () => getPnlHistory(1440, asset), { refreshInterval: 60_000 });
+    useSWR('pnl-global', () => getPnlHistory(1440), { refreshInterval: 60_000 });
 
   const { data: trades, isLoading: tradesLoading } =
     useSWR(['trades', asset], () => getTrades(60, asset), { refreshInterval: 15_000 });
