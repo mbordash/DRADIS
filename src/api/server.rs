@@ -663,26 +663,46 @@ async fn get_portfolio_value() -> Response {
             }
         }
 
-        // Get all open positions for this asset
-        let positions = db::get_open_positions(&pool).await;
-        total_position_count += positions.len();
+        // Build a deduped view of positions by token_id for count/fallback valuation.
+        // Prefer non-chain-adopted rows over chain-adopted placeholders, then larger shares.
+        let mut deduped_positions: std::collections::HashMap<String, db::OpenPositionRow> =
+            std::collections::HashMap::new();
+        for pos in db::get_open_positions(&pool).await {
+            match deduped_positions.get(&pos.token_id) {
+                None => {
+                    deduped_positions.insert(pos.token_id.clone(), pos);
+                }
+                Some(existing) => {
+                    let existing_shares = Decimal::from_str(&existing.shares).unwrap_or(Decimal::ZERO);
+                    let candidate_shares = Decimal::from_str(&pos.shares).unwrap_or(Decimal::ZERO);
+                    let replace = (existing.chain_adopted && !pos.chain_adopted)
+                        || (existing.chain_adopted == pos.chain_adopted && candidate_shares > existing_shares);
+                    if replace {
+                        deduped_positions.insert(pos.token_id.clone(), pos);
+                    }
+                }
+            }
+        }
+        total_position_count += deduped_positions.len();
 
-        // Calculate positions value and unrealized P&L
-        // For now, we'll use mid-price from CLOB or fallback to entry price
-        // TODO: Integrate live CLOB price fetching
-        for pos in positions {
+        // Primary valuation source: latest snapshot per asset (uses strategy task's
+        // mark-to-market pricing).  Fallback: cost basis from deduped open positions.
+        if let Some(snap) = pnl_snapshots.first() {
+            if let (Some(tv), Ok(collateral)) = (
+                snap.total_value.as_ref().and_then(|v| Decimal::from_str(v).ok()),
+                Decimal::from_str(&snap.collateral),
+            ) {
+                total_positions_value += (tv - collateral).max(Decimal::ZERO);
+                continue;
+            }
+        }
+
+        for (_, pos) in deduped_positions {
             if let (Ok(shares), Ok(entry_price)) = (
                 Decimal::from_str(&pos.shares),
                 Decimal::from_str(&pos.entry_price),
             ) {
-                // For now, assume mid-price = entry_price (positions_value = cost basis)
-                // This will show unrealized_pnl = 0 until we add live price fetching
-                let position_value = shares * entry_price;
-                total_positions_value += position_value;
-
-                // TODO: Fetch live mid-price from CLOB and calculate:
-                // let unrealized = shares * (current_mid - entry_price);
-                // total_unrealized_pnl += unrealized;
+                total_positions_value += shares * entry_price;
             }
         }
     }

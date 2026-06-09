@@ -120,24 +120,19 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
   }, []);
   const handleMouseLeave = useCallback(() => setHoveredPoint(null), []);
 
-  const chartData = reversedData.map((row, index) => {
+  const chartData = reversedData.map((row) => {
     const sessionPnl = parseFloat(row.session_pnl);
     const collateral = parseFloat(row.collateral);
-    const isLatestPoint = index === reversedData.length - 1;
 
     // Cash: actual collateral (liquid funds)
     const cash = ghostMode ? base + sessionPnl : collateral;
 
-    // Total portfolio value calculation:
-    // For the latest point, use real-time data from /api/portfolio if available
-    // For historical points, use the stored total_value if available (Phase 3f-7),
-    // otherwise fall back to approximation: starting balance + session P&L
+    // Total value uses the same asset-scoped snapshot source for every point.
+    // Mixing an all-assets realtime value into a single-asset series creates
+    // artificial right-edge spikes/vertical lines.
     let totalValue: number;
 
-    if (isLatestPoint && currentPortfolio) {
-      // Use accurate real-time data for the most recent point
-      totalValue = parseFloat(currentPortfolio.total_value);
-    } else if (row.total_value) {
+    if (row.total_value) {
       // Use historical total value stored in snapshot (cash + positions at that time)
       totalValue = parseFloat(row.total_value);
     } else {

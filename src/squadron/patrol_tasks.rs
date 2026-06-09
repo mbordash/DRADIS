@@ -174,8 +174,29 @@ async fn calculate_positions_value(
         dec!(0)
     };
 
-    let mut total_value = dec!(0);
+    // If the same token appears multiple times (e.g. one chain-adopted row plus one
+    // strategy-owned row), value it once to avoid portfolio inflation.
+    let mut deduped_by_token: std::collections::HashMap<String, db::OpenPositionRow> =
+        std::collections::HashMap::new();
     for pos in positions {
+        match deduped_by_token.get(&pos.token_id) {
+            None => {
+                deduped_by_token.insert(pos.token_id.clone(), pos);
+            }
+            Some(existing) => {
+                let existing_shares = existing.shares.parse::<Decimal>().unwrap_or(dec!(0));
+                let candidate_shares = pos.shares.parse::<Decimal>().unwrap_or(dec!(0));
+                let replace = (existing.chain_adopted && !pos.chain_adopted)
+                    || (existing.chain_adopted == pos.chain_adopted && candidate_shares > existing_shares);
+                if replace {
+                    deduped_by_token.insert(pos.token_id.clone(), pos);
+                }
+            }
+        }
+    }
+
+    let mut total_value = dec!(0);
+    for (_, pos) in deduped_by_token {
         // Parse shares
         let shares = match pos.shares.parse::<Decimal>() {
             Ok(s) => s,
