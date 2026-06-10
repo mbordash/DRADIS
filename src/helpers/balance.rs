@@ -66,6 +66,7 @@ pub async fn sync_position_balance(
     phantom_cooldowns: Option<&PhantomCooldowns>,
     baseline_shares: Decimal,
     max_wait_secs: i64,
+    token_ownership: &Arc<Mutex<HashMap<U256, String>>>,
 ) -> Result<()> {
     let key = (strategy_name.to_string(), token_id);
     let check_interval_ms: u64 = 3000;
@@ -140,6 +141,8 @@ pub async fn sync_position_balance(
                     }
                     error!("⚠️ Position Sync FAILED [{}] Token {} — phantom removed.", strategy_name, token_id);
                     positions.lock().await.remove(&key);
+                    // Release token claim — position was phantom/never filled.
+                    token_ownership.lock().await.remove(&token_id);
                     if let Some(cooldowns) = phantom_cooldowns {
                         cooldowns.lock().await.insert(format!("{}:{}", strategy_name, token_id), Instant::now());
                     }
