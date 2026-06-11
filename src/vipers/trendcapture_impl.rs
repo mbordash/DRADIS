@@ -204,12 +204,11 @@ impl Strategy for TrendCaptureStrategyImpl {
         let _ = (bull_reversal_thr, bear_reversal_thr); // used only in exit
 
         // ── 60m drift alignment gate ──────────────────────────────────────────
-        // REQUIREMENT: 60m drift MUST confirm the 10m direction.
-        // We require at least 10 minutes of oracle history (drift_60m != 0) before entry.
-        // A 10m spike that contradicts the 60m trend is a counter-trend bounce — skip.
-        // Changed from optional to mandatory: no trades until 10+ minutes of history exists.
-        let drift_60m_blocks_bull = drift_60m == dec!(0) || drift_60m < bull_drift_60m_thr;
-        let drift_60m_blocks_bear = drift_60m == dec!(0) || drift_60m > bear_drift_60m_thr;
+        // OPTIMIZATION: Removed mandatory 60m gate alignment to stop buying into
+        // late-stage trend exhaustion. We now allow entries on fresh 10m momentum
+        // even if the macro 60m indicator hasn't completely turned yet.
+        let drift_60m_blocks_bull = false;
+        let drift_60m_blocks_bear = false;
 
         // ── OBI adverse-direction veto ────────────────────────────────────────
         let yes_total_depth = snap.yes_bid_depth + snap.yes_ask_depth;
@@ -251,10 +250,11 @@ impl Strategy for TrendCaptureStrategyImpl {
             let strength = (drift_abs / thr)
                 .max(Decimal::ONE)
                 .min(config::TRENDCAPTURE_KELLY_MAX_MULTIPLIER);
-            let fraction = (strength - Decimal::ONE)
-                / (config::TRENDCAPTURE_KELLY_MAX_MULTIPLIER - Decimal::ONE);
-            dc.trendcapture_min_trade_size_usdc
-                + fraction * (dc.trendcapture_max_trade_size_usdc - dc.trendcapture_min_trade_size_usdc)
+            let fraction = (strength - Decimal::ONE) / (config::TRENDCAPTURE_KELLY_MAX_MULTIPLIER - Decimal::ONE);
+
+            // Scale trade sizing down by 50% to mitigate risk while working with wider stop-losses
+            let base_size = dc.trendcapture_min_trade_size_usdc + fraction * (dc.trendcapture_max_trade_size_usdc - dc.trendcapture_min_trade_size_usdc);
+            base_size * dec!(0.50)
         };
 
         // ── Macro: entry OrderParams ───────────────────────────────────────────
@@ -268,8 +268,8 @@ impl Strategy for TrendCaptureStrategyImpl {
                     is_neg_risk:  market.is_neg_risk,
                     market_name:  market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
-                    order_type:   OrderType::FAK,
-                    post_only:    false,
+                    order_type:   OrderType::LIMIT,
+                    post_only:    true,
                     ghost_mode:   dc.ghost_mode,
                 }
             };
@@ -387,9 +387,9 @@ impl Strategy for TrendCaptureStrategyImpl {
         let secs_left_opt = market.market_close_time
             .map(|ct| (ct - Utc::now()).num_seconds());
         let stop_loss_pct = match secs_left_opt {
-            Some(s) if s < config::TRENDCAPTURE_LATE_MARKET_SL_SECS =>
-                config::TRENDCAPTURE_LATE_MARKET_STOP_LOSS_PERCENT,
-            _ => dc.trendcapture_stop_loss_pct,
+            Some(s) if s < config::TRENDCAPTURE_LATE_MARKET_SL_SECS => config::TRENDCAPTURE_LATE_MARKET_STOP_LOSS_PERCENT,
+            // Scale out the stop-loss slightly to give binary option deltas structural breathing room
+            _ => dc.trendcapture_stop_loss_pct * dec!(1.5),
         };
 
         // Collect exit decision inside the lock scope, then act outside it.
@@ -518,8 +518,8 @@ impl Strategy for TrendCaptureStrategyImpl {
                     is_neg_risk:  p.is_neg_risk,
                     market_name:  p.market_name,
                     condition_id: p.condition_id,
-                    order_type:   OrderType::FAK,
-                    post_only:    false,
+                    order_type:   OrderType::LIMIT,
+                    post_only:    true,
                     ghost_mode:   p.ghost_mode,
                 },
                 reason:    p.reason,
