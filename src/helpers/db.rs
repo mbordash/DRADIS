@@ -320,6 +320,17 @@ async fn run_migrations(pool: &SqlitePool) {
     // Add total_value to pnl_snapshots (Phase 3f-7: proper portfolio value tracking)
     let _ = sqlx::query("ALTER TABLE pnl_snapshots ADD COLUMN total_value TEXT")
         .execute(pool).await;
+    // 1. Composite index for trade execution bubbles (Fixes main chart latency)
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_trades_session_ts ON trades(session_id, ts)")
+        .execute(pool).await;
+
+    // 2. Composite index for active entry position bubbles
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_open_positions_session_ts ON open_positions(session_id, ts)")
+        .execute(pool).await;
+
+    // 3. Composite index for the historical P&L time-series snapshots
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_pnl_snapshots_session_ts ON pnl_snapshots(session_id, ts)")
+        .execute(pool).await;
 }
 
 // ─── Session lifecycle ───────────────────────────────────────────────────────
