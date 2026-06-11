@@ -268,7 +268,7 @@ impl Strategy for TrendCaptureStrategyImpl {
                     is_neg_risk:  market.is_neg_risk,
                     market_name:  market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
-                    order_type:   OrderType::LIMIT,
+                    order_type:   OrderType::GTC,
                     post_only:    true,
                     ghost_mode:   dc.ghost_mode,
                 }
@@ -518,7 +518,7 @@ impl Strategy for TrendCaptureStrategyImpl {
                     is_neg_risk:  p.is_neg_risk,
                     market_name:  p.market_name,
                     condition_id: p.condition_id,
-                    order_type:   OrderType::LIMIT,
+                    order_type:   OrderType::GTC,
                     post_only:    true,
                     ghost_mode:   p.ghost_mode,
                 },
