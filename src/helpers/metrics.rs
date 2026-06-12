@@ -66,22 +66,32 @@ pub async fn record_entry(
 /// Returns `(entry_price, strategy_name)`, or None if no record exists.
 ///
 /// Checks open_positions table first (highest authority), then falls back to entries table.
+/// Searches ALL asset-specific DBs (btc, eth, sol) so that ETH/SOL position records
+/// are found correctly — not just the primary (BTC) pool.
 /// Used by `reconcile_orphaned_positions` to recover entry prices and assign positions
 /// to the correct strategy after bot restarts.
 pub async fn lookup_entry_from_csv(token_id_str: &str) -> Option<(Decimal, String)> {
-    // ── open_positions table (highest authority) ──────────────────────────────
-    if let Some(pool) = db::pool() {
-        if let Some((price, strategy)) = db::lookup_open_position_strategy(pool, token_id_str).await {
-            info!("📦 DB: found open_position strategy={} entry_price={} for token {}", strategy, price, token_id_str);
-            return Some((price, strategy));
+    // ── open_positions table: search ALL asset DBs (highest authority) ────────
+    // Bug fix (2026-06-12): previously only checked db::pool() which is the primary
+    // (BTC) pool.  ETH/SOL open_position records were never found, causing all
+    // reconciled ETH/SOL positions to fall back to "discount@25%" and be wrongly
+    // attributed to MomentumStrategy instead of the originating strategy.
+    for asset in db::available_assets() {
+        if let Some(pool) = db::pool_for(&asset) {
+            if let Some((price, strategy)) = db::lookup_open_position_strategy(&pool, token_id_str).await {
+                info!("📦 DB: found open_position strategy={} entry_price={} for token {} (asset={})", strategy, price, token_id_str, asset);
+                return Some((price, strategy));
+            }
         }
     }
 
-    // ── entries table (fallback) ──────────────────────────────────────────────
-    if let Some(pool) = db::pool() {
-        if let Some((price, strategy)) = db::lookup_entry_db(pool, token_id_str).await {
-            info!("📦 DB: found entry_price={} strategy={} for token {}", price, strategy, token_id_str);
-            return Some((price, strategy));
+    // ── entries table: search ALL asset DBs (fallback) ───────────────────────
+    for asset in db::available_assets() {
+        if let Some(pool) = db::pool_for(&asset) {
+            if let Some((price, strategy)) = db::lookup_entry_db(&pool, token_id_str).await {
+                info!("📦 DB: found entry_price={} strategy={} for token {} (asset={})", price, strategy, token_id_str, asset);
+                return Some((price, strategy));
+            }
         }
     }
 

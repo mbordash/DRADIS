@@ -9,6 +9,7 @@ import LlmAdvisorCard  from '@/components/LlmAdvisorCard';
 import OpenPositionsCard from '@/components/OpenPositionsCard';
 import SquadronsPanel  from '@/components/SquadronsPanel';
 import SquadronDetailView from '@/components/SquadronDetailView';
+import TradelogPage    from '@/components/TradelogPage';
 import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getPortfolioValue, getSquadrons } from '@/lib/api';
 import type { DynamicConfig, SquadronSummary } from '@/lib/types';
 
@@ -221,7 +222,46 @@ function PortfolioValueBanner({
 
 // ── Main page ─────────────────────────────────────────────────────────────────
 
+// ── Top-level nav ─────────────────────────────────────────────────────────────
+
+type AppView = 'main' | 'tradelog';
+
+function NavTabs({
+  active,
+  onChange,
+}: {
+  active: AppView;
+  onChange: (v: AppView) => void;
+}) {
+  const tabs: { id: AppView; label: string; icon: string }[] = [
+    { id: 'main',     label: 'Main',     icon: '🗺️' },
+    { id: 'tradelog', label: 'Tradelog', icon: '📋' },
+  ];
+  return (
+    <div className="flex items-center gap-1">
+      {tabs.map(t => (
+        <button
+          key={t.id}
+          onClick={() => onChange(t.id)}
+          className={[
+            'flex items-center gap-1.5 text-xs font-mono px-3 py-1.5 rounded-lg border transition-colors',
+            active === t.id
+              ? 'bg-indigo-500/20 border-indigo-500/40 text-indigo-300'
+              : 'bg-[#13131f] border-[#1e1e32] text-gray-500 hover:border-gray-600 hover:text-gray-300',
+          ].join(' ')}
+        >
+          <span>{t.icon}</span>
+          <span>{t.label}</span>
+        </button>
+      ))}
+    </div>
+  );
+}
+
 export default function DashboardPage() {
+  // ── Top-level view (Main vs Tradelog) ───────────────────────────────────────
+  const [activeView, setActiveView] = useState<AppView>('main');
+
   // ── Squadron drill-down state ────────────────────────────────────────────────
   const [focusedSquadronId, setFocusedSquadronId] = useState<string | null>(null);
 
@@ -324,10 +364,9 @@ export default function DashboardPage() {
   if (focusedSquadron) {
     return (
       <div className="min-h-screen bg-[#0a0a12]">
-        {/* ── Header ─────────────────────────────────────────────────────────── */}
         <header className="sticky top-0 z-10 border-b border-[#1e1e32] bg-[#0a0a12]/90 backdrop-blur-sm px-6 py-3">
           <div className="max-w-7xl mx-auto relative flex items-center justify-between gap-4">
-            {/* Logo */}
+            {/* Logo + nav */}
             <div className="flex items-center gap-3">
               <div className="flex items-center gap-1.5">
                 <span className="font-mono font-bold text-lg tracking-wide text-indigo-400">DRADIS</span>
@@ -337,6 +376,7 @@ export default function DashboardPage() {
               <span className="hidden sm:inline text-xs bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 rounded px-2 py-0.5 font-mono">
                 v0.4.0
               </span>
+              <NavTabs active={activeView} onChange={(v) => { setActiveView(v); if (v === 'main') setFocusedSquadronId(null); }} />
             </div>
 
             {/* Center — BSG motto */}
@@ -363,7 +403,7 @@ export default function DashboardPage() {
                       : 'bg-[#13131f] border-[#1e1e32] text-gray-400 hover:border-gray-600',
                   ].join(' ')}
                 >
-                  <span>{config.ghost_mode ? '👻' : '⚡'}</span>
+                  <span>{config.ghost_mode ? '' : '⚡'}</span>
                   <span>{config.ghost_mode ? 'GHOST' : 'LIVE'}</span>
                 </button>
               )}
@@ -371,12 +411,11 @@ export default function DashboardPage() {
           </div>
         </header>
 
-        {/* ── Body ───────────────────────────────────────────────────────────── */}
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <SquadronDetailView squadron={focusedSquadron} onBack={handleBackToCag} />
           <footer className="text-center text-xs text-gray-700 pb-4 font-mono mt-12">
-            DRADIS Control Tower · Polymarket CLOB Orchestrator ·{' '}
+            DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}
             <span className="text-gray-600">So say we all.</span>
           </footer>
         </main>
@@ -391,7 +430,7 @@ export default function DashboardPage() {
       {/* ── Header ─────────────────────────────────────────────────────────── */}
       <header className="sticky top-0 z-10 border-b border-[#1e1e32] bg-[#0a0a12]/90 backdrop-blur-sm px-6 py-3">
         <div className="max-w-7xl mx-auto relative flex items-center justify-between gap-4">
-          {/* Logo */}
+          {/* Logo + nav tabs */}
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-1.5">
               <span className="font-mono font-bold text-lg tracking-wide text-indigo-400">DRADIS</span>
@@ -399,8 +438,9 @@ export default function DashboardPage() {
               <span className="text-gray-400 text-sm font-medium">Control Tower</span>
             </div>
             <span className="hidden sm:inline text-xs bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 rounded px-2 py-0.5 font-mono">
-              v0.3.0
+              v0.4.0
             </span>
+            <NavTabs active={activeView} onChange={setActiveView} />
           </div>
 
           {/* Center — BSG motto */}
@@ -410,19 +450,13 @@ export default function DashboardPage() {
 
           {/* Right cluster */}
           <div className="flex items-center gap-3">
-
-            {/* Session start time */}
             <SessionBadge startedAt={status?.session_started_at} />
-
-            {/* API status */}
             <div className="flex items-center gap-1.5">
               <span className={`h-2 w-2 rounded-full ${isConnected ? 'bg-green-400 animate-pulse' : 'bg-red-500'}`} />
               <span className={`text-xs font-mono ${isConnected ? 'text-green-400' : 'text-red-400'}`}>
                 {isConnected ? 'LIVE' : 'OFFLINE'}
               </span>
             </div>
-
-            {/* Ghost mode toggle */}
             {config && (
               <button
                 onClick={() => handlePatch({ ghost_mode: !config.ghost_mode })}
@@ -441,7 +475,20 @@ export default function DashboardPage() {
         </div>
       </header>
 
-      {/* ── Body ───────────────────────────────────────────────────────────── */}
+      {/* ── Tradelog view ──────────────────────────────────────────────────── */}
+      {activeView === 'tradelog' && (
+        <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+          {config?.ghost_mode && <GhostBanner ghost />}
+          <TradelogPage availableAssets={availableAssets} />
+          <footer className="text-center text-xs text-gray-700 pb-4 font-mono">
+            DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}
+            <span className="text-gray-600">So say we all.</span>
+          </footer>
+        </main>
+      )}
+
+      {/* ── Main view ──────────────────────────────────────────────────────── */}
+      {activeView === 'main' && (
       <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
 
         {/* Ghost mode banner */}
@@ -523,13 +570,13 @@ export default function DashboardPage() {
           />
         </section>
 
-
         {/* Footer */}
         <footer className="text-center text-xs text-gray-700 pb-4 font-mono">
-          DRADIS Control Tower · Polymarket CLOB Orchestrator ·{' '}
+          DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}
           <span className="text-gray-600">So say we all.</span>
         </footer>
       </main>
+      )}
     </div>
   );
 }

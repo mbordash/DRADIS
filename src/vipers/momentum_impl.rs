@@ -382,9 +382,27 @@ impl Strategy for MomentumStrategyImpl {
 
         for ((strategy_name, token_id), position) in pos_map.iter() {
             if strategy_name != "MomentumStrategy" { continue; }
-            let bid = if token_id == &ctx.market.yes_token { ctx.snapshot.yes_bid }
-                      else if token_id == &ctx.market.no_token { ctx.snapshot.no_bid }
-                      else { continue };
+            // Check hourly market first, then maker/daily market.
+            // Bug fix (2026-06-12): positions reconciled from session restart can belong
+            // to the maker market (daily "Up or Down") rather than the hourly market.
+            // Skipping maker-market tokens caused reconciled positions to never hit
+            // stop-loss evaluation, producing uncontrolled losses (e.g. -$5.38 on a
+            // BasisStrategy position wrongly re-attributed to MomentumStrategy).
+            let bid = if token_id == &ctx.market.yes_token {
+                ctx.snapshot.yes_bid
+            } else if token_id == &ctx.market.no_token {
+                ctx.snapshot.no_bid
+            } else if let (Some(mk), Some(mk_snap)) = (&ctx.maker_market, &ctx.maker_snapshot) {
+                if token_id == &mk.yes_token {
+                    mk_snap.yes_bid
+                } else if token_id == &mk.no_token {
+                    mk_snap.no_bid
+                } else {
+                    continue
+                }
+            } else {
+                continue
+            };
 
             let secs_held = (chrono::Utc::now() - position.opened_at).num_seconds();
             if position.fill_confirmed_at.is_none() {
@@ -414,6 +432,20 @@ impl Strategy for MomentumStrategyImpl {
             if avg_entry <= dec!(0) { continue; }
             let profit_margin = (bid - avg_entry) / avg_entry;
 
+            // Resolve the market this token belongs to (hourly or daily/maker).
+            // Reconciled positions can sit on the maker market even though MomentumStrategy
+            // is normally venue=Hourly.  We need the right market context for exit params
+            // and for the near-expiry check.
+            let is_maker_token = ctx.maker_market.as_ref()
+                .map(|mk| token_id == &mk.yes_token || token_id == &mk.no_token)
+                .unwrap_or(false);
+            let exit_market: &crate::state::MarketConfig = if is_maker_token {
+                ctx.maker_market.as_ref().unwrap()
+            } else {
+                &ctx.market
+            };
+            let exit_close_time = exit_market.market_close_time;
+
             // Macro: build exit params for this token
             macro_rules! exit_params {
                 () => {
@@ -421,10 +453,10 @@ impl Strategy for MomentumStrategyImpl {
                         token_id: *token_id,
                         price: bid,
                         shares: position.shares,
-                        fee_bps: if token_id == &ctx.market.yes_token { ctx.market.yes_fee_bps as u16 } else { ctx.market.no_fee_bps as u16 },
-                        is_neg_risk: ctx.market.is_neg_risk,
-                        market_name: ctx.market.market_name.clone(),
-                        condition_id: ctx.market.condition_id.clone(),
+                        fee_bps: if token_id == &exit_market.yes_token { exit_market.yes_fee_bps as u16 } else { exit_market.no_fee_bps as u16 },
+                        is_neg_risk: exit_market.is_neg_risk,
+                        market_name: exit_market.market_name.clone(),
+                        condition_id: exit_market.condition_id.clone(),
                         order_type: OrderType::FAK,
                         post_only: false,
                         ghost_mode: dc.ghost_mode,
@@ -435,7 +467,7 @@ impl Strategy for MomentumStrategyImpl {
             // Near-expiry forced exit
             // Use net profit (after sell offset) for the hold threshold so we don't
             // artificially "hold" a position that is break-even or negative net of costs.
-            if let Some(close_time) = ctx.market.market_close_time {
+            if let Some(close_time) = exit_close_time {
                 let secs_left = (close_time - chrono::Utc::now()).num_seconds();
                 let net_profit_for_expiry = (bid - config::SELL_PRICE_OFFSET - avg_entry) / avg_entry;
                 if secs_left <= config::MOMENTUM_EXPIRY_EXIT_SECS && net_profit_for_expiry < config::MOMENTUM_EXPIRY_MIN_PROFIT_TO_HOLD {
