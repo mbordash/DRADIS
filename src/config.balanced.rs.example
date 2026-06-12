@@ -70,6 +70,13 @@ pub const EARLY_EXIT_COMBINED_BID_THRESHOLD: Decimal = dec!(0.995);
 // MOMENTUM & ORACLE SETTINGS (Predictive Arbitrage)
 // ============================================================================
 
+/// Scale a percentage-based threshold to an absolute dollar amount using the
+/// current oracle price.  Replaces the old per-asset dollar constants.
+#[inline]
+pub fn oracle_threshold(pct: Decimal, oracle_price: Decimal) -> Decimal {
+    pct * oracle_price
+}
+
 pub const ENABLE_MOMENTUM_TRADING: bool = true;
 
 pub const MOMENTUM_KELLY_MAX_MULTIPLIER: Decimal = dec!(3.0);
@@ -107,6 +114,9 @@ pub const MOMENTUM_DECAY_EXIT_FRACTION: Decimal = dec!(0.25);
 /// Velocity threshold as fraction of oracle price/5s.
 /// 0.001 = 0.10% of price. Balanced: at BTC=$100k → $100/5s.
 pub const MOMENTUM_THRESHOLD_PCT: Decimal = dec!(0.001);
+
+/// Legacy alias kept for LLM advisor prompt references.
+pub const BTC_MOMENTUM_THRESHOLD: Decimal = dec!(100.0);
 
 /// Window market consensus filter — moderate directional veto.
 pub const MOMENTUM_WINDOW_BEARISH_BLOCK: Decimal = dec!(0.30);
@@ -181,6 +191,9 @@ pub const MAKER_MAX_BOOK_IMBALANCE_RATIO: Decimal = dec!(3.0);
 /// Balanced: suppress entry when 40%+ of bid depth drains in 1.5s;
 /// exit on a moderately adverse book turn (OBI < -0.50).
 pub const MAKER_TAKER_FLOW_WINDOW_MS: u64 = 1500;
+/// Minimum elapsed ms between depth snapshots before the drain check runs.
+/// Prevents price-level rotation (normal tick moves) from false-triggering suppression.
+pub const MAKER_TAKER_FLOW_MIN_ELAPSED_MS: u64 = 500;
 pub const MAKER_TAKER_FLOW_DRAIN_THRESHOLD: Decimal = dec!(0.40);
 pub const MAKER_TOXIC_FLOW_EXIT_OBI: Decimal = dec!(-0.50);
 
