@@ -1131,7 +1131,7 @@ impl Strategy for GboostStrategyImpl {
         //   drift < -$200  → downtrend → block YES entries
         // Mirrors MAKER_SLOW_TREND_THRESHOLD_BTC and TIME_DECAY_MAX_SLOW_DRIFT_BTC.
         let drift_60m = ctx.snapshot.oracle_drift_60m;
-        let trend_block = config::GBOOST_TREND_DRIFT_BLOCK_USD;
+        let trend_block = config::oracle_threshold(config::GBOOST_TREND_DRIFT_BLOCK_PCT, ctx.snapshot.oracle_price);
 
         // ── Below-strike sustained suppressor ────────────────────────────────
         // If the daily market has a known strike price AND BTC spot has been
@@ -1148,7 +1148,7 @@ impl Strategy for GboostStrategyImpl {
             let oracle_price = ctx.snapshot.oracle_price;
             let opt_strike = target_market.strike_price;
             if let Some(strike) = opt_strike {
-                let buffer = config::BASIS_BTC_ORACLE_STRIKE_BUFFER;
+                let buffer = config::oracle_threshold(config::BASIS_ORACLE_STRIKE_BUFFER_PCT, oracle_price);
                 let threshold = strike - buffer;
                 let mut bss = self.below_strike_since.lock().unwrap();
                 if oracle_price < threshold {
@@ -1201,8 +1201,8 @@ impl Strategy for GboostStrategyImpl {
             if below_strike_suppressed_for_yes {
                 tracing::debug!(
                     "🚫 GBoost YES entry veto: below-strike suppressed \
-                     (BTC spot below daily_strike − ${:.0} for ≥ {}min)",
-                    config::BASIS_BTC_ORACLE_STRIKE_BUFFER,
+                     (BTC spot below daily_strike − {:.2}% for ≥ {}min)",
+                    config::BASIS_ORACLE_STRIKE_BUFFER_PCT * rust_decimal::Decimal::from(100),
                     config::GBOOST_BELOW_STRIKE_SUPPRESS_SECS / 60
                 );
                 return Ok(StrategySignal::NoSignal);

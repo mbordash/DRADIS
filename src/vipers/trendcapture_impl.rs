@@ -176,49 +176,19 @@ impl Strategy for TrendCaptureStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
-        // ── Determine thresholds per asset ─────────────────────────────────
-        let (bull_drift_10m_thr, bear_drift_10m_thr,
-             _bull_drift_60m_thr, _bear_drift_60m_thr,
-             bull_strike_gap,    bear_strike_gap,
-             bull_reversal_thr,  bear_reversal_thr) =
-        match ctx.crypto_filter.as_str() {
-            "eth" => (
-                config::TRENDCAPTURE_BULL_DRIFT_10M_ETH, config::TRENDCAPTURE_BEAR_DRIFT_10M_ETH,
-                config::TRENDCAPTURE_BULL_DRIFT_60M_ETH, config::TRENDCAPTURE_BEAR_DRIFT_60M_ETH,
-                config::TRENDCAPTURE_BULL_STRIKE_GAP_ETH, config::TRENDCAPTURE_BEAR_STRIKE_GAP_ETH,
-                config::TRENDCAPTURE_REVERSAL_DRIFT_ETH,  config::TRENDCAPTURE_REVERSAL_DRIFT_ETH,
-            ),
-            "sol" => (
-                config::TRENDCAPTURE_BULL_DRIFT_10M_SOL, config::TRENDCAPTURE_BEAR_DRIFT_10M_SOL,
-                config::TRENDCAPTURE_BULL_DRIFT_60M_SOL, config::TRENDCAPTURE_BEAR_DRIFT_60M_SOL,
-                config::TRENDCAPTURE_BULL_STRIKE_GAP_SOL, config::TRENDCAPTURE_BEAR_STRIKE_GAP_SOL,
-                config::TRENDCAPTURE_REVERSAL_DRIFT_SOL,  config::TRENDCAPTURE_REVERSAL_DRIFT_SOL,
-            ),
-            _ => (
-                config::TRENDCAPTURE_BULL_DRIFT_10M_BTC, config::TRENDCAPTURE_BEAR_DRIFT_10M_BTC,
-                config::TRENDCAPTURE_BULL_DRIFT_60M_BTC, config::TRENDCAPTURE_BEAR_DRIFT_60M_BTC,
-                config::TRENDCAPTURE_BULL_STRIKE_GAP_BTC, config::TRENDCAPTURE_BEAR_STRIKE_GAP_BTC,
-                config::TRENDCAPTURE_REVERSAL_DRIFT_BTC,  config::TRENDCAPTURE_REVERSAL_DRIFT_BTC,
-            ),
-        };
-        let _ = (bull_reversal_thr, bear_reversal_thr); // used only in exit
+        // ── Determine thresholds via oracle-relative scaling ─────────────────
+        // All thresholds are expressed as a fraction of the current oracle price,
+        // so they stay proportionally calibrated as BTC/ETH/SOL prices change.
+        let oracle_price = ctx.snapshot.oracle_price;
+        let bull_drift_10m_thr = config::oracle_threshold(config::TRENDCAPTURE_DRIFT_10M_PCT, oracle_price);
+        let bear_drift_10m_thr = -bull_drift_10m_thr;
+        let bull_strike_gap    = config::oracle_threshold(config::TRENDCAPTURE_STRIKE_GAP_PCT, oracle_price);
+        let bear_strike_gap    = bull_strike_gap;
+        let exhaustion_thr     = config::oracle_threshold(config::TRENDCAPTURE_EXHAUSTION_DRIFT_60M_PCT, oracle_price);
 
         // ── 60m drift exhaustion ceiling ─────────────────────────────────────
-        // Allow entries on fresh 10m momentum even if the macro 60m trend hasn't
-        // fully aligned yet — but slam the gate shut when the 60m move is so large
-        // that the trend is already exhausted.  This replaces the old hardcoded
-        // `false` (no protection) and the old hard alignment check (too restrictive).
-        //
-        // Examples (BTC, ceiling=$1000):
-        //   drift_60m = +$400 (healthy bull trend)  → bull entry ALLOWED
-        //   drift_60m = +$1200 (exhausted, tail-end) → bull entry BLOCKED
-        //   drift_60m = -$900 (deep bear, still moving) → bear entry ALLOWED
-        //   drift_60m = -$1100 (full crash, dead cat risk) → bear entry BLOCKED
-        let exhaustion_thr = match ctx.crypto_filter.as_str() {
-            "eth" => config::TRENDCAPTURE_EXHAUSTION_DRIFT_60M_ETH,
-            "sol" => config::TRENDCAPTURE_EXHAUSTION_DRIFT_60M_SOL,
-            _     => config::TRENDCAPTURE_EXHAUSTION_DRIFT_60M_BTC,
-        };
+        // Allow entries on fresh 10m momentum but block when the 60m move is so
+        // large the trend is already exhausted (tail-end capitulation risk).
         let drift_60m_blocks_bull = drift_60m >= exhaustion_thr;
         let drift_60m_blocks_bear = drift_60m <= -exhaustion_thr;
 
@@ -388,12 +358,11 @@ impl Strategy for TrendCaptureStrategyImpl {
 
         let drift_10m = ctx.snapshot.oracle_drift_10m;
 
-        // Per-asset reversal threshold
-        let reversal_thr = match ctx.crypto_filter.as_str() {
-            "eth" => config::TRENDCAPTURE_REVERSAL_DRIFT_ETH,
-            "sol" => config::TRENDCAPTURE_REVERSAL_DRIFT_SOL,
-            _     => config::TRENDCAPTURE_REVERSAL_DRIFT_BTC,
-        };
+        // Per-asset reversal threshold — oracle-relative
+        let reversal_thr = config::oracle_threshold(
+            config::TRENDCAPTURE_REVERSAL_DRIFT_PCT,
+            ctx.snapshot.oracle_price,
+        );
 
         // Dynamic SL: tighter in the last hour before expiry
         let secs_left_opt = market.market_close_time

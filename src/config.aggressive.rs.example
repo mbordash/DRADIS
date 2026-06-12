@@ -92,9 +92,8 @@ pub const MOMENTUM_EXPIRY_EXIT_SECS: i64 = 600;
 pub const MOMENTUM_EXPIRY_MIN_PROFIT_TO_HOLD: Decimal = dec!(0.01);
 pub const MOMENTUM_TAKE_PROFIT_CEILING: Decimal = dec!(0.90);
 
-pub const BTC_STRIKE_BUFFER: Decimal = dec!(40.0);
-pub const ETH_STRIKE_BUFFER: Decimal = dec!(4.0);
-pub const SOL_STRIKE_BUFFER: Decimal = dec!(0.15);
+/// Strike buffer as fraction of oracle price. 0.0004 = 0.04% of price. Aggressive: at BTC=$100k → $40.
+pub const STRIKE_BUFFER_PCT: Decimal = dec!(0.0004);
 
 pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.90);
 pub const MAX_MOMENTUM_CROSSING_ENTRY_PRICE: Decimal = dec!(0.78);
@@ -109,9 +108,8 @@ pub const MOMENTUM_DECAY_EXIT_FRACTION: Decimal = dec!(0.15);
 
 /// Raised from $60 → $100: requires stronger velocity confirmation even in aggressive mode.
 /// Root cause fix for 2026-06-05 losses.
-pub const BTC_MOMENTUM_THRESHOLD: Decimal = dec!(100.0);
-pub const ETH_MOMENTUM_THRESHOLD: Decimal = dec!(4.0);
-pub const SOL_MOMENTUM_THRESHOLD: Decimal = dec!(0.40);
+/// Velocity threshold: 0.001 = 0.10% of oracle price/5s. Aggressive: at BTC=$100k → $100/5s.
+pub const MOMENTUM_THRESHOLD_PCT: Decimal = dec!(0.001);
 
 /// Wider window market consensus filter — allows entries even when longer-horizon
 /// market is modestly directional.  Set tighter in balanced/conservative profiles.
@@ -136,12 +134,8 @@ pub const MOMENTUM_OBI_SWING_BLOCK: Decimal = dec!(0.95);
 /// medium-term BTC trend (dead-cat bounce / relief-rally filter).
 /// Aggressive: 3× threshold (-75/+75) — only vetoes extreme contra-trend moves.
 /// Set to dec!(-9999) / dec!(9999) to disable.
-pub const MOMENTUM_BULL_DRIFT_10M_BLOCK_BTC: Decimal = dec!(-75.0);
-pub const MOMENTUM_BULL_DRIFT_10M_BLOCK_ETH: Decimal = dec!(-3.0);
-pub const MOMENTUM_BULL_DRIFT_10M_BLOCK_SOL: Decimal = dec!(-0.30);
-pub const MOMENTUM_BEAR_DRIFT_10M_BLOCK_BTC: Decimal = dec!(75.0);
-pub const MOMENTUM_BEAR_DRIFT_10M_BLOCK_ETH: Decimal = dec!(3.0);
-pub const MOMENTUM_BEAR_DRIFT_10M_BLOCK_SOL: Decimal = dec!(0.30);
+/// 10m drift block: 0.00075 = 0.075% of price. Aggressive: at BTC=$100k → $75. Set to dec!(9999) to disable.
+pub const MOMENTUM_DRIFT_10M_BLOCK_PCT: Decimal = dec!(0.00075);
 
 /// Maximum combined ask sum (YES_ask + NO_ask) allowed for a Momentum entry.
 /// Aggressive: tolerates a wider spread (4-cent combined cap) to maximize fill opportunities.
@@ -196,7 +190,9 @@ pub const MAKER_TAKER_FLOW_DRAIN_THRESHOLD: Decimal = dec!(0.50);
 /// accepts more adverse-selection risk in exchange for fewer early exits.
 pub const MAKER_TOXIC_FLOW_EXIT_OBI: Decimal = dec!(-0.65);
 
-pub const MAKER_SLOW_TREND_THRESHOLD_BTC: Decimal = dec!(200.0);
+pub const MAKER_SLOW_TREND_THRESHOLD_BTC: Decimal = dec!(200.0); // legacy — not used in logic
+/// Slow trend threshold: 0.002 = 0.20% of price. Aggressive: looser threshold ($200 at BTC=$100k).
+pub const MAKER_SLOW_TREND_THRESHOLD_PCT: Decimal = dec!(0.002);
 pub const MAKER_INVENTORY_SKEW_MAX: Decimal = dec!(0.04);
 
 /// Posts immediately after 3 minutes — high adverse-selection risk on new markets.
@@ -222,13 +218,11 @@ pub const BASIS_ENTRY_SKEW_THRESHOLD: Decimal = dec!(0.05);
 
 pub const BASIS_NEGATIVE_FUNDING_THRESHOLD: Decimal = dec!(-0.0001);
 pub const BASIS_POSITIVE_FUNDING_THRESHOLD: Decimal = dec!(0.0001);
-pub const BASIS_BTC_MAX_VELOCITY: Decimal = dec!(40.0);
-pub const BASIS_ETH_MAX_VELOCITY: Decimal = dec!(2.0);
-pub const BASIS_SOL_MAX_VELOCITY: Decimal = dec!(0.20);
-
-pub const BASIS_BTC_ORACLE_STRIKE_BUFFER: Decimal = dec!(250.0);
-pub const BASIS_ETH_ORACLE_STRIKE_BUFFER: Decimal = dec!(12.0);
-pub const BASIS_SOL_ORACLE_STRIKE_BUFFER: Decimal = dec!(0.6);
+/// Basis velocity ceiling: 0.0004 = 0.04% of price/5s. Aggressive: wider gate ($40 at BTC=$100k).
+pub const BASIS_MAX_VELOCITY_PCT: Decimal = dec!(0.0004);
+pub const BASIS_BTC_ORACLE_STRIKE_BUFFER: Decimal = dec!(250.0); // legacy — not used in logic
+/// Strike buffer: 0.0025 = 0.25% of price. Aggressive: wider buffer ($250 at BTC=$100k).
+pub const BASIS_ORACLE_STRIKE_BUFFER_PCT: Decimal = dec!(0.0025);
 
 pub const BASIS_MAX_ENTRY_PRICE: Decimal = dec!(0.60);
 pub const BASIS_TARGET_PROFIT_PERCENT: Decimal = dec!(0.08);
@@ -326,7 +320,8 @@ pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v22f.json";
 pub const GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX: f64 = 0.80;
 /// 60m oracle drift threshold (USD) for the trend-alignment entry gate.
 /// Aggressive: wider at $300 — allows entries in moderate trends; only blocks strong trends.
-pub const GBOOST_TREND_DRIFT_BLOCK_USD: Decimal = dec!(300.0);
+/// 60m trend drift block: 0.003 = 0.30% of price. Aggressive: at BTC=$100k → $300.
+pub const GBOOST_TREND_DRIFT_BLOCK_PCT: Decimal = dec!(0.003);
 pub const GBOOST_MAX_HOURLY_ASK_SUM: Decimal = dec!(1.20);
 pub const GBOOST_MIN_HOURLY_BID_SUM: Decimal = dec!(0.70);
 pub const GBOOST_MIN_SECS_TO_EXPIRY: i64 = 900;
@@ -400,39 +395,25 @@ pub const TRENDCAPTURE_MAX_ENTRY_PRICE: Decimal = dec!(0.78);
 
 // 10m drift entry thresholds — raised from $100 → $200 to filter weak entries.
 // Root cause fix for 2026-06-05 losses.
-pub const TRENDCAPTURE_BULL_DRIFT_10M_BTC: Decimal = dec!(200.0);
-pub const TRENDCAPTURE_BEAR_DRIFT_10M_BTC: Decimal = dec!(-200.0);
-pub const TRENDCAPTURE_BULL_DRIFT_10M_ETH: Decimal = dec!(8.0);
-pub const TRENDCAPTURE_BEAR_DRIFT_10M_ETH: Decimal = dec!(-8.0);
-pub const TRENDCAPTURE_BULL_DRIFT_10M_SOL: Decimal = dec!(0.80);
-pub const TRENDCAPTURE_BEAR_DRIFT_10M_SOL: Decimal = dec!(-0.80);
+// TrendCapture thresholds — PCT-based.
+/// 10m drift: 0.002 = 0.20% of price. 60m confirmation: 0.003 = 0.30% of price.
+pub const TRENDCAPTURE_DRIFT_10M_PCT: Decimal = dec!(0.002);
+pub const TRENDCAPTURE_DRIFT_60M_PCT: Decimal = dec!(0.003);
 
 // 60m confirmation thresholds — raised from $150 → $300 to require sustained trends.
-pub const TRENDCAPTURE_BULL_DRIFT_60M_BTC: Decimal = dec!(300.0);
-pub const TRENDCAPTURE_BEAR_DRIFT_60M_BTC: Decimal = dec!(-300.0);
-pub const TRENDCAPTURE_BULL_DRIFT_60M_ETH: Decimal = dec!(12.0);
-pub const TRENDCAPTURE_BEAR_DRIFT_60M_ETH: Decimal = dec!(-12.0);
-pub const TRENDCAPTURE_BULL_DRIFT_60M_SOL: Decimal = dec!(1.20);
-pub const TRENDCAPTURE_BEAR_DRIFT_60M_SOL: Decimal = dec!(-1.20);
+// (60m drift thresholds merged into TRENDCAPTURE_DRIFT_60M_PCT above)
 
 // 60m exhaustion ceiling — block entries when macro trend has already run too far.
 // Aggressive: wide ceiling ($1500) allows entries later in extended trends.
-pub const TRENDCAPTURE_EXHAUSTION_DRIFT_60M_BTC: Decimal = dec!(1500.0);
-pub const TRENDCAPTURE_EXHAUSTION_DRIFT_60M_ETH: Decimal = dec!(60.0);
-pub const TRENDCAPTURE_EXHAUSTION_DRIFT_60M_SOL: Decimal = dec!(6.0);
+pub const TRENDCAPTURE_EXHAUSTION_DRIFT_60M_PCT: Decimal = dec!(0.015);  // 1.5% = $1500 at BTC=$100k
 
 // Strike gap requirements — raised from $200 → $400 to avoid chop near strike.
-pub const TRENDCAPTURE_BULL_STRIKE_GAP_BTC: Decimal = dec!(400.0);
-pub const TRENDCAPTURE_BEAR_STRIKE_GAP_BTC: Decimal = dec!(400.0);
-pub const TRENDCAPTURE_BULL_STRIKE_GAP_ETH: Decimal = dec!(16.0);
-pub const TRENDCAPTURE_BEAR_STRIKE_GAP_ETH: Decimal = dec!(16.0);
-pub const TRENDCAPTURE_BULL_STRIKE_GAP_SOL: Decimal = dec!(1.30);
-pub const TRENDCAPTURE_BEAR_STRIKE_GAP_SOL: Decimal = dec!(1.30);
+/// Strike gap: 0.004 = 0.40% of price. Aggressive: at BTC=$100k → $400.
+pub const TRENDCAPTURE_STRIKE_GAP_PCT: Decimal = dec!(0.004);
 
 // Reversal thresholds — aggressive: looser; only exit on strong counter-drift.
-pub const TRENDCAPTURE_REVERSAL_DRIFT_BTC: Decimal = dec!(100.0);
-pub const TRENDCAPTURE_REVERSAL_DRIFT_ETH: Decimal = dec!(4.0);
-pub const TRENDCAPTURE_REVERSAL_DRIFT_SOL: Decimal = dec!(0.40);
+/// Reversal drift: 0.001 = 0.10% of price. Aggressive: needs stronger reversal ($100 at BTC=$100k) before exiting.
+pub const TRENDCAPTURE_REVERSAL_DRIFT_PCT: Decimal = dec!(0.001);
 
 pub const TRENDCAPTURE_MAX_SNAPSHOT_AGE_SECS: i64 = 15;
 pub const TRENDCAPTURE_MIN_SECS_TO_EXPIRY: i64 = 1200;  // 20 min — enter closer to expiry
@@ -496,12 +477,10 @@ pub const TIME_DECAY_STOP_LOSS_COOLDOWN_SECS: u64 = 600;
 
 /// Oracle volatility gate — aggressive: allows entry in moderately active markets.
 /// Stop only tightens to 70% during vol spikes (accepts more drawdown before exiting).
-pub const TIME_DECAY_MAX_FAST_VELOCITY_BTC: Decimal = dec!(25.0);
-pub const TIME_DECAY_MAX_FAST_VELOCITY_ETH: Decimal = dec!(1.25);
-pub const TIME_DECAY_MAX_FAST_VELOCITY_SOL: Decimal = dec!(0.125);
-pub const TIME_DECAY_MAX_SLOW_DRIFT_BTC: Decimal = dec!(300.0);
-pub const TIME_DECAY_MAX_SLOW_DRIFT_ETH: Decimal = dec!(12.0);
-pub const TIME_DECAY_MAX_SLOW_DRIFT_SOL: Decimal = dec!(1.20);
+/// Fast velocity gate: 0.00025 = 0.025% of price/5s. Aggressive: wider ($25 at BTC=$100k).
+pub const TIME_DECAY_MAX_FAST_VELOCITY_PCT: Decimal = dec!(0.00025);
+/// Slow drift gate: 0.003 = 0.30% of price/hour. Aggressive: wider ($300 at BTC=$100k).
+pub const TIME_DECAY_MAX_SLOW_DRIFT_PCT: Decimal = dec!(0.003);
 pub const TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER: Decimal = dec!(0.70);
 
 /// Price bounds: only enter when genuine market uncertainty exists.

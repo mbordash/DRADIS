@@ -335,10 +335,9 @@ fn build_user_prompt(
         dyn_cfg.momentum_max_exposure_usdc,
     ));
     lines.push(format!(
-        "  Velocity thresholds (static): BTC=${}/5s, ETH=${}/5s, SOL=${}/5s | short_window_fraction={} | max_entry_price=${}",
+        "  Velocity threshold: {:.3}% of oracle price/5s (e.g. BTC@$100k → ${}/5s) | short_window_fraction={} | max_entry_price=${}",
+        config::MOMENTUM_THRESHOLD_PCT * rust_decimal_macros::dec!(100),
         config::BTC_MOMENTUM_THRESHOLD,
-        config::ETH_MOMENTUM_THRESHOLD,
-        config::SOL_MOMENTUM_THRESHOLD,
         config::MOMENTUM_SHORT_WINDOW_FRACTION,
         config::MAX_MOMENTUM_ENTRY_PRICE,
     ));

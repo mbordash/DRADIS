@@ -79,12 +79,10 @@ impl Strategy for BasisStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
-        // ── Select per-crypto constants ───────────────────────────────────────
-        let (max_velocity, oracle_buffer) = match ctx.crypto_filter.as_str() {
-            "eth" => (config::BASIS_ETH_MAX_VELOCITY, config::BASIS_ETH_ORACLE_STRIKE_BUFFER),
-            "sol" => (config::BASIS_SOL_MAX_VELOCITY, config::BASIS_SOL_ORACLE_STRIKE_BUFFER),
-            _     => (config::BASIS_BTC_MAX_VELOCITY, config::BASIS_BTC_ORACLE_STRIKE_BUFFER),
-        };
+        // ── Oracle-relative thresholds ─────────────────────────────────────────
+        let oracle_price  = ctx.snapshot.oracle_price;
+        let max_velocity  = config::oracle_threshold(config::BASIS_MAX_VELOCITY_PCT, oracle_price);
+        let oracle_buffer = config::oracle_threshold(config::BASIS_ORACLE_STRIKE_BUFFER_PCT, oracle_price);
 
         // ── Gate 1: Binance is flat ──────────────────────────────────────────
         if ctx.snapshot.velocity.abs() >= max_velocity {

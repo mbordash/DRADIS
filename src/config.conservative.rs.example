@@ -98,9 +98,8 @@ pub const MOMENTUM_EXPIRY_MIN_PROFIT_TO_HOLD: Decimal = dec!(0.03);
 pub const MOMENTUM_TAKE_PROFIT_CEILING: Decimal = dec!(0.90);
 
 /// Tighter strike buffers — only trade when well away from the strike.
-pub const BTC_STRIKE_BUFFER: Decimal = dec!(100.0);
-pub const ETH_STRIKE_BUFFER: Decimal = dec!(8.0);
-pub const SOL_STRIKE_BUFFER: Decimal = dec!(0.5);
+/// 0.001 = 0.10% of price. Conservative: 0.001 at BTC=$100k → $100.
+pub const STRIKE_BUFFER_PCT: Decimal = dec!(0.001);
 
 /// Lower max entry price — better risk/reward at conservative prices.
 pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.80);
@@ -114,10 +113,9 @@ pub const MOMENTUM_SHORT_WINDOW_FRACTION: Decimal = dec!(0.60);
 pub const MOMENTUM_ACCELERATION_BYPASS_MULTIPLIER: Decimal = dec!(3.5);
 pub const MOMENTUM_DECAY_EXIT_FRACTION: Decimal = dec!(0.30);
 
-/// Higher threshold — only the strongest BTC moves trigger entry.
-pub const BTC_MOMENTUM_THRESHOLD: Decimal = dec!(100.0);
-pub const ETH_MOMENTUM_THRESHOLD: Decimal = dec!(5.0);
-pub const SOL_MOMENTUM_THRESHOLD: Decimal = dec!(0.5);
+/// Higher threshold — only the strongest moves trigger entry.
+/// 0.001 = 0.10% of oracle price/5s. Conservative: same PCT as default.
+pub const MOMENTUM_THRESHOLD_PCT: Decimal = dec!(0.001);
 
 /// Narrow window consensus filter — blocks entries unless longer-horizon market is near 50/50.
 pub const MOMENTUM_WINDOW_BEARISH_BLOCK: Decimal = dec!(0.35);
@@ -137,17 +135,9 @@ pub const MOMENTUM_OBI_EXHAUST_MAX_ADVERSE_PCT: Decimal = dec!(-0.08);
 /// Conservative: 0.65 — strictest gate; blocks any significant book-side oscillation.
 pub const MOMENTUM_OBI_SWING_BLOCK: Decimal = dec!(0.65);
 
-/// 10-minute oracle drift alignment gate — blocks momentum entries that contradict the
-/// medium-term BTC trend (dead-cat bounce / relief-rally filter).
-/// Conservative: 1× threshold (-25/+25) — stricter; any contra-trend 5s spike is vetoed
-/// unless BTC has only drifted $25 in 10m (very flat market).
-/// Set to dec!(-9999) / dec!(9999) to disable.
-pub const MOMENTUM_BULL_DRIFT_10M_BLOCK_BTC: Decimal = dec!(-25.0);
-pub const MOMENTUM_BULL_DRIFT_10M_BLOCK_ETH: Decimal = dec!(-1.0);
-pub const MOMENTUM_BULL_DRIFT_10M_BLOCK_SOL: Decimal = dec!(-0.10);
-pub const MOMENTUM_BEAR_DRIFT_10M_BLOCK_BTC: Decimal = dec!(25.0);
-pub const MOMENTUM_BEAR_DRIFT_10M_BLOCK_ETH: Decimal = dec!(1.0);
-pub const MOMENTUM_BEAR_DRIFT_10M_BLOCK_SOL: Decimal = dec!(0.10);
+/// 10-minute oracle drift block as fraction of oracle price.
+/// Conservative: 0.00025 = 0.025% — stricter; blocks contra-trend entries on smaller moves.
+pub const MOMENTUM_DRIFT_10M_BLOCK_PCT: Decimal = dec!(0.00025);
 
 /// Maximum combined ask sum (YES_ask + NO_ask) allowed for a Momentum entry.
 /// Conservative: tight 2-cent spread cap — only enter on near-perfect books.
@@ -206,8 +196,10 @@ pub const MAKER_TAKER_FLOW_DRAIN_THRESHOLD: Decimal = dec!(0.30);
 /// the book has fully turned, accepting a smaller realized loss over a larger one.
 pub const MAKER_TOXIC_FLOW_EXIT_OBI: Decimal = dec!(-0.35);
 
-pub const MAKER_SLOW_TREND_THRESHOLD_BTC: Decimal = dec!(400.0);
-pub const MAKER_INVENTORY_SKEW_MAX: Decimal = dec!(0.02);
+pub const MAKER_SLOW_TREND_THRESHOLD_BTC: Decimal = dec!(400.0); // legacy — not used in logic
+/// Slow trend threshold as fraction of oracle price.
+/// 0.004 = 0.40% of price. Conservative: wider threshold before suppressing bids.
+pub const MAKER_SLOW_TREND_THRESHOLD_PCT: Decimal = dec!(0.004);
 
 /// Waits 10 minutes after market open before posting any maker orders.
 pub const MAKER_MIN_MARKET_AGE_SECS: i64 = 600;
@@ -235,13 +227,13 @@ pub const BASIS_NEGATIVE_FUNDING_THRESHOLD: Decimal = dec!(-0.0001);
 pub const BASIS_POSITIVE_FUNDING_THRESHOLD: Decimal = dec!(0.0001);
 
 /// More conservative velocity filter — only fades truly flat markets.
-pub const BASIS_BTC_MAX_VELOCITY: Decimal = dec!(20.0);
-pub const BASIS_ETH_MAX_VELOCITY: Decimal = dec!(1.0);
-pub const BASIS_SOL_MAX_VELOCITY: Decimal = dec!(0.1);
+/// 0.0002 = 0.020% of oracle price/5s. Conservative: tighter than balanced (0.0003).
+pub const BASIS_MAX_VELOCITY_PCT: Decimal = dec!(0.0002);
 
-pub const BASIS_BTC_ORACLE_STRIKE_BUFFER: Decimal = dec!(150.0);
-pub const BASIS_ETH_ORACLE_STRIKE_BUFFER: Decimal = dec!(8.0);
-pub const BASIS_SOL_ORACLE_STRIKE_BUFFER: Decimal = dec!(0.4);
+pub const BASIS_BTC_ORACLE_STRIKE_BUFFER: Decimal = dec!(150.0); // legacy — not used in logic
+/// Strike buffer as fraction of oracle price.
+/// 0.0015 = 0.15% of price. At BTC=$100k → $150.
+pub const BASIS_ORACLE_STRIKE_BUFFER_PCT: Decimal = dec!(0.0015);
 
 pub const BASIS_MAX_ENTRY_PRICE: Decimal = dec!(0.55);
 pub const BASIS_TARGET_PROFIT_PERCENT: Decimal = dec!(0.08);
@@ -405,41 +397,25 @@ pub const TRENDCAPTURE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.22);
 pub const TRENDCAPTURE_STOP_LOSS_PERCENT: Decimal = dec!(0.06);
 pub const TRENDCAPTURE_MAX_ENTRY_PRICE: Decimal = dec!(0.68);
 
-// 10m drift entry thresholds — conservative: higher threshold, requires a very
-// strong and clear directional move before entering.
-pub const TRENDCAPTURE_BULL_DRIFT_10M_BTC: Decimal = dec!(200.0);
-pub const TRENDCAPTURE_BEAR_DRIFT_10M_BTC: Decimal = dec!(-200.0);
-pub const TRENDCAPTURE_BULL_DRIFT_10M_ETH: Decimal = dec!(8.0);
-pub const TRENDCAPTURE_BEAR_DRIFT_10M_ETH: Decimal = dec!(-8.0);
-pub const TRENDCAPTURE_BULL_DRIFT_10M_SOL: Decimal = dec!(0.80);
-pub const TRENDCAPTURE_BEAR_DRIFT_10M_SOL: Decimal = dec!(-0.80);
+// 10m drift entry thresholds — PCT-based, oracle-relative.
+/// 0.002 = 0.20% of oracle price. Conservative: same as balanced — requires clear directional move.
+pub const TRENDCAPTURE_DRIFT_10M_PCT: Decimal = dec!(0.002);
 
-// 60m confirmation thresholds — conservative: stronger confirmation required.
-pub const TRENDCAPTURE_BULL_DRIFT_60M_BTC: Decimal = dec!(300.0);
-pub const TRENDCAPTURE_BEAR_DRIFT_60M_BTC: Decimal = dec!(-300.0);
-pub const TRENDCAPTURE_BULL_DRIFT_60M_ETH: Decimal = dec!(12.0);
-pub const TRENDCAPTURE_BEAR_DRIFT_60M_ETH: Decimal = dec!(-12.0);
-pub const TRENDCAPTURE_BULL_DRIFT_60M_SOL: Decimal = dec!(1.20);
-pub const TRENDCAPTURE_BEAR_DRIFT_60M_SOL: Decimal = dec!(-1.20);
+// 60m confirmation thresholds — PCT-based.
+/// 0.003 = 0.30% of price. Conservative: same as balanced.
+pub const TRENDCAPTURE_DRIFT_60M_PCT: Decimal = dec!(0.003);
 
-// 60m exhaustion ceiling — block entries when macro trend has already run too far.
-// Conservative: tighter ceiling ($700) exits the trade window earlier in extended moves.
-pub const TRENDCAPTURE_EXHAUSTION_DRIFT_60M_BTC: Decimal = dec!(700.0);
-pub const TRENDCAPTURE_EXHAUSTION_DRIFT_60M_ETH: Decimal = dec!(28.0);
-pub const TRENDCAPTURE_EXHAUSTION_DRIFT_60M_SOL: Decimal = dec!(2.8);
+// 60m exhaustion ceiling — PCT-based.
+/// 0.007 = 0.70% of price. Conservative: tighter ceiling ($700 at BTC=$100k).
+pub const TRENDCAPTURE_EXHAUSTION_DRIFT_60M_PCT: Decimal = dec!(0.007);
 
-// Strike gap requirements — conservative: larger gap; only enter on established moves.
-pub const TRENDCAPTURE_BULL_STRIKE_GAP_BTC: Decimal = dec!(500.0);
-pub const TRENDCAPTURE_BEAR_STRIKE_GAP_BTC: Decimal = dec!(500.0);
-pub const TRENDCAPTURE_BULL_STRIKE_GAP_ETH: Decimal = dec!(20.0);
-pub const TRENDCAPTURE_BEAR_STRIKE_GAP_ETH: Decimal = dec!(20.0);
-pub const TRENDCAPTURE_BULL_STRIKE_GAP_SOL: Decimal = dec!(2.0);
-pub const TRENDCAPTURE_BEAR_STRIKE_GAP_SOL: Decimal = dec!(2.0);
+// Strike gap requirements — PCT-based.
+/// 0.005 = 0.50% of price. Conservative: larger gap ($500 at BTC=$100k).
+pub const TRENDCAPTURE_STRIKE_GAP_PCT: Decimal = dec!(0.005);
 
-// Reversal thresholds — conservative: exit on smaller counter-drift.
-pub const TRENDCAPTURE_REVERSAL_DRIFT_BTC: Decimal = dec!(50.0);
-pub const TRENDCAPTURE_REVERSAL_DRIFT_ETH: Decimal = dec!(2.0);
-pub const TRENDCAPTURE_REVERSAL_DRIFT_SOL: Decimal = dec!(0.20);
+// Reversal thresholds — PCT-based.
+/// 0.0005 = 0.05% of price. Conservative: exits on smaller counter-drift ($50 at BTC=$100k).
+pub const TRENDCAPTURE_REVERSAL_DRIFT_PCT: Decimal = dec!(0.0005);
 
 pub const TRENDCAPTURE_MAX_SNAPSHOT_AGE_SECS: i64 = 15;
 /// Conservative: 45 min minimum expiry — needs more time buffer than other profiles.
@@ -508,14 +484,11 @@ pub const TIME_DECAY_STOP_LOSS_PERCENT: Decimal = dec!(0.02);
 pub const TIME_DECAY_MIN_HOLD_SECS: i64 = 120;
 pub const TIME_DECAY_STOP_LOSS_COOLDOWN_SECS: u64 = 600;
 
-/// Oracle volatility gate — conservative: tight thresholds, stop cut to 35% on any vol spike.
-/// Prefers missing trades over being caught in a repricing event.
-pub const TIME_DECAY_MAX_FAST_VELOCITY_BTC: Decimal = dec!(10.0);
-pub const TIME_DECAY_MAX_FAST_VELOCITY_ETH: Decimal = dec!(0.50);
-pub const TIME_DECAY_MAX_FAST_VELOCITY_SOL: Decimal = dec!(0.050);
-pub const TIME_DECAY_MAX_SLOW_DRIFT_BTC: Decimal = dec!(150.0);
-pub const TIME_DECAY_MAX_SLOW_DRIFT_ETH: Decimal = dec!(6.0);
-pub const TIME_DECAY_MAX_SLOW_DRIFT_SOL: Decimal = dec!(0.60);
+/// Oracle volatility gate — conservative: tight thresholds.
+/// TIME_DECAY_MAX_FAST_VELOCITY_PCT: 0.0001 = 0.010% of price/5s. Conservative: tighter than balanced.
+pub const TIME_DECAY_MAX_FAST_VELOCITY_PCT: Decimal = dec!(0.0001);
+/// TIME_DECAY_MAX_SLOW_DRIFT_PCT: 0.0015 = 0.15% of price/hour. Conservative: tighter than balanced.
+pub const TIME_DECAY_MAX_SLOW_DRIFT_PCT: Decimal = dec!(0.0015);
 pub const TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER: Decimal = dec!(0.35);
 
 /// Price bounds: only enter when genuine market uncertainty exists.

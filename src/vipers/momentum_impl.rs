@@ -59,19 +59,10 @@ impl Strategy for MomentumStrategyImpl {
         let acceleration = ctx.snapshot.acceleration;
         let binance_price = ctx.snapshot.oracle_price;
         let strike_price = ctx.market.strike_price;
-        let crypto_filter = &ctx.crypto_filter;
 
-        let threshold = match crypto_filter.as_str() {
-            "eth" => config::ETH_MOMENTUM_THRESHOLD,
-            "sol" => config::SOL_MOMENTUM_THRESHOLD,
-            _ => config::BTC_MOMENTUM_THRESHOLD,
-        };
-
-        let strike_buffer = match crypto_filter.as_str() {
-            "eth" => config::ETH_STRIKE_BUFFER,
-            "sol" => config::SOL_STRIKE_BUFFER,
-            _ => config::BTC_STRIKE_BUFFER,
-        };
+        // Oracle-relative thresholds — scale with asset price automatically
+        let threshold    = config::oracle_threshold(config::MOMENTUM_THRESHOLD_PCT, binance_price);
+        let strike_buffer = config::oracle_threshold(config::STRIKE_BUFFER_PCT, binance_price);
 
         let short_min = threshold * config::MOMENTUM_SHORT_WINDOW_FRACTION;
         let short_ok_bull = velocity_1s >= short_min;
@@ -276,12 +267,10 @@ impl Strategy for MomentumStrategyImpl {
         // Root cause: 2026-05-27 15:24 loss — BTC had been declining for 10m
         // before the 5s spike that triggered a YES entry at $0.64; the market
         // reversed $0.64→$0.61 in 30 seconds.
-        // Threshold = 2× primary velocity threshold (BTC: 2 × $25 = $50/10m).
-        let (drift_bull_block, drift_bear_block) = match crypto_filter.as_str() {
-            "eth" => (config::MOMENTUM_BULL_DRIFT_10M_BLOCK_ETH, config::MOMENTUM_BEAR_DRIFT_10M_BLOCK_ETH),
-            "sol" => (config::MOMENTUM_BULL_DRIFT_10M_BLOCK_SOL, config::MOMENTUM_BEAR_DRIFT_10M_BLOCK_SOL),
-            _     => (config::MOMENTUM_BULL_DRIFT_10M_BLOCK_BTC, config::MOMENTUM_BEAR_DRIFT_10M_BLOCK_BTC),
-        };
+        // Oracle-relative 10m drift block — scales with asset price
+        let drift_block_mag = config::oracle_threshold(config::MOMENTUM_DRIFT_10M_BLOCK_PCT, binance_price);
+        let drift_bull_block = -drift_block_mag;
+        let drift_bear_block =  drift_block_mag;
         let drift_10m = ctx.snapshot.oracle_drift_10m;
         // drift_bull_block is negative; block BULL entries when drift < this (BTC declining in last 10m)
         let drift_blocks_bull = drift_bull_block < dec!(0) && drift_10m < drift_bull_block;
@@ -420,11 +409,7 @@ impl Strategy for MomentumStrategyImpl {
             let avg_entry = position.avg_entry;
             let velocity = ctx.snapshot.velocity;
             let velocity_1s = ctx.snapshot.velocity_1s;
-            let threshold = match ctx.crypto_filter.as_str() {
-                "eth" => config::ETH_MOMENTUM_THRESHOLD,
-                "sol" => config::SOL_MOMENTUM_THRESHOLD,
-                _ => config::BTC_MOMENTUM_THRESHOLD,
-            };
+            let threshold = config::oracle_threshold(config::MOMENTUM_THRESHOLD_PCT, ctx.snapshot.oracle_price);
 
             if avg_entry <= dec!(0) { continue; }
             let profit_margin = (bid - avg_entry) / avg_entry;

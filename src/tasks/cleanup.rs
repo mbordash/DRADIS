@@ -96,6 +96,20 @@ static PERMANENTLY_SETTLED_CONDITIONS: LazyLock<Mutex<HashSet<B256>>> =
 static FAILED_SETTLEMENT_CONDITIONS: LazyLock<Mutex<HashMap<B256, DateTime<Utc>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Single-flight guard: only one auto-settle loop may run process-wide at a time.
+/// Multiple squadron tasks can trigger settlement on the same cadence; this prevents
+/// duplicate submissions for the same condition/nonces.
+static AUTO_SETTLE_RUN_LOCK: LazyLock<Mutex<()>> =
+    LazyLock::new(|| Mutex::new(()));
+
+fn is_retryable_settlement_submit_error(err: &anyhow::Error) -> bool {
+    let msg = err.to_string().to_ascii_lowercase();
+    msg.contains("replacement transaction underpriced")
+        || msg.contains("in-flight transaction limit reached")
+        || msg.contains("nonce too low")
+        || msg.contains("already known")
+}
+
 sol! {
     /// Gnosis Safe 1.3 — we only need execTransaction.
     #[sol(rpc)]
@@ -624,6 +638,15 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
     safe_address: Address,
     eoa_address: Address,
 ) -> bool {
+    // Avoid concurrent settlement scans/submits from multiple squadron tasks.
+    let _settle_guard = match AUTO_SETTLE_RUN_LOCK.try_lock() {
+        Ok(g) => g,
+        Err(_) => {
+            debug!("Auto-settle: another run is already in progress; skipping this cycle");
+            return false;
+        }
+    };
+
     let data_client = DataClient::default();
     let req = PositionsRequest::builder().user(safe_address).build();
 
@@ -740,7 +763,15 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
                 }
                 Err(e) => {
                     warn!("Auto-settle: neg-risk redeem failed for condition {}: {}", condition_id, e);
-                    FAILED_SETTLEMENT_CONDITIONS.lock().await.insert(condition_id, Utc::now());
+                    if is_retryable_settlement_submit_error(&e) {
+                        debug!(
+                            "Auto-settle: transient submit error for condition {} (no error cooldown): {}",
+                            condition_id,
+                            e
+                        );
+                    } else {
+                        FAILED_SETTLEMENT_CONDITIONS.lock().await.insert(condition_id, Utc::now());
+                    }
                 }
             }
         } else {
@@ -775,7 +806,15 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
                 }
                 Err(e) => {
                     warn!("Auto-settle: redeem failed for condition {}: {}", condition_id, e);
-                    FAILED_SETTLEMENT_CONDITIONS.lock().await.insert(condition_id, Utc::now());
+                    if is_retryable_settlement_submit_error(&e) {
+                        debug!(
+                            "Auto-settle: transient submit error for condition {} (no error cooldown): {}",
+                            condition_id,
+                            e
+                        );
+                    } else {
+                        FAILED_SETTLEMENT_CONDITIONS.lock().await.insert(condition_id, Utc::now());
+                    }
                 }
             }
         }

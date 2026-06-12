@@ -81,7 +81,7 @@ impl Strategy for TimeDecayStrategyImpl {
         }
 
         // ── Oracle Volatility Gate ────────────────────────────────────────────
-        let (max_fast_vel, max_slow_drift) = TimeDecayStrategy::iv_thresholds(&ctx.crypto_filter);
+        let (max_fast_vel, max_slow_drift) = TimeDecayStrategy::iv_thresholds(&ctx.crypto_filter, ctx.snapshot.oracle_price);
         if ctx.snapshot.velocity.abs() > max_fast_vel {
             return Ok(StrategySignal::NoSignal);
         }
@@ -222,7 +222,7 @@ impl Strategy for TimeDecayStrategyImpl {
             }
 
             // ── Dynamic stop: tighten when vol is elevated ────────────────────
-            let (max_fast_vel, _) = TimeDecayStrategy::iv_thresholds(&ctx.crypto_filter);
+            let (max_fast_vel, _) = TimeDecayStrategy::iv_thresholds(&ctx.crypto_filter, ctx.snapshot.oracle_price);
             let iv_elevated = snap.velocity.abs() > max_fast_vel;
             let effective_stop_pct = if iv_elevated {
                 let tight = dc.time_decay_stop_loss_pct * config::TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER;
@@ -279,12 +279,12 @@ impl Strategy for TimeDecayStrategyImpl {
 pub struct TimeDecayStrategy;
 
 impl TimeDecayStrategy {
-    pub fn iv_thresholds(crypto_filter: &str) -> (Decimal, Decimal) {
-        match crypto_filter {
-            "eth" => (config::TIME_DECAY_MAX_FAST_VELOCITY_ETH, config::TIME_DECAY_MAX_SLOW_DRIFT_ETH),
-            "sol" => (config::TIME_DECAY_MAX_FAST_VELOCITY_SOL, config::TIME_DECAY_MAX_SLOW_DRIFT_SOL),
-            _     => (config::TIME_DECAY_MAX_FAST_VELOCITY_BTC, config::TIME_DECAY_MAX_SLOW_DRIFT_BTC),
-        }
+    /// Return (max_fast_velocity, max_slow_drift) scaled to the current oracle price.
+    pub fn iv_thresholds(_crypto_filter: &str, oracle_price: Decimal) -> (Decimal, Decimal) {
+        (
+            config::oracle_threshold(config::TIME_DECAY_MAX_FAST_VELOCITY_PCT, oracle_price),
+            config::oracle_threshold(config::TIME_DECAY_MAX_SLOW_DRIFT_PCT, oracle_price),
+        )
     }
 
     /// Check whether the combined bid gap is wide enough to cover the
