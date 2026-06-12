@@ -871,10 +871,17 @@ pub async fn record_open_position_with_status(
 ) {
     let ts = Utc::now().to_rfc3339();
     let sid = current_session_id();
-    if let Err(e) = sqlx::query(
-        "INSERT OR REPLACE INTO open_positions
+    // Use INSERT WHERE NOT EXISTS to prevent duplicate rows for the same token_id.
+    // Without a UNIQUE constraint on token_id, `INSERT OR REPLACE` would always INSERT
+    // a new row (never replacing), causing duplicate open_positions rows when the
+    // strategy top-ups an existing position or when chain-sync has already adopted it.
+    // If a row for this token already exists (chain-adopted or from a prior cycle),
+    // we skip the insert — chain-sync will keep the shares count accurate via UPDATE.
+    match sqlx::query(
+        "INSERT INTO open_positions
          (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, status)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+         WHERE NOT EXISTS (SELECT 1 FROM open_positions WHERE token_id = ? AND strategy = ?)"
     )
     .bind(&ts)
     .bind(sid)
@@ -886,9 +893,12 @@ pub async fn record_open_position_with_status(
     .bind(shares.to_string())
     .bind(ghost_mode as i32)
     .bind(status)
+    .bind(token_id)
+    .bind(strategy)
     .execute(pool)
     .await {
-        error!("❌ DB record_open_position failed: {}", e);
+        Ok(_)  => {}
+        Err(e) => { error!("❌ DB record_open_position failed: {}", e); }
     }
 }
 
@@ -958,9 +968,13 @@ pub async fn purge_stale_open_positions(
     pool: &SqlitePool,
     live_token_ids: &std::collections::HashSet<String>,
 ) -> usize {
-    // Fetch every token_id currently in the table.
+    // Only fetch confirmed (non-pending) rows for purge consideration.
+    // Pending rows represent in-flight orders that have not yet been indexed by the
+    // Polymarket Data API — purging them before they're indexed causes a
+    // purge-then-re-adopt cycle that creates duplicate open_positions rows for the
+    // same token_id (one from the chain adoption, one from the strategy's fresh INSERT).
     let rows: Vec<String> = match sqlx::query_scalar(
-        "SELECT DISTINCT token_id FROM open_positions"
+        "SELECT DISTINCT token_id FROM open_positions WHERE COALESCE(status, 'confirmed') != 'pending'"
     )
     .fetch_all(pool)
     .await {
@@ -971,7 +985,10 @@ pub async fn purge_stale_open_positions(
     let mut purged = 0usize;
     for token_id in rows {
         if !live_token_ids.contains(&token_id) {
-            if let Err(e) = sqlx::query("DELETE FROM open_positions WHERE token_id = ?")
+            // Only delete confirmed rows — leave any pending rows for the same token alone.
+            if let Err(e) = sqlx::query(
+                "DELETE FROM open_positions WHERE token_id = ? AND COALESCE(status, 'confirmed') != 'pending'"
+            )
                 .bind(&token_id)
                 .execute(pool)
                 .await
@@ -1183,9 +1200,15 @@ pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
 /// Used by the API (/api/positions) and the LLM Advisor prompt.
 pub async fn get_open_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
     match sqlx::query(
+        // Deduplicate by token_id: if multiple rows exist for the same token (due to a
+        // chain-sync re-adoption race or a top-up INSERT that bypassed the NOT EXISTS guard),
+        // keep only the most recent row (MAX(id)) so the UI and portfolio calculations see
+        // exactly one entry per token — preventing phantom double-counting of positions.
         "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted,
          COALESCE(status, 'confirmed') as status, current_price
-         FROM open_positions ORDER BY ts ASC"
+         FROM open_positions
+         WHERE id IN (SELECT MAX(id) FROM open_positions GROUP BY token_id)
+         ORDER BY ts ASC"
     )
     .fetch_all(pool)
     .await {
