@@ -178,7 +178,7 @@ impl Strategy for TrendCaptureStrategyImpl {
 
         // ── Determine thresholds per asset ─────────────────────────────────
         let (bull_drift_10m_thr, bear_drift_10m_thr,
-             bull_drift_60m_thr, bear_drift_60m_thr,
+             _bull_drift_60m_thr, _bear_drift_60m_thr,
              bull_strike_gap,    bear_strike_gap,
              bull_reversal_thr,  bear_reversal_thr) =
         match ctx.crypto_filter.as_str() {
@@ -203,12 +203,24 @@ impl Strategy for TrendCaptureStrategyImpl {
         };
         let _ = (bull_reversal_thr, bear_reversal_thr); // used only in exit
 
-        // ── 60m drift alignment gate ──────────────────────────────────────────
-        // OPTIMIZATION: Removed mandatory 60m gate alignment to stop buying into
-        // late-stage trend exhaustion. We now allow entries on fresh 10m momentum
-        // even if the macro 60m indicator hasn't completely turned yet.
-        let drift_60m_blocks_bull = false;
-        let drift_60m_blocks_bear = false;
+        // ── 60m drift exhaustion ceiling ─────────────────────────────────────
+        // Allow entries on fresh 10m momentum even if the macro 60m trend hasn't
+        // fully aligned yet — but slam the gate shut when the 60m move is so large
+        // that the trend is already exhausted.  This replaces the old hardcoded
+        // `false` (no protection) and the old hard alignment check (too restrictive).
+        //
+        // Examples (BTC, ceiling=$1000):
+        //   drift_60m = +$400 (healthy bull trend)  → bull entry ALLOWED
+        //   drift_60m = +$1200 (exhausted, tail-end) → bull entry BLOCKED
+        //   drift_60m = -$900 (deep bear, still moving) → bear entry ALLOWED
+        //   drift_60m = -$1100 (full crash, dead cat risk) → bear entry BLOCKED
+        let exhaustion_thr = match ctx.crypto_filter.as_str() {
+            "eth" => config::TRENDCAPTURE_EXHAUSTION_DRIFT_60M_ETH,
+            "sol" => config::TRENDCAPTURE_EXHAUSTION_DRIFT_60M_SOL,
+            _     => config::TRENDCAPTURE_EXHAUSTION_DRIFT_60M_BTC,
+        };
+        let drift_60m_blocks_bull = drift_60m >= exhaustion_thr;
+        let drift_60m_blocks_bear = drift_60m <= -exhaustion_thr;
 
         // ── OBI adverse-direction veto ────────────────────────────────────────
         let yes_total_depth = snap.yes_bid_depth + snap.yes_ask_depth;

@@ -389,6 +389,12 @@ pub const TRENDCAPTURE_BEAR_DRIFT_60M_ETH: Decimal = dec!(-12.0);
 pub const TRENDCAPTURE_BULL_DRIFT_60M_SOL: Decimal = dec!(1.20);
 pub const TRENDCAPTURE_BEAR_DRIFT_60M_SOL: Decimal = dec!(-1.20);
 
+// 60m exhaustion ceiling — block entries when macro trend has already run too far.
+// Balanced: $1000 allows healthy trends while blocking tail-end exhaustion.
+pub const TRENDCAPTURE_EXHAUSTION_DRIFT_60M_BTC: Decimal = dec!(1000.0);
+pub const TRENDCAPTURE_EXHAUSTION_DRIFT_60M_ETH: Decimal = dec!(40.0);
+pub const TRENDCAPTURE_EXHAUSTION_DRIFT_60M_SOL: Decimal = dec!(4.0);
+
 // Strike gap requirements — tightened to avoid chop near strike.
 pub const TRENDCAPTURE_BULL_STRIKE_GAP_BTC: Decimal = dec!(400.0);
 pub const TRENDCAPTURE_BEAR_STRIKE_GAP_BTC: Decimal = dec!(400.0);

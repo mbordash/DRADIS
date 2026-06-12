@@ -422,6 +422,12 @@ pub const TRENDCAPTURE_BEAR_DRIFT_60M_ETH: Decimal = dec!(-12.0);
 pub const TRENDCAPTURE_BULL_DRIFT_60M_SOL: Decimal = dec!(1.20);
 pub const TRENDCAPTURE_BEAR_DRIFT_60M_SOL: Decimal = dec!(-1.20);
 
+// 60m exhaustion ceiling — block entries when macro trend has already run too far.
+// Conservative: tighter ceiling ($700) exits the trade window earlier in extended moves.
+pub const TRENDCAPTURE_EXHAUSTION_DRIFT_60M_BTC: Decimal = dec!(700.0);
+pub const TRENDCAPTURE_EXHAUSTION_DRIFT_60M_ETH: Decimal = dec!(28.0);
+pub const TRENDCAPTURE_EXHAUSTION_DRIFT_60M_SOL: Decimal = dec!(2.8);
+
 // Strike gap requirements — conservative: larger gap; only enter on established moves.
 pub const TRENDCAPTURE_BULL_STRIKE_GAP_BTC: Decimal = dec!(500.0);
 pub const TRENDCAPTURE_BEAR_STRIKE_GAP_BTC: Decimal = dec!(500.0);
