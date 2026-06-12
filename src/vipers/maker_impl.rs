@@ -116,7 +116,12 @@ impl Strategy for MakerStrategyImpl {
 
             let drain_flags = if let Some(ref p) = *prev_guard {
                 let elapsed_ms = now_inst.duration_since(p.sampled_at).as_millis();
-                if elapsed_ms > 0 && elapsed_ms <= config::MAKER_TAKER_FLOW_WINDOW_MS as u128 {
+                // Only measure drain when the sample is both fresh (≤ WINDOW) and old enough
+                // (≥ MIN_ELAPSED) to span multiple WS ticks.  Single-tick (49ms) comparisons
+                // produce false positives from best-bid price-level rotation on thin books.
+                if elapsed_ms >= config::MAKER_TAKER_FLOW_MIN_ELAPSED_MS as u128
+                    && elapsed_ms <= config::MAKER_TAKER_FLOW_WINDOW_MS as u128
+                {
                     // Positive value = depth decreased (bids were lifted by takers).
                     // Clamp at 0 so depth replenishment (depth increased) never triggers the gate.
                     let yes_drain = if p.yes_bid_depth > dec!(0) {
