@@ -96,6 +96,7 @@ export interface OpenPositionRow {
   ghost_mode:     boolean;
   chain_adopted:  boolean; // true when re-adopted from on-chain (ts = adoption time, not original entry)
   status:         string;  // "pending" (Viper Launch) | "confirmed" (Mission In-Flight)
+  current_price?: string;  // Live mark-to-market price from Polymarket Data API (null until first chain-sync)
 }
 
 export interface LlmRecommendationRow {

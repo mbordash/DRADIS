@@ -248,7 +248,7 @@ export default function OpenPositionsCard({ positions, trades, isLoading, asset 
               <table className="w-full text-xs font-mono">
                 <thead>
                   <tr className="border-b border-[#1e1e32]">
-                    {['Entered', 'Asset', 'Strategy', 'Market', 'Side', 'Entry', 'Shares', 'Mode', 'Actions'].map(h => (
+                     {['Entered', 'Asset', 'Strategy', 'Market', 'Side', 'Entry', 'Cur Price', 'Shares', 'Mode', 'Actions'].map(h => (
                       <th key={h} className="px-3 py-2 text-left text-gray-500 font-normal whitespace-nowrap">
                         {h}
                       </th>
@@ -280,6 +280,14 @@ export default function OpenPositionsCard({ positions, trades, isLoading, asset 
                         {p.side}
                       </td>
                       <td className="px-3 py-2 text-gray-300">{parseFloat(p.entry_price).toFixed(4)}</td>
+                      <td className="px-3 py-2">
+                        {p.current_price ? (() => {
+                          const cur = parseFloat(p.current_price);
+                          const entry = parseFloat(p.entry_price);
+                          const color = cur > entry ? 'text-green-400' : cur < entry ? 'text-red-400' : 'text-gray-300';
+                          return <span className={color}>{cur.toFixed(4)}</span>;
+                        })() : <span className="text-gray-600">—</span>}
+                      </td>
                       <td className="px-3 py-2 text-gray-400">{parseFloat(p.shares).toFixed(2)}</td>
                       <td className="px-3 py-2">
                         {p.ghost_mode

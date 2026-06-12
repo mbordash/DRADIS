@@ -19,7 +19,7 @@ use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use tokio::sync::Mutex;
 use tokio::time::timeout as tokio_timeout;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use polymarket_client_sdk_v2::clob::Client as ClobClient;
 use polymarket_client_sdk_v2::auth::state::Authenticated;
@@ -516,6 +516,7 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
         .collect();
 
         if let Some(asset_live_map) = live_map {
+            let mut total_updated_shares = 0usize;
             for (token_str, pos) in asset_live_map {
                 if !db_ids.contains(token_str) {
                     // Normalize binary market outcomes to YES/NO for consistency.
@@ -526,14 +527,66 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
                         "DOWN" => "NO",
                         _      => raw_outcome.as_str(),
                     };
-                    if db::adopt_chain_position(&pool, token_str, &pos.title, side, pos.avg_price, pos.size).await {
+                    if db::adopt_chain_position(&pool, token_str, &pos.title, side, pos.avg_price, pos.size, Some(pos.cur_price)).await {
                         total_adopted += 1;
-                        info!(" Chain-sync [{}]: re-adopted on-chain position — token {} | {} shares @ ${:.4} | \"{}\"",
+                        info!(" Chain-sync [{}]: re-adopted on-chain position — token {} | {} shares @ ${:.4} cur=${:.4} | \"{}\"",
                             asset.to_uppercase(),
                             &token_str[..token_str.len().min(20)],
-                            pos.size, pos.avg_price, pos.title);
+                            pos.size, pos.avg_price, pos.cur_price, pos.title);
+                    }
+                } else {
+                    // Row exists — UPDATE shares and avg_price if the on-chain value differs.
+                    // This corrects stale adoptions where the Data API returned a partial-fill
+                    // size at adoption time (e.g. 8.0399 instead of the correct 10.0 shares).
+                    let db_shares: Option<String> = sqlx::query_scalar(
+                        "SELECT shares FROM open_positions WHERE token_id = ? LIMIT 1"
+                    )
+                    .bind(token_str)
+                    .fetch_optional(&pool)
+                    .await
+                    .unwrap_or(None);
+
+                    if let Some(db_shares_str) = db_shares {
+                        let db_shares_val = db_shares_str.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+                        // Update when on-chain differs by more than dust (0.001 shares tolerance)
+                        if (pos.size - db_shares_val).abs() > Decimal::new(1, 3) {
+                            db::update_position_from_chain(&pool, token_str, pos.size, pos.avg_price, Some(pos.cur_price)).await;
+                            total_updated_shares += 1;
+                            info!("🔄 Chain-sync [{}]: corrected shares — token {} | {} → {} shares | \"{}\"",
+                                asset.to_uppercase(),
+                                &token_str[..token_str.len().min(20)],
+                                db_shares_val, pos.size, pos.title);
+                        } else {
+                            // Shares unchanged — still refresh current_price so mark-to-market stays live.
+                            db::update_position_current_price(&pool, token_str, pos.cur_price).await;
+                        }
                     }
                 }
+            }
+
+            // Write an accurate pnl_snapshot using Data API live current_value.
+            // This overwrites the status-task snapshot (which uses entry_price×shares fallback)
+            // so the Portfolio chart and banner reflect real mark-to-market.
+            let live_positions_value: Decimal = asset_live_map
+                .values()
+                .filter(|p| p.size > Decimal::ZERO && !p.redeemable)
+                .map(|p| p.current_value)
+                .sum();
+            // Get the most recent collateral and session_pnl from DB for the snapshot.
+            if let Some(latest_snap) = db::get_pnl_history(&pool, 1).await.into_iter().next() {
+                if let Ok(collateral) = latest_snap.collateral.parse::<Decimal>() {
+                    if collateral > Decimal::ZERO {
+                        let snap_session_pnl = latest_snap.session_pnl.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+                        let snap_total = collateral + live_positions_value;
+                        db::record_pnl_snapshot(&pool, snap_session_pnl, collateral, snap_total).await;
+                        debug!("📸 Chain-sync [{}]: wrote accurate pnl_snapshot — collateral=${:.4} positions=${:.4} total=${:.4}",
+                            asset.to_uppercase(), collateral, live_positions_value, snap_total);
+                    }
+                }
+            }
+            if total_updated_shares > 0 {
+                info!("✅ Chain-sync [{}]: updated {} position(s) share count(s) from on-chain data",
+                    asset.to_uppercase(), total_updated_shares);
             }
         }
     }

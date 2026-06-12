@@ -767,7 +767,7 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
 
     let mut latest_collateral: Option<(String, Decimal)> = None;
     let mut total_positions_value = Decimal::ZERO;
-    let total_unrealized_pnl = Decimal::ZERO;  // TODO: Calculate when live prices are added
+    let mut total_unrealized_pnl = Decimal::ZERO;
     let mut total_position_count = 0;
     let mut all_prices_live = true;
 
@@ -823,43 +823,70 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
                 .map(|dt| dt.with_timezone(&Utc) > freshness_threshold)
         }).unwrap_or(false);
 
-        if snapshot_is_fresh {
-            // Use fresh mark-to-market from snapshot (live prices within 5 min)
-            if let Some(snap) = pnl_snapshots.first() {
-                if let (Some(tv), Ok(collateral)) = (
-                    snap.total_value.as_ref().and_then(|v| Decimal::from_str(v).ok()),
-                    Decimal::from_str(&snap.collateral),
-                ) {
-                    let positions_contrib = (tv - collateral).max(Decimal::ZERO);
-                    total_positions_value += positions_contrib;
-                    debug!("✅ [{}] Fresh snapshot: positions_value = ${:.4}",
-                           asset.to_uppercase(), positions_contrib);
-                    continue;
-                }
-            }
-        } else {
-            // Stale or missing snapshot — fallback to cost basis
-            all_prices_live = false;
-            let snap_age = pnl_snapshots.first().and_then(|s| {
-                chrono::DateTime::parse_from_rfc3339(&s.ts).ok()
-                    .map(|dt| Utc::now().signed_duration_since(dt.with_timezone(&Utc)))
-            });
-            warn!("⚠️ [{}] Stale/missing snapshot (age: {:?}), using cost basis fallback",
-                  asset.to_uppercase(), snap_age);
-        }
+        // Compute positions value and unrealized P&L from deduped positions.
+        // Prefer current_price (live mark-to-market from chain-sync) when available.
+        // Fall back to fresh pnl_snapshot total_value - collateral, then to cost basis.
+        let mut asset_positions_value = Decimal::ZERO;
+        let mut asset_unrealized_pnl = Decimal::ZERO;
+        let mut has_live_prices = false;
 
-        // Fallback: value positions at cost basis (entry_price × shares)
-        let mut fallback_value = Decimal::ZERO;
-        for (_, pos) in deduped_positions {
+        for (_, pos) in &deduped_positions {
             if let (Ok(shares), Ok(entry_price)) = (
                 Decimal::from_str(&pos.shares),
                 Decimal::from_str(&pos.entry_price),
             ) {
-                fallback_value += shares * entry_price;
+                let cost_basis = shares * entry_price;
+                if let Some(ref cp_str) = pos.current_price {
+                    if let Ok(cur_price) = Decimal::from_str(cp_str) {
+                        if cur_price > Decimal::ZERO {
+                            let market_value = shares * cur_price;
+                            asset_positions_value += market_value;
+                            asset_unrealized_pnl += market_value - cost_basis;
+                            has_live_prices = true;
+                            debug!("💹 [{}] token {} {} shares × cur=${:.4} = ${:.4} (entry=${:.4} pnl={:+.4})",
+                                   asset.to_uppercase(), &pos.token_id[..pos.token_id.len().min(12)],
+                                   shares, cur_price, market_value, entry_price,
+                                   market_value - cost_basis);
+                            continue;
+                        }
+                    }
+                }
+                // No current_price — fall through to snapshot or cost basis below
+                // (tracked separately so we can mix per-position accuracy)
+                asset_positions_value += cost_basis;
             }
         }
-        total_positions_value += fallback_value;
-        debug!("📦 [{}] Fallback cost basis: ${:.4}", asset.to_uppercase(), fallback_value);
+
+        if !has_live_prices && deduped_positions.is_empty() {
+            // No positions — nothing to value
+        } else if !has_live_prices {
+            // No current_price on any position — try snapshot, then cost basis
+            if snapshot_is_fresh {
+                if let Some(snap) = pnl_snapshots.first() {
+                    if let (Some(tv), Ok(collateral)) = (
+                        snap.total_value.as_ref().and_then(|v| Decimal::from_str(v).ok()),
+                        Decimal::from_str(&snap.collateral),
+                    ) {
+                        asset_positions_value = (tv - collateral).max(Decimal::ZERO);
+                        debug!("✅ [{}] Fresh snapshot (no cur_price): positions_value = ${:.4}",
+                               asset.to_uppercase(), asset_positions_value);
+                    }
+                }
+            } else {
+                all_prices_live = false;
+                warn!("⚠️ [{}] No current_price and stale/missing snapshot — using cost basis",
+                      asset.to_uppercase());
+            }
+        }
+
+        if !has_live_prices {
+            all_prices_live = false;
+        }
+
+        total_positions_value += asset_positions_value;
+        total_unrealized_pnl  += asset_unrealized_pnl;
+        debug!("📊 [{}] positions=${:.4} unrealized_pnl={:+.4}",
+               asset.to_uppercase(), asset_positions_value, asset_unrealized_pnl);
     }
 
     // Use live CLOB collateral if available, otherwise fall back to latest snapshot

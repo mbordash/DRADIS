@@ -231,6 +231,13 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE open_positions ADD COLUMN session_id TEXT NOT NULL DEFAULT ''"
     ).execute(pool).await;
 
+    // current_price: live mark-to-market price from Polymarket Data API, updated on every
+    // chain-sync cycle.  NULL until first chain sync.  Used by calculate_positions_value()
+    // and /api/portfolio to price positions at current market value instead of entry price.
+    let _ = sqlx::query(
+        "ALTER TABLE open_positions ADD COLUMN current_price TEXT"
+    ).execute(pool).await;
+
     // llm_recommendations: LLM Advisor analysis results persisted for the dashboard
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS llm_recommendations (
@@ -983,6 +990,50 @@ pub async fn purge_stale_open_positions(
 /// Uses `INSERT ... WHERE NOT EXISTS` so it is safe to call repeatedly — it is a
 /// no-op if a row for `token_id` already exists.  Returns `true` if a row was
 /// inserted.
+/// Update an existing open position's share count and avg_price from on-chain data.
+///
+/// Called by `sync_open_positions_with_chain` whenever the Polymarket Data API
+/// reports a different share count than what is stored in the DB (e.g. after a
+/// partial fill later completes, or when the initial adoption recorded a stale value).
+/// Also stamps `chain_adopted = 1` so the UI shows the chain badge.
+pub async fn update_position_from_chain(
+    pool: &SqlitePool,
+    token_id: &str,
+    shares: rust_decimal::Decimal,
+    avg_price: rust_decimal::Decimal,
+    cur_price: Option<rust_decimal::Decimal>,
+) {
+    let cur_price_str = cur_price.map(|p| p.to_string());
+    if let Err(e) = sqlx::query(
+        "UPDATE open_positions SET shares = ?, entry_price = ?, chain_adopted = 1, current_price = COALESCE(?, current_price) WHERE token_id = ?"
+    )
+    .bind(shares.to_string())
+    .bind(avg_price.to_string())
+    .bind(&cur_price_str)
+    .bind(token_id)
+    .execute(pool)
+    .await {
+        error!("❌ DB update_position_from_chain failed for {}: {}", token_id, e);
+    }
+}
+
+/// Update only the current_price for an existing open position (called on every chain-sync).
+pub async fn update_position_current_price(
+    pool: &SqlitePool,
+    token_id: &str,
+    cur_price: rust_decimal::Decimal,
+) {
+    if let Err(e) = sqlx::query(
+        "UPDATE open_positions SET current_price = ? WHERE token_id = ?"
+    )
+    .bind(cur_price.to_string())
+    .bind(token_id)
+    .execute(pool)
+    .await {
+        error!("❌ DB update_position_current_price failed for {}: {}", token_id, e);
+    }
+}
+
 pub async fn adopt_chain_position(
     pool: &SqlitePool,
     token_id: &str,
@@ -990,6 +1041,7 @@ pub async fn adopt_chain_position(
     side: &str,
     avg_price: rust_decimal::Decimal,
     shares: rust_decimal::Decimal,
+    cur_price: Option<rust_decimal::Decimal>,
 ) -> bool {
     let ts  = Utc::now().to_rfc3339();
     let sid = current_session_id();
@@ -1004,10 +1056,11 @@ pub async fn adopt_chain_position(
     .execute(pool)
     .await;
 
+    let cur_price_str = cur_price.map(|p| p.to_string());
     match sqlx::query(
         "INSERT INTO open_positions
-             (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted)
-         SELECT ?, ?, 'ArbitrageStrategy', ?, ?, ?, ?, ?, 0, 1
+             (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted, current_price)
+         SELECT ?, ?, 'ArbitrageStrategy', ?, ?, ?, ?, ?, 0, 1, ?
          WHERE NOT EXISTS (SELECT 1 FROM open_positions WHERE token_id = ?)"
     )
     .bind(&ts)
@@ -1017,6 +1070,7 @@ pub async fn adopt_chain_position(
     .bind(side)
     .bind(avg_price.to_string())
     .bind(shares.to_string())
+    .bind(&cur_price_str)
     .bind(token_id)
     .execute(pool)
     .await {
@@ -1060,6 +1114,8 @@ pub struct OpenPositionRow {
     pub ghost_mode:     bool,
     pub chain_adopted:  bool,
     pub status:         String,
+    /// Live mark-to-market price from Polymarket Data API; None until first chain-sync.
+    pub current_price:  Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1128,7 +1184,7 @@ pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
 pub async fn get_open_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
     match sqlx::query(
         "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted,
-         COALESCE(status, 'confirmed') as status
+         COALESCE(status, 'confirmed') as status, current_price
          FROM open_positions ORDER BY ts ASC"
     )
     .fetch_all(pool)
@@ -1144,6 +1200,7 @@ pub async fn get_open_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
             ghost_mode:     r.try_get::<i64, _>(7).ok()? != 0,
             chain_adopted:  r.try_get::<i64, _>(8).ok()? != 0,
             status:         r.try_get::<String, _>(9).ok()?,
+            current_price:  r.try_get::<Option<String>, _>(10).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_open_positions failed: {}", e); vec![] }
     }
@@ -1152,7 +1209,7 @@ pub async fn get_open_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
 /// Return only pending positions (Viper Launches) - orders placed but not yet confirmed on-chain.
 pub async fn get_pending_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
     match sqlx::query(
-        "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted, status
+        "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted, status, current_price
          FROM open_positions WHERE status = 'pending' ORDER BY ts ASC"
     )
     .fetch_all(pool)
@@ -1168,6 +1225,7 @@ pub async fn get_pending_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
             ghost_mode:     r.try_get::<i64, _>(7).ok()? != 0,
             chain_adopted:  r.try_get::<i64, _>(8).ok()? != 0,
             status:         r.try_get::<String, _>(9).ok()?,
+            current_price:  r.try_get::<Option<String>, _>(10).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_pending_positions failed: {}", e); vec![] }
     }
@@ -1177,7 +1235,7 @@ pub async fn get_pending_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
 pub async fn get_confirmed_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
     match sqlx::query(
         "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted,
-         COALESCE(status, 'confirmed') as status
+         COALESCE(status, 'confirmed') as status, current_price
          FROM open_positions WHERE COALESCE(status, 'confirmed') = 'confirmed' ORDER BY ts ASC"
     )
     .fetch_all(pool)
@@ -1193,6 +1251,7 @@ pub async fn get_confirmed_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> 
             ghost_mode:     r.try_get::<i64, _>(7).ok()? != 0,
             chain_adopted:  r.try_get::<i64, _>(8).ok()? != 0,
             status:         r.try_get::<String, _>(9).ok()?,
+            current_price:  r.try_get::<Option<String>, _>(10).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_confirmed_positions failed: {}", e); vec![] }
     }
