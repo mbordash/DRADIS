@@ -16,11 +16,14 @@ use std::time::Duration as StdDuration;
 ///
 /// # Examples
 /// ```
+/// use rust_decimal_macros::dec;
+/// use dradis::helpers::oracle_threshold;
 /// // BTC at $100,000, 0.2% threshold → $200
-/// let thr = oracle_threshold(dec!(0.002), dec!(100_000));  // → 200
-///
+/// let thr = oracle_threshold(dec!(0.002), dec!(100_000));
+/// assert_eq!(thr, dec!(200));
 /// // ETH at $3,500, same 0.2% → $7
-/// let thr = oracle_threshold(dec!(0.002), dec!(3_500));    // → 7
+/// let thr = oracle_threshold(dec!(0.002), dec!(3_500));
+/// assert_eq!(thr, dec!(7));
 /// ```
 #[inline]
 pub fn oracle_threshold(pct: Decimal, oracle_price: Decimal) -> Decimal {
