@@ -479,6 +479,11 @@ pub fn spawn_cleanup_task(
                                                             let rh_sh  = orphan.shares;
                                                             let rh_asset = asset.clone();
                                                             let rh_tc = Arc::clone(&trading_client);
+                                                            // Needed so the async fill verifier can un-tombstone
+                                                            // the still-naked orphan leg if the re-hedge buy
+                                                            // doesn't actually fill on-chain (retry next cycle).
+                                                            let rh_tombstones = orphan_tombstones.clone();
+                                                            let rh_orphan_token = orphan.token_id;
 
                                                             // Write pending position immediately (Viper Launch)
                                                             if let Some(pool) = db::pool_for(&rh_asset) {
@@ -532,6 +537,11 @@ pub fn spawn_cleanup_task(
                                                                     if let Some(pool) = db::pool_for(&rh_asset) {
                                                                         db::close_open_position(&pool, "ArbitrageStrategy", &rh_tid).await;
                                                                     }
+                                                                    // Re-hedge buy never filled → the original leg is
+                                                                    // still naked. Un-tombstone it so the next cleanup
+                                                                    // cycle re-adopts and retries (re-hedge or flatten)
+                                                                    // instead of letting it ride to settlement.
+                                                                    rh_tombstones.lock().await.remove(&rh_orphan_token);
                                                                 }
                                                             });
                                                         }
@@ -541,9 +551,9 @@ pub fn spawn_cleanup_task(
                                     }
                                 } else {
                                     warn!(
-                                        "⚠️ ORPHAN RE-HEDGE skipped — rehedge cost ${:.4} ≥ threshold $0.99 \
+                                        "⚠️ ORPHAN RE-HEDGE skipped — rehedge cost ${:.4} ≥ threshold ${:.4} \
                                          (paired_ask=${:.4}); will sell orphan at current bid",
-                                        rehedge_cost, paired_ask_ticked,
+                                        rehedge_cost, rehedge_threshold, paired_ask_ticked,
                                     );
                                 }
                             }
