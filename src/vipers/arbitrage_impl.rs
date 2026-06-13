@@ -174,6 +174,24 @@ impl Strategy for ArbitrageStrategyImpl {
                 );
                 return Ok(StrategySignal::NoSignal);
             }
+
+            // ── Fill-symmetry (OBI asymmetry) gate ───────────────────────────
+            // Orphans are created by ASYMMETRIC fill likelihood: if one leg's book
+            // is seller-heavy (OBI ≪ 0 → fills fast) while the other is buyer-heavy
+            // (OBI ≫ 0 → won't fill), the fast leg fills alone and we are left naked.
+            // The max_obi gate above only rejects when the WORST leg is too
+            // directional; it still admits e.g. YES −0.50 / NO +0.49. In binary
+            // up/down markets a strong directional move makes exactly this happen,
+            // so we also reject when the two legs' OBIs diverge too far.
+            let obi_asymmetry = (yes_obi - no_obi).abs();
+            if obi_asymmetry > dc.arbitrage_max_obi_asymmetry {
+                debug!(
+                    " Arb fill-symmetry gate — YES OBI {:.3} NO OBI {:.3} asymmetry {:.3} > limit {:.3} \
+                     — skipping (one leg fills fast, the other won't → orphan risk)",
+                    yes_obi, no_obi, obi_asymmetry, dc.arbitrage_max_obi_asymmetry
+                );
+                return Ok(StrategySignal::NoSignal);
+            }
         } else {
             // No orderbook depth data in snapshot — fall back to legacy price cap.
             let max_leg_bid = safe_yes_bid.max(safe_no_bid);

@@ -76,3 +76,6 @@ session.file
 session.test
 #src/config-live.rs
 src/config.rs
+tools/verify-chart-alignment.sh
+tools/verify-portfolio-fix.sh
+tools/verify-token-sovereignty.sh

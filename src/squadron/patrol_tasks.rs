@@ -145,34 +145,27 @@ pub fn spawn_settlement_task<P>(
 
 // ─── Status task ─────────────────────────────────────────────────────────────
 
-/// Calculate the mark-to-market value of all open positions using current prices.
-/// Returns the sum of (shares × current_mid_price) for each position.
-async fn calculate_positions_value(
-    pool: &sqlx::SqlitePool,
-    yes_price_rx: &watch::Receiver<PriceState>,
-    no_price_rx: &watch::Receiver<PriceState>,
-) -> Decimal {
+/// Calculate the mark-to-market value of all open positions.
+/// Returns the sum of (shares × current_price) for each position.
+///
+/// IMPORTANT: each position is valued by its OWN token's live `current_price`
+/// (refreshed per-token from the Polymarket Data API by the chain-sync task),
+/// falling back to `entry_price` when no live price is available.
+///
+/// A single asset DB can hold positions across several DISTINCT markets
+/// (e.g. the hourly venue plus the daily maker venue). The previous
+/// implementation priced every position using the squadron's currently-attached
+/// market YES/NO mids, which inflated and wildly oscillated the portfolio value
+/// (positions in other/resolved markets were mis-priced). Valuing each token by
+/// its own `current_price` keeps this snapshot consistent with `/api/portfolio`
+/// and the chain-sync snapshot — a single source of truth.
+async fn calculate_positions_value(pool: &sqlx::SqlitePool) -> Decimal {
     // Fetch all open positions
     let positions = db::get_open_positions(pool).await;
     if positions.is_empty() {
         return dec!(0);
     }
 
-    // Get current mid prices
-    let (yes_bid, _, yes_ask, _, _) = *yes_price_rx.borrow();
-    let (no_bid, _, no_ask, _, _) = *no_price_rx.borrow();
-
-    let yes_mid = if yes_bid > dec!(0) && yes_ask > dec!(0) {
-        (yes_bid + yes_ask) / dec!(2)
-    } else {
-        dec!(0)
-    };
-
-    let no_mid = if no_bid > dec!(0) && no_ask > dec!(0) {
-        (no_bid + no_ask) / dec!(2)
-    } else {
-        dec!(0)
-    };
 
     // If the same token appears multiple times (e.g. one chain-adopted row plus one
     // strategy-owned row), value it once to avoid portfolio inflation.
@@ -203,28 +196,17 @@ async fn calculate_positions_value(
             Err(_) => continue,
         };
 
-        // Determine current price based on side
-        let current_price = if pos.side == "YES" || pos.side == "UP" {
-            yes_mid
-        } else if pos.side == "NO" || pos.side == "DOWN" {
-            no_mid
-        } else {
-            // Fallback to entry price if side is unknown
-            match pos.entry_price.parse::<Decimal>() {
-                Ok(p) => p,
-                Err(_) => continue,
-            }
-        };
-
-        // If we don't have a live price, use entry price
-        let price_to_use = if current_price > dec!(0) {
-            current_price
-        } else {
-            match pos.entry_price.parse::<Decimal>() {
-                Ok(p) => p,
-                Err(_) => continue,
-            }
-        };
+        // Value this position by its OWN live current_price (per-token, set by
+        // the chain-sync task from the Polymarket Data API). Fall back to the
+        // entry price when no live price is available. Never use another
+        // market's mids here — that inflates positions held in other markets.
+        let price_to_use = pos
+            .current_price
+            .as_deref()
+            .and_then(|p| p.parse::<Decimal>().ok())
+            .filter(|p| *p > dec!(0))
+            .or_else(|| pos.entry_price.parse::<Decimal>().ok())
+            .unwrap_or(dec!(0));
 
         total_value += shares * price_to_use;
     }
@@ -295,7 +277,7 @@ pub fn spawn_status_task(
                                 let pnl_snap = *total_pnl.lock().await;
 
                                 // Calculate total portfolio value: cash + mark-to-market positions
-                                let positions_value = calculate_positions_value(&pool, &yes_price_rx, &no_price_rx).await;
+                                let positions_value = calculate_positions_value(&pool).await;
                            let total_value = bal + positions_value;
 
                                 if tokio::time::timeout(
@@ -442,9 +424,16 @@ pub fn spawn_cleanup_task(
                                 let paired_ask_ticked = crate::helpers::price::round_to_tick_size(paired_ask);
                                 let rehedge_cost = paired_ask_ticked + orphan.original_entry;
 
-                                const RE_HEDGE_THRESHOLD: rust_decimal::Decimal = dec!(0.99);
+                                // Breakeven ceiling for a $1.00 binary payout, minus a buffer that
+                                // covers the taker (FAK) fee — up to ~1.8% on Polymarket crypto/hourly
+                                // markets — plus a small adverse-price cushion. Maker entries pay 0 fee;
+                                // only this FAK re-hedge incurs the taker fee, and settlement redeem is
+                                // free, so the buffer must absorb the re-hedge fee for the completed arb
+                                // to stay profitable. Matches the atomic arb_pair_fill_monitor gate
+                                // (balance.rs) so periodic and atomic re-hedges share one fee-aware threshold.
+                                let rehedge_threshold = dec!(1.00) - config::ARB_FAK_REHEDGE_BUFFER;
 
-                                if rehedge_cost < RE_HEDGE_THRESHOLD && paired_ask_ticked < dec!(0.99) {
+                                if rehedge_cost < rehedge_threshold && paired_ask_ticked < dec!(0.99) {
                                     let buy_price = (paired_ask_ticked + config::BUY_PRICE_OFFSET)
                                         .min(config::MAX_BUY_LIMIT_PRICE);
                                     warn!(

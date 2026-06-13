@@ -296,20 +296,72 @@ pub async fn reconcile_orphaned_positions(
     let mut pos_map = positions.lock().await;
     let now = Utc::now();
 
-    let mut orphans_to_exit: Vec<((String, U256), Position)> = Vec::new();
     let mut exits_to_sell: Vec<OrphanExit> = Vec::new();
 
+    // ── Naked-leg detection by per-market SHARE BALANCE ──────────────────────
+    // A true hedge holds EQUAL shares on both legs of the SAME market. We assess
+    // hedge integrity by share balance — not merely by presence of the opposite
+    // leg — so we catch BOTH:
+    //   (A) fully-naked single legs (pair never filled, or chain-adopted without
+    //       pair linkage), and
+    //   (B) imbalanced pairs where both legs exist but share counts differ — the
+    //       excess shares on the heavier leg are unhedged directional risk.
+    //
+    // Detected naked exposure is routed to the existing re-hedge-first /
+    // flatten-fallback economics downstream:
+    //   * fully-naked legs  → OrphanExit with the known pair token, so a CHEAP
+    //     re-hedge (total cost < $0.99) completes the arb at a profit; only if
+    //     the market moved too far do we FAK-sell at bid.
+    //   * imbalanced pairs  → flatten ONLY the excess shares (paired_token_id =
+    //     None forces the bid-based sell), avoiding a duplicate-row hazard from
+    //     re-hedging on top of an already-tracked opposite leg.
+    // Fees are ~0 on the V2 CLOB, so the only real cost is the ~1-3¢ bid/ask
+    // spread — making a fast cheap re-hedge strongly preferred over flatten.
+    let mut legs_by_market: std::collections::HashMap<String, Vec<((String, U256), Position)>> =
+        std::collections::HashMap::new();
     for ((strategy_name, token_id), position) in pos_map.iter() {
         if strategy_name != "ArbitrageStrategy" && strategy_name != "TimeDecayStrategy" {
             continue;
         }
-        let age_secs = (now - position.opened_at).num_seconds();
-        if age_secs < 60 { continue; }
+        if (now - position.opened_at).num_seconds() < 60 { continue; }
+        legs_by_market
+            .entry(position.market_name.clone())
+            .or_default()
+            .push(((strategy_name.clone(), *token_id), position.clone()));
+    }
 
-        if let Some(paired_token) = position.paired_leg_token_id {
-            let pair_key = (strategy_name.clone(), paired_token);
-            if pos_map.contains_key(&pair_key) { continue; }
-            orphans_to_exit.push(((strategy_name.clone(), *token_id), position.clone()));
+    // Fully-naked single legs → full orphan handling (re-hedge if cheap, else flatten).
+    let mut orphans_to_exit: Vec<((String, U256), Position)> = Vec::new();
+    // Imbalanced pairs → flatten ONLY the naked excess of the heavier leg.
+    let mut imbalanced_to_trim: Vec<((String, U256), Position, Decimal)> = Vec::new();
+
+    for (_market, legs) in legs_by_market {
+        match legs.len() {
+            1 => {
+                let (key, pos) = legs.into_iter().next().unwrap();
+                if pos.shares >= crate::config::MIN_ORDER_SHARES {
+                    orphans_to_exit.push((key, pos));
+                }
+            }
+            2 => {
+                let mut it = legs.into_iter();
+                let (k0, p0) = it.next().unwrap();
+                let (k1, p1) = it.next().unwrap();
+                // Only a genuine YES+NO pair (two DISTINCT tokens) can be a hedge.
+                // Two keys on the SAME token (e.g. arb + time-decay) are the same
+                // side — skip to avoid mis-flattening a non-hedge.
+                if k0.1 == k1.1 { continue; }
+                let excess = (p0.shares - p1.shares).abs();
+                if excess >= crate::config::MIN_ORDER_SHARES {
+                    let (heavy_key, heavy_pos) =
+                        if p0.shares > p1.shares { (k0, p0) } else { (k1, p1) };
+                    imbalanced_to_trim.push((heavy_key, heavy_pos, excess));
+                }
+            }
+            _ => {
+                // Unexpected >2 legs for one market — skip to avoid mis-flattening.
+                continue;
+            }
         }
     }
 
@@ -383,6 +435,49 @@ pub async fn reconcile_orphaned_positions(
                 shares: position.shares,
                 is_neg_risk: false, // ArbitrageStrategy only runs on standard binary markets
                 paired_token_id: position.paired_leg_token_id,
+                original_entry: position.avg_entry,
+            });
+        }
+    }
+
+    // ── Imbalanced-pair trim: flatten ONLY the naked excess ──────────────────
+    // Both legs are present but unequal — keep the hedged remainder, FAK-sell the
+    // excess of the heavier leg at bid. We do NOT re-hedge here (paired_token_id =
+    // None) because buying more of the opposite leg on top of an already-tracked
+    // row risks duplicate bookkeeping; flattening the excess is the conservative
+    // path and caps the loss at the spread (~1-3¢/share, fees ~0 on V2).
+    for ((strategy_name, token_id), position, excess) in imbalanced_to_trim {
+        // Re-processing guard: skip if we acted on this token within the cooldown
+        // window (chain-sync needs time to reflect the sell on-chain).
+        let cooldown_key = format!("{}:{}", strategy_name, token_id);
+        let on_cooldown = phantom_cooldowns.lock().await
+            .get(&cooldown_key)
+            .map(|t| t.elapsed().as_secs() < crate::helpers::balance::PHANTOM_COOLDOWN_SECS)
+            .unwrap_or(false);
+        if on_cooldown { continue; }
+
+        warn!("⚖️ IMBALANCED HEDGE [{}]: leg {} holds {:.4} shares but its pair is short — \
+               {:.4} shares NAKED; flattening excess at bid",
+              strategy_name, token_id, position.shares, excess);
+
+        // Optimistically reduce the tracked shares to the hedged remainder so the
+        // next cycle won't re-detect the same excess. Chain-sync self-heals this
+        // if the FAK sell fails (it re-reads actual on-chain holdings).
+        if let Some(p) = pos_map.get_mut(&(strategy_name.clone(), token_id)) {
+            p.shares = (p.shares - excess).max(Decimal::ZERO);
+        }
+        phantom_cooldowns.lock().await.insert(cooldown_key, tokio::time::Instant::now());
+
+        let _ = send_notification(tg_token, tg_chat_id,
+            &format!("⚖️ Imbalanced hedge trimmed [{}]: flattening {:.0} naked shares of token {} @ bid",
+                     strategy_name, excess.trunc(), token_id)).await;
+
+        if position.fill_confirmed_at.is_some() && excess > Decimal::ZERO {
+            exits_to_sell.push(OrphanExit {
+                token_id,
+                shares: excess,
+                is_neg_risk: false,
+                paired_token_id: None, // force flatten-only (no re-hedge atop existing opposite leg)
                 original_entry: position.avg_entry,
             });
         }
@@ -849,11 +944,19 @@ async fn record_settled_arb_trade(
     let yes_leg = legs.iter().find(|p| p.outcome_index == 0);
     let no_leg  = legs.iter().find(|p| p.outcome_index == 1);
 
-    // Use the primary asset pool for the trade record.
-    let asset_str = db::available_assets()
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| "btc".to_string());
+    // Route the settlement record to the asset DB that actually owns this market,
+    // inferred from the market title (e.g. "Solana Up or Down…" → sol). Previously
+    // this always used the primary asset pool, which dumped every settlement —
+    // including ETH/SOL markets — into the BTC DB and corrupted per-asset P&L.
+    let title_for_asset = yes_leg.or(no_leg).map(|l| l.title.as_str()).unwrap_or("");
+    let asset_str = infer_asset_from_title(title_for_asset)
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| {
+            db::available_assets()
+                .into_iter()
+                .next()
+                .unwrap_or_else(|| "btc".to_string())
+        });
 
     match (yes_leg, no_leg) {
         (Some(yes_leg), Some(no_leg)) => {
@@ -890,7 +993,7 @@ async fn record_settled_arb_trade(
             ).await;
         }
         (Some(leg), None) | (None, Some(leg)) => {
-            // Single-leg settlement (orphaned position)
+            // Single-leg settlement (orphaned / unhedged position).
             let side = if leg.outcome_index == 0 { "YES" } else { "NO" };
             let avg_price = leg.avg_price;
             let size = leg.size;
@@ -899,14 +1002,21 @@ async fn record_settled_arb_trade(
                 return;
             }
 
-            // Single-leg settled: if we held the winning side, we get full payout
-            // For now, assume it settled (otherwise we wouldn't be here), so payout = $1/share
-            let pnl = (Decimal::ONE - avg_price) * size;
+            // A single (unhedged) leg pays the market's RESOLVED price: ~$1.00 if
+            // this side won, ~$0.00 if it lost. `cur_price` on a redeemable position
+            // already reflects the resolved outcome, so use it as the exit price.
+            //
+            // The previous code hardcoded exit_price = $1.00, so pnl was always
+            // (1 − avg_price) × size > 0 — booking every LOSING settlement as a
+            // phantom win. That masked real cash losses (the losing leg paid $0)
+            // and is the root cause of the unexplained portfolio bleed.
+            let exit_price = leg.cur_price;
+            let pnl = (exit_price - avg_price) * size;
             let market_title = leg.title.clone();
 
             info!(
-                " ArbitrageStrategy single-leg settlement: \"{}\" | {} {} @ ${:.4} → pnl ${:.4}",
-                market_title, size, side, avg_price, pnl
+                " ArbitrageStrategy single-leg settlement: \"{}\" | {} {} @ ${:.4} → resolved ${:.4} → pnl ${:.4}",
+                market_title, size, side, avg_price, exit_price, pnl
             );
 
             metrics::record_trade(
@@ -915,7 +1025,7 @@ async fn record_settled_arb_trade(
                 market_title,
                 side.to_string(),
                 avg_price,
-                Decimal::ONE,
+                exit_price,
                 size,
                 pnl,
                 format!("Settlement (single-leg {})", side),

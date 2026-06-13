@@ -45,6 +45,7 @@ use crate::helpers::db;
 // defaults — clobbering any operator customisation made in the previous session.
 fn default_arb_max_leg_price()             -> Decimal { config::ARBITRAGE_MAX_LEG_PRICE             }
 fn default_arb_max_leg_obi()               -> Decimal { config::ARBITRAGE_MAX_LEG_OBI               }
+fn default_arb_max_obi_asymmetry()         -> Decimal { config::ARBITRAGE_MAX_OBI_ASYMMETRY         }
 fn default_trendcapture_enable()           -> bool    { config::ENABLE_TRENDCAPTURE_TRADING          }
 fn default_trendcapture_min_trade_size()   -> Decimal { config::TRENDCAPTURE_MIN_TRADE_SIZE_USDC     }
 fn default_trendcapture_max_trade_size()   -> Decimal { config::TRENDCAPTURE_MAX_TRADE_SIZE_USDC     }
@@ -90,6 +91,12 @@ pub struct DynamicConfig {
     /// Default 0.50 ≈ 3:1 bid/ask depth ratio ≈ >60% directional market.
     #[serde(default = "default_arb_max_leg_obi")]
     pub arbitrage_max_leg_obi:        Decimal,
+
+    /// Max allowed |YES_OBI − NO_OBI| before skipping a paired arb entry.
+    /// Blocks asymmetric books (one leg seller-heavy, the other buyer-heavy) that
+    /// fill one leg alone and leave a naked orphan. Lower = stricter. Default 0.60.
+    #[serde(default = "default_arb_max_obi_asymmetry")]
+    pub arbitrage_max_obi_asymmetry:  Decimal,
 
     // ── TimeDecay Viper ───────────────────────────────────────────────────────
     pub time_decay_position_size_usdc:  Decimal,
@@ -165,6 +172,7 @@ impl Default for DynamicConfig {
             arbitrage_max_fill_gap:       config::ARBITRAGE_MAX_FILL_GAP,
             arbitrage_max_leg_price:      config::ARBITRAGE_MAX_LEG_PRICE,
             arbitrage_max_leg_obi:        config::ARBITRAGE_MAX_LEG_OBI,
+            arbitrage_max_obi_asymmetry:  config::ARBITRAGE_MAX_OBI_ASYMMETRY,
 
             time_decay_position_size_usdc:  config::TIME_DECAY_POSITION_SIZE_USDC,
             time_decay_max_exposure_usdc:   config::TIME_DECAY_MAX_EXPOSURE_USDC,
