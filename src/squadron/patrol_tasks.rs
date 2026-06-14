@@ -168,7 +168,14 @@ async fn calculate_positions_value(pool: &sqlx::SqlitePool) -> Decimal {
 
 
     // If the same token appears multiple times (e.g. one chain-adopted row plus one
-    // strategy-owned row), value it once to avoid portfolio inflation.
+    // strategy-owned row on the same outcome), value it ONCE to avoid portfolio
+    // inflation — and pick the row that reflects on-chain reality.
+    //
+    // Prefer the CHAIN-ADOPTED row: chain-sync stamps it to the wallet's real on-chain
+    // size (stale ones are purged), so it is authoritative. A non-adopted strategy row
+    // may be a phantom that never settled on-chain. Among equal adoption status, prefer
+    // larger shares. Mirrors the dedup rule in /api/portfolio so both snapshots and the
+    // banner stay one source of truth.
     let mut deduped_by_token: std::collections::HashMap<String, db::OpenPositionRow> =
         std::collections::HashMap::new();
     for pos in positions {
@@ -179,7 +186,7 @@ async fn calculate_positions_value(pool: &sqlx::SqlitePool) -> Decimal {
             Some(existing) => {
                 let existing_shares = existing.shares.parse::<Decimal>().unwrap_or(dec!(0));
                 let candidate_shares = pos.shares.parse::<Decimal>().unwrap_or(dec!(0));
-                let replace = (existing.chain_adopted && !pos.chain_adopted)
+                let replace = (!existing.chain_adopted && pos.chain_adopted)
                     || (existing.chain_adopted == pos.chain_adopted && candidate_shares > existing_shares);
                 if replace {
                     deduped_by_token.insert(pos.token_id.clone(), pos);

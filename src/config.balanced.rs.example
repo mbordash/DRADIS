@@ -47,7 +47,6 @@ pub const ARBITRAGE_MAX_LEG_PRICE: Decimal = dec!(0.60);
 pub const ARB_FAK_REHEDGE_BUFFER: Decimal = dec!(0.03);
 
 pub const ARBITRAGE_MAX_LEG_OBI: Decimal = dec!(0.50);
-pub const ARBITRAGE_MAX_OBI_ASYMMETRY: Decimal = dec!(0.60);
 
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.97);
 pub const MIN_ORDER_SHARES: Decimal = dec!(1.0);

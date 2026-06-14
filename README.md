@@ -495,7 +495,9 @@ The safe pattern: bump the suffix in `GBOOST_MODEL_PATH` (e.g. `v14f` → `v15f`
 
 **Can I enable a Viper mid-session?** Yes — all seven are always instantiated. Toggle via Control Tower or `PATCH /api/config`. Takes effect on the next 50ms tick.
 
-**What about Kalshi?** DRADIS operates in the universe of PolyMarket. Kalshi is an alternate universe. Adama isn't ready to build this level of multiverse abstraction just yet.
+**Does DRADIS support the US Polymarket API?** Not yet. DRADIS today targets the **international CLOB** — self-custody, EIP-712 order signing over a Polygon wallet, on-chain `U256` token IDs. Polymarket's **US platform** is a separate, custodial, CFTC-regulated exchange with web2 auth (API key / secret / session token) and string/UUID market IDs. We're building a **venue abstraction** so a build can target either market via a Cargo feature flag (`intl_clob` today, `us_retail` planned) — single-venue per binary, so the US deployment carries none of the Polygon crypto weight and stays inside its own regulatory/network footprint. 
+
+**What about Kalshi?** DRADIS operates in the universe of PolyMarket. Kalshi is an alternate universe. Adama isn't ready to build this level of multiverse abstraction just yet — though the planned venue abstraction is the on-ramp: once the `Execution` trait lands, a `kalshi` venue becomes additive rather than a rewrite.
 
 **Control Tower shows "Offline"?** Check: (1) DRADIS running? (2) `curl http://localhost:9000/api/health`? (3) Docker — same `dradis-net` network?
 

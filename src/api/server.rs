@@ -795,7 +795,17 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
         }
 
         // Build a deduped view of positions by token_id for count/fallback valuation.
-        // Prefer non-chain-adopted rows over chain-adopted placeholders, then larger shares.
+        // The on-chain wallet holds ONE balance per token, so rows that share a
+        // token_id (e.g. an Arbitrage leg and a TrendCapture leg on the same outcome)
+        // must be valued ONCE — never summed (double-count) nor arbitrarily dropped.
+        //
+        // Prefer the CHAIN-ADOPTED row: chain-sync stamps it to the wallet's real
+        // on-chain size (and purges it when the token is no longer held), so it is the
+        // authoritative reflection of holdings. A non-adopted strategy row may be a
+        // phantom that never settled on-chain (e.g. a same-token leg that overlaps an
+        // existing position). Among rows with equal adoption status, prefer larger
+        // shares. The genuinely-additive case self-heals on the next chain-sync, which
+        // stamps every row for the token to the full on-chain size.
         let mut deduped_positions: std::collections::HashMap<String, db::OpenPositionRow> =
             std::collections::HashMap::new();
         for pos in db::get_open_positions(&pool).await {
@@ -806,7 +816,7 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
                 Some(existing) => {
                     let existing_shares = Decimal::from_str(&existing.shares).unwrap_or(Decimal::ZERO);
                     let candidate_shares = Decimal::from_str(&pos.shares).unwrap_or(Decimal::ZERO);
-                    let replace = (existing.chain_adopted && !pos.chain_adopted)
+                    let replace = (!existing.chain_adopted && pos.chain_adopted)
                         || (existing.chain_adopted == pos.chain_adopted && candidate_shares > existing_shares);
                     if replace {
                         deduped_positions.insert(pos.token_id.clone(), pos);

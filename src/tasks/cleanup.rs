@@ -661,7 +661,7 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
                         if (pos.size - db_shares_val).abs() > Decimal::new(1, 3) {
                             db::update_position_from_chain(&pool, token_str, pos.size, pos.avg_price, Some(pos.cur_price)).await;
                             total_updated_shares += 1;
-                            info!("🔄 Chain-sync [{}]: corrected shares — token {} | {} → {} shares | \"{}\"",
+                            info!(" Chain-sync [{}]: corrected shares — token {} | {} → {} shares | \"{}\"",
                                 asset.to_uppercase(),
                                 &token_str[..token_str.len().min(20)],
                                 db_shares_val, pos.size, pos.title);
@@ -688,7 +688,7 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
                         let snap_session_pnl = latest_snap.session_pnl.parse::<Decimal>().unwrap_or(Decimal::ZERO);
                         let snap_total = collateral + live_positions_value;
                         db::record_pnl_snapshot(&pool, snap_session_pnl, collateral, snap_total).await;
-                        debug!("📸 Chain-sync [{}]: wrote accurate pnl_snapshot — collateral=${:.4} positions=${:.4} total=${:.4}",
+                        debug!(" Chain-sync [{}]: wrote accurate pnl_snapshot — collateral=${:.4} positions=${:.4} total=${:.4}",
                             asset.to_uppercase(), collateral, live_positions_value, snap_total);
                     }
                 }
@@ -1289,7 +1289,7 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address, squadron_ass
                 }
 
                 info!(
-                    "🔍 Orphan detection [{}]: Found auto-settled arbitrage: \"{}\" | {} pairs @ entry ${:.4}/pair → pnl ${:.4}",
+                    " Orphan detection [{}]: Found auto-settled arbitrage: \"{}\" | {} pairs @ entry ${:.4}/pair → pnl ${:.4}",
                     squadron_asset.to_uppercase(), market_name, pairs, entry_per_pair, pnl
                 );
 
