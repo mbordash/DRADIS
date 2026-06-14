@@ -14,6 +14,8 @@ use tracing::info;
 use crate::config;
 use crate::helpers::market::{get_market_pair, MarketCandidate};
 use crate::helpers::time::{fetch_historical_strike_price, fetch_strike_price_from_close_time};
+use crate::venues::core::MarketId;
+use crate::venues::intl::market_id_from_u256;
 
 /// Hard cap on how long a single `get_market_pair` scan may run.
 ///
@@ -28,8 +30,8 @@ const MARKET_SCAN_TIMEOUT_SECS: u64 = 90;
 
 /// The shared market state tuple broadcast on the watch channel.
 pub type MarketState = (
-    U256,                        // yes_token
-    U256,                        // no_token
+    MarketId,                    // yes_token (venue-neutral)
+    MarketId,                    // no_token  (venue-neutral)
     String,                      // market_name
     Option<chrono::DateTime<Utc>>, // market_close_time
     Option<Decimal>,             // strike_price
@@ -61,14 +63,14 @@ pub async fn run_market_monitor(
                 continue;
             }
         };
-        if candidate.yes_token == U256::ZERO { continue; }
+        if candidate.yes_token == market_id_from_u256(U256::ZERO) { continue; }
 
         let (cur_yes, _, cur_name, cur_close_time, _, _, _, _cur_cid) = market_tx.borrow().clone();
 
         if candidate.yes_token == cur_yes {
             // Hourly market unchanged — still check if maker market changed
-            let cur_maker_yes = market_tx.borrow().6.as_ref().map(|m| m.yes_token);
-            let new_maker_yes = maker_candidate.as_ref().map(|m| m.yes_token);
+            let cur_maker_yes = market_tx.borrow().6.as_ref().map(|m| m.yes_token.clone());
+            let new_maker_yes = maker_candidate.as_ref().map(|m| m.yes_token.clone());
             if cur_maker_yes != new_maker_yes {
                 if let Some(ref mk) = maker_candidate {
                     info!("🏦 Maker market updated: \"{}\"", mk.name);

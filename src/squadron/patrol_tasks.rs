@@ -322,14 +322,14 @@ pub fn spawn_cleanup_task(
     shared_http:          Arc<reqwest::Client>,
     phantom_cooldowns:    PhantomCooldowns,
     orphan_tombstones:    OrphanTombstones,
-    time_decay_positions: Arc<Mutex<std::collections::HashMap<U256, crate::vipers::time_decay_impl::TimeDecayPosition>>>,
-    pending_orders:       Arc<Mutex<std::collections::HashMap<(String, U256), Instant>>>,
+    time_decay_positions: Arc<Mutex<std::collections::HashMap<crate::venues::core::MarketId, crate::vipers::time_decay_impl::TimeDecayPosition>>>,
+    pending_orders:       Arc<Mutex<std::collections::HashMap<(String, crate::venues::core::MarketId), Instant>>>,
     yes_price_rx:         watch::Receiver<PriceState>,
     no_price_rx:          watch::Receiver<PriceState>,
     maker_yes_price_rx:   Option<watch::Receiver<PriceState>>,
     maker_no_price_rx:    Option<watch::Receiver<PriceState>>,
-    hourly_yes_token:     U256,
-    hourly_no_token:      U256,
+    hourly_yes_token:     crate::venues::core::MarketId,
+    hourly_no_token:      crate::venues::core::MarketId,
     hourly_market_name:   String,
     hourly_market_close_time: Option<chrono::DateTime<chrono::Utc>>,
     maker_market_config:  Option<MarketConfig>,
@@ -350,11 +350,11 @@ pub fn spawn_cleanup_task(
                     // Returns the list of confirmed-fill orphans so we can attempt FAK sells
                     // OUTSIDE the timeout — sell latency does not count against the 45 s cap.
                     let orphan_exits = match tokio::time::timeout(Duration::from_secs(45), async {
-                        if hourly_yes_token != U256::ZERO {
+                        if hourly_yes_token != crate::venues::intl::market_id_from_u256(U256::ZERO) {
                             crate::tasks::cleanup::cleanup_expired_positions(
                                 Arc::clone(&positions),
                                 hourly_market_name.clone(),
-                                hourly_yes_token, hourly_no_token,
+                                hourly_yes_token.clone(), hourly_no_token.clone(),
                                 hourly_market_close_time,
                             ).await;
                         }
@@ -362,7 +362,7 @@ pub fn spawn_cleanup_task(
                             crate::tasks::cleanup::cleanup_expired_positions(
                                 Arc::clone(&positions),
                                 mk.market_name.clone(),
-                                mk.yes_token, mk.no_token,
+                                mk.yes_token.clone(), mk.no_token.clone(),
                                 mk.market_close_time,
                             ).await;
                         }
@@ -403,6 +403,7 @@ pub fn spawn_cleanup_task(
                     // GHOST_MODE guard: neither path places live orders in ghost mode.
                     if !config::GHOST_MODE {
                         for orphan in orphan_exits {
+                            // Slice 2b: OrphanExit and market tokens are all neutral MarketId.
                             let vc = if orphan.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                             let mut rehedged = false;
 
@@ -453,7 +454,7 @@ pub fn spawn_cleanup_task(
                                     match place_limit_order(
                                         &trading_client, &nonce_manager, &signer,
                                         safe_address, eoa_address,
-                                        vc, paired_id, Side::Buy, orphan.shares,
+                                        vc, &paired_id, Side::Buy, orphan.shares,
                                         buy_price, 0, OrderType::FAK, false, 0, &shared_http,
                                     ).await {
                                                         Ok(order_id) => {
@@ -490,7 +491,7 @@ pub fn spawn_cleanup_task(
                                                             // the still-naked orphan leg if the re-hedge buy
                                                             // doesn't actually fill on-chain (retry next cycle).
                                                             let rh_tombstones = orphan_tombstones.clone();
-                                                            let rh_orphan_token = orphan.token_id;
+                                                            let rh_orphan_token = orphan.token_id.clone();
 
                                                             // Write pending position immediately (Viper Launch)
                                                             if let Some(pool) = db::pool_for(&rh_asset) {
@@ -507,7 +508,7 @@ pub fn spawn_cleanup_task(
 
                                                                 let mut req = BalanceAllowanceRequest::default();
                                                                 req.asset_type = AssetType::Conditional;
-                                                                req.token_id = Some(paired_id);
+                                                                req.token_id = Some(crate::venues::intl::u256_from_market_id(&paired_id).unwrap_or_default());
 
                                                                 let balance_ok = match tokio::time::timeout(
                                                                     std::time::Duration::from_secs(10),
@@ -602,7 +603,7 @@ pub fn spawn_cleanup_task(
                                 match place_limit_order(
                                     &trading_client, &nonce_manager, &signer,
                                     safe_address, eoa_address,
-                                    vc, orphan.token_id, Side::Sell, orphan.shares,
+                                    vc, &orphan.token_id, Side::Sell, orphan.shares,
                                     sell_price, 0, OrderType::FAK, false, 0, &shared_http,
                                 ).await {
                                     Ok(order_id) => {

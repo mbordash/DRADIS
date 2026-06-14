@@ -21,6 +21,8 @@ use polymarket_client_sdk_v2::clob::types::{AssetType, OrderType, Side};
 
 use crate::helpers::metrics;
 use crate::helpers::orders::place_limit_order;
+use crate::venues::core::MarketId;
+use crate::venues::intl::{market_id_from_u256, u256_from_market_id};
 
 pub use crate::state::{Position, PositionMap};
 
@@ -31,7 +33,9 @@ pub type PhantomCooldowns = Arc<Mutex<HashMap<String, Instant>>>;
 /// Never cleared on market switch — once a token is tombstoned it is never re-adopted
 /// within the same session. This breaks the infinite reconcile→re-adopt→orphan-detect cycle
 /// that occurs when an unhedged daily-market leg persists across many hourly rotations.
-pub type OrphanTombstones = Arc<Mutex<HashSet<U256>>>;
+///
+/// Slice 2a: keyed by the venue-neutral [`MarketId`].
+pub type OrphanTombstones = Arc<Mutex<HashSet<MarketId>>>;
 
 /// How long to block re-entry after a phantom removal (seconds).
 ///
@@ -62,13 +66,16 @@ pub async fn sync_position_balance(
     client: &Arc<ClobClient<Authenticated<Normal>>>,
     positions: &Arc<Mutex<PositionMap>>,
     strategy_name: &str,
-    token_id: U256,
+    token_id: &MarketId,
     phantom_cooldowns: Option<&PhantomCooldowns>,
     baseline_shares: Decimal,
     max_wait_secs: i64,
-    token_ownership: &Arc<Mutex<HashMap<U256, String>>>,
+    token_ownership: &Arc<Mutex<HashMap<MarketId, String>>>,
 ) -> Result<()> {
-    let key = (strategy_name.to_string(), token_id);
+    // Slice 2b: resolve the on-chain U256 once; the rest of the body is unchanged.
+    let token_id = u256_from_market_id(token_id)?;
+    let market = market_id_from_u256(token_id);
+    let key = (strategy_name.to_string(), market.clone());
     let check_interval_ms: u64 = 3000;
 
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -142,7 +149,7 @@ pub async fn sync_position_balance(
                     error!("⚠️ Position Sync FAILED [{}] Token {} — phantom removed.", strategy_name, token_id);
                     positions.lock().await.remove(&key);
                     // Release token claim — position was phantom/never filled.
-                    token_ownership.lock().await.remove(&token_id);
+                    token_ownership.lock().await.remove(&market);
                     if let Some(cooldowns) = phantom_cooldowns {
                         cooldowns.lock().await.insert(format!("{}:{}", strategy_name, token_id), Instant::now());
                     }
@@ -207,21 +214,24 @@ async fn cancel_resting_orders(client: &Arc<ClobClient<Authenticated<Normal>>>, 
 pub async fn reconcile_orphaned_positions(
     client: &Arc<ClobClient<Authenticated<Normal>>>,
     positions: &Arc<Mutex<PositionMap>>,
-    tokens: &[(U256, &str)],
+    tokens: &[(MarketId, &str)],
     market_name: &str,
     market_close_time: Option<chrono::DateTime<Utc>>,
-    token_bids: &[(U256, Decimal)],
+    token_bids: &[(MarketId, Decimal)],
     adoption_order: &[String],
     orphan_tombstones: Option<&OrphanTombstones>,
 ) {
-    for &(token_id, side_label) in tokens {
+    for (token_id, side_label) in tokens {
+        // Slice 2b: keys are neutral MarketId; resolve the on-chain U256 at the SDK edge.
+        let market = token_id.clone();
+        let token_u = match u256_from_market_id(token_id) { Ok(t) => t, Err(_) => continue };
         // ── Tombstone check ───────────────────────────────────────────────────
         // If this token has been through orphan-detection this session, skip it
         // permanently.  Without this, cleanup removes the orphan, phantom_cooldowns
         // are cleared on the next hourly market switch, and this reconcile re-adopts it —
         // restarting the infinite detect→remove→re-adopt cycle.
         if let Some(tb) = orphan_tombstones {
-            if tb.lock().await.contains(&token_id) {
+            if tb.lock().await.contains(&market) {
                 debug!("⏭️  RECONCILE: skipping tombstoned token {} — previously orphan-removed this session", token_id);
                 continue;
             }
@@ -229,7 +239,7 @@ pub async fn reconcile_orphaned_positions(
 
         let mut req = BalanceAllowanceRequest::default();
         req.asset_type = AssetType::Conditional;
-        req.token_id = Some(token_id);
+        req.token_id = Some(token_u);
         // Hard 10s timeout — the outer 'market_loop calls this function BEFORE the inner
         // select! loop starts, so the watchdog ticker cannot fire to break a stall here.
         // Without this guard a CLOB API hang at market-switch time causes a permanent
@@ -256,10 +266,10 @@ pub async fn reconcile_orphaned_positions(
 
         {
             let map = positions.lock().await;
-            if map.iter().any(|((_, tid), _)| *tid == token_id) { continue; }
+            if map.iter().any(|((_, tid), _)| *tid == market) { continue; }
         }
 
-        let current_bid = token_bids.iter().find(|(tid, _)| *tid == token_id)
+        let current_bid = token_bids.iter().find(|(tid, _)| tid == token_id)
             .map(|(_, bid)| *bid)
             .filter(|b| *b > dec!(0))
             .unwrap_or(dec!(0.50));
@@ -297,7 +307,7 @@ pub async fn reconcile_orphaned_positions(
         let adopted_strategy = if let Some(ref logged) = logged_strategy {
             // Verify the strategy isn't already tracking this token before using it.
             let map = positions.lock().await;
-            if !map.contains_key(&(logged.clone(), token_id)) {
+            if !map.contains_key(&(logged.clone(), market.clone())) {
                 Some(logged.clone())
             } else {
                 // Logged strategy already has this token — fall back to adoption_order.
@@ -305,7 +315,7 @@ pub async fn reconcile_orphaned_positions(
                 let mut fallback = None;
                 for s in adoption_order {
                     let map = positions.lock().await;
-                    if !map.contains_key(&(s.clone(), token_id)) {
+                    if !map.contains_key(&(s.clone(), market.clone())) {
                         fallback = Some(s.clone());
                         break;
                     }
@@ -316,7 +326,7 @@ pub async fn reconcile_orphaned_positions(
             let mut fallback = None;
             for s in adoption_order {
                 let map = positions.lock().await;
-                if !map.contains_key(&(s.clone(), token_id)) {
+                if !map.contains_key(&(s.clone(), market.clone())) {
                     fallback = Some(s.clone());
                     break;
                 }
@@ -327,13 +337,13 @@ pub async fn reconcile_orphaned_positions(
         if let Some(strategy_name) = adopted_strategy {
             let mut pos_map = positions.lock().await;
 
-            pos_map.insert((strategy_name.to_string(), token_id), Position {
+            pos_map.insert((strategy_name.to_string(), market.clone()), Position {
                 shares: actual_shares,
                 avg_entry,
                 opened_at: Utc::now() - chrono::Duration::seconds(crate::config::MIN_HOLD_SECS_BEFORE_STOP_LOSS),
                 close_time: market_close_time,
                 market_name: market_name.to_string(),
-                pair_token_id: token_id,
+                pair_token_id: market.clone(),
                 fill_confirmed_at: Some(Utc::now()),
                 paired_leg_token_id: None, // fixed up below
             });
@@ -356,26 +366,26 @@ pub async fn reconcile_orphaned_positions(
     // balance (naked orphan), the cleanup cycle will detect the missing pair on
     // its next run and remove the position while preventing phantom re-entry.
     if tokens.len() == 2 {
-        let (tok_a, _) = tokens[0];
-        let (tok_b, _) = tokens[1];
+        let market_a = tokens[0].0.clone();
+        let market_b = tokens[1].0.clone();
         let mut pos_map = positions.lock().await;
 
         // Find which strategy adopted each token (may be None if balance was 0)
         let strat_a = pos_map.iter()
-            .find(|((_, tid), _)| *tid == tok_a)
+            .find(|((_, tid), _)| *tid == market_a)
             .map(|((s, _), _)| s.clone());
         let strat_b = pos_map.iter()
-            .find(|((_, tid), _)| *tid == tok_b)
+            .find(|((_, tid), _)| *tid == market_b)
             .map(|((s, _), _)| s.clone());
 
         if let Some(sa) = strat_a {
-            if let Some(p) = pos_map.get_mut(&(sa, tok_a)) {
-                p.paired_leg_token_id = Some(tok_b);
+            if let Some(p) = pos_map.get_mut(&(sa, market_a.clone())) {
+                p.paired_leg_token_id = Some(market_b.clone());
             }
         }
         if let Some(sb) = strat_b {
-            if let Some(p) = pos_map.get_mut(&(sb, tok_b)) {
-                p.paired_leg_token_id = Some(tok_a);
+            if let Some(p) = pos_map.get_mut(&(sb, market_b.clone())) {
+                p.paired_leg_token_id = Some(market_a.clone());
             }
         }
     }
@@ -404,8 +414,8 @@ pub async fn arb_pair_fill_monitor(
     positions: Arc<Mutex<PositionMap>>,
     phantom_cooldowns: PhantomCooldowns,
     strategy_name: String,
-    leg_a_token: U256,
-    leg_b_token: U256,
+    leg_a_token: &MarketId,
+    leg_b_token: &MarketId,
     leg_a_baseline: Decimal,
     leg_b_baseline: Decimal,
     leg_a_side_label: String,
@@ -418,11 +428,15 @@ pub async fn arb_pair_fill_monitor(
     /// tasks can run their own cancel + phantom-removal logic before the arbiter steps in.
     const ARBITER_GRACE_SECS: u64 = 15;
 
+    // Slice 2b: resolve on-chain U256 once; the rest of the body is unchanged.
+    let leg_a_token = u256_from_market_id(leg_a_token).unwrap_or_default();
+    let leg_b_token = u256_from_market_id(leg_b_token).unwrap_or_default();
+
     let total_wait = Duration::from_secs((max_wait_secs as u64).saturating_add(ARBITER_GRACE_SECS));
     tokio::time::sleep(total_wait).await;
 
-    let key_a = (strategy_name.clone(), leg_a_token);
-    let key_b = (strategy_name.clone(), leg_b_token);
+    let key_a = (strategy_name.clone(), market_id_from_u256(leg_a_token));
+    let key_b = (strategy_name.clone(), market_id_from_u256(leg_b_token));
 
     // Snapshot fill-confirmation state for both legs.
     let (a_confirmed, a_shares) = {
@@ -453,16 +467,20 @@ pub async fn arb_pair_fill_monitor(
     }
 
     // ── Asymmetric fill: one leg confirmed, the other is missing ──────────────
-    let (filled_token, missing_token, missing_baseline, missing_vc, missing_side) =
+    let (filled_token, missing_token, missing_baseline, missing_vc, missing_side, filled_vc, filled_side) =
         if a_confirmed {
             warn!("⚡ ARB ARBITER [{}]: Leg A ({}) filled ({} shares) but Leg B ({}) is MISSING — initiating orphan-leg cleanup",
                   strategy_name, leg_a_token, a_shares, leg_b_token);
-            (leg_a_token, leg_b_token, leg_b_baseline, vc_b, leg_b_side_label.as_str())
+            (leg_a_token, leg_b_token, leg_b_baseline, vc_b, leg_b_side_label.as_str(), vc_a, leg_a_side_label.as_str())
         } else {
             warn!("⚡ ARB ARBITER [{}]: Leg B ({}) filled ({} shares) but Leg A ({}) is MISSING — initiating orphan-leg cleanup",
                   strategy_name, leg_b_token, b_shares, leg_a_token);
-            (leg_b_token, leg_a_token, leg_a_baseline, vc_a, leg_a_side_label.as_str())
+            (leg_b_token, leg_a_token, leg_a_baseline, vc_a, leg_a_side_label.as_str(), vc_b, leg_b_side_label.as_str())
         };
+
+    // Slice 2a: neutral keys for map ops; raw U256 retained for SDK/chain calls.
+    let filled_market  = market_id_from_u256(filled_token);
+    let missing_market = market_id_from_u256(missing_token);
 
     // Step 1: Cancel any remaining GTC on the missing leg (idempotent if already cancelled
     //         by the individual sync task — the CLOB rejects cancels of non-existent orders
@@ -494,14 +512,14 @@ pub async fn arb_pair_fill_monitor(
         // The missing leg actually filled during the cancel settle-lag window — recover it.
         warn!("✅ ARB ARBITER [{}]: Missing leg {} RECOVERED post-cancel settle ({} shares)",
               strategy_name, missing_token, settled_shares);
-        let key_m = (strategy_name.clone(), missing_token);
+        let key_m = (strategy_name.clone(), missing_market.clone());
         let mut map = positions.lock().await;
         if let Some(pos) = map.get_mut(&key_m) {
             pos.shares = settled_shares;
             if pos.fill_confirmed_at.is_none() { pos.fill_confirmed_at = Some(Utc::now()); }
         } else {
             // Sync task already phantom-removed it; re-insert with data from the filled leg.
-            let reference = map.get(&(strategy_name.clone(), filled_token)).cloned();
+            let reference = map.get(&(strategy_name.clone(), filled_market.clone())).cloned();
             if let Some(ref_pos) = reference {
                 map.insert(key_m, Position {
                     shares: settled_shares,
@@ -509,9 +527,9 @@ pub async fn arb_pair_fill_monitor(
                     opened_at: Utc::now(),
                     close_time: ref_pos.close_time,
                     market_name: ref_pos.market_name.clone(),
-                    pair_token_id: missing_token,
+                    pair_token_id: missing_market.clone(),
                     fill_confirmed_at: Some(Utc::now()),
-                    paired_leg_token_id: Some(filled_token),
+                    paired_leg_token_id: Some(filled_market.clone()),
                 });
             }
         }
@@ -546,7 +564,7 @@ pub async fn arb_pair_fill_monitor(
     // Match the filled leg's confirmed share count AND entry price so we can compute a
     // breakeven ceiling — without this we'd cap at a fixed $0.99 and could lock in a loss.
     let (filled_shares, filled_avg_entry) = positions.lock().await
-        .get(&(strategy_name.clone(), filled_token))
+        .get(&(strategy_name.clone(), filled_market.clone()))
         .map(|p| (p.shares, p.avg_entry))
         .unwrap_or((dec!(0), dec!(0)));
     let fak_qty = if filled_shares >= crate::config::MIN_ORDER_SHARES {
@@ -568,88 +586,158 @@ pub async fn arb_pair_fill_monitor(
         dec!(0.49) // conservative fallback when entry is unknown
     };
 
-    // FAK limit = ask + one tick, capped at the dynamic breakeven ceiling.
-    // Using ask+1tick lets us cross the spread as a taker and get immediate fill.
-    let fak_price = (ask_price + dec!(0.01)).min(dynamic_ceiling);
+    // Re-hedge is only viable if we can cross the spread (ask + 1 tick) at or below
+    // the breakeven ceiling. A FAK priced BELOW the ask cannot fill, so attempting it
+    // would either no-op (and falsely record a phantom hedge) or fail — in both cases
+    // the naked leg used to be abandoned and ride to a $0 settlement (the −$5 SOL
+    // losses). Instead: only re-hedge when economical; otherwise flatten immediately.
+    let rehedge_price = ask_price + dec!(0.01);
+    let rehedge_viable = rehedge_price <= dynamic_ceiling;
 
-    debug!("DEBUG ARB ARBITER [{}]: FAK re-hedge attempt details: ask_price={:.4}, dynamic_ceiling={:.4}, fak_price={:.4}",
-           strategy_name, ask_price, dynamic_ceiling, fak_price);
+    if rehedge_viable {
+        warn!("🎯 ARB ARBITER [{}]: Placing FAK taker buy re-hedge — token={} qty={} limit={:.4} (ask={:.4}, breakeven_ceil={:.4}, filled_entry={:.4})",
+              strategy_name, missing_token, fak_qty, rehedge_price, ask_price, dynamic_ceiling, filled_avg_entry);
 
-    warn!("🎯 ARB ARBITER [{}]: Placing FAK taker buy — token={} qty={} limit={:.4} (ask={:.4}, breakeven_ceil={:.4}, filled_entry={:.4})",
-          strategy_name, missing_token, fak_qty, fak_price, ask_price, dynamic_ceiling, filled_avg_entry);
+        match place_limit_order(
+            &client, &nonce_manager, &signer,
+            safe_address, eoa_address, missing_vc,
+            &missing_market, Side::Buy, fak_qty, rehedge_price,
+            0, OrderType::FAK, false, 0, &*http,
+        ).await {
+            Ok(order_id) => {
+                warn!("✅ ARB ARBITER [{}]: FAK re-hedge placed (order_id={}) — delta exposure closed",
+                      strategy_name, order_id);
 
-    // Step 5: Place the FAK order — Immediate-or-Cancel, taker fill at current ask.
+                // Re-insert the missing leg into the positions map (the sync task already
+                // phantom-removed it; we restore it with the FAK fill data).
+                let reference = positions.lock().await
+                    .get(&(strategy_name.clone(), filled_market.clone()))
+                    .cloned();
+                if let Some(ref_pos) = reference {
+                    let key_m = (strategy_name.clone(), missing_market.clone());
+                    let mut map = positions.lock().await;
+                    if !map.contains_key(&key_m) {
+                        map.insert(key_m.clone(), Position {
+                            shares: fak_qty,
+                            avg_entry: rehedge_price,
+                            opened_at: Utc::now(),
+                            close_time: ref_pos.close_time,
+                            market_name: ref_pos.market_name.clone(),
+                            pair_token_id: missing_market.clone(),
+                            fill_confirmed_at: Some(Utc::now()),
+                            paired_leg_token_id: Some(filled_market.clone()),
+                        });
+                    }
+                    drop(map);
+
+                    // Clear phantom cooldown so a future cycle can enter this market again.
+                    phantom_cooldowns.lock().await
+                        .remove(&format!("{}:{}", strategy_name, missing_token));
+
+                    // Write the re-hedged fill to the DB.
+                    if let Some(pool) = crate::helpers::db::pool_for(&asset) {
+                        crate::helpers::db::record_open_position(
+                            &pool,
+                            &strategy_name,
+                            &missing_token.to_string(),
+                            &ref_pos.market_name,
+                            missing_side,
+                            rehedge_price,
+                            fak_qty,
+                            false,
+                        ).await;
+                    }
+                }
+                // Re-hedge complete — the pair is whole again. Do NOT fall through to flatten.
+                return;
+            }
+            Err(e) => {
+                warn!("❌ ARB ARBITER [{}]: FAK re-hedge FAILED for missing leg {}: {} — falling back to guaranteed bid-flatten",
+                      strategy_name, missing_token, e);
+                // fall through to the bid-flatten safety net below
+            }
+        }
+    } else {
+        warn!("🛟 ARB ARBITER [{}]: Re-hedge uneconomical (would need {:.4} > breakeven {:.4}) — flattening naked leg at bid to cap loss",
+              strategy_name, rehedge_price, dynamic_ceiling);
+    }
+
+    // ── Guaranteed bid-flatten: a naked leg must NEVER ride to settlement ────────
+    // When re-hedge is impossible/uneconomical we immediately FAK-SELL the filled leg
+    // at the live bid. Worst case is the spread (~1–3¢/share) instead of a full leg
+    // resolving to $0. This is the hard guarantee: exposure is always closed now.
+    let market_name = positions.lock().await
+        .get(&(strategy_name.clone(), filled_market.clone()))
+        .map(|p| p.market_name.clone())
+        .unwrap_or_default();
+
+    let bid_price = {
+        let req = PriceRequest::builder()
+            .token_id(filled_token)
+            .side(Side::Sell)
+            .build();
+        match client.price(&req).await {
+            Ok(resp) => resp.price,
+            Err(e) => {
+                warn!("⚠️ ARB ARBITER [{}]: Could not fetch bid for filled leg {}: {} — using $0.01 floor",
+                      strategy_name, filled_token, e);
+                dec!(0.01)
+            }
+        }
+    };
+    // Cross one tick below the bid to guarantee an immediate taker sell; floor at $0.01.
+    let sell_price = (bid_price - dec!(0.01)).max(dec!(0.01));
+
+    warn!("🛟 ARB ARBITER [{}]: Flattening naked leg {} — FAK SELL {} @ {:.4} (bid={:.4}, entry={:.4})",
+          strategy_name, filled_token, filled_shares, sell_price, bid_price, filled_avg_entry);
+
     match place_limit_order(
         &client, &nonce_manager, &signer,
-        safe_address, eoa_address, missing_vc,
-        missing_token, Side::Buy, fak_qty, fak_price,
+        safe_address, eoa_address, filled_vc,
+        &filled_market, Side::Sell, filled_shares, sell_price,
         0, OrderType::FAK, false, 0, &*http,
     ).await {
         Ok(order_id) => {
-            warn!("✅ ARB ARBITER [{}]: FAK re-hedge placed (order_id={}) — delta exposure closed",
-                  strategy_name, order_id);
-
-            // Re-insert the missing leg into the positions map (the sync task already
-            // phantom-removed it; we restore it with the FAK fill data).
-            let reference = positions.lock().await
-                .get(&(strategy_name.clone(), filled_token))
-                .cloned();
-            if let Some(ref_pos) = reference {
-                let key_m = (strategy_name.clone(), missing_token);
-                let mut map = positions.lock().await;
-                if !map.contains_key(&key_m) {
-                    map.insert(key_m.clone(), Position {
-                        shares: fak_qty,
-                        avg_entry: fak_price,
-                        opened_at: Utc::now(),
-                        close_time: ref_pos.close_time,
-                        market_name: ref_pos.market_name.clone(),
-                        pair_token_id: missing_token,
-                        fill_confirmed_at: Some(Utc::now()),
-                        paired_leg_token_id: Some(filled_token),
-                    });
-                }
-                drop(map);
-
-                // Clear phantom cooldown so a future cycle can enter this market again.
-                phantom_cooldowns.lock().await
-                    .remove(&format!("{}:{}", strategy_name, missing_token));
-
-                // Write the re-hedged fill to the DB.
-                if let Some(pool) = crate::helpers::db::pool_for(&asset) {
-                    crate::helpers::db::record_open_position(
-                        &pool,
-                        &strategy_name,
-                        &missing_token.to_string(),
-                        &ref_pos.market_name,
-                        missing_side,
-                        fak_price,
-                        fak_qty,
-                        false,
-                    ).await;
-                }
-            }
+            let realized = (sell_price - filled_avg_entry) * filled_shares;
+            warn!("✅ ARB ARBITER [{}]: Naked leg flattened (order_id={}) — exposure closed at bid, realized ${:.4}",
+                  strategy_name, order_id, realized);
+            // The leg is closed — drop it from tracking so it isn't counted as open.
+            positions.lock().await.remove(&(strategy_name.clone(), filled_market.clone()));
+            // Record the realized result so the dashboard reflects the true (small) loss.
+            crate::helpers::metrics::record_trade(
+                &asset,
+                strategy_name.clone(),
+                market_name,
+                filled_side.to_string(),
+                filled_avg_entry,
+                sell_price,
+                filled_shares,
+                realized,
+                "Orphan flatten (bid exit)".to_string(),
+            ).await;
         }
         Err(e) => {
-            warn!("❌ ARB ARBITER [{}]: FAK re-hedge FAILED for missing leg {}: {}",
-                  strategy_name, missing_token, e);
-            // Engage phantom cooldowns on BOTH legs so re-entry is blocked until the
-            // operator can inspect the exposure.
-            let mut cd = phantom_cooldowns.lock().await;
-            cd.insert(format!("{}:{}", strategy_name, leg_a_token), tokio::time::Instant::now());
-            cd.insert(format!("{}:{}", strategy_name, leg_b_token), tokio::time::Instant::now());
+            warn!("❌ ARB ARBITER [{}]: Bid-flatten FAILED for naked leg {}: {} — the 5-min cleanup backstop will retry",
+                  strategy_name, filled_token, e);
         }
     }
+
+    // Block re-entry on BOTH legs until the operator/cleanup confirms the state is clean.
+    let mut cd = phantom_cooldowns.lock().await;
+    cd.insert(format!("{}:{}", strategy_name, leg_a_token), tokio::time::Instant::now());
+    cd.insert(format!("{}:{}", strategy_name, leg_b_token), tokio::time::Instant::now());
 }
 
 pub async fn quick_confirm_fill(
     client: &Arc<ClobClient<Authenticated<Normal>>>,
     strategy_name: &str,
-    token_id: U256,
+    token_id: &MarketId,
     positions: &Arc<Mutex<PositionMap>>,
     _condition_id: &str, // retained for API compatibility; no longer used (FAK orders can't be cancelled)
     order_type: OrderType,
 ) -> Result<bool> {
+    // Slice 2b: resolve on-chain U256 once; the rest of the body is unchanged.
+    let token_id = u256_from_market_id(token_id)?;
     // Only quick-confirm FAK orders. GTC orders need to wait for on-chain sync.
     if order_type != OrderType::FAK {
         return Ok(false);
@@ -660,7 +748,7 @@ pub async fn quick_confirm_fill(
     let req2 = OrdersRequest::builder().asset_id(token_id).build();
     if !(match client.orders(&req2, None).await { Ok(p) => p.data.is_empty(), Err(_) => true }) {
         let mut pos_map = positions.lock().await;
-        if let Some(pos) = pos_map.get_mut(&(strategy_name.to_string(), token_id)) {
+        if let Some(pos) = pos_map.get_mut(&(strategy_name.to_string(), market_id_from_u256(token_id))) {
             pos.fill_confirmed_at = Some(Utc::now());
             info!("✅ QUICK CONFIRM FILL [{}]: Token {} filled instantly", strategy_name, token_id);
             return Ok(true);

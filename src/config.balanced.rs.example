@@ -45,7 +45,7 @@ pub const ARBITRAGE_MAX_FILL_GAP: Decimal = dec!(0.03);
 pub const ARBITRAGE_MAX_LEG_PRICE: Decimal = dec!(0.60);
 /// Increased from 0.02 to 0.03 to give more buffer for FAK re-hedges.
 pub const ARB_FAK_REHEDGE_BUFFER: Decimal = dec!(0.03);
-
+pub const ARBITRAGE_MAX_OBI_ASYMMETRY: Decimal = dec!(0.60);
 pub const ARBITRAGE_MAX_LEG_OBI: Decimal = dec!(0.50);
 
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.97);

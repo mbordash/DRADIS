@@ -1182,8 +1182,8 @@ impl Strategy for GboostStrategyImpl {
         let (has_yes, has_no) = {
             let map = ctx.positions.lock().await;
             (
-                map.contains_key(&("GboostStrategy".to_string(), target_market.yes_token)),
-                map.contains_key(&("GboostStrategy".to_string(), target_market.no_token)),
+                map.contains_key(&("GboostStrategy".to_string(), target_market.yes_token.clone())),
+                map.contains_key(&("GboostStrategy".to_string(), target_market.no_token.clone())),
             )
         };
 
@@ -1232,10 +1232,10 @@ impl Strategy for GboostStrategyImpl {
             // pos_map (can be several seconds), evaluate_entry fires every tick.
             // Without this guard those ticks all re-emit Entry signals, flooding
             // the executor and potentially placing duplicate orders.
-            if self.pending_entries.lock().unwrap().contains_key(&target_market.yes_token) {
+            if self.pending_entries.lock().unwrap().contains_key(&crate::venues::intl::u256_from_market_id(&target_market.yes_token).unwrap_or_default()) {
                 return Ok(StrategySignal::NoSignal);
             }
-            if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(target_market.yes_token) {
+            if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(crate::venues::intl::u256_from_market_id(&target_market.yes_token).unwrap_or_default()) {
                 tracing::debug!(
                     "🚫 GBoost YES entry veto: cooldown active | market='{}' token={:?} remaining={}s",
                     target_market.market_name,
@@ -1353,7 +1353,7 @@ impl Strategy for GboostStrategyImpl {
             let (entry_prev_snap, entry_hist_vol, entry_tick_momentum) =
                 (precomp_prev_snap.clone(), precomp_hist_vol, precomp_tick_momentum);
             self.pending_entries.lock().unwrap().insert(
-                target_market.yes_token,
+                crate::venues::intl::u256_from_market_id(&target_market.yes_token).unwrap_or_default(),
                 (target_snapshot.clone(), entry_prev_snap, price, entry_hist_vol, entry_tick_momentum)
             );
             // Record market-level hold lock to prevent rapid flip chop.
@@ -1361,7 +1361,7 @@ impl Strategy for GboostStrategyImpl {
                 .insert(target_market.condition_id.clone(), Instant::now());
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
-                    token_id: target_market.yes_token,
+                    token_id: target_market.yes_token.clone(),
                     price, shares,
                     fee_bps:     target_market.yes_fee_bps as u16,
                     is_neg_risk: target_market.is_neg_risk,
@@ -1402,10 +1402,10 @@ impl Strategy for GboostStrategyImpl {
                 }
             }
             // ── Entry latch ──────────────────────────────────────────────────
-            if self.pending_entries.lock().unwrap().contains_key(&target_market.no_token) {
+            if self.pending_entries.lock().unwrap().contains_key(&crate::venues::intl::u256_from_market_id(&target_market.no_token).unwrap_or_default()) {
                 return Ok(StrategySignal::NoSignal);
             }
-            if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(target_market.no_token) {
+            if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(crate::venues::intl::u256_from_market_id(&target_market.no_token).unwrap_or_default()) {
                 tracing::debug!(
                     "🚫 GBoost NO entry veto: cooldown active | market='{}' token={:?} remaining={}s",
                     target_market.market_name, target_market.no_token, remaining_secs
@@ -1508,7 +1508,7 @@ impl Strategy for GboostStrategyImpl {
             let (entry_prev_snap, entry_hist_vol, entry_tick_momentum) =
                 (precomp_prev_snap.clone(), precomp_hist_vol, precomp_tick_momentum);
             self.pending_entries.lock().unwrap().insert(
-                target_market.no_token,
+                crate::venues::intl::u256_from_market_id(&target_market.no_token).unwrap_or_default(),
                 (target_snapshot.clone(), entry_prev_snap, price, entry_hist_vol, entry_tick_momentum)
             );
             // Record market-level hold lock to prevent rapid flip chop.
@@ -1516,7 +1516,7 @@ impl Strategy for GboostStrategyImpl {
                 .insert(target_market.condition_id.clone(), Instant::now());
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
-                    token_id: target_market.no_token,
+                    token_id: target_market.no_token.clone(),
                     price, shares,
                     fee_bps:     target_market.no_fee_bps as u16,
                     is_neg_risk: target_market.is_neg_risk,
@@ -1557,7 +1557,7 @@ impl Strategy for GboostStrategyImpl {
         let pos_map = ctx.positions.lock().await;
 
         // ── YES position ──────────────────────────────────────────────────────
-        if let Some(pos) = pos_map.get(&("GboostStrategy".to_string(), target_market.yes_token)) {
+        if let Some(pos) = pos_map.get(&("GboostStrategy".to_string(), target_market.yes_token.clone())) {
             if pos.fill_confirmed_at.is_some() {
                 let bid = target_snapshot.yes_bid;
                 let profit_pct = if pos.avg_entry > dec!(0) {
@@ -1567,7 +1567,7 @@ impl Strategy for GboostStrategyImpl {
                     .map(|t| (Utc::now() - t).num_seconds()).unwrap_or(0);
 
                 let exit_params = || OrderParams {
-                    token_id: target_market.yes_token,
+                    token_id: target_market.yes_token.clone(),
                     price: bid, shares: pos.shares,
                     fee_bps: target_market.yes_fee_bps as u16,
                     is_neg_risk: target_market.is_neg_risk,
@@ -1579,8 +1579,8 @@ impl Strategy for GboostStrategyImpl {
                 };
 
                 if profit_pct >= tp {
-                    self.record_training_outcome_on_exit(target_market.yes_token, profit_pct > 0.0);
-                    self.mark_post_exit_cooldown(target_market.yes_token);
+                    self.record_training_outcome_on_exit(crate::venues::intl::u256_from_market_id(&target_market.yes_token).unwrap_or_default(), profit_pct > 0.0);
+                    self.mark_post_exit_cooldown(crate::venues::intl::u256_from_market_id(&target_market.yes_token).unwrap_or_default());
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
                         reason: format!("GBoost TP YES: gain={:.2}%", profit_pct * 100.0),
@@ -1588,8 +1588,8 @@ impl Strategy for GboostStrategyImpl {
                     });
                 }
                 if secs_held >= config::GBOOST_SL_MIN_HOLD_SECS && profit_pct <= -sl {
-                    self.record_training_outcome_on_exit(target_market.yes_token, profit_pct > 0.0);
-                    self.mark_post_exit_cooldown_sl(target_market.yes_token);
+                    self.record_training_outcome_on_exit(crate::venues::intl::u256_from_market_id(&target_market.yes_token).unwrap_or_default(), profit_pct > 0.0);
+                    self.mark_post_exit_cooldown_sl(crate::venues::intl::u256_from_market_id(&target_market.yes_token).unwrap_or_default());
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
                         reason: format!("GBoost SL YES: loss={:.2}% ({}s)", profit_pct * 100.0, secs_held),
@@ -1607,8 +1607,8 @@ impl Strategy for GboostStrategyImpl {
                         // This prevents exiting break-even positions that merely wasted spread.
                         let half_sl = sl / 2.0;
                         if profit_pct >= config::GBOOST_SIGNAL_REV_MIN_PROFIT || profit_pct <= -half_sl {
-                            self.record_training_outcome_on_exit(target_market.yes_token, profit_pct > 0.0);
-                            self.mark_post_exit_cooldown(target_market.yes_token);
+                            self.record_training_outcome_on_exit(crate::venues::intl::u256_from_market_id(&target_market.yes_token).unwrap_or_default(), profit_pct > 0.0);
+                            self.mark_post_exit_cooldown(crate::venues::intl::u256_from_market_id(&target_market.yes_token).unwrap_or_default());
                             return Ok(StrategySignal::Exit {
                                 params: exit_params(),
                                 reason: format!("GBoost SignalRev YES: P(UP)={:.3}", p),
@@ -1626,7 +1626,7 @@ impl Strategy for GboostStrategyImpl {
         }
 
         // ── NO position ───────────────────────────────────────────────────────
-        if let Some(pos) = pos_map.get(&("GboostStrategy".to_string(), target_market.no_token)) {
+        if let Some(pos) = pos_map.get(&("GboostStrategy".to_string(), target_market.no_token.clone())) {
             if pos.fill_confirmed_at.is_some() {
                 let bid = target_snapshot.no_bid;
                 let profit_pct = if pos.avg_entry > dec!(0) {
@@ -1636,7 +1636,7 @@ impl Strategy for GboostStrategyImpl {
                     .map(|t| (Utc::now() - t).num_seconds()).unwrap_or(0);
 
                 let exit_params = || OrderParams {
-                    token_id: target_market.no_token,
+                    token_id: target_market.no_token.clone(),
                     price: bid, shares: pos.shares,
                     fee_bps: target_market.no_fee_bps as u16,
                     is_neg_risk: target_market.is_neg_risk,
@@ -1648,8 +1648,8 @@ impl Strategy for GboostStrategyImpl {
                 };
 
                 if profit_pct >= tp {
-                    self.record_training_outcome_on_exit(target_market.no_token, profit_pct > 0.0);
-                    self.mark_post_exit_cooldown(target_market.no_token);
+                    self.record_training_outcome_on_exit(crate::venues::intl::u256_from_market_id(&target_market.no_token).unwrap_or_default(), profit_pct > 0.0);
+                    self.mark_post_exit_cooldown(crate::venues::intl::u256_from_market_id(&target_market.no_token).unwrap_or_default());
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
                         reason: format!("GBoost TP NO: gain={:.2}%", profit_pct * 100.0),
@@ -1657,8 +1657,8 @@ impl Strategy for GboostStrategyImpl {
                     });
                 }
                 if secs_held >= config::GBOOST_SL_MIN_HOLD_SECS && profit_pct <= -sl {
-                    self.record_training_outcome_on_exit(target_market.no_token, profit_pct > 0.0);
-                    self.mark_post_exit_cooldown_sl(target_market.no_token);
+                    self.record_training_outcome_on_exit(crate::venues::intl::u256_from_market_id(&target_market.no_token).unwrap_or_default(), profit_pct > 0.0);
+                    self.mark_post_exit_cooldown_sl(crate::venues::intl::u256_from_market_id(&target_market.no_token).unwrap_or_default());
                     return Ok(StrategySignal::Exit {
                         params: exit_params(),
                         reason: format!("GBoost SL NO: loss={:.2}% ({}s)", profit_pct * 100.0, secs_held),
@@ -1673,8 +1673,8 @@ impl Strategy for GboostStrategyImpl {
                         // hasn't covered round-trip costs and isn't deeply in the red.
                         let half_sl = sl / 2.0;
                         if profit_pct >= config::GBOOST_SIGNAL_REV_MIN_PROFIT || profit_pct <= -half_sl {
-                            self.record_training_outcome_on_exit(target_market.no_token, profit_pct > 0.0);
-                            self.mark_post_exit_cooldown(target_market.no_token);
+                            self.record_training_outcome_on_exit(crate::venues::intl::u256_from_market_id(&target_market.no_token).unwrap_or_default(), profit_pct > 0.0);
+                            self.mark_post_exit_cooldown(crate::venues::intl::u256_from_market_id(&target_market.no_token).unwrap_or_default());
                             return Ok(StrategySignal::Exit {
                                 params: exit_params(),
                                 reason: format!("GBoost SignalRev NO: P(UP)={:.3}", p),
@@ -1731,7 +1731,7 @@ mod tests {
     fn make_ctx() -> StrategyContext {
         StrategyContext {
             market: MarketConfig {
-                yes_token: U256::from(1u64), no_token: U256::from(2u64),
+                yes_token: crate::venues::intl::market_id_from_u256(U256::from(1u64)), no_token: crate::venues::intl::market_id_from_u256(U256::from(2u64)),
                 market_name: "Test".to_string(),
                 market_close_time: Some(Utc::now() + chrono::Duration::hours(1)),
                 strike_price: None, is_neg_risk: false,
@@ -1817,21 +1817,21 @@ mod tests {
         let ctx = make_ctx();
 
         strategy.pending_entries.lock().unwrap().insert(
-            ctx.market.yes_token,
+            crate::venues::intl::u256_from_market_id(&ctx.market.yes_token).unwrap_or_default(),
             (ctx.snapshot.clone(), None, dec!(0.50), 0.0, 0.0),
         );
 
         {
             let mut map = ctx.positions.lock().await;
             map.insert(
-                ("GboostStrategy".to_string(), ctx.market.yes_token),
+                ("GboostStrategy".to_string(), ctx.market.yes_token.clone()),
                 Position {
                     shares: dec!(10),
                     avg_entry: dec!(0.52),
                     opened_at: Utc::now(),
                     close_time: ctx.market.market_close_time,
                     market_name: ctx.market.market_name.clone(),
-                    pair_token_id: ctx.market.yes_token,
+                    pair_token_id: ctx.market.yes_token.clone(),
                     fill_confirmed_at: Some(Utc::now()),
                     paired_leg_token_id: None,
                 },
@@ -1850,21 +1850,21 @@ mod tests {
         let ctx = make_ctx();
 
         strategy.pending_entries.lock().unwrap().insert(
-            ctx.market.yes_token,
+            crate::venues::intl::u256_from_market_id(&ctx.market.yes_token).unwrap_or_default(),
             (ctx.snapshot.clone(), None, dec!(0.40), 0.0, 0.0),
         );
 
         {
             let mut map = ctx.positions.lock().await;
             map.insert(
-                ("GboostStrategy".to_string(), ctx.market.yes_token),
+                ("GboostStrategy".to_string(), ctx.market.yes_token.clone()),
                 Position {
                     shares: dec!(10),
                     avg_entry: dec!(0.40),
                     opened_at: Utc::now(),
                     close_time: ctx.market.market_close_time,
                     market_name: ctx.market.market_name.clone(),
-                    pair_token_id: ctx.market.yes_token,
+                    pair_token_id: ctx.market.yes_token.clone(),
                     fill_confirmed_at: Some(Utc::now()),
                     paired_leg_token_id: None,
                 },

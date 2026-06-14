@@ -315,7 +315,7 @@ impl Strategy for MomentumStrategyImpl {
                 && short_ok_bull && accel_ok_bull && !window_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
-                    params: entry_params!(ctx.market.yes_token, yes_ask, ctx.market.yes_fee_bps as u16),
+                    params: entry_params!(ctx.market.yes_token.clone(), yes_ask, ctx.market.yes_fee_bps as u16),
                     pair_params: None,
                 });
             } else if velocity < -threshold && binance_price < (strike - strike_buffer)
@@ -324,7 +324,7 @@ impl Strategy for MomentumStrategyImpl {
                 && short_ok_bear && accel_ok_bear && !window_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
-                    params: entry_params!(ctx.market.no_token, no_ask, ctx.market.no_fee_bps as u16),
+                    params: entry_params!(ctx.market.no_token.clone(), no_ask, ctx.market.no_fee_bps as u16),
                     pair_params: None,
                 });
             }
@@ -336,7 +336,7 @@ impl Strategy for MomentumStrategyImpl {
                 && short_ok_bull && accel_ok_bull && !window_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
-                    params: entry_params!(ctx.market.yes_token, yes_ask, ctx.market.yes_fee_bps as u16),
+                    params: entry_params!(ctx.market.yes_token.clone(), yes_ask, ctx.market.yes_fee_bps as u16),
                     pair_params: None,
                 });
             } else if velocity < -threshold && binance_price < strike
@@ -345,7 +345,7 @@ impl Strategy for MomentumStrategyImpl {
                 && short_ok_bear && accel_ok_bear && !window_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
-                    params: entry_params!(ctx.market.no_token, no_ask, ctx.market.no_fee_bps as u16),
+                    params: entry_params!(ctx.market.no_token.clone(), no_ask, ctx.market.no_fee_bps as u16),
                     pair_params: None,
                 });
             }
@@ -358,7 +358,7 @@ impl Strategy for MomentumStrategyImpl {
                 && short_ok_bull && accel_ok_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
-                    params: entry_params!(ctx.market.yes_token, yes_ask, ctx.market.yes_fee_bps as u16),
+                    params: entry_params!(ctx.market.yes_token.clone(), yes_ask, ctx.market.yes_fee_bps as u16),
                     pair_params: None,
                 });
             } else if velocity < -threshold
@@ -367,7 +367,7 @@ impl Strategy for MomentumStrategyImpl {
                 && short_ok_bear && accel_ok_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
-                    params: entry_params!(ctx.market.no_token, no_ask, ctx.market.no_fee_bps as u16),
+                    params: entry_params!(ctx.market.no_token.clone(), no_ask, ctx.market.no_fee_bps as u16),
                     pair_params: None,
                 });
             }
@@ -382,20 +382,22 @@ impl Strategy for MomentumStrategyImpl {
 
         for ((strategy_name, token_id), position) in pos_map.iter() {
             if strategy_name != "MomentumStrategy" { continue; }
+            // Slice 2b: position keys are neutral MarketId throughout (no U256).
+            let tok = token_id.clone();
             // Check hourly market first, then maker/daily market.
             // Bug fix (2026-06-12): positions reconciled from session restart can belong
             // to the maker market (daily "Up or Down") rather than the hourly market.
             // Skipping maker-market tokens caused reconciled positions to never hit
             // stop-loss evaluation, producing uncontrolled losses (e.g. -$5.38 on a
             // BasisStrategy position wrongly re-attributed to MomentumStrategy).
-            let bid = if token_id == &ctx.market.yes_token {
+            let bid = if tok == ctx.market.yes_token {
                 ctx.snapshot.yes_bid
-            } else if token_id == &ctx.market.no_token {
+            } else if tok == ctx.market.no_token {
                 ctx.snapshot.no_bid
             } else if let (Some(mk), Some(mk_snap)) = (&ctx.maker_market, &ctx.maker_snapshot) {
-                if token_id == &mk.yes_token {
+                if tok == mk.yes_token {
                     mk_snap.yes_bid
-                } else if token_id == &mk.no_token {
+                } else if tok == mk.no_token {
                     mk_snap.no_bid
                 } else {
                     continue
@@ -437,7 +439,7 @@ impl Strategy for MomentumStrategyImpl {
             // is normally venue=Hourly.  We need the right market context for exit params
             // and for the near-expiry check.
             let is_maker_token = ctx.maker_market.as_ref()
-                .map(|mk| token_id == &mk.yes_token || token_id == &mk.no_token)
+                .map(|mk| tok == mk.yes_token || tok == mk.no_token)
                 .unwrap_or(false);
             let exit_market: &crate::state::MarketConfig = if is_maker_token {
                 ctx.maker_market.as_ref().unwrap()
@@ -450,10 +452,10 @@ impl Strategy for MomentumStrategyImpl {
             macro_rules! exit_params {
                 () => {
                     OrderParams {
-                        token_id: *token_id,
+                        token_id: tok.clone(),
                         price: bid,
                         shares: position.shares,
-                        fee_bps: if token_id == &exit_market.yes_token { exit_market.yes_fee_bps as u16 } else { exit_market.no_fee_bps as u16 },
+                        fee_bps: if tok == exit_market.yes_token { exit_market.yes_fee_bps as u16 } else { exit_market.no_fee_bps as u16 },
                         is_neg_risk: exit_market.is_neg_risk,
                         market_name: exit_market.market_name.clone(),
                         condition_id: exit_market.condition_id.clone(),
@@ -501,7 +503,7 @@ impl Strategy for MomentumStrategyImpl {
             // was then consumed by SELL_PRICE_OFFSET, producing the observed $0.0000 PnL
             // on MomentumDecay exits (e.g. 2026-05-12 YES @ 0.71 entry, bid=$0.72 exit).
             let decay_min = threshold * config::MOMENTUM_DECAY_EXIT_FRACTION;
-            let is_yes = token_id == &ctx.market.yes_token;
+            let is_yes = tok == ctx.market.yes_token;
             let net_profit_margin = (bid - config::SELL_PRICE_OFFSET - avg_entry) / avg_entry;
             if net_profit_margin > dec!(0) && ((is_yes && velocity_1s < decay_min) || (!is_yes && velocity_1s > -decay_min)) {
                 let reason = format!("MomentumDecay: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100));

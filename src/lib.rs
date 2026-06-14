@@ -1,4 +1,5 @@
 pub mod config;
+pub mod venues;
 pub mod vipers;
 pub mod helpers;
 pub mod state;

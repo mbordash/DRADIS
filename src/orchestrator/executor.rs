@@ -7,10 +7,10 @@
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::StrategySignal;
+use crate::venues::core::MarketId;
 use anyhow::Result;
 use tracing::{info, debug, warn};
 use std::time::Instant;
-use alloy::primitives::U256;
 use tokio::time::Duration;
 
 /// Result of evaluating all strategies
@@ -202,7 +202,7 @@ pub fn prioritize_signals(result: &StrategyEvaluationResult) -> Vec<(&str, &Stra
 /// Signal conflict detection and resolution results
 #[derive(Debug, Clone)]
 pub struct SignalConflictInfo {
-    pub token_id: U256,
+    pub token_id: MarketId,
     pub signal_type: String,
     pub conflicting_strategies: Vec<String>,
     pub resolution: String,

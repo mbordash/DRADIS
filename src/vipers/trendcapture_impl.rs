@@ -274,9 +274,9 @@ impl Strategy for TrendCaptureStrategyImpl {
                 && yes_ask <= dc.trendcapture_max_entry_price
             {
                 // Cooldown check
-                let token_id = market.yes_token;
+                let token_id = market.yes_token.clone();
                 let cdl = effective_cooldown(&market.condition_id);
-                let in_cooldown = cooldowns.get(&token_id)
+                let in_cooldown = cooldowns.get(&crate::venues::intl::u256_from_market_id(&token_id).unwrap_or_default())
                     .map(|t| t.elapsed().as_secs() < cdl)
                     .unwrap_or(false);
                 if !in_cooldown {
@@ -308,9 +308,9 @@ impl Strategy for TrendCaptureStrategyImpl {
                 && no_ask >= effective_min_price
                 && no_ask <= dc.trendcapture_max_entry_price
             {
-                let token_id = market.no_token;
+                let token_id = market.no_token.clone();
                 let cdl = effective_cooldown(&market.condition_id);
-                let in_cooldown = cooldowns.get(&token_id)
+                let in_cooldown = cooldowns.get(&crate::venues::intl::u256_from_market_id(&token_id).unwrap_or_default())
                     .map(|t| t.elapsed().as_secs() < cdl)
                     .unwrap_or(false);
                 if !in_cooldown {
@@ -375,7 +375,7 @@ impl Strategy for TrendCaptureStrategyImpl {
 
         // Collect exit decision inside the lock scope, then act outside it.
         struct PendingExit {
-            token_id:     alloy::primitives::U256,
+            token_id:     crate::venues::core::MarketId,
             bid:          Decimal,
             shares:       Decimal,
             fee_bps:      u16,
@@ -418,7 +418,7 @@ impl Strategy for TrendCaptureStrategyImpl {
 
                 // Helper closure to build the pending exit
                 let make_exit = |reason: String, is_sl: bool| PendingExit {
-                    token_id:     *token_id,
+                    token_id:     token_id.clone(),
                     bid,
                     shares:       position.shares,
                     fee_bps,
@@ -485,7 +485,7 @@ impl Strategy for TrendCaptureStrategyImpl {
         };
 
         if let Some(p) = pending {
-            self.record_exit(&p.token_id, &p.condition_id, p.is_sl);
+            self.record_exit(&crate::venues::intl::u256_from_market_id(&p.token_id).unwrap_or_default(), &p.condition_id, p.is_sl);
             // Stamp the exit signal cooldown to prevent FAK-miss re-fire storm
             if let Ok(mut last) = self.last_exit_signal_at.lock() {
                 *last = Some(Instant::now());

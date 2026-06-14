@@ -231,8 +231,8 @@ impl Strategy for ArbitrageStrategyImpl {
             // line with spurious  on every tick.
             // This guards against both re-adopted on-chain positions and live GTC
             // orders waiting for confirmation (fill_confirmed_at == None).
-            if pos_map.contains_key(&(STRATEGY_NAME.to_string(), market.yes_token))
-                || pos_map.contains_key(&(STRATEGY_NAME.to_string(), market.no_token))
+            if pos_map.contains_key(&(STRATEGY_NAME.to_string(), market.yes_token.clone()))
+                || pos_map.contains_key(&(STRATEGY_NAME.to_string(), market.no_token.clone()))
             {
                 debug!(" Arb skipped — already hold YES or NO leg for this market");
                 return Ok(StrategySignal::NoSignal);
@@ -279,10 +279,10 @@ impl Strategy for ArbitrageStrategyImpl {
         let (leg_a_token, leg_a_price, leg_b_token, leg_b_price) =
             if safe_yes_bid >= safe_no_bid {
                 // YES is the expensive leg — place it first
-                (market.yes_token, safe_yes_bid, market.no_token, safe_no_bid)
+                (market.yes_token.clone(), safe_yes_bid, market.no_token.clone(), safe_no_bid)
             } else {
                 // NO is the expensive leg — place it first
-                (market.no_token, safe_no_bid, market.yes_token, safe_yes_bid)
+                (market.no_token.clone(), safe_no_bid, market.yes_token.clone(), safe_yes_bid)
             };
 
         return Ok(StrategySignal::Entry {
@@ -319,8 +319,8 @@ impl Strategy for ArbitrageStrategyImpl {
         let snapshot = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
         let pos_map = ctx.positions.lock().await;
 
-        let yes_key = (STRATEGY_NAME.to_string(), market.yes_token);
-        let no_key  = (STRATEGY_NAME.to_string(), market.no_token);
+        let yes_key = (STRATEGY_NAME.to_string(), market.yes_token.clone());
+        let no_key  = (STRATEGY_NAME.to_string(), market.no_token.clone());
 
         if let (Some(yp), Some(_np)) = (pos_map.get(&yes_key), pos_map.get(&no_key)) {
             let yes_bid = snapshot.yes_bid;
@@ -346,7 +346,7 @@ impl Strategy for ArbitrageStrategyImpl {
             if yes_bid + no_bid >= early_exit_threshold {
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
-                        token_id: market.yes_token,
+                        token_id: market.yes_token.clone(),
                         price: yes_bid,
                         shares: yp.shares,
                         fee_bps: market.yes_fee_bps as u16, // taker exit — fee applies

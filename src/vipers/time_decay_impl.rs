@@ -40,10 +40,10 @@ use anyhow::Result;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use chrono::{DateTime, Utc};
-use alloy::primitives::U256;
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
+use crate::venues::core::MarketId;
 use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
 use polymarket_client_sdk_v2::clob::types::OrderType;
@@ -171,7 +171,7 @@ impl Strategy for TimeDecayStrategyImpl {
 
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
-                    token_id:    market.yes_token,
+                    token_id:    market.yes_token.clone(),
                     price:       yes_bid,
                     shares:      pair_shares,
                     fee_bps:     0,
@@ -183,7 +183,7 @@ impl Strategy for TimeDecayStrategyImpl {
                     ghost_mode: dc.ghost_mode,
                 },
                 pair_params: Some(OrderParams {
-                    token_id:    market.no_token,
+                    token_id:    market.no_token.clone(),
                     price:       no_bid,
                     shares:      pair_shares,
                     fee_bps:     0,
@@ -205,8 +205,8 @@ impl Strategy for TimeDecayStrategyImpl {
 
         let (market, snap) = (&ctx.market, &ctx.snapshot);
 
-        let yes_key = ("TimeDecayStrategy".to_string(), market.yes_token);
-        let no_key  = ("TimeDecayStrategy".to_string(), market.no_token);
+        let yes_key = ("TimeDecayStrategy".to_string(), market.yes_token.clone());
+        let no_key  = ("TimeDecayStrategy".to_string(), market.no_token.clone());
 
         if let (Some(yp), Some(np)) = (pos_map.get(&yes_key), pos_map.get(&no_key)) {
             let yes_bid = snap.yes_bid;
@@ -215,7 +215,7 @@ impl Strategy for TimeDecayStrategyImpl {
             // ── Convergence exit ──────────────────────────────────────────────
             if yes_bid + no_bid >= dc.time_decay_convergence_exit_bid {
                 return Ok(StrategySignal::Exit {
-                    params: OrderParams { token_id: market.yes_token, price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: dc.ghost_mode },
+                    params: OrderParams { token_id: market.yes_token.clone(), price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: dc.ghost_mode },
                     reason: "Time Decay convergence".to_string(),
                     exit_pair: true,
                 });
@@ -248,7 +248,7 @@ impl Strategy for TimeDecayStrategyImpl {
                 let sl_threshold = entry_combined * (dec!(1) - effective_stop_pct);
                 if combined_bid < sl_threshold {
                     return Ok(StrategySignal::Exit {
-                        params: OrderParams { token_id: market.yes_token, price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: dc.ghost_mode },
+                        params: OrderParams { token_id: market.yes_token.clone(), price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: dc.ghost_mode },
                         reason: format!("Time Decay SL{}", if iv_elevated { " (IV-tightened)" } else { "" }),
                         exit_pair: true,
                     });
@@ -259,7 +259,7 @@ impl Strategy for TimeDecayStrategyImpl {
             if let Some(close_time) = market.market_close_time {
                 if (close_time - Utc::now()).num_seconds() < config::MARKET_EXPIRY_SAFETY_BUFFER_SECS as i64 {
                     return Ok(StrategySignal::Exit {
-                        params: OrderParams { token_id: market.yes_token, price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: dc.ghost_mode },
+                        params: OrderParams { token_id: market.yes_token.clone(), price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: dc.ghost_mode },
                         reason: "Time Decay Expiry".to_string(),
                         exit_pair: true,
                     });
@@ -323,7 +323,7 @@ pub enum ThetaMode { Settlement, Convergence }
 
 pub struct ThetaSignal { pub mode: ThetaMode, pub combined_ask: Decimal, pub net_profit_per_share: Decimal, pub total_fees: Decimal }
 
-pub struct TimeDecayPosition { pub yes_token_id: U256, pub no_token_id: U256, pub entry_time: DateTime<Utc>, pub expiry_time: DateTime<Utc>, pub yes_entry_price: Decimal, pub no_entry_price: Decimal, pub position_size: Decimal, pub total_invested: Decimal, pub mode: ThetaMode }
+pub struct TimeDecayPosition { pub yes_token_id: MarketId, pub no_token_id: MarketId, pub entry_time: DateTime<Utc>, pub expiry_time: DateTime<Utc>, pub yes_entry_price: Decimal, pub no_entry_price: Decimal, pub position_size: Decimal, pub total_invested: Decimal, pub mode: ThetaMode }
 
 impl TimeDecayPosition {
     pub fn time_to_expiry(&self) -> i64 { (self.expiry_time - Utc::now()).num_seconds() }

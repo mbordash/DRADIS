@@ -20,6 +20,8 @@ static LAST_NO_MAKER_VENUE_LOG: AtomicU64 = AtomicU64::new(0);
 use crate::config; // Keep this for constants
 use crate::helpers::json::{extract_token_ids_u256, extract_close_time, get_enable_orderbook};
 use crate::helpers::price::value_to_f64;
+use crate::venues::core::MarketId;
+use crate::venues::intl::market_id_from_u256;
 // Import the moved functions from config_helpers via crate::helpers
 use crate::helpers::{
     is_window_market, is_daily_market, is_ultra_short_window_market,
@@ -188,8 +190,8 @@ pub fn validate_market(
 
 #[derive(Clone, Debug)]
 pub struct MarketCandidate {
-    pub yes_token: U256,
-    pub no_token: U256,
+    pub yes_token: MarketId,
+    pub no_token: MarketId,
     pub name: String,
     pub link: String,
     pub description: String,
@@ -246,8 +248,8 @@ pub async fn fetch_specific_window_daily_market(
             let cond_id = m.get("conditionId").and_then(|v| v.as_str()).unwrap_or_default().to_string();
             info!("🗓 Found daily maker venue via slug '{}': \"{}\" ({}s left)", slug, name, left);
             return Some(MarketCandidate {
-                yes_token: tokens[0],
-                no_token: tokens[1],
+                yes_token: market_id_from_u256(tokens[0]),
+                no_token: market_id_from_u256(tokens[1]),
                 name,
                 link: m.get("slug").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
                 description: m.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
@@ -329,10 +331,10 @@ pub async fn get_market_pair(http: &reqwest::Client, asset_filter: &str) -> (Mar
     let hourly_final = if !high_vol_hourly.is_empty() { &high_vol_hourly } else { &hourly_c };
 
     let hourly = hourly_final.first()
-        .map(|b| MarketCandidate { yes_token: b.0[0], no_token: b.0[1], name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone(), strike_price: None })
-        .unwrap_or(MarketCandidate { yes_token: U256::ZERO, no_token: U256::ZERO, name: String::new(), link: String::new(), description: String::new(), is_hot: false, close_time: None, volume: 0.0, condition_id: String::new(), strike_price: None });
+        .map(|b| MarketCandidate { yes_token: market_id_from_u256(b.0[0]), no_token: market_id_from_u256(b.0[1]), name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone(), strike_price: None })
+        .unwrap_or(MarketCandidate { yes_token: market_id_from_u256(U256::ZERO), no_token: market_id_from_u256(U256::ZERO), name: String::new(), link: String::new(), description: String::new(), is_hot: false, close_time: None, volume: 0.0, condition_id: String::new(), strike_price: None });
 
-    if hourly.yes_token != U256::ZERO {
+    if hourly.yes_token != market_id_from_u256(U256::ZERO) {
         info!("📈 Hourly market selected: \"{}\" (vol24h={:.0})", hourly.name, hourly.volume);
     }
 
@@ -342,7 +344,7 @@ pub async fn get_market_pair(http: &reqwest::Client, asset_filter: &str) -> (Mar
     let maker = daily_direct.or_else(|| {
         if let Some(b) = maker_c.first() {
             info!("📋 Using volume-scan window/daily fallback for maker venue");
-            Some(MarketCandidate { yes_token: b.0[0], no_token: b.0[1], name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone(), strike_price: None })
+            Some(MarketCandidate { yes_token: market_id_from_u256(b.0[0]), no_token: market_id_from_u256(b.0[1]), name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone(), strike_price: None })
         } else {
             // No daily/window maker venue — expected for assets (e.g. BTC) where Polymarket
             // only lists hourly "Up or Down" markets.  Log at INFO at most once per hour to

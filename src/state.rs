@@ -1,11 +1,12 @@
 /// Shared state types for the orchestrator and strategies.
 /// Defines clear ownership boundaries and data structures used across the system.
 
-use alloy::primitives::U256;
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
 use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
+
+use crate::venues::core::MarketId;
 
 // ─── WebSocket price feed ─────────────────────────────────────────────────────
 
@@ -31,20 +32,24 @@ pub struct Position {
     pub close_time: Option<DateTime<Utc>>,
     /// Human-readable market name
     pub market_name: String,
-    /// Token ID for this position
-    pub pair_token_id: U256,
+    /// Token ID for this position (venue-neutral canonical key — slice 2a)
+    pub pair_token_id: MarketId,
     /// When the position balance was confirmed on-chain
     pub fill_confirmed_at: Option<DateTime<Utc>>,
     /// For paired strategies (Arbitrage, TimeDecay): token ID of the complementary leg.
     /// If Some, this position is part of a hedged pair. Used to detect orphaned positions
     /// when the paired leg fails to fill.
-    pub paired_leg_token_id: Option<U256>,
+    pub paired_leg_token_id: Option<MarketId>,
 }
 
 /// Compound key for the shared position map: (strategy_name, token_id).
 /// Each strategy has its own position slot per token, enabling fully independent
 /// capital allocation and eliminating cross-strategy entry conflicts (Option A).
-pub type PositionKey = (String, U256);
+///
+/// Slice 2a: the token component is the venue-neutral [`MarketId`] (decimal-`U256`
+/// string for intl) rather than a raw `U256`, so the canonical position key is
+/// venue-agnostic.
+pub type PositionKey = (String, MarketId);
 
 /// Shared positions state accessible by all strategies.
 /// Keyed by (strategy_name, token_id) so that MomentumStrategy and MakerStrategy
@@ -110,10 +115,10 @@ pub struct MarketSnapshot {
 /// Market identifiers and metadata.
 #[derive(Debug, Clone)]
 pub struct MarketConfig {
-    /// YES token ID
-    pub yes_token: U256,
-    /// NO token ID
-    pub no_token: U256,
+    /// YES token ID (venue-neutral)
+    pub yes_token: MarketId,
+    /// NO token ID (venue-neutral)
+    pub no_token: MarketId,
     /// Human-readable market name
     pub market_name: String,
     /// Market close/expiry time
@@ -145,7 +150,7 @@ pub enum StrategyStatus {
 /// Parameters required to place an order on the CLOB.
 #[derive(Debug, Clone)]
 pub struct OrderParams {
-    pub token_id: U256,
+    pub token_id: MarketId,
     pub price: Decimal,
     pub shares: Decimal,
     pub fee_bps: u16,

@@ -186,7 +186,7 @@ impl Strategy for BasisStrategyImpl {
 
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
-                    token_id: market.no_token,
+                    token_id: market.no_token.clone(),
                     price: target_price,
                     shares: (trade_size / effective_fee_multiplier) / target_price,
                     fee_bps: entry_fee_bps,
@@ -241,7 +241,7 @@ impl Strategy for BasisStrategyImpl {
 
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
-                    token_id: market.yes_token,
+                    token_id: market.yes_token.clone(),
                     price: target_price,
                     shares: (trade_size / effective_fee_multiplier) / target_price,
                     fee_bps: entry_fee_bps,
@@ -304,7 +304,7 @@ impl Strategy for BasisStrategyImpl {
             if profit_margin >= dc.basis_target_profit_pct {
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
-                        token_id: *token_id,
+                        token_id: token_id.clone(),
                         price: position_bid,
                         shares: position.shares,
                         fee_bps: if token_id == &target_market.yes_token { target_market.yes_fee_bps as u16 } else { target_market.no_fee_bps as u16 },
@@ -335,7 +335,7 @@ impl Strategy for BasisStrategyImpl {
 
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
-                        token_id: *token_id,
+                        token_id: token_id.clone(),
                         price: position_bid,
                         shares: position.shares,
                         fee_bps: if token_id == &target_market.yes_token { target_market.yes_fee_bps as u16 } else { target_market.no_fee_bps as u16 },
@@ -354,7 +354,7 @@ impl Strategy for BasisStrategyImpl {
             if profit_margin > dec!(0) && current_skew < config::BASIS_SKEW_COLLAPSE_THRESHOLD {
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
-                        token_id: *token_id,
+                        token_id: token_id.clone(),
                         price: position_bid,
                         shares: position.shares,
                         fee_bps: if token_id == &target_market.yes_token { target_market.yes_fee_bps as u16 } else { target_market.no_fee_bps as u16 },
@@ -385,7 +385,7 @@ impl Strategy for BasisStrategyImpl {
                     } else {
                         return Ok(StrategySignal::Exit {
                             params: OrderParams {
-                                token_id: *token_id,
+                                token_id: token_id.clone(),
                                 price: position_bid,
                                 shares: position.shares,
                                 fee_bps: if token_id == &target_market.yes_token { target_market.yes_fee_bps as u16 } else { target_market.no_fee_bps as u16 },

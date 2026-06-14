@@ -26,7 +26,7 @@ fn make_position(token_id: U256) -> Position {
         opened_at: Utc::now(),
         close_time: None,
         market_name: "Test Market".to_string(),
-        pair_token_id: token_id,
+        pair_token_id: dradis::venues::intl::market_id_from_u256(token_id),
         fill_confirmed_at: None,
         paired_leg_token_id: None,
     }
@@ -35,8 +35,8 @@ fn make_position(token_id: U256) -> Position {
 const TOKEN: U256 = U256::from_limbs([42, 0, 0, 0]);
 const STRATEGY: &str = "TestStrategy";
 
-fn key(token_id: U256) -> (String, U256) {
-    (STRATEGY.to_string(), token_id)
+fn key(token_id: U256) -> (String, dradis::venues::core::MarketId) {
+    (STRATEGY.to_string(), dradis::venues::intl::market_id_from_u256(token_id))
 }
 
 async fn entry_fixed(

@@ -32,6 +32,8 @@ use alloy::primitives::address as alloy_address;
 use crate::helpers::{db, metrics, send_notification, PhantomCooldowns};
 use crate::helpers::balance::OrphanTombstones;
 use crate::state::{Position, PositionMap};
+use crate::venues::core::MarketId;
+use crate::venues::intl::u256_from_market_id;
 use crate::vipers::time_decay_impl::TimeDecayPosition;
 use sqlx;
 // ── On-chain settlement contracts ────────────────────────────────────────────
@@ -215,12 +217,16 @@ async fn execute_via_safe<P: Provider + Clone>(
 pub async fn cleanup_expired_positions(
     positions: Arc<Mutex<PositionMap>>,
     market_name: String,
-    yes_token: U256,
-    no_token: U256,
+    yes_token: MarketId,
+    no_token: MarketId,
     close_time: Option<DateTime<Utc>>,
 ) {
     let mut pos_map = positions.lock().await;
     let now = Utc::now();
+
+    // Slice 2b: positions are keyed by the neutral MarketId directly.
+    let yes_market = yes_token;
+    let no_market = no_token;
 
     if let Some(ct) = close_time {
         let is_expired = ct <= now;
@@ -228,7 +234,7 @@ pub async fn cleanup_expired_positions(
 
         if is_expired || is_expiring_soon {
             let before = pos_map.len();
-            pos_map.retain(|(_, token), _| token != &yes_token && token != &no_token);
+            pos_map.retain(|(_, token), _| token != &yes_market && token != &no_market);
             let removed = before - pos_map.len();
 
             if removed > 0 {
@@ -266,8 +272,8 @@ pub async fn cleanup_expired_positions(
 /// Both paths use real market prices from the live price feeds available in
 /// the cleanup_ticker arm, not a fixed $0.01 panic-sell floor.
 pub struct OrphanExit {
-    /// The on-chain token ID of the orphaned (filled) leg.
-    pub token_id: U256,
+    /// The on-chain token ID of the orphaned (filled) leg (neutral MarketId — slice 2a).
+    pub token_id: MarketId,
     /// Confirmed on-chain share count.
     pub shares: Decimal,
     /// True if this token belongs to a NegRisk market.
@@ -277,7 +283,7 @@ pub struct OrphanExit {
     /// Token ID of the LEG THAT NEVER FILLED — the counterpart we must buy
     /// to complete the hedge.  None if the position had no recorded pair
     /// (e.g. reconcile-adopted position with paired_leg_token_id = None).
-    pub paired_token_id: Option<U256>,
+    pub paired_token_id: Option<MarketId>,
     /// Price we paid to enter the orphaned leg (avg_entry from Position).
     /// Used to evaluate re-hedge profitability:
     ///   re_hedge_cost = paired_ask + original_entry
@@ -317,7 +323,7 @@ pub async fn reconcile_orphaned_positions(
     //     re-hedging on top of an already-tracked opposite leg.
     // Fees are ~0 on the V2 CLOB, so the only real cost is the ~1-3¢ bid/ask
     // spread — making a fast cheap re-hedge strongly preferred over flatten.
-    let mut legs_by_market: std::collections::HashMap<String, Vec<((String, U256), Position)>> =
+    let mut legs_by_market: std::collections::HashMap<String, Vec<((String, MarketId), Position)>> =
         std::collections::HashMap::new();
     for ((strategy_name, token_id), position) in pos_map.iter() {
         if strategy_name != "ArbitrageStrategy" && strategy_name != "TimeDecayStrategy" {
@@ -327,13 +333,13 @@ pub async fn reconcile_orphaned_positions(
         legs_by_market
             .entry(position.market_name.clone())
             .or_default()
-            .push(((strategy_name.clone(), *token_id), position.clone()));
+            .push(((strategy_name.clone(), token_id.clone()), position.clone()));
     }
 
     // Fully-naked single legs → full orphan handling (re-hedge if cheap, else flatten).
-    let mut orphans_to_exit: Vec<((String, U256), Position)> = Vec::new();
+    let mut orphans_to_exit: Vec<((String, MarketId), Position)> = Vec::new();
     // Imbalanced pairs → flatten ONLY the naked excess of the heavier leg.
-    let mut imbalanced_to_trim: Vec<((String, U256), Position, Decimal)> = Vec::new();
+    let mut imbalanced_to_trim: Vec<((String, MarketId), Position, Decimal)> = Vec::new();
 
     for (_market, legs) in legs_by_market {
         match legs.len() {
@@ -370,11 +376,17 @@ pub async fn reconcile_orphaned_positions(
               strategy_name, position.shares, position.avg_entry,
               (now - position.opened_at).num_seconds());
 
+        // Slice 2a: convert the neutral key to the on-chain id for the SDK call.
+        let token_u256 = match u256_from_market_id(&token_id) {
+            Ok(t) => t,
+            Err(e) => { warn!("⚠️ Orphan cleanup: bad MarketId {}: {} — skipping", token_id, e); continue; }
+        };
+
         // Cancel any resting GTC order so it can't fill after we forget about it.
         // Hard 10s timeouts on both CLOB calls — same fix as the 2026-05-01 overnight freeze
         // (status_ticker arm). Without these, a TCP-level CLOB API stall inside the
         // cleanup_ticker select! arm blocks the ENTIRE event loop indefinitely.
-        let req = OrdersRequest::builder().asset_id(token_id).build();
+        let req = OrdersRequest::builder().asset_id(token_u256).build();
         match tokio_timeout(std::time::Duration::from_secs(10), clob_client.orders(&req, None)).await {
             Ok(Ok(page)) => {
                 let ids: Vec<String> = page.data.into_iter().map(|o| o.id).collect();
@@ -391,13 +403,13 @@ pub async fn reconcile_orphaned_positions(
             Err(_) => warn!("⚠️ Orphan cleanup: orders() timed out (10s) for token {} — skipping cancel", token_id),
         }
 
-        pos_map.remove(&(strategy_name.clone(), token_id));
+        pos_map.remove(&(strategy_name.clone(), token_id.clone()));
 
         // Tombstone this token so reconcile_orphaned_positions (balance.rs) never
         // re-adopts it within the same session.  Without this, phantom_cooldowns are
         // cleared on every hourly market switch and the reconcile loop immediately
         // re-adopts the unhedged on-chain leg, restarting the detect→remove→re-adopt cycle.
-        orphan_tombstones.lock().await.insert(token_id);
+        orphan_tombstones.lock().await.insert(token_id.clone());
 
         // Block re-entry into this token for PHANTOM_COOLDOWN_SECS so the strategy
         // cannot immediately open a new position on top of untracked on-chain shares.
@@ -409,7 +421,7 @@ pub async fn reconcile_orphaned_positions(
             format!("{}:{}", strategy_name, token_id),
             tokio::time::Instant::now(),
         );
-        if let Some(paired_token) = position.paired_leg_token_id {
+        if let Some(paired_token) = position.paired_leg_token_id.as_ref() {
             // Also set cooldown on the pair so new arb entries are blocked on both legs
             // until the orphan state fully clears (paired_leg cleanup + cooldown expiry).
             phantom_cooldowns.lock().await.insert(
@@ -463,7 +475,7 @@ pub async fn reconcile_orphaned_positions(
         // Optimistically reduce the tracked shares to the hedged remainder so the
         // next cycle won't re-detect the same excess. Chain-sync self-heals this
         // if the FAK sell fails (it re-reads actual on-chain holdings).
-        if let Some(p) = pos_map.get_mut(&(strategy_name.clone(), token_id)) {
+        if let Some(p) = pos_map.get_mut(&(strategy_name.clone(), token_id.clone())) {
             p.shares = (p.shares - excess).max(Decimal::ZERO);
         }
         phantom_cooldowns.lock().await.insert(cooldown_key, tokio::time::Instant::now());
@@ -488,7 +500,7 @@ pub async fn reconcile_orphaned_positions(
 
 /// Prune expired TimeDecay position metadata entries.
 pub async fn cleanup_time_decay_positions(
-    td_positions: Arc<Mutex<HashMap<U256, TimeDecayPosition>>>,
+    td_positions: Arc<Mutex<HashMap<MarketId, TimeDecayPosition>>>,
 ) {
     let mut td_map = td_positions.lock().await;
     td_map.retain(|_, pos| !pos.is_expired());
@@ -593,6 +605,13 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
 
     // Count redeemable positions so operators can see them in logs.
     let redeemable_count = live_positions.iter().filter(|p| p.redeemable).count();
+
+    // Decimal token IDs of every resolved (redeemable) position, for explicit purge below.
+    let redeemable_token_ids: HashSet<String> = live_positions
+        .iter()
+        .filter(|p| p.redeemable)
+        .map(|p| p.asset.to_string())
+        .collect();
 
     // ── Sync EVERY per-asset pool ─────────────────────────────────────────────
     // Each asset stores its own open_positions rows in its own SQLite file.
@@ -699,6 +718,42 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
             }
         }
     }
+
+    // ── Purge resolved (redeemable) positions regardless of status ──────────────
+    // A redeemable position has resolved on-chain; its payout is claimed into cash by
+    // auto_settle OR by the operator clicking "Redeem" on the Polymarket UI. Once
+    // resolved it must NEVER remain in open_positions, or it double-counts in the
+    // portfolio value (the winnings are — or will be — reflected in collateral instead).
+    //
+    // purge_stale_open_positions intentionally skips status='pending' rows to avoid a
+    // purge/re-adopt race on genuinely in-flight orders — but a redeemable position is
+    // never an in-flight order, so those rows would otherwise live forever (observed:
+    // chain-adopted 'pending' arb legs surviving long after the market settled and was
+    // redeemed off-app). Delete them explicitly here, ignoring status, across every pool.
+    let mut redeemable_purged = 0usize;
+    if !redeemable_token_ids.is_empty() {
+        for asset in &all_assets {
+            let pool = match db::pool_for(asset) {
+                Some(p) => p,
+                None    => continue,
+            };
+            for token_str in &redeemable_token_ids {
+                match sqlx::query("DELETE FROM open_positions WHERE token_id = ?")
+                    .bind(token_str)
+                    .execute(&pool)
+                    .await
+                {
+                    Ok(r) if r.rows_affected() > 0 => {
+                        redeemable_purged += r.rows_affected() as usize;
+                        info!("🧹 Chain-sync [{}]: purged resolved (redeemable) open_positions row for token {} — payout settles to cash, not a held position",
+                            asset.to_uppercase(), &token_str[..token_str.len().min(20)]);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    total_purged += redeemable_purged;
 
     if total_purged > 0 {
         info!(" Chain-sync: purged {} stale open_positions row(s) across {} asset DB(s)", total_purged, all_assets.len());
@@ -958,6 +1013,14 @@ async fn record_settled_arb_trade(
                 .unwrap_or_else(|| "btc".to_string())
         });
 
+    // Settlements are recorded idempotently: auto_settle can re-redeem an already-
+    // settled condition after a restart (in-memory dedup is empty on a fresh start),
+    // so a plain INSERT would double-count the same realized P&L once per session.
+    let pool = match db::pool_for(&asset_str) {
+        Some(p) => p,
+        None    => return,
+    };
+
     match (yes_leg, no_leg) {
         (Some(yes_leg), Some(no_leg)) => {
             // Complete YES+NO pair settlement
@@ -975,22 +1038,30 @@ async fn record_settled_arb_trade(
             let pnl = (Decimal::ONE - entry_per_pair) * pairs;
             let market_title = yes_leg.title.clone();
 
-            info!(
-                " ArbitrageStrategy settlement recorded: \"{}\" | {} pairs @ entry ${:.4}/pair → pnl ${:.4}",
-                market_title, pairs, entry_per_pair, pnl
-            );
-
-            metrics::record_trade(
-                &asset_str,
-                "ArbitrageStrategy".to_string(),
-                market_title,
-                "YES".to_string(),
+            let inserted = db::record_settlement_trade_idempotent(
+                &pool,
+                "ArbitrageStrategy",
+                &market_title,
+                "YES",
                 entry_per_pair,
                 Decimal::ONE,
                 pairs,
                 pnl,
-                "Settlement (YES+NO → $1.00)".to_string(),
+                "Settlement (YES+NO → $1.00)",
+                None,
             ).await;
+
+            if inserted {
+                info!(
+                    " ArbitrageStrategy settlement recorded: \"{}\" | {} pairs @ entry ${:.4}/pair → pnl ${:.4}",
+                    market_title, pairs, entry_per_pair, pnl
+                );
+            } else {
+                debug!(
+                    "Auto-settle: duplicate pair settlement for \"{}\" suppressed (already recorded)",
+                    market_title
+                );
+            }
         }
         (Some(leg), None) | (None, Some(leg)) => {
             // Single-leg settlement (orphaned / unhedged position).
@@ -1014,22 +1085,30 @@ async fn record_settled_arb_trade(
             let pnl = (exit_price - avg_price) * size;
             let market_title = leg.title.clone();
 
-            info!(
-                " ArbitrageStrategy single-leg settlement: \"{}\" | {} {} @ ${:.4} → resolved ${:.4} → pnl ${:.4}",
-                market_title, size, side, avg_price, exit_price, pnl
-            );
-
-            metrics::record_trade(
-                &asset_str,
-                "ArbitrageStrategy".to_string(),
-                market_title,
-                side.to_string(),
+            let inserted = db::record_settlement_trade_idempotent(
+                &pool,
+                "ArbitrageStrategy",
+                &market_title,
+                side,
                 avg_price,
                 exit_price,
                 size,
                 pnl,
-                format!("Settlement (single-leg {})", side),
+                &format!("Settlement (single-leg {})", side),
+                None,
             ).await;
+
+            if inserted {
+                info!(
+                    " ArbitrageStrategy single-leg settlement: \"{}\" | {} {} @ ${:.4} → resolved ${:.4} → pnl ${:.4}",
+                    market_title, size, side, avg_price, exit_price, pnl
+                );
+            } else {
+                debug!(
+                    "Auto-settle: duplicate single-leg {} settlement for \"{}\" suppressed (already recorded)",
+                    side, market_title
+                );
+            }
         }
         (None, None) => {
             // No legs to record

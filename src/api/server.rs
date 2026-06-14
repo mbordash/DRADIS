@@ -602,13 +602,13 @@ async fn manual_exit(
     info!("🎯 RTB: Placing FAK sell order — {} shares @ ${:.4}", shares, sell_price);
 
     let order_result = place_limit_order(
-        &session.trading_client,
-        &session.nonce_manager,
-        &session.signer,
+        session.venue.trading_client(),
+        session.venue.nonce_manager(),
+        session.venue.signer(),
         s.safe_address,
         s.safe_address, // eoa_address = safe_address for this context
         verifying_contract,
-        token_id,
+        &crate::venues::intl::market_id_from_u256(token_id),
         Side::Sell,
         shares,
         sell_price,
@@ -616,7 +616,7 @@ async fn manual_exit(
         OrderType::FAK,
         false, // not post-only
         0, // expiration_secs (FAK doesn't need expiration)
-        &session.shared_http,
+        session.venue.shared_http(),
     ).await;
 
     let order_id = match order_result {
@@ -657,7 +657,7 @@ async fn manual_exit(
     // ── Step 8: Remove from in-memory positions map ────────────────────────────
     {
         let mut pos_map = session.positions.lock().await;
-        pos_map.remove(&(req.strategy.clone(), token_id));
+        pos_map.remove(&(req.strategy.clone(), crate::venues::intl::market_id_from_u256(token_id)));
     }
 
     info!("✅ RTB: Manual exit complete — order_id={}", order_id);
@@ -743,7 +743,7 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
 
             match tokio::time::timeout(
                 std::time::Duration::from_secs(10),
-                sess.trading_client.balance_allowance(req),
+                sess.venue.trading_client().balance_allowance(req),
             ).await {
                 Ok(Ok(resp)) => {
                     let balance = Decimal::from_str(&resp.balance.to_string())

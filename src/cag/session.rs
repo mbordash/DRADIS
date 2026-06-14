@@ -23,19 +23,15 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
 
-use alloy::primitives::U256;
-use alloy::signers::local::LocalSigner;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
-use polymarket_client_sdk_v2::clob::Client as ClobClient;
-use polymarket_client_sdk_v2::auth::state::Authenticated;
-use polymarket_client_sdk_v2::auth::Normal;
 
 use crate::state::PositionMap;
+use crate::venues::ActiveVenue;
+use crate::venues::core::MarketId;
 use crate::helpers::balance::{PhantomCooldowns, OrphanTombstones};
 use crate::vipers::time_decay_impl::TimeDecayPosition;
 
@@ -62,7 +58,7 @@ pub struct SessionState {
     /// Key: `(strategy_name, token_id)` → expiry `Instant`.
     /// An entry present with `expiry > Instant::now()` blocks a new order
     /// placement for that (strategy, token) pair.
-    pub pending_orders: Arc<Mutex<HashMap<(String, U256), Instant>>>,
+    pub pending_orders: Arc<Mutex<HashMap<(String, MarketId), Instant>>>,
 
     /// Accumulated session P&L (realised on confirmed exits).
     pub total_pnl: Arc<Mutex<Decimal>>,
@@ -94,7 +90,7 @@ pub struct SessionState {
 
     /// TimeDecay strategy's per-token position metadata used by the cleanup
     /// worker to detect expired theta positions that need forced closure.
-    pub time_decay_positions: Arc<Mutex<HashMap<U256, TimeDecayPosition>>>,
+    pub time_decay_positions: Arc<Mutex<HashMap<MarketId, TimeDecayPosition>>>,
 
     /// Token ownership registry — maps `token_id` → `strategy_name`.
     ///
@@ -110,17 +106,14 @@ pub struct SessionState {
     /// cross-strategy interference bugs where (e.g.) GBoost re-enters a token
     /// that ArbitrageStrategy holds as a hedged leg, causing post-restart
     /// misattribution via the entries table.
-    pub token_ownership: Arc<Mutex<HashMap<U256, String>>>,
+    pub token_ownership: Arc<Mutex<HashMap<MarketId, String>>>,
 
-    // ── Trading infrastructure (Phase 3f-8: manual RTB) ──────────────────────
-    /// Authenticated CLOB REST client for manual exit orders via API.
-    pub trading_client: Arc<ClobClient<Authenticated<Normal>>>,
-    /// EOA signing key for manual exit order signatures.
-    pub signer: LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
-    /// Session-scoped nonce manager for manual exit orders.
-    pub nonce_manager: Arc<AtomicU64>,
-    /// Shared HTTP client for manual exit order placement.
-    pub shared_http: Arc<reqwest::Client>,
+    // ── Trading venue (venue-abstraction Step 1) ─────────────────────────────
+    /// The compile-time-selected execution venue. Collapses the former
+    /// `trading_client` / `signer` / `nonce_manager` / `shared_http` quartet into
+    /// a single handle that owns its security/identity state privately
+    /// (see `docs/VENUE_ABSTRACTION.md`). Cheaply cloneable via `Arc`.
+    pub venue: Arc<ActiveVenue>,
 }
 
 impl SessionState {
@@ -130,17 +123,13 @@ impl SessionState {
     /// `starting_collateral` so strategies have an accurate budget from
     /// the very first tick.
     ///
-    /// Phase 3f-8: Now also stores trading infrastructure (client, signer, etc.)
-    /// so the API server can execute manual "Return to Base" exits via authenticated
-    /// order placement.
-    #[allow(clippy::too_many_arguments)]
+    /// Phase 3f-8: Now also stores the trading venue (formerly client, signer,
+    /// nonce, http) so the API server can execute manual "Return to Base" exits
+    /// via authenticated order placement.
     pub fn new(
         startup_balance: Decimal,
         asset: impl Into<String>,
-        trading_client: Arc<ClobClient<Authenticated<Normal>>>,
-        signer: LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
-        nonce_manager: Arc<AtomicU64>,
-        shared_http: Arc<reqwest::Client>,
+        venue: Arc<ActiveVenue>,
     ) -> Self {
         Self {
             asset:                asset.into().to_lowercase(),
@@ -153,10 +142,7 @@ impl SessionState {
             orphan_tombstones:    Arc::new(Mutex::new(HashSet::new())),
             time_decay_positions: Arc::new(Mutex::new(HashMap::new())),
             token_ownership:      Arc::new(Mutex::new(HashMap::new())),
-            trading_client,
-            signer,
-            nonce_manager,
-            shared_http,
+            venue,
         }
     }
 }

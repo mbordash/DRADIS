@@ -433,6 +433,69 @@ pub async fn record_trade_db(
     }
 }
 
+/// Idempotently record a *settlement* trade — INSERTs only if no row with the same
+/// settlement fingerprint already exists.
+///
+/// Why this exists: a market resolves (and a given token settles) exactly once, but
+/// `auto_settle_closed_positions` can re-submit a redeem for an already-settled
+/// condition after a process restart — the in-memory `PERMANENTLY_SETTLED_CONDITIONS`
+/// guard is empty on a fresh start, so the same redeemable condition is re-redeemed
+/// (a harmless on-chain no-op) and, with the old plain INSERT, re-recorded as a fresh
+/// settlement row every session.  That double-counted realized losses (observed:
+/// the same SOL single-leg orphan booked 5× across 5 sessions → −$50 shown for a
+/// ~−$10 real loss).
+///
+/// The fingerprint (strategy, market, side, reason, shares, pnl) is stable across
+/// restarts for the same settlement, so the `WHERE NOT EXISTS` makes recording
+/// idempotent.  Returns true if a NEW row was inserted.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_settlement_trade_idempotent(
+    pool: &SqlitePool,
+    strategy: &str,
+    market: &str,
+    side: &str,
+    entry_price: Decimal,
+    exit_price: Decimal,
+    shares: Decimal,
+    pnl: Decimal,
+    reason: &str,
+    timestamp: Option<DateTime<Utc>>,
+) -> bool {
+    let ts = timestamp.unwrap_or_else(Utc::now).to_rfc3339();
+    let sid = current_session_id();
+    match sqlx::query(
+        "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+         WHERE NOT EXISTS (
+             SELECT 1 FROM trades
+             WHERE strategy = ? AND market = ? AND side = ? AND reason = ?
+               AND shares = ? AND pnl = ?
+         )"
+    )
+    .bind(&ts)
+    .bind(strategy)
+    .bind(market)
+    .bind(side)
+    .bind(entry_price.to_string())
+    .bind(exit_price.to_string())
+    .bind(shares.to_string())
+    .bind(pnl.to_string())
+    .bind(reason)
+    .bind(sid)
+    // WHERE NOT EXISTS fingerprint binds:
+    .bind(strategy)
+    .bind(market)
+    .bind(side)
+    .bind(reason)
+    .bind(shares.to_string())
+    .bind(pnl.to_string())
+    .execute(pool)
+    .await {
+        Ok(r)  => r.rows_affected() > 0,
+        Err(e) => { error!("❌ DB settlement idempotent write failed: {}", e); false }
+    }
+}
+
 pub async fn record_entry_db(
     pool: &SqlitePool,
     strategy: &str,
@@ -1035,13 +1098,18 @@ pub async fn update_position_from_chain(
 }
 
 /// Update only the current_price for an existing open position (called on every chain-sync).
+///
+/// Also flips `status` to 'confirmed': a position the Data API reports as a live on-chain
+/// holding is, by definition, confirmed (not an un-indexed in-flight order). Without this,
+/// a row first written as 'pending' by the strategy order path could stay 'pending'
+/// indefinitely after its fill, making it permanently immune to purge_stale_open_positions.
 pub async fn update_position_current_price(
     pool: &SqlitePool,
     token_id: &str,
     cur_price: rust_decimal::Decimal,
 ) {
     if let Err(e) = sqlx::query(
-        "UPDATE open_positions SET current_price = ? WHERE token_id = ?"
+        "UPDATE open_positions SET current_price = ?, status = 'confirmed' WHERE token_id = ?"
     )
     .bind(cur_price.to_string())
     .bind(token_id)

@@ -7,15 +7,10 @@
 
 use anyhow::Result;
 
-use polymarket_client_sdk_v2::clob::{Client as ClobClient, Config};
-use polymarket_client_sdk_v2::clob::types::SignatureType;
-use polymarket_client_sdk_v2::{POLYGON, PRIVATE_KEY_VAR, derive_safe_wallet};
 use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk_v2::clob::types::AssetType;
 
 use alloy::providers::ProviderBuilder;
-use alloy::signers::local::LocalSigner;
-use alloy::signers::Signer;
 
 use chrono::Utc;
 use chrono_tz::US::Eastern;
@@ -35,12 +30,12 @@ use tracing::{info, warn};
 use dradis::config;
 use dradis::squadron::{SquadronRaptors};
 use dradis::cag::{Cag, SessionState, RunArgs, run_market_loop};
+use dradis::venues::intl::IntlClobVenue;
 use dradis::helpers::dynamic_config::DynamicConfig;
 use dradis::api::server::AssetRaptorHealth;
 use tokio_util::sync::CancellationToken;
 
 use dradis::helpers::{
-    nonce::*,
     db,
 };
 
@@ -231,15 +226,23 @@ async fn main() -> Result<()> {
     // NOTE: API server is spawned after safe_address is derived below so it can
     // be passed in for the /api/positions/sync endpoint.
 
-    let private_key = env::var(PRIVATE_KEY_VAR).expect("POLYMARKET_PRIVATE_KEY");
     let _trade_size_usdc: Decimal = env::var("TRADE_SIZE_USDC").unwrap_or_else(|_| "10".to_string()).parse()?;
-
-    let signer = LocalSigner::from_str(&private_key)?.with_chain_id(Some(POLYGON));
-    let eoa_address = signer.address();
-    info!("Trading wallet (EOA) address: {}", eoa_address);
 
     let polygon_rpc_url = env::var("POLYGON_RPC_URL")
         .map_err(|_| anyhow::anyhow!("❌ POLYGON_RPC_URL not set in .env. Required for auto-settlement transactions. Use a paid RPC service like Helius (https://www.helius-rpc.com) or QuickNode. Example: POLYGON_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"))?;
+
+    // ── Connect the compile-time-selected execution venue ────────────────────
+    // For `intl_clob` this loads the EOA signer, authenticates the CLOB client,
+    // derives the Safe (maker) address, and seeds the order nonce from the API —
+    // the bootstrap that previously lived inline here (see VENUE_ABSTRACTION.md).
+    // The raw infra is re-exposed via accessors so the settlement provider,
+    // RunArgs, and startup balance/cancel flows below stay unchanged.
+    let venue = Arc::new(IntlClobVenue::connect(Arc::clone(&shared_http)).await?);
+    let signer         = venue.signer().clone();
+    let eoa_address    = venue.eoa_address();
+    let safe_address   = venue.safe_address();
+    let trading_client = Arc::clone(venue.trading_client());
+    let nonce_manager  = Arc::clone(venue.nonce_manager());
 
     let wallet_provider = ProviderBuilder::new()
         .with_nonce_management(alloy::providers::fillers::SimpleNonceManager::default())  // Auto-refresh nonce from chain; prevents "nonce too low" on auto-settle
@@ -248,14 +251,6 @@ async fn main() -> Result<()> {
         .await?;
     info!("✅ CTF auto-settlement client ready (rpc={})", polygon_rpc_url);
 
-    let trading_client = Arc::new(ClobClient::new(config::CLOB_API_BASE, Config::default())?
-        .authentication_builder(&signer)
-        .signature_type(SignatureType::GnosisSafe)
-        .authenticate()
-        .await?);
-
-    let safe_address = derive_safe_wallet(eoa_address, POLYGON).expect("Safe derivation failed");
-    info!("Authenticated on Polymarket CLOB. Safe (Maker) address: {}", safe_address);
 
     // ── Instantiate CAG (Phase 3e stub) ─────────────────────────────────────
     // The CAG registry is created here and passed to the API server so
@@ -276,9 +271,8 @@ async fn main() -> Result<()> {
         cag.clone(),
     ));
 
-    let initial_nonce = fetch_next_nonce(&shared_http, safe_address).await.unwrap_or(0);
-    info!(" Initialized Nonce from API (Maker/Safe): {}", initial_nonce);
-    let nonce_manager = Arc::new(AtomicU64::new(initial_nonce));
+    let initial_nonce = nonce_manager.load(AtomicOrdering::SeqCst);
+    info!(" Order nonce ready (Maker/Safe): {}", initial_nonce);
 
     let mut startup_balance = dec!(0);
     for i in 1..=3 {
@@ -378,15 +372,13 @@ async fn main() -> Result<()> {
         // live_collateral is refreshed from the CLOB every ~60 s so strategies
         // gate on actual available balance regardless of how many assets are active.
         //
-        // Phase 3f-8: SessionState now stores trading credentials so the API
-        // can execute manual "Return to Base" exits via authenticated orders.
+        // Step 1 (venue abstraction): SessionState now holds the execution venue
+        // (formerly the trading_client/signer/nonce/http quartet) so the API can
+        // execute manual "Return to Base" exits via authenticated orders.
         let asset_session = SessionState::new(
             startup_balance,
             asset.as_str(),
-            Arc::clone(&trading_client),
-            signer.clone(),
-            Arc::clone(&nonce_manager),
-            Arc::clone(&shared_http),
+            Arc::clone(&venue),
         );
 
         // Register EVERY asset's session with the CAG so API handlers can

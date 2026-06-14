@@ -31,6 +31,7 @@ use crate::helpers::time::fetch_historical_strike_price;
 use crate::state::{MarketConfig, PriceState};
 use crate::tasks::market_monitor::{run_market_monitor, MarketState};
 use crate::squadron::{Squadron, SquadronConfig, SquadronRaptors, CryptoAsset, PatrolContext, MarketPriceFeeds};
+use crate::venues::intl::{market_id_from_u256, u256_from_market_id};
 use tokio_util::sync::CancellationToken;
 
 // ─── RunArgs ──────────────────────────────────────────────────────────────────
@@ -139,7 +140,7 @@ where
     let (mut initial_hourly_candidate, mut initial_maker_candidate) = loop {
         let (hourly_cand, maker_cand) = get_market_pair(&shared_http, &crypto_filter).await;
 
-        if hourly_cand.yes_token != U256::ZERO {
+        if hourly_cand.yes_token != market_id_from_u256(U256::ZERO) {
             info!("✅ Found initial hourly market: \"{}\"", hourly_cand.name);
             break (hourly_cand, maker_cand);
         }
@@ -148,7 +149,7 @@ where
             info!("⚠️ No hourly market found, but a maker market is available. Starting with maker market context.");
             break (
                 MarketCandidate {
-                    yes_token: U256::ZERO, no_token: U256::ZERO,
+                    yes_token: market_id_from_u256(U256::ZERO), no_token: market_id_from_u256(U256::ZERO),
                     name: String::new(), link: String::new(),
                     description: String::new(), is_hot: false,
                     close_time: None, volume: 0.0,
@@ -164,7 +165,7 @@ where
     };
 
     // ── Resolve strike prices ─────────────────────────────────────────────────
-    if initial_hourly_candidate.yes_token != U256::ZERO {
+    if initial_hourly_candidate.yes_token != market_id_from_u256(U256::ZERO) {
         let mut strike = extract_strike_price(&initial_hourly_candidate.name);
         if strike.is_none() {
             strike = fetch_historical_strike_price(&shared_http, &crypto_filter, &initial_hourly_candidate.description).await;
@@ -282,7 +283,7 @@ where
         let (hourly_yes_token, hourly_no_token, hourly_market_name, hourly_market_close_time,
              hourly_strike_price, _hourly_desc, hourly_condition_id,
              hourly_is_neg_risk, hourly_yes_fee_rate, hourly_no_fee_rate)
-            = if hourly_yes_token != U256::ZERO
+            = if hourly_yes_token != market_id_from_u256(U256::ZERO)
         {
             let now = Utc::now();
             if let Some(close_time) = hourly_market_close_time {
@@ -299,7 +300,7 @@ where
 
             let yes_fee_rate = match tokio::time::timeout(
                 Duration::from_secs(10),
-                patrol_ctx.trading_client.fee_rate_bps(hourly_yes_token),
+                patrol_ctx.trading_client.fee_rate_bps(u256_from_market_id(&hourly_yes_token).unwrap_or_default()),
             ).await {
                 Ok(Ok(r))  => r.base_fee,
                 Ok(Err(e)) => { warn!("⚠️ hourly fee_rate YES error: {} — retrying init in 5s: {}", e, e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
@@ -307,7 +308,7 @@ where
             };
             let no_fee_rate = match tokio::time::timeout(
                 Duration::from_secs(10),
-                patrol_ctx.trading_client.fee_rate_bps(hourly_no_token),
+                patrol_ctx.trading_client.fee_rate_bps(u256_from_market_id(&hourly_no_token).unwrap_or_default()),
             ).await {
                 Ok(Ok(r))  => r.base_fee,
                 Ok(Err(e)) => { warn!("⚠️ hourly fee_rate NO error: {} — retrying init in 5s: {}", e, e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
@@ -315,7 +316,7 @@ where
             };
             let is_neg_risk = match tokio::time::timeout(
                 Duration::from_secs(10),
-                patrol_ctx.trading_client.neg_risk(hourly_yes_token),
+                patrol_ctx.trading_client.neg_risk(u256_from_market_id(&hourly_yes_token).unwrap_or_default()),
             ).await {
                 Ok(Ok(r))  => r.neg_risk,
                 Ok(Err(e)) => { warn!("⚠️ hourly neg_risk error: {} — retrying init in 5s: {}", e, e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
@@ -327,15 +328,15 @@ where
              hourly_strike_price, _hourly_desc, hourly_condition_id, is_neg_risk, yes_fee_rate, no_fee_rate)
         } else {
             info!("⚠️ No active hourly market found. Hourly-dependent strategies will be inactive.");
-            (U256::ZERO, U256::ZERO, String::new(), None, None, String::new(), String::new(), false, 0, 0)
+            (market_id_from_u256(U256::ZERO), market_id_from_u256(U256::ZERO), String::new(), None, None, String::new(), String::new(), false, 0u32, 0u32)
         };
 
         let _market_started_at = Utc::now();
 
         // ── Assemble the hourly MarketConfig and Squadron ─────────────────────
         let hourly_market_config_for_squadron = MarketConfig {
-            yes_token:         hourly_yes_token,
-            no_token:          hourly_no_token,
+            yes_token:         hourly_yes_token.clone(),
+            no_token:          hourly_no_token.clone(),
             market_name:       hourly_market_name.clone(),
             market_close_time: hourly_market_close_time,
             strike_price:      hourly_strike_price,
@@ -371,14 +372,21 @@ where
         // ── Subscribe to WS orderbook feeds for this market rotation ──────────
         let maker_tokens = maker_market_candidate_from_channel
             .as_ref()
-            .map(|mk| (mk.yes_token, mk.no_token));
-        patrol_ctx.feeds = squadron.subscribe_markets(hourly_yes_token, hourly_no_token, maker_tokens);
+            .map(|mk| (
+                u256_from_market_id(&mk.yes_token).unwrap_or_default(),
+                u256_from_market_id(&mk.no_token).unwrap_or_default(),
+            ));
+        patrol_ctx.feeds = squadron.subscribe_markets(
+            u256_from_market_id(&hourly_yes_token).unwrap_or_default(),
+            u256_from_market_id(&hourly_no_token).unwrap_or_default(),
+            maker_tokens,
+        );
 
         // ── Resolve maker market config ───────────────────────────────────────
         let maker_market_config: Option<MarketConfig> = if let Some(ref mk) = maker_market_candidate_from_channel {
             let mk_yes_fee = match tokio::time::timeout(
                 Duration::from_secs(10),
-                patrol_ctx.trading_client.fee_rate_bps(mk.yes_token),
+                patrol_ctx.trading_client.fee_rate_bps(u256_from_market_id(&mk.yes_token).unwrap_or_default()),
             ).await {
                 Ok(Ok(r))  => r.base_fee,
                 Ok(Err(e)) => { warn!("⚠️ maker fee_rate YES error: {} — retrying init in 5s: {}", e, e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
@@ -386,7 +394,7 @@ where
             };
             let mk_no_fee = match tokio::time::timeout(
                 Duration::from_secs(10),
-                patrol_ctx.trading_client.fee_rate_bps(mk.no_token),
+                patrol_ctx.trading_client.fee_rate_bps(u256_from_market_id(&mk.no_token).unwrap_or_default()),
             ).await {
                 Ok(Ok(r))  => r.base_fee,
                 Ok(Err(e)) => { warn!("⚠️ maker fee_rate NO error: {} — retrying init in 5s: {}", e, e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
@@ -394,7 +402,7 @@ where
             };
             let mk_neg_risk = match tokio::time::timeout(
                 Duration::from_secs(10),
-                patrol_ctx.trading_client.neg_risk(mk.yes_token),
+                patrol_ctx.trading_client.neg_risk(u256_from_market_id(&mk.yes_token).unwrap_or_default()),
             ).await {
                 Ok(Ok(r))  => r.neg_risk,
                 Ok(Err(e)) => { warn!("⚠️ maker neg_risk error: {} — retrying init in 5s: {}", e, e); tokio::time::sleep(Duration::from_secs(5)).await; continue 'market_loop; }
@@ -403,8 +411,8 @@ where
             info!("✅ Maker market settings: \"{}\" | NegRisk: {} | YES {} bps | NO {} bps",
                 mk.name, mk_neg_risk, mk_yes_fee, mk_no_fee);
             Some(MarketConfig {
-                yes_token: mk.yes_token,
-                no_token: mk.no_token,
+                yes_token: mk.yes_token.clone(),
+                no_token: mk.no_token.clone(),
                 market_name: mk.name.clone(),
                 market_close_time: mk.close_time,
                 strike_price: mk.strike_price,

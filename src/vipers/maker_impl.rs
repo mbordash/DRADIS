@@ -173,9 +173,9 @@ impl Strategy for MakerStrategyImpl {
         // ── Inventory and Net Exposure Check ─────────────────────────────────
         let (yes_inv_value, no_inv_value) = {
             let pos_map = ctx.positions.lock().await;
-            let yv = pos_map.get(&("MakerStrategy".to_string(), market.yes_token))
+            let yv = pos_map.get(&("MakerStrategy".to_string(), market.yes_token.clone()))
                 .map(|p| p.shares * p.avg_entry).unwrap_or(dec!(0));
-            let nv = pos_map.get(&("MakerStrategy".to_string(), market.no_token))
+            let nv = pos_map.get(&("MakerStrategy".to_string(), market.no_token.clone()))
                 .map(|p| p.shares * p.avg_entry).unwrap_or(dec!(0));
             (yv, nv)
         };
@@ -264,7 +264,7 @@ impl Strategy for MakerStrategyImpl {
         // the feeRateBps field is an EIP-712 struct attribute required by the API
         // but it is NOT deducted from maker fills.  Pass 0 so our P&L math is correct.
         let yes_params = final_yes.map(|p| OrderParams {
-            token_id: market.yes_token,
+            token_id: market.yes_token.clone(),
             price: p,
             shares: trade_size / p,
             fee_bps: 0,
@@ -277,7 +277,7 @@ impl Strategy for MakerStrategyImpl {
         });
 
         let no_params = final_no.map(|p| OrderParams {
-            token_id: market.no_token,
+            token_id: market.no_token.clone(),
             price: p,
             shares: trade_size / p,
             fee_bps: 0,
@@ -308,15 +308,14 @@ impl Strategy for MakerStrategyImpl {
         let profit_threshold = dec!(0.02);
         if secs_to_expiry < 900 {
             let pos_map = ctx.positions.lock().await;
-            for token_id in [market.yes_token, market.no_token] {
-                if let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id)) {
+            for token_id in [market.yes_token.clone(), market.no_token.clone()] {
+                if let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id.clone())) {
                     let bid = if token_id == market.yes_token { snapshot.yes_bid } else { snapshot.no_bid };
                     let profit_pct = (bid - position.avg_entry) / position.avg_entry;
                     if profit_pct < profit_threshold {
                         return Ok(StrategySignal::Exit {
                             params: OrderParams {
-                                token_id,
-                                price: bid,
+                                token_id: token_id.clone(),                                price: bid,
                                 shares: position.shares,
                                 fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
                                 is_neg_risk: market.is_neg_risk,
@@ -343,8 +342,8 @@ impl Strategy for MakerStrategyImpl {
         // ── Taker-Flow Book-Turn Exit ─────────────────────────────────────────
         {
             let pos_map = ctx.positions.lock().await;
-            for token_id in [market.yes_token, market.no_token] {
-                let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id)) else {
+            for token_id in [market.yes_token.clone(), market.no_token.clone()] {
+                let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id.clone())) else {
                     continue;
                 };
                 if position.fill_confirmed_at.is_none() { continue; }
@@ -367,8 +366,7 @@ impl Strategy for MakerStrategyImpl {
                     );
                     return Ok(StrategySignal::Exit {
                         params: OrderParams {
-                            token_id,
-                            price: bid,
+                            token_id: token_id.clone(),                            price: bid,
                             shares: position.shares,
                             fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
                             is_neg_risk: market.is_neg_risk,
@@ -387,8 +385,8 @@ impl Strategy for MakerStrategyImpl {
 
         let pos_map = ctx.positions.lock().await;
 
-        for token_id in [market.yes_token, market.no_token] {
-            let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id)) else {
+        for token_id in [market.yes_token.clone(), market.no_token.clone()] {
+            let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id.clone())) else {
                 continue;
             };
 
@@ -403,8 +401,7 @@ impl Strategy for MakerStrategyImpl {
             if position.fill_confirmed_at.is_some() && profit_pct >= dc.maker_target_profit_pct {
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
-                        token_id,
-                        price: bid,
+                        token_id: token_id.clone(),                        price: bid,
                         shares: position.shares,
                         fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
                         is_neg_risk: market.is_neg_risk,
@@ -425,8 +422,7 @@ impl Strategy for MakerStrategyImpl {
             {
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
-                        token_id,
-                        price: bid,
+                        token_id: token_id.clone(),                        price: bid,
                         shares: position.shares,
                         fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
                         is_neg_risk: market.is_neg_risk,
