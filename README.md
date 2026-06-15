@@ -456,6 +456,7 @@ API health: `http://YOUR_SERVER_IP:9000/api/health`
 
 ### Recently shipped
 
+- **US Retail venue (MVP)** — optional `us_retail` build target for the CFTC-regulated Polymarket US exchange; runs the arbitrage strategy with engine-atomic batched orders and live dashboard support.
 - **Phase 3f-7 — Per-asset SQLite DB pools** — Each asset in the fleet now owns its own SQLite file (`logs/btc-dradis.db`, `logs/eth-dradis.db`, etc.):
   - `db::init_for_asset()` / `db::pool_for()` / `db::pool_for_opt()` replace the single global pool
   - All hot-path writes (`record_open_position`, `close_open_position`, `record_trade_db`, etc.) scoped to the correct per-asset pool via `pool_for(&asset_lc)`
@@ -484,7 +485,7 @@ API health: `http://YOUR_SERVER_IP:9000/api/health`
 
 ### Next up
 - Control Tower multi-asset selector (switch between BTC / ETH / SOL session views in the dashboard)
-- **US venue hardening (Step 3d)** — private `/v1/ws/private` fill feed + active exit/position management for the US arb loop (see `docs/VENUE_ABSTRACTION.md`)
+- US Retail venue hardening — live private fill feed; active position exits
 
 ### Medium-term
 - Static deployment profiles (`profiles.toml`) with per-profile P&L tracking
