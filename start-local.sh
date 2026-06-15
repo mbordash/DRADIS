@@ -119,6 +119,20 @@ echo "   Dashboard → http://localhost:$UI_PORT"
 echo "   API       → http://localhost:$API_PORT/api/health"
 echo ""
 
+# Route ALL browser traffic through the Next.js proxy (src/app/api/[...path]/route.ts)
+# instead of letting the browser call :$API_PORT directly. The proxy runs server-side
+# and injects X-API-Key from DRADIS_API_KEY — the browser never sees the key, and
+# requests stop 401'ing when DRADIS_API_KEY is set on the engine.
+#
+# Forcing NEXT_PUBLIC_API_URL='' here OVERRIDES any value in control-tower/.env.local
+# (a process-env var set before `next dev` wins over .env files), so BASE='' in api.ts
+# → same-origin /api/* → proxy.
+#
+# The proxy reads DRADIS_API_KEY from the environment. It is inherited here from .env
+# (sourced above with `set -a`) — keep DRADIS_API_KEY in .env so the engine and the
+# proxy use the SAME value. (Next also auto-loads control-tower/.env.local, but .env
+# is the single source of truth that the Rust engine reads too.)
+NEXT_PUBLIC_API_URL='' \
 DRADIS_API_URL=http://localhost:$API_PORT \
     npm --prefix control-tower run dev -- -p $UI_PORT
 
