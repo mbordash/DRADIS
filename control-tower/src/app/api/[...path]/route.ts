@@ -19,7 +19,7 @@
  */
 import { NextRequest, NextResponse } from 'next/server';
 
-const API_BASE = process.env.DRADIS_API_URL ?? 'http://localhost:9000';
+const API_BASE = process.env.DRADIS_API_URL ?? 'http://127.0.0.1:9000';
 // Server-side only — NOT NEXT_PUBLIC_ so it never appears in the browser bundle.
 const API_KEY  = process.env.DRADIS_API_KEY ?? '';
 

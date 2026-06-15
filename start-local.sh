@@ -103,7 +103,7 @@ echo "   PID $DRADIS_PID → logs/dradis-local.log"
 # Wait for the API to come up
 echo -n "   Waiting for API on :$API_PORT"
 for i in $(seq 1 20); do
-    if curl -sf "http://localhost:$API_PORT/api/health" > /dev/null 2>&1; then
+    if curl -sf "http://127.0.0.1:$API_PORT/api/health" > /dev/null 2>&1; then
         echo " ✓"
         break
     fi
@@ -133,6 +133,6 @@ echo ""
 # proxy use the SAME value. (Next also auto-loads control-tower/.env.local, but .env
 # is the single source of truth that the Rust engine reads too.)
 NEXT_PUBLIC_API_URL='' \
-DRADIS_API_URL=http://localhost:$API_PORT \
+DRADIS_API_URL=http://127.0.0.1:$API_PORT \
     npm --prefix control-tower run dev -- -p $UI_PORT
 
