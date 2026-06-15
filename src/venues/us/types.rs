@@ -239,12 +239,34 @@ pub struct UsPosition {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AccountBalancesResponse {
-    #[serde(default, rename = "availableMarginUsd")]
-    pub available_margin_usd: String,
-    #[serde(default, rename = "lockedMarginUsd")]
-    pub locked_margin_usd: Option<String>,
-    #[serde(default, rename = "totalEquityUsd")]
-    pub total_equity_usd: Option<String>,
+    #[serde(default)]
+    pub balances: Vec<UserBalance>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct UserBalance {
+    #[serde(default, rename = "currentBalance")]
+    pub current_balance: f64,
+    #[serde(default)]
+    pub currency: String,
+    #[serde(default, rename = "lastUpdated")]
+    pub last_updated: Option<String>,
+    #[serde(default, rename = "buyingPower")]
+    pub buying_power: f64,
+    #[serde(default, rename = "assetNotional")]
+    pub asset_notional: Option<f64>,
+    #[serde(default, rename = "assetAvailable")]
+    pub asset_available: Option<f64>,
+    #[serde(default, rename = "pendingCredit")]
+    pub pending_credit: Option<f64>,
+    #[serde(default, rename = "openOrders")]
+    pub open_orders: Option<f64>,
+    #[serde(default, rename = "unsettledFunds")]
+    pub unsettled_funds: Option<f64>,
+    #[serde(default, rename = "marginRequirement")]
+    pub margin_requirement: Option<f64>,
+    #[serde(default, rename = "balanceReservation")]
+    pub balance_reservation: Option<f64>,
 }
 
 // ─── Combined portfolio (internal helper) ────────────────────────────────────
@@ -253,7 +275,7 @@ pub struct AccountBalancesResponse {
 #[derive(Debug, Clone)]
 pub struct PortfolioResponse {
     pub positions: Vec<UsPosition>,
-    pub available_margin_usd: String,
+    pub buying_power: f64,
 }
 
 

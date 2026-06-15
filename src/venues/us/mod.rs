@@ -276,9 +276,14 @@ impl UsRetailVenue {
         }
         positions.extend(pos_data.available_positions);
 
+        // Use buyingPower as the available collateral
+        let buying_power = bal_data.balances.first()
+            .map(|b| b.buying_power)
+            .unwrap_or(0.0);
+
         Ok(types::PortfolioResponse {
             positions,
-            available_margin_usd: bal_data.available_margin_usd,
+            buying_power,
         })
     }
 }
@@ -346,12 +351,8 @@ impl Execution for UsRetailVenue {
 
     async fn collateral(&self) -> Result<Decimal> {
         let portfolio = self.fetch_portfolio().await?;
-        let trimmed = portfolio.available_margin_usd.trim();
-        if trimmed.is_empty() {
-            return Ok(Decimal::ZERO);
-        }
-        Decimal::from_str(trimmed)
-            .map_err(|e| anyhow!("US retail: invalid available_margin_usd: {e}"))
+        Decimal::try_from(portfolio.buying_power)
+            .map_err(|e| anyhow!("US retail: invalid buying_power: {e}"))
     }
 
     async fn positions(&self) -> Result<Vec<Position>> {
