@@ -17,6 +17,23 @@
 
 ---
 
+
+## ️ Tactical Overview
+
+DRADIS is a comprehensive trading automation platform for prediction markets. Built in Rust for maximum concurrency and memory safety, it evaluates selected markets every 50ms, coordinating multiple autonomous strategies to preserve capital and place orders where it sees inefficiencies.
+
+The system is organized around four BSG-inspired tactical layers:
+
+| Layer        | Folder          | Role                                                                           |
+|--------------|-----------------|--------------------------------------------------------------------------------|
+| **Raptors**  | `src/raptors/`  | Signal scouts — fetch, normalise, broadcast external data                      |
+| **Vipers**   | `src/vipers/`   | Trading strategies — evaluate signals and place orders                         |
+| **Squadron** | `src/squadron/` | Deployment unit — bundles Raptors + Vipers onto a battle location              |
+| **CAG**      | `src/cag/`      | Commander Air Group — async dispatch, session state, multi-asset orchestration |
+
+
+---
+
 ## ⚡ Quick Start
 
 ```bash
@@ -88,22 +105,6 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 > reconcile. Open positions and portfolio P&L appear in the Control Tower under the **`us`**
 > asset selector. The Control Tower API stays live on `:9000` regardless. Crypto-hourly
 > strategies (Momentum/Maker/GBoost) remain intl-only for now.
-
----
-
-
-## ️ Tactical Overview
-
-DRADIS is a comprehensive trading automation platform for prediction markets. Built in Rust for maximum concurrency and memory safety, it evaluates selected markets every 50ms, coordinating multiple autonomous strategies to preserve capital and place orders where it sees inefficiencies.
-
-The system is organized around four BSG-inspired tactical layers:
-
-| Layer        | Folder          | Role                                                                           |
-|--------------|-----------------|--------------------------------------------------------------------------------|
-| **Raptors**  | `src/raptors/`  | Signal scouts — fetch, normalise, broadcast external data                      |
-| **Vipers**   | `src/vipers/`   | Trading strategies — evaluate signals and place orders                         |
-| **Squadron** | `src/squadron/` | Deployment unit — bundles Raptors + Vipers onto a battle location              |
-| **CAG**      | `src/cag/`      | Commander Air Group — async dispatch, session state, multi-asset orchestration |
 
 ---
 
@@ -484,18 +485,16 @@ API health: `http://YOUR_SERVER_IP:9000/api/health`
 - **Viper hot-enable** — All Vipers always instantiated at startup; toggle any live from Control Tower with no restart
 
 ### Next up
-- Control Tower multi-asset selector (switch between BTC / ETH / SOL session views in the dashboard)
 - US Retail venue hardening — live private fill feed; active position exits
 
 ### Medium-term
 - Static deployment profiles (`profiles.toml`) with per-profile P&L tracking
-- Profile selector in Control Tower
+- Squadron creator in Control Tower
 - LLM live config patches via Telegram approval gate
 
 ### Longer-term
 - Sports Raptor (line movement feeds)
 - Politics Raptor (polling aggregator feeds)
-- Market-agnostic Viper interfaces for community-built strategies
 
 ---
 
@@ -542,9 +541,9 @@ The safe pattern: bump the suffix in `GBOOST_MODEL_PATH` (e.g. `v14f` → `v15f`
 
 **Can I enable a Viper mid-session?** Yes — all seven are always instantiated. Toggle via Control Tower or `PATCH /api/config`. Takes effect on the next 50ms tick.
 
-**Does DRADIS support the US Polymarket API?** Not yet. DRADIS today targets the **international CLOB** — self-custody, EIP-712 order signing over a Polygon wallet, on-chain `U256` token IDs. Polymarket's **US platform** is a separate, custodial, CFTC-regulated exchange with web2 auth (API key / secret / session token) and string/UUID market IDs. We're building a **venue abstraction** so a build can target either market via a Cargo feature flag (`intl_clob` today, `us_retail` planned) — single-venue per binary, so the US deployment carries none of the Polygon crypto weight and stays inside its own regulatory/network footprint. 
+**Does DRADIS support the US Polymarket API?** Yes.  Polymarket's **US platform** is a separate, custodial, CFTC-regulated exchange with web2 auth (API key / secret / session token) and string/UUID market IDs. We have **venue abstraction** so a build can target either market via a Cargo feature flag (`intl_clob` today, `us_retail` planned) — single-venue per binary, so the US deployment carries none of the Polygon crypto weight and stays inside its own regulatory/network footprint. 
 
-**What about Kalshi?** DRADIS operates in the universe of PolyMarket. Kalshi is an alternate universe. Adama isn't ready to build this level of multiverse abstraction just yet — though the planned venue abstraction is the on-ramp: once the `Execution` trait lands, a `kalshi` venue becomes additive rather than a rewrite.
+**What about Kalshi?** Not yet. With our venue abstraction layer, it is now possible to create an integration with Kalshi. We will review PRs from the community if offered.
 
 **Control Tower shows "Offline"?** Check: (1) DRADIS running? (2) `curl http://localhost:9000/api/health`? (3) Docker — same `dradis-net` network?
 
