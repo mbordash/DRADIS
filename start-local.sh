@@ -51,6 +51,14 @@ if [ ! -f ".env" ]; then
     exit 1
 fi
 
+# Load .env into the environment so the DRADIS binary inherits credentials
+# (e.g. DRADIS_API_KEY, POLYMARKET_*). `set -a` auto-exports every variable
+# assigned while sourcing; `set +a` restores normal behavior afterwards.
+set -a
+# shellcheck disable=SC1091
+source .env
+set +a
+
 if [ ! -f "control-tower/package.json" ]; then
     echo "❌  control-tower/ not found. Run this script from the DRADIS repo root."
     exit 1
