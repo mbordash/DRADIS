@@ -101,7 +101,36 @@ impl UsRetailVenue {
             bail!("US retail markets returned HTTP {status}: {body}");
         }
         let body = resp.text().await.context("reading markets response")?;
-        let parsed: types::MarketsResponse = serde_json::from_str(&body)
+
+        // Parse as Value first to handle any JSON quirks
+        let mut json_val: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| {
+                let preview = &body.chars().take(4000).collect::<String>();
+                anyhow!("markets JSON parse failed: {e}\nFirst 4000 chars: {preview}")
+            })?;
+
+        // Fix stringified arrays in market objects if needed
+        if let Some(markets_array) = json_val.get_mut("markets").and_then(|v| v.as_array_mut()) {
+            for market in markets_array.iter_mut() {
+                // Check all string fields for stringified JSON arrays/objects
+                if let Some(obj) = market.as_object_mut() {
+                    for (_, val) in obj.iter_mut() {
+                        if let Some(s) = val.as_str() {
+                            // If it's a stringified array or object, try to parse it
+                            if (s.starts_with('[') && s.ends_with(']'))
+                                || (s.starts_with('{') && s.ends_with('}'))
+                            {
+                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
+                                    *val = parsed;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let parsed: types::MarketsResponse = serde_json::from_value(json_val)
             .map_err(|e| anyhow!("markets response decode failed: {e}"))?;
         Ok(markets::pair_markets(parsed.markets))
     }

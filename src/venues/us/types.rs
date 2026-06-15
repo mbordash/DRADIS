@@ -73,11 +73,11 @@ pub struct UsMarket {
     // Use Value to avoid nested parsing issues with malformed fields
     #[serde(default, rename = "marketSides")]
     pub market_sides: Vec<serde_json::Value>,
-    // Legacy fields for compatibility
+    // Legacy fields for compatibility - use Value since structure may vary
     #[serde(default)]
-    pub instruments: Vec<UsInstrument>,
+    pub instruments: Vec<serde_json::Value>,
     #[serde(default)]
-    pub outcomes: Vec<UsInstrument>,
+    pub outcomes: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
