@@ -1031,13 +1031,22 @@ pub async fn purge_stale_open_positions(
     pool: &SqlitePool,
     live_token_ids: &std::collections::HashSet<String>,
 ) -> usize {
-    // Only fetch confirmed (non-pending) rows for purge consideration.
-    // Pending rows represent in-flight orders that have not yet been indexed by the
-    // Polymarket Data API — purging them before they're indexed causes a
-    // purge-then-re-adopt cycle that creates duplicate open_positions rows for the
-    // same token_id (one from the chain adoption, one from the strategy's fresh INSERT).
-    let rows: Vec<String> = match sqlx::query_scalar(
-        "SELECT DISTINCT token_id FROM open_positions WHERE COALESCE(status, 'confirmed') != 'pending'"
+    // A row may legitimately sit `status='pending'` for a SHORT time between the
+    // strategy's INSERT and the Polymarket Data API indexing the resulting fill.
+    // Purging inside that window causes a purge→re-adopt cycle that duplicates the
+    // row, so pending rows are protected — but only transiently.
+    //
+    // Beyond the grace window a `pending` row whose token the Data API no longer
+    // reports is an ORPHAN, not an in-flight order. The canonical case: an arb leg
+    // that settled on-chain and was redeemed off-app via the Polymarket "Redeem"
+    // button. After redemption the wallet holds 0 of the token, so it appears in
+    // neither the live nor the redeemable on-chain sets, and the old pending-skip
+    // made it immune to every purge path forever — inflating the portfolio value
+    // by its phantom mark-to-market (observed: +$14.85 of redeemed ETH arb legs).
+    const STALE_PENDING_GRACE_SECS: i64 = 3600; // 60 min ≫ indexer lag, ≪ orphan lifetime
+
+    let rows: Vec<(i64, String, Option<String>, String)> = match sqlx::query_as(
+        "SELECT id, token_id, status, ts FROM open_positions"
     )
     .fetch_all(pool)
     .await {
@@ -1045,21 +1054,36 @@ pub async fn purge_stale_open_positions(
         Err(e) => { error!("❌ DB purge_stale_open_positions fetch failed: {}", e); return 0; }
     };
 
+    let now = Utc::now();
     let mut purged = 0usize;
-    for token_id in rows {
-        if !live_token_ids.contains(&token_id) {
-            // Only delete confirmed rows — leave any pending rows for the same token alone.
-            if let Err(e) = sqlx::query(
-                "DELETE FROM open_positions WHERE token_id = ? AND COALESCE(status, 'confirmed') != 'pending'"
-            )
-                .bind(&token_id)
-                .execute(pool)
-                .await
-            {
-                error!("❌ DB purge_stale_open_positions delete failed for {}: {}", token_id, e);
-            } else {
-                purged += 1;
+    for (id, token_id, status, ts) in rows {
+        // Still held on-chain (size > 0, not redeemable) — keep.
+        if live_token_ids.contains(&token_id) {
+            continue;
+        }
+
+        let is_pending = status.as_deref().unwrap_or("confirmed") == "pending";
+        if is_pending {
+            // Keep only if still inside the in-flight grace window. An unparseable
+            // timestamp is treated as old (purge) so malformed rows can't leak forever.
+            let age_secs = DateTime::parse_from_rfc3339(&ts)
+                .map(|t| (now - t.with_timezone(&Utc)).num_seconds())
+                .unwrap_or(i64::MAX);
+            if age_secs < STALE_PENDING_GRACE_SECS {
+                continue; // genuinely in-flight; leave alone
             }
+        }
+
+        // Delete this specific stale row by id (avoids touching a fresh pending row
+        // that may share the same token_id).
+        if let Err(e) = sqlx::query("DELETE FROM open_positions WHERE id = ?")
+            .bind(id)
+            .execute(pool)
+            .await
+        {
+            error!("❌ DB purge_stale_open_positions delete failed for id {}: {}", id, e);
+        } else {
+            purged += 1;
         }
     }
     purged

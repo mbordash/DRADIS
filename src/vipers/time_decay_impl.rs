@@ -46,7 +46,7 @@ use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::venues::core::MarketId;
 use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
-use polymarket_client_sdk_v2::clob::types::OrderType;
+use crate::venues::core::TimeInForce;
 
 const STRATEGY_NAME: &str = "TimeDecayStrategy";
 
@@ -178,7 +178,7 @@ impl Strategy for TimeDecayStrategyImpl {
                     is_neg_risk: market.is_neg_risk,
                     market_name: market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
-                    order_type: OrderType::GTC,
+                    order_type: TimeInForce::Gtc,
                     post_only:  true,
                     ghost_mode: dc.ghost_mode,
                 },
@@ -190,7 +190,7 @@ impl Strategy for TimeDecayStrategyImpl {
                     is_neg_risk: market.is_neg_risk,
                     market_name: market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
-                    order_type: OrderType::GTC,
+                    order_type: TimeInForce::Gtc,
                     post_only:  true,
                     ghost_mode: dc.ghost_mode,
                 }),
@@ -215,7 +215,7 @@ impl Strategy for TimeDecayStrategyImpl {
             // ── Convergence exit ──────────────────────────────────────────────
             if yes_bid + no_bid >= dc.time_decay_convergence_exit_bid {
                 return Ok(StrategySignal::Exit {
-                    params: OrderParams { token_id: market.yes_token.clone(), price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: dc.ghost_mode },
+                    params: OrderParams { token_id: market.yes_token.clone(), price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: TimeInForce::Fak, post_only: false, ghost_mode: dc.ghost_mode },
                     reason: "Time Decay convergence".to_string(),
                     exit_pair: true,
                 });
@@ -248,7 +248,7 @@ impl Strategy for TimeDecayStrategyImpl {
                 let sl_threshold = entry_combined * (dec!(1) - effective_stop_pct);
                 if combined_bid < sl_threshold {
                     return Ok(StrategySignal::Exit {
-                        params: OrderParams { token_id: market.yes_token.clone(), price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: dc.ghost_mode },
+                        params: OrderParams { token_id: market.yes_token.clone(), price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: TimeInForce::Fak, post_only: false, ghost_mode: dc.ghost_mode },
                         reason: format!("Time Decay SL{}", if iv_elevated { " (IV-tightened)" } else { "" }),
                         exit_pair: true,
                     });
@@ -259,7 +259,7 @@ impl Strategy for TimeDecayStrategyImpl {
             if let Some(close_time) = market.market_close_time {
                 if (close_time - Utc::now()).num_seconds() < config::MARKET_EXPIRY_SAFETY_BUFFER_SECS as i64 {
                     return Ok(StrategySignal::Exit {
-                        params: OrderParams { token_id: market.yes_token.clone(), price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: OrderType::FAK, post_only: false, ghost_mode: dc.ghost_mode },
+                        params: OrderParams { token_id: market.yes_token.clone(), price: yes_bid, shares: yp.shares, fee_bps: market.yes_fee_bps as u16, is_neg_risk: market.is_neg_risk, market_name: market.market_name.clone(), condition_id: market.condition_id.clone(), order_type: TimeInForce::Fak, post_only: false, ghost_mode: dc.ghost_mode },
                         reason: "Time Decay Expiry".to_string(),
                         exit_pair: true,
                     });

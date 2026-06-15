@@ -15,7 +15,7 @@ use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
-use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
+use crate::venues::core::TimeInForce;
 
 /// Stateful Momentum strategy implementation.
 ///
@@ -102,7 +102,7 @@ impl Strategy for MomentumStrategyImpl {
                     is_neg_risk: ctx.market.is_neg_risk,
                     market_name: ctx.market.market_name.clone(),
                     condition_id: ctx.market.condition_id.clone(),
-                    order_type:  OrderType::FAK,
+                    order_type:  TimeInForce::Fak,
                     post_only:   false,
                     ghost_mode:  dc.ghost_mode,
                 }
@@ -459,7 +459,7 @@ impl Strategy for MomentumStrategyImpl {
                         is_neg_risk: exit_market.is_neg_risk,
                         market_name: exit_market.market_name.clone(),
                         condition_id: exit_market.condition_id.clone(),
-                        order_type: OrderType::FAK,
+                        order_type: TimeInForce::Fak,
                         post_only: false,
                         ghost_mode: dc.ghost_mode,
                     }

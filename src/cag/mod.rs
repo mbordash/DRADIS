@@ -43,7 +43,9 @@
 pub mod session;
 pub use session::SessionState;
 
+#[cfg(feature = "intl_clob")]
 pub mod run;
+#[cfg(feature = "intl_clob")]
 pub use run::{RunArgs, run_market_loop};
 
 use std::collections::HashMap;

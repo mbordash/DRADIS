@@ -25,7 +25,7 @@ use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
-use polymarket_client_sdk_v2::clob::types::OrderType;
+use crate::venues::core::TimeInForce;
 use crate::helpers::price::floor_to_tick_size;
 // Import OrderType
 
@@ -271,7 +271,7 @@ impl Strategy for MakerStrategyImpl {
             is_neg_risk: market.is_neg_risk,
             market_name: market.market_name.clone(),
             condition_id: market.condition_id.clone(),
-            order_type: OrderType::GTC,
+            order_type: TimeInForce::Gtc,
             post_only: true,
             ghost_mode: dc.ghost_mode,
         });
@@ -284,7 +284,7 @@ impl Strategy for MakerStrategyImpl {
             is_neg_risk: market.is_neg_risk,
             market_name: market.market_name.clone(),
             condition_id: market.condition_id.clone(),
-            order_type: OrderType::GTC,
+            order_type: TimeInForce::Gtc,
             post_only: true,
             ghost_mode: dc.ghost_mode,
         });
@@ -321,7 +321,7 @@ impl Strategy for MakerStrategyImpl {
                                 is_neg_risk: market.is_neg_risk,
                                 market_name: market.market_name.clone(),
                                 condition_id: market.condition_id.clone(),
-                                order_type: OrderType::FAK,
+                                order_type: TimeInForce::Fak,
                                 post_only: false,
                                 ghost_mode: dc.ghost_mode,
                             },
@@ -372,7 +372,7 @@ impl Strategy for MakerStrategyImpl {
                             is_neg_risk: market.is_neg_risk,
                             market_name: market.market_name.clone(),
                             condition_id: market.condition_id.clone(),
-                            order_type: OrderType::FAK,
+                            order_type: TimeInForce::Fak,
                             post_only: false,
                             ghost_mode: dc.ghost_mode,
                         },
@@ -407,7 +407,7 @@ impl Strategy for MakerStrategyImpl {
                         is_neg_risk: market.is_neg_risk,
                         market_name: market.market_name.clone(),
                         condition_id: market.condition_id.clone(),
-                        order_type: OrderType::FAK,
+                        order_type: TimeInForce::Fak,
                         post_only: false,
                         ghost_mode: dc.ghost_mode,
                     },
@@ -428,7 +428,7 @@ impl Strategy for MakerStrategyImpl {
                         is_neg_risk: market.is_neg_risk,
                         market_name: market.market_name.clone(),
                         condition_id: market.condition_id.clone(),
-                        order_type: OrderType::FAK,
+                        order_type: TimeInForce::Fak,
                         post_only: false,
                         ghost_mode: dc.ghost_mode,
                     },

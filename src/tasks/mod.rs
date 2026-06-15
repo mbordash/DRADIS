@@ -7,5 +7,7 @@
 ///
 /// Note: Binance price and funding rate tasks have moved to `crate::raptors`
 /// as part of the Raptor recon-layer separation of concerns.
+#[cfg(feature = "intl_clob")]
 pub mod market_monitor;
+#[cfg(feature = "intl_clob")]
 pub mod cleanup;

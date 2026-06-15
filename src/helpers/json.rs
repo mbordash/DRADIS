@@ -1,9 +1,12 @@
+#[cfg(feature = "intl_clob")]
 use alloy::primitives::U256;
 use serde_json;
+#[cfg(feature = "intl_clob")]
 use std::str::FromStr as _;
 
 /// Extract U256 value from serde_json::Value
 /// Handles string, u64, i64, and numeric types
+#[cfg(feature = "intl_clob")]
 pub fn value_to_u256(v: &serde_json::Value) -> Option<U256> {
     if let Some(s) = v.as_str() {
         U256::from_str(s).ok()
@@ -59,6 +62,7 @@ pub fn extract_start_time(
 
 /// Extract token IDs from market object
 /// Handles multiple formats: array, JSON string, CSV string, or single value
+#[cfg(feature = "intl_clob")]
 pub fn extract_token_ids_u256(market: &serde_json::Value) -> Vec<U256> {
     let v = market
         .get("clobTokenIds")

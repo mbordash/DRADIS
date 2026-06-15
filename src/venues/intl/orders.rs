@@ -34,6 +34,7 @@ use rust_decimal::prelude::ToPrimitive;
 use crate::helpers::price::{round_to_tick_size, floor_to_tick_size};
 use crate::helpers::nonce::fetch_next_nonce;
 use crate::venues::core::MarketId;
+use crate::venues::core::TimeInForce;
 use crate::venues::intl::u256_from_market_id;
 
 const ORDER_NAME: &str = "Polymarket CTF Exchange";
@@ -42,6 +43,17 @@ const VERSION: &str = "2";
 /// Polymarket requires expiration timestamp to be >= now + 1 minute + 30 seconds.
 /// We add 90 seconds (1.5 minutes) as a safety buffer.
 const EXPIRATION_BUFFER_SECS: u64 = 90;
+
+/// Map the venue-neutral [`TimeInForce`] onto the intl SDK's `OrderType`.
+/// Confines the SDK enum to this module — callers speak only `TimeInForce`.
+fn to_clob(tif: TimeInForce) -> OrderType {
+    match tif {
+        TimeInForce::Gtc => OrderType::GTC,
+        TimeInForce::Gtd => OrderType::GTD,
+        TimeInForce::Fak => OrderType::FAK,
+        TimeInForce::Fok => OrderType::FOK,
+    }
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal: Build a SignedOrder without posting it
@@ -185,13 +197,15 @@ pub async fn place_limit_order(
     quantity: Decimal,
     limit_price: Decimal,
     _fee_rate_bps: u16,
-    order_type: OrderType,
+    order_type: TimeInForce,
     post_only: bool,
     expiration_secs: u64,
     http: &reqwest::Client,
 ) -> Result<String> {
     // Convert the neutral key to the on-chain id at the venue boundary (slice 2b).
     let token_id = u256_from_market_id(token_id)?;
+    // Map the neutral TIF onto the SDK enum once, at the venue boundary.
+    let order_type = to_clob(order_type);
     for attempt in 0..2 {
         // AtomicU64 load — kept for API compatibility; V2 orders have no nonce field.
         let _current_nonce = nonce_manager.load(Ordering::SeqCst);
@@ -277,7 +291,7 @@ pub async fn place_limit_orders_atomic(
     side_a: Side,
     quantity_a: Decimal,
     price_a: Decimal,
-    order_type_a: OrderType,
+    order_type_a: TimeInForce,
     post_only_a: bool,
     expiration_a: u64,
     // ── Leg B ──
@@ -286,7 +300,7 @@ pub async fn place_limit_orders_atomic(
     side_b: Side,
     quantity_b: Decimal,
     price_b: Decimal,
-    order_type_b: OrderType,
+    order_type_b: TimeInForce,
     post_only_b: bool,
     expiration_b: u64,
     http: &reqwest::Client,
@@ -301,7 +315,7 @@ pub async fn place_limit_orders_atomic(
     // or cause a server-side rejection that takes BOTH legs down.  Fail fast here
     // so callers are forced to use place_limit_order for taker fills.
     for (label, ot) in [("Leg A", &order_type_a), ("Leg B", &order_type_b)] {
-        if matches!(ot, OrderType::FAK | OrderType::FOK) {
+        if matches!(ot, TimeInForce::Fak | TimeInForce::Fok) {
             return Err(anyhow::anyhow!(
                 "place_limit_orders_atomic: {} uses {:?} — only GTC/GTD orders \
                  may be batched via POST /orders. Use place_limit_order instead.",
@@ -309,6 +323,9 @@ pub async fn place_limit_orders_atomic(
             ));
         }
     }
+    // Map the neutral TIFs onto the SDK enum once, past the batch-eligibility guard.
+    let order_type_a = to_clob(order_type_a);
+    let order_type_b = to_clob(order_type_b);
     for attempt in 0..2 {
         let _current_nonce = nonce_manager.load(Ordering::SeqCst);
 

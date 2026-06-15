@@ -32,7 +32,7 @@ use tokio::time::Instant;
 use crate::state::PositionMap;
 use crate::venues::ActiveVenue;
 use crate::venues::core::MarketId;
-use crate::helpers::balance::{PhantomCooldowns, OrphanTombstones};
+use crate::state::{PhantomCooldowns, OrphanTombstones};
 use crate::vipers::time_decay_impl::TimeDecayPosition;
 
 // ─── SessionState ─────────────────────────────────────────────────────────────

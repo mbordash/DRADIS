@@ -33,13 +33,13 @@
 ///
 /// # Cooldown & re-entry
 ///   Per-token post-exit cooldown prevents rapid re-entry after a loss.
-///   Uses a `HashMap<U256, Instant>` protected by `std::sync::Mutex` (no async holds).
+///   Uses a `HashMap<MarketId, Instant>` protected by `std::sync::Mutex` (no async holds).
 
 use async_trait::async_trait;
 use anyhow::Result;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use alloy::primitives::U256;
+use crate::venues::core::MarketId;
 use std::collections::HashMap;
 use std::sync::Mutex;
 use std::time::Instant;
@@ -50,14 +50,14 @@ use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
-use polymarket_client_sdk_v2::clob::types::OrderType;
+use crate::venues::core::TimeInForce;
 
 // ─── Stateful implementation ─────────────────────────────────────────────────
 
 pub struct TrendCaptureStrategyImpl {
     /// Per-token cooldown after any exit.
     /// Key: token_id, Value: Instant of last exit.
-    post_exit_cooldown: Mutex<HashMap<U256, Instant>>,
+    post_exit_cooldown: Mutex<HashMap<MarketId, Instant>>,
     /// Consecutive SL loss count per market condition_id.
     /// Resets to 0 on a TP exit; increments on every SL/forced exit.
     consecutive_losses: Mutex<HashMap<String, u32>>,
@@ -250,7 +250,7 @@ impl Strategy for TrendCaptureStrategyImpl {
                     is_neg_risk:  market.is_neg_risk,
                     market_name:  market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
-                    order_type:   OrderType::GTC,
+                    order_type:   TimeInForce::Gtc,
                     post_only:    true,
                     ghost_mode:   dc.ghost_mode,
                 }
@@ -276,7 +276,7 @@ impl Strategy for TrendCaptureStrategyImpl {
                 // Cooldown check
                 let token_id = market.yes_token.clone();
                 let cdl = effective_cooldown(&market.condition_id);
-                let in_cooldown = cooldowns.get(&crate::venues::intl::u256_from_market_id(&token_id).unwrap_or_default())
+                let in_cooldown = cooldowns.get(&token_id)
                     .map(|t| t.elapsed().as_secs() < cdl)
                     .unwrap_or(false);
                 if !in_cooldown {
@@ -310,7 +310,7 @@ impl Strategy for TrendCaptureStrategyImpl {
             {
                 let token_id = market.no_token.clone();
                 let cdl = effective_cooldown(&market.condition_id);
-                let in_cooldown = cooldowns.get(&crate::venues::intl::u256_from_market_id(&token_id).unwrap_or_default())
+                let in_cooldown = cooldowns.get(&token_id)
                     .map(|t| t.elapsed().as_secs() < cdl)
                     .unwrap_or(false);
                 if !in_cooldown {
@@ -485,7 +485,7 @@ impl Strategy for TrendCaptureStrategyImpl {
         };
 
         if let Some(p) = pending {
-            self.record_exit(&crate::venues::intl::u256_from_market_id(&p.token_id).unwrap_or_default(), &p.condition_id, p.is_sl);
+            self.record_exit(&p.token_id, &p.condition_id, p.is_sl);
             // Stamp the exit signal cooldown to prevent FAK-miss re-fire storm
             if let Ok(mut last) = self.last_exit_signal_at.lock() {
                 *last = Some(Instant::now());
@@ -499,7 +499,7 @@ impl Strategy for TrendCaptureStrategyImpl {
                     is_neg_risk:  p.is_neg_risk,
                     market_name:  p.market_name,
                     condition_id: p.condition_id,
-                    order_type:   OrderType::GTC,
+                    order_type:   TimeInForce::Gtc,
                     post_only:    true,
                     ghost_mode:   p.ghost_mode,
                 },
@@ -522,9 +522,9 @@ impl TrendCaptureStrategyImpl {
     /// Record exit time for post-exit cooldown tracking.
     /// If `is_sl` is true, increments the consecutive-loss counter for the
     /// given condition_id; a TP exit resets it.
-    fn record_exit(&self, token_id: &U256, condition_id: &str, is_sl: bool) {
+    fn record_exit(&self, token_id: &MarketId, condition_id: &str, is_sl: bool) {
         if let Ok(mut map) = self.post_exit_cooldown.lock() {
-            map.insert(*token_id, Instant::now());
+            map.insert(token_id.clone(), Instant::now());
         }
         if let Ok(mut losses) = self.consecutive_losses.lock() {
             if is_sl {

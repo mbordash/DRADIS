@@ -24,7 +24,7 @@
 
 use axum::{
     Router,
-    routing::{get, post, delete},
+    routing::{get, delete},
     extract::{State, Query, Path, Request},
     middleware::Next,
     response::{IntoResponse, Response},
@@ -37,16 +37,24 @@ use std::sync::Arc;
 use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
+#[cfg(feature = "intl_clob")]
 use alloy::primitives::{Address, U256};
-use polymarket_client_sdk_v2::clob::types::{OrderType, Side};
+#[cfg(feature = "intl_clob")]
+use polymarket_client_sdk_v2::clob::types::{Side};
+#[cfg(feature = "intl_clob")]
 use rust_decimal::Decimal;
+#[cfg(feature = "intl_clob")]
 use rust_decimal::prelude::FromStr;
 
 use crate::helpers::dynamic_config::DynamicConfig;
 use crate::helpers::db;
+#[cfg(feature = "intl_clob")]
 use crate::helpers::orders::place_limit_order;
+#[cfg(feature = "intl_clob")]
 use crate::helpers::price::round_to_tick_size;
+#[cfg(feature = "intl_clob")]
 use crate::helpers::metrics;
+#[cfg(feature = "intl_clob")]
 use crate::tasks::cleanup::sync_open_positions_with_chain;
 use crate::cag::Cag;
 
@@ -84,6 +92,8 @@ pub struct ApiState {
     pub api_key: Option<String>,
     /// Gnosis Safe wallet address — used by POST /api/positions/sync to fetch live
     /// on-chain holdings and purge stale open_positions rows without a restart.
+    /// Intl-only: the US custodial venue has no self-custody wallet address.
+    #[cfg(feature = "intl_clob")]
     pub safe_address: Address,
     /// CAG (Carrier Air Group) — squadron registry.
     /// Phase 3d: exposes GET /api/squadrons and GET /api/squadrons/{id}.
@@ -138,6 +148,7 @@ struct AssetQuery {
 /// specified position, records the trade with actual exit price and P&L,
 /// and closes the position in the database.
 #[derive(Deserialize)]
+#[cfg(feature = "intl_clob")]
 struct ManualExitRequest {
     /// Token ID (decimal U256 string)
     token_id: String,
@@ -488,6 +499,7 @@ async fn delete_open_position(Path(token_id): Path<String>, Query(q): Query<Asse
 /// reflect the cleared state in DRADIS without waiting for a bot restart.
 ///
 /// Returns: `{ "message": "Chain sync complete" }`
+#[cfg(feature = "intl_clob")]
 async fn sync_positions(State(s): State<ApiState>) -> Response {
     info!(" Manual chain-sync triggered via POST /api/positions/sync");
     sync_open_positions_with_chain(s.safe_address).await;
@@ -506,6 +518,7 @@ async fn sync_positions(State(s): State<ApiState>) -> Response {
 ///  5. Close position in DB
 ///
 /// Returns 200 with trade details on success, 4xx/5xx on failure.
+#[cfg(feature = "intl_clob")]
 async fn manual_exit(
     State(s): State<ApiState>,
     Json(req): Json<ManualExitRequest>,
@@ -613,7 +626,7 @@ async fn manual_exit(
         shares,
         sell_price,
         0, // fee_rate_bps (unused in V2)
-        OrderType::FAK,
+        crate::venues::core::TimeInForce::Fak,
         false, // not post-only
         0, // expiration_secs (FAK doesn't need expiration)
         session.venue.shared_http(),
@@ -722,6 +735,9 @@ struct PortfolioValue {
 
 async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
     debug!("Received GET /api/portfolio request");
+    // `s` is only consulted for the intl on-chain balance probe below.
+    #[cfg(feature = "us_retail")]
+    let _ = &s;
 
     use rust_decimal::Decimal;
     use std::str::FromStr;
@@ -730,6 +746,11 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
     let assets = db::available_assets();
 
     // Fetch live wallet collateral as ground truth (10s timeout)
+    // US custodial venue exposes no on-chain wallet balance here yet (Step 3b);
+    // fall back to the DB-tracked collateral snapshot below.
+    #[cfg(feature = "us_retail")]
+    let live_collateral: Option<Decimal> = None;
+    #[cfg(feature = "intl_clob")]
     let live_collateral = {
         use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
         use polymarket_client_sdk_v2::clob::types::AssetType;
@@ -1045,7 +1066,7 @@ pub async fn run_api_server(
     config_rx: watch::Receiver<Arc<DynamicConfig>>,
     markets_rx: watch::Receiver<HashMap<String, String>>,
     raptor_health_rx: watch::Receiver<HashMap<String, AssetRaptorHealth>>,
-    safe_address: Address,
+    #[cfg(feature = "intl_clob")] safe_address: Address,
     cag: Cag,
 ) {
     let port = std::env::var("API_PORT")
@@ -1060,7 +1081,7 @@ pub async fn run_api_server(
         tracing::info!(" API key authentication disabled (set DRADIS_API_KEY to enable)");
     }
 
-    let state = ApiState { config_tx, config_rx, markets_rx, raptor_health_rx, api_key, safe_address, cag };
+    let state = ApiState { config_tx, config_rx, markets_rx, raptor_health_rx, api_key, #[cfg(feature = "intl_clob")] safe_address, cag };
 
     // /api/health is intentionally public — no API key required.
     // Docker HEALTHCHECK, load balancers, and uptime monitors all probe this
@@ -1079,8 +1100,6 @@ pub async fn run_api_server(
         .route("/api/positions",             get(get_open_positions))
         .route("/api/positions/pending",     get(get_pending_positions))
         .route("/api/positions/confirmed",   get(get_confirmed_positions))
-        .route("/api/positions/sync",        post(sync_positions))
-        .route("/api/positions/manual-exit", post(manual_exit))
         .route("/api/positions/{token_id}",  delete(delete_open_position))
         .route("/api/status",                get(get_status))
         .route("/api/portfolio",             get(get_portfolio_value))
@@ -1088,7 +1107,16 @@ pub async fn run_api_server(
         // ── Phase 3d: Squadron registry endpoints ──────────────────────────
         .route("/api/squadrons",             get(get_squadrons))
         .route("/api/squadrons/{id}",        get(get_squadron_by_id))
-        .route("/api/squadrons/{id}/config", get(get_squadron_config).patch(patch_squadron_config))
+        .route("/api/squadrons/{id}/config", get(get_squadron_config).patch(patch_squadron_config));
+
+    // Intl-only endpoints: self-custody chain-sync + manual on-chain FAK exit.
+    // The US custodial venue performs settlement/exit differently (Step 3b).
+    #[cfg(feature = "intl_clob")]
+    let protected_routes = protected_routes
+        .route("/api/positions/sync",        axum::routing::post(sync_positions))
+        .route("/api/positions/manual-exit", axum::routing::post(manual_exit));
+
+    let protected_routes = protected_routes
         // API-key check applied to all matched routes (inner layer — runs after CORS).
         // No-op when DRADIS_API_KEY is unset so local-dev workflow is unchanged.
         .layer(axum::middleware::from_fn_with_state(state.clone(), require_api_key))

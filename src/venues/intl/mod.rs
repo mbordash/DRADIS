@@ -24,7 +24,7 @@ use alloy::signers::local::LocalSigner;
 use alloy::signers::Signer;
 
 use polymarket_client_sdk_v2::clob::{Client as ClobClient, Config};
-use polymarket_client_sdk_v2::clob::types::{OrderType as ClobOrderType, Side as ClobSide, SignatureType};
+use polymarket_client_sdk_v2::clob::types::{Side as ClobSide, SignatureType};
 use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk_v2::clob::types::AssetType;
 use polymarket_client_sdk_v2::auth::state::Authenticated;
@@ -34,7 +34,7 @@ use polymarket_client_sdk_v2::{POLYGON, PRIVATE_KEY_VAR, derive_safe_wallet};
 use crate::config;
 use crate::helpers::nonce::fetch_next_nonce;
 use crate::venues::core::{
-    Execution, Fill, MarketId, OrderId, OrderIntent, Position, Side, TimeInForce,
+    Execution, Fill, MarketId, OrderId, OrderIntent, Position, Side,
 };
 
 // ── V2 CTF Exchange verifying contracts (per neg-risk routing) ───────────────
@@ -161,14 +161,6 @@ impl IntlClobVenue {
         }
     }
 
-    fn map_tif(tif: TimeInForce) -> ClobOrderType {
-        match tif {
-            TimeInForce::Gtc => ClobOrderType::GTC,
-            TimeInForce::Gtd => ClobOrderType::GTD,
-            TimeInForce::Fak => ClobOrderType::FAK,
-            TimeInForce::Fok => ClobOrderType::FOK,
-        }
-    }
 }
 
 #[async_trait]
@@ -188,7 +180,7 @@ impl Execution for IntlClobVenue {
             intent.quantity,
             intent.price,
             intent.fee_bps,
-            Self::map_tif(intent.tif),
+            intent.tif,
             intent.post_only,
             intent.expiration_secs,
             &self.http,
@@ -217,7 +209,7 @@ impl Execution for IntlClobVenue {
             Self::map_side(a.side),
             a.quantity,
             a.price,
-            Self::map_tif(a.tif),
+            a.tif,
             a.post_only,
             a.expiration_secs,
             Self::verifying_contract(b.is_neg_risk),
@@ -225,7 +217,7 @@ impl Execution for IntlClobVenue {
             Self::map_side(b.side),
             b.quantity,
             b.price,
-            Self::map_tif(b.tif),
+            b.tif,
             b.post_only,
             b.expiration_secs,
             &self.http,

@@ -1,9 +1,13 @@
 pub mod price;
 pub mod json;
 pub mod time;
+#[cfg(feature = "intl_clob")]
 pub mod balance;
+#[cfg(feature = "intl_clob")]
 pub mod nonce;
+#[cfg(feature = "intl_clob")]
 pub mod orders;
+#[cfg(feature = "intl_clob")]
 pub mod market;
 pub mod notifications;
 pub mod metrics;
@@ -15,9 +19,13 @@ pub mod llm_advisor;
 pub use price::*;
 pub use json::*;
 pub use time::*;
+#[cfg(feature = "intl_clob")]
 pub use balance::*;
+#[cfg(feature = "intl_clob")]
 pub use nonce::*;
+#[cfg(feature = "intl_clob")]
 pub use orders::*;
+#[cfg(feature = "intl_clob")]
 pub use market::*;
 pub use notifications::*;
 pub use metrics::*;

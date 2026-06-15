@@ -26,7 +26,7 @@ use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
-use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
+use crate::venues::core::TimeInForce;
 
 pub struct BasisStrategyImpl;
 
@@ -168,14 +168,14 @@ impl Strategy for BasisStrategyImpl {
                 }
                 target_price = proposed_price;
                 entry_fee_bps = 0; // Maker orders have 0 fees
-                order_type = OrderType::GTC; // Good-Til-Cancelled for maker
+                order_type = TimeInForce::Gtc; // Good-Til-Cancelled for maker
                 post_only = true; // Ensure it's a post-only order
                 effective_fee_multiplier = dec!(1); // No fee to back off from trade_size
             } else {
                 // Taker entry (current behavior)
                 target_price = snap.no_ask;
                 entry_fee_bps = market.no_fee_bps as u16;
-                order_type = OrderType::FAK; // Fill-And-Kill for taker
+                order_type = TimeInForce::Fak; // Fill-And-Kill for taker
                 post_only = false; // Not post-only
                 effective_fee_multiplier = no_fee_headroom;
             }
@@ -223,14 +223,14 @@ impl Strategy for BasisStrategyImpl {
                 }
                 target_price = proposed_price;
                 entry_fee_bps = 0; // Maker orders have 0 fees
-                order_type = OrderType::GTC; // Good-Til-Cancelled for maker
+                order_type = TimeInForce::Gtc; // Good-Til-Cancelled for maker
                 post_only = true; // Ensure it's a post-only order
                 effective_fee_multiplier = dec!(1); // No fee to back off from trade_size
             } else {
                 // Taker entry (current behavior)
                 target_price = snap.yes_ask;
                 entry_fee_bps = market.yes_fee_bps as u16;
-                order_type = OrderType::FAK; // Fill-And-Kill for taker
+                order_type = TimeInForce::Fak; // Fill-And-Kill for taker
                 post_only = false; // Not post-only
                 effective_fee_multiplier = yes_fee_headroom;
             }
@@ -311,7 +311,7 @@ impl Strategy for BasisStrategyImpl {
                         is_neg_risk: target_market.is_neg_risk,
                         market_name: target_market.market_name.clone(),
                         condition_id: target_market.condition_id.clone(),
-                        order_type: OrderType::FAK,
+                        order_type: TimeInForce::Fak,
                         post_only: false,
                         ghost_mode: dc.ghost_mode,
                     },
@@ -342,7 +342,7 @@ impl Strategy for BasisStrategyImpl {
                         is_neg_risk: target_market.is_neg_risk,
                         market_name: target_market.market_name.clone(),
                         condition_id: target_market.condition_id.clone(),
-                        order_type: OrderType::FAK,
+                        order_type: TimeInForce::Fak,
                         post_only: false,
                         ghost_mode: dc.ghost_mode,
                     },
@@ -361,7 +361,7 @@ impl Strategy for BasisStrategyImpl {
                         is_neg_risk: target_market.is_neg_risk,
                         market_name: target_market.market_name.clone(),
                         condition_id: target_market.condition_id.clone(),
-                        order_type: OrderType::FAK,
+                        order_type: TimeInForce::Fak,
                         post_only: false,
                         ghost_mode: dc.ghost_mode,
                     },
@@ -392,7 +392,7 @@ impl Strategy for BasisStrategyImpl {
                                 is_neg_risk: target_market.is_neg_risk,
                                 market_name: target_market.market_name.clone(),
                                 condition_id: target_market.condition_id.clone(),
-                                order_type: OrderType::FAK,
+                                order_type: TimeInForce::Fak,
                                 post_only: false,
                                 ghost_mode: dc.ghost_mode,
                             },

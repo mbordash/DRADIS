@@ -29,7 +29,7 @@ use rust_decimal_macros::dec;
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::vipers::is_drawdown_limit_hit;
-use polymarket_client_sdk_v2::clob::types::OrderType;
+use crate::venues::core::TimeInForce;
 use tracing::debug;
 
 const STRATEGY_NAME: &str = "ArbitrageStrategy";
@@ -294,7 +294,7 @@ impl Strategy for ArbitrageStrategyImpl {
                 is_neg_risk: market.is_neg_risk,
                 market_name: market.market_name.clone(),
                 condition_id: market.condition_id.clone(),
-                order_type: OrderType::GTC,            // rest on the book as maker
+                order_type: TimeInForce::Gtc,            // rest on the book as maker
                 post_only: true,                       // reject if it would cross (no accidental taker)
                 ghost_mode: dc.ghost_mode,
             },
@@ -306,7 +306,7 @@ impl Strategy for ArbitrageStrategyImpl {
                 is_neg_risk: market.is_neg_risk,
                 market_name: market.market_name.clone(),
                 condition_id: market.condition_id.clone(),
-                order_type: OrderType::GTC,
+                order_type: TimeInForce::Gtc,
                 post_only: true,
                 ghost_mode: dc.ghost_mode,
             }),
@@ -353,7 +353,7 @@ impl Strategy for ArbitrageStrategyImpl {
                         is_neg_risk: market.is_neg_risk,
                         market_name: market.market_name.clone(),
                         condition_id: market.condition_id.clone(),
-                        order_type: OrderType::FAK,   // guaranteed exit before close
+                        order_type: TimeInForce::Fak,   // guaranteed exit before close
                         post_only: false,
                         ghost_mode: dc.ghost_mode,
                     },

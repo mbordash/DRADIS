@@ -7,32 +7,45 @@
 
 use anyhow::Result;
 
+#[cfg(feature = "intl_clob")]
 use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
+#[cfg(feature = "intl_clob")]
 use polymarket_client_sdk_v2::clob::types::AssetType;
 
+#[cfg(feature = "intl_clob")]
 use alloy::providers::ProviderBuilder;
 
 use chrono::Utc;
 use chrono_tz::US::Eastern;
 use reqwest;
 use rust_decimal::Decimal;
+#[cfg(feature = "intl_clob")]
 use rust_decimal_macros::dec;
 
 use std::env;
+#[cfg(feature = "intl_clob")]
 use std::str::FromStr as _;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use tokio::sync::watch;
+#[cfg(feature = "intl_clob")]
 use tokio::time::Duration;
 
+#[cfg(feature = "intl_clob")]
 use tracing::{info, warn};
 
 use dradis::config;
+#[cfg(feature = "intl_clob")]
 use dradis::squadron::{SquadronRaptors};
+#[cfg(feature = "intl_clob")]
 use dradis::cag::{Cag, SessionState, RunArgs, run_market_loop};
+#[cfg(feature = "us_retail")]
+use dradis::cag::Cag;
+#[cfg(feature = "intl_clob")]
 use dradis::venues::intl::IntlClobVenue;
 use dradis::helpers::dynamic_config::DynamicConfig;
 use dradis::api::server::AssetRaptorHealth;
+#[cfg(feature = "intl_clob")]
 use tokio_util::sync::CancellationToken;
 
 use dradis::helpers::{
@@ -87,8 +100,10 @@ fn print_banner() {
 
 // V2 CTF Exchange contracts are defined in squadron/patrol_tasks.rs (used by peripheral tasks)
 
-// Constants for cancel_all_orders retry logic
+// Constants for cancel_all_orders retry logic (intl self-custody startup only).
+#[cfg(feature = "intl_clob")]
 const MAX_CANCEL_RETRIES: u32 = 5;
+#[cfg(feature = "intl_clob")]
 const BASE_CANCEL_RETRY_DELAY_MS: u64 = 200; // Start with 200ms
 
 // Force at least 8 worker threads.  With multiple concurrent asset loops each
@@ -228,6 +243,37 @@ async fn main() -> Result<()> {
 
     let _trade_size_usdc: Decimal = env::var("TRADE_SIZE_USDC").unwrap_or_else(|_| "10".to_string()).parse()?;
 
+    // ── Instantiate CAG (shared by both venues) ─────────────────────────────
+    // Created here so both the intl bootstrap and the us_retail API-only path
+    // can hand it to the Control Tower API server.
+    let cag = Cag::new();
+
+    // ── US retail: Control-Tower-only mode ───────────────────────────────────
+    // The custodial US venue's trading bootstrap (auth, market discovery,
+    // execution) is implemented in Step 3b.  For now we bring up the API server
+    // so the dashboard is reachable, then park the main task so the process
+    // stays alive serving it.
+    #[cfg(feature = "us_retail")]
+    {
+        // These are consumed only by the intl bootstrap / per-asset loops below.
+        let _ = (&shared_http, &markets_tx, &raptor_health_tx);
+        tokio::spawn(dradis::api::server::run_api_server(
+            Arc::clone(&config_tx),
+            config_rx.clone(),
+            markets_rx,
+            raptor_health_rx,
+            cag.clone(),
+        ));
+        tracing::warn!(
+            "⚠️  UsRetailVenue trading bootstrap not yet implemented (Step 3b). \
+             Control Tower API is live; no trading loops spawned."
+        );
+        std::future::pending::<()>().await;
+    }
+
+    // ── Intl CLOB bootstrap (self-custody EIP-712 over Polygon) ──────────────
+    #[cfg(feature = "intl_clob")]
+    {
     let polygon_rpc_url = env::var("POLYGON_RPC_URL")
         .map_err(|_| anyhow::anyhow!("❌ POLYGON_RPC_URL not set in .env. Required for auto-settlement transactions. Use a paid RPC service like Helius (https://www.helius-rpc.com) or QuickNode. Example: POLYGON_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"))?;
 
@@ -251,13 +297,6 @@ async fn main() -> Result<()> {
         .await?;
     info!("✅ CTF auto-settlement client ready (rpc={})", polygon_rpc_url);
 
-
-    // ── Instantiate CAG (Phase 3e stub) ─────────────────────────────────────
-    // The CAG registry is created here and passed to the API server so
-    // GET /api/squadrons is live immediately.  Squadrons are registered into
-    // it via `cag.spawn_squadron(…, false)` inside the market_loop below
-    // (spawn_task=false: the existing loop still drives execution).
-    let cag = Cag::new();
 
     // ── Spawn Control Tower API server ───────────────────────────────────────
     // Spawned here (after safe_address is derived) so it can be passed to
@@ -449,6 +488,7 @@ async fn main() -> Result<()> {
             tracing::error!("❌ Market loop task exited unexpectedly: {:?}", e);
         }
     }
+    } // end intl_clob bootstrap block
 
     Ok(())
 }

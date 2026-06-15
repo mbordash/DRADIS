@@ -23,7 +23,7 @@ use tokio::time::{interval, Instant, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn, error, debug};
 
-use polymarket_client_sdk_v2::clob::types::{Side, OrderType};
+use polymarket_client_sdk_v2::clob::types::{Side};
 use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk_v2::clob::types::AssetType;
 
@@ -623,7 +623,7 @@ impl Squadron {
                                             let other_bid = if other_tid == target_yes_token { exit_snap.yes_bid } else { exit_snap.no_bid };
                                             let other_fee_bps = if other_tid == target_yes_token { target_yes_fee_bps as u16 } else { target_no_fee_bps as u16 };
                                             let other_vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
-                                                if !config::GHOST_MODE { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, &other_tid, Side::Sell, s, (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), other_fee_bps, OrderType::FAK, false, 0, &shared_http).await; }
+                                                if !config::GHOST_MODE { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, &other_tid, Side::Sell, s, (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), other_fee_bps, crate::venues::core::TimeInForce::Fak, false, 0, &shared_http).await; }
                                                     let mut map = positions.lock().await; if let Some(p) = map.remove(&pk) { let actual_other_exit = (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnl = (actual_other_exit - p.avg_entry) * p.shares; paired_pnl = pnl; *total_pnl.lock().await += pnl;
                                                 // Release paired token claim.
                                                 token_ownership.lock().await.remove(&other_tid_m);

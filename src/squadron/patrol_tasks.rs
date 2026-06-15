@@ -35,7 +35,7 @@ use tracing::{info, warn, error, debug};
 use polymarket_client_sdk_v2::clob::Client as ClobClient;
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::Normal;
-use polymarket_client_sdk_v2::clob::types::{Side, OrderType};
+use polymarket_client_sdk_v2::clob::types::{Side};
 use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
 use polymarket_client_sdk_v2::clob::types::AssetType;
 
@@ -455,7 +455,7 @@ pub fn spawn_cleanup_task(
                                         &trading_client, &nonce_manager, &signer,
                                         safe_address, eoa_address,
                                         vc, &paired_id, Side::Buy, orphan.shares,
-                                        buy_price, 0, OrderType::FAK, false, 0, &shared_http,
+                                        buy_price, 0, crate::venues::core::TimeInForce::Fak, false, 0, &shared_http,
                                     ).await {
                                                         Ok(order_id) => {
                                                             rehedged = true;
@@ -604,7 +604,7 @@ pub fn spawn_cleanup_task(
                                     &trading_client, &nonce_manager, &signer,
                                     safe_address, eoa_address,
                                     vc, &orphan.token_id, Side::Sell, orphan.shares,
-                                    sell_price, 0, OrderType::FAK, false, 0, &shared_http,
+                                    sell_price, 0, crate::venues::core::TimeInForce::Fak, false, 0, &shared_http,
                                 ).await {
                                     Ok(order_id) => {
                                         info!("✅ ORPHAN EXIT: FAK sell submitted (order {})", order_id);

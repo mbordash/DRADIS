@@ -2,7 +2,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use regex::Regex;
 use anyhow::Result;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::str::FromStr;
@@ -17,7 +17,7 @@ use polymarket_client_sdk_v2::clob::{Client as ClobClient};
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::Normal;
 use polymarket_client_sdk_v2::clob::types::request::{BalanceAllowanceRequest, OrdersRequest, PriceRequest};
-use polymarket_client_sdk_v2::clob::types::{AssetType, OrderType, Side};
+use polymarket_client_sdk_v2::clob::types::{AssetType, Side};
 
 use crate::helpers::metrics;
 use crate::helpers::orders::place_limit_order;
@@ -27,15 +27,10 @@ use crate::venues::intl::{market_id_from_u256, u256_from_market_id};
 pub use crate::state::{Position, PositionMap};
 
 /// Shared map of (strategy:token_id) → Instant for phantom removal cooldowns.
-pub type PhantomCooldowns = Arc<Mutex<HashMap<String, Instant>>>;
-
-/// Session-scoped set of token IDs that have been through orphan-detection and removal.
-/// Never cleared on market switch — once a token is tombstoned it is never re-adopted
-/// within the same session. This breaks the infinite reconcile→re-adopt→orphan-detect cycle
-/// that occurs when an unhedged daily-market leg persists across many hourly rotations.
-///
-/// Slice 2a: keyed by the venue-neutral [`MarketId`].
-pub type OrphanTombstones = Arc<Mutex<HashSet<MarketId>>>;
+/// Canonical definition lives in `crate::state` (venue-neutral); re-exported here
+/// for the intl balance/orphan handlers that historically referenced
+/// `helpers::balance::PhantomCooldowns`.
+pub use crate::state::{PhantomCooldowns, OrphanTombstones};
 
 /// How long to block re-entry after a phantom removal (seconds).
 ///
@@ -602,7 +597,7 @@ pub async fn arb_pair_fill_monitor(
             &client, &nonce_manager, &signer,
             safe_address, eoa_address, missing_vc,
             &missing_market, Side::Buy, fak_qty, rehedge_price,
-            0, OrderType::FAK, false, 0, &*http,
+            0, crate::venues::core::TimeInForce::Fak, false, 0, &*http,
         ).await {
             Ok(order_id) => {
                 warn!("✅ ARB ARBITER [{}]: FAK re-hedge placed (order_id={}) — delta exposure closed",
@@ -695,7 +690,7 @@ pub async fn arb_pair_fill_monitor(
         &client, &nonce_manager, &signer,
         safe_address, eoa_address, filled_vc,
         &filled_market, Side::Sell, filled_shares, sell_price,
-        0, OrderType::FAK, false, 0, &*http,
+        0, crate::venues::core::TimeInForce::Fak, false, 0, &*http,
     ).await {
         Ok(order_id) => {
             let realized = (sell_price - filled_avg_entry) * filled_shares;
@@ -734,12 +729,12 @@ pub async fn quick_confirm_fill(
     token_id: &MarketId,
     positions: &Arc<Mutex<PositionMap>>,
     _condition_id: &str, // retained for API compatibility; no longer used (FAK orders can't be cancelled)
-    order_type: OrderType,
+    order_type: crate::venues::core::TimeInForce,
 ) -> Result<bool> {
     // Slice 2b: resolve on-chain U256 once; the rest of the body is unchanged.
     let token_id = u256_from_market_id(token_id)?;
     // Only quick-confirm FAK orders. GTC orders need to wait for on-chain sync.
-    if order_type != OrderType::FAK {
+    if order_type != crate::venues::core::TimeInForce::Fak {
         return Ok(false);
     }
 

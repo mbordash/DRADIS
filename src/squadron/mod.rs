@@ -28,16 +28,21 @@ pub mod raptors;
 pub mod config;
 /// `PatrolContext` — all infrastructure `patrol()` needs.  Re-exported at
 /// crate level so `main.rs` can construct it without reaching into sub-modules.
+#[cfg(feature = "intl_clob")]
 pub mod context;
+#[cfg(feature = "intl_clob")]
 pub use context::PatrolContext;
 
 /// Inner tick-loop implementation for `Squadron::patrol()`.
 /// Kept in a separate file to avoid bloating mod.rs.
+#[cfg(feature = "intl_clob")]
 mod patrol_impl;
 
 /// Peripheral tasks spawned by `patrol()` — Phase 3f-4.
 /// Kept in a separate file for clarity; each function spawns one Tokio task.
+#[cfg(feature = "intl_clob")]
 mod patrol_tasks;
+#[cfg(feature = "intl_clob")]
 pub use patrol_tasks::{
     spawn_pulse_task, spawn_settlement_task, spawn_cleanup_task,
     spawn_status_task, spawn_watchdog_task,
@@ -48,13 +53,20 @@ pub use config::{SquadronConfig, RaptorProfile, ViperProfile};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+#[cfg(feature = "intl_clob")]
 use alloy::primitives::U256;
+#[cfg(feature = "intl_clob")]
 use futures::StreamExt as _;
+#[cfg(feature = "intl_clob")]
 use rust_decimal_macros::dec;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
+#[cfg(feature = "intl_clob")]
 use tracing::{info, warn};
+#[cfg(not(feature = "intl_clob"))]
+use tracing::info;
 
+#[cfg(feature = "intl_clob")]
 use polymarket_client_sdk_v2::clob::ws::Client as WsClient;
 
 use crate::state::{MarketConfig, PriceState};
@@ -271,6 +283,7 @@ impl Squadron {
     ///
     /// Phase 3f-2: called by `main.rs` to replace the two inline WS blocks.
     /// Phase 3f-3: called internally by `patrol()`.
+    #[cfg(feature = "intl_clob")]
     pub fn subscribe_markets(
         &mut self,
         hourly_yes_token: U256,
@@ -343,6 +356,7 @@ impl Squadron {
 ///
 /// Pushes `PriceState` updates into `tx`.  Stops cleanly when `cancel` fires.
 /// The `venue` label is used only for log messages.
+#[cfg(feature = "intl_clob")]
 fn spawn_ws_task(
     token:  U256,
     tx:     watch::Sender<PriceState>,

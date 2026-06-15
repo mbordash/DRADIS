@@ -4,9 +4,23 @@
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
-use polymarket_client_sdk_v2::clob::types::OrderType; // Import OrderType
+use crate::venues::core::TimeInForce;
 
 use crate::venues::core::MarketId;
+
+// ─── Phantom-fill / orphan tracking aliases ───────────────────────────────────
+// Venue-neutral shared maps used by the balance/orphan handlers and SessionState.
+// Defined here (not in the intl-gated `helpers::balance`) so venue-neutral code
+// can reference them under any active venue.
+use std::collections::HashSet;
+use std::sync::Arc;
+use tokio::sync::Mutex;
+use tokio::time::Instant;
+
+/// Cooldown map keyed by an opaque fingerprint string → expiry `Instant`.
+pub type PhantomCooldowns = Arc<Mutex<HashMap<String, Instant>>>;
+/// Set of market ids that have been flattened/abandoned and must not be re-hedged.
+pub type OrphanTombstones = Arc<Mutex<HashSet<MarketId>>>;
 
 // ─── WebSocket price feed ─────────────────────────────────────────────────────
 
@@ -157,7 +171,7 @@ pub struct OrderParams {
     pub is_neg_risk: bool,
     pub market_name: String,
     pub condition_id: String,
-    pub order_type: OrderType,
+    pub order_type: TimeInForce,
     pub post_only: bool,
     pub ghost_mode: bool, // Added this field
 }
