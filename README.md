@@ -484,6 +484,7 @@ API health: `http://YOUR_SERVER_IP:9000/api/health`
 
 ### Next up
 - Control Tower multi-asset selector (switch between BTC / ETH / SOL session views in the dashboard)
+- **US venue hardening (Step 3d)** — private `/v1/ws/private` fill feed + active exit/position management for the US arb loop (see `docs/VENUE_ABSTRACTION.md`)
 
 ### Medium-term
 - Static deployment profiles (`profiles.toml`) with per-profile P&L tracking
