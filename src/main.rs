@@ -265,28 +265,35 @@ async fn main() -> Result<()> {
             cag.clone(),
         ));
 
-        // ── Connect the custodial US retail venue (Step 3b) ──────────────────
-        // Best-effort: a connect failure (missing creds, gateway down) is logged
+        // ── Connect the custodial US retail venue + run the arb loop (Step 3c) ──
+        // Best-effort connect: a failure (missing creds, gateway down) is logged
         // but does not crash the process — the Control Tower API stays up so the
-        // operator can diagnose. The full market-discovery + WS patrol loop for
-        // this venue is Step 3c; for now we prove auth + gateway reachability and
-        // surface live collateral once.
+        // operator can diagnose. On success we drive the venue-neutral US trading
+        // loop (arbitrage over the `Execution` trait) until shutdown.
         match dradis::venues::us::UsRetailVenue::connect(Arc::clone(&shared_http)).await {
             Ok(venue) => {
+                let venue = Arc::new(venue);
                 use dradis::venues::core::Execution as _;
                 match venue.collateral().await {
                     Ok(c)  => tracing::info!("✅ US retail venue connected — available margin ${:.2}", c),
                     Err(e) => tracing::warn!("⚠️ US retail connected but collateral query failed: {e}"),
                 }
+                let cancel = tokio_util::sync::CancellationToken::new();
+                // Dedicated DB pool so the Control Tower shows the US venue under
+                // the "us" asset selector (positions, portfolio P&L).
+                if let Err(e) = dradis::helpers::db::init_for_asset(
+                    dradis::venues::us::trader::US_ASSET,
+                    "logs/us-dradis.db",
+                ).await {
+                    tracing::warn!("⚠️ US DB pool init failed (dashboard disabled): {e}");
+                }
+                dradis::venues::us::trader::run_us_trader(venue, cancel).await;
             }
-            Err(e) => tracing::warn!("⚠️ US retail venue connect failed (Control Tower still live): {e}"),
+            Err(e) => {
+                tracing::warn!("⚠️ US retail venue connect failed (Control Tower still live): {e}");
+                std::future::pending::<()>().await;
+            }
         }
-
-        tracing::warn!(
-            "⚠️  UsRetailVenue trading loops not yet wired (Step 3c). \
-             Control Tower API is live; venue is connected but idle."
-        );
-        std::future::pending::<()>().await;
     }
 
     // ── Intl CLOB bootstrap (self-custody EIP-712 over Polygon) ──────────────

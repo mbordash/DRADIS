@@ -14,11 +14,9 @@ use serde::{Deserialize, Serialize};
 // constants (not Rust enums) so an unrecognised server value never panics a
 // deserialise — we only ever *send* these, and parse statuses leniently.
 
-pub mod order_intent {
-    pub const BUY_LONG: &str = "ORDER_INTENT_BUY_LONG";
-    pub const SELL_LONG: &str = "ORDER_INTENT_SELL_LONG";
-    pub const BUY_SHORT: &str = "ORDER_INTENT_BUY_SHORT";
-    pub const SELL_SHORT: &str = "ORDER_INTENT_SELL_SHORT";
+pub mod order_action {
+    pub const BUY: &str = "ORDER_ACTION_BUY";
+    pub const SELL: &str = "ORDER_ACTION_SELL";
 }
 
 pub mod order_type {
@@ -88,8 +86,15 @@ pub struct HealthResponse {
 
 #[derive(Debug, Clone, Serialize)]
 pub struct PlaceOrderRequest {
-    pub market_slug: String,
-    pub intent: String,
+    /// Instrument token symbol (e.g. `tec-nfl-sbw-2026-02-08-kc-yes`). The live
+    /// API accepts symbol-addressed orders via `outcomeSide` + `action`, so the
+    /// older `market_slug` + `intent` pairing is no longer needed.
+    pub symbol: String,
+    /// `BUY` / `SELL`.
+    pub action: String,
+    /// `LONG` (YES) / `SHORT` (NO) — derived from the instrument symbol.
+    #[serde(rename = "outcomeSide")]
+    pub outcome_side: String,
     #[serde(rename = "type")]
     pub order_type: String,
     pub price: Money,
@@ -124,6 +129,25 @@ pub struct PlaceOrderResponse {
     pub remaining_quantity: u64,
     #[serde(default)]
     pub created_at: String,
+}
+
+// ─── Batched orders (POST /v1/orders/batched) ────────────────────────────────
+// Engine-atomic multi-leg placement: the gateway accepts a token array of orders
+// and (with `atomic = true`) either places them all or none. Used for the two
+// legs of an arbitrage pair so a single-sided orphan cannot occur.
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BatchedOrderRequest {
+    pub orders: Vec<PlaceOrderRequest>,
+    /// All-or-nothing placement of the whole batch.
+    pub atomic: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BatchedOrderResponse {
+    /// Per-order acks, index-aligned with the submitted `orders`.
+    #[serde(default)]
+    pub orders: Vec<PlaceOrderResponse>,
 }
 
 // ─── Order cancel (DELETE /v1/trading/orders/{id}) ───────────────────────────
@@ -164,4 +188,7 @@ pub struct Balances {
     #[serde(default)]
     pub locked_margin_usd: Option<String>,
 }
+
+
+
 

@@ -47,6 +47,51 @@ After ~5 minutes the stack is live:
 
 ---
 
+## 🌐 Choosing a venue (Intl CLOB vs US Retail)
+
+DRADIS compiles for **exactly one** execution venue, chosen at build time via a Cargo
+feature. Both share the same strategy/abstraction layers through the venue-neutral
+`Execution` trait (`src/venues/core.rs`); only the venue module differs, so the unused
+venue's dependencies are stripped from the binary.
+
+| Feature              | Venue                              | Auth                                   | Gateway                              |
+|----------------------|------------------------------------|----------------------------------------|--------------------------------------|
+| `intl_clob` *(default)* | Polymarket International (self-custody) | EOA wallet + EIP-712 over Polygon      | `clob.polymarket.com`                |
+| `us_retail`          | Polymarket US (custodial, CFTC)    | Ed25519 challenge-response → JWT        | `api.prod.polymarketexchange.com`    |
+
+```bash
+# International CLOB (default)
+cargo build --release
+cargo test
+
+# US Retail
+cargo build  --release --no-default-features --features us_retail
+cargo test            --no-default-features --features us_retail
+```
+
+### US Retail configuration (`.env`)
+
+```bash
+POLYMARKET_US_PARTICIPANT_ID=firms/<FIRM>/users/<USER>   # identity header
+POLYMARKET_US_ED25519_PRIVATE_KEY=<base64-32-byte-seed>  # signs the /v1/auth/mint nonce
+# optional:
+POLYMARKET_US_BASE_URL=https://api.prod.polymarketexchange.com  # override (staging/mock)
+POLYMARKET_US_TRADE_SIZE=10        # contracts per leg          (default 10)
+POLYMARKET_US_ARB_EDGE=0.02        # min risk-free edge per pair (default $0.02)
+POLYMARKET_US_MARKET_FILTER=chiefs # optional slug/question substring to pick a market
+ASSETS=us                          # keep the dashboard pool tidy (US data lives in logs/us-dradis.db)
+```
+
+> **US Retail status:** the MVP loop (`src/venues/us/trader.rs`) runs the venue-agnostic
+> **arbitrage** strategy — discover a binary market → stream both legs over WebSocket →
+> buy `YES`+`NO` for < $1 via an **engine-atomic** batched order (`/v1/orders/batched`) →
+> reconcile. Open positions and portfolio P&L appear in the Control Tower under the **`us`**
+> asset selector. The Control Tower API stays live on `:9000` regardless. Crypto-hourly
+> strategies (Momentum/Maker/GBoost) remain intl-only for now.
+
+---
+
+
 ## ️ Tactical Overview
 
 DRADIS is a comprehensive trading automation platform for prediction markets. Built in Rust for maximum concurrency and memory safety, it evaluates selected markets every 50ms, coordinating multiple autonomous strategies to preserve capital and place orders where it sees inefficiencies.
