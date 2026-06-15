@@ -3,9 +3,14 @@
 # start-local.sh — Runs DRADIS + Control Tower locally for development
 #
 # Usage:
-#   ./start-local.sh          # BTC (default)
-#   ./start-local.sh eth      # ETH
+#   ./start-local.sh             # intl CLOB, BTC (default)
+#   ./start-local.sh eth         # intl CLOB, ETH
+#   VENUE=us ./start-local.sh    # US Retail venue (us_retail build)
 #   RUST_LOG=debug ./start-local.sh
+#
+# Venue selection (VENUE env var):
+#   intl  → default build (international CLOB, self-custody)   [requires POLYMARKET_PRIVATE_KEY + POLYGON_RPC_URL]
+#   us    → us_retail build (US Retail, custodial API key)     [requires POLYMARKET_US_KEY_ID + POLYMARKET_US_SECRET_KEY]
 #
 # Logs:
 #   logs/dradis-local.log     ← DRADIS output
@@ -17,11 +22,28 @@
 
 set -euo pipefail
 
+VENUE=${VENUE:-intl}
 CRYPTO=${1:-btc}
 API_PORT=${API_PORT:-9000}
 UI_PORT=${UI_PORT:-3002}
 
-echo "🚀 Starting DRADIS + Control Tower locally (CRYPTO=$CRYPTO)"
+# Map the selected venue to its cargo feature flags + runtime asset.
+case "$VENUE" in
+    us|us_retail)
+        VENUE=us
+        CARGO_FEATURE_ARGS=(--no-default-features --features us_retail)
+        echo "🚀 Starting DRADIS + Control Tower locally (VENUE=us — US Retail)"
+        ;;
+    intl|intl_clob)
+        VENUE=intl
+        CARGO_FEATURE_ARGS=()
+        echo "🚀 Starting DRADIS + Control Tower locally (VENUE=intl, CRYPTO=$CRYPTO)"
+        ;;
+    *)
+        echo "❌  Unknown VENUE='$VENUE'. Use VENUE=intl (default) or VENUE=us."
+        exit 1
+        ;;
+esac
 
 # ── Sanity checks ─────────────────────────────────────────────────────────────
 if [ ! -f ".env" ]; then
@@ -49,14 +71,22 @@ if [ -f "logs/dradis-local.log" ]; then
 fi
 
 # ── Start DRADIS API + trading engine ─────────────────────────────────────────
-echo "⚙️  Building DRADIS (release)..."
-cargo build --release 2>&1 | tail -3
+echo "⚙️  Building DRADIS (release, VENUE=$VENUE)..."
+cargo build --release ${CARGO_FEATURE_ARGS[@]+"${CARGO_FEATURE_ARGS[@]}"} 2>&1 | tail -3
 
-echo "🦀 Starting DRADIS (GHOST_MODE, API on :$API_PORT)..."
-RUST_LOG=${RUST_LOG:-info,dradis=info} \
-API_PORT=$API_PORT \
-CRYPTO_FILTER=$CRYPTO \
-    ./target/release/dradis >> logs/dradis-local.log 2>&1 &
+if [ "$VENUE" = "us" ]; then
+    echo "🦀 Starting DRADIS (US Retail, API on :$API_PORT)..."
+    RUST_LOG=${RUST_LOG:-info,dradis=info} \
+    API_PORT=$API_PORT \
+    ASSETS=${ASSETS:-us} \
+        ./target/release/dradis >> logs/dradis-local.log 2>&1 &
+else
+    echo "🦀 Starting DRADIS (GHOST_MODE, API on :$API_PORT)..."
+    RUST_LOG=${RUST_LOG:-info,dradis=info} \
+    API_PORT=$API_PORT \
+    CRYPTO_FILTER=$CRYPTO \
+        ./target/release/dradis >> logs/dradis-local.log 2>&1 &
+fi
 
 DRADIS_PID=$!
 echo $DRADIS_PID > .dradis-local.pid
