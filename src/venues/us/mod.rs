@@ -37,8 +37,8 @@ use crate::venues::core::{
 use auth::UsAuth;
 use types::{order_action, order_type, outcome as oc, tif as tif_const};
 
-/// Default production REST/WS gateway (live-API update).
-const DEFAULT_BASE_URL: &str = "https://api.prod.polymarketexchange.com";
+/// Default authenticated API base (per developer portal).
+const DEFAULT_BASE_URL: &str = "https://api.polymarket.us";
 /// Override the gateway base URL (staging / mock).
 const ENV_BASE_URL: &str = "POLYMARKET_US_BASE_URL";
 
@@ -60,12 +60,12 @@ impl UsRetailVenue {
         let venue = Self { http, base_url, auth };
 
         venue.health_check().await.context("US retail health check failed")?;
-        // Validate the Ed25519 API key up-front with a signed portfolio probe.
+        // Validate the Ed25519 API key with a signed account balance probe.
         venue
             .fetch_portfolio()
             .await
-            .context("US retail auth validation failed (signed portfolio probe)")?;
-        info!("Authenticated on Polymarket US. Key ID: {}", venue.auth.key_id());
+            .context("US retail auth validation failed (signed account balance probe)")?;
+        info!("✅ Authenticated on Polymarket US. Key ID: {}", venue.auth.key_id());
 
         Ok(venue)
     }
@@ -83,13 +83,15 @@ impl UsRetailVenue {
 
     /// Discover active binary (`LONG`/`SHORT`) markets via `GET /v1/markets`.
     ///
-    /// This is public reference data (no auth required). Returns venue-neutral
-    /// [`markets::UsMarketPair`]s the arbitrage loop can subscribe and trade.
+    /// This is public reference data (no auth required per spec), but the production
+    /// gateway returns 401 without auth headers, so we attach them anyway.
     pub async fn discover_binary_markets(&self) -> Result<Vec<markets::UsMarketPair>> {
-        let resp = self
+        let rb = self
             .http
             .get(self.url("/v1/markets"))
-            .query(&[("status", "ACTIVE"), ("limit", "500")])
+            .query(&[("status", "ACTIVE"), ("limit", "500")]);
+        let rb = self.authed(rb, "GET", "/v1/markets");
+        let resp = rb
             .send()
             .await
             .context("markets request failed")?;
@@ -98,16 +100,18 @@ impl UsRetailVenue {
             let body = resp.text().await.unwrap_or_default();
             bail!("US retail markets returned HTTP {status}: {body}");
         }
-        let parsed: types::MarketsResponse =
-            resp.json().await.context("markets response decode failed")?;
+        let body = resp.text().await.context("reading markets response")?;
+        let parsed: types::MarketsResponse = serde_json::from_str(&body)
+            .map_err(|e| anyhow!("markets response decode failed: {e}"))?;
         Ok(markets::pair_markets(parsed.markets))
     }
 
     /// Attach the `X-PM-*` Ed25519 signature headers to an authenticated request.
     ///
     /// Signing is local and stateless (no token round-trip), so this is sync.
-    fn authed(&self, mut rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        for (name, value) in self.auth.signed_headers() {
+    /// The signature covers `method + path` (e.g., `"GET/v1/account/balance"`).
+    fn authed(&self, mut rb: reqwest::RequestBuilder, method: &str, path: &str) -> reqwest::RequestBuilder {
+        for (name, value) in self.auth.signed_headers(method, path) {
             rb = rb.header(name, value);
         }
         rb.header("Content-Type", "application/json")
@@ -209,7 +213,7 @@ impl UsRetailVenue {
     async fn submit_order(&self, intent: &OrderIntent) -> Result<Fill> {
         let body = Self::build_order(intent)?;
         let rb = self.http.post(self.url("/v1/trading/orders")).json(&body);
-        let rb = self.authed(rb);
+        let rb = self.authed(rb, "POST", "/v1/trading/orders");
         let resp = rb.send().await.context("order POST failed")?;
         let status = resp.status();
         if !status.is_success() {
@@ -235,17 +239,47 @@ impl UsRetailVenue {
         })
     }
 
-    /// Shared portfolio fetch used by both `collateral` and `positions`.
+    /// Fetch positions and balances (combines two API calls).
     async fn fetch_portfolio(&self) -> Result<types::PortfolioResponse> {
-        let rb = self.http.get(self.url("/v1/portfolio/positions"));
-        let rb = self.authed(rb);
-        let resp = rb.send().await.context("portfolio request failed")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let err = resp.text().await.unwrap_or_default();
-            bail!("US retail portfolio failed (HTTP {status}): {err}");
+        // Fetch positions
+        let pos_rb = self.http.get(self.url("/v1/portfolio/positions"));
+        let pos_rb = self.authed(pos_rb, "GET", "/v1/portfolio/positions");
+        let pos_resp = pos_rb.send().await.context("portfolio positions request failed")?;
+        let pos_status = pos_resp.status();
+        if !pos_status.is_success() {
+            let err = pos_resp.text().await.unwrap_or_default();
+            bail!("US portfolio/positions failed (HTTP {pos_status}): {err}");
         }
-        resp.json().await.context("portfolio response decode failed")
+        let pos_data: types::PortfolioPositionsResponse =
+            pos_resp.json().await.context("portfolio positions decode failed")?;
+
+        // Fetch balances
+        let bal_rb = self.http.get(self.url("/v1/account/balances"));
+        let bal_rb = self.authed(bal_rb, "GET", "/v1/account/balances");
+        let bal_resp = bal_rb.send().await.context("account balances request failed")?;
+        let bal_status = bal_resp.status();
+        if !bal_status.is_success() {
+            let err = bal_resp.text().await.unwrap_or_default();
+            bail!("US account/balances failed (HTTP {bal_status}): {err}");
+        }
+        let bal_data: types::AccountBalancesResponse =
+            bal_resp.json().await.context("account balances decode failed")?;
+
+        // Combine into a unified view
+        let mut positions = Vec::new();
+        // Positions map might have entries; also check availablePositions array
+        for (symbol, mut pos) in pos_data.positions {
+            if pos.symbol.is_empty() {
+                pos.symbol = symbol;
+            }
+            positions.push(pos);
+        }
+        positions.extend(pos_data.available_positions);
+
+        Ok(types::PortfolioResponse {
+            positions,
+            available_margin_usd: bal_data.available_margin_usd,
+        })
     }
 }
 
@@ -265,7 +299,7 @@ impl Execution for UsRetailVenue {
             atomic: true,
         };
         let rb = self.http.post(self.url("/v1/orders/batched")).json(&body);
-        let rb = self.authed(rb);
+        let rb = self.authed(rb, "POST", "/v1/orders/batched");
         let resp = rb.send().await.context("batched order POST failed")?;
         let status = resp.status();
         if !status.is_success() {
@@ -295,10 +329,9 @@ impl Execution for UsRetailVenue {
     }
 
     async fn cancel(&self, id: OrderId) -> Result<()> {
-        let rb = self
-            .http
-            .delete(self.url(&format!("/v1/trading/orders/{}", id.0)));
-        let rb = self.authed(rb);
+        let path = format!("/v1/trading/orders/{}", id.0);
+        let rb = self.http.delete(self.url(&path));
+        let rb = self.authed(rb, "DELETE", &path);
         let resp = rb.send().await.context("cancel DELETE failed")?;
         let status = resp.status();
         if !status.is_success() {
@@ -313,7 +346,11 @@ impl Execution for UsRetailVenue {
 
     async fn collateral(&self) -> Result<Decimal> {
         let portfolio = self.fetch_portfolio().await?;
-        Decimal::from_str(portfolio.balances.available_margin_usd.trim())
+        let trimmed = portfolio.available_margin_usd.trim();
+        if trimmed.is_empty() {
+            return Ok(Decimal::ZERO);
+        }
+        Decimal::from_str(trimmed)
             .map_err(|e| anyhow!("US retail: invalid available_margin_usd: {e}"))
     }
 

@@ -31,20 +31,54 @@ pub fn pair_markets(markets: Vec<types::UsMarket>) -> Vec<UsMarketPair> {
     let mut out = Vec::new();
     for m in markets {
         if !m.status.is_empty() && !m.status.eq_ignore_ascii_case("ACTIVE") {
-            continue;
+            // Also check the `active` boolean field
+            if !m.active {
+                continue;
+            }
         }
         let mut long_sym = None;
         let mut short_sym = None;
-        for inst in &m.instruments {
-            match inst.outcome.to_ascii_uppercase().as_str() {
-                oc::LONG => long_sym.get_or_insert_with(|| inst.symbol.clone()),
-                oc::SHORT => short_sym.get_or_insert_with(|| inst.symbol.clone()),
-                _ => continue,
-            };
+
+        // Parse `marketSides` array (raw JSON values)
+        for side_val in &m.market_sides {
+            // Extract fields manually from the Value
+            if let Some(side_type) = side_val.get("marketSideType").and_then(|v| v.as_str()) {
+                if side_type != "MARKET_SIDE_TYPE_INSTRUMENT" {
+                    continue;
+                }
+            }
+            let identifier = side_val.get("identifier")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if identifier.is_empty() {
+                continue;
+            }
+            let is_long = side_val.get("long")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+
+            if is_long {
+                long_sym.get_or_insert(identifier);
+            } else {
+                short_sym.get_or_insert(identifier);
+            }
+        }
+
+        // Fallback: parse legacy `instruments`/`outcomes` arrays (spec structure)
+        if long_sym.is_none() || short_sym.is_none() {
+            let legs: Vec<_> = m.instruments.iter().chain(m.outcomes.iter()).collect();
+            for inst in legs {
+                match inst.outcome.to_ascii_uppercase().as_str() {
+                    oc::LONG => long_sym.get_or_insert_with(|| inst.symbol.clone()),
+                    oc::SHORT => short_sym.get_or_insert_with(|| inst.symbol.clone()),
+                    _ => continue,
+                };
+            }
         }
         if let (Some(l), Some(s)) = (long_sym, short_sym) {
             out.push(UsMarketPair {
-                slug: m.market_slug,
+                slug: m.slug,
                 question: m.question,
                 long: MarketId::new(l),
                 short: MarketId::new(s),
@@ -64,10 +98,16 @@ mod tests {
     }
     fn market(slug: &str, status: &str, instruments: Vec<UsInstrument>) -> UsMarket {
         UsMarket {
-            market_slug: slug.to_string(),
+            id: String::new(),
+            slug: slug.to_string(),
             question: format!("Q {slug}?"),
             status: status.to_string(),
+            category: String::new(),
+            start_date: String::new(),
+            end_date: String::new(),
+            description: String::new(),
             instruments,
+            outcomes: Vec::new(),
         }
     }
 

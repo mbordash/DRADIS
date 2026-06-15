@@ -48,13 +48,60 @@ pub struct MarketsResponse {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UsMarket {
-    pub market_slug: String,
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub slug: String,
     #[serde(default)]
     pub question: String,
     #[serde(default)]
     pub status: String,
     #[serde(default)]
+    pub category: String,
+    #[serde(default, rename = "startDate")]
+    pub start_date: String,
+    #[serde(default, rename = "endDate")]
+    pub end_date: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub closed: bool,
+    #[serde(default, rename = "marketType")]
+    pub market_type: String,
+    // Use Value to avoid nested parsing issues with malformed fields
+    #[serde(default, rename = "marketSides")]
+    pub market_sides: Vec<serde_json::Value>,
+    // Legacy fields for compatibility
+    #[serde(default)]
     pub instruments: Vec<UsInstrument>,
+    #[serde(default)]
+    pub outcomes: Vec<UsInstrument>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct MarketSide {
+    #[serde(default)]
+    pub id: String,
+    #[serde(default)]
+    pub identifier: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub price: String,
+    #[serde(default)]
+    pub long: bool,
+    #[serde(default, rename = "marketSideType")]
+    pub market_side_type: String,
+    // Use Value for nested team/player data to skip problematic deserialization
+    #[serde(default)]
+    pub team: Option<serde_json::Value>,
+    #[serde(default)]
+    pub player: Option<serde_json::Value>,
+    // Catch-all for any other fields
+    #[serde(flatten)]
+    pub extra: std::collections::HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -161,32 +208,52 @@ pub struct CancelOrderResponse {
     pub cancelled_at: Option<String>,
 }
 
-// ─── Portfolio (GET /v1/portfolio/positions) ─────────────────────────────────
+// ─── Portfolio positions (GET /v1/portfolio/positions) ───────────────────────
 
 #[derive(Debug, Clone, Deserialize)]
-pub struct PortfolioResponse {
+pub struct PortfolioPositionsResponse {
+    /// Map of symbol → position. Empty `{}` if no positions.
     #[serde(default)]
-    pub positions: Vec<UsPosition>,
-    pub balances: Balances,
+    pub positions: std::collections::HashMap<String, UsPosition>,
+    #[serde(default)]
+    pub next_cursor: String,
+    #[serde(default)]
+    pub eof: bool,
+    #[serde(default, rename = "availablePositions")]
+    pub available_positions: Vec<UsPosition>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct UsPosition {
+    #[serde(default)]
     pub symbol: String,
     #[serde(default)]
     pub quantity: i64,
-    #[serde(default)]
+    #[serde(default, rename = "avgEntryPrice")]
     pub avg_entry_price: String,
-    #[serde(default)]
+    #[serde(default, rename = "unrealizedPnl")]
     pub unrealized_pnl: Option<String>,
 }
 
+// ─── Account balances (GET /v1/account/balances) ─────────────────────────────
+
 #[derive(Debug, Clone, Deserialize)]
-pub struct Balances {
-    #[serde(default)]
+pub struct AccountBalancesResponse {
+    #[serde(default, rename = "availableMarginUsd")]
     pub available_margin_usd: String,
-    #[serde(default)]
+    #[serde(default, rename = "lockedMarginUsd")]
     pub locked_margin_usd: Option<String>,
+    #[serde(default, rename = "totalEquityUsd")]
+    pub total_equity_usd: Option<String>,
+}
+
+// ─── Combined portfolio (internal helper) ────────────────────────────────────
+
+/// Combined view of positions + balances for `collateral()` and `positions()`.
+#[derive(Debug, Clone)]
+pub struct PortfolioResponse {
+    pub positions: Vec<UsPosition>,
+    pub available_margin_usd: String,
 }
 
 

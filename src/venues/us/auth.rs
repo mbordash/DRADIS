@@ -87,25 +87,34 @@ impl UsAuth {
 
     /// Build the canonical payload that gets Ed25519-signed for a request.
     ///
-    /// The portal documents only the timestamp as the signed challenge, so the
-    /// payload is the millisecond timestamp string. If the live gateway turns
-    /// out to bind method/path/body as well, this is the single place to extend.
-    fn signing_payload(timestamp_ms: i64) -> String {
-        timestamp_ms.to_string()
+    /// Common signature schemes:
+    /// - FTX-style: `timestamp + method.upper() + path` (+ body for POST/PUT)
+    /// - AWS SigV4: canonical request hash
+    /// - Simple: just `timestamp`
+    ///
+    /// **Trying FTX-like pattern first**: `timestamp + method + path`
+    /// (e.g., `"1750191234567GETv1/account/balance"`). If this fails, we'll need
+    /// to check the portal docs or contact support for the exact format.
+    fn signing_payload(timestamp_ms: i64, method: &str, path: &str) -> String {
+        format!("{}{}{}", timestamp_ms, method.to_uppercase(), path)
     }
 
-    /// Sign the current request, returning `(timestamp_ms, base64_signature)`.
-    pub fn sign(&self) -> (i64, String) {
+    /// Sign a request, returning `(timestamp_ms, base64_signature)`.
+    pub fn sign(&self, method: &str, path: &str) -> (i64, String) {
         let ts = chrono::Utc::now().timestamp_millis();
-        let payload = Self::signing_payload(ts);
-        let signature = base64::engine::general_purpose::STANDARD
-            .encode(self.signing_key.sign(payload.as_bytes()).to_bytes());
+        let payload = Self::signing_payload(ts, method, path);
+        let sig_bytes = self.signing_key.sign(payload.as_bytes()).to_bytes();
+        let signature = base64::engine::general_purpose::STANDARD.encode(sig_bytes);
+        tracing::debug!(
+            "🔐 Ed25519 sign: method={} path={} ts={} → payload={:?} → sig={}...",
+            method, path, ts, payload, &signature[..16.min(signature.len())]
+        );
         (ts, signature)
     }
 
-    /// The three auth headers `(name, value)` for the current request.
-    pub fn signed_headers(&self) -> [(&'static str, String); 3] {
-        let (ts, sig) = self.sign();
+    /// The three auth headers `(name, value)` for a request.
+    pub fn signed_headers(&self, method: &str, path: &str) -> [(&'static str, String); 3] {
+        let (ts, sig) = self.sign(method, path);
         [
             (HEADER_ACCESS_KEY, self.key_id.clone()),
             (HEADER_TIMESTAMP, ts.to_string()),
@@ -127,7 +136,7 @@ mod tests {
     fn loads_64_byte_keypair_and_signs_verifiably() {
         let auth = UsAuth::from_parts("483074f3-key".into(), SAMPLE_SECRET).unwrap();
 
-        let (ts, sig_b64) = auth.sign();
+        let (ts, sig_b64) = auth.sign("GET", "/v1/account/balance");
         let sig_bytes = base64::engine::general_purpose::STANDARD
             .decode(sig_b64)
             .unwrap();
@@ -139,13 +148,14 @@ mod tests {
             .unwrap();
         let pub_bytes: [u8; 32] = raw[32..64].try_into().unwrap();
         let vk = VerifyingKey::from_bytes(&pub_bytes).unwrap();
-        assert!(vk.verify(ts.to_string().as_bytes(), &sig).is_ok());
+        let payload = format!("{}GET/v1/account/balance", ts);
+        assert!(vk.verify(payload.as_bytes(), &sig).is_ok());
     }
 
     #[test]
     fn signed_headers_carry_key_id_and_timestamp() {
         let auth = UsAuth::from_parts("my-key-id".into(), SAMPLE_SECRET).unwrap();
-        let headers = auth.signed_headers();
+        let headers = auth.signed_headers("POST", "/v1/trading/orders");
         assert_eq!(headers[0].0, HEADER_ACCESS_KEY);
         assert_eq!(headers[0].1, "my-key-id");
         assert_eq!(headers[1].0, HEADER_TIMESTAMP);
