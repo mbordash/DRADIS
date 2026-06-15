@@ -1,163 +1,163 @@
 //! Custodial Web2 authentication for the Polymarket US retail venue.
 //!
-//! The US gateway uses an **asymmetric challenge-response** scheme rather than
-//! `intl_clob`'s EIP-712 wallet signatures: an Ed25519 key pair bound to the
-//! developer profile signs a fresh millisecond nonce, and the gateway returns a
-//! short-lived JWT (180s) plus a refresh token (spec: `docs/us_retail_api.md` §2
-//! + live-API update).
+//! The US gateway authenticates **every request** with an Ed25519 signature
+//! (there is no JWT/mint exchange). A developer-portal API key issues two values:
 //!
-//! Mint flow (`POST /v1/auth/mint`):
-//!   1. `nonce` = current Unix-millis timestamp (string).
-//!   2. `signature` = Base64( Ed25519_sign(private_key, nonce_bytes) ).
-//!   3. Gateway checks the nonce is within ±5s of exchange clock + verifies the
-//!      signature against the public key on file → issues `{ access_token,
-//!      refresh_token }`.
+//!   * **Key ID** — a UUID identifying the key (`X-PM-Access-Key`).
+//!   * **Secret Key** — Base64 of the 64-byte Ed25519 keypair (`seed ‖ public`),
+//!     shown once at creation.
 //!
-//! The token is held behind an `RwLock` and re-minted automatically when within
-//! the refresh-skew window of expiry, so call sites only ever call [`UsAuth::bearer`].
-
-use std::sync::Arc;
+//! Each request carries three headers:
+//!
+//! ```http
+//! X-PM-Access-Key: <KEY_ID>
+//! X-PM-Timestamp:  <unix_millis>
+//! X-PM-Signature:  Base64( Ed25519_sign(secret, <signing-payload>) )
+//! ```
+//!
+//! The gateway checks the timestamp is within its replay window and verifies the
+//! signature against the public key on file. Signing is stateless and local, so
+//! there is no token to cache or refresh — call sites just call
+//! [`UsAuth::signed_headers`] per request.
 
 use anyhow::{anyhow, Context, Result};
 use base64::Engine as _;
-use chrono::{DateTime, Duration, Utc};
 use ed25519_dalek::{Signer, SigningKey};
-use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
-use tracing::debug;
 
-/// Environment variable names (custodial credentials are never hard-coded).
-pub const ENV_PARTICIPANT_ID: &str = "POLYMARKET_US_PARTICIPANT_ID";
-/// Base64 of the 32-byte Ed25519 private seed bound to the developer profile.
-pub const ENV_ED25519_SEED: &str = "POLYMARKET_US_ED25519_PRIVATE_KEY";
+/// Environment variable holding the portal **Key ID** (UUID).
+pub const ENV_KEY_ID: &str = "POLYMARKET_US_KEY_ID";
+/// Environment variable holding the Base64 **Secret Key** (64-byte keypair).
+pub const ENV_SECRET_KEY: &str = "POLYMARKET_US_SECRET_KEY";
 
-/// Default access-token lifetime per spec §2 (JWT, 180s).
-const DEFAULT_TOKEN_TTL_SECS: i64 = 180;
-/// Re-mint this many seconds *before* expiry so an in-flight request never races
-/// a 401.
-const REFRESH_SKEW_SECS: i64 = 30;
-/// Mint endpoint path.
-const MINT_PATH: &str = "/v1/auth/mint";
+/// Request header names (per developer-portal usage notes).
+pub const HEADER_ACCESS_KEY: &str = "X-PM-Access-Key";
+pub const HEADER_TIMESTAMP: &str = "X-PM-Timestamp";
+pub const HEADER_SIGNATURE: &str = "X-PM-Signature";
 
-#[derive(Serialize)]
-struct MintRequest<'a> {
-    participant_id: &'a str,
-    /// Unix-millis timestamp string used as the signed challenge nonce.
-    nonce: &'a str,
-    /// Base64 Ed25519 signature over `nonce`.
-    signature: String,
-}
-
-#[derive(Deserialize)]
-struct MintResponse {
-    access_token: String,
-    #[serde(default)]
-    refresh_token: Option<String>,
-    /// Optional explicit lifetime (seconds); falls back to the 180s default.
-    #[serde(default)]
-    expires_in: Option<i64>,
-}
-
-struct TokenState {
-    access_token: String,
-    #[allow(dead_code)] // retained for a future dedicated rotation endpoint
-    refresh_token: Option<String>,
-    /// Wall-clock instant after which the token must be re-minted.
-    expires_at: DateTime<Utc>,
-}
-
-/// Auth state for one US retail session.
+/// Auth state for one US retail session — a key id + the Ed25519 signer.
+///
+/// Holds no network handle and no mutable token, since each request is signed
+/// independently.
 pub struct UsAuth {
-    /// `firms/<FIRM_NAME>/users/<USER_ID>` — sent as the `x-participant-id` header.
-    participant_id: String,
+    key_id: String,
     signing_key: SigningKey,
-    http: Arc<reqwest::Client>,
-    base_url: String,
-    token: RwLock<Option<TokenState>>,
 }
 
 impl UsAuth {
-    /// Build auth state from environment credentials. Does **not** mint yet — the
-    /// first [`bearer`](Self::bearer) (or an explicit [`mint`](Self::mint)) does.
-    pub fn from_env(http: Arc<reqwest::Client>, base_url: String) -> Result<Self> {
-        let participant_id = std::env::var(ENV_PARTICIPANT_ID)
-            .with_context(|| format!("{ENV_PARTICIPANT_ID} not set"))?;
-        let seed_b64 = std::env::var(ENV_ED25519_SEED)
-            .with_context(|| format!("{ENV_ED25519_SEED} not set"))?;
-
-        let seed = base64::engine::general_purpose::STANDARD
-            .decode(seed_b64.trim())
-            .context("POLYMARKET_US_ED25519_PRIVATE_KEY is not valid Base64")?;
-        let seed: [u8; 32] = seed
-            .as_slice()
-            .try_into()
-            .map_err(|_| anyhow!("Ed25519 private seed must decode to exactly 32 bytes"))?;
-        let signing_key = SigningKey::from_bytes(&seed);
-
-        Ok(Self {
-            participant_id,
-            signing_key,
-            http,
-            base_url,
-            token: RwLock::new(None),
-        })
+    /// Build auth state from environment credentials.
+    pub fn from_env() -> Result<Self> {
+        let key_id = std::env::var(ENV_KEY_ID)
+            .with_context(|| format!("{ENV_KEY_ID} not set"))?;
+        let secret_b64 = std::env::var(ENV_SECRET_KEY)
+            .with_context(|| format!("{ENV_SECRET_KEY} not set"))?;
+        Self::from_parts(key_id, &secret_b64)
     }
 
-    /// The participant identity header value.
-    pub fn participant_id(&self) -> &str {
-        &self.participant_id
-    }
-
-    /// Return a currently-valid bearer token, minting first if absent or within
-    /// the refresh-skew window of expiry.
-    pub async fn bearer(&self) -> Result<String> {
-        {
-            let guard = self.token.read().await;
-            if let Some(state) = guard.as_ref() {
-                if Utc::now() < state.expires_at - Duration::seconds(REFRESH_SKEW_SECS) {
-                    return Ok(state.access_token.clone());
-                }
+    /// Build auth state from explicit credentials (used by tests).
+    pub fn from_parts(key_id: String, secret_b64: &str) -> Result<Self> {
+        let secret = base64::engine::general_purpose::STANDARD
+            .decode(secret_b64.trim())
+            .context("POLYMARKET_US_SECRET_KEY is not valid Base64")?;
+        // The portal secret is the full 64-byte Ed25519 keypair (seed ‖ public).
+        // Accept a bare 32-byte seed too, for forward-compatibility.
+        let signing_key = match secret.len() {
+            64 => {
+                let kp: [u8; 64] = secret.as_slice().try_into().expect("len checked == 64");
+                SigningKey::from_keypair_bytes(&kp)
+                    .map_err(|e| anyhow!("invalid Ed25519 keypair bytes: {e}"))?
             }
-        }
-        self.mint().await
-    }
-
-    /// Perform the Ed25519 challenge-response mint and cache the resulting JWT.
-    pub async fn mint(&self) -> Result<String> {
-        let nonce = Utc::now().timestamp_millis().to_string();
-        let signature = base64::engine::general_purpose::STANDARD
-            .encode(self.signing_key.sign(nonce.as_bytes()).to_bytes());
-
-        let body = MintRequest {
-            participant_id: &self.participant_id,
-            nonce: &nonce,
-            signature,
+            32 => {
+                let seed: [u8; 32] = secret.as_slice().try_into().expect("len checked == 32");
+                SigningKey::from_bytes(&seed)
+            }
+            n => {
+                return Err(anyhow!(
+                    "POLYMARKET_US_SECRET_KEY must decode to 64 bytes (keypair) or 32 bytes (seed), got {n}"
+                ))
+            }
         };
 
-        let resp = self
-            .http
-            .post(format!("{}{}", self.base_url, MINT_PATH))
-            .json(&body)
-            .send()
-            .await
-            .context("auth mint request failed")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let err = resp.text().await.unwrap_or_default();
-            return Err(anyhow!("US retail auth mint rejected (HTTP {status}): {err}"));
-        }
-        let minted: MintResponse = resp.json().await.context("auth mint decode failed")?;
+        Ok(Self { key_id, signing_key })
+    }
 
-        let ttl = minted.expires_in.filter(|s| *s > 0).unwrap_or(DEFAULT_TOKEN_TTL_SECS);
-        let access_token = minted.access_token.clone();
-        *self.token.write().await = Some(TokenState {
-            access_token: minted.access_token,
-            refresh_token: minted.refresh_token,
-            expires_at: Utc::now() + Duration::seconds(ttl),
-        });
-        debug!("US retail: minted access token (ttl={ttl}s)");
-        Ok(access_token)
+    /// The portal Key ID (`X-PM-Access-Key` header value).
+    pub fn key_id(&self) -> &str {
+        &self.key_id
+    }
+
+    /// Build the canonical payload that gets Ed25519-signed for a request.
+    ///
+    /// The portal documents only the timestamp as the signed challenge, so the
+    /// payload is the millisecond timestamp string. If the live gateway turns
+    /// out to bind method/path/body as well, this is the single place to extend.
+    fn signing_payload(timestamp_ms: i64) -> String {
+        timestamp_ms.to_string()
+    }
+
+    /// Sign the current request, returning `(timestamp_ms, base64_signature)`.
+    pub fn sign(&self) -> (i64, String) {
+        let ts = chrono::Utc::now().timestamp_millis();
+        let payload = Self::signing_payload(ts);
+        let signature = base64::engine::general_purpose::STANDARD
+            .encode(self.signing_key.sign(payload.as_bytes()).to_bytes());
+        (ts, signature)
+    }
+
+    /// The three auth headers `(name, value)` for the current request.
+    pub fn signed_headers(&self) -> [(&'static str, String); 3] {
+        let (ts, sig) = self.sign();
+        [
+            (HEADER_ACCESS_KEY, self.key_id.clone()),
+            (HEADER_TIMESTAMP, ts.to_string()),
+            (HEADER_SIGNATURE, sig),
+        ]
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use ed25519_dalek::{Verifier, VerifyingKey};
+
+    const SAMPLE_SECRET: &str =
+        "lxcsopNhvp+FyZMtVPnHPeHAGihFMPEZcUg6TrJX6kCfwSEXu8v8vmyi3wJbMFUs3a9Fe7mkyRIwfZZkd/5kPg==";
+
+    /// The real portal sample is a 64-byte keypair → must load and sign.
+    #[test]
+    fn loads_64_byte_keypair_and_signs_verifiably() {
+        let auth = UsAuth::from_parts("483074f3-key".into(), SAMPLE_SECRET).unwrap();
+
+        let (ts, sig_b64) = auth.sign();
+        let sig_bytes = base64::engine::general_purpose::STANDARD
+            .decode(sig_b64)
+            .unwrap();
+        let sig = ed25519_dalek::Signature::from_slice(&sig_bytes).unwrap();
+
+        // The signature must verify against the public half of the keypair.
+        let raw = base64::engine::general_purpose::STANDARD
+            .decode(SAMPLE_SECRET)
+            .unwrap();
+        let pub_bytes: [u8; 32] = raw[32..64].try_into().unwrap();
+        let vk = VerifyingKey::from_bytes(&pub_bytes).unwrap();
+        assert!(vk.verify(ts.to_string().as_bytes(), &sig).is_ok());
+    }
+
+    #[test]
+    fn signed_headers_carry_key_id_and_timestamp() {
+        let auth = UsAuth::from_parts("my-key-id".into(), SAMPLE_SECRET).unwrap();
+        let headers = auth.signed_headers();
+        assert_eq!(headers[0].0, HEADER_ACCESS_KEY);
+        assert_eq!(headers[0].1, "my-key-id");
+        assert_eq!(headers[1].0, HEADER_TIMESTAMP);
+        assert!(headers[1].1.parse::<i64>().unwrap() > 0);
+        assert_eq!(headers[2].0, HEADER_SIGNATURE);
+        assert!(!headers[2].1.is_empty());
+    }
+
+    #[test]
+    fn rejects_wrong_length_secret() {
+        let bad = base64::engine::general_purpose::STANDARD.encode([0u8; 10]);
+        assert!(UsAuth::from_parts("k".into(), &bad).is_err());
+    }
+}
 

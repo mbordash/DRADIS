@@ -1,8 +1,8 @@
 //! US retail venue — custodial, CFTC-regulated Polymarket US platform.
 //!
-//! Web2 custodial execution (Ed25519-minted JWT + `x-participant-id`) against
-//! `api.prod.polymarketexchange.com`. No `alloy`, no Polymarket SDK, no EIP-712 —
-//! all crypto identity is replaced by the short-lived token in [`auth::UsAuth`].
+//! Web2 custodial execution (per-request Ed25519 signatures via the `X-PM-*`
+//! headers) against `api.prod.polymarketexchange.com`. No `alloy`, no Polymarket
+//! SDK, no EIP-712 — all crypto identity is the portal API key in [`auth::UsAuth`].
 //!
 //! ## Market identity
 //! The neutral [`MarketId`] carries the instrument **symbol**
@@ -51,19 +51,21 @@ pub struct UsRetailVenue {
 
 impl UsRetailVenue {
     /// Bootstrap the US venue: read custodial credentials from the environment,
-    /// verify gateway connectivity, and validate auth by minting an initial JWT.
+    /// verify gateway connectivity, and validate auth with a signed probe.
     pub async fn connect(http: Arc<reqwest::Client>) -> Result<Self> {
         let base_url = std::env::var(ENV_BASE_URL)
             .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
-        let auth = UsAuth::from_env(Arc::clone(&http), base_url.clone())
-            .context("US retail auth bootstrap failed")?;
+        let auth = UsAuth::from_env().context("US retail auth bootstrap failed")?;
 
         let venue = Self { http, base_url, auth };
 
         venue.health_check().await.context("US retail health check failed")?;
-        // Validate the Ed25519 credentials up-front by minting a token now.
-        venue.auth.mint().await.context("US retail auth mint failed")?;
-        info!("Authenticated on Polymarket US. Participant: {}", venue.auth.participant_id());
+        // Validate the Ed25519 API key up-front with a signed portfolio probe.
+        venue
+            .fetch_portfolio()
+            .await
+            .context("US retail auth validation failed (signed portfolio probe)")?;
+        info!("Authenticated on Polymarket US. Key ID: {}", venue.auth.key_id());
 
         Ok(venue)
     }
@@ -101,13 +103,14 @@ impl UsRetailVenue {
         Ok(markets::pair_markets(parsed.markets))
     }
 
-    /// Attach the bearer + participant headers to an authenticated request.
-    async fn authed(&self, rb: reqwest::RequestBuilder) -> Result<reqwest::RequestBuilder> {
-        let bearer = self.auth.bearer().await?;
-        Ok(rb
-            .header("Authorization", format!("Bearer {bearer}"))
-            .header("x-participant-id", self.auth.participant_id())
-            .header("Content-Type", "application/json"))
+    /// Attach the `X-PM-*` Ed25519 signature headers to an authenticated request.
+    ///
+    /// Signing is local and stateless (no token round-trip), so this is sync.
+    fn authed(&self, mut rb: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        for (name, value) in self.auth.signed_headers() {
+            rb = rb.header(name, value);
+        }
+        rb.header("Content-Type", "application/json")
     }
 
     /// Public connectivity probe (`GET /v1/health`, no auth).
@@ -206,7 +209,7 @@ impl UsRetailVenue {
     async fn submit_order(&self, intent: &OrderIntent) -> Result<Fill> {
         let body = Self::build_order(intent)?;
         let rb = self.http.post(self.url("/v1/trading/orders")).json(&body);
-        let rb = self.authed(rb).await?;
+        let rb = self.authed(rb);
         let resp = rb.send().await.context("order POST failed")?;
         let status = resp.status();
         if !status.is_success() {
@@ -235,7 +238,7 @@ impl UsRetailVenue {
     /// Shared portfolio fetch used by both `collateral` and `positions`.
     async fn fetch_portfolio(&self) -> Result<types::PortfolioResponse> {
         let rb = self.http.get(self.url("/v1/portfolio/positions"));
-        let rb = self.authed(rb).await?;
+        let rb = self.authed(rb);
         let resp = rb.send().await.context("portfolio request failed")?;
         let status = resp.status();
         if !status.is_success() {
@@ -262,7 +265,7 @@ impl Execution for UsRetailVenue {
             atomic: true,
         };
         let rb = self.http.post(self.url("/v1/orders/batched")).json(&body);
-        let rb = self.authed(rb).await?;
+        let rb = self.authed(rb);
         let resp = rb.send().await.context("batched order POST failed")?;
         let status = resp.status();
         if !status.is_success() {
@@ -295,7 +298,7 @@ impl Execution for UsRetailVenue {
         let rb = self
             .http
             .delete(self.url(&format!("/v1/trading/orders/{}", id.0)));
-        let rb = self.authed(rb).await?;
+        let rb = self.authed(rb);
         let resp = rb.send().await.context("cancel DELETE failed")?;
         let status = resp.status();
         if !status.is_success() {

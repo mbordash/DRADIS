@@ -79,3 +79,6 @@ src/config.rs
 tools/verify-chart-alignment.sh
 tools/verify-portfolio-fix.sh
 tools/verify-token-sovereignty.sh
+
+# Private internal design doc (do not publish)
+docs/VENUE_ABSTRACTION.md

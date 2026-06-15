@@ -89,8 +89,8 @@ cargo test            --no-default-features --features us_retail
 ### US Retail configuration (`.env`)
 
 ```bash
-POLYMARKET_US_PARTICIPANT_ID=firms/<FIRM>/users/<USER>   # identity header
-POLYMARKET_US_ED25519_PRIVATE_KEY=<base64-32-byte-seed>  # signs the /v1/auth/mint nonce
+POLYMARKET_US_KEY_ID=<key-id-uuid>      # developer-portal Key ID (X-PM-Access-Key)
+POLYMARKET_US_SECRET_KEY=<base64-secret> # portal Secret Key (Base64 Ed25519 keypair), shown once
 # optional:
 POLYMARKET_US_BASE_URL=https://api.prod.polymarketexchange.com  # override (staging/mock)
 POLYMARKET_US_TRADE_SIZE=10        # contracts per leg          (default 10)
