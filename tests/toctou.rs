@@ -10,39 +10,41 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use alloy::primitives::U256;
 use chrono::Utc;
 use rust_decimal_macros::dec;
 use tokio::sync::Mutex;
 
 use dradis::state::{Position, PositionMap};
+use dradis::venues::core::MarketId;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
+// Venue-neutral: keyed by the abstract `MarketId` so this race-condition test
+// runs identically under `intl_clob` and `us_retail`.
 
-fn make_position(token_id: U256) -> Position {
+fn make_position(token_id: &str) -> Position {
     Position {
         shares: dec!(10),
         avg_entry: dec!(0.55),
         opened_at: Utc::now(),
         close_time: None,
         market_name: "Test Market".to_string(),
-        pair_token_id: dradis::venues::intl::market_id_from_u256(token_id),
+        pair_token_id: MarketId::new(token_id),
         fill_confirmed_at: None,
         paired_leg_token_id: None,
     }
 }
 
-const TOKEN: U256 = U256::from_limbs([42, 0, 0, 0]);
+const TOKEN: &str = "42";
 const STRATEGY: &str = "TestStrategy";
 
-fn key(token_id: U256) -> (String, dradis::venues::core::MarketId) {
-    (STRATEGY.to_string(), dradis::venues::intl::market_id_from_u256(token_id))
+fn key(token_id: &str) -> (String, MarketId) {
+    (STRATEGY.to_string(), MarketId::new(token_id))
 }
 
 async fn entry_fixed(
     positions: Arc<Mutex<PositionMap>>,
     orders_placed: Arc<AtomicU32>,
-    token_id: U256,
+    token_id: &str,
 ) {
     // Atomic check-and-reserve in ONE lock scope
     {

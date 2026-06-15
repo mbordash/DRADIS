@@ -256,7 +256,7 @@ async fn main() -> Result<()> {
     #[cfg(feature = "us_retail")]
     {
         // These are consumed only by the intl bootstrap / per-asset loops below.
-        let _ = (&shared_http, &markets_tx, &raptor_health_tx);
+        let _ = (&markets_tx, &raptor_health_tx);
         tokio::spawn(dradis::api::server::run_api_server(
             Arc::clone(&config_tx),
             config_rx.clone(),
@@ -264,9 +264,27 @@ async fn main() -> Result<()> {
             raptor_health_rx,
             cag.clone(),
         ));
+
+        // ── Connect the custodial US retail venue (Step 3b) ──────────────────
+        // Best-effort: a connect failure (missing creds, gateway down) is logged
+        // but does not crash the process — the Control Tower API stays up so the
+        // operator can diagnose. The full market-discovery + WS patrol loop for
+        // this venue is Step 3c; for now we prove auth + gateway reachability and
+        // surface live collateral once.
+        match dradis::venues::us::UsRetailVenue::connect(Arc::clone(&shared_http)).await {
+            Ok(venue) => {
+                use dradis::venues::core::Execution as _;
+                match venue.collateral().await {
+                    Ok(c)  => tracing::info!("✅ US retail venue connected — available margin ${:.2}", c),
+                    Err(e) => tracing::warn!("⚠️ US retail connected but collateral query failed: {e}"),
+                }
+            }
+            Err(e) => tracing::warn!("⚠️ US retail venue connect failed (Control Tower still live): {e}"),
+        }
+
         tracing::warn!(
-            "⚠️  UsRetailVenue trading bootstrap not yet implemented (Step 3b). \
-             Control Tower API is live; no trading loops spawned."
+            "⚠️  UsRetailVenue trading loops not yet wired (Step 3c). \
+             Control Tower API is live; venue is connected but idle."
         );
         std::future::pending::<()>().await;
     }
