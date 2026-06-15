@@ -5,9 +5,10 @@ Cargo.lock
 
 # Environment / Secrets (CRITICAL - Never commit!)
 .env
-.env.local
 .env.*
 !.env.example
+!.env.local.example
+
 
 # Personal config — users must copy an example to create their own
 #src/config.rs
@@ -64,8 +65,6 @@ CONFIG_CHANGES_APPLIED.md
 .idea
 *.swp
 *.swo
-start-local.sh
-stop-local.sh
 /control-tower/tsconfig.tsbuildinfo
 deploy-live.sh
 deploy-test.sh
