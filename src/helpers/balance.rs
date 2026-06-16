@@ -389,15 +389,22 @@ pub async fn reconcile_orphaned_positions(
 /// Orphan-leg cleanup monitor spawned alongside every atomic two-leg arb entry.
 ///
 /// Enforces the invariant:
-///   If elapsed_time > MAX_WAIT_SECS and positions[Leg_A].shares != positions[Leg_B].shares
-///   (i.e. exactly one leg confirmed, the other expired unfilled):
+///   If exactly one leg confirmed and the other has not filled, repair the pair:
 ///     1. POST /cancel — atomically cancels the remaining open GTC order on the missing leg.
 ///     2. FAK (Immediate-or-Cancel) taker buy on the missing leg at current ask + one tick,
-///        capped at $0.99, to close the delta exposure at market price.
+///        capped at the dynamic breakeven ceiling, to close the delta exposure; or, if
+///        re-hedge is uneconomical, FAK-flatten the filled leg at the bid.
 ///
-/// The monitor sleeps for `max_wait_secs + ARBITER_GRACE_SECS` to let individual
-/// `sync_position_balance` tasks reach their own timeout branches first, then checks
-/// the joint fill state and acts only on asymmetry.
+/// ── Event-driven repair (first-leg-confirmation trigger) ─────────────────────
+/// Rather than sleeping out the entire `max_wait_secs` window (up to 600s on window
+/// markets) and checking once, the monitor POLLS the joint fill state every
+/// `POLL_INTERVAL_SECS`. The moment exactly one leg is confirmed it starts a short
+/// `FIRST_LEG_CONFIRM_GRACE_SECS` countdown — just enough time for the missing leg to
+/// still fill naturally as a free maker — and repairs as soon as that grace elapses.
+/// This bounds naked directional exposure to ~grace seconds after the first fill
+/// instead of the full fill window (the dominant orphan-loss window). The original
+/// `max_wait_secs + ARBITER_GRACE_SECS` is retained only as a hard deadline for the
+/// neither-filled case, where the individual `sync_position_balance` tasks own cleanup.
 pub async fn arb_pair_fill_monitor(
     client: Arc<ClobClient<Authenticated<Normal>>>,
     nonce_manager: Arc<AtomicU64>,
@@ -419,47 +426,79 @@ pub async fn arb_pair_fill_monitor(
     http: Arc<reqwest::Client>,
     asset: String,
 ) {
-    /// Grace period added on top of the fill window so the individual `sync_position_balance`
-    /// tasks can run their own cancel + phantom-removal logic before the arbiter steps in.
+    /// Hard-deadline grace added on top of the fill window. Only governs the
+    /// neither-leg-filled case now: once both legs have had their full chance to
+    /// fill, the individual `sync_position_balance` tasks own phantom cleanup.
     const ARBITER_GRACE_SECS: u64 = 15;
+    /// Once exactly one leg confirms, the missing leg gets only this short grace to
+    /// fill naturally as a free (0-fee) maker before we step in with a taker
+    /// re-hedge/flatten. Keeps the free-fill opportunity but caps naked directional
+    /// exposure to ~this many seconds after the first fill (was up to `max_wait_secs`).
+    const FIRST_LEG_CONFIRM_GRACE_SECS: u64 = 30;
+    /// Cadence at which the joint fill state is polled.
+    const POLL_INTERVAL_SECS: u64 = 5;
 
     // Slice 2b: resolve on-chain U256 once; the rest of the body is unchanged.
     let leg_a_token = u256_from_market_id(leg_a_token).unwrap_or_default();
     let leg_b_token = u256_from_market_id(leg_b_token).unwrap_or_default();
 
-    let total_wait = Duration::from_secs((max_wait_secs as u64).saturating_add(ARBITER_GRACE_SECS));
-    tokio::time::sleep(total_wait).await;
-
     let key_a = (strategy_name.clone(), market_id_from_u256(leg_a_token));
     let key_b = (strategy_name.clone(), market_id_from_u256(leg_b_token));
 
-    // Snapshot fill-confirmation state for both legs.
-    let (a_confirmed, a_shares) = {
-        let map = positions.lock().await;
-        map.get(&key_a)
-            .map(|p| (p.fill_confirmed_at.is_some(), p.shares))
-            .unwrap_or((false, dec!(0)))
-    };
-    let (b_confirmed, b_shares) = {
-        let map = positions.lock().await;
-        map.get(&key_b)
-            .map(|p| (p.fill_confirmed_at.is_some(), p.shares))
-            .unwrap_or((false, dec!(0)))
-    };
+    // Hard deadline for the neither-filled case; also a backstop upper bound for the
+    // asymmetric case so we never wait past the original window.
+    let deadline = Instant::now()
+        + Duration::from_secs((max_wait_secs as u64).saturating_add(ARBITER_GRACE_SECS));
+    // When we first observe exactly one confirmed leg, start the short repair countdown.
+    let mut first_asymmetric_at: Option<Instant> = None;
 
-    match (a_confirmed, b_confirmed) {
-        (true, true) => {
-            // Symmetric fill — both legs confirmed. Nothing to do.
-            debug!("✅ ARB ARBITER [{}]: Both legs confirmed ({} / {}) — no orphan", strategy_name, leg_a_token, leg_b_token);
-            return;
+    // Event-driven poll: exit with the asymmetric fill state to repair, or `return`
+    // early on both-filled / deadline-reached-with-neither-filled.
+    let (a_confirmed, a_shares, b_shares) = loop {
+        tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+
+        // Snapshot fill-confirmation state for both legs.
+        let (a_conf, a_sh) = {
+            let map = positions.lock().await;
+            map.get(&key_a)
+                .map(|p| (p.fill_confirmed_at.is_some(), p.shares))
+                .unwrap_or((false, dec!(0)))
+        };
+        let (b_conf, b_sh) = {
+            let map = positions.lock().await;
+            map.get(&key_b)
+                .map(|p| (p.fill_confirmed_at.is_some(), p.shares))
+                .unwrap_or((false, dec!(0)))
+        };
+
+        match (a_conf, b_conf) {
+            (true, true) => {
+                // Symmetric fill — both legs confirmed. Nothing to do.
+                debug!("✅ ARB ARBITER [{}]: Both legs confirmed ({} / {}) — no orphan", strategy_name, leg_a_token, leg_b_token);
+                return;
+            }
+            (false, false) => {
+                // Neither leg filled yet — reset any stale asymmetry timer and wait
+                // until the hard deadline, then hand off to the sync tasks.
+                first_asymmetric_at = None;
+                if Instant::now() >= deadline {
+                    debug!("⏭️  ARB ARBITER [{}]: Neither leg confirmed by deadline — sync tasks own cleanup", strategy_name);
+                    return;
+                }
+            }
+            _ => {
+                // Asymmetric — exactly one leg filled. Give the missing leg a short
+                // grace to fill as a free maker; repair the moment it elapses (or at
+                // the hard deadline, whichever comes first).
+                let since = *first_asymmetric_at.get_or_insert_with(Instant::now);
+                if since.elapsed() >= Duration::from_secs(FIRST_LEG_CONFIRM_GRACE_SECS)
+                    || Instant::now() >= deadline
+                {
+                    break (a_conf, a_sh, b_sh);
+                }
+            }
         }
-        (false, false) => {
-            // Neither leg filled — individual sync tasks already handle phantom-removal.
-            debug!("⏭️  ARB ARBITER [{}]: Neither leg confirmed — sync tasks own cleanup", strategy_name);
-            return;
-        }
-        _ => {} // Asymmetric — exactly one leg filled.
-    }
+    };
 
     // ── Asymmetric fill: one leg confirmed, the other is missing ──────────────
     let (filled_token, missing_token, missing_baseline, missing_vc, missing_side, filled_vc, filled_side) =
