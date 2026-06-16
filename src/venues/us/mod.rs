@@ -60,9 +60,12 @@ impl UsRetailVenue {
         let venue = Self { http, base_url, auth: Arc::new(auth) };
 
         venue.health_check().await.context("US retail health check failed")?;
-        // Validate the Ed25519 API key with a signed account balance probe.
+        // Validate the Ed25519 API key with a signed balances probe. We use the
+        // balances endpoint (not positions) because it's the auth-bearing call
+        // the trader actually depends on for collateral, and it fails
+        // independently of the sometimes-flaky positions service.
         venue
-            .fetch_portfolio()
+            .fetch_balances()
             .await
             .context("US retail auth validation failed (signed account balance probe)")?;
         info!("✅ Authenticated on Polymarket US. Key ID: {}", venue.auth.key_id());
@@ -277,9 +280,34 @@ impl UsRetailVenue {
         })
     }
 
-    /// Fetch positions and balances (combines two API calls).
-    async fn fetch_portfolio(&self) -> Result<types::PortfolioResponse> {
-        // Fetch positions
+    /// Fetch account balances (`GET /v1/account/balances`) and return the
+    /// available collateral (`buyingPower`).
+    ///
+    /// This is the canonical auth-validation + collateral probe: it touches only
+    /// the balances endpoint, so a transient outage on the *positions* endpoint
+    /// can't break venue bring-up or collateral reads (the two are independent
+    /// gateway services and fail independently).
+    async fn fetch_balances(&self) -> Result<f64> {
+        let bal_rb = self.http.get(self.url("/v1/account/balances"));
+        let bal_rb = self.authed(bal_rb, "GET", "/v1/account/balances");
+        let bal_resp = bal_rb.send().await.context("account balances request failed")?;
+        let bal_status = bal_resp.status();
+        if !bal_status.is_success() {
+            let err = bal_resp.text().await.unwrap_or_default();
+            bail!("US account/balances failed (HTTP {bal_status}): {err}");
+        }
+        let bal_data: types::AccountBalancesResponse =
+            bal_resp.json().await.context("account balances decode failed")?;
+        // Use buyingPower as the available collateral.
+        Ok(bal_data.balances.first().map(|b| b.buying_power).unwrap_or(0.0))
+    }
+
+    /// Fetch open positions (`GET /v1/portfolio/positions`).
+    ///
+    /// Kept independent from [`fetch_balances`] so a transient `5xx` here only
+    /// affects the positions view (dashboard sync tolerates it via
+    /// `unwrap_or_default`) and never the auth/collateral path.
+    async fn fetch_positions(&self) -> Result<Vec<types::UsPosition>> {
         let pos_rb = self.http.get(self.url("/v1/portfolio/positions"));
         let pos_rb = self.authed(pos_rb, "GET", "/v1/portfolio/positions");
         let pos_resp = pos_rb.send().await.context("portfolio positions request failed")?;
@@ -291,21 +319,8 @@ impl UsRetailVenue {
         let pos_data: types::PortfolioPositionsResponse =
             pos_resp.json().await.context("portfolio positions decode failed")?;
 
-        // Fetch balances
-        let bal_rb = self.http.get(self.url("/v1/account/balances"));
-        let bal_rb = self.authed(bal_rb, "GET", "/v1/account/balances");
-        let bal_resp = bal_rb.send().await.context("account balances request failed")?;
-        let bal_status = bal_resp.status();
-        if !bal_status.is_success() {
-            let err = bal_resp.text().await.unwrap_or_default();
-            bail!("US account/balances failed (HTTP {bal_status}): {err}");
-        }
-        let bal_data: types::AccountBalancesResponse =
-            bal_resp.json().await.context("account balances decode failed")?;
-
-        // Combine into a unified view
         let mut positions = Vec::new();
-        // Positions map might have entries; also check availablePositions array
+        // Positions map might have entries; also check availablePositions array.
         for (symbol, mut pos) in pos_data.positions {
             if pos.symbol.is_empty() {
                 pos.symbol = symbol;
@@ -313,16 +328,7 @@ impl UsRetailVenue {
             positions.push(pos);
         }
         positions.extend(pos_data.available_positions);
-
-        // Use buyingPower as the available collateral
-        let buying_power = bal_data.balances.first()
-            .map(|b| b.buying_power)
-            .unwrap_or(0.0);
-
-        Ok(types::PortfolioResponse {
-            positions,
-            buying_power,
-        })
+        Ok(positions)
     }
 }
 
@@ -388,15 +394,15 @@ impl Execution for UsRetailVenue {
     }
 
     async fn collateral(&self) -> Result<Decimal> {
-        let portfolio = self.fetch_portfolio().await?;
-        Decimal::try_from(portfolio.buying_power)
+        let buying_power = self.fetch_balances().await?;
+        Decimal::try_from(buying_power)
             .map_err(|e| anyhow!("US retail: invalid buying_power: {e}"))
     }
 
     async fn positions(&self) -> Result<Vec<Position>> {
-        let portfolio = self.fetch_portfolio().await?;
-        let mut out = Vec::with_capacity(portfolio.positions.len());
-        for p in portfolio.positions {
+        let raw = self.fetch_positions().await?;
+        let mut out = Vec::with_capacity(raw.len());
+        for p in raw {
             if p.quantity == 0 {
                 continue;
             }
