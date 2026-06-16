@@ -68,10 +68,21 @@ pub fn pair_markets(markets: Vec<types::UsMarket>) -> Vec<UsMarketPair> {
         // Fallback: parse legacy `instruments`/`outcomes` arrays (spec structure)
         if long_sym.is_none() || short_sym.is_none() {
             let legs: Vec<_> = m.instruments.iter().chain(m.outcomes.iter()).collect();
-            for inst in legs {
-                match inst.outcome.to_ascii_uppercase().as_str() {
-                    oc::LONG => long_sym.get_or_insert_with(|| inst.symbol.clone()),
-                    oc::SHORT => short_sym.get_or_insert_with(|| inst.symbol.clone()),
+            for inst_val in legs {
+                let outcome = inst_val.get("outcome")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_ascii_uppercase();
+                let symbol = inst_val.get("symbol")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if symbol.is_empty() {
+                    continue;
+                }
+                match outcome.as_str() {
+                    oc::LONG => long_sym.get_or_insert(symbol),
+                    oc::SHORT => short_sym.get_or_insert(symbol),
                     _ => continue,
                 };
             }

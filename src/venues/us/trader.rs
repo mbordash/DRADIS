@@ -71,6 +71,16 @@ pub async fn run_us_trader(venue: Arc<UsRetailVenue>, cancel: CancellationToken)
         }
         match venue.discover_binary_markets().await {
             Ok(markets) if !markets.is_empty() => {
+                info!(
+                    "📊 Discovered {} binary markets. First 5: {}",
+                    markets.len(),
+                    markets.iter()
+                        .take(5)
+                        .map(|m| format!("\"{}\"", m.question))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+
                 let selected = match &filter {
                     Some(f) => {
                         let fl = f.to_lowercase();

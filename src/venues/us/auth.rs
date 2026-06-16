@@ -58,13 +58,15 @@ impl UsAuth {
         let secret = base64::engine::general_purpose::STANDARD
             .decode(secret_b64.trim())
             .context("POLYMARKET_US_SECRET_KEY is not valid Base64")?;
-        // The portal secret is the full 64-byte Ed25519 keypair (seed ‖ public).
-        // Accept a bare 32-byte seed too, for forward-compatibility.
+
+        // The portal secret is either:
+        // - 64 bytes (full Ed25519 keypair: seed ‖ public), or
+        // - 32 bytes (just the seed)
+        // Per the official TypeScript SDK, we use the FIRST 32 BYTES (seed) for signing.
         let signing_key = match secret.len() {
             64 => {
-                let kp: [u8; 64] = secret.as_slice().try_into().expect("len checked == 64");
-                SigningKey::from_keypair_bytes(&kp)
-                    .map_err(|e| anyhow!("invalid Ed25519 keypair bytes: {e}"))?
+                let seed: [u8; 32] = secret[..32].try_into().expect("first 32 bytes");
+                SigningKey::from_bytes(&seed)
             }
             32 => {
                 let seed: [u8; 32] = secret.as_slice().try_into().expect("len checked == 32");
