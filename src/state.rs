@@ -150,6 +150,42 @@ pub struct MarketConfig {
     pub no_fee_bps: u32,
 }
 
+/// Lifecycle phase of a market derived from its close time.
+///
+/// **Venue-neutral core**: both the intl patrol and the US loop drive the same
+/// close/wind-down/stand-down semantics off this single classifier, so neither
+/// venue re-implements "is the market closing?" logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketPhase {
+    /// Trading normally — opening new positions is allowed.
+    Open,
+    /// Inside the wind-down window — stop opening new positions and let existing
+    /// ones resolve/exit (the squadron's RTB state).
+    WindingDown,
+    /// At or past close — stand down and rotate to the next market.
+    Closed,
+}
+
+impl MarketConfig {
+    /// Seconds until the market closes (negative if already past). `None` when
+    /// the market has no close time (e.g. always-open markets that never rotate).
+    pub fn secs_to_close(&self, now: DateTime<Utc>) -> Option<i64> {
+        self.market_close_time.map(|c| (c - now).num_seconds())
+    }
+
+    /// Classify the market's lifecycle [`MarketPhase`]. `rtb_window_secs` is how
+    /// long before close to stop opening new positions. Markets with no close
+    /// time are always [`MarketPhase::Open`].
+    pub fn phase(&self, now: DateTime<Utc>, rtb_window_secs: i64) -> MarketPhase {
+        match self.secs_to_close(now) {
+            None                            => MarketPhase::Open,
+            Some(s) if s <= 0               => MarketPhase::Closed,
+            Some(s) if s <= rtb_window_secs => MarketPhase::WindingDown,
+            Some(_)                         => MarketPhase::Open,
+        }
+    }
+}
+
 /// Strategy execution status for monitoring and lifecycle management.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StrategyStatus {
@@ -200,3 +236,37 @@ pub enum StrategySignal {
     /// No action at this time
     NoSignal,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::Duration as ChronoDuration;
+
+    fn market_closing_in(secs: Option<i64>) -> MarketConfig {
+        MarketConfig {
+            yes_token: MarketId::new("yes"),
+            no_token: MarketId::new("no"),
+            market_name: "t".into(),
+            market_close_time: secs.map(|s| Utc::now() + ChronoDuration::seconds(s)),
+            strike_price: None,
+            is_neg_risk: false,
+            condition_id: String::new(),
+            yes_fee_bps: 0,
+            no_fee_bps: 0,
+        }
+    }
+
+    #[test]
+    fn phase_classifies_open_winddown_closed() {
+        let now = Utc::now();
+        // No close time → always Open.
+        assert_eq!(market_closing_in(None).phase(now, 120), MarketPhase::Open);
+        // Plenty of time → Open.
+        assert_eq!(market_closing_in(Some(600)).phase(now, 120), MarketPhase::Open);
+        // Inside the wind-down window → WindingDown.
+        assert_eq!(market_closing_in(Some(60)).phase(now, 120), MarketPhase::WindingDown);
+        // Past close → Closed.
+        assert_eq!(market_closing_in(Some(-5)).phase(now, 120), MarketPhase::Closed);
+    }
+}
+

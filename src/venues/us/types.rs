@@ -7,6 +7,11 @@
 //!
 //! Spec: `docs/us_retail_api.md` §3.
 
+pub use polymarket_us::types::*;
+
+#[cfg(any())]
+mod legacy {
+
 use serde::{Deserialize, Serialize};
 
 // ─── Enumerated protocol constants ───────────────────────────────────────────
@@ -276,6 +281,8 @@ pub struct UserBalance {
 pub struct PortfolioResponse {
     pub positions: Vec<UsPosition>,
     pub buying_power: f64,
+}
+
 }
 
 

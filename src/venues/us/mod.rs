@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use polymarket_us::PolymarketUsClient;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::str::FromStr;
@@ -44,7 +45,7 @@ const ENV_BASE_URL: &str = "POLYMARKET_US_BASE_URL";
 
 /// The custodial US retail venue (web2 auth, no signer).
 pub struct UsRetailVenue {
-    http: Arc<reqwest::Client>,
+    client: PolymarketUsClient,
     base_url: String,
     auth: Arc<UsAuth>,
 }
@@ -56,8 +57,15 @@ impl UsRetailVenue {
         let base_url = std::env::var(ENV_BASE_URL)
             .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
         let auth = UsAuth::from_env().context("US retail auth bootstrap failed")?;
+        let client = PolymarketUsClient::builder()
+            .api_base_url(base_url.clone())
+            .gateway_base_url(base_url.clone())
+            .http_client(http.as_ref().clone())
+            .auth(auth.clone())
+            .build()
+            .map_err(|e| anyhow!("US retail SDK client bootstrap failed: {e}"))?;
 
-        let venue = Self { http, base_url, auth: Arc::new(auth) };
+        let venue = Self { client, base_url, auth: Arc::new(auth) };
 
         venue.health_check().await.context("US retail health check failed")?;
         // Validate the Ed25519 API key with a signed balances probe. We use the
@@ -71,12 +79,6 @@ impl UsRetailVenue {
         info!("✅ Authenticated on Polymarket US. Key ID: {}", venue.auth.key_id());
 
         Ok(venue)
-    }
-
-    // ── HTTP plumbing ────────────────────────────────────────────────────────
-
-    fn url(&self, path: &str) -> String {
-        format!("{}{}", self.base_url, path)
     }
 
     /// Full `wss://…/v1/ws/markets` endpoint for [`ws::spawn_market_feed`].
@@ -98,82 +100,17 @@ impl UsRetailVenue {
     /// This is public reference data (no auth required per spec), but the production
     /// gateway returns 401 without auth headers, so we attach them anyway.
     pub async fn discover_binary_markets(&self) -> Result<Vec<markets::UsMarketPair>> {
-        let rb = self
-            .http
-            .get(self.url("/v1/markets"))
-            .query(&[("status", "ACTIVE"), ("limit", "500")]);
-        let rb = self.authed(rb, "GET", "/v1/markets");
-        let resp = rb
-            .send()
+        let parsed = self
+            .client
+            .markets_list_authenticated()
             .await
             .context("markets request failed")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            bail!("US retail markets returned HTTP {status}: {body}");
-        }
-        let body = resp.text().await.context("reading markets response")?;
-
-        // Parse as Value first to handle any JSON quirks
-        let mut json_val: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| {
-                let preview = &body.chars().take(4000).collect::<String>();
-                anyhow!("markets JSON parse failed: {e}\nFirst 4000 chars: {preview}")
-            })?;
-
-        // Fix stringified arrays in market objects if needed
-        if let Some(markets_array) = json_val.get_mut("markets").and_then(|v| v.as_array_mut()) {
-            for market in markets_array.iter_mut() {
-                // Check all string fields for stringified JSON arrays/objects
-                if let Some(obj) = market.as_object_mut() {
-                    for (_, val) in obj.iter_mut() {
-                        if let Some(s) = val.as_str() {
-                            // If it's a stringified array or object, try to parse it
-                            if (s.starts_with('[') && s.ends_with(']'))
-                                || (s.starts_with('{') && s.ends_with('}'))
-                            {
-                                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(s) {
-                                    *val = parsed;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let parsed: types::MarketsResponse = serde_json::from_value(json_val)
-            .map_err(|e| anyhow!("markets response decode failed: {e}"))?;
         Ok(markets::pair_markets(parsed.markets))
-    }
-
-    /// Attach the `X-PM-*` Ed25519 signature headers to an authenticated request.
-    ///
-    /// Signing is local and stateless (no token round-trip), so this is sync.
-    /// The signature covers `method + path` (e.g., `"GET/v1/account/balance"`).
-    fn authed(&self, mut rb: reqwest::RequestBuilder, method: &str, path: &str) -> reqwest::RequestBuilder {
-        for (name, value) in self.auth.signed_headers(method, path) {
-            rb = rb.header(name, value);
-        }
-        rb.header("Content-Type", "application/json")
     }
 
     /// Public connectivity probe (`GET /v1/health`, no auth).
     pub async fn health_check(&self) -> Result<()> {
-        let resp = self
-            .http
-            .get(self.url("/v1/health"))
-            .send()
-            .await
-            .context("health request failed")?;
-        let status = resp.status();
-        let body: types::HealthResponse = resp
-            .json()
-            .await
-            .context("health response decode failed")?;
-        if !status.is_success() {
-            bail!("US retail health returned HTTP {status} ({})", body.status);
-        }
+        let body = self.client.health().await.context("health request failed")?;
         debug!("US retail gateway healthy ({}) @ {}", body.status, body.timestamp);
         Ok(())
     }
@@ -253,29 +190,12 @@ impl UsRetailVenue {
     /// POST a single prepared order and map the ack to a neutral `Fill`.
     async fn submit_order(&self, intent: &OrderIntent) -> Result<Fill> {
         let body = Self::build_order(intent)?;
-        let rb = self.http.post(self.url("/v1/trading/orders")).json(&body);
-        let rb = self.authed(rb, "POST", "/v1/trading/orders");
-        let resp = rb.send().await.context("order POST failed")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let err = resp.text().await.unwrap_or_default();
-            bail!("US retail order rejected (HTTP {status}): {err}");
-        }
-        let ack: types::PlaceOrderResponse =
-            resp.json().await.context("order response decode failed")?;
-
-        // `filled_quantity` is the venue-acknowledged fill; fall back to the
-        // requested size for resting (GTC) acks that report 0 filled immediately.
-        let filled = if ack.filled_quantity > 0 {
-            Decimal::from(ack.filled_quantity)
-        } else {
-            intent.quantity
-        };
+        let ack = self.client.place_order(&body).await.context("order POST failed")?;
 
         Ok(Fill {
             order_id: OrderId(ack.order_id),
             market: intent.market.clone(),
-            filled,
+            filled: resolve_filled(ack.filled_quantity, intent),
             price: intent.price,
         })
     }
@@ -288,16 +208,11 @@ impl UsRetailVenue {
     /// can't break venue bring-up or collateral reads (the two are independent
     /// gateway services and fail independently).
     async fn fetch_balances(&self) -> Result<f64> {
-        let bal_rb = self.http.get(self.url("/v1/account/balances"));
-        let bal_rb = self.authed(bal_rb, "GET", "/v1/account/balances");
-        let bal_resp = bal_rb.send().await.context("account balances request failed")?;
-        let bal_status = bal_resp.status();
-        if !bal_status.is_success() {
-            let err = bal_resp.text().await.unwrap_or_default();
-            bail!("US account/balances failed (HTTP {bal_status}): {err}");
-        }
-        let bal_data: types::AccountBalancesResponse =
-            bal_resp.json().await.context("account balances decode failed")?;
+        let bal_data = self
+            .client
+            .account_balances()
+            .await
+            .context("account balances request failed")?;
         // Use buyingPower as the available collateral.
         Ok(bal_data.balances.first().map(|b| b.buying_power).unwrap_or(0.0))
     }
@@ -308,16 +223,11 @@ impl UsRetailVenue {
     /// affects the positions view (dashboard sync tolerates it via
     /// `unwrap_or_default`) and never the auth/collateral path.
     async fn fetch_positions(&self) -> Result<Vec<types::UsPosition>> {
-        let pos_rb = self.http.get(self.url("/v1/portfolio/positions"));
-        let pos_rb = self.authed(pos_rb, "GET", "/v1/portfolio/positions");
-        let pos_resp = pos_rb.send().await.context("portfolio positions request failed")?;
-        let pos_status = pos_resp.status();
-        if !pos_status.is_success() {
-            let err = pos_resp.text().await.unwrap_or_default();
-            bail!("US portfolio/positions failed (HTTP {pos_status}): {err}");
-        }
-        let pos_data: types::PortfolioPositionsResponse =
-            pos_resp.json().await.context("portfolio positions decode failed")?;
+        let pos_data = self
+            .client
+            .portfolio_positions()
+            .await
+            .context("portfolio positions request failed")?;
 
         let mut positions = Vec::new();
         // Positions map might have entries; also check availablePositions array.
@@ -347,16 +257,11 @@ impl Execution for UsRetailVenue {
             orders: vec![Self::build_order(&a)?, Self::build_order(&b)?],
             atomic: true,
         };
-        let rb = self.http.post(self.url("/v1/orders/batched")).json(&body);
-        let rb = self.authed(rb, "POST", "/v1/orders/batched");
-        let resp = rb.send().await.context("batched order POST failed")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let err = resp.text().await.unwrap_or_default();
-            bail!("US retail batched order rejected (HTTP {status}): {err}");
-        }
-        let ack: types::BatchedOrderResponse =
-            resp.json().await.context("batched order response decode failed")?;
+        let ack = self
+            .client
+            .place_batched_orders(&body)
+            .await
+            .context("batched order POST failed")?;
         if ack.orders.len() != 2 {
             bail!(
                 "US retail batched order: expected 2 acks, got {}",
@@ -367,28 +272,18 @@ impl Execution for UsRetailVenue {
         let to_fill = |ack: &types::PlaceOrderResponse, intent: &OrderIntent| Fill {
             order_id: OrderId(ack.order_id.clone()),
             market: intent.market.clone(),
-            filled: if ack.filled_quantity > 0 {
-                Decimal::from(ack.filled_quantity)
-            } else {
-                intent.quantity
-            },
+            filled: resolve_filled(ack.filled_quantity, intent),
             price: intent.price,
         };
         Ok([to_fill(&ack.orders[0], &a), to_fill(&ack.orders[1], &b)])
     }
 
     async fn cancel(&self, id: OrderId) -> Result<()> {
-        let path = format!("/v1/trading/orders/{}", id.0);
-        let rb = self.http.delete(self.url(&path));
-        let rb = self.authed(rb, "DELETE", &path);
-        let resp = rb.send().await.context("cancel DELETE failed")?;
-        let status = resp.status();
-        if !status.is_success() {
-            let err = resp.text().await.unwrap_or_default();
-            bail!("US retail cancel failed (HTTP {status}): {err}");
-        }
-        let ack: types::CancelOrderResponse =
-            resp.json().await.context("cancel response decode failed")?;
+        let ack = self
+            .client
+            .cancel_trading_order(&id.0)
+            .await
+            .context("cancel DELETE failed")?;
         debug!("US retail: order {} → {}", ack.order_id, ack.status);
         Ok(())
     }
@@ -414,6 +309,26 @@ impl Execution for UsRetailVenue {
             });
         }
         Ok(out)
+    }
+}
+
+/// Resolve a venue-acknowledged fill quantity, honoring resting semantics.
+///
+/// Resting (`Gtc`/`Gtd`) orders report their **real** filled amount (0 = still
+/// resting on the book) so the US lifecycle reconciler confirms the actual fill
+/// later from the positions endpoint — never fabricating one. Immediate
+/// (`Fak`/`Fok`) acks that report 0 fall back to the requested size, since a
+/// success on an immediate order means it took liquidity.
+fn resolve_filled(filled_quantity: u64, intent: &OrderIntent) -> Decimal {
+    match intent.tif {
+        TimeInForce::Gtc | TimeInForce::Gtd => Decimal::from(filled_quantity),
+        TimeInForce::Fak | TimeInForce::Fok => {
+            if filled_quantity > 0 {
+                Decimal::from(filled_quantity)
+            } else {
+                intent.quantity
+            }
+        }
     }
 }
 
@@ -516,6 +431,30 @@ mod tests {
         assert_eq!(json["orders"].as_array().unwrap().len(), 2);
         assert_eq!(json["orders"][0]["outcomeSide"], oc::LONG);
         assert_eq!(json["orders"][1]["outcomeSide"], oc::SHORT);
+    }
+
+    #[test]
+    fn resting_orders_never_fabricate_fills() {
+        use rust_decimal_macros::dec;
+        let intent = |tif| OrderIntent {
+            market: MarketId::new("game-yes"),
+            side: Side::Buy,
+            quantity: dec!(100),
+            price: dec!(0.55),
+            tif,
+            post_only: false,
+            expiration_secs: 0,
+            is_neg_risk: false,
+            fee_bps: 0,
+        };
+        // Resting (GTC/GTD) acks reporting 0 filled stay 0 — no fabricated fill.
+        assert_eq!(resolve_filled(0, &intent(TimeInForce::Gtc)), dec!(0));
+        assert_eq!(resolve_filled(0, &intent(TimeInForce::Gtd)), dec!(0));
+        // Resting partial fill is reported as-is.
+        assert_eq!(resolve_filled(40, &intent(TimeInForce::Gtc)), dec!(40));
+        // Immediate (FAK/FOK) acks reporting 0 fall back to requested size.
+        assert_eq!(resolve_filled(0, &intent(TimeInForce::Fok)), dec!(100));
+        assert_eq!(resolve_filled(25, &intent(TimeInForce::Fak)), dec!(25));
     }
 }
 

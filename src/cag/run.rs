@@ -359,8 +359,11 @@ where
             ),
         );
 
-        // Initialize squadron-scoped config (copy from config.rs defaults)
-        let squadron_config = DynamicConfig::init_for_squadron(&squadron.id).await;
+        // Load squadron-scoped config, preserving operator edits made via the
+        // Control Tower. Only seeds compile-time defaults the first time this
+        // squadron is deployed — a restart or hourly rotation reuses the stable
+        // squadron id and the persisted row, so a disabled viper stays disabled.
+        let squadron_config = DynamicConfig::load_or_init_for_squadron(&squadron.id).await;
         patrol_ctx.dynamic_config = Arc::new(RwLock::new((*squadron_config).clone()));
 
         squadron.start_patrol();

@@ -10,6 +10,8 @@ use crate::venues::core::MarketId;
 
 use super::types::{self, outcome as oc};
 
+use chrono::{DateTime, Utc};
+
 /// A tradeable binary market reduced to its two neutral leg ids.
 #[derive(Debug, Clone)]
 pub struct UsMarketPair {
@@ -19,6 +21,24 @@ pub struct UsMarketPair {
     pub long: MarketId,
     /// `SHORT` (NO) leg symbol.
     pub short: MarketId,
+    /// Market close/expiry time, parsed from the gateway's `endDate`. `None`
+    /// when absent/unparseable — treated as an always-open market that never
+    /// rotates. Drives the squadron's wind-down / stand-down lifecycle.
+    pub close_time: Option<DateTime<Utc>>,
+}
+
+/// Parse the gateway's `endDate` string into a UTC instant.
+///
+/// Accepts RFC3339 (`2026-06-16T20:00:00Z`); returns `None` for empty or
+/// unparseable values so a missing close time degrades to "always open" rather
+/// than blocking the market.
+fn parse_close_time(end_date: &str) -> Option<DateTime<Utc>> {
+    if end_date.is_empty() {
+        return None;
+    }
+    DateTime::parse_from_rfc3339(end_date)
+        .ok()
+        .map(|dt| dt.with_timezone(&Utc))
 }
 
 /// Reduce raw markets to binary `LONG`/`SHORT` pairs.
@@ -93,6 +113,7 @@ pub fn pair_markets(markets: Vec<types::UsMarket>) -> Vec<UsMarketPair> {
                 question: m.question,
                 long: MarketId::new(l),
                 short: MarketId::new(s),
+                close_time: parse_close_time(&m.end_date),
             });
         }
     }
@@ -140,6 +161,26 @@ mod tests {
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].long.as_str(), "chiefs-sb-lx-yes");
         assert_eq!(pairs[0].short.as_str(), "chiefs-sb-lx-no");
+    }
+
+    #[test]
+    fn parses_close_time_from_end_date() {
+        let mut m = market(
+            "chiefs-sb-lx",
+            "ACTIVE",
+            vec![inst("chiefs-sb-lx-yes", "LONG"), inst("chiefs-sb-lx-no", "SHORT")],
+        );
+        m.end_date = "2026-06-16T20:00:00Z".to_string();
+        let pairs = pair_markets(vec![m]);
+        assert_eq!(pairs.len(), 1);
+        assert_eq!(
+            pairs[0].close_time,
+            Some("2026-06-16T20:00:00Z".parse::<chrono::DateTime<chrono::Utc>>().unwrap())
+        );
+
+        // Empty / unparseable endDate → None (always-open market).
+        let m2 = market("no-date", "ACTIVE", vec![inst("nd-yes", "LONG"), inst("nd-no", "SHORT")]);
+        assert_eq!(pair_markets(vec![m2])[0].close_time, None);
     }
 
     #[test]

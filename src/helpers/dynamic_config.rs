@@ -371,6 +371,22 @@ impl DynamicConfig {
         cfg
     }
 
+    /// Load a squadron's persisted config, seeding compile-time defaults **only**
+    /// if no row exists yet.
+    ///
+    /// Unlike [`init_for_squadron`], this never clobbers operator edits made via
+    /// the Control Tower. Startup/rotation paths must use this so a disabled
+    /// viper (or any tuned param) survives a process restart and hourly market
+    /// rotation instead of silently reverting to defaults.
+    pub async fn load_or_init_for_squadron(squadron_id: &str) -> Arc<Self> {
+        if let Some(pool) = db::pool() {
+            if db::squadron_config_get(pool, squadron_id).await.is_some() {
+                return Self::load_for_squadron(squadron_id).await;
+            }
+        }
+        Self::init_for_squadron(squadron_id).await
+    }
+
     /// Persist this config for a specific squadron.
     pub async fn save_for_squadron(&self, squadron_id: &str) {
         if let Some(pool) = db::pool() {

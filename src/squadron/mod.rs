@@ -226,11 +226,19 @@ impl Squadron {
         raptors: SquadronRaptors,
     ) -> Self {
         let deployed_at = Utc::now();
+        // Stable identity: `{asset}-{cadence}` — deliberately WITHOUT a timestamp.
+        //
+        // The squadron id is the persistence key for its operator config
+        // (`squadron_configs` row, read/written by the Control Tower). Embedding
+        // `deployed_at` here made the id change on every restart and every hourly
+        // market rotation, orphaning the saved config and silently reverting
+        // operator edits (e.g. a disabled viper re-enabling itself on restart).
+        // `deployed_at` is retained as its own field for sorting/display, so we
+        // lose no information by keeping the id stable across deployments.
         let id = format!(
-            "{}-{}-{}",
+            "{}-{}",
             asset.slug(),
             if market.market_close_time.is_some() { "hourly" } else { "open" },
-            deployed_at.format("%Y-%m-%dT%H:%M:%SZ"),
         );
         Self {
             id,
