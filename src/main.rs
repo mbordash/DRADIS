@@ -171,7 +171,7 @@ async fn main() -> Result<()> {
                 let silent_secs = now_secs.saturating_sub(last_beat);
                 if silent_secs > PROCESS_WATCHDOG_TIMEOUT_SECS {
                     eprintln!(
-                        "🚨 OS WATCHDOG: trading loop silent for {}s (limit={}s) \
+                        " OS WATCHDOG: trading loop silent for {}s (limit={}s) \
                          — calling process::exit(1) to trigger Docker restart",
                         silent_secs, PROCESS_WATCHDOG_TIMEOUT_SECS
                     );
@@ -347,7 +347,7 @@ async fn main() -> Result<()> {
 
     let mut startup_balance = dec!(0);
     for i in 1..=3 {
-        info!("🔍 Initializing portfolio balance (Attempt {}/3)...", i);
+        info!(" Initializing portfolio balance (Attempt {}/3)...", i);
         let mut req = BalanceAllowanceRequest::default();
         req.asset_type = AssetType::Collateral;
         match trading_client.balance_allowance(req).await {
@@ -359,10 +359,10 @@ async fn main() -> Result<()> {
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
-    info!("💰 Starting portfolio value: ${:.2}", startup_balance);
+    info!(" Starting portfolio value: ${:.2}", startup_balance);
 
     // ── Startup: cancel any GTC orders left over from the previous session ───
-    info!("🧹 Cancelling any leftover open orders from previous session...");
+    info!(" Cancelling any leftover open orders from previous session...");
     for i in 0..MAX_CANCEL_RETRIES {
         let delay = BASE_CANCEL_RETRY_DELAY_MS * (1 << i);
         match tokio::time::timeout(Duration::from_secs(8), trading_client.as_ref().cancel_all_orders()).await {
@@ -389,7 +389,7 @@ async fn main() -> Result<()> {
     // purge_stale_open_positions (called inside sync_open_positions_with_chain)
     // already removes any rows whose tokens are no longer on-chain, which covers
     // all the crash/orphan cases the blanket purge was originally intended to handle.
-    info!("🔗 Syncing open_positions DB with on-chain holdings...");
+    info!(" Syncing open_positions DB with on-chain holdings...");
     dradis::tasks::cleanup::sync_open_positions_with_chain(safe_address).await;
 
     // ── Phase 3f-6: Spawn one market loop per asset ──────────────────────────
@@ -410,7 +410,7 @@ async fn main() -> Result<()> {
     // ⚠️  DB: Phase 3f-7 — each asset has its own SQLite pool initialised above.
     //     The pools are looked up by asset slug in patrol_impl / patrol_tasks
     //     via db::pool_for(&asset_lc) so secondary assets write to their own DB.
-    info!("🗺️  Asset fleet: [{}] ({} asset{})",
+    info!("️  Asset fleet: [{}] ({} asset{})",
         assets.join(", ").to_uppercase(),
         assets.len(),
         if assets.len() == 1 { "" } else { "s" });
@@ -486,7 +486,7 @@ async fn main() -> Result<()> {
             cancel:         loop_cancel.clone(),
         };
 
-        info!("🚀 Spawning market loop for asset: {}", asset.to_uppercase());
+        info!(" Spawning market loop for asset: {}", asset.to_uppercase());
         let handle = tokio::spawn(run_market_loop(args));
 
         // Register the AbortHandle + cancel token with the CAG so stand_down_asset()

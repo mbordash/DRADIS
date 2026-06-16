@@ -89,6 +89,18 @@ pub struct SquadronSummary {
     /// a few seconds after the squadron is first registered.
     pub maker_market_name: Option<String>,
     pub deployed_at:       DateTime<Utc>,
+
+    /// Market taxonomy, resolved from the DB at request time by the API layer.
+    /// Empty in the in-registry copy (classification runs *after* registration);
+    /// `enrich_taxonomy()` populates these before the summary is serialised.
+    #[serde(default)]
+    pub market_class:      String,
+    /// Implemented raptor kinds meaningful for this squadron's market class.
+    #[serde(default)]
+    pub raptors:           Vec<String>,
+    /// Viper kinds meaningful for this squadron's market class.
+    #[serde(default)]
+    pub vipers:            Vec<String>,
 }
 
 impl SquadronSummary {
@@ -102,6 +114,9 @@ impl SquadronSummary {
             market_name:       s.market.market_name.clone(),
             maker_market_name: None,
             deployed_at:       s.deployed_at,
+            market_class:      String::new(),
+            raptors:           Vec::new(),
+            vipers:            Vec::new(),
         }
     }
 }

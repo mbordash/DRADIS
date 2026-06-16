@@ -149,6 +149,14 @@ export interface SquadronSummary {
   market_name:       string;        // primary (hourly) Polymarket market name
   maker_market_name?: string;       // window/daily maker venue name (present once fee-rate fetch completes)
   deployed_at:       string;        // ISO 8601
+
+  // ── Market taxonomy (data-driven; resolved from the DB join tables) ─────────
+  /** Resolved market domain, e.g. "crypto" | "sports" | "politics" | "unknown". */
+  market_class?:     string;
+  /** Implemented raptor kinds meaningful for this market class, e.g. ["price","funding"]. */
+  raptors?:          string[];
+  /** Viper kinds meaningful for this market class, e.g. ["arbitrage","maker"]. */
+  vipers?:           string[];
 }
 
 // ── Field descriptor for ViperCard ───────────────────────────────────────────

@@ -960,6 +960,19 @@ pub async fn set_squadron_market_class(pool: &SqlitePool, squadron_id: &str, cla
     }
 }
 
+/// Read the resolved market class for a squadron from its `squadron_configs`
+/// row. Returns `None` if the squadron has no row (or no class persisted yet).
+pub async fn get_squadron_market_class(pool: &SqlitePool, squadron_id: &str) -> Option<String> {
+    sqlx::query("SELECT market_class FROM squadron_configs WHERE squadron_id = ?")
+        .bind(squadron_id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+        .and_then(|row| row.try_get::<String, _>(0).ok())
+        .filter(|c| !c.is_empty())
+}
+
 // ─── Config history (audit log) ──────────────────────────────────────────────
 
 /// Record a config change to the append-only audit log.

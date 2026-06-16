@@ -966,7 +966,11 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
 /// ```
 async fn get_squadrons(State(s): State<ApiState>) -> Response {
     debug!("Received GET /api/squadrons");
-    Json(s.cag.list_squadrons()).into_response()
+    let mut list = s.cag.list_squadrons();
+    for summary in &mut list {
+        enrich_taxonomy(summary).await;
+    }
+    Json(list).into_response()
 }
 
 /// GET /api/squadrons/{id}
@@ -978,12 +982,32 @@ async fn get_squadron_by_id(
 ) -> Response {
     debug!("Received GET /api/squadrons/{}", id);
     match s.cag.get_squadron(&id) {
-        Some(summary) => Json(summary).into_response(),
+        Some(mut summary) => {
+            enrich_taxonomy(&mut summary).await;
+            Json(summary).into_response()
+        }
         None => {
             warn!("GET /api/squadrons/{}: not found", id);
             (StatusCode::NOT_FOUND, format!("squadron '{}' not found", id)).into_response()
         }
     }
+}
+
+/// Populate a squadron summary's market taxonomy (`market_class` + the
+/// `raptors`/`vipers` meaningful for it) from the DB at request time.
+///
+/// The class is resolved once at registration by `Squadron::classify_and_link`
+/// and persisted on the `squadron_configs` row; here we read it back and expand
+/// it through the join tables so the UI can render data-driven cards instead of
+/// a hardcoded set. Falls back to `"unknown"` (→ venue-agnostic vipers only).
+async fn enrich_taxonomy(summary: &mut crate::cag::SquadronSummary) {
+    let Some(pool) = db::pool() else { return };
+    let class = db::get_squadron_market_class(pool, &summary.id)
+        .await
+        .unwrap_or_else(|| "unknown".to_string());
+    summary.raptors = db::raptors_for_class(pool, &class).await;
+    summary.vipers = db::vipers_for_class(pool, &class).await;
+    summary.market_class = class;
 }
 
 /// GET /api/squadrons/{id}/config

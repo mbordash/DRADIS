@@ -16,45 +16,71 @@ import OpenPositionsCard from '@/components/OpenPositionsCard';
 
 // ── Raptor health panel ───────────────────────────────────────────────────────
 
+/** Display metadata per raptor kind. `flag` ties the kind to its health field
+ *  in the /api/status raptor map; kinds without a flag (future sports/politics)
+ *  render as "Pending" until their feed publishes health. */
+const RAPTOR_META: Record<
+  string,
+  { label: string; flag?: 'price_connected' | 'funding_connected'; dot: string; text: string; source: string }
+> = {
+  price:   { label: 'Price Raptor',   flag: 'price_connected',   dot: 'bg-cyan-400', text: 'text-cyan-300', source: 'Binance Spot WS' },
+  funding: { label: 'Funding Raptor', flag: 'funding_connected', dot: 'bg-teal-400', text: 'text-teal-300', source: 'Binance Funding API' },
+};
+
 function RaptorHealthPanel({
+  raptorKinds,
   raptors,
   asset,
+  marketClass,
 }: {
+  raptorKinds: string[];
   raptors?: Record<string, { price_connected: boolean; funding_connected: boolean }>;
   asset: string;
+  marketClass: string;
 }) {
   const h = raptors?.[asset];
-  const priceOk = h?.price_connected ?? false;
-  const fundingOk = h?.funding_connected ?? false;
 
   return (
     <div className="card p-4">
       <p className="label-muted mb-3">Raptor Telemetry</p>
-      {!h ? (
-        <div className="text-xs font-mono text-gray-600">No health snapshot yet for {asset.toUpperCase()}.</div>
+      {raptorKinds.length === 0 ? (
+        <div className="text-xs font-mono text-gray-600">
+          No raptors linked to the{' '}
+          <span className="text-gray-300">{marketClass || 'unknown'}</span> market class yet.
+        </div>
       ) : (
         <div className="space-y-2">
-          <div className="flex items-center justify-between px-3 py-2 rounded-lg border border-[#1e1e32] bg-[#0d0d1a]">
-            <div className="flex items-center gap-2">
-              <span className={`h-2 w-2 rounded-full ${priceOk ? 'bg-cyan-400 animate-pulse' : 'bg-red-500'}`} />
-              <span className="text-xs font-mono text-gray-300">Price Raptor</span>
-            </div>
-            <span className={`text-xs font-mono ${priceOk ? 'text-cyan-300' : 'text-red-400'}`}>
-              {priceOk ? 'Connected' : 'Reconnecting'}
-            </span>
-          </div>
-          <div className="flex items-center justify-between px-3 py-2 rounded-lg border border-[#1e1e32] bg-[#0d0d1a]">
-            <div className="flex items-center gap-2">
-              <span className={`h-2 w-2 rounded-full ${fundingOk ? 'bg-teal-400 animate-pulse' : 'bg-red-500'}`} />
-              <span className="text-xs font-mono text-gray-300">Funding Raptor</span>
-            </div>
-            <span className={`text-xs font-mono ${fundingOk ? 'text-teal-300' : 'text-red-400'}`}>
-              {fundingOk ? 'Connected' : 'Reconnecting'}
-            </span>
-          </div>
-          <div className="text-[10px] font-mono text-gray-600 pt-1">
-            Source: Binance Spot WS + Funding API
-          </div>
+          {raptorKinds.map((kind) => {
+            const meta = RAPTOR_META[kind];
+            const label = meta?.label ?? `${kind.charAt(0).toUpperCase()}${kind.slice(1)} Raptor`;
+            // Implemented raptors with a health flag report live connection;
+            // any without (roadmapped kinds) show as pending.
+            const hasFlag = !!meta?.flag;
+            const connected = hasFlag ? (h?.[meta!.flag!] ?? false) : false;
+            const dot = !hasFlag ? 'bg-gray-600' : connected ? `${meta!.dot} animate-pulse` : 'bg-red-500';
+            const statusText = !hasFlag ? 'Pending' : connected ? 'Connected' : 'Reconnecting';
+            const statusClass = !hasFlag ? 'text-gray-500' : connected ? meta!.text : 'text-red-400';
+            return (
+              <div
+                key={kind}
+                className="flex items-center justify-between px-3 py-2 rounded-lg border border-[#1e1e32] bg-[#0d0d1a]"
+              >
+                <div className="flex items-center gap-2">
+                  <span className={`h-2 w-2 rounded-full ${dot}`} />
+                  <span className="text-xs font-mono text-gray-300">{label}</span>
+                </div>
+                <span className={`text-xs font-mono ${statusClass}`}>{statusText}</span>
+              </div>
+            );
+          })}
+          {(() => {
+            const sources = raptorKinds.map((k) => RAPTOR_META[k]?.source).filter(Boolean);
+            return sources.length > 0 ? (
+              <div className="text-[10px] font-mono text-gray-600 pt-1">
+                Source: {sources.join(' + ')}
+              </div>
+            ) : null;
+          })()}
         </div>
       )}
     </div>
@@ -85,6 +111,12 @@ function SquadronInfoCard({ squadron }: { squadron: SquadronSummary }) {
           <span className="text-gray-500">Asset</span>
           <span className="text-gray-200">{squadron.asset}</span>
         </div>
+        {squadron.market_class && (
+          <div className="flex justify-between">
+            <span className="text-gray-500">Market Class</span>
+            <span className="text-indigo-300 capitalize">{squadron.market_class}</span>
+          </div>
+        )}
         <div className="flex justify-between">
           <span className="text-gray-500">State</span>
           <span className={stateColor}>{squadron.state}</span>
@@ -120,6 +152,15 @@ interface Props {
 
 export default function SquadronDetailView({ squadron, onBack }: Props) {
   const asset = squadron.asset.toLowerCase();
+
+  // Market taxonomy resolved by the backend (data-driven; falls back to the
+  // full set if an older backend didn't supply it).
+  const raptorKinds = squadron.raptors ?? [];
+  const marketClass = squadron.market_class ?? 'unknown';
+  const activeVipers =
+    squadron.vipers && squadron.vipers.length > 0
+      ? VIPER_DEFS.filter((v) => squadron.vipers!.includes(v.statusKey))
+      : VIPER_DEFS;
 
   // ── Data fetching ──────────────────────────────────────────────────────────
   // Load squadron-specific config instead of global config
@@ -181,7 +222,12 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
       {/* ── Squadron + Raptor info ────────────────────────────────────────── */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
         <SquadronInfoCard squadron={squadron} />
-        <RaptorHealthPanel raptors={status?.raptors} asset={asset} />
+        <RaptorHealthPanel
+          raptorKinds={raptorKinds}
+          raptors={status?.raptors}
+          asset={asset}
+          marketClass={marketClass}
+        />
       </div>
 
       {/* ── Performance stats for this squadron/asset ─────────────────────── */}
@@ -225,21 +271,28 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
         {/* Info banner explaining squadron configs */}
         <div className="mb-3 px-4 py-2 bg-indigo-500/5 border border-indigo-500/20 rounded-lg text-xs font-mono text-indigo-300">
           <span className="font-semibold">Squadron Config:</span> Changes here only affect this squadron.
-          Each squadron has independent viper parameters.
+          Vipers shown are those linked to the{' '}
+          <span className="capitalize text-indigo-200">{marketClass}</span> market class.
         </div>
 
         {config ? (
-          <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
-            {VIPER_DEFS.map((v) => (
-              <ViperCard
-                key={v.name}
-                viper={v}
-                config={config}
-                onPatch={handlePatch}
-                market={status?.strategy_markets[v.statusKey]}
-              />
-            ))}
-          </div>
+          activeVipers.length > 0 ? (
+            <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
+              {activeVipers.map((v) => (
+                <ViperCard
+                  key={v.name}
+                  viper={v}
+                  config={config}
+                  onPatch={handlePatch}
+                  market={status?.strategy_markets[v.statusKey]}
+                />
+              ))}
+            </div>
+          ) : (
+            <div className="card p-6 flex items-center justify-center h-32 text-gray-600 text-sm">
+              No vipers linked to the {marketClass} market class.
+            </div>
+          )
         ) : (
           <div className="card p-6 flex items-center justify-center h-32 text-gray-600 text-sm">
             Loading config…
