@@ -102,12 +102,15 @@ pub fn pair_markets(markets: Vec<types::UsMarket>) -> Vec<UsMarketPair> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::venues::us::types::{UsInstrument, UsMarket};
+    use crate::venues::us::types::UsMarket;
+    use serde_json::json;
 
-    fn inst(symbol: &str, outcome: &str) -> UsInstrument {
-        UsInstrument { symbol: symbol.to_string(), outcome: outcome.to_string(), price_scale: 1000 }
+    /// Build a legacy-`instruments` leg as a raw JSON value (the shape
+    /// `pair_markets` parses via `.get("symbol")` / `.get("outcome")`).
+    fn inst(symbol: &str, outcome: &str) -> serde_json::Value {
+        json!({ "symbol": symbol, "outcome": outcome, "priceScale": 1000 })
     }
-    fn market(slug: &str, status: &str, instruments: Vec<UsInstrument>) -> UsMarket {
+    fn market(slug: &str, status: &str, instruments: Vec<serde_json::Value>) -> UsMarket {
         UsMarket {
             id: String::new(),
             slug: slug.to_string(),

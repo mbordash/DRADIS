@@ -26,8 +26,10 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::cag::Cag;
 use crate::helpers::db;
-use crate::state::PriceState;
+use crate::squadron::{CryptoAsset, Squadron, SquadronConfig, SquadronRaptors, SquadronState};
+use crate::state::{MarketConfig, PriceState};
 use crate::venues::core::{Execution, OrderIntent, Side, TimeInForce};
 
 use super::{ws, UsRetailVenue};
@@ -53,7 +55,7 @@ const DASHBOARD_SYNC_SECS: u64 = 30;
 pub const US_ASSET: &str = "us";
 
 /// Run the US retail arbitrage loop until `cancel` fires.
-pub async fn run_us_trader(venue: Arc<UsRetailVenue>, cancel: CancellationToken) {
+pub async fn run_us_trader(venue: Arc<UsRetailVenue>, cag: Cag, cancel: CancellationToken) {
     let trade_size = env_u64(ENV_TRADE_SIZE, DEFAULT_TRADE_SIZE).max(1);
     let edge = env_decimal(ENV_ARB_EDGE, DEFAULT_ARB_EDGE);
     let filter = std::env::var(ENV_MARKET_FILTER).ok().filter(|s| !s.is_empty());
@@ -109,6 +111,13 @@ pub async fn run_us_trader(venue: Arc<UsRetailVenue>, cancel: CancellationToken)
         pair.question, pair.long, pair.short
     );
 
+    // ── Register a squadron with the CAG so the Control Tower lists it ────────
+    // The US venue runs a standalone arb loop (no intl-style patrol), but the
+    // dashboard reads squadrons from the CAG registry — so without this the UI
+    // shows zero squadrons even though the venue is live. Register a single
+    // arb-wing squadron for the selected market and drive its lifecycle state.
+    let squadron_id = register_us_squadron(&cag, &pair);
+
     // ── Stream both legs' order books ────────────────────────────────────────
     let ws_url = venue.markets_ws_url();
     let ws_auth = venue.ws_auth();
@@ -132,10 +141,17 @@ pub async fn run_us_trader(venue: Arc<UsRetailVenue>, cancel: CancellationToken)
     let mut dash_tick = tokio::time::interval(Duration::from_secs(DASHBOARD_SYNC_SECS));
     let mut cooldown_until = Instant::now();
 
+    // Squadron is now actively patrolling its market — reflect that in the UI.
+    cag.update_state(&squadron_id, SquadronState::Patrolling);
+
     loop {
         tokio::select! {
             biased;
-            _ = cancel.cancelled() => { info!("US trader: cancelled — standing down"); return; }
+            _ = cancel.cancelled() => {
+                info!("US trader: cancelled — standing down");
+                cag.update_state(&squadron_id, SquadronState::StoodDown);
+                return;
+            }
             _ = dash_tick.tick() => {
                 if let Some(p) = &pool { sync_dashboard(venue.as_ref(), p, starting).await; }
                 continue;
@@ -255,5 +271,41 @@ fn env_decimal(key: &str, default: Decimal) -> Decimal {
         .ok()
         .and_then(|s| Decimal::from_str_exact(s.trim()).ok())
         .unwrap_or(default)
+}
+
+/// Assemble and register a single arb-wing squadron for the selected US market
+/// so it appears in the Control Tower's CAG squadron list.
+///
+/// The US venue doesn't use the intl patrol/Raptor pipeline, so the signal
+/// receivers are placeholder watch channels — they exist only to satisfy the
+/// `SquadronRaptors` shape and are never read by the US arb loop. Returns the
+/// `SquadronId` for later lifecycle updates (`Patrolling` / `StoodDown`).
+fn register_us_squadron(cag: &Cag, pair: &super::markets::UsMarketPair) -> crate::squadron::SquadronId {
+    // Placeholder signal channels (US arb loop reads prices from the WS feed,
+    // not from Raptors). Receivers stay valid after the senders drop.
+    let (_, oracle_rx) = watch::channel(Decimal::ZERO);
+    let (_, velocity_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
+    let (_, drift_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO));
+    let raptors = SquadronRaptors::price_only(oracle_rx, velocity_rx, drift_rx);
+
+    let market = MarketConfig {
+        yes_token: pair.long.clone(),
+        no_token: pair.short.clone(),
+        market_name: pair.question.clone(),
+        market_close_time: None,
+        strike_price: None,
+        is_neg_risk: false,
+        condition_id: String::new(),
+        yes_fee_bps: 0,
+        no_fee_bps: 0,
+    };
+
+    let squadron = Squadron::new(
+        CryptoAsset::Custom(US_ASSET.to_uppercase()),
+        SquadronConfig::arb_wing("US Retail Arb"),
+        market,
+        raptors,
+    );
+    cag.register(&squadron)
 }
 

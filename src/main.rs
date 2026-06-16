@@ -287,7 +287,7 @@ async fn main() -> Result<()> {
                 ).await {
                     tracing::warn!("⚠️ US DB pool init failed (dashboard disabled): {e}");
                 }
-                dradis::venues::us::trader::run_us_trader(venue, cancel).await;
+                dradis::venues::us::trader::run_us_trader(venue, cag.clone(), cancel).await;
             }
             Err(e) => {
                 tracing::warn!("⚠️ US retail venue connect failed (Control Tower still live): {e}");
