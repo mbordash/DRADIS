@@ -330,6 +330,18 @@ impl Cag {
         }
     }
 
+    /// Rename a registered squadron's display name.
+    ///
+    /// Classification happens *after* registration (the squadron must exist
+    /// before its market can be classified and linked), so the venue loops call
+    /// this once the market class is resolved to give the squadron a name that
+    /// describes what it hunts — e.g. "US Sports Squadron".
+    pub fn update_name(&self, id: &SquadronId, name: String) {
+        if let Some(mut entry) = self.inner.registry.get_mut(id) {
+            entry.summary.name = name;
+        }
+    }
+
     /// Record the window/daily maker venue name for a registered squadron.
     ///
     /// Called from `run_market_loop` once the maker market fee-rate fetch

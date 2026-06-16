@@ -22,6 +22,7 @@
 //! the meantime.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -69,6 +70,7 @@ pub async fn run_us_trader(
     cag: Cag,
     raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
     markets_tx: Arc<watch::Sender<HashMap<String, String>>>,
+    process_heartbeat_secs: Arc<AtomicU64>,
     cancel: CancellationToken,
 ) {
     let filter = std::env::var(ENV_MARKET_FILTER).ok().filter(|s| !s.is_empty());
@@ -80,6 +82,9 @@ pub async fn run_us_trader(
         if cancel.is_cancelled() {
             return;
         }
+        // Keep the OS watchdog satisfied while we poll for a tradeable market —
+        // discovery can legitimately take many minutes (off-hours, thin slate).
+        touch_heartbeat(&process_heartbeat_secs);
         match venue.discover_binary_markets().await {
             Ok(markets) if !markets.is_empty() => {
                 info!(
@@ -138,6 +143,11 @@ pub async fn run_us_trader(
     // class drives which vipers this loop actually runs — no hardcoded strategy.
     let market_class = squadron.classify_and_link().await;
 
+    // Rename the squadron to describe what it hunts (its market class), now that
+    // classification has resolved. The CAG summary's name is what the Control
+    // Tower overview lists — "US Retail Arb" becomes "US Sports Squadron" etc.
+    cag.update_name(&squadron_id, us_squadron_name(&market_class));
+
     // Resolve the vipers meaningful for this market class and instantiate exactly
     // those strategy impls from the shared registry. For a US sports market this
     // is [arbitrage, maker]; for crypto it would be the full suite.
@@ -176,7 +186,7 @@ pub async fn run_us_trader(
     // Publish Raptor telemetry + active market so the squadron detail panels
     // populate (both feed `/api/status`).
     publish_us_raptor_health(&raptor_health_tx, true);
-    publish_us_strategy_market(&markets_tx, &pair.question);
+    publish_us_strategy_market(&markets_tx, &viper_kinds, &pair.question);
 
     // ── Stream both legs' order books ────────────────────────────────────────
     let ws_url = venue.markets_ws_url();
@@ -231,6 +241,9 @@ pub async fn run_us_trader(
             }
             _ = price_tick.tick() => {}
         }
+        // Pulse the OS watchdog every tick so quiet markets (no actionable
+        // signal for minutes) don't trip the 5-min silence kill-switch.
+        touch_heartbeat(&process_heartbeat_secs);
         if strategies.is_empty() || Instant::now() < cooldown_until {
             continue;
         }
@@ -277,6 +290,20 @@ pub async fn run_us_trader(
 }
 
 // ─── Strategy plumbing ────────────────────────────────────────────────────────
+
+/// Pulse the process-level OS watchdog heartbeat with the current wall-clock.
+///
+/// The watchdog (see `main.rs`) calls `process::exit(1)` if no loop has touched
+/// the heartbeat in 5 minutes. The intl patrol pulses it every iteration; the US
+/// loop must do the same or the watchdog will kill the backend after 300s of
+/// (legitimate) quiet — e.g. waiting on a thin book with no actionable signal.
+fn touch_heartbeat(hb: &AtomicU64) {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    hb.store(now, AtomicOrdering::Relaxed);
+}
 
 /// Instantiate the strategy impls whose viper kind is in `viper_kinds`.
 /// The shared registry builds all strategies; we keep only the resolved ones.
@@ -548,6 +575,19 @@ fn register_us_squadron(cag: &Cag, pair: &super::markets::UsMarketPair) -> Squad
     squadron
 }
 
+/// Derive a squadron display name from its resolved market class, so the name
+/// describes what the squadron hunts rather than a fixed "US Retail Arb".
+/// Falls back to a venue-generic name for the `unknown` class.
+fn us_squadron_name(class: &str) -> String {
+    match class {
+        "sports"   => "US Sports Squadron",
+        "politics" => "US Politics Squadron",
+        "crypto"   => "US Crypto Squadron",
+        _           => "US Retail Squadron",
+    }
+    .to_string()
+}
+
 /// Ensure a `squadron_configs` row exists for this squadron so the Control
 /// Tower's detail view can render the Viper strategy cards.
 ///
@@ -577,14 +617,18 @@ fn publish_us_raptor_health(
     });
 }
 
-/// Publish the Arbitrage Viper's active market into the `/api/status`
-/// strategy→market map so the squadron detail's Arbitrage card shows it.
+/// Publish the active market under **every** resolved viper kind into the
+/// `/api/status` strategy→market map, so each viper card in the squadron detail
+/// (Arbitrage, Maker, …) shows the market it's running on — not just Arbitrage.
 fn publish_us_strategy_market(
     tx: &watch::Sender<HashMap<String, String>>,
+    viper_kinds: &[String],
     market_name: &str,
 ) {
     tx.send_modify(|map| {
-        map.insert("arbitrage".to_string(), market_name.to_string());
+        for kind in viper_kinds {
+            map.insert(kind.clone(), market_name.to_string());
+        }
     });
 }
 

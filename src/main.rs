@@ -293,6 +293,7 @@ async fn main() -> Result<()> {
                     cag.clone(),
                     Arc::clone(&raptor_health_tx),
                     Arc::clone(&markets_tx),
+                    Arc::clone(&process_heartbeat_secs),
                     cancel,
                 ).await;
             }

@@ -376,7 +376,7 @@ export default function DashboardPage() {
               <span className="hidden sm:inline text-xs bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 rounded px-2 py-0.5 font-mono">
                 v0.4.0
               </span>
-              <NavTabs active={activeView} onChange={(v) => { setActiveView(v); if (v === 'main') setFocusedSquadronId(null); }} />
+              <NavTabs active={activeView} onChange={(v) => { setActiveView(v); setFocusedSquadronId(null); }} />
             </div>
 
             {/* Center — BSG motto */}

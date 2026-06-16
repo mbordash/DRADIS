@@ -87,6 +87,14 @@ function SquadronRow({
 
       {/* Right — mission count + state + deployed time + id */}
       <div className="flex items-center gap-3 shrink-0">
+        {sq.market_class && sq.market_class !== 'unknown' && (
+          <span
+            className="text-[10px] font-mono uppercase tracking-wide bg-violet-500/10 text-violet-300 border border-violet-500/20 rounded px-2 py-0.5"
+            title={`Market class: ${sq.market_class}`}
+          >
+            {sq.market_class}
+          </span>
+        )}
         {missionCount !== undefined && missionCount > 0 && (
           <span className="text-[10px] font-mono bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 rounded px-2 py-0.5" title={`${missionCount} active mission${missionCount === 1 ? '' : 's'}`}>
             ✈️ {missionCount}
