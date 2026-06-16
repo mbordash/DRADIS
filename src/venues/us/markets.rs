@@ -106,6 +106,10 @@ mod tests {
             start_date: String::new(),
             end_date: String::new(),
             description: String::new(),
+            active: status == "ACTIVE",
+            closed: false,
+            market_type: String::new(),
+            market_sides: Vec::new(),
             instruments,
             outcomes: Vec::new(),
         }

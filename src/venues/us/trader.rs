@@ -101,11 +101,12 @@ pub async fn run_us_trader(venue: Arc<UsRetailVenue>, cancel: CancellationToken)
 
     // ── Stream both legs' order books ────────────────────────────────────────
     let ws_url = venue.markets_ws_url();
+    let ws_auth = venue.ws_auth();
     let default_feed: PriceState = (dec!(0), dec!(0), dec!(1), dec!(0), Utc::now());
     let (long_tx, long_rx) = watch::channel(default_feed);
     let (short_tx, short_rx) = watch::channel(default_feed);
-    ws::spawn_market_feed(ws_url.clone(), pair.long.as_str().to_string(), long_tx, cancel.clone());
-    ws::spawn_market_feed(ws_url, pair.short.as_str().to_string(), short_tx, cancel.clone());
+    ws::spawn_market_feed(ws_url.clone(), pair.long.as_str().to_string(), ws_auth.clone(), long_tx, cancel.clone());
+    ws::spawn_market_feed(ws_url, pair.short.as_str().to_string(), ws_auth, short_tx, cancel.clone());
 
     // ── Dashboard wiring ─────────────────────────────────────────────────────
     // Snapshot starting collateral so portfolio P&L is session-relative, then push

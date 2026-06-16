@@ -46,7 +46,7 @@ const ENV_BASE_URL: &str = "POLYMARKET_US_BASE_URL";
 pub struct UsRetailVenue {
     http: Arc<reqwest::Client>,
     base_url: String,
-    auth: UsAuth,
+    auth: Arc<UsAuth>,
 }
 
 impl UsRetailVenue {
@@ -57,7 +57,7 @@ impl UsRetailVenue {
             .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
         let auth = UsAuth::from_env().context("US retail auth bootstrap failed")?;
 
-        let venue = Self { http, base_url, auth };
+        let venue = Self { http, base_url, auth: Arc::new(auth) };
 
         venue.health_check().await.context("US retail health check failed")?;
         // Validate the Ed25519 API key with a signed account balance probe.
@@ -79,6 +79,15 @@ impl UsRetailVenue {
     /// Full `wss://…/v1/ws/markets` endpoint for [`ws::spawn_market_feed`].
     pub fn markets_ws_url(&self) -> String {
         ws::ws_url_from_base(&self.base_url)
+    }
+
+    /// Shared Ed25519 signer for authenticating the market-data WS handshake.
+    ///
+    /// The US gateway rejects an unauthenticated WS upgrade with `401`, so the
+    /// streaming feed must sign the handshake with the same `X-PM-*` headers as
+    /// REST. The signer is re-used (re-signing per reconnect) by the feed task.
+    pub fn ws_auth(&self) -> Arc<UsAuth> {
+        Arc::clone(&self.auth)
     }
 
     /// Discover active binary (`LONG`/`SHORT`) markets via `GET /v1/markets`.

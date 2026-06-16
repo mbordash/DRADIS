@@ -15,6 +15,7 @@
 
 use rust_decimal::Decimal;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
@@ -23,8 +24,11 @@ use tokio::sync::watch;
 use tokio_tungstenite::tungstenite::Message;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
+use tungstenite::http::Uri;
+use tungstenite::ClientRequestBuilder;
 
 use crate::state::PriceState;
+use crate::venues::us::auth::UsAuth;
 
 /// Drop order-book frames whose exchange timestamp lags wall-clock by more than
 /// this, shielding strategies from a stalled stream (spec §5 "Timestamp Rejection").
@@ -108,9 +112,14 @@ fn is_stale(frame_ts_ms: i64, now_ms: i64) -> bool {
 ///
 /// Pushes `PriceState` updates into `tx`; stops cleanly when `cancel` fires.
 /// `ws_url` is the full `wss://…/v1/ws/markets` endpoint (see [`ws_url_from_base`]).
+///
+/// The US gateway rejects an unauthenticated WS upgrade with `401`, so `auth`
+/// signs the handshake with the same `X-PM-*` headers used for REST. Headers are
+/// re-signed on every (re)connect so the timestamp stays inside the replay window.
 pub fn spawn_market_feed(
     ws_url: String,
     symbol: String,
+    auth: Arc<UsAuth>,
     tx: watch::Sender<PriceState>,
     cancel: CancellationToken,
 ) {
@@ -120,7 +129,18 @@ pub fn spawn_market_feed(
                 return;
             }
 
-            let stream = match tokio_tungstenite::connect_async(&ws_url).await {
+            let request = match authed_request(&ws_url, &auth) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("⚠️ US WS request build failed for {symbol}: {e}. Retrying in {RECONNECT_DELAY_SECS}s…");
+                    if wait_or_cancel(&cancel, RECONNECT_DELAY_SECS).await {
+                        return;
+                    }
+                    continue;
+                }
+            };
+
+            let stream = match tokio_tungstenite::connect_async(request).await {
                 Ok((s, _)) => s,
                 Err(e) => {
                     warn!("⚠️ US WS connect failed for {symbol}: {e}. Retrying in {RECONNECT_DELAY_SECS}s…");
@@ -220,6 +240,20 @@ async fn wait_or_cancel(cancel: &CancellationToken, secs: u64) -> bool {
         _ = cancel.cancelled() => true,
         _ = tokio::time::sleep(std::time::Duration::from_secs(secs)) => false,
     }
+}
+
+/// Build a WS handshake request carrying freshly-signed `X-PM-*` auth headers.
+///
+/// The signature covers `GET` + the WS path (`/v1/ws/markets`), matching the
+/// REST signing scheme so the gateway accepts the upgrade. Re-signing per call
+/// keeps the timestamp inside the gateway's replay window across reconnects.
+fn authed_request(ws_url: &str, auth: &UsAuth) -> anyhow::Result<ClientRequestBuilder> {
+    let uri: Uri = ws_url.parse()?;
+    let mut builder = ClientRequestBuilder::new(uri);
+    for (name, value) in auth.signed_headers("GET", MARKETS_WS_PATH) {
+        builder = builder.with_header(name, value);
+    }
+    Ok(builder)
 }
 
 #[cfg(test)]
