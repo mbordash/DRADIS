@@ -249,6 +249,43 @@ impl Squadron {
         self.state = SquadronState::Patrolling;
     }
 
+    /// Classify this squadron's market into a `market_class` and link it to the
+    /// raptors/vipers that are meaningful for it, persisting the resolved class
+    /// onto the squadron's `squadron_configs` row.
+    ///
+    /// This is **venue-neutral core**: the category hint is derived from the
+    /// squadron's own asset (crypto assets self-identify as `crypto`; any other
+    /// asset falls back to the symbol-token / slug rules), so both the intl and
+    /// US registration paths get the same data-driven linkage. As future
+    /// `sports`/`politics` raptors are built and their `raptor_kind.implemented`
+    /// flag flipped, the matching squadrons light them up with no code change.
+    ///
+    /// Returns the resolved class. No-op-safe (`"unknown"`) if the DB pool is
+    /// not yet initialised. Call after the squadron's config row is seeded.
+    pub async fn classify_and_link(&self) -> String {
+        let Some(pool) = crate::helpers::db::pool() else {
+            return "unknown".to_string();
+        };
+        // Crypto assets self-identify; venue-specific assets (e.g. US retail)
+        // leave the category empty so the symbol-token rules drive the match.
+        let category = match &self.asset {
+            CryptoAsset::Btc | CryptoAsset::Eth | CryptoAsset::Sol => "crypto",
+            CryptoAsset::Custom(_) => "",
+        };
+        let symbols = [self.market.yes_token.as_str(), self.market.no_token.as_str()];
+        let class = crate::helpers::db::classify_market(
+            pool, category, &symbols, &self.market.market_name,
+        ).await;
+        let raptors = crate::helpers::db::raptors_for_class(pool, &class).await;
+        let vipers = crate::helpers::db::vipers_for_class(pool, &class).await;
+        crate::helpers::db::set_squadron_market_class(pool, &self.id, &class).await;
+        info!(
+            "🧬 Squadron [{}] classified as '{class}' → raptors={raptors:?}, vipers={vipers:?}",
+            self.id
+        );
+        class
+    }
+
     /// Signal RTB — no new entries, existing positions winding down.
     pub fn rtb(&mut self) {
         self.state = SquadronState::Rtb;

@@ -125,12 +125,19 @@ pub async fn run_us_trader(
     // dashboard reads squadrons from the CAG registry — so without this the UI
     // shows zero squadrons even though the venue is live. Register a single
     // arb-wing squadron for the selected market and drive its lifecycle state.
-    let squadron_id = register_us_squadron(&cag, &pair);
+    let squadron = register_us_squadron(&cag, &pair);
+    let squadron_id = squadron.id.clone();
 
     // Seed the squadron's Viper config so the detail view's strategy cards
     // render (the `/api/squadrons/{id}/config` endpoint 404s — and the UI shows
     // "Loading config…" forever — until a `squadron_configs` row exists).
     seed_squadron_config(&squadron_id).await;
+
+    // Classify the market's domain and link it to its eligible raptors/vipers
+    // via the shared, venue-neutral taxonomy (same path intl uses). A US sports
+    // market resolves to `sports` → only the venue-agnostic vipers, replacing
+    // the old hardcoded "US always gets arbitrage" assumption.
+    squadron.classify_and_link().await;
 
     // Publish Raptor telemetry + the Arbitrage Viper's active market so the
     // squadron detail panels populate (both feed `/api/status`). The US venue's
@@ -301,8 +308,9 @@ fn env_decimal(key: &str, default: Decimal) -> Decimal {
 /// The US venue doesn't use the intl patrol/Raptor pipeline, so the signal
 /// receivers are placeholder watch channels — they exist only to satisfy the
 /// `SquadronRaptors` shape and are never read by the US arb loop. Returns the
-/// `SquadronId` for later lifecycle updates (`Patrolling` / `StoodDown`).
-fn register_us_squadron(cag: &Cag, pair: &super::markets::UsMarketPair) -> crate::squadron::SquadronId {
+/// registered [`Squadron`] so the caller can classify it and drive its
+/// lifecycle state (`Patrolling` / `StoodDown`).
+fn register_us_squadron(cag: &Cag, pair: &super::markets::UsMarketPair) -> Squadron {
     // Placeholder signal channels (US arb loop reads prices from the WS feed,
     // not from Raptors). Receivers stay valid after the senders drop.
     let (_, oracle_rx) = watch::channel(Decimal::ZERO);
@@ -328,7 +336,8 @@ fn register_us_squadron(cag: &Cag, pair: &super::markets::UsMarketPair) -> crate
         market,
         raptors,
     );
-    cag.register(&squadron)
+    cag.register(&squadron);
+    squadron
 }
 
 /// Ensure a `squadron_configs` row exists for this squadron so the Control

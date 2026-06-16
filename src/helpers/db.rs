@@ -295,6 +295,174 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
         )"
     ).execute(pool).await?;
 
+    // ── Market taxonomy: market_class ↔ raptor_kind / viper_kind ──────────────
+    // Data-driven classification linking a market's domain (crypto / sports /
+    // politics / …) to the raptors (signal sources) and vipers (strategies)
+    // that are *meaningful* for it. Squadrons resolve their eligible
+    // raptors/vipers by joining through these tables instead of hardcoding a
+    // strategy list per venue, so adding a new domain (or wiring a future
+    // sports/politics raptor) is a data change, not a recompile.
+
+    // The domain a market belongs to.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS market_class (
+            id       TEXT    PRIMARY KEY,   -- 'crypto', 'sports', 'politics', 'unknown'
+            display  TEXT    NOT NULL,
+            enabled  INTEGER NOT NULL DEFAULT 1
+        )"
+    ).execute(pool).await?;
+
+    // Signal sources — one row per raptor in src/raptors/ (plus roadmapped ones).
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS raptor_kind (
+            id           TEXT    PRIMARY KEY,   -- 'price', 'funding', 'sports', 'politics'
+            display      TEXT    NOT NULL,
+            implemented  INTEGER NOT NULL DEFAULT 0   -- 0 = roadmapped, not built yet
+        )"
+    ).execute(pool).await?;
+
+    // Strategies — one row per Strategy impl in orchestrator/registry.rs.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS viper_kind (
+            id              TEXT    PRIMARY KEY,   -- 'arbitrage', 'maker', 'momentum', …
+            display         TEXT    NOT NULL,
+            venue_agnostic  INTEGER NOT NULL DEFAULT 0   -- 1 = pure order-book (arb/maker)
+        )"
+    ).execute(pool).await?;
+
+    // M:N — which raptors apply to which market class.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS market_class_raptor (
+            market_class TEXT NOT NULL REFERENCES market_class(id),
+            raptor_kind  TEXT NOT NULL REFERENCES raptor_kind(id),
+            PRIMARY KEY (market_class, raptor_kind)
+        )"
+    ).execute(pool).await?;
+
+    // M:N — which vipers apply to which market class.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS market_class_viper (
+            market_class TEXT NOT NULL REFERENCES market_class(id),
+            viper_kind   TEXT NOT NULL REFERENCES viper_kind(id),
+            PRIMARY KEY (market_class, viper_kind)
+        )"
+    ).execute(pool).await?;
+
+    // Classification rules consumed by classify_market(). Adding a new mapping
+    // (e.g. 'tennis' → sports) is one INSERT — no code change.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS market_class_rule (
+            id           INTEGER PRIMARY KEY AUTOINCREMENT,
+            pattern      TEXT    NOT NULL,
+            match_kind   TEXT    NOT NULL,   -- 'category' | 'symbol_token' | 'slug'
+            market_class TEXT    NOT NULL REFERENCES market_class(id),
+            priority     INTEGER NOT NULL DEFAULT 100,   -- lower = checked first
+            UNIQUE (pattern, match_kind)
+        )"
+    ).execute(pool).await?;
+
+    seed_market_taxonomy(pool).await?;
+
+    Ok(())
+}
+
+/// Seed the market-class taxonomy with the built-in domains, kinds, links, and
+/// classification rules. Idempotent (`INSERT OR IGNORE`) so it self-heals on
+/// every startup and never clobbers operator-added rows.
+async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
+    // market_class
+    for (id, display) in [
+        ("crypto",   "Crypto"),
+        ("sports",   "Sports"),
+        ("politics", "Politics"),
+        ("unknown",  "Unknown"),
+    ] {
+        sqlx::query("INSERT OR IGNORE INTO market_class (id, display) VALUES (?, ?)")
+            .bind(id).bind(display).execute(pool).await?;
+    }
+
+    // raptor_kind — implemented = 1 for raptors that exist in src/raptors/ today.
+    for (id, display, implemented) in [
+        ("price",    "Price Raptor (spot + velocity + drift)", 1),
+        ("funding",  "Funding Raptor (perp funding rate)",     1),
+        ("sports",   "Sports Raptor (roadmap)",                0),
+        ("politics", "Politics Raptor (roadmap)",              0),
+    ] {
+        sqlx::query("INSERT OR IGNORE INTO raptor_kind (id, display, implemented) VALUES (?, ?, ?)")
+            .bind(id).bind(display).bind(implemented).execute(pool).await?;
+    }
+
+    // viper_kind — venue_agnostic = 1 for pure order-book strategies.
+    for (id, display, agnostic) in [
+        ("arbitrage",    "Arbitrage",    1),
+        ("maker",        "Maker",        1),
+        ("momentum",     "Momentum",     0),
+        ("gboost",       "GBoost",       0),
+        ("basis",        "Basis",        0),
+        ("time_decay",   "TimeDecay",    0),
+        ("trendcapture", "TrendCapture", 0),
+    ] {
+        sqlx::query("INSERT OR IGNORE INTO viper_kind (id, display, venue_agnostic) VALUES (?, ?, ?)")
+            .bind(id).bind(display).bind(agnostic).execute(pool).await?;
+    }
+
+    // market_class → raptor_kind. sports/politics raptors are roadmapped, so
+    // they have no links yet (squadrons there get no raptor until one is built).
+    for (class, raptor) in [
+        ("crypto", "price"),
+        ("crypto", "funding"),
+    ] {
+        sqlx::query("INSERT OR IGNORE INTO market_class_raptor (market_class, raptor_kind) VALUES (?, ?)")
+            .bind(class).bind(raptor).execute(pool).await?;
+    }
+
+    // market_class → viper_kind. crypto gets the full suite; non-crypto (and the
+    // 'unknown' fallback) get only the venue-agnostic order-book strategies.
+    for (class, viper) in [
+        ("crypto", "arbitrage"), ("crypto", "maker"), ("crypto", "momentum"),
+        ("crypto", "gboost"),    ("crypto", "basis"), ("crypto", "time_decay"),
+        ("crypto", "trendcapture"),
+        ("sports",   "arbitrage"), ("sports",   "maker"),
+        ("politics", "arbitrage"), ("politics", "maker"),
+        ("unknown",  "arbitrage"), ("unknown",  "maker"),
+    ] {
+        sqlx::query("INSERT OR IGNORE INTO market_class_viper (market_class, viper_kind) VALUES (?, ?)")
+            .bind(class).bind(viper).execute(pool).await?;
+    }
+
+    // Classification rules (lower priority = checked first):
+    //   category (highest confidence) → symbol_token → slug keyword.
+    let rules: &[(&str, &str, &str, i64)] = &[
+        // pattern, match_kind, market_class, priority
+        ("crypto",   "category", "crypto",   10),
+        ("sports",   "category", "sports",   10),
+        ("politics", "category", "politics", 10),
+        // sports leagues embedded in instrument symbols (e.g. aec-nfl-lac-ten-…)
+        ("nfl",    "symbol_token", "sports", 20),
+        ("nba",    "symbol_token", "sports", 20),
+        ("mlb",    "symbol_token", "sports", 20),
+        ("nhl",    "symbol_token", "sports", 20),
+        ("ncaa",   "symbol_token", "sports", 20),
+        ("ufc",    "symbol_token", "sports", 20),
+        ("soccer", "symbol_token", "sports", 20),
+        ("tennis", "symbol_token", "sports", 20),
+        // politics keywords
+        ("election",  "symbol_token", "politics", 20),
+        ("potus",     "symbol_token", "politics", 20),
+        ("senate",    "symbol_token", "politics", 20),
+        ("president", "slug",         "politics", 30),
+        // crypto tickers
+        ("btc", "symbol_token", "crypto", 20),
+        ("eth", "symbol_token", "crypto", 20),
+        ("sol", "symbol_token", "crypto", 20),
+    ];
+    for (pattern, kind, class, prio) in rules {
+        sqlx::query(
+            "INSERT OR IGNORE INTO market_class_rule (pattern, match_kind, market_class, priority)
+             VALUES (?, ?, ?, ?)"
+        ).bind(pattern).bind(kind).bind(class).bind(prio).execute(pool).await?;
+    }
+
     Ok(())
 }
 
@@ -337,6 +505,11 @@ async fn run_migrations(pool: &SqlitePool) {
 
     // 3. Composite index for the historical P&L time-series snapshots
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_pnl_snapshots_session_ts ON pnl_snapshots(session_id, ts)")
+        .execute(pool).await;
+
+    // Market taxonomy: persist the resolved market class alongside each
+    // squadron's config so the UI/resolver can read it without re-classifying.
+    let _ = sqlx::query("ALTER TABLE squadron_configs ADD COLUMN market_class TEXT NOT NULL DEFAULT 'unknown'")
         .execute(pool).await;
 }
 
@@ -694,6 +867,97 @@ pub async fn squadron_config_list(pool: &SqlitePool) -> Vec<String> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+// ─── Market taxonomy queries ─────────────────────────────────────────────────
+
+/// Resolve the **implemented** raptor kinds linked to a market class.
+/// Roadmapped raptors (`implemented = 0`) are excluded so callers only see
+/// signal sources that actually exist today.
+pub async fn raptors_for_class(pool: &SqlitePool, class: &str) -> Vec<String> {
+    sqlx::query(
+        "SELECT r.id FROM market_class_raptor m
+         JOIN raptor_kind r ON r.id = m.raptor_kind
+         WHERE m.market_class = ? AND r.implemented = 1
+         ORDER BY r.id"
+    )
+    .bind(class)
+    .fetch_all(pool).await.ok()
+    .map(|rows| rows.into_iter().filter_map(|r| r.try_get::<String, _>(0).ok()).collect())
+    .unwrap_or_default()
+}
+
+/// Resolve the viper kinds linked to a market class.
+pub async fn vipers_for_class(pool: &SqlitePool, class: &str) -> Vec<String> {
+    sqlx::query(
+        "SELECT viper_kind FROM market_class_viper WHERE market_class = ? ORDER BY viper_kind"
+    )
+    .bind(class)
+    .fetch_all(pool).await.ok()
+    .map(|rows| rows.into_iter().filter_map(|r| r.try_get::<String, _>(0).ok()).collect())
+    .unwrap_or_default()
+}
+
+/// Classify a market into a `market_class` id using the seeded rule table.
+///
+/// Resolution order (highest-confidence first, by ascending `priority`):
+///   1. `category`     — exact case-insensitive match on the venue's category.
+///   2. `symbol_token` — the pattern appears as a `-`/`_` delimited token in
+///                       any leg symbol (e.g. `nfl` in `aec-nfl-lac-ten-…`).
+///   3. `slug`         — the pattern appears anywhere in the slug.
+///
+/// Falls back to `"unknown"`, which maps only to the venue-agnostic vipers —
+/// so a misclassified or brand-new market still trades safely (arbitrage/maker)
+/// and can never enable a domain strategy that doesn't fit it.
+pub async fn classify_market(
+    pool: &SqlitePool,
+    category: &str,
+    symbols: &[&str],
+    slug: &str,
+) -> String {
+    let rows = sqlx::query(
+        "SELECT pattern, match_kind, market_class FROM market_class_rule
+         ORDER BY priority ASC, id ASC"
+    ).fetch_all(pool).await.unwrap_or_default();
+
+    let cat = category.to_ascii_lowercase();
+    let slug_l = slug.to_ascii_lowercase();
+    // Tokenise every leg symbol on '-' and '_' for symbol_token matching.
+    let tokens: std::collections::HashSet<String> = symbols.iter()
+        .flat_map(|s| s.to_ascii_lowercase()
+            .split(['-', '_'])
+            .map(|t| t.to_string())
+            .collect::<Vec<_>>())
+        .collect();
+
+    for row in rows {
+        let pattern = row.try_get::<String, _>(0).unwrap_or_default().to_ascii_lowercase();
+        let kind    = row.try_get::<String, _>(1).unwrap_or_default();
+        let class   = row.try_get::<String, _>(2).unwrap_or_default();
+        let hit = match kind.as_str() {
+            "category"     => !cat.is_empty() && cat == pattern,
+            "symbol_token" => tokens.contains(&pattern),
+            "slug"         => !slug_l.is_empty() && slug_l.contains(&pattern),
+            _ => false,
+        };
+        if hit {
+            return class;
+        }
+    }
+    "unknown".to_string()
+}
+
+/// Persist the resolved market class onto a squadron's `squadron_configs` row.
+/// No-op if the row does not exist yet (seed the config first).
+pub async fn set_squadron_market_class(pool: &SqlitePool, squadron_id: &str, class: &str) {
+    if let Err(e) = sqlx::query("UPDATE squadron_configs SET market_class = ? WHERE squadron_id = ?")
+        .bind(class)
+        .bind(squadron_id)
+        .execute(pool)
+        .await
+    {
+        error!("❌ DB set_squadron_market_class failed [{}]: {}", squadron_id, e);
+    }
 }
 
 // ─── Config history (audit log) ──────────────────────────────────────────────

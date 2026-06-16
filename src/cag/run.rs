@@ -369,6 +369,12 @@ where
         // Register with CAG so GET /api/squadrons shows this deployment.
         let _squadron_id = patrol_ctx.cag.register(&squadron);
 
+        // Classify this market and link it to its eligible raptors/vipers via
+        // the shared DB taxonomy (crypto → price+funding + full viper suite).
+        // Same venue-neutral path the US venue uses, so adding sports/politics
+        // raptors later lights them up here too with no code change.
+        squadron.classify_and_link().await;
+
         // ── Subscribe to WS orderbook feeds for this market rotation ──────────
         let maker_tokens = maker_market_candidate_from_channel
             .as_ref()
