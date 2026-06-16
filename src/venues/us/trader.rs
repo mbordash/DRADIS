@@ -1,19 +1,25 @@
-//! US retail MVP trading loop — venue-neutral arbitrage over the [`Execution`]
-//! trait.
+//! US retail trading loop — venue-neutral strategy execution over the
+//! [`Execution`] trait.
 //!
-//! Arbitrage is the one strategy that is fully venue-agnostic: on any binary
-//! market the `YES` and `SHORT` legs settle to exactly `$1` combined, so buying
-//! both for less than `$1` locks a risk-free edge. This loop:
-//!   1. discovers an active binary market (`GET /v1/markets`),
-//!   2. streams both legs' order books over the [`ws`] feed,
-//!   3. enters via [`Execution::place_atomic`] when the combined ask is cheap
-//!      enough, and
-//!   4. logs live collateral after each entry.
+//! The loop is **data-driven**: it classifies the selected market, asks the
+//! taxonomy which vipers are meaningful for that market class
+//! (`db::vipers_for_class`), and runs exactly those strategy impls through the
+//! shared orchestrator (`evaluate_strategies`). Whatever signals they emit are
+//! dispatched onto the venue via [`Execution::place_atomic`] /
+//! [`Execution::place_order`], honoring each signal's time-in-force.
 //!
-//! It is intentionally small and self-contained so the venue can be funded and
-//! trialled end-to-end, and so other developers can read it as a reference for
-//! the `Execution` contract. Richer risk controls / persistence converge with
-//! the intl patrol loop in a later step.
+//! Flow:
+//!   1. discover an active binary market (`GET /v1/markets`),
+//!   2. classify it and resolve its eligible vipers,
+//!   3. stream both legs' order books over the [`ws`] feed,
+//!   4. each tick, build a venue-neutral [`StrategyContext`] and evaluate the
+//!      resolved strategies, dispatching their signals to the venue.
+//!
+//! Scope note (Option 1): resting-order lifecycle management — stale-order
+//! cancellation and naked-leg (orphan) re-hedge — is **not** ported here yet;
+//! that is the intl `patrol_impl` machinery and is deferred to a later step. A
+//! per-strategy position guard + post-action cooldown prevent re-entry spam in
+//! the meantime.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -22,7 +28,7 @@ use std::time::Duration;
 use chrono::Utc;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use tokio::sync::watch;
+use tokio::sync::{watch, Mutex};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -31,27 +37,27 @@ use crate::api::server::AssetRaptorHealth;
 use crate::cag::Cag;
 use crate::helpers::db;
 use crate::helpers::dynamic_config::DynamicConfig;
+use crate::orchestrator::{
+    aggregate_and_resolve_signals, evaluate_strategies, Strategy, StrategyContext,
+    StrategyRegistry,
+};
 use crate::squadron::{CryptoAsset, Squadron, SquadronConfig, SquadronRaptors, SquadronState};
-use crate::state::{MarketConfig, PriceState};
-use crate::venues::core::{Execution, OrderIntent, Side, TimeInForce};
+use crate::state::{
+    MarketConfig, MarketSnapshot, OrderParams, Position, PositionMap, PriceState, StrategySignal,
+};
+use crate::venues::core::{Execution, MarketId, OrderIntent, Side};
 
 use super::{ws, UsRetailVenue};
 
-/// Number of contracts per leg.
-const ENV_TRADE_SIZE: &str = "POLYMARKET_US_TRADE_SIZE";
-/// Minimum risk-free edge per pair (dollars), e.g. `0.02` = 2¢.
-const ENV_ARB_EDGE: &str = "POLYMARKET_US_ARB_EDGE";
 /// Optional substring filter (matched against slug / question) to pick a market.
 const ENV_MARKET_FILTER: &str = "POLYMARKET_US_MARKET_FILTER";
 
-const DEFAULT_TRADE_SIZE: u64 = 10;
-const DEFAULT_ARB_EDGE: Decimal = dec!(0.02);
 const TICK_MS: u64 = 500;
-/// Pause after each entry/attempt so the loop doesn't spam a fleeting book.
-const ARB_COOLDOWN_SECS: u64 = 30;
+/// Pause after any order placement so the loop doesn't spam a fleeting book.
+const ACTION_COOLDOWN_SECS: u64 = 30;
 /// Retry cadence while waiting for a tradeable market to appear.
 const DISCOVERY_RETRY_SECS: u64 = 30;
-/// How often to refresh the dashboard (open positions + portfolio snapshot).
+/// How often to refresh the dashboard + reload squadron config / collateral.
 const DASHBOARD_SYNC_SECS: u64 = 30;
 /// Asset slug the US venue writes its DB rows under (`logs/us-dradis.db`,
 /// surfaced in the Control Tower asset selector).
@@ -65,15 +71,9 @@ pub async fn run_us_trader(
     markets_tx: Arc<watch::Sender<HashMap<String, String>>>,
     cancel: CancellationToken,
 ) {
-    let trade_size = env_u64(ENV_TRADE_SIZE, DEFAULT_TRADE_SIZE).max(1);
-    let edge = env_decimal(ENV_ARB_EDGE, DEFAULT_ARB_EDGE);
     let filter = std::env::var(ENV_MARKET_FILTER).ok().filter(|s| !s.is_empty());
-    let size_dec = Decimal::from(trade_size);
 
-    info!(
-        "🇺🇸 US trader starting — size={trade_size} contracts, min edge=${edge}, filter={:?}",
-        filter
-    );
+    info!("🇺🇸 US trader starting — market filter={filter:?}");
 
     // ── Select a market (retry until one matches or we're cancelled) ─────────
     let pair = loop {
@@ -134,15 +134,47 @@ pub async fn run_us_trader(
     seed_squadron_config(&squadron_id).await;
 
     // Classify the market's domain and link it to its eligible raptors/vipers
-    // via the shared, venue-neutral taxonomy (same path intl uses). A US sports
-    // market resolves to `sports` → only the venue-agnostic vipers, replacing
-    // the old hardcoded "US always gets arbitrage" assumption.
-    squadron.classify_and_link().await;
+    // via the shared, venue-neutral taxonomy (same path intl uses). The returned
+    // class drives which vipers this loop actually runs — no hardcoded strategy.
+    let market_class = squadron.classify_and_link().await;
 
-    // Publish Raptor telemetry + the Arbitrage Viper's active market so the
-    // squadron detail panels populate (both feed `/api/status`). The US venue's
-    // single order-book WS feed is the price source; there is no Binance funding
-    // raptor, so funding is reported healthy to avoid a perpetual "reconnecting".
+    // Resolve the vipers meaningful for this market class and instantiate exactly
+    // those strategy impls from the shared registry. For a US sports market this
+    // is [arbitrage, maker]; for crypto it would be the full suite.
+    let viper_kinds = match db::pool() {
+        Some(p) => db::vipers_for_class(p, &market_class).await,
+        None => Vec::new(),
+    };
+    let strategies = build_strategies(&viper_kinds);
+    info!(
+        "🎯 US loop will run {} viper(s) for class '{}': {:?}",
+        strategies.len(),
+        market_class,
+        strategies.iter().map(|s| s.name()).collect::<Vec<_>>()
+    );
+    if strategies.is_empty() {
+        warn!("US trader: no runnable vipers for class '{market_class}' — dashboard only");
+    }
+
+    // Venue-neutral market config + shared position map (the per-strategy entry
+    // guard each viper consults to avoid double-entry). Populated by our own
+    // dispatches; cleared on exit.
+    let market_cfg = MarketConfig {
+        yes_token: pair.long.clone(),
+        no_token: pair.short.clone(),
+        market_name: pair.question.clone(),
+        market_close_time: None,
+        strike_price: None,
+        is_neg_risk: false,
+        condition_id: String::new(),
+        yes_fee_bps: 0,
+        no_fee_bps: 0,
+    };
+    let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+    let market_started_at = Utc::now();
+
+    // Publish Raptor telemetry + active market so the squadron detail panels
+    // populate (both feed `/api/status`).
     publish_us_raptor_health(&raptor_health_tx, true);
     publish_us_strategy_market(&markets_tx, &pair.question);
 
@@ -155,13 +187,19 @@ pub async fn run_us_trader(
     ws::spawn_market_feed(ws_url.clone(), pair.long.as_str().to_string(), ws_auth.clone(), long_tx, cancel.clone());
     ws::spawn_market_feed(ws_url, pair.short.as_str().to_string(), ws_auth, short_tx, cancel.clone());
 
-    // ── Dashboard wiring ─────────────────────────────────────────────────────
-    // Snapshot starting collateral so portfolio P&L is session-relative, then push
-    // an initial sync so the Control Tower shows the venue immediately.
+    // ── Dashboard + strategy-context state ───────────────────────────────────
+    // Snapshot starting collateral so portfolio P&L is session-relative.
     let pool = db::pool_for(US_ASSET);
     let starting = venue.collateral().await.unwrap_or(Decimal::ZERO);
+    let mut available_collateral = starting;
+    let mut session_pnl = Decimal::ZERO;
+    // Squadron DynamicConfig drives every viper's params/enables; reloaded on the
+    // dashboard tick so Control Tower edits take effect without a restart.
+    let mut dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
     if let Some(p) = &pool {
-        sync_dashboard(venue.as_ref(), p, starting).await;
+        let (coll, total) = sync_dashboard(venue.as_ref(), p, starting).await;
+        available_collateral = coll;
+        session_pnl = total - starting;
     }
 
     // ── Tick loop ────────────────────────────────────────────────────────────
@@ -182,66 +220,259 @@ pub async fn run_us_trader(
                 return;
             }
             _ = dash_tick.tick() => {
-                if let Some(p) = &pool { sync_dashboard(venue.as_ref(), p, starting).await; }
+                if let Some(p) = &pool {
+                    let (coll, total) = sync_dashboard(venue.as_ref(), p, starting).await;
+                    available_collateral = coll;
+                    session_pnl = total - starting;
+                }
+                // Pick up any Control Tower config edits for this squadron.
+                dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
                 continue;
             }
             _ = price_tick.tick() => {}
         }
-        if Instant::now() < cooldown_until {
+        if strategies.is_empty() || Instant::now() < cooldown_until {
             continue;
         }
 
-        // Snapshot both legs' best asks + depths without holding the borrow.
-        let (long_ask, long_depth) = { let b = long_rx.borrow(); (b.2, b.3) };
-        let (short_ask, short_depth) = { let b = short_rx.borrow(); (b.2, b.3) };
+        // Build a venue-neutral snapshot from both legs' live books. The US feed
+        // has no oracle/velocity/funding inputs, so those fields are zero — the
+        // order-book-only vipers (arbitrage/maker) don't read them.
+        let snapshot = build_snapshot(&long_rx, &short_rx);
 
-        // Require enough resting depth on both legs to fill the whole size.
-        if long_depth < size_dec || short_depth < size_dec {
+        let ctx = StrategyContext {
+            market: market_cfg.clone(),
+            snapshot,
+            positions: positions.clone(),
+            session_pnl,
+            starting_collateral: starting,
+            crypto_filter: US_ASSET.to_uppercase(),
+            market_started_at,
+            maker_market: None,
+            maker_snapshot: None,
+            available_collateral,
+            dynamic_config: dyn_cfg.clone(),
+        };
+
+        // Evaluate the resolved vipers and dispatch whatever they decide.
+        let eval = match evaluate_strategies(&strategies, &ctx).await {
+            Ok(e) => e,
+            Err(e) => { warn!("US strategy evaluation error: {e}"); continue; }
+        };
+        let (signals, _) = aggregate_and_resolve_signals(&eval);
+        if signals.is_empty() {
             continue;
         }
 
-        let cost = long_ask + short_ask;
-        let profit = dec!(1) - cost;
-        if profit < edge {
-            continue;
+        let mut acted = false;
+        for (strategy_name, signal) in signals {
+            if dispatch_signal(venue.as_ref(), &pool, &positions, &strategy_name, &signal, starting).await {
+                acted = true;
+            }
         }
+        if acted {
+            cooldown_until = Instant::now() + Duration::from_secs(ACTION_COOLDOWN_SECS);
+        }
+    }
+}
 
-        info!(
-            "⚡ US arb: cost {:.4} (YES {:.4} + NO {:.4}) → edge {:.4}/pair × {} = ${:.2}",
-            cost, long_ask, short_ask, profit, trade_size, profit * size_dec
-        );
+// ─── Strategy plumbing ────────────────────────────────────────────────────────
 
-        // FOK both legs (all-or-nothing, immediate). `place_atomic` now uses the
-        // gateway's engine-atomic `/v1/orders/batched` endpoint, so the pair places
-        // together or not at all — no single-leg orphan.
-        let legs = [
-            leg(&pair.long, long_ask, size_dec),
-            leg(&pair.short, short_ask, size_dec),
-        ];
-        match venue.place_atomic(legs).await {
-            Ok([a, b]) => {
-                info!(
-                    "✅ US arb filled: YES {} @ {:.4} | NO {} @ {:.4}",
-                    a.order_id, a.price, b.order_id, b.price
-                );
-                if let Some(p) = &pool {
-                    db::record_open_position(p, "ArbitrageStrategy", pair.long.as_str(), &pair.question, "YES", a.price, a.filled, false).await;
-                    db::record_open_position(p, "ArbitrageStrategy", pair.short.as_str(), &pair.question, "NO", b.price, b.filled, false).await;
-                    sync_dashboard(venue.as_ref(), p, starting).await;
+/// Instantiate the strategy impls whose viper kind is in `viper_kinds`.
+/// The shared registry builds all strategies; we keep only the resolved ones.
+fn build_strategies(viper_kinds: &[String]) -> Vec<Box<dyn Strategy>> {
+    StrategyRegistry::create_all_strategies()
+        .into_iter()
+        .filter(|s| viper_kinds.iter().any(|k| k == strategy_name_to_kind(&s.name())))
+        .collect()
+}
+
+/// Map a registry strategy name (`"ArbitrageStrategy"`) to its taxonomy viper
+/// kind id (`"arbitrage"`) so resolved kinds can select strategy impls.
+fn strategy_name_to_kind(name: &str) -> &'static str {
+    match name {
+        "ArbitrageStrategy"    => "arbitrage",
+        "MakerStrategy"        => "maker",
+        "MomentumStrategy"     => "momentum",
+        "TimeDecayStrategy"    => "time_decay",
+        "BasisStrategy"        => "basis",
+        "GboostStrategy"       => "gboost",
+        "TrendCaptureStrategy" => "trendcapture",
+        _ => "",
+    }
+}
+
+/// Build a venue-neutral [`MarketSnapshot`] from the two US leg feeds.
+/// `PriceState` layout: `(best_bid, bid_depth, best_ask, ask_depth, ts)`.
+fn build_snapshot(
+    long_rx: &watch::Receiver<PriceState>,
+    short_rx: &watch::Receiver<PriceState>,
+) -> MarketSnapshot {
+    let (yb, ybd, ya, yad) = { let b = long_rx.borrow();  (b.0, b.1, b.2, b.3) };
+    let (nb, nbd, na, nad) = { let b = short_rx.borrow(); (b.0, b.1, b.2, b.3) };
+    MarketSnapshot {
+        yes_bid: yb, yes_bid_depth: ybd, yes_ask: ya, yes_ask_depth: yad,
+        no_bid:  nb, no_bid_depth:  nbd, no_ask:  na, no_ask_depth:  nad,
+        oracle_price: dec!(0), velocity: dec!(0), velocity_1s: dec!(0), acceleration: dec!(0),
+        funding_rate: dec!(0), oracle_drift_60m: dec!(0), oracle_drift_10m: dec!(0),
+        secs_to_expiry: 0, timestamp: Utc::now(),
+    }
+}
+
+/// Map a viper's venue-neutral [`OrderParams`] to a venue [`OrderIntent`],
+/// preserving its time-in-force / post-only intent.
+fn order_params_to_intent(p: &OrderParams, side: Side) -> OrderIntent {
+    OrderIntent {
+        market: p.token_id.clone(),
+        side,
+        quantity: p.shares,
+        price: p.price,
+        tif: p.order_type,
+        post_only: p.post_only,
+        expiration_secs: 0,
+        is_neg_risk: p.is_neg_risk,
+        fee_bps: p.fee_bps,
+    }
+}
+
+/// Insert a per-strategy position guard so the viper won't re-enter the same
+/// token next tick. `paired` links the hedge partner for paired strategies.
+async fn record_guard(
+    positions: &Arc<Mutex<PositionMap>>,
+    strategy_name: &str,
+    params: &OrderParams,
+    paired: Option<&MarketId>,
+) {
+    let mut map = positions.lock().await;
+    map.insert(
+        (strategy_name.to_string(), params.token_id.clone()),
+        Position {
+            shares: params.shares,
+            avg_entry: params.price,
+            opened_at: Utc::now(),
+            close_time: None,
+            market_name: params.market_name.clone(),
+            pair_token_id: params.token_id.clone(),
+            fill_confirmed_at: None,
+            paired_leg_token_id: paired.cloned(),
+        },
+    );
+}
+
+/// Dispatch one resolved strategy signal onto the venue. Returns `true` if an
+/// order placement (or ghost simulation) occurred, so the caller applies the
+/// cooldown. Honors each signal's time-in-force; `ghost_mode` skips the venue.
+///
+/// Scope note (Option 1): naked-leg re-hedge and resting-order cancellation are
+/// not handled here — see the module-level scope note. `Exit { exit_pair }` sells
+/// the leg the signal carries and clears the pair's guards; selling the second
+/// leg is deferred to the lifecycle port.
+async fn dispatch_signal(
+    venue: &UsRetailVenue,
+    pool: &Option<sqlx::SqlitePool>,
+    positions: &Arc<Mutex<PositionMap>>,
+    strategy_name: &str,
+    signal: &StrategySignal,
+    starting: Decimal,
+) -> bool {
+    match signal {
+        StrategySignal::Entry { params, pair_params: Some(pp) } => {
+            if params.ghost_mode {
+                info!("👻 [{strategy_name}] ghost entry pair: {} + {}", params.token_id, pp.token_id);
+                record_guard(positions, strategy_name, params, Some(&pp.token_id)).await;
+                record_guard(positions, strategy_name, pp, Some(&params.token_id)).await;
+                return true;
+            }
+            let legs = [
+                order_params_to_intent(params, Side::Buy),
+                order_params_to_intent(pp, Side::Buy),
+            ];
+            match venue.place_atomic(legs).await {
+                Ok([a, b]) => {
+                    info!("✅ [{strategy_name}] entry pair: {} @ {:.4} | {} @ {:.4}",
+                        a.order_id, a.price, b.order_id, b.price);
+                    record_guard(positions, strategy_name, params, Some(&pp.token_id)).await;
+                    record_guard(positions, strategy_name, pp, Some(&params.token_id)).await;
+                    if let Some(p) = pool { sync_dashboard(venue, p, starting).await; }
+                    true
+                }
+                Err(e) => { warn!("[{strategy_name}] atomic entry failed: {e}"); false }
+            }
+        }
+        StrategySignal::Entry { params, pair_params: None } => {
+            dispatch_single(venue, pool, positions, strategy_name, params, Side::Buy, starting).await
+        }
+        StrategySignal::MakerQuote { yes, no } => {
+            let mut acted = false;
+            for q in [yes.as_ref(), no.as_ref()].into_iter().flatten() {
+                if dispatch_single(venue, pool, positions, strategy_name, q, Side::Buy, starting).await {
+                    acted = true;
                 }
             }
-            Err(e) => warn!("US arb order failed: {e}"),
+            acted
         }
-        cooldown_until = Instant::now() + Duration::from_secs(ARB_COOLDOWN_SECS);
+        StrategySignal::Exit { params, reason, exit_pair } => {
+            info!("🚪 [{strategy_name}] exit ({reason}): {} @ {:.4}", params.token_id, params.price);
+            let acted = dispatch_single(venue, pool, positions, strategy_name, params, Side::Sell, starting).await;
+            // Clear this strategy's guard for the leg (and the paired leg, if any)
+            // so it can re-enter later. Selling the second leg itself is Option 2.
+            let mut map = positions.lock().await;
+            map.remove(&(strategy_name.to_string(), params.token_id.clone()));
+            if *exit_pair {
+                let paired: Vec<_> = map.iter()
+                    .filter(|((s, _), p)| s == strategy_name
+                        && p.paired_leg_token_id.as_ref() == Some(&params.token_id))
+                    .map(|((s, t), _)| (s.clone(), t.clone()))
+                    .collect();
+                for k in paired { map.remove(&k); }
+            }
+            acted
+        }
+        StrategySignal::NoSignal => false,
+    }
+}
+
+/// Place a single venue order from viper params, recording a buy-side guard.
+async fn dispatch_single(
+    venue: &UsRetailVenue,
+    pool: &Option<sqlx::SqlitePool>,
+    positions: &Arc<Mutex<PositionMap>>,
+    strategy_name: &str,
+    params: &OrderParams,
+    side: Side,
+    starting: Decimal,
+) -> bool {
+    if params.ghost_mode {
+        info!("👻 [{strategy_name}] ghost {side:?}: {} @ {:.4} × {:.2}",
+            params.token_id, params.price, params.shares);
+        if matches!(side, Side::Buy) {
+            record_guard(positions, strategy_name, params, None).await;
+        }
+        return true;
+    }
+    match venue.place_order(order_params_to_intent(params, side)).await {
+        Ok(f) => {
+            info!("✅ [{strategy_name}] {side:?} {} @ {:.4} (order {})",
+                params.token_id, f.price, f.order_id);
+            if matches!(side, Side::Buy) {
+                record_guard(positions, strategy_name, params, None).await;
+            }
+            if let Some(p) = pool { sync_dashboard(venue, p, starting).await; }
+            true
+        }
+        Err(e) => { warn!("[{strategy_name}] {side:?} order failed: {e}"); false }
     }
 }
 
 /// Reconcile the Control Tower's view of the US venue: upsert live open positions,
-/// purge settled ones, and write a portfolio P&L snapshot.
-async fn sync_dashboard(venue: &UsRetailVenue, pool: &sqlx::SqlitePool, starting: Decimal) {
+/// purge settled ones, and write a portfolio P&L snapshot. Returns
+/// `(collateral, total_value)` so the tick loop can feed the strategy context.
+async fn sync_dashboard(venue: &UsRetailVenue, pool: &sqlx::SqlitePool, starting: Decimal) -> (Decimal, Decimal) {
     let collateral = match venue.collateral().await {
         Ok(c) => c,
-        Err(e) => { warn!("US dashboard sync: collateral query failed: {e}"); return; }
+        // On a transient collateral read failure, return zero available collateral
+        // (which safely gates strategies off) without writing a P&L snapshot.
+        Err(e) => { warn!("US dashboard sync: collateral query failed: {e}"); return (Decimal::ZERO, starting); }
     };
     let positions = venue.positions().await.unwrap_or_default();
 
@@ -260,6 +491,7 @@ async fn sync_dashboard(venue: &UsRetailVenue, pool: &sqlx::SqlitePool, starting
 
     let total = collateral + positions_value;
     db::record_pnl_snapshot(pool, total - starting, collateral, total).await;
+    (collateral, total)
 }
 
 /// `YES`/`NO` display label inferred from an instrument symbol suffix.
@@ -270,20 +502,6 @@ fn side_label(symbol: &str) -> &'static str {
     }
 }
 
-fn leg(market: &crate::venues::core::MarketId, price: Decimal, qty: Decimal) -> OrderIntent {
-    OrderIntent {
-        market: market.clone(),
-        side: Side::Buy,
-        quantity: qty,
-        price,
-        tif: TimeInForce::Fok,
-        post_only: false,
-        expiration_secs: 0,
-        is_neg_risk: false,
-        fee_bps: 0,
-    }
-}
-
 async fn wait_or_cancel(cancel: &CancellationToken, secs: u64) -> bool {
     tokio::select! {
         _ = cancel.cancelled() => true,
@@ -291,16 +509,6 @@ async fn wait_or_cancel(cancel: &CancellationToken, secs: u64) -> bool {
     }
 }
 
-fn env_u64(key: &str, default: u64) -> u64 {
-    std::env::var(key).ok().and_then(|s| s.parse().ok()).unwrap_or(default)
-}
-
-fn env_decimal(key: &str, default: Decimal) -> Decimal {
-    std::env::var(key)
-        .ok()
-        .and_then(|s| Decimal::from_str_exact(s.trim()).ok())
-        .unwrap_or(default)
-}
 
 /// Assemble and register a single arb-wing squadron for the selected US market
 /// so it appears in the Control Tower's CAG squadron list.
