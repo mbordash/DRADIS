@@ -255,8 +255,9 @@ async fn main() -> Result<()> {
     // stays alive serving it.
     #[cfg(feature = "us_retail")]
     {
-        // These are consumed only by the intl bootstrap / per-asset loops below.
-        let _ = (&markets_tx, &raptor_health_tx);
+        // markets_tx / raptor_health_tx feed the Control Tower's /api/status;
+        // the US trader publishes its squadron's Viper market + Raptor health
+        // into them so the squadron detail panels populate.
         tokio::spawn(dradis::api::server::run_api_server(
             Arc::clone(&config_tx),
             config_rx.clone(),
@@ -287,7 +288,13 @@ async fn main() -> Result<()> {
                 ).await {
                     tracing::warn!("⚠️ US DB pool init failed (dashboard disabled): {e}");
                 }
-                dradis::venues::us::trader::run_us_trader(venue, cag.clone(), cancel).await;
+                dradis::venues::us::trader::run_us_trader(
+                    venue,
+                    cag.clone(),
+                    Arc::clone(&raptor_health_tx),
+                    Arc::clone(&markets_tx),
+                    cancel,
+                ).await;
             }
             Err(e) => {
                 tracing::warn!("⚠️ US retail venue connect failed (Control Tower still live): {e}");

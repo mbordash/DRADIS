@@ -15,6 +15,7 @@
 //! the `Execution` contract. Richer risk controls / persistence converge with
 //! the intl patrol loop in a later step.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,8 +27,10 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use crate::api::server::AssetRaptorHealth;
 use crate::cag::Cag;
 use crate::helpers::db;
+use crate::helpers::dynamic_config::DynamicConfig;
 use crate::squadron::{CryptoAsset, Squadron, SquadronConfig, SquadronRaptors, SquadronState};
 use crate::state::{MarketConfig, PriceState};
 use crate::venues::core::{Execution, OrderIntent, Side, TimeInForce};
@@ -55,7 +58,13 @@ const DASHBOARD_SYNC_SECS: u64 = 30;
 pub const US_ASSET: &str = "us";
 
 /// Run the US retail arbitrage loop until `cancel` fires.
-pub async fn run_us_trader(venue: Arc<UsRetailVenue>, cag: Cag, cancel: CancellationToken) {
+pub async fn run_us_trader(
+    venue: Arc<UsRetailVenue>,
+    cag: Cag,
+    raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
+    markets_tx: Arc<watch::Sender<HashMap<String, String>>>,
+    cancel: CancellationToken,
+) {
     let trade_size = env_u64(ENV_TRADE_SIZE, DEFAULT_TRADE_SIZE).max(1);
     let edge = env_decimal(ENV_ARB_EDGE, DEFAULT_ARB_EDGE);
     let filter = std::env::var(ENV_MARKET_FILTER).ok().filter(|s| !s.is_empty());
@@ -118,6 +127,18 @@ pub async fn run_us_trader(venue: Arc<UsRetailVenue>, cag: Cag, cancel: Cancella
     // arb-wing squadron for the selected market and drive its lifecycle state.
     let squadron_id = register_us_squadron(&cag, &pair);
 
+    // Seed the squadron's Viper config so the detail view's strategy cards
+    // render (the `/api/squadrons/{id}/config` endpoint 404s — and the UI shows
+    // "Loading config…" forever — until a `squadron_configs` row exists).
+    seed_squadron_config(&squadron_id).await;
+
+    // Publish Raptor telemetry + the Arbitrage Viper's active market so the
+    // squadron detail panels populate (both feed `/api/status`). The US venue's
+    // single order-book WS feed is the price source; there is no Binance funding
+    // raptor, so funding is reported healthy to avoid a perpetual "reconnecting".
+    publish_us_raptor_health(&raptor_health_tx, true);
+    publish_us_strategy_market(&markets_tx, &pair.question);
+
     // ── Stream both legs' order books ────────────────────────────────────────
     let ws_url = venue.markets_ws_url();
     let ws_auth = venue.ws_auth();
@@ -150,6 +171,7 @@ pub async fn run_us_trader(venue: Arc<UsRetailVenue>, cag: Cag, cancel: Cancella
             _ = cancel.cancelled() => {
                 info!("US trader: cancelled — standing down");
                 cag.update_state(&squadron_id, SquadronState::StoodDown);
+                publish_us_raptor_health(&raptor_health_tx, false);
                 return;
             }
             _ = dash_tick.tick() => {
@@ -307,5 +329,45 @@ fn register_us_squadron(cag: &Cag, pair: &super::markets::UsMarketPair) -> crate
         raptors,
     );
     cag.register(&squadron)
+}
+
+/// Ensure a `squadron_configs` row exists for this squadron so the Control
+/// Tower's detail view can render the Viper strategy cards.
+///
+/// Only seeds when absent, so operator config edits made via
+/// `PATCH /api/squadrons/{id}/config` survive a restart.
+async fn seed_squadron_config(squadron_id: &str) {
+    if let Some(pool) = db::pool() {
+        if db::squadron_config_get(pool, squadron_id).await.is_none() {
+            DynamicConfig::init_for_squadron(squadron_id).await;
+        }
+    }
+}
+
+/// Publish the US venue's Raptor telemetry into the `/api/status` health map.
+///
+/// Keyed by the `us` asset slug so the squadron detail panel finds it. The US
+/// order-book WS feed is the price source; there is no separate funding raptor,
+/// so both flags track the same `connected` state.
+fn publish_us_raptor_health(
+    tx: &watch::Sender<HashMap<String, AssetRaptorHealth>>,
+    connected: bool,
+) {
+    tx.send_modify(|map| {
+        let h = map.entry(US_ASSET.to_string()).or_default();
+        h.price_connected = connected;
+        h.funding_connected = connected;
+    });
+}
+
+/// Publish the Arbitrage Viper's active market into the `/api/status`
+/// strategy→market map so the squadron detail's Arbitrage card shows it.
+fn publish_us_strategy_market(
+    tx: &watch::Sender<HashMap<String, String>>,
+    market_name: &str,
+) {
+    tx.send_modify(|map| {
+        map.insert("arbitrage".to_string(), market_name.to_string());
+    });
 }
 
