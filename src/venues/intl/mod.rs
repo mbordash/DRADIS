@@ -10,12 +10,14 @@
 
 pub mod orders;
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use std::str::FromStr;
 use tracing::info;
 
@@ -25,16 +27,18 @@ use alloy::signers::Signer;
 
 use polymarket_client_sdk_v2::clob::{Client as ClobClient, Config};
 use polymarket_client_sdk_v2::clob::types::{Side as ClobSide, SignatureType};
-use polymarket_client_sdk_v2::clob::types::request::BalanceAllowanceRequest;
+use polymarket_client_sdk_v2::clob::types::request::{BalanceAllowanceRequest, OrdersRequest};
 use polymarket_client_sdk_v2::clob::types::AssetType;
 use polymarket_client_sdk_v2::auth::state::Authenticated;
 use polymarket_client_sdk_v2::auth::Normal;
 use polymarket_client_sdk_v2::{POLYGON, PRIVATE_KEY_VAR, derive_safe_wallet};
 
+use tokio::sync::Mutex;
+
 use crate::config;
 use crate::helpers::nonce::fetch_next_nonce;
 use crate::venues::core::{
-    Execution, Fill, MarketId, OrderId, OrderIntent, Position, Side,
+    Execution, Fill, MarketId, OpenOrder, OrderId, OrderIntent, Position, Side, TimeInForce,
 };
 
 // ── V2 CTF Exchange verifying contracts (per neg-risk routing) ───────────────
@@ -61,10 +65,7 @@ pub fn market_id_from_u256(token: U256) -> MarketId {
 pub fn u256_from_market_id(market: &MarketId) -> Result<U256> {
     U256::from_str_radix(market.as_str(), 10)
         .with_context(|| format!("intl: invalid MarketId (not decimal U256): {market}"))
-}
-
-
-/// The international (self-custody) Polymarket CLOB venue.
+}/// The international (self-custody) Polymarket CLOB venue.
 pub struct IntlClobVenue {
     /// Authenticated CLOB REST client used for all order/balance operations.
     clob: Arc<ClobClient<Authenticated<Normal>>>,
@@ -78,6 +79,12 @@ pub struct IntlClobVenue {
     safe_address: Address,
     /// EOA (signer) address.
     eoa_address: Address,
+    /// Active token IDs the lifecycle engine should query for positions / open-orders.
+    ///
+    /// The patrol loop registers the current market's YES+NO tokens here so that
+    /// `positions()` and `open_orders()` can poll the CLOB for just those tokens —
+    /// avoiding a full scan of every token ever traded. Cleared on market rotation.
+    active_tokens: Arc<Mutex<HashSet<MarketId>>>,
 }
 
 impl IntlClobVenue {
@@ -112,7 +119,8 @@ impl IntlClobVenue {
         info!(" Initialized Nonce from API (Maker/Safe): {}", initial_nonce);
         let nonce = Arc::new(AtomicU64::new(initial_nonce));
 
-        Ok(Self { clob, signer, nonce, http, safe_address, eoa_address })
+        Ok(Self { clob, signer, nonce, http, safe_address, eoa_address,
+                   active_tokens: Arc::new(Mutex::new(HashSet::new())) })
     }
 
     // ── Accessors (raw infra for call sites not yet on the Execution trait) ──
@@ -145,6 +153,28 @@ impl IntlClobVenue {
     /// EOA (signer) address.
     pub fn eoa_address(&self) -> Address {
         self.eoa_address
+    }
+
+    // ── Token registry (shared OrderLifecycle support) ────────────────────────
+
+    /// Register tokens the lifecycle engine should watch (YES + NO legs of the
+    /// current market). Called by the patrol loop when entering a new market or
+    /// after placing an arb order.
+    pub async fn register_tokens(&self, tokens: &[MarketId]) {
+        let mut set = self.active_tokens.lock().await;
+        for t in tokens { set.insert(t.clone()); }
+    }
+
+    /// Remove tokens from the active set (e.g. after confirmed settlement).
+    pub async fn unregister_tokens(&self, tokens: &[MarketId]) {
+        let mut set = self.active_tokens.lock().await;
+        for t in tokens { set.remove(t); }
+    }
+
+    /// Clear all active tokens on market rotation so stale tokens are not
+    /// queried in `positions()` / `open_orders()` for the next market cycle.
+    pub async fn clear_active_tokens(&self) {
+        self.active_tokens.lock().await.clear();
     }
 
     // ── Private boundary helpers (U256 stays inside venues::intl) ────────────
@@ -230,10 +260,13 @@ impl Execution for IntlClobVenue {
         ])
     }
 
-    async fn cancel(&self, _id: OrderId) -> Result<()> {
-        // Single-order cancel is wired in a later venue-abstraction step; existing
-        // call paths use the client's `cancel_all_orders` directly for now.
-        anyhow::bail!("IntlClobVenue::cancel: single-order cancel not yet wired")
+    async fn cancel(&self, id: OrderId) -> Result<()> {
+        let id_str = id.0.clone();
+        self.clob
+            .cancel_orders(&[id_str.as_str()])
+            .await
+            .map_err(|e| anyhow::anyhow!("intl cancel failed for {}: {e}", id.0))?;
+        Ok(())
     }
 
     async fn collateral(&self) -> Result<Decimal> {
@@ -246,9 +279,67 @@ impl Execution for IntlClobVenue {
     }
 
     async fn positions(&self) -> Result<Vec<Position>> {
-        // Position reconciliation flows through the existing chain-sync path;
-        // a direct venue query is wired in a later venue-abstraction step.
-        Ok(Vec::new())
+        let tokens: Vec<MarketId> = self.active_tokens.lock().await.iter().cloned().collect();
+        let mut result = Vec::with_capacity(tokens.len());
+        for token in tokens {
+            let token_u256 = match u256_from_market_id(&token) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let mut req = BalanceAllowanceRequest::default();
+            req.asset_type = AssetType::Conditional;
+            req.token_id = Some(token_u256);
+            match self.clob.balance_allowance(req).await {
+                Ok(resp) => {
+                    let bal = Decimal::from_str(&resp.balance.to_string())
+                        .unwrap_or(Decimal::ZERO)
+                        / dec!(1_000_000);
+                    if bal >= config::MIN_ORDER_SHARES {
+                        result.push(Position {
+                            market: token,
+                            shares: bal,
+                            avg_price: Decimal::ZERO, // cost basis tracked in PositionMap, not queried here
+                        });
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        Ok(result)
+    }
+
+    async fn open_orders(&self) -> Result<Vec<OpenOrder>> {
+        // The CLOB `orders()` endpoint returns only resting/working orders for the
+        // given token. Every item returned is by definition still resting, so we
+        // map it with remaining_qty = 1 (> 0) to satisfy `is_resting() && remaining > 0`.
+        // The shared lifecycle uses this to extend the `resting_tokens` set — it does
+        // not need accurate qty/price from the venue response, only market identity.
+        let tokens: Vec<MarketId> = self.active_tokens.lock().await.iter().cloned().collect();
+        let mut result = Vec::new();
+        for token in tokens {
+            let token_u256 = match u256_from_market_id(&token) {
+                Ok(t) => t,
+                Err(_) => continue,
+            };
+            let req = OrdersRequest::builder().asset_id(token_u256).build();
+            match self.clob.orders(&req, None).await {
+                Ok(page) => {
+                    for o in page.data {
+                        result.push(OpenOrder {
+                            order_id: OrderId(o.id),
+                            market: token.clone(),
+                            side: Side::Buy,           // intl lifecycle only tracks GTC buy bids
+                            price: Decimal::ZERO,      // not consumed by lifecycle reconcile
+                            original_qty: Decimal::ONE, // CLOB only lists resting orders → qty > 0
+                            filled_qty: Decimal::ZERO,
+                            tif: TimeInForce::Gtc,
+                            pair_market: None,          // pair linkage kept in TrackedLeg
+                        });
+                    }
+                }
+                Err(_) => continue,
+            }
+        }
+        Ok(result)
     }
 }
-

@@ -367,10 +367,12 @@ impl Strategy for TrendCaptureStrategyImpl {
         // Dynamic SL: tighter in the last hour before expiry
         let secs_left_opt = market.market_close_time
             .map(|ct| (ct - Utc::now()).num_seconds());
+        // Use the base stop_loss_pct without multiplier.
+        // The previous * 1.5 multiplier inflated a 12% SL to 18%, collapsing R:R to ~1.1
+        // at max entry price. At 0.55 max entry, base 12% SL gives R:R = 20/12 = 1.67.
         let stop_loss_pct = match secs_left_opt {
             Some(s) if s < config::TRENDCAPTURE_LATE_MARKET_SL_SECS => config::TRENDCAPTURE_LATE_MARKET_STOP_LOSS_PERCENT,
-            // Scale out the stop-loss slightly to give binary option deltas structural breathing room
-            _ => dc.trendcapture_stop_loss_pct * dec!(1.5),
+            _ => dc.trendcapture_stop_loss_pct,
         };
 
         // Collect exit decision inside the lock scope, then act outside it.

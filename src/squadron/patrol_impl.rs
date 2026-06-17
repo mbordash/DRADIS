@@ -41,8 +41,9 @@ use crate::squadron::Squadron;
 use super::context::PatrolContext;
 use super::patrol_tasks::{
     spawn_pulse_task, spawn_settlement_task, spawn_cleanup_task,
-    spawn_status_task, spawn_watchdog_task,
+    spawn_status_task, spawn_watchdog_task, spawn_lifecycle_task,
 };
+use crate::venues::lifecycle::{LifecycleConfig, OrderLifecycle};
 
 // V2 CTF Exchange contracts — same as main.rs constants
 const EXCHANGE_NORMAL:   Address = address!("0xE111180000d2663C0091e4f400237545B87B996B");
@@ -225,6 +226,18 @@ impl Squadron {
             peripheral_cancel.clone(),
         );
 
+        // ── Slice 3: shared OrderLifecycle (intl migration) ──────────────────
+        // One engine drives fill-confirm, stale-cancel, and naked-leg flatten
+        // over the Execution trait surface. Runs alongside the existing bespoke
+        // arb_pair_fill_monitor / sync_position_balance paths (additive for now).
+        let lifecycle = std::sync::Arc::new(OrderLifecycle::new(LifecycleConfig::intl()));
+        spawn_lifecycle_task(
+            std::sync::Arc::clone(&lifecycle),
+            std::sync::Arc::clone(&ctx.session.venue),
+            Arc::clone(&positions),
+            peripheral_cancel.clone(),
+        );
+
         // Watchdog: fires cancel (the patrol token) on stall, stops on peripheral_cancel.
         spawn_watchdog_task(
             Arc::clone(&last_heartbeat_at),
@@ -271,6 +284,18 @@ impl Squadron {
                 &mk_config.market_name, mk_config.market_close_time, &maker_token_bids, &adoption_order,
                 Some(&orphan_tombstones),
             ).await;
+        }
+
+        // ── Slice 3: register current market tokens with the venue ────────────
+        // IntlClobVenue::positions() and open_orders() poll only the registered
+        // set so OrderLifecycle::reconcile() has real data without scanning all
+        // tokens ever traded. Clear first to drop tokens from the previous rotation.
+        ctx.session.venue.clear_active_tokens().await;
+        if hourly_yes_token != market_id_from_u256(U256::ZERO) {
+            ctx.session.venue.register_tokens(&[hourly_yes_token.clone(), hourly_no_token.clone()]).await;
+        }
+        if let Some(ref mk) = maker_market_config {
+            ctx.session.venue.register_tokens(&[mk.yes_token.clone(), mk.no_token.clone()]).await;
         }
 
         // ── Rebuild token ownership registry from the (now-reconciled) positions.
@@ -330,6 +355,10 @@ impl Squadron {
             );
         }
         let _ = markets_tx.send(strategy_markets_map);
+
+        // Extract venue Arc before the tick loop so it remains accessible inside
+        // strategy signal arms where `ctx` is shadowed by a local StrategyContext.
+        let patrol_venue = std::sync::Arc::clone(&ctx.session.venue);
 
         // ── Core tick loop: 3 arms ────────────────────────────────────────────
         let mut ticker = interval(config::main_ticker_interval());
@@ -839,7 +868,7 @@ impl Squadron {
                                                 last_trade_time.insert(sn.clone(), Instant::now());
                                                 consecutive_failures += 1; continue;
                                             }
-                                            Ok((_leg_a_id, _leg_b_id)) => {
+                                            Ok((leg_a_id, leg_b_id)) => {
                                                 let primary_wait_secs = if target_yes_token == hourly_yes_token { crate::helpers::balance::MAX_WAIT_SECS_HOURLY } else { crate::helpers::balance::MAX_WAIT_SECS_WINDOW };
                                                 let cl_s = Arc::clone(&trading_client); let ps_s = Arc::clone(&positions); let pc_s = Arc::clone(&phantom_cooldowns); let to_s = Arc::clone(&token_ownership); let sn_s = sn.clone(); let tn_s = params.token_id.clone();
                                                 let db_sn_a = sn.clone(); let db_tid_a = params.token_id.to_string(); let db_mn_a = params.market_name.clone();
@@ -886,7 +915,17 @@ impl Squadron {
                                                     let arb_tok_a = params.token_id.clone(); let arb_tok_b = pp.token_id.clone(); let arb_base_a = primary_baseline; let arb_base_b = pair_baseline;
                                                     let arb_side_a = if params.token_id == target_yes_token { "YES" } else { "NO" }.to_string();
                                                     let arb_side_b = if pp.token_id == target_yes_token { "YES" } else { "NO" }.to_string();
-                                                    let arb_wait = primary_wait_secs.max(pair_wait_secs);
+                                                    let arb_wait = if sn.contains("TimeDecay") {
+                                                        // TimeDecay resting maker bids need the full theta window
+                                                        // (up to TIME_DECAY_MAX_SECS_TO_EXPIRY = 1800s) to fill.
+                                                        // Using MAX_WAIT_SECS_HOURLY (180s) caused the arbiter to
+                                                        // declare orphan after 3 minutes while the GTC bid was still
+                                                        // resting. Match the wait to the theta window so both legs
+                                                        // get a fair chance before any orphan flatten fires.
+                                                        crate::config::TIME_DECAY_MAX_SECS_TO_EXPIRY
+                                                    } else {
+                                                        primary_wait_secs.max(pair_wait_secs)
+                                                    };
                                                     let arb_asset = asset_lc.clone();
                                                     tokio::spawn(async move {
                                                         crate::helpers::balance::arb_pair_fill_monitor(
@@ -896,6 +935,37 @@ impl Squadron {
                                                         ).await;
                                                     });
                                                 }
+
+                                                // ── Slice 3: register legs with lifecycle engine ───────────────
+                                                // Register the new arb pair in the venue's active-token set and
+                                                // track both GTC orders with the shared OrderLifecycle so the
+                                                // 30 s reconcile loop can confirm fills, cancel stale legs, and
+                                                // flatten naked legs independent of arb_pair_fill_monitor.
+                                                patrol_venue.register_tokens(
+                                                    &[params.token_id.clone(), pp.token_id.clone()]
+                                                ).await;
+                                                lifecycle.track(
+                                                    &crate::venues::core::Fill {
+                                                        order_id: crate::venues::core::OrderId(leg_a_id),
+                                                        market: params.token_id.clone(),
+                                                        filled: params.shares,
+                                                        price: actual_entry_price,
+                                                    },
+                                                    &sn,
+                                                    crate::venues::core::TimeInForce::Gtc,
+                                                    Some(pp.token_id.clone()),
+                                                ).await;
+                                                lifecycle.track(
+                                                    &crate::venues::core::Fill {
+                                                        order_id: crate::venues::core::OrderId(leg_b_id),
+                                                        market: pp.token_id.clone(),
+                                                        filled: pp.shares,
+                                                        price: actual_pair_entry_price,
+                                                    },
+                                                    &sn,
+                                                    crate::venues::core::TimeInForce::Gtc,
+                                                    Some(params.token_id.clone()),
+                                                ).await;
                                             }
                                         }
                                     } else {
@@ -991,6 +1061,10 @@ impl Squadron {
         }
 
         // ── Tear-down: stop all peripheral tasks ─────────────────────────────
+        // Clear the venue's active-token registry so the lifecycle task does not
+        // query stale tokens during the brief window between peripheral_cancel
+        // firing and the lifecycle task exiting.
+        ctx.session.venue.clear_active_tokens().await;
         peripheral_cancel.cancel();
     }
 }

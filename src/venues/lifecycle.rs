@@ -62,6 +62,21 @@ impl LifecycleConfig {
             flatten_is_neg_risk: false,
         }
     }
+
+    /// Defaults for the intl CLOB venue (Slice 3 migration).
+    ///
+    /// GTC maker bids can rest for much longer than US custodial orders: the
+    /// fill window for window/daily markets is up to 600 s. Use 30 min as the
+    /// stale-cancel threshold so slowly-filling books are not disrupted.
+    /// The existing `arb_pair_fill_monitor` handles the fast-path (30 s grace),
+    /// so this backstop only fires on genuinely abandoned resting orders.
+    pub fn intl() -> Self {
+        Self {
+            stale_order_secs: 1800, // 30 min backstop for slow resting bids
+            flatten_sell_limit: dec!(0.01),
+            flatten_is_neg_risk: false, // ArbitrageStrategy only trades standard binary markets
+        }
+    }
 }
 
 /// A resting order we placed and must reconcile. Only `Gtc`/`Gtd` buys are

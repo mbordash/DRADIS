@@ -674,3 +674,36 @@ pub fn spawn_watchdog_task(
     });
 }
 
+// ─── Shared OrderLifecycle task (Slice 3 — intl migration) ───────────────────
+
+/// Drive the shared venue-neutral [`OrderLifecycle`] for the intl CLOB venue.
+///
+/// Runs every `LIFECYCLE_SYNC_SECS` seconds. Confirms resting-order fills via
+/// [`Execution::positions`] (on-chain ERC-1155 balance polling), cancels orders
+/// that have been resting longer than `LifecycleConfig::intl().stale_order_secs`,
+/// and flattens any naked leg whose hedge partner neither filled nor still rests.
+///
+/// This is additive alongside the existing `arb_pair_fill_monitor` /
+/// `sync_position_balance` bespoke paths: both run in parallel until the
+/// legacy paths are retired in a follow-on slice.
+pub fn spawn_lifecycle_task(
+    lifecycle: Arc<crate::venues::lifecycle::OrderLifecycle>,
+    venue:     Arc<crate::venues::ActiveVenue>,
+    positions: Arc<Mutex<crate::state::PositionMap>>,
+    cancel:    CancellationToken,
+) {
+    const LIFECYCLE_SYNC_SECS: u64 = 30;
+    tokio::spawn(async move {
+        let mut ticker = interval(Duration::from_secs(LIFECYCLE_SYNC_SECS));
+        ticker.tick().await; // skip first tick — let the market settle
+        loop {
+            tokio::select! {
+                biased;
+                _ = cancel.cancelled() => return,
+                _ = ticker.tick() => {
+                    lifecycle.reconcile(venue.as_ref(), &positions).await;
+                }
+            }
+        }
+    });
+}
