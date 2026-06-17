@@ -46,8 +46,12 @@ cp src/config.balanced.rs.example src/config.rs   # or conservative/aggressive
 ```
 
 ```bash
-# 2. Deploy (builds Rust engine + Control Tower, starts Ollama, pulls model)
-./start-local.sh
+# 2. Start locally (builds Rust engine + Control Tower)
+./start-local.sh                  # Intl CLOB, BTC (default)
+./start-local.sh eth              # Intl CLOB, ETH
+VENUE=us ./start-local.sh        # US Retail venue (us_retail build)
+RUST_LOG=debug ./start-local.sh  # verbose logging
+
 tail -f logs/dradis-local.log
 ./stop-local.sh
 ```
@@ -68,13 +72,27 @@ After ~5 minutes the stack is live:
 
 DRADIS compiles for **exactly one** execution venue, chosen at build time via a Cargo
 feature. Both share the same strategy/abstraction layers through the venue-neutral
-`Execution` trait (`src/venues/core.rs`); only the venue module differs, so the unused
-venue's dependencies are stripped from the binary.
+`Execution` trait (`src/venues/core.rs`) and the shared `OrderLifecycle` reconciler
+(`src/venues/lifecycle.rs`); only the venue module differs, so the unused venue's
+dependencies are stripped from the binary.
 
 | Feature              | Venue                              | Auth                                   | Gateway                              |
 |----------------------|------------------------------------|----------------------------------------|--------------------------------------|
 | `intl_clob` *(default)* | Polymarket International (self-custody) | EOA wallet + EIP-712 over Polygon      | `clob.polymarket.com`                |
 | `us_retail`          | Polymarket US (custodial, CFTC)    | Ed25519 challenge-response → JWT        | `api.prod.polymarketexchange.com`    |
+
+### Start locally
+
+```bash
+# Intl CLOB (default)
+./start-local.sh                  # BTC
+./start-local.sh eth              # ETH
+
+# US Retail
+VENUE=us ./start-local.sh
+```
+
+### Build manually
 
 ```bash
 # International CLOB (default)
@@ -102,7 +120,7 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 > **US Retail status:** the MVP loop (`src/venues/us/trader.rs`) runs the venue-agnostic
 > **arbitrage** strategy — discover a binary market → stream both legs over WebSocket →
 > buy `YES`+`NO` for < $1 via an **engine-atomic** batched order (`/v1/orders/batched`) →
-> reconcile. Open positions and portfolio P&L appear in the Control Tower under the **`us`**
+> reconcile via `OrderLifecycle`. Open positions and portfolio P&L appear in the Control Tower under the **`us`**
 > asset selector. The Control Tower API stays live on `:9000` regardless. Crypto-hourly
 > strategies (Momentum/Maker/GBoost) remain intl-only for now.
 
@@ -358,7 +376,8 @@ OLLAMA_MODEL=mistral
 
 - **Circuit breaker**: Pauses all trading after 3 consecutive execution failures.
 - **TOCTOU-safe entry**: Atomic lock scope prevents duplicate orders.
-- **Orphaned pair detection**: Automatically scuttles one-sided hedged positions after 60s.
+- **Orphaned pair detection**: Arbiter waits 5s after first-leg confirm before acting on a missing second leg. TimeDecay GTC bids are given the full theta window (up to 30 min) before a resting order is declared orphaned.
+- **Rescue-profit gate**: Arbitrage entries are blocked when a single-leg failure cannot be rescued into profit (`yes_rescue_cost` or `no_rescue_cost ≥ $1.00` including fees and rehedge buffer).
 - **Fee Gates**: Blocks Taker Vipers from entering high-fee (10%+) markets.
 - **Chain-sync**: Startup and periodic reconciliation against on-chain wallet state — stale DB rows purged, missing positions re-adopted with correct side labels.
 
@@ -416,7 +435,16 @@ cargo build --release
 ```bash
 cp .env.example .env
 cp src/config.balanced.rs.example src/config.rs
-./start-local.sh            # builds, starts engine + Control Tower
+
+# Intl CLOB (default) — BTC
+./start-local.sh
+
+# Intl CLOB — specific asset
+./start-local.sh eth
+
+# US Retail venue
+VENUE=us ./start-local.sh
+
 tail -f logs/dradis-local.log
 ./stop-local.sh
 ```
@@ -457,6 +485,18 @@ API health: `http://YOUR_SERVER_IP:9000/api/health`
 
 ### Recently shipped
 
+- **TrendCapture & TimeDecay tuning** — Three targeted fixes from live production data:
+  - Removed `* 1.5` effective-SL multiplier in TrendCapture (SL was inflated 12% → 18%); now uses `trendcapture_stop_loss_pct` directly.
+  - `trendcapture_max_entry_price` lowered from `0.72 → 0.55` — avoids late-cycle entries where there is almost no room to run to the 20% TP.
+  - TimeDecay arb-wait deadline aligned to `TIME_DECAY_MAX_SECS_TO_EXPIRY` (1800s) so valid resting GTC bids are no longer declared orphaned at 185s.
+- **Rescue-profit gate** — Arbitrage entries are now blocked when a single-leg failure cannot be recovered into profit. The gate checks `safe_yes_bid + no_ask + fee + buffer ≥ $1.00` and `safe_no_bid + yes_ask + fee + buffer ≥ $1.00` before the collateral check, preventing entries into markets where a rescue trade would guarantee a loss.
+- **Shared OrderLifecycle (Slice 3)** — Venue-neutral position reconciler wired end-to-end for the Intl CLOB venue:
+  - `OrderLifecycle::reconcile()` polls `Execution::positions()` + `open_orders()` every 30s and flattens truly stale positions, replacing bespoke per-venue polling.
+  - `IntlClobVenue` now fully implements `cancel()`, `positions()`, `open_orders()`, and an `active_tokens` registry (cleared on rotation, populated at arb entry time).
+  - `LifecycleConfig::intl()` preset — 30-min stale-order backstop, `flatten_sell_limit: $0.01`.
+  - `spawn_lifecycle_task()` in `patrol_tasks.rs` wires the reconcile loop to the peripheral cancel token; `lifecycle.track()` fires on every arb entry success.
+  - First-leg confirm grace reduced 30s → 5s: once one arb leg confirms, the missing leg has only 5s as a free maker before the arbiter acts.
+  - Token sovereignty cooldown now fires at both rejection sites in `patrol_impl.rs`, eliminating a 7,000+/hr spin-loop.
 - **US Retail venue (MVP)** — optional `us_retail` build target for the CFTC-regulated Polymarket US exchange; runs the arbitrage strategy with engine-atomic batched orders and live dashboard support.
 - **Phase 3f-7 — Per-asset SQLite DB pools** — Each asset in the fleet now owns its own SQLite file (`logs/btc-dradis.db`, `logs/eth-dradis.db`, etc.):
   - `db::init_for_asset()` / `db::pool_for()` / `db::pool_for_opt()` replace the single global pool
@@ -485,7 +525,8 @@ API health: `http://YOUR_SERVER_IP:9000/api/health`
 - **Viper hot-enable** — All Vipers always instantiated at startup; toggle any live from Control Tower with no restart
 
 ### Next up
-- US Retail venue hardening — live private fill feed; active position exits
+- US Retail venue hardening — live private fills WebSocket; US re-hedge on single-leg failure
+- Kalshi venue integration (venue abstraction layer is ready; community PRs welcome)
 
 ### Medium-term
 - Static deployment profiles (`profiles.toml`) with per-profile P&L tracking
@@ -541,9 +582,9 @@ The safe pattern: bump the suffix in `GBOOST_MODEL_PATH` (e.g. `v14f` → `v15f`
 
 **Can I enable a Viper mid-session?** Yes — all seven are always instantiated. Toggle via Control Tower or `PATCH /api/config`. Takes effect on the next 50ms tick.
 
-**Does DRADIS support the US Polymarket API?** Yes.  Polymarket's **US platform** is a separate, custodial, CFTC-regulated exchange with web2 auth (API key / secret / session token) and string/UUID market IDs. We have **venue abstraction** so a build can target either market via a Cargo feature flag (`intl_clob` today, `us_retail` planned) — single-venue per binary, so the US deployment carries none of the Polygon crypto weight and stays inside its own regulatory/network footprint. 
+**Does DRADIS support the US Polymarket API?** Yes.  Polymarket's **US platform** is a separate, custodial, CFTC-regulated exchange with web2 auth (API key / secret / session token) and string/UUID market IDs. We have **venue abstraction** so a build can target either market via a Cargo feature flag (`intl_clob` default, `us_retail` available) — single-venue per binary, so the US deployment carries none of the Polygon crypto weight and stays inside its own regulatory/network footprint. Start a US build with `VENUE=us ./start-local.sh`.
 
-**What about Kalshi?** Not yet. With our venue abstraction layer, it is now possible to create an integration with Kalshi. We will review PRs from the community if offered.
+**What about Kalshi?** Not yet implemented, but the venue abstraction layer (`Execution` trait + `OrderLifecycle`) is complete, so adding Kalshi is a matter of implementing one trait. We will review PRs from the community if offered.
 
 **Control Tower shows "Offline"?** Check: (1) DRADIS running? (2) `curl http://localhost:9000/api/health`? (3) Docker — same `dradis-net` network?
 
