@@ -944,14 +944,33 @@ impl Strategy for GboostStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         // Maintain history and trigger background retrains.
         // This happens regardless of ENABLE_GBOOST_TRADING so the model can learn.
-        // Push the snapshot from the market GBoost actually TRADES on (daily/maker when
-        // available, hourly otherwise).  Previously ctx.snapshot (hourly) was always pushed,
-        // meaning the model was trained on hourly OBI features but predicted from daily OBI
-        // features — a fundamental mismatch.  Near hourly expiry the hourly OBI freezes at
-        // ±0.99, flooding the history buffer with homogeneous features and causing perpetual
-        // to auto-stop at 1 tree.  Using the daily snapshot keeps features healthy.
-        let training_snapshot = if ctx.maker_snapshot.is_some() {
-            ctx.maker_snapshot.as_ref().unwrap().clone()
+        //
+        // Snapshot sourcing strategy:
+        //   OBI / spread / price features → from the DAILY/maker market (what we trade)
+        //   Oracle / momentum features    → from the HOURLY snapshot (always fresh Binance WS)
+        //
+        // The daily CLOB WS only fires when someone places/changes an order on the daily book.
+        // Between daily order updates the maker_snapshot.oracle_price is frozen at the last
+        // received value.  60 frozen oracle prices → hist_vol ≈ 0.00 → the model predicts
+        // direction from OBI alone with no momentum context, producing unreliable high-confidence
+        // calls (seen in 2026-06-17 T1: vol=0.00, P(UP)=0.046 → SL hit for -$0.49).
+        //
+        // The hourly snapshot's oracle fields (oracle_price, velocity, velocity_1s, acceleration,
+        // funding_rate, oracle_drift_10m, oracle_drift_60m) are populated directly from the
+        // Binance price raptor WS and are always current to the most recent WS tick.
+        // Overriding the daily oracle fields with the hourly values ensures the training history
+        // always reflects live Binance momentum, and hist_vol is computed from real BTC movement.
+        let training_snapshot = if let Some(ref maker_snap) = ctx.maker_snapshot {
+            let mut s = maker_snap.clone();
+            // Override oracle/momentum fields with the always-fresh hourly snapshot values.
+            s.oracle_price     = ctx.snapshot.oracle_price;
+            s.velocity         = ctx.snapshot.velocity;
+            s.velocity_1s      = ctx.snapshot.velocity_1s;
+            s.acceleration     = ctx.snapshot.acceleration;
+            s.funding_rate     = ctx.snapshot.funding_rate;
+            s.oracle_drift_60m = ctx.snapshot.oracle_drift_60m;
+            s.oracle_drift_10m = ctx.snapshot.oracle_drift_10m;
+            s
         } else {
             ctx.snapshot.clone()
         };
@@ -1009,6 +1028,29 @@ impl Strategy for GboostStrategyImpl {
                 );
                 return Ok(StrategySignal::NoSignal);
             }
+
+            // ── Gate: hourly strong-trend block for daily entries ──────────────
+            // When the current hourly market shows BTC strongly trending UP
+            // (hourly YES bid > GBOOST_HOURLY_STRONG_TREND_BLOCK), entering DAILY NO
+            // is systematically losing — the daily YES price follows the hourly.
+            // Similarly, when hourly is strongly DOWN, entering DAILY YES is adverse.
+            //
+            // Evidence: 2026-06-17 T1 — hourly YES bid=$0.69 when GBoost entered DAILY NO
+            // at $0.45.  DAILY NO fell to $0.39 as the hourly resolved YES (-$0.49 loss).
+            // This gate at 0.65 would have blocked it (0.69 > 0.65).
+            let trend_block = config::GBOOST_HOURLY_STRONG_TREND_BLOCK.to_f64().unwrap_or(0.65);
+            let hourly_strong_up   = hourly_yes_bid_f > trend_block;
+            let hourly_strong_down = hourly_yes_ask_f < (1.0 - trend_block);
+            if hourly_strong_up || hourly_strong_down {
+                tracing::debug!(
+                    "🚫 GBoost entry blocked: hourly strong trend \
+                     (yes_bid={:.3} strong_up={} yes_ask={:.3} strong_down={} threshold={:.2})",
+                    hourly_yes_bid_f, hourly_strong_up,
+                    hourly_yes_ask_f, hourly_strong_down,
+                    trend_block
+                );
+                return Ok(StrategySignal::NoSignal);
+            }
         }
 
         // ── Gate: expiry guard ────────────────────────────────────────────────
@@ -1022,6 +1064,28 @@ impl Strategy for GboostStrategyImpl {
 
         let target_snapshot = if ctx.maker_snapshot.is_some() {
             ctx.maker_snapshot.as_ref().unwrap()
+        } else {
+            &ctx.snapshot
+        };
+
+        // Build a prediction snapshot that mirrors the training snapshot convention:
+        // daily OBI/price features from the maker snapshot, but oracle/momentum fields
+        // patched from the hourly snapshot (always fresh from the Binance price raptor).
+        // This keeps training features and prediction features consistent — the model was
+        // trained with fresh oracle data (from push_snapshot above), so predictions must
+        // also use fresh oracle data.
+        let patched_maker_snapshot_storage: crate::state::MarketSnapshot;
+        let predict_snapshot: &crate::state::MarketSnapshot = if ctx.maker_snapshot.is_some() {
+            let mut s = ctx.maker_snapshot.as_ref().unwrap().clone();
+            s.oracle_price     = ctx.snapshot.oracle_price;
+            s.velocity         = ctx.snapshot.velocity;
+            s.velocity_1s      = ctx.snapshot.velocity_1s;
+            s.acceleration     = ctx.snapshot.acceleration;
+            s.funding_rate     = ctx.snapshot.funding_rate;
+            s.oracle_drift_60m = ctx.snapshot.oracle_drift_60m;
+            s.oracle_drift_10m = ctx.snapshot.oracle_drift_10m;
+            patched_maker_snapshot_storage = s;
+            &patched_maker_snapshot_storage
         } else {
             &ctx.snapshot
         };
@@ -1077,7 +1141,7 @@ impl Strategy for GboostStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
-        let p_yes_up = match self.predict(target_snapshot) {
+        let p_yes_up = match self.predict(predict_snapshot) {
             Some(p) => p,
             None    => return Ok(StrategySignal::NoSignal),
         };

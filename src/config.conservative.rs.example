@@ -325,7 +325,7 @@ pub const GBOOST_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.70);
 /// Minimum historical volatility regime required for a GBoost entry.
 /// Conservative: 0.005 — stricter than default; requires more oracle movement before allowing
 /// entries.  Blocks entries during low-vol, low-confidence oracle environments.
-pub const GBOOST_MIN_HIST_VOL: f64 = 0.005;
+pub const GBOOST_MIN_HIST_VOL: f64 = 0.025; // Conservative: stricter oracle activity requirement before entry
 pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.40);
 pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(4.0);
 pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300;
@@ -351,6 +351,13 @@ pub const GBOOST_MAX_SNAPSHOT_AGE_SECS: i64 = 10;
 /// Guards against entering a daily position when the hourly market is near-resolved.
 pub const GBOOST_MIN_HOURLY_YES_BID: Decimal = dec!(0.05);
 pub const GBOOST_MAX_HOURLY_YES_ASK: Decimal = dec!(0.95);
+
+/// When trading the DAILY market, block DAILY NO entries if hourly YES bid > threshold
+/// (strong hourly uptrend → daily NO falls) and block DAILY YES entries if hourly YES
+/// ask < (1 − threshold) (strong hourly downtrend → daily YES falls).
+/// 0.60 = conservative: wider protection zone, only enters when hourly is 40–60%.
+/// Evidence: 2026-06-17 T1 hourly YES was 0.69 when GBoost entered DAILY NO → −$0.49 loss.
+pub const GBOOST_HOURLY_STRONG_TREND_BLOCK: Decimal = dec!(0.60);
 
 /// Seconds BTC spot must stay below (daily_strike − BASIS_BTC_ORACLE_STRIKE_BUFFER)
 /// before GBoost YES entries are suppressed. 3600s = 60 min sustained below-strike.
