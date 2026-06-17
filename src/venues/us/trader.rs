@@ -25,7 +25,7 @@
 //! a shared `OrderLifecycle` over an extended `Execution` trait is the eventual
 //! Option C convergence.)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -51,7 +51,8 @@ use crate::state::{
     MarketConfig, MarketPhase, MarketSnapshot, OrderParams, Position, PositionMap, PriceState,
     StrategySignal,
 };
-use crate::venues::core::{Execution, Fill, MarketId, OrderId, OrderIntent, Side, TimeInForce};
+use crate::venues::core::{Execution, MarketId, OrderIntent, Side};
+use crate::venues::lifecycle::{LifecycleConfig, OrderLifecycle};
 
 use super::{ws, UsRetailVenue};
 
@@ -75,13 +76,8 @@ const MARKET_RTB_WINDOW_SECS: i64 = 120; // 2 minutes
 /// naked-leg detection). Short enough to bound directional exposure on a resting
 /// maker leg, long enough not to hammer the positions endpoint.
 const LIFECYCLE_SYNC_SECS: u64 = 10;
-/// Cancel a resting order we placed that hasn't filled within this many seconds —
-/// it has drifted away from the market and should be re-quoted.
-const STALE_ORDER_SECS: u64 = 60;
-/// Marketable limit floor for an emergency naked-leg flatten (FAK sell). A sell
-/// at this limit crosses against any resting bid at/above it, so it executes at
-/// the best available bid — a deterministic de-risk, not a fill at this price.
-const FLATTEN_SELL_LIMIT: Decimal = dec!(0.01);
+// Stale-order and flatten thresholds now live in `LifecycleConfig::us()`
+// (`crate::venues::lifecycle`), shared with the venue-neutral lifecycle engine.
 /// Asset slug the US venue writes its DB rows under (`logs/us-dradis.db`,
 /// surfaced in the Control Tower asset selector).
 pub const US_ASSET: &str = "us";
@@ -287,7 +283,12 @@ async fn trade_one_market(
         no_fee_bps: 0,
     };
     let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-    let open_orders: OpenOrders = Arc::new(Mutex::new(Vec::new()));
+    // Shared, venue-neutral order lifecycle engine (Option C). Drives fill-confirm,
+    // stale-cancel, and naked-leg flatten off the `Execution` trait surface.
+    let lifecycle = Arc::new(OrderLifecycle::new(LifecycleConfig::us()));
+    // Upgrade fill confirmation to event-precise if the venue exposes a feed
+    // (no-op today: UsRetailVenue::subscribe_fills returns None → poll fallback).
+    let _fill_listener = lifecycle.spawn_fill_listener(Arc::clone(&venue), Arc::clone(&positions));
     let market_started_at = Utc::now();
 
     // Publish Raptor telemetry + active market so the squadron detail panels
@@ -331,7 +332,7 @@ async fn trade_one_market(
             biased;
             _ = cancel.cancelled() => {
                 info!("US trader: cancelled — standing down");
-                cancel_all_tracked(venue.as_ref(), &open_orders).await;
+                lifecycle.cancel_all(venue.as_ref()).await;
                 cag.update_state(&squadron_id, SquadronState::StoodDown);
                 publish_us_raptor_health(raptor_health_tx, false);
                 return MarketOutcome::Cancelled;
@@ -348,7 +349,7 @@ async fn trade_one_market(
             }
             _ = lifecycle_tick.tick() => {
                 // Confirm resting fills, cancel stale orders, flatten naked legs.
-                reconcile_orders(venue.as_ref(), &open_orders, &positions).await;
+                lifecycle.reconcile(venue.as_ref(), &positions).await;
                 continue;
             }
             _ = price_tick.tick() => {}
@@ -361,7 +362,7 @@ async fn trade_one_market(
         match market_cfg.phase(Utc::now(), MARKET_RTB_WINDOW_SECS) {
             MarketPhase::Closed => {
                 info!("🏁 US market \"{}\" reached close — standing down to rotate", market_cfg.market_name);
-                cancel_all_tracked(venue.as_ref(), &open_orders).await;
+                lifecycle.cancel_all(venue.as_ref()).await;
                 cag.update_state(&squadron_id, SquadronState::StoodDown);
                 publish_us_raptor_health(raptor_health_tx, false);
                 return MarketOutcome::Closed;
@@ -415,7 +416,7 @@ async fn trade_one_market(
 
         let mut acted = false;
         for (strategy_name, signal) in signals {
-            if dispatch_signal(venue.as_ref(), &pool, &positions, &open_orders, &strategy_name, &signal, starting).await {
+            if dispatch_signal(venue.as_ref(), &pool, &positions, &lifecycle, &strategy_name, &signal, starting).await {
                 acted = true;
             }
         }
@@ -522,153 +523,14 @@ async fn record_guard(
     );
 }
 
-// ─── Order lifecycle (Option A: reconciliation-based) ─────────────────────────
-
-/// A resting order we placed and must reconcile — confirm it filled (via the
-/// positions endpoint) or cancel it once stale. Only `Gtc`/`Gtd` buys are
-/// tracked; immediate (`Fak`/`Fok`) orders settle within their ack.
-#[derive(Clone)]
-struct TrackedOrder {
-    id: OrderId,
-    token: MarketId,
-    strategy: String,
-    placed_at: Instant,
-    /// Partner leg's token for a paired (arbitrage) entry — used to detect a
-    /// naked leg when this one fills but the partner doesn't.
-    #[allow(dead_code)]
-    pair_token: Option<MarketId>,
-}
-
-/// Shared set of resting orders awaiting fill-confirm / stale-cancel.
-type OpenOrders = Arc<Mutex<Vec<TrackedOrder>>>;
-
-/// Track a freshly placed resting order so the reconciler can manage it. No-op
-/// for immediate (`Fak`/`Fok`) orders, which fill or kill within their ack.
-async fn track_resting(
-    open: &OpenOrders,
-    fill: &Fill,
-    params: &OrderParams,
-    strategy: &str,
-    pair_token: Option<MarketId>,
-) {
-    if !matches!(params.order_type, TimeInForce::Gtc | TimeInForce::Gtd) {
-        return;
-    }
-    open.lock().await.push(TrackedOrder {
-        id: fill.order_id.clone(),
-        token: params.token_id.clone(),
-        strategy: strategy.to_string(),
-        placed_at: Instant::now(),
-        pair_token,
-    });
-}
-
-/// Mark a strategy's position guard fill-confirmed (idempotent).
-async fn confirm_guard(positions: &Arc<Mutex<PositionMap>>, strategy: &str, token: &MarketId) {
-    if let Some(p) = positions.lock().await.get_mut(&(strategy.to_string(), token.clone())) {
-        if p.fill_confirmed_at.is_none() {
-            p.fill_confirmed_at = Some(Utc::now());
-            info!("✅ [{strategy}] fill confirmed: {token}");
-        }
-    }
-}
-
-/// Drop a strategy's position guard for a token (so the viper may re-enter).
-async fn clear_guard(positions: &Arc<Mutex<PositionMap>>, strategy: &str, token: &MarketId) {
-    positions.lock().await.remove(&(strategy.to_string(), token.clone()));
-}
-
-/// Cancel every tracked resting order (called on squadron stand-down / rotation
-/// so we never leave a one-sided order working on a closing market).
-async fn cancel_all_tracked(venue: &UsRetailVenue, open: &OpenOrders) {
-    let orders: Vec<TrackedOrder> = std::mem::take(&mut *open.lock().await);
-    for ord in orders {
-        if let Err(e) = venue.cancel(ord.id.clone()).await {
-            warn!("stand-down cancel failed for {} ({}): {e}", ord.id, ord.token);
-        }
-    }
-}
-
-/// Reconcile resting orders against venue truth: confirm fills from the positions
-/// endpoint, cancel stale unfilled orders, then flatten any naked leg whose
-/// partner neither filled nor still rests.
-///
-/// This is the US loop's stand-in for intl's on-chain patrol lifecycle — it uses
-/// the custodial positions endpoint (no chain) as the source of truth instead of
-/// ERC-1155 balance polling.
-async fn reconcile_orders(
-    venue: &UsRetailVenue,
-    open: &OpenOrders,
-    positions: &Arc<Mutex<PositionMap>>,
-) {
-    // Venue truth: token → shares currently held.
-    let held: HashMap<String, Decimal> = venue.positions().await
-        .unwrap_or_default()
-        .into_iter()
-        .map(|p| (p.market.as_str().to_string(), p.shares))
-        .collect();
-
-    // Pass 1 — fill-confirm or stale-cancel each tracked order.
-    let snapshot: Vec<TrackedOrder> = open.lock().await.clone();
-    let mut keep: Vec<TrackedOrder> = Vec::with_capacity(snapshot.len());
-    for ord in snapshot {
-        let filled = held.get(ord.token.as_str()).copied().unwrap_or(Decimal::ZERO) > Decimal::ZERO;
-        if filled {
-            confirm_guard(positions, &ord.strategy, &ord.token).await;
-            continue; // resting done — drop from tracking
-        }
-        if ord.placed_at.elapsed().as_secs() >= STALE_ORDER_SECS {
-            match venue.cancel(ord.id.clone()).await {
-                Ok(_)  => info!("🧹 [{}] cancelled stale resting order {} ({})", ord.strategy, ord.id, ord.token),
-                Err(e) => warn!("[{}] stale cancel failed for {} ({}): {e}", ord.strategy, ord.id, ord.token),
-            }
-            clear_guard(positions, &ord.strategy, &ord.token).await;
-            continue;
-        }
-        keep.push(ord);
-    }
-    let resting_tokens: HashSet<String> = keep.iter().map(|o| o.token.as_str().to_string()).collect();
-    *open.lock().await = keep;
-
-    // Pass 2 — naked-leg detection. A confirmed paired leg whose partner is
-    // neither held nor still resting is directionally exposed → flatten it.
-    let orphans: Vec<(String, MarketId, Decimal)> = {
-        let map = positions.lock().await;
-        map.iter()
-            .filter_map(|((s, t), p)| {
-                let partner = p.paired_leg_token_id.as_ref()?;
-                let i_held          = held.get(t.as_str()).copied().unwrap_or_default() > Decimal::ZERO;
-                let partner_held    = held.get(partner.as_str()).copied().unwrap_or_default() > Decimal::ZERO;
-                let partner_resting = resting_tokens.contains(partner.as_str());
-                if p.fill_confirmed_at.is_some() && i_held && !partner_held && !partner_resting {
-                    Some((s.clone(), t.clone(), p.shares))
-                } else {
-                    None
-                }
-            })
-            .collect()
-    };
-    for (strategy, token, shares) in orphans {
-        warn!("🛡️ [{strategy}] naked leg: {token} filled but partner neither filled nor resting — flattening {shares}");
-        let intent = OrderIntent {
-            market: token.clone(),
-            side: Side::Sell,
-            quantity: shares,
-            price: FLATTEN_SELL_LIMIT,
-            tif: TimeInForce::Fak,
-            post_only: false,
-            expiration_secs: 0,
-            is_neg_risk: false,
-            fee_bps: 0,
-        };
-        match venue.place_order(intent).await {
-            Ok(f)  => info!("🛡️ [{strategy}] flattened naked leg {token} (order {})", f.order_id),
-            Err(e) => warn!("[{strategy}] flatten of {token} failed: {e} — will retry next reconcile"),
-        }
-        // Clear the guard so we don't re-flatten before the sell settles.
-        clear_guard(positions, &strategy, &token).await;
-    }
-}
+// ─── Order lifecycle ──────────────────────────────────────────────────────────
+//
+// Fill-confirm / stale-cancel / naked-leg flatten now live in the shared,
+// venue-neutral `OrderLifecycle` (`crate::venues::lifecycle`), driven from the
+// tick loop via `lifecycle.track(...)` / `lifecycle.reconcile(...)` /
+// `lifecycle.cancel_all(...)`. The previous bespoke US implementation
+// (`TrackedOrder` / `reconcile_orders` / `cancel_all_tracked`) was retired here
+// as part of Option C convergence; intl migrates onto the same engine next.
 
 /// Dispatch one resolved strategy signal onto the venue. Returns `true` if an
 /// order placement (or ghost simulation) occurred, so the caller applies the
@@ -682,7 +544,7 @@ async fn dispatch_signal(
     venue: &UsRetailVenue,
     pool: &Option<sqlx::SqlitePool>,
     positions: &Arc<Mutex<PositionMap>>,
-    open: &OpenOrders,
+    lifecycle: &OrderLifecycle,
     strategy_name: &str,
     signal: &StrategySignal,
     starting: Decimal,
@@ -707,8 +569,8 @@ async fn dispatch_signal(
                     record_guard(positions, strategy_name, pp, Some(&params.token_id)).await;
                     // Track both resting legs so the reconciler manages their
                     // lifecycle (fill-confirm / stale-cancel / naked-leg hedge).
-                    track_resting(open, &a, params, strategy_name, Some(pp.token_id.clone())).await;
-                    track_resting(open, &b, pp, strategy_name, Some(params.token_id.clone())).await;
+                    lifecycle.track(&a, strategy_name, params.order_type, Some(pp.token_id.clone())).await;
+                    lifecycle.track(&b, strategy_name, pp.order_type, Some(params.token_id.clone())).await;
                     if let Some(p) = pool { sync_dashboard(venue, p, starting).await; }
                     true
                 }
@@ -716,12 +578,12 @@ async fn dispatch_signal(
             }
         }
         StrategySignal::Entry { params, pair_params: None } => {
-            dispatch_single(venue, pool, positions, open, strategy_name, params, Side::Buy, starting).await
+            dispatch_single(venue, pool, positions, lifecycle, strategy_name, params, Side::Buy, starting).await
         }
         StrategySignal::MakerQuote { yes, no } => {
             let mut acted = false;
             for q in [yes.as_ref(), no.as_ref()].into_iter().flatten() {
-                if dispatch_single(venue, pool, positions, open, strategy_name, q, Side::Buy, starting).await {
+                if dispatch_single(venue, pool, positions, lifecycle, strategy_name, q, Side::Buy, starting).await {
                     acted = true;
                 }
             }
@@ -729,7 +591,7 @@ async fn dispatch_signal(
         }
         StrategySignal::Exit { params, reason, exit_pair } => {
             info!("🚪 [{strategy_name}] exit ({reason}): {} @ {:.4}", params.token_id, params.price);
-            let acted = dispatch_single(venue, pool, positions, open, strategy_name, params, Side::Sell, starting).await;
+            let acted = dispatch_single(venue, pool, positions, lifecycle, strategy_name, params, Side::Sell, starting).await;
             // Clear this strategy's guard for the leg (and the paired leg, if any)
             // so it can re-enter later.
             let mut map = positions.lock().await;
@@ -754,7 +616,7 @@ async fn dispatch_single(
     venue: &UsRetailVenue,
     pool: &Option<sqlx::SqlitePool>,
     positions: &Arc<Mutex<PositionMap>>,
-    open: &OpenOrders,
+    lifecycle: &OrderLifecycle,
     strategy_name: &str,
     params: &OrderParams,
     side: Side,
@@ -774,7 +636,7 @@ async fn dispatch_single(
                 params.token_id, f.price, f.order_id);
             if matches!(side, Side::Buy) {
                 record_guard(positions, strategy_name, params, None).await;
-                track_resting(open, &f, params, strategy_name, None).await;
+                lifecycle.track(&f, strategy_name, params.order_type, None).await;
             }
             if let Some(p) = pool { sync_dashboard(venue, p, starting).await; }
             true

@@ -123,6 +123,66 @@ pub struct Position {
     pub avg_price: Decimal,
 }
 
+// ─── Order-lifecycle primitives (Option C foundation) ───────────────────────
+
+/// A venue-neutral snapshot of a resting/working order, as reported by the venue.
+///
+/// This is the input the shared `OrderLifecycle` manager consumes (alongside
+/// [`Position`]) to confirm fills, cancel stale legs, and re-hedge/flatten naked
+/// legs — uniformly across venues. Intl sources it from the CLOB user feed /
+/// open-orders query; US from `/v1/trading/orders`. The manager never learns
+/// which scheme produced it.
+#[derive(Clone, Debug)]
+pub struct OpenOrder {
+    pub order_id: OrderId,
+    pub market: MarketId,
+    pub side: Side,
+    pub price: Decimal,
+    /// Quantity originally requested when the order was placed.
+    pub original_qty: Decimal,
+    /// Quantity filled so far (cumulative). `original_qty - filled_qty` still rests.
+    pub filled_qty: Decimal,
+    pub tif: TimeInForce,
+    /// The hedge-partner market for a paired arb leg, when the venue/tracker knows it.
+    pub pair_market: Option<MarketId>,
+}
+
+impl OpenOrder {
+    /// Quantity still resting on the book (never negative).
+    pub fn remaining_qty(&self) -> Decimal {
+        (self.original_qty - self.filled_qty).max(Decimal::ZERO)
+    }
+
+    /// Whether this order rests on the book (maker) rather than being immediate.
+    pub fn is_resting(&self) -> bool {
+        matches!(self.tif, TimeInForce::Gtc | TimeInForce::Gtd)
+    }
+}
+
+/// A venue-neutral fill notification pushed by a venue's event feed.
+///
+/// Lets the shared lifecycle react to fills **event-precisely** instead of at
+/// positions-poll granularity. Sourced from intl's chain/user WS or US's
+/// `/v1/ws/private`. Venues without an event feed return `None` from
+/// [`Execution::subscribe_fills`] and the lifecycle falls back to polling.
+#[derive(Clone, Debug)]
+pub struct FillEvent {
+    pub order_id: OrderId,
+    pub market: MarketId,
+    pub side: Side,
+    /// Cumulative quantity filled for this order at the time of the event.
+    pub filled: Decimal,
+    pub price: Decimal,
+    /// `true` once the order is fully filled or otherwise closed by the venue.
+    pub complete: bool,
+}
+
+/// Receiver half of a venue's fan-out fill-event feed.
+///
+/// A `broadcast` channel so multiple lifecycle consumers can observe the same
+/// stream; the venue owns the `Sender` and pumps it from its internal WS task.
+pub type FillStream = tokio::sync::broadcast::Receiver<FillEvent>;
+
 // ─── The contract (D4: no signer/nonce/EIP-712 in any signature) ────────────
 
 /// Compile-time execution contract every venue implements.
@@ -145,5 +205,24 @@ pub trait Execution: Send + Sync {
 
     /// Currently held positions, as reported by the venue.
     async fn positions(&self) -> Result<Vec<Position>>;
+
+    /// Currently resting/working orders, as reported by the venue.
+    ///
+    /// Foundation for the shared `OrderLifecycle` (Option C). Default returns an
+    /// empty set so a venue that has not yet wired its open-orders query compiles
+    /// and degrades to positions-poll reconciliation rather than failing.
+    async fn open_orders(&self) -> Result<Vec<OpenOrder>> {
+        Ok(Vec::new())
+    }
+
+    /// Subscribe to the venue's fill-event feed, if it has one.
+    ///
+    /// Returning `Some(stream)` lets the shared lifecycle confirm fills
+    /// event-precisely; `None` (the default) signals no event feed, so the
+    /// lifecycle falls back to polling [`open_orders`](Self::open_orders) /
+    /// [`positions`](Self::positions).
+    fn subscribe_fills(&self) -> Option<FillStream> {
+        None
+    }
 }
 

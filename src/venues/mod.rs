@@ -5,6 +5,10 @@
 
 pub mod core;
 
+/// Venue-neutral order lifecycle engine (Option C). Compiled for every venue;
+/// US drives it today, intl migrates onto it next.
+pub mod lifecycle;
+
 #[cfg(feature = "intl_clob")]
 pub mod intl;
 
