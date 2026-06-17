@@ -703,12 +703,16 @@ impl Squadron {
                                                 );
                                                 ownership.insert(token_m.clone(), sn.clone());
                                             } else {
-                                                // Current strategy has lower or equal priority, reject entry
+                                                // Current strategy has lower or equal priority, reject entry.
+                                                // Apply a trade cooldown so the lower-priority strategy
+                                                // backs off for TRADE_COOLDOWN_SECS instead of spinning
+                                                // every tick (~7,000+ rejections per hour otherwise).
                                                 warn!(
                                                     "🚫 TOKEN SOVEREIGNTY [{}]: token {} already claimed by {} (P={}) \
                                                      — entry rejected (registry hit) for {} (P={})",
                                                     sn, &params.token_id.to_string()[..16], existing_owner, existing_priority, sn, current_priority,
                                                 );
+                                                last_trade_time.insert(sn.clone(), Instant::now());
                                                 continue;
                                             }
                                         }
@@ -727,6 +731,7 @@ impl Squadron {
                                              (registry miss — positions scan fallback)",
                                             sn, params.token_id,
                                         );
+                                        last_trade_time.insert(sn.clone(), Instant::now());
                                         continue;
                                     }
                                 }

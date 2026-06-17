@@ -432,9 +432,10 @@ pub async fn arb_pair_fill_monitor(
     const ARBITER_GRACE_SECS: u64 = 15;
     /// Once exactly one leg confirms, the missing leg gets only this short grace to
     /// fill naturally as a free (0-fee) maker before we step in with a taker
-    /// re-hedge/flatten. Keeps the free-fill opportunity but caps naked directional
-    /// exposure to ~this many seconds after the first fill (was up to `max_wait_secs`).
-    const FIRST_LEG_CONFIRM_GRACE_SECS: u64 = 30;
+    /// re-hedge/flatten. Reduced from 30s → 5s: in crypto up/down markets the ask
+    /// can move out of the rescue-profit ceiling within seconds of the first fill,
+    /// turning a viable re-hedge into a forced flatten loss. Act quickly.
+    const FIRST_LEG_CONFIRM_GRACE_SECS: u64 = 5;
     /// Cadence at which the joint fill state is polled.
     const POLL_INTERVAL_SECS: u64 = 5;
 

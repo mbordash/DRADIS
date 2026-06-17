@@ -204,6 +204,27 @@ impl Strategy for ArbitrageStrategyImpl {
             }
         }
 
+        // ── Rescue-profit gate ───────────────────────────────────────────────
+        // Even when the maker bid sum looks profitable, the arbiter may need to
+        // FAK-buy the MISSING leg at its current ask if only one leg fills.
+        // That taker rescue costs: filled_leg_entry + missing_ask + 1tick + buffer.
+        // If EITHER rescue path costs ≥ $1.00 settlement payout the trade is only
+        // "profitable" if both legs fill simultaneously — which is never guaranteed.
+        // Block entry unless BOTH single-leg failure cases are recoverable:
+        //   YES fills first → rescue by buying NO at no_ask + 1 tick
+        //   NO  fills first → rescue by buying YES at yes_ask + 1 tick
+        let rehedge_buf = crate::config::ARB_FAK_REHEDGE_BUFFER;
+        let yes_rescue_cost = safe_yes_bid + no_ask  + dec!(0.01) + rehedge_buf;
+        let no_rescue_cost  = safe_no_bid  + yes_ask + dec!(0.01) + rehedge_buf;
+        if yes_rescue_cost >= dec!(1.00) || no_rescue_cost >= dec!(1.00) {
+            debug!(
+                " Arb rescue-profit gate — YES rescue {:.4} or NO rescue {:.4} ≥ $1.00 — skipping \
+                 (single-leg fill is not rescueable into a profitable hedge at live asks)",
+                yes_rescue_cost, no_rescue_cost
+            );
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Strategy Exposure Check ──────────────────────────────────────────
         let trade_size = dc.arbitrage_position_size_usdc;
 
