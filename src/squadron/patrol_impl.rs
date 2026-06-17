@@ -236,6 +236,7 @@ impl Squadron {
             std::sync::Arc::clone(&ctx.session.venue),
             Arc::clone(&positions),
             peripheral_cancel.clone(),
+            asset_lc.clone(),
         );
 
         // Watchdog: fires cancel (the patrol token) on stall, stops on peripheral_cancel.

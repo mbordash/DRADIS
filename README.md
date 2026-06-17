@@ -68,7 +68,7 @@ After ~5 minutes the stack is live:
 
 ---
 
-## 🌐 Choosing a venue (Intl CLOB vs US Retail)
+##  Choosing a venue (Intl CLOB vs US Retail)
 
 DRADIS compiles for **exactly one** execution venue, chosen at build time via a Cargo
 feature. Both share the same strategy/abstraction layers through the venue-neutral

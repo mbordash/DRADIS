@@ -482,24 +482,24 @@ impl GboostStrategyImpl {
                         // for 110 minutes while every retrain hit the same degenerate result.
                         if n < config::GBOOST_MIN_USABLE_TREES {
                             tracing::warn!(
-                                "🤖 GboostStrategy: discarding persisted model from '{}' ({} trees < min {}), cold-starting",
+                                " GboostStrategy: discarding persisted model from '{}' ({} trees < min {}), cold-starting",
                                 model_path, n, config::GBOOST_MIN_USABLE_TREES
                             );
                         } else {
                             *model_clone.lock().unwrap() = Some(loaded);
                             tracing::info!(
-                                "🤖 GboostStrategy: loaded persisted model from '{}' ({} trees)",
+                                " GboostStrategy: loaded persisted model from '{}' ({} trees)",
                                 model_path, n
                             );
                         }
                     }
                     Err(e) => tracing::warn!(
-                        "🤖 GboostStrategy: model parse failed for '{}' (will train from scratch): {:?}",
+                        " GboostStrategy: model parse failed for '{}' (will train from scratch): {:?}",
                         model_path, e
                     ),
                 },
                 Err(_) => tracing::info!(
-                    "🤖 GboostStrategy: no persisted model at '{}' — collecting data to train \
+                    " GboostStrategy: no persisted model at '{}' — collecting data to train \
                      (tip: copy prod model here, or set GBOOST_MODEL_PATH env var)",
                     model_path
                 ),
@@ -628,7 +628,7 @@ impl GboostStrategyImpl {
             || pos_fraction < (1.0 - config::GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX)
         {
             tracing::debug!(
-                "🤖 GBoost: skipping retrain — labels imbalanced ({:.0}% positive > max {:.0}%), waiting for balanced data",
+                " GBoost: skipping retrain — labels imbalanced ({:.0}% positive > max {:.0}%), waiting for balanced data",
                 pos_fraction * 100.0, config::GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX * 100.0
             );
             *self.ticks_since_retrain.lock().unwrap() = 0;
@@ -677,7 +677,7 @@ impl GboostStrategyImpl {
                                 format!("logs/{}-{}", crypto, config::GBOOST_MODEL_FILENAME)
                             });
                         if let Err(e) = tokio::fs::write(&model_path, &json).await {
-                            tracing::warn!("🤖 GboostStrategy: model save failed [{}]: {}", model_path, e);
+                            tracing::warn!(" GboostStrategy: model save failed [{}]: {}", model_path, e);
                         }
                     }
 
@@ -692,7 +692,7 @@ impl GboostStrategyImpl {
                         *retrain_backoff_until.lock().unwrap() =
                             Some(Instant::now() + std::time::Duration::from_secs(backoff_secs));
                         tracing::warn!(
-                            "🤖 GboostStrategy: retrain produced degenerate model ({} trees < min {}), keeping previous (backoff {}s, #{} consecutive)",
+                            " GboostStrategy: retrain produced degenerate model ({} trees < min {}), keeping previous (backoff {}s, #{} consecutive)",
                             n, config::GBOOST_MIN_USABLE_TREES, backoff_secs, *count
                         );
                         is_training.store(false, Ordering::Relaxed);
@@ -767,7 +767,7 @@ impl GboostStrategyImpl {
                             }
                         } else {
                             tracing::debug!(
-                                "📉 GBoost: drift below threshold (score={:.2}), stable streak: {}/{}",
+                                " GBoost: drift below threshold (score={:.2}), stable streak: {}/{}",
                                 drift_score, *stable, config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED
                             );
                         }
@@ -780,17 +780,17 @@ impl GboostStrategyImpl {
 
                     if n > old_tree_count + 5 || (old_tree_count >= 5 && n + 5 < old_tree_count) || (old_tree_count == 0 && n > 0) {
                         tracing::info!(
-                            "🤖 GboostStrategy: retrained — {} trees (was {}) | drift={:.2}",
+                            " GboostStrategy: retrained — {} trees (was {}) | drift={:.2}",
                             n, old_tree_count, drift_score
                         );
                     } else {
-                        tracing::debug!("🤖 GboostStrategy: retrained — {} trees | drift={:.2}", n, drift_score);
+                        tracing::debug!(" GboostStrategy: retrained — {} trees | drift={:.2}", n, drift_score);
                     }
 
                     *model_arc.lock().unwrap() = Some(new_model);
                 }
-                Ok(Err(e)) => tracing::warn!("🤖 GboostStrategy: training error: {}", e),
-                Err(e)     => tracing::warn!("🤖 GboostStrategy: spawn_blocking panic: {}", e),
+                Ok(Err(e)) => tracing::warn!(" GboostStrategy: training error: {}", e),
+                Err(e)     => tracing::warn!(" GboostStrategy: spawn_blocking panic: {}", e),
             }
 
             is_training.store(false, Ordering::Relaxed);
@@ -1003,7 +1003,7 @@ impl Strategy for GboostStrategyImpl {
                 || hourly_bid_sum < config::GBOOST_MIN_HOURLY_BID_SUM
             {
                 tracing::debug!(
-                    "🚫 GBoost entry blocked: hourly book degenerate (ask_sum={:.3} bid_sum={:.3})",
+                    " GBoost entry blocked: hourly book degenerate (ask_sum={:.3} bid_sum={:.3})",
                     hourly_ask_sum, hourly_bid_sum
                 );
                 return Ok(StrategySignal::NoSignal);
@@ -1021,7 +1021,7 @@ impl Strategy for GboostStrategyImpl {
                 || hourly_yes_ask_f > config::GBOOST_MAX_HOURLY_YES_ASK.to_f64().unwrap_or(0.95)
             {
                 tracing::debug!(
-                    "🚫 GBoost entry blocked: hourly market near-resolved \
+                    " GBoost entry blocked: hourly market near-resolved \
                      (yes_bid={:.3} < {:.2} or yes_ask={:.3} > {:.2})",
                     hourly_yes_bid_f, config::GBOOST_MIN_HOURLY_YES_BID,
                     hourly_yes_ask_f, config::GBOOST_MAX_HOURLY_YES_ASK,
@@ -1043,7 +1043,7 @@ impl Strategy for GboostStrategyImpl {
             let hourly_strong_down = hourly_yes_ask_f < (1.0 - trend_block);
             if hourly_strong_up || hourly_strong_down {
                 tracing::debug!(
-                    "🚫 GBoost entry blocked: hourly strong trend \
+                    " GBoost entry blocked: hourly strong trend \
                      (yes_bid={:.3} strong_up={} yes_ask={:.3} strong_down={} threshold={:.2})",
                     hourly_yes_bid_f, hourly_strong_up,
                     hourly_yes_ask_f, hourly_strong_down,
@@ -1100,7 +1100,7 @@ impl Strategy for GboostStrategyImpl {
         let target_ask_sum = target_snapshot.yes_ask + target_snapshot.no_ask;
         if target_ask_sum > config::GBOOST_MAX_TARGET_ASK_SUM {
             tracing::debug!(
-                "🚫 GBoost entry blocked: target book too wide (ask_sum={:.3} > max {:.3})",
+                " GBoost entry blocked: target book too wide (ask_sum={:.3} > max {:.3})",
                 target_ask_sum, config::GBOOST_MAX_TARGET_ASK_SUM
             );
             return Ok(StrategySignal::NoSignal);
@@ -1114,7 +1114,7 @@ impl Strategy for GboostStrategyImpl {
         let target_snap_age = (chrono::Utc::now() - target_snapshot.timestamp).num_seconds();
         if target_snap_age > config::GBOOST_MAX_SNAPSHOT_AGE_SECS {
             tracing::debug!(
-                "🚫 GBoost entry blocked: target snapshot too stale ({}s > max {}s)",
+                " GBoost entry blocked: target snapshot too stale ({}s > max {}s)",
                 target_snap_age, config::GBOOST_MAX_SNAPSHOT_AGE_SECS
             );
             return Ok(StrategySignal::NoSignal);
@@ -1124,7 +1124,7 @@ impl Strategy for GboostStrategyImpl {
             let hourly_snap_age = (chrono::Utc::now() - ctx.snapshot.timestamp).num_seconds();
             if hourly_snap_age > config::GBOOST_MAX_SNAPSHOT_AGE_SECS {
                 tracing::debug!(
-                    "🚫 GBoost entry blocked: hourly snapshot too stale ({}s > max {}s)",
+                    " GBoost entry blocked: hourly snapshot too stale ({}s > max {}s)",
                     hourly_snap_age, config::GBOOST_MAX_SNAPSHOT_AGE_SECS
                 );
                 return Ok(StrategySignal::NoSignal);
@@ -1152,7 +1152,7 @@ impl Strategy for GboostStrategyImpl {
         // suppress entries until the next retrain recaptures the regime.
         if self.concept_drift_suppressed.load(Ordering::Relaxed) {
             tracing::debug!(
-                "🚫 GBoost entry blocked: concept drift (score={:.2}) — awaiting next retrain",
+                " GBoost entry blocked: concept drift (score={:.2}) — awaiting next retrain",
                 *self.last_concept_drift_score.lock().unwrap()
             );
             return Ok(StrategySignal::NoSignal);
@@ -1181,7 +1181,7 @@ impl Strategy for GboostStrategyImpl {
         // 0.087 → 0.779 in 12 min → SignalRev exit for -$0.1636.
         if precomp_hist_vol < config::GBOOST_MIN_HIST_VOL {
             tracing::debug!(
-                "🚫 GBoost entry veto: oracle too flat | hist_vol={:.4} < min {:.4}",
+                " GBoost entry veto: oracle too flat | hist_vol={:.4} < min {:.4}",
                 precomp_hist_vol, config::GBOOST_MIN_HIST_VOL
             );
             return Ok(StrategySignal::NoSignal);
@@ -1220,7 +1220,7 @@ impl Strategy for GboostStrategyImpl {
                     if bss.is_none() {
                         *bss = Some(Instant::now());
                         tracing::debug!(
-                            "🕐 GBoost: BTC spot ${:.0} < strike(${:.0}) − buffer(${:.0}) = ${:.0} — starting below-strike timer",
+                            " GBoost: BTC spot ${:.0} < strike(${:.0}) − buffer(${:.0}) = ${:.0} — starting below-strike timer",
                             oracle_price, strike, buffer, threshold
                         );
                     }
@@ -1256,7 +1256,7 @@ impl Strategy for GboostStrategyImpl {
             // Trend-alignment: block YES entries in a downtrend
             if drift_60m < -trend_block {
                 tracing::debug!(
-                    "🚫 GBoost YES entry veto: counter-trend (drift_60m={:.0} < -{:.0})",
+                    " GBoost YES entry veto: counter-trend (drift_60m={:.0} < -{:.0})",
                     drift_60m, trend_block
                 );
                 return Ok(StrategySignal::NoSignal);
@@ -1264,7 +1264,7 @@ impl Strategy for GboostStrategyImpl {
             // Strike-distance: block YES entries when BTC has been below (strike−buffer) for 60+ min
             if below_strike_suppressed_for_yes {
                 tracing::debug!(
-                    "🚫 GBoost YES entry veto: below-strike suppressed \
+                    " GBoost YES entry veto: below-strike suppressed \
                      (BTC spot below daily_strike − {:.2}% for ≥ {}min)",
                     config::BASIS_ORACLE_STRIKE_BUFFER_PCT * rust_decimal::Decimal::from(100),
                     config::GBOOST_BELOW_STRIKE_SUPPRESS_SECS / 60
@@ -1282,7 +1282,7 @@ impl Strategy for GboostStrategyImpl {
                     let elapsed = lock_since.elapsed().as_secs() as i64;
                     if elapsed < config::GBOOST_MIN_HOLDING_LOCK_SECS {
                         tracing::debug!(
-                            "🚫 GBoost YES entry veto: market hold lock active | market='{}' \
+                            " GBoost YES entry veto: market hold lock active | market='{}' \
                              elapsed={}s < lock={}s",
                             target_market.market_name, elapsed,
                             config::GBOOST_MIN_HOLDING_LOCK_SECS
@@ -1301,7 +1301,7 @@ impl Strategy for GboostStrategyImpl {
             }
             if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(target_market.yes_token.clone()) {
                 tracing::debug!(
-                    "🚫 GBoost YES entry veto: cooldown active | market='{}' token={:?} remaining={}s",
+                    " GBoost YES entry veto: cooldown active | market='{}' token={:?} remaining={}s",
                     target_market.market_name,
                     target_market.yes_token,
                     remaining_secs
@@ -1311,7 +1311,7 @@ impl Strategy for GboostStrategyImpl {
             let yes_obi = Self::side_obi(true, target_snapshot);
             if yes_obi < config::GBOOST_OBI_ADVERSE_BLOCK {
                 tracing::debug!(
-                    "🚫 GBoost YES entry veto: adverse OBI | market='{}' token={:?} obi={:.3} block={:.3}",
+                    " GBoost YES entry veto: adverse OBI | market='{}' token={:?} obi={:.3} block={:.3}",
                     target_market.market_name,
                     target_market.yes_token,
                     yes_obi,
@@ -1325,7 +1325,7 @@ impl Strategy for GboostStrategyImpl {
             // selection. 2026-05-08 T2: |obi_y|=0.61 on a ~93% YES market → SL -$0.457.
             if yes_obi.abs() > config::GBOOST_OBI_EXHAUSTION_BLOCK {
                 tracing::debug!(
-                    "🚫 GBoost YES entry veto: OBI exhaustion | market='{}' |obi|={:.3} > {:.3}",
+                    " GBoost YES entry veto: OBI exhaustion | market='{}' |obi|={:.3} > {:.3}",
                     target_market.market_name,
                     yes_obi.abs(),
                     config::GBOOST_OBI_EXHAUSTION_BLOCK
@@ -1341,7 +1341,7 @@ impl Strategy for GboostStrategyImpl {
                 let hourly_yes_obi = Self::side_obi(true, &ctx.snapshot);
                 if hourly_yes_obi < config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK {
                     tracing::debug!(
-                        "🚫 GBoost YES entry veto: hourly YES OBI adverse | obi={:.3} block={:.3}",
+                        " GBoost YES entry veto: hourly YES OBI adverse | obi={:.3} block={:.3}",
                         hourly_yes_obi, config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK
                     );
                     return Ok(StrategySignal::NoSignal);
@@ -1355,7 +1355,7 @@ impl Strategy for GboostStrategyImpl {
                 // to $0.49 in 45 s (-$0.26 loss).  Blocked at OBI_EXHAUSTION_BLOCK=0.80.
                 if hourly_yes_obi.abs() > config::GBOOST_OBI_EXHAUSTION_BLOCK {
                     tracing::debug!(
-                        "🚫 GBoost YES entry veto: hourly OBI exhausted | hourly_obi={:.3} > {:.3}",
+                        " GBoost YES entry veto: hourly OBI exhausted | hourly_obi={:.3} > {:.3}",
                         hourly_yes_obi, config::GBOOST_OBI_EXHAUSTION_BLOCK
                     );
                     return Ok(StrategySignal::NoSignal);
@@ -1374,7 +1374,7 @@ impl Strategy for GboostStrategyImpl {
             // in a 50/50 coin flip. Require minimum edge distance from fair value.
             if (price - dec!(0.50)).abs() < config::GBOOST_MIN_EDGE_FROM_FAIR {
                 tracing::debug!(
-                    "🚫 GBoost YES entry veto: price too close to 0.50 | ask={:.3} edge={:.3} < min {:.3}",
+                    " GBoost YES entry veto: price too close to 0.50 | ask={:.3} edge={:.3} < min {:.3}",
                     price,
                     (price - dec!(0.50)).abs(),
                     config::GBOOST_MIN_EDGE_FROM_FAIR
@@ -1400,7 +1400,7 @@ impl Strategy for GboostStrategyImpl {
                 let net_expected   = expected_gross - estimated_fee;
                 if net_expected < config::GBOOST_MIN_NET_PROFIT_USDC {
                     tracing::debug!(
-                        "🚫 GBoost YES entry veto: net profit too low | \
+                        " GBoost YES entry veto: net profit too low | \
                          gross=${:.3} fee=${:.3} net=${:.3} < min=${:.3} \
                          (trade=${:.2} price={:.3})",
                         expected_gross, estimated_fee, net_expected,
@@ -1411,7 +1411,7 @@ impl Strategy for GboostStrategyImpl {
             }
             let shares = trade_usdc / price;
             tracing::info!(
-                "🔮 GBoost YES entry: P(UP)={:.3} | ask=${:.4} shares={:.2} usdc={:.2} vol={:.2}",
+                " GBoost YES entry: P(UP)={:.3} | ask=${:.4} shares={:.2} usdc={:.2} vol={:.2}",
                 p_yes_up, price, shares, trade_usdc, precomp_hist_vol
             );
             let (entry_prev_snap, entry_hist_vol, entry_tick_momentum) =
@@ -1444,7 +1444,7 @@ impl Strategy for GboostStrategyImpl {
             // Trend-alignment: block NO entries in an uptrend
             if drift_60m > trend_block {
                 tracing::debug!(
-                    "🚫 GBoost NO entry veto: counter-trend (drift_60m={:.0} > +{:.0})",
+                    " GBoost NO entry veto: counter-trend (drift_60m={:.0} > +{:.0})",
                     drift_60m, trend_block
                 );
                 return Ok(StrategySignal::NoSignal);
@@ -1456,7 +1456,7 @@ impl Strategy for GboostStrategyImpl {
                     let elapsed = lock_since.elapsed().as_secs() as i64;
                     if elapsed < config::GBOOST_MIN_HOLDING_LOCK_SECS {
                         tracing::debug!(
-                            "🚫 GBoost NO entry veto: market hold lock active | market='{}' \
+                            " GBoost NO entry veto: market hold lock active | market='{}' \
                              elapsed={}s < lock={}s",
                             target_market.market_name, elapsed,
                             config::GBOOST_MIN_HOLDING_LOCK_SECS
@@ -1471,7 +1471,7 @@ impl Strategy for GboostStrategyImpl {
             }
             if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(target_market.no_token.clone()) {
                 tracing::debug!(
-                    "🚫 GBoost NO entry veto: cooldown active | market='{}' token={:?} remaining={}s",
+                    " GBoost NO entry veto: cooldown active | market='{}' token={:?} remaining={}s",
                     target_market.market_name, target_market.no_token, remaining_secs
                 );
                 return Ok(StrategySignal::NoSignal);
@@ -1479,7 +1479,7 @@ impl Strategy for GboostStrategyImpl {
             let no_obi = Self::side_obi(false, target_snapshot);
             if no_obi < config::GBOOST_OBI_ADVERSE_BLOCK {
                 tracing::debug!(
-                    "🚫 GBoost NO entry veto: adverse OBI | market='{}' token={:?} obi={:.3} block={:.3}",
+                    " GBoost NO entry veto: adverse OBI | market='{}' token={:?} obi={:.3} block={:.3}",
                     target_market.market_name, target_market.no_token, no_obi, config::GBOOST_OBI_ADVERSE_BLOCK
                 );
                 return Ok(StrategySignal::NoSignal);
@@ -1489,7 +1489,7 @@ impl Strategy for GboostStrategyImpl {
             // the NO leg — the move is in progress and the risk/reward is exhausted.
             if no_obi.abs() > config::GBOOST_OBI_EXHAUSTION_BLOCK {
                 tracing::debug!(
-                    "🚫 GBoost NO entry veto: OBI exhaustion | market='{}' |obi|={:.3} > {:.3}",
+                    " GBoost NO entry veto: OBI exhaustion | market='{}' |obi|={:.3} > {:.3}",
                     target_market.market_name,
                     no_obi.abs(),
                     config::GBOOST_OBI_EXHAUSTION_BLOCK
@@ -1507,7 +1507,7 @@ impl Strategy for GboostStrategyImpl {
                 let hourly_no_obi = Self::side_obi(false, &ctx.snapshot);
                 if hourly_no_obi < config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK {
                     tracing::debug!(
-                        "🚫 GBoost NO entry veto: hourly NO OBI adverse | obi={:.3} block={:.3}",
+                        " GBoost NO entry veto: hourly NO OBI adverse | obi={:.3} block={:.3}",
                         hourly_no_obi, config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK
                     );
                     return Ok(StrategySignal::NoSignal);
@@ -1519,7 +1519,7 @@ impl Strategy for GboostStrategyImpl {
                 // into the last ticks of a NO surge — adverse selection is at its peak.
                 if hourly_no_obi.abs() > config::GBOOST_OBI_EXHAUSTION_BLOCK {
                     tracing::debug!(
-                        "🚫 GBoost NO entry veto: hourly OBI exhausted | hourly_obi={:.3} > {:.3}",
+                        " GBoost NO entry veto: hourly OBI exhausted | hourly_obi={:.3} > {:.3}",
                         hourly_no_obi, config::GBOOST_OBI_EXHAUSTION_BLOCK
                     );
                     return Ok(StrategySignal::NoSignal);
@@ -1535,7 +1535,7 @@ impl Strategy for GboostStrategyImpl {
             // ── 50-cent coin-flip zone gate ───────────────────────────────────
             if (price - dec!(0.50)).abs() < config::GBOOST_MIN_EDGE_FROM_FAIR {
                 tracing::debug!(
-                    "🚫 GBoost NO entry veto: price too close to 0.50 | ask={:.3} edge={:.3} < min {:.3}",
+                    " GBoost NO entry veto: price too close to 0.50 | ask={:.3} edge={:.3} < min {:.3}",
                     price,
                     (price - dec!(0.50)).abs(),
                     config::GBOOST_MIN_EDGE_FROM_FAIR
@@ -1555,7 +1555,7 @@ impl Strategy for GboostStrategyImpl {
                 let net_expected   = expected_gross - estimated_fee;
                 if net_expected < config::GBOOST_MIN_NET_PROFIT_USDC {
                     tracing::debug!(
-                        "🚫 GBoost NO entry veto: net profit too low | \
+                        " GBoost NO entry veto: net profit too low | \
                          gross=${:.3} fee=${:.3} net=${:.3} < min=${:.3} \
                          (trade=${:.2} price={:.3})",
                         expected_gross, estimated_fee, net_expected,
@@ -1566,7 +1566,7 @@ impl Strategy for GboostStrategyImpl {
             }
             let shares = trade_usdc / price;
             tracing::info!(
-                "🔮 GBoost NO entry: P(UP)={:.3} | ask=${:.4} shares={:.2} usdc={:.2} vol={:.2}",
+                " GBoost NO entry: P(UP)={:.3} | ask=${:.4} shares={:.2} usdc={:.2} vol={:.2}",
                 p_yes_up, price, shares, trade_usdc, precomp_hist_vol
             );
             let (entry_prev_snap, entry_hist_vol, entry_tick_momentum) =
@@ -1680,7 +1680,7 @@ impl Strategy for GboostStrategyImpl {
                             });
                         } else {
                             tracing::debug!(
-                                "🚫 GBoost SignalRev YES suppressed: profit={:.2}% not yet above min {:.0}% (not deep enough in red for protective exit)",
+                                " GBoost SignalRev YES suppressed: profit={:.2}% not yet above min {:.0}% (not deep enough in red for protective exit)",
                                 profit_pct * 100.0, config::GBOOST_SIGNAL_REV_MIN_PROFIT * 100.0
                             );
                         }
@@ -1746,7 +1746,7 @@ impl Strategy for GboostStrategyImpl {
                             });
                         } else {
                             tracing::debug!(
-                                "🚫 GBoost SignalRev NO suppressed: profit={:.2}% not yet above min {:.0}% (not deep enough in red for protective exit)",
+                                " GBoost SignalRev NO suppressed: profit={:.2}% not yet above min {:.0}% (not deep enough in red for protective exit)",
                                 profit_pct * 100.0, config::GBOOST_SIGNAL_REV_MIN_PROFIT * 100.0
                             );
                         }

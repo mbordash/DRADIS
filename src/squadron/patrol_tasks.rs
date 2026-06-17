@@ -691,6 +691,7 @@ pub fn spawn_lifecycle_task(
     venue:     Arc<crate::venues::ActiveVenue>,
     positions: Arc<Mutex<crate::state::PositionMap>>,
     cancel:    CancellationToken,
+    asset:     String,
 ) {
     const LIFECYCLE_SYNC_SECS: u64 = 30;
     tokio::spawn(async move {
@@ -701,7 +702,37 @@ pub fn spawn_lifecycle_task(
                 biased;
                 _ = cancel.cancelled() => return,
                 _ = ticker.tick() => {
-                    lifecycle.reconcile(venue.as_ref(), &positions).await;
+                    let flattened = lifecycle.reconcile(venue.as_ref(), &positions).await;
+                    for leg in flattened {
+                        let pnl = (leg.exit_price - leg.avg_entry) * leg.shares;
+                        warn!(
+                            "📋 [{strategy}] lifecycle flatten recorded: {market} entry={entry:.4} exit={exit:.4} shares={shares} pnl={pnl:.4}",
+                            strategy = leg.strategy,
+                            market   = leg.market_name,
+                            entry    = leg.avg_entry,
+                            exit     = leg.exit_price,
+                            shares   = leg.shares,
+                        );
+                        let asset_c    = asset.clone();
+                        let strat      = leg.strategy.clone();
+                        let market     = leg.market_name.clone();
+                        let avg_entry  = leg.avg_entry;
+                        let exit_price = leg.exit_price;
+                        let shares     = leg.shares;
+                        tokio::spawn(async move {
+                            metrics::record_trade(
+                                &asset_c,
+                                strat,
+                                market,
+                                "Sell".to_string(),
+                                avg_entry,
+                                exit_price,
+                                shares,
+                                pnl,
+                                "LifecycleFlatten".to_string(),
+                            ).await;
+                        });
+                    }
                 }
             }
         }

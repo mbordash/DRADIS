@@ -501,8 +501,8 @@ impl Strategy for TrendCaptureStrategyImpl {
                     is_neg_risk:  p.is_neg_risk,
                     market_name:  p.market_name,
                     condition_id: p.condition_id,
-                    order_type:   TimeInForce::Gtc,
-                    post_only:    true,
+                    order_type:   TimeInForce::Fak,   // exits are taker — selling at bid crosses book
+                    post_only:    false,               // post_only on a sell-at-bid always rejects
                     ghost_mode:   p.ghost_mode,
                 },
                 reason:    p.reason,

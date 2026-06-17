@@ -36,6 +36,18 @@ use crate::venues::core::{
     Execution, Fill, MarketId, OrderId, OrderIntent, Side, TimeInForce,
 };
 
+/// Describes a naked-leg that was forcibly flattened during reconcile.
+/// Returned to callers so they can write a `trades` DB record — lifecycle
+/// itself has no DB access and stays venue-neutral.
+#[derive(Debug, Clone)]
+pub struct FlattenedLeg {
+    pub strategy:    String,
+    pub market_name: String,
+    pub shares:      Decimal,
+    pub avg_entry:   Decimal,
+    pub exit_price:  Decimal,
+}
+
 /// Tunables for the lifecycle engine. Each venue/caller supplies its own window
 /// sizes so intl (slow daily/window markets) and US (fast custodial fills) can
 /// share one engine without sharing timing assumptions.
@@ -129,6 +141,9 @@ impl OrderLifecycle {
     /// positions endpoint, cancel stale unfilled orders, then flatten any naked
     /// leg whose partner neither filled nor still rests.
     ///
+    /// Returns a list of legs that were forcibly flattened so callers can write
+    /// `trades` DB records (lifecycle itself has no DB access).
+    ///
     /// Venue-neutral replacement for the US loop's `reconcile_orders` and intl's
     /// on-chain patrol lifecycle. Uses [`Execution::positions`] as the held-truth
     /// source and [`Execution::open_orders`] (when the venue reports it) to widen
@@ -137,7 +152,7 @@ impl OrderLifecycle {
         &self,
         venue: &V,
         positions: &Arc<Mutex<PositionMap>>,
-    ) {
+    ) -> Vec<FlattenedLeg> {
         // Venue truth: market → shares currently held.
         let held: HashMap<String, Decimal> = venue
             .positions()
@@ -184,7 +199,7 @@ impl OrderLifecycle {
 
         // Pass 2 — naked-leg detection. A confirmed paired leg whose partner is
         // neither held nor still resting is directionally exposed → flatten it.
-        let orphans: Vec<(String, MarketId, Decimal)> = {
+        let orphans: Vec<(String, MarketId, Decimal, String, Decimal)> = {
             let map = positions.lock().await;
             map.iter()
                 .filter_map(|((s, t), p)| {
@@ -193,14 +208,15 @@ impl OrderLifecycle {
                     let partner_held    = held.get(partner.as_str()).copied().unwrap_or_default() > Decimal::ZERO;
                     let partner_resting = resting_tokens.contains(partner.as_str());
                     if p.fill_confirmed_at.is_some() && i_held && !partner_held && !partner_resting {
-                        Some((s.clone(), t.clone(), p.shares))
+                        Some((s.clone(), t.clone(), p.shares, p.market_name.clone(), p.avg_entry))
                     } else {
                         None
                     }
                 })
                 .collect()
         };
-        for (strategy, token, shares) in orphans {
+        let mut flattened: Vec<FlattenedLeg> = Vec::new();
+        for (strategy, token, shares, market_name, avg_entry) in orphans {
             warn!("🛡️ [{strategy}] naked leg: {token} filled but partner neither filled nor resting — flattening {shares}");
             let intent = OrderIntent {
                 market: token.clone(),
@@ -214,12 +230,22 @@ impl OrderLifecycle {
                 fee_bps: 0,
             };
             match venue.place_order(intent).await {
-                Ok(f)  => info!("🛡️ [{strategy}] flattened naked leg {token} (order {})", f.order_id),
+                Ok(f)  => {
+                    info!("🛡️ [{strategy}] flattened naked leg {token} (order {})", f.order_id);
+                    flattened.push(FlattenedLeg {
+                        strategy: strategy.clone(),
+                        market_name,
+                        shares,
+                        avg_entry,
+                        exit_price: self.cfg.flatten_sell_limit,
+                    });
+                }
                 Err(e) => warn!("[{strategy}] flatten of {token} failed: {e} — will retry next reconcile"),
             }
             // Clear the guard so we don't re-flatten before the sell settles.
             clear_guard(positions, &strategy, &token).await;
         }
+        flattened
     }
 
     /// Cancel every tracked resting order (squadron stand-down / market rotation),
