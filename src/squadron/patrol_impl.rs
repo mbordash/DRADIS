@@ -971,7 +971,7 @@ impl Squadron {
                                         }
                                     } else {
                                         let leg_a_order_id = match place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &params.token_id, Side::Buy, params.shares, actual_entry_price, target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await {
-                                            Err(e) => { warn!("⚠️ ENTRY order failed [{}]: {}", sn, e); positions.lock().await.remove(&pos_key); pending_orders.lock().await.remove(&pos_key); token_ownership.lock().await.remove(&token_m); last_trade_time.insert(sn.clone(), Instant::now()); consecutive_failures += 1; continue; }
+                                            Err(e) => { warn!("⚠️ ENTRY order failed [{}]: {}", sn, e); positions.lock().await.remove(&pos_key); pending_orders.lock().await.remove(&pos_key); token_ownership.lock().await.remove(&token_m); if !e.to_string().contains("crosses book") { last_trade_time.insert(sn.clone(), Instant::now()); consecutive_failures += 1; } continue; }
                                             Ok(id) => id,
                                         };
                                         let _ = leg_a_order_id;

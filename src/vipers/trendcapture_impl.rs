@@ -186,9 +186,24 @@ impl Strategy for TrendCaptureStrategyImpl {
         let bear_strike_gap    = bull_strike_gap;
         let exhaustion_thr     = config::oracle_threshold(config::TRENDCAPTURE_EXHAUSTION_DRIFT_60M_PCT, oracle_price);
 
+        // ── 60m macro-trend alignment gate ───────────────────────────────────
+        // A 10m surge that runs counter to the 60m macro direction is a dip/bounce
+        // in the larger trend, not a new trend — high whipsaw risk.  Block the entry
+        // when the 60m drift meaningfully opposes the intended direction.
+        //
+        // Example that caused the Jun 18 loss:
+        //   drift_10m = −$131  → BEAR signal fired
+        //   drift_60m = +$200  → 60m macro was BULLISH (dip in uptrend)
+        //   Result: entered NO, reversed within 7 minutes for −6.25%
+        //
+        // With this gate: BEAR entry requires drift_60m < +alignment_thr.
+        let align_thr = config::oracle_threshold(config::TRENDCAPTURE_DRIFT_60M_PCT, oracle_price);
+        let drift_60m_misaligned_bull = drift_60m <= -align_thr;   // 60m macro is bearish — don't go BULL
+        let drift_60m_misaligned_bear = drift_60m >=  align_thr;   // 60m macro is bullish — don't go BEAR
+
         // ── 60m drift exhaustion ceiling ─────────────────────────────────────
-        // Allow entries on fresh 10m momentum but block when the 60m move is so
-        // large the trend is already exhausted (tail-end capitulation risk).
+        // Block when the 60m move is so large the trend is already exhausted
+        // (tail-end capitulation risk).
         let drift_60m_blocks_bull = drift_60m >= exhaustion_thr;
         let drift_60m_blocks_bear = drift_60m <= -exhaustion_thr;
 
@@ -259,6 +274,7 @@ impl Strategy for TrendCaptureStrategyImpl {
 
         // ══ BULL entry: buy YES when trend is strongly upward ════════════════
         if drift_10m >= bull_drift_10m_thr
+            && !drift_60m_misaligned_bull
             && !drift_60m_blocks_bull
             && !obi_blocks_bull
             && !obi_exhausted_bull
@@ -281,12 +297,16 @@ impl Strategy for TrendCaptureStrategyImpl {
                     .unwrap_or(false);
                 if !in_cooldown {
                     let size = trade_size(drift_10m.abs());
-                    debug!("🦅 TrendCapture BULL entry: drift_10m={:.0} drift_60m={:.0} yes_ask={:.3} size={:.2}",
-                        drift_10m, drift_60m, yes_ask, size);
+                    // Price one tick below the ask so the order rests as a maker.
+                    // Submitting at yes_ask crosses the book and is rejected by
+                    // Polymarket with "invalid post-only order: order crosses book".
+                    let entry_price = yes_ask - dec!(0.01);
+                    debug!("🦅 TrendCapture BULL entry: drift_10m={:.0} drift_60m={:.0} align_thr={:.0} yes_ask={:.3} entry={:.3} size={:.2}",
+                        drift_10m, drift_60m, align_thr, yes_ask, entry_price, size);
                     drop(cooldowns);
                     drop(consec);
                     return Ok(StrategySignal::Entry {
-                        params: entry_params!(token_id, yes_ask, market.yes_fee_bps as u16, size),
+                        params: entry_params!(token_id, entry_price, market.yes_fee_bps as u16, size),
                         pair_params: None,
                     });
                 }
@@ -295,6 +315,7 @@ impl Strategy for TrendCaptureStrategyImpl {
 
         // ══ BEAR entry: buy NO when trend is strongly downward ═══════════════
         if drift_10m <= bear_drift_10m_thr
+            && !drift_60m_misaligned_bear
             && !drift_60m_blocks_bear
             && !obi_blocks_bear
             && !obi_exhausted_bear
@@ -315,12 +336,14 @@ impl Strategy for TrendCaptureStrategyImpl {
                     .unwrap_or(false);
                 if !in_cooldown {
                     let size = trade_size(drift_10m.abs());
-                    debug!("🦅 TrendCapture BEAR entry: drift_10m={:.0} drift_60m={:.0} no_ask={:.3} size={:.2}",
-                        drift_10m, drift_60m, no_ask, size);
+                    // Price one tick below the ask so the order rests as a maker.
+                    let entry_price = no_ask - dec!(0.01);
+                    debug!("🦅 TrendCapture BEAR entry: drift_10m={:.0} drift_60m={:.0} align_thr={:.0} no_ask={:.3} entry={:.3} size={:.2}",
+                        drift_10m, drift_60m, align_thr, no_ask, entry_price, size);
                     drop(cooldowns);
                     drop(consec);
                     return Ok(StrategySignal::Entry {
-                        params: entry_params!(token_id, no_ask, market.no_fee_bps as u16, size),
+                        params: entry_params!(token_id, entry_price, market.no_fee_bps as u16, size),
                         pair_params: None,
                     });
                 }
