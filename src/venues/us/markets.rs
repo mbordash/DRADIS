@@ -85,9 +85,15 @@ pub fn pair_markets(markets: Vec<types::UsMarket>) -> Vec<UsMarketPair> {
             }
         }
 
-        // Fallback: parse legacy `instruments`/`outcomes` arrays (spec structure)
+        // Fallback: parse legacy `instruments`/`outcomes` arrays (spec structure).
+        // `outcomes` may be a JSON-encoded string (e.g. `"[\"Yes\",\"No\"]"`) or a
+        // real JSON array — treat it leniently so an unexpected shape doesn't block.
         if long_sym.is_none() || short_sym.is_none() {
-            let legs: Vec<_> = m.instruments.iter().chain(m.outcomes.iter()).collect();
+            let outcomes_arr: Vec<serde_json::Value> = m.outcomes
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let legs: Vec<_> = m.instruments.iter().chain(outcomes_arr.iter()).collect();
             for inst_val in legs {
                 let outcome = inst_val.get("outcome")
                     .and_then(|v| v.as_str())

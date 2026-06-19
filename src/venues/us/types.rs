@@ -9,39 +9,18 @@
 
 pub use polymarket_us::types::*;
 
-#[cfg(any())]
-mod legacy {
+// ─── Lenient market-discovery types (shadow the SDK's strict versions) ────────
+//
+// The live API returns `"outcomes":"[...]"` as a JSON-encoded *string*, not a
+// JSON array.  The SDK's `UsMarket.outcomes: Vec<serde_json::Value>` fails to
+// deserialise that — `#[serde(default)]` only helps when the key is *absent*,
+// not when the value has the wrong JSON type.
+//
+// Defining `MarketsResponse` and `UsMarket` here (after the glob import) causes
+// Rust to shadow the SDK's types with our lenient local versions everywhere in
+// this crate that writes `types::MarketsResponse` / `types::UsMarket`.
 
-use serde::{Deserialize, Serialize};
-
-// ─── Enumerated protocol constants ───────────────────────────────────────────
-// The US gateway uses fully-qualified protobuf-style string enums. Kept as
-// constants (not Rust enums) so an unrecognised server value never panics a
-// deserialise — we only ever *send* these, and parse statuses leniently.
-
-pub mod order_action {
-    pub const BUY: &str = "ORDER_ACTION_BUY";
-    pub const SELL: &str = "ORDER_ACTION_SELL";
-}
-
-pub mod order_type {
-    pub const LIMIT: &str = "ORDER_TYPE_LIMIT";
-}
-
-pub mod tif {
-    pub const GTC: &str = "TIME_IN_FORCE_GOOD_TILL_CANCEL";
-    pub const GTD: &str = "TIME_IN_FORCE_GOOD_TILL_DATE";
-    /// Fill-and-kill (immediate, partial allowed) — a.k.a. immediate-or-cancel.
-    pub const FAK: &str = "TIME_IN_FORCE_IMMEDIATE_OR_CANCEL";
-    /// Fill-or-kill (immediate, all-or-nothing).
-    pub const FOK: &str = "TIME_IN_FORCE_FILL_OR_KILL";
-}
-
-/// The custodial outcome leg of a market instrument.
-pub mod outcome {
-    pub const LONG: &str = "LONG";
-    pub const SHORT: &str = "SHORT";
-}
+use serde::Deserialize;
 
 // ─── Public market reference data (GET /v1/markets) ──────────────────────────
 
@@ -51,6 +30,10 @@ pub struct MarketsResponse {
     pub markets: Vec<UsMarket>,
 }
 
+/// Lenient market record — tolerates the API's non-standard field shapes:
+/// * `outcomes` arrives as a JSON-encoded string `"[...]"` (not an array) —
+///   captured as a raw `Value` so deserialisation never fails.
+/// * `marketSides` contains deeply nested team/player objects — kept as `Value`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UsMarket {
     #[serde(default)]
@@ -75,15 +58,20 @@ pub struct UsMarket {
     pub closed: bool,
     #[serde(default, rename = "marketType")]
     pub market_type: String,
-    // Use Value to avoid nested parsing issues with malformed fields
+    /// Primary instrument legs — contains `long: bool` + `identifier` fields.
     #[serde(default, rename = "marketSides")]
     pub market_sides: Vec<serde_json::Value>,
-    // Legacy fields for compatibility - use Value since structure may vary
+    /// Legacy instrument list (older API shape). Kept for compatibility.
     #[serde(default)]
     pub instruments: Vec<serde_json::Value>,
+    /// API sends this as a JSON-encoded string `"[\"Yes\",\"No\"]"` OR a real
+    /// array — using `Value` here accepts both without panicking.
     #[serde(default)]
-    pub outcomes: Vec<serde_json::Value>,
+    pub outcomes: serde_json::Value,
 }
+
+#[cfg(any())]
+mod legacy {
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct MarketSide {

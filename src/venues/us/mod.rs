@@ -48,6 +48,9 @@ pub struct UsRetailVenue {
     client: PolymarketUsClient,
     base_url: String,
     auth: Arc<UsAuth>,
+    /// Shared HTTP client — used for raw market-discovery requests that bypass
+    /// the SDK's typed deserialisers (which are too strict for the live API).
+    http: Arc<reqwest::Client>,
 }
 
 impl UsRetailVenue {
@@ -65,7 +68,7 @@ impl UsRetailVenue {
             .build()
             .map_err(|e| anyhow!("US retail SDK client bootstrap failed: {e}"))?;
 
-        let venue = Self { client, base_url, auth: Arc::new(auth) };
+        let venue = Self { client, base_url, auth: Arc::new(auth), http };
 
         venue.health_check().await.context("US retail health check failed")?;
         // Validate the Ed25519 API key with a signed balances probe. We use the
@@ -99,12 +102,37 @@ impl UsRetailVenue {
     ///
     /// This is public reference data (no auth required per spec), but the production
     /// gateway returns 401 without auth headers, so we attach them anyway.
+    ///
+    /// We intentionally bypass the SDK's typed `markets_list_authenticated()` here
+    /// because the live API returns `"outcomes":"[...]"` as a JSON-encoded *string*,
+    /// not a JSON array.  The SDK's strict `Vec<Value>` field rejects the string and
+    /// the whole response fails to deserialise.  Using a raw HTTP call lets us parse
+    /// into our own lenient `types::MarketsResponse` where `outcomes: Value` accepts
+    /// any JSON shape without error.
     pub async fn discover_binary_markets(&self) -> Result<Vec<markets::UsMarketPair>> {
-        let parsed = self
-            .client
-            .markets_list_authenticated()
+        let path = "/v1/markets";
+        let url = format!("{}{}", self.base_url, path);
+        let signed = self.auth.signed_headers("GET", path);
+
+        let response = self.http
+            .get(&url)
+            .header(signed[0].0, &signed[0].1)
+            .header(signed[1].0, &signed[1].1)
+            .header(signed[2].0, &signed[2].1)
+            .header("Content-Type", "application/json")
+            .send()
             .await
-            .context("markets request failed")?;
+            .context("markets HTTP request failed")?;
+
+        let status = response.status();
+        let text = response.text().await.context("markets response read failed")?;
+
+        if !status.is_success() {
+            anyhow::bail!("markets endpoint returned HTTP {}: {}", status, text);
+        }
+
+        let parsed: types::MarketsResponse = serde_json::from_str(&text)
+            .context("markets JSON parse failed")?;
         Ok(markets::pair_markets(parsed.markets))
     }
 
