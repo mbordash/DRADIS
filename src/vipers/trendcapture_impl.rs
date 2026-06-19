@@ -336,8 +336,14 @@ impl Strategy for TrendCaptureStrategyImpl {
                     .unwrap_or(false);
                 if !in_cooldown {
                     let size = trade_size(drift_10m.abs());
-                    // Price one tick below the ask so the order rests as a maker.
-                    let entry_price = no_ask - dec!(0.01);
+                    // At high-consensus prices use a wider offset to avoid crossing
+                    // thin books where bid-ask spread is only $0.01.
+                    let entry_offset = if no_ask >= config::TRENDCAPTURE_HIGH_CONSENSUS_ENTRY_THRESHOLD {
+                        config::TRENDCAPTURE_HIGH_CONSENSUS_ENTRY_OFFSET
+                    } else {
+                        dec!(0.01)
+                    };
+                    let entry_price = no_ask - entry_offset;
                     debug!("🦅 TrendCapture BEAR entry: drift_10m={:.0} drift_60m={:.0} align_thr={:.0} no_ask={:.3} entry={:.3} size={:.2}",
                         drift_10m, drift_60m, align_thr, no_ask, entry_price, size);
                     drop(cooldowns);

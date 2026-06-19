@@ -172,6 +172,8 @@ pub const MAKER_MIN_BID_IMPROVEMENT: Decimal = dec!(0.01);
 pub const MAKER_MAX_BID_IMPROVEMENT: Decimal = dec!(0.04);
 pub const MAKER_CROSS_BUFFER: Decimal = dec!(0.02);
 pub const CROSSES_BOOK_COOLDOWN_SECS: i64 = 15;
+/// Aggressive: shorter pause — willing to retry sooner to catch fast-moving books.
+pub const CROSSES_BOOK_RETRY_PAUSE_SECS: u64 = 3;
 
 /// Posts maker orders as close as 10 minutes to expiry.
 pub const MAKER_MIN_SECS_TO_EXPIRY: i64 = 600;
@@ -413,6 +415,9 @@ pub const TRENDCAPTURE_MAX_EXPOSURE_USDC: Decimal = dec!(25.0);
 pub const TRENDCAPTURE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.18);
 pub const TRENDCAPTURE_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
 pub const TRENDCAPTURE_MAX_ENTRY_PRICE: Decimal = dec!(0.78);
+/// Aggressive: higher threshold — only widens offset in very thin book conditions.
+pub const TRENDCAPTURE_HIGH_CONSENSUS_ENTRY_THRESHOLD: Decimal = dec!(0.65);
+pub const TRENDCAPTURE_HIGH_CONSENSUS_ENTRY_OFFSET: Decimal = dec!(0.02);
 
 // 10m drift entry thresholds — raised from $100 → $200 to filter weak entries.
 // Root cause fix for 2026-06-05 losses.

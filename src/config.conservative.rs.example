@@ -175,6 +175,9 @@ pub const MAKER_MIN_BID_IMPROVEMENT: Decimal = dec!(0.01);
 pub const MAKER_MAX_BID_IMPROVEMENT: Decimal = dec!(0.02);
 pub const MAKER_CROSS_BUFFER: Decimal = dec!(0.02);
 pub const CROSSES_BOOK_COOLDOWN_SECS: i64 = 60;
+/// Conservative: longer pause before retrying a rejected entry — lets the book
+/// settle before re-attempting to avoid repeated rejections.
+pub const CROSSES_BOOK_RETRY_PAUSE_SECS: u64 = 8;
 
 /// Won't post maker orders within 45 minutes of expiry.
 pub const MAKER_MIN_SECS_TO_EXPIRY: i64 = 2700;
@@ -413,6 +416,11 @@ pub const TRENDCAPTURE_MAX_EXPOSURE_USDC: Decimal = dec!(10.0);
 pub const TRENDCAPTURE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.22);
 pub const TRENDCAPTURE_STOP_LOSS_PERCENT: Decimal = dec!(0.06);
 pub const TRENDCAPTURE_MAX_ENTRY_PRICE: Decimal = dec!(0.68);
+/// At high-consensus prices the bid-ask spread compresses to $0.01, so
+/// `ask - $0.01` can still cross a resting sell. Switch to $0.02 offset above
+/// this threshold. Conservative: trigger earlier (0.58) to avoid thin books.
+pub const TRENDCAPTURE_HIGH_CONSENSUS_ENTRY_THRESHOLD: Decimal = dec!(0.58);
+pub const TRENDCAPTURE_HIGH_CONSENSUS_ENTRY_OFFSET: Decimal = dec!(0.02);
 
 // 10m drift entry thresholds — PCT-based, oracle-relative.
 /// 0.002 = 0.20% of oracle price. Conservative: same as balanced — requires clear directional move.

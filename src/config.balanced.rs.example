@@ -168,6 +168,8 @@ pub const MAKER_MIN_BID_IMPROVEMENT: Decimal = dec!(0.01);
 pub const MAKER_MAX_BID_IMPROVEMENT: Decimal = dec!(0.03);
 pub const MAKER_CROSS_BUFFER: Decimal = dec!(0.02);
 pub const CROSSES_BOOK_COOLDOWN_SECS: i64 = 45;
+/// Balanced: 5s pause lets the WS snapshot refresh without stalling entries long.
+pub const CROSSES_BOOK_RETRY_PAUSE_SECS: u64 = 5;
 
 pub const MAKER_MIN_SECS_TO_EXPIRY: i64 = 2100;
 /// Standard 1-day horizon for maker venue discovery.
@@ -395,6 +397,10 @@ pub const TRENDCAPTURE_MAX_EXPOSURE_USDC: Decimal = dec!(15.0);
 pub const TRENDCAPTURE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.20);
 pub const TRENDCAPTURE_STOP_LOSS_PERCENT: Decimal = dec!(0.12);
 pub const TRENDCAPTURE_MAX_ENTRY_PRICE: Decimal = dec!(0.65);
+/// At high-consensus prices (ask >= threshold) use $0.02 offset instead of $0.01
+/// to avoid crossing resting sells in thin book conditions.
+pub const TRENDCAPTURE_HIGH_CONSENSUS_ENTRY_THRESHOLD: Decimal = dec!(0.62);
+pub const TRENDCAPTURE_HIGH_CONSENSUS_ENTRY_OFFSET: Decimal = dec!(0.02);
 
 // 10m drift entry thresholds — tightened to require stronger trends.
 // TrendCapture thresholds — PCT-based, oracle-relative.
