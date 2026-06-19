@@ -36,7 +36,6 @@ use crate::venues::core::{
 };
 
 use auth::UsAuth;
-use types::{order_action, order_type, outcome as oc, tif as tif_const};
 
 /// Default authenticated API base (per developer portal).
 const DEFAULT_BASE_URL: &str = "https://api.polymarket.us";
@@ -171,28 +170,28 @@ impl UsRetailVenue {
     /// symbol suffix — the symbol uniquely identifies the side, so no catalog
     /// lookup is needed. Recognises the `yes/long/up` and `no/short/down`
     /// conventions Polymarket US uses across sports and crypto markets.
-    fn outcome_side_from_symbol(symbol: &str) -> Result<&'static str> {
+    fn outcome_side_from_symbol(symbol: &str) -> Result<polymarket_us::types::OrderSide> {
         let last = symbol.rsplit('-').next().unwrap_or("").to_ascii_lowercase();
         match last.as_str() {
-            "yes" | "long" | "up" => Ok(oc::LONG),
-            "no" | "short" | "down" => Ok(oc::SHORT),
+            "yes" | "long" | "up" => Ok(polymarket_us::types::OrderSide::Long),
+            "no" | "short" | "down" => Ok(polymarket_us::types::OrderSide::Short),
             _ => bail!("US retail: cannot infer outcome side from symbol '{symbol}'"),
         }
     }
 
-    fn map_action(side: Side) -> &'static str {
+    fn map_action(side: Side) -> polymarket_us::types::OrderAction {
         match side {
-            Side::Buy => order_action::BUY,
-            Side::Sell => order_action::SELL,
+            Side::Buy => polymarket_us::types::OrderAction::Buy,
+            Side::Sell => polymarket_us::types::OrderAction::Sell,
         }
     }
 
-    fn map_tif(tif: TimeInForce) -> &'static str {
+    fn map_tif(tif: TimeInForce) -> polymarket_us::types::TimeInForce {
         match tif {
-            TimeInForce::Gtc => tif_const::GTC,
-            TimeInForce::Gtd => tif_const::GTD,
-            TimeInForce::Fak => tif_const::FAK,
-            TimeInForce::Fok => tif_const::FOK,
+            TimeInForce::Gtc => polymarket_us::types::TimeInForce::GoodTillCancel,
+            TimeInForce::Gtd => polymarket_us::types::TimeInForce::GoodTillDate,
+            TimeInForce::Fak => polymarket_us::types::TimeInForce::ImmediateOrCancel,
+            TimeInForce::Fok => polymarket_us::types::TimeInForce::FillOrKill,
         }
     }
 
@@ -222,15 +221,15 @@ impl UsRetailVenue {
 
         Ok(types::PlaceOrderRequest {
             symbol,
-            action: Self::map_action(intent.side).to_string(),
-            outcome_side: outcome_side.to_string(),
-            order_type: order_type::LIMIT.to_string(),
+            action: Self::map_action(intent.side),
+            outcome_side: outcome_side,
+            order_type: polymarket_us::types::OrderType::Limit,
             price: types::Money {
                 value: intent.price.normalize().to_string(),
                 currency: "USD".to_string(),
             },
             quantity,
-            tif: Self::map_tif(intent.tif).to_string(),
+            tif: Self::map_tif(intent.tif),
             client_order_id: None,
             post_only: intent.post_only,
             expires_at,
@@ -240,7 +239,7 @@ impl UsRetailVenue {
     /// POST a single prepared order and map the ack to a neutral `Fill`.
     async fn submit_order(&self, intent: &OrderIntent) -> Result<Fill> {
         let body = Self::build_order(intent)?;
-        let ack = self.client.place_order(&body).await.context("order POST failed")?;
+        let ack = self.client.orders().place(&body).await.context("order POST failed")?;
 
         Ok(Fill {
             order_id: OrderId(ack.order_id),
@@ -260,7 +259,8 @@ impl UsRetailVenue {
     async fn fetch_balances(&self) -> Result<f64> {
         let bal_data = self
             .client
-            .account_balances()
+            .account()
+            .balances()
             .await
             .context("account balances request failed")?;
         // Use buyingPower as the available collateral.
@@ -275,7 +275,8 @@ impl UsRetailVenue {
     async fn fetch_positions(&self) -> Result<Vec<types::UsPosition>> {
         let pos_data = self
             .client
-            .portfolio_positions()
+            .portfolio()
+            .positions()
             .await
             .context("portfolio positions request failed")?;
 
@@ -309,7 +310,8 @@ impl Execution for UsRetailVenue {
         };
         let ack = self
             .client
-            .place_batched_orders(&body)
+            .orders()
+            .place_batch(&body)
             .await
             .context("batched order POST failed")?;
         if ack.orders.len() != 2 {
@@ -331,7 +333,8 @@ impl Execution for UsRetailVenue {
     async fn cancel(&self, id: OrderId) -> Result<()> {
         let ack = self
             .client
-            .cancel_trading_order(&id.0)
+            .orders()
+            .cancel_trading(&id.0)
             .await
             .context("cancel DELETE failed")?;
         debug!("US retail: order {} → {}", ack.order_id, ack.status);
