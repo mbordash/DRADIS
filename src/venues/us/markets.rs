@@ -152,7 +152,7 @@ mod tests {
             market_type: String::new(),
             market_sides: Vec::new(),
             instruments,
-            outcomes: Vec::new(),
+            outcomes: serde_json::Value::Array(Vec::new()),
         }
     }
 
