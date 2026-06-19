@@ -64,7 +64,7 @@ const TICK_MS: u64 = 500;
 /// Pause after any order placement so the loop doesn't spam a fleeting book.
 const ACTION_COOLDOWN_SECS: u64 = 30;
 /// Retry cadence while waiting for a tradeable market to appear.
-const DISCOVERY_RETRY_SECS: u64 = 30;
+const DISCOVERY_RETRY_SECS: u64 = 300; // 5 min — avoid hammering when no markets are live
 /// How often to refresh the dashboard + reload squadron config / collateral.
 const DASHBOARD_SYNC_SECS: u64 = 30;
 /// Skip selecting any market that closes within this many seconds — not worth
@@ -79,14 +79,19 @@ const MARKET_RTB_WINDOW_SECS: i64 = 120; // 2 minutes
 const LIFECYCLE_SYNC_SECS: u64 = 10;
 // Stale-order and flatten thresholds now live in `LifecycleConfig::us()`
 // (`crate::venues::lifecycle`), shared with the venue-neutral lifecycle engine.
-/// Asset slug the US venue writes its DB rows under (`logs/us-dradis.db`,
-/// surfaced in the Control Tower asset selector).
+/// How often to scan for a hotter market while already trading.
+const MARKET_RESCAN_SECS: u64 = 300; // 5 minutes
+/// Rotate to a new market only when it has at least this much more volume than
+/// the current one. Prevents thrashing between near-equal markets.
+const ROTATION_VOLUME_THRESHOLD: f64 = 10_000.0;
 pub const US_ASSET: &str = "us";
 
 /// Why a single-market trading session ended — drives the outer rotation loop.
 enum MarketOutcome {
     /// The market reached its close time; rotate to the next one.
     Closed,
+    /// A hotter market appeared and positions are flat — rotate now.
+    BetterMarketFound,
     /// Global cancellation fired; exit the trader entirely.
     Cancelled,
 }
@@ -141,6 +146,10 @@ pub async fn run_us_trader(
 
         match outcome {
             MarketOutcome::Cancelled => return,
+            MarketOutcome::BetterMarketFound => {
+                info!("🔀 US market rotation — hotter market found, switching");
+                // No pause: the new market is already live and liquid.
+            }
             MarketOutcome::Closed => {
                 info!("🔁 US market closed — rotating to next market");
                 // Brief pause so we don't hammer discovery the instant a market
@@ -184,6 +193,7 @@ async fn select_market(
                 // Drop markets already closed or too close to close to be worth
                 // entering — no point committing capital we can't work first.
                 let now = Utc::now();
+                let total_pairs = markets.len();
                 let tradeable: Vec<_> = markets.into_iter()
                     .filter(|m| match m.close_time {
                         Some(c) => (c - now).num_seconds() > MIN_TIME_TO_CLOSE_SECS,
@@ -192,7 +202,9 @@ async fn select_market(
                     .collect();
 
                 if tradeable.is_empty() {
-                    warn!("US trader: all markets closed or closing within {MIN_TIME_TO_CLOSE_SECS}s — retrying");
+                    warn!(
+                        "US trader: {total_pairs} pair(s) found but all closed or closing within {MIN_TIME_TO_CLOSE_SECS}s — retrying"
+                    );
                 } else {
                     let selected = match filter {
                         Some(f) => {
@@ -322,6 +334,8 @@ async fn trade_one_market(
     let mut price_tick = tokio::time::interval(Duration::from_millis(TICK_MS));
     let mut dash_tick = tokio::time::interval(Duration::from_secs(DASHBOARD_SYNC_SECS));
     let mut lifecycle_tick = tokio::time::interval(Duration::from_secs(LIFECYCLE_SYNC_SECS));
+    let mut rescan_tick = tokio::time::interval(Duration::from_secs(MARKET_RESCAN_SECS));
+    let _ = rescan_tick.tick().await; // skip the immediate first fire
     let mut cooldown_until = Instant::now();
     let mut winding_down = false;
 
@@ -346,6 +360,34 @@ async fn trade_one_market(
                 }
                 // Pick up any Control Tower config edits for this squadron.
                 dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
+                continue;
+            }
+            _ = rescan_tick.tick() => {
+                // Scan for a hotter market. Only rotate when flat (no open
+                // positions) to avoid leaving a naked leg mid-arb.
+                let has_positions = !positions.lock().await.is_empty();
+                if has_positions {
+                    continue;
+                }
+                match venue.discover_binary_markets().await {
+                    Ok(mut candidates) if !candidates.is_empty() => {
+                        // Best market by volume, excluding the one we're already on.
+                        candidates.retain(|m| m.slug != pair.slug);
+                        if let Some(best) = candidates.iter().max_by(|a, b| a.volume.partial_cmp(&b.volume).unwrap_or(std::cmp::Ordering::Equal)) {
+                            if best.volume > pair.volume + ROTATION_VOLUME_THRESHOLD {
+                                info!(
+                                    "🔍 Hotter market found: \"{}\" vol={:.0} > current \"{}\" vol={:.0} + threshold {:.0} — rotating",
+                                    best.question, best.volume, pair.question, pair.volume, ROTATION_VOLUME_THRESHOLD
+                                );
+                                lifecycle.cancel_all(venue.as_ref()).await;
+                                cag.update_state(&squadron_id, SquadronState::StoodDown);
+                                publish_us_raptor_health(raptor_health_tx, false);
+                                return MarketOutcome::BetterMarketFound;
+                            }
+                        }
+                    }
+                    _ => {} // discovery failure during rescan is non-fatal
+                }
                 continue;
             }
             _ = lifecycle_tick.tick() => {

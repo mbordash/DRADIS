@@ -271,6 +271,15 @@ async fn main() -> Result<()> {
         // but does not crash the process — the Control Tower API stays up so the
         // operator can diagnose. On success we drive the venue-neutral US trading
         // loop (arbitrage over the `Execution` trait) until shutdown.
+        //
+        // Guard: if the required env vars are absent (e.g. BTC-only run), skip the
+        // connect entirely so we don't emit a misleading WARN on every startup.
+        let us_creds_present = std::env::var(dradis::venues::us::auth::ENV_KEY_ID).is_ok()
+            && std::env::var(dradis::venues::us::auth::ENV_SECRET_KEY).is_ok();
+        if !us_creds_present {
+            tracing::debug!("US retail venue skipped — POLYMARKET_US_KEY_ID / POLYMARKET_US_SECRET_KEY not set");
+            std::future::pending::<()>().await;
+        }
         match dradis::venues::us::UsRetailVenue::connect(Arc::clone(&shared_http)).await {
             Ok(venue) => {
                 let venue = Arc::new(venue);

@@ -21,10 +21,10 @@ pub struct UsMarketPair {
     pub long: MarketId,
     /// `SHORT` (NO) leg symbol.
     pub short: MarketId,
-    /// Market close/expiry time, parsed from the gateway's `endDate`. `None`
-    /// when absent/unparseable — treated as an always-open market that never
-    /// rotates. Drives the squadron's wind-down / stand-down lifecycle.
+    /// Market close/expiry time, parsed from the gateway's `endDate`.
     pub close_time: Option<DateTime<Utc>>,
+    /// Cumulative USD trading volume — used to rank and rotate to the hottest market.
+    pub volume: f64,
 }
 
 /// Parse the gateway's `endDate` string into a UTC instant.
@@ -50,7 +50,9 @@ fn parse_close_time(end_date: &str) -> Option<DateTime<Utc>> {
 pub fn pair_markets(markets: Vec<types::UsMarket>) -> Vec<UsMarketPair> {
     let mut out = Vec::new();
     for m in markets {
-        // Explicitly skip closed markets regardless of active/status fields.
+        // Skip markets the venue has explicitly closed (game played / trading halted).
+        // `closed` is the only reliable signal — `gameStartTime` is the observation
+        // window start for futures/climate markets and must NOT be used as a trade gate.
         if m.closed {
             continue;
         }
@@ -124,6 +126,7 @@ pub fn pair_markets(markets: Vec<types::UsMarket>) -> Vec<UsMarketPair> {
                 long: MarketId::new(l),
                 short: MarketId::new(s),
                 close_time: parse_close_time(&m.end_date),
+                volume: m.volume,
             });
         }
     }
@@ -153,7 +156,9 @@ mod tests {
             description: String::new(),
             active: status == "ACTIVE",
             closed: false,
+            game_start_time: None,
             market_type: String::new(),
+            volume: 10_000.0,
             market_sides: Vec::new(),
             instruments,
             outcomes: serde_json::Value::Array(Vec::new()),

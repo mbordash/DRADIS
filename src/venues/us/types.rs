@@ -56,8 +56,17 @@ pub struct UsMarket {
     pub active: bool,
     #[serde(default)]
     pub closed: bool,
+    /// When the underlying event starts (e.g. game tip-off / fight start).
+    /// A market whose `gameStartTime` is in the past has already been played —
+    /// the event is over and trading is or will soon be closed.
+    #[serde(default, rename = "gameStartTime")]
+    pub game_start_time: Option<String>,
     #[serde(default, rename = "marketType")]
     pub market_type: String,
+    /// Cumulative trading volume in USD. Used to rank markets by liquidity
+    /// so the trader can rotate to the hottest book when positions are flat.
+    #[serde(default, rename = "volumeNum")]
+    pub volume: f64,
     /// Primary instrument legs — contains `long: bool` + `identifier` fields.
     #[serde(default, rename = "marketSides")]
     pub market_sides: Vec<serde_json::Value>,

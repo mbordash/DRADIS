@@ -41,6 +41,14 @@ use auth::UsAuth;
 const DEFAULT_BASE_URL: &str = "https://api.polymarket.us";
 /// Override the gateway base URL (staging / mock).
 const ENV_BASE_URL: &str = "POLYMARKET_US_BASE_URL";
+/// Minimum cumulative volume (USD) a market must have to be considered for
+/// trading. Low default — freshly-listed open markets have little volume yet;
+/// high-volume markets tend to be already-closed resolved events. Override via env.
+const ENV_MIN_VOLUME: &str = "POLYMARKET_US_MIN_VOLUME";
+const DEFAULT_MIN_VOLUME: f64 = 5_000.0;
+/// How many days back to look for recently-listed markets. Newly posted games
+/// are the ones still open; stale listings are resolved events awaiting settlement.
+const MARKET_START_LOOKBACK_DAYS: i64 = 7;
 
 /// The custodial US retail venue (web2 auth, no signer).
 pub struct UsRetailVenue {
@@ -110,14 +118,31 @@ impl UsRetailVenue {
     /// any JSON shape without error.
     pub async fn discover_binary_markets(&self) -> Result<Vec<markets::UsMarketPair>> {
         const PAGE_LIMIT: usize = 200;
+        const MAX_PAGES: usize = 20; // safety cap — the API may cycle
         let path = "/v1/markets";
         let mut all_markets: Vec<types::UsMarket> = Vec::new();
         let mut page = 1usize;
+        let mut prev_first_slug = String::new();
 
         loop {
+            // endDate = settlement date (can be days/weeks after the game).
+            // startDate = when the market was listed — recently-listed markets
+            // are the ones whose events are still upcoming. Using startDateMin
+            // focuses the query on fresh listings, avoiding the mass of resolved
+            // events that settled recently. volumeNumMin is kept low because
+            // open markets for today's games start with minimal volume.
+            let now = chrono::Utc::now();
+            let start_min = (now - chrono::Duration::days(MARKET_START_LOOKBACK_DAYS))
+                .format("%Y-%m-%dT%H:%M:%SZ");
+            let end_min = now.format("%Y-%m-%dT%H:%M:%SZ");
+            let end_max = (now + chrono::Duration::days(21)).format("%Y-%m-%dT%H:%M:%SZ");
+            let min_vol = std::env::var(ENV_MIN_VOLUME)
+                .ok()
+                .and_then(|v| v.parse::<f64>().ok())
+                .unwrap_or(DEFAULT_MIN_VOLUME);
             let url = format!(
-                "{}{}?status=ACTIVE&limit={}&page={}",
-                self.base_url, path, PAGE_LIMIT, page
+                "{}{}?startDateMin={}&endDateMin={}&endDateMax={}&volumeNumMin={}&orderBy=closed&limit={}&page={}",
+                self.base_url, path, start_min, end_min, end_max, min_vol, PAGE_LIMIT, page
             );
             // Auth headers are signed against the path only (no query string).
             let signed = self.auth.signed_headers("GET", path);
@@ -143,18 +168,42 @@ impl UsRetailVenue {
                 .context("markets JSON parse failed")?;
 
             let count = parsed.markets.len();
-            debug!("US market discovery page {page}: {} markets", count);
+
+            // Detect API pagination cycling: if the first slug repeats from the
+            // previous page, the server is ignoring the `page` param and looping.
+            let first_slug = parsed.markets.first().map(|m| m.slug.clone()).unwrap_or_default();
+            if page > 1 && first_slug == prev_first_slug {
+                info!("US market discovery: API is cycling at page {page} — stopping pagination");
+                break;
+            }
+            prev_first_slug = first_slug;
+
+            // Count open vs closed so we can tell at a glance what the API returned.
+            let open_count = parsed.markets.iter().filter(|m| !m.closed).count();
+            let sample: Vec<_> = parsed.markets.iter().take(3)
+                .map(|m| format!("\"{}\" (closed={})", m.question, m.closed))
+                .collect();
+            info!("US market discovery page {page}: {count} markets ({open_count} open) — sample: {}", sample.join(", "));
             all_markets.extend(parsed.markets);
 
-            // Stop when the API returns fewer results than the page size — last page reached.
-            if count < PAGE_LIMIT {
+            // Stop when: last page (fewer than limit), safety cap, or entire page was closed
+            // (API isn't filtering properly and there's nothing more to find).
+            if count < PAGE_LIMIT || page >= MAX_PAGES || open_count == 0 {
+                if open_count == 0 && count == PAGE_LIMIT {
+                    info!("US market discovery: full page returned but all closed — stopping (API filter ineffective)");
+                }
                 break;
             }
             page += 1;
         }
 
-        debug!("US market discovery: {} total raw markets fetched across {} page(s)", all_markets.len(), page);
-        Ok(markets::pair_markets(all_markets))
+        let raw_total = all_markets.len();
+        let pairs = markets::pair_markets(all_markets);
+        info!(
+            "US market discovery: {raw_total} raw markets across {page} page(s) → {} tradeable pairs",
+            pairs.len()
+        );
+        Ok(pairs)
     }
 
     /// Public connectivity probe (`GET /v1/health`, no auth).
