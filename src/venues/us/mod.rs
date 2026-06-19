@@ -110,30 +110,52 @@ impl UsRetailVenue {
     /// into our own lenient `types::MarketsResponse` where `outcomes: Value` accepts
     /// any JSON shape without error.
     pub async fn discover_binary_markets(&self) -> Result<Vec<markets::UsMarketPair>> {
+        const PAGE_LIMIT: usize = 200;
         let path = "/v1/markets";
-        let url = format!("{}{}", self.base_url, path);
-        let signed = self.auth.signed_headers("GET", path);
+        let mut all_markets: Vec<types::UsMarket> = Vec::new();
+        let mut page = 1usize;
 
-        let response = self.http
-            .get(&url)
-            .header(signed[0].0, &signed[0].1)
-            .header(signed[1].0, &signed[1].1)
-            .header(signed[2].0, &signed[2].1)
-            .header("Content-Type", "application/json")
-            .send()
-            .await
-            .context("markets HTTP request failed")?;
+        loop {
+            let url = format!(
+                "{}{}?status=ACTIVE&limit={}&page={}",
+                self.base_url, path, PAGE_LIMIT, page
+            );
+            // Auth headers are signed against the path only (no query string).
+            let signed = self.auth.signed_headers("GET", path);
 
-        let status = response.status();
-        let text = response.text().await.context("markets response read failed")?;
+            let response = self.http
+                .get(&url)
+                .header(signed[0].0, &signed[0].1)
+                .header(signed[1].0, &signed[1].1)
+                .header(signed[2].0, &signed[2].1)
+                .header("Content-Type", "application/json")
+                .send()
+                .await
+                .with_context(|| format!("markets HTTP request failed (page {page})"))?;
 
-        if !status.is_success() {
-            anyhow::bail!("markets endpoint returned HTTP {}: {}", status, text);
+            let http_status = response.status();
+            let text = response.text().await.context("markets response read failed")?;
+
+            if !http_status.is_success() {
+                anyhow::bail!("markets endpoint returned HTTP {}: {}", http_status, text);
+            }
+
+            let parsed: types::MarketsResponse = serde_json::from_str(&text)
+                .context("markets JSON parse failed")?;
+
+            let count = parsed.markets.len();
+            debug!("US market discovery page {page}: {} markets", count);
+            all_markets.extend(parsed.markets);
+
+            // Stop when the API returns fewer results than the page size — last page reached.
+            if count < PAGE_LIMIT {
+                break;
+            }
+            page += 1;
         }
 
-        let parsed: types::MarketsResponse = serde_json::from_str(&text)
-            .context("markets JSON parse failed")?;
-        Ok(markets::pair_markets(parsed.markets))
+        debug!("US market discovery: {} total raw markets fetched across {} page(s)", all_markets.len(), page);
+        Ok(markets::pair_markets(all_markets))
     }
 
     /// Public connectivity probe (`GET /v1/health`, no auth).

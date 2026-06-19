@@ -50,6 +50,10 @@ fn parse_close_time(end_date: &str) -> Option<DateTime<Utc>> {
 pub fn pair_markets(markets: Vec<types::UsMarket>) -> Vec<UsMarketPair> {
     let mut out = Vec::new();
     for m in markets {
+        // Explicitly skip closed markets regardless of active/status fields.
+        if m.closed {
+            continue;
+        }
         if !m.status.is_empty() && !m.status.eq_ignore_ascii_case("ACTIVE") {
             // Also check the `active` boolean field
             if !m.active {
