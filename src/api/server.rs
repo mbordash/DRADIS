@@ -830,6 +830,14 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
         let mut deduped_positions: std::collections::HashMap<String, db::OpenPositionRow> =
             std::collections::HashMap::new();
         for pos in db::get_open_positions(&pool).await {
+            // Skip UNCONFIRMED phantoms: still `status='pending'` AND not chain-adopted
+            // means the order was placed but never confirmed on-chain (never filled or
+            // rejected). Valuing it inflates the portfolio with non-existent profit until
+            // the 60-min purge grace elapses. Mirrors calculate_positions_value() so the
+            // banner and snapshots stay one source of truth.
+            if pos.status == "pending" && !pos.chain_adopted {
+                continue;
+            }
             match deduped_positions.get(&pos.token_id) {
                 None => {
                     deduped_positions.insert(pos.token_id.clone(), pos);

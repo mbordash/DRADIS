@@ -50,8 +50,26 @@ impl Strategy for ArbitrageStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
-        let market   = ctx.maker_market.as_ref().unwrap_or(&ctx.market);
-        let snapshot = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
+        // ── Maker venue required (orphan-loss guard) ─────────────────────────
+        // The profitable arbitrage regime is the near-settlement daily/window
+        // market, where both legs are deep (≈0.98+0.0x) and the spread converges
+        // to settlement — directional/orphan risk is minimal.
+        //
+        // Previously, when the daily/window maker venue was unavailable (e.g. the
+        // current day's market settled and the next day's is not yet listed) this
+        // code silently fell back to `ctx.market` (the volatile HOURLY book via
+        // `unwrap_or`). On the hourly venue mid-window a one-sided maker fill is a
+        // real directional bet: a fast underlying move fills only one leg, leaving
+        // a naked position that the arbiter must flatten at a loss (the 2026-06-19
+        // 11:50 ET episode — NO leg filled, BTC rallied, YES ran away, forced
+        // flatten −$1.44). Refuse to enter unless the dedicated maker venue (and
+        // its snapshot) are actually present.
+        let (Some(market), Some(snapshot)) =
+            (ctx.maker_market.as_ref(), ctx.maker_snapshot.as_ref())
+        else {
+            debug!(" Arb skipped — no maker (daily/window) venue available; refusing hourly fallback");
+            return Ok(StrategySignal::NoSignal);
+        };
 
         let yes_bid = snapshot.yes_bid;
         let no_bid  = snapshot.no_bid;

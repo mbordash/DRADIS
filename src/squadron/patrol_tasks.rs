@@ -179,6 +179,16 @@ async fn calculate_positions_value(pool: &sqlx::SqlitePool) -> Decimal {
     let mut deduped_by_token: std::collections::HashMap<String, db::OpenPositionRow> =
         std::collections::HashMap::new();
     for pos in positions {
+        // Skip UNCONFIRMED phantoms: a row that is still `status='pending'` AND has
+        // not been chain-adopted represents an order we placed but the chain never
+        // confirmed (never filled, or rejected). Marking these to market for up to
+        // the 60-min purge grace inflates the portfolio with profit that does not
+        // exist on-chain (observed 2026-06-19: a never-filled TrendCapture June-20 NO
+        // leg added a phantom +$2.83 / "open profitable trade"). A genuine fill flips
+        // to chain_adopted=1 on the next chain-sync and starts counting then.
+        if pos.status == "pending" && !pos.chain_adopted {
+            continue;
+        }
         match deduped_by_token.get(&pos.token_id) {
             None => {
                 deduped_by_token.insert(pos.token_id.clone(), pos);
