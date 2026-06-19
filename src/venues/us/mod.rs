@@ -388,40 +388,41 @@ fn resolve_filled(filled_quantity: u64, intent: &OrderIntent) -> Decimal {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use polymarket_us::types as sdk;
 
     #[test]
     fn outcome_side_inferred_from_symbol_suffix() {
         assert_eq!(
             UsRetailVenue::outcome_side_from_symbol("tec-nfl-sbw-2026-02-08-kc-yes").unwrap(),
-            oc::LONG
+            sdk::OrderSide::Long
         );
         assert_eq!(
             UsRetailVenue::outcome_side_from_symbol("btc-up-or-down-2026-06-15-no").unwrap(),
-            oc::SHORT
+            sdk::OrderSide::Short
         );
         assert_eq!(
             UsRetailVenue::outcome_side_from_symbol("eth-hourly-up").unwrap(),
-            oc::LONG
+            sdk::OrderSide::Long
         );
         assert_eq!(
             UsRetailVenue::outcome_side_from_symbol("eth-hourly-down").unwrap(),
-            oc::SHORT
+            sdk::OrderSide::Short
         );
         assert!(UsRetailVenue::outcome_side_from_symbol("mystery-symbol-xyz").is_err());
     }
 
     #[test]
     fn action_maps_from_side() {
-        assert_eq!(UsRetailVenue::map_action(Side::Buy), order_action::BUY);
-        assert_eq!(UsRetailVenue::map_action(Side::Sell), order_action::SELL);
+        assert_eq!(UsRetailVenue::map_action(Side::Buy), sdk::OrderAction::Buy);
+        assert_eq!(UsRetailVenue::map_action(Side::Sell), sdk::OrderAction::Sell);
     }
 
     #[test]
     fn tif_maps_to_protocol_enums() {
-        assert_eq!(UsRetailVenue::map_tif(TimeInForce::Gtc), tif_const::GTC);
-        assert_eq!(UsRetailVenue::map_tif(TimeInForce::Gtd), tif_const::GTD);
-        assert_eq!(UsRetailVenue::map_tif(TimeInForce::Fak), tif_const::FAK);
-        assert_eq!(UsRetailVenue::map_tif(TimeInForce::Fok), tif_const::FOK);
+        assert_eq!(UsRetailVenue::map_tif(TimeInForce::Gtc), sdk::TimeInForce::GoodTillCancel);
+        assert_eq!(UsRetailVenue::map_tif(TimeInForce::Gtd), sdk::TimeInForce::GoodTillDate);
+        assert_eq!(UsRetailVenue::map_tif(TimeInForce::Fak), sdk::TimeInForce::ImmediateOrCancel);
+        assert_eq!(UsRetailVenue::map_tif(TimeInForce::Fok), sdk::TimeInForce::FillOrKill);
     }
 
     #[test]
@@ -449,9 +450,9 @@ mod tests {
         };
         let body = UsRetailVenue::build_order(&intent).unwrap();
         assert_eq!(body.symbol, "tec-nfl-sbw-2026-02-08-kc-yes");
-        assert_eq!(body.action, order_action::BUY);
-        assert_eq!(body.outcome_side, oc::LONG);
-        assert_eq!(body.order_type, order_type::LIMIT);
+        assert_eq!(body.action, sdk::OrderAction::Buy);
+        assert_eq!(body.outcome_side, sdk::OrderSide::Long);
+        assert_eq!(body.order_type, sdk::OrderType::Limit);
         assert_eq!(body.quantity, 100);
         assert_eq!(body.price.value, "0.55");
         assert!(body.post_only);
@@ -482,8 +483,8 @@ mod tests {
         let json = serde_json::to_value(&body).unwrap();
         assert_eq!(json["atomic"], true);
         assert_eq!(json["orders"].as_array().unwrap().len(), 2);
-        assert_eq!(json["orders"][0]["outcomeSide"], oc::LONG);
-        assert_eq!(json["orders"][1]["outcomeSide"], oc::SHORT);
+        assert_eq!(json["orders"][0]["outcomeSide"], "LONG");
+        assert_eq!(json["orders"][1]["outcomeSide"], "SHORT");
     }
 
     #[test]
