@@ -289,6 +289,18 @@ impl Strategy for TrendCaptureStrategyImpl {
                 && yes_ask >= effective_min_price
                 && yes_ask <= dc.trendcapture_max_entry_price
             {
+                // Per-token spread gate: a hollow bid side guarantees an instant
+                // stop-out (SL is measured against the bid). Skip if the YES
+                // bid-ask spread exceeds the cap.
+                let yes_spread = if yes_ask > dec!(0) {
+                    (yes_ask - snap.yes_bid) / yes_ask
+                } else { Decimal::ONE };
+                if yes_spread > config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT {
+                    debug!("🦅 TrendCapture BULL blocked: YES spread {:.1}% > max {:.1}% (ask={:.3} bid={:.3}) — hollow bid would force instant SL",
+                        yes_spread * dec!(100), config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT * dec!(100), yes_ask, snap.yes_bid);
+                    return Ok(StrategySignal::NoSignal);
+                }
+
                 // Cooldown check
                 let token_id = market.yes_token.clone();
                 let cdl = effective_cooldown(&market.condition_id);
@@ -329,6 +341,19 @@ impl Strategy for TrendCaptureStrategyImpl {
                 && no_ask >= effective_min_price
                 && no_ask <= dc.trendcapture_max_entry_price
             {
+                // Per-token spread gate: a hollow bid side guarantees an instant
+                // stop-out (SL is measured against the bid). Skip if the NO
+                // bid-ask spread exceeds the cap. This is exactly the Jun 20
+                // trade id 51 failure: NO ask 0.326 / bid 0.241 = 26% spread.
+                let no_spread = if no_ask > dec!(0) {
+                    (no_ask - snap.no_bid) / no_ask
+                } else { Decimal::ONE };
+                if no_spread > config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT {
+                    debug!("🦅 TrendCapture BEAR blocked: NO spread {:.1}% > max {:.1}% (ask={:.3} bid={:.3}) — hollow bid would force instant SL",
+                        no_spread * dec!(100), config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT * dec!(100), no_ask, snap.no_bid);
+                    return Ok(StrategySignal::NoSignal);
+                }
+
                 let token_id = market.no_token.clone();
                 let cdl = effective_cooldown(&market.condition_id);
                 let in_cooldown = cooldowns.get(&token_id)

@@ -231,13 +231,21 @@ impl OrderLifecycle {
             };
             match venue.place_order(intent).await {
                 Ok(f)  => {
-                    info!("🛡️ [{strategy}] flattened naked leg {token} (order {})", f.order_id);
+                    // Record the ACTUAL fill price/qty from the venue, not the
+                    // flatten *limit*. Booking the 0.01 limit overstated losses:
+                    // e.g. Jun 19 trade id 50 booked −$2.94 at exit 0.01 when the
+                    // FAK sell actually crossed near the prevailing bid. Fall back
+                    // to the configured limit / intended shares only if the venue
+                    // doesn't report them.
+                    let exit_price  = if f.price  > dec!(0) { f.price }  else { self.cfg.flatten_sell_limit };
+                    let exit_shares = if f.filled > dec!(0) { f.filled } else { shares };
+                    info!("🛡️ [{strategy}] flattened naked leg {token} (order {}) — {exit_shares} @ {exit_price:.4}", f.order_id);
                     flattened.push(FlattenedLeg {
                         strategy: strategy.clone(),
                         market_name,
-                        shares,
+                        shares: exit_shares,
                         avg_entry,
-                        exit_price: self.cfg.flatten_sell_limit,
+                        exit_price,
                     });
                 }
                 Err(e) => warn!("[{strategy}] flatten of {token} failed: {e} — will retry next reconcile"),

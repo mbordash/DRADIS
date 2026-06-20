@@ -360,7 +360,21 @@ pub async fn reconcile_orphaned_positions(
     // adopted position at the other token.  If only one leg has an on-chain
     // balance (naked orphan), the cleanup cycle will detect the missing pair on
     // its next run and remove the position while preventing phantom re-entry.
+    //
+    // ⚠️ PAIRED-STRATEGY GUARD: only genuinely two-leg strategies may receive a
+    // `paired_leg_token_id`. Single-leg directional strategies (TrendCapture,
+    // Momentum, Gboost, Maker, Basis) hold ONE token by design and have no hedge
+    // partner. Stamping a phantom partner on them makes the lifecycle naked-leg
+    // detector (`venues/lifecycle.rs`) flatten a perfectly healthy position at the
+    // $0.01 floor — exactly the Jun 19 trade id 50 (−$2.94) false flatten: a
+    // TrendCapture YES leg was paired to the NO token it never held, then dumped.
+    // Only ArbitrageStrategy / TimeDecayStrategy emit `pair_params: Some`.
     if tokens.len() == 2 {
+        // Mirrors the strategies that enter with `pair_params: Some(..)`.
+        let is_paired_strategy = |s: &str| {
+            matches!(s, "ArbitrageStrategy" | "TimeDecayStrategy")
+        };
+
         let market_a = tokens[0].0.clone();
         let market_b = tokens[1].0.clone();
         let mut pos_map = positions.lock().await;
@@ -374,13 +388,21 @@ pub async fn reconcile_orphaned_positions(
             .map(|((s, _), _)| s.clone());
 
         if let Some(sa) = strat_a {
-            if let Some(p) = pos_map.get_mut(&(sa, market_a.clone())) {
-                p.paired_leg_token_id = Some(market_b.clone());
+            if is_paired_strategy(&sa) {
+                if let Some(p) = pos_map.get_mut(&(sa, market_a.clone())) {
+                    p.paired_leg_token_id = Some(market_b.clone());
+                }
+            } else {
+                debug!("🔁 RECONCILE: skipping phantom pairing for single-leg strategy [{}] on token {}", sa, market_a);
             }
         }
         if let Some(sb) = strat_b {
-            if let Some(p) = pos_map.get_mut(&(sb, market_b.clone())) {
-                p.paired_leg_token_id = Some(market_a.clone());
+            if is_paired_strategy(&sb) {
+                if let Some(p) = pos_map.get_mut(&(sb, market_b.clone())) {
+                    p.paired_leg_token_id = Some(market_a.clone());
+                }
+            } else {
+                debug!("🔁 RECONCILE: skipping phantom pairing for single-leg strategy [{}] on token {}", sb, market_b);
             }
         }
     }
