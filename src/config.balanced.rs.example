@@ -428,6 +428,7 @@ pub const TRENDCAPTURE_MAX_SNAPSHOT_AGE_SECS: i64 = 15;
 pub const TRENDCAPTURE_MIN_SECS_TO_EXPIRY: i64 = 1800;  // 30 min minimum
 pub const TRENDCAPTURE_MARKET_WARMUP_SECS: i64 = 120;
 pub const TRENDCAPTURE_MAX_ENTRY_ASK_SUM: Decimal = dec!(1.04);
+pub const TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT: Decimal = dec!(0.12);
 pub const TRENDCAPTURE_MIN_ENTRY_PRICE: Decimal = dec!(0.30);
 pub const TRENDCAPTURE_POST_EXIT_COOLDOWN_SECS: i64 = 1800;
 /// Late-market entry/exit tightening — applied in the last N seconds before close.

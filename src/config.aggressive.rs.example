@@ -447,6 +447,7 @@ pub const TRENDCAPTURE_MARKET_WARMUP_SECS: i64 = 60;
 
 /// Aggressive: wider spread tolerance — 5-cent combined cap.
 pub const TRENDCAPTURE_MAX_ENTRY_ASK_SUM: Decimal = dec!(1.05);
+pub const TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT: Decimal = dec!(0.12);
 pub const TRENDCAPTURE_MIN_ENTRY_PRICE: Decimal = dec!(0.25);
 pub const TRENDCAPTURE_POST_EXIT_COOLDOWN_SECS: i64 = 600;
 /// Late-market entry/exit tightening — applied in the last N seconds before close.
