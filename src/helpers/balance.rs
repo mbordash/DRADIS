@@ -192,7 +192,7 @@ async fn cancel_resting_orders(client: &Arc<ClobClient<Authenticated<Normal>>>, 
         return false;
     }
     let id_refs: Vec<&str> = order_ids.iter().map(|s| s.as_str()).collect();
-    warn!("🛑 Cancelling {} resting GTC order(s) for token {} — preventing orphan fills",
+    warn!(" Cancelling {} resting GTC order(s) for token {} — preventing orphan fills",
           id_refs.len(), token_id);
     let _ = client.cancel_orders(&id_refs).await;
     true
@@ -253,7 +253,7 @@ pub async fn reconcile_orphaned_positions(
                 continue;
             }
         };
-        debug!("🔍 RECONCILE: token {} ({}) on-chain balance = {:.4}", token_id, side_label, actual_shares);
+        debug!(" RECONCILE: token {} ({}) on-chain balance = {:.4}", token_id, side_label, actual_shares);
         if actual_shares < crate::config::MIN_ORDER_SHARES {
             debug!("⏭️  RECONCILE: skipping token {} — balance {:.4} below threshold", token_id, actual_shares);
             continue;
@@ -282,12 +282,12 @@ pub async fn reconcile_orphaned_positions(
         let db_entry = metrics::lookup_entry_from_csv(&token_id.to_string()).await;
         let (avg_entry, logged_strategy) = match db_entry {
             Some((real_entry, ref strat)) if !strat.is_empty() => {
-                warn!("🔁 RECONCILE: Recovered entry_price={:.4} strategy={} for token {} from entry log",
+                warn!(" RECONCILE: Recovered entry_price={:.4} strategy={} for token {} from entry log",
                     real_entry, strat, token_id);
                 (real_entry, Some(strat.clone()))
             }
             Some((real_entry, _)) => {
-                warn!("🔁 RECONCILE: Recovered entry_price={:.4} for token {} (no strategy in log)", real_entry, token_id);
+                warn!(" RECONCILE: Recovered entry_price={:.4} for token {} (no strategy in log)", real_entry, token_id);
                 (real_entry, None)
             }
             None => {
@@ -346,7 +346,7 @@ pub async fn reconcile_orphaned_positions(
             let source = if logged_strategy.is_some() { "DB" } else {
                 &format!("discount@{:.0}%", crate::config::RECONCILE_ADOPTED_ENTRY_DISCOUNT * dec!(100))
             };
-            warn!("🔁 RECONCILE: Adopted {} {} shares for token {} under [{}] — avg_entry={:.4} (source={}, current_bid={:.4})",
+            warn!(" RECONCILE: Adopted {} {} shares for token {} under [{}] — avg_entry={:.4} (source={}, current_bid={:.4})",
                 actual_shares, side_label, token_id, strategy_name, avg_entry, source, current_bid);
         }
     }
@@ -393,7 +393,7 @@ pub async fn reconcile_orphaned_positions(
                     p.paired_leg_token_id = Some(market_b.clone());
                 }
             } else {
-                debug!("🔁 RECONCILE: skipping phantom pairing for single-leg strategy [{}] on token {}", sa, market_a);
+                debug!(" RECONCILE: skipping phantom pairing for single-leg strategy [{}] on token {}", sa, market_a);
             }
         }
         if let Some(sb) = strat_b {
@@ -402,7 +402,7 @@ pub async fn reconcile_orphaned_positions(
                     p.paired_leg_token_id = Some(market_a.clone());
                 }
             } else {
-                debug!("🔁 RECONCILE: skipping phantom pairing for single-leg strategy [{}] on token {}", sb, market_b);
+                debug!(" RECONCILE: skipping phantom pairing for single-leg strategy [{}] on token {}", sb, market_b);
             }
         }
     }
@@ -607,7 +607,7 @@ pub async fn arb_pair_fill_monitor(
             .build();
         match client.price(&req).await {
             Ok(resp) => {
-                info!("📊 ARB ARBITER [{}]: Current ask for missing leg {} = {:.4}", strategy_name, missing_token, resp.price);
+                info!(" ARB ARBITER [{}]: Current ask for missing leg {} = {:.4}", strategy_name, missing_token, resp.price);
                 resp.price
             }
             Err(e) => {
@@ -652,7 +652,7 @@ pub async fn arb_pair_fill_monitor(
     let rehedge_viable = rehedge_price <= dynamic_ceiling;
 
     if rehedge_viable {
-        warn!("🎯 ARB ARBITER [{}]: Placing FAK taker buy re-hedge — token={} qty={} limit={:.4} (ask={:.4}, breakeven_ceil={:.4}, filled_entry={:.4})",
+        warn!(" ARB ARBITER [{}]: Placing FAK taker buy re-hedge — token={} qty={} limit={:.4} (ask={:.4}, breakeven_ceil={:.4}, filled_entry={:.4})",
               strategy_name, missing_token, fak_qty, rehedge_price, ask_price, dynamic_ceiling, filled_avg_entry);
 
         match place_limit_order(
@@ -715,7 +715,7 @@ pub async fn arb_pair_fill_monitor(
             }
         }
     } else {
-        warn!("🛟 ARB ARBITER [{}]: Re-hedge uneconomical (would need {:.4} > breakeven {:.4}) — flattening naked leg at bid to cap loss",
+        warn!(" ARB ARBITER [{}]: Re-hedge uneconomical (would need {:.4} > breakeven {:.4}) — flattening naked leg at bid to cap loss",
               strategy_name, rehedge_price, dynamic_ceiling);
     }
 
@@ -745,7 +745,7 @@ pub async fn arb_pair_fill_monitor(
     // Cross one tick below the bid to guarantee an immediate taker sell; floor at $0.01.
     let sell_price = (bid_price - dec!(0.01)).max(dec!(0.01));
 
-    warn!("🛟 ARB ARBITER [{}]: Flattening naked leg {} — FAK SELL {} @ {:.4} (bid={:.4}, entry={:.4})",
+    warn!(" ARB ARBITER [{}]: Flattening naked leg {} — FAK SELL {} @ {:.4} (bid={:.4}, entry={:.4})",
           strategy_name, filled_token, filled_shares, sell_price, bid_price, filled_avg_entry);
 
     match place_limit_order(

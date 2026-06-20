@@ -183,7 +183,7 @@ impl OrderLifecycle {
             }
             if ord.placed_at.elapsed().as_secs() >= self.cfg.stale_order_secs {
                 match venue.cancel(ord.id.clone()).await {
-                    Ok(_)  => info!("🧹 [{}] cancelled stale resting order {} ({})", ord.strategy, ord.id, ord.market),
+                    Ok(_)  => info!(" [{}] cancelled stale resting order {} ({})", ord.strategy, ord.id, ord.market),
                     Err(e) => warn!("[{}] stale cancel failed for {} ({}): {e}", ord.strategy, ord.id, ord.market),
                 }
                 clear_guard(positions, &ord.strategy, &ord.market).await;
@@ -217,7 +217,7 @@ impl OrderLifecycle {
         };
         let mut flattened: Vec<FlattenedLeg> = Vec::new();
         for (strategy, token, shares, market_name, avg_entry) in orphans {
-            warn!("🛡️ [{strategy}] naked leg: {token} filled but partner neither filled nor resting — flattening {shares}");
+            warn!("️ [{strategy}] naked leg: {token} filled but partner neither filled nor resting — flattening {shares}");
             let intent = OrderIntent {
                 market: token.clone(),
                 side: Side::Sell,
@@ -239,7 +239,7 @@ impl OrderLifecycle {
                     // doesn't report them.
                     let exit_price  = if f.price  > dec!(0) { f.price }  else { self.cfg.flatten_sell_limit };
                     let exit_shares = if f.filled > dec!(0) { f.filled } else { shares };
-                    info!("🛡️ [{strategy}] flattened naked leg {token} (order {}) — {exit_shares} @ {exit_price:.4}", f.order_id);
+                    info!("️ [{strategy}] flattened naked leg {token} (order {}) — {exit_shares} @ {exit_price:.4}", f.order_id);
                     flattened.push(FlattenedLeg {
                         strategy: strategy.clone(),
                         market_name,

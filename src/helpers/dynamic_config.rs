@@ -46,6 +46,8 @@ use crate::helpers::db;
 fn default_arb_max_leg_price()             -> Decimal { config::ARBITRAGE_MAX_LEG_PRICE             }
 fn default_arb_max_leg_obi()               -> Decimal { config::ARBITRAGE_MAX_LEG_OBI               }
 fn default_arb_max_obi_asymmetry()         -> Decimal { config::ARBITRAGE_MAX_OBI_ASYMMETRY         }
+fn default_arb_fak_rehedge_buffer()        -> Decimal { config::ARB_FAK_REHEDGE_BUFFER              }
+fn default_arb_max_rescue_cost()           -> Decimal { config::ARB_MAX_RESCUE_COST                 }
 fn default_trendcapture_enable()           -> bool    { config::ENABLE_TRENDCAPTURE_TRADING          }
 fn default_trendcapture_min_trade_size()   -> Decimal { config::TRENDCAPTURE_MIN_TRADE_SIZE_USDC     }
 fn default_trendcapture_max_trade_size()   -> Decimal { config::TRENDCAPTURE_MAX_TRADE_SIZE_USDC     }
@@ -97,6 +99,17 @@ pub struct DynamicConfig {
     /// fill one leg alone and leave a naked orphan. Lower = stricter. Default 0.60.
     #[serde(default = "default_arb_max_obi_asymmetry")]
     pub arbitrage_max_obi_asymmetry:  Decimal,
+
+    /// Breakeven buffer subtracted from the $1.00 payout when deciding whether to
+    /// FAK re-hedge a naked arb leg. Per-squadron so thin alt books (ETH/SOL) can
+    /// carry a larger taker-fee/adverse-price cushion than deep BTC books.
+    #[serde(default = "default_arb_fak_rehedge_buffer")]
+    pub arb_fak_rehedge_buffer:       Decimal,
+    /// Upper bound on single-leg orphan RESCUE cost in the arb entry gate. Entry is
+    /// blocked only when a single-leg fill would be materially unrecoverable
+    /// (rescue ≥ this). Per-squadron so alts can demand a tighter bound than BTC.
+    #[serde(default = "default_arb_max_rescue_cost")]
+    pub arb_max_rescue_cost:          Decimal,
 
     // ── TimeDecay Viper ───────────────────────────────────────────────────────
     pub time_decay_position_size_usdc:  Decimal,
@@ -173,6 +186,8 @@ impl Default for DynamicConfig {
             arbitrage_max_leg_price:      config::ARBITRAGE_MAX_LEG_PRICE,
             arbitrage_max_leg_obi:        config::ARBITRAGE_MAX_LEG_OBI,
             arbitrage_max_obi_asymmetry:  config::ARBITRAGE_MAX_OBI_ASYMMETRY,
+            arb_fak_rehedge_buffer:       config::ARB_FAK_REHEDGE_BUFFER,
+            arb_max_rescue_cost:          config::ARB_MAX_RESCUE_COST,
 
             time_decay_position_size_usdc:  config::TIME_DECAY_POSITION_SIZE_USDC,
             time_decay_max_exposure_usdc:   config::TIME_DECAY_MAX_EXPOSURE_USDC,

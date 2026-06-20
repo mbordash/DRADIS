@@ -83,7 +83,7 @@ pub fn spawn_pulse_task(
                         Ok(_) => {}
                         Err(_) => warn!("⚠️ Network Pulse: balance_allowance timed out (10s) — CLOB API stall suspected"),
                     }
-                    info!("🌐 Network Pulse: {:?}", start.elapsed());
+                    info!(" Network Pulse: {:?}", start.elapsed());
                 }
             }
         }
@@ -271,7 +271,7 @@ pub fn spawn_status_task(
                     let yes_obi = if ybd + yad > dec!(0) { (ybd - yad) / (ybd + yad) } else { dec!(0) };
                     let no_obi  = if nbd + nad > dec!(0) { (nbd - nad) / (nbd + nad) } else { dec!(0) };
                     info!(
-                        "💓 Heartbeat | Ask Sum ${:.4} (Y ask ${:.2} / N ask ${:.2}) | \
+                        " Heartbeat | Ask Sum ${:.4} (Y ask ${:.2} / N ask ${:.2}) | \
                          Bid Sum ${:.4} (Y bid ${:.2} / N bid ${:.2}) | \
                          Binance: ${:.2} | OBI Y={:.2} N={:.2}",
                         ya + na, ya, na, yb + nb, yb, nb, *oracle_rx.borrow(), yes_obi, no_obi,
@@ -289,7 +289,7 @@ pub fn spawn_status_task(
                             let bal = Decimal::from_str(&resp.balance.to_string())
                                 .unwrap_or(dec!(0)) / dec!(1_000_000);
                             *live_collateral.lock().await = bal;
-                            debug!("💰 Live pUSD balance: ${:.4}", bal);
+                            debug!(" Live pUSD balance: ${:.4}", bal);
                             if let Some(pool) = db::pool_for(&asset) {
                                 let pnl_snap = *total_pnl.lock().await;
 
@@ -606,7 +606,7 @@ pub fn spawn_cleanup_task(
                                 };
 
                                 warn!(
-                                    "🔴 ORPHAN EXIT: selling {:.4} shares of token {} @ ${:.4} (current bid=${:.4})",
+                                    " ORPHAN EXIT: selling {:.4} shares of token {} @ ${:.4} (current bid=${:.4})",
                                     orphan.shares, orphan.token_id, sell_price, orphan_bid,
                                 );
 
@@ -623,7 +623,7 @@ pub fn spawn_cleanup_task(
                                         let sh_o = orphan.shares;
                                         tokio::spawn(async move {
                                             let _ = send_notification(&tok_o, &cid_o, &format!(
-                                                "🔴 Orphan sold: {:.0} shares @ ${:.4} (bid-based FAK exit)",
+                                                " Orphan sold: {:.0} shares @ ${:.4} (bid-based FAK exit)",
                                                 sh_o, sell_price,
                                             )).await;
                                         });
@@ -671,7 +671,7 @@ pub fn spawn_watchdog_task(
                     let elapsed = last_heartbeat_at.lock().await.elapsed().as_secs();
                     if elapsed > LOOP_WATCHDOG_SECS {
                         error!(
-                            "🚨 WATCHDOG: inner loop silent for {}s (limit={}s) — \
+                            " WATCHDOG: inner loop silent for {}s (limit={}s) — \
                              calling patrol cancel to trigger restart",
                             elapsed, LOOP_WATCHDOG_SECS,
                         );
@@ -716,7 +716,7 @@ pub fn spawn_lifecycle_task(
                     for leg in flattened {
                         let pnl = (leg.exit_price - leg.avg_entry) * leg.shares;
                         warn!(
-                            "📋 [{strategy}] lifecycle flatten recorded: {market} entry={entry:.4} exit={exit:.4} shares={shares} pnl={pnl:.4}",
+                            " [{strategy}] lifecycle flatten recorded: {market} entry={entry:.4} exit={exit:.4} shares={shares} pnl={pnl:.4}",
                             strategy = leg.strategy,
                             market   = leg.market_name,
                             entry    = leg.avg_entry,

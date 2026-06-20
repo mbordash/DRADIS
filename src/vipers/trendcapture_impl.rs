@@ -107,7 +107,7 @@ impl Strategy for TrendCaptureStrategyImpl {
         // ── Snapshot staleness gate ───────────────────────────────────────────
         let snap_age = (Utc::now() - snap.timestamp).num_seconds();
         if snap_age > config::TRENDCAPTURE_MAX_SNAPSHOT_AGE_SECS {
-            debug!("🦅 TrendCapture blocked: snapshot stale ({}s > {}s)",
+            debug!(" TrendCapture blocked: snapshot stale ({}s > {}s)",
                 snap_age, config::TRENDCAPTURE_MAX_SNAPSHOT_AGE_SECS);
             return Ok(StrategySignal::NoSignal);
         }
@@ -125,7 +125,7 @@ impl Strategy for TrendCaptureStrategyImpl {
         let secs_left = if let Some(close_time) = market.market_close_time {
             let s = (close_time - Utc::now()).num_seconds();
             if s < config::TRENDCAPTURE_MIN_SECS_TO_EXPIRY {
-                debug!("🦅 TrendCapture blocked: only {}s to expiry (min {}s)",
+                debug!(" TrendCapture blocked: only {}s to expiry (min {}s)",
                     s, config::TRENDCAPTURE_MIN_SECS_TO_EXPIRY);
                 return Ok(StrategySignal::NoSignal);
             }
@@ -152,7 +152,7 @@ impl Strategy for TrendCaptureStrategyImpl {
         // ── Spread gate ───────────────────────────────────────────────────────
         let ask_sum = snap.yes_ask + snap.no_ask;
         if ask_sum > config::TRENDCAPTURE_MAX_ENTRY_ASK_SUM {
-            debug!("🦅 TrendCapture spread gate: ask_sum={:.3} > max {:.3} — book too wide",
+            debug!(" TrendCapture spread gate: ask_sum={:.3} > max {:.3} — book too wide",
                 ask_sum, config::TRENDCAPTURE_MAX_ENTRY_ASK_SUM);
             return Ok(StrategySignal::NoSignal);
         }
@@ -296,7 +296,7 @@ impl Strategy for TrendCaptureStrategyImpl {
                     (yes_ask - snap.yes_bid) / yes_ask
                 } else { Decimal::ONE };
                 if yes_spread > config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT {
-                    debug!("🦅 TrendCapture BULL blocked: YES spread {:.1}% > max {:.1}% (ask={:.3} bid={:.3}) — hollow bid would force instant SL",
+                    debug!(" TrendCapture BULL blocked: YES spread {:.1}% > max {:.1}% (ask={:.3} bid={:.3}) — hollow bid would force instant SL",
                         yes_spread * dec!(100), config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT * dec!(100), yes_ask, snap.yes_bid);
                     return Ok(StrategySignal::NoSignal);
                 }
@@ -313,7 +313,7 @@ impl Strategy for TrendCaptureStrategyImpl {
                     // Submitting at yes_ask crosses the book and is rejected by
                     // Polymarket with "invalid post-only order: order crosses book".
                     let entry_price = yes_ask - dec!(0.01);
-                    debug!("🦅 TrendCapture BULL entry: drift_10m={:.0} drift_60m={:.0} align_thr={:.0} yes_ask={:.3} entry={:.3} size={:.2}",
+                    debug!(" TrendCapture BULL entry: drift_10m={:.0} drift_60m={:.0} align_thr={:.0} yes_ask={:.3} entry={:.3} size={:.2}",
                         drift_10m, drift_60m, align_thr, yes_ask, entry_price, size);
                     drop(cooldowns);
                     drop(consec);
@@ -349,7 +349,7 @@ impl Strategy for TrendCaptureStrategyImpl {
                     (no_ask - snap.no_bid) / no_ask
                 } else { Decimal::ONE };
                 if no_spread > config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT {
-                    debug!("🦅 TrendCapture BEAR blocked: NO spread {:.1}% > max {:.1}% (ask={:.3} bid={:.3}) — hollow bid would force instant SL",
+                    debug!(" TrendCapture BEAR blocked: NO spread {:.1}% > max {:.1}% (ask={:.3} bid={:.3}) — hollow bid would force instant SL",
                         no_spread * dec!(100), config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT * dec!(100), no_ask, snap.no_bid);
                     return Ok(StrategySignal::NoSignal);
                 }
@@ -369,7 +369,7 @@ impl Strategy for TrendCaptureStrategyImpl {
                         dec!(0.01)
                     };
                     let entry_price = no_ask - entry_offset;
-                    debug!("🦅 TrendCapture BEAR entry: drift_10m={:.0} drift_60m={:.0} align_thr={:.0} no_ask={:.3} entry={:.3} size={:.2}",
+                    debug!(" TrendCapture BEAR entry: drift_10m={:.0} drift_60m={:.0} align_thr={:.0} no_ask={:.3} entry={:.3} size={:.2}",
                         drift_10m, drift_60m, align_thr, no_ask, entry_price, size);
                     drop(cooldowns);
                     drop(consec);

@@ -18,6 +18,8 @@ export interface DynamicConfig {
   arbitrage_position_size_usdc: string;
   arbitrage_max_exposure_usdc:  string;
   arbitrage_profit_threshold:   string;
+  arb_fak_rehedge_buffer:       string;
+  arb_max_rescue_cost:          string;
 
   // TimeDecay Viper
   time_decay_position_size_usdc:   string;

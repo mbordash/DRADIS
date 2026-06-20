@@ -149,6 +149,8 @@ export const VIPER_DEFS: ViperDef[] = [
       { key: 'arbitrage_position_size_usdc', label: 'Position Size',     type: 'usd'     },
       { key: 'arbitrage_max_exposure_usdc',  label: 'Max Exposure',      type: 'usd'     },
       { key: 'arbitrage_profit_threshold',   label: 'Min Profit/Share',  type: 'price'   },
+      { key: 'arb_fak_rehedge_buffer',       label: 'Re-hedge Buffer',   type: 'price'   },
+      { key: 'arb_max_rescue_cost',          label: 'Max Rescue Cost',   type: 'price'   },
     ],
   },
   {

@@ -231,14 +231,14 @@ impl Strategy for ArbitrageStrategyImpl {
         // Block entry unless BOTH single-leg failure cases are recoverable:
         //   YES fills first → rescue by buying NO at no_ask + 1 tick
         //   NO  fills first → rescue by buying YES at yes_ask + 1 tick
-        let rehedge_buf = crate::config::ARB_FAK_REHEDGE_BUFFER;
+        let rehedge_buf = dc.arb_fak_rehedge_buffer;
         let yes_rescue_cost = safe_yes_bid + no_ask  + dec!(0.01) + rehedge_buf;
         let no_rescue_cost  = safe_no_bid  + yes_ask + dec!(0.01) + rehedge_buf;
-        if yes_rescue_cost >= dec!(1.00) || no_rescue_cost >= dec!(1.00) {
+        if yes_rescue_cost >= dc.arb_max_rescue_cost || no_rescue_cost >= dc.arb_max_rescue_cost {
             debug!(
-                " Arb rescue-profit gate — YES rescue {:.4} or NO rescue {:.4} ≥ $1.00 — skipping \
-                 (single-leg fill is not rescueable into a profitable hedge at live asks)",
-                yes_rescue_cost, no_rescue_cost
+                " Arb rescue-profit gate — YES rescue {:.4} or NO rescue {:.4} ≥ ${:.2} — skipping \
+                 (single-leg orphan materially unrecoverable at live asks)",
+                yes_rescue_cost, no_rescue_cost, dc.arb_max_rescue_cost
             );
             return Ok(StrategySignal::NoSignal);
         }
