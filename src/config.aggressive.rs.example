@@ -47,6 +47,10 @@ pub const ARBITRAGE_MAX_LEG_OBI: Decimal = dec!(0.50);
 pub const ARBITRAGE_MAX_OBI_ASYMMETRY: Decimal = dec!(0.60);
 pub const ARB_FAK_REHEDGE_BUFFER: Decimal = dec!(0.02);
 
+/// Upper bound on single-leg orphan rescue cost in the arb entry gate. Aggressive:
+/// permissive so more 0.99-sum pairs qualify (orphan tail accepted for more fills).
+pub const ARB_MAX_RESCUE_COST: Decimal = dec!(1.10);
+
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.98);
 pub const MIN_ORDER_SHARES: Decimal = dec!(1.0);
 pub const MIN_ORDER_USDC: Decimal = dec!(1.05);
