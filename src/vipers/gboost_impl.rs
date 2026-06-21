@@ -1811,6 +1811,7 @@ mod tests {
             maker_market: None, // Added missing field
             maker_snapshot: None, // Added missing field
             dynamic_config: Arc::new(DynamicConfig::default()),
+            arb_market_lockouts: None,
         }
     }
 

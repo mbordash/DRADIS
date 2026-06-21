@@ -46,6 +46,11 @@ pub struct StrategyContext {
     /// read the latest values without any locking overhead.
     /// Hot-patched by the Control Tower API via `DynamicConfig::apply_patch`.
     pub dynamic_config: Arc<DynamicConfig>,
+    /// Session-scoped per-market arbitrage re-entry lockouts. When the arb viper
+    /// commits a pair to a market it inserts both tokens here; subsequent ticks see
+    /// the lock and refuse to open a second pair on the same market (hold-to-settle,
+    /// no churn). `None` for venues/tests that don't supply it.
+    pub arb_market_lockouts: Option<crate::state::ArbMarketLockouts>,
 }
 
 /// Trait that all strategies must implement.

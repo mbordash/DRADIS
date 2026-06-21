@@ -745,6 +745,22 @@ pub async fn lookup_entry_db(pool: &SqlitePool, token_id_str: &str) -> Option<(D
     Some((price, strategy))
 }
 
+/// Look up the YES/NO outcome side a token was entered as, from the `entries`
+/// table. Used to label a flatten/settlement trade with the leg's actual market
+/// outcome instead of a bare order direction ("Sell"). Prefers the most recent
+/// entry for the token. Returns `None` if the token was never recorded as an entry.
+pub async fn lookup_entry_side_db(pool: &SqlitePool, token_id_str: &str) -> Option<String> {
+    let row = sqlx::query(
+        "SELECT side FROM entries WHERE token_id = ? ORDER BY ts DESC LIMIT 1"
+    )
+    .bind(token_id_str)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()?;
+    row.try_get::<String, _>(0).ok().filter(|s| !s.is_empty())
+}
+
 /// Look up the strategy and entry price for a token from the `open_positions` table.
 ///
 /// This is the MOST AUTHORITATIVE source for restart reconciliation:

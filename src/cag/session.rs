@@ -32,7 +32,7 @@ use tokio::time::Instant;
 use crate::state::PositionMap;
 use crate::venues::ActiveVenue;
 use crate::venues::core::MarketId;
-use crate::state::{PhantomCooldowns, OrphanTombstones};
+use crate::state::{PhantomCooldowns, OrphanTombstones, ArbMarketLockouts};
 use crate::vipers::time_decay_impl::TimeDecayPosition;
 
 // ─── SessionState ─────────────────────────────────────────────────────────────
@@ -88,6 +88,16 @@ pub struct SessionState {
     /// reconcile → re-adopt → orphan-detect cycle observed on 2026-05-19.
     pub orphan_tombstones: OrphanTombstones,
 
+    /// Per-market arbitrage re-entry lockouts.
+    ///
+    /// Once the arb viper commits a hedged pair to a market this session, both of
+    /// that market's tokens are inserted here and no further arb entry is allowed
+    /// on that market — the single pair is held to settlement rather than churning
+    /// re-entries at the coin-flip midpoint (root cause of the 2026-06-21 overnight
+    /// orphan cascade). Never cleared on rotation; the next daily market has fresh
+    /// tokens and trades normally.
+    pub arb_market_lockouts: ArbMarketLockouts,
+
     /// TimeDecay strategy's per-token position metadata used by the cleanup
     /// worker to detect expired theta positions that need forced closure.
     pub time_decay_positions: Arc<Mutex<HashMap<MarketId, TimeDecayPosition>>>,
@@ -140,6 +150,7 @@ impl SessionState {
             starting_collateral:  Arc::new(Mutex::new(startup_balance)),
             phantom_cooldowns:    Arc::new(Mutex::new(HashMap::new())),
             orphan_tombstones:    Arc::new(Mutex::new(HashSet::new())),
+            arb_market_lockouts:  Arc::new(Mutex::new(HashSet::new())),
             time_decay_positions: Arc::new(Mutex::new(HashMap::new())),
             token_ownership:      Arc::new(Mutex::new(HashMap::new())),
             venue,

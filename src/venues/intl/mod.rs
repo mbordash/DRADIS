@@ -198,7 +198,7 @@ impl Execution for IntlClobVenue {
     async fn place_order(&self, intent: OrderIntent) -> Result<Fill> {
         let vc = Self::verifying_contract(intent.is_neg_risk);
 
-        let order_id = orders::place_limit_order(
+        let (order_id, making_amount, taking_amount) = orders::place_limit_order_filled(
             &self.clob,
             &self.nonce,
             &self.signer,
@@ -217,11 +217,34 @@ impl Execution for IntlClobVenue {
         )
         .await?;
 
+        // Derive the REAL average fill price from the matched amounts rather than
+        // echoing the limit. A marketable FAK/FOK (e.g. a naked-leg flatten with a
+        // $0.01 limit) often fills far better than its limit; booking the limit
+        // produced phantom losses (2026-06-21 trade 56: a leg that sold at $0.4426
+        // was booked at $0.01 → −$5.30 instead of −$0.97).
+        //
+        // making/taking come back in the order's maker/taker orientation:
+        //   SELL → making = shares given, taking = USDC received → price = taking/making
+        //   BUY  → making = USDC paid,    taking = shares recv   → price = making/taking
+        // The ratio is unit-invariant (any shared 1e6 scaling cancels). We clamp to
+        // a valid binary price (0,1]; anything outside means the response orientation
+        // was unexpected, so we fall back to the limit. Resting GTC/GTD orders match
+        // nothing immediately (making/taking = 0) and also fall back to the limit.
+        let fill_price = if making_amount > dec!(0) && taking_amount > dec!(0) {
+            let p = match intent.side {
+                Side::Sell => taking_amount / making_amount,
+                Side::Buy  => making_amount / taking_amount,
+            };
+            if p > dec!(0) && p <= dec!(1) { p } else { intent.price }
+        } else {
+            intent.price
+        };
+
         Ok(Fill {
             order_id: OrderId(order_id),
             market: intent.market,
             filled: intent.quantity,
-            price: intent.price,
+            price: fill_price,
         })
     }
 

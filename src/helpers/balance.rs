@@ -21,6 +21,7 @@ use polymarket_client_sdk_v2::clob::types::{AssetType, Side};
 
 use crate::helpers::metrics;
 use crate::helpers::orders::place_limit_order;
+use crate::helpers::orders::place_limit_order_filled;
 use crate::venues::core::MarketId;
 use crate::venues::intl::{market_id_from_u256, u256_from_market_id};
 
@@ -748,16 +749,27 @@ pub async fn arb_pair_fill_monitor(
     warn!(" ARB ARBITER [{}]: Flattening naked leg {} — FAK SELL {} @ {:.4} (bid={:.4}, entry={:.4})",
           strategy_name, filled_token, filled_shares, sell_price, bid_price, filled_avg_entry);
 
-    match place_limit_order(
+    match place_limit_order_filled(
         &client, &nonce_manager, &signer,
         safe_address, eoa_address, filled_vc,
         &filled_market, Side::Sell, filled_shares, sell_price,
         0, crate::venues::core::TimeInForce::Fak, false, 0, &*http,
     ).await {
-        Ok(order_id) => {
-            let realized = (sell_price - filled_avg_entry) * filled_shares;
-            warn!("✅ ARB ARBITER [{}]: Naked leg flattened (order_id={}) — exposure closed at bid, realized ${:.4}",
-                  strategy_name, order_id, realized);
+        Ok((order_id, making_amount, taking_amount)) => {
+            // Book the ACTUAL average fill price from the CLOB match, not the
+            // intended `sell_price` limit. For a SELL the matched proceeds/size
+            // give the real price (ratio is unit-invariant); clamp to a valid
+            // (0,1] binary price and fall back to the limit if the response
+            // orientation is unexpected or nothing matched (partial/again later).
+            let exit_price = if making_amount > dec!(0) && taking_amount > dec!(0) {
+                let p = taking_amount / making_amount;
+                if p > dec!(0) && p <= dec!(1) { p } else { sell_price }
+            } else {
+                sell_price
+            };
+            let realized = (exit_price - filled_avg_entry) * filled_shares;
+            warn!("✅ ARB ARBITER [{}]: Naked leg flattened (order_id={}) — exposure closed @ {:.4} (limit {:.4}), realized ${:.4}",
+                  strategy_name, order_id, exit_price, sell_price, realized);
             // The leg is closed — drop it from tracking so it isn't counted as open.
             positions.lock().await.remove(&(strategy_name.clone(), filled_market.clone()));
             // Record the realized result so the dashboard reflects the true (small) loss.
@@ -767,7 +779,7 @@ pub async fn arb_pair_fill_monitor(
                 market_name,
                 filled_side.to_string(),
                 filled_avg_entry,
-                sell_price,
+                exit_price,
                 filled_shares,
                 realized,
                 "Orphan flatten (bid exit)".to_string(),

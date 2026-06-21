@@ -185,7 +185,13 @@ async fn build_signed_order(
 ///
 /// Handles: nonce management, EIP-712 signing, posting to CLOB, retry on
 /// transient errors (nonce conflict, execution-engine 500).
-pub async fn place_limit_order(
+///
+/// Returns `(order_id, making_amount, taking_amount)` — the matched amounts come
+/// straight from the CLOB `POST /order` response. For a marketable FAK/FOK order
+/// these reflect the ACTUAL execution (so callers can compute the real average
+/// fill price); for a resting GTC/GTD order they are typically zero until a match
+/// occurs. Use [`place_limit_order`] if you only need the order id.
+pub async fn place_limit_order_filled(
     client: &Arc<ClobClient<Authenticated<Normal>>>,
     nonce_manager: &Arc<AtomicU64>,
     signer: &LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
@@ -201,7 +207,7 @@ pub async fn place_limit_order(
     post_only: bool,
     expiration_secs: u64,
     http: &reqwest::Client,
-) -> Result<String> {
+) -> Result<(String, Decimal, Decimal)> {
     // Convert the neutral key to the on-chain id at the venue boundary (slice 2b).
     let token_id = u256_from_market_id(token_id)?;
     // Map the neutral TIF onto the SDK enum once, at the venue boundary.
@@ -229,7 +235,7 @@ pub async fn place_limit_order(
             Ok(r) => r,
         };
         match post_result {
-            Ok(resp) => return Ok(resp.order_id),
+            Ok(resp) => return Ok((resp.order_id, resp.making_amount, resp.taking_amount)),
             Err(e) => {
                 let err_msg = format!("{:?}", e).to_lowercase();
                 if err_msg.contains("invalid nonce") && attempt == 0 {
@@ -250,6 +256,34 @@ pub async fn place_limit_order(
         }
     }
     Err(anyhow::anyhow!("Max retries reached"))
+}
+
+/// Thin wrapper over [`place_limit_order_filled`] for callers that only need the
+/// order id (the historical signature). The matched amounts are discarded.
+#[allow(clippy::too_many_arguments)]
+pub async fn place_limit_order(
+    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    nonce_manager: &Arc<AtomicU64>,
+    signer: &LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
+    safe_address: Address,
+    eoa_address: Address,
+    verifying_contract: Address,
+    token_id: &MarketId,
+    side: Side,
+    quantity: Decimal,
+    limit_price: Decimal,
+    fee_rate_bps: u16,
+    order_type: TimeInForce,
+    post_only: bool,
+    expiration_secs: u64,
+    http: &reqwest::Client,
+) -> Result<String> {
+    let (order_id, _making, _taking) = place_limit_order_filled(
+        client, nonce_manager, signer, safe_address, eoa_address, verifying_contract,
+        token_id, side, quantity, limit_price, fee_rate_bps, order_type, post_only,
+        expiration_secs, http,
+    ).await?;
+    Ok(order_id)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

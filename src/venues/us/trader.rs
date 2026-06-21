@@ -474,6 +474,7 @@ async fn trade_one_market(
             maker_snapshot: None,
             available_collateral,
             dynamic_config: dyn_cfg.clone(),
+            arb_market_lockouts: None,
         };
 
         // Evaluate the resolved vipers and dispatch whatever they decide.

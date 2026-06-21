@@ -258,6 +258,21 @@ impl Strategy for ArbitrageStrategyImpl {
             );
             return Ok(StrategySignal::NoSignal);
         }
+        // ── Per-market re-entry lockout ──────────────────────────────────────
+        // Once we've committed a hedged pair to THIS market this session, never
+        // open a second pair on it — hold the single pair to settlement instead
+        // of churning re-entries at the coin-flip midpoint (where one maker leg
+        // always gets picked off first → orphan flatten). Root cause of the
+        // 2026-06-21 overnight cascade: after a clean pair settled, the viper
+        // re-armed on the same daily market every tick and bled out 5 orphans.
+        if let Some(locks) = ctx.arb_market_lockouts.as_ref() {
+            let locked = locks.lock().await;
+            if locked.contains(&market.yes_token) || locked.contains(&market.no_token) {
+                debug!(" Arb skipped — market already traded this session (re-entry lockout)");
+                return Ok(StrategySignal::NoSignal);
+            }
+        }
+
         let current_exposure = {
             let pos_map = ctx.positions.lock().await;
 
@@ -323,6 +338,17 @@ impl Strategy for ArbitrageStrategyImpl {
                 // NO is the expensive leg — place it first
                 (market.no_token.clone(), safe_no_bid, market.yes_token.clone(), safe_yes_bid)
             };
+
+        // ── Commit: lock this market against any further arb entry this session ──
+        // Insert BEFORE returning the signal so the very next tick (and every tick
+        // after a future orphan flatten clears the position map) is refused. Both
+        // tokens are locked because either leg appearing on a re-entry attempt
+        // must block it.
+        if let Some(locks) = ctx.arb_market_lockouts.as_ref() {
+            let mut locked = locks.lock().await;
+            locked.insert(market.yes_token.clone());
+            locked.insert(market.no_token.clone());
+        }
 
         return Ok(StrategySignal::Entry {
             params: OrderParams {

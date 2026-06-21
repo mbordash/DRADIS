@@ -21,6 +21,12 @@ use tokio::time::Instant;
 pub type PhantomCooldowns = Arc<Mutex<HashMap<String, Instant>>>;
 /// Set of market ids that have been flattened/abandoned and must not be re-hedged.
 pub type OrphanTombstones = Arc<Mutex<HashSet<MarketId>>>;
+/// Set of token ids whose market the arbitrage viper has already committed a pair
+/// to this session. Once locked, no second arb pair is opened on that market — the
+/// viper holds the single pair to settlement instead of churning re-entries.
+/// Session-scoped (never cleared on market rotation); each new daily/window market
+/// has fresh tokens, so the next market trades normally.
+pub type ArbMarketLockouts = Arc<Mutex<HashSet<MarketId>>>;
 
 // ─── WebSocket price feed ─────────────────────────────────────────────────────
 

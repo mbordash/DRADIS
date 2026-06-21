@@ -27,9 +27,12 @@ use polymarket_client_sdk_v2::auth::Normal;
 use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
 use polymarket_client_sdk_v2::data::Client as DataClient;
 use polymarket_client_sdk_v2::data::types::request::PositionsRequest;
+use polymarket_client_sdk_v2::data::types::request::ClosedPositionsRequest;
+use polymarket_client_sdk_v2::data::types::ClosedPositionSortBy;
+
 use alloy::primitives::address as alloy_address;
 
-use crate::helpers::{db, metrics, send_notification, PhantomCooldowns};
+use crate::helpers::{db, send_notification, PhantomCooldowns};
 use crate::helpers::balance::OrphanTombstones;
 use crate::state::{Position, PositionMap};
 use crate::venues::core::MarketId;
@@ -1202,6 +1205,60 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address, squadron_ass
         }
     }
 
+    // ── Resolution evidence: closed-positions ────────────────────────────────
+    // CRITICAL: a token vanishing from `active_tokens` does NOT mean the market
+    // settled — it also vanishes when the leg was SOLD/FLATTENED (orphan cleanup,
+    // early exit) or never filled at all. Booking a $1.00 "auto-settled" trade on
+    // mere absence fabricates phantom profit on a still-open market (root cause of
+    // the 2026-06-21 trade booked at 04:18 on a noon-close market).
+    //
+    // The authoritative signal that a leg was REDEEMED (not sold) is the
+    // `/closed-positions` record: a redemption closes at/after the market's
+    // resolution (`end_date`), whereas an early sale closes strictly before it.
+    // We require both legs to show genuine redemption before booking a settlement.
+    let now = Utc::now();
+    let closed_positions = match tokio::time::timeout(
+        std::time::Duration::from_secs(20),
+        data_client.closed_positions(
+            &ClosedPositionsRequest::builder()
+                .user(safe_address)
+                .limit(50)
+                .expect("closed-positions limit 50 is within the 0-50 bound")
+                .sort_by(ClosedPositionSortBy::Timestamp)
+                .build(),
+        ),
+    ).await {
+        Ok(Ok(c)) => c,
+        Ok(Err(e)) => {
+            warn!("Orphan detection [{}]: closed_positions() error: {} — skipping settlement booking this cycle", squadron_asset, e);
+            return;
+        }
+        Err(_) => {
+            warn!("Orphan detection [{}]: closed_positions() timed out (20s) — skipping settlement booking this cycle", squadron_asset);
+            return;
+        }
+    };
+
+    // Map token_id (decimal) → (market resolution date, close timestamp unix secs).
+    let closed_by_token: HashMap<String, (DateTime<Utc>, i64)> = closed_positions
+        .iter()
+        .map(|cp| (cp.asset.to_string(), (cp.end_date, cp.timestamp)))
+        .collect();
+
+    // A leg was genuinely REDEEMED at settlement (not sold early / never filled)
+    // iff it closed at/after the market's resolution time. 60s grace absorbs minor
+    // indexer/clock skew between the redeem TX and the recorded end_date.
+    let redeemed_at_resolution = |token: &str| -> bool {
+        match closed_by_token.get(token) {
+            Some((end_date, close_ts)) => {
+                let market_resolved = *end_date <= now;
+                let closed_after_resolution = *close_ts >= end_date.timestamp() - 60;
+                market_resolved && closed_after_resolution
+            }
+            None => false,
+        }
+    };
+
     // Get database pool for this squadron's asset only
     let pool = match db::pool_for(squadron_asset) {
         Some(p) => p,
@@ -1220,14 +1277,12 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address, squadron_ass
         token_id: String,
         market: String,
         side: String,
-        entry_price: String,
-        shares: String,
         ts: String,
     }
 
     let entries_result = sqlx::query_as::<_, EntryRow>(
         r#"
-        SELECT token_id, market, side, entry_price, shares, ts
+        SELECT token_id, market, side, ts
         FROM entries
         WHERE strategy = 'ArbitrageStrategy'
           AND ts > ?
@@ -1295,98 +1350,41 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address, squadron_ass
                     continue;
                 }
 
-                // Parse entry prices and shares
-                let yes_price = match yes_leg.entry_price.parse::<Decimal>() {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-                let no_price = match no_leg.entry_price.parse::<Decimal>() {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-                let yes_shares = match yes_leg.shares.parse::<Decimal>() {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-                let no_shares = match no_leg.shares.parse::<Decimal>() {
-                    Ok(s) => s,
-                    Err(_) => continue,
-                };
-
-                // Calculate settlement P&L
-                let pairs = yes_shares.min(no_shares);
-                if pairs <= Decimal::ZERO {
+                // ── Resolution gate ──────────────────────────────────────────
+                // Both legs are absent from live positions, but that alone is
+                // ambiguous (sold / flattened / never-filled all look identical).
+                // Only book a settlement when BOTH legs are confirmed redeemed at
+                // the market's resolution. Otherwise the legs were closed for some
+                // other reason — booking a $1.00 settlement here would fabricate
+                // phantom profit on an open or early-exited market.
+                if !redeemed_at_resolution(&yes_leg.token_id)
+                    || !redeemed_at_resolution(&no_leg.token_id)
+                {
+                    debug!(
+                        " Orphan detection [{}]: \"{}\" legs absent but not redeemed at resolution \
+                         (sold/flattened/unfilled) — skipping phantom settlement booking",
+                        squadron_asset.to_uppercase(), market_name
+                    );
                     continue;
                 }
 
-                let entry_per_pair = yes_price + no_price;
-                let pnl = (Decimal::ONE - entry_per_pair) * pairs;
-
-                // Dedupe guard: only one synthetic settlement row per matched YES/NO pair.
-                // Use an order-safe timestamp window plus exact trade fingerprint fields.
-                #[derive(sqlx::FromRow)]
-                struct CountRow {
-                    count: i64,
-                }
-
-                let (ts_start, ts_end) = if yes_leg.ts <= no_leg.ts {
-                    (&yes_leg.ts, &no_leg.ts)
-                } else {
-                    (&no_leg.ts, &yes_leg.ts)
-                };
-
-                let trade_exists = sqlx::query_as::<_, CountRow>(
-                    r#"
-                    SELECT COUNT(*) as count
-                    FROM trades
-                    WHERE strategy = 'ArbitrageStrategy'
-                      AND reason = 'Settlement (auto-redeemed by Polymarket)'
-                      AND market = ?
-                      AND side = 'YES'
-                      AND entry_price = ?
-                      AND exit_price = '1'
-                      AND shares = ?
-                      AND pnl = ?
-                      AND ts >= ?
-                      AND ts <= ?
-                    "#
-                )
-                .bind(&market_name)
-                .bind(entry_per_pair.to_string())
-                .bind(pairs.to_string())
-                .bind(pnl.to_string())
-                .bind(ts_start)
-                .bind(ts_end)
-                .fetch_one(&pool)
-                .await
-                .ok()
-                .map(|r| r.count)
-                .unwrap_or(0) > 0;
-
-                if trade_exists {
-                    continue;
-                }
-
+                // ── Settlement recording is owned by `auto_settle` ───────────
+                // This backstop NO LONGER books a synthetic settlement trade. The
+                // previous math computed P&L from the stale `entries` rows and
+                // mis-stated it whenever the legs were churned/sold before
+                // resolution — e.g. 2026-06-21 trade 54/61 booked a phantom +$0.15
+                // off the 04:18 entries even though those exact legs were flattened
+                // hours earlier. Real settlement P&L is recorded by
+                // `auto_settle_closed_positions` → `record_settled_arb_trade`, which
+                // redeems on-chain and books the resolved `cur_price` (idempotent).
+                //
+                // Here we only purge any lingering `open_positions` rows for the
+                // confirmed-redeemed pair so the portfolio value doesn't double-count.
                 info!(
-                    " Orphan detection [{}]: Found auto-settled arbitrage: \"{}\" | {} pairs @ entry ${:.4}/pair → pnl ${:.4}",
-                    squadron_asset.to_uppercase(), market_name, pairs, entry_per_pair, pnl
+                    " Orphan detection [{}]: \"{}\" confirmed redeemed at resolution — \
+                     settlement P&L owned by auto_settle; purging stale open_positions rows",
+                    squadron_asset.to_uppercase(), market_name
                 );
-
-                // Record the settlement trade using the original entry timestamp
-                metrics::record_trade_with_timestamp(
-                    squadron_asset,
-                    "ArbitrageStrategy".to_string(),
-                    market_name.clone(),
-                    "YES".to_string(),
-                    entry_per_pair,
-                    Decimal::ONE,
-                    pairs,
-                    pnl,
-                    "Settlement (auto-redeemed by Polymarket)".to_string(),
-                    Some(yes_ts),
-                ).await;
-
-                // Also purge any lingering open_positions rows
                 let _ = sqlx::query("DELETE FROM open_positions WHERE token_id = ? OR token_id = ?")
                     .bind(&yes_leg.token_id)
                     .bind(&no_leg.token_id)

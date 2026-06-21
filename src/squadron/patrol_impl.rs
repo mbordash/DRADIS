@@ -83,6 +83,7 @@ impl Squadron {
         let starting_collateral_store = ctx.session.starting_collateral.clone();
         let phantom_cooldowns     = ctx.session.phantom_cooldowns.clone();
         let orphan_tombstones     = ctx.session.orphan_tombstones.clone();
+        let arb_market_lockouts   = ctx.session.arb_market_lockouts.clone();
         let time_decay_positions  = ctx.session.time_decay_positions.clone();
         let token_ownership       = ctx.session.token_ownership.clone();
 
@@ -514,6 +515,7 @@ impl Squadron {
                             timestamp: maker_snap_ts,
                         }),
                         dynamic_config: dyn_cfg,
+                        arb_market_lockouts: Some(arb_market_lockouts.clone()),
                     };
 
                     let eval_result = match execute_strategies_concurrent(&strategies, &ctx, 500, &mut last_executor_summary).await {

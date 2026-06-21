@@ -46,6 +46,10 @@ pub struct FlattenedLeg {
     pub shares:      Decimal,
     pub avg_entry:   Decimal,
     pub exit_price:  Decimal,
+    /// On-chain token id of the flattened leg, so the caller can resolve its
+    /// YES/NO market outcome for the trade record (lifecycle itself is
+    /// venue-neutral and has no YES/NO mapping).
+    pub token_id:    MarketId,
 }
 
 /// Tunables for the lifecycle engine. Each venue/caller supplies its own window
@@ -246,6 +250,7 @@ impl OrderLifecycle {
                         shares: exit_shares,
                         avg_entry,
                         exit_price,
+                        token_id: token.clone(),
                     });
                 }
                 Err(e) => warn!("[{strategy}] flatten of {token} failed: {e} — will retry next reconcile"),

@@ -715,6 +715,15 @@ pub fn spawn_lifecycle_task(
                     let flattened = lifecycle.reconcile(venue.as_ref(), &positions).await;
                     for leg in flattened {
                         let pnl = (leg.exit_price - leg.avg_entry) * leg.shares;
+                        // Resolve the leg's real YES/NO outcome from the entries
+                        // table so the trade isn't mislabelled "Sell" (the bare order
+                        // direction). The venue-neutral lifecycle only knows token ids.
+                        let side = match db::pool_for(&asset) {
+                            Some(p) => db::lookup_entry_side_db(&p, &leg.token_id.to_string())
+                                .await
+                                .unwrap_or_else(|| "Sell".to_string()),
+                            None => "Sell".to_string(),
+                        };
                         warn!(
                             " [{strategy}] lifecycle flatten recorded: {market} entry={entry:.4} exit={exit:.4} shares={shares} pnl={pnl:.4}",
                             strategy = leg.strategy,
@@ -734,7 +743,7 @@ pub fn spawn_lifecycle_task(
                                 &asset_c,
                                 strat,
                                 market,
-                                "Sell".to_string(),
+                                side,
                                 avg_entry,
                                 exit_price,
                                 shares,
