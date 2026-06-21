@@ -6,6 +6,7 @@
 ///   GET    /api/assets                — list of initialised asset pools (Phase 3f-7)
 ///   GET    /api/config                — current DynamicConfig as JSON
 ///   PATCH  /api/config               — JSON merge-patch; hot-reloads strategies
+///   GET    /api/config/schema         — editable-config field schema (drives Advanced UI)
 ///   GET    /api/pnl/history           — recent P&L snapshots  (?limit=200&asset=btc)
 ///   GET    /api/trades                — recent completed trades (?limit=100&asset=btc)
 ///   GET    /api/positions             — current open positions (?asset=btc)
@@ -1018,6 +1019,17 @@ async fn enrich_taxonomy(summary: &mut crate::cag::SquadronSummary) {
     summary.market_class = class;
 }
 
+/// GET /api/config/schema
+///
+/// Returns the editable-config field schema — the single source of truth describing
+/// every `DynamicConfig` field (group, label, type, unit, min/max, advanced flag).
+/// The Control Tower renders Basic panels + the Advanced modal from this, so new
+/// Rust config fields surface automatically without a hand-maintained frontend list.
+async fn get_config_schema() -> Response {
+    debug!("Received GET /api/config/schema");
+    Json(crate::api::config_schema::config_schema()).into_response()
+}
+
 /// GET /api/squadrons/{id}/config
 ///
 /// Returns the squadron's DynamicConfig as JSON, or 404 if squadron not found.
@@ -1127,6 +1139,7 @@ pub async fn run_api_server(
     // All other routes require X-API-Key when DRADIS_API_KEY is set.
     let protected_routes = Router::new()
         .route("/api/config",                get(get_config).patch(patch_config))
+        .route("/api/config/schema",         get(get_config_schema))
         .route("/api/pnl/history",           get(get_pnl_history))
         .route("/api/trades",                get(get_trades))
         .route("/api/positions",             get(get_open_positions))

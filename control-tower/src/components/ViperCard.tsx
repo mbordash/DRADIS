@@ -1,8 +1,11 @@
 'use client';
 
 import { useState, useCallback } from 'react';
-import type { DynamicConfig, ViperDef, FieldDef } from '@/lib/types';
+import useSWR from 'swr';
+import type { DynamicConfig, ViperDef, ConfigFieldSchema, FieldType } from '@/lib/types';
 import { toDisplay, fromDisplay, fieldUnit } from '@/lib/types';
+import { getConfigSchema } from '@/lib/api';
+import AdvancedConfigModal from '@/components/AdvancedConfigModal';
 
 // ── Accent color helpers ──────────────────────────────────────────────────────
 
@@ -40,26 +43,28 @@ function Toggle({ enabled, onToggle, loading }: { enabled: boolean; onToggle: ()
 // ── Editable param row ────────────────────────────────────────────────────────
 
 interface ParamRowProps {
-  field:    FieldDef;
+  field:    ConfigFieldSchema;
   config:   DynamicConfig;
   onPatch:  (patch: Partial<DynamicConfig>) => Promise<void>;
   disabled: boolean;
 }
 
 function ParamRow({ field, config, onPatch, disabled }: ParamRowProps) {
-  const rawValue = config[field.key];
-  const initial  = toDisplay(field.type, rawValue as string);
+  const type     = field.type as FieldType;
+  const cfgKey   = field.key as keyof DynamicConfig;
+  const rawValue = config[cfgKey];
+  const initial  = toDisplay(type, rawValue as string);
   const [draft,    setDraft]    = useState(initial);
   const [editMode, setEditMode] = useState(false);
   const [saving,   setSaving]   = useState(false);
 
   // Reset draft when config prop changes (e.g. after a remote patch)
-  const display = editMode ? draft : toDisplay(field.type, rawValue as string);
+  const display = editMode ? draft : toDisplay(type, rawValue as string);
 
   const commit = useCallback(async () => {
     setEditMode(false);
-    const stored = fromDisplay(field.type, draft);
-    const prev   = fromDisplay(field.type, toDisplay(field.type, rawValue as string));
+    const stored = fromDisplay(type, draft);
+    const prev   = fromDisplay(type, toDisplay(type, rawValue as string));
     if (stored === prev) return;
     setSaving(true);
     try {
@@ -67,7 +72,7 @@ function ParamRow({ field, config, onPatch, disabled }: ParamRowProps) {
     } finally {
       setSaving(false);
     }
-  }, [draft, field, rawValue, onPatch]);
+  }, [draft, field.key, type, rawValue, onPatch]);
 
   return (
     <div className="flex items-center justify-between py-1 border-b border-[#1e1e32] last:border-0">
@@ -85,7 +90,7 @@ function ParamRow({ field, config, onPatch, disabled }: ParamRowProps) {
           />
         ) : (
           <button
-            onClick={() => { if (!disabled) { setDraft(toDisplay(field.type, rawValue as string)); setEditMode(true); } }}
+            onClick={() => { if (!disabled) { setDraft(toDisplay(type, rawValue as string)); setEditMode(true); } }}
             disabled={disabled || saving}
             className={[
               'text-xs font-mono tabular-nums px-2 py-1 rounded',
@@ -94,11 +99,11 @@ function ParamRow({ field, config, onPatch, disabled }: ParamRowProps) {
               saving ? 'opacity-50' : '',
             ].join(' ')}
           >
-            {saving ? '…' : toDisplay(field.type, rawValue as string)}
+            {saving ? '…' : toDisplay(type, rawValue as string)}
           </button>
         )}
-        {fieldUnit(field.type) && (
-          <span className="text-xs text-gray-600 w-8">{fieldUnit(field.type)}</span>
+        {fieldUnit(type) && (
+          <span className="text-xs text-gray-600 w-8">{fieldUnit(type)}</span>
         )}
       </div>
     </div>
@@ -117,8 +122,19 @@ interface Props {
 
 export default function ViperCard({ viper, config, onPatch, market }: Props) {
   const [toggling, setToggling] = useState(false);
+  const [showAdvanced, setShowAdvanced] = useState(false);
   const enabled  = config[viper.enableKey] as boolean;
   const accent   = ACCENT[viper.accentColor] ?? ACCENT.indigo;
+
+  // Basic params are derived from the Rust schema registry (single source of
+  // truth) — `advanced:false`, non-bool fields for this viper group. Shared SWR
+  // key dedupes with the Advanced modal's fetch.
+  const { data: schema = [], isLoading: schemaLoading } = useSWR('config-schema', getConfigSchema, {
+    revalidateOnFocus: false,
+  });
+  const basicFields = schema.filter(
+    f => f.group === viper.name && !f.advanced && f.type !== 'bool',
+  );
 
   const handleToggle = async () => {
     setToggling(true);
@@ -166,16 +182,38 @@ export default function ViperCard({ viper, config, onPatch, market }: Props) {
 
       {/* Params */}
       <div className="flex flex-col">
-        {viper.fields.map(f => (
-          <ParamRow
-            key={String(f.key)}
-            field={f}
-            config={config}
-            onPatch={onPatch}
-            disabled={!enabled}
-          />
-        ))}
+        {schemaLoading && basicFields.length === 0 ? (
+          <p className="text-[11px] text-gray-600 py-1">Loading parameters…</p>
+        ) : (
+          basicFields.map(f => (
+            <ParamRow
+              key={f.key}
+              field={f}
+              config={config}
+              onPatch={onPatch}
+              disabled={!enabled}
+            />
+          ))
+        )}
       </div>
+
+      {/* Advanced settings */}
+      <button
+        onClick={() => setShowAdvanced(true)}
+        className="self-start text-xs text-gray-500 hover:text-gray-300 transition-colors mt-1"
+      >
+        Advanced ▸
+      </button>
+
+      {showAdvanced && (
+        <AdvancedConfigModal
+          viperName={viper.name}
+          config={config}
+          onPatch={onPatch}
+          onClose={() => setShowAdvanced(false)}
+          enabled={enabled}
+        />
+      )}
     </div>
   );
 }

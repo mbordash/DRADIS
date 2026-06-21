@@ -67,6 +67,21 @@ export interface DynamicConfig {
   trendcapture_max_entry_price:     string;
 }
 
+/** One editable config field, from GET /api/config/schema (Rust source of truth). */
+export interface ConfigFieldSchema {
+  key:         string;          // serde key in DynamicConfig (PATCH target)
+  group:       string;          // viper name or "Global"
+  enable_key:  string | null;   // owning viper enable flag (null for global)
+  label:       string;
+  type:        'usd' | 'price' | 'pct' | 'decimal' | 'secs' | 'bool';
+  unit:        string | null;
+  min:         number | null;
+  max:         number | null;
+  step:        number | null;
+  advanced:    boolean;         // false → Basic panel, true → Advanced modal
+  description: string;
+}
+
 export interface PnlSnapshotRow {
   ts:          string; // ISO 8601
   session_pnl: string; // Decimal string
@@ -163,7 +178,7 @@ export interface SquadronSummary {
 
 // ── Field descriptor for ViperCard ───────────────────────────────────────────
 
-export type FieldType = 'usd' | 'pct' | 'price' | 'decimal';
+export type FieldType = 'usd' | 'pct' | 'price' | 'decimal' | 'secs';
 
 export interface FieldDef {
   key:   keyof DynamicConfig;
@@ -171,6 +186,12 @@ export interface FieldDef {
   type:  FieldType;
 }
 
+/**
+ * Display-only metadata for a viper card. The editable field list is NO LONGER
+ * hand-maintained here — ViperCard derives its Basic params from the Rust schema
+ * registry (GET /api/config/schema, `advanced:false` entries). This struct only
+ * carries presentation bits the schema doesn't model (accent, blurb, status key).
+ */
 export interface ViperDef {
   name:       string;
   enableKey:  keyof DynamicConfig;
@@ -178,7 +199,6 @@ export interface ViperDef {
   description: string;
   /** Lower-snake key used in /api/status strategy_markets map */
   statusKey:  string;
-  fields:     FieldDef[];
 }
 
 // ── Conversion helpers ───────────────────────────────────────────────────────
@@ -191,6 +211,7 @@ export function toDisplay(type: FieldType, raw: string | number): string {
     case 'pct':   return (n * 100).toFixed(2);    // 0.08 → "8.00"
     case 'usd':   return n.toFixed(2);             // 15    → "15.00"
     case 'price': return n.toFixed(4);             // 0.48  → "0.4800"
+    case 'secs':  return String(Math.round(n));    // 1800  → "1800"
     default:      return String(raw);
   }
 }
@@ -200,8 +221,9 @@ export function fromDisplay(type: FieldType, display: string): string {
   const n = parseFloat(display);
   if (isNaN(n)) return display;
   switch (type) {
-    case 'pct': return (n / 100).toFixed(6); // "8.00" → "0.080000"
-    default:    return n.toString();
+    case 'pct':  return (n / 100).toFixed(6); // "8.00" → "0.080000"
+    case 'secs': return String(Math.round(n));
+    default:     return n.toString();
   }
 }
 
@@ -210,6 +232,7 @@ export function fieldUnit(type: FieldType): string {
     case 'usd':   return 'USDC';
     case 'pct':   return '%';
     case 'price': return 'cts';
+    case 'secs':  return 's';
     default:      return '';
   }
 }

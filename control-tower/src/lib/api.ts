@@ -1,4 +1,4 @@
-import type { DynamicConfig, PnlSnapshotRow, TradeRow, OpenPositionRow, LlmRecommendationRow, ViperDef, StatusResponse, PortfolioValue, SquadronSummary } from './types';
+import type { DynamicConfig, ConfigFieldSchema, PnlSnapshotRow, TradeRow, OpenPositionRow, LlmRecommendationRow, ViperDef, StatusResponse, PortfolioValue, SquadronSummary } from './types';
 
 // In development, NEXT_PUBLIC_API_URL=http://localhost:9000 (set in .env.local)
 // hits the DRADIS API directly.
@@ -40,6 +40,13 @@ export async function getAssets(): Promise<string[]> {
 export async function getConfig(): Promise<DynamicConfig> {
   const res = await fetch(`${BASE}/api/config`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/config → ${res.status}`);
+  return res.json();
+}
+
+/** Editable-config field schema — drives the dynamic Advanced modal. */
+export async function getConfigSchema(): Promise<ConfigFieldSchema[]> {
+  const res = await fetch(`${BASE}/api/config/schema`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/config/schema → ${res.status}`);
   return res.json();
 }
 
@@ -137,6 +144,12 @@ export async function patchSquadronConfig(squadronId: string, patch: Partial<Dyn
 }
 
 // ── Viper metadata ────────────────────────────────────────────────────────────
+//
+// Presentation-only metadata for each viper card. The editable parameter list is
+// NOT defined here anymore — ViperCard derives its Basic params (and the Advanced
+// modal its extra params) from the Rust schema registry served at
+// GET /api/config/schema. This list only supplies accent color, blurb and the
+// /api/status strategy key, none of which the schema models.
 
 export const VIPER_DEFS: ViperDef[] = [
   {
@@ -145,13 +158,6 @@ export const VIPER_DEFS: ViperDef[] = [
     accentColor: 'teal',
     statusKey: 'arbitrage',
     description: 'Hedged maker bids on YES+NO — captures mispriced spread at 0% fee',
-    fields: [
-      { key: 'arbitrage_position_size_usdc', label: 'Position Size',     type: 'usd'     },
-      { key: 'arbitrage_max_exposure_usdc',  label: 'Max Exposure',      type: 'usd'     },
-      { key: 'arbitrage_profit_threshold',   label: 'Min Profit/Share',  type: 'price'   },
-      { key: 'arb_fak_rehedge_buffer',       label: 'Re-hedge Buffer',   type: 'price'   },
-      { key: 'arb_max_rescue_cost',          label: 'Max Rescue Cost',   type: 'price'   },
-    ],
   },
   {
     name: 'Time Decay',
@@ -159,12 +165,6 @@ export const VIPER_DEFS: ViperDef[] = [
     accentColor: 'indigo',
     statusKey: 'time_decay',
     description: 'Targets gamma as hourly markets approach expiry',
-    fields: [
-      { key: 'time_decay_position_size_usdc', label: 'Position Size',  type: 'usd'   },
-      { key: 'time_decay_max_exposure_usdc',  label: 'Max Exposure',   type: 'usd'   },
-      { key: 'time_decay_stop_loss_pct',      label: 'Stop Loss',      type: 'pct'   },
-      { key: 'time_decay_max_entry_price',    label: 'Max Entry',      type: 'price' },
-    ],
   },
   {
     name: 'Momentum',
@@ -172,13 +172,6 @@ export const VIPER_DEFS: ViperDef[] = [
     accentColor: 'blue',
     statusKey: 'momentum',
     description: 'Rides Binance oracle velocity bursts',
-    fields: [
-      { key: 'momentum_min_trade_size_usdc', label: 'Min Size',    type: 'usd' },
-      { key: 'momentum_max_trade_size_usdc', label: 'Max Size',    type: 'usd' },
-      { key: 'momentum_stop_loss_pct',       label: 'Stop Loss',   type: 'pct' },
-      { key: 'momentum_target_profit_pct',   label: 'Take Profit', type: 'pct' },
-      { key: 'momentum_max_exposure_usdc',   label: 'Max Exposure',type: 'usd' },
-    ],
   },
   {
     name: 'Maker',
@@ -186,12 +179,6 @@ export const VIPER_DEFS: ViperDef[] = [
     accentColor: 'emerald',
     statusKey: 'maker',
     description: 'Two-sided resting bids — captures spread + rebates',
-    fields: [
-      { key: 'maker_max_entry_price',   label: 'Max Entry',   type: 'price' },
-      { key: 'maker_stop_loss_pct',     label: 'Stop Loss',   type: 'pct'   },
-      { key: 'maker_target_profit_pct', label: 'Take Profit', type: 'pct'   },
-      { key: 'maker_max_exposure_usdc', label: 'Max Exposure',type: 'usd'   },
-    ],
   },
   {
     name: 'Basis',
@@ -199,11 +186,6 @@ export const VIPER_DEFS: ViperDef[] = [
     accentColor: 'orange',
     statusKey: 'basis',
     description: 'Fades retail-skewed YES/NO implied probabilities',
-    fields: [
-      { key: 'basis_stop_loss_pct',     label: 'Stop Loss',   type: 'pct' },
-      { key: 'basis_target_profit_pct', label: 'Take Profit', type: 'pct' },
-      { key: 'basis_max_exposure_usdc', label: 'Max Exposure',type: 'usd' },
-    ],
   },
   {
     name: 'GBoost',
@@ -211,12 +193,6 @@ export const VIPER_DEFS: ViperDef[] = [
     accentColor: 'purple',
     statusKey: 'gboost',
     description: 'Online gradient-boosted orderbook classifier',
-    fields: [
-      { key: 'gboost_entry_threshold',   label: 'Entry Threshold', type: 'decimal' },
-      { key: 'gboost_stop_loss_pct',     label: 'Stop Loss',       type: 'pct'     },
-      { key: 'gboost_target_profit_pct', label: 'Take Profit',     type: 'pct'     },
-      { key: 'gboost_max_exposure_usdc', label: 'Max Exposure',    type: 'usd'     },
-    ],
   },
   {
     name: 'TrendCapture',
@@ -224,14 +200,6 @@ export const VIPER_DEFS: ViperDef[] = [
     accentColor: 'rose',
     statusKey: 'trendcapture',
     description: 'Rides sustained multi-minute oracle drift on Window/Daily markets',
-    fields: [
-      { key: 'trendcapture_min_trade_size_usdc', label: 'Min Size',    type: 'usd'   },
-      { key: 'trendcapture_max_trade_size_usdc', label: 'Max Size',    type: 'usd'   },
-      { key: 'trendcapture_stop_loss_pct',       label: 'Stop Loss',   type: 'pct'   },
-      { key: 'trendcapture_target_profit_pct',   label: 'Take Profit', type: 'pct'   },
-      { key: 'trendcapture_max_exposure_usdc',   label: 'Max Exposure',type: 'usd'   },
-      { key: 'trendcapture_max_entry_price',     label: 'Max Entry',   type: 'price' },
-    ],
   },
 ];
 
