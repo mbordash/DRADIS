@@ -53,6 +53,7 @@ pub struct StrategyContext {
     pub maker_snapshot: Option<MarketSnapshot>, // Prices for the Window venue
     pub available_collateral: Decimal,      // Live pUSD wallet balance (updated every 60s)
     pub dynamic_config: Arc<DynamicConfig>, // Runtime-tunable params from SQLite/Control Tower
+    pub arb_market_lockouts: Option<ArbMarketLockouts>, // Per-market arb re-entry locks (None in tests)
 }
 ```
 
@@ -84,13 +85,16 @@ pub enum StrategySignal {
 ### `OrderParams` Structure
 ```rust
 pub struct OrderParams {
-    pub token_id: U256,
+    pub token_id: MarketId,     // Venue-neutral token id (intl U256 string, US UUID/slug)
     pub price: Decimal,
     pub shares: Decimal,
     pub fee_bps: u16,
     pub is_neg_risk: bool,
     pub market_name: String,
     pub condition_id: String,
+    pub order_type: TimeInForce, // Gtc | Gtd | Fak | Fok
+    pub post_only: bool,         // Reject if it would cross (maker-only)
+    pub ghost_mode: bool,        // Simulate without submitting to the venue
 }
 ```
 
@@ -100,7 +104,7 @@ pub struct OrderParams {
 
 ### Step 1 — Create the implementation file
 
-Create `src/strategies/my_strategy_impl.rs`. Your strategy should perform its own risk checks using `is_drawdown_limit_hit`.
+Create `src/vipers/my_strategy_impl.rs`. Your strategy should perform its own risk checks using `is_drawdown_limit_hit`.
 
 ```rust
 use async_trait::async_trait;
@@ -108,7 +112,8 @@ use anyhow::Result;
 use rust_decimal_macros::dec;
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
-use crate::strategies::is_drawdown_limit_hit;
+use crate::venues::core::TimeInForce;
+use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
 
 pub struct MyStrategyImpl;
@@ -128,13 +133,16 @@ impl Strategy for MyStrategyImpl {
             
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
-                    token_id: ctx.market.yes_token,
+                    token_id: ctx.market.yes_token.clone(),
                     price,
                     shares: trade_size / price,
                     fee_bps: ctx.market.yes_fee_bps as u16,
                     is_neg_risk: ctx.market.is_neg_risk,
                     market_name: ctx.market.market_name.clone(),
                     condition_id: ctx.market.condition_id.clone(),
+                    order_type: TimeInForce::Fak, // taker entry
+                    post_only: false,
+                    ghost_mode: false,
                 },
                 pair_params: None,
             });
@@ -157,13 +165,17 @@ impl Strategy for MyStrategyImpl {
 ```
 
 ### Step 2 — Expose the module
-Add `pub mod my_strategy_impl;` to `src/strategies/mod.rs`.
+Add `pub mod my_strategy_impl;` to `src/vipers/mod.rs`.
 
 ### Step 3 — Add to Registry
-Add your strategy to `src/orchestrator/registry.rs`. This is the **only** file you need to touch outside your implementation:
+Add your strategy to `src/orchestrator/registry.rs`. This is the **only** file you need to touch outside your implementation. Add it to the `create_all_strategies` vec and to `strategy_names`:
 
 ```rust
-strategies.push(Box::new(MyStrategyImpl));
+// in create_all_strategies()
+Box::new(MyStrategyImpl::new()) as Box<dyn Strategy>,
+
+// in strategy_names()
+"MyStrategy",
 ```
 
 The registry is the single source of truth for:
@@ -196,13 +208,14 @@ mod tests {
     use std::sync::Arc;
     use tokio::sync::Mutex;
     use crate::state::{MarketConfig, MarketSnapshot, PositionMap};
-    use alloy::primitives::U256;
+    use crate::venues::core::MarketId;
+    use crate::helpers::dynamic_config::DynamicConfig;
     use chrono::Utc;
 
     fn test_ctx() -> StrategyContext {
         StrategyContext {
             market: MarketConfig {
-                yes_token: U256::from(1), no_token: U256::from(2),
+                yes_token: MarketId::new("1"), no_token: MarketId::new("2"),
                 market_name: "Test".to_string(), market_close_time: None,
                 strike_price: None, is_neg_risk: false,
                 condition_id: "".to_string(), yes_fee_bps: 100, no_fee_bps: 100,
@@ -225,6 +238,7 @@ mod tests {
             maker_snapshot: None,
             available_collateral: dec!(100),
             dynamic_config: Arc::new(DynamicConfig::default()),
+            arb_market_lockouts: None,
         }
     }
 }
