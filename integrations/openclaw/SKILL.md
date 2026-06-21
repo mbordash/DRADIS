@@ -5,9 +5,14 @@ homepage: https://github.com/mbordash/DRADIS
 user-invocable: true
 ---
 
-# Skill: DRADIS Tactical Command (v1.3.0)
+# Skill: DRADIS Tactical Command (v1.4.0)
 
 Full-featured autonomous supervisor for the **DRADIS** high-frequency prediction market execution engine.
+
+> **What's new in v1.4.0**
+> - Per-squadron monitoring & control: `list_squadrons`, `get_squadron`, `get_squadron_config`, `patch_squadron_config` (matches the CAG → Squadron architecture; the global `/config` is now the coarse fallback).
+> - Config introspection: `get_config_schema` exposes the field schema so the agent can validate a parameter before patching.
+> - Portfolio & position lifecycle: `get_portfolio_value`, `get_pending_positions`, `get_confirmed_positions`, `list_assets`.
 
 ## About DRADIS
 
@@ -37,8 +42,8 @@ DRADIS supports optional API key authentication via the `X-API-Key` header.
 **This skill controls a live trading system with real money at risk.**  
 The agent **must** follow these guardrails at all times:
 
-- `patch_dynamic_config` changes live strategy parameters without restarting the engine.  
-  **Never** apply any configuration change without first explicitly confirming the exact update with the human user and receiving clear approval.
+- `patch_dynamic_config` and `patch_squadron_config` change live strategy parameters without restarting the engine.
+  **Never** apply any configuration change without first explicitly confirming the exact update with the human user and receiving clear approval. Prefer `get_config_schema` to validate field names, units, and min/max bounds before proposing a patch.
 - Only call tools when the user’s request directly relates to monitoring or configuration.
 - If the engine returns 401 Unauthorized, tell the user to configure the `DRADIS_API_KEY`.
 
@@ -50,6 +55,10 @@ The agent **must** follow these guardrails at all times:
 - “List the last 10 trades”
 - “What does the LLM advisor recommend right now?”
 - “Show me the current config”
+- “List my squadrons and their P&L”
+- “Show me the BTC squadron’s config”
+- “What’s my total portfolio value right now?”
+- “Show pending vs confirmed positions for ETH”
 - “Can you increase the adverse block threshold? Show me the current config first and confirm before patching.”
 
 ## Configuration
@@ -89,12 +98,13 @@ The agent **must** follow these guardrails at all times:
 - **Method:** `GET`
 - **Endpoint:** `{{DRADIS_API_URL}}/trades`
 - **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
-- **Query Param:** `limit` (optional, default 100)
+- **Query Params:** `asset` (optional, e.g. `btc`), `limit` (optional, default 100)
 
 ### 6. get_open_positions
 - **Method:** `GET`
 - **Endpoint:** `{{DRADIS_API_URL}}/positions`
 - **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
+- **Query Param:** `asset` (optional, e.g. `btc`)
 - **Response Format:** JSON array of open position records
 
 ### 7. get_strategy_status
@@ -108,3 +118,65 @@ The agent **must** follow these guardrails at all times:
 - **Endpoint:** `{{DRADIS_API_URL}}/llm/recommendations`
 - **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
 - **Query Param:** `limit` (optional, default 10)
+
+### 9. list_squadrons
+- **Method:** `GET`
+- **Endpoint:** `{{DRADIS_API_URL}}/squadrons`
+- **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
+- **Response Format:** JSON array of squadron summaries (id, asset/market class, P&L, active raptors/vipers)
+
+### 10. get_squadron
+- **Method:** `GET`
+- **Endpoint:** `{{DRADIS_API_URL}}/squadrons/{id}`
+- **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
+- **Path Param:** `id` (squadron identifier, e.g. `btc`)
+- **Response Format:** JSON squadron summary, or 404 if unknown
+
+### 11. get_squadron_config
+- **Method:** `GET`
+- **Endpoint:** `{{DRADIS_API_URL}}/squadrons/{id}/config`
+- **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
+- **Path Param:** `id` (squadron identifier)
+- **Response Format:** JSON object of the squadron's DynamicConfig, or 404 if unknown
+
+### 12. patch_squadron_config
+- **Method:** `PATCH`
+- **Endpoint:** `{{DRADIS_API_URL}}/squadrons/{id}/config`
+- **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
+- **Path Param:** `id` (squadron identifier)
+- **Payload Type:** `application/json`
+- **Parameters:** partial `updates` object with only the fields to change (e.g. `{"time_decay_position_size_usdc": "8.0"}`)
+- **Safety Note:** Requires explicit user confirmation before executing. Validate field names/bounds with `get_config_schema` first.
+
+### 13. get_config_schema
+- **Method:** `GET`
+- **Endpoint:** `{{DRADIS_API_URL}}/config/schema`
+- **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
+- **Response Format:** JSON schema describing every editable config field (group, label, type, unit, min/max, advanced flag). Use before any PATCH to validate the change.
+
+### 14. get_portfolio_value
+- **Method:** `GET`
+- **Endpoint:** `{{DRADIS_API_URL}}/portfolio`
+- **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
+- **Response Format:** JSON object with total portfolio / collateral value
+
+### 15. get_pending_positions
+- **Method:** `GET`
+- **Endpoint:** `{{DRADIS_API_URL}}/positions/pending`
+- **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
+- **Query Param:** `asset` (optional, e.g. `btc`)
+- **Response Format:** JSON array of positions awaiting on-chain confirmation
+
+### 16. get_confirmed_positions
+- **Method:** `GET`
+- **Endpoint:** `{{DRADIS_API_URL}}/positions/confirmed`
+- **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
+- **Query Param:** `asset` (optional, e.g. `btc`)
+- **Response Format:** JSON array of confirmed open positions
+
+### 17. list_assets
+- **Method:** `GET`
+- **Endpoint:** `{{DRADIS_API_URL}}/assets`
+- **Headers:** `X-API-Key: {{DRADIS_API_KEY}}`
+- **Response Format:** JSON array of asset symbols, e.g. `["btc", "eth", "sol"]`
+
