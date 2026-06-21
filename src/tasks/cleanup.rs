@@ -1027,13 +1027,31 @@ async fn record_settled_arb_trade(
     match (yes_leg, no_leg) {
         (Some(yes_leg), Some(no_leg)) => {
             // Complete YES+NO pair settlement
-            let yes_avg   = yes_leg.avg_price;
-            let no_avg    = no_leg.avg_price;
             let yes_size  = yes_leg.size;
             let no_size   = no_leg.size;
             let pairs     = yes_size.min(no_size);
 
-            if pairs <= Decimal::ZERO || (yes_avg <= Decimal::ZERO && no_avg <= Decimal::ZERO) {
+            if pairs <= Decimal::ZERO {
+                warn!("Auto-settle: pair settlement for \"{}\" skipped — zero pair size", yes_leg.title);
+                return;
+            }
+
+            // Cost basis per leg: prefer Data API avg_price, fall back to the local
+            // `entries` cost basis when the API returns 0 (churn-residual legs).
+            let mut yes_avg = yes_leg.avg_price;
+            if yes_avg <= Decimal::ZERO {
+                yes_avg = db::lookup_entry_price_db(&pool, &yes_leg.asset.to_string()).await.unwrap_or(Decimal::ZERO);
+            }
+            let mut no_avg = no_leg.avg_price;
+            if no_avg <= Decimal::ZERO {
+                no_avg = db::lookup_entry_price_db(&pool, &no_leg.asset.to_string()).await.unwrap_or(Decimal::ZERO);
+            }
+            if yes_avg <= Decimal::ZERO && no_avg <= Decimal::ZERO {
+                warn!(
+                    "Auto-settle: pair settlement for \"{}\" NOT recorded — cost basis unknown for \
+                     both legs (Data API avg=0, no local entries). Redemption cash is in collateral.",
+                    yes_leg.title
+                );
                 return;
             }
 
@@ -1069,10 +1087,30 @@ async fn record_settled_arb_trade(
         (Some(leg), None) | (None, Some(leg)) => {
             // Single-leg settlement (orphaned / unhedged position).
             let side = if leg.outcome_index == 0 { "YES" } else { "NO" };
-            let avg_price = leg.avg_price;
             let size = leg.size;
 
-            if size <= Decimal::ZERO || avg_price <= Decimal::ZERO {
+            if size <= Decimal::ZERO {
+                warn!("Auto-settle: single-leg {} settlement for \"{}\" skipped — zero size", side, leg.title);
+                return;
+            }
+
+            // Cost basis: prefer the Data API avg_price; if it returns 0 (observed
+            // for churn-residual legs), fall back to the local `entries` cost basis
+            // for this token. Previously a 0 avg_price silently dropped the whole
+            // settlement — a real on-chain redemption with NO trade row (2026-06-21).
+            let mut avg_price = leg.avg_price;
+            if avg_price <= Decimal::ZERO {
+                if let Some(p) = db::lookup_entry_price_db(&pool, &leg.asset.to_string()).await {
+                    avg_price = p;
+                }
+            }
+            if avg_price <= Decimal::ZERO {
+                warn!(
+                    "Auto-settle: single-leg {} settlement for \"{}\" NOT recorded — cost basis \
+                     unknown (Data API avg=0, no local entry for token {}). Redemption cash is \
+                     reflected in collateral; trade row omitted to avoid fabricating P&L.",
+                    side, leg.title, leg.asset
+                );
                 return;
             }
 
