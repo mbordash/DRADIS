@@ -255,6 +255,17 @@ impl Strategy for TrendCaptureStrategyImpl {
         };
 
         // ── Macro: entry OrderParams ───────────────────────────────────────────
+        // TrendCapture is a trend-FOLLOWING strategy, so entries must fill *while the
+        // drift signal is still live*. A passive `post_only` maker bid (ask − 0.01)
+        // only fills when a counterparty SELLS into it — which on a live directional
+        // move only happens once the move stalls/reverses. That adverse selection
+        // systematically filled us right at the local top/bottom (e.g. Jun 21 trade
+        // id 68: rested ~5 min, filled exactly as BTC reversed → instant −13.5% SL).
+        //
+        // Entries are therefore marketable FAK takers: `price` is set to the touch
+        // (ask), patrol adds BUY_PRICE_OFFSET so the order crosses, and FAK fills
+        // immediately or kills (no resting order to be adversely selected). The
+        // `ask_sum ≤ 1.04` and per-token `spread ≤ 12%` gates above cap the cross cost.
         macro_rules! entry_params {
             ($token:expr, $price:expr, $fee:expr, $size:expr) => {
                 OrderParams {
@@ -265,8 +276,8 @@ impl Strategy for TrendCaptureStrategyImpl {
                     is_neg_risk:  market.is_neg_risk,
                     market_name:  market.market_name.clone(),
                     condition_id: market.condition_id.clone(),
-                    order_type:   TimeInForce::Gtc,
-                    post_only:    true,
+                    order_type:   TimeInForce::Fak,
+                    post_only:    false,
                     ghost_mode:   dc.ghost_mode,
                 }
             };
@@ -309,10 +320,10 @@ impl Strategy for TrendCaptureStrategyImpl {
                     .unwrap_or(false);
                 if !in_cooldown {
                     let size = trade_size(drift_10m.abs());
-                    // Price one tick below the ask so the order rests as a maker.
-                    // Submitting at yes_ask crosses the book and is rejected by
-                    // Polymarket with "invalid post-only order: order crosses book".
-                    let entry_price = yes_ask - dec!(0.01);
+                    // Marketable entry: price at the YES ask so the FAK order crosses
+                    // and fills immediately while the bullish drift is still live.
+                    // (A passive ask − 0.01 bid only fills on a reversal — see macro note.)
+                    let entry_price = yes_ask;
                     debug!(" TrendCapture BULL entry: drift_10m={:.0} drift_60m={:.0} align_thr={:.0} yes_ask={:.3} entry={:.3} size={:.2}",
                         drift_10m, drift_60m, align_thr, yes_ask, entry_price, size);
                     drop(cooldowns);
@@ -361,14 +372,9 @@ impl Strategy for TrendCaptureStrategyImpl {
                     .unwrap_or(false);
                 if !in_cooldown {
                     let size = trade_size(drift_10m.abs());
-                    // At high-consensus prices use a wider offset to avoid crossing
-                    // thin books where bid-ask spread is only $0.01.
-                    let entry_offset = if no_ask >= config::TRENDCAPTURE_HIGH_CONSENSUS_ENTRY_THRESHOLD {
-                        config::TRENDCAPTURE_HIGH_CONSENSUS_ENTRY_OFFSET
-                    } else {
-                        dec!(0.01)
-                    };
-                    let entry_price = no_ask - entry_offset;
+                    // Marketable entry: price at the NO ask so the FAK order crosses
+                    // and fills immediately while the bearish drift is still live.
+                    let entry_price = no_ask;
                     debug!(" TrendCapture BEAR entry: drift_10m={:.0} drift_60m={:.0} align_thr={:.0} no_ask={:.3} entry={:.3} size={:.2}",
                         drift_10m, drift_60m, align_thr, no_ask, entry_price, size);
                     drop(cooldowns);
