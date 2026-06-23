@@ -152,6 +152,18 @@ pub async fn run_price_raptor(
                                         } else { dec!(0) };
 
                                         let _ = drift_tx.send((drift_60m, drift_10m));
+
+                                        // Mirror the latest signal snapshot into the shared
+                                        // raptor-health map so GET /api/telemetry can graph it.
+                                        raptor_health_tx.send_modify(|map| {
+                                            let h = map.entry(crypto_filter.clone()).or_default();
+                                            h.oracle_price = price;
+                                            h.velocity_5s  = velocity_5s;
+                                            h.velocity_1s  = velocity_1s;
+                                            h.acceleration = acceleration;
+                                            h.drift_60m    = drift_60m;
+                                            h.drift_10m    = drift_10m;
+                                        });
                                     }
                                 }
                             }

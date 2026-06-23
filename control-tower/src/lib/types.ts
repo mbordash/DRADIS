@@ -127,10 +127,38 @@ export interface LlmRecommendationRow {
   is_current_session: boolean;  // true when generated in the currently-running session
 }
 
-/** Connection health for one asset's pair of Binance Raptors. */
+/** Connection health + live signal snapshot for one asset's Binance Raptors. */
 export interface AssetRaptorHealth {
   price_connected:   boolean;  // Price Raptor (Binance Spot WS) is live
   funding_connected: boolean;  // Funding Raptor (Binance FAPI REST) last polled OK
+
+  // Live signal values (Decimal → number over the wire). Present from /api/status
+  // and /api/telemetry; default 0 until the first Raptor tick arrives.
+  oracle_price?: number;  // current spot price (oracle)
+  velocity_5s?:  number;  // Δprice over trailing 5s
+  velocity_1s?:  number;  // Δprice over trailing 1s
+  acceleration?: number;  // rate of change of 5s velocity
+  drift_60m?:    number;  // Δprice over trailing 60m
+  drift_10m?:    number;  // Δprice over trailing 10m
+  funding_rate?: number;  // perpetual funding rate (×100 for percent)
+}
+
+/** Live Raptor signal snapshot keyed by asset symbol — GET /api/telemetry. */
+export type TelemetrySnapshot = Record<string, AssetRaptorHealth>;
+
+/** One timestamped Raptor signal sample from the server ring buffer —
+ *  GET /api/telemetry/history. Decimal values arrive as numbers over the wire. */
+export interface TelemetrySample {
+  t:                 number;  // epoch milliseconds (UTC)
+  oracle_price:      number;
+  velocity_5s:       number;
+  velocity_1s:       number;
+  acceleration:      number;
+  drift_60m:         number;
+  drift_10m:         number;
+  funding_rate:      number;  // fraction; ×100 for percent
+  price_connected:   boolean;
+  funding_connected: boolean;
 }
 
 /** Response from GET /api/status — maps strategy key to active market name. */

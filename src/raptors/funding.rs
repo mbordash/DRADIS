@@ -49,9 +49,12 @@ pub async fn run_funding_raptor(
             Some(rate) => {
                 consecutive_failures = 0;
                 let _ = funding_tx.send(rate);
-                // Mark funding raptor healthy on successful poll.
+                // Mark funding raptor healthy on successful poll and mirror the
+                // latest rate into the shared map for GET /api/telemetry.
                 raptor_health_tx.send_modify(|map| {
-                    map.entry(crypto_filter.clone()).or_default().funding_connected = true;
+                    let h = map.entry(crypto_filter.clone()).or_default();
+                    h.funding_connected = true;
+                    h.funding_rate = rate;
                 });
                 debug!("📡 Funding Raptor {}: {:.6}%", symbol, rate * dec!(100));
             }

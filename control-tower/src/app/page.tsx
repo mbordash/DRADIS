@@ -10,11 +10,13 @@ import OpenPositionsCard from '@/components/OpenPositionsCard';
 import SquadronsPanel  from '@/components/SquadronsPanel';
 import SquadronDetailView from '@/components/SquadronDetailView';
 import TradelogPage    from '@/components/TradelogPage';
+import ErrorBoundary   from '@/components/ErrorBoundary';
 import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getPortfolioValue, getSquadrons } from '@/lib/api';
 import type { DynamicConfig, SquadronSummary } from '@/lib/types';
 
 // Recharts must be loaded client-side only
 const PnlChart = dynamic(() => import('@/components/PnlChart'), { ssr: false });
+const TelemetryPage = dynamic(() => import('@/components/TelemetryPage'), { ssr: false });
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -224,7 +226,7 @@ function PortfolioValueBanner({
 
 // ── Top-level nav ─────────────────────────────────────────────────────────────
 
-type AppView = 'main' | 'tradelog';
+type AppView = 'main' | 'telemetry' | 'tradelog';
 
 function NavTabs({
   active,
@@ -234,8 +236,9 @@ function NavTabs({
   onChange: (v: AppView) => void;
 }) {
   const tabs: { id: AppView; label: string; icon: string }[] = [
-    { id: 'main',     label: 'Main',     icon: '🗺️' },
-    { id: 'tradelog', label: 'Tradelog', icon: '📋' },
+    { id: 'main',      label: 'Main',      icon: '🗺️' },
+    { id: 'telemetry', label: 'Telemetry', icon: '📡' },
+    { id: 'tradelog',  label: 'Tradelog',  icon: '📋' },
   ];
   return (
     <div className="flex items-center gap-1">
@@ -480,6 +483,20 @@ export default function DashboardPage() {
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <TradelogPage availableAssets={availableAssets} />
+          <footer className="text-center text-xs text-gray-700 pb-4 font-mono">
+            DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}
+            <span className="text-gray-600">So say we all.</span>
+          </footer>
+        </main>
+      )}
+
+      {/* ── Telemetry view ─────────────────────────────────────────────────── */}
+      {activeView === 'telemetry' && (
+        <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+          {config?.ghost_mode && <GhostBanner ghost />}
+          <ErrorBoundary label="Telemetry">
+            <TelemetryPage availableAssets={availableAssets} />
+          </ErrorBoundary>
           <footer className="text-center text-xs text-gray-700 pb-4 font-mono">
             DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}
             <span className="text-gray-600">So say we all.</span>

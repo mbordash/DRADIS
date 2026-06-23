@@ -34,7 +34,9 @@ use axum::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::sync::Arc;
+use std::sync::Mutex;
 use tokio::sync::watch;
 use tower_http::cors::CorsLayer;
 use tracing::{debug, error, info, warn};
@@ -42,7 +44,6 @@ use tracing::{debug, error, info, warn};
 use alloy::primitives::{Address, U256};
 #[cfg(feature = "intl_clob")]
 use polymarket_client_sdk_v2::clob::types::{Side};
-#[cfg(feature = "intl_clob")]
 use rust_decimal::Decimal;
 #[cfg(feature = "intl_clob")]
 use rust_decimal::prelude::FromStr;
@@ -67,10 +68,104 @@ use crate::cag::Cag;
 ///                       delivering ticker messages from Binance Spot.
 /// `funding_connected` — true when the Funding Raptor last polled
 ///                       Binance FAPI successfully.
+///
+/// The remaining fields carry the **latest signal values** broadcast by each
+/// Raptor, so the Control Tower Telemetry view can graph them without a
+/// separate persistence layer (the frontend builds its own rolling buffer).
+/// All default to `0` until the first tick arrives.
 #[derive(Serialize, Clone, Default, Debug)]
 pub struct AssetRaptorHealth {
     pub price_connected:   bool,
     pub funding_connected: bool,
+
+    // ── Live Price Raptor signal snapshot (Binance Spot WS) ────────────────
+    /// Current spot price (oracle).
+    pub oracle_price:  Decimal,
+    /// 5-second price velocity (Δprice over the 5s window).
+    pub velocity_5s:   Decimal,
+    /// 1-second price velocity (short window).
+    pub velocity_1s:   Decimal,
+    /// Acceleration — rate of change of 5s velocity.
+    pub acceleration:  Decimal,
+    /// 60-minute drift (Δprice over the trailing hour).
+    pub drift_60m:     Decimal,
+    /// 10-minute drift (fills the 5s–60m temporal gap).
+    pub drift_10m:     Decimal,
+
+    // ── Live Funding Raptor signal snapshot (Binance FAPI) ─────────────────
+    /// Perpetual funding rate (fraction; ×100 for percent).
+    pub funding_rate:  Decimal,
+}
+
+// ─── Telemetry ring buffer ────────────────────────────────────────────────────
+
+/// One timestamped snapshot of every Raptor signal for a single asset.
+///
+/// Stored in the server-side ring buffer (`TelemetryHistory`) and served by
+/// `GET /api/telemetry/history`, giving the Control Tower Telemetry view durable,
+/// scrubable history that survives browser reloads (the live snapshot in
+/// `AssetRaptorHealth` only ever holds the latest tick).
+#[derive(Serialize, Clone, Debug)]
+pub struct TelemetrySample {
+    /// Sample time — epoch milliseconds (UTC).
+    pub t:             i64,
+    pub oracle_price:  Decimal,
+    pub velocity_5s:   Decimal,
+    pub velocity_1s:   Decimal,
+    pub acceleration:  Decimal,
+    pub drift_60m:     Decimal,
+    pub drift_10m:     Decimal,
+    pub funding_rate:  Decimal,
+    pub price_connected:   bool,
+    pub funding_connected: bool,
+}
+
+/// Per-asset rolling history of telemetry samples.
+/// Bounded to `TELEMETRY_HISTORY_CAP` entries per asset by the sampler task.
+pub type TelemetryHistory = Arc<Mutex<HashMap<String, VecDeque<TelemetrySample>>>>;
+
+/// Sampler cadence — how often the background task snapshots the live signals.
+const TELEMETRY_SAMPLE_SECS: u64 = 2;
+/// Retention cap per asset (samples). 1800 × 2s = 1 hour of scrubable history.
+const TELEMETRY_HISTORY_CAP: usize = 1800;
+
+/// Background task — every `TELEMETRY_SAMPLE_SECS`, snapshot the current Raptor
+/// signal values into the per-asset ring buffer. Spawned once by
+/// `run_api_server`; runs for the life of the process.
+async fn run_telemetry_sampler(
+    raptor_health_rx: watch::Receiver<HashMap<String, AssetRaptorHealth>>,
+    history: TelemetryHistory,
+) {
+    let mut ticker = tokio::time::interval(std::time::Duration::from_secs(TELEMETRY_SAMPLE_SECS));
+    loop {
+        ticker.tick().await;
+        let now = chrono::Utc::now().timestamp_millis();
+        let snapshot = raptor_health_rx.borrow().clone();
+        if snapshot.is_empty() { continue; }
+        let mut hist = match history.lock() {
+            Ok(h) => h,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        for (asset, h) in snapshot.iter() {
+            let buf = hist.entry(asset.clone()).or_default();
+            buf.push_back(TelemetrySample {
+                t: now,
+                oracle_price: h.oracle_price,
+                velocity_5s:  h.velocity_5s,
+                velocity_1s:  h.velocity_1s,
+                acceleration: h.acceleration,
+                drift_60m:    h.drift_60m,
+                drift_10m:    h.drift_10m,
+                funding_rate: h.funding_rate,
+                price_connected:   h.price_connected,
+                funding_connected: h.funding_connected,
+            });
+            let len = buf.len();
+            if len > TELEMETRY_HISTORY_CAP {
+                buf.drain(0..len - TELEMETRY_HISTORY_CAP);
+            }
+        }
+    }
 }
 
 // ─── Shared state ────────────────────────────────────────────────────────────
@@ -100,6 +195,10 @@ pub struct ApiState {
     /// Phase 3d: exposes GET /api/squadrons and GET /api/squadrons/{id}.
     /// Phase 3f: will also handle POST/DELETE once patrol() is fully wired.
     pub cag: Cag,
+    /// Server-side ring buffer of Raptor signal samples (per asset).
+    /// Populated by the telemetry sampler task; served by
+    /// GET /api/telemetry/history so the UI survives reloads and can scrub.
+    pub telemetry_history: TelemetryHistory,
 }
 
 // ─── API-key middleware ──────────────────────────────────────────────────────
@@ -381,6 +480,67 @@ async fn get_status(State(s): State<ApiState>) -> Response {
     Json(StatusResponse { strategy_markets: markets, session_started_at, raptors }).into_response()
 }
 
+/// GET /api/telemetry
+///
+/// Returns the live signal snapshot for every asset's Raptors — the same
+/// `AssetRaptorHealth` map exposed under `/api/status.raptors`, but on a
+/// dedicated lightweight endpoint the Control Tower Telemetry view can poll at
+/// a high cadence (every ~2 s) to build rolling signal graphs.
+///
+/// Response (keyed by asset symbol):
+/// ```json
+/// {
+///   "btc": {
+///     "price_connected": true, "funding_connected": true,
+///     "oracle_price": 64210.5, "velocity_5s": 12.3, "velocity_1s": 4.1,
+///     "acceleration": 1.2, "drift_60m": 305.0, "drift_10m": 88.0,
+///     "funding_rate": 0.00012
+///   }
+/// }
+/// ```
+async fn get_telemetry(State(s): State<ApiState>) -> Response {
+    debug!("Received GET /api/telemetry request");
+    let raptors = s.raptor_health_rx.borrow().clone();
+    Json(raptors).into_response()
+}
+
+/// Query params for telemetry history.
+#[derive(Deserialize)]
+struct TelemetryHistoryQuery {
+    asset: Option<String>,
+    limit: Option<usize>,
+}
+
+/// GET /api/telemetry/history?asset=btc&limit=900
+///
+/// Returns up to `limit` most-recent telemetry samples (oldest→newest) for the
+/// given asset from the server-side ring buffer. Defaults to the primary asset
+/// and the full retained window (1 hour). This durable history lets the Control
+/// Tower Telemetry view survive reloads and scrub back over past signal windows.
+async fn get_telemetry_history(
+    State(s): State<ApiState>,
+    Query(q): Query<TelemetryHistoryQuery>,
+) -> Response {
+    debug!("Received GET /api/telemetry/history request");
+    let limit = q.limit.unwrap_or(TELEMETRY_HISTORY_CAP).clamp(1, TELEMETRY_HISTORY_CAP);
+    let hist = match s.telemetry_history.lock() {
+        Ok(h) => h,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    // Resolve asset: explicit param (lowercased), else the first (primary) key.
+    let key = q.asset
+        .map(|a| a.to_lowercase())
+        .or_else(|| hist.keys().next().cloned());
+    let samples: Vec<TelemetrySample> = match key.as_deref().and_then(|k| hist.get(k)) {
+        Some(buf) => {
+            let start = buf.len().saturating_sub(limit);
+            buf.iter().skip(start).cloned().collect()
+        }
+        None => Vec::new(),
+    };
+    Json(samples).into_response()
+}
+
 /// GET /api/trades?limit=100&asset=btc
 ///
 /// Returns up to `limit` completed trades, newest first.
@@ -524,7 +684,7 @@ async fn manual_exit(
     State(s): State<ApiState>,
     Json(req): Json<ManualExitRequest>,
 ) -> Response {
-    info!("🎯 RTB: Manual exit request for token {} [{}]", &req.token_id[..req.token_id.len().min(20)], req.strategy);
+    info!(" RTB: Manual exit request for token {} [{}]", &req.token_id[..req.token_id.len().min(20)], req.strategy);
 
     // ── Step 1: Get session for this asset ────────────────────────────────────
     let session = match s.cag.session_for_asset(&req.asset) {
@@ -613,7 +773,7 @@ async fn manual_exit(
 
     // ── Step 4: Place FAK market sell order ────────────────────────────────────
     let sell_price = round_to_tick_size(current_bid);
-    info!("🎯 RTB: Placing FAK sell order — {} shares @ ${:.4}", shares, sell_price);
+    info!(" RTB: Placing FAK sell order — {} shares @ ${:.4}", shares, sell_price);
 
     let order_result = place_limit_order(
         session.venue.trading_client(),
@@ -650,7 +810,7 @@ async fn manual_exit(
 
     // ── Step 6: Calculate P&L and record trade ────────────────────────────────
     let pnl = (sell_price - entry_price) * shares;
-    info!("📊 RTB: Trade recorded — {} shares | entry ${:.4} → exit ${:.4} | P&L ${:.4}",
+    info!(" RTB: Trade recorded — {} shares | entry ${:.4} → exit ${:.4} | P&L ${:.4}",
           shares, entry_price, sell_price, pnl);
 
     metrics::record_trade(
@@ -770,7 +930,7 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
                 Ok(Ok(resp)) => {
                     let balance = Decimal::from_str(&resp.balance.to_string())
                         .unwrap_or(Decimal::ZERO) / Decimal::from_str("1000000").unwrap();
-                    debug!("💰 Live wallet collateral from CLOB: ${:.4}", balance);
+                    debug!(" Live wallet collateral from CLOB: ${:.4}", balance);
                     Some(balance)
                 }
                 Ok(Err(e)) => {
@@ -883,7 +1043,7 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
                             asset_positions_value += market_value;
                             asset_unrealized_pnl += market_value - cost_basis;
                             has_live_prices = true;
-                            debug!("💹 [{}] token {} {} shares × cur=${:.4} = ${:.4} (entry=${:.4} pnl={:+.4})",
+                            debug!(" [{}] token {} {} shares × cur=${:.4} = ${:.4} (entry=${:.4} pnl={:+.4})",
                                    asset.to_uppercase(), &pos.token_id[..pos.token_id.len().min(12)],
                                    shares, cur_price, market_value, entry_price,
                                    market_value - cost_basis);
@@ -925,7 +1085,7 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
 
         total_positions_value += asset_positions_value;
         total_unrealized_pnl  += asset_unrealized_pnl;
-        debug!("📊 [{}] positions=${:.4} unrealized_pnl={:+.4}",
+        debug!(" [{}] positions=${:.4} unrealized_pnl={:+.4}",
                asset.to_uppercase(), asset_positions_value, asset_unrealized_pnl);
     }
 
@@ -941,7 +1101,7 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
 
     let total_value = total_collateral + total_positions_value;
 
-    debug!("📊 Portfolio summary: collateral=${:.4} positions=${:.4} total=${:.4} count={} live={}",
+    debug!(" Portfolio summary: collateral=${:.4} positions=${:.4} total=${:.4} count={} live={}",
            total_collateral, total_positions_value, total_value, total_position_count, all_prices_live);
 
     Json(PortfolioValue {
@@ -1125,7 +1285,15 @@ pub async fn run_api_server(
         tracing::info!(" API key authentication disabled (set DRADIS_API_KEY to enable)");
     }
 
-    let state = ApiState { config_tx, config_rx, markets_rx, raptor_health_rx, api_key, #[cfg(feature = "intl_clob")] safe_address, cag };
+    // Server-side ring buffer for Raptor signal telemetry (durable across reloads).
+    let telemetry_history: TelemetryHistory = Arc::new(Mutex::new(HashMap::new()));
+
+    let state = ApiState { config_tx, config_rx, markets_rx, raptor_health_rx: raptor_health_rx.clone(), api_key, #[cfg(feature = "intl_clob")] safe_address, cag, telemetry_history: telemetry_history.clone() };
+
+    // Spawn the telemetry sampler — snapshots live Raptor signals into the ring
+    // buffer every TELEMETRY_SAMPLE_SECS so the Control Tower has durable,
+    // scrubable history that survives browser reloads.
+    tokio::spawn(run_telemetry_sampler(raptor_health_rx, telemetry_history));
 
     // /api/health is intentionally public — no API key required.
     // Docker HEALTHCHECK, load balancers, and uptime monitors all probe this
@@ -1147,6 +1315,8 @@ pub async fn run_api_server(
         .route("/api/positions/confirmed",   get(get_confirmed_positions))
         .route("/api/positions/{token_id}",  delete(delete_open_position))
         .route("/api/status",                get(get_status))
+        .route("/api/telemetry",             get(get_telemetry))
+        .route("/api/telemetry/history",     get(get_telemetry_history))
         .route("/api/portfolio",             get(get_portfolio_value))
         .route("/api/llm/recommendations",   get(get_llm_recommendations))
         // ── Phase 3d: Squadron registry endpoints ──────────────────────────

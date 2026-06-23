@@ -1,4 +1,4 @@
-import type { DynamicConfig, ConfigFieldSchema, PnlSnapshotRow, TradeRow, OpenPositionRow, LlmRecommendationRow, ViperDef, StatusResponse, PortfolioValue, SquadronSummary } from './types';
+import type { DynamicConfig, ConfigFieldSchema, PnlSnapshotRow, TradeRow, OpenPositionRow, LlmRecommendationRow, ViperDef, StatusResponse, PortfolioValue, SquadronSummary, TelemetrySnapshot, TelemetrySample } from './types';
 
 // In development, NEXT_PUBLIC_API_URL=http://localhost:9000 (set in .env.local)
 // hits the DRADIS API directly.
@@ -104,6 +104,21 @@ export async function getHealth(): Promise<string> {
 export async function getStatus(): Promise<StatusResponse> {
   const res = await fetch(`${BASE}/api/status`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/status → ${res.status}`);
+  return res.json();
+}
+
+/** Live Raptor signal snapshot (oracle/velocity/drift/funding) keyed by asset. */
+export async function getTelemetry(): Promise<TelemetrySnapshot> {
+  const res = await fetch(`${BASE}/api/telemetry`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/telemetry → ${res.status}`);
+  return res.json();
+}
+
+/** Durable Raptor signal history from the server ring buffer (oldest→newest). */
+export async function getTelemetryHistory(asset: string, limit = 1800): Promise<TelemetrySample[]> {
+  const url = withAsset(`${BASE}/api/telemetry/history?limit=${limit}`, asset);
+  const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/telemetry/history → ${res.status}`);
   return res.json();
 }
 
