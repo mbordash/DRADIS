@@ -32,6 +32,9 @@ interface Row {
   d60: number;
   d10: number;
   funding: number;   // percent
+  oi: number;        // open interest (base contracts)
+  oiDelta: number;   // percent change vs previous poll
+  cvd: number;       // taker buy/sell ratio (1.0 = balanced)
 }
 
 function fmtClock(ms: number): string {
@@ -60,6 +63,9 @@ function toRow(s: TelemetrySample): Row {
     d60: num(s.drift_60m),
     d10: num(s.drift_10m),
     funding: num(s.funding_rate) * 100,
+    oi: num(s.open_interest),
+    oiDelta: num(s.oi_delta_pct) * 100,
+    cvd: num(s.cvd_ratio),
   };
 }
 
@@ -68,7 +74,7 @@ function toRow(s: TelemetrySample): Row {
 interface SeriesDef { key: keyof Row; label: string; color: string }
 
 function SignalChart({
-  title, subtitle, data, series, fmtY, zeroLine = false,
+  title, subtitle, data, series, fmtY, zeroLine = false, refY, refLabel,
 }: {
   title: string;
   subtitle: string;
@@ -76,6 +82,9 @@ function SignalChart({
   series: SeriesDef[];
   fmtY: (v: number) => string;
   zeroLine?: boolean;
+  /** Optional horizontal baseline (e.g. 1.0 for a balanced CVD ratio). */
+  refY?: number;
+  refLabel?: string;
 }) {
   const latest = data[data.length - 1];
   return (
@@ -129,6 +138,14 @@ function SignalChart({
                 formatter={(v: number, name: string) => [fmtY(v), name]}
               />
               {zeroLine && <ReferenceLine y={0} stroke="#374151" strokeDasharray="4 4" />}
+              {typeof refY === 'number' && (
+                <ReferenceLine
+                  y={refY}
+                  stroke="#4b5563"
+                  strokeDasharray="4 4"
+                  label={refLabel ? { value: refLabel, position: 'insideTopLeft', fill: '#6b7280', fontSize: 9 } : undefined}
+                />
+              )}
               {series.map(s => (
                 <Line
                   key={String(s.key)}
@@ -242,6 +259,15 @@ function fmtSigned(n: number): string {
   return `${sign}${n.toFixed(2)}`;
 }
 
+// Compact large magnitudes (open interest) → "12.3K", "1.2M".
+function fmtCompact(n: number): string {
+  const abs = Math.abs(n);
+  if (abs >= 1e9) return `${(n / 1e9).toFixed(2)}B`;
+  if (abs >= 1e6) return `${(n / 1e6).toFixed(2)}M`;
+  if (abs >= 1e3) return `${(n / 1e3).toFixed(2)}K`;
+  return n.toFixed(2);
+}
+
 // ── Main telemetry page ───────────────────────────────────────────────────────
 
 export default function TelemetryPage({ availableAssets }: { availableAssets: string[] }) {
@@ -294,8 +320,8 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
             <p className="label-muted text-xs">📡 Raptor Signal Telemetry</p>
             <p className="text-sm text-gray-400 mt-0.5">
               Live signal collectors feeding the squadrons. Watch the raw price, velocity,
-              drift and funding streams to understand what your vipers see —
-              <span className="text-gray-500"> the first step toward designing your own CAG / Squadron.</span>
+              drift, funding and derivatives streams to understand what your vipers see —
+              <span className="text-gray-500"> from spot micro-structure up to perp macro pressure.</span>
             </p>
           </div>
           <AssetSelector assets={assets} selected={asset} onChange={setSelectedAsset} />
@@ -304,6 +330,7 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
         <div className="flex flex-wrap items-center gap-3 mt-3 pt-3 border-t border-[#1e1e32]">
           <ConnPill label="Price Raptor" live={!!lastSample?.price_connected} />
           <ConnPill label="Funding Raptor" live={!!lastSample?.funding_connected} />
+          <ConnPill label="Derivatives Raptor" live={!!lastSample?.deriv_connected} />
 
           {/* Window selector */}
           <div className="flex items-center gap-1 ml-2">
@@ -354,11 +381,17 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
 
       {/* Current-value stat strip */}
       {latest && (
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+        <div className="grid grid-cols-2 sm:grid-cols-3 lg:grid-cols-6 gap-3">
           <StatCard label="Oracle Price" value={`$${latest.oracle.toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`} />
           <StatCard label="Velocity (5s)" value={fmtSigned(latest.v5)} valueClass={latest.v5 >= 0 ? 'text-green-400' : 'text-red-400'} />
           <StatCard label="Drift (10m)" value={fmtSigned(latest.d10)} valueClass={latest.d10 >= 0 ? 'text-green-400' : 'text-red-400'} />
           <StatCard label="Funding Rate" value={`${latest.funding >= 0 ? '+' : ''}${latest.funding.toFixed(4)}%`} valueClass={latest.funding >= 0 ? 'text-green-400' : 'text-red-400'} />
+          <StatCard label="Open Interest Δ" value={`${latest.oiDelta >= 0 ? '+' : ''}${latest.oiDelta.toFixed(3)}%`} valueClass={latest.oiDelta >= 0 ? 'text-green-400' : 'text-red-400'} />
+          <StatCard
+            label="Taker CVD"
+            value={latest.cvd > 0 ? latest.cvd.toFixed(3) : '—'}
+            valueClass={latest.cvd === 0 ? 'text-gray-500' : latest.cvd >= 1 ? 'text-green-400' : 'text-red-400'}
+          />
         </div>
       )}
 
@@ -407,12 +440,32 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
           series={[{ key: 'funding', label: 'rate', color: '#14b8a6' }]}
           fmtY={v => `${v.toFixed(4)}%`}
         />
+        <SignalChart
+          title="Open Interest Δ"
+          subtitle="Binance perp OI change — 10m regime pressure"
+          data={viewRows}
+          zeroLine
+          series={[{ key: 'oiDelta', label: 'ΔOI', color: '#f97316' }]}
+          fmtY={v => `${v >= 0 ? '+' : ''}${v.toFixed(3)}%`}
+        />
+        <SignalChart
+          title="Taker CVD Ratio"
+          subtitle="Perp buy÷sell aggression — >1 buyers lifting, <1 sellers hitting"
+          data={viewRows}
+          refY={1}
+          refLabel="balanced"
+          series={[{ key: 'cvd', label: 'ratio', color: '#eab308' }]}
+          fmtY={v => v.toFixed(3)}
+        />
       </div>
 
       <p className="text-[10px] font-mono text-gray-600">
         History is served from the engine ring buffer (<span className="text-gray-500">/api/telemetry/history</span>),
         so it survives page reloads. Pick a window, then <span className="text-gray-500">Pause</span> to scrub a past
         interval. Positive velocity/drift = price rising; funding &gt; 0 = longs paying shorts (bullish lean).
+        The macro Derivatives Raptor adds perp context: rising <span className="text-gray-500">Open Interest Δ</span>
+        {' '}with price = fresh positioning, while <span className="text-gray-500">Taker CVD</span> &gt; 1 marks buy-side
+        aggression — your vipers fuse these slow macro reads with the fast spot micro signals.
       </p>
     </div>
   );

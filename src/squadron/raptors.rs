@@ -13,6 +13,8 @@
 use rust_decimal::Decimal;
 use tokio::sync::watch;
 
+use crate::raptors::derivatives::DerivativesSnapshot;
+
 /// All Raptor signal receivers available to a squadron.
 pub struct SquadronRaptors {
     /// Current spot price from the Price Raptor (Binance WS).
@@ -28,6 +30,12 @@ pub struct SquadronRaptors {
     /// `None` when the Funding Raptor is not deployed for this squadron
     /// (e.g. a pure momentum run that doesn't need smart-money sentiment).
     pub funding: Option<watch::Receiver<Decimal>>,
+
+    /// Open-interest / taker-flow snapshot from the Derivatives Raptor
+    /// (Binance FAPI). A *macro* signal — the Viper fuses it with the fast
+    /// price/velocity micro signals to read 10-minute regime shifts. `None`
+    /// when the Derivatives Raptor is not deployed for this squadron.
+    pub derivatives: Option<watch::Receiver<DerivativesSnapshot>>,
     // ── Future Raptors ────────────────────────────────────────────────────────
     // pub sports:   Option<watch::Receiver<SportsSignal>>,
     // pub politics: Option<watch::Receiver<PoliticsSignal>>,
@@ -36,22 +44,29 @@ pub struct SquadronRaptors {
 impl SquadronRaptors {
     /// Compose a full squadron raptor bundle from all available signal channels.
     pub fn full(
-        oracle:   watch::Receiver<Decimal>,
-        velocity: watch::Receiver<(Decimal, Decimal, Decimal)>,
-        drift:    watch::Receiver<(Decimal, Decimal)>,
-        funding:  watch::Receiver<Decimal>,
+        oracle:      watch::Receiver<Decimal>,
+        velocity:    watch::Receiver<(Decimal, Decimal, Decimal)>,
+        drift:       watch::Receiver<(Decimal, Decimal)>,
+        funding:     watch::Receiver<Decimal>,
+        derivatives: watch::Receiver<DerivativesSnapshot>,
     ) -> Self {
-        Self { oracle, velocity, drift, funding: Some(funding) }
+        Self {
+            oracle,
+            velocity,
+            drift,
+            funding: Some(funding),
+            derivatives: Some(derivatives),
+        }
     }
 
-    /// Compose a price-only bundle (no Funding Raptor).
-    /// Suitable for momentum-only deployments where funding rate is not consumed.
+    /// Compose a price-only bundle (no Funding / Derivatives Raptor).
+    /// Suitable for momentum-only deployments where macro signals are not consumed.
     pub fn price_only(
         oracle:   watch::Receiver<Decimal>,
         velocity: watch::Receiver<(Decimal, Decimal, Decimal)>,
         drift:    watch::Receiver<(Decimal, Decimal)>,
     ) -> Self {
-        Self { oracle, velocity, drift, funding: None }
+        Self { oracle, velocity, drift, funding: None, derivatives: None }
     }
 }
 

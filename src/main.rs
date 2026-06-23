@@ -271,6 +271,7 @@ async fn main() -> Result<()> {
         // but does not crash the process — the Control Tower API stays up so the
         // operator can diagnose. On success we drive the venue-neutral US trading
         // loop (arbitrage over the `Execution` trait) until shutdown.
+
         //
         // Guard: if the required env vars are absent (e.g. BTC-only run), skip the
         // connect entirely so we don't emit a misleading WARN on every startup.
@@ -436,6 +437,8 @@ async fn main() -> Result<()> {
         let (velocity_tx, velocity_rx) = watch::channel((dec!(0), dec!(0), dec!(0)));
         let (funding_tx, funding_rx)   = watch::channel(dec!(0));
         let (drift_tx, drift_rx)       = watch::channel((dec!(0), dec!(0)));
+        let (deriv_tx, deriv_rx)       =
+            watch::channel(dradis::raptors::derivatives::DerivativesSnapshot::default());
 
         tokio::spawn(dradis::raptors::price::run_price_raptor(
             asset.clone(), oracle_tx, velocity_tx, drift_tx,
@@ -445,7 +448,11 @@ async fn main() -> Result<()> {
             Arc::clone(&shared_http), asset.clone(), funding_tx,
             Arc::clone(&raptor_health_tx),
         ));
-        let raptor_signals = SquadronRaptors::full(oracle_rx, velocity_rx, drift_rx, funding_rx);
+        tokio::spawn(dradis::raptors::derivatives::run_derivatives_raptor(
+            Arc::clone(&shared_http), asset.clone(), deriv_tx,
+            Arc::clone(&raptor_health_tx),
+        ));
+        let raptor_signals = SquadronRaptors::full(oracle_rx, velocity_rx, drift_rx, funding_rx, deriv_rx);
 
         // ── Per-asset session state ────────────────────────────────────────────
         // startup_balance is the real wallet balance at process start — used as

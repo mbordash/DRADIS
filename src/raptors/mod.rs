@@ -22,3 +22,4 @@
 /// signals as features — no single Raptor has veto power alone.
 pub mod price;
 pub mod funding;
+pub mod derivatives;

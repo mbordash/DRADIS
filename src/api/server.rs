@@ -77,6 +77,7 @@ use crate::cag::Cag;
 pub struct AssetRaptorHealth {
     pub price_connected:   bool,
     pub funding_connected: bool,
+    pub deriv_connected:   bool,
 
     // ── Live Price Raptor signal snapshot (Binance Spot WS) ────────────────
     /// Current spot price (oracle).
@@ -95,6 +96,14 @@ pub struct AssetRaptorHealth {
     // ── Live Funding Raptor signal snapshot (Binance FAPI) ─────────────────
     /// Perpetual funding rate (fraction; ×100 for percent).
     pub funding_rate:  Decimal,
+
+    // ── Live Derivatives Raptor signal snapshot (Binance FAPI) ─────────────
+    /// Open interest (base contracts) — raw perp positioning size.
+    pub open_interest: Decimal,
+    /// Fractional change in open interest since the previous poll (×100 = %).
+    pub oi_delta_pct:  Decimal,
+    /// Taker buy÷sell volume ratio (CVD proxy); >1 buy aggression, 0 = no data.
+    pub cvd_ratio:     Decimal,
 }
 
 // ─── Telemetry ring buffer ────────────────────────────────────────────────────
@@ -116,8 +125,12 @@ pub struct TelemetrySample {
     pub drift_60m:     Decimal,
     pub drift_10m:     Decimal,
     pub funding_rate:  Decimal,
+    pub open_interest: Decimal,
+    pub oi_delta_pct:  Decimal,
+    pub cvd_ratio:     Decimal,
     pub price_connected:   bool,
     pub funding_connected: bool,
+    pub deriv_connected:   bool,
 }
 
 /// Per-asset rolling history of telemetry samples.
@@ -157,8 +170,12 @@ async fn run_telemetry_sampler(
                 drift_60m:    h.drift_60m,
                 drift_10m:    h.drift_10m,
                 funding_rate: h.funding_rate,
+                open_interest: h.open_interest,
+                oi_delta_pct:  h.oi_delta_pct,
+                cvd_ratio:     h.cvd_ratio,
                 price_connected:   h.price_connected,
                 funding_connected: h.funding_connected,
+                deriv_connected:   h.deriv_connected,
             });
             let len = buf.len();
             if len > TELEMETRY_HISTORY_CAP {

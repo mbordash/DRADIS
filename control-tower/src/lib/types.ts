@@ -131,6 +131,7 @@ export interface LlmRecommendationRow {
 export interface AssetRaptorHealth {
   price_connected:   boolean;  // Price Raptor (Binance Spot WS) is live
   funding_connected: boolean;  // Funding Raptor (Binance FAPI REST) last polled OK
+  deriv_connected?:  boolean;  // Derivatives Raptor (Binance FAPI REST) last polled OK
 
   // Live signal values (Decimal → number over the wire). Present from /api/status
   // and /api/telemetry; default 0 until the first Raptor tick arrives.
@@ -141,6 +142,9 @@ export interface AssetRaptorHealth {
   drift_60m?:    number;  // Δprice over trailing 60m
   drift_10m?:    number;  // Δprice over trailing 10m
   funding_rate?: number;  // perpetual funding rate (×100 for percent)
+  open_interest?: number; // perp open interest (base contracts)
+  oi_delta_pct?:  number;  // Δ open interest vs previous poll (×100 for percent)
+  cvd_ratio?:     number;  // taker buy÷sell volume ratio (>1 buy aggression, 0 = no data)
 }
 
 /** Live Raptor signal snapshot keyed by asset symbol — GET /api/telemetry. */
@@ -157,8 +161,12 @@ export interface TelemetrySample {
   drift_60m:         number;
   drift_10m:         number;
   funding_rate:      number;  // fraction; ×100 for percent
+  open_interest:     number;  // perp open interest (base contracts)
+  oi_delta_pct:      number;  // Δ open interest vs previous poll (fraction; ×100 for percent)
+  cvd_ratio:         number;  // taker buy÷sell volume ratio (>1 buy aggression, 0 = no data)
   price_connected:   boolean;
   funding_connected: boolean;
+  deriv_connected:   boolean;
 }
 
 /** Response from GET /api/status — maps strategy key to active market name. */

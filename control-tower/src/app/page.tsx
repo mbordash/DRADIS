@@ -374,11 +374,7 @@ export default function DashboardPage() {
               <div className="flex items-center gap-1.5">
                 <span className="font-mono font-bold text-lg tracking-wide text-indigo-400">DRADIS</span>
                 <span className="text-gray-600 text-lg">|</span>
-                <span className="text-gray-400 text-sm font-medium">Squadron Detail</span>
               </div>
-              <span className="hidden sm:inline text-xs bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 rounded px-2 py-0.5 font-mono">
-                v0.4.0
-              </span>
               <NavTabs active={activeView} onChange={(v) => { setActiveView(v); setFocusedSquadronId(null); }} />
             </div>
 
@@ -438,11 +434,7 @@ export default function DashboardPage() {
             <div className="flex items-center gap-1.5">
               <span className="font-mono font-bold text-lg tracking-wide text-indigo-400">DRADIS</span>
               <span className="text-gray-600 text-lg">|</span>
-              <span className="text-gray-400 text-sm font-medium">Control Tower</span>
             </div>
-            <span className="hidden sm:inline text-xs bg-indigo-500/10 text-indigo-400 border border-indigo-500/20 rounded px-2 py-0.5 font-mono">
-              v0.4.0
-            </span>
             <NavTabs active={activeView} onChange={setActiveView} />
           </div>
 
