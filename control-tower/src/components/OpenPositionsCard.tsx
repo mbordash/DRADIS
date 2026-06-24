@@ -109,7 +109,7 @@ export default function OpenPositionsCard({ positions, trades, isLoading, asset 
           // TODO: Get actual current bid from live price feed
           current_bid: "0.5", // Placeholder - will be fetched by backend from CLOB
           // TODO: Get actual exchange address from config
-          verifying_address: "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E", // Polymarket CTF Exchange
+          verifying_contract: "0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E", // Polymarket CTF Exchange
         }),
       });
 

@@ -356,7 +356,7 @@ export default function TradelogPage({ availableAssets }: Props) {
           market:            rtbEntry.rawPosition.market,
           side:              rtbEntry.rawPosition.side,
           current_bid:       '0.5',
-          verifying_address: '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E',
+          verifying_contract: '0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E',
         }),
       });
       if (!res.ok) {

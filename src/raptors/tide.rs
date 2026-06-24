@@ -12,15 +12,19 @@
 /// For each ETF i, fair value is its **synthetic iNAV**, computed millisecond-
 /// fresh from the live Binance oracle the Price Raptor already streams:
 ///
-///     synthetic_inav_i = btc_per_share_i × binance_oracle
-///     premium_i_bps     = (equity_last_i / synthetic_inav_i − 1) × 10_000
+/// ```text
+/// synthetic_inav_i = btc_per_share_i × binance_oracle
+/// premium_i_bps     = (equity_last_i / synthetic_inav_i − 1) × 10_000
+/// ```
 ///
 /// Each premium is z-scored against its own rolling mean/σ (so a structurally
 /// wider quote doesn't dominate), then volume-weighted by traded dollar-volume
 /// into two emitted fields:
 ///
-///     institutional_pulse = Σ(z_i · $vol_i) / Σ($vol_i)      // signed magnitude
-///     coherence           = |Σ(sign(z_i) · $vol_i)| / Σ($vol_i)  // 0..1 agreement
+/// ```text
+/// institutional_pulse = Σ(z_i · $vol_i) / Σ($vol_i)          // signed magnitude
+/// coherence           = |Σ(sign(z_i) · $vol_i)| / Σ($vol_i)  // 0..1 agreement
+/// ```
 ///
 /// Because every synthetic iNAV multiplies the **same** oracle, oracle error
 /// (latency, the USDT≠USD basis) is *common-mode* across all three ETFs and
