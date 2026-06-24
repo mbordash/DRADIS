@@ -259,6 +259,11 @@ pub const BASIS_MAX_SNAPSHOT_AGE_SECS: i64 = 15;
 pub const BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 30;
 pub const BASIS_FUNDING_POLL_SECS: u64 = 60;
 
+/// Polling interval (seconds) for the Derivatives Raptor (open interest + taker
+/// CVD ratio). Faster than funding because OI-driven regime shifts unfold on a
+/// ~10-minute horizon.
+pub const DERIVATIVES_POLL_SECS: u64 = 30;
+
 // ============================================================================
 // TIDE RAPTOR — "Institutional Pulse" spot-BTC-ETF premium signal
 // ============================================================================

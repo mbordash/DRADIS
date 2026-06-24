@@ -275,6 +275,11 @@ pub const BASIS_MAX_SNAPSHOT_AGE_SECS: i64 = 15;
 pub const BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 60;
 pub const BASIS_FUNDING_POLL_SECS: u64 = 60;
 
+/// Polling interval (seconds) for the Derivatives Raptor (open interest + taker
+/// CVD ratio). Faster than funding because OI-driven regime shifts unfold on a
+/// ~10-minute horizon.
+pub const DERIVATIVES_POLL_SECS: u64 = 30;
+
 // ============================================================================
 // TIDE RAPTOR — "Institutional Pulse" spot-BTC-ETF premium signal
 // ============================================================================
@@ -385,6 +390,12 @@ pub const GBOOST_MAX_SNAPSHOT_AGE_SECS: i64 = 10;
 /// Guards against entering a daily position when the hourly market is near-resolved.
 pub const GBOOST_MIN_HOURLY_YES_BID: Decimal = dec!(0.05);
 pub const GBOOST_MAX_HOURLY_YES_ASK: Decimal = dec!(0.95);
+
+/// Block DAILY NO entries when the current hourly market shows BTC strongly
+/// trending UP (hourly YES bid above this threshold), and DAILY YES entries when
+/// the hourly YES bid drops below (1 − this). Strong hourly trend predicts the
+/// daily follows, making the opposite-side daily entry systematically unprofitable.
+pub const GBOOST_HOURLY_STRONG_TREND_BLOCK: Decimal = dec!(0.65);
 
 /// Seconds BTC spot must stay below (daily_strike − BASIS_BTC_ORACLE_STRIKE_BUFFER)
 /// before GBoost YES entries are suppressed. 3600s = 60 min sustained below-strike.
