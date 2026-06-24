@@ -104,6 +104,20 @@ pub struct AssetRaptorHealth {
     pub oi_delta_pct:  Decimal,
     /// Taker buy÷sell volume ratio (CVD proxy); >1 buy aggression, 0 = no data.
     pub cvd_ratio:     Decimal,
+
+    // ── Live Tide Raptor signal snapshot (synthetic iNAV vs IEX ETF prints) ──
+    /// Tide Raptor has at least one fresh, in-session ETF premium this tick.
+    pub tide_connected:      bool,
+    /// True during the US cash session (09:30–16:00 ET); false ⇒ pulse held 0.
+    pub tide_market_open:    bool,
+    /// Volume-weighted, vol-normalized aggregate premium z-score (signed).
+    pub institutional_pulse: Decimal,
+    /// Agreement of the Big Three premium signs (0..1); high = conviction.
+    pub tide_coherence:      Decimal,
+    /// Per-ETF premium vs synthetic iNAV, basis points.
+    pub ibit_premium_bps:    Decimal,
+    pub fbtc_premium_bps:    Decimal,
+    pub arkb_premium_bps:    Decimal,
 }
 
 // ─── Telemetry ring buffer ────────────────────────────────────────────────────
@@ -131,6 +145,15 @@ pub struct TelemetrySample {
     pub price_connected:   bool,
     pub funding_connected: bool,
     pub deriv_connected:   bool,
+
+    // ── Tide Raptor (Institutional Pulse) ──
+    pub tide_connected:      bool,
+    pub tide_market_open:    bool,
+    pub institutional_pulse: Decimal,
+    pub tide_coherence:      Decimal,
+    pub ibit_premium_bps:    Decimal,
+    pub fbtc_premium_bps:    Decimal,
+    pub arkb_premium_bps:    Decimal,
 }
 
 /// Per-asset rolling history of telemetry samples.
@@ -176,6 +199,13 @@ async fn run_telemetry_sampler(
                 price_connected:   h.price_connected,
                 funding_connected: h.funding_connected,
                 deriv_connected:   h.deriv_connected,
+                tide_connected:      h.tide_connected,
+                tide_market_open:    h.tide_market_open,
+                institutional_pulse: h.institutional_pulse,
+                tide_coherence:      h.tide_coherence,
+                ibit_premium_bps:    h.ibit_premium_bps,
+                fbtc_premium_bps:    h.fbtc_premium_bps,
+                arkb_premium_bps:    h.arkb_premium_bps,
             });
             let len = buf.len();
             if len > TELEMETRY_HISTORY_CAP {

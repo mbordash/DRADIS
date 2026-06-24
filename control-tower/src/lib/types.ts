@@ -145,6 +145,15 @@ export interface AssetRaptorHealth {
   open_interest?: number; // perp open interest (base contracts)
   oi_delta_pct?:  number;  // Δ open interest vs previous poll (×100 for percent)
   cvd_ratio?:     number;  // taker buy÷sell volume ratio (>1 buy aggression, 0 = no data)
+
+  // ── Tide Raptor — "Institutional Pulse" (spot-BTC-ETF premium) ──
+  tide_connected?:      boolean; // ≥1 fresh in-session ETF premium this tick
+  tide_market_open?:    boolean; // true during US cash session (09:30–16:00 ET)
+  institutional_pulse?: number;  // volume-weighted, vol-normalized aggregate z-score (signed)
+  tide_coherence?:      number;  // 0..1 agreement of the Big Three premium signs
+  ibit_premium_bps?:    number;  // per-ETF premium vs synthetic iNAV (bps)
+  fbtc_premium_bps?:    number;
+  arkb_premium_bps?:    number;
 }
 
 /** Live Raptor signal snapshot keyed by asset symbol — GET /api/telemetry. */
@@ -167,6 +176,15 @@ export interface TelemetrySample {
   price_connected:   boolean;
   funding_connected: boolean;
   deriv_connected:   boolean;
+
+  // ── Tide Raptor — "Institutional Pulse" (spot-BTC-ETF premium) ──
+  tide_connected:      boolean;
+  tide_market_open:    boolean;
+  institutional_pulse: number;  // signed volume-weighted z-score
+  tide_coherence:      number;  // 0..1 agreement
+  ibit_premium_bps:    number;
+  fbtc_premium_bps:    number;
+  arkb_premium_bps:    number;
 }
 
 /** Response from GET /api/status — maps strategy key to active market name. */

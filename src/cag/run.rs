@@ -357,6 +357,7 @@ where
                 raptor_signals.drift.clone(),
                 raptor_signals.funding.clone().expect("funding raptor always present"),
                 raptor_signals.derivatives.clone().expect("derivatives raptor always present"),
+                raptor_signals.tide.clone(),
             ),
         );
 

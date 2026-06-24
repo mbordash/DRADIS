@@ -35,6 +35,12 @@ interface Row {
   oi: number;        // open interest (base contracts)
   oiDelta: number;   // percent change vs previous poll
   cvd: number;       // taker buy/sell ratio (1.0 = balanced)
+  pulse: number;     // institutional pulse (signed z-score)
+  coherence: number; // 0..1 agreement
+  ibitBps: number;   // per-ETF premium (bps)
+  fbtcBps: number;
+  arkbBps: number;
+  tideOpen: boolean; // US cash session live
 }
 
 function fmtClock(ms: number): string {
@@ -66,6 +72,12 @@ function toRow(s: TelemetrySample): Row {
     oi: num(s.open_interest),
     oiDelta: num(s.oi_delta_pct) * 100,
     cvd: num(s.cvd_ratio),
+    pulse: num(s.institutional_pulse),
+    coherence: num(s.tide_coherence),
+    ibitBps: num(s.ibit_premium_bps),
+    fbtcBps: num(s.fbtc_premium_bps),
+    arkbBps: num(s.arkb_premium_bps),
+    tideOpen: !!s.tide_market_open,
   };
 }
 
@@ -268,6 +280,113 @@ function fmtCompact(n: number): string {
   return n.toFixed(2);
 }
 
+// ── Tide Raptor — Institutional Pulse card (BTC-only) ─────────────────────────
+
+function fmtBps(n: number): string {
+  return `${n >= 0 ? '+' : ''}${n.toFixed(1)} bps`;
+}
+
+function TideCard({ data, latest }: { data: Row[]; latest: Row }) {
+  const open = latest.tideOpen;
+  const pulse = latest.pulse;
+  const coherence = latest.coherence;
+
+  // Greyed/idle styling when the US cash session is closed: premiums are stale
+  // and the pulse is intentionally held at 0.
+  const dim = open ? '' : 'opacity-50';
+  const pulseClass = !open
+    ? 'text-gray-500'
+    : pulse > 0 ? 'text-green-400' : pulse < 0 ? 'text-red-400' : 'text-gray-400';
+
+  // Coherence drives conviction: high agreement = trust the pulse.
+  const cohClass = !open
+    ? 'text-gray-500'
+    : coherence >= 0.66 ? 'text-green-400' : coherence >= 0.34 ? 'text-amber-400' : 'text-gray-400';
+
+  const etf = (label: string, bps: number) => (
+    <div className="card px-3 py-2 flex flex-col gap-0.5">
+      <span className="label-muted text-[10px]">{label}</span>
+      <span className={`font-mono text-sm ${!open ? 'text-gray-500' : bps > 0 ? 'text-green-400' : bps < 0 ? 'text-red-400' : 'text-gray-400'}`}>
+        {open ? fmtBps(bps) : '—'}
+      </span>
+    </div>
+  );
+
+  return (
+    <div className="card p-4 border border-indigo-500/20">
+      <div className="flex items-start justify-between mb-3">
+        <div>
+          <p className="label-muted text-[10px]">🌊 Institutional Pulse · Tide Raptor</p>
+          <p className="text-[10px] text-gray-600 font-mono">
+            Spot-BTC-ETF premium vs synthetic iNAV — IBIT / FBTC / ARKB · observe-only
+          </p>
+        </div>
+        <div className="flex items-center gap-1.5 text-[10px] font-mono">
+          <span className={`h-2 w-2 rounded-full ${open ? 'bg-green-400 animate-pulse' : 'bg-gray-600'}`} />
+          <span className={open ? 'text-green-400' : 'text-gray-500'}>
+            {open ? 'US SESSION OPEN' : 'MARKET CLOSED'}
+          </span>
+        </div>
+      </div>
+
+      <div className={`grid grid-cols-2 sm:grid-cols-5 gap-3 ${dim}`}>
+        <div className="card px-3 py-2 flex flex-col gap-0.5">
+          <span className="label-muted text-[10px]">Pulse (Iₚ)</span>
+          <span className={`font-mono text-lg ${pulseClass}`}>
+            {open ? `${pulse >= 0 ? '+' : ''}${pulse.toFixed(2)}σ` : '—'}
+          </span>
+        </div>
+        <div className="card px-3 py-2 flex flex-col gap-0.5">
+          <span className="label-muted text-[10px]">Coherence (C)</span>
+          <span className={`font-mono text-lg ${cohClass}`}>
+            {open ? coherence.toFixed(2) : '—'}
+          </span>
+        </div>
+        {etf('IBIT', latest.ibitBps)}
+        {etf('FBTC', latest.fbtcBps)}
+        {etf('ARKB', latest.arkbBps)}
+      </div>
+
+      <div className="mt-3" style={{ height: 160 }}>
+        {data.length < 2 ? (
+          <div className="h-full flex items-center justify-center text-gray-600 text-xs">
+            {open ? 'Collecting samples…' : 'Pulse resumes at the US cash open (09:30 ET)'}
+          </div>
+        ) : (
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={data} syncId="telemetry" margin={{ top: 6, right: 12, bottom: 0, left: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#1e1e32" vertical={false} />
+              <XAxis
+                dataKey="time"
+                tick={{ fill: '#6b7280', fontSize: 10, fontFamily: 'monospace' }}
+                tickLine={false}
+                axisLine={{ stroke: '#1e1e32' }}
+                interval="preserveStartEnd"
+                minTickGap={40}
+              />
+              <YAxis
+                tick={{ fill: '#6b7280', fontSize: 10, fontFamily: 'monospace' }}
+                tickLine={false}
+                axisLine={false}
+                tickFormatter={(v: number) => v.toFixed(1)}
+                width={44}
+                domain={['auto', 'auto']}
+              />
+              <Tooltip
+                contentStyle={{ background: '#0d0d1a', border: '1px solid #1e1e32', borderRadius: 8, fontSize: 11, fontFamily: 'monospace' }}
+                labelStyle={{ color: '#9ca3af' }}
+              />
+              <ReferenceLine y={0} stroke="#374151" strokeDasharray="4 4" />
+              <Line type="monotone" dataKey="pulse" name="pulse σ" stroke="#818cf8" strokeWidth={1.8} dot={false} isAnimationActive={false} />
+              <Line type="monotone" dataKey="coherence" name="coherence" stroke="#22d3ee" strokeWidth={1.2} dot={false} isAnimationActive={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Main telemetry page ───────────────────────────────────────────────────────
 
 export default function TelemetryPage({ availableAssets }: { availableAssets: string[] }) {
@@ -331,6 +450,9 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
           <ConnPill label="Price Raptor" live={!!lastSample?.price_connected} />
           <ConnPill label="Funding Raptor" live={!!lastSample?.funding_connected} />
           <ConnPill label="Derivatives Raptor" live={!!lastSample?.deriv_connected} />
+          {asset === 'btc' && (
+            <ConnPill label="Tide Raptor" live={!!lastSample?.tide_connected} />
+          )}
 
           {/* Window selector */}
           <div className="flex items-center gap-1 ml-2">
@@ -398,6 +520,11 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
       {/* Scrubber — only when paused */}
       {!live && range && rows.length > 1 && (
         <Scrubber data={rows} range={range} onChange={setRange} />
+      )}
+
+      {/* Institutional Pulse — Tide Raptor (BTC-only, observe-only) */}
+      {asset === 'btc' && latest && (
+        <TideCard data={viewRows} latest={latest} />
       )}
 
       {/* Signal charts */}

@@ -14,6 +14,7 @@ use rust_decimal::Decimal;
 use tokio::sync::watch;
 
 use crate::raptors::derivatives::DerivativesSnapshot;
+use crate::raptors::tide::TideSnapshot;
 
 /// All Raptor signal receivers available to a squadron.
 pub struct SquadronRaptors {
@@ -36,6 +37,12 @@ pub struct SquadronRaptors {
     /// price/velocity micro signals to read 10-minute regime shifts. `None`
     /// when the Derivatives Raptor is not deployed for this squadron.
     pub derivatives: Option<watch::Receiver<DerivativesSnapshot>>,
+
+    /// Institutional-tide snapshot from the Tide Raptor (synthetic iNAV vs IEX
+    /// ETF prints). A *macro / observe-only* signal — BTC-only, so `None` for
+    /// ETH/SOL squadrons and for momentum-only deployments. Not yet consumed by
+    /// Viper sizing (telemetry observation phase).
+    pub tide: Option<watch::Receiver<TideSnapshot>>,
     // ── Future Raptors ────────────────────────────────────────────────────────
     // pub sports:   Option<watch::Receiver<SportsSignal>>,
     // pub politics: Option<watch::Receiver<PoliticsSignal>>,
@@ -43,12 +50,14 @@ pub struct SquadronRaptors {
 
 impl SquadronRaptors {
     /// Compose a full squadron raptor bundle from all available signal channels.
+    /// `tide` is optional — BTC-only, `None` for ETH/SOL squadrons.
     pub fn full(
         oracle:      watch::Receiver<Decimal>,
         velocity:    watch::Receiver<(Decimal, Decimal, Decimal)>,
         drift:       watch::Receiver<(Decimal, Decimal)>,
         funding:     watch::Receiver<Decimal>,
         derivatives: watch::Receiver<DerivativesSnapshot>,
+        tide:        Option<watch::Receiver<TideSnapshot>>,
     ) -> Self {
         Self {
             oracle,
@@ -56,17 +65,18 @@ impl SquadronRaptors {
             drift,
             funding: Some(funding),
             derivatives: Some(derivatives),
+            tide,
         }
     }
 
-    /// Compose a price-only bundle (no Funding / Derivatives Raptor).
+    /// Compose a price-only bundle (no Funding / Derivatives / Tide Raptor).
     /// Suitable for momentum-only deployments where macro signals are not consumed.
     pub fn price_only(
         oracle:   watch::Receiver<Decimal>,
         velocity: watch::Receiver<(Decimal, Decimal, Decimal)>,
         drift:    watch::Receiver<(Decimal, Decimal)>,
     ) -> Self {
-        Self { oracle, velocity, drift, funding: None, derivatives: None }
+        Self { oracle, velocity, drift, funding: None, derivatives: None, tide: None }
     }
 }
 

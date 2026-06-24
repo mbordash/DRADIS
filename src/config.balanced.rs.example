@@ -251,6 +251,33 @@ pub const BASIS_KELLY_MAX_MULTIPLIER: Decimal = dec!(3.0);
 pub const BASIS_MAX_TAKER_FEE_BPS: u32 = 1500; // Updated from 200
 pub const BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 30;
 pub const BASIS_FUNDING_POLL_SECS: u64 = 60;
+
+// ============================================================================
+// TIDE RAPTOR — "Institutional Pulse" spot-BTC-ETF premium signal
+// ============================================================================
+// Observe-only macro Raptor (BTC-only). Computes a synthetic iNAV for each of
+// the Big Three spot BTC ETFs (IBIT / FBTC / ARKB) from the live Binance oracle
+// (btc_per_share x oracle), compares it to the real-time equity print, and
+// aggregates the per-ETF premium/discount into a volume-weighted, vol-normalized
+// "Institutional Pulse" plus a 0..1 "Coherence" agreement score.
+
+/// How often the Tide Raptor recomputes the pulse from the latest oracle +
+/// equity prints. Local compute only (no network), so cheap.
+pub const TIDE_RECOMPUTE_SECS: u64 = 2;
+
+/// Rolling window length (samples) for each ETF's premium z-score buffer.
+pub const TIDE_ZSCORE_WINDOW: usize = 90;
+
+/// Max age (seconds) of an ETF's last equity print before its weight drops to 0.
+pub const TIDE_QUOTE_STALENESS_SECS: u64 = 30;
+
+/// Rolling window (seconds) over which each ETF's traded dollar-volume is summed.
+pub const TIDE_VOLUME_WINDOW_SECS: u64 = 60;
+
+/// Env var names for the Alpaca free-tier real-time IEX equity feed. Absent =>
+/// Raptor runs observe-only (synthetic iNAV only, zero pulse).
+pub const TIDE_ALPACA_KEY_ENV:    &str = "ALPACA_API_KEY_ID";
+pub const TIDE_ALPACA_SECRET_ENV: &str = "ALPACA_API_SECRET_KEY";
 pub const BASIS_MIN_STOP_LOSS_EXIT_BID: Decimal = dec!(0.005);
 
 // ============================================================================

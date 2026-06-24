@@ -12,6 +12,7 @@
 /// │─────────────────│──────────────────────│──────────────────────────────────────────│
 /// │ Price Raptor    │ Binance Spot WS      │ spot price, 5s/1s velocity, accel, drift │
 /// │ Funding Raptor  │ Binance FAPI REST    │ perpetual funding rate (smart-money)     │
+/// │ Tide Raptor     │ Binance oracle + IEX │ ETF "Institutional Pulse" + coherence    │
 ///
 /// Future Raptors (not yet implemented)
 /// ─────────────────────────────────────
@@ -23,3 +24,4 @@
 pub mod price;
 pub mod funding;
 pub mod derivatives;
+pub mod tide;

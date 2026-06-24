@@ -452,7 +452,22 @@ async fn main() -> Result<()> {
             Arc::clone(&shared_http), asset.clone(), deriv_tx,
             Arc::clone(&raptor_health_tx),
         ));
-        let raptor_signals = SquadronRaptors::full(oracle_rx, velocity_rx, drift_rx, funding_rx, deriv_rx);
+
+        // Tide Raptor — "Institutional Pulse" from spot-BTC-ETF premium. BTC-only
+        // and singular: spawned for the btc asset, reusing its live oracle feed.
+        // ETH/SOL squadrons get `tide: None`. Observe-only (not consumed by Vipers).
+        let tide_rx = if asset == "btc" {
+            let (tide_tx, tide_rx) =
+                watch::channel(dradis::raptors::tide::TideSnapshot::default());
+            tokio::spawn(dradis::raptors::tide::run_tide_raptor(
+                oracle_rx.clone(), tide_tx, Arc::clone(&raptor_health_tx),
+            ));
+            Some(tide_rx)
+        } else {
+            None
+        };
+
+        let raptor_signals = SquadronRaptors::full(oracle_rx, velocity_rx, drift_rx, funding_rx, deriv_rx, tide_rx);
 
         // ── Per-asset session state ────────────────────────────────────────────
         // startup_balance is the real wallet balance at process start — used as
