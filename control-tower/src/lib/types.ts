@@ -13,6 +13,7 @@ export interface DynamicConfig {
   enable_basis:        boolean;
   enable_gboost:       boolean;
   enable_trendcapture: boolean;
+  enable_convergence:  boolean;
 
   // Arbitrage Viper
   arbitrage_position_size_usdc: string;
@@ -65,6 +66,13 @@ export interface DynamicConfig {
   trendcapture_stop_loss_pct:       string;
   trendcapture_target_profit_pct:   string;
   trendcapture_max_entry_price:     string;
+
+  // Convergence Viper
+  convergence_position_size_usdc: string;
+  convergence_max_exposure_usdc:  string;
+  convergence_stop_loss_pct:      string;
+  convergence_target_profit_pct:  string;
+  convergence_max_entry_price:    string;
 }
 
 /** One editable config field, from GET /api/config/schema (Rust source of truth). */

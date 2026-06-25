@@ -15,6 +15,7 @@ const ACCENT: Record<string, { ring: string; badge: string; dot: string }> = {
   emerald: { ring: 'ring-emerald-500/30', badge: 'bg-emerald-500/10 text-emerald-300',dot: 'bg-emerald-500' },
   orange:  { ring: 'ring-orange-500/30',  badge: 'bg-orange-500/10 text-orange-300',  dot: 'bg-orange-500'  },
   purple:  { ring: 'ring-purple-500/30',  badge: 'bg-purple-500/10 text-purple-300',  dot: 'bg-purple-500'  },
+  cyan:    { ring: 'ring-cyan-500/30',    badge: 'bg-cyan-500/10 text-cyan-300',      dot: 'bg-cyan-500'    },
 };
 
 // ── Toggle switch ─────────────────────────────────────────────────────────────

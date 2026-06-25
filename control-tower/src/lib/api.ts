@@ -216,5 +216,12 @@ export const VIPER_DEFS: ViperDef[] = [
     statusKey: 'trendcapture',
     description: 'Rides sustained multi-minute oracle drift on Window/Daily markets',
   },
+  {
+    name: 'Convergence',
+    enableKey: 'enable_convergence',
+    accentColor: 'cyan',
+    statusKey: 'convergence',
+    description: 'Macro-conviction directional (BTC-only): enters on aligned Institutional Pulse + CVD/OI during US hours',
+  },
 ];
 

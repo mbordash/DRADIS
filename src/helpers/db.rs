@@ -401,6 +401,7 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
         ("basis",        "Basis",        0),
         ("time_decay",   "TimeDecay",    0),
         ("trendcapture", "TrendCapture", 0),
+        ("convergence",  "Convergence",  0),
     ] {
         sqlx::query("INSERT OR IGNORE INTO viper_kind (id, display, venue_agnostic) VALUES (?, ?, ?)")
             .bind(id).bind(display).bind(agnostic).execute(pool).await?;
@@ -421,7 +422,7 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
     for (class, viper) in [
         ("crypto", "arbitrage"), ("crypto", "maker"), ("crypto", "momentum"),
         ("crypto", "gboost"),    ("crypto", "basis"), ("crypto", "time_decay"),
-        ("crypto", "trendcapture"),
+        ("crypto", "trendcapture"), ("crypto", "convergence"),
         ("sports",   "arbitrage"), ("sports",   "maker"),
         ("politics", "arbitrage"), ("politics", "maker"),
         ("unknown",  "arbitrage"), ("unknown",  "maker"),
