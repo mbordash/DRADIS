@@ -15,6 +15,9 @@
 
 **WARNING**: This is **ALPHA** software. You will probably lose money. Start in GHOST mode and tune before going live. Make sure to regularly pull updates as our own LLM advises on config and Viper strategy impls daily.
 
+Public Demo Site: https://dradis.live/
+
+
 ---
 
 

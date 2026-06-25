@@ -12,6 +12,7 @@ import SquadronDetailView from '@/components/SquadronDetailView';
 import TradelogPage    from '@/components/TradelogPage';
 import ErrorBoundary   from '@/components/ErrorBoundary';
 import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getPortfolioValue, getSquadrons } from '@/lib/api';
+import { DEMO_MODE } from '@/lib/demo';
 import type { DynamicConfig, SquadronSummary } from '@/lib/types';
 
 // Recharts must be loaded client-side only
@@ -346,6 +347,7 @@ export default function DashboardPage() {
 
   // ── Patch handler ────────────────────────────────────────────────────────────
   const handlePatch = useCallback(async (patch: Partial<DynamicConfig>) => {
+    if (DEMO_MODE) return;
     await patchConfig(patch);
     await refreshConfig();
   }, [refreshConfig]);
@@ -392,7 +394,7 @@ export default function DashboardPage() {
                   {isConnected ? 'LIVE' : 'OFFLINE'}
                 </span>
               </div>
-              {config && (
+              {config && !DEMO_MODE && (
                 <button
                   onClick={() => handlePatch({ ghost_mode: !config.ghost_mode })}
                   className={[
@@ -452,7 +454,7 @@ export default function DashboardPage() {
                 {isConnected ? 'LIVE' : 'OFFLINE'}
               </span>
             </div>
-            {config && (
+            {config && !DEMO_MODE && (
               <button
                 onClick={() => handlePatch({ ghost_mode: !config.ghost_mode })}
                 className={[

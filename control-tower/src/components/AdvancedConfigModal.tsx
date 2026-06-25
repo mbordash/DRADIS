@@ -4,6 +4,7 @@ import { useState, useCallback, useEffect } from 'react';
 import useSWR from 'swr';
 import type { DynamicConfig, ConfigFieldSchema } from '@/lib/types';
 import { getConfigSchema } from '@/lib/api';
+import { DEMO_MODE } from '@/lib/demo';
 
 // ── Advanced config modal ─────────────────────────────────────────────────────
 //
@@ -187,7 +188,7 @@ export default function AdvancedConfigModal({ viperName, config, onPatch, onClos
             <p className="py-6 text-center text-xs text-gray-500">No advanced settings for this viper.</p>
           )}
           {fields.map(f => (
-            <AdvancedRow key={f.key} field={f} config={config} onPatch={onPatch} disabled={false} />
+            <AdvancedRow key={f.key} field={f} config={config} onPatch={onPatch} disabled={DEMO_MODE} />
           ))}
         </div>
 

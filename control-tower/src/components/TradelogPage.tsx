@@ -4,6 +4,7 @@ import { useState, useMemo } from 'react';
 import useSWR from 'swr';
 import type { TradeRow, OpenPositionRow } from '@/lib/types';
 import { getTrades, getOpenPositions } from '@/lib/api';
+import { DEMO_MODE } from '@/lib/demo';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
 
@@ -343,6 +344,7 @@ export default function TradelogPage({ availableAssets }: Props) {
 
   // ── RTB handler ──────────────────────────────────────────────────────────────
   const handleRtbConfirm = async () => {
+    if (DEMO_MODE) return;
     if (!rtbEntry?.rawPosition) return;
     setRtbLoading(true);
     try {
@@ -563,7 +565,7 @@ export default function TradelogPage({ availableAssets }: Props) {
 
                       {/* Actions */}
                       <td className="px-3 py-2">
-                        {e.status === 'inflight' && e.rawPosition && (
+                        {e.status === 'inflight' && e.rawPosition && !DEMO_MODE && (
                           <button
                             onClick={() => setRtbEntry(e)}
                             className="px-2 py-0.5 text-[10px] rounded bg-orange-500/10 text-orange-300 border border-orange-500/30 hover:bg-orange-500/20 transition-colors"

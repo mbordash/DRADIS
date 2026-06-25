@@ -13,6 +13,7 @@ import {
 } from '@/lib/api';
 import ViperCard from '@/components/ViperCard';
 import OpenPositionsCard from '@/components/OpenPositionsCard';
+import { DEMO_MODE } from '@/lib/demo';
 
 // ── Raptor health panel ───────────────────────────────────────────────────────
 
@@ -217,6 +218,7 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
   // ── Handlers ───────────────────────────────────────────────────────────────
   const handlePatch = useCallback(
     async (patch: Partial<DynamicConfig>) => {
+      if (DEMO_MODE) return;
       await patchSquadronConfig(squadron.id, patch);
       await refreshConfig();
     },

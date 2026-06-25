@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import type { OpenPositionRow, TradeRow } from '@/lib/types';
+import { DEMO_MODE } from '@/lib/demo';
 
 function fmtTime(iso: string) {
   const d = new Date(iso);
@@ -93,6 +94,7 @@ export default function OpenPositionsCard({ positions, trades, isLoading, asset 
   };
 
   const handleRtbConfirm = async () => {
+    if (DEMO_MODE) return;
     if (!rtbModal.position) return;
 
     setRtbLoading(true);
@@ -296,13 +298,17 @@ export default function OpenPositionsCard({ positions, trades, isLoading, asset 
                         }
                       </td>
                       <td className="px-3 py-2">
-                        <button
-                          onClick={() => handleRtbClick(p)}
-                          className="px-2 py-0.5 text-[10px] rounded bg-orange-500/10 text-orange-300 border border-orange-500/30 hover:bg-orange-500/20 transition-colors"
-                          title="Return to Base: Manually close this position"
-                        >
-                          🛬 RTB
-                        </button>
+                        {DEMO_MODE ? (
+                          <span className="text-[10px] text-gray-600 font-mono">demo</span>
+                        ) : (
+                          <button
+                            onClick={() => handleRtbClick(p)}
+                            className="px-2 py-0.5 text-[10px] rounded bg-orange-500/10 text-orange-300 border border-orange-500/30 hover:bg-orange-500/20 transition-colors"
+                            title="Return to Base: Manually close this position"
+                          >
+                            🛬 RTB
+                          </button>
+                        )}
                       </td>
                     </tr>
                   ))}

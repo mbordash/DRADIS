@@ -5,6 +5,7 @@ import useSWR from 'swr';
 import type { DynamicConfig, ViperDef, ConfigFieldSchema, FieldType } from '@/lib/types';
 import { toDisplay, fromDisplay, fieldUnit } from '@/lib/types';
 import { getConfigSchema } from '@/lib/api';
+import { DEMO_MODE } from '@/lib/demo';
 import AdvancedConfigModal from '@/components/AdvancedConfigModal';
 
 // ── Accent color helpers ──────────────────────────────────────────────────────
@@ -138,6 +139,7 @@ export default function ViperCard({ viper, config, onPatch, market }: Props) {
   );
 
   const handleToggle = async () => {
+    if (DEMO_MODE) return;
     setToggling(true);
     try {
       await onPatch({ [viper.enableKey]: !enabled } as Partial<DynamicConfig>);
@@ -157,7 +159,7 @@ export default function ViperCard({ viper, config, onPatch, market }: Props) {
           <span className={`inline-block h-2 w-2 rounded-full shrink-0 ${enabled ? accent.dot : 'bg-gray-700'}`} />
           <span className="text-sm font-semibold text-white truncate">{viper.name}</span>
         </div>
-        <Toggle enabled={enabled} onToggle={handleToggle} loading={toggling} />
+        <Toggle enabled={enabled} onToggle={handleToggle} loading={toggling || DEMO_MODE} />
       </div>
 
       {/* Description */}
@@ -192,7 +194,7 @@ export default function ViperCard({ viper, config, onPatch, market }: Props) {
               field={f}
               config={config}
               onPatch={onPatch}
-              disabled={!enabled}
+              disabled={!enabled || DEMO_MODE}
             />
           ))
         )}

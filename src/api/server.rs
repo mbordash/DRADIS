@@ -30,7 +30,7 @@ use axum::{
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
-    http::StatusCode,
+    http::{StatusCode, Method, header},
 };
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
@@ -233,6 +233,11 @@ pub struct ApiState {
     /// When `Some`, every request must include `X-API-Key: <value>`.
     /// When `None`, no authentication is required (default for local dev).
     pub api_key: Option<String>,
+    /// When true (`DRADIS_READ_ONLY=true`), every mutating request (any method
+    /// other than GET/HEAD) is rejected with 403. Powers the public read-only
+    /// demo at dradis.live — the live raptor telemetry streams, but no visitor
+    /// can patch config, toggle vipers, or exit positions.
+    pub read_only: bool,
     /// Gnosis Safe wallet address — used by POST /api/positions/sync to fetch live
     /// on-chain holdings and purge stale open_positions rows without a restart.
     /// Intl-only: the US custodial venue has no self-custody wallet address.
@@ -277,7 +282,38 @@ async fn require_api_key(
     next.run(req).await
 }
 
-// ─── Query params ─────────────────────────────────────────────────────────────
+/// Read-only demo gate.
+///
+/// When `DRADIS_READ_ONLY=true`, any state-mutating request (any HTTP method
+/// other than the safe `GET`/`HEAD`) is rejected with `403 Forbidden` and a
+/// small JSON body. This is the single server-side chokepoint that makes the
+/// public demo safe: even if a visitor bypasses the UI and hits the API
+/// directly, no write (config patch, viper toggle, position exit, chain sync)
+/// can land. A no-op when the env var is unset/false, so normal deployments are
+/// unchanged.
+///
+/// CORS pre-flight (`OPTIONS`) is handled by the outer `CorsLayer` and never
+/// reaches this middleware.
+async fn enforce_read_only(
+    State(s): State<ApiState>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if s.read_only && !matches!(*req.method(), Method::GET | Method::HEAD) {
+        warn!(
+            " Read-only demo: rejected {} {}",
+            req.method(),
+            req.uri().path()
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            [(header::CONTENT_TYPE, "application/json")],
+            r#"{"error":"read-only demo — deploy your own at github.com/mbordash/DRADIS"}"#,
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
 
 
 /// Query params for asset-scoped endpoints.
@@ -1332,10 +1368,18 @@ pub async fn run_api_server(
         tracing::info!(" API key authentication disabled (set DRADIS_API_KEY to enable)");
     }
 
+    let read_only = std::env::var("DRADIS_READ_ONLY")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false);
+    if read_only {
+        tracing::info!(" READ-ONLY demo mode ENABLED — all mutating requests will be rejected (403)");
+    }
+
     // Server-side ring buffer for Raptor signal telemetry (durable across reloads).
     let telemetry_history: TelemetryHistory = Arc::new(Mutex::new(HashMap::new()));
 
-    let state = ApiState { config_tx, config_rx, markets_rx, raptor_health_rx: raptor_health_rx.clone(), api_key, #[cfg(feature = "intl_clob")] safe_address, cag, telemetry_history: telemetry_history.clone() };
+    let state = ApiState { config_tx, config_rx, markets_rx, raptor_health_rx: raptor_health_rx.clone(), api_key, read_only, #[cfg(feature = "intl_clob")] safe_address, cag, telemetry_history: telemetry_history.clone() };
 
     // Spawn the telemetry sampler — snapshots live Raptor signals into the ring
     // buffer every TELEMETRY_SAMPLE_SECS so the Control Tower has durable,
@@ -1382,6 +1426,9 @@ pub async fn run_api_server(
         // API-key check applied to all matched routes (inner layer — runs after CORS).
         // No-op when DRADIS_API_KEY is unset so local-dev workflow is unchanged.
         .layer(axum::middleware::from_fn_with_state(state.clone(), require_api_key))
+        // Read-only demo gate — rejects all mutating methods when DRADIS_READ_ONLY=true.
+        // No-op otherwise. All mutating endpoints live in protected_routes.
+        .layer(axum::middleware::from_fn_with_state(state.clone(), enforce_read_only))
         .with_state(state.clone());
 
     let app = public_routes
