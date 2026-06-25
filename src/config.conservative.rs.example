@@ -896,7 +896,7 @@ pub const CONVERGENCE_OI_MIN_BUILD: Decimal = dec!(0.0);
 pub const CONVERGENCE_MAX_ENTRY_PRICE: Decimal = dec!(0.65);
 
 /// Lowest token ask considered tradable (avoid lottery-ticket tails).
-pub const CONVERGENCE_MIN_ENTRY_PRICE: Decimal = dec!(0.10);
+pub const CONVERGENCE_MIN_ENTRY_PRICE: Decimal = dec!(0.35);
 
 /// Max per-token bid-ask spread (fraction of ask). A hollow bid guarantees an
 /// instant stop-out, so skip when the spread is wider than this.

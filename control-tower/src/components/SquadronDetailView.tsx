@@ -2,7 +2,7 @@
 
 import { useCallback } from 'react';
 import useSWR from 'swr';
-import type { SquadronSummary, DynamicConfig } from '@/lib/types';
+import type { SquadronSummary, DynamicConfig, AssetRaptorHealth } from '@/lib/types';
 import {
   getTrades,
   getOpenPositions,
@@ -21,10 +21,23 @@ import OpenPositionsCard from '@/components/OpenPositionsCard';
  *  render as "Pending" until their feed publishes health. */
 const RAPTOR_META: Record<
   string,
-  { label: string; flag?: 'price_connected' | 'funding_connected'; dot: string; text: string; source: string }
+  {
+    label: string;
+    flag?: 'price_connected' | 'funding_connected' | 'deriv_connected' | 'tide_connected';
+    dot: string; text: string; source: string;
+    /** When the feed is expected to be intermittently offline (e.g. off-hours),
+     *  render the disconnected state as a neutral idle badge rather than a red error. */
+    offlineText?: string; offlineDot?: string; offlineClass?: string;
+  }
 > = {
   price:   { label: 'Price Raptor',   flag: 'price_connected',   dot: 'bg-cyan-400', text: 'text-cyan-300', source: 'Binance Spot WS' },
   funding: { label: 'Funding Raptor', flag: 'funding_connected', dot: 'bg-teal-400', text: 'text-teal-300', source: 'Binance Funding API' },
+  derivatives: { label: 'Derivatives Raptor', flag: 'deriv_connected', dot: 'bg-amber-400', text: 'text-amber-300', source: 'Binance FAPI (OI + CVD)' },
+  tide:    {
+    label: 'Tide Raptor', flag: 'tide_connected', dot: 'bg-sky-400', text: 'text-sky-300',
+    source: 'Alpaca IEX (ETF iNAV)',
+    offlineText: 'Idle (off-hours)', offlineDot: 'bg-gray-600', offlineClass: 'text-gray-500',
+  },
 };
 
 function RaptorHealthPanel({
@@ -34,7 +47,7 @@ function RaptorHealthPanel({
   marketClass,
 }: {
   raptorKinds: string[];
-  raptors?: Record<string, { price_connected: boolean; funding_connected: boolean }>;
+  raptors?: Record<string, AssetRaptorHealth>;
   asset: string;
   marketClass: string;
 }) {
@@ -57,9 +70,24 @@ function RaptorHealthPanel({
             // any without (roadmapped kinds) show as pending.
             const hasFlag = !!meta?.flag;
             const connected = hasFlag ? (h?.[meta!.flag!] ?? false) : false;
-            const dot = !hasFlag ? 'bg-gray-600' : connected ? `${meta!.dot} animate-pulse` : 'bg-red-500';
-            const statusText = !hasFlag ? 'Pending' : connected ? 'Connected' : 'Reconnecting';
-            const statusClass = !hasFlag ? 'text-gray-500' : connected ? meta!.text : 'text-red-400';
+            // A feed with an `offlineText` (e.g. Tide off-hours) shows a neutral
+            // idle badge when down rather than a red "Reconnecting" error.
+            const idleStyle = !connected && meta?.offlineText;
+            const dot = !hasFlag
+              ? 'bg-gray-600'
+              : connected
+                ? `${meta!.dot} animate-pulse`
+                : idleStyle ? (meta!.offlineDot ?? 'bg-gray-600') : 'bg-red-500';
+            const statusText = !hasFlag
+              ? 'Pending'
+              : connected
+                ? 'Connected'
+                : idleStyle ? meta!.offlineText! : 'Reconnecting';
+            const statusClass = !hasFlag
+              ? 'text-gray-500'
+              : connected
+                ? meta!.text
+                : idleStyle ? (meta!.offlineClass ?? 'text-gray-500') : 'text-red-400';
             return (
               <div
                 key={kind}
