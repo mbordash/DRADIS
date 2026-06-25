@@ -32,7 +32,7 @@ pub const ENABLE_X: bool = false;
 pub const GHOST_MODE: bool = false;
 pub const ENABLE_ARBITRAGE_TRADING: bool = true;
 
-pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.01);
+pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.03);
 pub const ARBITRAGE_MAX_TAKER_FEE_BPS: u32 = 1500; // Updated from 300
 
 /// Maximum allowable gap between our safe bid and the current ask on each arb leg.
@@ -49,9 +49,9 @@ pub const ARB_FAK_REHEDGE_BUFFER: Decimal = dec!(0.02);
 
 /// Upper bound on single-leg orphan rescue cost in the arb entry gate. Aggressive:
 /// permissive so more 0.99-sum pairs qualify (orphan tail accepted for more fills).
-pub const ARB_MAX_RESCUE_COST: Decimal = dec!(1.10);
+pub const ARB_MAX_RESCUE_COST: Decimal = dec!(1.00);
 
-pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.98);
+pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.96);
 pub const MIN_ORDER_SHARES: Decimal = dec!(1.0);
 pub const MIN_ORDER_USDC: Decimal = dec!(1.05);
 

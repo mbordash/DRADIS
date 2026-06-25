@@ -46,11 +46,11 @@ pub const ARBITRAGE_MAX_LEG_PRICE: Decimal = dec!(0.60);
 /// Increased from 0.02 to 0.03 to give more buffer for FAK re-hedges.
 pub const ARB_FAK_REHEDGE_BUFFER: Decimal = dec!(0.03);
 /// Upper bound on single-leg orphan rescue cost in the arb entry gate. Balanced default.
-pub const ARB_MAX_RESCUE_COST: Decimal = dec!(1.08);
+pub const ARB_MAX_RESCUE_COST: Decimal = dec!(1.00);
 pub const ARBITRAGE_MAX_OBI_ASYMMETRY: Decimal = dec!(0.60);
 pub const ARBITRAGE_MAX_LEG_OBI: Decimal = dec!(0.50);
 
-pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.97);
+pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.96);
 pub const MIN_ORDER_SHARES: Decimal = dec!(1.0);
 pub const MIN_ORDER_USDC: Decimal = dec!(1.05);
 
