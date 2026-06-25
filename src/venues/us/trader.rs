@@ -552,6 +552,8 @@ fn build_snapshot(
         no_bid:  nb, no_bid_depth:  nbd, no_ask:  na, no_ask_depth:  nad,
         oracle_price: dec!(0), velocity: dec!(0), velocity_1s: dec!(0), acceleration: dec!(0),
         funding_rate: dec!(0), oracle_drift_60m: dec!(0), oracle_drift_10m: dec!(0),
+        institutional_pulse: dec!(0), tide_coherence: dec!(0),
+        oi_delta_pct: dec!(0), cvd_ratio: dec!(0),
         secs_to_expiry: 0, timestamp: Utc::now(),
     }
 }

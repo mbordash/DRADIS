@@ -3,7 +3,7 @@
 /// Uses the `perpetual` crate's `PerpetualBooster` (LogLoss objective) to predict
 /// near-term YES price direction from a rolling window of orderbook + oracle features.
 ///
-/// ── Feature Vector (NUM_FEATURES = 22) ──────────────────────────────────────
+/// ── Feature Vector (NUM_FEATURES = 26) ──────────────────────────────────────
 ///   [0]  yes_obi         — (yes_bid_depth − yes_ask_depth) / total depth
 ///   [1]  no_obi          — (no_bid_depth − no_ask_depth) / total depth
 ///   [2]  yes_ask         — best ask price for YES token
@@ -47,6 +47,15 @@
 ///                          to [-1, +1] over (N−1) comparisons.
 ///                          +1 = all 9 ticks up (strong up momentum).
 ///                          −1 = all 9 ticks down (strong down momentum).
+///  [22]  institutional_pulse — Tide Raptor volume-weighted z-score of spot-BTC-ETF
+///                          premium/discount vs synthetic iNAV. >0 = institutions paying
+///                          a premium (bullish). BTC-only; 0 for ETH/SOL or outside US hours.
+///  [23]  tide_coherence   — agreement across IBIT/FBTC/ARKB premiums in [0, 1].
+///                          High coherence + large |pulse| = institutional conviction.
+///  [24]  oi_delta_pct     — Derivatives Raptor perp open-interest delta since last poll.
+///                          >0 = positioning building, <0 = de-leveraging/squeeze. All-asset.
+///  [25]  cvd_ratio        — taker buy÷sell volume ratio. >1 = buy aggression, <1 = sell
+///                          aggression, 0 = no data (treated neutral). All-asset.
 ///
 /// ── Label ────────────────────────────────────────────────────────────────────
 ///   1.0  if yes_bid rises in GBOOST_LOOKAHEAD_TICKS ticks
@@ -86,7 +95,7 @@ use crate::helpers::price::floor_to_tick_size;
 use crate::venues::core::TimeInForce;
 
 /// Number of f64 features per snapshot row fed into the booster.
-const NUM_FEATURES: usize = 22;
+const NUM_FEATURES: usize = 26;
 
 /// Represents a single training sample for the Gboost model.
 /// Contains the features at the time of entry and whether the trade was profitable.
@@ -306,6 +315,10 @@ fn extract_features(s: &MarketSnapshot, prev_s: Option<&MarketSnapshot>, hist_vo
         spread_velocity,                                            // [19] NEW: spread momentum
         hist_vol,                                                   // [20] NEW: volatility regime
         tick_momentum,                                              // [21] NEW: tick direction momentum
+        s.institutional_pulse.to_f64().unwrap_or(0.0),             // [22] NEW: institutional pulse (BTC ETF tide z-score)
+        s.tide_coherence.to_f64().unwrap_or(0.0),                  // [23] NEW: tide coherence (ETF agreement, 0..1)
+        s.oi_delta_pct.to_f64().unwrap_or(0.0),                    // [24] NEW: perp open-interest delta (positioning build/unwind)
+        s.cvd_ratio.to_f64().unwrap_or(0.0),                       // [25] NEW: taker buy/sell ratio (aggression; 1.0-centred, 0=no data)
     ]
 }
 
@@ -448,18 +461,20 @@ impl GboostStrategyImpl {
 
         // Warm-start: try to load a previously persisted model from disk.
         //
-        // The model path is version-locked to the current feature set (NUM_FEATURES = 22).
+        // The model path is version-locked to the current feature set (NUM_FEATURES = 26).
         // NEVER load a model from a different version — the feature dimensions won't match.
         // History: v14f (14 features) → v19f (added yes_mid_change, no_obi_change,
         // relative_depth_ratio, combined_ask_spread, oracle_drift_10m in May 2026) →
-        // v22f (added spread_velocity, hist_vol_regime, tick_momentum in May 2026).
+        // v22f (added spread_velocity, hist_vol_regime, tick_momentum in May 2026) →
+        // v24f (added institutional_pulse, tide_coherence in Jun 2026) →
+        // v26f (added oi_delta_pct, cvd_ratio in Jun 2026).
         //
         // Override the path at runtime via the GBOOST_MODEL_PATH env var, e.g.:
         //   GBOOST_MODEL_PATH=/path/to/gboost_model_v19f.json cargo run
         // This is the recommended way to seed a local instance with a model trained on prod.
         // When not overridden the path is namespaced by CRYPTO_FILTER so that each
         // container in a shared-volume multi-instance deploy writes its own file:
-        //   logs/btc-gboost_model_v22f.json, logs/eth-gboost_model_v22f.json, etc.
+        //   logs/btc-gboost_model_v26f.json, logs/eth-gboost_model_v26f.json, etc.
         let model_clone = Arc::clone(&model_arc);
         tokio::spawn(async move {
             // Env var takes precedence; fall back to CRYPTO_FILTER-namespaced default.
@@ -970,6 +985,10 @@ impl Strategy for GboostStrategyImpl {
             s.funding_rate     = ctx.snapshot.funding_rate;
             s.oracle_drift_60m = ctx.snapshot.oracle_drift_60m;
             s.oracle_drift_10m = ctx.snapshot.oracle_drift_10m;
+            s.institutional_pulse = ctx.snapshot.institutional_pulse;
+            s.tide_coherence      = ctx.snapshot.tide_coherence;
+            s.oi_delta_pct        = ctx.snapshot.oi_delta_pct;
+            s.cvd_ratio           = ctx.snapshot.cvd_ratio;
             s
         } else {
             ctx.snapshot.clone()
@@ -1084,6 +1103,10 @@ impl Strategy for GboostStrategyImpl {
             s.funding_rate     = ctx.snapshot.funding_rate;
             s.oracle_drift_60m = ctx.snapshot.oracle_drift_60m;
             s.oracle_drift_10m = ctx.snapshot.oracle_drift_10m;
+            s.institutional_pulse = ctx.snapshot.institutional_pulse;
+            s.tide_coherence      = ctx.snapshot.tide_coherence;
+            s.oi_delta_pct        = ctx.snapshot.oi_delta_pct;
+            s.cvd_ratio           = ctx.snapshot.cvd_ratio;
             patched_maker_snapshot_storage = s;
             &patched_maker_snapshot_storage
         } else {
@@ -1787,6 +1810,8 @@ mod tests {
             velocity: dec!(50), velocity_1s: dec!(10), acceleration: dec!(5),
             funding_rate: dec!(0.0001), oracle_drift_60m: dec!(100),
             oracle_drift_10m: dec!(30), // ~10min drift for test
+            institutional_pulse: dec!(0.5), tide_coherence: dec!(0.7),
+            oi_delta_pct: dec!(0.01), cvd_ratio: dec!(1.2),
             secs_to_expiry: 3600, // 1 hour — mid-range for tests
             timestamp: Utc::now(),
         }

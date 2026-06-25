@@ -1,0 +1,345 @@
+/// Convergence Strategy — Macro-Conviction Directional Viper
+///
+/// # Thesis
+///
+/// Where `MomentumStrategy` trades 5-second oracle velocity and `TrendCapture`
+/// trades 10–60 minute drift, Convergence trades **institutional + derivatives
+/// agreement** — a slower, higher-conviction regime signal the price-based Vipers
+/// cannot see. It is the first Viper that *opens* a directional position off the
+/// macro Raptor stack rather than merely gating on it.
+///
+/// # Entry — all conditions must agree on one direction
+///   - Tide Raptor `institutional_pulse` beyond `CONVERGENCE_PULSE_THRESHOLD`
+///     (sign = direction: >0 institutions bid → buy YES; <0 → buy NO), AND
+///   - `tide_coherence ≥ CONVERGENCE_COHERENCE_MIN` (the three ETFs agree), AND
+///   - Derivatives Raptor `cvd_ratio` confirms the same side
+///     (bull: cvd ≥ 1+margin; bear: cvd ≤ 1−margin), AND
+///   - `oi_delta_pct ≥ CONVERGENCE_OI_MIN_BUILD` (positioning not unwinding).
+///
+/// # Scope
+///   BTC-only — `institutional_pulse` is BTC-only (no ETH/SOL ETF analog), so the
+///   strategy no-ops for other assets. Naturally **US-cash-hours-only**: the pulse
+///   is zero outside the session, so `|pulse| ≥ threshold` cannot be met. Entries
+///   are marketable FAK takers at the touch so they fill while conviction is live.
+///
+/// # Risk
+///   Fixed tiny size (`CONVERGENCE_POSITION_SIZE_USDC`) while it proves itself
+///   live, capped by `CONVERGENCE_MAX_EXPOSURE_USDC`. One position per market.
+///   Exits on take-profit, stop-loss, **signal decay/reversal** (the pulse flips
+///   or coherence collapses), or near-expiry.
+
+use async_trait::async_trait;
+use anyhow::Result;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Instant;
+use chrono::Utc;
+use tracing::debug;
+
+use crate::orchestrator::{Strategy, StrategyContext};
+use crate::state::{StrategySignal, StrategyStatus, OrderParams};
+use crate::vipers::is_drawdown_limit_hit;
+use crate::config;
+use crate::venues::core::{MarketId, TimeInForce};
+
+const STRATEGY_NAME: &str = "ConvergenceStrategy";
+
+/// Stateful Convergence strategy implementation.
+pub struct ConvergenceStrategyImpl {
+    /// Per-token cooldown after any exit. Key: token_id, Value: Instant of exit.
+    post_exit_cooldown: Mutex<HashMap<MarketId, Instant>>,
+    /// Viper-level exit-signal cooldown to prevent FAK-miss re-fire storms.
+    last_exit_signal_at: Mutex<Option<Instant>>,
+}
+
+impl ConvergenceStrategyImpl {
+    pub fn new() -> Self {
+        Self {
+            post_exit_cooldown: Mutex::new(HashMap::new()),
+            last_exit_signal_at: Mutex::new(None),
+        }
+    }
+
+    fn is_btc(ctx: &StrategyContext) -> bool {
+        ctx.crypto_filter.eq_ignore_ascii_case("btc")
+    }
+
+    fn record_exit(&self, token_id: &MarketId) {
+        if let Ok(mut map) = self.post_exit_cooldown.lock() {
+            map.insert(token_id.clone(), Instant::now());
+        }
+        if let Ok(mut last) = self.last_exit_signal_at.lock() {
+            *last = Some(Instant::now());
+        }
+    }
+}
+
+impl Default for ConvergenceStrategyImpl {
+    fn default() -> Self { Self::new() }
+}
+
+#[async_trait]
+impl Strategy for ConvergenceStrategyImpl {
+    async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
+        let dc = &ctx.dynamic_config;
+        if !dc.enable_convergence {
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Global risk + scope gates ─────────────────────────────────────────
+        if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
+            return Ok(StrategySignal::NoSignal);
+        }
+        // BTC-only: institutional_pulse has no ETH/SOL analog.
+        if !Self::is_btc(ctx) {
+            return Ok(StrategySignal::NoSignal);
+        }
+        // Market maturation — avoid the thin, noisy book at market open.
+        let secs_since_start = (Utc::now() - ctx.market_started_at).num_seconds();
+        if secs_since_start < config::CONVERGENCE_MARKET_WARMUP_SECS {
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        let snap   = &ctx.snapshot;
+        let market = &ctx.market;
+
+        // ── Macro conviction ─────────────────────────────────────────────────
+        let pulse = snap.institutional_pulse;
+        let coh   = snap.tide_coherence;
+        let cvd   = snap.cvd_ratio;
+        let oi    = snap.oi_delta_pct;
+
+        // Direction from the institutional pulse sign (also gates US-hours, since
+        // pulse is zero outside the cash session → neither branch fires).
+        let want_bull = pulse >= config::CONVERGENCE_PULSE_THRESHOLD;
+        let want_bear = pulse <= -config::CONVERGENCE_PULSE_THRESHOLD;
+        if !want_bull && !want_bear {
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // The three ETFs must cohere.
+        if coh < config::CONVERGENCE_COHERENCE_MIN {
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // Open interest must not be unwinding (de-leveraging / squeeze).
+        if oi < config::CONVERGENCE_OI_MIN_BUILD {
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // Derivatives taker flow must CONFIRM the side. `cvd == 0` means no FAPI
+        // data → no confirmation → stand down (conviction requires live confirmation).
+        let cvd_confirms = if want_bull {
+            cvd >= dec!(1) + config::CONVERGENCE_CVD_CONFIRM_MARGIN
+        } else {
+            cvd > dec!(0) && cvd <= dec!(1) - config::CONVERGENCE_CVD_CONFIRM_MARGIN
+        };
+        if !cvd_confirms {
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Pick the token + touch price ──────────────────────────────────────
+        let (token_id, ask, bid, fee_bps) = if want_bull {
+            (market.yes_token.clone(), snap.yes_ask, snap.yes_bid, market.yes_fee_bps as u16)
+        } else {
+            (market.no_token.clone(), snap.no_ask, snap.no_bid, market.no_fee_bps as u16)
+        };
+
+        // ── Price / spread gates ──────────────────────────────────────────────
+        if ask < config::CONVERGENCE_MIN_ENTRY_PRICE || ask > dc.convergence_max_entry_price {
+            return Ok(StrategySignal::NoSignal);
+        }
+        let spread = if ask > dec!(0) { (ask - bid) / ask } else { Decimal::ONE };
+        if spread > config::CONVERGENCE_MAX_TOKEN_SPREAD_PCT {
+            debug!(" Convergence blocked: spread {:.1}% > max (ask={:.3} bid={:.3})",
+                spread * dec!(100), ask, bid);
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Per-token cooldown ────────────────────────────────────────────────
+        if let Ok(map) = self.post_exit_cooldown.lock() {
+            if let Some(t) = map.get(&token_id) {
+                if t.elapsed().as_secs() < config::CONVERGENCE_POST_EXIT_COOLDOWN_SECS {
+                    return Ok(StrategySignal::NoSignal);
+                }
+            }
+        }
+
+        // ── Exposure + one-position-per-market checks ─────────────────────────
+        let size = dc.convergence_position_size_usdc;
+        {
+            let pos_map = ctx.positions.lock().await;
+            let mut exposure = Decimal::ZERO;
+            for ((sname, tok), pos) in pos_map.iter() {
+                if sname != STRATEGY_NAME { continue; }
+                exposure += pos.shares * pos.avg_entry;
+                // Don't stack a second position on either leg of this market.
+                if tok == &market.yes_token || tok == &market.no_token {
+                    return Ok(StrategySignal::NoSignal);
+                }
+            }
+            if exposure + size > dc.convergence_max_exposure_usdc {
+                return Ok(StrategySignal::NoSignal);
+            }
+        }
+
+        debug!(
+            " Convergence {} entry: pulse={:.2} coh={:.2} cvd={:.2} oi={:.3} | {} ask={:.3} size=${:.2}",
+            if want_bull { "BULL" } else { "BEAR" },
+            pulse, coh, cvd, oi,
+            if want_bull { "YES" } else { "NO" }, ask, size,
+        );
+
+        Ok(StrategySignal::Entry {
+            params: OrderParams {
+                token_id,
+                price: ask,
+                shares: size / ask,
+                fee_bps,
+                is_neg_risk: market.is_neg_risk,
+                market_name: market.market_name.clone(),
+                condition_id: market.condition_id.clone(),
+                order_type: TimeInForce::Fak, // marketable taker — fill while conviction is live
+                post_only: false,
+                ghost_mode: dc.ghost_mode,
+            },
+            pair_params: None,
+        })
+    }
+
+    async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
+        let dc = &ctx.dynamic_config;
+
+        // ── Viper-level exit-signal cooldown ──────────────────────────────────
+        {
+            let last = self.last_exit_signal_at.lock().unwrap();
+            if let Some(t) = *last {
+                if t.elapsed().as_secs() < config::CONVERGENCE_EXIT_SIGNAL_COOLDOWN_SECS {
+                    return Ok(StrategySignal::NoSignal);
+                }
+            }
+        }
+
+        let snap   = &ctx.snapshot;
+        let market = &ctx.market;
+        let pulse  = snap.institutional_pulse;
+        let coh    = snap.tide_coherence;
+
+        struct PendingExit {
+            token_id:     MarketId,
+            bid:          Decimal,
+            shares:       Decimal,
+            fee_bps:      u16,
+            is_neg_risk:  bool,
+            market_name:  String,
+            condition_id: String,
+            ghost_mode:   bool,
+            reason:       String,
+        }
+
+        let pending: Option<PendingExit> = {
+            let pos_map = ctx.positions.lock().await;
+            let mut found: Option<PendingExit> = None;
+
+            'outer: for ((sname, token_id), position) in pos_map.iter() {
+                if sname != STRATEGY_NAME { continue; }
+
+                let is_yes = token_id == &market.yes_token;
+                let bid = if is_yes { snap.yes_bid }
+                          else if token_id == &market.no_token { snap.no_bid }
+                          else { continue };
+
+                let avg_entry = position.avg_entry;
+                if avg_entry <= dec!(0) { continue; }
+
+                let fee_bps = if is_yes { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 };
+                let secs_held = (Utc::now() - position.opened_at).num_seconds();
+                let profit_margin = (bid - avg_entry) / avg_entry;
+
+                let make_exit = |reason: String| PendingExit {
+                    token_id: token_id.clone(),
+                    bid,
+                    shares: position.shares,
+                    fee_bps,
+                    is_neg_risk: market.is_neg_risk,
+                    market_name: market.market_name.clone(),
+                    condition_id: market.condition_id.clone(),
+                    ghost_mode: dc.ghost_mode,
+                    reason,
+                };
+
+                // Before fill-confirmation only a catastrophic move may exit.
+                if position.fill_confirmed_at.is_none() {
+                    if profit_margin <= config::CONVERGENCE_CATASTROPHIC_SL_PCT {
+                        found = Some(make_exit(format!(
+                            "ConvergenceCatastrophic: bid=${:.4} loss={:.2}%",
+                            bid, profit_margin * dec!(100))));
+                        break 'outer;
+                    }
+                    continue;
+                }
+
+                // Take-profit.
+                if profit_margin >= dc.convergence_target_profit_pct {
+                    found = Some(make_exit(format!(
+                        "ConvergenceTP: bid=${:.4} profit={:.2}%", bid, profit_margin * dec!(100))));
+                    break 'outer;
+                }
+
+                // Stop-loss (after minimum hold).
+                if secs_held >= config::CONVERGENCE_MIN_HOLD_SECS
+                    && profit_margin <= -dc.convergence_stop_loss_pct
+                {
+                    found = Some(make_exit(format!(
+                        "ConvergenceSL: bid=${:.4} loss={:.2}%", bid, profit_margin * dec!(100))));
+                    break 'outer;
+                }
+
+                // Signal-decay / reversal exit: the conviction that opened the
+                // position has flipped against it, or coherence has collapsed.
+                if secs_held >= config::CONVERGENCE_MIN_HOLD_SECS {
+                    let half_thr = config::CONVERGENCE_PULSE_THRESHOLD / dec!(2);
+                    let pulse_reversed = if is_yes { pulse <= -half_thr } else { pulse >= half_thr };
+                    let coherence_collapsed = coh < config::CONVERGENCE_COHERENCE_MIN / dec!(2);
+                    if pulse_reversed || coherence_collapsed {
+                        found = Some(make_exit(format!(
+                            "ConvergenceDecay: bid=${:.4} pulse={:.2} coh={:.2} profit={:.2}%",
+                            bid, pulse, coh, profit_margin * dec!(100))));
+                        break 'outer;
+                    }
+                }
+            }
+            found
+        };
+
+        if let Some(p) = pending {
+            self.record_exit(&p.token_id);
+            return Ok(StrategySignal::Exit {
+                params: OrderParams {
+                    token_id:     p.token_id,
+                    price:        p.bid,
+                    shares:       p.shares,
+                    fee_bps:      p.fee_bps,
+                    is_neg_risk:  p.is_neg_risk,
+                    market_name:  p.market_name,
+                    condition_id: p.condition_id,
+                    order_type:   TimeInForce::Fak, // exits are taker — sell at bid crosses
+                    post_only:    false,
+                    ghost_mode:   p.ghost_mode,
+                },
+                reason:    p.reason,
+                exit_pair: false,
+            });
+        }
+
+        Ok(StrategySignal::NoSignal)
+    }
+
+    fn status(&self) -> StrategyStatus { StrategyStatus::Active }
+    fn name(&self) -> String { STRATEGY_NAME.to_string() }
+    fn venue(&self) -> &'static str { "Hourly" }
+    fn max_exposure(&self) -> Decimal { config::CONVERGENCE_MAX_EXPOSURE_USDC }
+    fn risk_model(&self) -> &'static str { "Macro conviction (pulse+CVD+OI)" }
+}

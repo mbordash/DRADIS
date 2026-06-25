@@ -157,6 +157,13 @@ impl Squadron {
             .as_ref()
             .expect("funding raptor always present")
             .clone();
+        // Tide Raptor is optional (BTC-only); `None` for ETH/SOL squadrons and
+        // momentum-only deployments. Read into a local so no borrow guard is held
+        // across an .await when the snapshot is built below.
+        let tide_rx = self.raptors.tide.clone();
+        // Derivatives Raptor is optional (all-asset, but absent on price-only
+        // deployments). Same borrow-guard discipline as `tide_rx`.
+        let deriv_rx = self.raptors.derivatives.clone();
 
         // ── Phase 3f-4: Peripheral token + spawned tasks ─────────────────────
         //
@@ -490,6 +497,10 @@ impl Squadron {
                             velocity_1s: velocity_rx.borrow().1,
                             acceleration: velocity_rx.borrow().2,
                             funding_rate: *funding_rx.borrow(),
+                            institutional_pulse: tide_rx.as_ref().map(|r| r.borrow().institutional_pulse).unwrap_or(Decimal::ZERO),
+                            tide_coherence: tide_rx.as_ref().map(|r| r.borrow().coherence).unwrap_or(Decimal::ZERO),
+                            oi_delta_pct: deriv_rx.as_ref().map(|r| r.borrow().oi_delta_pct).unwrap_or(Decimal::ZERO),
+                            cvd_ratio: deriv_rx.as_ref().map(|r| r.borrow().cvd_ratio).unwrap_or(Decimal::ZERO),
                             oracle_drift_60m: drift_rx.borrow().0,
                             oracle_drift_10m: drift_rx.borrow().1,
                             secs_to_expiry: hourly_market_close_time
@@ -509,6 +520,10 @@ impl Squadron {
                             no_bid: maker_nb, no_bid_depth: maker_nbd, no_ask: maker_na, no_ask_depth: maker_nad,
                             oracle_price: *oracle_rx.borrow(), velocity: velocity_rx.borrow().0, velocity_1s: velocity_rx.borrow().1, acceleration: velocity_rx.borrow().2,
                             funding_rate: *funding_rx.borrow(), oracle_drift_60m: drift_rx.borrow().0, oracle_drift_10m: drift_rx.borrow().1,
+                            institutional_pulse: tide_rx.as_ref().map(|r| r.borrow().institutional_pulse).unwrap_or(Decimal::ZERO),
+                            tide_coherence: tide_rx.as_ref().map(|r| r.borrow().coherence).unwrap_or(Decimal::ZERO),
+                            oi_delta_pct: deriv_rx.as_ref().map(|r| r.borrow().oi_delta_pct).unwrap_or(Decimal::ZERO),
+                            cvd_ratio: deriv_rx.as_ref().map(|r| r.borrow().cvd_ratio).unwrap_or(Decimal::ZERO),
                             secs_to_expiry: mk.market_close_time
                                 .map(|t| (t - Utc::now()).num_seconds())
                                 .unwrap_or(0),
@@ -932,7 +947,7 @@ impl Squadron {
                                                 });
 
                                                 {
-                                                    let arb_cl = Arc::clone(&trading_client); let arb_nm = Arc::clone(&nonce_manager); let arb_sg = signer.clone(); let arb_ps = Arc::clone(&positions); let arb_pc = Arc::clone(&phantom_cooldowns); let arb_sn = sn.clone(); let arb_http = shared_http.clone();
+                                                    let arb_cl = Arc::clone(&trading_client); let arb_nm = Arc::clone(&nonce_manager); let arb_sg = signer.clone(); let arb_ps = Arc::clone(&positions); let arb_pc = Arc::clone(&phantom_cooldowns); let arb_to = Arc::clone(&token_ownership); let arb_sn = sn.clone(); let arb_http = shared_http.clone();
                                                     let arb_tok_a = params.token_id.clone(); let arb_tok_b = pp.token_id.clone(); let arb_base_a = primary_baseline; let arb_base_b = pair_baseline;
                                                     let arb_side_a = if params.token_id == target_yes_token { "YES" } else { "NO" }.to_string();
                                                     let arb_side_b = if pp.token_id == target_yes_token { "YES" } else { "NO" }.to_string();
@@ -951,7 +966,7 @@ impl Squadron {
                                                     tokio::spawn(async move {
                                                         crate::helpers::balance::arb_pair_fill_monitor(
                                                             arb_cl, arb_nm, arb_sg, safe_address, eoa_address, vc, vc_p,
-                                                            arb_ps, arb_pc, arb_sn, &arb_tok_a, &arb_tok_b,
+                                                            arb_ps, arb_pc, arb_to, arb_sn, &arb_tok_a, &arb_tok_b,
                                                             arb_base_a, arb_base_b, arb_side_a, arb_side_b, arb_wait, arb_http, arb_asset,
                                                         ).await;
                                                     });

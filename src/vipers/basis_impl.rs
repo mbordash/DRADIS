@@ -114,6 +114,22 @@ impl Strategy for BasisStrategyImpl {
             && ctx.snapshot.funding_rate > config::BASIS_POSITIVE_FUNDING_THRESHOLD;
         let extreme_skew_bypass = skew.abs() >= config::BASIS_ENTRY_SKEW_THRESHOLD * dec!(2);
 
+        // ── Gate 4b: Institutional-tide contradiction veto ────────────────────
+        // Basis fades retail skew; the Tide Raptor reports where institutions are
+        // leaning. When institutions strongly disagree with the fade (and the three
+        // ETFs cohere), don't fade into their flow. Absolute — not bypassed by
+        // extreme skew. Inert for ETH/SOL / outside US hours (pulse/coherence = 0)
+        // and disabled by default (observe-first).
+        if config::BASIS_TIDE_GATE_ENABLED
+            && ctx.snapshot.tide_coherence >= config::BASIS_TIDE_COHERENCE_THRESHOLD
+            && (
+                (skew > dec!(0) && ctx.snapshot.institutional_pulse >=  config::BASIS_TIDE_PULSE_THRESHOLD)
+                || (skew < dec!(0) && ctx.snapshot.institutional_pulse <= -config::BASIS_TIDE_PULSE_THRESHOLD)
+            )
+        {
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // Kelly sizing — then back off by the taker fee so order_amount + fee never exceeds trade_size.
         // Without this, a $15 order at 1000 bps adds ~$0.67 in fees, pushing the required total
         // above the available pUSD balance and causing a 400 "not enough balance" rejection.

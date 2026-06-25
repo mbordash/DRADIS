@@ -1,6 +1,6 @@
 # DRADIS
 
-> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Polymarket. Seven autonomous Viper strategies, a Raptor recon layer, a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor that delivers optimization recommendations via Ollama (local or remote) + Telegram & OpenClaw.
+> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Polymarket. Eight autonomous Viper strategies, a Raptor recon layer (Price, Funding, Derivatives, and Tide "Institutional Pulse" scouts), a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor that delivers optimization recommendations via Ollama (local or remote) + Telegram & OpenClaw.
 
 ![Rust](https://img.shields.io/badge/Rust-1.95+-orange?logo=rust&logoColor=white)
 ![Tokio](https://img.shields.io/badge/Tokio-async%20runtime-darkgreen?logo=rust&logoColor=white)
@@ -133,7 +133,7 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 │                         src/ layout                                 │
 │                                                                     │
 │  raptors/          ← Signal scouts (Binance WS + FAPI REST)         │
-│  vipers/           ← Trading strategies (7 Vipers)                  │
+│  vipers/           ← Trading strategies (8 Vipers)                  │
 │  squadron/         ← Deployment layer (Raptor+Viper+Market bundle)  │
 │  cag/              ← Commander (async dispatch, multi-asset)        │
 │  orchestrator/     ← Strategy trait, registry, executor             │
@@ -150,6 +150,10 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 │  (Binance Spot WS)   │   │                      │
 │  Funding Raptor      │   │                      │
 │  (Binance FAPI REST) │   │                      │
+│  Derivatives Raptor  │   │                      │
+│  (Binance FAPI: OI)  │   │                      │
+│  Tide Raptor         │   │                      │
+│  (Alpaca IEX + iNAV) │   │                      │
 └──────────┬───────────┘   └───────────┬──────────┘
            │  watch channels           │ orderbook WS
            └─────────────┬─────────────┘
@@ -228,16 +232,18 @@ Raptors are intentionally dumb: **fetch, normalize, broadcast** — no trading l
 |--------------------------------|-------------------------|---------------------------------------------------------|--------------------------|
 | **Price Raptor**               | Binance Spot WS         | spot price, 5s/1s velocity, acceleration, 10m/60m drift | `src/raptors/price.rs`   |
 | **Funding Raptor**             | Binance Perpetuals FAPI | Perpetual funding rate (smart-money sentiment)          | `src/raptors/funding.rs` |
+| **Derivatives Raptor**         | Binance Perpetuals FAPI | Open-interest delta + taker CVD ratio (positioning pressure, all-asset) | `src/raptors/derivatives.rs` |
+| **Tide Raptor**                | Alpaca IEX + synthetic iNAV | "Institutional Pulse" + coherence from spot-BTC-ETF (IBIT/FBTC/ARKB) premium vs iNAV — BTC-only, US-hours | `src/raptors/tide.rs` |
 | *(future)* **Sports Raptor**   | Line movement APIs      | Betting line drift, public money %                      | —                        |
 | *(future)* **Politics Raptor** | Polling aggregators     | Approval drift, event probability shifts                | —                        |
 
-When multiple Raptors are active, GBoost and Basis Vipers fuse their signals as features — no single Raptor has veto power alone.
+When multiple Raptors are active, the GBoost Viper fuses every signal as model features (funding, OI/CVD, institutional pulse/coherence); Basis, Momentum and TrendCapture use them as confirmation gates; and the **Convergence** Viper opens directional positions only when the institutional + derivatives stack agrees. No single Raptor has veto power alone.
 
 ---
 
 ## ✈️ Viper Wing (`src/vipers/`)
 
-Seven specialized Viper strategy classes. Each Viper is an autonomous tactical unit with its own capital budget, position book, and entry/exit logic.
+Eight specialized Viper strategy classes. Each Viper is an autonomous tactical unit with its own capital budget, position book, and entry/exit logic.
 
 | Viper            | Venue        | Description                                                                                                                                 |
 |------------------|--------------|---------------------------------------------------------------------------------------------------------------------------------------------|
@@ -248,6 +254,7 @@ Seven specialized Viper strategy classes. Each Viper is an autonomous tactical u
 | **Basis**        | Window       | Fades retail skew using Binance funding rates as smart-money confirmation                                                                   |
 | **GBoost**       | Window/Daily | Online gradient-boosted ML model retraining continuously on live orderbook + Raptor features                                                |
 | **TrendCapture** | Window/Daily | Exploits sustained multi-minute oracle drift (10m + 60m) before Polymarket reprices; Kelly-fractional sizing, OBI veto, trend-reversal exit |
+| **Convergence**  | Hourly       | Macro-conviction directional Viper — opens YES/NO only when the Tide institutional pulse, Derivatives CVD, and OI all agree on a direction. BTC-only, US-cash-hours-only, fixed tiny size |
 
 Build your own: [CUSTOM_STRATEGY.md](docs/CUSTOM_STRATEGY.md).
 
@@ -269,7 +276,7 @@ Squadron
 
 | Preset          | Raptors         | Vipers                             |
 |-----------------|-----------------|------------------------------------|
-| `full_wing`     | Price + Funding | All seven Vipers (current default) |
+| `full_wing`     | Price + Funding + Derivatives + Tide | All eight Vipers (current default) |
 | `momentum_only` | Price only      | Momentum + GBoost                  |
 | `arb_wing`      | Price + Funding | Arbitrage + Basis                  |
 
@@ -333,13 +340,14 @@ DRADIS ships with a real-time web dashboard called **Control Tower** built on Ne
 | **P&L Chart**      | Rolling equity curve across recent snapshots                                                     |
 | **Viper Cards**    | Live enabled/disabled toggle + all parameters editable inline without a restart                  |
 | **Open Positions** | In-flight positions with entry time, side (YES/NO/UP/DOWN in correct color), entry price, shares |
+| **Telemetry**      | Live Raptor macro cards — including the **Institutional Pulse** card (Tide pulse dial, coherence, per-ETF premium bps; greyed outside US market hours) |
 | **Trade Log**      | Last N completed trades with strategy, side, entry/exit prices, shares, P&L, exit reason         |
 
 ### Live Config Editing
 
 Every parameter in the Viper cards maps directly to the runtime `DynamicConfig`. Editing a value sends `PATCH /api/config` — **no restart required**. Changes take effect on the next 50ms tick.
 
-> **Hot-Enable Design** — All seven Vipers are always instantiated at startup. The `DynamicConfig` enable flags are the sole runtime gate. Toggle any Viper on or off during a live session with immediate effect.
+> **Hot-Enable Design** — All eight Vipers are always instantiated at startup. The `DynamicConfig` enable flags are the sole runtime gate. Toggle any Viper on or off during a live session with immediate effect.
 
 ### Authentication
 
@@ -400,6 +408,23 @@ OLLAMA_MODEL=mistral
 - A Polygon wallet with USDC and MATIC
 - **A paid Polygon RPC endpoint** (required for auto-settlement)
 - Telegram bot token (optional)
+- Alpaca API key/secret (optional — free tier; only needed for the **Tide Raptor**'s live IEX ETF feed. Without it the Institutional Pulse card stays idle.)
+
+### Tide Raptor (Institutional Pulse) — optional
+
+The Tide Raptor streams real-time spot-BTC-ETF (IBIT/FBTC/ARKB) prints from Alpaca's
+free-tier IEX feed and compares them to a synthetic iNAV (btc-per-share × Binance
+oracle) to produce the **Institutional Pulse** and **coherence** signals. It is
+BTC-only and active during US market hours (09:30–16:00 ET). To enable it, add your
+Alpaca keys to `.env`:
+
+```bash
+ALPACA_API_KEY_ID=your-key-id
+ALPACA_API_SECRET_KEY=your-secret-key
+```
+
+These feed the GBoost feature vector, the Basis tide veto, and the **Convergence**
+Viper. Omit them and those consumers simply treat the pulse as neutral/zero.
 
 ### RPC Configuration
 
@@ -418,8 +443,8 @@ POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_API_KEY
 | Profile      | File                                 | Wallet    | Risk   | Vipers            |
 |--------------|--------------------------------------|-----------|--------|-------------------|
 | Conservative | `src/config.conservative.rs.example` | < $100    | Low    | Maker, Time Decay |
-| Balanced     | `src/config.balanced.rs.example`     | $100–$300 | Medium | All seven         |
-| Aggressive   | `src/config.aggressive.rs.example`   | $200+     | High   | All seven         |
+| Balanced     | `src/config.balanced.rs.example`     | $100–$300 | Medium | All eight         |
+| Aggressive   | `src/config.aggressive.rs.example`   | $200+     | High   | All eight         |
 
 ```bash
 cp src/config.balanced.rs.example src/config.rs
@@ -517,7 +542,7 @@ API health: `http://YOUR_SERVER_IP:9000/api/health`
   - Backward-compatible: `CRYPTO_FILTER=btc` (single-asset) still works unchanged
 - **Raptor / Viper / Squadron architecture** — Three-layer BSG tactical separation of concerns:
   - `src/raptors/` — Price Raptor (Binance WS) + Funding Raptor (Binance FAPI)
-  - `src/vipers/` — seven Viper trading strategies (Momentum, Maker, Arbitrage, Time Decay, Basis, GBoost, TrendCapture)
+  - `src/vipers/` — eight Viper trading strategies (Momentum, Maker, Arbitrage, Time Decay, Basis, GBoost, TrendCapture, Convergence)
   - `src/squadron/` — `Squadron`, `SquadronRaptors`, `SquadronConfig`, `SquadronState`
   - Each market rotation logs `️ Squadron [...] → state=PATROLLING`
 - **Open Positions improvements** — Side column colors YES/UP green and NO/DOWN red; chain-adopted positions show `⛓ adopted`; `chain_adopted` DB column with live migration
@@ -564,7 +589,7 @@ DRADIS_API_KEY=replace-with-a-strong-random-secret
 
 ## FAQ
 
-**Why Rust?** Fearless concurrency — evaluating seven Vipers every 50ms needs a multi-threaded runtime with no GIL or GC pauses.
+**Why Rust?** Fearless concurrency — evaluating eight Vipers every 50ms needs a multi-threaded runtime with no GIL or GC pauses.
 
 **Can I trade multiple assets at once?** Yes — set `ASSETS=btc,eth,sol` in `.env`. Each asset runs its own independent patrol loop (raptors, session state, LLM advisor, SQLite DB) inside a `tokio::spawn`ed task. The wallet, CLOB client, and API server are shared. Each asset writes to its own DB file (`logs/btc-dradis.db`, `logs/eth-dradis.db`, etc.); pass `?asset=eth` to any API endpoint to scope results to that asset.
 
@@ -580,7 +605,7 @@ rm -f logs/gboost_model_*.json
 ```
 The safe pattern: bump the suffix in `GBOOST_MODEL_PATH` (e.g. `v14f` → `v15f`) when adding a new feature in `src/vipers/gboost_impl.rs`.
 
-**Can I enable a Viper mid-session?** Yes — all seven are always instantiated. Toggle via Control Tower or `PATCH /api/config`. Takes effect on the next 50ms tick.
+**Can I enable a Viper mid-session?** Yes — all eight are always instantiated. Toggle via Control Tower or `PATCH /api/config`. Takes effect on the next 50ms tick.
 
 **Does DRADIS support the US Polymarket API?** Yes.  Polymarket's **US platform** is a separate, custodial, CFTC-regulated exchange with web2 auth (API key / secret / session token) and string/UUID market IDs. We have **venue abstraction** so a build can target either market via a Cargo feature flag (`intl_clob` default, `us_retail` available) — single-venue per binary, so the US deployment carries none of the Polygon crypto weight and stays inside its own regulatory/network footprint. Start a US build with `VENUE=us ./start-local.sh`.
 

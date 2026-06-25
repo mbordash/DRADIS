@@ -214,6 +214,23 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Highest price the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
     }
 
+    // ── Convergence ───────────────────────────────────────────────────────────
+    {
+        let g = "Convergence"; let e = Some("enable_convergence");
+        v.push(F::new(g, e, "enable_convergence", "Enabled", "bool", false,
+            "Macro-conviction directional Viper (BTC-only): enters on aligned institutional pulse + CVD/OI."));
+        v.push(F::new(g, e, "convergence_position_size_usdc", "Size", "usd", false,
+            "Fixed entry size per position.").min(0.0).step(0.5).unit("USDC"));
+        v.push(F::new(g, e, "convergence_max_exposure_usdc", "Max Exposure", "usd", false,
+            "Hard cap on total Convergence capital at risk.").min(0.0).step(0.5).unit("USDC"));
+        v.push(F::new(g, e, "convergence_stop_loss_pct", "Stop Loss", "pct", false,
+            "Entry-relative stop loss (0.10 = 10%).").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "convergence_target_profit_pct", "Take Profit", "pct", false,
+            "Entry-relative take profit (0.15 = 15%).").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "convergence_max_entry_price", "Max Entry", "price", false,
+            "Highest token ask the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
+    }
+
     v
 }
 

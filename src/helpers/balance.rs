@@ -438,6 +438,7 @@ pub async fn arb_pair_fill_monitor(
     vc_b: Address,
     positions: Arc<Mutex<PositionMap>>,
     phantom_cooldowns: PhantomCooldowns,
+    token_ownership: Arc<Mutex<HashMap<MarketId, String>>>,
     strategy_name: String,
     leg_a_token: &MarketId,
     leg_b_token: &MarketId,
@@ -772,6 +773,9 @@ pub async fn arb_pair_fill_monitor(
                   strategy_name, order_id, exit_price, sell_price, realized);
             // The leg is closed — drop it from tracking so it isn't counted as open.
             positions.lock().await.remove(&(strategy_name.clone(), filled_market.clone()));
+            // The filled leg has been flattened — release its token claim so other
+            // strategies aren't blocked on a position we no longer hold.
+            token_ownership.lock().await.remove(&filled_market);
             // Record the realized result so the dashboard reflects the true (small) loss.
             crate::helpers::metrics::record_trade(
                 &asset,
@@ -790,6 +794,14 @@ pub async fn arb_pair_fill_monitor(
                   strategy_name, filled_token, e);
         }
     }
+
+    // The missing leg never filled and its GTC was cancelled in Step 1 — proactively
+    // drop its phantom position and release its token claim now instead of waiting for
+    // `sync_position_balance` to age it out at `max_wait_secs`. This stops the redundant
+    // Position-Sync retry loop on the next poll and frees the token immediately so
+    // higher-priority strategies aren't rejected by TOKEN SOVEREIGNTY for ~minutes.
+    positions.lock().await.remove(&(strategy_name.clone(), missing_market.clone()));
+    token_ownership.lock().await.remove(&missing_market);
 
     // Block re-entry on BOTH legs until the operator/cleanup confirms the state is clean.
     let mut cd = phantom_cooldowns.lock().await;

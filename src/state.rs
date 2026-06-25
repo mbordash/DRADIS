@@ -111,6 +111,24 @@ pub struct MarketSnapshot {
     /// Positive = longs paying shorts (bullish bias from smart money).
     /// Updated every ~60 seconds; zero if unavailable.
     pub funding_rate: Decimal,
+    /// Institutional Pulse from the Tide Raptor — volume-weighted z-score of the
+    /// spot-BTC-ETF (IBIT/FBTC/ARKB) premium/discount vs a synthetic iNAV.
+    /// Positive = institutions paying a premium (bullish), negative = discount (bearish).
+    /// BTC-only and US-market-hours-only: zero for ETH/SOL squadrons, outside US
+    /// session, or when the Tide Raptor is not deployed.
+    pub institutional_pulse: Decimal,
+    /// Tide coherence in [0, 1] — agreement across the three ETF premiums.
+    /// High coherence + large |pulse| = institutional conviction. Zero when the
+    /// Tide Raptor is absent/dormant (same gating as `institutional_pulse`).
+    pub tide_coherence: Decimal,
+    /// Fractional change in Binance perp open interest since the previous poll
+    /// (Derivatives Raptor). >0 = positioning building, <0 = unwinding/de-leveraging.
+    /// Zero when the Derivatives Raptor is absent or on its first poll. All-asset.
+    pub oi_delta_pct: Decimal,
+    /// Taker buy÷sell volume ratio from the Derivatives Raptor. >1 = buyers lifting
+    /// offers (bullish aggression), <1 = sellers hitting bids (bearish aggression),
+    /// 0 = no data (FAPI unreachable). Treated as neutral when zero.
+    pub cvd_ratio: Decimal,
     /// 60-minute oracle price drift (current_price − price_60_minutes_ago).
     /// Positive = BTC trending UP over the last hour.
     /// Negative = BTC trending DOWN over the last hour.

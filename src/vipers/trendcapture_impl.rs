@@ -283,12 +283,28 @@ impl Strategy for TrendCaptureStrategyImpl {
             };
         }
 
+        // ── Derivatives confirmation gate (Derivatives Raptor) ───────────────
+        // Block the trend entry when the perp book actively contradicts it:
+        // aggressive counter-taker flow (cvd) or hard OI unwind (de-leveraging /
+        // squeeze → trend exhaustion). Disabled by default; inert on no-data
+        // (cvd/oi = 0 → neutral). All-asset. Mirrors the drift-alignment gates.
+        let deriv_cvd = ctx.snapshot.cvd_ratio;
+        let deriv_oi_unwind = config::DERIV_GATE_ENABLED
+            && ctx.snapshot.oi_delta_pct <= config::DERIV_OI_UNWIND_BLOCK;
+        let deriv_blocks_bull = config::DERIV_GATE_ENABLED
+            && (deriv_oi_unwind
+                || (deriv_cvd > dec!(0) && deriv_cvd <= dec!(1) - config::DERIV_CVD_CONFIRM_MARGIN));
+        let deriv_blocks_bear = config::DERIV_GATE_ENABLED
+            && (deriv_oi_unwind
+                || (deriv_cvd > dec!(0) && deriv_cvd >= dec!(1) + config::DERIV_CVD_CONFIRM_MARGIN));
+
         // ══ BULL entry: buy YES when trend is strongly upward ════════════════
         if drift_10m >= bull_drift_10m_thr
             && !drift_60m_misaligned_bull
             && !drift_60m_blocks_bull
             && !obi_blocks_bull
             && !obi_exhausted_bull
+            && !deriv_blocks_bull
         {
             // Strike gap check
             let passes_gap = match strike_price {
@@ -342,6 +358,7 @@ impl Strategy for TrendCaptureStrategyImpl {
             && !drift_60m_blocks_bear
             && !obi_blocks_bear
             && !obi_exhausted_bear
+            && !deriv_blocks_bear
         {
             let passes_gap = match strike_price {
                 Some(strike) => binance_price <= strike - bear_strike_gap,

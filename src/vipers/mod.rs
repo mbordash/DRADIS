@@ -10,6 +10,7 @@ pub mod maker_impl;
 pub mod basis_impl;
 pub mod gboost_impl;
 pub mod trendcapture_impl;
+pub mod convergence_impl;
 
 use rust_decimal::Decimal;
 use crate::config;

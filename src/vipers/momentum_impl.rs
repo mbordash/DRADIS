@@ -72,6 +72,29 @@ impl Strategy for MomentumStrategyImpl {
         let accel_ok_bull = acceleration >= dec!(0) || velocity >= accel_bypass;
         let accel_ok_bear = acceleration <= dec!(0) || velocity <= -accel_bypass;
 
+        // ── Derivatives confirmation gate (Derivatives Raptor) ───────────────
+        // A velocity spike with the perp book pushing the other way (aggressive
+        // counter-taker flow) or unwinding hard (de-leveraging/squeeze) is a fade,
+        // not a trend to chase. Block the contradicted direction. Disabled by
+        // default; inert when OI/CVD report no data (zero = neutral). All-asset.
+        if config::DERIV_GATE_ENABLED {
+            let cvd = ctx.snapshot.cvd_ratio;
+            let oi_unwind = ctx.snapshot.oi_delta_pct <= config::DERIV_OI_UNWIND_BLOCK;
+            if velocity > dec!(0) {
+                let cvd_contradicts = cvd > dec!(0) && cvd <= dec!(1) - config::DERIV_CVD_CONFIRM_MARGIN;
+                if cvd_contradicts || oi_unwind {
+                    debug!(" Momentum deriv-gate blocked BULL: cvd={:.2} oi_unwind={}", cvd, oi_unwind);
+                    return Ok(StrategySignal::NoSignal);
+                }
+            } else if velocity < dec!(0) {
+                let cvd_contradicts = cvd > dec!(0) && cvd >= dec!(1) + config::DERIV_CVD_CONFIRM_MARGIN;
+                if cvd_contradicts || oi_unwind {
+                    debug!(" Momentum deriv-gate blocked BEAR: cvd={:.2} oi_unwind={}", cvd, oi_unwind);
+                    return Ok(StrategySignal::NoSignal);
+                }
+            }
+        }
+
         let trade_size = kelly_momentum_size(
             velocity, threshold,
             dc.momentum_min_trade_size_usdc,

@@ -56,6 +56,13 @@ fn default_trendcapture_stop_loss()        -> Decimal { config::TRENDCAPTURE_STO
 fn default_trendcapture_target_profit()    -> Decimal { config::TRENDCAPTURE_TARGET_PROFIT_PERCENT   }
 fn default_trendcapture_max_entry_price()  -> Decimal { config::TRENDCAPTURE_MAX_ENTRY_PRICE         }
 
+fn default_convergence_enable()            -> bool    { config::ENABLE_CONVERGENCE_TRADING            }
+fn default_convergence_position_size()     -> Decimal { config::CONVERGENCE_POSITION_SIZE_USDC        }
+fn default_convergence_max_exposure()      -> Decimal { config::CONVERGENCE_MAX_EXPOSURE_USDC         }
+fn default_convergence_stop_loss()         -> Decimal { config::CONVERGENCE_STOP_LOSS_PERCENT         }
+fn default_convergence_target_profit()     -> Decimal { config::CONVERGENCE_TARGET_PROFIT_PERCENT     }
+fn default_convergence_max_entry_price()   -> Decimal { config::CONVERGENCE_MAX_ENTRY_PRICE           }
+
 // ─── Struct ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -161,6 +168,20 @@ pub struct DynamicConfig {
     pub trendcapture_target_profit_pct:   Decimal,
     #[serde(default = "default_trendcapture_max_entry_price")]
     pub trendcapture_max_entry_price:     Decimal,
+
+    // ── Convergence Viper ─────────────────────────────────────────────────────
+    #[serde(default = "default_convergence_enable")]
+    pub enable_convergence:               bool,
+    #[serde(default = "default_convergence_position_size")]
+    pub convergence_position_size_usdc:   Decimal,
+    #[serde(default = "default_convergence_max_exposure")]
+    pub convergence_max_exposure_usdc:    Decimal,
+    #[serde(default = "default_convergence_stop_loss")]
+    pub convergence_stop_loss_pct:        Decimal,
+    #[serde(default = "default_convergence_target_profit")]
+    pub convergence_target_profit_pct:    Decimal,
+    #[serde(default = "default_convergence_max_entry_price")]
+    pub convergence_max_entry_price:      Decimal,
 }
 
 impl Default for DynamicConfig {
@@ -227,6 +248,13 @@ impl Default for DynamicConfig {
             trendcapture_stop_loss_pct:       config::TRENDCAPTURE_STOP_LOSS_PERCENT,
             trendcapture_target_profit_pct:   config::TRENDCAPTURE_TARGET_PROFIT_PERCENT,
             trendcapture_max_entry_price:     config::TRENDCAPTURE_MAX_ENTRY_PRICE,
+
+            enable_convergence:               config::ENABLE_CONVERGENCE_TRADING,
+            convergence_position_size_usdc:   config::CONVERGENCE_POSITION_SIZE_USDC,
+            convergence_max_exposure_usdc:    config::CONVERGENCE_MAX_EXPOSURE_USDC,
+            convergence_stop_loss_pct:        config::CONVERGENCE_STOP_LOSS_PERCENT,
+            convergence_target_profit_pct:    config::CONVERGENCE_TARGET_PROFIT_PERCENT,
+            convergence_max_entry_price:      config::CONVERGENCE_MAX_ENTRY_PRICE,
         }
     }
 }

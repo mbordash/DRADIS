@@ -238,6 +238,9 @@ pub const BASIS_ENTRY_SKEW_THRESHOLD: Decimal = dec!(0.05);
 
 pub const BASIS_NEGATIVE_FUNDING_THRESHOLD: Decimal = dec!(-0.0001);
 pub const BASIS_POSITIVE_FUNDING_THRESHOLD: Decimal = dec!(0.0001);
+pub const BASIS_TIDE_GATE_ENABLED: bool = false;
+pub const BASIS_TIDE_PULSE_THRESHOLD: Decimal = dec!(1.0);
+pub const BASIS_TIDE_COHERENCE_THRESHOLD: Decimal = dec!(0.6);
 /// Basis velocity ceiling: 0.0004 = 0.04% of price/5s. Aggressive: wider gate ($40 at BTC=$100k).
 pub const BASIS_MAX_VELOCITY_PCT: Decimal = dec!(0.0004);
 pub const BASIS_BTC_ORACLE_STRIKE_BUFFER: Decimal = dec!(250.0); // legacy — not used in logic
@@ -263,6 +266,9 @@ pub const BASIS_FUNDING_POLL_SECS: u64 = 60;
 /// CVD ratio). Faster than funding because OI-driven regime shifts unfold on a
 /// ~10-minute horizon.
 pub const DERIVATIVES_POLL_SECS: u64 = 30;
+pub const DERIV_GATE_ENABLED: bool = false;
+pub const DERIV_CVD_CONFIRM_MARGIN: Decimal = dec!(0.15);
+pub const DERIV_OI_UNWIND_BLOCK: Decimal = dec!(-0.05);
 
 // ============================================================================
 // TIDE RAPTOR — "Institutional Pulse" spot-BTC-ETF premium signal
@@ -365,8 +371,8 @@ pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.080); // aggressive: 8% —
 pub const GBOOST_MIN_HOLD_SECS: i64 = 180;
 pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 10;
 pub const GBOOST_MIN_USABLE_TREES: usize = 30;
-pub const GBOOST_MODEL_FILENAME: &str = "gboost_model_v22f.json";
-pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v22f.json";
+pub const GBOOST_MODEL_FILENAME: &str = "gboost_model_v26f.json";
+pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v26f.json";
 /// Max fraction of identical labels before skipping a retrain cycle (avoids degenerate storms).
 /// Aggressive: same threshold — label imbalance is a hard data quality issue, not a risk preference.
 pub const GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX: f64 = 0.80;
@@ -829,3 +835,72 @@ pub fn connector_init_delay() -> StdDuration {
 pub fn order_execution_delay() -> StdDuration {
     StdDuration::from_millis(200)
 }
+// ============================================================================
+// CONVERGENCE STRATEGY PARAMETERS
+// ============================================================================
+//
+// The Convergence Viper is a directional, macro-conviction strategy. Unlike the
+// price-driven Vipers (Momentum = 5s velocity, TrendCapture = 10–60m drift), it
+// enters ONLY when the institutional + derivatives stack agrees on a direction:
+//   • Tide Raptor institutional_pulse beyond threshold AND high coherence, plus
+//   • Derivatives Raptor CVD confirming the same side, and OI not unwinding.
+// BTC-only (institutional_pulse is BTC-only) and naturally US-market-hours-only
+// (pulse is zero outside the cash session). Ships LIVE but with a tiny fixed size.
+
+/// Enable/disable the Convergence (macro-conviction) Viper.
+///
+/// ⚠️  This is the compile-time startup DEFAULT — NOT a permanent setting.
+/// The Control Tower UI (PATCH /api/config {"enable_convergence": false}) can
+/// flip it at runtime; changes hot-load and persist to SQLite.
+pub const ENABLE_CONVERGENCE_TRADING: bool = true;
+
+/// Fixed entry size (USDC) per Convergence position — deliberately tiny while the
+/// strategy proves itself live. Not Kelly-scaled (unlike Momentum/TrendCapture).
+pub const CONVERGENCE_POSITION_SIZE_USDC: Decimal = dec!(5.0);
+
+/// Hard cap on total Convergence capital at risk across all open positions.
+pub const CONVERGENCE_MAX_EXPOSURE_USDC: Decimal = dec!(20.0);
+
+/// Minimum |institutional_pulse| (z-score) required to consider a directional entry.
+pub const CONVERGENCE_PULSE_THRESHOLD: Decimal = dec!(1.0);
+
+/// Minimum Tide coherence (0..1) — the three ETFs must agree before we act.
+pub const CONVERGENCE_COHERENCE_MIN: Decimal = dec!(0.6);
+
+/// Distance from the neutral CVD ratio of 1.0 the perp taker flow must clear to
+/// CONFIRM the trade direction (bull needs cvd ≥ 1+margin, bear ≤ 1−margin).
+pub const CONVERGENCE_CVD_CONFIRM_MARGIN: Decimal = dec!(0.10);
+
+/// Open-interest delta floor: positioning must not be unwinding (de-leveraging /
+/// squeeze) for a conviction entry. 0.0 = require OI flat-or-building.
+pub const CONVERGENCE_OI_MIN_BUILD: Decimal = dec!(0.0);
+
+/// Highest token ask the strategy will pay to enter (no edge buying near $1).
+pub const CONVERGENCE_MAX_ENTRY_PRICE: Decimal = dec!(0.65);
+
+/// Lowest token ask considered tradable (avoid lottery-ticket tails).
+pub const CONVERGENCE_MIN_ENTRY_PRICE: Decimal = dec!(0.10);
+
+/// Max per-token bid-ask spread (fraction of ask). A hollow bid guarantees an
+/// instant stop-out, so skip when the spread is wider than this.
+pub const CONVERGENCE_MAX_TOKEN_SPREAD_PCT: Decimal = dec!(0.12);
+
+/// Entry-relative take-profit and stop-loss.
+pub const CONVERGENCE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.15);
+pub const CONVERGENCE_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
+
+/// Catastrophic stop applied BEFORE fill-confirmation (negative = loss fraction).
+pub const CONVERGENCE_CATASTROPHIC_SL_PCT: Decimal = dec!(-0.20);
+
+/// Per-token cooldown after any exit before re-entry is allowed (seconds).
+pub const CONVERGENCE_POST_EXIT_COOLDOWN_SECS: u64 = 300;
+
+/// Minimum hold (seconds) before a normal stop-loss or reversal exit may fire.
+pub const CONVERGENCE_MIN_HOLD_SECS: i64 = 60;
+
+/// After emitting an Exit, suppress further exit signals for this many seconds
+/// (prevents FAK-miss re-fire storms while patrol executes).
+pub const CONVERGENCE_EXIT_SIGNAL_COOLDOWN_SECS: u64 = 20;
+
+/// Minimum market maturation (seconds) before Convergence will open in a market.
+pub const CONVERGENCE_MARKET_WARMUP_SECS: i64 = 60;

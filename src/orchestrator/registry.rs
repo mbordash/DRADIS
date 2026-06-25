@@ -6,6 +6,7 @@ use crate::vipers::maker_impl::MakerStrategyImpl;
 use crate::vipers::basis_impl::BasisStrategyImpl;
 use crate::vipers::gboost_impl::GboostStrategyImpl;
 use crate::vipers::trendcapture_impl::TrendCaptureStrategyImpl;
+use crate::vipers::convergence_impl::ConvergenceStrategyImpl;
 use crate::config;
 use rust_decimal_macros::dec;
 use tracing::info;
@@ -61,6 +62,14 @@ impl StrategyRegistry {
             config::TRENDCAPTURE_LATE_MARKET_STOP_LOSS_PERCENT * dec!(100),
             config::TRENDCAPTURE_TAKE_PROFIT_CEILING,
         );
+        info!(
+            "   Convergence | pulse_thr={} coh_min={} cvd_margin={} | size=${} max_exp=${} | TP={}% SL={}% (BTC-only, live)",
+            config::CONVERGENCE_PULSE_THRESHOLD, config::CONVERGENCE_COHERENCE_MIN,
+            config::CONVERGENCE_CVD_CONFIRM_MARGIN, config::CONVERGENCE_POSITION_SIZE_USDC,
+            config::CONVERGENCE_MAX_EXPOSURE_USDC,
+            config::CONVERGENCE_TARGET_PROFIT_PERCENT * dec!(100),
+            config::CONVERGENCE_STOP_LOSS_PERCENT * dec!(100),
+        );
     }
 
     /// Create a vector of ALL strategy instances.
@@ -76,6 +85,7 @@ impl StrategyRegistry {
             Box::new(BasisStrategyImpl)                    as Box<dyn Strategy>,
             Box::new(GboostStrategyImpl::default())        as Box<dyn Strategy>,
             Box::new(TrendCaptureStrategyImpl::new())      as Box<dyn Strategy>,
+            Box::new(ConvergenceStrategyImpl::new())       as Box<dyn Strategy>,
         ]
     }
 
@@ -110,6 +120,7 @@ impl StrategyRegistry {
             "BasisStrategy",
             "GboostStrategy",
             "TrendCaptureStrategy",
+            "ConvergenceStrategy",
         ]
         .into_iter().map(|s| s.to_string()).collect()
     }
