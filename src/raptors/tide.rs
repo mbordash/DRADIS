@@ -309,10 +309,29 @@ async fn run_equity_feed(quotes: QuoteMap) {
 
     loop {
         match stream_alpaca_iex(&key, &secret, &quotes, &mut vol_windows).await {
-            Ok(())  => warn!("🌊 Tide equity feed: stream ended cleanly — reconnecting in 5s"),
-            Err(e)  => warn!("🌊 Tide equity feed: {e} — reconnecting in 5s"),
+            Ok(())  => {
+                warn!("🌊 Tide equity feed: stream ended cleanly — reconnecting in 5s");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
+            // Alpaca free tier allows only ONE concurrent market-data connection
+            // per account (error 406). If another DRADIS instance (e.g. your live
+            // box) holds that connection with the same key, retrying every 5s just
+            // spams the log and never succeeds — back off hard and tell the operator
+            // exactly what to do.
+            Err(e) if e.contains("406") || e.to_lowercase().contains("connection limit") => {
+                warn!(
+                    "🌊 Tide equity feed: {e}. Alpaca's free tier permits ONE concurrent \
+                     market-data connection per account — another instance is using this key. \
+                     Use a SEPARATE Alpaca key for this instance, or disable Tide elsewhere. \
+                     Backing off 60s.",
+                );
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+            Err(e)  => {
+                warn!("🌊 Tide equity feed: {e} — reconnecting in 5s");
+                tokio::time::sleep(Duration::from_secs(5)).await;
+            }
         }
-        tokio::time::sleep(Duration::from_secs(5)).await;
     }
 }
 
