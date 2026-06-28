@@ -317,7 +317,7 @@ impl Squadron {
             let map = positions.lock().await;
             let mut ownership = token_ownership.lock().await;
             ownership.clear();
-            for ((sn, tid), _) in map.iter() {
+            for ((sn, tid), _pos) in map.iter() {
                 let current_priority = StrategyRegistry::get_strategy_priority(sn).unwrap_or(usize::MAX);
                 let entry = ownership.entry(tid.clone()).or_insert_with(|| sn.clone());
                 let existing_priority = StrategyRegistry::get_strategy_priority(entry).unwrap_or(usize::MAX);
@@ -721,6 +721,18 @@ impl Squadron {
                             // ════════════════════ ENTRY ════════════════════
                             StrategySignal::Entry { params, pair_params } => {
                                 let token_m = params.token_id.clone(); // neutral key (slice 2a)
+                                // Venue-appropriate snapshot for entry-signal logging: Window/Daily
+                                // strategies (e.g. TrendCapture) evaluate the maker snapshot; hourly
+                                // strategies the primary snapshot. Captured here so both the ghost and
+                                // live entry paths can persist the feature-vector behind the fill.
+                                let entry_snap: crate::state::MarketSnapshot = {
+                                    let strat_venue = strategies.iter().find(|s| s.name() == sn).map(|s| s.venue()).unwrap_or("Hourly");
+                                    if strat_venue == "Window/Daily" {
+                                        ctx.maker_snapshot.clone().unwrap_or_else(|| ctx.snapshot.clone())
+                                    } else {
+                                        ctx.snapshot.clone()
+                                    }
+                                };
                                 if let Some(close_time) = target_market_close_time { if (close_time - Utc::now()).num_seconds() < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY { continue; } }
                                 if let Some(lt) = last_trade_time.get(&sn) { if lt.elapsed() < Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64) { continue; } }
                                 if let Some(lt) = last_stop_loss_time.get(&sn) { if lt.elapsed() < Duration::from_secs(config::STOP_LOSS_COOLDOWN_SECS) { continue; } }
@@ -769,6 +781,13 @@ impl Squadron {
                                                 ownership.insert(token_m.clone(), sn.clone());
                                             } else {
                                                 // Current strategy has lower or equal priority, reject entry.
+                                                // Sovereignty is strict per-token: on-chain the token is a
+                                                // single fungible ERC-1155 balance, so two strategies holding
+                                                // it cannot be reconciled independently (one's sync clobbers
+                                                // the other). A residual dust holder still keeps the claim
+                                                // until its position actually settles — letting a second
+                                                // strategy pile onto the shared balance caused the 2026-06-27
+                                                // Basis commingling loss.
                                                 // Apply a trade cooldown so the lower-priority strategy
                                                 // backs off for TRADE_COOLDOWN_SECS instead of spinning
                                                 // every tick (~7,000+ rejections per hour otherwise).
@@ -790,7 +809,10 @@ impl Squadron {
                                 // tick loop, but belt-and-suspenders).
                                 {
                                     let pm = positions.lock().await;
-                                    if pm.iter().any(|((other_sn, tid), _)| *tid == token_m && other_sn != &sn) {
+                                    let blocked = pm.iter().any(|((other_sn, tid), _p)| {
+                                        *tid == token_m && other_sn != &sn
+                                    });
+                                    if blocked {
                                         warn!(
                                             "🚫 TOKEN SOVEREIGNTY [{}]: token {} held by another strategy \
                                              (registry miss — positions scan fallback)",
@@ -817,6 +839,7 @@ impl Squadron {
                                     let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" };
                                     info!("👻 GHOST_MODE ENTRY {} [{}]: {} | ${:.4} x {:.1} (simulated)", side_g, sn, params.market_name, params.price, params.shares);
                                     { let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" }; let sn_g = sn.clone(); let tid_g = params.token_id.to_string(); let mn_g = params.market_name.clone(); let side_gs = side_g.to_string(); let ep_g = actual_entry_price; let sh_g = params.shares; let asset_g = asset_lc.clone(); tokio::spawn(async move { metrics::record_entry(&asset_g, sn_g, tid_g, mn_g, side_gs, ep_g, sh_g).await; }); }
+                                    { let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" }; let sn_g = sn.clone(); let tid_g = params.token_id.to_string(); let mn_g = params.market_name.clone(); let side_gs = side_g.to_string(); let ep_g = actual_entry_price; let sh_g = params.shares; let asset_g = asset_lc.clone(); let snap_g = entry_snap.clone(); tokio::spawn(async move { metrics::record_entry_signal(&asset_g, sn_g, tid_g, mn_g, side_gs, ep_g, sh_g, &snap_g).await; }); }
                                     if let Some(pool) = db::pool_for(&asset_lc) { let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" }; db::record_open_position(&pool, &sn, &params.token_id.to_string(), &params.market_name, side_g, actual_entry_price, params.shares, true).await; }
                                     if let Some(pp) = pair_params {
                                         let pp_close_time = target_market_close_time;
@@ -1014,6 +1037,7 @@ impl Squadron {
                                         let primary_wait_secs = if target_yes_token == hourly_yes_token { crate::helpers::balance::MAX_WAIT_SECS_HOURLY } else { crate::helpers::balance::MAX_WAIT_SECS_WINDOW };
                                         let db_sn_s = sn.clone(); let db_tid_s = params.token_id.to_string(); let db_mn_s = params.market_name.clone();
                                         let db_side_s = if params.token_id == target_yes_token { "YES" } else { "NO" }; let db_ep_s = actual_entry_price; let db_sh_s = params.shares; let asset_s = asset_lc.clone();
+                                        let feat_snap_s = entry_snap.clone();
                                         // Write pending position immediately (Viper Launch)
                                         if let Some(pool) = db::pool_for(&asset_s) {
                                             db::record_open_position_with_status(&pool, &sn, &db_tid_s, &db_mn_s, db_side_s, db_ep_s, db_sh_s, false, "pending").await;
@@ -1024,7 +1048,8 @@ impl Squadron {
                                                 if let Some(pool) = db::pool_for(&asset_s) {
                                                     db::confirm_position_status(&pool, &db_sn_s, &db_tid_s).await;
                                                 }
-                                                metrics::record_entry(&asset_s, db_sn_s, db_tid_s, db_mn_s, db_side_s.to_string(), db_ep_s, db_sh_s).await;
+                                                metrics::record_entry(&asset_s, db_sn_s.clone(), db_tid_s.clone(), db_mn_s.clone(), db_side_s.to_string(), db_ep_s, db_sh_s).await;
+                                                metrics::record_entry_signal(&asset_s, db_sn_s, db_tid_s, db_mn_s, db_side_s.to_string(), db_ep_s, db_sh_s, &feat_snap_s).await;
                                             }
                                         });
                                     }

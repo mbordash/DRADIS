@@ -165,6 +165,40 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
         )"
     ).execute(pool).await?;
 
+    // entry_signals: the signal feature-vector captured at the moment of each entry.
+    // Persisted so win/loss outcomes (trades table) can be correlated with the entry
+    // conditions that produced them — the data foundation for tuning entry criteria.
+    // Join to `trades`/`entries` on (session_id, token_id) ordered by ts.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS entry_signals (
+            id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts                  TEXT    NOT NULL,
+            session_id          TEXT    NOT NULL DEFAULT '',
+            strategy            TEXT    NOT NULL,
+            token_id            TEXT    NOT NULL,
+            market              TEXT    NOT NULL,
+            side                TEXT    NOT NULL,
+            entry_price         TEXT    NOT NULL,
+            shares              TEXT    NOT NULL,
+            oracle_price        TEXT    NOT NULL,
+            drift_10m           TEXT    NOT NULL,
+            drift_60m           TEXT    NOT NULL,
+            obi_yes             TEXT    NOT NULL,
+            ask_sum             TEXT    NOT NULL,
+            bid_sum             TEXT    NOT NULL,
+            funding_rate        TEXT    NOT NULL,
+            institutional_pulse TEXT    NOT NULL,
+            cvd_ratio           TEXT    NOT NULL,
+            oi_delta_pct        TEXT    NOT NULL,
+            velocity            TEXT    NOT NULL,
+            secs_to_expiry      INTEGER NOT NULL
+        )"
+    ).execute(pool).await?;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_entry_signals_session_token ON entry_signals(session_id, token_id)")
+        .execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_entry_signals_strategy_ts ON entry_signals(strategy, ts)")
+        .execute(pool).await;
+
     // pnl_snapshots: periodic P&L checkpoints for the Control Tower chart
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS pnl_snapshots (
@@ -700,6 +734,68 @@ pub async fn record_entry_db(
     .execute(pool)
     .await {
         error!("❌ DB entry write failed: {}", e);
+    }
+}
+
+/// Signal feature-vector captured at entry time, persisted to `entry_signals`.
+/// All market features are snapshot-derived; identity fields tie the row back to the
+/// resulting position/trade for win-loss correlation.
+#[derive(Clone, Debug)]
+pub struct EntrySignalRow {
+    pub strategy:            String,
+    pub token_id:            String,
+    pub market:              String,
+    pub side:                String,
+    pub entry_price:         Decimal,
+    pub shares:              Decimal,
+    pub oracle_price:        Decimal,
+    pub drift_10m:           Decimal,
+    pub drift_60m:           Decimal,
+    pub obi_yes:             Decimal,
+    pub ask_sum:             Decimal,
+    pub bid_sum:             Decimal,
+    pub funding_rate:        Decimal,
+    pub institutional_pulse: Decimal,
+    pub cvd_ratio:           Decimal,
+    pub oi_delta_pct:        Decimal,
+    pub velocity:            Decimal,
+    pub secs_to_expiry:      i64,
+}
+
+/// Persist an entry-signal feature-vector row.
+pub async fn record_entry_signal_db(pool: &SqlitePool, row: &EntrySignalRow) {
+    let ts = Utc::now().to_rfc3339();
+    let sid = current_session_id();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO entry_signals
+            (ts, session_id, strategy, token_id, market, side, entry_price, shares,
+             oracle_price, drift_10m, drift_60m, obi_yes, ask_sum, bid_sum,
+             funding_rate, institutional_pulse, cvd_ratio, oi_delta_pct, velocity, secs_to_expiry)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    .bind(&ts)
+    .bind(sid)
+    .bind(&row.strategy)
+    .bind(&row.token_id)
+    .bind(&row.market)
+    .bind(&row.side)
+    .bind(row.entry_price.to_string())
+    .bind(row.shares.to_string())
+    .bind(row.oracle_price.to_string())
+    .bind(row.drift_10m.to_string())
+    .bind(row.drift_60m.to_string())
+    .bind(row.obi_yes.to_string())
+    .bind(row.ask_sum.to_string())
+    .bind(row.bid_sum.to_string())
+    .bind(row.funding_rate.to_string())
+    .bind(row.institutional_pulse.to_string())
+    .bind(row.cvd_ratio.to_string())
+    .bind(row.oi_delta_pct.to_string())
+    .bind(row.velocity.to_string())
+    .bind(row.secs_to_expiry)
+    .execute(pool)
+    .await {
+        error!("❌ DB entry_signal write failed: {}", e);
     }
 }
 

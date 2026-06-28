@@ -45,6 +45,10 @@ pub const ARBITRAGE_MAX_FILL_GAP: Decimal = dec!(0.03);
 pub const ARBITRAGE_MAX_LEG_PRICE: Decimal = dec!(0.55);
 pub const ARBITRAGE_MAX_LEG_OBI: Decimal = dec!(0.50);
 pub const ARBITRAGE_MAX_OBI_ASYMMETRY: Decimal = dec!(0.60);
+/// Min conviction: dominant leg bid must be ≥ this to enter — restricts arb to deep
+/// near-settlement markets and rejects ≈0.50 coin-flips (core orphan guard).
+/// Conservative: stricter 0.85 (fewer entries, lowest orphan risk).
+pub const ARBITRAGE_MIN_LEG_CONVICTION: Decimal = dec!(0.85);
 pub const ARB_FAK_REHEDGE_BUFFER: Decimal = dec!(0.02);
 
 /// Upper bound on single-leg orphan rescue cost in the arb entry gate. Conservative:
@@ -56,6 +60,10 @@ pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.96);
 /// Minimum shares and order size (exchange minimums — do not lower).
 pub const MIN_ORDER_SHARES: Decimal = dec!(1.0);
 pub const MIN_ORDER_USDC: Decimal = dec!(1.05);
+/// Token-sovereignty dust threshold (notional USDC). A held position below this is
+/// dust and won't block another viper from entering the same token. Conservative: 2.0
+/// (stricter — respects existing claims more, fewer dust waivers).
+pub const TOKEN_SOVEREIGNTY_DUST_NOTIONAL_USDC: Decimal = dec!(2.0);
 
 /// Discount applied to current bid when setting avg_entry for a reconciled orphaned position.
 /// Discount applied to current bid when setting avg_entry for a reconciled orphaned position.
@@ -265,6 +273,7 @@ pub const BASIS_ORACLE_STRIKE_BUFFER_PCT: Decimal = dec!(0.0015);
 pub const BASIS_MAX_ENTRY_PRICE: Decimal = dec!(0.55);
 pub const BASIS_TARGET_PROFIT_PERCENT: Decimal = dec!(0.08);
 pub const BASIS_STOP_LOSS_PERCENT: Decimal = dec!(0.06);
+pub const BASIS_CATASTROPHIC_SL_PCT: Decimal = dec!(0.09); // bypasses min-hold guard on deep drawdown
 pub const BASIS_SKEW_COLLAPSE_THRESHOLD: Decimal = dec!(0.04);
 pub const BASIS_MIN_SECS_TO_EXPIRY: i64 = 1800;
 /// Minimum best-bid required to fire a basis forced-exit near expiry.

@@ -46,6 +46,7 @@ use crate::helpers::db;
 fn default_arb_max_leg_price()             -> Decimal { config::ARBITRAGE_MAX_LEG_PRICE             }
 fn default_arb_max_leg_obi()               -> Decimal { config::ARBITRAGE_MAX_LEG_OBI               }
 fn default_arb_max_obi_asymmetry()         -> Decimal { config::ARBITRAGE_MAX_OBI_ASYMMETRY         }
+fn default_arb_min_leg_conviction()        -> Decimal { config::ARBITRAGE_MIN_LEG_CONVICTION        }
 fn default_arb_fak_rehedge_buffer()        -> Decimal { config::ARB_FAK_REHEDGE_BUFFER              }
 fn default_arb_max_rescue_cost()           -> Decimal { config::ARB_MAX_RESCUE_COST                 }
 fn default_trendcapture_enable()           -> bool    { config::ENABLE_TRENDCAPTURE_TRADING          }
@@ -106,6 +107,13 @@ pub struct DynamicConfig {
     /// fill one leg alone and leave a naked orphan. Lower = stricter. Default 0.60.
     #[serde(default = "default_arb_max_obi_asymmetry")]
     pub arbitrage_max_obi_asymmetry:  Decimal,
+
+    /// Minimum conviction to enter: the dominant leg's bid must be ≥ this.
+    /// Restricts arb to DEEP near-settlement markets (one leg ≈0.90+) where both
+    /// legs fill reliably, and rejects ≈0.50 coin-flips where a one-tick move
+    /// orphans a leg. Core orphan-prevention gate (default 0.80). Higher = stricter.
+    #[serde(default = "default_arb_min_leg_conviction")]
+    pub arbitrage_min_leg_conviction: Decimal,
 
     /// Breakeven buffer subtracted from the $1.00 payout when deciding whether to
     /// FAK re-hedge a naked arb leg. Per-squadron so thin alt books (ETH/SOL) can
@@ -207,6 +215,7 @@ impl Default for DynamicConfig {
             arbitrage_max_leg_price:      config::ARBITRAGE_MAX_LEG_PRICE,
             arbitrage_max_leg_obi:        config::ARBITRAGE_MAX_LEG_OBI,
             arbitrage_max_obi_asymmetry:  config::ARBITRAGE_MAX_OBI_ASYMMETRY,
+            arbitrage_min_leg_conviction: config::ARBITRAGE_MIN_LEG_CONVICTION,
             arb_fak_rehedge_buffer:       config::ARB_FAK_REHEDGE_BUFFER,
             arb_max_rescue_cost:          config::ARB_MAX_RESCUE_COST,
 
@@ -263,10 +272,28 @@ impl Default for DynamicConfig {
 
 const DB_KEY: &str = "dynamic_config";
 
+/// Read-only / demo mode flag, mirroring the API server's `DRADIS_READ_ONLY` gate.
+///
+/// In demo mode the persisted DynamicConfig (global + squadron-scoped) is bypassed
+/// entirely so the Control Tower always renders the compile-time defaults from
+/// config.rs. The demo DB is never edited via the UI (all mutations are rejected),
+/// so without this its stale config rows would shadow newer config.rs constants
+/// (e.g. a lowered take-profit) indefinitely. Live deployments are unaffected.
+fn read_only_mode() -> bool {
+    std::env::var("DRADIS_READ_ONLY")
+        .ok()
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
 impl DynamicConfig {
     /// Load the most recent DynamicConfig from SQLite.
     /// If no record exists (first run), seeds defaults and writes them to DB.
     pub async fn load_or_default() -> Arc<Self> {
+        if read_only_mode() {
+            info!("⚙️  READ-ONLY demo mode — bypassing persisted DynamicConfig, using compile-time defaults");
+            return Arc::new(DynamicConfig::default());
+        }
         if let Some(pool) = db::pool() {
             if let Some(json) = db::config_get(pool, DB_KEY).await {
                 match serde_json::from_str::<DynamicConfig>(&json) {
@@ -380,6 +407,10 @@ impl DynamicConfig {
     /// If none exists, returns a fresh copy of compile-time defaults (does NOT persist yet).
     /// Caller is responsible for persisting via save_for_squadron() if needed.
     pub async fn load_for_squadron(squadron_id: &str) -> Arc<Self> {
+        if read_only_mode() {
+            info!("⚙️  READ-ONLY demo mode — squadron {} using compile-time defaults", squadron_id);
+            return Arc::new(DynamicConfig::default());
+        }
         if let Some(pool) = db::pool() {
             if let Some(json) = db::squadron_config_get(pool, squadron_id).await {
                 match serde_json::from_str::<DynamicConfig>(&json) {
@@ -422,6 +453,10 @@ impl DynamicConfig {
     /// viper (or any tuned param) survives a process restart and hourly market
     /// rotation instead of silently reverting to defaults.
     pub async fn load_or_init_for_squadron(squadron_id: &str) -> Arc<Self> {
+        if read_only_mode() {
+            // Demo mode: never persist, always reflect compile-time defaults.
+            return Self::load_for_squadron(squadron_id).await;
+        }
         if let Some(pool) = db::pool() {
             if db::squadron_config_get(pool, squadron_id).await.is_some() {
                 return Self::load_for_squadron(squadron_id).await;

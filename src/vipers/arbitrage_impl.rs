@@ -95,6 +95,27 @@ impl Strategy for ArbitrageStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── Conviction (anti-coin-flip) gate ─────────────────────────────────
+        // The core orphan-prevention check. The profitable maker-arb regime is the
+        // DEEP near-settlement market (dominant leg ≈0.90+, complement ≈0.05): both
+        // books are thick and the outcome near-decided, so resting GTC bids on each
+        // side fill reliably. The danger regime is the ≈0.50/0.50 coin-flip — the
+        // combined bid can still clear the profit threshold (so every other gate
+        // passes), but a one-tick BTC move fills the leaning leg while the other
+        // runs away, leaving a naked orphan we flatten at a loss. Lifetime, this
+        // single failure mode lost −$6.66 across 15 orphan flattens (2026-06-26).
+        // Require the dominant leg's bid ≥ conviction floor to admit only decided
+        // markets and reject the coin-flip zone outright.
+        let dominant_leg_bid = yes_bid.max(no_bid);
+        if dominant_leg_bid < dc.arbitrage_min_leg_conviction {
+            debug!(
+                " Arb conviction gate — dominant leg bid {:.3} < min {:.3} — skipping \
+                 (near-coin-flip market; leg-fill is directional → orphan risk)",
+                dominant_leg_bid, dc.arbitrage_min_leg_conviction
+            );
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Safe maker prices: cap bids one tick below ask ───────────────────
         // A GTC post-only order is rejected with "order crosses book" if
         // bid >= ask.  This can happen on tight markets where the WS snapshot

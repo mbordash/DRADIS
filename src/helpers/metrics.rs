@@ -3,9 +3,11 @@
 /// Fully asynchronous and non-blocking for high-frequency trading.
 
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use chrono::{DateTime, Utc};
 use tracing::info;
 use crate::helpers::db;
+use crate::state::MarketSnapshot;
 
 /// Records a completed trade to the SQLite database.
 ///
@@ -59,6 +61,55 @@ pub async fn record_entry(
 ) {
     if let Some(pool) = db::pool_for(asset) {
         db::record_entry_db(&pool, &strategy, &token_id, &market, &side, entry_price, shares).await;
+    }
+}
+
+/// Captures the entry-time signal feature-vector and persists it to `entry_signals`,
+/// so trade outcomes can later be correlated with the conditions that produced them.
+///
+/// `snap` is the venue-appropriate orderbook/oracle snapshot the strategy evaluated
+/// (maker snapshot for Window/Daily strategies, hourly snapshot otherwise).
+#[allow(clippy::too_many_arguments)]
+pub async fn record_entry_signal(
+    asset: &str,
+    strategy: String,
+    token_id: String,
+    market: String,
+    side: String,
+    entry_price: Decimal,
+    shares: Decimal,
+    snap: &MarketSnapshot,
+) {
+    if let Some(pool) = db::pool_for(asset) {
+        // Order-book imbalance for the YES token: (bid_depth − ask_depth) / total.
+        // Zero when depth is unavailable (avoids divide-by-zero).
+        let yes_depth = snap.yes_bid_depth + snap.yes_ask_depth;
+        let obi_yes = if yes_depth > dec!(0) {
+            (snap.yes_bid_depth - snap.yes_ask_depth) / yes_depth
+        } else {
+            dec!(0)
+        };
+        let row = db::EntrySignalRow {
+            strategy,
+            token_id,
+            market,
+            side,
+            entry_price,
+            shares,
+            oracle_price:        snap.oracle_price,
+            drift_10m:           snap.oracle_drift_10m,
+            drift_60m:           snap.oracle_drift_60m,
+            obi_yes,
+            ask_sum:             snap.yes_ask + snap.no_ask,
+            bid_sum:             snap.yes_bid + snap.no_bid,
+            funding_rate:        snap.funding_rate,
+            institutional_pulse: snap.institutional_pulse,
+            cvd_ratio:           snap.cvd_ratio,
+            oi_delta_pct:        snap.oi_delta_pct,
+            velocity:            snap.velocity,
+            secs_to_expiry:      snap.secs_to_expiry,
+        };
+        db::record_entry_signal_db(&pool, &row).await;
     }
 }
 

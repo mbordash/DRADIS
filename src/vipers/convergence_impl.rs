@@ -212,15 +212,24 @@ impl Strategy for ConvergenceStrategyImpl {
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
 
-        // ── Viper-level exit-signal cooldown ──────────────────────────────────
-        {
+        // ── Soft-exit cooldown (take-profit / signal-decay only) ──────────────
+        // After we emit a *discretionary* Exit signal, suppress further discretionary
+        // re-fires for EXIT_SIGNAL_COOLDOWN_SECS so patrol has time to execute before
+        // we re-fire (prevents FAK-miss re-fire storms).
+        //
+        // CRITICAL: safety-critical exits (stop-loss, catastrophic) are NEVER gated by
+        // this cooldown. A prior soft-exit FAK miss must not freeze the stop-loss while
+        // the position bleeds. (Jun 25 trade id 88: entry $0.23 — a discretionary FAK
+        // miss froze ALL exit re-evaluation; the bid collapsed $0.23→$0.13 and the
+        // position realized −43.5%, far past both the 10% stop and the 20% catastrophic
+        // floor, because the blanket cooldown also gated the stop-loss.)
+        let soft_exit_cooldown_active = {
             let last = self.last_exit_signal_at.lock().unwrap();
-            if let Some(t) = *last {
-                if t.elapsed().as_secs() < config::CONVERGENCE_EXIT_SIGNAL_COOLDOWN_SECS {
-                    return Ok(StrategySignal::NoSignal);
-                }
+            match *last {
+                Some(t) => t.elapsed().as_secs() < config::CONVERGENCE_EXIT_SIGNAL_COOLDOWN_SECS,
+                None => false,
             }
-        }
+        };
 
         let snap   = &ctx.snapshot;
         let market = &ctx.market;
@@ -270,25 +279,26 @@ impl Strategy for ConvergenceStrategyImpl {
                     reason,
                 };
 
-                // Before fill-confirmation only a catastrophic move may exit.
-                if position.fill_confirmed_at.is_none() {
-                    if profit_margin <= config::CONVERGENCE_CATASTROPHIC_SL_PCT {
-                        found = Some(make_exit(format!(
-                            "ConvergenceCatastrophic: bid=${:.4} loss={:.2}%",
-                            bid, profit_margin * dec!(100))));
-                        break 'outer;
-                    }
-                    continue;
-                }
-
-                // Take-profit.
-                if profit_margin >= dc.convergence_target_profit_pct {
+                // Catastrophic stop — ALWAYS active (pre- AND post-confirmation),
+                // ungated by the soft-exit cooldown and the minimum hold. This is the
+                // hard floor that must never be frozen by a prior FAK-miss cooldown.
+                // Previously this only existed in the pre-confirmation branch, so a
+                // CONFIRMED position had no catastrophic backstop at all (root cause of
+                // the −43.5% overshoot on trade id 88).
+                if profit_margin <= config::CONVERGENCE_CATASTROPHIC_SL_PCT {
                     found = Some(make_exit(format!(
-                        "ConvergenceTP: bid=${:.4} profit={:.2}%", bid, profit_margin * dec!(100))));
+                        "ConvergenceCatastrophic: bid=${:.4} loss={:.2}%",
+                        bid, profit_margin * dec!(100))));
                     break 'outer;
                 }
 
-                // Stop-loss (after minimum hold).
+                // Before fill-confirmation, only the catastrophic move above may exit.
+                if position.fill_confirmed_at.is_none() {
+                    continue;
+                }
+
+                // Stop-loss (after minimum hold) — safety-critical, NEVER gated by the
+                // soft-exit cooldown so a prior discretionary FAK miss can't freeze it.
                 if secs_held >= config::CONVERGENCE_MIN_HOLD_SECS
                     && profit_margin <= -dc.convergence_stop_loss_pct
                 {
@@ -297,9 +307,20 @@ impl Strategy for ConvergenceStrategyImpl {
                     break 'outer;
                 }
 
-                // Signal-decay / reversal exit: the conviction that opened the
-                // position has flipped against it, or coherence has collapsed.
-                if secs_held >= config::CONVERGENCE_MIN_HOLD_SECS {
+                // Take-profit (discretionary — suppressed during soft-exit cooldown).
+                if !soft_exit_cooldown_active
+                    && profit_margin >= dc.convergence_target_profit_pct
+                {
+                    found = Some(make_exit(format!(
+                        "ConvergenceTP: bid=${:.4} profit={:.2}%", bid, profit_margin * dec!(100))));
+                    break 'outer;
+                }
+
+                // Signal-decay / reversal exit (discretionary — suppressed during
+                // soft-exit cooldown): the conviction that opened the position has
+                // flipped against it, or coherence has collapsed.
+                if !soft_exit_cooldown_active
+                    && secs_held >= config::CONVERGENCE_MIN_HOLD_SECS {
                     let half_thr = config::CONVERGENCE_PULSE_THRESHOLD / dec!(2);
                     let pulse_reversed = if is_yes { pulse <= -half_thr } else { pulse >= half_thr };
                     let coherence_collapsed = coh < config::CONVERGENCE_COHERENCE_MIN / dec!(2);

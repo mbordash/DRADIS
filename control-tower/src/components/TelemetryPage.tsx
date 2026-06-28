@@ -438,8 +438,7 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
           <div>
             <p className="label-muted text-xs">📡 Raptor Signal Telemetry</p>
             <p className="text-sm text-gray-400 mt-0.5">
-              Live signal collectors feeding the squadrons. Watch the raw price, velocity,
-              drift, funding and derivatives streams to understand what your vipers see —
+              Live signal collectors -- watch the data streams to understand what your vipers see —
               <span className="text-gray-500"> from spot micro-structure up to perp macro pressure.</span>
             </p>
           </div>

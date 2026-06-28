@@ -307,29 +307,54 @@ async fn run_equity_feed(quotes: QuoteMap) {
     let mut vol_windows: HashMap<&'static str, VecDeque<(Instant, Decimal)>> =
         BIG_THREE.iter().map(|s| (s.ticker, VecDeque::new())).collect();
 
+    // Consecutive 406 ("connection limit") counter. A single 406 is almost always a
+    // self-reconnect race (Alpaca hasn't reaped our prior slot yet) and clears on a
+    // short backoff; repeated 406s mean a genuine second instance shares the key, so
+    // the backoff escalates from MIN toward MAX.
+    let mut conn_limit_strikes: u32 = 0;
+
     loop {
         match stream_alpaca_iex(&key, &secret, &quotes, &mut vol_windows).await {
             Ok(())  => {
-                warn!("🌊 Tide equity feed: stream ended cleanly — reconnecting in 5s");
-                tokio::time::sleep(Duration::from_secs(5)).await;
-            }
-            // Alpaca free tier allows only ONE concurrent market-data connection
-            // per account (error 406). If another DRADIS instance (e.g. your live
-            // box) holds that connection with the same key, retrying every 5s just
-            // spams the log and never succeeds — back off hard and tell the operator
-            // exactly what to do.
-            Err(e) if e.contains("406") || e.to_lowercase().contains("connection limit") => {
+                conn_limit_strikes = 0;
                 warn!(
-                    "🌊 Tide equity feed: {e}. Alpaca's free tier permits ONE concurrent \
-                     market-data connection per account — another instance is using this key. \
-                     Use a SEPARATE Alpaca key for this instance, or disable Tide elsewhere. \
-                     Backing off 60s.",
+                    "🌊 Tide equity feed: stream ended cleanly — reconnecting in {}s",
+                    config::TIDE_RECONNECT_DELAY_SECS,
                 );
-                tokio::time::sleep(Duration::from_secs(60)).await;
+                tokio::time::sleep(Duration::from_secs(config::TIDE_RECONNECT_DELAY_SECS)).await;
+            }
+            // Alpaca free tier allows only ONE concurrent market-data connection per
+            // account (error 406). With a correctly-separated key this is almost always
+            // a self-reconnect race against our own just-dropped slot, which clears on a
+            // short backoff. Only persistent, repeated 406s indicate a real second
+            // instance sharing the key — so escalate the backoff toward the max and
+            // surface the operator action only once it's clearly not a transient race.
+            Err(e) if e.contains("406") || e.to_lowercase().contains("connection limit") => {
+                conn_limit_strikes = conn_limit_strikes.saturating_add(1);
+                let backoff = (config::TIDE_CONN_LIMIT_BACKOFF_MIN_SECS * conn_limit_strikes as u64)
+                    .min(config::TIDE_CONN_LIMIT_BACKOFF_MAX_SECS);
+                if conn_limit_strikes <= 1 {
+                    warn!(
+                        "🌊 Tide equity feed: {e}. Likely a self-reconnect race against our own \
+                         just-dropped Alpaca slot — backing off {backoff}s and retrying.",
+                    );
+                } else {
+                    warn!(
+                        "🌊 Tide equity feed: {e}. Persistent connection-limit (strike #{conn_limit_strikes}) — \
+                         another instance is likely using this key. Alpaca's free tier permits ONE \
+                         concurrent market-data connection per account: use a SEPARATE Alpaca key/account \
+                         for this instance, or disable Tide elsewhere. Backing off {backoff}s.",
+                    );
+                }
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
             }
             Err(e)  => {
-                warn!("🌊 Tide equity feed: {e} — reconnecting in 5s");
-                tokio::time::sleep(Duration::from_secs(5)).await;
+                conn_limit_strikes = 0;
+                warn!(
+                    "🌊 Tide equity feed: {e} — reconnecting in {}s",
+                    config::TIDE_RECONNECT_DELAY_SECS,
+                );
+                tokio::time::sleep(Duration::from_secs(config::TIDE_RECONNECT_DELAY_SECS)).await;
             }
         }
     }

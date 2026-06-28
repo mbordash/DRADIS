@@ -414,17 +414,23 @@ impl Strategy for TrendCaptureStrategyImpl {
     async fn evaluate_exit(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
 
-        // ── Viper-level exit signal cooldown ──────────────────────────────────
-        // Prevents FAK-miss storms: after we emit an Exit signal, suppress for
-        // EXIT_SIGNAL_COOLDOWN_SECS so patrol has time to execute before we re-fire.
-        {
+        // ── Soft-exit cooldown (reversal / take-profit only) ──────────────────
+        // After we emit a *discretionary* Exit signal, suppress further discretionary
+        // re-fires for EXIT_SIGNAL_COOLDOWN_SECS so patrol has time to execute before we
+        // re-fire (prevents FAK-miss re-fire storms).
+        //
+        // CRITICAL: safety-critical exits (stop-loss, catastrophic, near-expiry forced)
+        // are NEVER gated by this cooldown. A prior soft-exit FAK miss must not freeze the
+        // stop-loss while the position bleeds. (Jun 26 trade id 96: a reversal FAK miss at
+        // −6.5% froze ALL exit re-evaluation for 180s; the NO bid collapsed $0.43→$0.35 and
+        // the position realized −23.9% — nearly 2× the 12% stop — when the cooldown lapsed.)
+        let soft_exit_cooldown_active = {
             let last = self.last_exit_signal_at.lock().unwrap();
-            if let Some(t) = *last {
-                if t.elapsed().as_secs() < config::TRENDCAPTURE_EXIT_SIGNAL_COOLDOWN_SECS {
-                    return Ok(StrategySignal::NoSignal);
-                }
+            match *last {
+                Some(t) => t.elapsed().as_secs() < config::TRENDCAPTURE_EXIT_SIGNAL_COOLDOWN_SECS,
+                None => false,
             }
-        }
+        };
 
         // TrendCapture operates on the maker venue — resolve market/snap for exit checks
         let (market, snap) = if let (Some(mk), Some(ms)) = (&ctx.maker_market, &ctx.maker_snapshot) {
@@ -521,9 +527,10 @@ impl Strategy for TrendCaptureStrategyImpl {
                     }
                 }
 
-                // Take-profit
-                if profit_margin >= dc.trendcapture_target_profit_pct
-                    || bid >= config::TRENDCAPTURE_TAKE_PROFIT_CEILING
+                // Take-profit (discretionary — suppressed during soft-exit cooldown)
+                if !soft_exit_cooldown_active
+                    && (profit_margin >= dc.trendcapture_target_profit_pct
+                        || bid >= config::TRENDCAPTURE_TAKE_PROFIT_CEILING)
                 {
                     found = Some(make_exit(format!("TrendCaptureTP: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100)), false));
                     break 'outer;
@@ -537,8 +544,9 @@ impl Strategy for TrendCaptureStrategyImpl {
                     break 'outer;
                 }
 
-                // Trend-reversal exit
-                if secs_held >= config::TRENDCAPTURE_MIN_HOLD_BEFORE_REVERSAL_SECS {
+                // Trend-reversal exit (discretionary — suppressed during soft-exit cooldown)
+                if !soft_exit_cooldown_active
+                    && secs_held >= config::TRENDCAPTURE_MIN_HOLD_BEFORE_REVERSAL_SECS {
                     let is_yes = token_id == &market.yes_token;
                     let reversal = if is_yes {
                         drift_10m <= -reversal_thr

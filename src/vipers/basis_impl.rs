@@ -337,8 +337,10 @@ impl Strategy for BasisStrategyImpl {
             }
 
             if profit_margin <= -dc.basis_stop_loss_pct
-                && secs_held >= config::BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS
+                && (profit_margin <= -config::BASIS_CATASTROPHIC_SL_PCT
+                    || secs_held >= config::BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS)
             {
+                let is_catastrophic = profit_margin <= -config::BASIS_CATASTROPHIC_SL_PCT;
                 // EMERGENCY FIX: If the bid is too low, assume FAK will miss and defer exit.
                 // This prevents repeated exit attempts at unfillable prices, which causes log floods.
                 if position_bid < config::BASIS_MIN_STOP_LOSS_EXIT_BID {
@@ -362,7 +364,11 @@ impl Strategy for BasisStrategyImpl {
                         post_only: false,
                         ghost_mode: dc.ghost_mode,
                     },
-                    reason: format!("BasisSL: bid=${:.4}, loss={:.2}%", position_bid, profit_margin * dec!(100)),
+                    reason: if is_catastrophic {
+                        format!("BasisCatastrophicSL: bid=${:.4}, loss={:.2}% (min-hold bypassed @ {}s)", position_bid, profit_margin * dec!(100), secs_held)
+                    } else {
+                        format!("BasisSL: bid=${:.4}, loss={:.2}%", position_bid, profit_margin * dec!(100))
+                    },
                     exit_pair: false,
                 });
             }

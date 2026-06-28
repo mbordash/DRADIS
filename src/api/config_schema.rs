@@ -102,6 +102,8 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Max order-book imbalance on either leg before skipping (fill-asymmetry guard).").range(0.0, 1.0).step(0.05));
         v.push(F::new(g, e, "arbitrage_max_obi_asymmetry", "Max OBI Asymmetry", "decimal", true,
             "Max |YES_OBI − NO_OBI| before skipping — blocks lopsided books that orphan a leg.").range(0.0, 1.0).step(0.05));
+        v.push(F::new(g, e, "arbitrage_min_leg_conviction", "Min Leg Conviction", "price", false,
+            "Dominant leg bid must be ≥ this to enter — restricts arb to deep near-settlement markets and rejects ≈0.50 coin-flips (core orphan guard).").range(0.5, 1.0).step(0.01));
     }
 
     // ── Time Decay ────────────────────────────────────────────────────────────
