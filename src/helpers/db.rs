@@ -1502,15 +1502,34 @@ pub async fn update_position_from_chain(
     cur_price: Option<rust_decimal::Decimal>,
 ) {
     let cur_price_str = cur_price.map(|p| p.to_string());
-    if let Err(e) = sqlx::query(
-        "UPDATE open_positions SET shares = ?, entry_price = ?, chain_adopted = 1, current_price = COALESCE(?, current_price) WHERE token_id = ?"
-    )
-    .bind(shares.to_string())
-    .bind(avg_price.to_string())
-    .bind(&cur_price_str)
-    .bind(token_id)
-    .execute(pool)
-    .await {
+    // The Polymarket Data API frequently reports avg_price = 0 for a position whose
+    // cost basis it has not indexed yet (common in the seconds right after entry).
+    // Never let a zero/negative chain avg_price clobber the real strategy entry price:
+    // doing so destroys the cost basis and fabricates phantom unrealized P&L (e.g. a
+    // genuine $0.55 entry overwritten to $0.00 then mark-to-markets as +100% "profit").
+    // When avg_price is non-positive, correct shares + current_price ONLY and keep the
+    // existing entry_price.
+    let result = if avg_price > rust_decimal::Decimal::ZERO {
+        sqlx::query(
+            "UPDATE open_positions SET shares = ?, entry_price = ?, chain_adopted = 1, current_price = COALESCE(?, current_price) WHERE token_id = ?"
+        )
+        .bind(shares.to_string())
+        .bind(avg_price.to_string())
+        .bind(&cur_price_str)
+        .bind(token_id)
+        .execute(pool)
+        .await
+    } else {
+        sqlx::query(
+            "UPDATE open_positions SET shares = ?, chain_adopted = 1, current_price = COALESCE(?, current_price) WHERE token_id = ?"
+        )
+        .bind(shares.to_string())
+        .bind(&cur_price_str)
+        .bind(token_id)
+        .execute(pool)
+        .await
+    };
+    if let Err(e) = result {
         error!("❌ DB update_position_from_chain failed for {}: {}", token_id, e);
     }
 }
@@ -1560,6 +1579,15 @@ pub async fn adopt_chain_position(
     .await;
 
     let cur_price_str = cur_price.map(|p| p.to_string());
+    // A fresh adoption has no prior entry_price to preserve, but the Data API still
+    // frequently reports avg_price = 0 (cost basis not yet indexed). Recording a 0
+    // entry would fabricate phantom mark-to-market P&L, so fall back to the current
+    // price (the best available cost-basis estimate) when avg_price is non-positive.
+    let entry_price = if avg_price > rust_decimal::Decimal::ZERO {
+        avg_price
+    } else {
+        cur_price.unwrap_or(avg_price)
+    };
     match sqlx::query(
         "INSERT INTO open_positions
              (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted, current_price)
@@ -1571,7 +1599,7 @@ pub async fn adopt_chain_position(
     .bind(token_id)
     .bind(market)
     .bind(side)
-    .bind(avg_price.to_string())
+    .bind(entry_price.to_string())
     .bind(shares.to_string())
     .bind(&cur_price_str)
     .bind(token_id)

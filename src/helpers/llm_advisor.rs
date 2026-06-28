@@ -479,8 +479,17 @@ pub async fn run_llm_advisor_loop(
     starting_collateral: Arc<Mutex<rust_decimal::Decimal>>,
     mut config_rx: tokio::sync::watch::Receiver<Arc<DynamicConfig>>,
 ) {
-    if !config::ENABLE_LLM_ADVISOR {
-        info!("🤖 LLM Advisor: disabled (set ENABLE_LLM_ADVISOR = true in config.rs to activate)");
+    // Resolve the enable flag: the ENABLE_LLM_ADVISOR env var (if set) overrides
+    // the compile-time default. This lets a single binary run the advisor on the
+    // demo box while disabling it on the live box — the live .env sets
+    // ENABLE_LLM_ADVISOR=false and .env.demo re-enables it (demo overrides win).
+    // Accepts 1/true/yes/on (case-insensitive) as truthy; anything else is false.
+    let advisor_enabled = match std::env::var("ENABLE_LLM_ADVISOR") {
+        Ok(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        Err(_) => config::ENABLE_LLM_ADVISOR,
+    };
+    if !advisor_enabled {
+        info!("🤖 LLM Advisor: disabled (ENABLE_LLM_ADVISOR=false)");
         return;
     }
 
