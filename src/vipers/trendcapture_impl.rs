@@ -207,6 +207,16 @@ impl Strategy for TrendCaptureStrategyImpl {
         let drift_60m_blocks_bull = drift_60m >= exhaustion_thr;
         let drift_60m_blocks_bear = drift_60m <= -exhaustion_thr;
 
+        // ── Hard 60m regime confirmation (rework 2026-06-28) ──────────────────
+        // Require the 60m drift to actively AGREE with the 10m entry direction by
+        // at least align_thr, not merely "not oppose" it. This stands the strategy
+        // aside in chop (10m spike + flat 60m), the regime that produced the 22%
+        // win rate. Gated by TRENDCAPTURE_REQUIRE_60M_CONFIRMATION.
+        let drift_60m_confirms_bull = !config::TRENDCAPTURE_REQUIRE_60M_CONFIRMATION
+            || drift_60m >= align_thr;
+        let drift_60m_confirms_bear = !config::TRENDCAPTURE_REQUIRE_60M_CONFIRMATION
+            || drift_60m <= -align_thr;
+
         // ── OBI adverse-direction veto ────────────────────────────────────────
         let yes_total_depth = snap.yes_bid_depth + snap.yes_ask_depth;
         let no_total_depth  = snap.no_bid_depth  + snap.no_ask_depth;
@@ -301,6 +311,7 @@ impl Strategy for TrendCaptureStrategyImpl {
         // ══ BULL entry: buy YES when trend is strongly upward ════════════════
         if drift_10m >= bull_drift_10m_thr
             && !drift_60m_misaligned_bull
+            && drift_60m_confirms_bull
             && !drift_60m_blocks_bull
             && !obi_blocks_bull
             && !obi_exhausted_bull
@@ -355,6 +366,7 @@ impl Strategy for TrendCaptureStrategyImpl {
         // ══ BEAR entry: buy NO when trend is strongly downward ═══════════════
         if drift_10m <= bear_drift_10m_thr
             && !drift_60m_misaligned_bear
+            && drift_60m_confirms_bear
             && !drift_60m_blocks_bear
             && !obi_blocks_bear
             && !obi_exhausted_bear
@@ -557,11 +569,17 @@ impl Strategy for TrendCaptureStrategyImpl {
                     if reversal {
                         let net_profit = (bid - config::SELL_PRICE_OFFSET - avg_entry) / avg_entry;
 
-                        if net_profit <= dec!(0.06) || profit_margin <= dec!(-0.03) {
+                        // Profit-protection only (rework 2026-06-28): fire the reversal exit
+                        // ONLY when the position is net-profitable, to lock in the gain when
+                        // the trend that justified entry has flipped. Underwater positions are
+                        // left to the clean 5% stop — the old `|| profit_margin <= -3%` branch
+                        // acted as a second, looser stop that bailed at scratch losses on a
+                        // drift wiggle (33 reversal exits netted −$3.07).
+                        if net_profit > dec!(0) {
                             found = Some(make_exit(format!(
                                 "TrendCaptureRev: bid=${:.4}, drift_10m={:.0}, profit={:.2}%",
                                 bid, drift_10m, profit_margin * dec!(100)
-                            ), profit_margin < dec!(0)));
+                            ), false));
                             break 'outer;
                         }
                     }

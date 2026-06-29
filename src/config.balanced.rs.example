@@ -456,6 +456,9 @@ pub const TRENDCAPTURE_DRIFT_10M_PCT: Decimal = dec!(0.002);
 /// 60m confirmation: 0.003 = 0.30% of price. Balanced: at BTC=$100k → $300.
 pub const TRENDCAPTURE_DRIFT_60M_PCT: Decimal = dec!(0.003);
 
+/// Balanced: require 60m drift to confirm the 10m direction (stands aside in chop).
+pub const TRENDCAPTURE_REQUIRE_60M_CONFIRMATION: bool = true;
+
 // 60m confirmation thresholds — tightened to require sustained trends.
 // (60m drift thresholds merged into TRENDCAPTURE_DRIFT_60M_PCT above)
 

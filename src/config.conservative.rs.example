@@ -487,6 +487,9 @@ pub const TRENDCAPTURE_DRIFT_10M_PCT: Decimal = dec!(0.002);
 /// 0.003 = 0.30% of price. Conservative: same as balanced.
 pub const TRENDCAPTURE_DRIFT_60M_PCT: Decimal = dec!(0.003);
 
+/// Conservative: require 60m drift to confirm the 10m direction (only strong trends).
+pub const TRENDCAPTURE_REQUIRE_60M_CONFIRMATION: bool = true;
+
 // 60m exhaustion ceiling — PCT-based.
 /// 0.007 = 0.70% of price. Conservative: tighter ceiling ($700 at BTC=$100k).
 pub const TRENDCAPTURE_EXHAUSTION_DRIFT_60M_PCT: Decimal = dec!(0.007);

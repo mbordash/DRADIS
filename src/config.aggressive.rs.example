@@ -477,6 +477,9 @@ pub const TRENDCAPTURE_HIGH_CONSENSUS_ENTRY_OFFSET: Decimal = dec!(0.02);
 pub const TRENDCAPTURE_DRIFT_10M_PCT: Decimal = dec!(0.002);
 pub const TRENDCAPTURE_DRIFT_60M_PCT: Decimal = dec!(0.003);
 
+/// Aggressive: looser regime gate — 10m signal alone (60m veto only), trades more often.
+pub const TRENDCAPTURE_REQUIRE_60M_CONFIRMATION: bool = false;
+
 // 60m confirmation thresholds — raised from $150 → $300 to require sustained trends.
 // (60m drift thresholds merged into TRENDCAPTURE_DRIFT_60M_PCT above)
 
