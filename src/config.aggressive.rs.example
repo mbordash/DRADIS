@@ -249,6 +249,9 @@ pub const BASIS_POSITIVE_FUNDING_THRESHOLD: Decimal = dec!(0.0001);
 pub const BASIS_TIDE_GATE_ENABLED: bool = false;
 pub const BASIS_TIDE_PULSE_THRESHOLD: Decimal = dec!(1.0);
 pub const BASIS_TIDE_COHERENCE_THRESHOLD: Decimal = dec!(0.6);
+pub const TIDE_RECONNECT_DELAY_SECS: u64 = 12;
+pub const TIDE_CONN_LIMIT_BACKOFF_MIN_SECS: u64 = 15;
+pub const TIDE_CONN_LIMIT_BACKOFF_MAX_SECS: u64 = 60;
 /// Basis velocity ceiling: 0.0004 = 0.04% of price/5s. Aggressive: wider gate ($40 at BTC=$100k).
 pub const BASIS_MAX_VELOCITY_PCT: Decimal = dec!(0.0004);
 pub const BASIS_BTC_ORACLE_STRIKE_BUFFER: Decimal = dec!(250.0); // legacy — not used in logic
