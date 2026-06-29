@@ -437,6 +437,7 @@ impl Strategy for BasisStrategyImpl {
 }
 
 pub fn basis_trade_size(skew_abs: Decimal) -> Decimal {
+    if !config::ENABLE_KELLY_SIZING { return config::BASIS_MIN_TRADE_SIZE_USDC; }
     let threshold = config::BASIS_ENTRY_SKEW_THRESHOLD;
     if threshold <= Decimal::ZERO { return config::BASIS_MIN_TRADE_SIZE_USDC; }
     let multiplier = (skew_abs / threshold).max(Decimal::ONE).min(config::BASIS_KELLY_MAX_MULTIPLIER);

@@ -615,6 +615,7 @@ pub fn kelly_momentum_size(
     min_size:  rust_decimal::Decimal,
     max_size:  rust_decimal::Decimal,
 ) -> rust_decimal::Decimal {
+    if !config::ENABLE_KELLY_SIZING { return min_size; }
     if threshold <= rust_decimal::Decimal::ZERO { return min_size; }
     let strength = (velocity.abs() / threshold)
         .max(rust_decimal::Decimal::ONE)

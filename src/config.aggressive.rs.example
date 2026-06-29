@@ -69,6 +69,14 @@ pub const TOKEN_SOVEREIGNTY_DUST_NOTIONAL_USDC: Decimal = dec!(3.5);
 pub const RECONCILE_ADOPTED_ENTRY_DISCOUNT: Decimal = dec!(0.25);
 pub const MIN_LIQUIDITY_FILL_RATIO: Decimal = dec!(0.80);
 pub const BUY_PRICE_OFFSET: Decimal = dec!(0.01);
+
+// ── Fleet-wide risk controls (2026-06-29) ────────────────────────────────────
+/// Aggressive: keep Kelly upsizing ON (bet bigger on strong signals).
+pub const ENABLE_KELLY_SIZING: bool = true;
+/// Block entries within this many seconds of resolution (gap-through risk).
+pub const ENTRY_MIN_SECS_TO_RESOLUTION: i64 = 300;
+/// Require exit-side bid depth ≥ position × this ratio (else stop gaps through).
+pub const ENTRY_MIN_EXIT_BID_DEPTH_RATIO: Decimal = dec!(0.5);
 pub const MOMENTUM_BUY_PRICE_OFFSET: Decimal = dec!(0.04);
 pub const MOMENTUM_ENTRY_FAK_RETRIES: u32 = 3;
 pub const MAX_BUY_LIMIT_PRICE: Decimal = dec!(0.99);
@@ -521,6 +529,14 @@ pub const TRENDCAPTURE_EXIT_SIGNAL_COOLDOWN_SECS: u64 = 120;
 
 /// Aggressive: looser OBI gates — accepts more adverse-selection risk.
 pub const TRENDCAPTURE_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.60);
+
+// ── TrendReversal mode (2026-06-29) ──────────────────────────────────────────
+// Fade the detected drift (buy the opposite token) instead of following it.
+pub const TRENDREVERSAL_MODE: bool = true;
+pub const TRENDREVERSAL_EXHAUSTION_MULT: Decimal = dec!(1.5);
+pub const TRENDREVERSAL_TARGET_PROFIT_PCT: Decimal = dec!(0.20);
+pub const TRENDREVERSAL_STOP_LOSS_PCT: Decimal = dec!(0.05);
+
 pub const TRENDCAPTURE_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.85);
 
 pub const TRENDCAPTURE_KELLY_MAX_MULTIPLIER: Decimal = dec!(4.0);

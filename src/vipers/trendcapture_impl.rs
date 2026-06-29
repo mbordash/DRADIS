@@ -180,7 +180,12 @@ impl Strategy for TrendCaptureStrategyImpl {
         // All thresholds are expressed as a fraction of the current oracle price,
         // so they stay proportionally calibrated as BTC/ETH/SOL prices change.
         let oracle_price = ctx.snapshot.oracle_price;
-        let bull_drift_10m_thr = config::oracle_threshold(config::TRENDCAPTURE_DRIFT_10M_PCT, oracle_price);
+        // TrendReversal: the exhaustion multiplier raises the entry trigger so we
+        // only fade genuinely over-extended moves (1.0 = legacy trigger).
+        let exhaust_mult = if config::TRENDREVERSAL_MODE {
+            config::TRENDREVERSAL_EXHAUSTION_MULT
+        } else { dec!(1.0) };
+        let bull_drift_10m_thr = config::oracle_threshold(config::TRENDCAPTURE_DRIFT_10M_PCT, oracle_price) * exhaust_mult;
         let bear_drift_10m_thr = -bull_drift_10m_thr;
         let bull_strike_gap    = config::oracle_threshold(config::TRENDCAPTURE_STRIKE_GAP_PCT, oracle_price);
         let bear_strike_gap    = bull_strike_gap;
@@ -251,8 +256,12 @@ impl Strategy for TrendCaptureStrategyImpl {
             }
         };
 
-        // ── Kelly-fractional position sizing ──────────────────────────────────
+        // ── Position sizing ───────────────────────────────────────────────────
         let trade_size = |drift_abs: Decimal| -> Decimal {
+            // Flat sizing when Kelly is disabled — never upsize into a fade.
+            if !config::ENABLE_KELLY_SIZING {
+                return dc.trendcapture_min_trade_size_usdc;
+            }
             let thr = bull_drift_10m_thr.abs().max(Decimal::ONE);
             let strength = (drift_abs / thr)
                 .max(Decimal::ONE)
@@ -327,36 +336,49 @@ impl Strategy for TrendCaptureStrategyImpl {
                 && yes_ask >= effective_min_price
                 && yes_ask <= dc.trendcapture_max_entry_price
             {
-                // Per-token spread gate: a hollow bid side guarantees an instant
-                // stop-out (SL is measured against the bid). Skip if the YES
-                // bid-ask spread exceeds the cap.
-                let yes_spread = if yes_ask > dec!(0) {
-                    (yes_ask - snap.yes_bid) / yes_ask
+                // ── TrendReversal: fade-token selection ───────────────────────
+                // A strong, confirmed UP drift is already priced in and tends to
+                // mean-revert on these binaries — so BUY NO (fade) instead of YES.
+                // (TRENDREVERSAL_MODE=false restores trend-following: buy YES.)
+                let (buy_token, buy_ask, buy_bid, buy_bid_depth, buy_fee) = if config::TRENDREVERSAL_MODE {
+                    (market.no_token.clone(),  no_ask,  snap.no_bid,  snap.no_bid_depth,  market.no_fee_bps as u16)
+                } else {
+                    (market.yes_token.clone(), yes_ask, snap.yes_bid, snap.yes_bid_depth, market.yes_fee_bps as u16)
+                };
+
+                // Per-token spread gate on the BOUGHT token: a hollow bid side
+                // guarantees an instant stop-out (SL is measured against the bid).
+                let buy_spread = if buy_ask > dec!(0) {
+                    (buy_ask - buy_bid) / buy_ask
                 } else { Decimal::ONE };
-                if yes_spread > config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT {
-                    debug!(" TrendCapture BULL blocked: YES spread {:.1}% > max {:.1}% (ask={:.3} bid={:.3}) — hollow bid would force instant SL",
-                        yes_spread * dec!(100), config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT * dec!(100), yes_ask, snap.yes_bid);
+                if buy_spread > config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT {
+                    debug!(" TrendReversal BULL→fade blocked: bought-token spread {:.1}% > max {:.1}% (ask={:.3} bid={:.3}) — hollow bid would force instant SL",
+                        buy_spread * dec!(100), config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT * dec!(100), buy_ask, buy_bid);
                     return Ok(StrategySignal::NoSignal);
                 }
 
-                // Cooldown check
-                let token_id = market.yes_token.clone();
+                // Cooldown check (keyed by the bought token)
+                let token_id = buy_token;
                 let cdl = effective_cooldown(&market.condition_id);
                 let in_cooldown = cooldowns.get(&token_id)
                     .map(|t| t.elapsed().as_secs() < cdl)
                     .unwrap_or(false);
                 if !in_cooldown {
                     let size = trade_size(drift_10m.abs());
-                    // Marketable entry: price at the YES ask so the FAK order crosses
-                    // and fills immediately while the bullish drift is still live.
-                    // (A passive ask − 0.01 bid only fills on a reversal — see macro note.)
-                    let entry_price = yes_ask;
-                    debug!(" TrendCapture BULL entry: drift_10m={:.0} drift_60m={:.0} align_thr={:.0} yes_ask={:.3} entry={:.3} size={:.2}",
-                        drift_10m, drift_60m, align_thr, yes_ask, entry_price, size);
+                    let entry_price = buy_ask;
+                    // Liquidity / near-resolution gate: don't enter where a stop
+                    // would gap through (thin exit bid or too close to close).
+                    let intended_shares = if entry_price > dec!(0) { size / entry_price } else { dec!(0) };
+                    if let Some(reason) = crate::vipers::entry_liquidity_gate(secs_left, intended_shares, buy_bid_depth) {
+                        debug!(" TrendReversal BULL→fade blocked: {}", reason);
+                        return Ok(StrategySignal::NoSignal);
+                    }
+                    debug!(" TrendReversal BULL→fade entry (drift UP, buying NO): drift_10m={:.0} drift_60m={:.0} align_thr={:.0} buy_ask={:.3} entry={:.3} size={:.2}",
+                        drift_10m, drift_60m, align_thr, buy_ask, entry_price, size);
                     drop(cooldowns);
                     drop(consec);
                     return Ok(StrategySignal::Entry {
-                        params: entry_params!(token_id, entry_price, market.yes_fee_bps as u16, size),
+                        params: entry_params!(token_id, entry_price, buy_fee, size),
                         pair_params: None,
                     });
                 }
@@ -381,35 +403,48 @@ impl Strategy for TrendCaptureStrategyImpl {
                 && no_ask >= effective_min_price
                 && no_ask <= dc.trendcapture_max_entry_price
             {
-                // Per-token spread gate: a hollow bid side guarantees an instant
-                // stop-out (SL is measured against the bid). Skip if the NO
-                // bid-ask spread exceeds the cap. This is exactly the Jun 20
-                // trade id 51 failure: NO ask 0.326 / bid 0.241 = 26% spread.
-                let no_spread = if no_ask > dec!(0) {
-                    (no_ask - snap.no_bid) / no_ask
+                // ── TrendReversal: fade-token selection ───────────────────────
+                // A strong, confirmed DOWN drift is already priced in and tends to
+                // mean-revert — so BUY YES (fade) instead of NO.
+                // (TRENDREVERSAL_MODE=false restores trend-following: buy NO.)
+                let (buy_token, buy_ask, buy_bid, buy_bid_depth, buy_fee) = if config::TRENDREVERSAL_MODE {
+                    (market.yes_token.clone(), yes_ask, snap.yes_bid, snap.yes_bid_depth, market.yes_fee_bps as u16)
+                } else {
+                    (market.no_token.clone(),  no_ask,  snap.no_bid,  snap.no_bid_depth,  market.no_fee_bps as u16)
+                };
+
+                // Per-token spread gate on the BOUGHT token (see Jun 20 id 51:
+                // NO ask 0.326 / bid 0.241 = 26% spread → instant −23% stop-out).
+                let buy_spread = if buy_ask > dec!(0) {
+                    (buy_ask - buy_bid) / buy_ask
                 } else { Decimal::ONE };
-                if no_spread > config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT {
-                    debug!(" TrendCapture BEAR blocked: NO spread {:.1}% > max {:.1}% (ask={:.3} bid={:.3}) — hollow bid would force instant SL",
-                        no_spread * dec!(100), config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT * dec!(100), no_ask, snap.no_bid);
+                if buy_spread > config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT {
+                    debug!(" TrendReversal BEAR→fade blocked: bought-token spread {:.1}% > max {:.1}% (ask={:.3} bid={:.3}) — hollow bid would force instant SL",
+                        buy_spread * dec!(100), config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT * dec!(100), buy_ask, buy_bid);
                     return Ok(StrategySignal::NoSignal);
                 }
 
-                let token_id = market.no_token.clone();
+                let token_id = buy_token;
                 let cdl = effective_cooldown(&market.condition_id);
                 let in_cooldown = cooldowns.get(&token_id)
                     .map(|t| t.elapsed().as_secs() < cdl)
                     .unwrap_or(false);
                 if !in_cooldown {
                     let size = trade_size(drift_10m.abs());
-                    // Marketable entry: price at the NO ask so the FAK order crosses
-                    // and fills immediately while the bearish drift is still live.
-                    let entry_price = no_ask;
-                    debug!(" TrendCapture BEAR entry: drift_10m={:.0} drift_60m={:.0} align_thr={:.0} no_ask={:.3} entry={:.3} size={:.2}",
-                        drift_10m, drift_60m, align_thr, no_ask, entry_price, size);
+                    let entry_price = buy_ask;
+                    // Liquidity / near-resolution gate: don't enter where a stop
+                    // would gap through (thin exit bid or too close to close).
+                    let intended_shares = if entry_price > dec!(0) { size / entry_price } else { dec!(0) };
+                    if let Some(reason) = crate::vipers::entry_liquidity_gate(secs_left, intended_shares, buy_bid_depth) {
+                        debug!(" TrendReversal BEAR→fade blocked: {}", reason);
+                        return Ok(StrategySignal::NoSignal);
+                    }
+                    debug!(" TrendReversal BEAR→fade entry (drift DOWN, buying YES): drift_10m={:.0} drift_60m={:.0} align_thr={:.0} buy_ask={:.3} entry={:.3} size={:.2}",
+                        drift_10m, drift_60m, align_thr, buy_ask, entry_price, size);
                     drop(cooldowns);
                     drop(consec);
                     return Ok(StrategySignal::Entry {
-                        params: entry_params!(token_id, entry_price, market.no_fee_bps as u16, size),
+                        params: entry_params!(token_id, entry_price, buy_fee, size),
                         pair_params: None,
                     });
                 }
@@ -462,12 +497,26 @@ impl Strategy for TrendCaptureStrategyImpl {
         // Dynamic SL: tighter in the last hour before expiry
         let secs_left_opt = market.market_close_time
             .map(|ct| (ct - Utc::now()).num_seconds());
-        // Use the base stop_loss_pct without multiplier.
-        // The previous * 1.5 multiplier inflated a 12% SL to 18%, collapsing R:R to ~1.1
-        // at max entry price. At 0.55 max entry, base 12% SL gives R:R = 20/12 = 1.67.
-        let stop_loss_pct = match secs_left_opt {
-            Some(s) if s < config::TRENDCAPTURE_LATE_MARKET_SL_SECS => config::TRENDCAPTURE_LATE_MARKET_STOP_LOSS_PERCENT,
-            _ => dc.trendcapture_stop_loss_pct,
+        // Tradelog/reason tag reflecting the active thesis.
+        let tag = if config::TRENDREVERSAL_MODE { "TrendReversal" } else { "TrendCapture" };
+
+        // Stop-loss percentage. In fade mode use the tight TRENDREVERSAL stop (the
+        // failure mode is the trend continuing, which is fast). Otherwise the legacy
+        // dynamic stop (tighter near expiry).
+        let stop_loss_pct = if config::TRENDREVERSAL_MODE {
+            config::TRENDREVERSAL_STOP_LOSS_PCT
+        } else {
+            match secs_left_opt {
+                Some(s) if s < config::TRENDCAPTURE_LATE_MARKET_SL_SECS => config::TRENDCAPTURE_LATE_MARKET_STOP_LOSS_PERCENT,
+                _ => dc.trendcapture_stop_loss_pct,
+            }
+        };
+
+        // Take-profit target. Fade mode lets the reversion run to a wide target.
+        let tp_target = if config::TRENDREVERSAL_MODE {
+            config::TRENDREVERSAL_TARGET_PROFIT_PCT
+        } else {
+            dc.trendcapture_target_profit_pct
         };
 
         // Collect exit decision inside the lock scope, then act outside it.
@@ -527,6 +576,20 @@ impl Strategy for TrendCaptureStrategyImpl {
                     is_sl,
                 };
 
+                // ── Catastrophic stop — ALWAYS active ─────────────────────────
+                // Fires regardless of fill-confirmation AND the minimum-hold window.
+                // Previously the catastrophic check lived only in the pre-confirmation
+                // branch, so a CONFIRMED position in its first FILL_CONFIRM_MIN_HOLD_SECS
+                // (30s) had NO stop at all — the exact blackout that let the 2026-06-29
+                // 09:30 trade gap from entry to −18% in 34s before the normal 5% stop
+                // became eligible. The hard catastrophic floor must never be frozen.
+                if profit_margin <= -config::TRENDCAPTURE_CATASTROPHIC_SL_PCT {
+                    found = Some(make_exit(format!(
+                        "{}Catastrophic: bid=${:.4}, loss={:.2}%",
+                        tag, bid, profit_margin * dec!(100)), true));
+                    break 'outer;
+                }
+
                 // Near-expiry forced exit
                 if let Some(close_time) = market.market_close_time {
                     let secs_left = (close_time - Utc::now()).num_seconds();
@@ -534,17 +597,17 @@ impl Strategy for TrendCaptureStrategyImpl {
                     if secs_left <= config::TRENDCAPTURE_EXPIRY_EXIT_SECS
                         && net_profit < config::TRENDCAPTURE_EXPIRY_MIN_PROFIT_TO_HOLD
                     {
-                        found = Some(make_exit(format!("TrendCaptureNearExpiry: bid=${:.4}, net={:.2}%", bid, net_profit * dec!(100)), true));
+                        found = Some(make_exit(format!("{}NearExpiry: bid=${:.4}, net={:.2}%", tag, bid, net_profit * dec!(100)), true));
                         break 'outer;
                     }
                 }
 
                 // Take-profit (discretionary — suppressed during soft-exit cooldown)
                 if !soft_exit_cooldown_active
-                    && (profit_margin >= dc.trendcapture_target_profit_pct
+                    && (profit_margin >= tp_target
                         || bid >= config::TRENDCAPTURE_TAKE_PROFIT_CEILING)
                 {
-                    found = Some(make_exit(format!("TrendCaptureTP: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100)), false));
+                    found = Some(make_exit(format!("{}TP: bid=${:.4}, profit={:.2}%", tag, bid, profit_margin * dec!(100)), false));
                     break 'outer;
                 }
 
@@ -552,12 +615,15 @@ impl Strategy for TrendCaptureStrategyImpl {
                 if secs_held >= config::TRENDCAPTURE_FILL_CONFIRM_MIN_HOLD_SECS
                     && profit_margin <= -stop_loss_pct
                 {
-                    found = Some(make_exit(format!("TrendCaptureSL: bid=${:.4}, loss={:.2}%", bid, profit_margin * dec!(100)), true));
+                    found = Some(make_exit(format!("{}SL: bid=${:.4}, loss={:.2}%", tag, bid, profit_margin * dec!(100)), true));
                     break 'outer;
                 }
 
-                // Trend-reversal exit (discretionary — suppressed during soft-exit cooldown)
-                if !soft_exit_cooldown_active
+                // Trend-reversal exit — trend-FOLLOWING only. In fade (TrendReversal)
+                // mode the entry already fades the drift, so a drift flip is the
+                // thesis playing OUT, not a reason to bail; rely on TP/SL/catastrophic.
+                if !config::TRENDREVERSAL_MODE
+                    && !soft_exit_cooldown_active
                     && secs_held >= config::TRENDCAPTURE_MIN_HOLD_BEFORE_REVERSAL_SECS {
                     let is_yes = token_id == &market.yes_token;
                     let reversal = if is_yes {
@@ -620,7 +686,9 @@ impl Strategy for TrendCaptureStrategyImpl {
     fn name(&self) -> String { "TrendCaptureStrategy".to_string() }
     fn venue(&self) -> &'static str { "Window/Daily" }
     fn max_exposure(&self) -> Decimal { config::TRENDCAPTURE_MAX_EXPOSURE_USDC }
-    fn risk_model(&self) -> &'static str { "One-sided drift" }
+    fn risk_model(&self) -> &'static str {
+        if config::TRENDREVERSAL_MODE { "Drift fade (mean-reversion)" } else { "One-sided drift" }
+    }
 }
 
 impl TrendCaptureStrategyImpl {
@@ -653,6 +721,7 @@ pub fn kelly_trendcapture_size(
     min_size:  Decimal,
     max_size:  Decimal,
 ) -> Decimal {
+    if !config::ENABLE_KELLY_SIZING { return min_size; }
     if threshold <= Decimal::ZERO { return min_size; }
     let strength = (drift_abs / threshold)
         .max(Decimal::ONE)

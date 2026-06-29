@@ -930,6 +930,9 @@ fn scale_trade_size(
     max_exposure: Decimal, // dc.gboost_max_exposure_usdc
 ) -> Decimal {
     let min_exposure = config::GBOOST_MIN_EXPOSURE_USDC;
+    // Flat sizing fleet-wide: when Kelly/confidence upsizing is disabled, trade the
+    // base (minimum) exposure regardless of model confidence.
+    if !config::ENABLE_KELLY_SIZING { return min_exposure; }
     // Confidence scale: fraction of the [threshold, 1.0] range that `confidence` covers.
     let conf_range = (1.0_f64 - entry_thresh).max(1e-9);
     let conf_excess = (confidence - entry_thresh).max(0.0);

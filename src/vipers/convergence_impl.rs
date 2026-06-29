@@ -185,6 +185,17 @@ impl Strategy for ConvergenceStrategyImpl {
             }
         }
 
+        // ── Liquidity / near-resolution entry gate (2026-06-29) ───────────────
+        // Block entries that would gap through the stop: too close to resolution,
+        // or our position larger than the resting depth on our future-exit bid.
+        let intended_shares = size / ask;
+        let exit_bid_depth = if want_bull { snap.yes_bid_depth } else { snap.no_bid_depth };
+        let secs_left = market.market_close_time.map(|ct| (ct - Utc::now()).num_seconds());
+        if let Some(reason) = crate::vipers::entry_liquidity_gate(secs_left, intended_shares, exit_bid_depth) {
+            debug!(" Convergence blocked: {}", reason);
+            return Ok(StrategySignal::NoSignal);
+        }
+
         debug!(
             " Convergence {} entry: pulse={:.2} coh={:.2} cvd={:.2} oi={:.3} | {} ask={:.3} size=${:.2}",
             if want_bull { "BULL" } else { "BEAR" },
