@@ -155,6 +155,30 @@ impl Strategy for ConvergenceStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── Adverse order-book imbalance gate (2026-06-30) ────────────────────
+        // Direction comes from the slow institutional pulse, but we must not enter
+        // INTO a book stacked the other way. obi_yes = (yes_bid − yes_ask)/total.
+        // Audit (15 trades): every NO entry with obi_yes > +0.5 lost (4/4, incl. a
+        // −20.9% catastrophic); no winner on either side had adverse OBI ≥ 0.5.
+        //   NO  (want_bear): adverse if YES has buy pressure  → obi_yes > +block
+        //   YES (want_bull): adverse if YES has sell pressure → obi_yes < −block
+        let yes_depth = snap.yes_bid_depth + snap.yes_ask_depth;
+        let obi_yes = if yes_depth > dec!(0) {
+            (snap.yes_bid_depth - snap.yes_ask_depth) / yes_depth
+        } else {
+            dec!(0)
+        };
+        let obi_adverse = if want_bull {
+            obi_yes < -config::CONVERGENCE_OBI_ADVERSE_BLOCK
+        } else {
+            obi_yes > config::CONVERGENCE_OBI_ADVERSE_BLOCK
+        };
+        if obi_adverse {
+            debug!(" Convergence blocked: adverse OBI (obi_yes={:.2}, want_bull={}) — book stacked against entry",
+                obi_yes, want_bull);
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Pick the token + touch price ──────────────────────────────────────
         let (token_id, ask, bid, fee_bps) = if want_bull {
             (market.yes_token.clone(), snap.yes_ask, snap.yes_bid, market.yes_fee_bps as u16)

@@ -936,6 +936,7 @@ pub const CONVERGENCE_MAX_TOKEN_SPREAD_PCT: Decimal = dec!(0.12);
 pub const CONVERGENCE_EXHAUSTION_DRIFT_60M_PCT: Decimal = dec!(0.0012);
 pub const CONVERGENCE_SKIP_BAND_LOW: Decimal = dec!(0.43);
 pub const CONVERGENCE_SKIP_BAND_HIGH: Decimal = dec!(0.57);
+pub const CONVERGENCE_OBI_ADVERSE_BLOCK: Decimal = dec!(0.45); // 2026-06-30: block entry into adverse order-book imbalance
 
 /// Entry-relative take-profit and stop-loss.
 pub const CONVERGENCE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.15);
