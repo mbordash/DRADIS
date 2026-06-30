@@ -5,7 +5,7 @@ use crate::vipers::time_decay_impl::TimeDecayStrategyImpl;
 use crate::vipers::maker_impl::MakerStrategyImpl;
 use crate::vipers::basis_impl::BasisStrategyImpl;
 use crate::vipers::gboost_impl::GboostStrategyImpl;
-use crate::vipers::trendcapture_impl::TrendCaptureStrategyImpl;
+use crate::vipers::trendreversal_impl::TrendReversalStrategyImpl;
 use crate::vipers::convergence_impl::ConvergenceStrategyImpl;
 use crate::config;
 use rust_decimal_macros::dec;
@@ -56,11 +56,14 @@ impl StrategyRegistry {
             config::GBOOST_STOP_LOSS_PERCENT * dec!(100),
         );
         info!(
-            "   TrendCapture| reversal_pct={} (×oracle) | min_entry=${} late=${} | max_ask_sum={} | late_SL={}% | tp_ceiling=${}",
-            config::TRENDCAPTURE_REVERSAL_DRIFT_PCT, config::TRENDCAPTURE_MIN_ENTRY_PRICE,
+            "   {}| mode={} exhaust_mult={} | TP={}% SL={}% (fade) | min_entry=${} late=${} | max_ask_sum={}",
+            if config::TRENDREVERSAL_MODE { "TrendReversal" } else { "TrendCapture " },
+            if config::TRENDREVERSAL_MODE { "FADE drift" } else { "FOLLOW drift" },
+            config::TRENDREVERSAL_EXHAUSTION_MULT,
+            config::TRENDREVERSAL_TARGET_PROFIT_PCT * dec!(100),
+            config::TRENDREVERSAL_STOP_LOSS_PCT * dec!(100),
+            config::TRENDCAPTURE_MIN_ENTRY_PRICE,
             config::TRENDCAPTURE_LATE_MARKET_MIN_ENTRY_PRICE, config::TRENDCAPTURE_MAX_ENTRY_ASK_SUM,
-            config::TRENDCAPTURE_LATE_MARKET_STOP_LOSS_PERCENT * dec!(100),
-            config::TRENDCAPTURE_TAKE_PROFIT_CEILING,
         );
         info!(
             "   Convergence | pulse_thr={} coh_min={} cvd_margin={} | size=${} max_exp=${} | TP={}% SL={}% (BTC-only, live)",
@@ -84,7 +87,7 @@ impl StrategyRegistry {
             Box::new(MakerStrategyImpl::new())             as Box<dyn Strategy>,
             Box::new(BasisStrategyImpl)                    as Box<dyn Strategy>,
             Box::new(GboostStrategyImpl::default())        as Box<dyn Strategy>,
-            Box::new(TrendCaptureStrategyImpl::new())      as Box<dyn Strategy>,
+            Box::new(TrendReversalStrategyImpl::new())      as Box<dyn Strategy>,
             Box::new(ConvergenceStrategyImpl::new())       as Box<dyn Strategy>,
         ]
     }
@@ -119,7 +122,7 @@ impl StrategyRegistry {
             "MakerStrategy",
             "BasisStrategy",
             "GboostStrategy",
-            "TrendCaptureStrategy",
+            "TrendReversalStrategy",
             "ConvergenceStrategy",
         ]
         .into_iter().map(|s| s.to_string()).collect()

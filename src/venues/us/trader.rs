@@ -534,7 +534,8 @@ fn strategy_name_to_kind(name: &str) -> &'static str {
         "TimeDecayStrategy"    => "time_decay",
         "BasisStrategy"        => "basis",
         "GboostStrategy"       => "gboost",
-        "TrendCaptureStrategy" => "trendcapture",
+        "TrendReversalStrategy" => "trendcapture",
+        "TrendCaptureStrategy" => "trendcapture", // legacy alias (pre-rename positions)
         _ => "",
     }
 }

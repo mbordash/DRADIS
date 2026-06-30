@@ -129,6 +129,21 @@ impl Strategy for ConvergenceStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── 60m drift exhaustion ceiling (2026-06-30) ─────────────────────────
+        // Block when BTC has already moved hard in the entry direction over the
+        // last hour — the move is priced in and prone to revert. Audit: losers
+        // entered at avg |drift_60m| ≈ $116 vs winners ≈ $34.
+        let exhaustion_thr = config::oracle_threshold(
+            config::CONVERGENCE_EXHAUSTION_DRIFT_60M_PCT, snap.oracle_price);
+        let drift_60m = snap.oracle_drift_60m;
+        if (want_bull && drift_60m >= exhaustion_thr)
+            || (want_bear && drift_60m <= -exhaustion_thr)
+        {
+            debug!(" Convergence blocked: 60m drift exhausted ({:.0} vs ±{:.0}) — move already priced in",
+                drift_60m, exhaustion_thr);
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // Derivatives taker flow must CONFIRM the side. `cvd == 0` means no FAPI
         // data → no confirmation → stand down (conviction requires live confirmation).
         let cvd_confirms = if want_bull {
@@ -149,6 +164,16 @@ impl Strategy for ConvergenceStrategyImpl {
 
         // ── Price / spread gates ──────────────────────────────────────────────
         if ask < config::CONVERGENCE_MIN_ENTRY_PRICE || ask > dc.convergence_max_entry_price {
+            return Ok(StrategySignal::NoSignal);
+        }
+        // Coin-flip skip band: avoid the ~$0.50 zone (max binary uncertainty, most
+        // gap-prone near resolution — the audit's worst price band).
+        if config::CONVERGENCE_SKIP_BAND_LOW < config::CONVERGENCE_SKIP_BAND_HIGH
+            && ask >= config::CONVERGENCE_SKIP_BAND_LOW
+            && ask <= config::CONVERGENCE_SKIP_BAND_HIGH
+        {
+            debug!(" Convergence blocked: ask {:.3} in coin-flip skip band [{:.2}, {:.2}]",
+                ask, config::CONVERGENCE_SKIP_BAND_LOW, config::CONVERGENCE_SKIP_BAND_HIGH);
             return Ok(StrategySignal::NoSignal);
         }
         let spread = if ask > dec!(0) { (ask - bid) / ask } else { Decimal::ONE };

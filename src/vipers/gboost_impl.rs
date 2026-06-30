@@ -453,6 +453,11 @@ pub struct GboostStrategyImpl {
     /// where the model enters YES, exits quickly, then immediately enters NO (or vice versa).
     /// Both YES and NO entries check this lock; it is set whenever either fires.
     market_hold_locks: Arc<StdMutex<std::collections::HashMap<String, Instant>>>,
+    /// Throttle for the prediction-confidence diagnostic log (INFO).
+    /// GBoost rarely trades, so we log the model's peak conviction periodically to
+    /// reveal how close it gets to the entry threshold — calibration visibility when
+    /// no entry fires. Rate-limited to GBOOST_PRED_LOG_INTERVAL_SECS.
+    last_pred_log_at: Arc<StdMutex<Option<Instant>>>,
 }
 
 impl GboostStrategyImpl {
@@ -541,6 +546,7 @@ impl GboostStrategyImpl {
             consecutive_drift_above_threshold: Arc::new(StdMutex::new(0)),
             consecutive_stable_retrains: Arc::new(StdMutex::new(0)),
             market_hold_locks: Arc::new(StdMutex::new(std::collections::HashMap::new())),
+            last_pred_log_at: Arc::new(StdMutex::new(None)),
         }
     }
 
@@ -1171,6 +1177,27 @@ impl Strategy for GboostStrategyImpl {
             Some(p) => p,
             None    => return Ok(StrategySignal::NoSignal),
         };
+
+        // ── Diagnostic: periodic prediction-confidence visibility ────────────
+        // GBoost trades rarely, so without this we are blind to how confident the
+        // model actually gets. Log the conviction (distance from 0.50) and whether
+        // it cleared the entry threshold, rate-limited so it never floods. This is
+        // the data we use to calibrate gboost_entry_threshold.
+        {
+            let entry_thresh_dbg = dc.gboost_entry_threshold.to_f64().unwrap_or(0.65);
+            let conviction = (p_yes_up - 0.5).abs() * 2.0; // 0.0 at coin-flip, 1.0 at certainty
+            let would_fire = p_yes_up >= entry_thresh_dbg || p_yes_up <= 1.0 - entry_thresh_dbg;
+            let mut last = self.last_pred_log_at.lock().unwrap();
+            let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::GBOOST_PRED_LOG_INTERVAL_SECS);
+            if due {
+                *last = Some(Instant::now());
+                tracing::info!(
+                    " GboostStrategy: P(UP)={:.3} conviction={:.2} thr={:.2} {}",
+                    p_yes_up, conviction, entry_thresh_dbg,
+                    if would_fire { "→ ENTRY-ELIGIBLE (checking quality gates)" } else { "(below threshold)" },
+                );
+            }
+        }
 
         // ── Gate: concept drift suppression ──────────────────────────────────
         // If the last retrain detected that live market data is flowing through

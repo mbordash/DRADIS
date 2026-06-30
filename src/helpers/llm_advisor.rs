@@ -124,11 +124,12 @@ Maker (GTC/post-only) orders pay 0% fee; taker (FAK) orders pay the dynamic fee.
                   from 19 orderbook + oracle features.  Retrained every 30s.
                   Has concept-drift suppression: if market regime shifts significantly,
                   entries are blocked until the next retrain clears the drift flag.
-7. TRENDCAPTURE — Exploits sustained oracle drift on Window/Daily markets.
-                  Buys YES (BULL) or NO (BEAR) when 10-min and 60-min drift both
-                  exceed asset-specific thresholds.  One-sided, maker venue, uses
-                  Kelly-fractional sizing.  Exits via TP, dynamic SL (tighter near
-                  expiry), trend-reversal signal, or near-expiry forced exit.
+7. TRENDREVERSAL — Fades priced-in oracle drift on Window/Daily markets.
+                  Buys NO when 10-min and 60-min drift are strongly BULL, YES when
+                  strongly BEAR (the move is already in the token price and tends to
+                  mean-revert).  One-sided, maker venue, flat sizing.  Asymmetric
+                  exits: wide TP to catch the reversion, tight SL when the trend
+                  instead continues, plus an always-on catastrophic stop.
                   Common failure: drift reversal before TP; adverse OBI at entry;
                   position held too long on ranging/sideways oracle.
 

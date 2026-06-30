@@ -71,7 +71,7 @@ pub const BUY_PRICE_OFFSET: Decimal = dec!(0.01);
 /// Balanced: flat sizing — cap losses on violent high-strength setups.
 pub const ENABLE_KELLY_SIZING: bool = false;
 /// Block entries within this many seconds of resolution (gap-through risk).
-pub const ENTRY_MIN_SECS_TO_RESOLUTION: i64 = 600;
+pub const ENTRY_MIN_SECS_TO_RESOLUTION: i64 = 900;
 /// Require exit-side bid depth ≥ position × this ratio (else stop gaps through).
 pub const ENTRY_MIN_EXIT_BID_DEPTH_RATIO: Decimal = dec!(1.0);
 pub const MOMENTUM_BUY_PRICE_OFFSET: Decimal = dec!(0.02);
@@ -342,7 +342,8 @@ pub const GBOOST_MIN_TRAINING_SAMPLES: usize = 320;
 pub const GBOOST_RETRAIN_EVERY_N: usize = 200;
 pub const GBOOST_BUDGET: f32 = 0.80; // raised from 0.65 — gives perpetual room to grow past 1 tree
 pub const GBOOST_NUM_THREADS: usize = 2;
-pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.80);
+pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.72); // 2026-06-30: lowered (0.88 startup default produced zero trades in 13d)
+pub const GBOOST_PRED_LOG_INTERVAL_SECS: u64 = 120; // periodic P(UP) conviction diagnostic
 pub const GBOOST_POST_EXIT_COOLDOWN_SECS: i64 = 300;
 /// Balanced: matches current config.rs — tightened from -0.20 based on 2026-05-07 session data.
 pub const GBOOST_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.25);
@@ -860,6 +861,10 @@ pub const CONVERGENCE_MIN_ENTRY_PRICE: Decimal = dec!(0.35);
 /// Max per-token bid-ask spread (fraction of ask). A hollow bid guarantees an
 /// instant stop-out, so skip when the spread is wider than this.
 pub const CONVERGENCE_MAX_TOKEN_SPREAD_PCT: Decimal = dec!(0.12);
+
+pub const CONVERGENCE_EXHAUSTION_DRIFT_60M_PCT: Decimal = dec!(0.0015);
+pub const CONVERGENCE_SKIP_BAND_LOW: Decimal = dec!(0.45);
+pub const CONVERGENCE_SKIP_BAND_HIGH: Decimal = dec!(0.55);
 
 /// Entry-relative take-profit and stop-loss.
 pub const CONVERGENCE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.15);

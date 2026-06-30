@@ -197,11 +197,11 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Hard cap on total GBoost capital at risk.").min(0.0).step(0.5).unit("USDC"));
     }
 
-    // ── TrendCapture ────────────────────────────────────────────────────────────
+    // ── TrendReversal ─────────────────────────────────────────────────────────────
     {
-        let g = "TrendCapture"; let e = Some("enable_trendcapture");
+        let g = "TrendReversal"; let e = Some("enable_trendcapture");
         v.push(F::new(g, e, "enable_trendcapture", "Enabled", "bool", false,
-            "Rides sustained oracle drift with maker entries."));
+            "Fades priced-in oracle drift (TrendReversal): buys the opposite token to a strong, confirmed move and rides the mean-reversion."));
         v.push(F::new(g, e, "trendcapture_min_trade_size_usdc", "Min Size", "usd", false,
             "Lower bound on Kelly-sized trade.").min(0.0).step(0.5).unit("USDC"));
         v.push(F::new(g, e, "trendcapture_max_trade_size_usdc", "Max Size", "usd", false,

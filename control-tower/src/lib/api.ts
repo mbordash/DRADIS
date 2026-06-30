@@ -210,11 +210,11 @@ export const VIPER_DEFS: ViperDef[] = [
     description: 'Online gradient-boosted orderbook classifier',
   },
   {
-    name: 'TrendCapture',
+    name: 'TrendReversal',
     enableKey: 'enable_trendcapture',
     accentColor: 'rose',
     statusKey: 'trendcapture',
-    description: 'Rides sustained multi-minute oracle drift on Window/Daily markets',
+    description: 'Fades priced-in multi-minute oracle drift on Window/Daily markets (mean-reversion)',
   },
   {
     name: 'Convergence',

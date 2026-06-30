@@ -1,35 +1,53 @@
-/// TrendCapture Strategy — Sustained Oracle Drift on Window/Daily Markets
+/// TrendCapture / TrendReversal Strategy — Oracle-Drift Fade on Window/Daily Markets
 ///
 /// # Thesis
 ///
-/// Polymarket binary markets on window (4h) and daily horizons frequently **lag**
-/// the Binance oracle when BTC makes a sustained multi-minute directional move.
-/// While `MomentumStrategy` handles 5-second velocity spikes on hourly markets,
-/// TrendCapture exploits drift events where:
+/// Live results (60 trades, 22% win, −$19.74) showed that *following* a strong,
+/// confirmed oracle drift on these binary markets loses: by the time the 10m AND
+/// 60m windows both confirm a move, it is already priced into the YES/NO token and
+/// tends to **mean-revert**. A same-entry / opposite-token study over those 60
+/// trades flipped the record to 73% wins / +$14.46. So the strategy now **fades**
+/// the drift instead of riding it.
 ///
-///   - BTC has moved meaningfully over both the 10-minute AND 60-minute windows
-///   - The corresponding YES/NO token is still in the tradable price range
-///     (market hasn't fully priced in the move yet)
-///   - BTC spot is already meaningfully away from the strike price
+/// Entry trigger (unchanged): BTC has moved meaningfully over both the 10-minute
+/// AND 60-minute windows (sustained, confirmed drift), the token is in the tradable
+/// price band, and spot is meaningfully away from the strike.
 ///
-/// Example — today's BTC crash:
-///   drift_10m = −$150 (BTC fell $150 in 10 min)
-///   drift_60m = −$400 (BTC fell $400 in 60 min, confirmed downtrend)
-///   binance_price = $66,900  vs  daily_strike = $68,000  → $1,100 below strike
-///   NO on daily market still priced at $0.58  ← entry window
-///   → TrendCapture buys NO at $0.58, targets $0.78 (+20 TP)
+/// Direction (flipped by `config::TRENDREVERSAL_MODE`, default true):
+///   - Strong UP drift   → BUY NO  (fade the priced-in up-move)
+///   - Strong DOWN drift → BUY YES (fade the priced-in down-move)
+///   Set `TRENDREVERSAL_MODE = false` to restore the legacy trend-FOLLOWING
+///   behaviour (UP→YES, DOWN→NO).
+///
+/// Example — BTC crash (fade mode):
+///   drift_10m = −$150, drift_60m = −$400 (confirmed downtrend, already priced in)
+///   YES on the daily market is cheap (the crash is in the price)
+///   → BUY YES, targeting the mean-reversion bounce (wide TP) with a tight stop for
+///     when the downtrend instead continues (thesis wrong).
+///
+/// # Exits (fade mode)
+///   Asymmetric "let winners run": wide take-profit (TRENDREVERSAL_TARGET_PROFIT_PCT)
+///   to capture the reversion, tight stop (TRENDREVERSAL_STOP_LOSS_PCT) because the
+///   failure mode — the trend continuing — is fast. An always-on catastrophic stop
+///   (TRENDCAPTURE_CATASTROPHIC_SL_PCT) backstops gap-throughs regardless of the
+///   min-hold window. The trend-FOLLOWING reversal exit is disabled in fade mode (a
+///   drift flip there is the thesis playing out, not a reason to bail).
 ///
 /// # Venue
 ///   Window or Daily market (uses `maker_market` / `maker_snapshot` when available;
 ///   falls back to the hourly market if no window/daily is configured).
 ///   A longer expiry gives the trade more time to develop before forced resolution.
 ///
-/// # Key differences from MomentumStrategy
-///   - Primary entry signal: `oracle_drift_10m` + `oracle_drift_60m` (multi-minute trend)
-///     NOT short-term `velocity` / `velocity_1s` (spike-based)
-///   - Position expected to be held minutes to hours, not seconds to minutes
-///   - Higher TP target (20%), moderate SL (8%), longer min-hold before exits
-///   - Trend-reversal exit fires when drift_10m crosses meaningfully counter-direction
+/// # Naming
+///   Strategy id is "TrendReversalStrategy" — surfaced in the `trades.strategy`
+///   column, the tradelog UI, the config panel, and the startup log. The exit and
+///   exposure filters also accept the legacy "TrendCaptureStrategy" tag so any
+///   position opened under the old name survives the rename across a deploy.
+///   Two internal storage keys are intentionally kept stable to avoid orphaning
+///   persisted tuning: the `viper_kind` taxonomy id ("trendcapture") and the
+///   DynamicConfig fields (`enable_trendcapture`, `trendcapture_*`) embedded in
+///   per-squadron `squadron_configs` JSON. These are identifiers only; their UI
+///   display labels read "TrendReversal".
 ///
 /// # Cooldown & re-entry
 ///   Per-token post-exit cooldown prevents rapid re-entry after a loss.
@@ -54,7 +72,7 @@ use crate::venues::core::TimeInForce;
 
 // ─── Stateful implementation ─────────────────────────────────────────────────
 
-pub struct TrendCaptureStrategyImpl {
+pub struct TrendReversalStrategyImpl {
     /// Per-token cooldown after any exit.
     /// Key: token_id, Value: Instant of last exit.
     post_exit_cooldown: Mutex<HashMap<MarketId, Instant>>,
@@ -67,7 +85,7 @@ pub struct TrendCaptureStrategyImpl {
     last_exit_signal_at: Mutex<Option<Instant>>,
 }
 
-impl TrendCaptureStrategyImpl {
+impl TrendReversalStrategyImpl {
     pub fn new() -> Self {
         Self {
             post_exit_cooldown:  Mutex::new(HashMap::new()),
@@ -77,14 +95,14 @@ impl TrendCaptureStrategyImpl {
     }
 }
 
-impl Default for TrendCaptureStrategyImpl {
+impl Default for TrendReversalStrategyImpl {
     fn default() -> Self { Self::new() }
 }
 
 // ─── Entry evaluation ─────────────────────────────────────────────────────────
 
 #[async_trait]
-impl Strategy for TrendCaptureStrategyImpl {
+impl Strategy for TrendReversalStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
         if !dc.enable_trendcapture {
@@ -168,7 +186,10 @@ impl Strategy for TrendCaptureStrategyImpl {
         let current_exposure = {
             let pos_map = ctx.positions.lock().await;
             pos_map.iter()
-                .filter(|((s, _), _)| s == "TrendCaptureStrategy")
+                // Match this strategy's own positions. Accept the legacy
+                // "TrendCaptureStrategy" tag too so any position opened under the old
+                // name (pre-rename) is still exposure-counted across a deploy.
+                .filter(|((s, _), _)| s == "TrendReversalStrategy" || s == "TrendCaptureStrategy")
                 .map(|(_, p)| p.shares * p.avg_entry)
                 .sum::<Decimal>()
         };
@@ -539,7 +560,9 @@ impl Strategy for TrendCaptureStrategyImpl {
             let mut found: Option<PendingExit> = None;
 
             'outer: for ((strategy_name, token_id), position) in pos_map.iter() {
-                if strategy_name != "TrendCaptureStrategy" { continue; }
+                // Accept legacy "TrendCaptureStrategy" too so a position opened under
+                // the old name is still exited after the rename.
+                if strategy_name != "TrendReversalStrategy" && strategy_name != "TrendCaptureStrategy" { continue; }
 
                 let bid = if token_id == &market.yes_token { snap.yes_bid }
                           else if token_id == &market.no_token { snap.no_bid }
@@ -683,7 +706,7 @@ impl Strategy for TrendCaptureStrategyImpl {
     }
 
     fn status(&self) -> StrategyStatus { StrategyStatus::Active }
-    fn name(&self) -> String { "TrendCaptureStrategy".to_string() }
+    fn name(&self) -> String { "TrendReversalStrategy".to_string() }
     fn venue(&self) -> &'static str { "Window/Daily" }
     fn max_exposure(&self) -> Decimal { config::TRENDCAPTURE_MAX_EXPOSURE_USDC }
     fn risk_model(&self) -> &'static str {
@@ -691,7 +714,7 @@ impl Strategy for TrendCaptureStrategyImpl {
     }
 }
 
-impl TrendCaptureStrategyImpl {
+impl TrendReversalStrategyImpl {
     /// Record exit time for post-exit cooldown tracking.
     /// If `is_sl` is true, increments the consecutive-loss counter for the
     /// given condition_id; a TP exit resets it.

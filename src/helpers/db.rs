@@ -436,7 +436,7 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
         ("gboost",       "GBoost",       0),
         ("basis",        "Basis",        0),
         ("time_decay",   "TimeDecay",    0),
-        ("trendcapture", "TrendCapture", 0),
+        ("trendcapture", "TrendReversal", 0),
         ("convergence",  "Convergence",  0),
     ] {
         sqlx::query("INSERT OR IGNORE INTO viper_kind (id, display, venue_agnostic) VALUES (?, ?, ?)")
