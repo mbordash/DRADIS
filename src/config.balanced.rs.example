@@ -32,7 +32,7 @@ pub const ENABLE_ARBITRAGE_TRADING: bool = true;
 
 /// Min net profit after fees to trigger arbitrage.
 /// Adjusted from 0.03 to 0.04 to be more conservative.
-pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.04);
+pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.015);
 pub const ARBITRAGE_MAX_TAKER_FEE_BPS: u32 = 1500; // Updated from 200
 
 /// Maximum allowable gap between our safe bid and the current ask on each arb leg.

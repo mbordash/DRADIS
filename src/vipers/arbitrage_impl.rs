@@ -162,12 +162,23 @@ impl Strategy for ArbitrageStrategyImpl {
         //
         // This gate always fires regardless of whether orderbook depth data is
         // present, complementing the OBI gate that follows.
-        let max_leg_ask = yes_ask.max(no_ask);
-        if max_leg_ask > dc.arbitrage_max_leg_price {
+        // ── Complement-leg ask ceiling (orphan guard) ────────────────────────
+        // Identify the COMPLEMENT (cheaper) leg by bid. The deep near-settlement
+        // regime — the ONLY historically profitable one (7/7 wins in early June,
+        // zero orphans) — intentionally has a high-priced DOMINANT leg (0.90+ ask),
+        // so the legacy MAX-leg ask ceiling (0.60) rejected every profitable entry.
+        // Stacked with the conviction gate (dominant bid ≥ 0.80) it made the
+        // admissible set EMPTY → zero arb trades since 2026-06-26. Orphan risk lives
+        // on the COMPLEMENT side: a decided market has a cheap complement (≈0.05);
+        // a complement ask above the ceiling means the market is near coin-flip and
+        // undecided → reject. The dominant leg being expensive is expected and safe.
+        let yes_is_dominant = yes_bid >= no_bid;
+        let complement_ask = if yes_is_dominant { no_ask } else { yes_ask };
+        if complement_ask > dc.arbitrage_max_leg_price {
             debug!(
-                " Arb ask ceiling — max leg ask {:.3} > limit {:.3} — skipping \
-                 (directional market; seller prices above cap)",
-                max_leg_ask, dc.arbitrage_max_leg_price
+                " Arb ask ceiling — complement leg ask {:.3} > limit {:.3} — skipping \
+                 (undecided/near-coin-flip market)",
+                complement_ask, dc.arbitrage_max_leg_price
             );
             return Ok(StrategySignal::NoSignal);
         }
@@ -193,51 +204,44 @@ impl Strategy for ArbitrageStrategyImpl {
         let depth_available = yes_total_depth > dec!(0) || no_total_depth > dec!(0);
 
         if depth_available {
-            let yes_obi = if yes_total_depth > dec!(0) {
-                (snapshot.yes_bid_depth - snapshot.yes_ask_depth) / yes_total_depth
+            // Fill-rate check on the COMPLEMENT (cheaper) leg only. The DOMINANT
+            // leg of a decided market is naturally bid-heavy (few sellers of a
+            // near-certain winner → OBI ≈ +1); gating on it (or on cross-leg
+            // asymmetry, which is inherently ≈2.0 in a hedged deep pair) rejected
+            // the entire profitable deep-arb regime. What actually matters for a
+            // clean hedge is that the COMPLEMENT leg can fill: if its book is so
+            // bid-heavy that no sellers sit near our maker bid (OBI > limit), the
+            // complement bid won't fill and we'd hold the dominant leg alone.
+            // A dominant-only orphan is a near-certain winner (low risk), but we
+            // still skip to avoid an unhedged entry. Orphan COST is independently
+            // bounded by the rescue-profit gate and the per-market re-entry lockout
+            // below, so the removed max-OBI / asymmetry gates are not load-bearing.
+            let complement_total_depth = if yes_is_dominant { no_total_depth } else { yes_total_depth };
+            let complement_obi = if complement_total_depth > dec!(0) {
+                if yes_is_dominant {
+                    (snapshot.no_bid_depth - snapshot.no_ask_depth) / no_total_depth
+                } else {
+                    (snapshot.yes_bid_depth - snapshot.yes_ask_depth) / yes_total_depth
+                }
             } else {
-                // One side has zero depth — treat as maximally directional to be safe.
+                // Complement book empty — no sellers to fill our bid → unfillable.
                 dec!(1)
             };
-            let no_obi = if no_total_depth > dec!(0) {
-                (snapshot.no_bid_depth - snapshot.no_ask_depth) / no_total_depth
-            } else {
-                dec!(1)
-            };
-            let max_obi = yes_obi.max(no_obi);
-            if max_obi > dc.arbitrage_max_leg_obi {
+            if complement_obi > dc.arbitrage_max_leg_obi {
                 debug!(
-                    " Arb OBI gate — YES OBI {:.3} NO OBI {:.3} max {:.3} > limit {:.3} — skipping \
-                     (directional book; fill asymmetry likely)",
-                    yes_obi, no_obi, max_obi, dc.arbitrage_max_leg_obi
-                );
-                return Ok(StrategySignal::NoSignal);
-            }
-
-            // ── Fill-symmetry (OBI asymmetry) gate ───────────────────────────
-            // Orphans are created by ASYMMETRIC fill likelihood: if one leg's book
-            // is seller-heavy (OBI ≪ 0 → fills fast) while the other is buyer-heavy
-            // (OBI ≫ 0 → won't fill), the fast leg fills alone and we are left naked.
-            // The max_obi gate above only rejects when the WORST leg is too
-            // directional; it still admits e.g. YES −0.50 / NO +0.49. In binary
-            // up/down markets a strong directional move makes exactly this happen,
-            // so we also reject when the two legs' OBIs diverge too far.
-            let obi_asymmetry = (yes_obi - no_obi).abs();
-            if obi_asymmetry > dc.arbitrage_max_obi_asymmetry {
-                debug!(
-                    " Arb fill-symmetry gate — YES OBI {:.3} NO OBI {:.3} asymmetry {:.3} > limit {:.3} \
-                     — skipping (one leg fills fast, the other won't → orphan risk)",
-                    yes_obi, no_obi, obi_asymmetry, dc.arbitrage_max_obi_asymmetry
+                    " Arb OBI gate — complement leg OBI {:.3} > limit {:.3} — skipping \
+                     (complement bid unlikely to fill → unhedged entry)",
+                    complement_obi, dc.arbitrage_max_leg_obi
                 );
                 return Ok(StrategySignal::NoSignal);
             }
         } else {
-            // No orderbook depth data in snapshot — fall back to legacy price cap.
-            let max_leg_bid = safe_yes_bid.max(safe_no_bid);
-            if max_leg_bid > dc.arbitrage_max_leg_price {
+            // No orderbook depth data in snapshot — fall back to complement price cap.
+            let complement_bid = if yes_is_dominant { safe_no_bid } else { safe_yes_bid };
+            if complement_bid > dc.arbitrage_max_leg_price {
                 debug!(
-                    " Arb price-cap fallback (no depth data) — max leg bid {:.3} > limit {:.3} — skipping",
-                    max_leg_bid, dc.arbitrage_max_leg_price
+                    " Arb price-cap fallback (no depth data) — complement bid {:.3} > limit {:.3} — skipping",
+                    complement_bid, dc.arbitrage_max_leg_price
                 );
                 return Ok(StrategySignal::NoSignal);
             }

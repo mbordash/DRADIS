@@ -32,7 +32,7 @@ pub const ENABLE_X: bool = false;
 pub const GHOST_MODE: bool = false;
 pub const ENABLE_ARBITRAGE_TRADING: bool = true;
 
-pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.03);
+pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.012);
 pub const ARBITRAGE_MAX_TAKER_FEE_BPS: u32 = 1500; // Updated from 300
 
 /// Maximum allowable gap between our safe bid and the current ask on each arb leg.
