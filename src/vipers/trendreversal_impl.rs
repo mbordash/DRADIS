@@ -210,9 +210,50 @@ impl Strategy for TrendReversalStrategyImpl {
         let bear_drift_10m_thr = -bull_drift_10m_thr;
         let bull_strike_gap    = config::oracle_threshold(config::TRENDCAPTURE_STRIKE_GAP_PCT, oracle_price);
         let bear_strike_gap    = bull_strike_gap;
-        let exhaustion_thr     = config::oracle_threshold(config::TRENDCAPTURE_EXHAUSTION_DRIFT_60M_PCT, oracle_price);
+        let exhaustion_thr     = if config::TRENDREVERSAL_MODE {
+            // Fade mode: tighter falling-knife ceiling — block extreme drift where
+            // the move is momentum (keeps running) rather than exhaustion (reverts).
+            config::oracle_threshold(config::TRENDREVERSAL_FADE_MAX_DRIFT_60M_PCT, oracle_price)
+        } else {
+            config::oracle_threshold(config::TRENDCAPTURE_EXHAUSTION_DRIFT_60M_PCT, oracle_price)
+        };
 
-        // ── 60m macro-trend alignment gate ───────────────────────────────────
+        // ── Persistent cross-restart cascade guard ────────────────────────────
+        // The in-memory post_exit_cooldown map (checked below) is WIPED on every
+        // redeploy/restart. On 2026-07-02 the bot restarted mid-cascade (23:56,
+        // 00:09 EDT) and re-entered the SAME losing YES fade 3× as BTC fell
+        // 0.50→0.43 — the cooldown that should have blocked it was cleared each
+        // restart. Persist the guard in the trades table: if this market+side
+        // already stopped out within the cooldown window, stand aside regardless
+        // of in-memory state. Runs only when |drift_10m| clears the entry trigger
+        // (rare), so the query is cheap. Placed before the std-mutex cooldown locks
+        // below so no guard is held across this await.
+        if config::TRENDREVERSAL_MODE {
+            let intended_side = if drift_10m <= bear_drift_10m_thr {
+                Some("YES")   // drift DOWN → fade UP → buy YES
+            } else if drift_10m >= bull_drift_10m_thr {
+                Some("NO")    // drift UP → fade DOWN → buy NO
+            } else {
+                None
+            };
+            if let Some(side) = intended_side {
+                let pool = crate::helpers::db::pool_for(&ctx.crypto_filter.to_lowercase())
+                    .or_else(|| crate::helpers::db::pool().cloned());
+                if let Some(pool) = pool {
+                    let blocked = crate::helpers::db::recent_stop_loss_exists(
+                        &pool,
+                        &market.market_name,
+                        side,
+                        config::TRENDCAPTURE_POST_EXIT_COOLDOWN_SECS,
+                    ).await;
+                    if blocked {
+                        debug!(" TrendReversal cascade guard: recent SL on '{}' {} within {}s — standing aside (persistent, survives restart)",
+                            market.market_name, side, config::TRENDCAPTURE_POST_EXIT_COOLDOWN_SECS);
+                        return Ok(StrategySignal::NoSignal);
+                    }
+                }
+            }
+        }
         // A 10m surge that runs counter to the 60m macro direction is a dip/bounce
         // in the larger trend, not a new trend — high whipsaw risk.  Block the entry
         // when the 60m drift meaningfully opposes the intended direction.

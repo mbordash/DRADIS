@@ -1684,6 +1684,38 @@ pub async fn get_pnl_history(pool: &SqlitePool, limit: i64) -> Vec<PnlSnapshotRo
     }
 }
 
+/// Return true if a TrendReversal/TrendCapture stop-loss (or catastrophic) exit
+/// was recorded on `market`+`side` within the last `within_secs` seconds.
+///
+/// Backs TrendReversal's PERSISTENT cascade guard. The strategy's in-memory
+/// post-exit cooldown map is wiped on every redeploy/restart, which let a losing
+/// fade re-fire repeatedly across restarts (2026-07-02 cascade). This DB-backed
+/// check survives restarts. `reason` for SL exits contains "SL:"; catastrophic
+/// exits contain "Catastrophic"; profit/reversal exits match neither.
+pub async fn recent_stop_loss_exists(
+    pool: &SqlitePool,
+    market: &str,
+    side: &str,
+    within_secs: i64,
+) -> bool {
+    match sqlx::query(
+        "SELECT COUNT(*) FROM trades
+         WHERE strategy IN ('TrendReversalStrategy','TrendCaptureStrategy')
+           AND market = ?
+           AND side = ?
+           AND (reason LIKE '%SL:%' OR reason LIKE '%Catastrophic%')
+           AND (julianday('now') - julianday(ts)) * 86400.0 <= ?"
+    )
+    .bind(market)
+    .bind(side)
+    .bind(within_secs as f64)
+    .fetch_one(pool)
+    .await {
+        Ok(row) => row.try_get::<i64, _>(0).map(|n| n > 0).unwrap_or(false),
+        Err(e) => { error!("❌ DB recent_stop_loss_exists failed: {}", e); false }
+    }
+}
+
 /// Return the most recent `limit` completed trades, newest first.
 pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
     match sqlx::query(

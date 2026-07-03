@@ -542,6 +542,7 @@ pub const TRENDCAPTURE_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.25);
 // Fade the detected drift (buy the opposite token) instead of following it.
 pub const TRENDREVERSAL_MODE: bool = true;
 pub const TRENDREVERSAL_EXHAUSTION_MULT: Decimal = dec!(1.5);
+pub const TRENDREVERSAL_FADE_MAX_DRIFT_60M_PCT: Decimal = dec!(0.004);
 pub const TRENDREVERSAL_TARGET_PROFIT_PCT: Decimal = dec!(0.15);
 pub const TRENDREVERSAL_STOP_LOSS_PCT: Decimal = dec!(0.04);
 
