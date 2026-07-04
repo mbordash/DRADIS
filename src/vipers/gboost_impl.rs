@@ -132,24 +132,9 @@ fn obi_from_depths(bid: rust_decimal::Decimal, ask: rust_decimal::Decimal) -> f6
 /// Compute historical volatility regime from a slice of oracle prices (log-return std-dev).
 /// Normalised to [0, 1] where 1.0 = 2% per-tick std-dev (extreme volatility).
 fn compute_historical_volatility(prices: &[f64]) -> f64 {
-    if prices.len() < 5 {
-        return 0.0;
-    }
-    let mut log_returns: Vec<f64> = Vec::with_capacity(prices.len() - 1);
-    for i in 1..prices.len() {
-        if prices[i - 1] > 0.0 && prices[i] > 0.0 {
-            log_returns.push((prices[i] / prices[i - 1]).ln());
-        }
-    }
-    if log_returns.is_empty() {
-        return 0.0;
-    }
-    let mean = log_returns.iter().sum::<f64>() / log_returns.len() as f64;
-    let variance = log_returns.iter()
-        .map(|r| (r - mean).powi(2))
-        .sum::<f64>() / log_returns.len() as f64;
-    // Normalise: 0.020 (2% per-tick std-dev) → 1.0; cap at 1.0
-    (variance.sqrt() / 0.020).min(1.0)
+    // Delegates to the shared helper so the GBoost flatness gate and the Price
+    // raptor's periodic telemetry compute realized volatility identically.
+    crate::helpers::volatility::normalized_hist_vol(prices)
 }
 
 /// Compute tick-direction momentum from a slice of YES bid prices.
@@ -1255,7 +1240,7 @@ impl Strategy for GboostStrategyImpl {
         // Diagnosed from 2026-05-30 T1: vol=0.00 at entry → P(UP) flipped from
         // 0.087 → 0.779 in 12 min → SignalRev exit for -$0.1636.
         if precomp_hist_vol < config::GBOOST_MIN_HIST_VOL {
-            veto!("oracle too flat");
+            veto!(format!("oracle too flat (hist_vol={:.4} < min={:.4})", precomp_hist_vol, config::GBOOST_MIN_HIST_VOL));
         }
 
         // ── Gate: trend-alignment ─────────────────────────────────────────────

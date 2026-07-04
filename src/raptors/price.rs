@@ -21,6 +21,7 @@ use std::collections::HashMap;
 
 use futures::StreamExt as _;
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive as _;
 use rust_decimal_macros::dec;
 use tokio::sync::watch;
 use tokio::time::{Duration, Instant, timeout as tokio_timeout};
@@ -31,6 +32,7 @@ use std::sync::Arc;
 
 use crate::config;
 use crate::api::server::AssetRaptorHealth;
+use crate::helpers::volatility::{normalized_hist_vol, range_pct};
 
 pub async fn run_price_raptor(
     crypto_filter: String,
@@ -51,6 +53,11 @@ pub async fn run_price_raptor(
     let mut price_history_60m: VecDeque<(Instant, Decimal)> = VecDeque::new();
     let mut price_history_10m: VecDeque<(Instant, Decimal)> = VecDeque::new();
     let mut prev_velocity = dec!(0);
+    // Throttle for the periodic realized-volatility telemetry log.
+    // Seeded in the past so the first eligible tick logs immediately.
+    let mut last_vol_log = Instant::now()
+        .checked_sub(Duration::from_secs(3600))
+        .unwrap_or_else(Instant::now);
 
     loop {
         if let Ok((mut ws_stream, _)) = connect_async(&url_str).await {
@@ -164,6 +171,28 @@ pub async fn run_price_raptor(
                                             h.drift_60m    = drift_60m;
                                             h.drift_10m    = drift_10m;
                                         });
+
+                                        // Periodic realized-volatility telemetry (~every 120s).
+                                        // Shared oracle-vol math so any viper can calibrate its
+                                        // own choppiness gates against a common 60m measure.
+                                        if now.duration_since(last_vol_log).as_secs()
+                                            >= config::GBOOST_PRED_LOG_INTERVAL_SECS
+                                        {
+                                            last_vol_log = now;
+                                            let prices: Vec<f64> = price_history_60m
+                                                .iter()
+                                                .map(|(_, p)| p.to_f64().unwrap_or(0.0))
+                                                .collect();
+                                            if prices.len() >= 5 {
+                                                info!(
+                                                    " [{}] 60m realized-vol: hist_vol={:.4} (norm 0-1) | range={:.3}% | samples={}",
+                                                    crypto_filter.to_uppercase(),
+                                                    normalized_hist_vol(&prices),
+                                                    range_pct(&prices),
+                                                    prices.len(),
+                                                );
+                                            }
+                                        }
                                     }
                                 }
                             }

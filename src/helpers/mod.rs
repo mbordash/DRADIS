@@ -15,6 +15,7 @@ pub mod config_helpers;
 pub mod db;
 pub mod dynamic_config;
 pub mod llm_advisor;
+pub mod volatility;
 
 pub use price::*;
 pub use json::*;
