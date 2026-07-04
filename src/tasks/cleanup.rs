@@ -1316,11 +1316,13 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address, squadron_ass
         market: String,
         side: String,
         ts: String,
+        entry_price: String,
+        shares: String,
     }
 
     let entries_result = sqlx::query_as::<_, EntryRow>(
         r#"
-        SELECT token_id, market, side, ts
+        SELECT token_id, market, side, ts, entry_price, shares
         FROM entries
         WHERE strategy = 'ArbitrageStrategy'
           AND ts > ?
@@ -1406,21 +1408,80 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address, squadron_ass
                     continue;
                 }
 
-                // ── Settlement recording is owned by `auto_settle` ───────────
-                // This backstop NO LONGER books a synthetic settlement trade. The
-                // previous math computed P&L from the stale `entries` rows and
-                // mis-stated it whenever the legs were churned/sold before
-                // resolution — e.g. 2026-06-21 trade 54/61 booked a phantom +$0.15
-                // off the 04:18 entries even though those exact legs were flattened
-                // hours earlier. Real settlement P&L is recorded by
-                // `auto_settle_closed_positions` → `record_settled_arb_trade`, which
-                // redeems on-chain and books the resolved `cur_price` (idempotent).
+                // ── Settlement recording (Polymarket auto-redeem backstop) ──
+                // Both legs are confirmed REDEEMED at the market's resolution (the
+                // `redeemed_at_resolution` gate above). This is the case Polymarket
+                // auto-redeems on-chain OUTSIDE our settlement ticker: the tokens
+                // leave the wallet, so `auto_settle_closed_positions` sees size=0,
+                // filters them out (`size > 0`), and never books the trade. Without
+                // this backstop the realized P&L is silently dropped (observed
+                // 2026-07-04: a hedged YES@0.82 + NO@0.16 pair redeemed to $1.00 for
+                // +$0.30 but session_pnl stayed 0 and the UI showed a phantom loss).
                 //
-                // Here we only purge any lingering `open_positions` rows for the
-                // confirmed-redeemed pair so the portfolio value doesn't double-count.
+                // Safe against the 2026-06-21 phantom-profit bug because booking is
+                // gated on `redeemed_at_resolution` (confirmed on-chain redemption at
+                // the market's close), not mere token absence (sold/flattened legs
+                // close BEFORE resolution and are excluded).
+                //
+                // Idempotency: skip if ANY settlement row already exists for this
+                // market — covers both a prior orphan cycle AND the auto_settle path
+                // (which books "Settlement (YES+NO → $1.00)" when DRADIS itself
+                // redeems), so we never double-count the same resolution.
+                let already_booked: Option<(i64,)> = sqlx::query_as(
+                    "SELECT 1 FROM trades \
+                     WHERE strategy = 'ArbitrageStrategy' AND market = ? \
+                       AND reason LIKE 'Settlement%' LIMIT 1"
+                )
+                .bind(&market_name)
+                .fetch_optional(&pool)
+                .await
+                .unwrap_or(None);
+
+                if already_booked.is_none() {
+                    let yes_avg = yes_leg.entry_price.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+                    let no_avg  = no_leg.entry_price.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+                    let yes_sh  = yes_leg.shares.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+                    let no_sh   = no_leg.shares.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+                    let pairs   = yes_sh.min(no_sh);
+                    let entry_per_pair = yes_avg + no_avg;
+
+                    if pairs > Decimal::ZERO && entry_per_pair > Decimal::ZERO {
+                        // A confirmed YES+NO pair resolves to exactly $1.00 (one leg
+                        // pays $1, the other $0). Realized P&L = ($1.00 − cost)/pair.
+                        let pnl = (Decimal::ONE - entry_per_pair) * pairs;
+                        let inserted = db::record_settlement_trade_idempotent(
+                            &pool,
+                            "ArbitrageStrategy",
+                            &market_name,
+                            "YES",
+                            entry_per_pair,
+                            Decimal::ONE,
+                            pairs,
+                            pnl,
+                            "Settlement (auto-redeemed by Polymarket)",
+                            None,
+                        ).await;
+                        if inserted {
+                            info!(
+                                " Orphan detection [{}]: booked auto-redeemed settlement \"{}\" | {} pairs @ ${:.4}/pair → pnl ${:.4}",
+                                squadron_asset.to_uppercase(), market_name, pairs, entry_per_pair, pnl
+                            );
+                        }
+                    } else {
+                        warn!(
+                            " Orphan detection [{}]: \"{}\" redeemed at resolution but cost basis \
+                             unknown (pairs={} entry/pair={}) — redemption cash is in collateral, \
+                             trade row omitted to avoid fabricating P&L",
+                            squadron_asset.to_uppercase(), market_name, pairs, entry_per_pair
+                        );
+                    }
+                }
+
+                // Purge any lingering `open_positions` rows for the confirmed-redeemed
+                // pair so the portfolio value doesn't double-count.
                 info!(
                     " Orphan detection [{}]: \"{}\" confirmed redeemed at resolution — \
-                     settlement P&L owned by auto_settle; purging stale open_positions rows",
+                     purging stale open_positions rows",
                     squadron_asset.to_uppercase(), market_name
                 );
                 let _ = sqlx::query("DELETE FROM open_positions WHERE token_id = ? OR token_id = ?")
