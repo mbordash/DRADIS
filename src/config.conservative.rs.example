@@ -540,7 +540,7 @@ pub const TRENDCAPTURE_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.25);
 
 // ── TrendReversal mode (2026-06-29) ──────────────────────────────────────────
 // Fade the detected drift (buy the opposite token) instead of following it.
-pub const TRENDREVERSAL_MODE: bool = true;
+pub const TRENDREVERSAL_MODE: bool = false;  // A/B TEST: follow (invert fade). Data 07-02→03: fade 0W/9L, drift continued not reverted.
 pub const TRENDREVERSAL_EXHAUSTION_MULT: Decimal = dec!(1.5);
 pub const TRENDREVERSAL_FADE_MAX_DRIFT_60M_PCT: Decimal = dec!(0.004);
 pub const TRENDREVERSAL_TARGET_PROFIT_PCT: Decimal = dec!(0.15);
