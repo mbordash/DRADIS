@@ -738,19 +738,22 @@ pub fn spawn_lifecycle_task(
                         let avg_entry  = leg.avg_entry;
                         let exit_price = leg.exit_price;
                         let shares     = leg.shares;
-                        tokio::spawn(async move {
-                            metrics::record_trade(
-                                &asset_c,
-                                strat,
-                                market,
-                                side,
-                                avg_entry,
-                                exit_price,
-                                shares,
-                                pnl,
-                                "LifecycleFlatten".to_string(),
-                            ).await;
-                        });
+                        // Book synchronously (awaited, not a detached spawn): a container
+                        // restart mid-cleanup used to kill the fire-and-forget task before
+                        // the DB write flushed, leaving a flattened leg with no trade record
+                        // (the invisible half of the 2026-07-03 arb orphan). Awaiting here
+                        // guarantees the flatten is persisted before we move on.
+                        metrics::record_trade(
+                            &asset_c,
+                            strat,
+                            market,
+                            side,
+                            avg_entry,
+                            exit_price,
+                            shares,
+                            pnl,
+                            "LifecycleFlatten".to_string(),
+                        ).await;
                     }
                 }
             }

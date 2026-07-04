@@ -462,6 +462,12 @@ pub async fn arb_pair_fill_monitor(
     const FIRST_LEG_CONFIRM_GRACE_SECS: u64 = 5;
     /// Cadence at which the joint fill state is polled.
     const POLL_INTERVAL_SECS: u64 = 5;
+    /// After the filled leg is flattened, the missing leg's cancelled GTC can still be
+    /// taker-matched in a late race (observed 2026-07-03: NO flattened at 11:10:33, YES
+    /// GTC filled 11:10:38 → invisible naked YES). Keep watching the missing leg for this
+    /// bounded window and flatten+book it too if it fills late, instead of leaving it to
+    /// ride until the 30s lifecycle sweep (or, on a restart, unbooked entirely).
+    const ARBITER_LATE_FILL_WATCH_SECS: u64 = 20;
 
     // Slice 2b: resolve on-chain U256 once; the rest of the body is unchanged.
     let leg_a_token = u256_from_market_id(leg_a_token).unwrap_or_default();
@@ -780,7 +786,7 @@ pub async fn arb_pair_fill_monitor(
             crate::helpers::metrics::record_trade(
                 &asset,
                 strategy_name.clone(),
-                market_name,
+                market_name.clone(),
                 filled_side.to_string(),
                 filled_avg_entry,
                 exit_price,
@@ -793,6 +799,92 @@ pub async fn arb_pair_fill_monitor(
             warn!("❌ ARB ARBITER [{}]: Bid-flatten FAILED for naked leg {}: {} — the 5-min cleanup backstop will retry",
                   strategy_name, filled_token, e);
         }
+    }
+
+    // ── (A) Post-flatten late-fill guard ────────────────────────────────────────
+    // Step 1 cancelled the missing leg's GTC, but a maker GTC can still be taker-matched
+    // in a race AFTER we've already flattened the filled leg — leaving a naked directional
+    // leg that either rides to a $0 settlement or (on a container restart mid-cleanup)
+    // gets disposed with no trade record at all. This is the exact 2026-07-03 failure: the
+    // NO leg was flattened at 11:10:33, then the YES GTC filled at 11:10:38, and the naked
+    // YES was closed without ever being booked. Watch the missing leg for a bounded window;
+    // if it fills late, flatten and BOOK it synchronously so exposure is closed now and the
+    // dashboard reflects the true result.
+    let late_watch_deadline = Instant::now() + Duration::from_secs(ARBITER_LATE_FILL_WATCH_SECS);
+    loop {
+        tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+        let late_shares = {
+            let mut req = BalanceAllowanceRequest::default();
+            req.asset_type = AssetType::Conditional;
+            req.token_id = Some(missing_token);
+            match client.balance_allowance(req).await {
+                Ok(resp) => {
+                    let raw = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
+                    (raw - missing_baseline).max(dec!(0))
+                }
+                Err(_) => dec!(0),
+            }
+        };
+        if late_shares >= crate::config::MIN_ORDER_SHARES {
+            warn!("⚡ ARB ARBITER [{}]: Missing leg {} FILLED LATE post-flatten ({} shares) — flattening newly-naked leg to close exposure",
+                  strategy_name, missing_token, late_shares);
+
+            // Entry price/side from the entries ledger (record_open_position wrote it on fill).
+            let late_entry = match crate::helpers::db::pool_for(&asset) {
+                Some(p) => crate::helpers::db::lookup_entry_price_db(&p, &missing_token.to_string()).await.unwrap_or(dec!(0)),
+                None => dec!(0),
+            };
+            let late_bid = {
+                let req = PriceRequest::builder().token_id(missing_token).side(Side::Sell).build();
+                match client.price(&req).await { Ok(r) => r.price, Err(_) => dec!(0.01) }
+            };
+            let late_sell = (late_bid - dec!(0.01)).max(dec!(0.01));
+
+            match place_limit_order_filled(
+                &client, &nonce_manager, &signer,
+                safe_address, eoa_address, missing_vc,
+                &missing_market, Side::Sell, late_shares, late_sell,
+                0, crate::venues::core::TimeInForce::Fak, false, 0, &*http,
+            ).await {
+                Ok((order_id, making_amount, taking_amount)) => {
+                    let exit_price = if making_amount > dec!(0) && taking_amount > dec!(0) {
+                        let p = taking_amount / making_amount;
+                        if p > dec!(0) && p <= dec!(1) { p } else { late_sell }
+                    } else {
+                        late_sell
+                    };
+                    let realized = (exit_price - late_entry) * late_shares;
+                    warn!("✅ ARB ARBITER [{}]: Late-fill naked leg flattened (order_id={}) — exposure closed @ {:.4} (limit {:.4}), realized ${:.4}",
+                          strategy_name, order_id, exit_price, late_sell, realized);
+                    positions.lock().await.remove(&(strategy_name.clone(), missing_market.clone()));
+                    token_ownership.lock().await.remove(&missing_market);
+                    // (B) Book synchronously (awaited, not fire-and-forget) so a restart
+                    // mid-cleanup cannot drop the record — the July-3 invisibility mode.
+                    crate::helpers::metrics::record_trade(
+                        &asset,
+                        strategy_name.clone(),
+                        market_name.clone(),
+                        missing_side.to_string(),
+                        late_entry,
+                        exit_price,
+                        late_shares,
+                        realized,
+                        "Orphan flatten (late-fill race)".to_string(),
+                    ).await;
+                    let mut cd = phantom_cooldowns.lock().await;
+                    cd.insert(format!("{}:{}", strategy_name, leg_a_token), tokio::time::Instant::now());
+                    cd.insert(format!("{}:{}", strategy_name, leg_b_token), tokio::time::Instant::now());
+                    return;
+                }
+                Err(e) => {
+                    warn!("❌ ARB ARBITER [{}]: Late-fill flatten FAILED for {}: {} — leaving position for the 30s lifecycle sweep to retry",
+                          strategy_name, missing_token, e);
+                    // Leave the position/phantom in place so lifecycle reconcile catches it.
+                    return;
+                }
+            }
+        }
+        if Instant::now() >= late_watch_deadline { break; }
     }
 
     // The missing leg never filled and its GTC was cancelled in Step 1 — proactively
