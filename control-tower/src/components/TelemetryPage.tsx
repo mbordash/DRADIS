@@ -406,6 +406,18 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
     { refreshInterval: live ? POLL_MS : 0, revalidateOnFocus: false, keepPreviousData: true },
   );
 
+  // The Sports Raptor is venue-neutral and publishes under a fixed "sports" key,
+  // independent of the selected crypto asset — fetch its latest sample separately
+  // so its connection pill reflects the global raptor regardless of asset.
+  const { data: sportsSamples } = useSWR(
+    ['telemetry-history', 'sports', 2],
+    () => getTelemetryHistory('sports', 2),
+    { refreshInterval: live ? POLL_MS : 0, revalidateOnFocus: false, keepPreviousData: true },
+  );
+  const sportsLast = sportsSamples && sportsSamples.length > 0
+    ? sportsSamples[sportsSamples.length - 1]
+    : undefined;
+
   const rows = useMemo<Row[]>(() => (samples ?? []).map(toRow), [samples]);
 
   // When pausing, seed the scrub range to the full loaded window; clear on resume.
@@ -452,6 +464,7 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
           {asset === 'btc' && (
             <ConnPill label="Tide Raptor" live={!!lastSample?.tide_connected} />
           )}
+          <ConnPill label="Sports Raptor" live={!!sportsLast?.sports_connected} />
 
           {/* Window selector */}
           <div className="flex items-center gap-1 ml-2">

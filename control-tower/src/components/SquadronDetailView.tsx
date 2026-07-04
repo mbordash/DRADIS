@@ -24,8 +24,11 @@ const RAPTOR_META: Record<
   string,
   {
     label: string;
-    flag?: 'price_connected' | 'funding_connected' | 'deriv_connected' | 'tide_connected';
+    flag?: 'price_connected' | 'funding_connected' | 'deriv_connected' | 'tide_connected' | 'sports_connected';
     dot: string; text: string; source: string;
+    /** Health-map key to read this raptor's flag from, when it differs from the
+     *  squadron's asset (e.g. the venue-neutral Sports Raptor publishes under "sports"). */
+    healthKey?: string;
     /** When the feed is expected to be intermittently offline (e.g. off-hours),
      *  render the disconnected state as a neutral idle badge rather than a red error. */
     offlineText?: string; offlineDot?: string; offlineClass?: string;
@@ -38,6 +41,11 @@ const RAPTOR_META: Record<
     label: 'Tide Raptor', flag: 'tide_connected', dot: 'bg-sky-400', text: 'text-sky-300',
     source: 'Alpaca IEX (ETF iNAV)',
     offlineText: 'Idle (off-hours)', offlineDot: 'bg-gray-600', offlineClass: 'text-gray-500',
+  },
+  sports:  {
+    label: 'Sports Raptor', flag: 'sports_connected', dot: 'bg-fuchsia-400', text: 'text-fuchsia-300',
+    source: 'The Odds API (line movement)', healthKey: 'sports',
+    offlineText: 'Idle (no key)', offlineDot: 'bg-gray-600', offlineClass: 'text-gray-500',
   },
 };
 
@@ -70,7 +78,8 @@ function RaptorHealthPanel({
             // Implemented raptors with a health flag report live connection;
             // any without (roadmapped kinds) show as pending.
             const hasFlag = !!meta?.flag;
-            const connected = hasFlag ? (h?.[meta!.flag!] ?? false) : false;
+            const src = meta?.healthKey ? raptors?.[meta.healthKey] : h;
+            const connected = hasFlag ? (src?.[meta!.flag!] ?? false) : false;
             // A feed with an `offlineText` (e.g. Tide off-hours) shows a neutral
             // idle badge when down rather than a red "Reconnecting" error.
             const idleStyle = !connected && meta?.offlineText;

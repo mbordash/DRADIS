@@ -266,6 +266,17 @@ async fn main() -> Result<()> {
             cag.clone(),
         ));
 
+        // ── Sports Raptor (venue-neutral, observe-only) ───────────────────────
+        // Same shared instance the intl pipeline runs — spawned here for the US
+        // build so its line-movement telemetry ("sports" health key) is available
+        // to US squadrons too. Degrades to Default without ODDS_API_KEY. Its
+        // receiver is threaded into the US trader's SquadronRaptors.
+        let (us_sports_tx, us_sports_rx) =
+            watch::channel(dradis::raptors::sports::SportsSnapshot::default());
+        tokio::spawn(dradis::raptors::sports::run_sports_raptor(
+            Arc::clone(&shared_http), us_sports_tx, Arc::clone(&raptor_health_tx),
+        ));
+
         // ── Connect the custodial US retail venue + run the arb loop (Step 3c) ──
         // Best-effort connect: a failure (missing creds, gateway down) is logged
         // but does not crash the process — the Control Tower API stays up so the
@@ -304,6 +315,7 @@ async fn main() -> Result<()> {
                     Arc::clone(&raptor_health_tx),
                     Arc::clone(&markets_tx),
                     Arc::clone(&process_heartbeat_secs),
+                    us_sports_rx,
                     cancel,
                 ).await;
             }
@@ -431,6 +443,18 @@ async fn main() -> Result<()> {
     // Store first asset's session for LLM Advisor (P&L tracking reference)
     let mut primary_session: Option<SessionState> = None;
 
+    // ── Sports Raptor (venue-neutral, observe-only) ───────────────────────────
+    // A single shared instance regardless of asset — line movement is not a
+    // per-crypto-asset signal. Its receiver is cloned cheaply into every
+    // squadron's `SquadronRaptors`. Publishes telemetry under the "sports" key
+    // and degrades to Default when ODDS_API_KEY is unset. Not consumed by Viper
+    // sizing yet (telemetry observation phase, same status as the Tide Raptor).
+    let (sports_tx, sports_rx) =
+        watch::channel(dradis::raptors::sports::SportsSnapshot::default());
+    tokio::spawn(dradis::raptors::sports::run_sports_raptor(
+        Arc::clone(&shared_http), sports_tx, Arc::clone(&raptor_health_tx),
+    ));
+
     for asset in assets.iter() {
         // ── Per-asset raptor signal feeds ─────────────────────────────────────
         let (oracle_tx, oracle_rx)     = watch::channel(dec!(0));
@@ -467,7 +491,7 @@ async fn main() -> Result<()> {
             None
         };
 
-        let raptor_signals = SquadronRaptors::full(oracle_rx, velocity_rx, drift_rx, funding_rx, deriv_rx, tide_rx);
+        let raptor_signals = SquadronRaptors::full(oracle_rx, velocity_rx, drift_rx, funding_rx, deriv_rx, tide_rx, Some(sports_rx.clone()));
 
         // ── Per-asset session state ────────────────────────────────────────────
         // startup_balance is the real wallet balance at process start — used as

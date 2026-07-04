@@ -118,6 +118,18 @@ pub struct AssetRaptorHealth {
     pub ibit_premium_bps:    Decimal,
     pub fbtc_premium_bps:    Decimal,
     pub arkb_premium_bps:    Decimal,
+
+    // ── Live Sports Raptor signal snapshot (The Odds API line movement) ──────
+    /// Sports Raptor has a fresh cross-book consensus this poll (observe-only).
+    pub sports_connected:     bool,
+    /// Vig-free consensus implied prob of the tracked event's reference outcome (0..1).
+    pub sports_consensus_prob: Decimal,
+    /// Δ consensus_prob since the previous poll for the same event (signed line drift).
+    pub sports_line_drift:     Decimal,
+    /// Spread of per-book implied probs (0..1); high = soft/disagreeing line.
+    pub sports_book_dispersion: Decimal,
+    /// Number of bookmakers in the sample (0 = no data).
+    pub sports_num_books:      Decimal,
 }
 
 // ─── Telemetry ring buffer ────────────────────────────────────────────────────
@@ -154,6 +166,13 @@ pub struct TelemetrySample {
     pub ibit_premium_bps:    Decimal,
     pub fbtc_premium_bps:    Decimal,
     pub arkb_premium_bps:    Decimal,
+
+    // ── Sports Raptor (line movement) ──
+    pub sports_connected:      bool,
+    pub sports_consensus_prob: Decimal,
+    pub sports_line_drift:     Decimal,
+    pub sports_book_dispersion: Decimal,
+    pub sports_num_books:      Decimal,
 }
 
 /// Per-asset rolling history of telemetry samples.
@@ -206,6 +225,11 @@ async fn run_telemetry_sampler(
                 ibit_premium_bps:    h.ibit_premium_bps,
                 fbtc_premium_bps:    h.fbtc_premium_bps,
                 arkb_premium_bps:    h.arkb_premium_bps,
+                sports_connected:      h.sports_connected,
+                sports_consensus_prob: h.sports_consensus_prob,
+                sports_line_drift:     h.sports_line_drift,
+                sports_book_dispersion: h.sports_book_dispersion,
+                sports_num_books:      h.sports_num_books,
             });
             let len = buf.len();
             if len > TELEMETRY_HISTORY_CAP {

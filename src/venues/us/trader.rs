@@ -48,6 +48,7 @@ use crate::orchestrator::{
     StrategyRegistry,
 };
 use crate::squadron::{CryptoAsset, Squadron, SquadronConfig, SquadronRaptors, SquadronState};
+use crate::raptors::sports::SportsSnapshot;
 use crate::state::{
     MarketConfig, MarketPhase, MarketSnapshot, OrderParams, Position, PositionMap, PriceState,
     StrategySignal,
@@ -110,6 +111,7 @@ pub async fn run_us_trader(
     raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
     markets_tx: Arc<watch::Sender<HashMap<String, String>>>,
     process_heartbeat_secs: Arc<AtomicU64>,
+    sports_rx: watch::Receiver<SportsSnapshot>,
     cancel: CancellationToken,
 ) {
     let filter = std::env::var(ENV_MARKET_FILTER).ok().filter(|s| !s.is_empty());
@@ -137,6 +139,7 @@ pub async fn run_us_trader(
             &raptor_health_tx,
             &markets_tx,
             &process_heartbeat_secs,
+            &sports_rx,
             &market_cancel,
             pair,
         ).await;
@@ -245,6 +248,7 @@ async fn trade_one_market(
     raptor_health_tx: &Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
     markets_tx: &Arc<watch::Sender<HashMap<String, String>>>,
     process_heartbeat_secs: &AtomicU64,
+    sports_rx: &watch::Receiver<SportsSnapshot>,
     cancel: &CancellationToken,
     pair: super::markets::UsMarketPair,
 ) -> MarketOutcome {
@@ -252,7 +256,7 @@ async fn trade_one_market(
     // The US venue runs a standalone arb loop (no intl-style patrol), but the
     // dashboard reads squadrons from the CAG registry — so without this the UI
     // shows zero squadrons even though the venue is live.
-    let squadron = register_us_squadron(cag, &pair);
+    let squadron = register_us_squadron(cag, &pair, sports_rx.clone());
     let squadron_id = squadron.id.clone();
 
     // Seed the squadron's Viper config so the detail view's strategy cards render.
@@ -775,13 +779,20 @@ async fn wait_or_cancel(cancel: &CancellationToken, secs: u64) -> bool {
 /// `SquadronRaptors` shape and are never read by the US arb loop. Returns the
 /// registered [`Squadron`] so the caller can classify it and drive its
 /// lifecycle state (`Patrolling` / `StoodDown`).
-fn register_us_squadron(cag: &Cag, pair: &super::markets::UsMarketPair) -> Squadron {
+fn register_us_squadron(
+    cag: &Cag,
+    pair: &super::markets::UsMarketPair,
+    sports_rx: watch::Receiver<SportsSnapshot>,
+) -> Squadron {
     // Placeholder signal channels (US arb loop reads prices from the WS feed,
     // not from Raptors). Receivers stay valid after the senders drop.
     let (_, oracle_rx) = watch::channel(Decimal::ZERO);
     let (_, velocity_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
     let (_, drift_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO));
-    let raptors = SquadronRaptors::price_only(oracle_rx, velocity_rx, drift_rx);
+    // The venue-neutral Sports Raptor IS a real feed on the US build — attach it
+    // so its observe-only line-movement signal is available to US squadrons.
+    let mut raptors = SquadronRaptors::price_only(oracle_rx, velocity_rx, drift_rx);
+    raptors.sports = Some(sports_rx);
 
     let market = MarketConfig {
         yes_token: pair.long.clone(),

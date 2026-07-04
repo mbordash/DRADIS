@@ -421,12 +421,17 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
         ("funding",  "Funding Raptor (perp funding rate)",     1),
         ("derivatives", "Derivatives Raptor (open interest + CVD)", 1),
         ("tide",     "Tide Raptor (ETF institutional pulse)",  1),
-        ("sports",   "Sports Raptor (roadmap)",                0),
+        ("sports",   "Sports Raptor (line movement, observe-only)", 1),
         ("politics", "Politics Raptor (roadmap)",              0),
     ] {
         sqlx::query("INSERT OR IGNORE INTO raptor_kind (id, display, implemented) VALUES (?, ?, ?)")
             .bind(id).bind(display).bind(implemented).execute(pool).await?;
     }
+    // Self-heal DBs seeded before the Sports Raptor was implemented (INSERT OR
+    // IGNORE above won't flip an existing row's `implemented` flag / display).
+    sqlx::query("UPDATE raptor_kind SET implemented = 1, display = ? WHERE id = 'sports'")
+        .bind("Sports Raptor (line movement, observe-only)")
+        .execute(pool).await?;
 
     // viper_kind — venue_agnostic = 1 for pure order-book strategies.
     for (id, display, agnostic) in [
@@ -443,13 +448,15 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
             .bind(id).bind(display).bind(agnostic).execute(pool).await?;
     }
 
-    // market_class → raptor_kind. sports/politics raptors are roadmapped, so
-    // they have no links yet (squadrons there get no raptor until one is built).
+    // market_class → raptor_kind. The Sports Raptor is now implemented and links
+    // to the sports class (observe-only). politics raptor is still roadmapped, so
+    // that class gets no raptor until one is built.
     for (class, raptor) in [
         ("crypto", "price"),
         ("crypto", "funding"),
         ("crypto", "derivatives"),
         ("crypto", "tide"),
+        ("sports", "sports"),
     ] {
         sqlx::query("INSERT OR IGNORE INTO market_class_raptor (market_class, raptor_kind) VALUES (?, ?)")
             .bind(class).bind(raptor).execute(pool).await?;

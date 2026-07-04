@@ -162,6 +162,13 @@ export interface AssetRaptorHealth {
   ibit_premium_bps?:    number;  // per-ETF premium vs synthetic iNAV (bps)
   fbtc_premium_bps?:    number;
   arkb_premium_bps?:    number;
+
+  // ── Sports Raptor — line movement (The Odds API, observe-only) ──
+  sports_connected?:      boolean; // fresh cross-book consensus this poll
+  sports_consensus_prob?: number;  // vig-free consensus implied prob (0..1)
+  sports_line_drift?:     number;  // Δ consensus vs previous poll (signed)
+  sports_book_dispersion?: number; // spread of per-book implied probs (0..1)
+  sports_num_books?:      number;  // bookmakers in the sample (0 = no data)
 }
 
 /** Live Raptor signal snapshot keyed by asset symbol — GET /api/telemetry. */
@@ -193,6 +200,13 @@ export interface TelemetrySample {
   ibit_premium_bps:    number;
   fbtc_premium_bps:    number;
   arkb_premium_bps:    number;
+
+  // ── Sports Raptor — line movement (The Odds API, observe-only) ──
+  sports_connected:      boolean;
+  sports_consensus_prob: number;  // vig-free consensus implied prob (0..1)
+  sports_line_drift:     number;  // Δ consensus vs previous poll (signed)
+  sports_book_dispersion: number; // spread of per-book implied probs (0..1)
+  sports_num_books:      number;  // bookmakers in the sample (0 = no data)
 }
 
 /** Response from GET /api/status — maps strategy key to active market name. */
