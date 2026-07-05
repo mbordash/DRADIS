@@ -1003,18 +1003,28 @@ async fn record_settled_arb_trade(
     let no_leg  = legs.iter().find(|p| p.outcome_index == 1);
 
     // Route the settlement record to the asset DB that actually owns this market,
-    // inferred from the market title (e.g. "Solana Up or Down…" → sol). Previously
-    // this always used the primary asset pool, which dumped every settlement —
-    // including ETH/SOL markets — into the BTC DB and corrupted per-asset P&L.
+    // inferred from the market title (e.g. "Solana Up or Down…" → sol). Only crypto
+    // markets DRADIS actually trades on the intl (Polymarket) side name BTC/ETH/SOL
+    // in their title. The same wallet can also hold unrelated redeemable positions —
+    // sports/politics markets ("Devils vs. Flames", etc.) bought manually or via
+    // other venues. auto_settle still redeems those on-chain (the cash lands in
+    // collateral and is reflected by chain-sync pnl_snapshots), but we must NOT
+    // fabricate an "ArbitrageStrategy" trade row for a position the arb Viper never
+    // opened. Previously such non-crypto settlements fell back to the primary (BTC)
+    // pool and were booked as "₿ BTC / Arbitrage" trades — corrupting per-asset P&L
+    // (the NBA/NHL "X vs. Y" single-leg NO rows in the BTC tradelog).
     let title_for_asset = yes_leg.or(no_leg).map(|l| l.title.as_str()).unwrap_or("");
-    let asset_str = infer_asset_from_title(title_for_asset)
-        .map(|s| s.to_string())
-        .unwrap_or_else(|| {
-            db::available_assets()
-                .into_iter()
-                .next()
-                .unwrap_or_else(|| "btc".to_string())
-        });
+    let asset_str = match infer_asset_from_title(title_for_asset) {
+        Some(a) => a.to_string(),
+        None => {
+            info!(
+                "Auto-settle: redeemed non-crypto position \"{}\" — cash claimed to \
+                 collateral, trade row skipped (not a DRADIS-managed market)",
+                title_for_asset
+            );
+            return;
+        }
+    };
 
     // Settlements are recorded idempotently: auto_settle can re-redeem an already-
     // settled condition after a restart (in-memory dedup is empty on a fresh start),
