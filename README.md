@@ -446,9 +446,11 @@ probability, and broadcasts **line drift** (movement since the previous poll) an
 ODDS_API_KEY=your-the-odds-api-key
 ```
 
-The free tier is quota-limited (~500 requests/month), so the raptor polls
-conservatively every 5 minutes. It publishes telemetry only — no Viper consumes it
-for sizing yet. Omit the key and it runs idle (neutral snapshot, offline pill).
+The free tier is a hard ~500 requests/month, so the raptor polls conservatively
+every 2 hours (~360 requests/month, leaving headroom). It publishes telemetry only
+— no Viper consumes it for sizing yet. The remaining monthly budget is logged each
+poll (from the API's `x-requests-remaining` header), with a loud warning when it
+runs low. Omit the key and it runs idle (neutral snapshot, offline pill).
 
 ### RPC Configuration
 

@@ -171,6 +171,32 @@ async fn try_fetch_nearest_event(http: &reqwest::Client, url: &str) -> Result<Ev
     .map_err(|e| format!("transport error: {e}"))?;
 
     let status = resp.status();
+    // The Odds API returns the remaining monthly quota on every response. Capture
+    // it before consuming the body so we can log budget draw-down and warn loudly
+    // before the free-tier cap is hit.
+    let remaining = resp
+        .headers()
+        .get("x-requests-remaining")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .map(|f| f as i64);
+    let used = resp
+        .headers()
+        .get("x-requests-used")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .map(|f| f as i64);
+    match remaining {
+        Some(r) if r <= config::SPORTS_ODDS_LOW_BUDGET_WARN => warn!(
+            "⚠️ Sports Raptor: The Odds API budget low — {r} requests remaining (used {}). Consider raising SPORTS_POLL_SECS.",
+            used.map(|u| u.to_string()).unwrap_or_else(|| "?".into()),
+        ),
+        Some(r) => debug!(
+            "🏈 Sports Raptor budget: {r} requests remaining (used {})",
+            used.map(|u| u.to_string()).unwrap_or_else(|| "?".into()),
+        ),
+        None => {}
+    }
     let body = resp.text().await.map_err(|e| format!("failed reading body: {e}"))?;
     if !status.is_success() {
         // The Odds API returns a JSON `{ "message": ... }` on error — surface it,

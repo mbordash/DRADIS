@@ -411,6 +411,51 @@ function TideCard({ data, latest }: { data: Row[]; latest: Row }) {
 
 // ── Main telemetry page ───────────────────────────────────────────────────────
 
+// ── Asset-class sub-navigation ────────────────────────────────────────────────
+
+type TelemetryClass = 'crypto' | 'sports' | 'politics';
+
+const TELEMETRY_CLASSES: { id: TelemetryClass; label: string; icon: string; ready: boolean }[] = [
+  { id: 'crypto',   label: 'Crypto',   icon: '₿',  ready: true },
+  { id: 'sports',   label: 'Sports',   icon: '🏟️', ready: true },
+  { id: 'politics', label: 'Politics', icon: '🗳️', ready: false },
+];
+
+function ClassNav({
+  active, onChange,
+}: {
+  active: TelemetryClass;
+  onChange: (c: TelemetryClass) => void;
+}) {
+  return (
+    <div className="flex items-center gap-1.5">
+      {TELEMETRY_CLASSES.map(c => {
+        const isActive = c.id === active;
+        return (
+          <button
+            key={c.id}
+            disabled={!c.ready}
+            onClick={() => c.ready && onChange(c.id)}
+            title={c.ready ? undefined : 'Coming soon'}
+            className={[
+              'flex items-center gap-1.5 text-xs font-mono px-3 py-1.5 rounded-lg border transition-colors',
+              isActive
+                ? 'bg-indigo-500/20 border-indigo-500/40 text-indigo-300'
+                : c.ready
+                  ? 'bg-[#13131f] border-[#1e1e32] text-gray-500 hover:border-gray-600 hover:text-gray-300'
+                  : 'bg-[#13131f] border-[#1e1e32] text-gray-700 cursor-not-allowed opacity-60',
+            ].join(' ')}
+          >
+            <span>{c.icon}</span>
+            <span>{c.label}</span>
+            {!c.ready && <span className="text-[9px] text-gray-600">soon</span>}
+          </button>
+        );
+      })}
+    </div>
+  );
+}
+
 export default function TelemetryPage({ availableAssets }: { availableAssets: string[] }) {
   const assets = availableAssets.length ? availableAssets : ['btc'];
   const [selectedAsset, setSelectedAsset] = useState<string>('');
@@ -419,6 +464,7 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
   const [windowMins, setWindowMins] = useState(15);
   const [live, setLive] = useState(true);
   const [range, setRange] = useState<{ startIndex: number; endIndex: number } | null>(null);
+  const [assetClass, setAssetClass] = useState<TelemetryClass>('crypto');
 
   const limit = windowMins * SAMPLES_PER_MIN;
 
@@ -470,6 +516,14 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
 
   return (
     <div className="space-y-5">
+      {/* Asset-class sub-navigation */}
+      <div className="flex items-center gap-3 flex-wrap">
+        <p className="label-muted text-xs">📡 Telemetry</p>
+        <ClassNav active={assetClass} onChange={setAssetClass} />
+      </div>
+
+      {assetClass === 'crypto' && (
+      <div className="space-y-5">
       {/* Header / intro + controls */}
       <div className="card px-5 py-4 border border-indigo-500/20 bg-[#0d0d1a]">
         <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
@@ -490,7 +544,6 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
           {asset === 'btc' && (
             <ConnPill label="Tide Raptor" live={!!lastSample?.tide_connected} />
           )}
-          <ConnPill label="Sports Raptor" live={!!sportsLast?.sports_connected} />
 
           {/* Window selector */}
           <div className="flex items-center gap-1 ml-2">
@@ -624,45 +677,7 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
         />
       </div>
 
-      {/* Sports Raptor — venue-neutral, observe-only cross-book consensus */}
-      <div className="card px-5 py-4 border border-emerald-500/20 bg-[#0d0d1a]">
-        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
-          <div>
-            <p className="label-muted text-xs">🏟️ Sports Raptor — Cross-Book Consensus</p>
-            <p className="text-[11px] text-gray-500 mt-0.5">
-              Venue-neutral observe-only feed (The Odds API). Vig-free consensus of the nearest
-              priced event — shared by every deployed squadron, independent of the crypto asset above.
-            </p>
-          </div>
-          <div className="flex items-center gap-3 text-[10px] font-mono shrink-0">
-            <ConnPill label="Sports Raptor" live={!!sportsLast?.sports_connected} />
-            <span className="text-gray-500">
-              books <span className="text-gray-300">{num(sportsLast?.sports_num_books).toFixed(0)}</span>
-            </span>
-          </div>
-        </div>
-        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-          <SignalChart<SportsRow>
-            title="Consensus Probability"
-            subtitle="Vig-free implied prob of reference outcome (0–1)"
-            data={sportsRows}
-            series={[{ key: 'consensus', label: 'consensus', color: '#34d399' }]}
-            fmtY={v => v.toFixed(3)}
-          />
-          <SignalChart<SportsRow>
-            title="Line Drift & Book Dispersion"
-            subtitle="Δconsensus vs prior poll (signed) + cross-book spread"
-            data={sportsRows}
-            zeroLine
-            series={[
-              { key: 'drift', label: 'drift', color: '#f59e0b' },
-              { key: 'dispersion', label: 'dispersion', color: '#38bdf8' },
-            ]}
-            fmtY={v => fmtSigned(v)}
-          />
-        </div>
-      </div>
-
+      {/* Footer note */}
       <p className="text-[10px] font-mono text-gray-600">
         History is served from the engine ring buffer (<span className="text-gray-500">/api/telemetry/history</span>),
         so it survives page reloads. Pick a window, then <span className="text-gray-500">Pause</span> to scrub a past
@@ -671,6 +686,59 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
         {' '}with price = fresh positioning, while <span className="text-gray-500">Taker CVD</span> &gt; 1 marks buy-side
         aggression — your vipers fuse these slow macro reads with the fast spot micro signals.
       </p>
+      </div>
+      )}
+
+      {assetClass === 'sports' && (
+      <div className="space-y-5">
+        <div className="card px-5 py-4 border border-emerald-500/20 bg-[#0d0d1a]">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+            <div>
+              <p className="label-muted text-xs">🏟️ Sports Raptor — Cross-Book Consensus</p>
+              <p className="text-[11px] text-gray-500 mt-0.5">
+                Venue-neutral observe-only feed (The Odds API). Vig-free consensus of the nearest
+                priced event — shared by every deployed squadron across every venue.
+              </p>
+            </div>
+            <div className="flex items-center gap-3 text-[10px] font-mono shrink-0">
+              <ConnPill label="Sports Raptor" live={!!sportsLast?.sports_connected} />
+              <span className="text-gray-500">
+                books <span className="text-gray-300">{num(sportsLast?.sports_num_books).toFixed(0)}</span>
+              </span>
+            </div>
+          </div>
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <SignalChart<SportsRow>
+              title="Consensus Probability"
+              subtitle="Vig-free implied prob of reference outcome (0–1)"
+              data={sportsRows}
+              series={[{ key: 'consensus', label: 'consensus', color: '#34d399' }]}
+              fmtY={v => v.toFixed(3)}
+            />
+            <SignalChart<SportsRow>
+              title="Line Drift & Book Dispersion"
+              subtitle="Δconsensus vs prior poll (signed) + cross-book spread"
+              data={sportsRows}
+              zeroLine
+              series={[
+                { key: 'drift', label: 'drift', color: '#f59e0b' },
+                { key: 'dispersion', label: 'dispersion', color: '#38bdf8' },
+              ]}
+              fmtY={v => fmtSigned(v)}
+            />
+          </div>
+        </div>
+
+        <p className="text-[10px] font-mono text-gray-600">
+          The Sports Raptor observes only — no Viper trades on it yet. It polls The Odds API on a
+          slow (~2h) cadence to stay inside the free-tier budget (~500 requests/month), so the trend
+          fills in gradually. <span className="text-gray-500">Consensus</span> is the vig-free cross-book
+          implied probability of the reference outcome; <span className="text-gray-500">drift</span> is its
+          move since the prior poll; <span className="text-gray-500">dispersion</span> is how much the
+          books disagree — a proxy for soft, potentially mispriced lines.
+        </p>
+      </div>
+      )}
     </div>
   );
 }
