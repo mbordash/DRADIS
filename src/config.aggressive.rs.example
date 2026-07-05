@@ -528,6 +528,7 @@ pub const TRENDCAPTURE_REVERSAL_DRIFT_PCT: Decimal = dec!(0.001);
 
 pub const TRENDCAPTURE_MAX_SNAPSHOT_AGE_SECS: i64 = 15;
 pub const TRENDCAPTURE_MIN_SECS_TO_EXPIRY: i64 = 1200;  // 20 min — enter closer to expiry
+pub const TRENDCAPTURE_MAX_SECS_TO_EXPIRY: i64 = 14400;
 pub const TRENDCAPTURE_MARKET_WARMUP_SECS: i64 = 60;
 
 /// Aggressive: wider spread tolerance — 5-cent combined cap.

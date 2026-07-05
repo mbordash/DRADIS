@@ -536,6 +536,7 @@ pub const TRENDCAPTURE_REVERSAL_DRIFT_PCT: Decimal = dec!(0.0005);
 pub const TRENDCAPTURE_MAX_SNAPSHOT_AGE_SECS: i64 = 15;
 /// Conservative: 45 min minimum expiry — needs more time buffer than other profiles.
 pub const TRENDCAPTURE_MIN_SECS_TO_EXPIRY: i64 = 2700;
+pub const TRENDCAPTURE_MAX_SECS_TO_EXPIRY: i64 = 14400;
 /// Conservative: 3-minute warmup for fully stable orderbook readings.
 pub const TRENDCAPTURE_MARKET_WARMUP_SECS: i64 = 180;
 /// Conservative: tight 3-cent combined spread cap.
