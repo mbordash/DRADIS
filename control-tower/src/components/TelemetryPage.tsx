@@ -81,17 +81,39 @@ function toRow(s: TelemetrySample): Row {
   };
 }
 
+// The Sports Raptor is venue-neutral and polls on its own (~5 min) cadence, so it
+// gets its own chart row type independent of the crypto asset samples.
+interface SportsRow {
+  t: number;
+  time: string;
+  consensus: number;   // vig-free consensus implied prob (0..1)
+  drift: number;       // Δ consensus vs previous poll (signed)
+  dispersion: number;  // spread of per-book implied probs (0..1)
+  numBooks: number;    // bookmakers in the sample
+}
+
+function toSportsRow(s: TelemetrySample): SportsRow {
+  return {
+    t: Number(s.t),
+    time: fmtClock(Number(s.t)),
+    consensus: num(s.sports_consensus_prob),
+    drift: num(s.sports_line_drift),
+    dispersion: num(s.sports_book_dispersion),
+    numBooks: num(s.sports_num_books),
+  };
+}
+
 // ── Signal-graph card ─────────────────────────────────────────────────────────
 
-interface SeriesDef { key: keyof Row; label: string; color: string }
+interface SeriesDef<R> { key: keyof R; label: string; color: string }
 
-function SignalChart({
+function SignalChart<R extends { time: string }>({
   title, subtitle, data, series, fmtY, zeroLine = false, refY, refLabel,
 }: {
   title: string;
   subtitle: string;
-  data: Row[];
-  series: SeriesDef[];
+  data: R[];
+  series: SeriesDef<R>[];
   fmtY: (v: number) => string;
   zeroLine?: boolean;
   /** Optional horizontal baseline (e.g. 1.0 for a balanced CVD ratio). */
@@ -407,16 +429,20 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
   );
 
   // The Sports Raptor is venue-neutral and publishes under a fixed "sports" key,
-  // independent of the selected crypto asset — fetch its latest sample separately
-  // so its connection pill reflects the global raptor regardless of asset.
+  // independent of the selected crypto asset. It polls on a ~5-min cadence, so fetch
+  // a generous fixed history (independent of the crypto window selector) to plot it.
   const { data: sportsSamples } = useSWR(
-    ['telemetry-history', 'sports', 2],
-    () => getTelemetryHistory('sports', 2),
+    ['telemetry-history', 'sports', 288],
+    () => getTelemetryHistory('sports', 288),
     { refreshInterval: live ? POLL_MS : 0, revalidateOnFocus: false, keepPreviousData: true },
   );
   const sportsLast = sportsSamples && sportsSamples.length > 0
     ? sportsSamples[sportsSamples.length - 1]
     : undefined;
+  const sportsRows = useMemo<SportsRow[]>(
+    () => (sportsSamples ?? []).map(toSportsRow),
+    [sportsSamples],
+  );
 
   const rows = useMemo<Row[]>(() => (samples ?? []).map(toRow), [samples]);
 
@@ -596,6 +622,45 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
           series={[{ key: 'cvd', label: 'ratio', color: '#eab308' }]}
           fmtY={v => v.toFixed(3)}
         />
+      </div>
+
+      {/* Sports Raptor — venue-neutral, observe-only cross-book consensus */}
+      <div className="card px-5 py-4 border border-emerald-500/20 bg-[#0d0d1a]">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+          <div>
+            <p className="label-muted text-xs">🏟️ Sports Raptor — Cross-Book Consensus</p>
+            <p className="text-[11px] text-gray-500 mt-0.5">
+              Venue-neutral observe-only feed (The Odds API). Vig-free consensus of the nearest
+              priced event — shared by every deployed squadron, independent of the crypto asset above.
+            </p>
+          </div>
+          <div className="flex items-center gap-3 text-[10px] font-mono shrink-0">
+            <ConnPill label="Sports Raptor" live={!!sportsLast?.sports_connected} />
+            <span className="text-gray-500">
+              books <span className="text-gray-300">{num(sportsLast?.sports_num_books).toFixed(0)}</span>
+            </span>
+          </div>
+        </div>
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          <SignalChart<SportsRow>
+            title="Consensus Probability"
+            subtitle="Vig-free implied prob of reference outcome (0–1)"
+            data={sportsRows}
+            series={[{ key: 'consensus', label: 'consensus', color: '#34d399' }]}
+            fmtY={v => v.toFixed(3)}
+          />
+          <SignalChart<SportsRow>
+            title="Line Drift & Book Dispersion"
+            subtitle="Δconsensus vs prior poll (signed) + cross-book spread"
+            data={sportsRows}
+            zeroLine
+            series={[
+              { key: 'drift', label: 'drift', color: '#f59e0b' },
+              { key: 'dispersion', label: 'dispersion', color: '#38bdf8' },
+            ]}
+            fmtY={v => fmtSigned(v)}
+          />
+        </div>
       </div>
 
       <p className="text-[10px] font-mono text-gray-600">
