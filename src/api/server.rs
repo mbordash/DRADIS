@@ -130,6 +130,21 @@ pub struct AssetRaptorHealth {
     pub sports_book_dispersion: Decimal,
     /// Number of bookmakers in the sample (0 = no data).
     pub sports_num_books:      Decimal,
+    /// Tracked event label, e.g. "Colorado Rockies vs Los Angeles Dodgers".
+    #[serde(default)]
+    pub sports_event:          String,
+    /// The outcome the consensus/drift refer to (first-listed h2h outcome).
+    #[serde(default)]
+    pub sports_reference:      String,
+    /// Sport title from the feed, e.g. "MLB" ("upcoming" mixes sports).
+    #[serde(default)]
+    pub sports_sport:          String,
+    /// ISO-8601 UTC kickoff time of the tracked event.
+    #[serde(default)]
+    pub sports_commence:       String,
+    /// Comma-separated bookmaker titles in the consensus (e.g. "DraftKings, FanDuel").
+    #[serde(default)]
+    pub sports_books:          String,
 }
 
 // ─── Telemetry ring buffer ────────────────────────────────────────────────────
@@ -173,6 +188,16 @@ pub struct TelemetrySample {
     pub sports_line_drift:     Decimal,
     pub sports_book_dispersion: Decimal,
     pub sports_num_books:      Decimal,
+    #[serde(default)]
+    pub sports_event:          String,
+    #[serde(default)]
+    pub sports_reference:      String,
+    #[serde(default)]
+    pub sports_sport:          String,
+    #[serde(default)]
+    pub sports_commence:       String,
+    #[serde(default)]
+    pub sports_books:          String,
 }
 
 /// Per-asset rolling history of telemetry samples.
@@ -230,6 +255,11 @@ async fn run_telemetry_sampler(
                 sports_line_drift:     h.sports_line_drift,
                 sports_book_dispersion: h.sports_book_dispersion,
                 sports_num_books:      h.sports_num_books,
+                sports_event:          h.sports_event.clone(),
+                sports_reference:      h.sports_reference.clone(),
+                sports_sport:          h.sports_sport.clone(),
+                sports_commence:       h.sports_commence.clone(),
+                sports_books:          h.sports_books.clone(),
             });
             let len = buf.len();
             if len > TELEMETRY_HISTORY_CAP {

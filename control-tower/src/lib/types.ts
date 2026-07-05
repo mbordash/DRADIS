@@ -207,6 +207,11 @@ export interface TelemetrySample {
   sports_line_drift:     number;  // Δ consensus vs previous poll (signed)
   sports_book_dispersion: number; // spread of per-book implied probs (0..1)
   sports_num_books:      number;  // bookmakers in the sample (0 = no data)
+  sports_event?:         string;  // tracked event label ("A vs B")
+  sports_reference?:     string;  // outcome the consensus/drift refer to
+  sports_sport?:         string;  // sport title ("MLB", "NFL", …)
+  sports_commence?:      string;  // ISO-8601 UTC kickoff of the tracked event
+  sports_books?:         string;  // comma-separated bookmaker titles
 }
 
 /** Response from GET /api/status — maps strategy key to active market name. */

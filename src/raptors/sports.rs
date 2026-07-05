@@ -124,6 +124,11 @@ pub async fn run_sports_raptor(
                     h.sports_line_drift     = snap.line_drift;
                     h.sports_book_dispersion = snap.book_dispersion;
                     h.sports_num_books      = snap.num_books;
+                    h.sports_event          = sample.event_label.clone();
+                    h.sports_reference      = sample.ref_outcome.clone();
+                    h.sports_sport          = sample.sport_title.clone();
+                    h.sports_commence       = sample.commence_time.clone();
+                    h.sports_books          = sample.book_names.join(", ");
                 });
                 info!(
                     "🏈 Sports Raptor [{}]: consensus={:.3} drift={:+.3} dispersion={:.3} books={}",
@@ -151,6 +156,14 @@ pub async fn run_sports_raptor(
 struct EventSample {
     event_id: String,
     event_label: String,
+    /// The outcome the consensus/drift track (first-listed h2h outcome).
+    ref_outcome: String,
+    /// Human sport title from the feed (e.g. "MLB", "NFL"); "upcoming" mixes sports.
+    sport_title: String,
+    /// ISO-8601 UTC kickoff time of the tracked event.
+    commence_time: String,
+    /// Bookmaker titles contributing to the consensus (e.g. "DraftKings, FanDuel").
+    book_names: Vec<String>,
     consensus_prob: Decimal,
     book_dispersion: Decimal,
     num_books: u32,
@@ -249,6 +262,16 @@ async fn try_fetch_nearest_event(http: &reqwest::Client, url: &str) -> Result<Ev
     let home = event.get("home_team").and_then(|v| v.as_str()).unwrap_or("home");
     let away = event.get("away_team").and_then(|v| v.as_str()).unwrap_or("away");
     let event_label = format!("{} vs {}", home, away);
+    let sport_title = event
+        .get("sport_title")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let commence_time = event
+        .get("commence_time")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
 
     // The reference outcome is the first outcome listed in a book's h2h market.
     // Determine its name from the first book, then read the SAME name across all
@@ -262,9 +285,13 @@ async fn try_fetch_nearest_event(http: &reqwest::Client, url: &str) -> Result<Ev
         .ok_or_else(|| format!("event '{event_label}' has no h2h market outcomes"))?;
 
     let mut probs: Vec<Decimal> = Vec::new();
+    let mut book_names: Vec<String> = Vec::new();
     for book in books {
         if let Some(p) = vig_free_prob_for(book, &ref_name) {
             probs.push(p);
+            if let Some(name) = book.get("title").and_then(|v| v.as_str()) {
+                book_names.push(name.to_string());
+            }
         }
     }
     if probs.is_empty() {
@@ -278,7 +305,17 @@ async fn try_fetch_nearest_event(http: &reqwest::Client, url: &str) -> Result<Ev
     let min = probs.iter().copied().min().unwrap_or(dec!(0));
     let book_dispersion = max - min;
 
-    Ok(EventSample { event_id, event_label, consensus_prob, book_dispersion, num_books })
+    Ok(EventSample {
+        event_id,
+        event_label,
+        ref_outcome: ref_name,
+        sport_title,
+        commence_time,
+        book_names,
+        consensus_prob,
+        book_dispersion,
+        num_books,
+    })
 }
 
 /// Name of the first outcome in the first book's h2h market — the reference

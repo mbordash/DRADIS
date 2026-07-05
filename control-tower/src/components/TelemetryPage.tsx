@@ -49,6 +49,15 @@ function fmtClock(ms: number): string {
   });
 }
 
+// Render an ISO-8601 kickoff time as a compact local "Sat 8:10 PM" label.
+function fmtKickoff(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return iso;
+  return d.toLocaleString('en-US', {
+    weekday: 'short', hour: 'numeric', minute: '2-digit', hour12: true,
+  });
+}
+
 // rust_decimal::Decimal serializes to JSON as a *string* ("64000.5"), so every
 // numeric signal arrives here as a string despite the TelemetrySample type. Coerce
 // at the boundary — otherwise chart/stat formatters call .toFixed() on a string and
@@ -707,6 +716,47 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
               </span>
             </div>
           </div>
+
+          {/* Which event / outcome / books the numbers describe */}
+          {sportsLast?.sports_connected && sportsLast?.sports_event ? (
+            <div className="mb-4 rounded-lg border border-[#1e1e32] bg-[#0a0a14] px-4 py-3">
+              <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                {sportsLast.sports_sport && (
+                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/25">
+                    {sportsLast.sports_sport}
+                  </span>
+                )}
+                <span className="text-sm text-gray-200 font-medium">{sportsLast.sports_event}</span>
+                {sportsLast.sports_commence && (
+                  <span className="text-[11px] font-mono text-gray-500">
+                    · {fmtKickoff(sportsLast.sports_commence)}
+                  </span>
+                )}
+              </div>
+              <p className="text-[11px] text-gray-500 mt-1.5">
+                Consensus is the vig-free implied probability that{' '}
+                <span className="text-emerald-300 font-mono">
+                  {sportsLast.sports_reference || 'the reference outcome'}
+                </span>{' '}
+                wins — currently{' '}
+                <span className="text-gray-200 font-mono">
+                  {(num(sportsLast.sports_consensus_prob) * 100).toFixed(1)}%
+                </span>.
+              </p>
+              {sportsLast.sports_books && (
+                <p className="text-[10px] font-mono text-gray-600 mt-1">
+                  <span className="text-gray-500">{num(sportsLast.sports_num_books).toFixed(0)} books:</span>{' '}
+                  {sportsLast.sports_books}
+                </p>
+              )}
+            </div>
+          ) : (
+            <div className="mb-4 rounded-lg border border-[#1e1e32] bg-[#0a0a14] px-4 py-3 text-[11px] font-mono text-gray-600">
+              No priced event yet — the raptor tracks the nearest upcoming game with live odds
+              (polls every ~2h to stay inside the free-tier budget).
+            </div>
+          )}
+
           <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
             <SignalChart<SportsRow>
               title="Consensus Probability"
