@@ -147,6 +147,14 @@ impl Strategy for TrendReversalStrategyImpl {
                     s, config::TRENDCAPTURE_MIN_SECS_TO_EXPIRY);
                 return Ok(StrategySignal::NoSignal);
             }
+            // Upper bound: a 10m/60m drift signal has no directional relevance to a
+            // market resolving many hours out. Block far-from-expiry entries — the
+            // dominant loss source in production (61% of entries were >12h out).
+            if s > config::TRENDCAPTURE_MAX_SECS_TO_EXPIRY {
+                debug!(" TrendCapture blocked: {}s to expiry exceeds max {}s (drift signal horizon mismatch)",
+                    s, config::TRENDCAPTURE_MAX_SECS_TO_EXPIRY);
+                return Ok(StrategySignal::NoSignal);
+            }
             Some(s)
         } else {
             None

@@ -100,7 +100,7 @@ pub async fn run_sports_raptor(
 
     loop {
         match try_fetch_nearest_event(&http, &url).await {
-            Some(sample) => {
+            Ok(sample) => {
                 consecutive_failures = 0;
                 let line_drift = match &prev_event {
                     Some((id, prev_prob)) if *id == sample.event_id => {
@@ -125,21 +125,21 @@ pub async fn run_sports_raptor(
                     h.sports_book_dispersion = snap.book_dispersion;
                     h.sports_num_books      = snap.num_books;
                 });
-                debug!(
+                info!(
                     "🏈 Sports Raptor [{}]: consensus={:.3} drift={:+.3} dispersion={:.3} books={}",
                     sample.event_label, snap.consensus_prob, snap.line_drift,
                     snap.book_dispersion, sample.num_books,
                 );
             }
-            None => {
+            Err(reason) => {
                 consecutive_failures += 1;
                 raptor_health_tx.send_modify(|map| {
                     map.entry(SPORTS_HEALTH_KEY.to_string()).or_default().sports_connected = false;
                 });
                 if consecutive_failures == 1 {
-                    warn!("⚠️ Sports Raptor poll failed (will retry silently). Signal treated as neutral.");
+                    warn!("⚠️ Sports Raptor poll failed: {reason} (will retry silently; signal treated as neutral)");
                 } else {
-                    debug!("🏈 Sports Raptor unavailable (attempt {}), neutral snapshot", consecutive_failures);
+                    debug!("🏈 Sports Raptor unavailable (attempt {}): {reason}", consecutive_failures);
                 }
             }
         }
@@ -158,29 +158,68 @@ struct EventSample {
 
 /// Fetch the configured sport's h2h odds and reduce the nearest-commencing event
 /// to a vig-free consensus for its reference (first-listed) outcome.
-async fn try_fetch_nearest_event(http: &reqwest::Client, url: &str) -> Option<EventSample> {
+///
+/// Returns `Err(reason)` on any failure so the caller can log *why* the poll
+/// produced no signal (bad key, quota exhausted, error payload, no events, …).
+async fn try_fetch_nearest_event(http: &reqwest::Client, url: &str) -> Result<EventSample, String> {
     let resp = tokio::time::timeout(
         std::time::Duration::from_secs(8),
         http.get(url).send(),
-    ).await.ok()?.ok()?;
-    if !resp.status().is_success() {
-        return None;
-    }
-    let events = resp.json::<serde_json::Value>().await.ok()?;
-    let events = events.as_array()?;
+    )
+    .await
+    .map_err(|_| "request timed out after 8s".to_string())?
+    .map_err(|e| format!("transport error: {e}"))?;
 
-    // Pick the nearest-commencing event (smallest ISO-8601 commence_time sorts
-    // lexicographically for a fixed offset — all Odds API times are UTC "Z").
+    let status = resp.status();
+    let body = resp.text().await.map_err(|e| format!("failed reading body: {e}"))?;
+    if !status.is_success() {
+        // The Odds API returns a JSON `{ "message": ... }` on error — surface it,
+        // truncated, so 401 (bad key) / 429 (quota) are obvious in the logs.
+        let snippet: String = body.chars().take(200).collect();
+        return Err(format!("HTTP {status}: {snippet}"));
+    }
+
+    let events: serde_json::Value =
+        serde_json::from_str(&body).map_err(|e| format!("invalid JSON: {e}"))?;
+    let events = events
+        .as_array()
+        .ok_or_else(|| {
+            let snippet: String = body.chars().take(200).collect();
+            format!("expected a JSON array of events, got: {snippet}")
+        })?;
+    if events.is_empty() {
+        return Err(format!("no upcoming events returned for sport '{}'", config::SPORTS_ODDS_SPORT));
+    }
+
+    // Pick the nearest-commencing event that actually has priced h2h odds. The
+    // Odds API commonly returns the very nearest events with an empty
+    // `bookmakers: []` (books pulled the line at/near start), so selecting purely
+    // by time and then requiring odds would fail spuriously. Filter to events
+    // that carry ≥1 bookmaker with an h2h market first, then take the soonest.
+    // Times are ISO-8601 UTC ("Z") so lexical order == chronological order.
     let event = events
         .iter()
         .filter(|e| e.get("commence_time").and_then(|t| t.as_str()).is_some())
+        .filter(|e| {
+            e.get("bookmakers")
+                .and_then(|b| b.as_array())
+                .map(|books| books.iter().any(|b| h2h_outcomes(b).is_some()))
+                .unwrap_or(false)
+        })
         .min_by(|a, b| {
             let ta = a.get("commence_time").and_then(|t| t.as_str()).unwrap_or("");
             let tb = b.get("commence_time").and_then(|t| t.as_str()).unwrap_or("");
             ta.cmp(tb)
+        })
+        .ok_or_else(|| {
+            format!("{} events returned but none have priced h2h odds yet", events.len())
         })?;
 
-    let event_id = event.get("id").and_then(|v| v.as_str())?.to_string();
+    let event_id = event
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "nearest event missing id".to_string())?
+        .to_string();
     let home = event.get("home_team").and_then(|v| v.as_str()).unwrap_or("home");
     let away = event.get("away_team").and_then(|v| v.as_str()).unwrap_or("away");
     let event_label = format!("{} vs {}", home, away);
@@ -188,8 +227,13 @@ async fn try_fetch_nearest_event(http: &reqwest::Client, url: &str) -> Option<Ev
     // The reference outcome is the first outcome listed in a book's h2h market.
     // Determine its name from the first book, then read the SAME name across all
     // books for a like-for-like consensus.
-    let books = event.get("bookmakers").and_then(|v| v.as_array())?;
-    let ref_name = first_h2h_outcome_name(books)?;
+    let books = event
+        .get("bookmakers")
+        .and_then(|v| v.as_array())
+        .filter(|b| !b.is_empty())
+        .ok_or_else(|| format!("event '{event_label}' has no bookmakers (h2h not yet priced)"))?;
+    let ref_name = first_h2h_outcome_name(books)
+        .ok_or_else(|| format!("event '{event_label}' has no h2h market outcomes"))?;
 
     let mut probs: Vec<Decimal> = Vec::new();
     for book in books {
@@ -198,17 +242,17 @@ async fn try_fetch_nearest_event(http: &reqwest::Client, url: &str) -> Option<Ev
         }
     }
     if probs.is_empty() {
-        return None;
+        return Err(format!("event '{event_label}': no usable h2h odds across {} books", books.len()));
     }
 
     let num_books = probs.len() as u32;
     let sum: Decimal = probs.iter().copied().sum();
     let consensus_prob = sum / Decimal::from(num_books);
-    let max = probs.iter().copied().max()?;
-    let min = probs.iter().copied().min()?;
+    let max = probs.iter().copied().max().unwrap_or(dec!(0));
+    let min = probs.iter().copied().min().unwrap_or(dec!(0));
     let book_dispersion = max - min;
 
-    Some(EventSample { event_id, event_label, consensus_prob, book_dispersion, num_books })
+    Ok(EventSample { event_id, event_label, consensus_prob, book_dispersion, num_books })
 }
 
 /// Name of the first outcome in the first book's h2h market — the reference
