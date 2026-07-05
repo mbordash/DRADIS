@@ -320,6 +320,25 @@ pub const TIDE_ALPACA_SECRET_ENV: &str = "ALPACA_API_SECRET_KEY";
 /// Prevents log floods and API hammering when FAK exits fail due to thin books.
 pub const BASIS_MIN_STOP_LOSS_EXIT_BID: Decimal = dec!(0.005);
 
+// ── Sports Raptor (The Odds API line-movement feed) ──────────────────────────
+//
+/// Env var carrying the The Odds API (the-odds-api.com) key. Absent ⇒ the Sports
+/// Raptor runs idle/observe-only: it seeds a neutral snapshot, reports
+/// `sports_connected = false`, and publishes no line-movement signal.
+pub const SPORTS_ODDS_KEY_ENV: &str = "ODDS_API_KEY";
+
+/// Sport key polled by the Sports Raptor. `upcoming` returns the next games
+/// across all in-season sports — a broad, always-populated market-mood sample.
+/// Override with a specific key (e.g. `americanfootball_nfl`) for a focused feed.
+pub const SPORTS_ODDS_SPORT: &str = "upcoming";
+
+/// Comma-separated bookmaker regions for the odds query (`us`, `uk`, `eu`, `au`).
+pub const SPORTS_ODDS_REGIONS: &str = "us";
+
+/// Seconds between Sports Raptor polls. The Odds API free tier is quota-limited
+/// (~500 requests/month), so poll conservatively — line movement is a slow signal.
+pub const SPORTS_POLL_SECS: u64 = 300;
+
 // ============================================================================
 // BASIS STRATEGY MAKER ORDER PARAMETERS
 // ============================================================================
