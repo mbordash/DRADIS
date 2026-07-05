@@ -327,6 +327,8 @@ pub const SPORTS_ODDS_REGIONS: &str = "us";
 /// Seconds between Sports Raptor polls. The Odds API free tier is quota-limited
 /// (~500 requests/month), so poll conservatively — line movement is a slow signal.
 pub const SPORTS_POLL_SECS: u64 = 300;
+pub const SPORTS_ODDS_LOW_BUDGET_WARN: i64 = 50;
+
 
 // ============================================================================
 // BASIS STRATEGY MAKER ORDER PARAMETERS
