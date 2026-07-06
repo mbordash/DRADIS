@@ -606,16 +606,18 @@ impl Squadron {
                                                 if let Some(p) = map.remove(&pos_key) {
                                                     let actual_exit_price = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
                                                     let pnl = (actual_exit_price - p.avg_entry) * p.shares;
-                                                    *total_pnl.lock().await += pnl;
 
                                                     re_m = p.avg_entry;
                                                     rs_m = p.shares;
                                                     rc_m = p.close_time;
                                                     pnl_m = pnl;
 
-                                                    // NOTE: record_trade and close_open_position are deferred
-                                                    // to the FAK verification block below so we only write to
-                                                    // the DB once the fill is confirmed (not on order placement).
+                                                    // session_pnl credit, record_trade, and close_open_position are
+                                                    // ALL deferred to the FAK verification block below so the running
+                                                    // PnL counter and the trades table are updated together, only once
+                                                    // a fill is confirmed. Crediting here (on order placement) caused
+                                                    // phantom PnL + unbooked wins when the verify spawn returned early
+                                                    // or was killed by a restart before it could record/reverse.
                                                 } else { continue; }
                                             }
                                             // Release token claim — position is fully closed.
@@ -635,7 +637,17 @@ impl Squadron {
                                             tokio::spawn(async move {
                                                 tokio::time::sleep(Duration::from_millis(2500)).await;
                                                 let mut req = BalanceAllowanceRequest::default(); req.asset_type = AssetType::Conditional; req.token_id = Some(u256_from_market_id(&tid_async).unwrap_or_default());
-                                                let rem = match cl.balance_allowance(req).await { Ok(r) => Decimal::from_str(&r.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000), Err(_) => return };
+                                                let rem = match cl.balance_allowance(req).await {
+                                                    Ok(r) => Decimal::from_str(&r.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
+                                                    Err(_) => {
+                                                        // Balance RPC failed — we can't confirm the fill. Re-insert the
+                                                        // position (no PnL credit, no DB write) so a later exit retry
+                                                        // reconciles it, instead of leaking it out of the position map.
+                                                        let mut map = ps.lock().await;
+                                                        map.entry((sn_async.clone(), tid_async.clone())).or_insert_with(|| Position { shares: rs_m, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name.clone(), pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
+                                                        return;
+                                                    }
+                                                };
 
                                                 let other_strats_shares = {
                                                     let map = ps.lock().await;
@@ -647,28 +659,32 @@ impl Squadron {
                                                 let our_rem = (rem - other_strats_shares).max(dec!(0));
 
                                                 if our_rem >= config::MIN_ORDER_SHARES {
-                                                    let fill = (rs_m - our_rem).max(dec!(0)); let aep2 = aep_exit; let pnlc = -((aep2 - re_m) * our_rem.min(rs_m)); *tp.lock().await += pnlc;
+                                                    let fill = (rs_m - our_rem).max(dec!(0));
                                                     if fill < config::MIN_ORDER_SHARES {
                                                         warn!("⚠️ PARTIAL EXIT [{}]: FAK filled 0/{:.4} shares (our_rem={:.4}, other_strats={:.4}) — re-inserting for retry.", sn_async, rs_m, our_rem, other_strats_shares);
                                                         let mut map = ps.lock().await;
                                                         if !map.contains_key(&(sn_async.clone(), tid_async.clone())) {
                                                             map.insert((sn_async.clone(), tid_async.clone()), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
                                                         }
-                                                        // 0 fills — do NOT record to DB; position is re-inserted for retry.
+                                                        // 0 fills — no PnL credit, no DB write; position re-inserted for retry.
                                                     } else {
                                                         warn!("⚠️ PARTIAL EXIT [{}]: sold {:.4}/{:.4} (our_rem={:.4}, other_strats={:.4}) — re-inserting.", sn_async, fill, rs_m, our_rem, other_strats_shares);
-                                                        let mut map = ps.lock().await;
-                                                        if !map.contains_key(&(sn_async.clone(), tid_async.clone())) {
-                                                            map.insert((sn_async.clone(), tid_async.clone()), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name.clone(), pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
+                                                        {
+                                                            let mut map = ps.lock().await;
+                                                            if !map.contains_key(&(sn_async.clone(), tid_async.clone())) {
+                                                                map.insert((sn_async.clone(), tid_async.clone()), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name.clone(), pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
+                                                            }
                                                         }
-                                                        // Partial fill — record only the filled portion.
-                                                        let partial_pnl = (aep2 - re_m) * fill;
-                                                        metrics::record_trade(&asset_t, sn_rec, m_name, sid_m, re_m, aep2, fill, partial_pnl, r_m).await;
+                                                        // Partial fill — credit and record ONLY the filled portion, together.
+                                                        let partial_pnl = (aep_exit - re_m) * fill;
+                                                        *tp.lock().await += partial_pnl;
+                                                        metrics::record_trade(&asset_t, sn_rec, m_name, sid_m, re_m, aep_exit, fill, partial_pnl, r_m).await;
                                                         if let Some(pool) = db::pool_for(&asset_t) { db::close_open_position(&pool, &sn_async, &tid_async.to_string()).await; }
                                                     }
                                                 } else {
-                                                    // Full fill confirmed — now it's safe to write to DB.
+                                                    // Full fill confirmed — credit session PnL and write to DB together.
                                                     info!("✅ FAK exit confirmed [{sn_async}]: {rs_m:.4} shares sold @ ${aep_exit:.4} pnl=${pnl_m:.4}");
+                                                    *tp.lock().await += pnl_m;
                                                     metrics::record_trade(&asset_t, sn_rec, m_name, sid_m, re_m, aep_exit, rs_m, pnl_m, r_m).await;
                                                     if let Some(pool) = db::pool_for(&asset_t) { db::close_open_position(&pool, &sn_async, &tid_async.to_string()).await; }
                                                 }
