@@ -49,6 +49,14 @@ function fmtClock(ms: number): string {
   });
 }
 
+// Sports telemetry now spans days (de-duplicated ~2h polls), so a seconds-level
+// clock is ambiguous. Label these points with month/day + HH:MM instead.
+function fmtDayClock(ms: number): string {
+  return new Date(ms).toLocaleString('en-US', {
+    month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit', hour12: false,
+  });
+}
+
 // Render an ISO-8601 kickoff time as a compact local "Sat 8:10 PM" label.
 function fmtKickoff(iso: string): string {
   const d = new Date(iso);
@@ -90,8 +98,9 @@ function toRow(s: TelemetrySample): Row {
   };
 }
 
-// The Sports Raptor is venue-neutral and polls on its own (~5 min) cadence, so it
-// gets its own chart row type independent of the crypto asset samples.
+// The Sports Raptor is venue-neutral and polls on its own (~2h) cadence; its telemetry
+// is de-duplicated server-side, so it gets its own sparse, multi-day chart row type
+// independent of the crypto asset samples.
 interface SportsRow {
   t: number;
   time: string;
@@ -104,7 +113,7 @@ interface SportsRow {
 function toSportsRow(s: TelemetrySample): SportsRow {
   return {
     t: Number(s.t),
-    time: fmtClock(Number(s.t)),
+    time: fmtDayClock(Number(s.t)),
     consensus: num(s.sports_consensus_prob),
     drift: num(s.sports_line_drift),
     dispersion: num(s.sports_book_dispersion),
@@ -484,8 +493,9 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
   );
 
   // The Sports Raptor is venue-neutral and publishes under a fixed "sports" key,
-  // independent of the selected crypto asset. It polls on a ~5-min cadence, so fetch
-  // a generous fixed history (independent of the crypto window selector) to plot it.
+  // independent of the selected crypto asset. It polls every ~2h and its telemetry is
+  // de-duplicated server-side (one point per change/heartbeat), so a modest fixed
+  // request spans many days of readable movement regardless of the crypto window.
   const { data: sportsSamples } = useSWR(
     ['telemetry-history', 'sports', 288],
     () => getTelemetryHistory('sports', 288),

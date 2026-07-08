@@ -208,6 +208,15 @@ pub type TelemetryHistory = Arc<Mutex<HashMap<String, VecDeque<TelemetrySample>>
 const TELEMETRY_SAMPLE_SECS: u64 = 2;
 /// Retention cap per asset (samples). 1800 × 2s = 1 hour of scrubable history.
 const TELEMETRY_HISTORY_CAP: usize = 1800;
+/// The Sports Raptor polls every ~2h (`config::SPORTS_POLL_SECS`), so sampling it at
+/// the 2s crypto cadence would store thousands of identical points and flatline its
+/// chart. Its samples are de-duplicated (stored only on a value change, or once per
+/// heartbeat), so a much larger cap spans many days for a trivial memory cost.
+const SPORTS_HISTORY_CAP: usize = 1440;
+/// Force a sports sample at least this often even when the signal is unchanged, so the
+/// series keeps advancing in time and the most-recent point stays reasonably fresh.
+/// 1440 points × 30 min ≈ 30 days of retained, readable movement.
+const SPORTS_TELEMETRY_HEARTBEAT_SECS: i64 = 1800;
 
 /// Background task — every `TELEMETRY_SAMPLE_SECS`, snapshot the current Raptor
 /// signal values into the per-asset ring buffer. Spawned once by
@@ -228,6 +237,31 @@ async fn run_telemetry_sampler(
         };
         for (asset, h) in snapshot.iter() {
             let buf = hist.entry(asset.clone()).or_default();
+
+            // De-duplicate the slow Sports feed: it polls every ~2h, so storing it at
+            // the 2s crypto cadence would fill the buffer with identical points and
+            // render a flat line. Keep a point only when a signal actually changes, or
+            // once per heartbeat so the series still advances in time.
+            if asset == "sports" {
+                let changed = match buf.back() {
+                    Some(last) => {
+                        last.sports_consensus_prob  != h.sports_consensus_prob
+                            || last.sports_line_drift      != h.sports_line_drift
+                            || last.sports_book_dispersion != h.sports_book_dispersion
+                            || last.sports_num_books       != h.sports_num_books
+                            || last.sports_event           != h.sports_event
+                            || last.sports_connected       != h.sports_connected
+                    }
+                    None => true,
+                };
+                let heartbeat_due = buf.back()
+                    .map(|last| now - last.t >= SPORTS_TELEMETRY_HEARTBEAT_SECS * 1000)
+                    .unwrap_or(true);
+                if !changed && !heartbeat_due {
+                    continue;
+                }
+            }
+
             buf.push_back(TelemetrySample {
                 t: now,
                 oracle_price: h.oracle_price,
@@ -262,8 +296,9 @@ async fn run_telemetry_sampler(
                 sports_books:          h.sports_books.clone(),
             });
             let len = buf.len();
-            if len > TELEMETRY_HISTORY_CAP {
-                buf.drain(0..len - TELEMETRY_HISTORY_CAP);
+            let cap = if asset == "sports" { SPORTS_HISTORY_CAP } else { TELEMETRY_HISTORY_CAP };
+            if len > cap {
+                buf.drain(0..len - cap);
             }
         }
     }
