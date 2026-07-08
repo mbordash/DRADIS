@@ -454,8 +454,6 @@ runs low. Omit the key and it runs idle (neutral snapshot, offline pill).
 
 ### RPC Configuration
 
-> ⚠️ **Helius is Solana-only — do not use it for DRADIS.**
-
 Recommended: [Alchemy](https://www.alchemy.com/), [QuickNode](https://www.quicknode.com/), [Infura](https://infura.io/)
 
 ```bash
@@ -529,64 +527,6 @@ tail -f logs/dradis-local.log | grep -E "WARN|ERROR"             # problems
 
 Dashboard: `http://YOUR_SERVER_IP:3002`  
 API health: `http://YOUR_SERVER_IP:9000/api/health`
-
----
-
-## ️ Roadmap
-
-### Recently shipped
-
-- **TrendCapture & TimeDecay tuning** — Three targeted fixes from live production data:
-  - Removed `* 1.5` effective-SL multiplier in TrendCapture (SL was inflated 12% → 18%); now uses `trendcapture_stop_loss_pct` directly.
-  - `trendcapture_max_entry_price` lowered from `0.72 → 0.55` — avoids late-cycle entries where there is almost no room to run to the 20% TP.
-  - TimeDecay arb-wait deadline aligned to `TIME_DECAY_MAX_SECS_TO_EXPIRY` (1800s) so valid resting GTC bids are no longer declared orphaned at 185s.
-- **Rescue-profit gate** — Arbitrage entries are now blocked when a single-leg failure cannot be recovered into profit. The gate checks `safe_yes_bid + no_ask + fee + buffer ≥ $1.00` and `safe_no_bid + yes_ask + fee + buffer ≥ $1.00` before the collateral check, preventing entries into markets where a rescue trade would guarantee a loss.
-- **Shared OrderLifecycle (Slice 3)** — Venue-neutral position reconciler wired end-to-end for the Intl CLOB venue:
-  - `OrderLifecycle::reconcile()` polls `Execution::positions()` + `open_orders()` every 30s and flattens truly stale positions, replacing bespoke per-venue polling.
-  - `IntlClobVenue` now fully implements `cancel()`, `positions()`, `open_orders()`, and an `active_tokens` registry (cleared on rotation, populated at arb entry time).
-  - `LifecycleConfig::intl()` preset — 30-min stale-order backstop, `flatten_sell_limit: $0.01`.
-  - `spawn_lifecycle_task()` in `patrol_tasks.rs` wires the reconcile loop to the peripheral cancel token; `lifecycle.track()` fires on every arb entry success.
-  - First-leg confirm grace reduced 30s → 5s: once one arb leg confirms, the missing leg has only 5s as a free maker before the arbiter acts.
-  - Token sovereignty cooldown now fires at both rejection sites in `patrol_impl.rs`, eliminating a 7,000+/hr spin-loop.
-- **US Retail venue (MVP)** — optional `us_retail` build target for the CFTC-regulated Polymarket US exchange; runs the arbitrage strategy with engine-atomic batched orders and live dashboard support.
-- **Phase 3f-7 — Per-asset SQLite DB pools** — Each asset in the fleet now owns its own SQLite file (`logs/btc-dradis.db`, `logs/eth-dradis.db`, etc.):
-  - `db::init_for_asset()` / `db::pool_for()` / `db::pool_for_opt()` replace the single global pool
-  - All hot-path writes (`record_open_position`, `close_open_position`, `record_trade_db`, etc.) scoped to the correct per-asset pool via `pool_for(&asset_lc)`
-  - `sync_open_positions_with_chain` and `purge_settled_legs` iterate ALL registered pools — secondary-asset DBs are fully reconciled on startup and after settlement
-  - API endpoints accept `?asset=` query param to scope trades, positions, P&L, and recommendations to any active asset pool
-- **Phase 3f-6 — CAG task ownership** — Per-asset `AssetTask { AbortHandle, CancellationToken }` registered in `CagInner`:
-  - `register_loop_task()`, `stand_down_asset()`, `loop_asset_names()` wired end-to-end
-  - `stand_down_all()` cancels + aborts every running asset loop
-  - `RunArgs.cancel` checked at the top of every `'market_loop` iteration
-  - `Cag::run()` stub deleted; `src/cag/mod.rs` carries accurate architecture docs
-- **OBI Swing Block gate** — `MOMENTUM_OBI_SWING_BLOCK` config constant now wired into all 6 Momentum entry paths (primary, strike-crossing, and no-strike for both bull and bear). Previously computed but never applied.
-- **Phase 3 — CAG (Commander Air Group)** — Async dispatch layer replacing the manual market-rotation loop:
-  - `src/cag/` — `Cag`, `SessionState`, `RunArgs<P>`, `run_market_loop()`
-  - `main.rs` reduced from ~730 lines to ~415 lines; full market loop lives in `cag/run.rs`
-  - **Multi-asset**: `ASSETS=btc,eth,sol` spawns one concurrent patrol loop per asset (independent raptors, session state, LLM advisor, SQLite DB)
-  - Tokio runtime bumped to 8 worker threads; OS-thread watchdog added (5-minute silence → `process::exit(1)`)
-  - Backward-compatible: `CRYPTO_FILTER=btc` (single-asset) still works unchanged
-- **Raptor / Viper / Squadron architecture** — Three-layer BSG tactical separation of concerns:
-  - `src/raptors/` — Price Raptor (Binance WS) + Funding Raptor (Binance FAPI)
-  - `src/vipers/` — eight Viper trading strategies (Momentum, Maker, Arbitrage, Time Decay, Basis, GBoost, TrendCapture, Convergence)
-  - `src/squadron/` — `Squadron`, `SquadronRaptors`, `SquadronConfig`, `SquadronState`
-  - Each market rotation logs `️ Squadron [...] → state=PATROLLING`
-- **Open Positions improvements** — Side column colors YES/UP green and NO/DOWN red; chain-adopted positions show `⛓ adopted`; `chain_adopted` DB column with live migration
-- **Side label fix** — `adopt_chain_position` correctly binds the Polymarket outcome string (was storing literal `?`)
-- **Viper hot-enable** — All Vipers always instantiated at startup; toggle any live from Control Tower with no restart
-
-### Next up
-- US Retail venue hardening — live private fills WebSocket; US re-hedge on single-leg failure
-- Kalshi venue integration (venue abstraction layer is ready; community PRs welcome)
-
-### Medium-term
-- Static deployment profiles (`profiles.toml`) with per-profile P&L tracking
-- Squadron creator in Control Tower
-- LLM live config patches via Telegram approval gate
-
-### Longer-term
-- Politics Raptor (polling aggregator feeds)
-- Sports Viper — a dedicated strategy that consumes the Sports Raptor's line-movement signal (currently observe-only)
 
 ---
 
