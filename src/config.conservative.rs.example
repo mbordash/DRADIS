@@ -387,6 +387,7 @@ pub const GBOOST_MIN_ENTRY_PRICE: Decimal = dec!(0.42); // Conservative: further
 pub const GBOOST_HISTORY_BUFFER_SIZE: usize = 1000;
 pub const GBOOST_LOOKAHEAD_TICKS: usize = 200;
 pub const GBOOST_MIN_TRAINING_SAMPLES: usize = 320;
+pub const GBOOST_MIN_RETRAIN_INTERVAL_SECS: u64 = 300;
 pub const GBOOST_RETRAIN_EVERY_N: usize = 200;
 pub const GBOOST_BUDGET: f32 = 0.80; // raised from 0.65 — gives perpetual room to grow past 1 tree
 pub const GBOOST_NUM_THREADS: usize = 2;

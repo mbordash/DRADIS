@@ -60,7 +60,11 @@ pub async fn run_price_raptor(
         .unwrap_or_else(Instant::now);
 
     loop {
-        if let Ok((mut ws_stream, _)) = connect_async(&url_str).await {
+        // Bounded connect: an unbounded `connect_async().await` can hang forever on a
+        // half-open TCP path or geo-block, silently wedging the task with no reconnect
+        // and no log (observed 2026-07-07 — oracle price frozen for ~10h). Cap it.
+        let conn = tokio_timeout(Duration::from_secs(20), connect_async(&url_str)).await;
+        if let Ok(Ok((mut ws_stream, _))) = conn {
             info!(" Price Raptor connected to Binance for {}", binance_pair.to_uppercase());
             // Mark price raptor as healthy for this asset.
             raptor_health_tx.send_modify(|map| {

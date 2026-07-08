@@ -106,6 +106,39 @@ const MAX_CANCEL_RETRIES: u32 = 5;
 #[cfg(feature = "intl_clob")]
 const BASE_CANCEL_RETRY_DELAY_MS: u64 = 200; // Start with 200ms
 
+/// Supervise a long-lived feed task so it can never silently flatline.
+///
+/// The raptor feeds (Price, Funding, Derivatives, …) were previously fire-and-forget
+/// `tokio::spawn`s with no supervision. On 2026-07-07 a CPU-starvation episode killed
+/// the Price + Funding raptors; because nothing watched them they stayed dead for ~10h
+/// (Binance oracle price frozen at a single value), flatlining the Oracle Price,
+/// Velocity/Acceleration, Drift and Funding Rate telemetry charts until the next full
+/// process restart. This wrapper runs the task inside an inner `tokio::spawn`, awaits its
+/// `JoinHandle`, and respawns it (after a short backoff) if it ever returns or panics —
+/// so a feed always heals itself without needing a whole-process restart.
+fn spawn_supervised<F, Fut>(name: &'static str, factory: F) -> tokio::task::JoinHandle<()>
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            match tokio::spawn(factory()).await {
+                Ok(()) => tracing::warn!(
+                    "⚠️ Supervised feed '{}' exited unexpectedly — respawning in 5s", name,
+                ),
+                Err(e) if e.is_panic() => tracing::error!(
+                    "💥 Supervised feed '{}' PANICKED — respawning in 5s: {:?}", name, e,
+                ),
+                Err(e) => tracing::warn!(
+                    "⚠️ Supervised feed '{}' terminated ({:?}) — respawning in 5s", name, e,
+                ),
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        }
+    })
+}
+
 // Force at least 8 worker threads.  With multiple concurrent asset loops each
 // running peripheral tasks (status, cleanup, settlement, pulse, watchdog) plus
 // WS reconnect loops, a larger pool prevents one blocking call from starving
@@ -451,9 +484,15 @@ async fn main() -> Result<()> {
     // sizing yet (telemetry observation phase, same status as the Tide Raptor).
     let (sports_tx, sports_rx) =
         watch::channel(dradis::raptors::sports::SportsSnapshot::default());
-    tokio::spawn(dradis::raptors::sports::run_sports_raptor(
-        Arc::clone(&shared_http), sports_tx, Arc::clone(&raptor_health_tx),
-    ));
+    {
+        let http = Arc::clone(&shared_http);
+        let health = Arc::clone(&raptor_health_tx);
+        spawn_supervised("sports-raptor", move || {
+            dradis::raptors::sports::run_sports_raptor(
+                Arc::clone(&http), sports_tx.clone(), Arc::clone(&health),
+            )
+        });
+    }
 
     for asset in assets.iter() {
         // ── Per-asset raptor signal feeds ─────────────────────────────────────
@@ -464,18 +503,36 @@ async fn main() -> Result<()> {
         let (deriv_tx, deriv_rx)       =
             watch::channel(dradis::raptors::derivatives::DerivativesSnapshot::default());
 
-        tokio::spawn(dradis::raptors::price::run_price_raptor(
-            asset.clone(), oracle_tx, velocity_tx, drift_tx,
-            Arc::clone(&raptor_health_tx),
-        ));
-        tokio::spawn(dradis::raptors::funding::run_funding_raptor(
-            Arc::clone(&shared_http), asset.clone(), funding_tx,
-            Arc::clone(&raptor_health_tx),
-        ));
-        tokio::spawn(dradis::raptors::derivatives::run_derivatives_raptor(
-            Arc::clone(&shared_http), asset.clone(), deriv_tx,
-            Arc::clone(&raptor_health_tx),
-        ));
+        {
+            let asset_c = asset.clone();
+            let health = Arc::clone(&raptor_health_tx);
+            spawn_supervised("price-raptor", move || {
+                dradis::raptors::price::run_price_raptor(
+                    asset_c.clone(), oracle_tx.clone(), velocity_tx.clone(), drift_tx.clone(),
+                    Arc::clone(&health),
+                )
+            });
+        }
+        {
+            let http = Arc::clone(&shared_http);
+            let asset_c = asset.clone();
+            let health = Arc::clone(&raptor_health_tx);
+            spawn_supervised("funding-raptor", move || {
+                dradis::raptors::funding::run_funding_raptor(
+                    Arc::clone(&http), asset_c.clone(), funding_tx.clone(), Arc::clone(&health),
+                )
+            });
+        }
+        {
+            let http = Arc::clone(&shared_http);
+            let asset_c = asset.clone();
+            let health = Arc::clone(&raptor_health_tx);
+            spawn_supervised("derivatives-raptor", move || {
+                dradis::raptors::derivatives::run_derivatives_raptor(
+                    Arc::clone(&http), asset_c.clone(), deriv_tx.clone(), Arc::clone(&health),
+                )
+            });
+        }
 
         // Tide Raptor — "Institutional Pulse" from spot-BTC-ETF premium. BTC-only
         // and singular: spawned for the btc asset, reusing its live oracle feed.
@@ -483,9 +540,13 @@ async fn main() -> Result<()> {
         let tide_rx = if asset == "btc" {
             let (tide_tx, tide_rx) =
                 watch::channel(dradis::raptors::tide::TideSnapshot::default());
-            tokio::spawn(dradis::raptors::tide::run_tide_raptor(
-                oracle_rx.clone(), tide_tx, Arc::clone(&raptor_health_tx),
-            ));
+            let oracle_rx_c = oracle_rx.clone();
+            let health = Arc::clone(&raptor_health_tx);
+            spawn_supervised("tide-raptor", move || {
+                dradis::raptors::tide::run_tide_raptor(
+                    oracle_rx_c.clone(), tide_tx.clone(), Arc::clone(&health),
+                )
+            });
             Some(tide_rx)
         } else {
             None

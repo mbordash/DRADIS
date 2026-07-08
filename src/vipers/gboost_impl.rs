@@ -411,6 +411,12 @@ pub struct GboostStrategyImpl {
     consecutive_degenerate: Arc<StdMutex<usize>>,
     /// When set, `maybe_retrain` skips all retrain attempts until this instant passes.
     retrain_backoff_until: Arc<StdMutex<Option<Instant>>>,
+    /// `Instant` of the last SUCCESSFUL retrain trigger.  Enforces a hard wall-clock
+    /// floor (GBOOST_MIN_RETRAIN_INTERVAL_SECS) between CPU-bound retrains so a fast tick
+    /// rate cannot storm booster.fit() every ~30s and starve the runtime (watchdog stalls,
+    /// observed 2026-07-07).  Unlike retrain_backoff_until this applies to HEALTHY retrains
+    /// too, not just degenerate ones.
+    last_retrain_at: Arc<StdMutex<Option<Instant>>>,
     /// When set, records the `Instant` at which BTC spot first dropped below
     /// (daily_strike − BASIS_BTC_ORACLE_STRIKE_BUFFER).  Resets to None whenever spot
     /// recovers above the threshold.  Used to suppress YES entries on daily markets when
@@ -531,6 +537,7 @@ impl GboostStrategyImpl {
             post_exit_cooldowns: Arc::new(StdMutex::new(HashMap::new())),
             consecutive_degenerate: Arc::new(StdMutex::new(0)),
             retrain_backoff_until: Arc::new(StdMutex::new(None)),
+            last_retrain_at: Arc::new(StdMutex::new(None)),
             below_strike_since: Arc::new(StdMutex::new(None)),
             concept_drift_suppressed: Arc::new(AtomicBool::new(false)),
             last_concept_drift_score: Arc::new(StdMutex::new(0.0_f32)),
@@ -571,6 +578,22 @@ impl GboostStrategyImpl {
             let guard = self.retrain_backoff_until.lock().unwrap();
             if let Some(until) = *guard {
                 if Instant::now() < until {
+                    return;
+                }
+            }
+        }
+
+        // ── Hard wall-clock retrain floor ──────────────────────────────────────
+        // GBOOST_RETRAIN_EVERY_N is a tick counter, not a time interval; at a fast
+        // main-loop tick rate it can trip every ~30s.  A full booster.fit() +
+        // concept-drift pass every 30s pegs a 1-2 vCPU box, starves the tokio runtime
+        // and trips the loop/OS watchdogs (observed 2026-07-07).  Enforce a minimum
+        // wall-clock gap between SUCCESSFUL retrains regardless of tick rate.  This is
+        // independent of the degenerate-backoff above (which only fires on bad models).
+        {
+            let guard = self.last_retrain_at.lock().unwrap();
+            if let Some(last) = *guard {
+                if last.elapsed().as_secs() < config::GBOOST_MIN_RETRAIN_INTERVAL_SECS {
                     return;
                 }
             }
@@ -645,10 +668,12 @@ impl GboostStrategyImpl {
                 pos_fraction * 100.0, config::GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX * 100.0
             );
             *self.ticks_since_retrain.lock().unwrap() = 0;
+            *self.last_retrain_at.lock().unwrap() = Some(Instant::now());
             return;
         }
 
         *self.ticks_since_retrain.lock().unwrap() = 0;
+        *self.last_retrain_at.lock().unwrap() = Some(Instant::now());
         self.is_training.store(true, Ordering::Relaxed);
 
         let model_arc   = Arc::clone(&self.model);
