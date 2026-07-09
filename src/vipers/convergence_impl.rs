@@ -50,6 +50,9 @@ const STRATEGY_NAME: &str = "ConvergenceStrategy";
 pub struct ConvergenceStrategyImpl {
     /// Per-token cooldown after any exit. Key: token_id, Value: Instant of exit.
     post_exit_cooldown: Mutex<HashMap<MarketId, Instant>>,
+    /// Per-market cooldown after a CATASTROPHIC exit. Key: condition_id. Blocks BOTH
+    /// legs so the strategy cannot flip to the opposite side and get whipsawed again.
+    catastrophic_cooldown: Mutex<HashMap<String, Instant>>,
     /// Viper-level exit-signal cooldown to prevent FAK-miss re-fire storms.
     last_exit_signal_at: Mutex<Option<Instant>>,
 }
@@ -58,6 +61,7 @@ impl ConvergenceStrategyImpl {
     pub fn new() -> Self {
         Self {
             post_exit_cooldown: Mutex::new(HashMap::new()),
+            catastrophic_cooldown: Mutex::new(HashMap::new()),
             last_exit_signal_at: Mutex::new(None),
         }
     }
@@ -72,6 +76,14 @@ impl ConvergenceStrategyImpl {
         }
         if let Ok(mut last) = self.last_exit_signal_at.lock() {
             *last = Some(Instant::now());
+        }
+    }
+
+    /// Arm the market-wide cooldown after a catastrophic exit so neither leg of this
+    /// market can be re-entered until CONVERGENCE_CATASTROPHIC_COOLDOWN_SECS elapses.
+    fn record_catastrophic(&self, condition_id: &str) {
+        if let Ok(mut map) = self.catastrophic_cooldown.lock() {
+            map.insert(condition_id.to_string(), Instant::now());
         }
     }
 }
@@ -216,6 +228,20 @@ impl Strategy for ConvergenceStrategyImpl {
             }
         }
 
+        // ── Market-wide catastrophic cooldown ─────────────────────────────────
+        // After a catastrophic stop in this market, block BOTH legs (not just the
+        // stopped token) so we don't flip to the opposite side and get whipsawed again
+        // in the same chop (observed 2026-07-08: YES @0.60 then NO @0.60, both -21%).
+        if let Ok(map) = self.catastrophic_cooldown.lock() {
+            if let Some(t) = map.get(&market.condition_id) {
+                if t.elapsed().as_secs() < config::CONVERGENCE_CATASTROPHIC_COOLDOWN_SECS {
+                    debug!(" Convergence blocked: market in post-catastrophic cooldown ({}s left)",
+                        config::CONVERGENCE_CATASTROPHIC_COOLDOWN_SECS.saturating_sub(t.elapsed().as_secs()));
+                    return Ok(StrategySignal::NoSignal);
+                }
+            }
+        }
+
         // ── Exposure + one-position-per-market checks ─────────────────────────
         let size = dc.convergence_position_size_usdc;
         {
@@ -345,7 +371,15 @@ impl Strategy for ConvergenceStrategyImpl {
                 // Previously this only existed in the pre-confirmation branch, so a
                 // CONFIRMED position had no catastrophic backstop at all (root cause of
                 // the −43.5% overshoot on trade id 88).
-                if profit_margin <= config::CONVERGENCE_CATASTROPHIC_SL_PCT {
+                //
+                // The threshold scales with the LIVE stop-loss (2×) rather than a fixed
+                // -20%: with a tight 5% stop the old -20% floor let fast whipsaws (held <
+                // MIN_HOLD, so the normal stop can't fire yet) cost 4× the intended risk.
+                // Clamped so it can never be looser than CONVERGENCE_CATASTROPHIC_SL_PCT.
+                let catastrophic_pct =
+                    (-(dc.convergence_stop_loss_pct * config::CONVERGENCE_CATASTROPHIC_SL_MULT))
+                        .max(config::CONVERGENCE_CATASTROPHIC_SL_PCT);
+                if profit_margin <= catastrophic_pct {
                     found = Some(make_exit(format!(
                         "ConvergenceCatastrophic: bid=${:.4} loss={:.2}%",
                         bid, profit_margin * dec!(100))));
@@ -397,6 +431,11 @@ impl Strategy for ConvergenceStrategyImpl {
 
         if let Some(p) = pending {
             self.record_exit(&p.token_id);
+            // A catastrophic stop cools down the WHOLE market (both legs), not just the
+            // stopped token, to prevent an immediate opposite-side whipsaw re-entry.
+            if p.reason.starts_with("ConvergenceCatastrophic") {
+                self.record_catastrophic(&p.condition_id);
+            }
             return Ok(StrategySignal::Exit {
                 params: OrderParams {
                     token_id:     p.token_id,

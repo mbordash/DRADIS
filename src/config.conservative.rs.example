@@ -137,6 +137,7 @@ pub const MOMENTUM_CATASTROPHIC_SL_PCT: Decimal = dec!(0.06); // Conservative: t
 
 pub const MOMENTUM_WINDOW_SECS: u64 = 5;
 pub const MOMENTUM_SHORT_WINDOW_SECS: u64 = 1;
+pub const DRIFT_60M_MIN_WINDOW_SECS: u64 = 600;
 pub const MOMENTUM_SHORT_WINDOW_FRACTION: Decimal = dec!(0.60);
 pub const MOMENTUM_ACCELERATION_BYPASS_MULTIPLIER: Decimal = dec!(3.5);
 pub const MOMENTUM_DECAY_EXIT_FRACTION: Decimal = dec!(0.30);
@@ -969,6 +970,13 @@ pub const CONVERGENCE_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
 
 /// Catastrophic stop applied BEFORE fill-confirmation (negative = loss fraction).
 pub const CONVERGENCE_CATASTROPHIC_SL_PCT: Decimal = dec!(-0.20);
+
+/// Catastrophic backstop = this multiple of the live stop-loss, clamped to
+/// CONVERGENCE_CATASTROPHIC_SL_PCT. Scales the hard floor with a tight stop.
+pub const CONVERGENCE_CATASTROPHIC_SL_MULT: Decimal = dec!(2.0);
+
+/// After a catastrophic stop, block BOTH legs of that market for this long.
+pub const CONVERGENCE_CATASTROPHIC_COOLDOWN_SECS: u64 = 900;
 
 /// Per-token cooldown after any exit before re-entry is allowed (seconds).
 pub const CONVERGENCE_POST_EXIT_COOLDOWN_SECS: u64 = 300;

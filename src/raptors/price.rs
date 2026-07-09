@@ -131,11 +131,16 @@ pub async fn run_price_raptor(
                                                 price_history_60m.pop_front();
                                             } else { break; }
                                         }
-                                        let drift_60m = if price_history_60m.len() > 1 {
-                                            if let Some((oldest_t, oldest_p)) = price_history_60m.front() {
-                                                if now.duration_since(*oldest_t).as_secs() >= 3600 {
-                                                    price - oldest_p
-                                                } else { dec!(0) }
+                                        // Graceful degradation (mirrors drift_10m below): once at least
+                                        // DRIFT_60M_MIN_WINDOW_SECS of history exists, report the drift over
+                                        // whatever window IS available rather than staying 0 until a full
+                                        // hour accrues.  The prior all-or-nothing `>= 3600s` check left the
+                                        // Convergence 60m-exhaustion gate blind for a full hour after every
+                                        // restart.  A shorter window yields a smaller drift → conservative.
+                                        let drift_60m = if let Some((oldest_t, oldest_p)) = price_history_60m.front() {
+                                            let window_secs = now.duration_since(*oldest_t).as_secs();
+                                            if window_secs >= config::DRIFT_60M_MIN_WINDOW_SECS {
+                                                price - oldest_p
                                             } else { dec!(0) }
                                         } else { dec!(0) };
 
