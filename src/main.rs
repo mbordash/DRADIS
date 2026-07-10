@@ -499,7 +499,7 @@ async fn main() -> Result<()> {
         let (oracle_tx, oracle_rx)     = watch::channel(dec!(0));
         let (velocity_tx, velocity_rx) = watch::channel((dec!(0), dec!(0), dec!(0)));
         let (funding_tx, funding_rx)   = watch::channel(dec!(0));
-        let (drift_tx, drift_rx)       = watch::channel((dec!(0), dec!(0)));
+        let (drift_tx, drift_rx)       = watch::channel((dec!(0), dec!(0), dec!(0)));
         let (deriv_tx, deriv_rx)       =
             watch::channel(dradis::raptors::derivatives::DerivativesSnapshot::default());
 

@@ -140,6 +140,14 @@ pub struct MarketSnapshot {
     /// Captures the medium-term directional move where profitable binary trades develop.
     /// Zero when fewer than 10 minutes of price history are available.
     pub oracle_drift_10m: Decimal,
+    /// Canonical 60-minute realized volatility of the oracle (Binance) price, from the
+    /// Price raptor's `normalized_hist_vol` over a proper time-spaced 60-min window.
+    /// Normalized to [0, 1] where 1.0 = 2%-per-tick log-return std-dev. ~0.0025–0.0035
+    /// for normal BTC; ~0.0 when the oracle is frozen. Consumed by GBoost's flatness
+    /// gate (and its `hist_vol_regime` feature) instead of recomputing from the
+    /// 50ms-cadence snapshot buffer, which oversamples duplicate prints and collapses
+    /// to 0. Zero until the raptor has ≥5 samples.
+    pub hist_vol: Decimal,
     /// Seconds remaining until this market's expiry at the time of snapshot creation.
     /// Negative if market has already expired.  Zero when close_time is unknown.
     /// Used by GBoost as a direct feature: binary market microstructure changes

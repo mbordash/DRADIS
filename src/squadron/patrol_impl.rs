@@ -503,6 +503,7 @@ impl Squadron {
                             cvd_ratio: deriv_rx.as_ref().map(|r| r.borrow().cvd_ratio).unwrap_or(Decimal::ZERO),
                             oracle_drift_60m: drift_rx.borrow().0,
                             oracle_drift_10m: drift_rx.borrow().1,
+                            hist_vol: drift_rx.borrow().2,
                             secs_to_expiry: hourly_market_close_time
                                 .map(|t| (t - Utc::now()).num_seconds())
                                 .unwrap_or(0),
@@ -520,6 +521,7 @@ impl Squadron {
                             no_bid: maker_nb, no_bid_depth: maker_nbd, no_ask: maker_na, no_ask_depth: maker_nad,
                             oracle_price: *oracle_rx.borrow(), velocity: velocity_rx.borrow().0, velocity_1s: velocity_rx.borrow().1, acceleration: velocity_rx.borrow().2,
                             funding_rate: *funding_rx.borrow(), oracle_drift_60m: drift_rx.borrow().0, oracle_drift_10m: drift_rx.borrow().1,
+                            hist_vol: drift_rx.borrow().2,
                             institutional_pulse: tide_rx.as_ref().map(|r| r.borrow().institutional_pulse).unwrap_or(Decimal::ZERO),
                             tide_coherence: tide_rx.as_ref().map(|r| r.borrow().coherence).unwrap_or(Decimal::ZERO),
                             oi_delta_pct: deriv_rx.as_ref().map(|r| r.borrow().oi_delta_pct).unwrap_or(Decimal::ZERO),

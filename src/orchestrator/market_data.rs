@@ -70,6 +70,7 @@ impl MarketDataBroadcaster {
             funding_rate,
             oracle_drift_60m,
             oracle_drift_10m,
+            hist_vol: Decimal::ZERO,
             institutional_pulse: Decimal::ZERO,
             tide_coherence: Decimal::ZERO,
             oi_delta_pct: Decimal::ZERO,

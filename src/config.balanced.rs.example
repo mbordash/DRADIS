@@ -388,7 +388,7 @@ pub const GBOOST_HOURLY_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.65);
 pub const GBOOST_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.80);
 /// Minimum historical volatility regime required for a GBoost entry.
 /// Balanced: 0.002 — default value; blocks entries when the oracle is completely flat.
-pub const GBOOST_MIN_HIST_VOL: f64 = 0.020; // Raised from 0.002: blocks entries when oracle is frozen (2026-06-17 T1 root cause)
+pub const GBOOST_MIN_HIST_VOL: f64 = 0.0010; // Recalibrated from 0.020 (2026-07-10): normal BTC 60m realized-vol is ~0.0025-0.0035; old floor blocked ALL entries. Blocks frozen oracle (~0.0), admits live BTC.
 pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.40);
 pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(4.0);
 pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300;
@@ -895,15 +895,15 @@ pub const CONVERGENCE_SKIP_BAND_HIGH: Decimal = dec!(0.55);
 pub const CONVERGENCE_OBI_ADVERSE_BLOCK: Decimal = dec!(0.50); // 2026-06-30: block entry into adverse order-book imbalance
 
 /// Entry-relative take-profit and stop-loss.
-pub const CONVERGENCE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.15);
+pub const CONVERGENCE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.08); // 2026-07-10: 0.15 never hit (decay-exit first); 8% (~+5.7% net) stops fee-eroded 5% scalps. LIVE knob overrides in prod.
 pub const CONVERGENCE_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
 
 /// Catastrophic stop applied BEFORE fill-confirmation (negative = loss fraction).
-pub const CONVERGENCE_CATASTROPHIC_SL_PCT: Decimal = dec!(-0.20);
+pub const CONVERGENCE_CATASTROPHIC_SL_PCT: Decimal = dec!(-0.15); // 2026-07-10: tightened from -0.20 — caps the fast-whipsaw tail (9 trades -16 to -24%) ~6-8pts.
 
 /// Catastrophic backstop = this multiple of the live stop-loss, clamped to
 /// CONVERGENCE_CATASTROPHIC_SL_PCT. Scales the hard floor with a tight stop.
-pub const CONVERGENCE_CATASTROPHIC_SL_MULT: Decimal = dec!(2.0);
+pub const CONVERGENCE_CATASTROPHIC_SL_MULT: Decimal = dec!(1.5); // 2026-07-10: 2.0 -> 1.5 tightens catastrophic across the live-stop range (-15% at a 10% stop).
 
 /// After a catastrophic stop, block BOTH legs of that market for this long.
 pub const CONVERGENCE_CATASTROPHIC_COOLDOWN_SECS: u64 = 900;

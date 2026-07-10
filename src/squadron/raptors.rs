@@ -25,8 +25,8 @@ pub struct SquadronRaptors {
     /// (5s velocity, 1s velocity, acceleration) from the Price Raptor.
     pub velocity: watch::Receiver<(Decimal, Decimal, Decimal)>,
 
-    /// (60-min drift, 10-min drift) from the Price Raptor.
-    pub drift: watch::Receiver<(Decimal, Decimal)>,
+    /// (60-min drift, 10-min drift, 60-min normalized realized-vol) from the Price Raptor.
+    pub drift: watch::Receiver<(Decimal, Decimal, Decimal)>,
 
     /// Perpetual funding rate from the Funding Raptor (Binance FAPI).
     /// `None` when the Funding Raptor is not deployed for this squadron
@@ -61,7 +61,7 @@ impl SquadronRaptors {
     pub fn full(
         oracle:      watch::Receiver<Decimal>,
         velocity:    watch::Receiver<(Decimal, Decimal, Decimal)>,
-        drift:       watch::Receiver<(Decimal, Decimal)>,
+        drift:       watch::Receiver<(Decimal, Decimal, Decimal)>,
         funding:     watch::Receiver<Decimal>,
         derivatives: watch::Receiver<DerivativesSnapshot>,
         tide:        Option<watch::Receiver<TideSnapshot>>,
@@ -83,7 +83,7 @@ impl SquadronRaptors {
     pub fn price_only(
         oracle:   watch::Receiver<Decimal>,
         velocity: watch::Receiver<(Decimal, Decimal, Decimal)>,
-        drift:    watch::Receiver<(Decimal, Decimal)>,
+        drift:    watch::Receiver<(Decimal, Decimal, Decimal)>,
     ) -> Self {
         Self { oracle, velocity, drift, funding: None, derivatives: None, tide: None, sports: None }
     }

@@ -7,7 +7,7 @@
 /// │────────────────│────────────────────────────────│────────────────────────────────────│
 /// │ oracle_tx      │ Decimal                        │ Current spot price                 │
 /// │ velocity_tx    │ (Decimal, Decimal, Decimal)    │ (5s velocity, 1s velocity, accel)  │
-/// │ drift_tx       │ (Decimal, Decimal)             │ (60-min drift, 10-min drift)       │
+/// │ drift_tx       │ (Decimal, Decimal, Decimal)    │ (60m drift, 10m drift, hist_vol)   │
 ///
 /// Reconnects automatically on:
 ///   • Disconnect or WS error
@@ -38,9 +38,10 @@ pub async fn run_price_raptor(
     crypto_filter: String,
     oracle_tx: watch::Sender<Decimal>,
     velocity_tx: watch::Sender<(Decimal, Decimal, Decimal)>,
-    // Sends (drift_60m, drift_10m) — both raw USD Decimal values.
+    // Sends (drift_60m, drift_10m, hist_vol) — drift values are raw USD Decimal;
+    // hist_vol is the normalized [0,1] 60-min realized-vol (canonical flatness measure).
     // drift_10m fills the 5s–60m temporal gap for GBoost feature [18].
-    drift_tx: watch::Sender<(Decimal, Decimal)>,
+    drift_tx: watch::Sender<(Decimal, Decimal, Decimal)>,
     raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
 ) {
     let binance_pair = match crypto_filter.as_str() {
@@ -167,7 +168,20 @@ pub async fn run_price_raptor(
                                             } else { dec!(0) }
                                         } else { dec!(0) };
 
-                                        let _ = drift_tx.send((drift_60m, drift_10m));
+                                        // Canonical 60-min realized volatility (normalized [0,1]),
+                                        // computed over the proper time-spaced 60-min price window —
+                                        // the same value logged in the periodic realized-vol telemetry.
+                                        // Sent every tick so GBoost's flatness gate reads a real
+                                        // measure instead of recomputing from its 50ms-cadence buffer.
+                                        let hist_vol_norm = {
+                                            let prices: Vec<f64> = price_history_60m
+                                                .iter()
+                                                .map(|(_, p)| p.to_f64().unwrap_or(0.0))
+                                                .collect();
+                                            Decimal::from_f64_retain(normalized_hist_vol(&prices)).unwrap_or(dec!(0))
+                                        };
+
+                                        let _ = drift_tx.send((drift_60m, drift_10m, hist_vol_norm));
 
                                         // Mirror the latest signal snapshot into the shared
                                         // raptor-health map so GET /api/telemetry can graph it.

@@ -557,6 +557,7 @@ fn build_snapshot(
         no_bid:  nb, no_bid_depth:  nbd, no_ask:  na, no_ask_depth:  nad,
         oracle_price: dec!(0), velocity: dec!(0), velocity_1s: dec!(0), acceleration: dec!(0),
         funding_rate: dec!(0), oracle_drift_60m: dec!(0), oracle_drift_10m: dec!(0),
+        hist_vol: dec!(0),
         institutional_pulse: dec!(0), tide_coherence: dec!(0),
         oi_delta_pct: dec!(0), cvd_ratio: dec!(0),
         secs_to_expiry: 0, timestamp: Utc::now(),
@@ -788,7 +789,7 @@ fn register_us_squadron(
     // not from Raptors). Receivers stay valid after the senders drop.
     let (_, oracle_rx) = watch::channel(Decimal::ZERO);
     let (_, velocity_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
-    let (_, drift_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO));
+    let (_, drift_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
     // The venue-neutral Sports Raptor IS a real feed on the US build — attach it
     // so its observe-only line-movement signal is available to US squadrons.
     let mut raptors = SquadronRaptors::price_only(oracle_rx, velocity_rx, drift_rx);

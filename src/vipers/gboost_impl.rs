@@ -129,14 +129,6 @@ fn obi_from_depths(bid: rust_decimal::Decimal, ask: rust_decimal::Decimal) -> f6
     }
 }
 
-/// Compute historical volatility regime from a slice of oracle prices (log-return std-dev).
-/// Normalised to [0, 1] where 1.0 = 2% per-tick std-dev (extreme volatility).
-fn compute_historical_volatility(prices: &[f64]) -> f64 {
-    // Delegates to the shared helper so the GBoost flatness gate and the Price
-    // raptor's periodic telemetry compute realized volatility identically.
-    crate::helpers::volatility::normalized_hist_vol(prices)
-}
-
 /// Compute tick-direction momentum from a slice of YES bid prices.
 /// Returns (up_ticks − down_ticks) / (n−1), normalised to [−1, +1].
 fn compute_tick_momentum(bids: &[rust_decimal::Decimal]) -> f64 {
@@ -156,14 +148,16 @@ fn compute_tick_momentum(bids: &[rust_decimal::Decimal]) -> f64 {
     (up_ticks as f64 - down_ticks as f64) / comparisons
 }
 
-/// Compute hist_vol from a position in the history VecDeque (looks back up to 60 snapshots).
+/// Read the canonical 60-min realized-vol captured on the snapshot at position `idx`.
+///
+/// Previously this recomputed volatility from a 60-sample window of `oracle_price`.
+/// At the 50ms patrol cadence that window spans only ~3 seconds and is dominated by
+/// duplicate oracle prints (the Binance watch channel updates far slower than the
+/// tick), collapsing log-returns to ~0 → a literal 0.0000 that permanently vetoed the
+/// flatness gate.  The Price raptor now stamps each snapshot with a proper 60-minute
+/// `hist_vol` (computed off the always-live Binance feed), so we simply read it.
 fn hist_vol_from_deque(h: &VecDeque<MarketSnapshot>, idx: usize) -> f64 {
-    let start = idx.saturating_sub(59);
-    let prices: Vec<f64> = (start..=idx)
-        .filter_map(|k| h.get(k))
-        .map(|s| s.oracle_price.to_f64().unwrap_or(1.0))
-        .collect();
-    compute_historical_volatility(&prices)
+    h.get(idx).map(|s| s.hist_vol.to_f64().unwrap_or(0.0)).unwrap_or(0.0)
 }
 
 /// Compute tick_momentum from a position in the history VecDeque (looks back up to 10 snapshots).
@@ -176,14 +170,10 @@ fn tick_momentum_from_deque(h: &VecDeque<MarketSnapshot>, idx: usize) -> f64 {
     compute_tick_momentum(&bids)
 }
 
-/// Compute hist_vol from a position in a `&[MarketSnapshot]` slice (used in concept-drift path).
+/// Read the canonical 60-min realized-vol captured on the snapshot at position `idx`
+/// (slice variant, used in the concept-drift / retrain reconstruction path).
 fn hist_vol_from_slice(snaps: &[MarketSnapshot], idx: usize) -> f64 {
-    let start = idx.saturating_sub(59);
-    let prices: Vec<f64> = snaps[start..=idx]
-        .iter()
-        .map(|s| s.oracle_price.to_f64().unwrap_or(1.0))
-        .collect();
-    compute_historical_volatility(&prices)
+    snaps.get(idx).map(|s| s.hist_vol.to_f64().unwrap_or(0.0)).unwrap_or(0.0)
 }
 
 /// Compute tick_momentum from a position in a `&[MarketSnapshot]` slice.
@@ -1011,6 +1001,7 @@ impl Strategy for GboostStrategyImpl {
             s.funding_rate     = ctx.snapshot.funding_rate;
             s.oracle_drift_60m = ctx.snapshot.oracle_drift_60m;
             s.oracle_drift_10m = ctx.snapshot.oracle_drift_10m;
+            s.hist_vol         = ctx.snapshot.hist_vol;
             s.institutional_pulse = ctx.snapshot.institutional_pulse;
             s.tide_coherence      = ctx.snapshot.tide_coherence;
             s.oi_delta_pct        = ctx.snapshot.oi_delta_pct;
@@ -1129,6 +1120,7 @@ impl Strategy for GboostStrategyImpl {
             s.funding_rate     = ctx.snapshot.funding_rate;
             s.oracle_drift_60m = ctx.snapshot.oracle_drift_60m;
             s.oracle_drift_10m = ctx.snapshot.oracle_drift_10m;
+            s.hist_vol         = ctx.snapshot.hist_vol;
             s.institutional_pulse = ctx.snapshot.institutional_pulse;
             s.tide_coherence      = ctx.snapshot.tide_coherence;
             s.oi_delta_pct        = ctx.snapshot.oi_delta_pct;
@@ -1767,6 +1759,7 @@ mod tests {
             velocity: dec!(50), velocity_1s: dec!(10), acceleration: dec!(5),
             funding_rate: dec!(0.0001), oracle_drift_60m: dec!(100),
             oracle_drift_10m: dec!(30), // ~10min drift for test
+            hist_vol: dec!(0.003), // normal live-BTC 60m realized-vol — clears GBOOST_MIN_HIST_VOL
             institutional_pulse: dec!(0.5), tide_coherence: dec!(0.7),
             oi_delta_pct: dec!(0.01), cvd_ratio: dec!(1.2),
             secs_to_expiry: 3600, // 1 hour — mid-range for tests

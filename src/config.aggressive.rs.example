@@ -406,7 +406,7 @@ pub const GBOOST_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.90);
 /// Minimum historical volatility regime required for a GBoost entry.
 /// Aggressive: 0.001 — slightly more permissive than the default 0.002 to allow entries
 /// in marginally flat-oracle conditions.  Still blocks completely frozen (vol=0) oracles.
-pub const GBOOST_MIN_HIST_VOL: f64 = 0.010; // Aggressive: lower floor, allows entry in moderate BTC volatility
+pub const GBOOST_MIN_HIST_VOL: f64 = 0.0007; // Recalibrated from 0.010 (2026-07-10): aggressive — lowest floor, admits even the quietest live BTC (normal 60m realized-vol ~0.0025-0.0035)
 pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.40);
 pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(4.0);
 pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300;
@@ -948,15 +948,15 @@ pub const CONVERGENCE_SKIP_BAND_HIGH: Decimal = dec!(0.50);
 pub const CONVERGENCE_OBI_ADVERSE_BLOCK: Decimal = dec!(0.55); // 2026-06-30: block entry into adverse order-book imbalance
 
 /// Entry-relative take-profit and stop-loss.
-pub const CONVERGENCE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.15);
+pub const CONVERGENCE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.10); // 2026-07-10: aggressive lets winners run further before booking.
 pub const CONVERGENCE_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
 
 /// Catastrophic stop applied BEFORE fill-confirmation (negative = loss fraction).
-pub const CONVERGENCE_CATASTROPHIC_SL_PCT: Decimal = dec!(-0.20);
+pub const CONVERGENCE_CATASTROPHIC_SL_PCT: Decimal = dec!(-0.18); // 2026-07-10: aggressive tolerates a slightly wider catastrophic floor than balanced (-0.15).
 
 /// Catastrophic backstop = this multiple of the live stop-loss, clamped to
 /// CONVERGENCE_CATASTROPHIC_SL_PCT. Scales the hard floor with a tight stop.
-pub const CONVERGENCE_CATASTROPHIC_SL_MULT: Decimal = dec!(2.0);
+pub const CONVERGENCE_CATASTROPHIC_SL_MULT: Decimal = dec!(1.5); // 2026-07-10: tightened from 2.0.
 
 /// After a catastrophic stop, block BOTH legs of that market for this long.
 pub const CONVERGENCE_CATASTROPHIC_COOLDOWN_SECS: u64 = 900;
