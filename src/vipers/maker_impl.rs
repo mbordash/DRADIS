@@ -82,7 +82,7 @@ impl Strategy for MakerStrategyImpl {
 
         // ── Expiry gate ───────────────────────────────────────────────────────
         if let Some(close_time) = market.market_close_time {
-            if (close_time - Utc::now()).num_seconds() < config::MAKER_MIN_SECS_TO_EXPIRY {
+            if (close_time - Utc::now()).num_seconds() < dc.maker_min_secs_to_expiry {
                 return Ok(StrategySignal::NoSignal);
             }
         } else {
@@ -96,9 +96,9 @@ impl Strategy for MakerStrategyImpl {
 
         // ── Orderbook imbalance gate ──────────────────────────────────────────
         let yes_book_ok = snapshot.yes_bid_depth > dec!(0)
-            && (snapshot.yes_ask_depth / snapshot.yes_bid_depth) <= config::MAKER_MAX_BOOK_IMBALANCE_RATIO;
+            && (snapshot.yes_ask_depth / snapshot.yes_bid_depth) <= dc.maker_max_book_imbalance_ratio;
         let no_book_ok  = snapshot.no_bid_depth > dec!(0)
-            && (snapshot.no_ask_depth  / snapshot.no_bid_depth)  <= config::MAKER_MAX_BOOK_IMBALANCE_RATIO;
+            && (snapshot.no_ask_depth  / snapshot.no_bid_depth)  <= dc.maker_max_book_imbalance_ratio;
 
         if !yes_book_ok && !no_book_ok {
             return Ok(StrategySignal::NoSignal);
@@ -192,7 +192,7 @@ impl Strategy for MakerStrategyImpl {
 
         // ── Pricing Logic ─────────────────────────────────────────────────────
         // Use a wider buffer to avoid long-unfilled GTC orders in slower books
-        let bid_buffer = if ctx.maker_market.is_some() { config::MAKER_BID_BUFFER } else { dec!(0.015) };
+        let bid_buffer = if ctx.maker_market.is_some() { dc.maker_bid_buffer } else { dec!(0.015) };
 
         let raw_yes_price = (snapshot.yes_ask - bid_buffer - skew).max(dc.maker_min_entry_price);
         let raw_no_price  = (snapshot.no_ask - bid_buffer + skew).max(dc.maker_min_entry_price);
@@ -202,8 +202,8 @@ impl Strategy for MakerStrategyImpl {
         // Previously used a hardcoded dec!(0.01) which allowed 1-tick spreads when
         // the skew (±0.03) exceeded the bid_buffer (0.025), triggering the cap.
         // Now uses the configured MAKER_CROSS_BUFFER constant (0.02) for consistency.
-        let yes_bid_price = floor_to_tick_size(raw_yes_price.min(snapshot.yes_ask - config::MAKER_CROSS_BUFFER));
-        let no_bid_price  = floor_to_tick_size(raw_no_price.min(snapshot.no_ask  - config::MAKER_CROSS_BUFFER));
+        let yes_bid_price = floor_to_tick_size(raw_yes_price.min(snapshot.yes_ask - dc.maker_cross_buffer));
+        let no_bid_price  = floor_to_tick_size(raw_no_price.min(snapshot.no_ask  - dc.maker_cross_buffer));
 
         let yes_spread = yes_ask - yes_bid;
         let no_spread  = no_ask - no_bid;
@@ -211,20 +211,20 @@ impl Strategy for MakerStrategyImpl {
         // ── Qualification ─────────────────────────────────────────────────
         let yes_qualifies = yes_book_ok
             && !taker_flow_blocks_yes
-            && yes_spread >= config::MAKER_MIN_SPREAD
+            && yes_spread >= dc.maker_min_spread
             && yes_bid_price >= dc.maker_min_entry_price
             && yes_bid_price <= dc.maker_max_entry_price
-            && yes_bid_price <= snapshot.yes_ask - config::MAKER_CROSS_BUFFER
-            && no_bid <= config::MAKER_MAX_COMPLEMENTARY_PRICE
+            && yes_bid_price <= snapshot.yes_ask - dc.maker_cross_buffer
+            && no_bid <= dc.maker_max_complementary_price
             && !velocity_bias_strong_negative;
 
         let no_qualifies = no_book_ok
             && !taker_flow_blocks_no
-            && no_spread >= config::MAKER_MIN_SPREAD
+            && no_spread >= dc.maker_min_spread
             && no_bid_price >= dc.maker_min_entry_price
             && no_bid_price <= dc.maker_max_entry_price
-            && no_bid_price <= snapshot.no_ask - config::MAKER_CROSS_BUFFER
-            && yes_bid <= config::MAKER_MAX_COMPLEMENTARY_PRICE
+            && no_bid_price <= snapshot.no_ask - dc.maker_cross_buffer
+            && yes_bid <= dc.maker_max_complementary_price
             && !velocity_bias_strong_positive;
 
         if !yes_qualifies && !no_qualifies {
@@ -244,7 +244,7 @@ impl Strategy for MakerStrategyImpl {
         // ── Combined price guard ──────────────────────────────────────────────
         let (final_yes, final_no) = if yes_qualifies && no_qualifies {
             let combined = yes_bid_price + no_bid_price;
-            if combined >= config::MAKER_MAX_COMBINED_BID {
+            if combined >= dc.maker_max_combined_bid {
                 if yes_spread <= no_spread { (None, Some(no_bid_price)) } else { (Some(yes_bid_price), None) }
             } else {
                 (Some(yes_bid_price), Some(no_bid_price))
@@ -359,10 +359,10 @@ impl Strategy for MakerStrategyImpl {
                     (bid_depth - ask_depth) / total_depth
                 } else { dec!(0) };
 
-                if obi < config::MAKER_TOXIC_FLOW_EXIT_OBI {
+                if obi < dc.maker_toxic_flow_exit_obi {
                     tracing::info!(
                         "⚡ Maker ToxicFill exit triggered: OBI={:.2} (threshold={:.2}) | bid=${:.4}",
-                        obi, config::MAKER_TOXIC_FLOW_EXIT_OBI, bid
+                        obi, dc.maker_toxic_flow_exit_obi, bid
                     );
                     return Ok(StrategySignal::Exit {
                         params: OrderParams {

@@ -132,6 +132,14 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Don't enter with more than this many seconds left.").min(0.0).step(1.0).unit("s"));
         v.push(F::new(g, e, "min_time_decay_net_profit", "Min Net Profit", "price", true,
             "Minimum net edge (after fees) required to enter.").range(0.0, 1.0).step(0.005));
+        v.push(F::new(g, e, "time_decay_max_fast_velocity_pct", "Max Fast Velocity", "decimal", true,
+            "Block entry when short-window oracle velocity exceeds this fraction.").range(0.0, 0.01).step(0.00005));
+        v.push(F::new(g, e, "time_decay_max_slow_drift_pct", "Max Slow Drift", "decimal", true,
+            "Block entry when slow oracle drift exceeds this fraction.").range(0.0, 0.1).step(0.0005));
+        v.push(F::new(g, e, "time_decay_iv_stop_tighten_multiplier", "IV Stop Tighten Mult", "decimal", true,
+            "Multiplier that tightens the stop-loss as implied vol rises.").range(0.0, 1.0).step(0.05));
+        v.push(F::new(g, e, "time_decay_min_hold_secs", "Min Hold Secs", "secs", true,
+            "Minimum hold time before a stop-loss can trigger.").min(0.0).step(1.0).unit("s"));
     }
 
     // ── Momentum ────────────────────────────────────────────────────────────────
@@ -149,6 +157,25 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Entry-relative take profit (0.20 = 20%).").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "momentum_max_exposure_usdc", "Max Exposure", "usd", false,
             "Hard cap on total momentum capital at risk.").min(0.0).step(0.5).unit("USDC"));
+        // Advanced
+        v.push(F::new(g, e, "momentum_max_entry_price", "Max Entry", "price", true,
+            "Highest price the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "momentum_min_entry_price", "Min Entry", "price", true,
+            "Lowest price the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "momentum_threshold_pct", "Velocity Threshold", "decimal", true,
+            "Minimum oracle velocity (fractional) required to trigger entry.").range(0.0, 0.1).step(0.0005));
+        v.push(F::new(g, e, "momentum_max_entry_ask_sum", "Max Entry Ask Sum", "decimal", true,
+            "Skip entry when YES_ask + NO_ask exceeds this (fee/slippage guard).").range(1.0, 1.2).step(0.005));
+        v.push(F::new(g, e, "momentum_obi_adverse_block", "OBI Adverse Block", "decimal", true,
+            "Block entry when order-book imbalance is adverse beyond this (negative).").range(-1.0, 1.0).step(0.05));
+        v.push(F::new(g, e, "momentum_obi_exhaustion_block", "OBI Exhaustion Block", "decimal", true,
+            "Block entry when order-book imbalance signals exhaustion above this.").range(0.0, 1.0).step(0.05));
+        v.push(F::new(g, e, "momentum_take_profit_ceiling", "Take-Profit Ceiling", "price", true,
+            "Cap the take-profit target token price at this level.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "momentum_catastrophic_sl_pct", "Catastrophic Stop", "pct", true,
+            "Hard emergency stop-loss overriding the min-hold window.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "momentum_min_secs_to_expiry_for_entry", "Min Secs to Expiry", "secs", true,
+            "Don't enter with fewer than this many seconds left.").min(0.0).step(1.0).unit("s"));
     }
 
     // ── Maker ─────────────────────────────────────────────────────────────────
@@ -167,6 +194,22 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         // Advanced
         v.push(F::new(g, e, "maker_min_entry_price", "Min Entry", "price", true,
             "Lowest price a resting bid will sit at.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "maker_min_spread", "Min Spread", "price", true,
+            "Minimum book spread required before quoting (in price units).").range(0.0, 0.5).step(0.005));
+        v.push(F::new(g, e, "maker_bid_buffer", "Bid Buffer", "price", true,
+            "Distance below best ask to place the resting bid.").range(0.0, 0.5).step(0.005));
+        v.push(F::new(g, e, "maker_cross_buffer", "Cross Buffer", "price", true,
+            "Anti-cross safety buffer to avoid taking the book.").range(0.0, 0.5).step(0.005));
+        v.push(F::new(g, e, "maker_max_combined_bid", "Max Combined Bid", "price", true,
+            "Skip when YES_bid + NO_bid exceeds this (overpriced pair guard).").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "maker_max_complementary_price", "Max Complementary Price", "price", true,
+            "Max allowed price on the complementary leg before skipping.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "maker_max_book_imbalance_ratio", "Max Book Imbalance", "decimal", true,
+            "Skip when bid/ask depth ratio exceeds this (toxic imbalance).").range(1.0, 10.0).step(0.5));
+        v.push(F::new(g, e, "maker_min_secs_to_expiry", "Min Secs to Expiry", "secs", true,
+            "Don't quote with fewer than this many seconds left.").min(0.0).step(1.0).unit("s"));
+        v.push(F::new(g, e, "maker_toxic_flow_exit_obi", "Toxic Flow Exit OBI", "decimal", true,
+            "Exit a resting position when OBI turns adverse beyond this (negative).").range(-1.0, 0.0).step(0.05));
     }
 
     // ── Basis ─────────────────────────────────────────────────────────────────
@@ -180,6 +223,21 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Entry-relative take profit.").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "basis_max_exposure_usdc", "Max Exposure", "usd", false,
             "Hard cap on total basis capital at risk.").min(0.0).step(0.5).unit("USDC"));
+        // Advanced
+        v.push(F::new(g, e, "basis_max_entry_price", "Max Entry", "price", true,
+            "Highest token price the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "basis_min_trade_size_usdc", "Min Size", "usd", true,
+            "Lower bound on Kelly-sized trade.").min(0.0).step(0.5).unit("USDC"));
+        v.push(F::new(g, e, "basis_max_trade_size_usdc", "Max Size", "usd", true,
+            "Upper bound on Kelly-sized trade.").min(0.0).step(0.5).unit("USDC"));
+        v.push(F::new(g, e, "basis_entry_skew_threshold", "Entry Skew Threshold", "decimal", true,
+            "Minimum YES/NO implied-prob skew required to fade for entry.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "basis_skew_collapse_threshold", "Skew Collapse Exit", "decimal", true,
+            "Exit when the skew collapses to/below this level (thesis realised).").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "basis_catastrophic_sl_pct", "Catastrophic Stop", "pct", true,
+            "Hard emergency stop-loss overriding the min-hold window.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "basis_min_secs_to_expiry", "Min Secs to Expiry", "secs", true,
+            "Don't enter with fewer than this many seconds left.").min(0.0).step(1.0).unit("s"));
     }
 
     // ── GBoost ────────────────────────────────────────────────────────────────
@@ -195,6 +253,25 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Entry-relative take profit.").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "gboost_max_exposure_usdc", "Max Exposure", "usd", false,
             "Hard cap on total GBoost capital at risk.").min(0.0).step(0.5).unit("USDC"));
+        // Advanced
+        v.push(F::new(g, e, "gboost_max_yes_entry_price", "Max YES Entry", "price", true,
+            "Highest YES-token ask the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "gboost_max_no_entry_price", "Max NO Entry", "price", true,
+            "Highest NO-token ask the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "gboost_min_entry_price", "Min Entry", "price", true,
+            "Lowest token price the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "gboost_obi_adverse_block", "OBI Adverse Block", "decimal", true,
+            "Block entry when order-book imbalance is adverse beyond this (negative).").range(-1.0, 1.0).step(0.05));
+        v.push(F::new(g, e, "gboost_obi_exhaustion_block", "OBI Exhaustion Block", "decimal", true,
+            "Block entry when order-book imbalance signals exhaustion above this.").range(0.0, 1.0).step(0.05));
+        v.push(F::new(g, e, "gboost_min_edge_from_fair", "Min Edge from Fair", "price", true,
+            "Minimum edge vs classifier fair value required to enter.").range(0.0, 0.5).step(0.005));
+        v.push(F::new(g, e, "gboost_min_net_profit_usdc", "Min Net Profit", "usd", true,
+            "Minimum net expected profit (after fees) required to enter.").min(0.0).step(0.05).unit("USDC"));
+        v.push(F::new(g, e, "gboost_min_secs_to_expiry", "Min Secs to Expiry", "secs", true,
+            "Don't enter with fewer than this many seconds left.").min(0.0).step(1.0).unit("s"));
+        v.push(F::new(g, e, "gboost_signal_exit_threshold", "Signal Exit Threshold", "decimal", true,
+            "Exit when classifier probability decays to/below this level.").range(0.0, 1.0).step(0.01));
     }
 
     // ── TrendReversal ─────────────────────────────────────────────────────────────
@@ -214,6 +291,27 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Entry-relative take profit (0.20 = 20%).").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "trendcapture_max_entry_price", "Max Entry", "price", false,
             "Highest price the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
+        // Advanced
+        v.push(F::new(g, e, "trendcapture_min_entry_price", "Min Entry", "price", true,
+            "Lowest price the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "trendcapture_max_entry_ask_sum", "Max Entry Ask Sum", "decimal", true,
+            "Skip entry when YES_ask + NO_ask exceeds this (fee/slippage guard).").range(1.0, 1.2).step(0.005));
+        v.push(F::new(g, e, "trendcapture_obi_adverse_block", "OBI Adverse Block", "decimal", true,
+            "Block entry when order-book imbalance is adverse beyond this (negative).").range(-1.0, 1.0).step(0.05));
+        v.push(F::new(g, e, "trendcapture_obi_exhaustion_block", "OBI Exhaustion Block", "decimal", true,
+            "Block entry when order-book imbalance signals exhaustion above this.").range(0.0, 1.0).step(0.05));
+        v.push(F::new(g, e, "trendcapture_max_token_spread_pct", "Max Token Spread", "pct", true,
+            "Skip entry when the token bid/ask spread exceeds this fraction.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "trendcapture_reversal_drift_pct", "Reversal Drift", "decimal", true,
+            "Adverse drift fraction that signals the fade thesis is breaking (exit).").range(0.0, 0.1).step(0.0005));
+        v.push(F::new(g, e, "trendcapture_strike_gap_pct", "Strike Gap", "decimal", true,
+            "Minimum oracle-vs-strike gap (fraction) required to enter.").range(0.0, 0.1).step(0.0005));
+        v.push(F::new(g, e, "trendcapture_take_profit_ceiling", "Take-Profit Ceiling", "price", true,
+            "Cap the take-profit target token price at this level.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "trendcapture_catastrophic_sl_pct", "Catastrophic Stop", "pct", true,
+            "Hard emergency stop-loss overriding the min-hold window.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "trendreversal_mode", "Follow Mode (invert fade)", "bool", true,
+            "When on, follow the confirmed move instead of fading it (A/B toggle)."));
     }
 
     // ── Convergence ───────────────────────────────────────────────────────────
@@ -231,6 +329,23 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Entry-relative take profit (0.15 = 15%).").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "convergence_max_entry_price", "Max Entry", "price", false,
             "Highest token ask the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
+        // Advanced
+        v.push(F::new(g, e, "convergence_min_entry_price", "Min Entry", "price", true,
+            "Lowest token price the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "convergence_pulse_threshold", "Pulse Threshold", "decimal", true,
+            "Minimum institutional-pulse magnitude required to enter.").range(0.0, 5.0).step(0.1));
+        v.push(F::new(g, e, "convergence_coherence_min", "Min Coherence", "decimal", true,
+            "Minimum tide coherence required to trust the pulse signal.").range(0.0, 1.0).step(0.05));
+        v.push(F::new(g, e, "convergence_cvd_confirm_margin", "CVD Confirm Margin", "decimal", true,
+            "Minimum CVD confirmation margin required to align with the pulse.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "convergence_max_token_spread_pct", "Max Token Spread", "pct", true,
+            "Skip entry when the token bid/ask spread exceeds this fraction.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "convergence_obi_adverse_block", "OBI Adverse Block", "decimal", true,
+            "Block entry when order-book imbalance is adverse beyond this.").range(-1.0, 1.0).step(0.05));
+        v.push(F::new(g, e, "convergence_skip_band_low", "Skip Band Low", "price", true,
+            "Lower edge of the ~0.50 coin-flip band where entries are skipped.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "convergence_skip_band_high", "Skip Band High", "price", true,
+            "Upper edge of the ~0.50 coin-flip band where entries are skipped.").range(0.0, 1.0).step(0.01));
     }
 
     v
@@ -261,6 +376,23 @@ mod tests {
             if let (Some(min), Some(max)) = (f.min, f.max) {
                 assert!(min <= max, "{}: min {} > max {}", f.key, min, max);
             }
+        }
+    }
+
+    #[test]
+    fn every_schema_key_exists_in_dynamic_config() {
+        use crate::helpers::dynamic_config::DynamicConfig;
+        // Serialize factory defaults; each schema `key` MUST be a real serde field
+        // so PATCH/render can never target a phantom knob (drift guard).
+        let json = serde_json::to_value(DynamicConfig::default())
+            .expect("DynamicConfig serializes");
+        let obj = json.as_object().expect("DynamicConfig is a JSON object");
+        for f in config_schema() {
+            assert!(
+                obj.contains_key(f.key),
+                "schema key `{}` (group {}) is not a DynamicConfig field",
+                f.key, f.group,
+            );
         }
     }
 }

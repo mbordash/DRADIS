@@ -81,7 +81,7 @@ impl Strategy for TimeDecayStrategyImpl {
         }
 
         // ── Oracle Volatility Gate ────────────────────────────────────────────
-        let (max_fast_vel, max_slow_drift) = TimeDecayStrategy::iv_thresholds(&ctx.crypto_filter, ctx.snapshot.oracle_price);
+        let (max_fast_vel, max_slow_drift) = TimeDecayStrategy::iv_thresholds(ctx.snapshot.oracle_price, dc.time_decay_max_fast_velocity_pct, dc.time_decay_max_slow_drift_pct);
         if ctx.snapshot.velocity.abs() > max_fast_vel {
             return Ok(StrategySignal::NoSignal);
         }
@@ -222,10 +222,10 @@ impl Strategy for TimeDecayStrategyImpl {
             }
 
             // ── Dynamic stop: tighten when vol is elevated ────────────────────
-            let (max_fast_vel, _) = TimeDecayStrategy::iv_thresholds(&ctx.crypto_filter, ctx.snapshot.oracle_price);
+            let (max_fast_vel, _) = TimeDecayStrategy::iv_thresholds(ctx.snapshot.oracle_price, dc.time_decay_max_fast_velocity_pct, dc.time_decay_max_slow_drift_pct);
             let iv_elevated = snap.velocity.abs() > max_fast_vel;
             let effective_stop_pct = if iv_elevated {
-                let tight = dc.time_decay_stop_loss_pct * config::TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER;
+                let tight = dc.time_decay_stop_loss_pct * dc.time_decay_iv_stop_tighten_multiplier;
                 tracing::debug!("⚡ TimeDecay IV elevated (|vel|={:.2}): stop tightened to {:.1}%", snap.velocity, tight * dec!(100));
                 tight
             } else {
@@ -234,8 +234,8 @@ impl Strategy for TimeDecayStrategyImpl {
 
             // ── Min-hold guard ────────────────────────────────────────────────
             let hold_secs = (Utc::now() - yp.opened_at).num_seconds();
-            if hold_secs < config::TIME_DECAY_MIN_HOLD_SECS {
-                tracing::debug!("⏳ TimeDecay SL suppressed: hold={}s < min={}s", hold_secs, config::TIME_DECAY_MIN_HOLD_SECS);
+            if hold_secs < dc.time_decay_min_hold_secs {
+                tracing::debug!("⏳ TimeDecay SL suppressed: hold={}s < min={}s", hold_secs, dc.time_decay_min_hold_secs);
             } else {
                 let combined_bid = yes_bid + no_bid;
                 // ── Entry-relative stop-loss ──────────────────────────────────────
@@ -280,10 +280,10 @@ pub struct TimeDecayStrategy;
 
 impl TimeDecayStrategy {
     /// Return (max_fast_velocity, max_slow_drift) scaled to the current oracle price.
-    pub fn iv_thresholds(_crypto_filter: &str, oracle_price: Decimal) -> (Decimal, Decimal) {
+    pub fn iv_thresholds(oracle_price: Decimal, max_fast_velocity_pct: Decimal, max_slow_drift_pct: Decimal) -> (Decimal, Decimal) {
         (
-            config::oracle_threshold(config::TIME_DECAY_MAX_FAST_VELOCITY_PCT, oracle_price),
-            config::oracle_threshold(config::TIME_DECAY_MAX_SLOW_DRIFT_PCT, oracle_price),
+            config::oracle_threshold(max_fast_velocity_pct, oracle_price),
+            config::oracle_threshold(max_slow_drift_pct, oracle_price),
         )
     }
 

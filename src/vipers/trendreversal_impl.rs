@@ -166,7 +166,7 @@ impl Strategy for TrendReversalStrategyImpl {
         let effective_min_price = match secs_left {
             Some(s) if s < config::TRENDCAPTURE_LATE_MARKET_SECS =>
                 config::TRENDCAPTURE_LATE_MARKET_MIN_ENTRY_PRICE,
-            _ => config::TRENDCAPTURE_MIN_ENTRY_PRICE,
+            _ => dc.trendcapture_min_entry_price,
         };
 
         // ── Market warmup gate ────────────────────────────────────────────────
@@ -177,9 +177,9 @@ impl Strategy for TrendReversalStrategyImpl {
 
         // ── Spread gate ───────────────────────────────────────────────────────
         let ask_sum = snap.yes_ask + snap.no_ask;
-        if ask_sum > config::TRENDCAPTURE_MAX_ENTRY_ASK_SUM {
+        if ask_sum > dc.trendcapture_max_entry_ask_sum {
             debug!(" TrendCapture spread gate: ask_sum={:.3} > max {:.3} — book too wide",
-                ask_sum, config::TRENDCAPTURE_MAX_ENTRY_ASK_SUM);
+                ask_sum, dc.trendcapture_max_entry_ask_sum);
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -211,14 +211,14 @@ impl Strategy for TrendReversalStrategyImpl {
         let oracle_price = ctx.snapshot.oracle_price;
         // TrendReversal: the exhaustion multiplier raises the entry trigger so we
         // only fade genuinely over-extended moves (1.0 = legacy trigger).
-        let exhaust_mult = if config::TRENDREVERSAL_MODE {
+        let exhaust_mult = if dc.trendreversal_mode {
             config::TRENDREVERSAL_EXHAUSTION_MULT
         } else { dec!(1.0) };
         let bull_drift_10m_thr = config::oracle_threshold(config::TRENDCAPTURE_DRIFT_10M_PCT, oracle_price) * exhaust_mult;
         let bear_drift_10m_thr = -bull_drift_10m_thr;
-        let bull_strike_gap    = config::oracle_threshold(config::TRENDCAPTURE_STRIKE_GAP_PCT, oracle_price);
+        let bull_strike_gap    = config::oracle_threshold(dc.trendcapture_strike_gap_pct, oracle_price);
         let bear_strike_gap    = bull_strike_gap;
-        let exhaustion_thr     = if config::TRENDREVERSAL_MODE {
+        let exhaustion_thr     = if dc.trendreversal_mode {
             // Fade mode: tighter falling-knife ceiling — block extreme drift where
             // the move is momentum (keeps running) rather than exhaustion (reverts).
             config::oracle_threshold(config::TRENDREVERSAL_FADE_MAX_DRIFT_60M_PCT, oracle_price)
@@ -236,7 +236,7 @@ impl Strategy for TrendReversalStrategyImpl {
         // of in-memory state. Runs only when |drift_10m| clears the entry trigger
         // (rare), so the query is cheap. Placed before the std-mutex cooldown locks
         // below so no guard is held across this await.
-        if config::TRENDREVERSAL_MODE {
+        if dc.trendreversal_mode {
             let intended_side = if drift_10m <= bear_drift_10m_thr {
                 Some("YES")   // drift DOWN → fade UP → buy YES
             } else if drift_10m >= bull_drift_10m_thr {
@@ -302,10 +302,10 @@ impl Strategy for TrendReversalStrategyImpl {
             (snap.no_bid_depth - snap.no_ask_depth) / no_total_depth
         } else { dec!(-1.0) };
 
-        let obi_blocks_bull = yes_obi < config::TRENDCAPTURE_OBI_ADVERSE_BLOCK;
-        let obi_blocks_bear = no_obi  < config::TRENDCAPTURE_OBI_ADVERSE_BLOCK;
-        let obi_exhausted_bull = yes_obi > config::TRENDCAPTURE_OBI_EXHAUSTION_BLOCK;
-        let obi_exhausted_bear = no_obi  > config::TRENDCAPTURE_OBI_EXHAUSTION_BLOCK;
+        let obi_blocks_bull = yes_obi < dc.trendcapture_obi_adverse_block;
+        let obi_blocks_bear = no_obi  < dc.trendcapture_obi_adverse_block;
+        let obi_exhausted_bull = yes_obi > dc.trendcapture_obi_exhaustion_block;
+        let obi_exhausted_bear = no_obi  > dc.trendcapture_obi_exhaustion_block;
 
         // ── Strike price distance requirement ─────────────────────────────────
         let binance_price = ctx.snapshot.oracle_price;
@@ -410,7 +410,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 // A strong, confirmed UP drift is already priced in and tends to
                 // mean-revert on these binaries — so BUY NO (fade) instead of YES.
                 // (TRENDREVERSAL_MODE=false restores trend-following: buy YES.)
-                let (buy_token, buy_ask, buy_bid, buy_bid_depth, buy_fee) = if config::TRENDREVERSAL_MODE {
+                let (buy_token, buy_ask, buy_bid, buy_bid_depth, buy_fee) = if dc.trendreversal_mode {
                     (market.no_token.clone(),  no_ask,  snap.no_bid,  snap.no_bid_depth,  market.no_fee_bps as u16)
                 } else {
                     (market.yes_token.clone(), yes_ask, snap.yes_bid, snap.yes_bid_depth, market.yes_fee_bps as u16)
@@ -421,9 +421,9 @@ impl Strategy for TrendReversalStrategyImpl {
                 let buy_spread = if buy_ask > dec!(0) {
                     (buy_ask - buy_bid) / buy_ask
                 } else { Decimal::ONE };
-                if buy_spread > config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT {
+                if buy_spread > dc.trendcapture_max_token_spread_pct {
                     debug!(" TrendReversal BULL→fade blocked: bought-token spread {:.1}% > max {:.1}% (ask={:.3} bid={:.3}) — hollow bid would force instant SL",
-                        buy_spread * dec!(100), config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT * dec!(100), buy_ask, buy_bid);
+                        buy_spread * dec!(100), dc.trendcapture_max_token_spread_pct * dec!(100), buy_ask, buy_bid);
                     return Ok(StrategySignal::NoSignal);
                 }
 
@@ -477,7 +477,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 // A strong, confirmed DOWN drift is already priced in and tends to
                 // mean-revert — so BUY YES (fade) instead of NO.
                 // (TRENDREVERSAL_MODE=false restores trend-following: buy NO.)
-                let (buy_token, buy_ask, buy_bid, buy_bid_depth, buy_fee) = if config::TRENDREVERSAL_MODE {
+                let (buy_token, buy_ask, buy_bid, buy_bid_depth, buy_fee) = if dc.trendreversal_mode {
                     (market.yes_token.clone(), yes_ask, snap.yes_bid, snap.yes_bid_depth, market.yes_fee_bps as u16)
                 } else {
                     (market.no_token.clone(),  no_ask,  snap.no_bid,  snap.no_bid_depth,  market.no_fee_bps as u16)
@@ -488,9 +488,9 @@ impl Strategy for TrendReversalStrategyImpl {
                 let buy_spread = if buy_ask > dec!(0) {
                     (buy_ask - buy_bid) / buy_ask
                 } else { Decimal::ONE };
-                if buy_spread > config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT {
+                if buy_spread > dc.trendcapture_max_token_spread_pct {
                     debug!(" TrendReversal BEAR→fade blocked: bought-token spread {:.1}% > max {:.1}% (ask={:.3} bid={:.3}) — hollow bid would force instant SL",
-                        buy_spread * dec!(100), config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT * dec!(100), buy_ask, buy_bid);
+                        buy_spread * dec!(100), dc.trendcapture_max_token_spread_pct * dec!(100), buy_ask, buy_bid);
                     return Ok(StrategySignal::NoSignal);
                 }
 
@@ -560,7 +560,7 @@ impl Strategy for TrendReversalStrategyImpl {
 
         // Per-asset reversal threshold — oracle-relative
         let reversal_thr = config::oracle_threshold(
-            config::TRENDCAPTURE_REVERSAL_DRIFT_PCT,
+            dc.trendcapture_reversal_drift_pct,
             ctx.snapshot.oracle_price,
         );
 
@@ -568,12 +568,12 @@ impl Strategy for TrendReversalStrategyImpl {
         let secs_left_opt = market.market_close_time
             .map(|ct| (ct - Utc::now()).num_seconds());
         // Tradelog/reason tag reflecting the active thesis.
-        let tag = if config::TRENDREVERSAL_MODE { "TrendReversal" } else { "TrendCapture" };
+        let tag = if dc.trendreversal_mode { "TrendReversal" } else { "TrendCapture" };
 
         // Stop-loss percentage. In fade mode use the tight TRENDREVERSAL stop (the
         // failure mode is the trend continuing, which is fast). Otherwise the legacy
         // dynamic stop (tighter near expiry).
-        let stop_loss_pct = if config::TRENDREVERSAL_MODE {
+        let stop_loss_pct = if dc.trendreversal_mode {
             config::TRENDREVERSAL_STOP_LOSS_PCT
         } else {
             match secs_left_opt {
@@ -583,7 +583,7 @@ impl Strategy for TrendReversalStrategyImpl {
         };
 
         // Take-profit target. Fade mode lets the reversion run to a wide target.
-        let tp_target = if config::TRENDREVERSAL_MODE {
+        let tp_target = if dc.trendreversal_mode {
             config::TRENDREVERSAL_TARGET_PROFIT_PCT
         } else {
             dc.trendcapture_target_profit_pct
@@ -625,7 +625,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 // Wait for fill confirmation before any non-catastrophic exit
                 if position.fill_confirmed_at.is_none() {
                     let loss_pct = (avg_entry - bid) / avg_entry;
-                    if loss_pct < config::TRENDCAPTURE_CATASTROPHIC_SL_PCT {
+                    if loss_pct < dc.trendcapture_catastrophic_sl_pct {
                         continue;
                     }
                 }
@@ -655,7 +655,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 // (30s) had NO stop at all — the exact blackout that let the 2026-06-29
                 // 09:30 trade gap from entry to −18% in 34s before the normal 5% stop
                 // became eligible. The hard catastrophic floor must never be frozen.
-                if profit_margin <= -config::TRENDCAPTURE_CATASTROPHIC_SL_PCT {
+                if profit_margin <= -dc.trendcapture_catastrophic_sl_pct {
                     found = Some(make_exit(format!(
                         "{}Catastrophic: bid=${:.4}, loss={:.2}%",
                         tag, bid, profit_margin * dec!(100)), true));
@@ -677,7 +677,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 // Take-profit (discretionary — suppressed during soft-exit cooldown)
                 if !soft_exit_cooldown_active
                     && (profit_margin >= tp_target
-                        || bid >= config::TRENDCAPTURE_TAKE_PROFIT_CEILING)
+                        || bid >= dc.trendcapture_take_profit_ceiling)
                 {
                     found = Some(make_exit(format!("{}TP: bid=${:.4}, profit={:.2}%", tag, bid, profit_margin * dec!(100)), false));
                     break 'outer;
@@ -694,7 +694,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 // Trend-reversal exit — trend-FOLLOWING only. In fade (TrendReversal)
                 // mode the entry already fades the drift, so a drift flip is the
                 // thesis playing OUT, not a reason to bail; rely on TP/SL/catastrophic.
-                if !config::TRENDREVERSAL_MODE
+                if !dc.trendreversal_mode
                     && !soft_exit_cooldown_active
                     && secs_held >= config::TRENDCAPTURE_MIN_HOLD_BEFORE_REVERSAL_SECS {
                     let is_yes = token_id == &market.yes_token;

@@ -53,7 +53,7 @@ impl Strategy for BasisStrategyImpl {
         // ── Expiry guard ─────────────────────────────────────────────────────
         if let Some(close_time) = market.market_close_time {
             let secs_left = (close_time - Utc::now()).num_seconds();
-            if secs_left < config::BASIS_MIN_SECS_TO_EXPIRY {
+            if secs_left < dc.basis_min_secs_to_expiry {
                 return Ok(StrategySignal::NoSignal);
             }
         }
@@ -103,7 +103,7 @@ impl Strategy for BasisStrategyImpl {
         let skew = yes_mid - dec!(0.50);
 
         // ── Gate 3: Skew must exceed entry threshold ──────────────────────────
-        if skew.abs() < config::BASIS_ENTRY_SKEW_THRESHOLD {
+        if skew.abs() < dc.basis_entry_skew_threshold {
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -112,7 +112,7 @@ impl Strategy for BasisStrategyImpl {
             && ctx.snapshot.funding_rate < config::BASIS_NEGATIVE_FUNDING_THRESHOLD;
         let funding_confirms_yes_trade = skew < dec!(0) // NO over-priced
             && ctx.snapshot.funding_rate > config::BASIS_POSITIVE_FUNDING_THRESHOLD;
-        let extreme_skew_bypass = skew.abs() >= config::BASIS_ENTRY_SKEW_THRESHOLD * dec!(2);
+        let extreme_skew_bypass = skew.abs() >= dc.basis_entry_skew_threshold * dec!(2);
 
         // ── Gate 4b: Institutional-tide contradiction veto ────────────────────
         // Basis fades retail skew; the Tide Raptor reports where institutions are
@@ -133,14 +133,14 @@ impl Strategy for BasisStrategyImpl {
         // Kelly sizing — then back off by the taker fee so order_amount + fee never exceeds trade_size.
         // Without this, a $15 order at 1000 bps adds ~$0.67 in fees, pushing the required total
         // above the available pUSD balance and causing a 400 "not enough balance" rejection.
-        let trade_size = crate::vipers::basis_impl::basis_trade_size(skew.abs());
+        let trade_size = crate::vipers::basis_impl::basis_trade_size(skew.abs(), dc.basis_min_trade_size_usdc, dc.basis_max_trade_size_usdc, dc.basis_entry_skew_threshold);
         let no_fee_headroom  = dec!(1) + Decimal::from(market.no_fee_bps)  / dec!(10000);
         let yes_fee_headroom = dec!(1) + Decimal::from(market.yes_fee_bps) / dec!(10000);
 
         // ── Balance Gate ─────────────────────────────────────────────────────
         // If the wallet can't cover even the minimum trade + fee, skip entirely.
         // This prevents 400 rejections from firing every 60s when the balance is depleted.
-        let min_required = config::BASIS_MIN_TRADE_SIZE_USDC / no_fee_headroom.min(yes_fee_headroom);
+        let min_required = dc.basis_min_trade_size_usdc / no_fee_headroom.min(yes_fee_headroom);
         if ctx.available_collateral < min_required {
             return Ok(StrategySignal::NoSignal);
         }
@@ -196,7 +196,7 @@ impl Strategy for BasisStrategyImpl {
                 effective_fee_multiplier = no_fee_headroom;
             }
 
-            if target_price > config::BASIS_MAX_ENTRY_PRICE {
+            if target_price > dc.basis_max_entry_price {
                 return Ok(StrategySignal::NoSignal);
             }
 
@@ -251,7 +251,7 @@ impl Strategy for BasisStrategyImpl {
                 effective_fee_multiplier = yes_fee_headroom;
             }
 
-            if target_price > config::BASIS_MAX_ENTRY_PRICE {
+            if target_price > dc.basis_max_entry_price {
                 return Ok(StrategySignal::NoSignal);
             }
 
@@ -337,10 +337,10 @@ impl Strategy for BasisStrategyImpl {
             }
 
             if profit_margin <= -dc.basis_stop_loss_pct
-                && (profit_margin <= -config::BASIS_CATASTROPHIC_SL_PCT
+                && (profit_margin <= -dc.basis_catastrophic_sl_pct
                     || secs_held >= config::BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS)
             {
-                let is_catastrophic = profit_margin <= -config::BASIS_CATASTROPHIC_SL_PCT;
+                let is_catastrophic = profit_margin <= -dc.basis_catastrophic_sl_pct;
                 // EMERGENCY FIX: If the bid is too low, assume FAK will miss and defer exit.
                 // This prevents repeated exit attempts at unfillable prices, which causes log floods.
                 if position_bid < config::BASIS_MIN_STOP_LOSS_EXIT_BID {
@@ -373,7 +373,7 @@ impl Strategy for BasisStrategyImpl {
                 });
             }
 
-            if profit_margin > dec!(0) && current_skew < config::BASIS_SKEW_COLLAPSE_THRESHOLD {
+            if profit_margin > dec!(0) && current_skew < dc.basis_skew_collapse_threshold {
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
                         token_id: token_id.clone(),
@@ -394,7 +394,7 @@ impl Strategy for BasisStrategyImpl {
 
             if let Some(close_time) = position.close_time {
                 let secs_left = (close_time - Utc::now()).num_seconds();
-                if secs_left < config::BASIS_MIN_SECS_TO_EXPIRY / 2 {
+                if secs_left < dc.basis_min_secs_to_expiry / 2 {
                     // Skip BasisExpiry if the bid is too thin to get a FAK fill — near market
                     // close the order book dries up and FAK returns 0 fills while the position
                     // map is cleared optimistically, leaving orphaned on-chain shares.
@@ -436,11 +436,11 @@ impl Strategy for BasisStrategyImpl {
     fn risk_model(&self) -> &'static str { "Gross one-sided" }
 }
 
-pub fn basis_trade_size(skew_abs: Decimal) -> Decimal {
-    if !config::ENABLE_KELLY_SIZING { return config::BASIS_MIN_TRADE_SIZE_USDC; }
-    let threshold = config::BASIS_ENTRY_SKEW_THRESHOLD;
-    if threshold <= Decimal::ZERO { return config::BASIS_MIN_TRADE_SIZE_USDC; }
+pub fn basis_trade_size(skew_abs: Decimal, min_size: Decimal, max_size: Decimal, skew_threshold: Decimal) -> Decimal {
+    if !config::ENABLE_KELLY_SIZING { return min_size; }
+    let threshold = skew_threshold;
+    if threshold <= Decimal::ZERO { return min_size; }
     let multiplier = (skew_abs / threshold).max(Decimal::ONE).min(config::BASIS_KELLY_MAX_MULTIPLIER);
     let fraction = (multiplier - Decimal::ONE) / (config::BASIS_KELLY_MAX_MULTIPLIER - Decimal::ONE);
-    config::BASIS_MIN_TRADE_SIZE_USDC + fraction * (config::BASIS_MAX_TRADE_SIZE_USDC - config::BASIS_MIN_TRADE_SIZE_USDC)
+    min_size + fraction * (max_size - min_size)
 }

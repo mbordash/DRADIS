@@ -64,6 +64,69 @@ fn default_convergence_stop_loss()         -> Decimal { config::CONVERGENCE_STOP
 fn default_convergence_target_profit()     -> Decimal { config::CONVERGENCE_TARGET_PROFIT_PERCENT     }
 fn default_convergence_max_entry_price()   -> Decimal { config::CONVERGENCE_MAX_ENTRY_PRICE           }
 
+// ── Newly-exposed advanced knobs (previously compile-time only) ───────────────
+fn default_basis_max_entry_price()          -> Decimal { config::BASIS_MAX_ENTRY_PRICE                 }
+fn default_basis_min_trade_size_usdc()      -> Decimal { config::BASIS_MIN_TRADE_SIZE_USDC             }
+fn default_basis_max_trade_size_usdc()      -> Decimal { config::BASIS_MAX_TRADE_SIZE_USDC             }
+fn default_basis_entry_skew_threshold()     -> Decimal { config::BASIS_ENTRY_SKEW_THRESHOLD            }
+fn default_basis_skew_collapse_threshold()  -> Decimal { config::BASIS_SKEW_COLLAPSE_THRESHOLD         }
+fn default_basis_catastrophic_sl_pct()      -> Decimal { config::BASIS_CATASTROPHIC_SL_PCT             }
+fn default_basis_min_secs_to_expiry()       -> i64     { config::BASIS_MIN_SECS_TO_EXPIRY              }
+
+fn default_convergence_min_entry_price()    -> Decimal { config::CONVERGENCE_MIN_ENTRY_PRICE           }
+fn default_convergence_pulse_threshold()    -> Decimal { config::CONVERGENCE_PULSE_THRESHOLD           }
+fn default_convergence_coherence_min()      -> Decimal { config::CONVERGENCE_COHERENCE_MIN             }
+fn default_convergence_cvd_confirm_margin() -> Decimal { config::CONVERGENCE_CVD_CONFIRM_MARGIN        }
+fn default_convergence_max_token_spread_pct() -> Decimal { config::CONVERGENCE_MAX_TOKEN_SPREAD_PCT    }
+fn default_convergence_obi_adverse_block()  -> Decimal { config::CONVERGENCE_OBI_ADVERSE_BLOCK         }
+fn default_convergence_skip_band_low()      -> Decimal { config::CONVERGENCE_SKIP_BAND_LOW             }
+fn default_convergence_skip_band_high()     -> Decimal { config::CONVERGENCE_SKIP_BAND_HIGH            }
+
+fn default_maker_min_spread()               -> Decimal { config::MAKER_MIN_SPREAD                      }
+fn default_maker_bid_buffer()               -> Decimal { config::MAKER_BID_BUFFER                      }
+fn default_maker_cross_buffer()             -> Decimal { config::MAKER_CROSS_BUFFER                    }
+fn default_maker_max_combined_bid()         -> Decimal { config::MAKER_MAX_COMBINED_BID                }
+fn default_maker_max_complementary_price()  -> Decimal { config::MAKER_MAX_COMPLEMENTARY_PRICE         }
+fn default_maker_max_book_imbalance_ratio() -> Decimal { config::MAKER_MAX_BOOK_IMBALANCE_RATIO        }
+fn default_maker_min_secs_to_expiry()       -> i64     { config::MAKER_MIN_SECS_TO_EXPIRY              }
+fn default_maker_toxic_flow_exit_obi()      -> Decimal { config::MAKER_TOXIC_FLOW_EXIT_OBI             }
+
+fn default_momentum_max_entry_price()       -> Decimal { config::MAX_MOMENTUM_ENTRY_PRICE              }
+fn default_momentum_min_entry_price()       -> Decimal { config::MOMENTUM_MIN_ENTRY_PRICE              }
+fn default_momentum_threshold_pct()         -> Decimal { config::MOMENTUM_THRESHOLD_PCT                }
+fn default_momentum_max_entry_ask_sum()     -> Decimal { config::MOMENTUM_MAX_ENTRY_ASK_SUM            }
+fn default_momentum_obi_adverse_block()     -> Decimal { config::MOMENTUM_OBI_ADVERSE_BLOCK            }
+fn default_momentum_obi_exhaustion_block()  -> Decimal { config::MOMENTUM_OBI_EXHAUSTION_BLOCK         }
+fn default_momentum_take_profit_ceiling()   -> Decimal { config::MOMENTUM_TAKE_PROFIT_CEILING          }
+fn default_momentum_catastrophic_sl_pct()   -> Decimal { config::MOMENTUM_CATASTROPHIC_SL_PCT          }
+fn default_momentum_min_secs_to_expiry_for_entry() -> i64 { config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY }
+
+fn default_time_decay_max_fast_velocity_pct()      -> Decimal { config::TIME_DECAY_MAX_FAST_VELOCITY_PCT      }
+fn default_time_decay_max_slow_drift_pct()         -> Decimal { config::TIME_DECAY_MAX_SLOW_DRIFT_PCT         }
+fn default_time_decay_iv_stop_tighten_multiplier() -> Decimal { config::TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER }
+fn default_time_decay_min_hold_secs()              -> i64     { config::TIME_DECAY_MIN_HOLD_SECS              }
+
+fn default_gboost_max_yes_entry_price()     -> Decimal { config::GBOOST_MAX_YES_ENTRY_PRICE            }
+fn default_gboost_max_no_entry_price()      -> Decimal { config::GBOOST_MAX_NO_ENTRY_PRICE             }
+fn default_gboost_min_entry_price()         -> Decimal { config::GBOOST_MIN_ENTRY_PRICE                }
+fn default_gboost_obi_adverse_block()       -> Decimal { config::GBOOST_OBI_ADVERSE_BLOCK              }
+fn default_gboost_obi_exhaustion_block()    -> Decimal { config::GBOOST_OBI_EXHAUSTION_BLOCK           }
+fn default_gboost_min_edge_from_fair()      -> Decimal { config::GBOOST_MIN_EDGE_FROM_FAIR             }
+fn default_gboost_min_net_profit_usdc()     -> Decimal { config::GBOOST_MIN_NET_PROFIT_USDC            }
+fn default_gboost_min_secs_to_expiry()      -> i64     { config::GBOOST_MIN_SECS_TO_EXPIRY             }
+fn default_gboost_signal_exit_threshold()   -> Decimal { config::GBOOST_SIGNAL_EXIT_THRESHOLD          }
+
+fn default_trendcapture_min_entry_price()      -> Decimal { config::TRENDCAPTURE_MIN_ENTRY_PRICE          }
+fn default_trendcapture_max_entry_ask_sum()    -> Decimal { config::TRENDCAPTURE_MAX_ENTRY_ASK_SUM        }
+fn default_trendcapture_obi_adverse_block()    -> Decimal { config::TRENDCAPTURE_OBI_ADVERSE_BLOCK        }
+fn default_trendcapture_obi_exhaustion_block() -> Decimal { config::TRENDCAPTURE_OBI_EXHAUSTION_BLOCK     }
+fn default_trendcapture_max_token_spread_pct() -> Decimal { config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT     }
+fn default_trendcapture_reversal_drift_pct()   -> Decimal { config::TRENDCAPTURE_REVERSAL_DRIFT_PCT       }
+fn default_trendcapture_strike_gap_pct()       -> Decimal { config::TRENDCAPTURE_STRIKE_GAP_PCT           }
+fn default_trendcapture_take_profit_ceiling()  -> Decimal { config::TRENDCAPTURE_TAKE_PROFIT_CEILING      }
+fn default_trendcapture_catastrophic_sl_pct()  -> Decimal { config::TRENDCAPTURE_CATASTROPHIC_SL_PCT      }
+fn default_trendreversal_mode()                -> bool    { config::TRENDREVERSAL_MODE                    }
+
 // ─── Struct ──────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -137,6 +200,14 @@ pub struct DynamicConfig {
     pub time_decay_min_secs_to_expiry:  i64,
     pub time_decay_max_secs_to_expiry:  i64,
     pub min_time_decay_net_profit:      Decimal,
+    #[serde(default = "default_time_decay_max_fast_velocity_pct")]
+    pub time_decay_max_fast_velocity_pct:      Decimal,
+    #[serde(default = "default_time_decay_max_slow_drift_pct")]
+    pub time_decay_max_slow_drift_pct:         Decimal,
+    #[serde(default = "default_time_decay_iv_stop_tighten_multiplier")]
+    pub time_decay_iv_stop_tighten_multiplier: Decimal,
+    #[serde(default = "default_time_decay_min_hold_secs")]
+    pub time_decay_min_hold_secs:              i64,
 
     // ── Momentum Viper ────────────────────────────────────────────────────────
     pub momentum_min_trade_size_usdc:  Decimal,
@@ -144,6 +215,24 @@ pub struct DynamicConfig {
     pub momentum_stop_loss_pct:        Decimal,
     pub momentum_target_profit_pct:    Decimal,
     pub momentum_max_exposure_usdc:    Decimal,
+    #[serde(default = "default_momentum_max_entry_price")]
+    pub momentum_max_entry_price:      Decimal,
+    #[serde(default = "default_momentum_min_entry_price")]
+    pub momentum_min_entry_price:      Decimal,
+    #[serde(default = "default_momentum_threshold_pct")]
+    pub momentum_threshold_pct:        Decimal,
+    #[serde(default = "default_momentum_max_entry_ask_sum")]
+    pub momentum_max_entry_ask_sum:    Decimal,
+    #[serde(default = "default_momentum_obi_adverse_block")]
+    pub momentum_obi_adverse_block:    Decimal,
+    #[serde(default = "default_momentum_obi_exhaustion_block")]
+    pub momentum_obi_exhaustion_block: Decimal,
+    #[serde(default = "default_momentum_take_profit_ceiling")]
+    pub momentum_take_profit_ceiling:  Decimal,
+    #[serde(default = "default_momentum_catastrophic_sl_pct")]
+    pub momentum_catastrophic_sl_pct:  Decimal,
+    #[serde(default = "default_momentum_min_secs_to_expiry_for_entry")]
+    pub momentum_min_secs_to_expiry_for_entry: i64,
 
     // ── Maker Viper ───────────────────────────────────────────────────────────
     pub maker_max_entry_price:    Decimal,
@@ -151,17 +240,65 @@ pub struct DynamicConfig {
     pub maker_stop_loss_pct:      Decimal,
     pub maker_target_profit_pct:  Decimal,
     pub maker_max_exposure_usdc:  Decimal,
+    #[serde(default = "default_maker_min_spread")]
+    pub maker_min_spread:              Decimal,
+    #[serde(default = "default_maker_bid_buffer")]
+    pub maker_bid_buffer:              Decimal,
+    #[serde(default = "default_maker_cross_buffer")]
+    pub maker_cross_buffer:            Decimal,
+    #[serde(default = "default_maker_max_combined_bid")]
+    pub maker_max_combined_bid:        Decimal,
+    #[serde(default = "default_maker_max_complementary_price")]
+    pub maker_max_complementary_price: Decimal,
+    #[serde(default = "default_maker_max_book_imbalance_ratio")]
+    pub maker_max_book_imbalance_ratio: Decimal,
+    #[serde(default = "default_maker_min_secs_to_expiry")]
+    pub maker_min_secs_to_expiry:      i64,
+    #[serde(default = "default_maker_toxic_flow_exit_obi")]
+    pub maker_toxic_flow_exit_obi:     Decimal,
 
     // ── Basis Viper ───────────────────────────────────────────────────────────
     pub basis_max_exposure_usdc:  Decimal,
     pub basis_stop_loss_pct:      Decimal,
     pub basis_target_profit_pct:  Decimal,
+    #[serde(default = "default_basis_max_entry_price")]
+    pub basis_max_entry_price:         Decimal,
+    #[serde(default = "default_basis_min_trade_size_usdc")]
+    pub basis_min_trade_size_usdc:     Decimal,
+    #[serde(default = "default_basis_max_trade_size_usdc")]
+    pub basis_max_trade_size_usdc:     Decimal,
+    #[serde(default = "default_basis_entry_skew_threshold")]
+    pub basis_entry_skew_threshold:    Decimal,
+    #[serde(default = "default_basis_skew_collapse_threshold")]
+    pub basis_skew_collapse_threshold: Decimal,
+    #[serde(default = "default_basis_catastrophic_sl_pct")]
+    pub basis_catastrophic_sl_pct:     Decimal,
+    #[serde(default = "default_basis_min_secs_to_expiry")]
+    pub basis_min_secs_to_expiry:      i64,
 
     // ── GBoost Viper ──────────────────────────────────────────────────────────
     pub gboost_entry_threshold:   Decimal,
     pub gboost_stop_loss_pct:     Decimal,
     pub gboost_target_profit_pct: Decimal,
     pub gboost_max_exposure_usdc: Decimal,
+    #[serde(default = "default_gboost_max_yes_entry_price")]
+    pub gboost_max_yes_entry_price:   Decimal,
+    #[serde(default = "default_gboost_max_no_entry_price")]
+    pub gboost_max_no_entry_price:    Decimal,
+    #[serde(default = "default_gboost_min_entry_price")]
+    pub gboost_min_entry_price:       Decimal,
+    #[serde(default = "default_gboost_obi_adverse_block")]
+    pub gboost_obi_adverse_block:     Decimal,
+    #[serde(default = "default_gboost_obi_exhaustion_block")]
+    pub gboost_obi_exhaustion_block:  Decimal,
+    #[serde(default = "default_gboost_min_edge_from_fair")]
+    pub gboost_min_edge_from_fair:    Decimal,
+    #[serde(default = "default_gboost_min_net_profit_usdc")]
+    pub gboost_min_net_profit_usdc:   Decimal,
+    #[serde(default = "default_gboost_min_secs_to_expiry")]
+    pub gboost_min_secs_to_expiry:    i64,
+    #[serde(default = "default_gboost_signal_exit_threshold")]
+    pub gboost_signal_exit_threshold: Decimal,
 
     // ── TrendCapture Viper ────────────────────────────────────────────────────
     #[serde(default = "default_trendcapture_min_trade_size")]
@@ -176,6 +313,26 @@ pub struct DynamicConfig {
     pub trendcapture_target_profit_pct:   Decimal,
     #[serde(default = "default_trendcapture_max_entry_price")]
     pub trendcapture_max_entry_price:     Decimal,
+    #[serde(default = "default_trendcapture_min_entry_price")]
+    pub trendcapture_min_entry_price:      Decimal,
+    #[serde(default = "default_trendcapture_max_entry_ask_sum")]
+    pub trendcapture_max_entry_ask_sum:    Decimal,
+    #[serde(default = "default_trendcapture_obi_adverse_block")]
+    pub trendcapture_obi_adverse_block:    Decimal,
+    #[serde(default = "default_trendcapture_obi_exhaustion_block")]
+    pub trendcapture_obi_exhaustion_block: Decimal,
+    #[serde(default = "default_trendcapture_max_token_spread_pct")]
+    pub trendcapture_max_token_spread_pct: Decimal,
+    #[serde(default = "default_trendcapture_reversal_drift_pct")]
+    pub trendcapture_reversal_drift_pct:   Decimal,
+    #[serde(default = "default_trendcapture_strike_gap_pct")]
+    pub trendcapture_strike_gap_pct:       Decimal,
+    #[serde(default = "default_trendcapture_take_profit_ceiling")]
+    pub trendcapture_take_profit_ceiling:  Decimal,
+    #[serde(default = "default_trendcapture_catastrophic_sl_pct")]
+    pub trendcapture_catastrophic_sl_pct:  Decimal,
+    #[serde(default = "default_trendreversal_mode")]
+    pub trendreversal_mode:                bool,
 
     // ── Convergence Viper ─────────────────────────────────────────────────────
     #[serde(default = "default_convergence_enable")]
@@ -190,6 +347,22 @@ pub struct DynamicConfig {
     pub convergence_target_profit_pct:    Decimal,
     #[serde(default = "default_convergence_max_entry_price")]
     pub convergence_max_entry_price:      Decimal,
+    #[serde(default = "default_convergence_min_entry_price")]
+    pub convergence_min_entry_price:      Decimal,
+    #[serde(default = "default_convergence_pulse_threshold")]
+    pub convergence_pulse_threshold:      Decimal,
+    #[serde(default = "default_convergence_coherence_min")]
+    pub convergence_coherence_min:        Decimal,
+    #[serde(default = "default_convergence_cvd_confirm_margin")]
+    pub convergence_cvd_confirm_margin:   Decimal,
+    #[serde(default = "default_convergence_max_token_spread_pct")]
+    pub convergence_max_token_spread_pct: Decimal,
+    #[serde(default = "default_convergence_obi_adverse_block")]
+    pub convergence_obi_adverse_block:    Decimal,
+    #[serde(default = "default_convergence_skip_band_low")]
+    pub convergence_skip_band_low:        Decimal,
+    #[serde(default = "default_convergence_skip_band_high")]
+    pub convergence_skip_band_high:       Decimal,
 }
 
 impl Default for DynamicConfig {
@@ -229,27 +402,64 @@ impl Default for DynamicConfig {
             time_decay_min_secs_to_expiry:  config::TIME_DECAY_MIN_SECS_TO_EXPIRY,
             time_decay_max_secs_to_expiry:  config::TIME_DECAY_MAX_SECS_TO_EXPIRY,
             min_time_decay_net_profit:      config::MIN_TIME_DECAY_NET_PROFIT,
+            time_decay_max_fast_velocity_pct:      config::TIME_DECAY_MAX_FAST_VELOCITY_PCT,
+            time_decay_max_slow_drift_pct:         config::TIME_DECAY_MAX_SLOW_DRIFT_PCT,
+            time_decay_iv_stop_tighten_multiplier: config::TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER,
+            time_decay_min_hold_secs:              config::TIME_DECAY_MIN_HOLD_SECS,
 
             momentum_min_trade_size_usdc:  config::MOMENTUM_MIN_TRADE_SIZE_USDC,
             momentum_max_trade_size_usdc:  config::MOMENTUM_MAX_TRADE_SIZE_USDC,
             momentum_stop_loss_pct:        config::MOMENTUM_STOP_LOSS_PERCENT,
             momentum_target_profit_pct:    config::MOMENTUM_TARGET_PROFIT_PERCENT,
             momentum_max_exposure_usdc:    config::MOMENTUM_MAX_EXPOSURE_USDC,
+            momentum_max_entry_price:      config::MAX_MOMENTUM_ENTRY_PRICE,
+            momentum_min_entry_price:      config::MOMENTUM_MIN_ENTRY_PRICE,
+            momentum_threshold_pct:        config::MOMENTUM_THRESHOLD_PCT,
+            momentum_max_entry_ask_sum:    config::MOMENTUM_MAX_ENTRY_ASK_SUM,
+            momentum_obi_adverse_block:    config::MOMENTUM_OBI_ADVERSE_BLOCK,
+            momentum_obi_exhaustion_block: config::MOMENTUM_OBI_EXHAUSTION_BLOCK,
+            momentum_take_profit_ceiling:  config::MOMENTUM_TAKE_PROFIT_CEILING,
+            momentum_catastrophic_sl_pct:  config::MOMENTUM_CATASTROPHIC_SL_PCT,
+            momentum_min_secs_to_expiry_for_entry: config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY,
 
             maker_max_entry_price:    config::MAKER_MAX_ENTRY_PRICE,
             maker_min_entry_price:    config::MAKER_MIN_ENTRY_PRICE,
             maker_stop_loss_pct:      config::MAKER_STOP_LOSS_PERCENT,
             maker_target_profit_pct:  config::MAKER_TARGET_PROFIT_PERCENT,
             maker_max_exposure_usdc:  config::MAKER_MAX_EXPOSURE_USDC,
+            maker_min_spread:              config::MAKER_MIN_SPREAD,
+            maker_bid_buffer:              config::MAKER_BID_BUFFER,
+            maker_cross_buffer:            config::MAKER_CROSS_BUFFER,
+            maker_max_combined_bid:        config::MAKER_MAX_COMBINED_BID,
+            maker_max_complementary_price: config::MAKER_MAX_COMPLEMENTARY_PRICE,
+            maker_max_book_imbalance_ratio: config::MAKER_MAX_BOOK_IMBALANCE_RATIO,
+            maker_min_secs_to_expiry:      config::MAKER_MIN_SECS_TO_EXPIRY,
+            maker_toxic_flow_exit_obi:     config::MAKER_TOXIC_FLOW_EXIT_OBI,
 
             basis_max_exposure_usdc:  config::BASIS_MAX_EXPOSURE_USDC,
             basis_stop_loss_pct:      config::BASIS_STOP_LOSS_PERCENT,
             basis_target_profit_pct:  config::BASIS_TARGET_PROFIT_PERCENT,
+            basis_max_entry_price:         config::BASIS_MAX_ENTRY_PRICE,
+            basis_min_trade_size_usdc:     config::BASIS_MIN_TRADE_SIZE_USDC,
+            basis_max_trade_size_usdc:     config::BASIS_MAX_TRADE_SIZE_USDC,
+            basis_entry_skew_threshold:    config::BASIS_ENTRY_SKEW_THRESHOLD,
+            basis_skew_collapse_threshold: config::BASIS_SKEW_COLLAPSE_THRESHOLD,
+            basis_catastrophic_sl_pct:     config::BASIS_CATASTROPHIC_SL_PCT,
+            basis_min_secs_to_expiry:      config::BASIS_MIN_SECS_TO_EXPIRY,
 
             gboost_entry_threshold:   config::GBOOST_ENTRY_THRESHOLD,
             gboost_stop_loss_pct:     config::GBOOST_STOP_LOSS_PERCENT,
             gboost_target_profit_pct: config::GBOOST_TARGET_PROFIT_PERCENT,
             gboost_max_exposure_usdc: config::GBOOST_MAX_EXPOSURE_USDC,
+            gboost_max_yes_entry_price:   config::GBOOST_MAX_YES_ENTRY_PRICE,
+            gboost_max_no_entry_price:    config::GBOOST_MAX_NO_ENTRY_PRICE,
+            gboost_min_entry_price:       config::GBOOST_MIN_ENTRY_PRICE,
+            gboost_obi_adverse_block:     config::GBOOST_OBI_ADVERSE_BLOCK,
+            gboost_obi_exhaustion_block:  config::GBOOST_OBI_EXHAUSTION_BLOCK,
+            gboost_min_edge_from_fair:    config::GBOOST_MIN_EDGE_FROM_FAIR,
+            gboost_min_net_profit_usdc:   config::GBOOST_MIN_NET_PROFIT_USDC,
+            gboost_min_secs_to_expiry:    config::GBOOST_MIN_SECS_TO_EXPIRY,
+            gboost_signal_exit_threshold: config::GBOOST_SIGNAL_EXIT_THRESHOLD,
 
             trendcapture_min_trade_size_usdc: config::TRENDCAPTURE_MIN_TRADE_SIZE_USDC,
             trendcapture_max_trade_size_usdc: config::TRENDCAPTURE_MAX_TRADE_SIZE_USDC,
@@ -257,6 +467,16 @@ impl Default for DynamicConfig {
             trendcapture_stop_loss_pct:       config::TRENDCAPTURE_STOP_LOSS_PERCENT,
             trendcapture_target_profit_pct:   config::TRENDCAPTURE_TARGET_PROFIT_PERCENT,
             trendcapture_max_entry_price:     config::TRENDCAPTURE_MAX_ENTRY_PRICE,
+            trendcapture_min_entry_price:      config::TRENDCAPTURE_MIN_ENTRY_PRICE,
+            trendcapture_max_entry_ask_sum:    config::TRENDCAPTURE_MAX_ENTRY_ASK_SUM,
+            trendcapture_obi_adverse_block:    config::TRENDCAPTURE_OBI_ADVERSE_BLOCK,
+            trendcapture_obi_exhaustion_block: config::TRENDCAPTURE_OBI_EXHAUSTION_BLOCK,
+            trendcapture_max_token_spread_pct: config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT,
+            trendcapture_reversal_drift_pct:   config::TRENDCAPTURE_REVERSAL_DRIFT_PCT,
+            trendcapture_strike_gap_pct:       config::TRENDCAPTURE_STRIKE_GAP_PCT,
+            trendcapture_take_profit_ceiling:  config::TRENDCAPTURE_TAKE_PROFIT_CEILING,
+            trendcapture_catastrophic_sl_pct:  config::TRENDCAPTURE_CATASTROPHIC_SL_PCT,
+            trendreversal_mode:                config::TRENDREVERSAL_MODE,
 
             enable_convergence:               config::ENABLE_CONVERGENCE_TRADING,
             convergence_position_size_usdc:   config::CONVERGENCE_POSITION_SIZE_USDC,
@@ -264,6 +484,14 @@ impl Default for DynamicConfig {
             convergence_stop_loss_pct:        config::CONVERGENCE_STOP_LOSS_PERCENT,
             convergence_target_profit_pct:    config::CONVERGENCE_TARGET_PROFIT_PERCENT,
             convergence_max_entry_price:      config::CONVERGENCE_MAX_ENTRY_PRICE,
+            convergence_min_entry_price:      config::CONVERGENCE_MIN_ENTRY_PRICE,
+            convergence_pulse_threshold:      config::CONVERGENCE_PULSE_THRESHOLD,
+            convergence_coherence_min:        config::CONVERGENCE_COHERENCE_MIN,
+            convergence_cvd_confirm_margin:   config::CONVERGENCE_CVD_CONFIRM_MARGIN,
+            convergence_max_token_spread_pct: config::CONVERGENCE_MAX_TOKEN_SPREAD_PCT,
+            convergence_obi_adverse_block:    config::CONVERGENCE_OBI_ADVERSE_BLOCK,
+            convergence_skip_band_low:        config::CONVERGENCE_SKIP_BAND_LOW,
+            convergence_skip_band_high:       config::CONVERGENCE_SKIP_BAND_HIGH,
         }
     }
 }

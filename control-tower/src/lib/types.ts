@@ -33,6 +33,10 @@ export interface DynamicConfig {
   time_decay_min_secs_to_expiry:   number;
   time_decay_max_secs_to_expiry:   number;
   min_time_decay_net_profit:       string;
+  time_decay_max_fast_velocity_pct:      string;
+  time_decay_max_slow_drift_pct:         string;
+  time_decay_iv_stop_tighten_multiplier: string;
+  time_decay_min_hold_secs:              number;
 
   // Momentum Viper
   momentum_min_trade_size_usdc: string;
@@ -40,6 +44,15 @@ export interface DynamicConfig {
   momentum_stop_loss_pct:       string;
   momentum_target_profit_pct:   string;
   momentum_max_exposure_usdc:   string;
+  momentum_max_entry_price:      string;
+  momentum_min_entry_price:      string;
+  momentum_threshold_pct:        string;
+  momentum_max_entry_ask_sum:    string;
+  momentum_obi_adverse_block:    string;
+  momentum_obi_exhaustion_block: string;
+  momentum_take_profit_ceiling:  string;
+  momentum_catastrophic_sl_pct:  string;
+  momentum_min_secs_to_expiry_for_entry: number;
 
   // Maker Viper
   maker_max_entry_price:   string;
@@ -47,17 +60,41 @@ export interface DynamicConfig {
   maker_stop_loss_pct:     string;
   maker_target_profit_pct: string;
   maker_max_exposure_usdc: string;
+  maker_min_spread:              string;
+  maker_bid_buffer:              string;
+  maker_cross_buffer:            string;
+  maker_max_combined_bid:        string;
+  maker_max_complementary_price: string;
+  maker_max_book_imbalance_ratio: string;
+  maker_min_secs_to_expiry:      number;
+  maker_toxic_flow_exit_obi:     string;
 
   // Basis Viper
   basis_max_exposure_usdc: string;
   basis_stop_loss_pct:     string;
   basis_target_profit_pct: string;
+  basis_max_entry_price:         string;
+  basis_min_trade_size_usdc:     string;
+  basis_max_trade_size_usdc:     string;
+  basis_entry_skew_threshold:    string;
+  basis_skew_collapse_threshold: string;
+  basis_catastrophic_sl_pct:     string;
+  basis_min_secs_to_expiry:      number;
 
   // GBoost Viper
   gboost_entry_threshold:   string;
   gboost_stop_loss_pct:     string;
   gboost_target_profit_pct: string;
   gboost_max_exposure_usdc: string;
+  gboost_max_yes_entry_price:   string;
+  gboost_max_no_entry_price:    string;
+  gboost_min_entry_price:       string;
+  gboost_obi_adverse_block:     string;
+  gboost_obi_exhaustion_block:  string;
+  gboost_min_edge_from_fair:    string;
+  gboost_min_net_profit_usdc:   string;
+  gboost_min_secs_to_expiry:    number;
+  gboost_signal_exit_threshold: string;
 
   // TrendCapture Viper
   trendcapture_min_trade_size_usdc: string;
@@ -66,6 +103,16 @@ export interface DynamicConfig {
   trendcapture_stop_loss_pct:       string;
   trendcapture_target_profit_pct:   string;
   trendcapture_max_entry_price:     string;
+  trendcapture_min_entry_price:      string;
+  trendcapture_max_entry_ask_sum:    string;
+  trendcapture_obi_adverse_block:    string;
+  trendcapture_obi_exhaustion_block: string;
+  trendcapture_max_token_spread_pct: string;
+  trendcapture_reversal_drift_pct:   string;
+  trendcapture_strike_gap_pct:       string;
+  trendcapture_take_profit_ceiling:  string;
+  trendcapture_catastrophic_sl_pct:  string;
+  trendreversal_mode:                boolean;
 
   // Convergence Viper
   convergence_position_size_usdc: string;
@@ -73,6 +120,14 @@ export interface DynamicConfig {
   convergence_stop_loss_pct:      string;
   convergence_target_profit_pct:  string;
   convergence_max_entry_price:    string;
+  convergence_min_entry_price:      string;
+  convergence_pulse_threshold:      string;
+  convergence_coherence_min:        string;
+  convergence_cvd_confirm_margin:   string;
+  convergence_max_token_spread_pct: string;
+  convergence_obi_adverse_block:    string;
+  convergence_skip_band_low:        string;
+  convergence_skip_band_high:       string;
 }
 
 /** One editable config field, from GET /api/config/schema (Rust source of truth). */

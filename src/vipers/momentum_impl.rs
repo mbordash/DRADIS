@@ -61,7 +61,7 @@ impl Strategy for MomentumStrategyImpl {
         let strike_price = ctx.market.strike_price;
 
         // Oracle-relative thresholds — scale with asset price automatically
-        let threshold    = config::oracle_threshold(config::MOMENTUM_THRESHOLD_PCT, binance_price);
+        let threshold    = config::oracle_threshold(dc.momentum_threshold_pct, binance_price);
         let strike_buffer = config::oracle_threshold(config::STRIKE_BUFFER_PCT, binance_price);
 
         let short_min = threshold * config::MOMENTUM_SHORT_WINDOW_FRACTION;
@@ -143,9 +143,9 @@ impl Strategy for MomentumStrategyImpl {
         // ── Expiry guard ──────────────────────────────────────────────────────
         if let Some(close_time) = ctx.market.market_close_time {
             let secs_left = (close_time - chrono::Utc::now()).num_seconds();
-            if secs_left < config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY {
+            if secs_left < dc.momentum_min_secs_to_expiry_for_entry {
                 debug!(" Momentum entry blocked: only {}s to expiry (min {}s)",
-                    secs_left, config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY);
+                    secs_left, dc.momentum_min_secs_to_expiry_for_entry);
                 return Ok(StrategySignal::NoSignal);
             }
         }
@@ -179,9 +179,9 @@ impl Strategy for MomentumStrategyImpl {
 
         // ── Spread gate: block wide-book entries ──────────────────────────────
         let ask_sum = ctx.snapshot.yes_ask + ctx.snapshot.no_ask;
-        if ask_sum > config::MOMENTUM_MAX_ENTRY_ASK_SUM {
+        if ask_sum > dc.momentum_max_entry_ask_sum {
             debug!(" Momentum spread gate: ask_sum={:.3} > max {:.3} — book too wide",
-                ask_sum, config::MOMENTUM_MAX_ENTRY_ASK_SUM);
+                ask_sum, dc.momentum_max_entry_ask_sum);
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -193,9 +193,9 @@ impl Strategy for MomentumStrategyImpl {
         // MOMENTUM_MIN_ENTRY_PRICE = 0.18 limits entries to 18%–82% probability range.
         let yes_ask = ctx.snapshot.yes_ask;
         let no_ask  = ctx.snapshot.no_ask;
-        if yes_ask < config::MOMENTUM_MIN_ENTRY_PRICE && no_ask < config::MOMENTUM_MIN_ENTRY_PRICE {
+        if yes_ask < dc.momentum_min_entry_price && no_ask < dc.momentum_min_entry_price {
             debug!(" Momentum min-price blocked: yes_ask={:.3} no_ask={:.3} both below floor {:.3}",
-                yes_ask, no_ask, config::MOMENTUM_MIN_ENTRY_PRICE);
+                yes_ask, no_ask, dc.momentum_min_entry_price);
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -209,15 +209,15 @@ impl Strategy for MomentumStrategyImpl {
         let no_obi = if no_total_depth > dec!(0) {
             (ctx.snapshot.no_bid_depth - ctx.snapshot.no_ask_depth) / no_total_depth
         } else { dec!(-1.0) };
-        let obi_blocks_bull = yes_obi < config::MOMENTUM_OBI_ADVERSE_BLOCK;
-        let obi_blocks_bear = no_obi  < config::MOMENTUM_OBI_ADVERSE_BLOCK;
+        let obi_blocks_bull = yes_obi < dc.momentum_obi_adverse_block;
+        let obi_blocks_bear = no_obi  < dc.momentum_obi_adverse_block;
         if obi_blocks_bull {
             debug!(" Momentum OBI veto (BULL): YES OBI={:.3} < block {:.3} — book fading the pump",
-                yes_obi, config::MOMENTUM_OBI_ADVERSE_BLOCK);
+                yes_obi, dc.momentum_obi_adverse_block);
         }
         if obi_blocks_bear {
             debug!(" Momentum OBI veto (BEAR): NO OBI={:.3} < block {:.3} — book fading the dump",
-                no_obi, config::MOMENTUM_OBI_ADVERSE_BLOCK);
+                no_obi, dc.momentum_obi_adverse_block);
         }
 
         // ── OBI exhaustion veto ───────────────────────────────────────────────
@@ -227,15 +227,15 @@ impl Strategy for MomentumStrategyImpl {
         // the last buyer before the flush.
         // 2026-05-24 8PM ghost trade: YES OBI=0.86 at entry → price dropped from
         // $0.67 to $0.61 in 30 s, -$0.72 loss.  Blocked at threshold 0.70.
-        let obi_exhausted_bull = yes_obi > config::MOMENTUM_OBI_EXHAUSTION_BLOCK;
-        let obi_exhausted_bear = no_obi  > config::MOMENTUM_OBI_EXHAUSTION_BLOCK;
+        let obi_exhausted_bull = yes_obi > dc.momentum_obi_exhaustion_block;
+        let obi_exhausted_bear = no_obi  > dc.momentum_obi_exhaustion_block;
         if obi_exhausted_bull {
             debug!(" Momentum OBI exhaustion (BULL): YES OBI={:.3} > threshold {:.3} — buyers exhausted",
-                yes_obi, config::MOMENTUM_OBI_EXHAUSTION_BLOCK);
+                yes_obi, dc.momentum_obi_exhaustion_block);
         }
         if obi_exhausted_bear {
             debug!(" Momentum OBI exhaustion (BEAR): NO OBI={:.3} > threshold {:.3} — sellers exhausted",
-                no_obi, config::MOMENTUM_OBI_EXHAUSTION_BLOCK);
+                no_obi, dc.momentum_obi_exhaustion_block);
         }
 
         // ── OBI oscillation gate ─────────────────────────────────────────────────
@@ -333,8 +333,8 @@ impl Strategy for MomentumStrategyImpl {
 
             // Primary entry
             if velocity > threshold && binance_price > (strike + strike_buffer)
-                && yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
-                && yes_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
+                && yes_ask <= dc.momentum_max_entry_price
+                && yes_ask >= dc.momentum_min_entry_price
                 && short_ok_bull && accel_ok_bull && !window_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
@@ -342,8 +342,8 @@ impl Strategy for MomentumStrategyImpl {
                     pair_params: None,
                 });
             } else if velocity < -threshold && binance_price < (strike - strike_buffer)
-                && no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
-                && no_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
+                && no_ask <= dc.momentum_max_entry_price
+                && no_ask >= dc.momentum_min_entry_price
                 && short_ok_bear && accel_ok_bear && !window_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
@@ -355,7 +355,7 @@ impl Strategy for MomentumStrategyImpl {
             // Secondary "strike-crossing" entry
             if velocity > threshold && binance_price > strike
                 && yes_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE
-                && yes_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
+                && yes_ask >= dc.momentum_min_entry_price
                 && short_ok_bull && accel_ok_bull && !window_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
@@ -364,7 +364,7 @@ impl Strategy for MomentumStrategyImpl {
                 });
             } else if velocity < -threshold && binance_price < strike
                 && no_ask <= config::MAX_MOMENTUM_CROSSING_ENTRY_PRICE
-                && no_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
+                && no_ask >= dc.momentum_min_entry_price
                 && short_ok_bear && accel_ok_bear && !window_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
@@ -376,8 +376,8 @@ impl Strategy for MomentumStrategyImpl {
             // Without strike — universal gates already applied above; only
             // velocity + price bounds + drift alignment needed here.
             if velocity > threshold
-                && yes_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
-                && yes_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
+                && yes_ask <= dc.momentum_max_entry_price
+                && yes_ask >= dc.momentum_min_entry_price
                 && short_ok_bull && accel_ok_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
             {
                 return Ok(StrategySignal::Entry {
@@ -385,8 +385,8 @@ impl Strategy for MomentumStrategyImpl {
                     pair_params: None,
                 });
             } else if velocity < -threshold
-                && no_ask <= config::MAX_MOMENTUM_ENTRY_PRICE
-                && no_ask >= config::MOMENTUM_MIN_ENTRY_PRICE
+                && no_ask <= dc.momentum_max_entry_price
+                && no_ask >= dc.momentum_min_entry_price
                 && short_ok_bear && accel_ok_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
             {
                 return Ok(StrategySignal::Entry {
@@ -439,7 +439,7 @@ impl Strategy for MomentumStrategyImpl {
                     // the Polymarket indexer to register the balance.
                     // Root cause: 2026-05-13 Trade #3 lost -14% during a 30s lock with
                     // no exit allowed; a catastrophic SL at 8% would have exited at ~5s.
-                    if profit_margin_check > -config::MOMENTUM_CATASTROPHIC_SL_PCT {
+                    if profit_margin_check > -dc.momentum_catastrophic_sl_pct {
                         continue; // Not catastrophic yet — wait for fill confirmation
                     }
                     // Fall through: loss > catastrophic threshold → allow exit below
@@ -452,7 +452,7 @@ impl Strategy for MomentumStrategyImpl {
             let avg_entry = position.avg_entry;
             let velocity = ctx.snapshot.velocity;
             let velocity_1s = ctx.snapshot.velocity_1s;
-            let threshold = config::oracle_threshold(config::MOMENTUM_THRESHOLD_PCT, ctx.snapshot.oracle_price);
+            let threshold = config::oracle_threshold(dc.momentum_threshold_pct, ctx.snapshot.oracle_price);
 
             if avg_entry <= dec!(0) { continue; }
             let profit_margin = (bid - avg_entry) / avg_entry;
@@ -505,7 +505,7 @@ impl Strategy for MomentumStrategyImpl {
             let stop_loss = -dc.momentum_stop_loss_pct;
             let reversal_threshold = -(threshold * config::MOMENTUM_REVERSAL_RATIO);
 
-            if profit_margin >= target || bid >= config::MOMENTUM_TAKE_PROFIT_CEILING {
+            if profit_margin >= target || bid >= dc.momentum_take_profit_ceiling {
                 let reason = format!("MomentumTP: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100));
                 return Ok(StrategySignal::Exit { params: exit_params!(), reason, exit_pair: false });
             }
@@ -567,8 +567,8 @@ impl Strategy for MomentumStrategyImpl {
                 } else { dec!(-1.0) };
 
                 let obi_exhausted_in_pos =
-                    (is_yes  && yes_obi > config::MOMENTUM_OBI_EXHAUSTION_BLOCK) ||
-                        (!is_yes && no_obi  > config::MOMENTUM_OBI_EXHAUSTION_BLOCK);
+                    (is_yes  && yes_obi > dc.momentum_obi_exhaustion_block) ||
+                        (!is_yes && no_obi  > dc.momentum_obi_exhaustion_block);
 
                 if obi_exhausted_in_pos {
                     // ── Max adverse move guard for OBI exhaustion exit ─────────────────────

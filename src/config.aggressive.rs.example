@@ -48,7 +48,7 @@ pub const ARBITRAGE_MAX_OBI_ASYMMETRY: Decimal = dec!(0.60);
 /// Min conviction: dominant leg bid must be ≥ this to enter — restricts arb to deep
 /// near-settlement markets and rejects ≈0.50 coin-flips (core orphan guard).
 /// Aggressive: looser 0.75 (more entries, higher orphan risk).
-pub const ARBITRAGE_MIN_LEG_CONVICTION: Decimal = dec!(0.75);
+pub const ARBITRAGE_MIN_LEG_CONVICTION: Decimal = dec!(0.85);
 pub const ARB_FAK_REHEDGE_BUFFER: Decimal = dec!(0.02);
 
 /// Upper bound on single-leg orphan rescue cost in the arb entry gate. Aggressive:

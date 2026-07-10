@@ -51,7 +51,7 @@ pub const ARBITRAGE_MAX_OBI_ASYMMETRY: Decimal = dec!(0.60);
 pub const ARBITRAGE_MAX_LEG_OBI: Decimal = dec!(0.50);
 /// Min conviction: dominant leg bid must be ≥ this to enter — restricts arb to deep
 /// near-settlement markets and rejects ≈0.50 coin-flips (core orphan guard). Balanced default.
-pub const ARBITRAGE_MIN_LEG_CONVICTION: Decimal = dec!(0.80);
+pub const ARBITRAGE_MIN_LEG_CONVICTION: Decimal = dec!(0.90);
 
 pub const MAX_SUM_PRICE_FOR_ENTRY: Decimal = dec!(0.96);
 pub const MIN_ORDER_SHARES: Decimal = dec!(1.0);

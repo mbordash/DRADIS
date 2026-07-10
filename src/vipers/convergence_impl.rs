@@ -125,14 +125,14 @@ impl Strategy for ConvergenceStrategyImpl {
 
         // Direction from the institutional pulse sign (also gates US-hours, since
         // pulse is zero outside the cash session → neither branch fires).
-        let want_bull = pulse >= config::CONVERGENCE_PULSE_THRESHOLD;
-        let want_bear = pulse <= -config::CONVERGENCE_PULSE_THRESHOLD;
+        let want_bull = pulse >= dc.convergence_pulse_threshold;
+        let want_bear = pulse <= -dc.convergence_pulse_threshold;
         if !want_bull && !want_bear {
             return Ok(StrategySignal::NoSignal);
         }
 
         // The three ETFs must cohere.
-        if coh < config::CONVERGENCE_COHERENCE_MIN {
+        if coh < dc.convergence_coherence_min {
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -159,9 +159,9 @@ impl Strategy for ConvergenceStrategyImpl {
         // Derivatives taker flow must CONFIRM the side. `cvd == 0` means no FAPI
         // data → no confirmation → stand down (conviction requires live confirmation).
         let cvd_confirms = if want_bull {
-            cvd >= dec!(1) + config::CONVERGENCE_CVD_CONFIRM_MARGIN
+            cvd >= dec!(1) + dc.convergence_cvd_confirm_margin
         } else {
-            cvd > dec!(0) && cvd <= dec!(1) - config::CONVERGENCE_CVD_CONFIRM_MARGIN
+            cvd > dec!(0) && cvd <= dec!(1) - dc.convergence_cvd_confirm_margin
         };
         if !cvd_confirms {
             return Ok(StrategySignal::NoSignal);
@@ -181,9 +181,9 @@ impl Strategy for ConvergenceStrategyImpl {
             dec!(0)
         };
         let obi_adverse = if want_bull {
-            obi_yes < -config::CONVERGENCE_OBI_ADVERSE_BLOCK
+            obi_yes < -dc.convergence_obi_adverse_block
         } else {
-            obi_yes > config::CONVERGENCE_OBI_ADVERSE_BLOCK
+            obi_yes > dc.convergence_obi_adverse_block
         };
         if obi_adverse {
             debug!(" Convergence blocked: adverse OBI (obi_yes={:.2}, want_bull={}) — book stacked against entry",
@@ -199,21 +199,21 @@ impl Strategy for ConvergenceStrategyImpl {
         };
 
         // ── Price / spread gates ──────────────────────────────────────────────
-        if ask < config::CONVERGENCE_MIN_ENTRY_PRICE || ask > dc.convergence_max_entry_price {
+        if ask < dc.convergence_min_entry_price || ask > dc.convergence_max_entry_price {
             return Ok(StrategySignal::NoSignal);
         }
         // Coin-flip skip band: avoid the ~$0.50 zone (max binary uncertainty, most
         // gap-prone near resolution — the audit's worst price band).
-        if config::CONVERGENCE_SKIP_BAND_LOW < config::CONVERGENCE_SKIP_BAND_HIGH
-            && ask >= config::CONVERGENCE_SKIP_BAND_LOW
-            && ask <= config::CONVERGENCE_SKIP_BAND_HIGH
+        if dc.convergence_skip_band_low < dc.convergence_skip_band_high
+            && ask >= dc.convergence_skip_band_low
+            && ask <= dc.convergence_skip_band_high
         {
             debug!(" Convergence blocked: ask {:.3} in coin-flip skip band [{:.2}, {:.2}]",
-                ask, config::CONVERGENCE_SKIP_BAND_LOW, config::CONVERGENCE_SKIP_BAND_HIGH);
+                ask, dc.convergence_skip_band_low, dc.convergence_skip_band_high);
             return Ok(StrategySignal::NoSignal);
         }
         let spread = if ask > dec!(0) { (ask - bid) / ask } else { Decimal::ONE };
-        if spread > config::CONVERGENCE_MAX_TOKEN_SPREAD_PCT {
+        if spread > dc.convergence_max_token_spread_pct {
             debug!(" Convergence blocked: spread {:.1}% > max (ask={:.3} bid={:.3})",
                 spread * dec!(100), ask, bid);
             return Ok(StrategySignal::NoSignal);
@@ -415,9 +415,9 @@ impl Strategy for ConvergenceStrategyImpl {
                 // flipped against it, or coherence has collapsed.
                 if !soft_exit_cooldown_active
                     && secs_held >= config::CONVERGENCE_MIN_HOLD_SECS {
-                    let half_thr = config::CONVERGENCE_PULSE_THRESHOLD / dec!(2);
+                    let half_thr = dc.convergence_pulse_threshold / dec!(2);
                     let pulse_reversed = if is_yes { pulse <= -half_thr } else { pulse >= half_thr };
-                    let coherence_collapsed = coh < config::CONVERGENCE_COHERENCE_MIN / dec!(2);
+                    let coherence_collapsed = coh < dc.convergence_coherence_min / dec!(2);
                     if pulse_reversed || coherence_collapsed {
                         found = Some(make_exit(format!(
                             "ConvergenceDecay: bid=${:.4} pulse={:.2} coh={:.2} profit={:.2}%",
