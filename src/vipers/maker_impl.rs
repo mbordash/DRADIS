@@ -19,6 +19,7 @@ use chrono::Utc;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::time::Instant;
+use std::collections::HashMap;
 use tokio::sync::Mutex;
 
 use crate::orchestrator::{Strategy, StrategyContext};
@@ -105,6 +106,33 @@ pub struct MakerStrategyImpl {
     last_quote_log: Mutex<Option<Instant>>,
 }
 
+/// Process-global market-maturation tracker: market identity → first time ANY
+/// maker instance observed it.  Must be global (not per-strategy) because the
+/// patrol loop rebuilds the strategy objects on every market rotation
+/// (`create_all_strategies()`), which would otherwise wipe the baseline and
+/// wrongly re-arm the 5-minute maturation blackout on a day-old daily maker
+/// market each hour.  Keyed on `market_name` (stable for the daily maker venue
+/// across hourly rotations; a genuinely new market gets a fresh entry, correctly
+/// re-arming maturation).  Survives rotations within a process; re-arms once on a
+/// full process restart (correct — a fresh process hasn't observed stability).
+fn maker_market_first_seen() -> &'static std::sync::Mutex<HashMap<String, Instant>> {
+    static REG: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Seconds since a maker market identity was first observed by any instance.
+/// Returns 0 the first time an identity is seen (arming maturation) and grows
+/// monotonically thereafter, surviving strategy re-instantiation on rotation.
+fn market_age_secs(market_ident: &str) -> i64 {
+    let mut reg = match maker_market_first_seen().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let first_seen = reg.entry(market_ident.to_string()).or_insert_with(Instant::now);
+    first_seen.elapsed().as_secs() as i64
+}
+
 impl MakerStrategyImpl {
     pub fn new() -> Self {
         Self {
@@ -159,7 +187,11 @@ impl Strategy for MakerStrategyImpl {
 
 
         // ── Market maturation gate ────────────────────────────────────────────
-        let secs_since_market_start = (Utc::now() - ctx.market_started_at).num_seconds();
+        // Age is measured from when THIS maker market was first observed (keyed on
+        // market_name), not ctx.market_started_at — the latter resets on every
+        // hourly rotation and would wrongly re-arm the maturation blackout on a
+        // day-old daily maker market each hour.
+        let secs_since_market_start = market_age_secs(&market.market_name);
         if secs_since_market_start < config::MAKER_MIN_MARKET_AGE_SECS {
             self.log_gate("market_age", &format!(
                 "market_age {}s < min {}s",
