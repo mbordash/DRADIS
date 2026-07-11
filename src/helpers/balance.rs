@@ -67,6 +67,7 @@ pub async fn sync_position_balance(
     baseline_shares: Decimal,
     max_wait_secs: i64,
     token_ownership: &Arc<Mutex<HashMap<MarketId, String>>>,
+    post_only: bool,
 ) -> Result<()> {
     // Slice 2b: resolve the on-chain U256 once; the rest of the body is unchanged.
     let token_id = u256_from_market_id(token_id)?;
@@ -141,6 +142,17 @@ pub async fn sync_position_balance(
                                 return Ok(());
                             }
                         }
+                        // Genuinely-resting post-only maker quote that simply wasn't hit
+                        // within the window is NOT a phantom — it's a normal unfilled
+                        // quote we just cancelled for refresh.  Clear it quietly with no
+                        // ERROR and no phantom cooldown so the maker can re-quote.
+                        if post_only {
+                            info!("💤 Maker quote expired unfilled [{}]: Token {} rested {}s without a fill — cancelled for refresh (no penalty)",
+                                  strategy_name, token_id, time_since_open);
+                            positions.lock().await.remove(&key);
+                            token_ownership.lock().await.remove(&market);
+                            return Ok(());
+                        }
                     }
                     error!("⚠️ Position Sync FAILED [{}] Token {} — phantom removed.", strategy_name, token_id);
                     positions.lock().await.remove(&key);
@@ -152,10 +164,12 @@ pub async fn sync_position_balance(
                     return Ok(());
                 } else {
                     if time_since_open > 15 {
+                        // A resting post-only maker quote sitting at 0 balance is the
+                        // EXPECTED state (waiting for a taker), so keep it at debug.
                         // First warning fires at ~15s.  After that, throttle to once per
                         // 60 seconds so GTC orders resting on a slow daily market don't
                         // flood the log with hundreds of identical WARN lines.
-                        if time_since_open <= 20 || time_since_open % 60 < 4 {
+                        if !post_only && (time_since_open <= 20 || time_since_open % 60 < 4) {
                             warn!("⚠️ Position Sync [{}]: Token {} balance is 0 ({}s since open). Retrying...", strategy_name, token_id, time_since_open);
                         } else {
                             debug!("⏳ Position Sync [{}]: Token {} balance is 0 ({}s since open). Retrying...", strategy_name, token_id, time_since_open);

@@ -376,7 +376,10 @@ impl Strategy for MakerStrategyImpl {
         }
 
         // ── Net Exposure Risk Check ──────────────────────────────────────────
-        let trade_size = dec!(10.0);
+        // Quote size is config-driven and clamped to the exposure cap so a single
+        // quote from a flat book always fits under the limit (a quote larger than
+        // the cap would self-gate the maker after one clip).
+        let trade_size = dc.maker_quote_size_usdc.min(dc.maker_max_exposure_usdc);
         let projected_yes = yes_inv_value + (if yes_qualifies { trade_size } else { dec!(0.0) });
         let projected_no  = no_inv_value  + (if no_qualifies { trade_size } else { dec!(0.0) });
         let net_exposure  = (projected_yes - projected_no).abs();

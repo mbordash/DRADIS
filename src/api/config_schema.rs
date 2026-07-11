@@ -191,6 +191,8 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Entry-relative take profit.").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "maker_max_exposure_usdc", "Max Exposure", "usd", false,
             "Hard cap on total maker capital at risk.").min(0.0).step(0.5).unit("USDC"));
+        v.push(F::new(g, e, "maker_quote_size_usdc", "Quote Size", "usd", false,
+            "USDC notional per resting quote. Clamped to Max Exposure; keep at or below it (ideally ≤ half) so the maker can post without tripping the exposure cap.").min(0.0).step(0.5).unit("USDC"));
         // Advanced
         v.push(F::new(g, e, "maker_min_entry_price", "Min Entry", "price", true,
             "Lowest price a resting bid will sit at.").range(0.0, 1.0).step(0.01));

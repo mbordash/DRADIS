@@ -234,6 +234,9 @@ pub const MAKER_INVENTORY_SKEW_MAX: Decimal = dec!(0.04);
 
 /// Posts immediately after 3 minutes — high adverse-selection risk on new markets.
 pub const MAKER_MIN_MARKET_AGE_SECS: i64 = 180;
+/// Throttle interval (secs) for MakerStrategy gate-rejection diagnostics — a gate
+/// reason is logged when it changes or after this interval, without per-tick spam.
+pub const MAKER_GATE_LOG_INTERVAL_SECS: u64 = 30;
 pub const MOMENTUM_MIN_MARKET_AGE_SECS: i64 = 180;
 /// Must be strictly > MOMENTUM_EXPIRY_EXIT_SECS (600s); gives 5 min breathing room.
 pub const MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY: i64 = 900;
@@ -711,6 +714,10 @@ pub const MIN_HOURLY_MARKET_VOL24H: f64 = 500.0;
 
 pub const MOMENTUM_MAX_EXPOSURE_USDC: Decimal = dec!(30);
 pub const MAKER_MAX_EXPOSURE_USDC: Decimal = dec!(25);
+/// USDC notional per resting maker quote. Drives order size and net-exposure
+/// projection; kept ≤ half of MAKER_MAX_EXPOSURE_USDC so the maker has room to
+/// quote both sides without tripping the exposure cap.
+pub const MAKER_QUOTE_SIZE_USDC: Decimal = dec!(12);
 pub const ARBITRAGE_MAX_EXPOSURE_USDC: Decimal = dec!(75);
 pub const ARBITRAGE_POSITION_SIZE_USDC: Decimal = dec!(10.0);
 pub const TIME_DECAY_MAX_EXPOSURE_USDC: Decimal = dec!(80);

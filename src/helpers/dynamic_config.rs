@@ -111,6 +111,7 @@ fn default_convergence_skip_band_high()     -> Decimal { config::CONVERGENCE_SKI
 fn default_maker_min_spread()               -> Decimal { config::MAKER_MIN_SPREAD                      }
 fn default_maker_bid_buffer()               -> Decimal { config::MAKER_BID_BUFFER                      }
 fn default_maker_cross_buffer()             -> Decimal { config::MAKER_CROSS_BUFFER                    }
+fn default_maker_quote_size_usdc()          -> Decimal { config::MAKER_QUOTE_SIZE_USDC                 }
 fn default_maker_max_combined_bid()         -> Decimal { config::MAKER_MAX_COMBINED_BID                }
 fn default_maker_max_complementary_price()  -> Decimal { config::MAKER_MAX_COMPLEMENTARY_PRICE         }
 fn default_maker_max_book_imbalance_ratio() -> Decimal { config::MAKER_MAX_BOOK_IMBALANCE_RATIO        }
@@ -266,6 +267,8 @@ pub struct DynamicConfig {
     pub maker_stop_loss_pct:      Decimal,
     pub maker_target_profit_pct:  Decimal,
     pub maker_max_exposure_usdc:  Decimal,
+    #[serde(default = "default_maker_quote_size_usdc")]
+    pub maker_quote_size_usdc:    Decimal,
     #[serde(default = "default_maker_min_spread")]
     pub maker_min_spread:              Decimal,
     #[serde(default = "default_maker_bid_buffer")]
@@ -453,6 +456,7 @@ impl Default for DynamicConfig {
             maker_stop_loss_pct:      config::MAKER_STOP_LOSS_PERCENT,
             maker_target_profit_pct:  config::MAKER_TARGET_PROFIT_PERCENT,
             maker_max_exposure_usdc:  config::MAKER_MAX_EXPOSURE_USDC,
+            maker_quote_size_usdc:    config::MAKER_QUOTE_SIZE_USDC,
             maker_min_spread:              config::MAKER_MIN_SPREAD,
             maker_bid_buffer:              config::MAKER_BID_BUFFER,
             maker_cross_buffer:            config::MAKER_CROSS_BUFFER,

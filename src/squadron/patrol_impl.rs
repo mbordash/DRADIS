@@ -955,7 +955,7 @@ impl Squadron {
                                                     db::record_open_position_with_status(&pool, &sn, &db_tid_a, &db_mn_a, db_side_a, db_ep_a, db_sh_a, false, "pending").await;
                                                 }
                                                 tokio::spawn(async move {
-                                                    if sync_position_balance(&cl_s, &ps_s, &sn_s, &tn_s, Some(&pc_s), primary_baseline, primary_wait_secs, &to_s).await.is_ok() {
+                                                    if sync_position_balance(&cl_s, &ps_s, &sn_s, &tn_s, Some(&pc_s), primary_baseline, primary_wait_secs, &to_s, false).await.is_ok() {
                                                         // Update to confirmed (Mission In-Flight) + record entry
                                                         if let Some(pool) = db::pool_for(&asset_a) {
                                                             db::confirm_position_status(&pool, &db_sn_a, &db_tid_a).await;
@@ -978,7 +978,7 @@ impl Squadron {
                                                     db::record_open_position_with_status(&pool, &sn, &db_tid_b, &db_mn_b, db_side_b, db_ep_b, db_sh_b, false, "pending").await;
                                                 }
                                                 tokio::spawn(async move {
-                                                    if sync_position_balance(&cl_p, &ps_p, &sn_p, &tn_p, Some(&pc_p), pair_baseline, pair_wait_secs, &to_p).await.is_ok() {
+                                                    if sync_position_balance(&cl_p, &ps_p, &sn_p, &tn_p, Some(&pc_p), pair_baseline, pair_wait_secs, &to_p, false).await.is_ok() {
                                                         // Update to confirmed (Mission In-Flight) + record entry
                                                         if let Some(pool) = db::pool_for(&asset_b) {
                                                             db::confirm_position_status(&pool, &db_sn_b, &db_tid_b).await;
@@ -1061,7 +1061,7 @@ impl Squadron {
                                             db::record_open_position_with_status(&pool, &sn, &db_tid_s, &db_mn_s, db_side_s, db_ep_s, db_sh_s, false, "pending").await;
                                         }
                                         tokio::spawn(async move {
-                                            if sync_position_balance(&cl_s, &ps_s, &sn_s, &tn_s, Some(&pc_s), primary_baseline, primary_wait_secs, &to_s).await.is_ok() {
+                                            if sync_position_balance(&cl_s, &ps_s, &sn_s, &tn_s, Some(&pc_s), primary_baseline, primary_wait_secs, &to_s, false).await.is_ok() {
                                                 // Update to confirmed (Mission In-Flight) + record entry
                                                 if let Some(pool) = db::pool_for(&asset_s) {
                                                     db::confirm_position_status(&pool, &db_sn_s, &db_tid_s).await;
@@ -1112,7 +1112,7 @@ impl Squadron {
                                                 db::record_open_position_with_status(&pool, &sn, &tid_em, &mn_em, &side_em, ep_em, sh_em, false, "pending").await;
                                             }
                                             tokio::spawn(async move {
-                                                if sync_position_balance(&cl_m, &ps_m, &sn_m, &p.token_id, Some(&pc_m), dec!(0), crate::helpers::balance::MAX_WAIT_SECS_WINDOW, &to_m).await.is_ok() {
+                                                if sync_position_balance(&cl_m, &ps_m, &sn_m, &p.token_id, Some(&pc_m), dec!(0), crate::helpers::balance::MAX_WAIT_SECS_WINDOW, &to_m, true).await.is_ok() {
                                                     // Update to confirmed (Mission In-Flight) + record entry
                                                     if let Some(pool) = db::pool_for(&asset_em) {
                                                         db::confirm_position_status(&pool, &sn_m, &tid_em).await;
