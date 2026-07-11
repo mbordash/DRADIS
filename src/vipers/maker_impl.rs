@@ -36,6 +36,54 @@ struct DepthSample {
     sampled_at: Instant,
 }
 
+/// Returns the first entry sub-gate a single side (YES or NO) fails, or `None`
+/// if the side qualifies.  The first element is a STABLE category key (no live
+/// numbers) used for log throttling; the second is a human-readable detail
+/// string with the live values.  Keeping the throttle key stable prevents the
+/// 50 ms tick loop from defeating the throttle via fluctuating price numbers.
+fn side_reject_reason(
+    book_ok: bool,
+    taker_block: bool,
+    spread: Decimal,
+    bid_price: Decimal,
+    ask: Decimal,
+    complementary_bid: Decimal,
+    velocity_block: bool,
+    dc: &crate::helpers::dynamic_config::DynamicConfig,
+) -> Option<(&'static str, String)> {
+    if !book_ok {
+        return Some(("book_imbalance", "book_imbalance".to_string()));
+    }
+    if taker_block {
+        return Some(("taker_flow_drain", "taker_flow_drain".to_string()));
+    }
+    if spread < dc.maker_min_spread {
+        return Some(("spread", format!("spread {:.3} < min {:.3}", spread, dc.maker_min_spread)));
+    }
+    if bid_price < dc.maker_min_entry_price {
+        return Some(("min_entry", format!("bid {:.3} < min_entry {:.3}", bid_price, dc.maker_min_entry_price)));
+    }
+    if bid_price > dc.maker_max_entry_price {
+        return Some(("max_entry", format!("bid {:.3} > max_entry {:.3}", bid_price, dc.maker_max_entry_price)));
+    }
+    if bid_price > ask - dc.maker_cross_buffer {
+        return Some(("cross_buffer", format!(
+            "cross_buffer: bid {:.3} > ask {:.3} - {:.3}",
+            bid_price, ask, dc.maker_cross_buffer
+        )));
+    }
+    if complementary_bid > dc.maker_max_complementary_price {
+        return Some(("complementary", format!(
+            "complementary {:.3} > max {:.3}",
+            complementary_bid, dc.maker_max_complementary_price
+        )));
+    }
+    if velocity_block {
+        return Some(("velocity_bias", "velocity_bias".to_string()));
+    }
+    None
+}
+
 pub struct MakerStrategyImpl {
     /// Per-strategy state: best-bid depths from the previous evaluation tick.
     /// Used to compute how fast bid depth is being consumed by takers within
@@ -44,11 +92,47 @@ pub struct MakerStrategyImpl {
     /// (tokio::join! in the executor).  evaluate_entry owns writes; evaluate_exit
     /// reads whatever sample is available (one-tick lag is acceptable for a gate).
     prev_depths: Mutex<Option<DepthSample>>,
+
+    /// Gate-diagnostics throttle: (last reason logged, when).  We log a gate
+    /// rejection whenever the reason changes OR MAKER_GATE_LOG_INTERVAL_SECS has
+    /// elapsed, so the reason a maker is silent is visible without spamming every
+    /// evaluation tick.
+    last_gate_log: Mutex<Option<(String, Instant)>>,
+
+    /// Throttle for the positive "quoting" log.  The eval loop runs on a ~50 ms
+    /// tick, so an unthrottled quote log would emit ~20×/sec; this caps it to one
+    /// line per MAKER_GATE_LOG_INTERVAL_SECS.
+    last_quote_log: Mutex<Option<Instant>>,
 }
 
 impl MakerStrategyImpl {
     pub fn new() -> Self {
-        Self { prev_depths: Mutex::new(None) }
+        Self {
+            prev_depths: Mutex::new(None),
+            last_gate_log: Mutex::new(None),
+            last_quote_log: Mutex::new(None),
+        }
+    }
+
+    /// Throttled gate-rejection logger.  `key` is a STABLE category (no live
+    /// numbers); `detail` carries the human-readable values.  Emits at INFO when
+    /// `key` differs from the last logged key, or when MAKER_GATE_LOG_INTERVAL_SECS
+    /// has passed since the last emit for the same key.  Throttling on the stable
+    /// key (not the detail) keeps the 50 ms tick loop from flooding the log when
+    /// live prices fluctuate.
+    async fn log_gate(&self, key: &str, detail: &str) {
+        let mut guard = self.last_gate_log.lock().await;
+        let should_log = match guard.as_ref() {
+            Some((prev_key, at)) => {
+                prev_key != key
+                    || at.elapsed().as_secs() >= config::MAKER_GATE_LOG_INTERVAL_SECS
+            }
+            None => true,
+        };
+        if should_log {
+            tracing::info!("🔒 Maker gate: {}", detail);
+            *guard = Some((key.to_string(), Instant::now()));
+        }
     }
 }
 
@@ -77,15 +161,25 @@ impl Strategy for MakerStrategyImpl {
         // ── Market maturation gate ────────────────────────────────────────────
         let secs_since_market_start = (Utc::now() - ctx.market_started_at).num_seconds();
         if secs_since_market_start < config::MAKER_MIN_MARKET_AGE_SECS {
+            self.log_gate("market_age", &format!(
+                "market_age {}s < min {}s",
+                secs_since_market_start, config::MAKER_MIN_MARKET_AGE_SECS
+            )).await;
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Expiry gate ───────────────────────────────────────────────────────
         if let Some(close_time) = market.market_close_time {
-            if (close_time - Utc::now()).num_seconds() < dc.maker_min_secs_to_expiry {
+            let secs_to_expiry = (close_time - Utc::now()).num_seconds();
+            if secs_to_expiry < dc.maker_min_secs_to_expiry {
+                self.log_gate("expiry", &format!(
+                    "secs_to_expiry {}s < min {}s",
+                    secs_to_expiry, dc.maker_min_secs_to_expiry
+                )).await;
                 return Ok(StrategySignal::NoSignal);
             }
         } else {
+            self.log_gate("no_close_time", "no market_close_time").await;
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -101,6 +195,12 @@ impl Strategy for MakerStrategyImpl {
             && (snapshot.no_ask_depth  / snapshot.no_bid_depth)  <= dc.maker_max_book_imbalance_ratio;
 
         if !yes_book_ok && !no_book_ok {
+            self.log_gate("book_imbalance", &format!(
+                "book_imbalance both sides (ratio>{:.1}): yes_bidD={:.0} yes_askD={:.0} | no_bidD={:.0} no_askD={:.0}",
+                dc.maker_max_book_imbalance_ratio,
+                snapshot.yes_bid_depth, snapshot.yes_ask_depth,
+                snapshot.no_bid_depth, snapshot.no_ask_depth
+            )).await;
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -228,6 +328,18 @@ impl Strategy for MakerStrategyImpl {
             && !velocity_bias_strong_positive;
 
         if !yes_qualifies && !no_qualifies {
+            let (yes_key, yes_detail) = side_reject_reason(
+                yes_book_ok, taker_flow_blocks_yes, yes_spread, yes_bid_price,
+                snapshot.yes_ask, no_bid, velocity_bias_strong_negative, dc,
+            ).unwrap_or(("unknown", "unknown".to_string()));
+            let (no_key, no_detail) = side_reject_reason(
+                no_book_ok, taker_flow_blocks_no, no_spread, no_bid_price,
+                snapshot.no_ask, yes_bid, velocity_bias_strong_positive, dc,
+            ).unwrap_or(("unknown", "unknown".to_string()));
+            self.log_gate(
+                &format!("noqual:{}/{}", yes_key, no_key),
+                &format!("no side qualifies | YES: {} | NO: {}", yes_detail, no_detail),
+            ).await;
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -238,6 +350,10 @@ impl Strategy for MakerStrategyImpl {
         let net_exposure  = (projected_yes - projected_no).abs();
 
         if net_exposure > dc.maker_max_exposure_usdc {
+            self.log_gate("net_exposure", &format!(
+                "net_exposure ${:.2} > max ${:.2}",
+                net_exposure, dc.maker_max_exposure_usdc
+            )).await;
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -256,6 +372,7 @@ impl Strategy for MakerStrategyImpl {
         };
 
         if final_yes.is_none() && final_no.is_none() {
+            self.log_gate("combined_bid", "combined_bid guard suppressed both sides").await;
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -288,6 +405,19 @@ impl Strategy for MakerStrategyImpl {
             post_only: true,
             ghost_mode: dc.ghost_mode,
         });
+
+        {
+            let mut guard = self.last_quote_log.lock().await;
+            let due = guard.map_or(true, |t| t.elapsed().as_secs() >= config::MAKER_GATE_LOG_INTERVAL_SECS);
+            if due {
+                tracing::info!(
+                    "✅ Maker quoting: YES={} NO={}",
+                    yes_params.as_ref().map(|p| format!("${:.3}", p.price)).unwrap_or_else(|| "—".to_string()),
+                    no_params.as_ref().map(|p| format!("${:.3}", p.price)).unwrap_or_else(|| "—".to_string()),
+                );
+                *guard = Some(Instant::now());
+            }
+        }
 
         Ok(StrategySignal::MakerQuote {
             yes: yes_params,

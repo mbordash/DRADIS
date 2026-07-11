@@ -369,6 +369,13 @@ where
         let squadron_config = DynamicConfig::load_or_init_for_squadron(&squadron.id).await;
         patrol_ctx.dynamic_config = Arc::new(RwLock::new((*squadron_config).clone()));
 
+        // Register the live config handle so squadron-scoped PATCHes apply on the
+        // next patrol tick instead of only at the next market rotation.
+        crate::helpers::dynamic_config::register_squadron_config_handle(
+            &squadron.id,
+            Arc::clone(&patrol_ctx.dynamic_config),
+        );
+
         squadron.start_patrol();
         info!("🛫  Squadron [{}] → state={}", squadron.id, squadron.state);
 

@@ -486,7 +486,7 @@ async fn get_config(State(s): State<ApiState>) -> Response {
 /// On success, broadcasts the new config on the watch channel so all
 /// in-flight strategy tick contexts pick it up within 50 ms.
 async fn patch_config(State(s): State<ApiState>, body: String) -> Response {
-    debug!("Received PATCH /api/config request with body: {}", body);
+    info!("📥 Received PATCH /api/config (global) with body: {}", body);
     let current = s.config_rx.borrow().clone();
     match DynamicConfig::apply_patch(&current, &body).await {
         Ok(new_cfg) => {
@@ -1410,7 +1410,7 @@ async fn patch_squadron_config(
     Path(id): Path<String>,
     body: String,
 ) -> Response {
-    debug!("Received PATCH /api/squadrons/{}/config with body: {}", id, body);
+    info!("📥 Received PATCH /api/squadrons/{}/config with body: {}", id, body);
     match DynamicConfig::apply_squadron_patch(&id, &body).await {
         Ok(new_cfg) => {
             match serde_json::to_value(new_cfg.as_ref()) {

@@ -33,10 +33,36 @@ use serde::{Serialize, Deserialize};
 use rust_decimal::Decimal;
 use anyhow::Result;
 use tracing::{info, warn};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock, Mutex, OnceLock};
+use std::collections::HashMap;
 
 use crate::config;
 use crate::helpers::db;
+
+/// Registry of the LIVE, in-memory config handle for each running squadron,
+/// keyed by squadron id.  Each squadron's patrol loop reads its config every
+/// tick from an `Arc<RwLock<DynamicConfig>>` seeded at deploy.  A squadron-scoped
+/// PATCH persists to the DB, but the running loop never re-reads the DB except on
+/// market rotation — so without this registry a live edit (Min Spread, viper
+/// enable/disable, etc.) would not take effect until the next hourly rotation.
+///
+/// `register_squadron_config_handle` records the same `Arc` the patrol loop holds,
+/// and `apply_squadron_patch` writes the merged config straight into it so edits
+/// apply on the next tick.
+static SQUADRON_CONFIG_REGISTRY: OnceLock<Mutex<HashMap<String, Arc<RwLock<DynamicConfig>>>>> =
+    OnceLock::new();
+
+fn squadron_config_registry() -> &'static Mutex<HashMap<String, Arc<RwLock<DynamicConfig>>>> {
+    SQUADRON_CONFIG_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Register (or replace) the live config handle a running squadron's patrol loop
+/// reads each tick.  Called once per squadron deploy / market rotation.
+pub fn register_squadron_config_handle(squadron_id: &str, handle: Arc<RwLock<DynamicConfig>>) {
+    if let Ok(mut reg) = squadron_config_registry().lock() {
+        reg.insert(squadron_id.to_string(), handle);
+    }
+}
 
 // ── serde default helpers ────────────────────────────────────────────────────
 // Required when adding new fields to DynamicConfig: old DB rows that were
@@ -719,8 +745,25 @@ impl DynamicConfig {
 
         let updated: DynamicConfig = serde_json::from_value(value)?;
         updated.save_for_squadron(squadron_id).await;
+
+        // Push the merged config into the running squadron's live handle so the
+        // patrol loop picks it up on the next tick (not just on market rotation).
+        if let Ok(reg) = squadron_config_registry().lock() {
+            if let Some(handle) = reg.get(squadron_id) {
+                if let Ok(mut live) = handle.write() {
+                    *live = updated.clone();
+                    info!("⚙️  Squadron config applied live: {}", squadron_id);
+                } else {
+                    warn!("⚠️  Squadron config live handle poisoned [{}] — DB updated, live apply on next rotation", squadron_id);
+                }
+            } else {
+                warn!("⚠️  Squadron config live handle not registered [{}] — DB updated, live apply on next rotation", squadron_id);
+            }
+        }
+
         info!("⚙️  Squadron config hot-patched: {}", squadron_id);
         Ok(Arc::new(updated))
     }
 }
+
 
