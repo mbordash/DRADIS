@@ -952,7 +952,7 @@ async fn manual_exit(
         session.venue.nonce_manager(),
         session.venue.signer(),
         s.safe_address,
-        s.safe_address, // eoa_address = safe_address for this context
+        session.venue.eoa_address(), // signer EOA — must match the API key's address
         verifying_contract,
         &crate::venues::intl::market_id_from_u256(token_id),
         Side::Sell,
