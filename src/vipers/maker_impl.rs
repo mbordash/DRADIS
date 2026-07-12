@@ -10,8 +10,9 @@
 ///   - evaluate_entry tracks bid-depth drain over a 1.5s window to suppress new
 ///     maker bids when takers are actively sweeping one side of the book.
 ///   - evaluate_exit fires an accelerated "ToxicFill" exit whenever an open
-///     position's book OBI falls below MAKER_TOXIC_FLOW_EXIT_OBI, meaning
-///     the ask side has grown 3× larger than the bid side — a book turn.
+///     *filled* position's book OBI falls below MAKER_TOXIC_FLOW_EXIT_OBI.
+///   - For *unfilled* resting quotes under the same toxic OBI, emits MakerCancel
+///     so the quote is pulled before it can be adversely filled (80/20 fix).
 
 use async_trait::async_trait;
 use anyhow::Result;
@@ -530,12 +531,16 @@ impl Strategy for MakerStrategyImpl {
             let pos_map = ctx.positions.lock().await;
             for token_id in [market.yes_token.clone(), market.no_token.clone()] {
                 if let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id.clone())) {
+                    // Only force-exit *filled* positions near expiry. Unfilled quotes
+                    // will be cancelled by the toxic / near-expiry path below if needed.
+                    if position.fill_confirmed_at.is_none() { continue; }
                     let bid = if token_id == market.yes_token { snapshot.yes_bid } else { snapshot.no_bid };
                     let profit_pct = (bid - position.avg_entry) / position.avg_entry;
                     if profit_pct < profit_threshold {
                         return Ok(StrategySignal::Exit {
                             params: OrderParams {
-                                token_id: token_id.clone(),                                price: bid,
+                                token_id: token_id.clone(),
+                                price: bid,
                                 shares: position.shares,
                                 fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
                                 is_neg_risk: market.is_neg_risk,
@@ -559,12 +564,18 @@ impl Strategy for MakerStrategyImpl {
             dc.maker_stop_loss_pct
         };
 
+<<<<<<< HEAD
         // ── Taker-Flow Book-Turn Exit / Quote-Pull ────────────────────────────
         // A book that has turned adverse (OBI below the toxic threshold) is a
         // one-way sweep. For a FILLED position we exit at the bid (ToxicFill). For
         // an UNFILLED resting quote we cancel it (reactive quote-pull) so it isn't
         // left on the book to be picked off by the informed flow — the exact
         // adverse-selection mechanism behind the noon-ET maker losses.
+=======
+        // ── Taker-Flow Book-Turn / Toxic Cancel ───────────────────────────────
+        // Filled position + toxic OBI → Exit (ToxicFill)
+        // Unfilled resting quote + toxic OBI → MakerCancel (pull before fill)
+>>>>>>> 8e09f791bcfe1beae0cacccbfc4b47fd8a1b4fec
         {
             let pos_map = ctx.positions.lock().await;
             let mut pull_tokens = Vec::new();
@@ -585,11 +596,18 @@ impl Strategy for MakerStrategyImpl {
                 } else { dec!(0) };
 
                 if obi < dc.maker_toxic_flow_exit_obi {
+<<<<<<< HEAD
                     arm_maker_toxic_cooldown(token_id.as_str());
                     if position.fill_confirmed_at.is_some() {
                         tracing::info!(
                             "⚡ Maker ToxicFill exit triggered: OBI={:.2} (threshold={:.2}) | bid=${:.4} | re-entry locked {}s",
                             obi, dc.maker_toxic_flow_exit_obi, bid, dc.maker_toxic_reentry_cooldown_secs
+=======
+                    if position.fill_confirmed_at.is_some() {
+                        tracing::info!(
+                            "⚡ Maker ToxicFill exit triggered: OBI={:.2} (threshold={:.2}) | bid=${:.4}",
+                            obi, dc.maker_toxic_flow_exit_obi, bid
+>>>>>>> 8e09f791bcfe1beae0cacccbfc4b47fd8a1b4fec
                         );
                         return Ok(StrategySignal::Exit {
                             params: OrderParams {
@@ -608,8 +626,20 @@ impl Strategy for MakerStrategyImpl {
                             exit_pair: false,
                         });
                     } else {
+<<<<<<< HEAD
                         // Unfilled resting quote sitting in a toxic book → pull it.
                         pull_tokens.push(token_id.clone());
+=======
+                        // Unfilled resting quote — pull it before it can be hit.
+                        tracing::info!(
+                            "🛑 MakerCancel (unfilled toxic): OBI={:.2} (threshold={:.2}) token={}",
+                            obi, dc.maker_toxic_flow_exit_obi, &token_id.to_string()[..16.min(token_id.to_string().len())]
+                        );
+                        return Ok(StrategySignal::MakerCancel {
+                            token_id: token_id.clone(),
+                            reason: format!("ToxicCancel: OBI={:.2} (pull unfilled quote)", obi),
+                        });
+>>>>>>> 8e09f791bcfe1beae0cacccbfc4b47fd8a1b4fec
                     }
                 }
             }
@@ -629,6 +659,9 @@ impl Strategy for MakerStrategyImpl {
                 continue;
             };
 
+            // Only TP / SL on *filled* positions
+            if position.fill_confirmed_at.is_none() { continue; }
+
             let bid = if token_id == market.yes_token { snapshot.yes_bid } else { snapshot.no_bid };
             if position.avg_entry <= dec!(0) { continue; }
 
@@ -637,10 +670,11 @@ impl Strategy for MakerStrategyImpl {
                 .map(|t| (Utc::now() - t).num_seconds())
                 .unwrap_or(0);
 
-            if position.fill_confirmed_at.is_some() && profit_pct >= dc.maker_target_profit_pct {
+            if profit_pct >= dc.maker_target_profit_pct {
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
-                        token_id: token_id.clone(),                        price: bid,
+                        token_id: token_id.clone(),
+                        price: bid,
                         shares: position.shares,
                         fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
                         is_neg_risk: market.is_neg_risk,
@@ -655,13 +689,13 @@ impl Strategy for MakerStrategyImpl {
                 });
             }
 
-            if position.fill_confirmed_at.is_some()
-                && secs_since_fill >= config::MAKER_MIN_HOLD_SECS_BEFORE_STOP
+            if secs_since_fill >= config::MAKER_MIN_HOLD_SECS_BEFORE_STOP
                 && profit_pct <= -effective_stop_pct
             {
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
-                        token_id: token_id.clone(),                        price: bid,
+                        token_id: token_id.clone(),
+                        price: bid,
                         shares: position.shares,
                         fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
                         is_neg_risk: market.is_neg_risk,
