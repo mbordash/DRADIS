@@ -670,6 +670,25 @@ async fn dispatch_signal(
             }
             acted
         }
+        StrategySignal::MakerCancel { tokens } => {
+            // Reactive quote-pull: cancel resting UNFILLED maker orders on these
+            // tokens (book turned toxic before fill). Cancel via the venue's
+            // open-orders surface, then drop the strategy's phantom guard.
+            let mut acted = false;
+            let open = venue.open_orders().await.unwrap_or_default();
+            for tok in &tokens {
+                for ord in open.iter().filter(|o| &o.market == tok) {
+                    if let Err(e) = venue.cancel(ord.order_id.clone()).await {
+                        warn!("[{strategy_name}] maker quote-pull cancel failed for {} ({}): {e}", ord.order_id, tok);
+                    } else {
+                        info!("🚫 [{strategy_name}] maker quote-pulled: {} — resting order cancelled (toxic book)", tok);
+                        acted = true;
+                    }
+                }
+                positions.lock().await.remove(&(strategy_name.to_string(), tok.clone()));
+            }
+            acted
+        }
         StrategySignal::Exit { params, reason, exit_pair } => {
             info!("🚪 [{strategy_name}] exit ({reason}): {} @ {:.4}", params.token_id, params.price);
             let acted = dispatch_single(venue, pool, positions, lifecycle, strategy_name, params, Side::Sell, starting).await;

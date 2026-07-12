@@ -117,6 +117,7 @@ fn default_maker_max_complementary_price()  -> Decimal { config::MAKER_MAX_COMPL
 fn default_maker_max_book_imbalance_ratio() -> Decimal { config::MAKER_MAX_BOOK_IMBALANCE_RATIO        }
 fn default_maker_min_secs_to_expiry()       -> i64     { config::MAKER_MIN_SECS_TO_EXPIRY              }
 fn default_maker_toxic_flow_exit_obi()      -> Decimal { config::MAKER_TOXIC_FLOW_EXIT_OBI             }
+fn default_maker_toxic_reentry_cooldown_secs() -> i64  { config::MAKER_TOXIC_REENTRY_COOLDOWN_SECS     }
 
 fn default_momentum_max_entry_price()       -> Decimal { config::MAX_MOMENTUM_ENTRY_PRICE              }
 fn default_momentum_min_entry_price()       -> Decimal { config::MOMENTUM_MIN_ENTRY_PRICE              }
@@ -285,6 +286,8 @@ pub struct DynamicConfig {
     pub maker_min_secs_to_expiry:      i64,
     #[serde(default = "default_maker_toxic_flow_exit_obi")]
     pub maker_toxic_flow_exit_obi:     Decimal,
+    #[serde(default = "default_maker_toxic_reentry_cooldown_secs")]
+    pub maker_toxic_reentry_cooldown_secs: i64,
 
     // ── Basis Viper ───────────────────────────────────────────────────────────
     pub basis_max_exposure_usdc:  Decimal,
@@ -465,6 +468,7 @@ impl Default for DynamicConfig {
             maker_max_book_imbalance_ratio: config::MAKER_MAX_BOOK_IMBALANCE_RATIO,
             maker_min_secs_to_expiry:      config::MAKER_MIN_SECS_TO_EXPIRY,
             maker_toxic_flow_exit_obi:     config::MAKER_TOXIC_FLOW_EXIT_OBI,
+            maker_toxic_reentry_cooldown_secs: config::MAKER_TOXIC_REENTRY_COOLDOWN_SECS,
 
             basis_max_exposure_usdc:  config::BASIS_MAX_EXPOSURE_USDC,
             basis_stop_loss_pct:      config::BASIS_STOP_LOSS_PERCENT,

@@ -258,6 +258,11 @@ pub enum StrategySignal {
         yes: Option<OrderParams>,
         no: Option<OrderParams>,
     },
+    /// Reactive quote-pull: cancel resting UNFILLED maker quotes on these tokens
+    /// when the book turns toxic before they fill (avoids adverse-selection fills).
+    MakerCancel {
+        tokens: Vec<MarketId>,
+    },
     /// Exit signal with metadata.
     Exit {
         params: OrderParams,

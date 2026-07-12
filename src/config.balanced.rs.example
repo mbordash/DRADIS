@@ -215,6 +215,11 @@ pub const MAKER_TAKER_FLOW_WINDOW_MS: u64 = 1500;
 pub const MAKER_TAKER_FLOW_MIN_ELAPSED_MS: u64 = 500;
 pub const MAKER_TAKER_FLOW_DRAIN_THRESHOLD: Decimal = dec!(0.40);
 pub const MAKER_TOXIC_FLOW_EXIT_OBI: Decimal = dec!(-0.50);
+/// After a ToxicFill exit, block re-entry on that same token for this long.
+/// Prevents the maker from immediately re-quoting into a collapsing book and
+/// getting picked off again (the "double knife-catch" adverse-selection loss).
+/// Balanced: 3-minute re-entry lockout.
+pub const MAKER_TOXIC_REENTRY_COOLDOWN_SECS: i64 = 180;
 
 pub const MAKER_SLOW_TREND_THRESHOLD_BTC: Decimal = dec!(300.0); // legacy — not used in logic
 /// Slow trend threshold as fraction of oracle price.

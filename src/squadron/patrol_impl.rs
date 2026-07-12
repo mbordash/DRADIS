@@ -1127,6 +1127,33 @@ impl Squadron {
                                 if placed { last_trade_time.insert(sn.clone(), Instant::now()); }
                                 if consecutive_failures >= config::MAX_CONSECUTIVE_FAILURES { error!("🚨 Circuit breaker hit!"); tokio::time::sleep(Duration::from_secs(60)).await; consecutive_failures = 0; }
                             }
+                            // ════════════════════ MAKER QUOTE-PULL ════════════════════
+                            // Cancel resting UNFILLED maker quotes whose book turned toxic
+                            // before they filled — pull them off the book so informed flow
+                            // can't pick them off (the noon-ET adverse-selection losses).
+                            StrategySignal::MakerCancel { tokens } => {
+                                for tok in tokens {
+                                    let pk = (sn.clone(), tok.clone());
+                                    // Never touch a CONFIRMED fill — only pull unfilled resting quotes.
+                                    let is_unfilled = {
+                                        let pos = positions.lock().await;
+                                        matches!(pos.get(&pk), Some(p) if p.fill_confirmed_at.is_none())
+                                    };
+                                    if !is_unfilled { continue; }
+                                    if config::GHOST_MODE {
+                                        info!("👻 GHOST_MODE MakerCancel [{}]: {} (simulated quote-pull)", sn, tok);
+                                    } else {
+                                        crate::helpers::balance::cancel_resting_orders_for_token(&trading_client, &tok).await;
+                                    }
+                                    positions.lock().await.remove(&pk);
+                                    pending_orders.lock().await.remove(&pk);
+                                    token_ownership.lock().await.remove(&tok);
+                                    if let Some(pool) = db::pool_for(&asset_lc) {
+                                        db::close_open_position(&pool, &sn, tok.as_str()).await;
+                                    }
+                                    info!("🚫 Maker quote-pulled [{}]: {} — resting quote cancelled (book turned toxic)", sn, tok);
+                                }
+                            }
                             StrategySignal::NoSignal => {}
                         }
                     }

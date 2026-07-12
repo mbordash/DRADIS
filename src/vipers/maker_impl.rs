@@ -45,6 +45,7 @@ struct DepthSample {
 fn side_reject_reason(
     book_ok: bool,
     taker_block: bool,
+    toxic_cooldown: bool,
     spread: Decimal,
     bid_price: Decimal,
     ask: Decimal,
@@ -57,6 +58,9 @@ fn side_reject_reason(
     }
     if taker_block {
         return Some(("taker_flow_drain", "taker_flow_drain".to_string()));
+    }
+    if toxic_cooldown {
+        return Some(("toxic_cooldown", "toxic_cooldown (post-ToxicFill re-entry lockout)".to_string()));
     }
     if spread < dc.maker_min_spread {
         return Some(("spread", format!("spread {:.3} < min {:.3}", spread, dc.maker_min_spread)));
@@ -131,6 +135,48 @@ fn market_age_secs(market_ident: &str) -> i64 {
     };
     let first_seen = reg.entry(market_ident.to_string()).or_insert_with(Instant::now);
     first_seen.elapsed().as_secs() as i64
+}
+
+/// Process-global post-ToxicFill re-entry cooldown: token_id → the instant the
+/// last ToxicFill exit fired for that token.  Global (not a per-strategy field)
+/// for the same reason as `maker_market_first_seen`: patrol rebuilds the strategy
+/// objects on every market rotation (`create_all_strategies()`), which would wipe
+/// per-instance state and let the maker immediately re-quote into the very book it
+/// was just picked off in.  Keyed on the specific YES/NO token so only the toxic
+/// side is locked out; a genuinely new market gets a fresh token_id (no stale block).
+fn maker_toxic_cooldowns() -> &'static std::sync::Mutex<HashMap<String, Instant>> {
+    static REG: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Record that a ToxicFill exit just fired for `token_id`, arming the re-entry cooldown.
+fn arm_maker_toxic_cooldown(token_id: &str) {
+    let mut reg = match maker_toxic_cooldowns().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.insert(token_id.to_string(), Instant::now());
+}
+
+/// Returns true if `token_id` is still within its post-ToxicFill re-entry cooldown
+/// (i.e. fewer than `cooldown_secs` have elapsed since the last toxic exit).  A
+/// non-positive `cooldown_secs` disables the gate.  Expired entries are pruned on read.
+fn maker_toxic_cooldown_active(token_id: &str, cooldown_secs: i64) -> bool {
+    if cooldown_secs <= 0 {
+        return false;
+    }
+    let mut reg = match maker_toxic_cooldowns().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if let Some(t) = reg.get(token_id) {
+        if (t.elapsed().as_secs() as i64) < cooldown_secs {
+            return true;
+        }
+        reg.remove(token_id);
+    }
+    false
 }
 
 impl MakerStrategyImpl {
@@ -341,8 +387,16 @@ impl Strategy for MakerStrategyImpl {
         let no_spread  = no_ask - no_bid;
 
         // ── Qualification ─────────────────────────────────────────────────
+        // Post-ToxicFill re-entry lockout: if this token was picked off by a
+        // book-turn within the last `maker_toxic_reentry_cooldown_secs`, do not
+        // re-quote that side — avoids catching the same falling knife twice.
+        let cooldown_secs = dc.maker_toxic_reentry_cooldown_secs;
+        let yes_toxic_cooldown = maker_toxic_cooldown_active(market.yes_token.as_str(), cooldown_secs);
+        let no_toxic_cooldown  = maker_toxic_cooldown_active(market.no_token.as_str(), cooldown_secs);
+
         let yes_qualifies = yes_book_ok
             && !taker_flow_blocks_yes
+            && !yes_toxic_cooldown
             && yes_spread >= dc.maker_min_spread
             && yes_bid_price >= dc.maker_min_entry_price
             && yes_bid_price <= dc.maker_max_entry_price
@@ -352,6 +406,7 @@ impl Strategy for MakerStrategyImpl {
 
         let no_qualifies = no_book_ok
             && !taker_flow_blocks_no
+            && !no_toxic_cooldown
             && no_spread >= dc.maker_min_spread
             && no_bid_price >= dc.maker_min_entry_price
             && no_bid_price <= dc.maker_max_entry_price
@@ -361,11 +416,11 @@ impl Strategy for MakerStrategyImpl {
 
         if !yes_qualifies && !no_qualifies {
             let (yes_key, yes_detail) = side_reject_reason(
-                yes_book_ok, taker_flow_blocks_yes, yes_spread, yes_bid_price,
+                yes_book_ok, taker_flow_blocks_yes, yes_toxic_cooldown, yes_spread, yes_bid_price,
                 snapshot.yes_ask, no_bid, velocity_bias_strong_negative, dc,
             ).unwrap_or(("unknown", "unknown".to_string()));
             let (no_key, no_detail) = side_reject_reason(
-                no_book_ok, taker_flow_blocks_no, no_spread, no_bid_price,
+                no_book_ok, taker_flow_blocks_no, no_toxic_cooldown, no_spread, no_bid_price,
                 snapshot.no_ask, yes_bid, velocity_bias_strong_positive, dc,
             ).unwrap_or(("unknown", "unknown".to_string()));
             self.log_gate(
@@ -504,14 +559,19 @@ impl Strategy for MakerStrategyImpl {
             dc.maker_stop_loss_pct
         };
 
-        // ── Taker-Flow Book-Turn Exit ─────────────────────────────────────────
+        // ── Taker-Flow Book-Turn Exit / Quote-Pull ────────────────────────────
+        // A book that has turned adverse (OBI below the toxic threshold) is a
+        // one-way sweep. For a FILLED position we exit at the bid (ToxicFill). For
+        // an UNFILLED resting quote we cancel it (reactive quote-pull) so it isn't
+        // left on the book to be picked off by the informed flow — the exact
+        // adverse-selection mechanism behind the noon-ET maker losses.
         {
             let pos_map = ctx.positions.lock().await;
+            let mut pull_tokens = Vec::new();
             for token_id in [market.yes_token.clone(), market.no_token.clone()] {
                 let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id.clone())) else {
                     continue;
                 };
-                if position.fill_confirmed_at.is_none() { continue; }
 
                 let (bid_depth, ask_depth, bid) = if token_id == market.yes_token {
                     (snapshot.yes_bid_depth, snapshot.yes_ask_depth, snapshot.yes_bid)
@@ -525,26 +585,40 @@ impl Strategy for MakerStrategyImpl {
                 } else { dec!(0) };
 
                 if obi < dc.maker_toxic_flow_exit_obi {
-                    tracing::info!(
-                        "⚡ Maker ToxicFill exit triggered: OBI={:.2} (threshold={:.2}) | bid=${:.4}",
-                        obi, dc.maker_toxic_flow_exit_obi, bid
-                    );
-                    return Ok(StrategySignal::Exit {
-                        params: OrderParams {
-                            token_id: token_id.clone(),                            price: bid,
-                            shares: position.shares,
-                            fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
-                            is_neg_risk: market.is_neg_risk,
-                            market_name: market.market_name.clone(),
-                            condition_id: market.condition_id.clone(),
-                            order_type: TimeInForce::Fak,
-                            post_only: false,
-                            ghost_mode: dc.ghost_mode,
-                        },
-                        reason: format!("ToxicFill: OBI={:.2} (book turned adverse)", obi),
-                        exit_pair: false,
-                    });
+                    arm_maker_toxic_cooldown(token_id.as_str());
+                    if position.fill_confirmed_at.is_some() {
+                        tracing::info!(
+                            "⚡ Maker ToxicFill exit triggered: OBI={:.2} (threshold={:.2}) | bid=${:.4} | re-entry locked {}s",
+                            obi, dc.maker_toxic_flow_exit_obi, bid, dc.maker_toxic_reentry_cooldown_secs
+                        );
+                        return Ok(StrategySignal::Exit {
+                            params: OrderParams {
+                                token_id: token_id.clone(),
+                                price: bid,
+                                shares: position.shares,
+                                fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
+                                is_neg_risk: market.is_neg_risk,
+                                market_name: market.market_name.clone(),
+                                condition_id: market.condition_id.clone(),
+                                order_type: TimeInForce::Fak,
+                                post_only: false,
+                                ghost_mode: dc.ghost_mode,
+                            },
+                            reason: format!("ToxicFill: OBI={:.2} (book turned adverse)", obi),
+                            exit_pair: false,
+                        });
+                    } else {
+                        // Unfilled resting quote sitting in a toxic book → pull it.
+                        pull_tokens.push(token_id.clone());
+                    }
                 }
+            }
+            if !pull_tokens.is_empty() {
+                tracing::info!(
+                    "⚡ Maker quote-pull: cancelling {} unfilled resting quote(s) — book turned toxic (OBI < {:.2}), re-entry locked {}s",
+                    pull_tokens.len(), dc.maker_toxic_flow_exit_obi, dc.maker_toxic_reentry_cooldown_secs
+                );
+                return Ok(StrategySignal::MakerCancel { tokens: pull_tokens });
             }
         }
 
@@ -612,4 +686,41 @@ impl Strategy for MakerStrategyImpl {
     fn venue(&self) -> &'static str { "Window/Daily" }
     fn max_exposure(&self) -> rust_decimal::Decimal { crate::config::MAKER_MAX_EXPOSURE_USDC }
     fn risk_model(&self) -> &'static str { "Net |YES-NO|" }
+}
+
+#[cfg(test)]
+mod toxic_cooldown_tests {
+    use super::{arm_maker_toxic_cooldown, maker_toxic_cooldown_active};
+
+    #[test]
+    fn armed_token_is_locked_out() {
+        let tok = "test_tok_armed_lockout";
+        assert!(!maker_toxic_cooldown_active(tok, 180));
+        arm_maker_toxic_cooldown(tok);
+        assert!(maker_toxic_cooldown_active(tok, 180));
+    }
+
+    #[test]
+    fn unknown_token_is_not_locked() {
+        assert!(!maker_toxic_cooldown_active("test_tok_never_armed", 180));
+    }
+
+    #[test]
+    fn zero_or_negative_cooldown_disables_gate() {
+        let tok = "test_tok_disabled_gate";
+        arm_maker_toxic_cooldown(tok);
+        assert!(!maker_toxic_cooldown_active(tok, 0));
+        assert!(!maker_toxic_cooldown_active(tok, -5));
+    }
+
+    #[test]
+    fn expired_cooldown_allows_reentry() {
+        let tok = "test_tok_expired";
+        arm_maker_toxic_cooldown(tok);
+        // Immediately after arming, a sub-second window has already elapsed
+        // (elapsed secs = 0 is NOT < 0), so the token reads as no-longer-locked
+        // and is pruned on read. Use cooldown_secs so small it is already expired.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        assert!(!maker_toxic_cooldown_active(tok, 1));
+    }
 }

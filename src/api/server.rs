@@ -44,6 +44,8 @@ use tracing::{debug, error, info, warn};
 use alloy::primitives::{Address, U256};
 #[cfg(feature = "intl_clob")]
 use polymarket_client_sdk_v2::clob::types::{Side};
+#[cfg(feature = "intl_clob")]
+use polymarket_client_sdk_v2::clob::types::request::PriceRequest;
 use rust_decimal::Decimal;
 #[cfg(feature = "intl_clob")]
 use rust_decimal::prelude::FromStr;
@@ -432,9 +434,15 @@ struct ManualExitRequest {
     market: String,
     /// Side (YES/NO) for trade recording
     side: String,
-    /// Current bid price (for FAK sell order)
+    /// Current bid supplied by the client. IGNORED server-side — the live best bid
+    /// is fetched from the CLOB (the client value was a hardcoded "0.5" placeholder).
+    /// Retained for wire compatibility with existing Control Tower builds.
+    #[allow(dead_code)]
     current_bid: String,
-    /// Verifying contract address (exchange address)
+    /// Verifying contract address supplied by the client. IGNORED server-side —
+    /// the exchange is resolved from the market's neg-risk status (see handler).
+    /// Retained for wire compatibility with existing Control Tower builds.
+    #[allow(dead_code)]
     verifying_contract: String,
 }
 
@@ -927,25 +935,66 @@ async fn manual_exit(
         }
     };
 
-    let current_bid = match Decimal::from_str(&req.current_bid) {
-        Ok(b) => b,
-        Err(e) => {
-            error!("RTB: Invalid current_bid: {}", e);
-            return (StatusCode::BAD_REQUEST, "Invalid current_bid").into_response();
+    // ── Fetch the LIVE best bid SERVER-SIDE ────────────────────────────────────
+    // The client's `req.current_bid` is a hardcoded placeholder ("0.5") and is
+    // deliberately IGNORED. Using it would price the FAK sell at 0.5 regardless of
+    // the real market, so any position whose true bid is below 0.5 would never fill
+    // (RTB silently leaves underwater positions open). Query the CLOB for the
+    // current best bid (the Side::Sell price = what a seller can hit).
+    let current_bid = {
+        let price_req = PriceRequest::builder().token_id(token_id).side(Side::Sell).build();
+        match tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            session.venue.trading_client().price(&price_req),
+        ).await {
+            Ok(Ok(r)) => r.price,
+            Ok(Err(e)) => {
+                error!("RTB: failed to fetch best bid from CLOB: {}", e);
+                return (StatusCode::BAD_GATEWAY, format!("Could not fetch current bid: {}", e)).into_response();
+            }
+            Err(_) => {
+                error!("RTB: best-bid lookup timed out (10s)");
+                return (StatusCode::GATEWAY_TIMEOUT, "Bid lookup timed out").into_response();
+            }
         }
     };
+    if current_bid <= Decimal::ZERO {
+        warn!("RTB: no live bid for token (bid={}) — cannot place sell", current_bid);
+        return (StatusCode::CONFLICT, "No live bid available to sell into").into_response();
+    }
+    info!("RTB: live best bid = ${:.4}", current_bid);
 
-    let verifying_contract = match req.verifying_contract.parse::<Address>() {
-        Ok(a) => a,
-        Err(e) => {
-            error!("RTB: Invalid verifying_contract: {}", e);
-            return (StatusCode::BAD_REQUEST, "Invalid verifying_contract").into_response();
+    // ── Resolve the EIP-712 verifying contract SERVER-SIDE ─────────────────────
+    // The client-supplied `req.verifying_contract` is deliberately IGNORED: the
+    // Control Tower sends a stale/hardcoded CTF Exchange address, which yields the
+    // wrong EIP-712 domain and a "invalid POLY_GNOSIS_SAFE signature" rejection.
+    // Derive neg-risk status from the CLOB (same lookup used at market discovery)
+    // and pick the matching exchange — exactly as every automated order path does.
+    let is_neg_risk = match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        session.venue.trading_client().neg_risk(token_id),
+    ).await {
+        Ok(Ok(r)) => r.neg_risk,
+        Ok(Err(e)) => {
+            error!("RTB: neg_risk lookup failed for token: {}", e);
+            return (StatusCode::BAD_GATEWAY, format!("neg_risk lookup failed: {}", e)).into_response();
+        }
+        Err(_) => {
+            error!("RTB: neg_risk lookup timed out (10s)");
+            return (StatusCode::GATEWAY_TIMEOUT, "neg_risk lookup timed out").into_response();
         }
     };
+    let verifying_contract = crate::venues::intl::exchange_verifying_contract(is_neg_risk);
+    info!("RTB: resolved exchange {} (neg_risk={})", verifying_contract, is_neg_risk);
 
     // ── Step 4: Place FAK market sell order ────────────────────────────────────
-    let sell_price = round_to_tick_size(current_bid);
-    info!(" RTB: Placing FAK sell order — {} shares @ ${:.4}", shares, sell_price);
+    // Shave SELL_PRICE_OFFSET below the live bid (floored at MIN_SELL_LIMIT_PRICE)
+    // so the FAK limit is marketable and clears against the resting bid — the same
+    // convention every automated exit path uses.
+    let sell_price = round_to_tick_size(
+        (current_bid - crate::config::SELL_PRICE_OFFSET).max(crate::config::MIN_SELL_LIMIT_PRICE)
+    );
+    info!(" RTB: Placing FAK sell order — {} shares @ ${:.4} (live bid ${:.4})", shares, sell_price, current_bid);
 
     let order_result = place_limit_order(
         session.venue.trading_client(),

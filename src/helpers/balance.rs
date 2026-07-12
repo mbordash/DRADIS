@@ -213,6 +213,21 @@ async fn cancel_resting_orders(client: &Arc<ClobClient<Authenticated<Normal>>>, 
     true
 }
 
+/// Public reactive quote-pull entry point: cancel any resting order on `token_id`.
+/// Used by the Maker's book-turn quote-pull (patrol `MakerCancel` handling) to pull
+/// an UNFILLED resting quote before informed flow picks it off. Resolves the
+/// on-chain U256 from the venue-neutral `MarketId`, then delegates to
+/// [`cancel_resting_orders`]. Returns true if any resting order was cancelled.
+pub async fn cancel_resting_orders_for_token(
+    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    token_id: &MarketId,
+) -> bool {
+    match u256_from_market_id(token_id) {
+        Ok(u) => cancel_resting_orders(client, u).await,
+        Err(_) => false,
+    }
+}
+
 /// Reconcile on-chain token balances against the in-memory position map.
 /// `adoption_order` is the ordered list of strategy names to try when assigning an
 /// orphaned position — derived from `StrategyRegistry::strategy_names()` so that

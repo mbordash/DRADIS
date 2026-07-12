@@ -24,7 +24,7 @@ use rust_decimal::Decimal;
 use chrono::{DateTime, Utc};
 use anyhow::Result;
 use serde::Serialize;
-use tracing::{error, info};
+use tracing::{error, info, debug};
 
 use crate::config;
 
@@ -1423,11 +1423,45 @@ pub async fn purge_all_live_open_positions(pool: &SqlitePool) -> usize {
     }
 }
 
+/// Returns true if a `trades` row already exists for `market` whose share count
+/// matches `shares` within a small dust tolerance.
+///
+/// Used by `purge_stale_open_positions` to decide whether a stale (vanished-from-
+/// wallet) position was ALREADY booked to the ledger — either by the strategy's own
+/// close path or by the idempotent settlement path (`record_settlement_trade_idempotent`).
+/// Matching on market+shares (rather than market+side) intentionally covers the
+/// arbitrage case where a resolved YES+NO pair is booked as a single YES-side
+/// settlement row: the NO leg shares equal the pair size, so it still matches and is
+/// correctly NOT re-booked. If a match exists we must NOT fabricate a second row.
+async fn market_has_matching_trade(pool: &SqlitePool, market: &str, shares: Decimal) -> bool {
+    let share_dust = Decimal::new(1, 3); // 0.001
+    let rows: Vec<String> = sqlx::query_scalar("SELECT shares FROM trades WHERE market = ?")
+        .bind(market)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+    rows.iter().any(|s| {
+        s.parse::<Decimal>()
+            .map(|v| (v - shares).abs() <= share_dust)
+            .unwrap_or(false)
+    })
+}
+
 /// Delete every `open_positions` row whose token_id is NOT in `live_token_ids`.
 ///
 /// Called by the chain-sync task after it fetches the wallet's actual live positions
 /// from the Polymarket Data API.  Any row left in the table after that is stale
 /// (settled, sold, or from a crashed session that never called close_open_position).
+///
+/// Ledger reconciliation: a `confirmed` position that vanished from the wallet moved
+/// real cash but — if it closed OUTSIDE the strategy's own exit path (e.g. a resting
+/// maker order filled during an hourly market rotation that reset loop state) — left
+/// NO row in the `trades` ledger. That makes the balance graph dip with no explaining
+/// tradelog event. Before deleting such a row we book a best-effort "ChainReconcile"
+/// trade (exit priced at the position's last mark-to-market) so every cash move is
+/// auditable. Settlements/normal closes are skipped via `market_has_matching_trade`
+/// (they are already booked), and `pending` rows are never booked (they may be
+/// never-filled orders — booking them would fabricate P&L).
 pub async fn purge_stale_open_positions(
     pool: &SqlitePool,
     live_token_ids: &std::collections::HashSet<String>,
@@ -1446,8 +1480,8 @@ pub async fn purge_stale_open_positions(
     // by its phantom mark-to-market (observed: +$14.85 of redeemed ETH arb legs).
     const STALE_PENDING_GRACE_SECS: i64 = 3600; // 60 min ≫ indexer lag, ≪ orphan lifetime
 
-    let rows: Vec<(i64, String, Option<String>, String)> = match sqlx::query_as(
-        "SELECT id, token_id, status, ts FROM open_positions"
+    let rows: Vec<(i64, String, Option<String>, String, String, String, String, String, String, Option<String>)> = match sqlx::query_as(
+        "SELECT id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price FROM open_positions"
     )
     .fetch_all(pool)
     .await {
@@ -1457,13 +1491,14 @@ pub async fn purge_stale_open_positions(
 
     let now = Utc::now();
     let mut purged = 0usize;
-    for (id, token_id, status, ts) in rows {
+    for (id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price) in rows {
         // Still held on-chain (size > 0, not redeemable) — keep.
         if live_token_ids.contains(&token_id) {
             continue;
         }
 
-        let is_pending = status.as_deref().unwrap_or("confirmed") == "pending";
+        let status_str = status.as_deref().unwrap_or("confirmed");
+        let is_pending = status_str == "pending";
         if is_pending {
             // Keep only if still inside the in-flight grace window. An unparseable
             // timestamp is treated as old (purge) so malformed rows can't leak forever.
@@ -1472,6 +1507,45 @@ pub async fn purge_stale_open_positions(
                 .unwrap_or(i64::MAX);
             if age_secs < STALE_PENDING_GRACE_SECS {
                 continue; // genuinely in-flight; leave alone
+            }
+        }
+
+        // ── Ledger reconciliation for off-strategy exits ─────────────────────────
+        // A `confirmed` position that vanished from the wallet with NO matching
+        // ledger row closed outside the strategy's exit path. Book a best-effort
+        // "ChainReconcile" trade (exit = last mark) so the balance move is auditable.
+        // `pending` rows are skipped (possibly never-filled orders → would fabricate).
+        if !is_pending {
+            let entry = entry_price.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+            let qty   = shares.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+            let exit  = current_price.as_deref().and_then(|s| s.parse::<Decimal>().ok());
+            match exit {
+                Some(exit_px) if entry > Decimal::ZERO && qty > Decimal::ZERO && exit_px > Decimal::ZERO => {
+                    if market_has_matching_trade(pool, &market, qty).await {
+                        // Already booked (strategy close or settlement) — don't double-count.
+                    } else {
+                        // Position is a long outcome token: P&L = (exit − entry) × shares
+                        // for either YES or NO side (both were bought at `entry`).
+                        let pnl = (exit_px - entry) * qty;
+                        let reason = format!(
+                            "ChainReconcile: closed off-strategy (est. @ ${:.4} last mark)",
+                            exit_px
+                        );
+                        record_trade_db(pool, &strategy, &market, &side, entry, exit_px, qty, pnl, &reason, None).await;
+                        info!(
+                            "🧾 Ledger reconcile: booked off-strategy exit — {} {} {} | {} sh entry=${:.4} exit=${:.4} → pnl=${:.4}",
+                            strategy, market, side, qty, entry, exit_px, pnl
+                        );
+                    }
+                }
+                _ => {
+                    // No usable mark (missing/zero current_price) — cannot estimate P&L
+                    // without fabricating. Purge silently; cash move stays in pnl_snapshots.
+                    debug!(
+                        "🧾 Ledger reconcile: skipped {} \"{}\" (no usable mark: entry={} shares={} cur={:?})",
+                        strategy, market, entry_price, shares, current_price
+                    );
+                }
             }
         }
 
@@ -1989,3 +2063,103 @@ pub async fn get_recent_llm_recommendations(pool: &SqlitePool, limit: i64) -> Ve
     }
 }
 
+
+#[cfg(test)]
+mod reconcile_tests {
+    use super::*;
+    use std::collections::HashSet;
+
+    async fn mem_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        init_schema(&pool).await.expect("init schema");
+        run_migrations(&pool).await;
+        pool
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn insert_open(
+        pool: &SqlitePool, strategy: &str, token: &str, market: &str, side: &str,
+        entry: &str, shares: &str, cur: Option<&str>, status: &str,
+    ) {
+        sqlx::query(
+            "INSERT INTO open_positions
+             (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted, status, current_price)
+             VALUES (?, 'test-sess', ?, ?, ?, ?, ?, ?, 0, 0, ?, ?)"
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(strategy).bind(token).bind(market).bind(side)
+        .bind(entry).bind(shares).bind(status).bind(cur)
+        .execute(pool).await.expect("insert open_position");
+    }
+
+    // An off-strategy exit (position vanished from wallet, no matching trade) is
+    // booked to the ledger with an estimated P&L from the last mark.
+    #[tokio::test]
+    async fn off_strategy_sell_books_reconcile_trade() {
+        let pool = mem_pool().await;
+        insert_open(&pool, "MakerStrategy", "tok1", "MarketA", "YES", "0.33", "11.44", Some("0.40"), "confirmed").await;
+
+        let purged = purge_stale_open_positions(&pool, &HashSet::new()).await;
+        assert_eq!(purged, 1);
+
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT reason, pnl FROM trades WHERE market = 'MarketA'")
+                .fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1, "expected exactly one reconcile trade");
+        assert!(rows[0].0.contains("ChainReconcile"), "reason was: {}", rows[0].0);
+        // pnl = (0.40 - 0.33) * 11.44 = 0.8008
+        let pnl: Decimal = rows[0].1.parse().unwrap();
+        assert!((pnl - Decimal::new(8008, 4)).abs() < Decimal::new(1, 4), "pnl was: {}", pnl);
+    }
+
+    // A position already booked (settlement or normal close) with matching shares is
+    // NOT re-booked — protects against double-counting realized P&L.
+    #[tokio::test]
+    async fn already_booked_is_not_double_counted() {
+        let pool = mem_pool().await;
+        record_trade_db(&pool, "MakerStrategy", "MarketB", "YES",
+            Decimal::new(33, 2), Decimal::ONE, Decimal::new(1144, 2),
+            Decimal::new(10, 2), "Settlement (auto-redeemed by Polymarket)", None).await;
+        insert_open(&pool, "MakerStrategy", "tok2", "MarketB", "YES", "0.33", "11.44", Some("0.40"), "confirmed").await;
+
+        purge_stale_open_positions(&pool, &HashSet::new()).await;
+
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE market = 'MarketB'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1, "must not add a second row for an already-booked position");
+    }
+
+    // A `pending` row still inside the in-flight grace window is neither purged nor
+    // booked (it may be a never-filled resting order — booking would fabricate P&L).
+    #[tokio::test]
+    async fn pending_within_grace_is_untouched() {
+        let pool = mem_pool().await;
+        insert_open(&pool, "MakerStrategy", "tok3", "MarketC", "YES", "0.33", "11.44", Some("0.40"), "pending").await;
+
+        let purged = purge_stale_open_positions(&pool, &HashSet::new()).await;
+        assert_eq!(purged, 0);
+
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE market = 'MarketC'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    // A stale position with no usable mark (missing current_price) is purged but NOT
+    // booked — we never fabricate a P&L without a price.
+    #[tokio::test]
+    async fn missing_mark_purges_without_booking() {
+        let pool = mem_pool().await;
+        insert_open(&pool, "MakerStrategy", "tok4", "MarketD", "YES", "0.33", "11.44", None, "confirmed").await;
+
+        let purged = purge_stale_open_positions(&pool, &HashSet::new()).await;
+        assert_eq!(purged, 1);
+
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE market = 'MarketD'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 0);
+    }
+}

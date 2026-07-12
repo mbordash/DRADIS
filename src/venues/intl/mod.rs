@@ -46,6 +46,16 @@ use crate::venues::core::{
 const EXCHANGE_NORMAL: Address = address!("0xE111180000d2663C0091e4f400237545B87B996B");
 const EXCHANGE_NEG_RISK: Address = address!("0xe2222d279d744050d28e00520010520000310F59");
 
+/// Public resolver for the EIP-712 verifying contract (CTF Exchange) that must be
+/// used when signing an order for a market of the given neg-risk status. Callers
+/// outside the venue (e.g. the API's manual-exit/RTB path) MUST derive the address
+/// this way rather than trusting a client-supplied value — a mismatched verifying
+/// contract produces the wrong EIP-712 domain and an "invalid POLY_GNOSIS_SAFE
+/// signature" rejection from the CLOB.
+pub fn exchange_verifying_contract(is_neg_risk: bool) -> Address {
+    if is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL }
+}
+
 // ── MarketId ↔ U256 boundary (decision D5/D6) ────────────────────────────────
 // The neutral `MarketId` carries the decimal-`U256` string for the intl venue.
 // These are the ONLY sanctioned conversion points outside the order-signing path:

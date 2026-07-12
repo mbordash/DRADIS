@@ -233,6 +233,11 @@ pub const MAKER_TAKER_FLOW_DRAIN_THRESHOLD: Decimal = dec!(0.30);
 /// Conservative: force-exit open positions at OBI < -0.35 — cuts losses before
 /// the book has fully turned, accepting a smaller realized loss over a larger one.
 pub const MAKER_TOXIC_FLOW_EXIT_OBI: Decimal = dec!(-0.35);
+/// After a ToxicFill exit, block re-entry on that same token for this long.
+/// Prevents the maker from immediately re-quoting into a collapsing book and
+/// getting picked off again (the "double knife-catch" adverse-selection loss).
+/// Conservative: longer 5-minute re-entry lockout.
+pub const MAKER_TOXIC_REENTRY_COOLDOWN_SECS: i64 = 300;
 
 pub const MAKER_SLOW_TREND_THRESHOLD_BTC: Decimal = dec!(400.0); // legacy — not used in logic
 /// Slow trend threshold as fraction of oracle price.
