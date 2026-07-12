@@ -162,6 +162,11 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" "${CT_USERNA
     # ── MODEL A: Single container, multi-asset (Phase 3f-6 — recommended) ───────
     # ASSETS=btc,eth,sol runs all three market loops concurrently in one process.
     # DB persists the primary asset (btc); secondary assets use CSV-only metrics.
+    #
+    # Worker threads: the runtime defaults to the host's core count (floor 2).
+    # For 3 concurrent asset loops, provision at least 4 vCPUs and set
+    # TOKIO_WORKER_THREADS to the core count (or a bit higher) so the patrol
+    # loops don't oversubscribe — e.g. `-e TOKIO_WORKER_THREADS=4` on a t3.xlarge.
     echo "🚀 Starting dradis (BTC+ETH+SOL concurrent, API on :9000)..."
     docker run -d \
         --restart unless-stopped \
@@ -170,6 +175,7 @@ ssh -p "$SSH_PORT" -i "$KEY" "$USER@$HOST" bash -s -- "$REMOTE_DIR" "${CT_USERNA
         --env-file .env \
         -e ASSETS=btc,eth,sol \
         -e API_PORT=9000 \
+        -e TOKIO_WORKER_THREADS=4 \
         -e OLLAMA_URL=http://ollama:11434 \
         -e OLLAMA_MODEL=qwen2.5:3b-instruct-q4_K_M \
         -p 9000:9000 \

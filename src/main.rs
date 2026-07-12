@@ -139,12 +139,47 @@ where
     })
 }
 
-// Force at least 8 worker threads.  With multiple concurrent asset loops each
-// running peripheral tasks (status, cleanup, settlement, pulse, watchdog) plus
-// WS reconnect loops, a larger pool prevents one blocking call from starving
-// the rest.  Previously 4 was sufficient for single-asset; 8 covers BTC+ETH+SOL.
-#[tokio::main(flavor = "multi_thread", worker_threads = 8)]
-async fn main() -> Result<()> {
+// Runtime worker-thread sizing.
+//
+// Previously hardcoded to 8 to cover a BTC+ETH+SOL multi-asset deployment.  On
+// the single-asset (ASSETS=btc) t3.large production box (2 vCPUs) that is 4x
+// oversubscription: during a rayon-based GBoost retrain — which itself spawns
+// ~num_cpus threads that saturate both cores — 8 tokio workers, the rayon pool,
+// and the timer driver all contend for 2 cores.  Because `tokio::time::timeout`
+// is cooperative it cannot interrupt a synchronous / std::sync::Mutex-blocked
+// section, so a CPU-starved eval tick can hang past the 300 s watchdog (see the
+// watchdog comment below — this is the exact class of stall it names).
+//
+// Right-size the pool to the host instead: default to the machine's core count
+// (floor 2 so we always keep the trading loop + peripheral tasks parallel), and
+// allow `TOKIO_WORKER_THREADS` to override upward for multi-asset boxes.  Blocking
+// work already lives on the dedicated `spawn_blocking` pool, so matching workers
+// to cores is the correct tokio configuration and removes the oversubscription.
+fn main() -> Result<()> {
+    let host_cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(2);
+    let worker_threads = std::env::var("TOKIO_WORKER_THREADS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n >= 1)
+        .unwrap_or(host_cores)
+        .max(2);
+    eprintln!(
+        "🧵 tokio runtime: {} worker threads (host cores={}, override={:?})",
+        worker_threads,
+        host_cores,
+        std::env::var("TOKIO_WORKER_THREADS").ok()
+    );
+    tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .thread_name("dradis-worker")
+        .enable_all()
+        .build()?
+        .block_on(run())
+}
+
+async fn run() -> Result<()> {
     let clob_host = "clob.polymarket.com";
     let gamma_host = "gamma-api.polymarket.com";
 

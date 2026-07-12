@@ -219,7 +219,7 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 
 - **Parallel Dispatch**: Every 50ms heartbeat, the CIC evaluates all registered Vipers concurrently.
 - **Isolated budgets**: Each Viper has its own independent capital budget and position book — a loss in one sector can't drain another's fuel.
-- **Multi-asset concurrency**: Each asset runs in its own `tokio::spawn`ed task with independent raptors and session state. The runtime uses 8 worker threads to cover BTC + ETH + SOL comfortably.
+- **Multi-asset concurrency**: Each asset runs in its own `tokio::spawn`ed task with independent raptors and session state. The tokio runtime sizes its worker pool to the host's core count (floor 2) to avoid oversubscribing small instances; set `TOKIO_WORKER_THREADS` to raise it for multi-asset boxes (e.g. BTC + ETH + SOL on a 4+ vCPU host). Blocking work runs on the dedicated `spawn_blocking` pool, so matching workers to cores is the correct configuration.
 - **OS-thread watchdog**: A native OS thread (outside the tokio runtime) checks an atomic heartbeat every 60 s. If the trading loop goes silent for 5 minutes, it calls `process::exit(1)` to trigger Docker's restart policy — immune to tokio runtime deadlocks.
 - **OBI Veto**: A built-in Order Book Imbalance gate at −0.60 blocks entries into toxic flow / distribution walls.
 - **Strategy Timeout**: Each Viper evaluation is hard-capped at 500ms. A hung Viper is skipped for that tick — the engine never freezes.
