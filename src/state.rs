@@ -258,19 +258,10 @@ pub enum StrategySignal {
         yes: Option<OrderParams>,
         no: Option<OrderParams>,
     },
-<<<<<<< HEAD
     /// Reactive quote-pull: cancel resting UNFILLED maker quotes on these tokens
     /// when the book turns toxic before they fill (avoids adverse-selection fills).
     MakerCancel {
         tokens: Vec<MarketId>,
-=======
-    /// Cancel a resting (unfilled) maker quote before adverse fill.
-    /// Used when the book turns toxic (OBI) while the GTC bid is still open.
-    /// Removes the phantom position and cancels the live order; arms re-entry cooldown.
-    MakerCancel {
-        token_id: MarketId,
-        reason: String,
->>>>>>> 8e09f791bcfe1beae0cacccbfc4b47fd8a1b4fec
     },
     /// Exit signal with metadata.
     Exit {
@@ -315,3 +306,4 @@ mod tests {
         assert_eq!(market_closing_in(Some(-5)).phase(now, 120), MarketPhase::Closed);
     }
 }
+

@@ -165,9 +165,34 @@ pub async fn run_us_trader(
     }
 }
 
-// ... (rest of the file remains the same as previous, with MakerCancel added in dispatch_signal)
+/// Discover markets and pick one to trade, skipping any already closed or closing
+/// within [`MIN_TIME_TO_CLOSE_SECS`]. Retries until a market matches or `cancel`
+/// fires. Returns `None` only on cancellation.
+async fn select_market(
+    venue: &Arc<UsRetailVenue>,
+    filter: &Option<String>,
+    cancel: &CancellationToken,
+    process_heartbeat_secs: &AtomicU64,
+) -> Option<super::markets::UsMarketPair> {
+    loop {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        // Keep the OS watchdog satisfied while we poll for a tradeable market —
+        // discovery can legitimately take many minutes (off-hours, thin slate).
+        touch_heartbeat(process_heartbeat_secs);
+        match venue.discover_binary_markets().await {
+            Ok(markets) if !markets.is_empty() => {
+                info!(
+                    "📊 Discovered {} binary markets. First 5: {}",
+                    markets.len(),
+                    markets.iter()
+                        .take(5)
+                        .map(|m| format!("\"{}\"", m.question))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
 
-<<<<<<< HEAD
                 // Drop markets already closed or too close to close to be worth
                 // entering — no point committing capital we can't work first.
                 let now = Utc::now();
@@ -867,16 +892,4 @@ fn publish_us_strategy_market(
         }
     });
 }
-=======
-// For brevity in this update, the critical change is in dispatch_signal:
-// Add:
-// StrategySignal::MakerCancel { token_id, reason } => {
-//     info!("🛑 [{strategy_name}] MakerCancel ({reason}): {token_id}");
-//     let mut map = positions.lock().await;
-//     map.remove(&(strategy_name.to_string(), token_id.clone()));
-//     // Lifecycle will clean resting orders on next reconcile or we can force
-//     true
-// },
->>>>>>> 8e09f791bcfe1beae0cacccbfc4b47fd8a1b4fec
 
-// Full file update is truncated for this response; the SHA update will be applied with the MakerCancel arm in the match.
