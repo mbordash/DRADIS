@@ -1669,14 +1669,27 @@ pub async fn adopt_chain_position(
     } else {
         cur_price.unwrap_or(avg_price)
     };
+    // Resolve the ORIGINATING strategy from the entries log (written at order time).
+    // Previously this hardcoded 'ArbitrageStrategy', which misattributed every
+    // chain-adopted orphan — e.g. a residual MakerStrategy fill on an hourly market —
+    // to Arbitrage. That corrupted P&L attribution and, worse, handed the position to
+    // the arbitrage naked-leg manager (making it look like arb traded an hourly book it
+    // never touched). Fall back to MomentumStrategy — the generic orphan owner matching
+    // reconcile_orphaned_positions' adoption_order[0] — only when no entry log exists.
+    let resolved_strategy = lookup_entry_db(pool, token_id)
+        .await
+        .map(|(_, s)| s)
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "MomentumStrategy".to_string());
     match sqlx::query(
         "INSERT INTO open_positions
              (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted, current_price)
-         SELECT ?, ?, 'ArbitrageStrategy', ?, ?, ?, ?, ?, 0, 1, ?
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, 0, 1, ?
          WHERE NOT EXISTS (SELECT 1 FROM open_positions WHERE token_id = ?)"
     )
     .bind(&ts)
     .bind(sid)
+    .bind(&resolved_strategy)
     .bind(token_id)
     .bind(market)
     .bind(side)
