@@ -779,8 +779,17 @@ pub async fn arb_pair_fill_monitor(
             }
         }
     };
-    // Cross one tick below the bid to guarantee an immediate taker sell; floor at $0.01.
-    let sell_price = (bid_price - dec!(0.01)).max(dec!(0.01));
+    // Cross by the LARGER of an absolute buffer and a percentage haircut so the FAK
+    // limit reliably sweeps the real top-of-book even when the quoted bid is stale-high.
+    // FAK ⇒ the executed price is still the best resting bid; the lower limit only
+    // guarantees the fill. Floor at MIN_SELL_LIMIT_PRICE and snap to the tick grid.
+    let cross = std::cmp::max(
+        crate::config::ARB_FLATTEN_MIN_BID_BUFFER,
+        bid_price * crate::config::ARB_FLATTEN_BID_HAIRCUT_PCT,
+    );
+    let sell_price = crate::helpers::price::floor_to_tick_size(
+        (bid_price - cross).max(crate::config::MIN_SELL_LIMIT_PRICE)
+    );
 
     warn!(" ARB ARBITER [{}]: Flattening naked leg {} — FAK SELL {} @ {:.4} (bid={:.4}, entry={:.4})",
           strategy_name, filled_token, filled_shares, sell_price, bid_price, filled_avg_entry);
