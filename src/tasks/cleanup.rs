@@ -1104,15 +1104,20 @@ async fn record_settled_arb_trade(
                 return;
             }
 
-            // Cost basis: prefer the Data API avg_price; if it returns 0 (observed
-            // for churn-residual legs), fall back to the local `entries` cost basis
-            // for this token. Previously a 0 avg_price silently dropped the whole
-            // settlement — a real on-chain redemption with NO trade row (2026-06-21).
-            let mut avg_price = leg.avg_price;
+            // Cost basis AND originating strategy: prefer the local `entries` log (the
+            // strategy that actually opened this leg). If the Data API avg_price is 0
+            // (observed for churn-residual legs) fall back to the logged cost basis.
+            // Previously this hardcoded strategy = "ArbitrageStrategy", which mislabeled
+            // any non-arb single leg (e.g. a Convergence NO leg on an hourly market that
+            // rode to settlement) AND, combined with the ledger-reconcile path booking
+            // the same position under its true strategy, produced a DOUBLE-COUNT
+            // (2026-07-13: one 13.72-share NO leg booked twice, ≈ −$4.94 each).
+            let (mut avg_price, logged_strategy) = match db::lookup_entry_db(&pool, &leg.asset.to_string()).await {
+                Some((p, s)) => (p, if s.is_empty() { None } else { Some(s) }),
+                None => (leg.avg_price, None),
+            };
             if avg_price <= Decimal::ZERO {
-                if let Some(p) = db::lookup_entry_price_db(&pool, &leg.asset.to_string()).await {
-                    avg_price = p;
-                }
+                avg_price = leg.avg_price;
             }
             if avg_price <= Decimal::ZERO {
                 warn!(
@@ -1136,9 +1141,23 @@ async fn record_settled_arb_trade(
             let pnl = (exit_price - avg_price) * size;
             let market_title = leg.title.clone();
 
+            // Cross-path dedup: the ledger-reconcile path (purge_stale_open_positions)
+            // may have already booked this same position (matched on market + shares)
+            // under its true strategy/reason. Its fingerprint differs from ours, so the
+            // idempotent-insert guard below would NOT catch it — check explicitly here.
+            if db::market_has_matching_trade(&pool, &market_title, size).await {
+                debug!(
+                    "Auto-settle: single-leg {} settlement for \"{}\" suppressed — already booked \
+                     ({} sh) by another path (ledger reconcile or strategy close)",
+                    side, market_title, size
+                );
+                return;
+            }
+
+            let settle_strategy = logged_strategy.as_deref().unwrap_or("ArbitrageStrategy");
             let inserted = db::record_settlement_trade_idempotent(
                 &pool,
-                "ArbitrageStrategy",
+                settle_strategy,
                 &market_title,
                 side,
                 avg_price,
@@ -1151,8 +1170,8 @@ async fn record_settled_arb_trade(
 
             if inserted {
                 info!(
-                    " ArbitrageStrategy single-leg settlement: \"{}\" | {} {} @ ${:.4} → resolved ${:.4} → pnl ${:.4}",
-                    market_title, size, side, avg_price, exit_price, pnl
+                    " {} single-leg settlement: \"{}\" | {} {} @ ${:.4} → resolved ${:.4} → pnl ${:.4}",
+                    settle_strategy, market_title, size, side, avg_price, exit_price, pnl
                 );
             } else {
                 debug!(

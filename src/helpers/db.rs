@@ -1433,7 +1433,7 @@ pub async fn purge_all_live_open_positions(pool: &SqlitePool) -> usize {
 /// arbitrage case where a resolved YES+NO pair is booked as a single YES-side
 /// settlement row: the NO leg shares equal the pair size, so it still matches and is
 /// correctly NOT re-booked. If a match exists we must NOT fabricate a second row.
-async fn market_has_matching_trade(pool: &SqlitePool, market: &str, shares: Decimal) -> bool {
+pub async fn market_has_matching_trade(pool: &SqlitePool, market: &str, shares: Decimal) -> bool {
     let share_dust = Decimal::new(1, 3); // 0.001
     let rows: Vec<String> = sqlx::query_scalar("SELECT shares FROM trades WHERE market = ?")
         .bind(market)
