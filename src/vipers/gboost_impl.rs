@@ -58,8 +58,8 @@
 ///                          aggression, 0 = no data (treated neutral). All-asset.
 ///
 /// ── Label ────────────────────────────────────────────────────────────────────
-///   1.0  if yes_bid rises in GBOOST_LOOKAHEAD_TICKS ticks
-///   0.0  otherwise
+///   1.0  if the oracle (Binance) price is higher GBOOST_LABEL_HORIZON_SECS later
+///   0.0  otherwise (flat-oracle samples below GBOOST_LABEL_MIN_ORACLE_MOVE_FRAC are skipped)
 ///
 /// ── Lifecycle ────────────────────────────────────────────────────────────────
 ///   1. Snapshots are pushed into a fixed-size ring buffer every tick.
@@ -188,10 +188,10 @@ fn tick_momentum_from_slice(snaps: &[MarketSnapshot], idx: usize) -> f64 {
 
 /// Convert a `MarketSnapshot` into a fixed-length `f64` feature array.
 fn extract_features(s: &MarketSnapshot, prev_s: Option<&MarketSnapshot>, hist_vol: f64, tick_momentum: f64) -> [f64; NUM_FEATURES] {
-    // Use obi_from_depths (which returns -1.0 on zero depth) to match the entry gate's
-    // side_obi() convention.  The entry gate blocks zero-depth entries (OBI=-1.0 < adverse
-    // threshold), so training records will also never have zero-depth — but prediction can
-    // receive any snapshot. Aligning the default removes a hidden prediction/gate mismatch.
+    // obi_from_depths returns -1.0 on zero depth as a stable FEATURE convention (the
+    // model needs some numeric value for a zero-depth book).  Note: the entry gates no
+    // longer share this convention — they consume an EMA-smoothed OBI (smoothed_obi())
+    // where zero depth means "unknown" and falls back to the last fresh EMA value.
     let yes_obi = obi_from_depths(s.yes_bid_depth, s.yes_ask_depth);
     let no_obi  = obi_from_depths(s.no_bid_depth,  s.no_ask_depth);
 
@@ -445,6 +445,12 @@ pub struct GboostStrategyImpl {
     /// eval loop never floods. This reveals why GBoost isn't trading despite the
     /// model being confident.
     last_veto_log_at: Arc<StdMutex<Option<Instant>>>,
+    /// EMA state for the OBI quality gates, one slot per (venue, side) — see
+    /// OBI_SLOT_* constants. Each slot stores (ema_value, last_update_instant).
+    /// Smoothing rationale: instantaneous OBI on thin books is quote-flicker noise
+    /// (observed ±0.9 swings minute-to-minute on 2026-07-14, vetoing every eligible
+    /// signal); the EMA captures the persistent book lean the gates are meant to read.
+    obi_ema: Arc<StdMutex<[Option<(f64, Instant)>; 4]>>,
 }
 
 impl GboostStrategyImpl {
@@ -536,12 +542,22 @@ impl GboostStrategyImpl {
             market_hold_locks: Arc::new(StdMutex::new(std::collections::HashMap::new())),
             last_pred_log_at: Arc::new(StdMutex::new(None)),
             last_veto_log_at: Arc::new(StdMutex::new(None)),
+            obi_ema: Arc::new(StdMutex::new([None; 4])),
         }
     }
 
     /// Push snapshot into the ring buffer, evicting the oldest entry when at capacity.
+    /// Time-decimated: snapshots arriving less than GBOOST_HISTORY_MIN_SPACING_MS after
+    /// the previous accepted snapshot are dropped, so the buffer spans wall-clock time
+    /// (~18 min at 500ms spacing) instead of ~110s of near-duplicate 50ms ticks.
     fn push_snapshot(&self, snap: MarketSnapshot) {
         let mut h = self.history.lock().unwrap();
+        if let Some(last) = h.back() {
+            let spacing_ms = (snap.timestamp - last.timestamp).num_milliseconds();
+            if spacing_ms < config::GBOOST_HISTORY_MIN_SPACING_MS {
+                return;
+            }
+        }
         h.push_back(snap);
         if h.len() > config::GBOOST_HISTORY_BUFFER_SIZE {
             h.pop_front();
@@ -554,7 +570,7 @@ impl GboostStrategyImpl {
     /// Label sourcing priority:
     ///   1. Real trade outcomes stored in `training_data` (highest quality — actual P&L).
     ///   2. Lookahead labels from the `history` ring buffer when `training_data` is too
-    ///      sparse.  Label: yes_bid rises within GBOOST_LOOKAHEAD_TICKS ticks → 1.0.
+    ///      sparse.  Label: oracle price higher GBOOST_LABEL_HORIZON_SECS later → 1.0.
     ///      This breaks the chicken-and-egg deadlock that prevents the model from ever
     ///      reaching the minimum sample count required to produce its first predictions.
     fn maybe_retrain(&self) {
@@ -596,6 +612,14 @@ impl GboostStrategyImpl {
         };
         if !triggered { return; }
 
+        // Watchdog breadcrumb: the retrain trigger's SYNCHRONOUS section (sample
+        // collection + drift-window capture) runs on the loop thread and acquires the
+        // std::sync locks (training_data, history) that the eval path also takes — the
+        // exact contention the OS watchdog comment names. Mark it distinctly so a stall
+        // here reports GBOOST_RETRAIN rather than the generic SIGNAL_EVAL/gboost.
+        crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::GboostRetrain);
+        tracing::info!(" GboostStrategy: retrain trigger fired — collecting samples (sync section)");
+
         // ── Collect real trade outcomes (Source 1: highest quality labels) ──────────
         // These are actual entry/exit P&L labels — far more informative than lookahead
         // proxies.  Always collected first; they are prepended to the training batch so
@@ -613,35 +637,72 @@ impl GboostStrategyImpl {
             // When real outcomes exist but are too few, prepend them to the lookahead batch.
             // This breaks the chicken-and-egg bootstrap deadlock while continuously
             // improving model quality as real trade-outcome labels accumulate.
-            // Label = 1.0 if the YES bid rises within GBOOST_LOOKAHEAD_TICKS ticks.
+            // Label = 1.0 if the ORACLE price is higher GBOOST_LABEL_HORIZON_SECS later.
+            // The market resolves on the oracle, so this is the actual prediction target —
+            // the previous yes_bid-based label learned thin-book quote noise instead
+            // (2026-07-14: model called DOWN 14/17 times while BTC rose +1.7%).
             let h = self.history.lock().unwrap();
             let n = h.len();
-            let lookahead = config::GBOOST_LOOKAHEAD_TICKS;
-            // After blending, we need at least (MIN - real_count) lookahead samples plus
-            // the lookahead window itself.  Without real samples this collapses to the
-            // original MIN_TRAINING_SAMPLES + lookahead check.
+            let horizon = chrono::Duration::seconds(config::GBOOST_LABEL_HORIZON_SECS);
             let needed = config::GBOOST_MIN_TRAINING_SAMPLES.saturating_sub(real_samples.len());
-            if n < needed + lookahead {
-                return; // Not enough history yet, wait for more ticks
+            // `usable` = number of leading samples whose label horizon is fully inside
+            // the buffer (a future snapshot ≥ horizon later exists for them).
+            let usable = match (h.front(), h.back()) {
+                (Some(first), Some(last)) if last.timestamp - first.timestamp >= horizon => {
+                    h.iter().take_while(|s| last.timestamp - s.timestamp >= horizon).count()
+                }
+                _ => 0,
+            };
+            if usable < needed {
+                // Not enough time-span in the history yet. Reset the tick counter so the
+                // trigger re-arms after a full GBOOST_RETRAIN_EVERY_N cycle (~30s) instead
+                // of re-firing (and logging) on every subsequent 50ms tick while the
+                // decimated buffer is still filling (~8 min from cold start).
+                *self.ticks_since_retrain.lock().unwrap() = 0;
+                return;
             }
-            let usable = n - lookahead;
             let mut combined = real_samples; // Real outcomes first (highest quality)
-            combined.extend((0..usable).map(|i| {
-                let snap      = &h[i];
-                let prev_snap = if i > 0 { Some(&h[i-1]) } else { None };
-                let future    = &h[i + lookahead];
+            // Two-pointer scan: `j` tracks the first snapshot ≥ horizon after `i`.
+            // Both indices only move forward, so the whole pass is O(n).
+            let mut j = 0usize;
+            for i in 0..usable {
+                let snap = &h[i];
+                while j < n && h[j].timestamp - snap.timestamp < horizon {
+                    j += 1;
+                }
+                if j >= n {
+                    break; // No future snapshot far enough ahead (shouldn't happen within `usable`)
+                }
+                let future = &h[j];
+                let cur = snap.oracle_price.to_f64().unwrap_or(0.0);
+                let fut = future.oracle_price.to_f64().unwrap_or(0.0);
+                // Skip directionally-uninformative samples: oracle essentially flat
+                // (or missing) over the horizon. Force-labelling these 0 teaches the
+                // model that "flat" equals "down".
+                if cur <= 0.0 || fut <= 0.0
+                    || ((fut - cur).abs() / cur) < config::GBOOST_LABEL_MIN_ORACLE_MOVE_FRAC
+                {
+                    continue;
+                }
+                let prev_snap = if i > 0 { Some(&h[i - 1]) } else { None };
                 let hv = hist_vol_from_deque(&h, i);
                 let tm = tick_momentum_from_deque(&h, i);
-                TrainingSample {
+                combined.push(TrainingSample {
                     features: extract_features(snap, prev_snap, hv, tm),
-                    is_profitable: future.yes_bid > snap.yes_bid,
+                    is_profitable: fut > cur,
                     entry_timestamp: snap.timestamp,
-                }
-            }));
+                });
+            }
             combined
         };
 
-        if training_samples.len() < config::GBOOST_MIN_TRAINING_SAMPLES { return; }
+        if training_samples.len() < config::GBOOST_MIN_TRAINING_SAMPLES {
+            // Same re-arm rationale as the `usable < needed` return above: without the
+            // reset this fires every tick (flat-oracle samples skipped by the label
+            // deadband can leave the batch short even when the buffer time-span is OK).
+            *self.ticks_since_retrain.lock().unwrap() = 0;
+            return;
+        }
 
         // ── Label-balance guard ───────────────────────────────────────────────
         // In a strongly trending market the lookahead window is nearly all-1 or
@@ -905,7 +966,9 @@ impl GboostStrategyImpl {
     /// so we conservatively block the entry rather than silently allowing it.
     /// "Ghost OBI" entries (zero depth at evaluation but adverse at heartbeat time)
     /// were responsible for losing trades in the 2026-05-07 afternoon session.
-    fn side_obi(is_yes_side: bool, s: &MarketSnapshot) -> rust_decimal::Decimal {
+    /// Raw one-sided OBI in [-1, 1] for a snapshot, or `None` when the book reports
+    /// zero total depth (no data — NOT the same thing as an adverse book).
+    fn side_obi(is_yes_side: bool, s: &MarketSnapshot) -> Option<rust_decimal::Decimal> {
         let (bid, ask) = if is_yes_side {
             (s.yes_bid_depth, s.yes_ask_depth)
         } else {
@@ -913,12 +976,54 @@ impl GboostStrategyImpl {
         };
         let total = bid + ask;
         if total > dec!(0) {
-            (bid - ask) / total
+            Some((bid - ask) / total)
         } else {
-            dec!(-1.0) // no depth data → treat as maximally adverse → block entry
+            None
+        }
+    }
+
+    /// Update and read the EMA-smoothed OBI for one of the four gate slots
+    /// (OBI_SLOT_*). Instantaneous OBI on these thin books whipsaws ±0.9 minute to
+    /// minute, so the gates consume a GBOOST_OBI_EMA_TAU_SECS exponential moving
+    /// average instead — cadence-independent via alpha = 1 − exp(−dt/τ).
+    ///
+    /// `raw == None` (zero-depth book): the previous EMA is returned as-is when it is
+    /// fresher than GBOOST_OBI_EMA_STALE_SECS; otherwise `None` (caller vetoes).
+    fn smoothed_obi(&self, slot: usize, raw: Option<rust_decimal::Decimal>) -> Option<rust_decimal::Decimal> {
+        let now = Instant::now();
+        let mut slots = self.obi_ema.lock().unwrap();
+        let entry = &mut slots[slot];
+        match raw {
+            Some(r) => {
+                let r = r.to_f64().unwrap_or(0.0);
+                let ema = match *entry {
+                    Some((prev, last_at)) => {
+                        let dt = now.duration_since(last_at).as_secs_f64();
+                        let alpha = 1.0 - (-dt / config::GBOOST_OBI_EMA_TAU_SECS).exp();
+                        prev + alpha * (r - prev)
+                    }
+                    None => r,
+                };
+                *entry = Some((ema, now));
+                rust_decimal::Decimal::from_f64_retain(ema)
+            }
+            None => match *entry {
+                Some((prev, last_at))
+                    if now.duration_since(last_at).as_secs_f64() <= config::GBOOST_OBI_EMA_STALE_SECS =>
+                {
+                    rust_decimal::Decimal::from_f64_retain(prev)
+                }
+                _ => None,
+            },
         }
     }
 }
+
+/// Slot indices into `GboostStrategyImpl::obi_ema`.
+const OBI_SLOT_TARGET_YES: usize = 0;
+const OBI_SLOT_TARGET_NO:  usize = 1;
+const OBI_SLOT_HOURLY_YES: usize = 2;
+const OBI_SLOT_HOURLY_NO:  usize = 3;
 
 // ── Position-sizing helpers ───────────────────────────────────────────────────
 
@@ -1182,6 +1287,21 @@ impl Strategy for GboostStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── OBI EMA update (every evaluated tick) ────────────────────────────
+        // Feed the smoothed-OBI slots on every tick that reaches evaluation so the
+        // EMA tracks the book continuously — not just at the moment a gate fires.
+        // The quality gates below consume these smoothed values.
+        let smoothed_target_yes_obi = self.smoothed_obi(OBI_SLOT_TARGET_YES, Self::side_obi(true, target_snapshot));
+        let smoothed_target_no_obi  = self.smoothed_obi(OBI_SLOT_TARGET_NO,  Self::side_obi(false, target_snapshot));
+        let (smoothed_hourly_yes_obi, smoothed_hourly_no_obi) = if ctx.maker_snapshot.is_some() {
+            (
+                self.smoothed_obi(OBI_SLOT_HOURLY_YES, Self::side_obi(true, &ctx.snapshot)),
+                self.smoothed_obi(OBI_SLOT_HOURLY_NO,  Self::side_obi(false, &ctx.snapshot)),
+            )
+        } else {
+            (None, None)
+        };
+
         let p_yes_up = match self.predict(predict_snapshot) {
             Some(p) => p,
             None    => return Ok(StrategySignal::NoSignal),
@@ -1359,7 +1479,12 @@ impl Strategy for GboostStrategyImpl {
             if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(target_market.yes_token.clone()) {
                 veto!(format!("cooldown active ({remaining_secs}s left)"));
             }
-            let yes_obi = Self::side_obi(true, target_snapshot);
+            // Smoothed (EMA) OBI — see smoothed_obi(). None = zero-depth book with no
+            // fresh EMA to fall back on: the book state is unknown, so don't trade it.
+            if smoothed_target_yes_obi.is_none() {
+                veto!("no OBI depth data");
+            }
+            let yes_obi = smoothed_target_yes_obi.unwrap();
             if yes_obi < dc.gboost_obi_adverse_block {
                 veto!("adverse OBI");
             }
@@ -1376,7 +1501,10 @@ impl Strategy for GboostStrategyImpl {
             // fading a pump — entering daily YES contradicts the hourly signal.
             // 2026-05-07 afternoon: blocked entries where hourly OBI was -0.81 to -0.88.
             if ctx.maker_snapshot.is_some() {
-                let hourly_yes_obi = Self::side_obi(true, &ctx.snapshot);
+                if smoothed_hourly_yes_obi.is_none() {
+                    veto!("no hourly OBI depth data");
+                }
+                let hourly_yes_obi = smoothed_hourly_yes_obi.unwrap();
                 if hourly_yes_obi < config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK {
                     veto!("hourly YES OBI adverse");
                 }
@@ -1479,7 +1607,11 @@ impl Strategy for GboostStrategyImpl {
             if let Some(remaining_secs) = self.post_exit_cooldown_remaining_secs(target_market.no_token.clone()) {
                 veto!(format!("cooldown active ({remaining_secs}s left)"));
             }
-            let no_obi = Self::side_obi(false, target_snapshot);
+            // Smoothed (EMA) OBI — see smoothed_obi(). None = unknown book state.
+            if smoothed_target_no_obi.is_none() {
+                veto!("no OBI depth data");
+            }
+            let no_obi = smoothed_target_no_obi.unwrap();
             if no_obi < dc.gboost_obi_adverse_block {
                 veto!("adverse OBI");
             }
@@ -1497,7 +1629,10 @@ impl Strategy for GboostStrategyImpl {
             // 2026-05-07 trade 2: hourly NO OBI = -0.88 → blocked (saved $0.30).
             // 2026-05-07 trade 9: hourly NO OBI = -0.81 → blocked (saved $0.30).
             if ctx.maker_snapshot.is_some() {
-                let hourly_no_obi = Self::side_obi(false, &ctx.snapshot);
+                if smoothed_hourly_no_obi.is_none() {
+                    veto!("no hourly OBI depth data");
+                }
+                let hourly_no_obi = smoothed_hourly_no_obi.unwrap();
                 if hourly_no_obi < config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK {
                     veto!("hourly NO OBI adverse");
                 }

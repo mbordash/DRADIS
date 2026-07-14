@@ -224,6 +224,7 @@ pub async fn cleanup_expired_positions(
     no_token: MarketId,
     close_time: Option<DateTime<Utc>>,
 ) {
+    crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::Cleanup);
     let mut pos_map = positions.lock().await;
     let now = Utc::now();
 
@@ -551,6 +552,7 @@ fn infer_asset_from_title(title: &str) -> Option<&'static str> {
 /// building the live-ID set; the hex format would never match and would cause
 /// every valid DB row to be wrongly purged on every tick.
 pub async fn sync_open_positions_with_chain(safe_address: Address) {
+    crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::ChainSync);
     // Collect all per-asset pools.  The Data API returns wallet-wide positions
     // regardless of which asset opened them, so we must sync EVERY asset DB —
     // not just the primary — to keep secondary asset open_positions tables in sync.
@@ -791,6 +793,7 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
     safe_address: Address,
     eoa_address: Address,
 ) -> bool {
+    crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::Settlement);
     // Avoid concurrent settlement scans/submits from multiple squadron tasks.
     let _settle_guard = match AUTO_SETTLE_RUN_LOCK.try_lock() {
         Ok(g) => g,

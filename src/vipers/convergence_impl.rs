@@ -55,6 +55,13 @@ pub struct ConvergenceStrategyImpl {
     catastrophic_cooldown: Mutex<HashMap<String, Instant>>,
     /// Viper-level exit-signal cooldown to prevent FAK-miss re-fire storms.
     last_exit_signal_at: Mutex<Option<Instant>>,
+    /// Best bid observed at entry-signal time, per token. The catastrophic stop
+    /// measures adverse MARKET movement against this reference instead of the
+    /// entry ask: marking a fresh fill against the bid always shows an instant
+    /// paper loss equal to the spread, and with wide books that alone crossed
+    /// the catastrophic floor and stopped positions the same second they opened
+    /// (2026-07-14, −16.2% with zero price movement).
+    entry_bid: Mutex<HashMap<MarketId, Decimal>>,
 }
 
 impl ConvergenceStrategyImpl {
@@ -63,6 +70,7 @@ impl ConvergenceStrategyImpl {
             post_exit_cooldown: Mutex::new(HashMap::new()),
             catastrophic_cooldown: Mutex::new(HashMap::new()),
             last_exit_signal_at: Mutex::new(None),
+            entry_bid: Mutex::new(HashMap::new()),
         }
     }
 
@@ -73,6 +81,9 @@ impl ConvergenceStrategyImpl {
     fn record_exit(&self, token_id: &MarketId) {
         if let Ok(mut map) = self.post_exit_cooldown.lock() {
             map.insert(token_id.clone(), Instant::now());
+        }
+        if let Ok(mut map) = self.entry_bid.lock() {
+            map.remove(token_id);
         }
         if let Ok(mut last) = self.last_exit_signal_at.lock() {
             *last = Some(Instant::now());
@@ -278,6 +289,12 @@ impl Strategy for ConvergenceStrategyImpl {
             if want_bull { "YES" } else { "NO" }, ask, size,
         );
 
+        // Record the bid at entry time as the catastrophic-stop reference (see
+        // `entry_bid` field doc). Overwritten on re-entry; removed on exit.
+        if let Ok(mut map) = self.entry_bid.lock() {
+            map.insert(token_id.clone(), bid);
+        }
+
         Ok(StrategySignal::Entry {
             params: OrderParams {
                 token_id,
@@ -376,13 +393,25 @@ impl Strategy for ConvergenceStrategyImpl {
                 // -20%: with a tight 5% stop the old -20% floor let fast whipsaws (held <
                 // MIN_HOLD, so the normal stop can't fire yet) cost 4× the intended risk.
                 // Clamped so it can never be looser than CONVERGENCE_CATASTROPHIC_SL_PCT.
+                //
+                // 2026-07-14: measured against the bid AT ENTRY (when recorded), not the
+                // entry ask. Mark-to-bid vs ask shows an instant paper loss equal to the
+                // spread, which alone crossed this floor on wide books and stopped
+                // positions the same second they opened. The catastrophic stop exists to
+                // catch adverse MARKET moves; the regular SL (vs avg_entry, after
+                // MIN_HOLD) still accounts for the spread in realized terms.
                 let catastrophic_pct =
                     (-(dc.convergence_stop_loss_pct * config::CONVERGENCE_CATASTROPHIC_SL_MULT))
                         .max(config::CONVERGENCE_CATASTROPHIC_SL_PCT);
-                if profit_margin <= catastrophic_pct {
+                let cat_ref = self.entry_bid.lock().ok()
+                    .and_then(|m| m.get(token_id).copied())
+                    .filter(|b| *b > dec!(0))
+                    .unwrap_or(avg_entry);
+                let cat_move = (bid - cat_ref) / cat_ref;
+                if cat_move <= catastrophic_pct {
                     found = Some(make_exit(format!(
-                        "ConvergenceCatastrophic: bid=${:.4} loss={:.2}%",
-                        bid, profit_margin * dec!(100))));
+                        "ConvergenceCatastrophic: bid=${:.4} move={:.2}% (ref=${:.4}) pnl={:.2}%",
+                        bid, cat_move * dec!(100), cat_ref, profit_margin * dec!(100))));
                     break 'outer;
                 }
 

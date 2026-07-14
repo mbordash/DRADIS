@@ -312,8 +312,8 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Cap the take-profit target token price at this level.").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "trendcapture_catastrophic_sl_pct", "Catastrophic Stop", "pct", true,
             "Hard emergency stop-loss overriding the min-hold window.").range(0.0, 1.0).step(0.01));
-        v.push(F::new(g, e, "trendreversal_mode", "Follow Mode (invert fade)", "bool", true,
-            "When on, follow the confirmed move instead of fading it (A/B toggle)."));
+        v.push(F::new(g, e, "trendreversal_mode", "Fade Mode", "bool", true,
+            "ON = fade the 10m spike in a flat 60m macro (mean-reversion). OFF = legacy trend-following (buy with the confirmed drift)."));
     }
 
     // ── Convergence ───────────────────────────────────────────────────────────

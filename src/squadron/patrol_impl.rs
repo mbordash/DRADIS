@@ -401,6 +401,7 @@ impl Squadron {
                         continue;
                     }
                     info!("🔄 Market switch detected — restarting trading loop with new market context");
+                    crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::MarketRotate);
                     let mut cancel_success = false;
                     for i in 0..MAX_CANCEL_RETRIES {
                         let delay = BASE_CANCEL_RETRY_DELAY_MS * (1 << i);
@@ -456,6 +457,10 @@ impl Squadron {
                             .as_secs(),
                         AtomicOrdering::Relaxed,
                     );
+                    // Watchdog breadcrumb: we are building the market snapshot + evaluating
+                    // strategies. The executor refines this to the specific viper; a stall
+                    // before it reaches the executor still shows SIGNAL_EVAL.
+                    crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::SignalEval);
 
                     // Get hourly market snapshot
                     let (hourly_yb, hourly_ybd, hourly_ya, hourly_yad, hourly_yes_ws_ts) = *yes_price_rx.borrow();
@@ -543,6 +548,7 @@ impl Squadron {
                     if resolved_signals.is_empty() { continue; }
 
                     // ── Signal-processing timeout guard (45 s) ───────────────────────
+                    crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::OrderPlace);
                     let signal_processing_result = tokio::time::timeout(Duration::from_secs(45), async {
 
                     for (strategy_name, signal) in resolved_signals {
@@ -1162,6 +1168,8 @@ impl Squadron {
                     if signal_processing_result.is_err() {
                         warn!("⚠️ Signal processing timed out (45s) — select! loop unblocked, watchdog/heartbeat resume");
                     }
+                    // Tick complete — back to waiting in the select!.
+                    crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::Idle);
                 }
             }
         }

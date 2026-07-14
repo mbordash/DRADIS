@@ -229,6 +229,8 @@ async fn run() -> Result<()> {
         let hb = Arc::clone(&process_heartbeat_secs);
         std::thread::spawn(move || {
             const PROCESS_WATCHDOG_TIMEOUT_SECS: u64 = 300; // 5 minutes
+            const SOFT_WARN_SECS: u64 = 180; // early breadcrumb before the hard kill
+            let mut soft_warned = false;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(60));
                 let last_beat = hb.load(AtomicOrdering::Relaxed);
@@ -237,11 +239,31 @@ async fn run() -> Result<()> {
                     .unwrap_or_default()
                     .as_secs();
                 let silent_secs = now_secs.saturating_sub(last_beat);
+                // Lock-free read of the last activity breadcrumb — safe even if the
+                // tokio runtime is fully wedged on a std::sync primitive.
+                let (phase, phase_secs, seq) = dradis::helpers::watchdog::snapshot();
+
+                // Soft warning: emit ONE early breadcrumb naming the stalling phase so
+                // the cause is captured in logs even if the loop recovers before 300s.
+                if silent_secs > SOFT_WARN_SECS && silent_secs <= PROCESS_WATCHDOG_TIMEOUT_SECS {
+                    if !soft_warned {
+                        eprintln!(
+                            " OS WATCHDOG: trading loop silent for {}s (soft warn @ {}s) \
+                             — last phase={} (in phase {}s, seq={})",
+                            silent_secs, SOFT_WARN_SECS, phase, phase_secs, seq
+                        );
+                        soft_warned = true;
+                    }
+                } else if silent_secs <= SOFT_WARN_SECS {
+                    soft_warned = false; // loop is healthy again — re-arm the soft warn
+                }
+
                 if silent_secs > PROCESS_WATCHDOG_TIMEOUT_SECS {
                     eprintln!(
                         " OS WATCHDOG: trading loop silent for {}s (limit={}s) \
+                         — frozen phase={} (in phase {}s, seq={}) \
                          — calling process::exit(1) to trigger Docker restart",
-                        silent_secs, PROCESS_WATCHDOG_TIMEOUT_SECS
+                        silent_secs, PROCESS_WATCHDOG_TIMEOUT_SECS, phase, phase_secs, seq
                     );
                     std::process::exit(1);
                 }

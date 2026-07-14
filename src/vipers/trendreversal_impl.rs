@@ -9,29 +9,35 @@
 /// trades flipped the record to 73% wins / +$14.46. So the strategy now **fades**
 /// the drift instead of riding it.
 ///
-/// Entry trigger (unchanged): BTC has moved meaningfully over both the 10-minute
-/// AND 60-minute windows (sustained, confirmed drift), the token is in the tradable
-/// price band, and spot is meaningfully away from the strike.
+/// Entry trigger (fade mode, rework 2026-07-14): BTC has spiked meaningfully over
+/// the 10-minute window while the 60-minute macro is FLAT (|drift_60m| < align_thr)
+/// — an unabsorbed chop-regime spike, the population the flip study measured. The
+/// Jul 1-4 fade instead required 60m *confirmation* and faded genuine sustained
+/// trends (1W/16L). Follow mode keeps the legacy confirmed-drift trigger.
 ///
 /// Direction (flipped by `config::TRENDREVERSAL_MODE`, default true):
-///   - Strong UP drift   → BUY NO  (fade the priced-in up-move)
-///   - Strong DOWN drift → BUY YES (fade the priced-in down-move)
+///   - Strong UP spike   → BUY NO  (fade the unabsorbed up-spike)
+///   - Strong DOWN spike → BUY YES (fade the unabsorbed down-spike)
 ///   Set `TRENDREVERSAL_MODE = false` to restore the legacy trend-FOLLOWING
 ///   behaviour (UP→YES, DOWN→NO).
 ///
-/// Example — BTC crash (fade mode):
-///   drift_10m = −$150, drift_60m = −$400 (confirmed downtrend, already priced in)
-///   YES on the daily market is cheap (the crash is in the price)
-///   → BUY YES, targeting the mean-reversion bounce (wide TP) with a tight stop for
-///     when the downtrend instead continues (thesis wrong).
+/// Example — BTC flash dip in a flat hour (fade mode):
+///   drift_10m = −$150, drift_60m = +$40 (spike against a flat macro — chop)
+///   YES on the daily market just got cheap on an unabsorbed move
+///   → BUY YES, targeting the snap-back.
 ///
-/// # Exits (fade mode)
-///   Asymmetric "let winners run": wide take-profit (TRENDREVERSAL_TARGET_PROFIT_PCT)
-///   to capture the reversion, tight stop (TRENDREVERSAL_STOP_LOSS_PCT) because the
-///   failure mode — the trend continuing — is fast. An always-on catastrophic stop
-///   (TRENDCAPTURE_CATASTROPHIC_SL_PCT) backstops gap-throughs regardless of the
-///   min-hold window. The trend-FOLLOWING reversal exit is disabled in fade mode (a
-///   drift flip there is the thesis playing out, not a reason to bail).
+/// # Exits (fade mode, rework 2026-07-14)
+///   Mean-reversion geometry: modest take-profit (TRENDREVERSAL_TARGET_PROFIT_PCT,
+///   8%) — reversion off a chop spike is a snap-back, not a trend — with a WIDE stop
+///   (TRENDREVERSAL_STOP_LOSS_PCT, 12%) because adverse excursion before the
+///   reversion is normal (the old tight 5% stop was collected by a single noise
+///   tick: 16 of 17 Jul 1-4 exits were stops). A time-stop
+///   (TRENDREVERSAL_MAX_HOLD_SECS) exits stale positions at market, and a wide
+///   catastrophic floor (TRENDREVERSAL_CATASTROPHIC_SL_PCT, outside the 12% stop)
+///   backstops gap-throughs regardless of the min-hold window. Entries within
+///   TRENDREVERSAL_MIN_EDGE_FROM_FAIR of $0.50 are blocked (max-fee coin-flip
+///   zone). The trend-FOLLOWING reversal exit is disabled in fade mode (a drift
+///   flip there is the thesis playing out, not a reason to bail).
 ///
 /// # Venue
 ///   Window or Daily market (uses `maker_market` / `maker_snapshot` when available;
@@ -218,13 +224,7 @@ impl Strategy for TrendReversalStrategyImpl {
         let bear_drift_10m_thr = -bull_drift_10m_thr;
         let bull_strike_gap    = config::oracle_threshold(dc.trendcapture_strike_gap_pct, oracle_price);
         let bear_strike_gap    = bull_strike_gap;
-        let exhaustion_thr     = if dc.trendreversal_mode {
-            // Fade mode: tighter falling-knife ceiling — block extreme drift where
-            // the move is momentum (keeps running) rather than exhaustion (reverts).
-            config::oracle_threshold(config::TRENDREVERSAL_FADE_MAX_DRIFT_60M_PCT, oracle_price)
-        } else {
-            config::oracle_threshold(config::TRENDCAPTURE_EXHAUSTION_DRIFT_60M_PCT, oracle_price)
-        };
+        let exhaustion_thr     = config::oracle_threshold(config::TRENDCAPTURE_EXHAUSTION_DRIFT_60M_PCT, oracle_price);
 
         // ── Persistent cross-restart cascade guard ────────────────────────────
         // The in-memory post_exit_cooldown map (checked below) is WIPED on every
@@ -273,24 +273,37 @@ impl Strategy for TrendReversalStrategyImpl {
         //
         // With this gate: BEAR entry requires drift_60m < +alignment_thr.
         let align_thr = config::oracle_threshold(config::TRENDCAPTURE_DRIFT_60M_PCT, oracle_price);
-        let drift_60m_misaligned_bull = drift_60m <= -align_thr;   // 60m macro is bearish — don't go BULL
-        let drift_60m_misaligned_bear = drift_60m >=  align_thr;   // 60m macro is bullish — don't go BEAR
 
-        // ── 60m drift exhaustion ceiling ─────────────────────────────────────
-        // Block when the 60m move is so large the trend is already exhausted
-        // (tail-end capitulation risk).
-        let drift_60m_blocks_bull = drift_60m >= exhaustion_thr;
-        let drift_60m_blocks_bear = drift_60m <= -exhaustion_thr;
-
-        // ── Hard 60m regime confirmation (rework 2026-06-28) ──────────────────
-        // Require the 60m drift to actively AGREE with the 10m entry direction by
-        // at least align_thr, not merely "not oppose" it. This stands the strategy
-        // aside in chop (10m spike + flat 60m), the regime that produced the 22%
-        // win rate. Gated by TRENDCAPTURE_REQUIRE_60M_CONFIRMATION.
-        let drift_60m_confirms_bull = !config::TRENDCAPTURE_REQUIRE_60M_CONFIRMATION
-            || drift_60m >= align_thr;
-        let drift_60m_confirms_bear = !config::TRENDCAPTURE_REQUIRE_60M_CONFIRMATION
-            || drift_60m <= -align_thr;
+        // ── 60m regime gate (mode-dependent, rework 2026-07-14) ───────────────
+        //
+        // FOLLOW mode: require the 60m drift to actively AGREE with the 10m entry
+        // direction by ≥ align_thr (rework 2026-06-28), block 60m opposition, and
+        // block exhaustion (|drift_60m| ≥ exhaustion ceiling → tail-end capitulation).
+        //
+        // FADE mode: require the 60m macro to be FLAT (|drift_60m| < align_thr).
+        // A 10m spike against a flat macro is unabsorbed chop — the mean-reverting
+        // population the original 73%-win flip study measured. The Jul 1-4 fade
+        // (1W/16L) instead required 60m CONFIRMATION and then bought against it,
+        // i.e. it faded genuine sustained trends — a falling-knife catcher by
+        // construction. Flat-macro also subsumes the old falling-knife ceiling
+        // (TRENDREVERSAL_FADE_MAX_DRIFT_60M_PCT): align_thr is stricter.
+        let (regime_ok_bull, regime_ok_bear) = if dc.trendreversal_mode {
+            let macro_flat = drift_60m.abs() < align_thr;
+            (macro_flat, macro_flat)
+        } else {
+            let misaligned_bull = drift_60m <= -align_thr;   // 60m macro is bearish — don't go BULL
+            let misaligned_bear = drift_60m >=  align_thr;   // 60m macro is bullish — don't go BEAR
+            let blocks_bull = drift_60m >= exhaustion_thr;
+            let blocks_bear = drift_60m <= -exhaustion_thr;
+            let confirms_bull = !config::TRENDCAPTURE_REQUIRE_60M_CONFIRMATION
+                || drift_60m >= align_thr;
+            let confirms_bear = !config::TRENDCAPTURE_REQUIRE_60M_CONFIRMATION
+                || drift_60m <= -align_thr;
+            (
+                !misaligned_bull && confirms_bull && !blocks_bull,
+                !misaligned_bear && confirms_bear && !blocks_bear,
+            )
+        };
 
         // ── OBI adverse-direction veto ────────────────────────────────────────
         let yes_total_depth = snap.yes_bid_depth + snap.yes_ask_depth;
@@ -389,9 +402,7 @@ impl Strategy for TrendReversalStrategyImpl {
 
         // ══ BULL entry: buy YES when trend is strongly upward ════════════════
         if drift_10m >= bull_drift_10m_thr
-            && !drift_60m_misaligned_bull
-            && drift_60m_confirms_bull
-            && !drift_60m_blocks_bull
+            && regime_ok_bull
             && !obi_blocks_bull
             && !obi_exhausted_bull
             && !deriv_blocks_bull
@@ -415,6 +426,18 @@ impl Strategy for TrendReversalStrategyImpl {
                 } else {
                     (market.yes_token.clone(), yes_ask, snap.yes_bid, snap.yes_bid_depth, market.yes_fee_bps as u16)
                 };
+
+                // ── Coin-flip-zone gate (fade mode) ──────────────────────────
+                // Polymarket's fee (CRYPTO_FEE_RATE·p·(1−p)) peaks at $0.50; every
+                // Jul 1-4 fade entry sat in the $0.43-0.58 max-fee band where ~3.6%
+                // round-trip fees consume most of the 8% reversion target.
+                if dc.trendreversal_mode
+                    && (buy_ask - dec!(0.50)).abs() < config::TRENDREVERSAL_MIN_EDGE_FROM_FAIR
+                {
+                    debug!(" TrendReversal BULL→fade blocked: buy_ask={:.3} within ±{:.2} of $0.50 (max-fee coin-flip zone)",
+                        buy_ask, config::TRENDREVERSAL_MIN_EDGE_FROM_FAIR);
+                    return Ok(StrategySignal::NoSignal);
+                }
 
                 // Per-token spread gate on the BOUGHT token: a hollow bid side
                 // guarantees an instant stop-out (SL is measured against the bid).
@@ -457,9 +480,7 @@ impl Strategy for TrendReversalStrategyImpl {
 
         // ══ BEAR entry: buy NO when trend is strongly downward ═══════════════
         if drift_10m <= bear_drift_10m_thr
-            && !drift_60m_misaligned_bear
-            && drift_60m_confirms_bear
-            && !drift_60m_blocks_bear
+            && regime_ok_bear
             && !obi_blocks_bear
             && !obi_exhausted_bear
             && !deriv_blocks_bear
@@ -482,6 +503,15 @@ impl Strategy for TrendReversalStrategyImpl {
                 } else {
                     (market.no_token.clone(),  no_ask,  snap.no_bid,  snap.no_bid_depth,  market.no_fee_bps as u16)
                 };
+
+                // ── Coin-flip-zone gate (fade mode) — see BULL branch ─────────
+                if dc.trendreversal_mode
+                    && (buy_ask - dec!(0.50)).abs() < config::TRENDREVERSAL_MIN_EDGE_FROM_FAIR
+                {
+                    debug!(" TrendReversal BEAR→fade blocked: buy_ask={:.3} within ±{:.2} of $0.50 (max-fee coin-flip zone)",
+                        buy_ask, config::TRENDREVERSAL_MIN_EDGE_FROM_FAIR);
+                    return Ok(StrategySignal::NoSignal);
+                }
 
                 // Per-token spread gate on the BOUGHT token (see Jun 20 id 51:
                 // NO ask 0.326 / bid 0.241 = 26% spread → instant −23% stop-out).
@@ -570,9 +600,11 @@ impl Strategy for TrendReversalStrategyImpl {
         // Tradelog/reason tag reflecting the active thesis.
         let tag = if dc.trendreversal_mode { "TrendReversal" } else { "TrendCapture" };
 
-        // Stop-loss percentage. In fade mode use the tight TRENDREVERSAL stop (the
-        // failure mode is the trend continuing, which is fast). Otherwise the legacy
-        // dynamic stop (tighter near expiry).
+        // Stop-loss percentage. In fade mode use the wide TRENDREVERSAL stop —
+        // mean-reversion positions must tolerate adverse excursion before the
+        // reversion arrives (a tight stop collected every noise tick, Jul 1-4:
+        // 16 of 17 exits were stops). Otherwise the legacy dynamic stop
+        // (tighter near expiry).
         let stop_loss_pct = if dc.trendreversal_mode {
             config::TRENDREVERSAL_STOP_LOSS_PCT
         } else {
@@ -582,7 +614,17 @@ impl Strategy for TrendReversalStrategyImpl {
             }
         };
 
-        // Take-profit target. Fade mode lets the reversion run to a wide target.
+        // Catastrophic hard floor. In fade mode this must sit OUTSIDE the wide
+        // 12% reversion stop (the legacy 6-10% floor would fire first and become
+        // the effective stop — the exact Jul 1-4 failure mode). Follow mode keeps
+        // the tighter dynamic-config value.
+        let catastrophic_sl_pct = if dc.trendreversal_mode {
+            config::TRENDREVERSAL_CATASTROPHIC_SL_PCT.max(dc.trendcapture_catastrophic_sl_pct)
+        } else {
+            dc.trendcapture_catastrophic_sl_pct
+        };
+
+        // Take-profit target. Fade mode takes the modest reversion snap-back.
         let tp_target = if dc.trendreversal_mode {
             config::TRENDREVERSAL_TARGET_PROFIT_PCT
         } else {
@@ -625,7 +667,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 // Wait for fill confirmation before any non-catastrophic exit
                 if position.fill_confirmed_at.is_none() {
                     let loss_pct = (avg_entry - bid) / avg_entry;
-                    if loss_pct < dc.trendcapture_catastrophic_sl_pct {
+                    if loss_pct < catastrophic_sl_pct {
                         continue;
                     }
                 }
@@ -655,7 +697,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 // (30s) had NO stop at all — the exact blackout that let the 2026-06-29
                 // 09:30 trade gap from entry to −18% in 34s before the normal 5% stop
                 // became eligible. The hard catastrophic floor must never be frozen.
-                if profit_margin <= -dc.trendcapture_catastrophic_sl_pct {
+                if profit_margin <= -catastrophic_sl_pct {
                     found = Some(make_exit(format!(
                         "{}Catastrophic: bid=${:.4}, loss={:.2}%",
                         tag, bid, profit_margin * dec!(100)), true));
@@ -688,6 +730,21 @@ impl Strategy for TrendReversalStrategyImpl {
                     && profit_margin <= -stop_loss_pct
                 {
                     found = Some(make_exit(format!("{}SL: bid=${:.4}, loss={:.2}%", tag, bid, profit_margin * dec!(100)), true));
+                    break 'outer;
+                }
+
+                // ── Time-stop (fade mode, 2026-07-14) ─────────────────────────
+                // A chop-regime reversion either arrives within the window or the
+                // thesis is stale. Exit at market rather than letting a dead
+                // position drift into the wide 12% stop or expiry. A losing
+                // time-stop counts as an SL for the consecutive-loss cooldown.
+                if dc.trendreversal_mode
+                    && secs_held >= config::TRENDREVERSAL_MAX_HOLD_SECS
+                {
+                    found = Some(make_exit(format!(
+                        "{}TimeStop: bid=${:.4}, pnl={:.2}% after {}s",
+                        tag, bid, profit_margin * dec!(100), secs_held),
+                        profit_margin < dec!(0)));
                     break 'outer;
                 }
 

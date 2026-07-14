@@ -91,6 +91,14 @@ pub async fn execute_strategies_concurrent(
         let strategy_name = strategy.name().to_string();
         let start = Instant::now();
 
+        // Watchdog breadcrumb: name the strategy currently evaluating. A synchronous
+        // std::sync-lock stall inside evaluate_* can't be interrupted by the timeout
+        // below (the future never yields), so this atomic is what lets the OS-thread
+        // watchdog report WHICH strategy froze instead of just "silent for Ns".
+        crate::helpers::watchdog::enter_eval(
+            crate::helpers::watchdog::signal_detail_for(&strategy_name),
+        );
+
         // Evaluate entry and exit in parallel using tokio::join!, wrapped in a hard timeout.
         // Previously `timeout_ms` was silently ignored (prefixed `_timeout_ms`), meaning a
         // single hung strategy evaluation (e.g. StdMutex contention during GBoost retrain)

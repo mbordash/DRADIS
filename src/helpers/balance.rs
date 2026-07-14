@@ -756,6 +756,23 @@ pub async fn arb_pair_fill_monitor(
               strategy_name, rehedge_price, dynamic_ceiling);
     }
 
+    // ── Purge the abandoned missing leg ─────────────────────────────────────────
+    // Reaching here means we've committed to flattening the FILLED leg instead of
+    // completing the pair (re-hedge was uneconomical or its FAK failed), so the
+    // missing leg will never be held. It never filled on-chain (balance 0 — rechecked
+    // above), which is exactly why the 5-min orphan backstop can't clean it: that
+    // backstop keys off *on-chain* holdings, and a zero-balance leg is invisible to
+    // it. Left alone, the missing leg's entry row lingers forever as a phantom
+    // "pending" open_position (fake notional on the dashboard, a stale token-ownership
+    // claim that blocks re-entry, polluted P&L). Drop it now from the DB, the
+    // in-memory map, and the ownership set. Idempotent: the sync task may have already
+    // phantom-removed the in-memory entry, and deleting an absent DB row is a no-op.
+    positions.lock().await.remove(&(strategy_name.clone(), missing_market.clone()));
+    token_ownership.lock().await.remove(&missing_market);
+    if let Some(pool) = crate::helpers::db::pool_for(&asset) {
+        crate::helpers::db::close_open_position(&pool, &strategy_name, &missing_token.to_string()).await;
+    }
+
     // ── Guaranteed bid-flatten: a naked leg must NEVER ride to settlement ────────
     // When re-hedge is impossible/uneconomical we immediately FAK-SELL the filled leg
     // at the live bid. Worst case is the spread (~1–3¢/share) instead of a full leg
@@ -820,6 +837,11 @@ pub async fn arb_pair_fill_monitor(
             // The filled leg has been flattened — release its token claim so other
             // strategies aren't blocked on a position we no longer hold.
             token_ownership.lock().await.remove(&filled_market);
+            // Purge the filled leg's DB row too, so it can't linger as a phantom if the
+            // on-chain-keyed backstop races or misses it (defense in depth).
+            if let Some(pool) = crate::helpers::db::pool_for(&asset) {
+                crate::helpers::db::close_open_position(&pool, &strategy_name, &filled_token.to_string()).await;
+            }
             // Record the realized result so the dashboard reflects the true (small) loss.
             crate::helpers::metrics::record_trade(
                 &asset,
