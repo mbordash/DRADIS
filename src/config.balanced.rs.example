@@ -204,6 +204,8 @@ pub const MAKER_LATE_MARKET_STOP_TIGHTEN_SECS: i64 = 2700;
 pub const MAKER_LATE_MARKET_STOP_LOSS_PERCENT: Decimal = dec!(0.05);
 pub const MAKER_MIN_HOLD_SECS_BEFORE_STOP: i64 = 720;
 pub const MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = MAKER_MIN_HOLD_SECS_BEFORE_STOP;
+/// Catastrophic floor at (live SL × mult), ungated by min-hold (2026-07-14).
+pub const MAKER_CATASTROPHIC_SL_MULT: Decimal = dec!(1.5);
 pub const MAKER_STOP_LOSS_COOLDOWN_SECS: i64 = 720;
 pub const MAKER_MAX_COMBINED_BID: Decimal = dec!(0.89);
 pub const MAKER_MAX_BOOK_IMBALANCE_RATIO: Decimal = dec!(3.0);
@@ -369,7 +371,10 @@ pub const GBOOST_MIN_ENTRY_PRICE: Decimal = dec!(0.40); // Raised from 0.35 — 
 pub const GBOOST_MAX_YES_ENTRY_PRICE: Decimal = dec!(0.55);
 pub const GBOOST_MAX_NO_ENTRY_PRICE: Decimal = dec!(0.45);
 pub const GBOOST_HISTORY_BUFFER_SIZE: usize = 1000;
-pub const GBOOST_LOOKAHEAD_TICKS: usize = 200;
+pub const GBOOST_LOOKAHEAD_TICKS: usize = 200; // legacy — superseded 2026-07-14 by GBOOST_LABEL_HORIZON_SECS
+pub const GBOOST_HISTORY_MIN_SPACING_MS: i64 = 500; // time-decimated snapshot buffer
+pub const GBOOST_LABEL_HORIZON_SECS: i64 = 180; // oracle-based label: BTC higher after 180s
+pub const GBOOST_LABEL_MIN_ORACLE_MOVE_FRAC: f64 = 0.0002; // skip flat samples (<2bp move)
 pub const GBOOST_MIN_TRAINING_SAMPLES: usize = 320;
 pub const GBOOST_RETRAIN_EVERY_N: usize = 200;
 /// Hard minimum wall-clock interval (seconds) between successful GBoost retrains.
@@ -382,6 +387,9 @@ pub const GBOOST_PRED_LOG_INTERVAL_SECS: u64 = 120; // periodic P(UP) conviction
 pub const GBOOST_POST_EXIT_COOLDOWN_SECS: i64 = 300;
 /// Balanced: matches current config.rs — tightened from -0.20 based on 2026-05-07 session data.
 pub const GBOOST_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.25);
+/// OBI EMA smoothing (2026-07-14): gates consume time-based EMA of OBI, not raw ticks.
+pub const GBOOST_OBI_EMA_TAU_SECS: f64 = 60.0;
+pub const GBOOST_OBI_EMA_STALE_SECS: f64 = 30.0;
 /// Minimum fraction of price distance from 0.50 required for a GBoost entry.
 /// Balanced: same as default — blocks coin-flip entries at 50/50.
 pub const GBOOST_MIN_EDGE_FROM_FAIR: Decimal = dec!(0.04);
@@ -407,8 +415,8 @@ pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.075); // balanced: 7.5% —
 pub const GBOOST_MIN_HOLD_SECS: i64 = 180;
 pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 10;
 pub const GBOOST_MIN_USABLE_TREES: usize = 30;
-pub const GBOOST_MODEL_FILENAME: &str = "gboost_model_v26f.json";
-pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v26f.json";
+pub const GBOOST_MODEL_FILENAME: &str = "gboost_model_v26f_o180.json";
+pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v26f_o180.json";
 /// Max fraction of identical labels before skipping a retrain cycle (avoids degenerate storms).
 pub const GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX: f64 = 0.80;
 /// 60m oracle drift threshold (USD) for the trend-alignment entry gate.
@@ -544,13 +552,18 @@ pub const TRENDCAPTURE_EXIT_SIGNAL_COOLDOWN_SECS: u64 = 180;
 /// Balanced: standard OBI gates — same as default config.rs.
 pub const TRENDCAPTURE_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.35);
 
-// ── TrendReversal mode (2026-06-29) ──────────────────────────────────────────
-// Fade the detected drift (buy the opposite token) instead of following it.
-pub const TRENDREVERSAL_MODE: bool = false;  // A/B TEST: follow (invert fade). Data 07-02→03: fade 0W/9L, drift continued not reverted.
+// ── TrendReversal mode (2026-06-29, reworked 2026-07-14) ─────────────────────
+// true = fade a sharp 10m spike inside a FLAT 60m macro (mean-reversion);
+// false = legacy trend-following (lost 79% of trades; the old fade-the-trend
+// variant went 1W/16L — see trendreversal_impl.rs doc header).
+pub const TRENDREVERSAL_MODE: bool = true;
 pub const TRENDREVERSAL_EXHAUSTION_MULT: Decimal = dec!(1.0);
 pub const TRENDREVERSAL_FADE_MAX_DRIFT_60M_PCT: Decimal = dec!(0.005);
-pub const TRENDREVERSAL_TARGET_PROFIT_PCT: Decimal = dec!(0.18);
-pub const TRENDREVERSAL_STOP_LOSS_PCT: Decimal = dec!(0.05);
+pub const TRENDREVERSAL_TARGET_PROFIT_PCT: Decimal = dec!(0.08);
+pub const TRENDREVERSAL_STOP_LOSS_PCT: Decimal = dec!(0.12);
+pub const TRENDREVERSAL_MAX_HOLD_SECS: i64 = 2700; // fade time-stop: exit at market after 45 min
+pub const TRENDREVERSAL_CATASTROPHIC_SL_PCT: Decimal = dec!(0.18); // hard floor, ungated
+pub const TRENDREVERSAL_MIN_EDGE_FROM_FAIR: Decimal = dec!(0.05); // block coin-flip-zone entries
 
 pub const TRENDCAPTURE_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.75);
 

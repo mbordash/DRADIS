@@ -524,9 +524,15 @@ impl Strategy for MakerStrategyImpl {
             .map(|t| (t - Utc::now()).num_seconds())
             .unwrap_or(9999);
 
-        // Near-expiry forced exit to avoid binary resolution risk
+        // Near-expiry forced exit to avoid binary resolution risk.
+        //
+        // 2026-07-14: fires at maker_min_secs_to_expiry (1800s) instead of a hardcoded
+        // 900s. Quoting already stops at 1800s, so the old 900s threshold left a
+        // 15-minute dead zone holding pure directional risk with no new quotes — a
+        // YES @ $0.48 rode through it to resolution at $0.004 (−$3.81, the single
+        // largest maker loss). Flatten the moment the strategy stops quoting.
         let profit_threshold = dec!(0.02);
-        if secs_to_expiry < 900 {
+        if secs_to_expiry < dc.maker_min_secs_to_expiry {
             let pos_map = ctx.positions.lock().await;
             for token_id in [market.yes_token.clone(), market.no_token.clone()] {
                 if let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id.clone())) {
@@ -636,6 +642,29 @@ impl Strategy for MakerStrategyImpl {
             let secs_since_fill = position.fill_confirmed_at
                 .map(|t| (Utc::now() - t).num_seconds())
                 .unwrap_or(0);
+
+            // Catastrophic floor — ungated by the min-hold and by fill confirmation,
+            // so a fast adverse move during the stop's blind window (or on an adopted
+            // position) is still cut. See MAKER_CATASTROPHIC_SL_MULT.
+            let catastrophic_pct = effective_stop_pct * config::MAKER_CATASTROPHIC_SL_MULT;
+            if profit_pct <= -catastrophic_pct {
+                return Ok(StrategySignal::Exit {
+                    params: OrderParams {
+                        token_id: token_id.clone(),
+                        price: bid,
+                        shares: position.shares,
+                        fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
+                        is_neg_risk: market.is_neg_risk,
+                        market_name: market.market_name.clone(),
+                        condition_id: market.condition_id.clone(),
+                        order_type: TimeInForce::Fak,
+                        post_only: false,
+                        ghost_mode: dc.ghost_mode,
+                    },
+                    reason: format!("Maker Catastrophic: loss={:.2}% ({}s held)", profit_pct * dec!(100), secs_since_fill),
+                    exit_pair: false,
+                });
+            }
 
             if position.fill_confirmed_at.is_some() && profit_pct >= dc.maker_target_profit_pct {
                 return Ok(StrategySignal::Exit {
