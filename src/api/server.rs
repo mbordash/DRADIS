@@ -1389,12 +1389,30 @@ async fn get_squadron_by_id(
 /// The class is resolved once at registration by `Squadron::classify_and_link`
 /// and persisted on the `squadron_configs` row; here we read it back and expand
 /// it through the join tables so the UI can render data-driven cards instead of
-/// a hardcoded set. Falls back to `"unknown"` (→ venue-agnostic vipers only).
+/// a hardcoded set.
+///
+/// In read-only demo mode (or when the DB row doesn't exist), infers the class
+/// from the asset symbol instead of relying on the missing squadron_configs row.
 async fn enrich_taxonomy(summary: &mut crate::cag::SquadronSummary) {
     let Some(pool) = db::pool() else { return };
-    let class = db::get_squadron_market_class(pool, &summary.id)
-        .await
-        .unwrap_or_else(|| "unknown".to_string());
+
+    // Try to read the persisted market_class first.
+    let class = match db::get_squadron_market_class(pool, &summary.id).await {
+        Some(c) if !c.is_empty() && c != "unknown" => c,
+        _ => {
+            // No DB row (read-only mode) or empty/unknown class — infer from asset.
+            // BTC/ETH/SOL are always crypto; custom assets fall back to classification.
+            let asset_lower = summary.asset.to_ascii_lowercase();
+            if matches!(asset_lower.as_str(), "btc" | "eth" | "sol") {
+                "crypto".to_string()
+            } else {
+                // For custom assets, attempt classification from the market name.
+                let symbols: [&str; 0] = [];
+                db::classify_market(pool, "", &symbols, &summary.market_name).await
+            }
+        }
+    };
+
     summary.raptors = db::raptors_for_class(pool, &class).await;
     summary.vipers = db::vipers_for_class(pool, &class).await;
     summary.market_class = class;
@@ -1413,11 +1431,26 @@ async fn get_config_schema() -> Response {
 
 /// GET /api/squadrons/{id}/config
 ///
-/// Returns the squadron's DynamicConfig as JSON, or 404 if squadron not found.
+/// Returns the squadron's DynamicConfig as JSON.
+/// In read-only demo mode (or if no DB row exists yet), returns compile-time defaults.
 async fn get_squadron_config(
     Path(id): Path<String>,
 ) -> Response {
     debug!("Received GET /api/squadrons/{}/config", id);
+
+    // In read-only demo mode, squadron configs are never persisted to DB, so
+    // we return compile-time defaults directly rather than 404.
+    if crate::helpers::dynamic_config::read_only_mode() {
+        debug!("READ-ONLY mode: returning compile-time defaults for squadron {}", id);
+        match serde_json::to_value(&DynamicConfig::default()) {
+            Ok(val) => return (StatusCode::OK, Json(val)).into_response(),
+            Err(e) => {
+                error!("Error serializing default config for {}: {}", id, e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, e.to_string()).into_response();
+            }
+        }
+    }
+
     match db::pool() {
         Some(pool) => {
             if let Some(json) = db::squadron_config_get(&pool, &id).await {

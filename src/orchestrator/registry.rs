@@ -82,7 +82,7 @@ impl StrategyRegistry {
         Self::log_active_thresholds();
         vec![
             Box::new(MomentumStrategyImpl::new())          as Box<dyn Strategy>,
-            Box::new(ArbitrageStrategyImpl)                as Box<dyn Strategy>,
+            Box::new(ArbitrageStrategyImpl::default())                as Box<dyn Strategy>,
             Box::new(TimeDecayStrategyImpl)                as Box<dyn Strategy>,
             Box::new(MakerStrategyImpl::new())             as Box<dyn Strategy>,
             Box::new(BasisStrategyImpl)                    as Box<dyn Strategy>,
@@ -99,7 +99,7 @@ impl StrategyRegistry {
 
     /// Create only arbitrage strategy
     pub fn create_arbitrage() -> Box<dyn Strategy> {
-        Box::new(ArbitrageStrategyImpl)
+        Box::new(ArbitrageStrategyImpl::default())
     }
 
     /// Create only time decay strategy

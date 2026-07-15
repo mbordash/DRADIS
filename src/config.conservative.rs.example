@@ -35,6 +35,10 @@ pub const ENABLE_ARBITRAGE_TRADING: bool = true;
 pub const ARBITRAGE_PROFIT_THRESHOLD: Decimal = dec!(0.025);
 pub const ARBITRAGE_MAX_TAKER_FEE_BPS: u32 = 1500; // Updated from 100
 
+/// Quote-persistence debounce: profitable bid_sum must hold continuously this many
+/// seconds before the arb enters (filters phantom arbs during fast BTC moves).
+pub const ARB_QUOTE_PERSISTENCE_SECS: u64 = 5;
+
 /// Maximum allowable gap between our safe bid and the current ask on each arb leg.
 /// Conservative profile: 3 ticks — only enter when the book is tight on both legs.
 pub const ARBITRAGE_MAX_FILL_GAP: Decimal = dec!(0.03);

@@ -30,11 +30,19 @@ use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::vipers::is_drawdown_limit_hit;
 use crate::venues::core::TimeInForce;
-use tracing::debug;
+use tracing::{debug, info};
+use std::sync::Mutex;
+use std::time::Instant;
 
 const STRATEGY_NAME: &str = "ArbitrageStrategy";
 
-pub struct ArbitrageStrategyImpl;
+#[derive(Default)]
+pub struct ArbitrageStrategyImpl {
+    /// Quote-persistence debounce state: (market condition_id, first Instant the
+    /// profitable bid_sum was observed). Reset whenever the condition breaks or
+    /// the market rotates. See ARB_QUOTE_PERSISTENCE_SECS.
+    profitable_since: Mutex<Option<(String, Instant)>>,
+}
 
 #[async_trait]
 impl Strategy for ArbitrageStrategyImpl {
@@ -92,7 +100,39 @@ impl Strategy for ArbitrageStrategyImpl {
 
         // ── Maker arb profitability gate (0% fee on GTC fills) ───────────────
         if !is_maker_arb_profitable(yes_bid, no_bid, dc.arbitrage_profit_threshold) {
+            // Condition broke — reset the persistence clock.
+            *self.profitable_since.lock().unwrap() = None;
             return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Quote-persistence debounce (anti-phantom-arb) ────────────────────
+        // A single-snapshot profit check passes on transient book dislocations
+        // during fast BTC moves ("phantom arbs" — 2026-07-15 09:21: YES filled
+        // @ $0.90, the book reverted within 12s, NO never filled, orphan
+        // flattened at a loss). Genuine resting-quote arbs sit on the book for
+        // minutes, so require the profitable condition to persist continuously
+        // for ARB_QUOTE_PERSISTENCE_SECS before entering.
+        {
+            let mut guard = self.profitable_since.lock().unwrap();
+            match guard.as_ref() {
+                Some((cid, first_seen)) if *cid == market.condition_id => {
+                    let held = first_seen.elapsed().as_secs();
+                    if held < crate::config::ARB_QUOTE_PERSISTENCE_SECS {
+                        debug!(
+                            " Arb debounce — profitable quote held {}s < {}s required",
+                            held, crate::config::ARB_QUOTE_PERSISTENCE_SECS
+                        );
+                        return Ok(StrategySignal::NoSignal);
+                    }
+                    // Persisted long enough — fall through to the remaining gates.
+                }
+                _ => {
+                    // First sighting (or market rotated) — start the clock.
+                    *guard = Some((market.condition_id.clone(), Instant::now()));
+                    debug!(" Arb debounce — profitable quote first seen, starting persistence clock");
+                    return Ok(StrategySignal::NoSignal);
+                }
+            }
         }
 
         // ── Conviction (anti-coin-flip) gate ─────────────────────────────────
@@ -449,6 +489,52 @@ impl Strategy for ArbitrageStrategyImpl {
                     },
                     reason: "Arbitrage convergence".to_string(),
                     exit_pair: true,
+                });
+            }
+        }
+
+        // ── Naked single-leg exit (restart-orphan guard, 2026-07-15) ─────────
+        // The ARB ARBITER that rescues/flattens one-sided fills is an in-process
+        // task: a redeploy kills it, and ChainReconcile re-adopts the naked leg
+        // as a position that the pair-only exit above can never touch. On 07-12
+        // two such legs rode to $0 settlement (−$7.70 combined). If we hold
+        // exactly ONE leg of the pair — confirmed filled and older than the
+        // arbiter's full rescue window (so we never fight a live arbiter) —
+        // flatten it at bid via FAK. A naked arb leg is an unintended
+        // directional bet; realizing the small flatten cost strictly dominates
+        // settlement roulette.
+        let single_leg = match (pos_map.get(&yes_key), pos_map.get(&no_key)) {
+            (Some(p), None) => Some((p, market.yes_token.clone(), snapshot.yes_bid,
+                                     market.yes_fee_bps as u16, "YES")),
+            (None, Some(p)) => Some((p, market.no_token.clone(), snapshot.no_bid,
+                                     market.no_fee_bps as u16, "NO")),
+            _ => None,
+        };
+        if let Some((pos, token, bid, fee_bps, leg)) = single_leg {
+            let age_secs = (chrono::Utc::now() - pos.opened_at).num_seconds();
+            let arbiter_window =
+                crate::helpers::balance::MAX_WAIT_SECS_WINDOW + 60; // grace margin
+            if pos.fill_confirmed_at.is_some() && age_secs > arbiter_window && bid > Decimal::ZERO {
+                info!(
+                    " Arb naked-leg flatten — holding only {} leg ({} shares, age {}s) \
+                     with no live arbiter; exiting at bid {:.3}",
+                    leg, pos.shares, age_secs, bid
+                );
+                return Ok(StrategySignal::Exit {
+                    params: OrderParams {
+                        token_id: token,
+                        price: bid,
+                        shares: pos.shares,
+                        fee_bps,
+                        is_neg_risk: market.is_neg_risk,
+                        market_name: market.market_name.clone(),
+                        condition_id: market.condition_id.clone(),
+                        order_type: TimeInForce::Fak,
+                        post_only: false,
+                        ghost_mode: dc.ghost_mode,
+                    },
+                    reason: format!("Arb naked {} leg flatten (orphaned single-leg)", leg),
+                    exit_pair: false,
                 });
             }
         }

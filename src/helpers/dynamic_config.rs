@@ -541,7 +541,7 @@ const DB_KEY: &str = "dynamic_config";
 /// config.rs. The demo DB is never edited via the UI (all mutations are rejected),
 /// so without this its stale config rows would shadow newer config.rs constants
 /// (e.g. a lowered take-profit) indefinitely. Live deployments are unaffected.
-fn read_only_mode() -> bool {
+pub fn read_only_mode() -> bool {
     std::env::var("DRADIS_READ_ONLY")
         .ok()
         .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
