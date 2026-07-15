@@ -24,7 +24,7 @@ use rust_decimal::Decimal;
 use chrono::{DateTime, Utc};
 use anyhow::Result;
 use serde::Serialize;
-use tracing::{error, info, debug};
+use tracing::{error, info, debug, warn};
 
 use crate::config;
 
@@ -1447,6 +1447,52 @@ pub async fn market_has_matching_trade(pool: &SqlitePool, market: &str, shares: 
     })
 }
 
+/// Returns true if a SETTLEMENT trade row already exists for `market` + `side` with a
+/// share count matching `shares` within dust tolerance.
+///
+/// Settlement-scoped variant of `market_has_matching_trade`. The generic market+shares
+/// match is too weak for resolution-time booking: an earlier same-session round-trip on
+/// the same market with the same share count (e.g. a 15-share orphan flatten in the
+/// morning, then a fresh 15-share arb pair at noon) false-matches and silently drops
+/// the settlement row (observed 2026-07-15: the winning YES leg's +$1.50 was never
+/// booked because the 09:23 "Orphan flatten" row matched on market+shares).
+pub async fn market_has_settlement_trade(
+    pool: &SqlitePool,
+    market: &str,
+    side: &str,
+    shares: Decimal,
+) -> bool {
+    let share_dust = Decimal::new(1, 3); // 0.001
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT shares FROM trades WHERE market = ? AND side = ? AND reason LIKE 'Settlement%'"
+    )
+        .bind(market)
+        .bind(side)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+    rows.iter().any(|s| {
+        s.parse::<Decimal>()
+            .map(|v| (v - shares).abs() <= share_dust)
+            .unwrap_or(false)
+    })
+}
+
+/// Returns true if any resolution-time settlement row ("pending redemption") already
+/// exists for `market`. Used by auto_settle to avoid double-booking P&L that chain-sync
+/// already recognized at resolution — the later on-chain redemption is then a cash-only
+/// event.
+pub async fn market_has_pending_redemption_settlement(pool: &SqlitePool, market: &str) -> bool {
+    sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM trades WHERE market = ? AND reason LIKE '%pending redemption%' LIMIT 1"
+    )
+        .bind(market)
+        .fetch_optional(pool)
+        .await
+        .unwrap_or(None)
+        .is_some()
+}
+
 /// Delete every `open_positions` row whose token_id is NOT in `live_token_ids`.
 ///
 /// Called by the chain-sync task after it fetches the wallet's actual live positions
@@ -1462,9 +1508,19 @@ pub async fn market_has_matching_trade(pool: &SqlitePool, market: &str, shares: 
 /// auditable. Settlements/normal closes are skipped via `market_has_matching_trade`
 /// (they are already booked), and `pending` rows are never booked (they may be
 /// never-filled orders — booking them would fabricate P&L).
+///
+/// Resolution-time settlement recognition (2026-07-15, accrual accounting): tokens in
+/// `redeemable_marks` belong to RESOLVED markets — the wallet still holds them but
+/// their value is final ($1.00 winner / $0.00 loser). Waiting for on-chain redemption
+/// to book the winner (while the loser's row is reconciled immediately) makes net P&L
+/// dip negative for minutes-to-hours on every settled arb pair. Instead, book both
+/// legs HERE at their resolved value with reason "Settlement (won/lost — pending
+/// redemption)"; auto_settle's later redemption becomes a cash-only event.
 pub async fn purge_stale_open_positions(
     pool: &SqlitePool,
     live_token_ids: &std::collections::HashSet<String>,
+    // token_id → (resolved cur_price, on-chain size) for redeemable positions
+    redeemable_marks: &std::collections::HashMap<String, (Decimal, Decimal)>,
 ) -> usize {
     // A row may legitimately sit `status='pending'` for a SHORT time between the
     // strategy's INSERT and the Polymarket Data API indexing the resulting fill.
@@ -1499,6 +1555,65 @@ pub async fn purge_stale_open_positions(
 
         let status_str = status.as_deref().unwrap_or("confirmed");
         let is_pending = status_str == "pending";
+
+        // ── Resolution-time settlement booking (redeemable tokens) ──────────────
+        // The wallet still HOLDS this token but the market has resolved: its value
+        // is final. Book the leg at exactly $1.00 (winner) or $0.00 (loser) now, so
+        // net P&L is correct the moment the market resolves instead of after the
+        // on-chain redemption lands. Applies to `pending` rows too — a redeemable
+        // wallet holding proves the fill happened.
+        if let Some((resolved_mark, chain_size)) = redeemable_marks.get(&token_id) {
+            let entry = entry_price.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+            let row_qty = shares.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+            let qty = if *chain_size > Decimal::ZERO { *chain_size } else { row_qty };
+            // Settlement pays exactly $1.00 or $0.00; cur_price on a redeemable
+            // position is ~0.9995/~0.0005 — snap to the true payout.
+            let resolved_px = if *resolved_mark >= Decimal::new(5, 1) { Decimal::ONE } else { Decimal::ZERO };
+            let won = resolved_px == Decimal::ONE;
+
+            if entry > Decimal::ZERO && qty > Decimal::ZERO {
+                if market_has_settlement_trade(pool, &market, &side, qty).await {
+                    debug!(
+                        "🧾 Resolution booking: settlement already recorded for {} {} {} sh — skipping",
+                        market, side, qty
+                    );
+                } else {
+                    let pnl = (resolved_px - entry) * qty;
+                    let reason = format!(
+                        "Settlement ({} — pending redemption)",
+                        if won { "won" } else { "lost" }
+                    );
+                    let inserted = record_settlement_trade_idempotent(
+                        pool, &strategy, &market, &side, entry, resolved_px, qty, pnl, &reason, None,
+                    ).await;
+                    if inserted {
+                        info!(
+                            "🧾 Resolution booking: {} {} {} | {} sh entry=${:.4} → resolved ${:.2} → pnl=${:.4} (redemption pending)",
+                            strategy, market, side, qty, entry, resolved_px, pnl
+                        );
+                    }
+                }
+            } else {
+                warn!(
+                    "🧾 Resolution booking: {} \"{}\" resolved but cost basis unknown \
+                     (entry={} qty={}) — trade row omitted; redemption cash lands in collateral",
+                    strategy, market, entry_price, shares
+                );
+            }
+
+            // Row is resolved — always delete (never re-adopt a settled token).
+            if let Err(e) = sqlx::query("DELETE FROM open_positions WHERE id = ?")
+                .bind(id)
+                .execute(pool)
+                .await
+            {
+                error!("❌ DB purge_stale_open_positions delete failed for id {}: {}", id, e);
+            } else {
+                purged += 1;
+            }
+            continue;
+        }
+
         if is_pending {
             // Keep only if still inside the in-flight grace window. An unparseable
             // timestamp is treated as old (purge) so malformed rows can't leak forever.
@@ -2116,7 +2231,7 @@ mod reconcile_tests {
         let pool = mem_pool().await;
         insert_open(&pool, "MakerStrategy", "tok1", "MarketA", "YES", "0.33", "11.44", Some("0.40"), "confirmed").await;
 
-        let purged = purge_stale_open_positions(&pool, &HashSet::new()).await;
+        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &std::collections::HashMap::new()).await;
         assert_eq!(purged, 1);
 
         let rows: Vec<(String, String)> =
@@ -2139,7 +2254,7 @@ mod reconcile_tests {
             Decimal::new(10, 2), "Settlement (auto-redeemed by Polymarket)", None).await;
         insert_open(&pool, "MakerStrategy", "tok2", "MarketB", "YES", "0.33", "11.44", Some("0.40"), "confirmed").await;
 
-        purge_stale_open_positions(&pool, &HashSet::new()).await;
+        purge_stale_open_positions(&pool, &HashSet::new(), &std::collections::HashMap::new()).await;
 
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE market = 'MarketB'")
             .fetch_one(&pool).await.unwrap();
@@ -2153,7 +2268,7 @@ mod reconcile_tests {
         let pool = mem_pool().await;
         insert_open(&pool, "MakerStrategy", "tok3", "MarketC", "YES", "0.33", "11.44", Some("0.40"), "pending").await;
 
-        let purged = purge_stale_open_positions(&pool, &HashSet::new()).await;
+        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &std::collections::HashMap::new()).await;
         assert_eq!(purged, 0);
 
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE market = 'MarketC'")
@@ -2168,11 +2283,80 @@ mod reconcile_tests {
         let pool = mem_pool().await;
         insert_open(&pool, "MakerStrategy", "tok4", "MarketD", "YES", "0.33", "11.44", None, "confirmed").await;
 
-        let purged = purge_stale_open_positions(&pool, &HashSet::new()).await;
+        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &std::collections::HashMap::new()).await;
         assert_eq!(purged, 1);
 
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE market = 'MarketD'")
             .fetch_one(&pool).await.unwrap();
         assert_eq!(n, 0);
+    }
+
+    // Resolution-time booking: both legs of a resolved arb pair are booked at their
+    // settlement value ($1.00 winner / $0.00 loser) the moment chain-sync sees them
+    // redeemable — so net P&L never dips while the winner awaits redemption.
+    #[tokio::test]
+    async fn redeemable_pair_books_both_legs_at_resolution() {
+        let pool = mem_pool().await;
+        insert_open(&pool, "ArbitrageStrategy", "tokY", "MarketE", "YES", "0.90", "15.003", Some("0.90"), "confirmed").await;
+        insert_open(&pool, "ArbitrageStrategy", "tokN", "MarketE", "NO",  "0.09", "15",     Some("0.09"), "confirmed").await;
+
+        let mut marks = std::collections::HashMap::new();
+        marks.insert("tokY".to_string(), (Decimal::new(9995, 4), Decimal::new(15003, 3))); // winner ~1.00
+        marks.insert("tokN".to_string(), (Decimal::new(5, 4),    Decimal::new(15, 0)));    // loser ~0.00
+
+        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &marks).await;
+        assert_eq!(purged, 2);
+
+        let rows: Vec<(String, String, String)> =
+            sqlx::query_as("SELECT side, reason, pnl FROM trades WHERE market = 'MarketE' ORDER BY side DESC")
+                .fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 2, "both legs must be booked");
+        // YES: won → pnl = (1.00 − 0.90) × 15.003 = +1.5003
+        assert!(rows[0].1.contains("won") && rows[0].1.contains("pending redemption"), "reason: {}", rows[0].1);
+        assert_eq!(rows[0].2.parse::<Decimal>().unwrap(), Decimal::new(15003, 4));
+        // NO: lost → pnl = (0.00 − 0.09) × 15 = −1.35
+        assert!(rows[1].1.contains("lost") && rows[1].1.contains("pending redemption"), "reason: {}", rows[1].1);
+        assert_eq!(rows[1].2.parse::<Decimal>().unwrap(), Decimal::new(-135, 2));
+    }
+
+    // The settlement-scoped dedup must NOT false-match an earlier same-market,
+    // same-shares round-trip (e.g. a morning orphan flatten) — the 2026-07-15 bug
+    // where the winning leg's +$1.50 settlement was silently dropped.
+    #[tokio::test]
+    async fn resolution_booking_ignores_prior_non_settlement_trades() {
+        let pool = mem_pool().await;
+        // Morning flatten: same market, same side, same 15 shares, reason ≠ Settlement.
+        record_trade_db(&pool, "ArbitrageStrategy", "MarketF", "YES",
+            Decimal::new(90, 2), Decimal::new(89, 2), Decimal::new(15, 0),
+            Decimal::new(-15, 2), "Orphan flatten (bid exit)", None).await;
+        insert_open(&pool, "ArbitrageStrategy", "tokY2", "MarketF", "YES", "0.90", "15", Some("0.90"), "confirmed").await;
+
+        let mut marks = std::collections::HashMap::new();
+        marks.insert("tokY2".to_string(), (Decimal::new(9995, 4), Decimal::new(15, 0)));
+
+        purge_stale_open_positions(&pool, &HashSet::new(), &marks).await;
+
+        let n: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM trades WHERE market = 'MarketF' AND reason LIKE 'Settlement%'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1, "settlement must be booked despite the earlier flatten row");
+    }
+
+    // A redeemable row is booked and purged even while status='pending' — a
+    // redeemable wallet holding proves the fill happened.
+    #[tokio::test]
+    async fn redeemable_pending_row_is_booked_and_purged() {
+        let pool = mem_pool().await;
+        insert_open(&pool, "ArbitrageStrategy", "tokP", "MarketG", "NO", "0.09", "15", Some("0.09"), "pending").await;
+
+        let mut marks = std::collections::HashMap::new();
+        marks.insert("tokP".to_string(), (Decimal::new(5, 4), Decimal::new(15, 0)));
+
+        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &marks).await;
+        assert_eq!(purged, 1);
+
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE market = 'MarketG'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1);
     }
 }

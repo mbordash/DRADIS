@@ -50,9 +50,11 @@ const STRATEGY_NAME: &str = "ConvergenceStrategy";
 pub struct ConvergenceStrategyImpl {
     /// Per-token cooldown after any exit. Key: token_id, Value: Instant of exit.
     post_exit_cooldown: Mutex<HashMap<MarketId, Instant>>,
-    /// Per-market cooldown after a CATASTROPHIC exit. Key: condition_id. Blocks BOTH
-    /// legs so the strategy cannot flip to the opposite side and get whipsawed again.
-    catastrophic_cooldown: Mutex<HashMap<String, Instant>>,
+    /// Per-market cooldown after ANY stop exit (SL or catastrophic). Key: condition_id.
+    /// Blocks BOTH legs so the strategy cannot flip to the opposite side and get
+    /// whipsawed again in the same chop (2026-07-15: NO stopped −11%, pulse flipped,
+    /// YES bought 23 min later in the same hour → −19.5% catastrophic).
+    stop_market_cooldown: Mutex<HashMap<String, Instant>>,
     /// Viper-level exit-signal cooldown to prevent FAK-miss re-fire storms.
     last_exit_signal_at: Mutex<Option<Instant>>,
     /// Best bid observed at entry-signal time, per token. The catastrophic stop
@@ -62,15 +64,22 @@ pub struct ConvergenceStrategyImpl {
     /// the catastrophic floor and stopped positions the same second they opened
     /// (2026-07-14, −16.2% with zero price movement).
     entry_bid: Mutex<HashMap<MarketId, Decimal>>,
+    /// Entry-signal persistence streak: (condition_id, want_bull, first_seen, last_seen).
+    /// The full signal stack must hold continuously for
+    /// CONVERGENCE_ENTRY_PERSISTENCE_SECS before an entry fires (anti-burst debounce —
+    /// 2026-07-15: both losers were stopped <70s after entering on a transient
+    /// mid-vol-burst pulse).
+    signal_streak: Mutex<Option<(String, bool, Instant, Instant)>>,
 }
 
 impl ConvergenceStrategyImpl {
     pub fn new() -> Self {
         Self {
             post_exit_cooldown: Mutex::new(HashMap::new()),
-            catastrophic_cooldown: Mutex::new(HashMap::new()),
+            stop_market_cooldown: Mutex::new(HashMap::new()),
             last_exit_signal_at: Mutex::new(None),
             entry_bid: Mutex::new(HashMap::new()),
+            signal_streak: Mutex::new(None),
         }
     }
 
@@ -90,10 +99,11 @@ impl ConvergenceStrategyImpl {
         }
     }
 
-    /// Arm the market-wide cooldown after a catastrophic exit so neither leg of this
-    /// market can be re-entered until CONVERGENCE_CATASTROPHIC_COOLDOWN_SECS elapses.
-    fn record_catastrophic(&self, condition_id: &str) {
-        if let Ok(mut map) = self.catastrophic_cooldown.lock() {
+    /// Arm the market-wide cooldown after a stop exit (SL or catastrophic) so neither
+    /// leg of this market can be re-entered until CONVERGENCE_STOP_MARKET_COOLDOWN_SECS
+    /// elapses.
+    fn record_market_stop(&self, condition_id: &str) {
+        if let Ok(mut map) = self.stop_market_cooldown.lock() {
             map.insert(condition_id.to_string(), Instant::now());
         }
     }
@@ -202,6 +212,37 @@ impl Strategy for ConvergenceStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── Entry-signal persistence debounce (anti-burst, 2026-07-15) ───────
+        // All signal gates passed. Require the signal to hold continuously for
+        // CONVERGENCE_ENTRY_PERSISTENCE_SECS before entering: a pulse that fires
+        // mid-vol-burst decays within a tick or two (both of today's losers were
+        // stopped <70s after entry), while genuine institutional flow persists.
+        // A direction flip or a sighting gap > CONTINUITY_GAP resets the clock.
+        if let Ok(mut streak) = self.signal_streak.lock() {
+            let now = Instant::now();
+            let held_long_enough = match streak.as_mut() {
+                Some((cid, dir, first_seen, last_seen))
+                    if *cid == market.condition_id
+                        && *dir == want_bull
+                        && last_seen.elapsed().as_secs()
+                            <= config::CONVERGENCE_SIGNAL_CONTINUITY_GAP_SECS =>
+                {
+                    *last_seen = now;
+                    first_seen.elapsed().as_secs() >= config::CONVERGENCE_ENTRY_PERSISTENCE_SECS
+                }
+                _ => {
+                    // First sighting, direction flip, market rotation, or stale streak.
+                    *streak = Some((market.condition_id.clone(), want_bull, now, now));
+                    false
+                }
+            };
+            if !held_long_enough {
+                debug!(" Convergence debounce: signal must persist {}s before entry",
+                    config::CONVERGENCE_ENTRY_PERSISTENCE_SECS);
+                return Ok(StrategySignal::NoSignal);
+            }
+        }
+
         // ── Pick the token + touch price ──────────────────────────────────────
         let (token_id, ask, bid, fee_bps) = if want_bull {
             (market.yes_token.clone(), snap.yes_ask, snap.yes_bid, market.yes_fee_bps as u16)
@@ -239,15 +280,16 @@ impl Strategy for ConvergenceStrategyImpl {
             }
         }
 
-        // ── Market-wide catastrophic cooldown ─────────────────────────────────
-        // After a catastrophic stop in this market, block BOTH legs (not just the
-        // stopped token) so we don't flip to the opposite side and get whipsawed again
-        // in the same chop (observed 2026-07-08: YES @0.60 then NO @0.60, both -21%).
-        if let Ok(map) = self.catastrophic_cooldown.lock() {
+        // ── Market-wide stop cooldown ─────────────────────────────────────────
+        // After ANY stop exit (SL or catastrophic) in this market, block BOTH legs
+        // (not just the stopped token) so we don't flip to the opposite side and get
+        // whipsawed again in the same chop (2026-07-08: YES @0.60 then NO @0.60, both
+        // −21%; 2026-07-15: NO SL'd −11%, YES bought 23 min later → −19.5%).
+        if let Ok(map) = self.stop_market_cooldown.lock() {
             if let Some(t) = map.get(&market.condition_id) {
-                if t.elapsed().as_secs() < config::CONVERGENCE_CATASTROPHIC_COOLDOWN_SECS {
-                    debug!(" Convergence blocked: market in post-catastrophic cooldown ({}s left)",
-                        config::CONVERGENCE_CATASTROPHIC_COOLDOWN_SECS.saturating_sub(t.elapsed().as_secs()));
+                if t.elapsed().as_secs() < config::CONVERGENCE_STOP_MARKET_COOLDOWN_SECS {
+                    debug!(" Convergence blocked: market in post-stop cooldown ({}s left)",
+                        config::CONVERGENCE_STOP_MARKET_COOLDOWN_SECS.saturating_sub(t.elapsed().as_secs()));
                     return Ok(StrategySignal::NoSignal);
                 }
             }
@@ -293,6 +335,10 @@ impl Strategy for ConvergenceStrategyImpl {
         // `entry_bid` field doc). Overwritten on re-entry; removed on exit.
         if let Ok(mut map) = self.entry_bid.lock() {
             map.insert(token_id.clone(), bid);
+        }
+        // Consume the signal streak — the next entry must build fresh persistence.
+        if let Ok(mut streak) = self.signal_streak.lock() {
+            *streak = None;
         }
 
         Ok(StrategySignal::Entry {
@@ -460,10 +506,13 @@ impl Strategy for ConvergenceStrategyImpl {
 
         if let Some(p) = pending {
             self.record_exit(&p.token_id);
-            // A catastrophic stop cools down the WHOLE market (both legs), not just the
-            // stopped token, to prevent an immediate opposite-side whipsaw re-entry.
-            if p.reason.starts_with("ConvergenceCatastrophic") {
-                self.record_catastrophic(&p.condition_id);
+            // ANY stop exit (regular SL or catastrophic) cools down the WHOLE market
+            // (both legs), not just the stopped token, to prevent an immediate
+            // opposite-side whipsaw re-entry in the same chop.
+            if p.reason.starts_with("ConvergenceCatastrophic")
+                || p.reason.starts_with("ConvergenceSL")
+            {
+                self.record_market_stop(&p.condition_id);
             }
             return Ok(StrategySignal::Exit {
                 params: OrderParams {

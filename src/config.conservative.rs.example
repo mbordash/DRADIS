@@ -1005,7 +1005,18 @@ pub const CONVERGENCE_CATASTROPHIC_SL_PCT: Decimal = dec!(-0.12); // 2026-07-10:
 pub const CONVERGENCE_CATASTROPHIC_SL_MULT: Decimal = dec!(1.5); // 2026-07-10: tightened from 2.0.
 
 /// After a catastrophic stop, block BOTH legs of that market for this long.
-pub const CONVERGENCE_CATASTROPHIC_COOLDOWN_SECS: u64 = 900;
+pub const CONVERGENCE_CATASTROPHIC_COOLDOWN_SECS: u64 = 900;  // legacy — superseded by CONVERGENCE_STOP_MARKET_COOLDOWN_SECS
+
+/// Market-wide cooldown (both legs) after ANY stop exit — regular SL or catastrophic.
+/// A stop-out means the market hour is chopping against the macro signal — stand down.
+pub const CONVERGENCE_STOP_MARKET_COOLDOWN_SECS: u64 = 2700;
+
+/// Entry-signal persistence debounce: the full signal stack must hold continuously
+/// this many seconds before entry (filters transient mid-vol-burst pulses).
+pub const CONVERGENCE_ENTRY_PERSISTENCE_SECS: u64 = 90;
+
+/// Max gap (seconds) between signal sightings before the persistence clock resets.
+pub const CONVERGENCE_SIGNAL_CONTINUITY_GAP_SECS: u64 = 30;
 
 /// Per-token cooldown after any exit before re-entry is allowed (seconds).
 pub const CONVERGENCE_POST_EXIT_COOLDOWN_SECS: u64 = 300;

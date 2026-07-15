@@ -618,6 +618,17 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
         .map(|p| p.asset.to_string())
         .collect();
 
+    // Resolved marks for redeemable positions: token_id → (cur_price, on-chain size).
+    // cur_price on a redeemable position reflects the resolved outcome (~$1 winner /
+    // ~$0 loser). purge_stale_open_positions uses this to book BOTH legs of a settled
+    // pair at resolution time ("pending redemption"), so net P&L never shows a phantom
+    // loss while the winning leg awaits on-chain redemption.
+    let redeemable_marks: HashMap<String, (Decimal, Decimal)> = live_positions
+        .iter()
+        .filter(|p| p.redeemable)
+        .map(|p| (p.asset.to_string(), (p.cur_price, p.size)))
+        .collect();
+
     // ── Sync EVERY per-asset pool ─────────────────────────────────────────────
     // Each asset stores its own open_positions rows in its own SQLite file.
     // Apply purge + adopt with asset-filtered live IDs for each pool.
@@ -634,8 +645,8 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
 
-        // Purge stale rows in this asset's DB.
-        total_purged += db::purge_stale_open_positions(&pool, &live_ids).await;
+        // Purge stale rows in this asset's DB (books resolved legs at settlement value).
+        total_purged += db::purge_stale_open_positions(&pool, &live_ids, &redeemable_marks).await;
 
         // Re-adopt on-chain positions missing from this asset's DB.
         // Query AFTER the purge so we don't re-adopt something just removed.
@@ -764,7 +775,7 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
         info!(" Chain-sync: purged {} stale open_positions row(s) across {} asset DB(s)", total_purged, all_assets.len());
     }
     if redeemable_count > 0 {
-        info!("⏳ Chain-sync: skipped {} redeemable (settled) position(s) — auto_settle will handle redemption", redeemable_count);
+        info!("⏳ Chain-sync: {} redeemable (settled) position(s) booked at resolution — auto_settle will claim the cash", redeemable_count);
     }
     if unmatched_titles > 0 {
         warn!("⚠️ Chain-sync: {} live position(s) had unknown market-asset title and were not mapped to an asset DB", unmatched_titles);
@@ -1072,6 +1083,18 @@ async fn record_settled_arb_trade(
             let pnl = (Decimal::ONE - entry_per_pair) * pairs;
             let market_title = yes_leg.title.clone();
 
+            // Cross-path dedup: chain-sync may have already booked both legs at
+            // resolution ("pending redemption" rows). This redemption is then a
+            // cash-only event — booking the pair again would double-count the P&L.
+            if db::market_has_pending_redemption_settlement(&pool, &market_title).await {
+                debug!(
+                    "Auto-settle: pair settlement for \"{}\" suppressed — already booked at \
+                     resolution (pending-redemption rows exist)",
+                    market_title
+                );
+                return;
+            }
+
             let inserted = db::record_settlement_trade_idempotent(
                 &pool,
                 "ArbitrageStrategy",
@@ -1148,6 +1171,16 @@ async fn record_settled_arb_trade(
             // may have already booked this same position (matched on market + shares)
             // under its true strategy/reason. Its fingerprint differs from ours, so the
             // idempotent-insert guard below would NOT catch it — check explicitly here.
+            // Likewise, chain-sync may have booked this leg at resolution ("pending
+            // redemption") — the redemption is then a cash-only event.
+            if db::market_has_pending_redemption_settlement(&pool, &market_title).await {
+                debug!(
+                    "Auto-settle: single-leg {} settlement for \"{}\" suppressed — already \
+                     booked at resolution (pending-redemption row exists)",
+                    side, market_title
+                );
+                return;
+            }
             if db::market_has_matching_trade(&pool, &market_title, size).await {
                 debug!(
                     "Auto-settle: single-leg {} settlement for \"{}\" suppressed — already booked \
