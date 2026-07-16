@@ -41,6 +41,12 @@ interface Row {
   fbtcBps: number;
   arkbBps: number;
   tideOpen: boolean; // US cash session live
+  // Horizon Raptor
+  tradfiVel: number;   // SPY+QQQ 5s velocity
+  macroCoh: number;    // BTC/QQQ correlation
+  vix: number;         // UVXY price
+  vixVel: number;      // UVXY 5s velocity
+  horizonOpen: boolean; // US cash session
 }
 
 function fmtClock(ms: number): string {
@@ -95,6 +101,12 @@ function toRow(s: TelemetrySample): Row {
     fbtcBps: num(s.fbtc_premium_bps),
     arkbBps: num(s.arkb_premium_bps),
     tideOpen: !!s.tide_market_open,
+    // Horizon Raptor
+    tradfiVel: num(s.tradfi_velocity),
+    macroCoh: num(s.macro_coherence),
+    vix: num(s.vix_proxy),
+    vixVel: num(s.vix_velocity),
+    horizonOpen: !!s.horizon_market_open,
   };
 }
 
@@ -427,6 +439,114 @@ function TideCard({ data, latest }: { data: Row[]; latest: Row }) {
   );
 }
 
+// ── Horizon Raptor — TradFi Velocity / VIX Proxy card (BTC-only) ──────────────
+
+function HorizonCard({ data, latest }: { data: Row[]; latest: Row }) {
+  const open = latest.horizonOpen;
+  const tradfiVel = latest.tradfiVel;
+  const macroCoh = latest.macroCoh;
+  const vix = latest.vix;
+  const vixVel = latest.vixVel;
+
+  const dim = open ? '' : 'opacity-50';
+  const velClass = !open
+    ? 'text-gray-500'
+    : tradfiVel > 0 ? 'text-green-400' : tradfiVel < 0 ? 'text-red-400' : 'text-gray-400';
+
+  // Macro coherence: high positive = BTC tracking tech, low = decoupled
+  const cohClass = !open
+    ? 'text-gray-500'
+    : macroCoh >= 0.5 ? 'text-green-400' : macroCoh >= 0 ? 'text-amber-400' : 'text-red-400';
+
+  // VIX velocity: spikes indicate panic
+  const vixVelClass = !open
+    ? 'text-gray-500'
+    : vixVel > 0.5 ? 'text-red-400' : vixVel < -0.5 ? 'text-green-400' : 'text-gray-400';
+
+  return (
+    <div className="card p-4 border border-amber-500/20">
+      <div className="flex items-start justify-between mb-3">
+        <div>
+          <p className="label-muted text-[10px]">🌅 TradFi Velocity · Horizon Raptor</p>
+          <p className="text-[10px] text-gray-600 font-mono">
+            SPY + QQQ momentum · BTC/QQQ correlation · UVXY VIX proxy · observe-only
+          </p>
+        </div>
+        <div className="flex items-center gap-1.5 text-[10px] font-mono">
+          <span className={`h-2 w-2 rounded-full ${open ? 'bg-green-400 animate-pulse' : 'bg-gray-600'}`} />
+          <span className={open ? 'text-green-400' : 'text-gray-500'}>
+            {open ? 'US SESSION OPEN' : 'MARKET CLOSED'}
+          </span>
+        </div>
+      </div>
+
+      <div className={`grid grid-cols-2 sm:grid-cols-4 gap-3 ${dim}`}>
+        <div className="card px-3 py-2 flex flex-col gap-0.5">
+          <span className="label-muted text-[10px]">TradFi Vel</span>
+          <span className={`font-mono text-lg ${velClass}`}>
+            {open ? `${tradfiVel >= 0 ? '+' : ''}${tradfiVel.toFixed(3)}` : '—'}
+          </span>
+        </div>
+        <div className="card px-3 py-2 flex flex-col gap-0.5">
+          <span className="label-muted text-[10px]">Macro Cₘ</span>
+          <span className={`font-mono text-lg ${cohClass}`}>
+            {open ? macroCoh.toFixed(2) : '—'}
+          </span>
+        </div>
+        <div className="card px-3 py-2 flex flex-col gap-0.5">
+          <span className="label-muted text-[10px]">VIX (UVXY)</span>
+          <span className="font-mono text-lg text-amber-400">
+            {open && vix > 0 ? `$${vix.toFixed(2)}` : '—'}
+          </span>
+        </div>
+        <div className="card px-3 py-2 flex flex-col gap-0.5">
+          <span className="label-muted text-[10px]">VIX Vel</span>
+          <span className={`font-mono text-lg ${vixVelClass}`}>
+            {open ? `${vixVel >= 0 ? '+' : ''}${vixVel.toFixed(3)}` : '—'}
+          </span>
+        </div>
+      </div>
+
+      <div className="mt-3" style={{ height: 160 }}>
+        {data.length < 2 ? (
+          <div className="h-full flex items-center justify-center text-gray-600 text-xs">
+            {open ? 'Collecting samples…' : 'TradFi velocity resumes at the US cash open (09:30 ET)'}
+          </div>
+        ) : (
+          <ResponsiveContainer width="100%" height="100%">
+            <LineChart data={data} syncId="telemetry" margin={{ top: 6, right: 12, bottom: 0, left: 0 }}>
+              <CartesianGrid strokeDasharray="3 3" stroke="#1e1e32" vertical={false} />
+              <XAxis
+                dataKey="time"
+                tick={{ fill: '#6b7280', fontSize: 10, fontFamily: 'monospace' }}
+                tickLine={false}
+                axisLine={{ stroke: '#1e1e32' }}
+                interval="preserveStartEnd"
+                minTickGap={40}
+              />
+              <YAxis
+                tick={{ fill: '#6b7280', fontSize: 10, fontFamily: 'monospace' }}
+                tickLine={false}
+                axisLine={false}
+                tickFormatter={(v: number) => v.toFixed(2)}
+                width={44}
+                domain={['auto', 'auto']}
+              />
+              <Tooltip
+                contentStyle={{ background: '#0d0d1a', border: '1px solid #1e1e32', borderRadius: 8, fontSize: 11, fontFamily: 'monospace' }}
+                labelStyle={{ color: '#9ca3af' }}
+              />
+              <ReferenceLine y={0} stroke="#374151" strokeDasharray="4 4" />
+              <Line type="monotone" dataKey="tradfiVel" name="TradFi vel" stroke="#f59e0b" strokeWidth={1.8} dot={false} isAnimationActive={false} />
+              <Line type="monotone" dataKey="macroCoh" name="macro Cₘ" stroke="#22d3ee" strokeWidth={1.2} dot={false} isAnimationActive={false} />
+            </LineChart>
+          </ResponsiveContainer>
+        )}
+      </div>
+    </div>
+  );
+}
+
 // ── Main telemetry page ───────────────────────────────────────────────────────
 
 // ── Asset-class sub-navigation ────────────────────────────────────────────────
@@ -563,6 +683,9 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
           {asset === 'btc' && (
             <ConnPill label="Tide Raptor" live={!!lastSample?.tide_connected} />
           )}
+          {asset === 'btc' && (
+            <ConnPill label="Horizon Raptor" live={!!lastSample?.horizon_connected} />
+          )}
 
           {/* Window selector */}
           <div className="flex items-center gap-1 ml-2">
@@ -635,6 +758,11 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
       {/* Institutional Pulse — Tide Raptor (BTC-only, observe-only) */}
       {asset === 'btc' && latest && (
         <TideCard data={viewRows} latest={latest} />
+      )}
+
+      {/* TradFi Velocity — Horizon Raptor (BTC-only, observe-only) */}
+      {asset === 'btc' && latest && (
+        <HorizonCard data={viewRows} latest={latest} />
       )}
 
       {/* Signal charts */}

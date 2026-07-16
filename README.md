@@ -1,6 +1,6 @@
 # DRADIS
 
-> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Polymarket. Eight autonomous Viper strategies, a Raptor recon layer (Price, Funding, Derivatives, Tide "Institutional Pulse", and a venue-neutral Sports line-movement scout), a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor that delivers optimization recommendations via Ollama (local or remote) + Telegram & OpenClaw.
+> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Polymarket. Eight autonomous Viper strategies, a Raptor recon layer (Price, Funding, Derivatives, Tide "Institutional Pulse", Horizon "TradFi Velocity", and a venue-neutral Sports line-movement scout), a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor that delivers optimization recommendations via Ollama (local or remote) + Telegram & OpenClaw.
 
 ![Rust](https://img.shields.io/badge/Rust-1.95+-orange?logo=rust&logoColor=white)
 ![Tokio](https://img.shields.io/badge/Tokio-async%20runtime-darkgreen?logo=rust&logoColor=white)
@@ -157,6 +157,8 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 │  (Binance FAPI: OI)  │   │                      │
 │  Tide Raptor         │   │                      │
 │  (Alpaca IEX + iNAV) │   │                      │
+│  Horizon Raptor      │   │                      │
+│  (SPY/QQQ/UVXY)      │   │                      │
 │  Sports Raptor       │   │                      │
 │  (The Odds API)      │   │                      │
 └──────────┬───────────┘   └───────────┬──────────┘
@@ -239,10 +241,13 @@ Raptors are intentionally dumb: **fetch, normalize, broadcast** — no trading l
 | **Funding Raptor**             | Binance Perpetuals FAPI | Perpetual funding rate (smart-money sentiment)          | `src/raptors/funding.rs` |
 | **Derivatives Raptor**         | Binance Perpetuals FAPI | Open-interest delta + taker CVD ratio (positioning pressure, all-asset) | `src/raptors/derivatives.rs` |
 | **Tide Raptor**                | Alpaca IEX + synthetic iNAV | "Institutional Pulse" + coherence from spot-BTC-ETF (IBIT/FBTC/ARKB) premium vs iNAV — BTC-only, US-hours | `src/raptors/tide.rs` |
+| **Horizon Raptor**             | Alpaca IEX (shared)     | TradFi velocity (SPY/QQQ), macro coherence (BTC↔QQQ), VIX proxy (UVXY) — BTC-only, US-hours, **observe-only** | `src/raptors/horizon.rs` |
 | **Sports Raptor**              | The Odds API (h2h)      | Vig-free consensus probability, line drift, book dispersion — venue-neutral (US + intl), **observe-only** | `src/raptors/sports.rs` |
 | *(future)* **Politics Raptor** | Polling aggregators     | Approval drift, event probability shifts                | —                        |
 
 When multiple Raptors are active, the GBoost Viper fuses every signal as model features (funding, OI/CVD, institutional pulse/coherence); Basis, Momentum and TrendCapture use them as confirmation gates; and the **Convergence** Viper opens directional positions only when the institutional + derivatives stack agrees. No single Raptor has veto power alone.
+
+The **Tide** and **Horizon** Raptors share a single Alpaca IEX WebSocket connection (free tier allows only one per account). Tide tracks BTC-specific institutional flow (ETF premium); Horizon tracks TradFi macro regime (equity velocity, VIX). Together they enable divergence detection — e.g., equities selling off but BTC ETFs at premium suggests institutional flight *into* crypto.
 
 The **Sports Raptor** is the first non-crypto scout: a single venue-neutral instance shared by both the US and intl pipelines. It polls The Odds API (keyed on `ODDS_API_KEY`), reduces the nearest-commencing event's cross-book moneyline to a vig-free consensus, and broadcasts line drift + book dispersion. Like the Tide Raptor it runs **observe-only** — it publishes telemetry but no Viper consumes it for sizing yet — and degrades silently to a neutral snapshot when no API key is set.
 
@@ -347,7 +352,7 @@ DRADIS ships with a real-time web dashboard called **Control Tower** built on Ne
 | **P&L Chart**      | Rolling equity curve across recent snapshots                                                     |
 | **Viper Cards**    | Live enabled/disabled toggle + all parameters editable inline without a restart                  |
 | **Open Positions** | In-flight positions with entry time, side (YES/NO/UP/DOWN in correct color), entry price, shares |
-| **Telemetry**      | Live Raptor macro cards — including the **Institutional Pulse** card (Tide pulse dial, coherence, per-ETF premium bps; greyed outside US market hours) |
+| **Telemetry**      | Live Raptor macro cards — **Tide** (ETF premium, institutional pulse), **Horizon** (TradFi velocity, VIX proxy), greyed outside US market hours |
 | **Trade Log**      | Last N completed trades with strategy, side, entry/exit prices, shares, P&L, exit reason         |
 
 ### Live Config Editing
@@ -415,24 +420,26 @@ OLLAMA_MODEL=mistral
 - A Polygon wallet with USDC and MATIC
 - **A paid Polygon RPC endpoint** (required for auto-settlement)
 - Telegram bot token (optional)
-- Alpaca API key/secret (optional — free tier; only needed for the **Tide Raptor**'s live IEX ETF feed. Without it the Institutional Pulse card stays idle.)
+- Alpaca API key/secret (optional — free tier; powers both **Tide** and **Horizon** Raptors from one connection. Without it both cards stay idle.)
 - The Odds API key (optional — free tier; only needed for the **Sports Raptor**'s line-movement feed. Without it the Sports Raptor pill stays idle.)
 
-### Tide Raptor (Institutional Pulse) — optional
+### Tide + Horizon Raptors (Alpaca IEX) — optional
 
-The Tide Raptor streams real-time spot-BTC-ETF (IBIT/FBTC/ARKB) prints from Alpaca's
-free-tier IEX feed and compares them to a synthetic iNAV (btc-per-share × Binance
-oracle) to produce the **Institutional Pulse** and **coherence** signals. It is
-BTC-only and active during US market hours (09:30–16:00 ET). To enable it, add your
-Alpaca keys to `.env`:
+The Tide and Horizon Raptors share a **single Alpaca IEX WebSocket connection** (free tier allows only one per account). Together they stream 6 symbols:
+
+| Raptor   | Symbols         | Signal |
+|----------|-----------------|--------|
+| **Tide** | IBIT, FBTC, ARKB | BTC ETF premium vs synthetic iNAV → "Institutional Pulse" |
+| **Horizon** | SPY, QQQ, UVXY | TradFi velocity, macro coherence (BTC↔QQQ), VIX proxy |
+
+Both are BTC-only and active during US market hours (09:30–16:00 ET). To enable them, add your Alpaca keys to `.env`:
 
 ```bash
 ALPACA_API_KEY_ID=your-key-id
 ALPACA_API_SECRET_KEY=your-secret-key
 ```
 
-These feed the GBoost feature vector, the Basis tide veto, and the **Convergence**
-Viper. Omit them and those consumers simply treat the pulse as neutral/zero.
+Tide feeds the GBoost feature vector, the Basis tide veto, and the **Convergence** Viper. Horizon is currently **observe-only** (telemetry only, no Viper consumes it yet) — useful for detecting TradFi↔crypto divergences. Omit the keys and both run idle (neutral snapshots, offline pills).
 
 ### Sports Raptor (line movement) — optional
 

@@ -225,6 +225,13 @@ export interface AssetRaptorHealth {
   sports_line_drift?:     number;  // Δ consensus vs previous poll (signed)
   sports_book_dispersion?: number; // spread of per-book implied probs (0..1)
   sports_num_books?:      number;  // bookmakers in the sample (0 = no data)
+
+  // ── Horizon Raptor — TradFi velocity / VIX proxy (Alpaca IEX, observe-only) ──
+  horizon_connected?:  boolean; // ≥1 fresh SPY/QQQ/UVXY print this tick
+  tradfi_velocity?:    number;  // SPY+QQQ 5s momentum, volume-weighted
+  macro_coherence?:    number;  // 10-min Pearson(BTC_vel, QQQ_vel)
+  vix_proxy?:          number;  // UVXY price
+  vix_velocity?:       number;  // UVXY 5s rate-of-change
 }
 
 /** Live Raptor signal snapshot keyed by asset symbol — GET /api/telemetry. */
@@ -268,6 +275,14 @@ export interface TelemetrySample {
   sports_sport?:         string;  // sport title ("MLB", "NFL", …)
   sports_commence?:      string;  // ISO-8601 UTC kickoff of the tracked event
   sports_books?:         string;  // comma-separated bookmaker titles
+
+  // ── Horizon Raptor — TradFi velocity / VIX proxy (Alpaca IEX, observe-only) ──
+  horizon_connected:  boolean;
+  horizon_market_open: boolean;
+  tradfi_velocity:    number;  // SPY+QQQ 5s momentum, volume-weighted
+  macro_coherence:    number;  // 10-min Pearson(BTC_vel, QQQ_vel)
+  vix_proxy:          number;  // UVXY price
+  vix_velocity:       number;  // UVXY 5s rate-of-change
 }
 
 /** Response from GET /api/status — maps strategy key to active market name. */

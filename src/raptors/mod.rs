@@ -19,10 +19,11 @@
 /// Future Raptors (not yet implemented)
 /// ─────────────────────────────────────
 /// │ Politics Raptor │ Polling aggregators  │ approval drift, event probability shifts │
+/// │ Horizon Raptor  │ Alpaca IEX WS        │ TradFi velocity (SPY/QQQ), VIX proxy     │
 ///
-/// The Sports Raptor is venue-neutral (shared by the US and intl pipelines) and,
-/// like the Tide Raptor, runs observe-only: it publishes telemetry but no Viper
-/// consumes it for sizing yet.
+/// The Sports and Horizon Raptors are venue-neutral (shared by all pipelines) and,
+/// like the Tide Raptor, run observe-only: they publish telemetry but no Viper
+/// consumes them for sizing yet.
 ///
 /// When multiple Raptors are active the GBoost and Basis strategies fuse their
 /// signals as features — no single Raptor has veto power alone.
@@ -31,3 +32,4 @@ pub mod funding;
 pub mod derivatives;
 pub mod tide;
 pub mod sports;
+pub mod horizon;

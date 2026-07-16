@@ -594,22 +594,44 @@ async fn run() -> Result<()> {
         // Tide Raptor — "Institutional Pulse" from spot-BTC-ETF premium. BTC-only
         // and singular: spawned for the btc asset, reusing its live oracle feed.
         // ETH/SOL squadrons get `tide: None`. Observe-only (not consumed by Vipers).
-        let tide_rx = if asset == "btc" {
+        //
+        // Horizon Raptor shares the same Alpaca connection with Tide (free tier
+        // allows only one concurrent connection per account). The shared quote map
+        // holds all equity quotes (BTC ETFs + SPY/QQQ/UVXY).
+        let (tide_rx, horizon_rx) = if asset == "btc" {
+            // Create the shared quote map for both Tide and Horizon raptors
+            let shared_quotes = dradis::raptors::tide::new_shared_quote_map();
+
+            // Spawn Tide Raptor
             let (tide_tx, tide_rx) =
                 watch::channel(dradis::raptors::tide::TideSnapshot::default());
             let oracle_rx_c = oracle_rx.clone();
             let health = Arc::clone(&raptor_health_tx);
+            let quotes_for_tide = Arc::clone(&shared_quotes);
             spawn_supervised("tide-raptor", move || {
                 dradis::raptors::tide::run_tide_raptor(
-                    oracle_rx_c.clone(), tide_tx.clone(), Arc::clone(&health),
+                    oracle_rx_c.clone(), tide_tx.clone(), Arc::clone(&health), Arc::clone(&quotes_for_tide),
                 )
             });
-            Some(tide_rx)
+
+            // Spawn Horizon Raptor (reads from same shared quote map)
+            let (horizon_tx, horizon_rx) =
+                watch::channel(dradis::raptors::horizon::HorizonSnapshot::default());
+            let velocity_rx_c = velocity_rx.clone();
+            let health = Arc::clone(&raptor_health_tx);
+            let quotes_for_horizon = Arc::clone(&shared_quotes);
+            spawn_supervised("horizon-raptor", move || {
+                dradis::raptors::horizon::run_horizon_raptor(
+                    Arc::clone(&quotes_for_horizon), velocity_rx_c.clone(), horizon_tx.clone(), Arc::clone(&health),
+                )
+            });
+
+            (Some(tide_rx), Some(horizon_rx))
         } else {
-            None
+            (None, None)
         };
 
-        let raptor_signals = SquadronRaptors::full(oracle_rx, velocity_rx, drift_rx, funding_rx, deriv_rx, tide_rx, Some(sports_rx.clone()));
+        let raptor_signals = SquadronRaptors::full(oracle_rx, velocity_rx, drift_rx, funding_rx, deriv_rx, tide_rx, horizon_rx, Some(sports_rx.clone()));
 
         // ── Per-asset session state ────────────────────────────────────────────
         // startup_balance is the real wallet balance at process start — used as

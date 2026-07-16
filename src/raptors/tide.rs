@@ -103,20 +103,44 @@ const BIG_THREE: [EtfSpec; 3] = [
     EtfSpec { ticker: "ARKB", fallback_btc_per_share: dec!(0.00143) },
 ];
 
-/// Latest real-time equity print for one ETF, written by the equity-feed task
-/// and read by the compute loop. Shared behind a `Mutex` so the deferred Alpaca
-/// IEX WS task can update it independently of the recompute cadence.
-#[derive(Clone, Copy, Debug, Default)]
-struct EtfQuote {
-    /// Last trade price (USD). `0` ⇒ no print received yet.
-    last_price: Decimal,
-    /// Wall-clock instant of the last print, for the staleness guard.
-    last_at: Option<Instant>,
-    /// Traded dollar-volume summed over the trailing `TIDE_VOLUME_WINDOW_SECS`.
-    dollar_vol: Decimal,
+/// Horizon Raptor symbols — TradFi velocity and VIX proxy.
+/// Subscribed alongside the Big Three on the same Alpaca connection.
+const HORIZON_SYMBOLS: [&str; 3] = ["SPY", "QQQ", "UVXY"];
+
+/// All symbols subscribed on the shared Alpaca IEX connection.
+fn all_tickers() -> Vec<&'static str> {
+    BIG_THREE.iter().map(|s| s.ticker)
+        .chain(HORIZON_SYMBOLS.iter().copied())
+        .collect()
 }
 
-type QuoteMap = Arc<Mutex<HashMap<&'static str, EtfQuote>>>;
+/// Latest real-time equity print for one symbol, written by the equity-feed task
+/// and read by the compute loops. Shared behind a `Mutex` so the deferred Alpaca
+/// IEX WS task can update it independently of the recompute cadence.
+///
+/// Public so the Horizon Raptor can consume quotes from the same shared map.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct EquityQuote {
+    /// Last trade price (USD). `0` ⇒ no print received yet.
+    pub last_price: Decimal,
+    /// Wall-clock instant of the last print, for the staleness guard.
+    pub last_at: Option<Instant>,
+    /// Traded dollar-volume summed over the trailing `TIDE_VOLUME_WINDOW_SECS`.
+    pub dollar_vol: Decimal,
+}
+
+/// Shared quote map for all Alpaca-subscribed symbols (BTC ETFs + Horizon TradFi).
+/// Both the Tide and Horizon Raptors read from this map.
+pub type SharedQuoteMap = Arc<Mutex<HashMap<&'static str, EquityQuote>>>;
+
+/// Create a new shared quote map. Called once in main.rs before spawning Tide
+/// and Horizon raptors.
+pub fn new_shared_quote_map() -> SharedQuoteMap {
+    Arc::new(Mutex::new(HashMap::new()))
+}
+
+// Internal alias for backward compat
+type QuoteMap = SharedQuoteMap;
 
 /// Per-ETF rolling premium buffer for z-scoring, owned by the compute loop.
 struct PremiumBuffer {
@@ -171,7 +195,7 @@ fn decimal_sqrt(v: Decimal) -> Decimal {
 /// True during the US cash session: 09:30–16:00 America/New_York, Mon–Fri.
 /// (Market holidays are not yet handled — on a holiday this returns true but the
 /// equity feed simply yields no prints, so the pulse stays at 0 regardless.)
-fn is_us_market_open(now: chrono::DateTime<chrono::Utc>) -> bool {
+pub fn is_us_market_open(now: chrono::DateTime<chrono::Utc>) -> bool {
     let et = now.with_timezone(&Eastern);
     let wd = et.weekday().number_from_monday(); // 1=Mon .. 7=Sun
     if wd >= 6 { return false; }
@@ -179,17 +203,18 @@ fn is_us_market_open(now: chrono::DateTime<chrono::Utc>) -> bool {
     (9 * 60 + 30..=16 * 60).contains(&mins)
 }
 
+/// Spawn the Tide Raptor. Returns the shared quote map that the Horizon Raptor
+/// should also consume (both read from the same Alpaca IEX feed).
 pub async fn run_tide_raptor(
     oracle_rx: watch::Receiver<Decimal>,
     tide_tx: watch::Sender<TideSnapshot>,
     raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
+    shared_quotes: SharedQuoteMap,
 ) {
-    // Shared latest-quote map populated by the (deferred) equity-feed task.
-    let quotes: QuoteMap = Arc::new(Mutex::new(HashMap::new()));
-
     // Spawn the real-time equity leg. In observe-only mode (no Alpaca creds) it
     // logs once and idles, leaving the quote map empty so the pulse stays 0.
-    tokio::spawn(run_equity_feed(Arc::clone(&quotes)));
+    // Subscribes to ALL symbols (BTC ETFs + Horizon TradFi) on one connection.
+    tokio::spawn(run_equity_feed(Arc::clone(&shared_quotes)));
 
     // Per-ETF rolling premium buffers, seeded with fallback multipliers.
     let mut buffers: HashMap<&'static str, PremiumBuffer> = BIG_THREE
@@ -213,7 +238,7 @@ pub async fn run_tide_raptor(
         let mut any_connected = false;
 
         // Snapshot the quote map for this compute tick.
-        let snap = { quotes.lock().await.clone() };
+        let snap = { shared_quotes.lock().await.clone() };
 
         for spec in BIG_THREE.iter() {
             let buf = buffers.get_mut(spec.ticker).expect("buffer seeded for every ETF");
@@ -304,8 +329,9 @@ async fn run_equity_feed(quotes: QuoteMap) {
     };
 
     // Per-symbol rolling dollar-volume windows, owned by this task.
+    // Covers both BTC ETFs (Tide) and TradFi symbols (Horizon).
     let mut vol_windows: HashMap<&'static str, VecDeque<(Instant, Decimal)>> =
-        BIG_THREE.iter().map(|s| (s.ticker, VecDeque::new())).collect();
+        all_tickers().into_iter().map(|t| (t, VecDeque::new())).collect();
 
     // Consecutive 406 ("connection limit") counter. A single 406 is almost always a
     // self-reconnect race (Alpaca hasn't reaped our prior slot yet) and clears on a
@@ -318,7 +344,7 @@ async fn run_equity_feed(quotes: QuoteMap) {
             Ok(())  => {
                 conn_limit_strikes = 0;
                 warn!(
-                    "🌊 Tide equity feed: stream ended cleanly — reconnecting in {}s",
+                    "🌊 Alpaca equity feed: stream ended cleanly — reconnecting in {}s",
                     config::TIDE_RECONNECT_DELAY_SECS,
                 );
                 tokio::time::sleep(Duration::from_secs(config::TIDE_RECONNECT_DELAY_SECS)).await;
@@ -335,15 +361,14 @@ async fn run_equity_feed(quotes: QuoteMap) {
                     .min(config::TIDE_CONN_LIMIT_BACKOFF_MAX_SECS);
                 if conn_limit_strikes <= 1 {
                     warn!(
-                        "🌊 Tide equity feed: {e}. Likely a self-reconnect race against our own \
+                        "🌊 Alpaca equity feed: {e}. Likely a self-reconnect race against our own \
                          just-dropped Alpaca slot — backing off {backoff}s and retrying.",
                     );
                 } else {
                     warn!(
-                        "🌊 Tide equity feed: {e}. Persistent connection-limit (strike #{conn_limit_strikes}) — \
+                        "🌊 Alpaca equity feed: {e}. Persistent connection-limit (strike #{conn_limit_strikes}) — \
                          another instance is likely using this key. Alpaca's free tier permits ONE \
-                         concurrent market-data connection per account: use a SEPARATE Alpaca key/account \
-                         for this instance, or disable Tide elsewhere. Backing off {backoff}s.",
+                         concurrent market-data connection per account. Backing off {backoff}s.",
                     );
                 }
                 tokio::time::sleep(Duration::from_secs(backoff)).await;
@@ -351,7 +376,7 @@ async fn run_equity_feed(quotes: QuoteMap) {
             Err(e)  => {
                 conn_limit_strikes = 0;
                 warn!(
-                    "🌊 Tide equity feed: {e} — reconnecting in {}s",
+                    "🌊 Alpaca equity feed: {e} — reconnecting in {}s",
                     config::TIDE_RECONNECT_DELAY_SECS,
                 );
                 tokio::time::sleep(Duration::from_secs(config::TIDE_RECONNECT_DELAY_SECS)).await;
@@ -362,8 +387,8 @@ async fn run_equity_feed(quotes: QuoteMap) {
 
 fn idle_observe_only() {
     warn!(
-        "🌊 Tide Raptor equity feed idle — set {} / {} to enable the live \
-         Alpaca IEX premium stream (observe-only until then)",
+        "🌊 Alpaca equity feed idle — set {} / {} to enable live \
+         Tide + Horizon Raptors (observe-only until then)",
         config::TIDE_ALPACA_KEY_ENV, config::TIDE_ALPACA_SECRET_ENV,
     );
 }
@@ -386,7 +411,8 @@ async fn stream_alpaca_iex(
     ws.send(Message::Text(auth.into())).await.map_err(|e| format!("auth send failed: {e}"))?;
 
     let mut subscribed = false;
-    let tickers: Vec<&str> = BIG_THREE.iter().map(|s| s.ticker).collect();
+    // Subscribe to all symbols: BTC ETFs (Tide) + TradFi (Horizon)
+    let tickers: Vec<&str> = all_tickers();
 
     loop {
         // Generous read timeout: off-hours the feed is legitimately silent, so a
@@ -444,7 +470,7 @@ async fn handle_alpaca_payload(
                     ws.send(Message::Text(sub.into())).await
                         .map_err(|e| format!("subscribe send failed: {e}"))?;
                     *subscribed = true;
-                    info!("🌊 Tide equity feed: authenticated, subscribed {:?} (Alpaca IEX)", tickers);
+                    info!("🌊 Alpaca equity feed: authenticated, subscribed {:?} (IEX)", tickers);
                 }
             }
             Some("subscription") => {} // subscription confirmation — no action
@@ -488,12 +514,17 @@ async fn ingest_trade(
     let dollar_vol: Decimal = dq.iter().map(|(_, n)| *n).sum();
 
     let mut map = quotes.lock().await;
-    map.insert(sym, EtfQuote { last_price: price, last_at: Some(now), dollar_vol });
+    map.insert(sym, EquityQuote { last_price: price, last_at: Some(now), dollar_vol });
 }
 
-/// Map an Alpaca symbol string to one of the Big Three `&'static str` keys.
+/// Map an Alpaca symbol string to one of our known tickers (BTC ETFs + TradFi).
 fn resolve_ticker(s: &str) -> Option<&'static str> {
-    BIG_THREE.iter().find(|spec| spec.ticker == s).map(|spec| spec.ticker)
+    // Check BTC ETFs first
+    if let Some(spec) = BIG_THREE.iter().find(|spec| spec.ticker == s) {
+        return Some(spec.ticker);
+    }
+    // Check Horizon TradFi symbols
+    HORIZON_SYMBOLS.iter().copied().find(|&t| t == s)
 }
 
 /// Coerce a JSON number (or numeric string) to `Decimal`.

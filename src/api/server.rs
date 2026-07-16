@@ -121,6 +121,18 @@ pub struct AssetRaptorHealth {
     pub fbtc_premium_bps:    Decimal,
     pub arkb_premium_bps:    Decimal,
 
+    // ── Live Horizon Raptor signal snapshot (TradFi velocity / VIX proxy) ─────
+    /// Horizon Raptor has at least one fresh SPY/QQQ/UVXY print this tick.
+    pub horizon_connected:   bool,
+    /// Volume-weighted 5-second velocity of SPY+QQQ (USD Δprice).
+    pub tradfi_velocity:     Decimal,
+    /// 10-minute rolling Pearson correlation of QQQ velocity vs BTC velocity.
+    pub macro_coherence:     Decimal,
+    /// UVXY last trade price (VIX futures ETF proxy).
+    pub vix_proxy:           Decimal,
+    /// 5-second rate of change of UVXY (VIX velocity).
+    pub vix_velocity:        Decimal,
+
     // ── Live Sports Raptor signal snapshot (The Odds API line movement) ──────
     /// Sports Raptor has a fresh cross-book consensus this poll (observe-only).
     pub sports_connected:     bool,
@@ -200,6 +212,14 @@ pub struct TelemetrySample {
     pub sports_commence:       String,
     #[serde(default)]
     pub sports_books:          String,
+
+    // ── Horizon Raptor (TradFi velocity / VIX proxy) ──
+    pub horizon_connected:   bool,
+    pub horizon_market_open: bool,
+    pub tradfi_velocity:     Decimal,
+    pub macro_coherence:     Decimal,
+    pub vix_proxy:           Decimal,
+    pub vix_velocity:        Decimal,
 }
 
 /// Per-asset rolling history of telemetry samples.
@@ -296,6 +316,12 @@ async fn run_telemetry_sampler(
                 sports_sport:          h.sports_sport.clone(),
                 sports_commence:       h.sports_commence.clone(),
                 sports_books:          h.sports_books.clone(),
+                horizon_connected:   h.horizon_connected,
+                horizon_market_open: h.tradfi_velocity != Decimal::ZERO || h.vix_proxy != Decimal::ZERO,
+                tradfi_velocity:     h.tradfi_velocity,
+                macro_coherence:     h.macro_coherence,
+                vix_proxy:           h.vix_proxy,
+                vix_velocity:        h.vix_velocity,
             });
             let len = buf.len();
             let cap = if asset == "sports" { SPORTS_HISTORY_CAP } else { TELEMETRY_HISTORY_CAP };
