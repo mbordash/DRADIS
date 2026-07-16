@@ -407,6 +407,10 @@ pub struct GboostStrategyImpl {
     /// observed 2026-07-07).  Unlike retrain_backoff_until this applies to HEALTHY retrains
     /// too, not just degenerate ones.
     last_retrain_at: Arc<StdMutex<Option<Instant>>>,
+    /// Throttle for the once-per-interval INFO status line explaining WHY retrain
+    /// cycles are aborting (cold-start visibility).  Without this the abort paths
+    /// are silent (debug-only) and a stalled bootstrap is invisible in prod logs.
+    last_retrain_status_log: Arc<StdMutex<Option<Instant>>>,
     /// When set, records the `Instant` at which BTC spot first dropped below
     /// (daily_strike − BASIS_BTC_ORACLE_STRIKE_BUFFER).  Resets to None whenever spot
     /// recovers above the threshold.  Used to suppress YES entries on daily markets when
@@ -453,9 +457,60 @@ pub struct GboostStrategyImpl {
     obi_ema: Arc<StdMutex<[Option<(f64, Instant)>; 4]>>,
 }
 
+/// ── Process-global GBoost state (survives market rotations) ─────────────────
+/// The patrol loop rebuilds all strategy objects on every hourly market rotation
+/// (`create_all_strategies()`), which used to wipe the snapshot history, the real
+/// trade-outcome buffer, and the trained model — GBoost restarted its bootstrap
+/// from zero every hour.  In a flat regime the ~18-min history window can never
+/// produce GBOOST_MIN_TRAINING_SAMPLES deadband-surviving labels on its own, so
+/// the model NEVER trained (observed 2026-07-16: 17.5h of retrain triggers, zero
+/// trains).  These globals follow the same pattern as maker_market_first_seen().
+/// One crypto per process is already assumed (CRYPTO_FILTER namespaces the model
+/// file), so a single global per state item is safe.
+fn gboost_shared_model() -> Arc<StdMutex<Option<PerpetualBooster>>> {
+    static REG: std::sync::OnceLock<Arc<StdMutex<Option<PerpetualBooster>>>> =
+        std::sync::OnceLock::new();
+    Arc::clone(REG.get_or_init(|| Arc::new(StdMutex::new(None))))
+}
+
+fn gboost_shared_history() -> Arc<StdMutex<VecDeque<MarketSnapshot>>> {
+    static REG: std::sync::OnceLock<Arc<StdMutex<VecDeque<MarketSnapshot>>>> =
+        std::sync::OnceLock::new();
+    Arc::clone(REG.get_or_init(|| {
+        Arc::new(StdMutex::new(VecDeque::with_capacity(config::GBOOST_HISTORY_BUFFER_SIZE + 16)))
+    }))
+}
+
+fn gboost_shared_training_data() -> Arc<StdMutex<VecDeque<TrainingSample>>> {
+    static REG: std::sync::OnceLock<Arc<StdMutex<VecDeque<TrainingSample>>>> =
+        std::sync::OnceLock::new();
+    Arc::clone(REG.get_or_init(|| {
+        Arc::new(StdMutex::new(VecDeque::with_capacity(config::GBOOST_HISTORY_BUFFER_SIZE)))
+    }))
+}
+
+/// Cumulative lookahead-label pool: (labeled samples, timestamp of the last
+/// history snapshot already harvested).  Each retrain cycle labels only NEW
+/// snapshots (timestamp > last-harvest) and appends the deadband survivors here,
+/// so informative samples ACCUMULATE across hours and rotations instead of having
+/// to all come from one 18-min window.  Flat nights fill slowly, volatile hours
+/// fill fast; FIFO-capped at GBOOST_LABEL_POOL_CAP so stale regimes age out.
+fn gboost_label_pool()
+    -> &'static StdMutex<(VecDeque<TrainingSample>, Option<chrono::DateTime<chrono::Utc>>)>
+{
+    static REG: std::sync::OnceLock<
+        StdMutex<(VecDeque<TrainingSample>, Option<chrono::DateTime<chrono::Utc>>)>,
+    > = std::sync::OnceLock::new();
+    REG.get_or_init(|| StdMutex::new((VecDeque::new(), None)))
+}
+
 impl GboostStrategyImpl {
     pub fn new() -> Self {
-        let model_arc = Arc::new(StdMutex::new(None::<PerpetualBooster>));
+        // Rotation-surviving model handle. Only hit the disk when no model is in
+        // memory yet (process start) — reloading on every rotation could clobber a
+        // freshly trained in-memory model with an older disk copy.
+        let model_arc = gboost_shared_model();
+        let need_disk_load = model_arc.lock().unwrap().is_none();
 
         // Warm-start: try to load a previously persisted model from disk.
         //
@@ -474,7 +529,7 @@ impl GboostStrategyImpl {
         // container in a shared-volume multi-instance deploy writes its own file:
         //   logs/btc-gboost_model_v26f.json, logs/eth-gboost_model_v26f.json, etc.
         let model_clone = Arc::clone(&model_arc);
-        tokio::spawn(async move {
+        if need_disk_load { tokio::spawn(async move {
             // Env var takes precedence; fall back to CRYPTO_FILTER-namespaced default.
             let model_path = std::env::var("GBOOST_MODEL_PATH")
                 .unwrap_or_else(|_| {
@@ -517,23 +572,20 @@ impl GboostStrategyImpl {
                     model_path
                 ),
             }
-        });
+        }); }
 
         Self {
             model: model_arc,
-            history: Arc::new(StdMutex::new(
-                VecDeque::with_capacity(config::GBOOST_HISTORY_BUFFER_SIZE + 16)
-            )),
+            history: gboost_shared_history(),
             ticks_since_retrain: Arc::new(StdMutex::new(0)),
             is_training: Arc::new(AtomicBool::new(false)),
-            training_data: Arc::new(StdMutex::new(
-                VecDeque::with_capacity(config::GBOOST_HISTORY_BUFFER_SIZE)
-            )),
+            training_data: gboost_shared_training_data(),
             pending_entries: Arc::new(StdMutex::new(HashMap::new())),
             post_exit_cooldowns: Arc::new(StdMutex::new(HashMap::new())),
             consecutive_degenerate: Arc::new(StdMutex::new(0)),
             retrain_backoff_until: Arc::new(StdMutex::new(None)),
             last_retrain_at: Arc::new(StdMutex::new(None)),
+            last_retrain_status_log: Arc::new(StdMutex::new(None)),
             below_strike_since: Arc::new(StdMutex::new(None)),
             concept_drift_suppressed: Arc::new(AtomicBool::new(false)),
             last_concept_drift_score: Arc::new(StdMutex::new(0.0_f32)),
@@ -544,6 +596,18 @@ impl GboostStrategyImpl {
             last_veto_log_at: Arc::new(StdMutex::new(None)),
             obi_ema: Arc::new(StdMutex::new([None; 4])),
         }
+    }
+
+    /// Test-only constructor: replaces the process-global shared state (model,
+    /// history, training_data) with fresh isolated instances so parallel tests
+    /// don't observe each other's samples through the rotation-surviving globals.
+    #[cfg(test)]
+    fn new_isolated() -> Self {
+        let mut s = Self::new();
+        s.model = Arc::new(StdMutex::new(None));
+        s.history = Arc::new(StdMutex::new(VecDeque::new()));
+        s.training_data = Arc::new(StdMutex::new(VecDeque::new()));
+        s
     }
 
     /// Push snapshot into the ring buffer, evicting the oldest entry when at capacity.
@@ -618,7 +682,17 @@ impl GboostStrategyImpl {
         // exact contention the OS watchdog comment names. Mark it distinctly so a stall
         // here reports GBOOST_RETRAIN rather than the generic SIGNAL_EVAL/gboost.
         crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::GboostRetrain);
-        tracing::info!(" GboostStrategy: retrain trigger fired — collecting samples (sync section)");
+        tracing::debug!(" GboostStrategy: retrain trigger fired — collecting samples (sync section)");
+
+        // Throttled INFO status (once per 10 min): abort paths below are otherwise
+        // silent/debug-only, which made a 17h cold-start stall invisible in prod logs.
+        let status = |msg: String| {
+            let mut guard = self.last_retrain_status_log.lock().unwrap();
+            if guard.map_or(true, |t| t.elapsed().as_secs() >= 600) {
+                tracing::info!(" GboostStrategy: retrain waiting — {}", msg);
+                *guard = Some(Instant::now());
+            }
+        };
 
         // ── Collect real trade outcomes (Source 1: highest quality labels) ──────────
         // These are actual entry/exit P&L labels — far more informative than lookahead
@@ -633,18 +707,21 @@ impl GboostStrategyImpl {
             // Enough real trade outcomes — use them exclusively for the cleanest signal.
             real_samples
         } else {
-            // ── Source 2 (+ Source 1 blend): lookahead labels from history ring buffer ──
+            // ── Source 2 (+ Source 1 blend): lookahead labels via the global pool ──────
             // When real outcomes exist but are too few, prepend them to the lookahead batch.
-            // This breaks the chicken-and-egg bootstrap deadlock while continuously
-            // improving model quality as real trade-outcome labels accumulate.
             // Label = 1.0 if the ORACLE price is higher GBOOST_LABEL_HORIZON_SECS later.
             // The market resolves on the oracle, so this is the actual prediction target —
             // the previous yes_bid-based label learned thin-book quote noise instead
             // (2026-07-14: model called DOWN 14/17 times while BTC rose +1.7%).
+            //
+            // Harvest is INCREMENTAL: each cycle labels only snapshots newer than the
+            // pool's last-harvest watermark, and deadband survivors accumulate in the
+            // process-global pool (see gboost_label_pool) across cycles and rotations.
             let h = self.history.lock().unwrap();
             let n = h.len();
             let horizon = chrono::Duration::seconds(config::GBOOST_LABEL_HORIZON_SECS);
-            let needed = config::GBOOST_MIN_TRAINING_SAMPLES.saturating_sub(real_samples.len());
+            let mut pool_guard = gboost_label_pool().lock().unwrap();
+            let (pool, last_harvest_ts) = &mut *pool_guard;
             // `usable` = number of leading samples whose label horizon is fully inside
             // the buffer (a future snapshot ≥ horizon later exists for them).
             let usable = match (h.front(), h.back()) {
@@ -653,20 +730,15 @@ impl GboostStrategyImpl {
                 }
                 _ => 0,
             };
-            if usable < needed {
-                // Not enough time-span in the history yet. Reset the tick counter so the
-                // trigger re-arms after a full GBOOST_RETRAIN_EVERY_N cycle (~30s) instead
-                // of re-firing (and logging) on every subsequent 50ms tick while the
-                // decimated buffer is still filling (~8 min from cold start).
-                *self.ticks_since_retrain.lock().unwrap() = 0;
-                return;
-            }
-            let mut combined = real_samples; // Real outcomes first (highest quality)
             // Two-pointer scan: `j` tracks the first snapshot ≥ horizon after `i`.
             // Both indices only move forward, so the whole pass is O(n).
             let mut j = 0usize;
             for i in 0..usable {
                 let snap = &h[i];
+                // Already harvested by a previous cycle — never relabel a snapshot.
+                if last_harvest_ts.map_or(false, |ts| snap.timestamp <= ts) {
+                    continue;
+                }
                 while j < n && h[j].timestamp - snap.timestamp < horizon {
                     j += 1;
                 }
@@ -674,6 +746,8 @@ impl GboostStrategyImpl {
                     break; // No future snapshot far enough ahead (shouldn't happen within `usable`)
                 }
                 let future = &h[j];
+                // Mark processed regardless of whether the deadband keeps it below.
+                *last_harvest_ts = Some(snap.timestamp);
                 let cur = snap.oracle_price.to_f64().unwrap_or(0.0);
                 let fut = future.oracle_price.to_f64().unwrap_or(0.0);
                 // Skip directionally-uninformative samples: oracle essentially flat
@@ -687,19 +761,30 @@ impl GboostStrategyImpl {
                 let prev_snap = if i > 0 { Some(&h[i - 1]) } else { None };
                 let hv = hist_vol_from_deque(&h, i);
                 let tm = tick_momentum_from_deque(&h, i);
-                combined.push(TrainingSample {
+                pool.push_back(TrainingSample {
                     features: extract_features(snap, prev_snap, hv, tm),
                     is_profitable: fut > cur,
                     entry_timestamp: snap.timestamp,
                 });
+                if pool.len() > config::GBOOST_LABEL_POOL_CAP {
+                    pool.pop_front(); // FIFO: stale regimes age out
+                }
             }
+            let mut combined = real_samples; // Real outcomes first (highest quality)
+            combined.extend(pool.iter().cloned());
             combined
         };
 
         if training_samples.len() < config::GBOOST_MIN_TRAINING_SAMPLES {
-            // Same re-arm rationale as the `usable < needed` return above: without the
-            // reset this fires every tick (flat-oracle samples skipped by the label
-            // deadband can leave the batch short even when the buffer time-span is OK).
+            // Re-arm the tick counter so the trigger fires again after a full
+            // GBOOST_RETRAIN_EVERY_N cycle instead of on every 50ms tick.  The pool
+            // accumulates across cycles, so this state always progresses toward a train.
+            status(format!(
+                "label pool filling ({} of {} — {} real outcomes; flat regimes fill slowly)",
+                training_samples.len(), config::GBOOST_MIN_TRAINING_SAMPLES, {
+                    let td = self.training_data.lock().unwrap(); td.len()
+                }
+            ));
             *self.ticks_since_retrain.lock().unwrap() = 0;
             return;
         }
@@ -718,6 +803,12 @@ impl GboostStrategyImpl {
                 " GBoost: skipping retrain — labels imbalanced ({:.0}% positive > max {:.0}%), waiting for balanced data",
                 pos_fraction * 100.0, config::GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX * 100.0
             );
+            status(format!(
+                "labels imbalanced ({:.0}% positive, allowed {:.0}–{:.0}%) — one-sided drift over the horizon",
+                pos_fraction * 100.0,
+                (1.0 - config::GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX) * 100.0,
+                config::GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX * 100.0
+            ));
             *self.ticks_since_retrain.lock().unwrap() = 0;
             *self.last_retrain_at.lock().unwrap() = Some(Instant::now());
             return;
@@ -726,6 +817,10 @@ impl GboostStrategyImpl {
         *self.ticks_since_retrain.lock().unwrap() = 0;
         *self.last_retrain_at.lock().unwrap() = Some(Instant::now());
         self.is_training.store(true, Ordering::Relaxed);
+        tracing::info!(
+            " GboostStrategy: retraining model — {} samples ({} real outcomes, {:.0}% positive labels)",
+            training_samples.len(), pos_count, pos_fraction * 100.0
+        );
 
         let model_arc   = Arc::clone(&self.model);
         let is_training = Arc::clone(&self.is_training);
@@ -1962,14 +2057,14 @@ mod tests {
 
     #[tokio::test]
     async fn no_signal_without_model() {
-        let strategy = GboostStrategyImpl::new();
+        let strategy = GboostStrategyImpl::new_isolated();
         let signal = strategy.evaluate_entry(&make_ctx()).await.unwrap();
         assert!(matches!(signal, StrategySignal::NoSignal));
     }
 
     #[tokio::test]
     async fn evaluates_with_trained_model() {
-        let strategy = GboostStrategyImpl::new();
+        let strategy = GboostStrategyImpl::new_isolated();
         let n = config::GBOOST_MIN_TRAINING_SAMPLES + 10; // No lookahead needed
         let mut samples: Vec<TrainingSample> = Vec::with_capacity(n);
         for i in 0..n {
@@ -1988,7 +2083,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_entry_is_kept_when_no_exit_signal() {
-        let strategy = GboostStrategyImpl::new();
+        let strategy = GboostStrategyImpl::new_isolated();
         let ctx = make_ctx();
 
         strategy.pending_entries.lock().unwrap().insert(
@@ -2021,7 +2116,7 @@ mod tests {
 
     #[tokio::test]
     async fn pending_entry_is_consumed_when_exit_signal_emitted() {
-        let strategy = GboostStrategyImpl::new();
+        let strategy = GboostStrategyImpl::new_isolated();
         let ctx = make_ctx();
 
         strategy.pending_entries.lock().unwrap().insert(

@@ -587,7 +587,33 @@ impl Squadron {
                                     if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &tid, Side::Sell, shares, (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await {
                                         let es = e.to_string();
                                         if es.contains("not enough balance") || es.contains("balance: 0") || es.contains("invalid price") {
-                                            let mut map = positions.lock().await; if let Some(p) = map.remove(&pos_key) { if p.fill_confirmed_at.is_some() { let aep3 = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); *total_pnl.lock().await += (aep3 - p.avg_entry) * p.shares; } }
+                                            // The exchange says we don't hold the shares (typically: a prior
+                                            // FAK exit DID fill but a stale balance read resurrected the
+                                            // position — observed 2026-07-16).  The position is gone on-chain,
+                                            // so book the exit NOW at the estimated price and close the DB row.
+                                            // The old path credited session P&L silently with no trade record
+                                            // and no open_positions cleanup, so the ledger diverged and
+                                            // ChainReconcile later invented a second exit at the current mark.
+                                            let removed = { let mut map = positions.lock().await; map.remove(&pos_key) };
+                                            if let Some(p) = removed {
+                                                if p.fill_confirmed_at.is_some() {
+                                                    let aep3 = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
+                                                    let pnl3 = (aep3 - p.avg_entry) * p.shares;
+                                                    warn!(
+                                                        "⚠️ EXIT rejected by exchange [{}] (\"{}\"): position already gone — booking est. exit @ ${:.4} pnl=${:.4}",
+                                                        sn, es.chars().take(80).collect::<String>(), aep3, pnl3
+                                                    );
+                                                    *total_pnl.lock().await += pnl3;
+                                                    let sid3 = if tid == target_yes_token { "YES".to_string() } else { "NO".to_string() };
+                                                    metrics::record_trade(
+                                                        &asset_lc, sn.clone(), params.market_name.clone(), sid3,
+                                                        p.avg_entry, aep3, p.shares, pnl3,
+                                                        format!("{} (ExitUnverified: est. price — sell rejected, shares gone)", reason),
+                                                    ).await;
+                                                    if let Some(pool) = db::pool_for(&asset_lc) { db::close_open_position(&pool, &sn, &tid_m.to_string()).await; }
+                                                }
+                                                token_ownership.lock().await.remove(&tid_m);
+                                            }
                                             last_trade_time.insert(sn.clone(), Instant::now()); continue;
                                         }
                                         if es.contains("no orders found") {
@@ -643,12 +669,33 @@ impl Squadron {
                                             let sn_rec = sn.clone();
                                             let tid_rec = tid.to_string();
                                             tokio::spawn(async move {
-                                                tokio::time::sleep(Duration::from_millis(2500)).await;
-                                                let mut req = BalanceAllowanceRequest::default(); req.asset_type = AssetType::Conditional; req.token_id = Some(u256_from_market_id(&tid_async).unwrap_or_default());
-                                                let rem = match cl.balance_allowance(req).await {
-                                                    Ok(r) => Decimal::from_str(&r.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
-                                                    Err(_) => {
-                                                        // Balance RPC failed — we can't confirm the fill. Re-insert the
+                                                // Poll the balance with escalating delays (2.5s, +5s, +10s).
+                                                // The balance API can lag a filled FAK by several seconds; a
+                                                // single stale read here showed 10/10 shares still held on
+                                                // 2026-07-16 for a FAK that HAD filled, resurrecting the
+                                                // position → retry exit → exchange reject → phantom P&L.
+                                                // Only trust a "nothing filled" answer after the final poll;
+                                                // any read showing a reduced balance is accepted immediately.
+                                                let mut rem: Option<Decimal> = None;
+                                                for (i, delay_ms) in [2500u64, 5000, 10000].iter().enumerate() {
+                                                    tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
+                                                    let mut req = BalanceAllowanceRequest::default(); req.asset_type = AssetType::Conditional; req.token_id = Some(u256_from_market_id(&tid_async).unwrap_or_default());
+                                                    match cl.balance_allowance(req).await {
+                                                        Ok(r) => {
+                                                            let b = Decimal::from_str(&r.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
+                                                            rem = Some(b);
+                                                            if b < rs_m { break; } // fill visible — no need to keep polling
+                                                            if i < 2 {
+                                                                warn!("⏳ FAK verify [{}]: balance still shows {:.4}/{:.4} unfilled — re-polling (attempt {}/3)", sn_async, b, rs_m, i + 2);
+                                                            }
+                                                        }
+                                                        Err(_) => { /* transient RPC error — try next poll */ }
+                                                    }
+                                                }
+                                                let rem = match rem {
+                                                    Some(r) => r,
+                                                    None => {
+                                                        // All balance reads failed — we can't confirm the fill. Re-insert the
                                                         // position (no PnL credit, no DB write) so a later exit retry
                                                         // reconciles it, instead of leaking it out of the position map.
                                                         let mut map = ps.lock().await;
@@ -1157,7 +1204,7 @@ impl Squadron {
                                     if let Some(pool) = db::pool_for(&asset_lc) {
                                         db::close_open_position(&pool, &sn, tok.as_str()).await;
                                     }
-                                    info!("🚫 Maker quote-pulled [{}]: {} — resting quote cancelled (book turned toxic)", sn, tok);
+                                    info!("🚫 Maker quote-pulled [{}]: {} — resting quote cancelled (toxic book / oracle drift)", sn, tok);
                                 }
                             }
                             StrategySignal::NoSignal => {}

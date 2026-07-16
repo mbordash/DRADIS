@@ -193,6 +193,9 @@ pub const MOMENTUM_MAX_SNAPSHOT_AGE_SECS: i64 = 15;
 pub const ENABLE_MAKER_TRADING: bool = true;
 
 pub const MAKER_VELOCITY_BIAS_THRESHOLD: Decimal = dec!(25.0);
+/// Oracle-drift quote pull: cancel unfilled resting quote on adverse oracle move.
+/// Conservative: 3 bps — pulls at the first hint of adverse drift.
+pub const MAKER_ORACLE_DRIFT_PULL_FRAC: Decimal = dec!(0.0003);
 pub const MAKER_BID_BUFFER: Decimal = dec!(0.04);
 /// Requires a wider spread before posting — more edge per fill.
 pub const MAKER_MIN_SPREAD: Decimal = dec!(0.05);
@@ -408,6 +411,7 @@ pub const GBOOST_HISTORY_MIN_SPACING_MS: i64 = 500; // time-decimated snapshot b
 pub const GBOOST_LABEL_HORIZON_SECS: i64 = 300; // conservative: longer horizon, slower but steadier signal
 pub const GBOOST_LABEL_MIN_ORACLE_MOVE_FRAC: f64 = 0.0003; // skip flat samples (<3bp move)
 pub const GBOOST_MIN_TRAINING_SAMPLES: usize = 320;
+pub const GBOOST_LABEL_POOL_CAP: usize = 8000; // conservative: larger pool — more data, smoother model
 pub const GBOOST_MIN_RETRAIN_INTERVAL_SECS: u64 = 300;
 pub const GBOOST_RETRAIN_EVERY_N: usize = 200;
 pub const GBOOST_BUDGET: f32 = 0.80; // raised from 0.65 — gives perpetual room to grow past 1 tree

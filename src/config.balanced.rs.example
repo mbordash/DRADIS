@@ -183,6 +183,9 @@ pub const MOMENTUM_MAX_SNAPSHOT_AGE_SECS: i64 = 15;
 pub const ENABLE_MAKER_TRADING: bool = true;
 
 pub const MAKER_VELOCITY_BIAS_THRESHOLD: Decimal = dec!(25.0);
+/// Oracle-drift quote pull: cancel unfilled resting quote on adverse oracle move.
+/// The oracle leads OBI by minutes — pulls stale quotes before informed takers arrive.
+pub const MAKER_ORACLE_DRIFT_PULL_FRAC: Decimal = dec!(0.0005);
 pub const MAKER_BID_BUFFER: Decimal = dec!(0.03);
 pub const MAKER_MIN_SPREAD: Decimal = dec!(0.04);
 pub const MAKER_BID_IMPROVEMENT: Decimal = dec!(0.01);
@@ -380,6 +383,9 @@ pub const GBOOST_HISTORY_MIN_SPACING_MS: i64 = 500; // time-decimated snapshot b
 pub const GBOOST_LABEL_HORIZON_SECS: i64 = 180; // oracle-based label: BTC higher after 180s
 pub const GBOOST_LABEL_MIN_ORACLE_MOVE_FRAC: f64 = 0.0002; // skip flat samples (<2bp move)
 pub const GBOOST_MIN_TRAINING_SAMPLES: usize = 320;
+/// FIFO cap on the process-global lookahead label pool — labels accumulate across
+/// retrain cycles and market rotations so flat regimes can still bootstrap the model.
+pub const GBOOST_LABEL_POOL_CAP: usize = 6000;
 pub const GBOOST_RETRAIN_EVERY_N: usize = 200;
 /// Hard minimum wall-clock interval (seconds) between successful GBoost retrains.
 /// Prevents a fast tick rate from storming booster.fit() and starving the runtime.

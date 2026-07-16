@@ -179,6 +179,50 @@ fn maker_toxic_cooldown_active(token_id: &str, cooldown_secs: i64) -> bool {
     false
 }
 
+/// Process-global oracle baseline per quoted token: token_id → oracle price at the
+/// moment the quote was (re)placed.  Global for the same rotation-survival reason as
+/// the trackers above.  Used by the oracle-drift quote pull: the oracle is the
+/// LEADING toxicity signal — informed takers act on Binance moves seconds before the
+/// Polymarket book (OBI) reflects them, so an OBI-triggered pull loses the race
+/// (2026-07-16: quote placed 12:56 @ BTC $64,420, BTC broke down ~12:58, OBI pull
+/// fired 13:02:46, taker filled us anyway → −$0.365).  Drift-based pulls cancel the
+/// stale quote minutes earlier.
+fn maker_quote_oracle_baselines() -> &'static std::sync::Mutex<HashMap<String, Decimal>> {
+    static REG: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Decimal>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Record the oracle price behind a freshly placed/refreshed quote for `token_id`.
+fn set_maker_quote_oracle_baseline(token_id: &str, oracle: Decimal) {
+    if oracle <= dec!(0) { return; }
+    let mut reg = match maker_quote_oracle_baselines().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.insert(token_id.to_string(), oracle);
+}
+
+/// Clear the baseline once the quote is gone (pulled, filled, or exited).
+fn clear_maker_quote_oracle_baseline(token_id: &str) {
+    let mut reg = match maker_quote_oracle_baselines().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.remove(token_id);
+}
+
+/// Signed fractional oracle move since the quote baseline for `token_id`
+/// (positive = oracle rose).  None when no baseline exists or oracle is invalid.
+fn maker_quote_oracle_drift(token_id: &str, oracle_now: Decimal) -> Option<Decimal> {
+    if oracle_now <= dec!(0) { return None; }
+    let reg = match maker_quote_oracle_baselines().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.get(token_id).map(|base| (oracle_now - base) / base)
+}
+
 impl MakerStrategyImpl {
     pub fn new() -> Self {
         Self {
@@ -571,13 +615,47 @@ impl Strategy for MakerStrategyImpl {
         // an UNFILLED resting quote we cancel it (reactive quote-pull) so it isn't
         // left on the book to be picked off by the informed flow — the exact
         // adverse-selection mechanism behind the noon-ET maker losses.
+        //
+        // ORACLE-DRIFT pull (leading signal): OBI only turns AFTER informed takers
+        // arrive, and the OBI pull loses the cancel race (2026-07-16: pull fired
+        // 13:02:46, taker filled us anyway → −$0.365).  The oracle moves first, so
+        // an unfilled quote whose oracle has drifted adversely beyond
+        // MAKER_ORACLE_DRIFT_PULL_FRAC since placement is cancelled immediately.
         {
             let pos_map = ctx.positions.lock().await;
             let mut pull_tokens = Vec::new();
             for token_id in [market.yes_token.clone(), market.no_token.clone()] {
                 let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id.clone())) else {
+                    // No quote/position on this token — drop any stale drift baseline.
+                    clear_maker_quote_oracle_baseline(token_id.as_str());
                     continue;
                 };
+
+                if position.fill_confirmed_at.is_none() {
+                    // Unfilled resting quote: arm/check the oracle-drift baseline.
+                    let oracle_now = snapshot.oracle_price;
+                    match maker_quote_oracle_drift(token_id.as_str(), oracle_now) {
+                        None => set_maker_quote_oracle_baseline(token_id.as_str(), oracle_now),
+                        Some(drift) => {
+                            // YES bid: oracle falling is adverse. NO bid: oracle rising.
+                            let adverse = if token_id == market.yes_token { -drift } else { drift };
+                            if adverse >= config::MAKER_ORACLE_DRIFT_PULL_FRAC {
+                                arm_maker_toxic_cooldown(token_id.as_str());
+                                clear_maker_quote_oracle_baseline(token_id.as_str());
+                                tracing::info!(
+                                    "⚡ Maker quote-pull (oracle drift): oracle moved {:.3}% adverse to resting {} quote (threshold {:.3}%) — cancelling before the book turns, re-entry locked {}s",
+                                    adverse * dec!(100), if token_id == market.yes_token { "YES" } else { "NO" },
+                                    config::MAKER_ORACLE_DRIFT_PULL_FRAC * dec!(100), dc.maker_toxic_reentry_cooldown_secs
+                                );
+                                pull_tokens.push(token_id.clone());
+                                continue;
+                            }
+                        }
+                    }
+                } else {
+                    // Quote filled — baseline no longer meaningful.
+                    clear_maker_quote_oracle_baseline(token_id.as_str());
+                }
 
                 let (bid_depth, ask_depth, bid) = if token_id == market.yes_token {
                     (snapshot.yes_bid_depth, snapshot.yes_ask_depth, snapshot.yes_bid)
@@ -592,6 +670,7 @@ impl Strategy for MakerStrategyImpl {
 
                 if obi < dc.maker_toxic_flow_exit_obi {
                     arm_maker_toxic_cooldown(token_id.as_str());
+                    clear_maker_quote_oracle_baseline(token_id.as_str());
                     if position.fill_confirmed_at.is_some() {
                         tracing::info!(
                             "⚡ Maker ToxicFill exit triggered: OBI={:.2} (threshold={:.2}) | bid=${:.4} | re-entry locked {}s",
