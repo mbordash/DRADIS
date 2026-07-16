@@ -329,6 +329,21 @@ pub const TIDE_ALPACA_KEY_ENV:    &str = "ALPACA_API_KEY_ID";
 pub const TIDE_ALPACA_SECRET_ENV: &str = "ALPACA_API_SECRET_KEY";
 pub const BASIS_MIN_STOP_LOSS_EXIT_BID: Decimal = dec!(0.005);
 
+// ── Horizon Raptor (TradFi velocity / VIX proxy) ──────────────────────────────
+//
+// NOTE: The Horizon Raptor shares the Alpaca IEX connection with the Tide Raptor
+// (via SharedQuoteMap). No separate Alpaca credentials needed.
+
+/// Compute tick interval for the Horizon Raptor signal recompute loop.
+pub const HORIZON_TICK_MS: u64 = 500;
+
+/// Max age (seconds) of an equity quote before it's considered stale.
+pub const HORIZON_QUOTE_STALENESS_SECS: u64 = 30;
+
+/// Rolling window (seconds) for the macro coherence Pearson correlation
+/// between BTC velocity and QQQ velocity. 10 minutes = 600s.
+pub const HORIZON_CORRELATION_WINDOW_SECS: u64 = 600;
+
 // ── Sports Raptor (The Odds API line-movement feed) ──────────────────────────
 //
 /// Env var carrying the The Odds API (the-odds-api.com) key. Absent ⇒ the Sports
