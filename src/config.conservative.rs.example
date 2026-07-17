@@ -196,6 +196,9 @@ pub const MAKER_VELOCITY_BIAS_THRESHOLD: Decimal = dec!(25.0);
 /// Oracle-drift quote pull: cancel unfilled resting quote on adverse oracle move.
 /// Conservative: 3 bps — pulls at the first hint of adverse drift.
 pub const MAKER_ORACLE_DRIFT_PULL_FRAC: Decimal = dec!(0.0003);
+/// Gate-dwell: gates must pass continuously this long before quoting.
+/// Conservative: 30s — only quote into persistently calm books.
+pub const MAKER_GATE_DWELL_SECS: i64 = 30;
 pub const MAKER_BID_BUFFER: Decimal = dec!(0.04);
 /// Requires a wider spread before posting — more edge per fill.
 pub const MAKER_MIN_SPREAD: Decimal = dec!(0.05);

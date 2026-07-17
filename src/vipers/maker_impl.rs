@@ -212,6 +212,37 @@ fn clear_maker_quote_oracle_baseline(token_id: &str) {
     reg.remove(token_id);
 }
 
+/// Process-global gate-qualification streaks: token_id → the instant that side
+/// FIRST began continuously passing every entry gate.  Global for the usual
+/// rotation-survival reason.  Backs the gate-dwell requirement: a single clean
+/// tick amid book_imbalance/velocity_bias flicker during a directional move is
+/// noise, not a regime change (2026-07-17: gates blocked NO at 12:47:51, one
+/// clean tick at 12:47:55 posted a quote that was lifted within 5s → ToxicFill
+/// −$0.20).  Requiring MAKER_GATE_DWELL_SECS of continuous qualification blocks
+/// quoting into an active move; instant fills on fresh quotes are near-always
+/// adverse selection.
+fn maker_gate_streaks() -> &'static std::sync::Mutex<HashMap<String, Instant>> {
+    static REG: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Update the qualification streak for `token_id` and return the seconds it has
+/// been continuously qualifying (0 on the first qualifying tick).  A
+/// non-qualifying tick resets the streak and returns None.
+fn maker_gate_streak_secs(token_id: &str, qualifies: bool) -> Option<i64> {
+    let mut reg = match maker_gate_streaks().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if !qualifies {
+        reg.remove(token_id);
+        return None;
+    }
+    let started = reg.entry(token_id.to_string()).or_insert_with(Instant::now);
+    Some(started.elapsed().as_secs() as i64)
+}
+
 /// Signed fractional oracle move since the quote baseline for `token_id`
 /// (positive = oracle rose).  None when no baseline exists or oracle is invalid.
 fn maker_quote_oracle_drift(token_id: &str, oracle_now: Decimal) -> Option<Decimal> {
@@ -283,6 +314,8 @@ impl Strategy for MakerStrategyImpl {
         // day-old daily maker market each hour.
         let secs_since_market_start = market_age_secs(&market.market_name);
         if secs_since_market_start < config::MAKER_MIN_MARKET_AGE_SECS {
+            maker_gate_streak_secs(market.yes_token.as_str(), false);
+            maker_gate_streak_secs(market.no_token.as_str(), false);
             self.log_gate("market_age", &format!(
                 "market_age {}s < min {}s",
                 secs_since_market_start, config::MAKER_MIN_MARKET_AGE_SECS
@@ -294,6 +327,8 @@ impl Strategy for MakerStrategyImpl {
         if let Some(close_time) = market.market_close_time {
             let secs_to_expiry = (close_time - Utc::now()).num_seconds();
             if secs_to_expiry < dc.maker_min_secs_to_expiry {
+                maker_gate_streak_secs(market.yes_token.as_str(), false);
+                maker_gate_streak_secs(market.no_token.as_str(), false);
                 self.log_gate("expiry", &format!(
                     "secs_to_expiry {}s < min {}s",
                     secs_to_expiry, dc.maker_min_secs_to_expiry
@@ -301,6 +336,8 @@ impl Strategy for MakerStrategyImpl {
                 return Ok(StrategySignal::NoSignal);
             }
         } else {
+            maker_gate_streak_secs(market.yes_token.as_str(), false);
+            maker_gate_streak_secs(market.no_token.as_str(), false);
             self.log_gate("no_close_time", "no market_close_time").await;
             return Ok(StrategySignal::NoSignal);
         }
@@ -317,6 +354,8 @@ impl Strategy for MakerStrategyImpl {
             && (snapshot.no_ask_depth  / snapshot.no_bid_depth)  <= dc.maker_max_book_imbalance_ratio;
 
         if !yes_book_ok && !no_book_ok {
+            maker_gate_streak_secs(market.yes_token.as_str(), false);
+            maker_gate_streak_secs(market.no_token.as_str(), false);
             self.log_gate("book_imbalance", &format!(
                 "book_imbalance both sides (ratio>{:.1}): yes_bidD={:.0} yes_askD={:.0} | no_bidD={:.0} no_askD={:.0}",
                 dc.maker_max_book_imbalance_ratio,
@@ -438,7 +477,7 @@ impl Strategy for MakerStrategyImpl {
         let yes_toxic_cooldown = maker_toxic_cooldown_active(market.yes_token.as_str(), cooldown_secs);
         let no_toxic_cooldown  = maker_toxic_cooldown_active(market.no_token.as_str(), cooldown_secs);
 
-        let yes_qualifies = yes_book_ok
+        let yes_gates_pass = yes_book_ok
             && !taker_flow_blocks_yes
             && !yes_toxic_cooldown
             && yes_spread >= dc.maker_min_spread
@@ -448,7 +487,7 @@ impl Strategy for MakerStrategyImpl {
             && no_bid <= dc.maker_max_complementary_price
             && !velocity_bias_strong_negative;
 
-        let no_qualifies = no_book_ok
+        let no_gates_pass = no_book_ok
             && !taker_flow_blocks_no
             && !no_toxic_cooldown
             && no_spread >= dc.maker_min_spread
@@ -458,15 +497,31 @@ impl Strategy for MakerStrategyImpl {
             && yes_bid <= dc.maker_max_complementary_price
             && !velocity_bias_strong_positive;
 
+        // ── Gate-dwell requirement ────────────────────────────────────────────
+        // Gates must pass CONTINUOUSLY for MAKER_GATE_DWELL_SECS before a side may
+        // quote.  A single clean tick amid gate flicker during a directional move
+        // is noise (2026-07-17 instant-fill ToxicFill); any gate failure resets
+        // that side's streak.
+        let yes_streak = maker_gate_streak_secs(market.yes_token.as_str(), yes_gates_pass);
+        let no_streak  = maker_gate_streak_secs(market.no_token.as_str(), no_gates_pass);
+        let yes_qualifies = yes_streak.is_some_and(|s| s >= config::MAKER_GATE_DWELL_SECS);
+        let no_qualifies  = no_streak.is_some_and(|s| s >= config::MAKER_GATE_DWELL_SECS);
+
         if !yes_qualifies && !no_qualifies {
-            let (yes_key, yes_detail) = side_reject_reason(
-                yes_book_ok, taker_flow_blocks_yes, yes_toxic_cooldown, yes_spread, yes_bid_price,
-                snapshot.yes_ask, no_bid, velocity_bias_strong_negative, dc,
-            ).unwrap_or(("unknown", "unknown".to_string()));
-            let (no_key, no_detail) = side_reject_reason(
-                no_book_ok, taker_flow_blocks_no, no_toxic_cooldown, no_spread, no_bid_price,
-                snapshot.no_ask, yes_bid, velocity_bias_strong_positive, dc,
-            ).unwrap_or(("unknown", "unknown".to_string()));
+            let (yes_key, yes_detail) = match yes_streak {
+                Some(s) => ("gate_dwell", format!("gate_dwell {}s/{}s", s, config::MAKER_GATE_DWELL_SECS)),
+                None => side_reject_reason(
+                    yes_book_ok, taker_flow_blocks_yes, yes_toxic_cooldown, yes_spread, yes_bid_price,
+                    snapshot.yes_ask, no_bid, velocity_bias_strong_negative, dc,
+                ).unwrap_or(("unknown", "unknown".to_string())),
+            };
+            let (no_key, no_detail) = match no_streak {
+                Some(s) => ("gate_dwell", format!("gate_dwell {}s/{}s", s, config::MAKER_GATE_DWELL_SECS)),
+                None => side_reject_reason(
+                    no_book_ok, taker_flow_blocks_no, no_toxic_cooldown, no_spread, no_bid_price,
+                    snapshot.no_ask, yes_bid, velocity_bias_strong_positive, dc,
+                ).unwrap_or(("unknown", "unknown".to_string())),
+            };
             self.log_gate(
                 &format!("noqual:{}/{}", yes_key, no_key),
                 &format!("no side qualifies | YES: {} | NO: {}", yes_detail, no_detail),

@@ -194,6 +194,9 @@ pub const MAKER_VELOCITY_BIAS_THRESHOLD: Decimal = dec!(25.0);
 /// Oracle-drift quote pull: cancel unfilled resting quote on adverse oracle move.
 /// Aggressive: 8 bps — tolerates more drift, keeps quotes resting longer.
 pub const MAKER_ORACLE_DRIFT_PULL_FRAC: Decimal = dec!(0.0008);
+/// Gate-dwell: gates must pass continuously this long before quoting.
+/// Aggressive: 10s — quicker to quote once conditions look clean.
+pub const MAKER_GATE_DWELL_SECS: i64 = 10;
 pub const MAKER_BID_BUFFER: Decimal = dec!(0.02);
 pub const MAKER_MIN_SPREAD: Decimal = dec!(0.02);
 pub const MAKER_BID_IMPROVEMENT: Decimal = dec!(0.01);
