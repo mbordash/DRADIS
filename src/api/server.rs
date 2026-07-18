@@ -1668,13 +1668,22 @@ async fn get_available_markets(Query(q): Query<AvailableMarketsQuery>) -> Respon
     let market_type = q.market_type.to_lowercase();
     let min_liquidity = q.min_liquidity.unwrap_or(500.0);
     
-    // Parse expiry window to seconds
+    // Parse expiry window to seconds (default varies by market type)
+    let default_expiry = match q.market_type.to_lowercase().as_str() {
+        "sports" => 86400,    // 24h for sports (game-day markets)
+        "crypto" => 86400,    // 24h for crypto (daily price markets)
+        "politics" => 2592000, // 30d for politics (longer horizons)
+        _ => 604800,          // 7d fallback
+    };
+    
     let max_expiry_secs: i64 = match q.expiry_window.as_deref() {
         Some("1h") => 3600,
         Some("4h") => 14400,
         Some("24h") => 86400,
         Some("7d") => 604800,
-        _ => 86400, // default 24h
+        Some("30d") => 2592000,
+        Some("90d") => 7776000,
+        _ => default_expiry,
     };
     
     let http = reqwest::Client::builder()
@@ -2333,9 +2342,9 @@ async fn run_deployment_queue_processor(cag: Cag) {
                 "🛫 Admiral Adama: processing deployment"
             );
             
-            // Fetch market details from Gamma API
-            let market_question = match fetch_market_question(&http, &market_id).await {
-                Some(q) => q,
+            // Fetch full market details from Gamma API (question + token IDs)
+            let market_info = match fetch_market_info(&http, &market_id).await {
+                Some(info) => info,
                 None => {
                     warn!("Failed to fetch market details for {}", market_id);
                     if let Err(e) = crate::helpers::db::update_deployment_status(
@@ -2347,37 +2356,61 @@ async fn run_deployment_queue_processor(cag: Cag) {
                 }
             };
             
-            // Register the staged deployment in the CAG registry
-            let squadron_id = cag.register_staged_deployment(
+            // Spawn a real trading squadron via Admiral Adama infrastructure
+            match cag.spawn_adama_squadron(
                 &deployment_id,
                 &market_id,
                 &market_type,
-                &market_question,
+                &market_info.question,
+                &market_info.yes_token,
+                &market_info.no_token,
                 &raptors,
                 &vipers,
-            );
-            
-            // Mark as deployed in the queue
-            if let Err(e) = crate::helpers::db::update_deployment_status(
-                &deployment_id, "deployed", Some(&squadron_id), None
             ).await {
-                warn!("Failed to mark deployment as deployed: {}", e);
-                continue;
+                Ok(squadron_id) => {
+                    // Mark as deployed in the queue
+                    if let Err(e) = crate::helpers::db::update_deployment_status(
+                        &deployment_id, "deployed", Some(&squadron_id), None
+                    ).await {
+                        warn!("Failed to mark deployment as deployed: {}", e);
+                    }
+                    
+                    info!(
+                        deployment_id = %deployment_id,
+                        squadron_id = %squadron_id,
+                        market_question = %market_info.question,
+                        "✅ Admiral Adama: {} squadron DEPLOYED and PATROLLING",
+                        market_type.to_uppercase()
+                    );
+                }
+                Err(e) => {
+                    error!(
+                        deployment_id = %deployment_id,
+                        error = %e,
+                        "❌ Admiral Adama: failed to spawn squadron"
+                    );
+                    if let Err(e) = crate::helpers::db::update_deployment_status(
+                        &deployment_id, "failed", None, Some(&format!("Spawn failed: {}", e))
+                    ).await {
+                        warn!("Failed to update deployment status: {}", e);
+                    }
+                }
             }
-            
-            info!(
-                deployment_id = %deployment_id,
-                squadron_id = %squadron_id,
-                market_question = %market_question,
-                "✅ Admiral Adama: {} squadron staged for market",
-                market_type.to_uppercase()
-            );
         }
     }
 }
 
-/// Fetch market question from Gamma API by condition_id.
-async fn fetch_market_question(http: &reqwest::Client, condition_id: &str) -> Option<String> {
+/// Market info needed for squadron spawning.
+#[cfg(feature = "intl_clob")]
+struct MarketInfo {
+    question: String,
+    yes_token: String,
+    no_token: String,
+}
+
+/// Fetch full market details from Gamma API by condition_id.
+#[cfg(feature = "intl_clob")]
+async fn fetch_market_info(http: &reqwest::Client, condition_id: &str) -> Option<MarketInfo> {
     let url = format!(
         "https://gamma-api.polymarket.com/markets?condition_id={}",
         condition_id
@@ -2386,8 +2419,23 @@ async fn fetch_market_question(http: &reqwest::Client, condition_id: &str) -> Op
     let resp = http.get(&url).send().await.ok()?;
     let markets: Vec<serde_json::Value> = resp.json().await.ok()?;
     
-    markets.first()
-        .and_then(|m| m.get("question"))
+    let market = markets.first()?;
+    
+    let question = market.get("question")
         .and_then(|q| q.as_str())
-        .map(String::from)
+        .map(String::from)?;
+    
+    // Token IDs are in the clobTokenIds array: [yes_token, no_token]
+    let clob_tokens = market.get("clobTokenIds")
+        .and_then(|t| t.as_array())?;
+    
+    let yes_token = clob_tokens.first()
+        .and_then(|t| t.as_str())
+        .map(String::from)?;
+    
+    let no_token = clob_tokens.get(1)
+        .and_then(|t| t.as_str())
+        .map(String::from)?;
+    
+    Some(MarketInfo { question, yes_token, no_token })
 }

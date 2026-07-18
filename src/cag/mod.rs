@@ -18,6 +18,9 @@
 /// │  sessions     ──►  HashMap<asset, SessionState>                     │
 /// │                     positions / P&L / collateral per asset           │
 /// │                                                                      │
+/// │  adama_infra  ──►  Option<AdamaInfrastructure>                      │
+/// │                     trading client, signer, etc. for spawning        │
+/// │                                                                      │
 /// │  stand_down_asset()  ──►  cancel token + abort handle               │
 /// │  stand_down_all()    ──►  cancels every asset loop                  │
 /// └──────────────────────────────────────────────────────────────────────┘
@@ -36,9 +39,11 @@
 /// `AbortHandle` therefore lives in `asset_tasks`, keyed by asset, not in
 /// any individual `CagEntry`.
 ///
-/// `CagEntry._handle` is reserved for the Admiral Adama extension, where the
-/// CAG will directly spawn individual one-shot patrol tasks into user-chosen
-/// markets.  It is always `None` in the current architecture.
+/// ## Admiral Adama Extension
+///
+/// `CagEntry._handle` stores the JoinHandle for squadrons spawned directly
+/// by Admiral Adama (via `spawn_adama_squadron`). The CAG uses stored
+/// `AdamaInfrastructure` to create proper trading squadrons on demand.
 
 pub mod session;
 pub use session::SessionState;
@@ -47,6 +52,9 @@ pub use session::SessionState;
 pub mod run;
 #[cfg(feature = "intl_clob")]
 pub use run::{RunArgs, run_market_loop};
+
+#[cfg(feature = "intl_clob")]
+pub mod adama;
 
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
@@ -142,6 +150,9 @@ pub struct Cag {
     inner: Arc<CagInner>,
 }
 
+#[cfg(feature = "intl_clob")]
+use crate::cag::adama::AdamaInfrastructure;
+
 struct CagInner {
     registry: DashMap<SquadronId, CagEntry>,
     /// Per-asset loop tasks.  Key = lowercase asset symbol ("btc", "eth", …).
@@ -153,6 +164,10 @@ struct CagInner {
     /// The first asset registered is the "primary" for backward-compat callers.
     /// `RwLock` allows concurrent reads from API handlers without blocking.
     sessions: RwLock<HashMap<String, SessionState>>,
+    /// Admiral Adama trading infrastructure — set once by main.rs after startup.
+    /// Used by `spawn_adama_squadron()` to create real trading squadrons.
+    #[cfg(feature = "intl_clob")]
+    adama_infra: RwLock<Option<Arc<AdamaInfrastructure>>>,
 }
 
 impl Cag {
@@ -163,6 +178,8 @@ impl Cag {
                 registry:    DashMap::new(),
                 asset_tasks: DashMap::new(),
                 sessions:    RwLock::new(HashMap::new()),
+                #[cfg(feature = "intl_clob")]
+                adama_infra: RwLock::new(None),
             }),
         }
     }
@@ -335,6 +352,89 @@ impl Cag {
             "✈️  CAG: staged deployment registered (Admiral Adama)"
         );
         squadron_id
+    }
+
+    /// Store the Admiral Adama trading infrastructure.
+    ///
+    /// Called once by `main.rs` after startup, before the API server starts
+    /// processing deployment requests. This gives Admiral Adama the handles
+    /// it needs to spawn real trading squadrons.
+    #[cfg(feature = "intl_clob")]
+    pub fn set_adama_infrastructure(&self, infra: AdamaInfrastructure) {
+        *self.inner.adama_infra.write().expect("adama_infra lock poisoned") = Some(Arc::new(infra));
+        info!("✈️  CAG: Admiral Adama infrastructure registered");
+    }
+
+    /// Spawn a real trading squadron via Admiral Adama.
+    ///
+    /// Unlike `register_staged_deployment` which just creates a registry entry,
+    /// this method actually creates a Squadron, subscribes to orderbook feeds,
+    /// and starts the patrol loop.
+    ///
+    /// Returns the squadron ID on success.
+    #[cfg(feature = "intl_clob")]
+    pub async fn spawn_adama_squadron(
+        &self,
+        deployment_id: &str,
+        market_id: &str,
+        market_type: &str,
+        market_question: &str,
+        yes_token: &str,
+        no_token: &str,
+        raptors: &[String],
+        vipers: &[String],
+    ) -> Result<SquadronId, String> {
+        let infra = {
+            let guard = self.inner.adama_infra.read().expect("adama_infra lock poisoned");
+            match guard.as_ref() {
+                Some(i) => Arc::clone(i),
+                None => return Err("Admiral Adama infrastructure not initialized".to_string()),
+            }
+        };
+
+        let squadron_id = format!("{}-sq", deployment_id);
+        let cancel_token = CancellationToken::new();
+
+        // Spawn the actual squadron patrol task
+        let handle = infra.spawn_squadron(
+            squadron_id.clone(),
+            market_id,
+            market_type,
+            market_question,
+            yes_token,
+            no_token,
+            raptors,
+            vipers,
+        ).await?;
+
+        // Register in the CAG with PATROLLING state
+        let summary = SquadronSummary {
+            id:                squadron_id.clone(),
+            asset:             market_type.to_uppercase(),
+            name:              format!("{} Squadron", market_type.to_uppercase()),
+            state:             "PATROLLING".to_string(),
+            market_name:       market_question.to_string(),
+            maker_market_name: None,
+            deployed_at:       Utc::now(),
+            market_class:      market_type.to_string(),
+            raptors:           raptors.to_vec(),
+            vipers:            vipers.to_vec(),
+        };
+
+        self.inner.registry.insert(squadron_id.clone(), CagEntry {
+            summary,
+            cancel_token,
+            _handle: Some(handle),
+        });
+
+        info!(
+            squadron = %squadron_id,
+            market_id = %market_id,
+            market_type = %market_type,
+            "✈️  CAG: Admiral Adama squadron spawned and patrolling"
+        );
+
+        Ok(squadron_id)
     }
 
     /// Stand down a specific squadron by firing its cancellation token.

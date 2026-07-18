@@ -150,8 +150,9 @@ interface Props {
 export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, onDeploySuccess }: Props) {
   const [deployModalOpen, setDeployModalOpen] = useState(false);
   
-  const active   = squadrons.filter(s => s.state === 'PATROLLING' || s.state === 'DEPLOYED');
-  const inactive = squadrons.filter(s => s.state !== 'PATROLLING' && s.state !== 'DEPLOYED');
+  // STAGED is active (pending deployment), not inactive
+  const active   = squadrons.filter(s => s.state === 'PATROLLING' || s.state === 'DEPLOYED' || s.state === 'STAGED');
+  const inactive = squadrons.filter(s => s.state === 'RTB' || s.state === 'STOOD_DOWN');
 
   // Get unique assets from squadrons
   const assets = [...new Set(squadrons.map(s => s.asset.toLowerCase()))];

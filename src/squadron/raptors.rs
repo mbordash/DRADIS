@@ -95,5 +95,44 @@ impl SquadronRaptors {
     ) -> Self {
         Self { oracle, velocity, drift, funding: None, derivatives: None, tide: None, horizon: None, sports: None }
     }
+
+    /// Compose a sports-only bundle for Admiral Adama sports market squadrons.
+    /// Uses placeholder channels for price signals (sports markets don't use crypto oracles).
+    pub fn sports_only(sports: SportsRaptorHandle) -> Self {
+        let (_, oracle_rx) = watch::channel(Decimal::ZERO);
+        let (_, velocity_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
+        let (_, drift_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
+        Self {
+            oracle: oracle_rx,
+            velocity: velocity_rx,
+            drift: drift_rx,
+            funding: None,
+            derivatives: None,
+            tide: None,
+            horizon: None,
+            sports: Some(sports),
+        }
+    }
+
+    /// Create an empty raptor bundle with placeholder channels.
+    /// Used for market types that don't have implemented raptors yet (e.g. politics).
+    pub fn empty() -> Self {
+        let (_, oracle_rx) = watch::channel(Decimal::ZERO);
+        let (_, velocity_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
+        let (_, drift_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
+        Self {
+            oracle: oracle_rx,
+            velocity: velocity_rx,
+            drift: drift_rx,
+            funding: None,
+            derivatives: None,
+            tide: None,
+            horizon: None,
+            sports: None,
+        }
+    }
 }
+
+/// Handle to a Sports Raptor signal channel — cloneable for sharing across squadrons.
+pub type SportsRaptorHandle = watch::Receiver<SportsSnapshot>;
 

@@ -706,6 +706,26 @@ async fn run() -> Result<()> {
         ));
     }
 
+    // ── Admiral Adama infrastructure for user-deployed squadrons ─────────────
+    // Bundles the trading handles that Admiral Adama needs to spawn real
+    // squadrons for sports/politics markets. The API server's deployment queue
+    // processor uses these via cag.spawn_adama_squadron().
+    if let Some(ref session) = primary_session {
+        let adama_infra = dradis::cag::adama::AdamaInfrastructure {
+            trading_client: Arc::clone(&trading_client),
+            signer:         signer.clone(),
+            nonce_manager:  Arc::clone(&nonce_manager),
+            safe_address,
+            eoa_address,
+            shared_http:    Arc::clone(&shared_http),
+            sports_raptor:  Some(sports_rx.clone()),
+            default_session: session.clone(),
+            markets_tx:     Arc::clone(&markets_tx),
+        };
+        cag.set_adama_infrastructure(adama_infra);
+        info!("✅ Admiral Adama infrastructure ready — user squadrons can now be deployed");
+    }
+
     // Block until ALL market loops exit (expected: never — each loops forever).
     // The CAG owns AbortHandles for control; main.rs retains JoinHandles here
     // for awaiting.  If a loop task panics, log it and let the remaining assets
