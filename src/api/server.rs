@@ -1539,6 +1539,623 @@ async fn patch_squadron_config(
     }
 }
 
+// ─── Deployment Region & Taxonomy Endpoints ──────────────────────────────────
+
+/// Response for GET /api/deployment/region.
+#[derive(Serialize)]
+struct DeploymentRegionResponse {
+    region: String,
+    available_types: Vec<String>,
+}
+
+/// GET /api/deployment/region
+///
+/// Returns the deployment region and available market types based on feature flags.
+/// US deployment (default): politics, sports only
+/// INTL deployment (intl_clob feature): politics, sports, crypto
+async fn get_deployment_region() -> Response {
+    debug!("Received GET /api/deployment/region");
+    
+    #[cfg(feature = "intl_clob")]
+    let (region, types) = ("intl", vec!["politics", "sports", "crypto"]);
+    
+    #[cfg(not(feature = "intl_clob"))]
+    let (region, types) = ("us", vec!["politics", "sports"]);
+    
+    Json(DeploymentRegionResponse {
+        region: region.to_string(),
+        available_types: types.into_iter().map(String::from).collect(),
+    }).into_response()
+}
+
+/// Raptor kind info for taxonomy endpoints.
+#[derive(Serialize)]
+struct RaptorKindResponse {
+    id: String,
+    display: String,
+    implemented: bool,
+}
+
+/// Viper kind info for taxonomy endpoints.
+#[derive(Serialize)]
+struct ViperKindResponse {
+    id: String,
+    display: String,
+    venue_agnostic: bool,
+}
+
+/// Query params for taxonomy endpoints.
+#[derive(Deserialize)]
+struct TaxonomyQuery {
+    market_class: String,
+}
+
+/// GET /api/taxonomy/raptors?market_class=crypto
+///
+/// Returns the raptor kinds available for a given market class.
+async fn get_taxonomy_raptors(Query(q): Query<TaxonomyQuery>) -> Response {
+    debug!("Received GET /api/taxonomy/raptors for class {}", q.market_class);
+    
+    let Some(pool) = db::pool() else {
+        return Json(Vec::<RaptorKindResponse>::new()).into_response();
+    };
+    
+    let raptors = db::raptors_for_class_full(pool, &q.market_class).await;
+    Json(raptors.into_iter().map(|(id, display, implemented)| RaptorKindResponse {
+        id,
+        display,
+        implemented,
+    }).collect::<Vec<_>>()).into_response()
+}
+
+/// GET /api/taxonomy/vipers?market_class=crypto
+///
+/// Returns the viper kinds available for a given market class.
+async fn get_taxonomy_vipers(Query(q): Query<TaxonomyQuery>) -> Response {
+    debug!("Received GET /api/taxonomy/vipers for class {}", q.market_class);
+    
+    let Some(pool) = db::pool() else {
+        return Json(Vec::<ViperKindResponse>::new()).into_response();
+    };
+    
+    let vipers = db::vipers_for_class_full(pool, &q.market_class).await;
+    Json(vipers.into_iter().map(|(id, display, venue_agnostic)| ViperKindResponse {
+        id,
+        display,
+        venue_agnostic,
+    }).collect::<Vec<_>>()).into_response()
+}
+
+// ─── Available Markets Endpoint ──────────────────────────────────────────────
+
+/// Query params for GET /api/markets/available.
+#[derive(Deserialize)]
+struct AvailableMarketsQuery {
+    market_type: String,           // "crypto" | "sports" | "politics"
+    expiry_window: Option<String>, // "1h" | "4h" | "24h" | "7d"
+    min_liquidity: Option<f64>,
+}
+
+/// A market available for squadron deployment.
+#[derive(Serialize)]
+struct AvailableMarket {
+    condition_id: String,
+    question: String,
+    market_class: String,
+    end_date: Option<String>,
+    liquidity: f64,
+    tokens: AvailableMarketTokens,
+}
+
+#[derive(Serialize)]
+struct AvailableMarketTokens {
+    yes_id: String,
+    no_id: String,
+}
+
+#[derive(Serialize)]
+struct AvailableMarketsResponse {
+    markets: Vec<AvailableMarket>,
+}
+
+/// GET /api/markets/available?market_type=crypto&expiry_window=4h&min_liquidity=1000
+///
+/// Returns available markets for squadron deployment, filtered by type.
+/// Uses the Gamma API (INTL) or retail venue (US) depending on build features.
+async fn get_available_markets(Query(q): Query<AvailableMarketsQuery>) -> Response {
+    debug!("Received GET /api/markets/available for type {}", q.market_type);
+    
+    let market_type = q.market_type.to_lowercase();
+    let min_liquidity = q.min_liquidity.unwrap_or(500.0);
+    
+    // Parse expiry window to seconds
+    let max_expiry_secs: i64 = match q.expiry_window.as_deref() {
+        Some("1h") => 3600,
+        Some("4h") => 14400,
+        Some("24h") => 86400,
+        Some("7d") => 604800,
+        _ => 86400, // default 24h
+    };
+    
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
+    
+    let markets = fetch_markets_by_type(&http, &market_type, max_expiry_secs, min_liquidity).await;
+    
+    Json(AvailableMarketsResponse { markets }).into_response()
+}
+
+/// Fetch markets from Gamma API filtered by market type.
+/// Uses tag-based filtering for sports (via /sports endpoint), regex for crypto/politics.
+/// Only available when intl_clob feature is enabled.
+#[cfg(feature = "intl_clob")]
+async fn fetch_markets_by_type(
+    http: &reqwest::Client,
+    market_type: &str,
+    max_expiry_secs: i64,
+    min_liquidity: f64,
+) -> Vec<AvailableMarket> {
+    let mut out = Vec::new();
+    let now = chrono::Utc::now();
+    
+    // For sports, use tag-based filtering from /sports endpoint
+    if market_type == "sports" {
+        return fetch_sports_markets_by_tags(http, max_expiry_secs, min_liquidity).await;
+    }
+    
+    // For crypto/politics, use regex filtering (no clean umbrella tags exist)
+    let filter_patterns: Vec<regex::Regex> = match market_type {
+        "crypto" => vec![
+            regex::Regex::new(r"(?i)\bbitcoin\b").ok(),
+            regex::Regex::new(r"(?i)\bbtc\b").ok(),
+            regex::Regex::new(r"(?i)\bethereum\b").ok(),
+            regex::Regex::new(r"(?i)\bsolana\b").ok(),
+            regex::Regex::new(r"(?i)\bcrypto\b").ok(),
+            regex::Regex::new(r"(?i)\bdogecoin\b").ok(),
+            regex::Regex::new(r"(?i)\bxrp\b").ok(),
+        ].into_iter().flatten().collect(),
+        "politics" => vec![
+            regex::Regex::new(r"(?i)\belection\b").ok(),
+            regex::Regex::new(r"(?i)\bpresident\b").ok(),
+            regex::Regex::new(r"(?i)\bsenate\b").ok(),
+            regex::Regex::new(r"(?i)\bcongress\b").ok(),
+            regex::Regex::new(r"(?i)\bvote\b").ok(),
+            regex::Regex::new(r"(?i)\bprime minister\b").ok(),
+            regex::Regex::new(r"(?i)\bgovernment\b").ok(),
+            regex::Regex::new(r"(?i)\btrump\b").ok(),
+            regex::Regex::new(r"(?i)\bbiden\b").ok(),
+        ].into_iter().flatten().collect(),
+        _ => vec![],
+    };
+    
+    // Fetch top markets by volume, then filter locally
+    let url = "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=200&order=volume24hrClob&ascending=false";
+    
+    let resp = match http.get(url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Market fetch failed: {}", e);
+            return out;
+        }
+    };
+    
+    let data: serde_json::Value = match resp.json().await {
+        Ok(d) => d,
+        Err(_) => return out,
+    };
+    
+    let markets_arr = data.as_array()
+        .or_else(|| data.get("data").and_then(|v| v.as_array()));
+    
+    if let Some(arr) = markets_arr {
+        for m in arr {
+            let question = m.get("question")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            
+            // Filter by market type using regex patterns
+            let matches_type = filter_patterns.iter().any(|re| re.is_match(&question));
+            if !matches_type {
+                continue;
+            }
+            
+            // Skip if already seen (dedup by condition_id)
+            let condition_id = m.get("conditionId")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string();
+            if condition_id.is_empty() || out.iter().any(|e: &AvailableMarket| e.condition_id == condition_id) {
+                continue;
+            }
+            
+            // Check liquidity
+            let volume = m.get("volume24hrClob")
+                .and_then(|v| v.as_f64())
+                .unwrap_or(0.0);
+            if volume < min_liquidity {
+                continue;
+            }
+            
+            // Check expiry
+            let end_date_str = m.get("endDate")
+                .or_else(|| m.get("event").and_then(|e| e.get("endDate")))
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            
+            let close_time = chrono::DateTime::parse_from_rfc3339(end_date_str)
+                .ok()
+                .map(|dt| dt.with_timezone(&chrono::Utc));
+            
+            if let Some(ct) = close_time {
+                let secs_left = (ct - now).num_seconds();
+                if secs_left < 300 || secs_left > max_expiry_secs {
+                    continue; // Too close to expiry or too far out
+                }
+            }
+            
+            // Extract token IDs
+            let tokens = crate::helpers::json::extract_token_ids_u256(m);
+            if tokens.len() < 2 {
+                continue;
+            }
+            
+            out.push(AvailableMarket {
+                condition_id,
+                question,
+                market_class: market_type.to_string(),
+                end_date: close_time.map(|ct| ct.to_rfc3339()),
+                liquidity: volume,
+                tokens: AvailableMarketTokens {
+                    yes_id: crate::venues::intl::market_id_from_u256(tokens[0]).to_string(),
+                    no_id: crate::venues::intl::market_id_from_u256(tokens[1]).to_string(),
+                },
+            });
+        }
+    }
+    
+    // Sort by liquidity descending
+    out.sort_by(|a, b| b.liquidity.partial_cmp(&a.liquidity).unwrap_or(std::cmp::Ordering::Equal));
+    
+    // Limit to top 50
+    out.truncate(50);
+    out
+}
+
+/// Fetch sports markets using tag IDs from the /sports endpoint.
+/// This is the official Polymarket approach per their API docs.
+#[cfg(feature = "intl_clob")]
+async fn fetch_sports_markets_by_tags(
+    http: &reqwest::Client,
+    max_expiry_secs: i64,
+    min_liquidity: f64,
+) -> Vec<AvailableMarket> {
+    let mut out = Vec::new();
+    let now = chrono::Utc::now();
+    
+    // Step 1: Fetch all sports and collect their tag IDs
+    let sports_url = "https://gamma-api.polymarket.com/sports";
+    let sports_resp = match http.get(sports_url).send().await {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("Sports endpoint fetch failed: {}", e);
+            return out;
+        }
+    };
+    
+    let sports_data: serde_json::Value = match sports_resp.json().await {
+        Ok(d) => d,
+        Err(_) => return out,
+    };
+    
+    // Collect unique tag IDs from all sports
+    let mut tag_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    if let Some(arr) = sports_data.as_array() {
+        for sport in arr {
+            if let Some(tags_str) = sport.get("tags").and_then(|v| v.as_str()) {
+                for tag in tags_str.split(',') {
+                    let tag = tag.trim();
+                    if !tag.is_empty() {
+                        tag_ids.insert(tag.to_string());
+                    }
+                }
+            }
+        }
+    }
+    
+    // Step 2: Fetch markets for each tag (parallelize with first few high-volume tags)
+    // Use tag_id=1 which appears in all sports as an umbrella
+    let primary_tags: Vec<&str> = vec!["1", "450", "100381"]; // Sports umbrella, NFL, MLB
+    
+    for tag_id in primary_tags.iter().take(3) {
+        let url = format!(
+            "https://gamma-api.polymarket.com/markets?tag_id={}&active=true&closed=false&limit=100&order=volume24hrClob&ascending=false",
+            tag_id
+        );
+        
+        let resp = match http.get(&url).send().await {
+            Ok(r) => r,
+            Err(_) => continue,
+        };
+        
+        let data: serde_json::Value = match resp.json().await {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        
+        let markets_arr = data.as_array()
+            .or_else(|| data.get("data").and_then(|v| v.as_array()));
+        
+        if let Some(arr) = markets_arr {
+            for m in arr {
+                let question = m.get("question")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                
+                let condition_id = m.get("conditionId")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                
+                // Skip duplicates
+                if condition_id.is_empty() || out.iter().any(|e: &AvailableMarket| e.condition_id == condition_id) {
+                    continue;
+                }
+                
+                // Check liquidity
+                let volume = m.get("volume24hrClob")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(0.0);
+                if volume < min_liquidity {
+                    continue;
+                }
+                
+                // Check expiry
+                let end_date_str = m.get("endDate")
+                    .or_else(|| m.get("event").and_then(|e| e.get("endDate")))
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default();
+                
+                let close_time = chrono::DateTime::parse_from_rfc3339(end_date_str)
+                    .ok()
+                    .map(|dt| dt.with_timezone(&chrono::Utc));
+                
+                if let Some(ct) = close_time {
+                    let secs_left = (ct - now).num_seconds();
+                    if secs_left < 300 || secs_left > max_expiry_secs {
+                        continue;
+                    }
+                }
+                
+                // Extract token IDs
+                let tokens = crate::helpers::json::extract_token_ids_u256(m);
+                if tokens.len() < 2 {
+                    continue;
+                }
+                
+                out.push(AvailableMarket {
+                    condition_id,
+                    question,
+                    market_class: "sports".to_string(),
+                    end_date: close_time.map(|ct| ct.to_rfc3339()),
+                    liquidity: volume,
+                    tokens: AvailableMarketTokens {
+                        yes_id: crate::venues::intl::market_id_from_u256(tokens[0]).to_string(),
+                        no_id: crate::venues::intl::market_id_from_u256(tokens[1]).to_string(),
+                    },
+                });
+            }
+        }
+    }
+    
+    // Sort by liquidity and limit
+    out.sort_by(|a, b| b.liquidity.partial_cmp(&a.liquidity).unwrap_or(std::cmp::Ordering::Equal));
+    out.truncate(50);
+    out
+}
+
+/// Fetch markets for US venue (placeholder — returns empty until US market discovery is wired).
+#[cfg(not(feature = "intl_clob"))]
+async fn fetch_markets_by_type(
+    _http: &reqwest::Client,
+    market_type: &str,
+    _max_expiry_secs: i64,
+    _min_liquidity: f64,
+) -> Vec<AvailableMarket> {
+    // US venue market discovery requires the retail client to be initialized.
+    // For now, return an empty list — the UI will show "No markets available".
+    // Future: wire up crate::venues::us::UsRetailVenue::discover_binary_markets()
+    warn!("US venue market fetch not yet implemented for type '{}'", market_type);
+    Vec::new()
+}
+
+// ─── Squadron Deployment Endpoints ───────────────────────────────────────────
+
+/// Request body for POST /api/squadrons/deploy.
+#[derive(Debug, Deserialize)]
+struct DeploySquadronRequest {
+    mode: String,         // "quick" or "manual"
+    market_type: String,  // "crypto", "sports", "politics"
+    #[serde(default)]
+    #[allow(dead_code)]
+    auto_config: bool,
+    market_id: Option<String>,
+    #[serde(default)]
+    raptors: Vec<String>,
+    #[serde(default)]
+    vipers: Vec<String>,
+}
+
+/// Response for POST /api/squadrons/deploy.
+#[derive(Serialize)]
+struct DeploySquadronResponse {
+    success: bool,
+    squadron_id: Option<String>,
+    error: Option<String>,
+}
+
+/// POST /api/squadrons/deploy
+///
+/// Deploy a new squadron to a market.
+/// - Quick mode: DRADIS auto-selects the best market for the given type
+/// - Manual mode: User specifies market_id, raptors, and vipers
+async fn deploy_squadron(
+    State(_s): State<ApiState>,
+    Json(req): Json<DeploySquadronRequest>,
+) -> Response {
+    info!("📥 POST /api/squadrons/deploy: mode={}, type={}", req.mode, req.market_type);
+    
+    // Validate market type against deployment region
+    #[cfg(not(feature = "intl_clob"))]
+    if req.market_type == "crypto" {
+        return Json(DeploySquadronResponse {
+            success: false,
+            squadron_id: None,
+            error: Some("Crypto markets are not available in US deployment".to_string()),
+        }).into_response();
+    }
+    
+    // For Quick mode, auto-select a market
+    let market_id = if req.mode == "quick" {
+        // Fetch available markets and pick the best one (highest liquidity)
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .unwrap_or_default();
+        
+        let markets = fetch_markets_by_type(&http, &req.market_type, 7 * 24 * 3600, 10000.0).await;
+        
+        if markets.is_empty() {
+            return Json(DeploySquadronResponse {
+                success: false,
+                squadron_id: None,
+                error: Some(format!("No {} markets available for deployment", req.market_type)),
+            }).into_response();
+        }
+        
+        // Return the best market (first one, already sorted by liquidity)
+        markets[0].condition_id.clone()
+    } else {
+        // Manual mode: user must provide market_id
+        match req.market_id {
+            Some(id) => id,
+            None => {
+                return Json(DeploySquadronResponse {
+                    success: false,
+                    squadron_id: None,
+                    error: Some("Manual mode requires market_id".to_string()),
+                }).into_response();
+            }
+        }
+    };
+    
+    // Validate raptors and vipers (if manual mode)
+    let raptors = if req.mode == "manual" && !req.raptors.is_empty() {
+        req.raptors.clone()
+    } else {
+        // Auto-select default raptors for this market class
+        default_raptors_for_class(&req.market_type)
+    };
+    
+    let vipers = if req.mode == "manual" && !req.vipers.is_empty() {
+        req.vipers.clone()
+    } else {
+        // Auto-select default vipers for this market class
+        default_vipers_for_class(&req.market_type)
+    };
+    
+    // Queue the deployment request for the CAG to process
+    // NOTE: Full Admiral Adama extension will spawn actual squadron tasks.
+    // For now, we record the intent and return success.
+    let deployment_id = format!("deploy-{}-{}", req.market_type, chrono::Utc::now().timestamp());
+    
+    info!(
+        deployment_id = %deployment_id,
+        market_id = %market_id,
+        raptors = ?raptors,
+        vipers = ?vipers,
+        "🚀 Squadron deployment queued"
+    );
+    
+    // Store deployment request in the database for CAG to pick up
+    if let Err(e) = crate::helpers::db::queue_deployment(&deployment_id, &market_id, &req.market_type, &raptors, &vipers).await {
+        error!("Failed to queue deployment: {}", e);
+        return Json(DeploySquadronResponse {
+            success: false,
+            squadron_id: None,
+            error: Some(format!("Failed to queue deployment: {}", e)),
+        }).into_response();
+    }
+    
+    Json(DeploySquadronResponse {
+        success: true,
+        squadron_id: Some(deployment_id),
+        error: None,
+    }).into_response()
+}
+
+/// Return default raptors for a market class.
+fn default_raptors_for_class(market_class: &str) -> Vec<String> {
+    match market_class {
+        "crypto" => vec!["momentum".to_string(), "reversal".to_string()],
+        "sports" => vec!["market_maker".to_string()],
+        "politics" => vec!["momentum".to_string(), "market_maker".to_string()],
+        _ => vec!["market_maker".to_string()],
+    }
+}
+
+/// Return default vipers for a market class.
+fn default_vipers_for_class(market_class: &str) -> Vec<String> {
+    match market_class {
+        "crypto" => vec!["trailing_stop".to_string(), "time_decay".to_string()],
+        "sports" => vec!["trailing_stop".to_string()],
+        "politics" => vec!["trailing_stop".to_string(), "time_decay".to_string()],
+        _ => vec!["trailing_stop".to_string()],
+    }
+}
+
+/// Response for GET /api/deployments.
+#[derive(Serialize)]
+struct DeploymentStatusResponse {
+    id: String,
+    market_id: String,
+    market_type: String,
+    raptors: Vec<String>,
+    vipers: Vec<String>,
+    status: String,
+    squadron_id: Option<String>,
+    error: Option<String>,
+    created_at: String,
+}
+
+/// GET /api/deployments
+///
+/// Returns all deployment requests from the queue with their status.
+async fn get_deployments() -> Response {
+    debug!("Received GET /api/deployments");
+    
+    let deployments = crate::helpers::db::fetch_all_deployments().await;
+    
+    let response: Vec<DeploymentStatusResponse> = deployments.into_iter().map(|d| {
+        DeploymentStatusResponse {
+            id: d.0,
+            market_id: d.1,
+            market_type: d.2,
+            raptors: d.3,
+            vipers: d.4,
+            status: d.5,
+            squadron_id: d.6,
+            error: d.7,
+            created_at: d.8,
+        }
+    }).collect();
+    
+    Json(response).into_response()
+}
+
 // ─── Server startup ──────────────────────────────────────────────────────────
 
 /// Spawn the Control Tower axum server.
@@ -1610,7 +2227,14 @@ pub async fn run_api_server(
         // ── Phase 3d: Squadron registry endpoints ──────────────────────────
         .route("/api/squadrons",             get(get_squadrons))
         .route("/api/squadrons/{id}",        get(get_squadron_by_id))
-        .route("/api/squadrons/{id}/config", get(get_squadron_config).patch(patch_squadron_config));
+        .route("/api/squadrons/{id}/config", get(get_squadron_config).patch(patch_squadron_config))
+        .route("/api/squadrons/deploy",      axum::routing::post(deploy_squadron))
+        // ── Squadron Deployment & Taxonomy (Admiral Adama extension) ───────
+        .route("/api/deployment/region",     get(get_deployment_region))
+        .route("/api/deployments",           get(get_deployments))
+        .route("/api/taxonomy/raptors",      get(get_taxonomy_raptors))
+        .route("/api/taxonomy/vipers",       get(get_taxonomy_vipers))
+        .route("/api/markets/available",     get(get_available_markets));
 
     // Intl-only endpoints: self-custody chain-sync + manual on-chain FAK exit.
     // The US custodial venue performs settlement/exit differently (Step 3b).
@@ -1634,6 +2258,12 @@ pub async fn run_api_server(
         // before the API-key middleware is reached).
         .layer(CorsLayer::permissive());
 
+    // ── Spawn the Admiral Adama deployment queue processor ────────────────────
+    // Polls the deployment_queue table every 5 seconds and processes pending
+    // deployment requests. Currently logs the request; full squadron spawning
+    // requires wiring into the CAG's run loop (Phase 4).
+    tokio::spawn(run_deployment_queue_processor(state.cag.clone()));
+
     let addr = format!("0.0.0.0:{}", port);
     let listener = match tokio::net::TcpListener::bind(&addr).await {
         Ok(l)  => l,
@@ -1648,4 +2278,116 @@ pub async fn run_api_server(
     if let Err(e) = axum::serve(listener, app.into_make_service()).await {
         tracing::error!(" Control Tower API error: {}", e);
     }
+}
+
+// ─── Deployment Queue Processor (Admiral Adama) ──────────────────────────────
+
+/// Background task that polls the deployment queue and processes pending requests.
+///
+/// This is the Admiral Adama extension — user-requested squadron deployments.
+/// The processor runs in a loop, checking the `deployment_queue` table every
+/// 5 seconds for new requests. When found, it:
+///   1. Marks the request as "processing"
+///   2. Fetches market details from Gamma API
+///   3. Registers a staged squadron in the CAG registry
+///   4. Updates status to "deployed" or "failed"
+async fn run_deployment_queue_processor(cag: Cag) {
+    use tokio::time::{interval, Duration};
+    
+    info!("🚀 Admiral Adama: deployment queue processor started");
+    
+    let http = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+        .unwrap_or_default();
+    
+    let mut ticker = interval(Duration::from_secs(5));
+    
+    loop {
+        ticker.tick().await;
+        
+        // Fetch pending deployments from the queue
+        let pending = crate::helpers::db::fetch_pending_deployments().await;
+        
+        if pending.is_empty() {
+            continue;
+        }
+        
+        info!("📋 Admiral Adama: {} pending deployment(s) found", pending.len());
+        
+        for (deployment_id, market_id, market_type, raptors, vipers) in pending {
+            // Mark as processing
+            if let Err(e) = crate::helpers::db::update_deployment_status(
+                &deployment_id, "processing", None, None
+            ).await {
+                warn!("Failed to update deployment status: {}", e);
+                continue;
+            }
+            
+            info!(
+                deployment_id = %deployment_id,
+                market_id = %market_id,
+                market_type = %market_type,
+                raptors = ?raptors,
+                vipers = ?vipers,
+                "🛫 Admiral Adama: processing deployment"
+            );
+            
+            // Fetch market details from Gamma API
+            let market_question = match fetch_market_question(&http, &market_id).await {
+                Some(q) => q,
+                None => {
+                    warn!("Failed to fetch market details for {}", market_id);
+                    if let Err(e) = crate::helpers::db::update_deployment_status(
+                        &deployment_id, "failed", None, Some("Failed to fetch market details")
+                    ).await {
+                        warn!("Failed to update deployment status: {}", e);
+                    }
+                    continue;
+                }
+            };
+            
+            // Register the staged deployment in the CAG registry
+            let squadron_id = cag.register_staged_deployment(
+                &deployment_id,
+                &market_id,
+                &market_type,
+                &market_question,
+                &raptors,
+                &vipers,
+            );
+            
+            // Mark as deployed in the queue
+            if let Err(e) = crate::helpers::db::update_deployment_status(
+                &deployment_id, "deployed", Some(&squadron_id), None
+            ).await {
+                warn!("Failed to mark deployment as deployed: {}", e);
+                continue;
+            }
+            
+            info!(
+                deployment_id = %deployment_id,
+                squadron_id = %squadron_id,
+                market_question = %market_question,
+                "✅ Admiral Adama: {} squadron staged for market",
+                market_type.to_uppercase()
+            );
+        }
+    }
+}
+
+/// Fetch market question from Gamma API by condition_id.
+async fn fetch_market_question(http: &reqwest::Client, condition_id: &str) -> Option<String> {
+    let url = format!(
+        "https://gamma-api.polymarket.com/markets?condition_id={}",
+        condition_id
+    );
+    
+    let resp = http.get(&url).send().await.ok()?;
+    let markets: Vec<serde_json::Value> = resp.json().await.ok()?;
+    
+    markets.first()
+        .and_then(|m| m.get("question"))
+        .and_then(|q| q.as_str())
+        .map(String::from)
 }

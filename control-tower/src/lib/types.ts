@@ -388,3 +388,81 @@ export function fieldUnit(type: FieldType): string {
     default:      return '';
   }
 }
+
+// ── Squadron Deployment types ────────────────────────────────────────────────
+
+/** Market types available for squadron deployment. */
+export type MarketType = 'crypto' | 'sports' | 'politics';
+
+/** Deployment region determines available market types. */
+export type DeploymentRegion = 'us' | 'intl';
+
+/** Response from GET /api/deployment/region. */
+export interface DeploymentRegionInfo {
+  region: DeploymentRegion;
+  available_types: MarketType[];
+}
+
+/** A market available for squadron deployment. */
+export interface AvailableMarket {
+  condition_id: string;
+  question: string;
+  market_class: MarketType;
+  end_date: string;        // ISO 8601
+  liquidity: number;
+  tokens: {
+    yes_id: string;
+    no_id: string;
+  };
+}
+
+/** Response from GET /api/markets/available. */
+export interface AvailableMarketsResponse {
+  markets: AvailableMarket[];
+}
+
+/** Raptor kind with implementation status. */
+export interface RaptorKind {
+  id: string;
+  display: string;
+  implemented: boolean;
+}
+
+/** Viper kind with venue compatibility. */
+export interface ViperKindInfo {
+  id: string;
+  display: string;
+  venue_agnostic: boolean;
+}
+
+/** Request body for POST /api/squadrons/deploy. */
+export interface DeploySquadronRequest {
+  mode: 'quick' | 'manual';
+  market_type: MarketType;
+  // Quick mode: DRADIS auto-selects
+  auto_config?: boolean;
+  // Manual mode: user specifies
+  market_id?: string;
+  raptors?: string[];
+  vipers?: string[];
+}
+
+/** Response from POST /api/squadrons/deploy. */
+export interface DeploySquadronResponse {
+  success: boolean;
+  squadron_id?: string;
+  error?: string;
+}
+
+/** Deployment status from GET /api/deployments. */
+export interface DeploymentStatus {
+  id: string;
+  market_id: string;
+  market_type: MarketType;
+  raptors: string[];
+  vipers: string[];
+  status: 'pending' | 'processing' | 'deployed' | 'failed';
+  squadron_id?: string;
+  error?: string;
+  created_at: string;
+}

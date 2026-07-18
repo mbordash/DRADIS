@@ -289,6 +289,54 @@ impl Cag {
         id
     }
 
+    /// Register a staged deployment from the Admiral Adama deployment queue.
+    ///
+    /// Creates a `SquadronSummary` in the "STAGED" state visible in the Control
+    /// Tower UI. The squadron is not yet trading — it's waiting for either:
+    ///   - An existing asset loop to adopt it (crypto markets)
+    ///   - Future full-spawn infrastructure (sports/politics markets)
+    ///
+    /// Returns the squadron ID for tracking.
+    pub fn register_staged_deployment(
+        &self,
+        deployment_id: &str,
+        market_id: &str,
+        market_type: &str,
+        market_question: &str,
+        raptors: &[String],
+        vipers: &[String],
+    ) -> SquadronId {
+        let squadron_id = format!("{}-sq", deployment_id);
+        let cancel_token = CancellationToken::new();
+
+        let summary = SquadronSummary {
+            id:                squadron_id.clone(),
+            asset:             market_type.to_uppercase(),
+            name:              format!("{} Squadron", market_type.to_uppercase()),
+            state:             "STAGED".to_string(),
+            market_name:       market_question.to_string(),
+            maker_market_name: None,
+            deployed_at:       Utc::now(),
+            market_class:      market_type.to_string(),
+            raptors:           raptors.to_vec(),
+            vipers:            vipers.to_vec(),
+        };
+
+        self.inner.registry.insert(squadron_id.clone(), CagEntry {
+            summary,
+            cancel_token,
+            _handle: None,
+        });
+
+        info!(
+            squadron = %squadron_id,
+            market_id = %market_id,
+            market_type = %market_type,
+            "✈️  CAG: staged deployment registered (Admiral Adama)"
+        );
+        squadron_id
+    }
+
     /// Stand down a specific squadron by firing its cancellation token.
     ///
     /// Returns `true` if the squadron was found and signalled, `false` if unknown.

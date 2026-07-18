@@ -395,6 +395,22 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
         )"
     ).execute(pool).await?;
 
+    // Deployment queue for Admiral Adama extension — user-requested squadron deployments.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS deployment_queue (
+            id           TEXT    PRIMARY KEY,
+            market_id    TEXT    NOT NULL,
+            market_type  TEXT    NOT NULL,   -- 'crypto' | 'sports' | 'politics'
+            raptors      TEXT    NOT NULL,   -- JSON array of raptor kind IDs
+            vipers       TEXT    NOT NULL,   -- JSON array of viper kind IDs
+            status       TEXT    NOT NULL DEFAULT 'pending',  -- pending | processing | deployed | failed
+            squadron_id  TEXT,               -- populated once deployed
+            error        TEXT,               -- populated on failure
+            created_at   TEXT    NOT NULL DEFAULT (datetime('now')),
+            updated_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+        )"
+    ).execute(pool).await?;
+
     seed_market_taxonomy(pool).await?;
 
     Ok(())
@@ -1019,6 +1035,160 @@ pub async fn vipers_for_class(pool: &SqlitePool, class: &str) -> Vec<String> {
     .bind(class)
     .fetch_all(pool).await.ok()
     .map(|rows| rows.into_iter().filter_map(|r| r.try_get::<String, _>(0).ok()).collect())
+    .unwrap_or_default()
+}
+
+/// Resolve the raptor kinds linked to a market class with full info.
+/// Returns (id, display, implemented) tuples.
+pub async fn raptors_for_class_full(pool: &SqlitePool, class: &str) -> Vec<(String, String, bool)> {
+    sqlx::query(
+        "SELECT r.id, r.display, r.implemented FROM market_class_raptor m
+         JOIN raptor_kind r ON r.id = m.raptor_kind
+         WHERE m.market_class = ?
+         ORDER BY r.id"
+    )
+    .bind(class)
+    .fetch_all(pool).await.ok()
+    .map(|rows| rows.into_iter().filter_map(|r| {
+        let id = r.try_get::<String, _>(0).ok()?;
+        let display = r.try_get::<String, _>(1).ok()?;
+        let implemented = r.try_get::<i32, _>(2).ok()? == 1;
+        Some((id, display, implemented))
+    }).collect())
+    .unwrap_or_default()
+}
+
+/// Resolve the viper kinds linked to a market class with full info.
+/// Returns (id, display, venue_agnostic) tuples.
+pub async fn vipers_for_class_full(pool: &SqlitePool, class: &str) -> Vec<(String, String, bool)> {
+    sqlx::query(
+        "SELECT v.id, v.display, v.venue_agnostic FROM market_class_viper m
+         JOIN viper_kind v ON v.id = m.viper_kind
+         WHERE m.market_class = ?
+         ORDER BY v.id"
+    )
+    .bind(class)
+    .fetch_all(pool).await.ok()
+    .map(|rows| rows.into_iter().filter_map(|r| {
+        let id = r.try_get::<String, _>(0).ok()?;
+        let display = r.try_get::<String, _>(1).ok()?;
+        let venue_agnostic = r.try_get::<i32, _>(2).ok()? == 1;
+        Some((id, display, venue_agnostic))
+    }).collect())
+    .unwrap_or_default()
+}
+
+// ─── Deployment Queue (Admiral Adama extension) ──────────────────────────────
+
+/// Queue a user-requested squadron deployment.
+///
+/// The CAG will periodically poll the `deployment_queue` table and spawn
+/// squadrons for pending requests.
+pub async fn queue_deployment(
+    deployment_id: &str,
+    market_id: &str,
+    market_type: &str,
+    raptors: &[String],
+    vipers: &[String],
+) -> Result<()> {
+    let Some(pool) = pool() else {
+        return Err(anyhow::anyhow!("DB pool not initialized"));
+    };
+    
+    let raptors_json = serde_json::to_string(raptors)?;
+    let vipers_json = serde_json::to_string(vipers)?;
+    
+    sqlx::query(
+        "INSERT INTO deployment_queue (id, market_id, market_type, raptors, vipers, status)
+         VALUES (?, ?, ?, ?, ?, 'pending')"
+    )
+    .bind(deployment_id)
+    .bind(market_id)
+    .bind(market_type)
+    .bind(&raptors_json)
+    .bind(&vipers_json)
+    .execute(pool).await?;
+    
+    info!(deployment_id, market_id, market_type, "📋 Deployment request queued");
+    Ok(())
+}
+
+/// Fetch pending deployment requests from the queue.
+pub async fn fetch_pending_deployments() -> Vec<(String, String, String, Vec<String>, Vec<String>)> {
+    let Some(pool) = pool() else {
+        return Vec::new();
+    };
+    
+    sqlx::query(
+        "SELECT id, market_id, market_type, raptors, vipers FROM deployment_queue
+         WHERE status = 'pending' ORDER BY created_at ASC LIMIT 10"
+    )
+    .fetch_all(pool).await.ok()
+    .map(|rows| rows.into_iter().filter_map(|r| {
+        let id = r.try_get::<String, _>(0).ok()?;
+        let market_id = r.try_get::<String, _>(1).ok()?;
+        let market_type = r.try_get::<String, _>(2).ok()?;
+        let raptors_json = r.try_get::<String, _>(3).ok()?;
+        let vipers_json = r.try_get::<String, _>(4).ok()?;
+        let raptors: Vec<String> = serde_json::from_str(&raptors_json).ok()?;
+        let vipers: Vec<String> = serde_json::from_str(&vipers_json).ok()?;
+        Some((id, market_id, market_type, raptors, vipers))
+    }).collect())
+    .unwrap_or_default()
+}
+
+/// Update deployment status in the queue.
+pub async fn update_deployment_status(
+    deployment_id: &str,
+    status: &str,
+    squadron_id: Option<&str>,
+    error: Option<&str>,
+) -> Result<()> {
+    let Some(pool) = pool() else {
+        return Err(anyhow::anyhow!("DB pool not initialized"));
+    };
+    
+    sqlx::query(
+        "UPDATE deployment_queue
+         SET status = ?, squadron_id = ?, error = ?, updated_at = datetime('now')
+         WHERE id = ?"
+    )
+    .bind(status)
+    .bind(squadron_id)
+    .bind(error)
+    .bind(deployment_id)
+    .execute(pool).await?;
+    
+    info!(deployment_id, status, "📋 Deployment status updated");
+    Ok(())
+}
+
+/// Fetch all deployments from the queue (for status endpoint).
+/// Returns: (id, market_id, market_type, raptors, vipers, status, squadron_id, error, created_at)
+pub async fn fetch_all_deployments() -> Vec<(String, String, String, Vec<String>, Vec<String>, String, Option<String>, Option<String>, String)> {
+    let Some(pool) = pool() else {
+        return Vec::new();
+    };
+    
+    sqlx::query(
+        "SELECT id, market_id, market_type, raptors, vipers, status, squadron_id, error, created_at 
+         FROM deployment_queue ORDER BY created_at DESC LIMIT 50"
+    )
+    .fetch_all(pool).await.ok()
+    .map(|rows| rows.into_iter().filter_map(|r| {
+        let id = r.try_get::<String, _>(0).ok()?;
+        let market_id = r.try_get::<String, _>(1).ok()?;
+        let market_type = r.try_get::<String, _>(2).ok()?;
+        let raptors_json = r.try_get::<String, _>(3).ok()?;
+        let vipers_json = r.try_get::<String, _>(4).ok()?;
+        let status = r.try_get::<String, _>(5).ok()?;
+        let squadron_id = r.try_get::<Option<String>, _>(6).ok()?;
+        let error = r.try_get::<Option<String>, _>(7).ok()?;
+        let created_at = r.try_get::<String, _>(8).ok()?;
+        let raptors: Vec<String> = serde_json::from_str(&raptors_json).ok()?;
+        let vipers: Vec<String> = serde_json::from_str(&vipers_json).ok()?;
+        Some((id, market_id, market_type, raptors, vipers, status, squadron_id, error, created_at))
+    }).collect())
     .unwrap_or_default()
 }
 

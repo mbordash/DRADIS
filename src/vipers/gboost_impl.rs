@@ -1543,7 +1543,7 @@ impl Strategy for GboostStrategyImpl {
         if p_yes_up >= entry_thresh && !has_yes {
             // Trend-alignment: block YES entries in a downtrend
             if drift_60m < -trend_block {
-                veto!("counter-trend");
+                veto!(format!("counter-trend (drift_60m=${:.0} < -${:.0})", drift_60m, trend_block));
             }
             // Strike-distance: block YES entries when BTC has been below (strike−buffer) for 60+ min
             if below_strike_suppressed_for_yes {
@@ -1581,14 +1581,14 @@ impl Strategy for GboostStrategyImpl {
             }
             let yes_obi = smoothed_target_yes_obi.unwrap();
             if yes_obi < dc.gboost_obi_adverse_block {
-                veto!("adverse OBI");
+                veto!(format!("adverse OBI (yes_obi={:.2} < {:.2})", yes_obi, dc.gboost_obi_adverse_block));
             }
             // ── OBI exhaustion gate ───────────────────────────────────────────
             // When |obi| is very large the move is already mature — entering YES
             // into an already-resolved book is tail-chasing with maximum adverse
             // selection. 2026-05-08 T2: |obi_y|=0.61 on a ~93% YES market → SL -$0.457.
             if yes_obi.abs() > dc.gboost_obi_exhaustion_block {
-                veto!("OBI exhaustion");
+                veto!(format!("OBI exhaustion (|yes_obi|={:.2} > {:.2})", yes_obi.abs(), dc.gboost_obi_exhaustion_block));
             }
             // ── Hourly OBI direction check for daily entries ──────────────────
             // When trading daily market, the hourly YES OBI foreshadows daily direction.
@@ -1601,7 +1601,7 @@ impl Strategy for GboostStrategyImpl {
                 }
                 let hourly_yes_obi = smoothed_hourly_yes_obi.unwrap();
                 if hourly_yes_obi < config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK {
-                    veto!("hourly YES OBI adverse");
+                    veto!(format!("hourly YES OBI adverse ({:.2} < {:.2})", hourly_yes_obi, config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK));
                 }
                 // ── Hourly OBI exhaustion check ───────────────────────────────
                 // When the hourly book is overwhelmingly bid-dominated (OBI > +threshold)
@@ -1611,7 +1611,7 @@ impl Strategy for GboostStrategyImpl {
                 // 2026-05-24 11:39: hourly YES OBI=0.85 at entry → price fell from $0.54
                 // to $0.49 in 45 s (-$0.26 loss).  Blocked at OBI_EXHAUSTION_BLOCK=0.80.
                 if hourly_yes_obi.abs() > dc.gboost_obi_exhaustion_block {
-                    veto!("hourly OBI exhausted");
+                    veto!(format!("hourly OBI exhausted (|{:.2}| > {:.2})", hourly_yes_obi, dc.gboost_obi_exhaustion_block));
                 }
             }
             let price  = floor_to_tick_size(target_snapshot.yes_ask);
@@ -1619,14 +1619,14 @@ impl Strategy for GboostStrategyImpl {
                 || price < dc.gboost_min_entry_price
                 || price <= dec!(0)
             {
-                veto!("YES price out of range");
+                veto!(format!("YES price out of range (ask=${:.2}, allowed ${:.2}–${:.2})", price, dc.gboost_min_entry_price, dc.gboost_max_yes_entry_price));
             }
             // ── 50-cent coin-flip zone gate ───────────────────────────────────
             // Near 0.50 the market is directionally undecided. With 10% round-trip
             // taker fees, GBoost needs > 10% price move to break even — impossible
             // in a 50/50 coin flip. Require minimum edge distance from fair value.
             if (price - dec!(0.50)).abs() < dc.gboost_min_edge_from_fair {
-                veto!("price too close to 0.50");
+                veto!(format!("price too close to 0.50 (ask=${:.2}, min edge {:.2})", price, dc.gboost_min_edge_from_fair));
             }
             // Confidence-proportional sizing: more capital for higher-conviction signals.
             // Volatility-scaled: reduce size when oracle hist_vol_regime is elevated.
@@ -1646,7 +1646,7 @@ impl Strategy for GboostStrategyImpl {
                 let estimated_fee  = trade_usdc * fee_roundtrip;
                 let net_expected   = expected_gross - estimated_fee;
                 if net_expected < dc.gboost_min_net_profit_usdc {
-                    veto!("net profit too low");
+                    veto!(format!("net profit too low (est ${:.2} < min ${:.2})", net_expected, dc.gboost_min_net_profit_usdc));
                 }
             }
             let shares = trade_usdc / price;
@@ -1683,7 +1683,7 @@ impl Strategy for GboostStrategyImpl {
         if p_yes_up <= (1.0 - entry_thresh) && !has_no {
             // Trend-alignment: block NO entries in an uptrend
             if drift_60m > trend_block {
-                veto!("counter-trend");
+                veto!(format!("counter-trend (drift_60m=+${:.0} > ${:.0})", drift_60m, trend_block));
             }
             // ── Market-level holding lock ─────────────────────────────────────
             {
@@ -1708,13 +1708,13 @@ impl Strategy for GboostStrategyImpl {
             }
             let no_obi = smoothed_target_no_obi.unwrap();
             if no_obi < dc.gboost_obi_adverse_block {
-                veto!("adverse OBI");
+                veto!(format!("adverse OBI (no_obi={:.2} < {:.2})", no_obi, dc.gboost_obi_adverse_block));
             }
             // ── OBI exhaustion gate ───────────────────────────────────────────
             // Blocks NO entries where the book is already heavily one-sided against
             // the NO leg — the move is in progress and the risk/reward is exhausted.
             if no_obi.abs() > dc.gboost_obi_exhaustion_block {
-                veto!("OBI exhaustion");
+                veto!(format!("OBI exhaustion (|no_obi|={:.2} > {:.2})", no_obi.abs(), dc.gboost_obi_exhaustion_block));
             }
             // ── Hourly OBI direction check for daily entries ──────────────────
             // When trading daily market, the hourly NO OBI reveals whether smart money
@@ -1729,7 +1729,7 @@ impl Strategy for GboostStrategyImpl {
                 }
                 let hourly_no_obi = smoothed_hourly_no_obi.unwrap();
                 if hourly_no_obi < config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK {
-                    veto!("hourly NO OBI adverse");
+                    veto!(format!("hourly NO OBI adverse ({:.2} < {:.2})", hourly_no_obi, config::GBOOST_HOURLY_OBI_ADVERSE_BLOCK));
                 }
                 // ── Hourly OBI exhaustion check ───────────────────────────────
                 // Mirrors the YES exhaustion check: when hourly NO book is overwhelmingly
@@ -1737,7 +1737,7 @@ impl Strategy for GboostStrategyImpl {
                 // a reversal is imminent.  Entering daily NO at this point means buying
                 // into the last ticks of a NO surge — adverse selection is at its peak.
                 if hourly_no_obi.abs() > dc.gboost_obi_exhaustion_block {
-                    veto!("hourly OBI exhausted");
+                    veto!(format!("hourly OBI exhausted (|{:.2}| > {:.2})", hourly_no_obi, dc.gboost_obi_exhaustion_block));
                 }
             }
             let price  = floor_to_tick_size(target_snapshot.no_ask);
@@ -1745,11 +1745,11 @@ impl Strategy for GboostStrategyImpl {
                 || price < dc.gboost_min_entry_price
                 || price <= dec!(0)
             {
-                veto!("NO price out of range");
+                veto!(format!("NO price out of range (ask=${:.2}, allowed ${:.2}–${:.2})", price, dc.gboost_min_entry_price, dc.gboost_max_no_entry_price));
             }
             // ── 50-cent coin-flip zone gate ───────────────────────────────────
             if (price - dec!(0.50)).abs() < dc.gboost_min_edge_from_fair {
-                veto!("price too close to 0.50");
+                veto!(format!("price too close to 0.50 (ask=${:.2}, min edge {:.2})", price, dc.gboost_min_edge_from_fair));
             }
             // Confidence for NO direction is (1 - p_yes_up); scale size accordingly.
             let trade_usdc = scale_trade_size(1.0 - p_yes_up, entry_thresh, precomp_hist_vol, dc.gboost_max_exposure_usdc);
@@ -1763,7 +1763,7 @@ impl Strategy for GboostStrategyImpl {
                 let estimated_fee  = trade_usdc * fee_roundtrip;
                 let net_expected   = expected_gross - estimated_fee;
                 if net_expected < dc.gboost_min_net_profit_usdc {
-                    veto!("net profit too low");
+                    veto!(format!("net profit too low (est ${:.2} < min ${:.2})", net_expected, dc.gboost_min_net_profit_usdc));
                 }
             }
             let shares = trade_usdc / price;

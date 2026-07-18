@@ -1,8 +1,10 @@
 'use client';
 
+import { useState } from 'react';
 import useSWR from 'swr';
 import type { SquadronSummary, SquadronState } from '@/lib/types';
 import { getOpenPositions } from '@/lib/api';
+import DeploySquadronModal from './DeploySquadronModal';
 
 // ── State badge ───────────────────────────────────────────────────────────────
 
@@ -142,9 +144,12 @@ interface Props {
   squadrons: SquadronSummary[];
   isLoading: boolean;
   onSquadronClick?: (sq: SquadronSummary) => void;
+  onDeploySuccess?: () => void;
 }
 
-export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick }: Props) {
+export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, onDeploySuccess }: Props) {
+  const [deployModalOpen, setDeployModalOpen] = useState(false);
+  
   const active   = squadrons.filter(s => s.state === 'PATROLLING' || s.state === 'DEPLOYED');
   const inactive = squadrons.filter(s => s.state !== 'PATROLLING' && s.state !== 'DEPLOYED');
 
@@ -167,27 +172,39 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick }
   }
 
   return (
-    <div className="rounded-xl border border-[#1e1e32] bg-[#0d0d1a] overflow-hidden">
-      {/* Header */}
-      <div className="flex items-center justify-between px-4 py-3 border-b border-[#1e1e32]">
-        <div className="flex items-center gap-2">
-          <span className="text-sm font-mono font-semibold text-gray-200">✈️ CAG Registry</span>
-          {!isLoading && squadrons.length > 0 && (
-            <span className="text-[10px] font-mono bg-green-500/10 text-green-400 border border-green-500/20 rounded-full px-2 py-0.5">
-              {active.length} active
+    <>
+      <div className="rounded-xl border border-[#1e1e32] bg-[#0d0d1a] overflow-hidden">
+        {/* Header */}
+        <div className="flex items-center justify-between px-4 py-3 border-b border-[#1e1e32]">
+          <div className="flex items-center gap-2">
+            <span className="text-sm font-mono font-semibold text-gray-200">✈️ CAG Registry</span>
+            {!isLoading && squadrons.length > 0 && (
+              <span className="text-[10px] font-mono bg-green-500/10 text-green-400 border border-green-500/20 rounded-full px-2 py-0.5">
+                {active.length} active
+              </span>
+            )}
+          </div>
+          <div className="flex items-center gap-2">
+            {/* Deploy Squadron button */}
+            <button
+              onClick={() => setDeployModalOpen(true)}
+              className="flex items-center gap-1.5 text-[10px] font-mono bg-green-500/10 text-green-400 border border-green-500/20 rounded px-2 py-1 hover:bg-green-500/20 transition-colors"
+              title="Deploy a new squadron"
+            >
+              <span>+</span>
+              <span>Deploy</span>
+            </button>
+            {/* Phase badge */}
+            <span className="text-[9px] font-mono text-gray-700 border border-[#1e1e32] rounded px-1.5 py-0.5">
+              Phase 3f
             </span>
-          )}
+          </div>
         </div>
-        {/* Phase badge */}
-        <span className="text-[9px] font-mono text-gray-700 border border-[#1e1e32] rounded px-1.5 py-0.5">
-          Phase 3f
-        </span>
-      </div>
 
-      {/* Body */}
-      {isLoading || squadrons.length === 0 ? (
-        <EmptyState isLoading={isLoading} />
-      ) : (
+        {/* Body */}
+        {isLoading || squadrons.length === 0 ? (
+          <EmptyState isLoading={isLoading} />
+        ) : (
         <>
           {/* Active squadrons */}
           {active.length > 0 && (
@@ -223,6 +240,17 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick }
         </>
       )}
     </div>
+
+    {/* Deploy Squadron Modal */}
+    <DeploySquadronModal
+      isOpen={deployModalOpen}
+      onClose={() => setDeployModalOpen(false)}
+      onDeployed={(squadronId) => {
+        setDeployModalOpen(false);
+        onDeploySuccess?.();
+      }}
+    />
+  </>
   );
 }
 

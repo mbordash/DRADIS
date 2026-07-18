@@ -227,6 +227,32 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 - **Strategy Timeout**: Each Viper evaluation is hard-capped at 500ms. A hung Viper is skipped for that tick — the engine never freezes.
 - **REST API**: axum server on `:9000` exposes live config, P&L, positions, and trade history to the Control Tower.
 
+### REST API Endpoints
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/api/health` | GET | Liveness check |
+| `/api/assets` | GET | List initialized asset pools |
+| `/api/config` | GET | Current DynamicConfig as JSON |
+| `/api/config` | PATCH | JSON merge-patch — hot-reloads strategies |
+| `/api/config/schema` | GET | Editable-config field schema |
+| `/api/pnl/history` | GET | Recent P&L snapshots |
+| `/api/trades` | GET | Recent completed trades |
+| `/api/positions` | GET | Current open positions |
+| `/api/squadrons` | GET | List all active squadrons |
+| `/api/squadrons/{id}` | GET | Get one squadron by id |
+| `/api/squadrons/{id}/config` | GET/PATCH | Squadron-specific config |
+| `/api/squadrons/deploy` | POST | Queue a new squadron deployment |
+| `/api/deployments` | GET | List deployment queue status |
+| `/api/deployment/region` | GET | Region + available market types |
+| `/api/markets/available` | GET | Fetch markets by type from Gamma API |
+| `/api/taxonomy/raptors` | GET | Raptor kinds for market class |
+| `/api/taxonomy/vipers` | GET | Viper kinds for market class |
+| `/api/telemetry` | GET | Live Raptor signal snapshots |
+| `/api/llm/recommendations` | GET | Recent LLM Advisor analyses |
+
+All data endpoints accept `?asset=btc` query param to scope to a specific asset pool.
+
 ---
 
 ##  Raptor Wing (`src/raptors/`)
@@ -284,6 +310,18 @@ Squadron
 └── SquadronState    →  STAGED → DEPLOYED → PATROLLING → RTB → STOOD_DOWN
 ```
 
+### Market Taxonomy
+
+Markets are classified into domains that determine which Raptors and Vipers are meaningful:
+
+| Market Class | Raptors | Vipers |
+|--------------|---------|--------|
+| `crypto` | Price, Funding, Derivatives, Tide | All eight Vipers |
+| `sports` | Sports (line movement) | Arbitrage, Maker (venue-agnostic) |
+| `politics` | Politics (roadmap) | Arbitrage, Maker (venue-agnostic) |
+
+Classification is data-driven via the `market_class_rule` table — add a new mapping (e.g., `tennis → sports`) with one INSERT, no code change.
+
 ### Composition presets
 
 | Preset          | Raptors         | Vipers                             |
@@ -296,7 +334,7 @@ Squadron
 
 | State        | Meaning                                          |
 |--------------|--------------------------------------------------|
-| `STAGED`     | Assembled, waiting for a battle location         |
+| `STAGED`     | Assembled, waiting for a battle location (user-deployed via UI) |
 | `DEPLOYED`   | Market acquired, WS subscriptions live           |
 | `PATROLLING` | Active trading tick loop running                 |
 | `RTB`        | Returning to base — no new entries, winding down |
@@ -354,12 +392,42 @@ DRADIS ships with a real-time web dashboard called **Control Tower** built on Ne
 | **Open Positions** | In-flight positions with entry time, side (YES/NO/UP/DOWN in correct color), entry price, shares |
 | **Telemetry**      | Live Raptor macro cards — **Tide** (ETF premium, institutional pulse), **Horizon** (TradFi velocity, VIX proxy), greyed outside US market hours |
 | **Trade Log**      | Last N completed trades with strategy, side, entry/exit prices, shares, P&L, exit reason         |
+| **CAG Registry**   | Active squadrons with market, state, deployed time, and **+ Deploy** button                      |
 
 ### Live Config Editing
 
 Every parameter in the Viper cards maps directly to the runtime `DynamicConfig`. Editing a value sends `PATCH /api/config` — **no restart required**. Changes take effect on the next 50ms tick.
 
 > **Hot-Enable Design** — All eight Vipers are always instantiated at startup. The `DynamicConfig` enable flags are the sole runtime gate. Toggle any Viper on or off during a live session with immediate effect.
+
+### Squadron Builder (Admiral Adama Extension)
+
+The **+ Deploy** button in the CAG Registry panel opens the Squadron Builder modal — craft custom squadrons with market type selection, raptor/viper configuration, and regional deployment restrictions.
+
+| Mode | Description |
+|------|-------------|
+| **Quick Deploy** | Select market type (crypto/sports/politics) → DRADIS auto-selects the highest-liquidity market and optimal raptors/vipers |
+| **Full Control** | Browse available markets, manually select raptors and vipers, see implementation status badges |
+
+**Regional restrictions:**
+
+| Deployment | Available Market Types |
+|------------|------------------------|
+| US (`us_retail`) | Politics, Sports |
+| INTL (`intl_clob`) | Politics, Sports, Crypto |
+
+**Deployment flow:**
+```
+User → "+ Deploy" → Modal → POST /api/squadrons/deploy
+                                    ↓
+                        deployment_queue (pending)
+                                    ↓
+                    Admiral Adama processor (5s poll)
+                                    ↓
+               CAG.register_staged_deployment() → STAGED in UI
+```
+
+Staged squadrons appear in the CAG Registry. The auto-discovery loops for crypto assets (BTC/ETH/SOL) adopt staged deployments on their next market rotation.
 
 ### Authentication
 

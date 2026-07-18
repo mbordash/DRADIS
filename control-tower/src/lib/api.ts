@@ -166,6 +166,71 @@ export async function patchSquadronConfig(squadronId: string, patch: Partial<Dyn
 // GET /api/config/schema. This list only supplies accent color, blurb and the
 // /api/status strategy key, none of which the schema models.
 
+// ── Deployment API ────────────────────────────────────────────────────────────
+
+import type { DeploymentRegionInfo, AvailableMarketsResponse, MarketType, DeploySquadronRequest, DeploySquadronResponse, RaptorKind, ViperKindInfo } from './types';
+
+/** Get deployment region and available market types. */
+export async function getDeploymentRegion(): Promise<DeploymentRegionInfo> {
+  const res = await fetch(`${BASE}/api/deployment/region`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/deployment/region → ${res.status}`);
+  return res.json();
+}
+
+/** Get available markets for deployment, filtered by type. */
+export async function getAvailableMarkets(
+  marketType: MarketType,
+  options?: { expiryWindow?: string; minLiquidity?: number }
+): Promise<AvailableMarketsResponse> {
+  const params = new URLSearchParams({ market_type: marketType });
+  if (options?.expiryWindow) params.set('expiry_window', options.expiryWindow);
+  if (options?.minLiquidity) params.set('min_liquidity', String(options.minLiquidity));
+  
+  const res = await fetch(`${BASE}/api/markets/available?${params}`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/markets/available → ${res.status}`);
+  return res.json();
+}
+
+/** Get raptors available for a market class. */
+export async function getRaptorsForClass(marketClass: MarketType): Promise<RaptorKind[]> {
+  const res = await fetch(`${BASE}/api/taxonomy/raptors?market_class=${marketClass}`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/taxonomy/raptors → ${res.status}`);
+  return res.json();
+}
+
+/** Get vipers available for a market class. */
+export async function getVipersForClass(marketClass: MarketType): Promise<ViperKindInfo[]> {
+  const res = await fetch(`${BASE}/api/taxonomy/vipers?market_class=${marketClass}`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/taxonomy/vipers → ${res.status}`);
+  return res.json();
+}
+
+/** Deploy a new squadron. */
+export async function deploySquadron(request: DeploySquadronRequest): Promise<DeploySquadronResponse> {
+  const res = await fetch(`${BASE}/api/squadrons/deploy`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(request),
+    cache: 'no-store',
+  });
+  if (!res.ok) {
+    const errorText = await res.text();
+    return { success: false, error: errorText };
+  }
+  return res.json();
+}
+
+import type { DeploymentStatus } from './types';
+
+/** Get all deployment requests with their status. */
+export async function getDeployments(): Promise<DeploymentStatus[]> {
+  const res = await fetch(`${BASE}/api/deployments`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/deployments → ${res.status}`);
+  return res.json();
+}
+
+// ── Viper metadata ────────────────────────────────────────────────────────────
+
 export const VIPER_DEFS: ViperDef[] = [
   {
     name: 'Arbitrage',
