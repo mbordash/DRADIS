@@ -707,23 +707,33 @@ async fn run() -> Result<()> {
     }
 
     // ── Admiral Adama infrastructure for user-deployed squadrons ─────────────
-    // Bundles the trading handles that Admiral Adama needs to spawn real
-    // squadrons for sports/politics markets. The API server's deployment queue
-    // processor uses these via cag.spawn_adama_squadron().
+    // Bundles ALL trading handles needed to spawn real squadrons. The processor
+    // runs here in main.rs where we have access to the wallet_provider.
     if let Some(ref session) = primary_session {
-        let adama_infra = dradis::cag::adama::AdamaInfrastructure {
+        let adama_infra = Arc::new(dradis::cag::adama::AdamaInfrastructure {
             trading_client: Arc::clone(&trading_client),
             signer:         signer.clone(),
             nonce_manager:  Arc::clone(&nonce_manager),
             safe_address,
             eoa_address,
             shared_http:    Arc::clone(&shared_http),
-            sports_raptor:  Some(sports_rx.clone()),
+            wallet_provider: wallet_provider.clone(),
+            cag:            cag.clone(),
             default_session: session.clone(),
             markets_tx:     Arc::clone(&markets_tx),
-        };
-        cag.set_adama_infrastructure(adama_infra);
-        info!("✅ Admiral Adama infrastructure ready — user squadrons can now be deployed");
+            sports_raptor:  Some(sports_rx.clone()),
+            tg_token:       env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
+            tg_chat_id:     env::var("TELEGRAM_CHAT_ID").unwrap_or_default(),
+            tw_api_key:     env::var("X_API_KEY").unwrap_or_default(),
+            tw_api_secret:  env::var("X_API_SECRET").unwrap_or_default(),
+            tw_access_token: env::var("X_ACCESS_TOKEN").unwrap_or_default(),
+            tw_access_token_secret: env::var("X_ACCESS_TOKEN_SECRET").unwrap_or_default(),
+            process_heartbeat_secs: Arc::clone(&process_heartbeat_secs),
+        });
+        
+        // Spawn the Admiral Adama deployment processor
+        tokio::spawn(dradis::cag::adama::run_adama_processor(adama_infra));
+        info!("✅ Admiral Adama processor started — user squadrons can now be deployed");
     }
 
     // Block until ALL market loops exit (expected: never — each loops forever).
