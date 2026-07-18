@@ -1670,10 +1670,10 @@ async fn get_available_markets(Query(q): Query<AvailableMarketsQuery>) -> Respon
     
     // Parse expiry window to seconds (default varies by market type)
     let default_expiry = match q.market_type.to_lowercase().as_str() {
-        "sports" => 86400,    // 24h for sports (game-day markets)
-        "crypto" => 86400,    // 24h for crypto (daily price markets)
-        "politics" => 2592000, // 30d for politics (longer horizons)
-        _ => 604800,          // 7d fallback
+        "sports" => 86400,     // 24h for sports (game-day markets)
+        "crypto" => 2592000,   // 30d for crypto (price targets have longer horizons)
+        "politics" => 7776000, // 90d for politics (longer horizons)
+        _ => 604800,           // 7d fallback
     };
     
     let max_expiry_secs: i64 = match q.expiry_window.as_deref() {
@@ -1697,47 +1697,63 @@ async fn get_available_markets(Query(q): Query<AvailableMarketsQuery>) -> Respon
 }
 
 /// Fetch markets from Gamma API filtered by market type.
-/// Uses tag-based filtering for sports (via /sports endpoint), regex for crypto/politics.
-/// Only available when intl_clob feature is enabled.
+/// Uses existing helpers: fetch_simplified_crypto_candidates for crypto,
+/// tag-based filtering for sports, regex for politics.
 #[cfg(feature = "intl_clob")]
 async fn fetch_markets_by_type(
     http: &reqwest::Client,
     market_type: &str,
-    max_expiry_secs: i64,
+    _max_expiry_secs: i64,
     min_liquidity: f64,
 ) -> Vec<AvailableMarket> {
+    // For sports, use tag-based filtering from /sports endpoint
+    if market_type == "sports" {
+        return fetch_sports_markets_by_tags(http, _max_expiry_secs, min_liquidity).await;
+    }
+    
+    // For crypto, use the existing market.rs helper that already handles
+    // slug-based filtering, window markets, daily markets, etc.
+    if market_type == "crypto" {
+        let candidates = crate::helpers::market::fetch_simplified_crypto_candidates(http, "all").await;
+        let mut out: Vec<AvailableMarket> = candidates
+            .into_iter()
+            .filter(|(_, _, _, vol, _, _, _, _)| *vol >= min_liquidity)
+            .map(|(tokens, question, _slug, liquidity, _priority, end_date, _desc, condition_id)| {
+                AvailableMarket {
+                    condition_id,
+                    question,
+                    market_class: "crypto".to_string(),
+                    end_date: end_date.map(|dt| dt.to_rfc3339()),
+                    liquidity,
+                    tokens: AvailableMarketTokens {
+                        yes_id: crate::venues::intl::market_id_from_u256(tokens[0]).to_string(),
+                        no_id: crate::venues::intl::market_id_from_u256(tokens[1]).to_string(),
+                    },
+                }
+            })
+            .collect();
+        
+        out.sort_by(|a, b| b.liquidity.partial_cmp(&a.liquidity).unwrap_or(std::cmp::Ordering::Equal));
+        out.truncate(50);
+        info!("📊 fetch_markets_by_type: found {} crypto markets", out.len());
+        return out;
+    }
+    
+    // For politics, use regex filtering (no clean umbrella tags exist)
     let mut out = Vec::new();
     let now = chrono::Utc::now();
     
-    // For sports, use tag-based filtering from /sports endpoint
-    if market_type == "sports" {
-        return fetch_sports_markets_by_tags(http, max_expiry_secs, min_liquidity).await;
-    }
-    
-    // For crypto/politics, use regex filtering (no clean umbrella tags exist)
-    let filter_patterns: Vec<regex::Regex> = match market_type {
-        "crypto" => vec![
-            regex::Regex::new(r"(?i)\bbitcoin\b").ok(),
-            regex::Regex::new(r"(?i)\bbtc\b").ok(),
-            regex::Regex::new(r"(?i)\bethereum\b").ok(),
-            regex::Regex::new(r"(?i)\bsolana\b").ok(),
-            regex::Regex::new(r"(?i)\bcrypto\b").ok(),
-            regex::Regex::new(r"(?i)\bdogecoin\b").ok(),
-            regex::Regex::new(r"(?i)\bxrp\b").ok(),
-        ].into_iter().flatten().collect(),
-        "politics" => vec![
-            regex::Regex::new(r"(?i)\belection\b").ok(),
-            regex::Regex::new(r"(?i)\bpresident\b").ok(),
-            regex::Regex::new(r"(?i)\bsenate\b").ok(),
-            regex::Regex::new(r"(?i)\bcongress\b").ok(),
-            regex::Regex::new(r"(?i)\bvote\b").ok(),
-            regex::Regex::new(r"(?i)\bprime minister\b").ok(),
-            regex::Regex::new(r"(?i)\bgovernment\b").ok(),
-            regex::Regex::new(r"(?i)\btrump\b").ok(),
-            regex::Regex::new(r"(?i)\bbiden\b").ok(),
-        ].into_iter().flatten().collect(),
-        _ => vec![],
-    };
+    let filter_patterns: Vec<regex::Regex> = vec![
+        regex::Regex::new(r"(?i)\belection\b").ok(),
+        regex::Regex::new(r"(?i)\bpresident\b").ok(),
+        regex::Regex::new(r"(?i)\bsenate\b").ok(),
+        regex::Regex::new(r"(?i)\bcongress\b").ok(),
+        regex::Regex::new(r"(?i)\bvote\b").ok(),
+        regex::Regex::new(r"(?i)\bprime minister\b").ok(),
+        regex::Regex::new(r"(?i)\bgovernment\b").ok(),
+        regex::Regex::new(r"(?i)\btrump\b").ok(),
+        regex::Regex::new(r"(?i)\bbiden\b").ok(),
+    ].into_iter().flatten().collect();
     
     // Fetch top markets by volume, then filter locally
     let url = "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=200&order=volume24hrClob&ascending=false";
@@ -1800,7 +1816,7 @@ async fn fetch_markets_by_type(
             
             if let Some(ct) = close_time {
                 let secs_left = (ct - now).num_seconds();
-                if secs_left < 300 || secs_left > max_expiry_secs {
+                if secs_left < 300 || secs_left > _max_expiry_secs {
                     continue; // Too close to expiry or too far out
                 }
             }
@@ -1814,7 +1830,7 @@ async fn fetch_markets_by_type(
             out.push(AvailableMarket {
                 condition_id,
                 question,
-                market_class: market_type.to_string(),
+                market_class: "politics".to_string(),
                 end_date: close_time.map(|ct| ct.to_rfc3339()),
                 liquidity: volume,
                 tokens: AvailableMarketTokens {
@@ -1824,6 +1840,8 @@ async fn fetch_markets_by_type(
             });
         }
     }
+    
+    info!("📊 fetch_markets_by_type: found {} politics markets", out.len());
     
     // Sort by liquidity descending
     out.sort_by(|a, b| b.liquidity.partial_cmp(&a.liquidity).unwrap_or(std::cmp::Ordering::Equal));
