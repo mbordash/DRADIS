@@ -849,26 +849,16 @@ impl GboostStrategyImpl {
             match result {
                 Ok(Ok((new_model, drift_score))) => {
                     let n = new_model.trees.len();
-                    // Persist to disk first so a crash doesn't lose the trained weights.
-                    // Use the same path resolution as startup load (env var override first,
-                    // then CRYPTO_FILTER-namespaced default so containers don't stomp each other).
-                    if let Ok(json) = new_model.json_dump() {
-                        let model_path = std::env::var("GBOOST_MODEL_PATH")
-                            .unwrap_or_else(|_| {
-                                let crypto = std::env::var("CRYPTO_FILTER")
-                                    .unwrap_or_else(|_| "btc".to_string())
-                                    .to_lowercase();
-                                format!("logs/{}-{}", crypto, config::GBOOST_MODEL_FILENAME)
-                            });
-                        if let Err(e) = tokio::fs::write(&model_path, &json).await {
-                            tracing::warn!(" GboostStrategy: model save failed [{}]: {}", model_path, e);
-                        }
-                    }
-
-                    // Reject degenerate models — a model with fewer than
-                    // GBOOST_MIN_USABLE_TREES trees is essentially a random stump.
+                    // Reject degenerate models BEFORE persisting — a model with fewer
+                    // than GBOOST_MIN_USABLE_TREES trees is essentially a random stump.
                     // Keep the previous (better) model rather than regressing.
                     // Apply exponential backoff so we don't storm every 10 seconds.
+                    //
+                    // 2026-07-18/19: the save used to happen first ("crash safety"),
+                    // which let a quiet-market 16-tree stump OVERWRITE the good model
+                    // on disk; it was then rejected in memory, and the next deploy
+                    // cold-started with nothing loadable — GBoost was blind for 21h.
+                    // Only accepted models may touch the disk file.
                     if n < config::GBOOST_MIN_USABLE_TREES {
                         let mut count = consecutive_degenerate.lock().unwrap();
                         *count += 1;
@@ -886,6 +876,23 @@ impl GboostStrategyImpl {
                     // Good model — reset degenerate backoff counters.
                     *consecutive_degenerate.lock().unwrap() = 0;
                     *retrain_backoff_until.lock().unwrap() = None;
+
+                    // Persist the ACCEPTED model to disk so a crash/redeploy doesn't
+                    // lose the trained weights.  Same path resolution as startup load
+                    // (env var override first, then CRYPTO_FILTER-namespaced default
+                    // so containers don't stomp each other).
+                    if let Ok(json) = new_model.json_dump() {
+                        let model_path = std::env::var("GBOOST_MODEL_PATH")
+                            .unwrap_or_else(|_| {
+                                let crypto = std::env::var("CRYPTO_FILTER")
+                                    .unwrap_or_else(|_| "btc".to_string())
+                                    .to_lowercase();
+                                format!("logs/{}-{}", crypto, config::GBOOST_MODEL_FILENAME)
+                            });
+                        if let Err(e) = tokio::fs::write(&model_path, &json).await {
+                            tracing::warn!(" GboostStrategy: model save failed [{}]: {}", model_path, e);
+                        }
+                    }
 
                     // ── Concept drift monitoring ──────────────────────────────
                     // Compare how live data flows through the new model's split points
