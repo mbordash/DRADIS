@@ -565,6 +565,33 @@ impl Strategy for MakerStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // Viper Backtrace: stash quote-time decision state per side.  The stash is
+        // keyed by token and only drained when a fill is confirmed (record_entry_signal),
+        // so re-quotes simply overwrite with the latest state — the row captures the
+        // quote that actually filled.
+        if let Some(p) = final_yes {
+            crate::helpers::metrics::stash_entry_signals_json(market.yes_token.as_str(), serde_json::json!({
+                "viper": "Maker",
+                "side": "YES",
+                "quote_bid": p.to_string(),
+                "spread": yes_spread.to_string(),
+                "trade_size": trade_size.to_string(),
+                "net_exposure": net_exposure.to_string(),
+                "both_sides_quoted": final_no.is_some(),
+            }));
+        }
+        if let Some(p) = final_no {
+            crate::helpers::metrics::stash_entry_signals_json(market.no_token.as_str(), serde_json::json!({
+                "viper": "Maker",
+                "side": "NO",
+                "quote_bid": p.to_string(),
+                "spread": no_spread.to_string(),
+                "trade_size": trade_size.to_string(),
+                "net_exposure": net_exposure.to_string(),
+                "both_sides_quoted": final_yes.is_some(),
+            }));
+        }
+
         // ── Build detailed signals ───────────────────────────────────────────
         // Maker (post-only) orders are NEVER charged a taker fee by the CLOB —
         // the feeRateBps field is an EIP-712 struct attribute required by the API

@@ -200,6 +200,18 @@ impl Strategy for BasisStrategyImpl {
                 return Ok(StrategySignal::NoSignal);
             }
 
+            // Viper Backtrace: persist the gate/decision state for this entry.
+            crate::helpers::metrics::stash_entry_signals_json(market.no_token.as_str(), serde_json::json!({
+                "viper": "Basis",
+                "branch": "fade_YES_buy_NO",
+                "skew": skew.to_string(),
+                "funding_confirms": funding_confirms_no_trade,
+                "extreme_skew_bypass": extreme_skew_bypass,
+                "target_price": target_price.to_string(),
+                "trade_size": trade_size.to_string(),
+                "maker_entry": config::BASIS_ENTRY_AS_MAKER,
+            }));
+
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
                     token_id: market.no_token.clone(),
@@ -254,6 +266,18 @@ impl Strategy for BasisStrategyImpl {
             if target_price > dc.basis_max_entry_price {
                 return Ok(StrategySignal::NoSignal);
             }
+
+            // Viper Backtrace: persist the gate/decision state for this entry.
+            crate::helpers::metrics::stash_entry_signals_json(market.yes_token.as_str(), serde_json::json!({
+                "viper": "Basis",
+                "branch": "fade_NO_buy_YES",
+                "skew": skew.to_string(),
+                "funding_confirms": funding_confirms_yes_trade,
+                "extreme_skew_bypass": extreme_skew_bypass,
+                "target_price": target_price.to_string(),
+                "trade_size": trade_size.to_string(),
+                "maker_entry": config::BASIS_ENTRY_AS_MAKER,
+            }));
 
             return Ok(StrategySignal::Entry {
                 params: OrderParams {

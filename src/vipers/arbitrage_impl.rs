@@ -415,6 +415,17 @@ impl Strategy for ArbitrageStrategyImpl {
             locked.insert(market.no_token.clone());
         }
 
+        // Viper Backtrace: persist the gate/decision state for this entry (keyed by
+        // Leg A, the primary leg that record_entry_signal records).
+        crate::helpers::metrics::stash_entry_signals_json(leg_a_token.as_str(), serde_json::json!({
+            "viper": "Arbitrage",
+            "leg_a_price": leg_a_price.to_string(),
+            "leg_b_price": leg_b_price.to_string(),
+            "pair_sum": (safe_yes_bid + safe_no_bid).to_string(),
+            "pair_shares": pair_shares.to_string(),
+            "trade_size": trade_size.to_string(),
+        }));
+
         return Ok(StrategySignal::Entry {
             params: OrderParams {
                 token_id: leg_a_token,

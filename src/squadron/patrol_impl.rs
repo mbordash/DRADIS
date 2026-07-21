@@ -1160,6 +1160,10 @@ impl Squadron {
                                             let tid_em = p.token_id.to_string(); let mn_em = p.market_name.clone();
                                             let side_em = if p.token_id == target_yes_token { "YES" } else { "NO" }.to_string();
                                             let ep_em = p.price; let sh_em = p.shares; let asset_em = asset_lc.clone();
+                                            // Maker quotes evaluate the Window/Daily book — capture that
+                                            // snapshot so the entry_signals feature-vector matches what
+                                            // the strategy actually saw (falls back to primary snapshot).
+                                            let feat_snap_m = ctx.maker_snapshot.clone().unwrap_or_else(|| ctx.snapshot.clone());
                                             // Write pending position immediately (Viper Launch)
                                             if let Some(pool) = db::pool_for(&asset_em) {
                                                 db::record_open_position_with_status(&pool, &sn, &tid_em, &mn_em, &side_em, ep_em, sh_em, false, "pending").await;
@@ -1170,7 +1174,8 @@ impl Squadron {
                                                     if let Some(pool) = db::pool_for(&asset_em) {
                                                         db::confirm_position_status(&pool, &sn_m, &tid_em).await;
                                                     }
-                                                    metrics::record_entry(&asset_em, sn_m, tid_em, mn_em, side_em, ep_em, sh_em).await;
+                                                    metrics::record_entry(&asset_em, sn_m.clone(), tid_em.clone(), mn_em.clone(), side_em.clone(), ep_em, sh_em).await;
+                                                    metrics::record_entry_signal(&asset_em, sn_m, tid_em, mn_em, side_em, ep_em, sh_em, &feat_snap_m).await;
                                                 }
                                             });
                                         }

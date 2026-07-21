@@ -169,6 +169,18 @@ impl Strategy for TimeDecayStrategyImpl {
 
             let pair_shares = trade_size / combined_bid;
 
+            // Viper Backtrace: persist the gate/decision state for this entry
+            // (keyed by the YES leg, the primary leg that record_entry_signal records).
+            crate::helpers::metrics::stash_entry_signals_json(market.yes_token.as_str(), serde_json::json!({
+                "viper": "TimeDecay",
+                "yes_bid": yes_bid.to_string(),
+                "no_bid": no_bid.to_string(),
+                "combined_bid": combined_bid.to_string(),
+                "net_theta": net.to_string(),
+                "pair_shares": pair_shares.to_string(),
+                "trade_size": trade_size.to_string(),
+            }));
+
             return Ok(StrategySignal::Entry {
                 params: OrderParams {
                     token_id:    market.yes_token.clone(),

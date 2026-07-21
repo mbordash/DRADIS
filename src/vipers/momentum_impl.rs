@@ -308,6 +308,21 @@ impl Strategy for MomentumStrategyImpl {
                 drift_10m, drift_bear_block);
         }
 
+        // Viper Backtrace: shared stash helper — called once at whichever entry
+        // branch actually fires, immediately before the Entry signal is returned.
+        let stash_entry = |token: &crate::venues::core::MarketId, branch: &str, ask: rust_decimal::Decimal| {
+            crate::helpers::metrics::stash_entry_signals_json(token.as_str(), serde_json::json!({
+                "viper": "Momentum",
+                "branch": branch,
+                "velocity": velocity.to_string(),
+                "threshold": threshold.to_string(),
+                "binance_price": binance_price.to_string(),
+                "strike": strike_price.map(|s| s.to_string()),
+                "drift_10m": drift_10m.to_string(),
+                "ask": ask.to_string(),
+            }));
+        };
+
         if let Some(strike) = strike_price {
             // ── Window/Daily trend filter ─────────────────────────────────────
             let window_blocks_bull;
@@ -337,6 +352,7 @@ impl Strategy for MomentumStrategyImpl {
                 && yes_ask >= dc.momentum_min_entry_price
                 && short_ok_bull && accel_ok_bull && !window_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
             {
+                stash_entry(&ctx.market.yes_token, "BULL_primary", yes_ask);
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.yes_token.clone(), yes_ask, ctx.market.yes_fee_bps as u16),
                     pair_params: None,
@@ -346,6 +362,7 @@ impl Strategy for MomentumStrategyImpl {
                 && no_ask >= dc.momentum_min_entry_price
                 && short_ok_bear && accel_ok_bear && !window_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
             {
+                stash_entry(&ctx.market.no_token, "BEAR_primary", no_ask);
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.no_token.clone(), no_ask, ctx.market.no_fee_bps as u16),
                     pair_params: None,
@@ -358,6 +375,7 @@ impl Strategy for MomentumStrategyImpl {
                 && yes_ask >= dc.momentum_min_entry_price
                 && short_ok_bull && accel_ok_bull && !window_blocks_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
             {
+                stash_entry(&ctx.market.yes_token, "BULL_crossing", yes_ask);
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.yes_token.clone(), yes_ask, ctx.market.yes_fee_bps as u16),
                     pair_params: None,
@@ -367,6 +385,7 @@ impl Strategy for MomentumStrategyImpl {
                 && no_ask >= dc.momentum_min_entry_price
                 && short_ok_bear && accel_ok_bear && !window_blocks_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
             {
+                stash_entry(&ctx.market.no_token, "BEAR_crossing", no_ask);
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.no_token.clone(), no_ask, ctx.market.no_fee_bps as u16),
                     pair_params: None,
@@ -380,6 +399,7 @@ impl Strategy for MomentumStrategyImpl {
                 && yes_ask >= dc.momentum_min_entry_price
                 && short_ok_bull && accel_ok_bull && !obi_blocks_bull && !obi_exhausted_bull && !obi_swing_blocks_bull && !drift_blocks_bull
             {
+                stash_entry(&ctx.market.yes_token, "BULL_nostrike", yes_ask);
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.yes_token.clone(), yes_ask, ctx.market.yes_fee_bps as u16),
                     pair_params: None,
@@ -389,6 +409,7 @@ impl Strategy for MomentumStrategyImpl {
                 && no_ask >= dc.momentum_min_entry_price
                 && short_ok_bear && accel_ok_bear && !obi_blocks_bear && !obi_exhausted_bear && !obi_swing_blocks_bear && !drift_blocks_bear
             {
+                stash_entry(&ctx.market.no_token, "BEAR_nostrike", no_ask);
                 return Ok(StrategySignal::Entry {
                     params: entry_params!(ctx.market.no_token.clone(), no_ask, ctx.market.no_fee_bps as u16),
                     pair_params: None,
