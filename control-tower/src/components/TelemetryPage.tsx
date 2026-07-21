@@ -370,7 +370,7 @@ function TideCard({ data, latest }: { data: Row[]; latest: Row }) {
         <div>
           <p className="label-muted text-[10px]">🌊 Institutional Pulse · Tide Raptor</p>
           <p className="text-[10px] text-gray-600 font-mono">
-            Spot-BTC-ETF premium vs synthetic iNAV — IBIT / FBTC / ARKB · observe-only
+            Spot-BTC-ETF premium vs synthetic iNAV — IBIT / FBTC / ARKB · live: Convergence · GBoost · Basis
           </p>
         </div>
         <div className="flex items-center gap-1.5 text-[10px] font-mono">
@@ -469,7 +469,7 @@ function HorizonCard({ data, latest }: { data: Row[]; latest: Row }) {
         <div>
           <p className="label-muted text-[10px]">🌅 TradFi Velocity · Horizon Raptor</p>
           <p className="text-[10px] text-gray-600 font-mono">
-            SPY + QQQ momentum · BTC/QQQ correlation · UVXY VIX proxy · observe-only
+            SPY + QQQ momentum · BTC/QQQ correlation · UVXY VIX proxy · live: Maker · TrendReversal gates
           </p>
         </div>
         <div className="flex items-center gap-1.5 text-[10px] font-mono">
@@ -755,12 +755,12 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
         <Scrubber data={rows} range={range} onChange={setRange} />
       )}
 
-      {/* Institutional Pulse — Tide Raptor (BTC-only, observe-only) */}
+      {/* Institutional Pulse — Tide Raptor (BTC-only, consumed by Convergence/GBoost/Basis) */}
       {asset === 'btc' && latest && (
         <TideCard data={viewRows} latest={latest} />
       )}
 
-      {/* TradFi Velocity — Horizon Raptor (BTC-only, observe-only) */}
+      {/* TradFi Velocity — Horizon Raptor (BTC-only, consumed by Maker/TrendReversal gates) */}
       {asset === 'btc' && latest && (
         <HorizonCard data={viewRows} latest={latest} />
       )}

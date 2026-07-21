@@ -31,10 +31,11 @@
 /// to compute its signals. This avoids needing two Alpaca accounts (free tier
 /// allows only one concurrent connection per account).
 ///
-/// ── Observe-only status ──────────────────────────────────────────────────────
+/// ── Consumption status (2026-07-21) ─────────────────────────────────────────
 ///
-/// Like the Tide Raptor, the Horizon Raptor is wired in **observe-only** mode:
-/// it publishes to telemetry but is NOT consumed by any Viper sizing logic yet.
+/// Published into `MarketSnapshot` (tradfi_velocity / macro_coherence /
+/// vix_proxy / vix_velocity) and consumed by the Maker Horizon gate and the
+/// TrendReversal fade veto (both observe-first: *_ENFORCE consts arm them).
 /// Zero signals degrade gracefully (neutral).
 use std::collections::HashMap;
 use std::collections::VecDeque;
@@ -223,7 +224,7 @@ pub async fn run_horizon_raptor(
     let mut tick_interval = tokio::time::interval(Duration::from_millis(config::HORIZON_TICK_MS));
     tick_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    info!("🌅 Horizon Raptor online (observe-only) — reading SPY/QQQ/UVXY from shared Alpaca feed");
+    info!("🌅 Horizon Raptor online — reading SPY/QQQ/UVXY from shared Alpaca feed (consumed by Maker/TrendReversal Horizon gates)");
 
     loop {
         tick_interval.tick().await;

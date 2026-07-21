@@ -477,9 +477,38 @@ impl Strategy for MakerStrategyImpl {
         let yes_toxic_cooldown = maker_toxic_cooldown_active(market.yes_token.as_str(), cooldown_secs);
         let no_toxic_cooldown  = maker_toxic_cooldown_active(market.no_token.as_str(), cooldown_secs);
 
+        // ── Horizon Raptor gate (4th defense layer, observe-first) ───────────
+        // TradFi front-runs BTC when macro_coherence is high, and a VIX-proxy
+        // velocity spike is the earliest panic-onset signal — both LEAD the OBI
+        // flip.  Risk-off flow ⇒ BTC likely down ⇒ suppress YES bids (they'd be
+        // lifted by informed sellers); risk-on ⇒ suppress NO.  A VIX spike
+        // suppresses BOTH sides regardless of coherence (panic is panic).
+        // With MAKER_HORIZON_GATE_ENFORCE=false this only logs "would veto".
+        let hz = &ctx.snapshot;
+        let hz_vix_spike = hz.vix_velocity >= config::MAKER_HORIZON_VIX_VEL_MAX;
+        let hz_coherent  = hz.macro_coherence >= config::MAKER_HORIZON_COHERENCE_MIN;
+        let hz_risk_off  = hz_coherent && hz.tradfi_velocity <= -config::MAKER_HORIZON_TRADFI_VETO;
+        let hz_risk_on   = hz_coherent && hz.tradfi_velocity >=  config::MAKER_HORIZON_TRADFI_VETO;
+        let horizon_blocks_yes = hz_vix_spike || hz_risk_off;
+        let horizon_blocks_no  = hz_vix_spike || hz_risk_on;
+        if horizon_blocks_yes || horizon_blocks_no {
+            self.log_gate("horizon", &format!(
+                "🔭 Horizon gate{}: {}{}{} | tradfi_vel={:.3} coh={:.2} vix_vel={:.3} (blocks: YES={} NO={})",
+                if config::MAKER_HORIZON_GATE_ENFORCE { "" } else { " (observe — would veto)" },
+                if hz_vix_spike { "VIX spike " } else { "" },
+                if hz_risk_off { "risk-off " } else { "" },
+                if hz_risk_on { "risk-on " } else { "" },
+                hz.tradfi_velocity, hz.macro_coherence, hz.vix_velocity,
+                horizon_blocks_yes, horizon_blocks_no,
+            )).await;
+        }
+        let horizon_vetoes_yes = config::MAKER_HORIZON_GATE_ENFORCE && horizon_blocks_yes;
+        let horizon_vetoes_no  = config::MAKER_HORIZON_GATE_ENFORCE && horizon_blocks_no;
+
         let yes_gates_pass = yes_book_ok
             && !taker_flow_blocks_yes
             && !yes_toxic_cooldown
+            && !horizon_vetoes_yes
             && yes_spread >= dc.maker_min_spread
             && yes_bid_price >= dc.maker_min_entry_price
             && yes_bid_price <= dc.maker_max_entry_price
@@ -490,6 +519,7 @@ impl Strategy for MakerStrategyImpl {
         let no_gates_pass = no_book_ok
             && !taker_flow_blocks_no
             && !no_toxic_cooldown
+            && !horizon_vetoes_no
             && no_spread >= dc.maker_min_spread
             && no_bid_price >= dc.maker_min_entry_price
             && no_bid_price <= dc.maker_max_entry_price

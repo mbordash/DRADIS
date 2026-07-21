@@ -31,9 +31,10 @@
 /// cancels in `coherence` and cross-ETF dispersion — only a small constant bias
 /// survives in the absolute `institutional_pulse` level.
 ///
-/// ── Observe-only status ─────────────────────────────────────────────────────
-/// This Raptor is wired in **observe-only** mode: it publishes to telemetry but
-/// is NOT consumed by any Viper sizing logic yet. The real-time equity leg
+/// ── Consumption status (2026-07-21) ─────────────────────────────────────────
+/// Published into `MarketSnapshot` (institutional_pulse / tide_coherence) and
+/// consumed by Convergence (core signal), GBoost (model features [22][23]) and
+/// the optional Basis tide gate. The real-time equity leg
 /// (Alpaca free-tier IEX WS) is implemented — set `ALPACA_API_KEY_ID` /
 /// `ALPACA_API_SECRET_KEY` to stream live IBIT/FBTC/ARKB prints. Without keys the
 /// Raptor still gates on US market hours and publishes synthetic iNAV, but emits
@@ -222,7 +223,7 @@ pub async fn run_tide_raptor(
         .map(|s| (s.ticker, PremiumBuffer::new(s.fallback_btc_per_share)))
         .collect();
 
-    info!("🌊 Tide Raptor online (observe-only) — tracking IBIT/FBTC/ARKB premium vs synthetic iNAV");
+    info!("🌊 Tide Raptor online — tracking IBIT/FBTC/ARKB premium vs synthetic iNAV (consumed by Convergence/GBoost/Basis)");
 
     loop {
         tokio::time::sleep(Duration::from_secs(config::TIDE_RECOMPUTE_SECS)).await;

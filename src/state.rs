@@ -121,6 +121,22 @@ pub struct MarketSnapshot {
     /// High coherence + large |pulse| = institutional conviction. Zero when the
     /// Tide Raptor is absent/dormant (same gating as `institutional_pulse`).
     pub tide_coherence: Decimal,
+    /// TradFi velocity from the Horizon Raptor — volume-weighted 5-second momentum
+    /// of SPY+QQQ in USD. Positive = risk-on front-running, negative = risk-off.
+    /// Zero outside US market hours or when the Horizon Raptor is absent.
+    pub tradfi_velocity: Decimal,
+    /// Macro coherence from the Horizon Raptor — 10-minute rolling Pearson
+    /// correlation of QQQ velocity vs BTC velocity in [-1, 1]. High = BTC trading
+    /// as a high-beta tech asset (TradFi signals are informative); ~0 = decoupled
+    /// regime (treat TradFi signals as noise). Zero when insufficient history.
+    pub macro_coherence: Decimal,
+    /// VIX proxy from the Horizon Raptor — UVXY last trade price. Higher = more
+    /// fear/volatility. Zero outside US hours / when the raptor is absent.
+    pub vix_proxy: Decimal,
+    /// 5-second rate of change of the VIX proxy (UVXY velocity). A sharp positive
+    /// spike signals panic onset — market-making vipers should stop quoting.
+    /// Zero outside US hours / when the raptor is absent.
+    pub vix_velocity: Decimal,
     /// Fractional change in Binance perp open interest since the previous poll
     /// (Derivatives Raptor). >0 = positioning building, <0 = unwinding/de-leveraging.
     /// Zero when the Derivatives Raptor is absent or on its first poll. All-asset.

@@ -197,6 +197,16 @@ pub const MAKER_ORACLE_DRIFT_PULL_FRAC: Decimal = dec!(0.0008);
 /// Gate-dwell: gates must pass continuously this long before quoting.
 /// Aggressive: 10s — quicker to quote once conditions look clean.
 pub const MAKER_GATE_DWELL_SECS: i64 = 10;
+
+// ── Horizon Raptor maker gate (2026-07-21, observe-first) ───────────────────
+/// Master switch: false = observe-only (log "would veto", never suppress).
+pub const MAKER_HORIZON_GATE_ENFORCE: bool = false;
+/// Suppress BOTH maker sides when UVXY 5s velocity exceeds this ($/5s).
+pub const MAKER_HORIZON_VIX_VEL_MAX: Decimal = dec!(0.15);
+/// Suppress the adverse maker side when |tradfi_velocity| exceeds this ($/5s).
+pub const MAKER_HORIZON_TRADFI_VETO: Decimal = dec!(0.20);
+/// Directional TradFi vetoes require at least this QQQ-vs-BTC macro coherence.
+pub const MAKER_HORIZON_COHERENCE_MIN: Decimal = dec!(0.6);
 pub const MAKER_BID_BUFFER: Decimal = dec!(0.02);
 pub const MAKER_MIN_SPREAD: Decimal = dec!(0.02);
 pub const MAKER_BID_IMPROVEMENT: Decimal = dec!(0.01);
@@ -460,8 +470,8 @@ pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.080); // aggressive: 8% —
 pub const GBOOST_MIN_HOLD_SECS: i64 = 180;
 pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 10;
 pub const GBOOST_MIN_USABLE_TREES: usize = 30;
-pub const GBOOST_MODEL_FILENAME: &str = "gboost_model_v26f_o180.json";
-pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v26f_o180.json";
+pub const GBOOST_MODEL_FILENAME: &str = "gboost_model_v30g_o180.json";
+pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v30g_o180.json";
 /// Max fraction of identical labels before skipping a retrain cycle (avoids degenerate storms).
 /// Aggressive: same threshold — label imbalance is a hard data quality issue, not a risk preference.
 pub const GBOOST_LOOKAHEAD_LABEL_BALANCE_MAX: f64 = 0.80;
@@ -607,6 +617,14 @@ pub const TRENDCAPTURE_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.60);
 pub const TRENDREVERSAL_MODE: bool = true;
 pub const TRENDREVERSAL_EXHAUSTION_MULT: Decimal = dec!(1.5);
 pub const TRENDREVERSAL_FADE_MAX_DRIFT_60M_PCT: Decimal = dec!(0.006);
+
+// ── Horizon Raptor fade veto (2026-07-21, observe-first) ────────────────────
+/// Master switch: false = observe-only (log "would veto", never suppress).
+pub const TRENDREVERSAL_HORIZON_VETO_ENFORCE: bool = false;
+/// Veto a fade when tradfi_velocity confirms the drift direction beyond this ($/5s).
+pub const TRENDREVERSAL_HORIZON_TRADFI_CONFIRM: Decimal = dec!(0.15);
+/// Minimum macro_coherence for the fade veto to apply.
+pub const TRENDREVERSAL_HORIZON_COHERENCE_MIN: Decimal = dec!(0.6);
 pub const TRENDREVERSAL_TARGET_PROFIT_PCT: Decimal = dec!(0.10); // aggressive: let winners run further
 pub const TRENDREVERSAL_STOP_LOSS_PCT: Decimal = dec!(0.14);
 pub const TRENDREVERSAL_MAX_HOLD_SECS: i64 = 3600; // fade time-stop: 60 min

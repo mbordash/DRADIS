@@ -3,7 +3,7 @@
 /// Uses the `perpetual` crate's `PerpetualBooster` (LogLoss objective) to predict
 /// near-term YES price direction from a rolling window of orderbook + oracle features.
 ///
-/// ── Feature Vector (NUM_FEATURES = 26) ──────────────────────────────────────
+/// ── Feature Vector (NUM_FEATURES = 30) ──────────────────────────────────────
 ///   [0]  yes_obi         — (yes_bid_depth − yes_ask_depth) / total depth
 ///   [1]  no_obi          — (no_bid_depth − no_ask_depth) / total depth
 ///   [2]  yes_ask         — best ask price for YES token
@@ -56,6 +56,16 @@
 ///                          >0 = positioning building, <0 = de-leveraging/squeeze. All-asset.
 ///  [25]  cvd_ratio        — taker buy÷sell volume ratio. >1 = buy aggression, <1 = sell
 ///                          aggression, 0 = no data (treated neutral). All-asset.
+///  [26]  tradfi_velocity  — Horizon Raptor volume-weighted 5s momentum of SPY+QQQ ($).
+///                          >0 = risk-on front-running, <0 = risk-off. 0 outside US hours.
+///  [27]  macro_coherence  — 10m rolling Pearson correlation of QQQ vs BTC velocity in
+///                          [-1, 1]. High = BTC trading as high-beta tech (TradFi
+///                          features informative); ~0 = decoupled regime.
+///  [28]  vix_proxy        — UVXY last price ÷ 100 (fear/volatility level). The model
+///                          can learn regime interactions (e.g. mean-reversion works
+///                          in low-VIX chop, fails in high-VIX trends).
+///  [29]  vix_velocity     — UVXY 5s rate of change ($). Sharp positive spike = panic
+///                          onset. 0 outside US hours / raptor absent.
 ///
 /// ── Label ────────────────────────────────────────────────────────────────────
 ///   1.0  if the oracle (Binance) price is higher GBOOST_LABEL_HORIZON_SECS later
@@ -95,7 +105,7 @@ use crate::helpers::price::floor_to_tick_size;
 use crate::venues::core::TimeInForce;
 
 /// Number of f64 features per snapshot row fed into the booster.
-const NUM_FEATURES: usize = 26;
+const NUM_FEATURES: usize = 30;
 
 /// Represents a single training sample for the Gboost model.
 /// Contains the features at the time of entry and whether the trade was profitable.
@@ -294,6 +304,10 @@ fn extract_features(s: &MarketSnapshot, prev_s: Option<&MarketSnapshot>, hist_vo
         s.tide_coherence.to_f64().unwrap_or(0.0),                  // [23] NEW: tide coherence (ETF agreement, 0..1)
         s.oi_delta_pct.to_f64().unwrap_or(0.0),                    // [24] NEW: perp open-interest delta (positioning build/unwind)
         s.cvd_ratio.to_f64().unwrap_or(0.0),                       // [25] NEW: taker buy/sell ratio (aggression; 1.0-centred, 0=no data)
+        s.tradfi_velocity.to_f64().unwrap_or(0.0),                 // [26] NEW: Horizon SPY+QQQ 5s momentum ($; 0 off-hours)
+        s.macro_coherence.to_f64().unwrap_or(0.0),                 // [27] NEW: Horizon QQQ↔BTC 10m correlation [-1,1]
+        s.vix_proxy.to_f64().unwrap_or(0.0)         / 100.0,       // [28] NEW: Horizon UVXY level ÷ 100 (vol regime)
+        s.vix_velocity.to_f64().unwrap_or(0.0),                    // [29] NEW: Horizon UVXY 5s velocity ($; panic onset)
     ]
 }
 
@@ -514,20 +528,22 @@ impl GboostStrategyImpl {
 
         // Warm-start: try to load a previously persisted model from disk.
         //
-        // The model path is version-locked to the current feature set (NUM_FEATURES = 26).
+        // The model path is version-locked to the current feature set (NUM_FEATURES = 30).
         // NEVER load a model from a different version — the feature dimensions won't match.
         // History: v14f (14 features) → v19f (added yes_mid_change, no_obi_change,
         // relative_depth_ratio, combined_ask_spread, oracle_drift_10m in May 2026) →
         // v22f (added spread_velocity, hist_vol_regime, tick_momentum in May 2026) →
         // v24f (added institutional_pulse, tide_coherence in Jun 2026) →
-        // v26f (added oi_delta_pct, cvd_ratio in Jun 2026).
+        // v26f (added oi_delta_pct, cvd_ratio in Jun 2026) →
+        // v30g (added Horizon tradfi_velocity, macro_coherence, vix_proxy, vix_velocity
+        // in Jul 2026; zero off-US-hours so the model learns session-dependent splits).
         //
         // Override the path at runtime via the GBOOST_MODEL_PATH env var, e.g.:
         //   GBOOST_MODEL_PATH=/path/to/gboost_model_v19f.json cargo run
         // This is the recommended way to seed a local instance with a model trained on prod.
         // When not overridden the path is namespaced by CRYPTO_FILTER so that each
         // container in a shared-volume multi-instance deploy writes its own file:
-        //   logs/btc-gboost_model_v26f.json, logs/eth-gboost_model_v26f.json, etc.
+        //   logs/btc-gboost_model_v30g.json, logs/eth-gboost_model_v30g.json, etc.
         let model_clone = Arc::clone(&model_arc);
         if need_disk_load { tokio::spawn(async move {
             // Env var takes precedence; fall back to CRYPTO_FILTER-namespaced default.
@@ -2020,6 +2036,8 @@ mod tests {
             oracle_drift_10m: dec!(30), // ~10min drift for test
             hist_vol: dec!(0.003), // normal live-BTC 60m realized-vol — clears GBOOST_MIN_HIST_VOL
             institutional_pulse: dec!(0.5), tide_coherence: dec!(0.7),
+            tradfi_velocity: dec!(0), macro_coherence: dec!(0),
+            vix_proxy: dec!(0), vix_velocity: dec!(0),
             oi_delta_pct: dec!(0.01), cvd_ratio: dec!(1.2),
             secs_to_expiry: 3600, // 1 hour — mid-range for tests
             timestamp: Utc::now(),

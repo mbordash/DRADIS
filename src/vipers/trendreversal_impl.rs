@@ -439,6 +439,23 @@ impl Strategy for TrendReversalStrategyImpl {
                     return Ok(StrategySignal::NoSignal);
                 }
 
+                // ── Horizon fade veto (observe-first) ────────────────────────
+                // Don't fade an UP drift that TradFi is confirming: risk-on
+                // SPY+QQQ flow with high QQQ↔BTC coherence means the spike is
+                // macro continuation, not local exhaustion (2026-07-20: faded a
+                // +$188 spike that ran another $1,000).
+                if dc.trendreversal_mode
+                    && ctx.snapshot.macro_coherence >= config::TRENDREVERSAL_HORIZON_COHERENCE_MIN
+                    && ctx.snapshot.tradfi_velocity >= config::TRENDREVERSAL_HORIZON_TRADFI_CONFIRM
+                {
+                    tracing::info!(" TrendReversal BULL→fade Horizon veto{}: TradFi confirms UP (tradfi_vel={:.3} ≥ {:.2}, coh={:.2}) — trend continuation, not exhaustion",
+                        if config::TRENDREVERSAL_HORIZON_VETO_ENFORCE { "" } else { " (observe — would veto)" },
+                        ctx.snapshot.tradfi_velocity, config::TRENDREVERSAL_HORIZON_TRADFI_CONFIRM, ctx.snapshot.macro_coherence);
+                    if config::TRENDREVERSAL_HORIZON_VETO_ENFORCE {
+                        return Ok(StrategySignal::NoSignal);
+                    }
+                }
+
                 // Per-token spread gate on the BOUGHT token: a hollow bid side
                 // guarantees an instant stop-out (SL is measured against the bid).
                 let buy_spread = if buy_ask > dec!(0) {
@@ -530,6 +547,20 @@ impl Strategy for TrendReversalStrategyImpl {
                     debug!(" TrendReversal BEAR→fade blocked: buy_ask={:.3} within ±{:.2} of $0.50 (max-fee coin-flip zone)",
                         buy_ask, config::TRENDREVERSAL_MIN_EDGE_FROM_FAIR);
                     return Ok(StrategySignal::NoSignal);
+                }
+
+                // ── Horizon fade veto (observe-first) — see BULL branch ──────
+                // Don't fade a DOWN drift that TradFi is confirming (risk-off).
+                if dc.trendreversal_mode
+                    && ctx.snapshot.macro_coherence >= config::TRENDREVERSAL_HORIZON_COHERENCE_MIN
+                    && ctx.snapshot.tradfi_velocity <= -config::TRENDREVERSAL_HORIZON_TRADFI_CONFIRM
+                {
+                    tracing::info!(" TrendReversal BEAR→fade Horizon veto{}: TradFi confirms DOWN (tradfi_vel={:.3} ≤ -{:.2}, coh={:.2}) — trend continuation, not exhaustion",
+                        if config::TRENDREVERSAL_HORIZON_VETO_ENFORCE { "" } else { " (observe — would veto)" },
+                        ctx.snapshot.tradfi_velocity, config::TRENDREVERSAL_HORIZON_TRADFI_CONFIRM, ctx.snapshot.macro_coherence);
+                    if config::TRENDREVERSAL_HORIZON_VETO_ENFORCE {
+                        return Ok(StrategySignal::NoSignal);
+                    }
                 }
 
                 // Per-token spread gate on the BOUGHT token (see Jun 20 id 51:

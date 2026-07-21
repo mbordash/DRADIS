@@ -50,7 +50,18 @@ use sqlx;
 /// finds balance = 0, and the tx succeeds as a silent no-op (no tokens burned, no payout).
 ///
 /// Reference: https://docs.polymarket.com/developers/CTF/redeem-positions
+///
+/// **2026-07-21 caveat**: "ALL" is only true for positions minted after the pUSD
+/// migration.  Older positions (observed: June/early-July 2026 markets) were minted
+/// with USDC.e collateral — redeeming those with pUSD computes the wrong position ID
+/// and silently no-ops (6 stuck redeemables, each "redeemed" successfully at
+/// 2026-07-20 23:19 with 0 tokens burned, then blacklisted forever by
+/// PERMANENTLY_SETTLED_CONDITIONS).  Use `detect_condition_collateral` to pick the
+/// right collateral per condition instead of assuming pUSD.
 const PUSD_COLLATERAL: Address = alloy_address!("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB");
+
+/// USDC.e (bridged USDC) on Polygon — collateral for pre-pUSD-migration positions.
+const USDCE_COLLATERAL: Address = alloy_address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
 
 /// Gnosis Conditional Token Framework contract on Polygon.
 const CTF_ADDRESS: Address = alloy_address!("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045");
@@ -131,6 +142,16 @@ sol! {
             address refundReceiver,
             bytes   memory signatures
         ) external payable returns (bool success);
+    }
+
+    /// CTF view functions (called via RPC, not through the Safe).
+    #[sol(rpc)]
+    interface ICtfView {
+        function getCollectionId(
+            bytes32 parentCollectionId,
+            bytes32 conditionId,
+            uint256 indexSet
+        ) external view returns (bytes32);
     }
 
     /// Calldata encoder for the CTF contract.
@@ -214,6 +235,57 @@ async fn execute_via_safe<P: Provider + Clone>(
         .map_err(|e| anyhow::anyhow!("execute_via_safe: get_receipt error: {}", e))?;
 
     Ok(tx_hash)
+}
+
+/// Detect which collateral token a resolved condition's outcome tokens were minted with.
+///
+/// The ERC1155 position ID is `keccak256(collateralToken ++ collectionId)`, so a redeem
+/// call with the wrong collateral computes a different position ID, finds balance = 0,
+/// and the TX "succeeds" as a silent no-op (observed 2026-07-20: six pre-pUSD-migration
+/// positions "redeemed" with pUSD collateral, 0 tokens burned, then blacklisted forever).
+///
+/// We fetch the collection ID for the leg's index set via the CTF view function (it uses
+/// elliptic-curve math, so it can't be computed locally), then keccak-match the position's
+/// actual token ID against candidate collaterals.  Falls back to pUSD (the current
+/// default) if the RPC call fails or nothing matches.
+async fn detect_condition_collateral<P: Provider + Clone>(
+    provider: P,
+    condition_id: B256,
+    leg_token_id: U256,
+    leg_outcome_index: i32,
+) -> Address {
+    use alloy::primitives::keccak256;
+
+    let index_set = U256::from(1u64) << (leg_outcome_index as usize); // outcome 0 → 0b01, 1 → 0b10
+    let ctf = ICtfView::new(CTF_ADDRESS, provider);
+    let collection_id = match tokio_timeout(
+        std::time::Duration::from_secs(10),
+        ctf.getCollectionId(B256::ZERO, condition_id, index_set).call(),
+    ).await {
+        Ok(Ok(cid)) => cid,
+        Ok(Err(e)) => {
+            warn!("Auto-settle: getCollectionId failed for condition {} — assuming pUSD: {}", condition_id, e);
+            return PUSD_COLLATERAL;
+        }
+        Err(_) => {
+            warn!("Auto-settle: getCollectionId timed out for condition {} — assuming pUSD", condition_id);
+            return PUSD_COLLATERAL;
+        }
+    };
+
+    for collateral in [PUSD_COLLATERAL, USDCE_COLLATERAL] {
+        let mut buf = [0u8; 52];
+        buf[..20].copy_from_slice(collateral.as_slice());
+        buf[20..].copy_from_slice(collection_id.as_slice());
+        if U256::from_be_bytes(keccak256(buf).0) == leg_token_id {
+            return collateral;
+        }
+    }
+    warn!(
+        "Auto-settle: token {} of condition {} matches neither pUSD nor USDC.e position ID — assuming pUSD",
+        leg_token_id, condition_id
+    );
+    PUSD_COLLATERAL
 }
 
 /// Remove all positions for a market that has expired or is expiring within 60s.
@@ -943,8 +1015,23 @@ pub async fn auto_settle_closed_positions<P: Provider + Clone>(
             }
         } else {
             // Standard binary market redemption via CTF.
+            // Detect the collateral from a held leg's actual token ID: pre-pUSD-migration
+            // positions were minted with USDC.e, and redeeming with the wrong collateral
+            // silently no-ops (see PUSD_COLLATERAL doc).
+            let collateral = match legs.iter().find(|p| shares_to_base_units(p.size) > 0) {
+                Some(leg) => detect_condition_collateral(
+                    wallet_provider.clone(),
+                    condition_id,
+                    leg.asset,
+                    leg.outcome_index,
+                ).await,
+                None => PUSD_COLLATERAL, // unreachable: zero-units guard above
+            };
+            if collateral != PUSD_COLLATERAL {
+                info!("Auto-settle: condition {} uses legacy USDC.e collateral", condition_id);
+            }
             let calldata = ICtfDirect::redeemPositionsCall {
-                collateralToken: PUSD_COLLATERAL,
+                collateralToken: collateral,
                 parentCollectionId: B256::ZERO,
                 conditionId: condition_id,
                 indexSets: vec![U256::from(1u64), U256::from(2u64)],

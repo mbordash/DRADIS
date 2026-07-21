@@ -161,6 +161,9 @@ impl Squadron {
         // momentum-only deployments. Read into a local so no borrow guard is held
         // across an .await when the snapshot is built below.
         let tide_rx = self.raptors.tide.clone();
+        // Horizon Raptor is optional (shares the Alpaca WS with Tide; absent when
+        // undeployed). Same borrow-guard discipline as `tide_rx`.
+        let horizon_rx = self.raptors.horizon.clone();
         // Derivatives Raptor is optional (all-asset, but absent on price-only
         // deployments). Same borrow-guard discipline as `tide_rx`.
         let deriv_rx = self.raptors.derivatives.clone();
@@ -504,6 +507,10 @@ impl Squadron {
                             funding_rate: *funding_rx.borrow(),
                             institutional_pulse: tide_rx.as_ref().map(|r| r.borrow().institutional_pulse).unwrap_or(Decimal::ZERO),
                             tide_coherence: tide_rx.as_ref().map(|r| r.borrow().coherence).unwrap_or(Decimal::ZERO),
+                            tradfi_velocity: horizon_rx.as_ref().map(|r| r.borrow().tradfi_velocity).unwrap_or(Decimal::ZERO),
+                            macro_coherence: horizon_rx.as_ref().map(|r| r.borrow().macro_coherence).unwrap_or(Decimal::ZERO),
+                            vix_proxy: horizon_rx.as_ref().map(|r| r.borrow().vix_proxy).unwrap_or(Decimal::ZERO),
+                            vix_velocity: horizon_rx.as_ref().map(|r| r.borrow().vix_velocity).unwrap_or(Decimal::ZERO),
                             oi_delta_pct: deriv_rx.as_ref().map(|r| r.borrow().oi_delta_pct).unwrap_or(Decimal::ZERO),
                             cvd_ratio: deriv_rx.as_ref().map(|r| r.borrow().cvd_ratio).unwrap_or(Decimal::ZERO),
                             oracle_drift_60m: drift_rx.borrow().0,
@@ -529,6 +536,10 @@ impl Squadron {
                             hist_vol: drift_rx.borrow().2,
                             institutional_pulse: tide_rx.as_ref().map(|r| r.borrow().institutional_pulse).unwrap_or(Decimal::ZERO),
                             tide_coherence: tide_rx.as_ref().map(|r| r.borrow().coherence).unwrap_or(Decimal::ZERO),
+                            tradfi_velocity: horizon_rx.as_ref().map(|r| r.borrow().tradfi_velocity).unwrap_or(Decimal::ZERO),
+                            macro_coherence: horizon_rx.as_ref().map(|r| r.borrow().macro_coherence).unwrap_or(Decimal::ZERO),
+                            vix_proxy: horizon_rx.as_ref().map(|r| r.borrow().vix_proxy).unwrap_or(Decimal::ZERO),
+                            vix_velocity: horizon_rx.as_ref().map(|r| r.borrow().vix_velocity).unwrap_or(Decimal::ZERO),
                             oi_delta_pct: deriv_rx.as_ref().map(|r| r.borrow().oi_delta_pct).unwrap_or(Decimal::ZERO),
                             cvd_ratio: deriv_rx.as_ref().map(|r| r.borrow().cvd_ratio).unwrap_or(Decimal::ZERO),
                             secs_to_expiry: mk.market_close_time
