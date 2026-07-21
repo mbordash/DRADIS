@@ -9,6 +9,38 @@ use tracing::info;
 use crate::helpers::db;
 use crate::state::MarketSnapshot;
 
+/// Process-global stash for per-viper gate/decision state, keyed by token_id.
+/// A viper calls `stash_entry_signals_json` immediately before returning an Entry
+/// signal; the patrol's `record_entry_signal` (spawned after the order is placed)
+/// drains it into the `entry_signals.signals_json` column.  Global because the
+/// viper and the recorder run in different tasks with no shared handle, and keyed
+/// by token so concurrent entries from different vipers can't cross wires.
+/// Entries are drained on read (or overwritten on re-stash), so the map stays tiny.
+fn entry_signals_json_stash() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static REG: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Stash the viper's gate/decision state (a JSON value) for `token_id`, to be
+/// attached to the entry_signals row when the entry is recorded.
+pub fn stash_entry_signals_json(token_id: &str, json: serde_json::Value) {
+    let mut reg = match entry_signals_json_stash().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.insert(token_id.to_string(), json.to_string());
+}
+
+/// Take (and remove) the stashed gate-state JSON for `token_id`, if any.
+fn take_entry_signals_json(token_id: &str) -> Option<String> {
+    let mut reg = match entry_signals_json_stash().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.remove(token_id)
+}
+
 /// Records a completed trade to the SQLite database.
 ///
 /// `asset` — lowercase crypto symbol, e.g. `"btc"`.  Drives the SQLite pool selection.
@@ -90,6 +122,7 @@ pub async fn record_entry_signal(
             dec!(0)
         };
         let row = db::EntrySignalRow {
+            signals_json: take_entry_signals_json(&token_id),
             strategy,
             token_id,
             market,

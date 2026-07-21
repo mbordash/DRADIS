@@ -341,6 +341,21 @@ impl Strategy for ConvergenceStrategyImpl {
             *streak = None;
         }
 
+        // Viper Backtrace: persist the gate/decision state for this entry.
+        crate::helpers::metrics::stash_entry_signals_json(token_id.as_str(), serde_json::json!({
+            "viper": "Convergence",
+            "branch": if want_bull { "BULL" } else { "BEAR" },
+            "pulse": pulse.to_string(),
+            "coherence": coh.to_string(),
+            "cvd": cvd.to_string(),
+            "oi": oi.to_string(),
+            "ask": ask.to_string(),
+            "bid": bid.to_string(),
+            "trade_size": size.to_string(),
+            "exit_bid_depth": exit_bid_depth.to_string(),
+            "secs_left": secs_left,
+        }));
+
         Ok(StrategySignal::Entry {
             params: OrderParams {
                 token_id,

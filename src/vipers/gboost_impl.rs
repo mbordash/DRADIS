@@ -1667,6 +1667,17 @@ impl Strategy for GboostStrategyImpl {
                 target_market.yes_token.clone(),
                 (target_snapshot.clone(), entry_prev_snap, price, entry_hist_vol, entry_tick_momentum)
             );
+            // Viper Backtrace: persist the model/decision state for this entry.
+            crate::helpers::metrics::stash_entry_signals_json(target_market.yes_token.as_str(), serde_json::json!({
+                "viper": "GBoost",
+                "side": "YES",
+                "p_yes_up": p_yes_up,
+                "entry_thresh": entry_thresh,
+                "entry_price": price.to_string(),
+                "trade_usdc": trade_usdc.to_string(),
+                "hist_vol": precomp_hist_vol,
+                "tick_momentum": precomp_tick_momentum,
+            }));
             // Record market-level hold lock to prevent rapid flip chop.
             self.market_hold_locks.lock().unwrap()
                 .insert(target_market.condition_id.clone(), Instant::now());
@@ -1784,6 +1795,17 @@ impl Strategy for GboostStrategyImpl {
                 target_market.no_token.clone(),
                 (target_snapshot.clone(), entry_prev_snap, price, entry_hist_vol, entry_tick_momentum)
             );
+            // Viper Backtrace: persist the model/decision state for this entry.
+            crate::helpers::metrics::stash_entry_signals_json(target_market.no_token.as_str(), serde_json::json!({
+                "viper": "GBoost",
+                "side": "NO",
+                "p_yes_up": p_yes_up,
+                "entry_thresh": entry_thresh,
+                "entry_price": price.to_string(),
+                "trade_usdc": trade_usdc.to_string(),
+                "hist_vol": precomp_hist_vol,
+                "tick_momentum": precomp_tick_momentum,
+            }));
             // Record market-level hold lock to prevent rapid flip chop.
             self.market_hold_locks.lock().unwrap()
                 .insert(target_market.condition_id.clone(), Instant::now());

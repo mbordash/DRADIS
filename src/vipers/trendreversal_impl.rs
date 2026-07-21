@@ -466,8 +466,27 @@ impl Strategy for TrendReversalStrategyImpl {
                         debug!(" TrendReversal BULL→fade blocked: {}", reason);
                         return Ok(StrategySignal::NoSignal);
                     }
-                    debug!(" TrendReversal BULL→fade entry (drift UP, buying NO): drift_10m={:.0} drift_60m={:.0} align_thr={:.0} buy_ask={:.3} entry={:.3} size={:.2}",
+                    // INFO (fires once per actual entry): audit trail for post-trade
+                    // review — prod runs at INFO so debug-level diagnostics are invisible
+                    // (2026-07-20 TP had to be reverse-engineered from heartbeats).
+                    tracing::info!(" TrendReversal BULL→fade entry (drift UP, buying NO): drift_10m={:.0} drift_60m={:.0} align_thr={:.0} buy_ask={:.3} entry={:.3} size={:.2}",
                         drift_10m, drift_60m, align_thr, buy_ask, entry_price, size);
+                    // Viper Backtrace: persist the gate/decision state for this entry.
+                    crate::helpers::metrics::stash_entry_signals_json(token_id.as_str(), serde_json::json!({
+                        "viper": "TrendReversal",
+                        "branch": "BULL_fade",
+                        "fade_mode": dc.trendreversal_mode,
+                        "drift_10m": drift_10m.to_string(),
+                        "drift_60m": drift_60m.to_string(),
+                        "align_thr": align_thr.to_string(),
+                        "buy_ask": buy_ask.to_string(),
+                        "buy_bid": buy_bid.to_string(),
+                        "buy_spread": buy_spread.to_string(),
+                        "buy_bid_depth": buy_bid_depth.to_string(),
+                        "trade_size": size.to_string(),
+                        "cooldown_secs": cdl,
+                        "secs_left": secs_left,
+                    }));
                     drop(cooldowns);
                     drop(consec);
                     return Ok(StrategySignal::Entry {
@@ -539,8 +558,25 @@ impl Strategy for TrendReversalStrategyImpl {
                         debug!(" TrendReversal BEAR→fade blocked: {}", reason);
                         return Ok(StrategySignal::NoSignal);
                     }
-                    debug!(" TrendReversal BEAR→fade entry (drift DOWN, buying YES): drift_10m={:.0} drift_60m={:.0} align_thr={:.0} buy_ask={:.3} entry={:.3} size={:.2}",
+                    // INFO (fires once per actual entry): audit trail — see BULL note.
+                    tracing::info!(" TrendReversal BEAR→fade entry (drift DOWN, buying YES): drift_10m={:.0} drift_60m={:.0} align_thr={:.0} buy_ask={:.3} entry={:.3} size={:.2}",
                         drift_10m, drift_60m, align_thr, buy_ask, entry_price, size);
+                    // Viper Backtrace: persist the gate/decision state for this entry.
+                    crate::helpers::metrics::stash_entry_signals_json(token_id.as_str(), serde_json::json!({
+                        "viper": "TrendReversal",
+                        "branch": "BEAR_fade",
+                        "fade_mode": dc.trendreversal_mode,
+                        "drift_10m": drift_10m.to_string(),
+                        "drift_60m": drift_60m.to_string(),
+                        "align_thr": align_thr.to_string(),
+                        "buy_ask": buy_ask.to_string(),
+                        "buy_bid": buy_bid.to_string(),
+                        "buy_spread": buy_spread.to_string(),
+                        "buy_bid_depth": buy_bid_depth.to_string(),
+                        "trade_size": size.to_string(),
+                        "cooldown_secs": cdl,
+                        "secs_left": secs_left,
+                    }));
                     drop(cooldowns);
                     drop(consec);
                     return Ok(StrategySignal::Entry {

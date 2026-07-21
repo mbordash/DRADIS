@@ -199,6 +199,16 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_entry_signals_strategy_ts ON entry_signals(strategy, ts)")
         .execute(pool).await;
 
+    // signals_json: per-viper gate/decision state captured at entry (JSON blob).
+    // The generic columns above answer "what did the market look like?"; this column
+    // answers "what did the STRATEGY see and decide?" — model probabilities, gate
+    // thresholds vs. measured values, mode flags.  Written by each viper via
+    // metrics::stash_entry_signals_json just before it returns an Entry signal.
+    // NULL for entries recorded before this migration or vipers not yet instrumented.
+    let _ = sqlx::query(
+        "ALTER TABLE entry_signals ADD COLUMN signals_json TEXT"
+    ).execute(pool).await;
+
     // pnl_snapshots: periodic P&L checkpoints for the Control Tower chart
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS pnl_snapshots (
@@ -783,6 +793,8 @@ pub struct EntrySignalRow {
     pub oi_delta_pct:        Decimal,
     pub velocity:            Decimal,
     pub secs_to_expiry:      i64,
+    /// Per-viper gate/decision state as a JSON blob (None = viper not instrumented).
+    pub signals_json:        Option<String>,
 }
 
 /// Persist an entry-signal feature-vector row.
@@ -793,8 +805,9 @@ pub async fn record_entry_signal_db(pool: &SqlitePool, row: &EntrySignalRow) {
         "INSERT INTO entry_signals
             (ts, session_id, strategy, token_id, market, side, entry_price, shares,
              oracle_price, drift_10m, drift_60m, obi_yes, ask_sum, bid_sum,
-             funding_rate, institutional_pulse, cvd_ratio, oi_delta_pct, velocity, secs_to_expiry)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+             funding_rate, institutional_pulse, cvd_ratio, oi_delta_pct, velocity, secs_to_expiry,
+             signals_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&ts)
     .bind(sid)
@@ -816,6 +829,7 @@ pub async fn record_entry_signal_db(pool: &SqlitePool, row: &EntrySignalRow) {
     .bind(row.oi_delta_pct.to_string())
     .bind(row.velocity.to_string())
     .bind(row.secs_to_expiry)
+    .bind(row.signals_json.as_deref())
     .execute(pool)
     .await {
         error!("❌ DB entry_signal write failed: {}", e);
