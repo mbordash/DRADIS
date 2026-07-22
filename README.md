@@ -267,15 +267,15 @@ Raptors are intentionally dumb: **fetch, normalize, broadcast** — no trading l
 | **Funding Raptor**             | Binance Perpetuals FAPI | Perpetual funding rate (smart-money sentiment)          | `src/raptors/funding.rs` |
 | **Derivatives Raptor**         | Binance Perpetuals FAPI | Open-interest delta + taker CVD ratio (positioning pressure, all-asset) | `src/raptors/derivatives.rs` |
 | **Tide Raptor**                | Alpaca IEX + synthetic iNAV | "Institutional Pulse" + coherence from spot-BTC-ETF (IBIT/FBTC/ARKB) premium vs iNAV — BTC-only, US-hours | `src/raptors/tide.rs` |
-| **Horizon Raptor**             | Alpaca IEX (shared)     | TradFi velocity (SPY/QQQ), macro coherence (BTC↔QQQ), VIX proxy (UVXY) — BTC-only, US-hours, **observe-only** | `src/raptors/horizon.rs` |
+| **Horizon Raptor**             | Alpaca IEX (shared)     | TradFi velocity (SPY/QQQ), macro coherence (BTC↔QQQ), VIX proxy (UVXY) — BTC-only, US-hours | `src/raptors/horizon.rs` |
 | **Sports Raptor**              | The Odds API (h2h)      | Vig-free consensus probability, line drift, book dispersion — venue-neutral (US + intl), **observe-only** | `src/raptors/sports.rs` |
 | *(future)* **Politics Raptor** | Polling aggregators     | Approval drift, event probability shifts                | —                        |
 
-When multiple Raptors are active, the GBoost Viper fuses every signal as model features (funding, OI/CVD, institutional pulse/coherence); Basis, Momentum and TrendCapture use them as confirmation gates; and the **Convergence** Viper opens directional positions only when the institutional + derivatives stack agrees. No single Raptor has veto power alone.
+When multiple Raptors are active, the GBoost Viper fuses every signal as model features (funding, OI/CVD, institutional pulse/coherence, TradFi velocity/VIX); Basis, Momentum and TrendCapture use them as confirmation gates; Maker and TrendCapture consume the Horizon macro signal as preventative gates (VIX-spike / coherent-TradFi-flow quote suppression, fade veto — observe-first, enforcement behind config flags); and the **Convergence** Viper opens directional positions only when the institutional + derivatives stack agrees. No single Raptor has veto power alone.
 
 The **Tide** and **Horizon** Raptors share a single Alpaca IEX WebSocket connection (free tier allows only one per account). Tide tracks BTC-specific institutional flow (ETF premium); Horizon tracks TradFi macro regime (equity velocity, VIX). Together they enable divergence detection — e.g., equities selling off but BTC ETFs at premium suggests institutional flight *into* crypto.
 
-The **Sports Raptor** is the first non-crypto scout: a single venue-neutral instance shared by both the US and intl pipelines. It polls The Odds API (keyed on `ODDS_API_KEY`), reduces the nearest-commencing event's cross-book moneyline to a vig-free consensus, and broadcasts line drift + book dispersion. Like the Tide Raptor it runs **observe-only** — it publishes telemetry but no Viper consumes it for sizing yet — and degrades silently to a neutral snapshot when no API key is set.
+The **Sports Raptor** is the first non-crypto scout: a single venue-neutral instance shared by both the US and intl pipelines. It polls The Odds API (keyed on `ODDS_API_KEY`), reduces the nearest-commencing event's cross-book moneyline to a vig-free consensus, and broadcasts line drift + book dispersion. It runs **observe-only** — it publishes telemetry but no Viper consumes it for sizing yet — and degrades silently to a neutral snapshot when no API key is set.
 
 ---
 
@@ -507,7 +507,7 @@ ALPACA_API_KEY_ID=your-key-id
 ALPACA_API_SECRET_KEY=your-secret-key
 ```
 
-Tide feeds the GBoost feature vector, the Basis tide veto, and the **Convergence** Viper. Horizon is currently **observe-only** (telemetry only, no Viper consumes it yet) — useful for detecting TradFi↔crypto divergences. Omit the keys and both run idle (neutral snapshots, offline pills).
+Tide feeds the GBoost feature vector, the Basis tide veto, and the **Convergence** Viper. Horizon feeds the GBoost feature vector (TradFi velocity, macro coherence, VIX proxy/velocity) and drives preventative gates on **Maker** (VIX-spike / coherent-TradFi-flow quote suppression) and **TrendCapture** (fade veto when TradFi confirms the drift) — the gates run observe-first and enforce once calibrated (`MAKER_HORIZON_GATE_ENFORCE`, `TRENDREVERSAL_HORIZON_VETO_ENFORCE`). Omit the keys and both run idle (neutral snapshots, offline pills).
 
 ### Sports Raptor (line movement) — optional
 
