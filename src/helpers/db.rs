@@ -447,6 +447,7 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
         ("funding",  "Funding Raptor (perp funding rate)",     1),
         ("derivatives", "Derivatives Raptor (open interest + CVD)", 1),
         ("tide",     "Tide Raptor (ETF institutional pulse)",  1),
+        ("horizon",  "Horizon Raptor (TradFi velocity / VIX proxy)", 1),
         ("sports",   "Sports Raptor (line movement, observe-only)", 1),
         ("politics", "Politics Raptor (roadmap)",              0),
     ] {
@@ -482,6 +483,7 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
         ("crypto", "funding"),
         ("crypto", "derivatives"),
         ("crypto", "tide"),
+        ("crypto", "horizon"),
         ("sports", "sports"),
     ] {
         sqlx::query("INSERT OR IGNORE INTO market_class_raptor (market_class, raptor_kind) VALUES (?, ?)")

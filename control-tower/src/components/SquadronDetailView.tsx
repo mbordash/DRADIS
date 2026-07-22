@@ -24,7 +24,7 @@ const RAPTOR_META: Record<
   string,
   {
     label: string;
-    flag?: 'price_connected' | 'funding_connected' | 'deriv_connected' | 'tide_connected' | 'sports_connected';
+    flag?: 'price_connected' | 'funding_connected' | 'deriv_connected' | 'tide_connected' | 'sports_connected' | 'horizon_connected';
     dot: string; text: string; source: string;
     /** Health-map key to read this raptor's flag from, when it differs from the
      *  squadron's asset (e.g. the venue-neutral Sports Raptor publishes under "sports"). */
@@ -40,6 +40,13 @@ const RAPTOR_META: Record<
   tide:    {
     label: 'Tide Raptor', flag: 'tide_connected', dot: 'bg-sky-400', text: 'text-sky-300',
     source: 'Alpaca IEX (ETF iNAV)',
+    offlineText: 'Idle (off-hours)', offlineDot: 'bg-gray-600', offlineClass: 'text-gray-500',
+  },
+  horizon: {
+    label: 'Horizon Raptor', flag: 'horizon_connected', dot: 'bg-orange-400', text: 'text-orange-300',
+    source: 'Alpaca IEX (SPY/QQQ/UVXY)',
+    // Macro raptor — publishes health under the "btc" key regardless of squadron asset.
+    healthKey: 'btc',
     offlineText: 'Idle (off-hours)', offlineDot: 'bg-gray-600', offlineClass: 'text-gray-500',
   },
   sports:  {
