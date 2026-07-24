@@ -119,7 +119,7 @@ pub async fn sync_position_balance(
                     // zero balance AND zero resting orders while Polygon settles the fill.
                     // After cancelling, wait one grace period and re-check the balance
                     // before declaring phantom — this catches the settlement-lag race.
-                    let had_resting = cancel_resting_orders(client, token_id).await;
+                    let (had_resting, _) = cancel_resting_orders(client, token_id).await;
                     if had_resting {
                         // Order was live → may have been matching. Wait for on-chain settlement.
                         tokio::time::sleep(Duration::from_secs(20)).await;
@@ -194,37 +194,45 @@ pub async fn sync_position_balance(
 }
 
 /// Fetch all open orders for a token and cancel them.
-/// Returns true if any orders were found (and cancelled).
-/// This prevents GTC orders that were "forgotten" by position-sync from
-/// sitting on the book and filling unexpectedly later.
-async fn cancel_resting_orders(client: &Arc<ClobClient<Authenticated<Normal>>>, token_id: U256) -> bool {
+/// Returns `(had_orders, size_matched_total)` — whether any orders were found
+/// (and cancelled), and the total shares already matched on those orders at
+/// cancel time. A resting GTC quote can partially fill in the seconds before a
+/// quote-pull (2026-07-23 trade 280: 5 of 9.09 shares filled in the 16s window);
+/// callers MUST inspect `size_matched_total` and adopt any filled shares instead
+/// of discarding the position.
+async fn cancel_resting_orders(client: &Arc<ClobClient<Authenticated<Normal>>>, token_id: U256) -> (bool, Decimal) {
     let req = OrdersRequest::builder().asset_id(token_id).build();
-    let order_ids: Vec<String> = match client.orders(&req, None).await {
-        Ok(page) => page.data.into_iter().map(|o| o.id).collect(),
-        Err(_) => return false,
+    let orders = match client.orders(&req, None).await {
+        Ok(page) => page.data,
+        Err(_) => return (false, dec!(0)),
     };
-    if order_ids.is_empty() {
-        return false;
+    if orders.is_empty() {
+        return (false, dec!(0));
     }
+    let matched: Decimal = orders.iter().map(|o| o.size_matched).sum();
+    let order_ids: Vec<String> = orders.into_iter().map(|o| o.id).collect();
     let id_refs: Vec<&str> = order_ids.iter().map(|s| s.as_str()).collect();
-    warn!(" Cancelling {} resting GTC order(s) for token {} — preventing orphan fills",
-          id_refs.len(), token_id);
+    warn!(" Cancelling {} resting GTC order(s) for token {} — preventing orphan fills{}",
+          id_refs.len(), token_id,
+          if matched > dec!(0) { format!(" ({matched:.4} shares already matched)") } else { String::new() });
     let _ = client.cancel_orders(&id_refs).await;
-    true
+    (true, matched)
 }
 
 /// Public reactive quote-pull entry point: cancel any resting order on `token_id`.
 /// Used by the Maker's book-turn quote-pull (patrol `MakerCancel` handling) to pull
 /// an UNFILLED resting quote before informed flow picks it off. Resolves the
 /// on-chain U256 from the venue-neutral `MarketId`, then delegates to
-/// [`cancel_resting_orders`]. Returns true if any resting order was cancelled.
+/// [`cancel_resting_orders`]. Returns the total shares already MATCHED on the
+/// cancelled order(s) — non-zero means a partial fill landed before the pull and
+/// the caller must adopt those shares as a live position instead of dropping them.
 pub async fn cancel_resting_orders_for_token(
     client: &Arc<ClobClient<Authenticated<Normal>>>,
     token_id: &MarketId,
-) -> bool {
+) -> Decimal {
     match u256_from_market_id(token_id) {
-        Ok(u) => cancel_resting_orders(client, u).await,
-        Err(_) => false,
+        Ok(u) => cancel_resting_orders(client, u).await.1,
+        Err(_) => dec!(0),
     }
 }
 
@@ -579,7 +587,7 @@ pub async fn arb_pair_fill_monitor(
     // Step 1: Cancel any remaining GTC on the missing leg (idempotent if already cancelled
     //         by the individual sync task — the CLOB rejects cancels of non-existent orders
     //         gracefully).
-    cancel_resting_orders(&client, missing_token).await;
+    let _ = cancel_resting_orders(&client, missing_token).await;
 
     // Step 2: Short settlement grace — the cancel may have raced against a taker fill
     //         that was mid-settlement on-chain.

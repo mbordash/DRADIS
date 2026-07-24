@@ -1209,10 +1209,41 @@ impl Squadron {
                                         matches!(pos.get(&pk), Some(p) if p.fill_confirmed_at.is_none())
                                     };
                                     if !is_unfilled { continue; }
-                                    if config::GHOST_MODE {
+                                    let matched = if config::GHOST_MODE {
                                         info!("👻 GHOST_MODE MakerCancel [{}]: {} (simulated quote-pull)", sn, tok);
+                                        dec!(0)
                                     } else {
-                                        crate::helpers::balance::cancel_resting_orders_for_token(&trading_client, &tok).await;
+                                        crate::helpers::balance::cancel_resting_orders_for_token(&trading_client, &tok).await
+                                    };
+                                    // ── Partial-fill guard ────────────────────────────────
+                                    // A resting quote can partially fill in the seconds before
+                                    // the pull (2026-07-23 trade 280: 5 of 9.09 shares filled in
+                                    // a 16s window, then sat unmanaged for 25 min until a
+                                    // market-switch reconcile). If the cancelled order had any
+                                    // matched size, adopt those shares as a live confirmed
+                                    // position so TP/SL/ToxicFill manage it immediately.
+                                    if matched >= config::MIN_ORDER_SHARES {
+                                        let adopted = {
+                                            let mut pos = positions.lock().await;
+                                            pos.get_mut(&pk).map(|p| {
+                                                p.shares = matched;
+                                                p.fill_confirmed_at = Some(Utc::now());
+                                                (p.market_name.clone(), p.avg_entry)
+                                            })
+                                        };
+                                        if let Some((mn, ep)) = adopted {
+                                            pending_orders.lock().await.remove(&pk);
+                                            let side = if tok == target_yes_token { "YES".to_string() } else { "NO".to_string() };
+                                            if let Some(pool) = db::pool_for(&asset_lc) {
+                                                db::update_position_from_chain(&pool, tok.as_str(), matched, ep, None).await;
+                                                db::confirm_position_status(&pool, &sn, tok.as_str()).await;
+                                            }
+                                            metrics::record_entry(&asset_lc, sn.clone(), tok.to_string(), mn.clone(), side.clone(), ep, matched).await;
+                                            let feat_snap = ctx.maker_snapshot.clone().unwrap_or_else(|| ctx.snapshot.clone());
+                                            metrics::record_entry_signal(&asset_lc, sn.clone(), tok.to_string(), mn, side, ep, matched, &feat_snap).await;
+                                            warn!("⚡ Maker quote-pull [{}]: {} — quote PARTIALLY FILLED ({:.4} shares @ ${:.4}) before cancel; adopting as live position", sn, tok, matched, ep);
+                                            continue;
+                                        }
                                     }
                                     positions.lock().await.remove(&pk);
                                     pending_orders.lock().await.remove(&pk);
