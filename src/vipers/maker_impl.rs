@@ -108,6 +108,14 @@ pub struct MakerStrategyImpl {
     /// tick, so an unthrottled quote log would emit ~20×/sec; this caps it to one
     /// line per MAKER_GATE_LOG_INTERVAL_SECS.
     last_quote_log: Mutex<Option<Instant>>,
+
+    /// Dedicated throttle for the Horizon gate log.  The Horizon line fires
+    /// BEFORE the main gate-summary log in the same tick, so routing it through
+    /// `log_gate` made the two alternate keys ("horizon" → "no side qualifies")
+    /// and the `prev_key != key` rule defeated the throttle for both — observed
+    /// 2026-07-23: up to 370 identical Horizon lines/min during US-open veto
+    /// windows.  A time-only throttle caps it at one line per interval.
+    last_horizon_log: Mutex<Option<Instant>>,
 }
 
 /// Process-global market-maturation tracker: market identity → first time ANY
@@ -260,6 +268,7 @@ impl MakerStrategyImpl {
             prev_depths: Mutex::new(None),
             last_gate_log: Mutex::new(None),
             last_quote_log: Mutex::new(None),
+            last_horizon_log: Mutex::new(None),
         }
     }
 
@@ -492,15 +501,26 @@ impl Strategy for MakerStrategyImpl {
         let horizon_blocks_yes = hz_vix_spike || hz_risk_off;
         let horizon_blocks_no  = hz_vix_spike || hz_risk_on;
         if horizon_blocks_yes || horizon_blocks_no {
-            self.log_gate("horizon", &format!(
-                "🔭 Horizon gate{}: {}{}{} | tradfi_vel={:.3} coh={:.2} vix_vel={:.3} (blocks: YES={} NO={})",
-                if config::MAKER_HORIZON_GATE_ENFORCE { "" } else { " (observe — would veto)" },
-                if hz_vix_spike { "VIX spike " } else { "" },
-                if hz_risk_off { "risk-off " } else { "" },
-                if hz_risk_on { "risk-on " } else { "" },
-                hz.tradfi_velocity, hz.macro_coherence, hz.vix_velocity,
-                horizon_blocks_yes, horizon_blocks_no,
-            )).await;
+            // Time-only throttle (see `last_horizon_log`): this fires every tick
+            // during a veto window, and sharing `log_gate`'s key-change rule with
+            // the gate-summary line floods the log.
+            let mut guard = self.last_horizon_log.lock().await;
+            let due = guard
+                .map(|at| at.elapsed().as_secs() >= config::MAKER_GATE_LOG_INTERVAL_SECS)
+                .unwrap_or(true);
+            if due {
+                *guard = Some(Instant::now());
+                drop(guard);
+                tracing::info!(
+                    "🔒 Maker gate: 🔭 Horizon gate{}: {}{}{} | tradfi_vel={:.3} coh={:.2} vix_vel={:.3} (blocks: YES={} NO={})",
+                    if config::MAKER_HORIZON_GATE_ENFORCE { "" } else { " (observe — would veto)" },
+                    if hz_vix_spike { "VIX spike " } else { "" },
+                    if hz_risk_off { "risk-off " } else { "" },
+                    if hz_risk_on { "risk-on " } else { "" },
+                    hz.tradfi_velocity, hz.macro_coherence, hz.vix_velocity,
+                    horizon_blocks_yes, horizon_blocks_no,
+                );
+            }
         }
         let horizon_vetoes_yes = config::MAKER_HORIZON_GATE_ENFORCE && horizon_blocks_yes;
         let horizon_vetoes_no  = config::MAKER_HORIZON_GATE_ENFORCE && horizon_blocks_no;
