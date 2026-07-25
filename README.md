@@ -393,12 +393,23 @@ DRADIS ships with a real-time web dashboard called **Control Tower** built on Ne
 | **Telemetry**      | Live Raptor macro cards — **Tide** (ETF premium, institutional pulse), **Horizon** (TradFi velocity, VIX proxy), greyed outside US market hours |
 | **Trade Log**      | Last N completed trades with strategy, side, entry/exit prices, shares, P&L, exit reason         |
 | **CAG Registry**   | Active squadrons with market, state, deployed time, and **+ Deploy** button                      |
+| **Setup**          | Admin-gated credential management — venue keys, RPC, Alpaca, Telegram — with test-connection buttons and one-click engine restart |
 
 ### Live Config Editing
 
 Every parameter in the Viper cards maps directly to the runtime `DynamicConfig`. Editing a value sends `PATCH /api/config` — **no restart required**. Changes take effect on the next 50ms tick.
 
 > **Hot-Enable Design** — All eight Vipers are always instantiated at startup. The `DynamicConfig` enable flags are the sole runtime gate. Toggle any Viper on or off during a live session with immediate effect.
+
+### Setup Tab — No-Shell Credential Management
+
+The **Setup** tab lets you configure DRADIS entirely from the browser — designed for prosumer deployments (e.g. a prebuilt AWS image) where editing `.env` on the server isn't practical.
+
+- **First boot**: if no admin password exists, the tab shows a first-boot wizard — create the password, enter venue credentials, restart.
+- **Admin gate**: setup routes require a login (argon2-hashed password, 24h HMAC session tokens); the rest of the dashboard is unaffected.
+- **Write-only fields**: the API never returns stored secrets — only a "set / …last4" hint.
+- **Test buttons**: validate credentials live before saving (intl wallet → full CLOB auth + Safe derivation; Polygon RPC → `eth_blockNumber`; Alpaca → data probe; Telegram → `getMe`).
+- **Storage**: saved to `$DRADIS_DATA_DIR/secrets.env` on the data volume; it **overrides** container env on boot, so values survive container recreation. **Restart engine** applies them (Docker respawns the process).
 
 ### Squadron Builder (Admiral Adama Extension)
 

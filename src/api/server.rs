@@ -2283,8 +2283,17 @@ pub async fn run_api_server(
         .layer(axum::middleware::from_fn_with_state(state.clone(), enforce_read_only))
         .with_state(state.clone());
 
+    // Setup & credentials management (prosumer onboarding). Admin-token gate
+    // lives inside setup::admin_routes(); the X-API-Key and read-only layers
+    // stack on top so existing deployment gates keep applying.
+    let setup_routes = crate::api::setup::admin_routes()
+        .merge(crate::api::setup::public_routes())
+        .layer(axum::middleware::from_fn_with_state(state.clone(), require_api_key))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), enforce_read_only));
+
     let app = public_routes
         .merge(protected_routes)
+        .merge(setup_routes)
         // Permissive CORS (outer layer — runs first, handles OPTIONS pre-flight
         // before the API-key middleware is reached).
         .layer(CorsLayer::permissive());

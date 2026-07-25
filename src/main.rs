@@ -199,6 +199,9 @@ async fn run() -> Result<()> {
 
     let shared_http = Arc::new(client_builder.build()?);
     dotenv::dotenv().ok();
+    // UI-managed secrets (data/secrets.env) override container env — the .env
+    // baked in at `docker create` is a stale copy once the setup UI has run.
+    dradis::api::setup::load_secrets_file();
     tracing_subscriber::fmt()
         .with_timer(EasternTime)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())

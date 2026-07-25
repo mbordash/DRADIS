@@ -10,6 +10,7 @@ import OpenPositionsCard from '@/components/OpenPositionsCard';
 import SquadronsPanel  from '@/components/SquadronsPanel';
 import SquadronDetailView from '@/components/SquadronDetailView';
 import TradelogPage    from '@/components/TradelogPage';
+import SetupPage       from '@/components/SetupPage';
 import ErrorBoundary   from '@/components/ErrorBoundary';
 import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getPortfolioValue, getSquadrons } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
@@ -227,7 +228,7 @@ function PortfolioValueBanner({
 
 // ── Top-level nav ─────────────────────────────────────────────────────────────
 
-type AppView = 'main' | 'telemetry' | 'tradelog';
+type AppView = 'main' | 'telemetry' | 'tradelog' | 'setup';
 
 function NavTabs({
   active,
@@ -240,6 +241,7 @@ function NavTabs({
     { id: 'main',      label: 'Main',      icon: '🗺️' },
     { id: 'telemetry', label: 'Telemetry', icon: '📡' },
     { id: 'tradelog',  label: 'Tradelog',  icon: '📋' },
+    { id: 'setup',     label: 'Setup',     icon: '⚙️' },
   ];
   return (
     <div className="flex items-center gap-1">
@@ -490,6 +492,19 @@ export default function DashboardPage() {
           {config?.ghost_mode && <GhostBanner ghost />}
           <ErrorBoundary label="Telemetry">
             <TelemetryPage availableAssets={availableAssets} />
+          </ErrorBoundary>
+          <footer className="text-center text-xs text-gray-700 pb-4 font-mono">
+            DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}
+            <span className="text-gray-600">So say we all.</span>
+          </footer>
+        </main>
+      )}
+
+      {/* ── Setup view ─────────────────────────────────────────────────────── */}
+      {activeView === 'setup' && (
+        <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+          <ErrorBoundary label="Setup">
+            <SetupPage />
           </ErrorBoundary>
           <footer className="text-center text-xs text-gray-700 pb-4 font-mono">
             DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}

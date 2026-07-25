@@ -16,6 +16,9 @@
  * browser), it is forwarded as X-API-Key on every proxied request so external
  * tools like OpenClaw can be gated behind the same key without exposing it in
  * the client-side JS bundle.
+ *
+ * Authorization: the admin session Bearer token (Setup UI login) is forwarded
+ * verbatim so /api/setup/* and /api/auth/* can enforce the admin gate.
  */
 import { NextRequest, NextResponse } from 'next/server';
 
@@ -29,6 +32,8 @@ async function proxy(req: NextRequest, path: string[]): Promise<NextResponse> {
 
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (API_KEY) headers['X-API-Key'] = API_KEY;
+  const auth = req.headers.get('authorization');
+  if (auth) headers['Authorization'] = auth;
 
   try {
     const upstream = await fetch(target, {
@@ -69,6 +74,22 @@ export async function PATCH(
 }
 
 export async function POST(
+  req: NextRequest,
+  { params }: { params: Promise<{ path: string[] }> },
+) {
+  const { path } = await params;
+  return proxy(req, path);
+}
+
+export async function PUT(
+  req: NextRequest,
+  { params }: { params: Promise<{ path: string[] }> },
+) {
+  const { path } = await params;
+  return proxy(req, path);
+}
+
+export async function DELETE(
   req: NextRequest,
   { params }: { params: Promise<{ path: string[] }> },
 ) {
