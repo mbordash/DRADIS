@@ -598,10 +598,27 @@ impl Squadron {
                                     if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &tid, Side::Sell, shares, (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await {
                                         let es = e.to_string();
                                         if es.contains("not enough balance") || es.contains("balance: 0") || es.contains("invalid price") {
-                                            // The exchange says we don't hold the shares (typically: a prior
-                                            // FAK exit DID fill but a stale balance read resurrected the
-                                            // position — observed 2026-07-16).  The position is gone on-chain,
-                                            // so book the exit NOW at the estimated price and close the DB row.
+                                            // The exchange says we don't hold the shares. Two very different
+                                            // causes produce this rejection:
+                                            //  (a) the position IS gone on-chain (a prior FAK exit filled but a
+                                            //      stale balance read resurrected it — observed 2026-07-16), or
+                                            //  (b) the shares are TOO FRESH to sell — bought seconds ago and
+                                            //      still settling (observed 2026-07-25 trade 294: a just-adopted
+                                            //      partial fill was booked as "gone" while 1.25 shares floated
+                                            //      unmanaged for 8 min until the next quote-pull re-adopted them).
+                                            // Cross-check the on-chain balance to tell them apart.
+                                            let held = crate::helpers::balance::onchain_balance_for_token(&trading_client, &tid_m).await;
+                                            if held >= config::MIN_ORDER_SHARES {
+                                                // (b) settlement lag — shares are still held. Keep the position
+                                                // under management and retry the exit after the cooldown.
+                                                warn!("⚠️ EXIT rejected but {:.4} shares still held on-chain [{}]: settlement lag — holding position, retrying exit in {}s",
+                                                      held, sn, config::EXIT_RETRY_COOLDOWN_SECS);
+                                                if let Some(p) = positions.lock().await.get_mut(&pos_key) { p.shares = held; }
+                                                last_trade_time.insert(sn.clone(), Instant::now());
+                                                continue;
+                                            }
+                                            // (a) confirmed gone on-chain — book the exit NOW at the estimated
+                                            // price and close the DB row.
                                             // The old path credited session P&L silently with no trade record
                                             // and no open_positions cleanup, so the ledger diverged and
                                             // ChainReconcile later invented a second exit at the current mark.
@@ -1162,10 +1179,21 @@ impl Squadron {
                                             let vc = if p.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                             if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &p.token_id, Side::Buy, p.shares, p.price, target_yes_fee_bps as u16, p.order_type, true, 0, &shared_http).await {
                                                 positions.lock().await.remove(&pk);
-                                                pending_orders.lock().await.remove(&pk);
                                                 // Release token claim — order placement failed.
                                                 token_ownership.lock().await.remove(&p_token_m);
-                                                if !e.to_string().contains("crosses book") { consecutive_failures += 1; } continue;
+                                                if e.to_string().contains("crosses book") {
+                                                    // Post-only quote crossed the book: the viper re-signals
+                                                    // every ~50ms tick while the book stays crossed, hammering
+                                                    // the CLOB (2026-07-25: 84 rejected placements in ~2s).
+                                                    // Park a pending-order expiry to suppress re-quoting until
+                                                    // the book has had time to move.
+                                                    pending_orders.lock().await.insert(pk.clone(), Instant::now() + Duration::from_secs(config::MAKER_CROSSES_BOOK_COOLDOWN_SECS));
+                                                    info!("⏸️ Maker quote crossed book [{}]: {} — re-quote suppressed {}s", sn, p.market_name, config::MAKER_CROSSES_BOOK_COOLDOWN_SECS);
+                                                } else {
+                                                    pending_orders.lock().await.remove(&pk);
+                                                    consecutive_failures += 1;
+                                                }
+                                                continue;
                                             }
                                             let cl_m = Arc::clone(&trading_client); let ps_m = Arc::clone(&positions); let pc_m = Arc::clone(&phantom_cooldowns); let to_m = Arc::clone(&token_ownership); let sn_m = sn.clone();
                                             let tid_em = p.token_id.to_string(); let mn_em = p.market_name.clone();

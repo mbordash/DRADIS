@@ -729,6 +729,11 @@ pub const STOP_LOSS_COOLDOWN_SECS: u64 = 180;
 /// This prevents log floods and API hammering when FAK exits fail due to thin books.
 pub const EXIT_RETRY_COOLDOWN_SECS: u64 = 5;
 
+/// Cooldown after a post-only maker quote is rejected for crossing the book.
+/// Prevents tick-rate re-quote hammering while the book stays crossed.
+/// Conservative: longer cooldown — wait for the book to settle decisively.
+pub const MAKER_CROSSES_BOOK_COOLDOWN_SECS: u64 = 30;
+
 /// Flash-Exit: operational constants — same across all profiles.
 pub const FLASH_EXIT_CONFIRM_MS: u64 = 12_000;
 pub const FLASH_EXIT_POLL_MS: u64 = 500;
