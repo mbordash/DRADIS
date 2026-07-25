@@ -966,9 +966,13 @@ async fn manual_exit(
     // deliberately IGNORED. Using it would price the FAK sell at 0.5 regardless of
     // the real market, so any position whose true bid is below 0.5 would never fill
     // (RTB silently leaves underwater positions open). Query the CLOB for the
-    // current best bid (the Side::Sell price = what a seller can hit).
+    // current best bid. NOTE: the CLOB /price endpoint returns the best resting
+    // order ON the requested side of the book — side=Buy → best bid, side=Sell →
+    // best ask (verified empirically 2026-07-24: RTB used Side::Sell, got the ask,
+    // priced the FAK sell 1¢ under the ask but above the real bid → "no orders
+    // found to match with FAK order").
     let current_bid = {
-        let price_req = PriceRequest::builder().token_id(token_id).side(Side::Sell).build();
+        let price_req = PriceRequest::builder().token_id(token_id).side(Side::Buy).build();
         match tokio::time::timeout(
             std::time::Duration::from_secs(10),
             session.venue.trading_client().price(&price_req),

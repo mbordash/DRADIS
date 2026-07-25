@@ -1213,15 +1213,25 @@ impl Squadron {
                                         info!("👻 GHOST_MODE MakerCancel [{}]: {} (simulated quote-pull)", sn, tok);
                                         dec!(0)
                                     } else {
-                                        crate::helpers::balance::cancel_resting_orders_for_token(&trading_client, &tok).await
+                                        let m = crate::helpers::balance::cancel_resting_orders_for_token(&trading_client, &tok).await;
+                                        // ── Complete-fill guard ──────────────────────────
+                                        // A quote that FULLY filled vanishes from the CLOB
+                                        // open-orders list, so the cancel sweep reports zero
+                                        // matched (2026-07-24 trade 288: an 8-share YES fill
+                                        // was dropped as "unfilled", re-adopted under the
+                                        // WRONG strategy at market switch, and SL'd −$0.40).
+                                        // When nothing was matched, cross-check the on-chain
+                                        // balance before discarding the position.
+                                        if m < config::MIN_ORDER_SHARES {
+                                            crate::helpers::balance::onchain_balance_for_token(&trading_client, &tok).await
+                                        } else { m }
                                     };
-                                    // ── Partial-fill guard ────────────────────────────────
-                                    // A resting quote can partially fill in the seconds before
-                                    // the pull (2026-07-23 trade 280: 5 of 9.09 shares filled in
-                                    // a 16s window, then sat unmanaged for 25 min until a
-                                    // market-switch reconcile). If the cancelled order had any
-                                    // matched size, adopt those shares as a live confirmed
-                                    // position so TP/SL/ToxicFill manage it immediately.
+                                    // ── Fill-adoption guard ───────────────────────────────
+                                    // A resting quote can partially or fully fill in the
+                                    // seconds before the pull (trades 280 and 288). If any
+                                    // matched size or on-chain balance is found, adopt those
+                                    // shares as a live confirmed position so TP/SL/ToxicFill
+                                    // manage it immediately.
                                     if matched >= config::MIN_ORDER_SHARES {
                                         let adopted = {
                                             let mut pos = positions.lock().await;
@@ -1241,7 +1251,7 @@ impl Squadron {
                                             metrics::record_entry(&asset_lc, sn.clone(), tok.to_string(), mn.clone(), side.clone(), ep, matched).await;
                                             let feat_snap = ctx.maker_snapshot.clone().unwrap_or_else(|| ctx.snapshot.clone());
                                             metrics::record_entry_signal(&asset_lc, sn.clone(), tok.to_string(), mn, side, ep, matched, &feat_snap).await;
-                                            warn!("⚡ Maker quote-pull [{}]: {} — quote PARTIALLY FILLED ({:.4} shares @ ${:.4}) before cancel; adopting as live position", sn, tok, matched, ep);
+                                            warn!("⚡ Maker quote-pull [{}]: {} — quote FILLED ({:.4} shares @ ${:.4}) before cancel; adopting as live position", sn, tok, matched, ep);
                                             continue;
                                         }
                                     }

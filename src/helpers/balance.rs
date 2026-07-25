@@ -219,6 +219,27 @@ async fn cancel_resting_orders(client: &Arc<ClobClient<Authenticated<Normal>>>, 
     (true, matched)
 }
 
+/// One-shot on-chain conditional-token balance lookup (shares, 6-dp scaled).
+/// Used by the Maker quote-pull to detect a quote that FULLY filled before the
+/// pull: a fully-matched order vanishes from the CLOB open-orders list, so
+/// `cancel_resting_orders` reports zero matched even though shares are held
+/// (2026-07-24 trade 288: an 8-share YES fill was dropped as "unfilled", then
+/// mis-adopted under MomentumStrategy at market switch and SL'd for −$0.40).
+/// Returns 0 on lookup failure — callers treat that as "no shares detected".
+pub async fn onchain_balance_for_token(
+    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    token_id: &MarketId,
+) -> Decimal {
+    let token_u = match u256_from_market_id(token_id) { Ok(u) => u, Err(_) => return dec!(0) };
+    let mut req = BalanceAllowanceRequest::default();
+    req.asset_type = AssetType::Conditional;
+    req.token_id = Some(token_u);
+    match tokio::time::timeout(Duration::from_secs(10), client.balance_allowance(req)).await {
+        Ok(Ok(resp)) => Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000),
+        _ => dec!(0),
+    }
+}
+
 /// Public reactive quote-pull entry point: cancel any resting order on `token_id`.
 /// Used by the Maker's book-turn quote-pull (patrol `MakerCancel` handling) to pull
 /// an UNFILLED resting quote before informed flow picks it off. Resolves the
@@ -644,11 +665,14 @@ pub async fn arb_pair_fill_monitor(
         return;
     }
 
-    // Step 4: Query the CLOB for the current best Buy price on the missing leg.
+    // Step 4: Query the CLOB for the current best ASK on the missing leg (the price
+    // we must pay to BUY it). NOTE: /price side semantics are "best resting order on
+    // that side" — side=Sell → best ask, side=Buy → best bid (2026-07-24 fix: this
+    // used Side::Buy and fetched the BID, understating the re-hedge cost).
     let ask_price = {
         let req = PriceRequest::builder()
             .token_id(missing_token)
-            .side(Side::Buy)
+            .side(Side::Sell)
             .build();
         match client.price(&req).await {
             Ok(resp) => {
@@ -790,10 +814,11 @@ pub async fn arb_pair_fill_monitor(
         .map(|p| p.market_name.clone())
         .unwrap_or_default();
 
+    // /price side semantics: side=Buy → best bid (what a seller can hit).
     let bid_price = {
         let req = PriceRequest::builder()
             .token_id(filled_token)
-            .side(Side::Sell)
+            .side(Side::Buy)
             .build();
         match client.price(&req).await {
             Ok(resp) => resp.price,
@@ -903,7 +928,8 @@ pub async fn arb_pair_fill_monitor(
                 None => dec!(0),
             };
             let late_bid = {
-                let req = PriceRequest::builder().token_id(missing_token).side(Side::Sell).build();
+                // side=Buy → best bid (see /price side semantics note above)
+                let req = PriceRequest::builder().token_id(missing_token).side(Side::Buy).build();
                 match client.price(&req).await { Ok(r) => r.price, Err(_) => dec!(0.01) }
             };
             let late_sell = (late_bid - dec!(0.01)).max(dec!(0.01));
