@@ -52,7 +52,10 @@ export function clearAdminToken() {
 function authHeaders(): HeadersInit {
   const h: Record<string, string> = { 'Content-Type': 'application/json' };
   const token = getAdminToken();
-  if (token) h['Authorization'] = `Bearer ${token}`;
+  // Sent as X-Admin-Token (NOT Authorization): the Authorization header is
+  // owned by CT Basic Auth — overriding it forces the browser login loop.
+  // The Next.js proxy translates this to Authorization: Bearer for the engine.
+  if (token) h['X-Admin-Token'] = token;
   return h;
 }
 

@@ -204,14 +204,18 @@ fn verify_password(password: &str, hash: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Extract and verify the admin bearer token from a request.
+/// Extract and verify the admin token: `Authorization: Bearer` (proxy path)
+/// or `X-Admin-Token` (direct browser → engine in local dev, where the
+/// Authorization header is reserved for CT Basic Auth).
 fn request_is_admin(req: &Request) -> bool {
-    req.headers()
+    let bearer = req.headers()
         .get(axum::http::header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
-        .map(verify_token)
-        .unwrap_or(false)
+        .and_then(|v| v.strip_prefix("Bearer "));
+    let direct = req.headers()
+        .get("x-admin-token")
+        .and_then(|v| v.to_str().ok());
+    bearer.or(direct).map(verify_token).unwrap_or(false)
 }
 
 /// Middleware: require a valid admin session token.

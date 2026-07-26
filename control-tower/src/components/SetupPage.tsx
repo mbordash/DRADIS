@@ -236,8 +236,10 @@ export default function SetupPage() {
       const s = await getSetupStatus();
       setStatus(s);
       // Operator disabled the setup gate (DRADIS_SETUP_AUTH=off) → no login.
+      // Drop any stale token so it isn't sent along needlessly.
       // No admin password yet → first-boot wizard, routes are open.
-      if (s.auth_disabled || !s.admin_set) setAuthed(true);
+      if (s.auth_disabled) { clearAdminToken(); setAuthed(true); }
+      else if (!s.admin_set) setAuthed(true);
       else if (getAdminToken()) setAuthed(true);
     } catch {
       setNotice({ kind: 'err', text: 'Cannot reach the DRADIS engine.' });

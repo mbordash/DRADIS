@@ -17,8 +17,10 @@
  * tools like OpenClaw can be gated behind the same key without exposing it in
  * the client-side JS bundle.
  *
- * Authorization: the admin session Bearer token (Setup UI login) is forwarded
- * verbatim so /api/setup/* and /api/auth/* can enforce the admin gate.
+ * Authorization: the admin session token (Setup UI login) arrives from the
+ * browser as X-Admin-Token — it can't use Authorization directly because CT
+ * Basic Auth owns that header browser-side. We translate it to
+ * Authorization: Bearer for the engine's /api/setup/* admin gate.
  */
 import { NextRequest, NextResponse } from 'next/server';
 
@@ -32,8 +34,8 @@ async function proxy(req: NextRequest, path: string[]): Promise<NextResponse> {
 
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
   if (API_KEY) headers['X-API-Key'] = API_KEY;
-  const auth = req.headers.get('authorization');
-  if (auth) headers['Authorization'] = auth;
+  const adminToken = req.headers.get('x-admin-token');
+  if (adminToken) headers['Authorization'] = `Bearer ${adminToken}`;
 
   try {
     const upstream = await fetch(target, {
