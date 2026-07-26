@@ -39,6 +39,7 @@ jobs:
       # 2. Populate dependencies and generate metadata before CodeQL initializes
       - name: Fetch and Check Dependencies
         run: |
+          cp src/config.balanced.rs.example src/config.rs
           cargo fetch
           cargo check --all-targets --all-features
 
