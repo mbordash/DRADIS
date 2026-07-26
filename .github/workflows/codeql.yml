@@ -22,28 +22,33 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Changed build-mode to none as required by the Rust extractor
           - language: rust
             build-mode: none
 
     steps:
-    - name: Checkout repository
-      uses: actions/checkout@v4
+      - name: Checkout repository
+        uses: actions/checkout@v4
 
-    # CodeQL for Rust still needs the toolchain available to parse dependencies
-    - name: Install Rust Toolchain
-      uses: dtolnay/rust-toolchain@stable
+      - name: Install Rust Toolchain
+        uses: dtolnay/rust-toolchain@stable
 
-    - name: Initialize CodeQL
-      uses: github/codeql-action/init@v4
-      with:
-        languages: ${{ matrix.language }}
-        build-mode: ${{ matrix.build-mode }}
+      # 1. Add caching to speed up and stabilize dependency resolution
+      - name: Cache Cargo Dependencies
+        uses: Swatinem/rust-cache@v2
 
-    # Note: The manual 'cargo build' step is removed entirely. 
-    # CodeQL will analyze the codebase automatically during the next step.
+      # 2. Populate dependencies and generate metadata before CodeQL initializes
+      - name: Fetch and Check Dependencies
+        run: |
+          cargo fetch
+          cargo check --all-targets --all-features
 
-    - name: Perform CodeQL Analysis
-      uses: github/codeql-action/analyze@v4
-      with:
-        category: "/language:${{matrix.language}}"
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@v4
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+
+      - name: Perform CodeQL Analysis
+        uses: github/codeql-action/analyze@v4
+        with:
+          category: "/language:${{matrix.language}}"
