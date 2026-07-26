@@ -14,6 +14,7 @@ const TOKEN_KEY = 'dradis_admin_token';
 export interface SetupStatus {
   venue: 'intl' | 'us';
   admin_set: boolean;
+  auth_disabled: boolean;
   venue_configured: boolean;
 }
 

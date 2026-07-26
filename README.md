@@ -406,7 +406,7 @@ Every parameter in the Viper cards maps directly to the runtime `DynamicConfig`.
 The **Setup** tab lets you configure DRADIS entirely from the browser — designed for prosumer deployments (e.g. a prebuilt AWS image) where editing `.env` on the server isn't practical.
 
 - **First boot**: if no admin password exists, the tab shows a first-boot wizard — create the password, enter venue credentials, restart.
-- **Admin gate**: setup routes require a login (argon2-hashed password, 24h HMAC session tokens); the rest of the dashboard is unaffected.
+- **Admin gate**: setup routes require a login (argon2-hashed password, 24h HMAC session tokens); the rest of the dashboard is unaffected. Already protected by `CT_USERNAME`/`CT_PASSWORD` + `DRADIS_API_KEY`? Set `DRADIS_SETUP_AUTH=off` to skip the second password.
 - **Write-only fields**: the API never returns stored secrets — only a "set / …last4" hint.
 - **Test buttons**: validate credentials live before saving (intl wallet → full CLOB auth + Safe derivation; Polygon RPC → `eth_blockNumber`; Alpaca → data probe; Telegram → `getMe`).
 - **Storage**: saved to `$DRADIS_DATA_DIR/secrets.env` on the data volume; it **overrides** container env on boot, so values survive container recreation. **Restart engine** applies them (Docker respawns the process).

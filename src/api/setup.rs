@@ -216,11 +216,24 @@ fn request_is_admin(req: &Request) -> bool {
 
 /// Middleware: require a valid admin session token.
 ///
+/// True when the operator has explicitly disabled the setup admin gate
+/// (`DRADIS_SETUP_AUTH=off|false|disabled|0`). Intended for deployments that
+/// already gate access via CT basic auth + DRADIS_API_KEY — the setup routes
+/// remain behind those layers, just without a second password prompt.
+fn setup_auth_disabled() -> bool {
+    std::env::var("DRADIS_SETUP_AUTH")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "off" | "false" | "disabled" | "0"))
+        .unwrap_or(false)
+}
+
+/// Middleware: require a valid admin session token.
+///
 /// First-boot exception: while NO admin password is configured, requests pass so
 /// the AMI first-boot wizard can enter credentials and create the password. The
 /// moment a hash exists, everything behind this gate requires a login.
+/// Operator exception: DRADIS_SETUP_AUTH=off waives the gate entirely.
 async fn require_admin(req: Request, next: Next) -> Response {
-    if admin_hash().is_some() && !request_is_admin(&req) {
+    if !setup_auth_disabled() && admin_hash().is_some() && !request_is_admin(&req) {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "admin session required", "login": "/api/auth/login"})),
@@ -255,6 +268,7 @@ async fn get_status() -> Response {
     Json(json!({
         "venue": venue,
         "admin_set": admin_hash().is_some(),
+        "auth_disabled": setup_auth_disabled(),
         "venue_configured": venue_configured,
         "restart_pending": false,
     })).into_response()

@@ -235,8 +235,9 @@ export default function SetupPage() {
     try {
       const s = await getSetupStatus();
       setStatus(s);
+      // Operator disabled the setup gate (DRADIS_SETUP_AUTH=off) → no login.
       // No admin password yet → first-boot wizard, routes are open.
-      if (!s.admin_set) setAuthed(true);
+      if (s.auth_disabled || !s.admin_set) setAuthed(true);
       else if (getAdminToken()) setAuthed(true);
     } catch {
       setNotice({ kind: 'err', text: 'Cannot reach the DRADIS engine.' });
@@ -325,7 +326,7 @@ export default function SetupPage() {
 
   // First-boot: wizard forces password creation AFTER credentials are entered?
   // Simpler + safer: force password creation FIRST, then the credential forms.
-  if (!status.admin_set) {
+  if (!status.admin_set && !status.auth_disabled) {
     return (
       <div className="space-y-6">
         <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl px-4 py-3 text-xs font-mono text-amber-300">
@@ -360,15 +361,23 @@ export default function SetupPage() {
           </p>
         </div>
         <div className="flex items-center gap-2">
-          <button onClick={() => setShowChangePw(v => !v)} className={btnCls('ghost')}>
-            {showChangePw ? 'Cancel' : 'Change password'}
-          </button>
-          <button
-            onClick={() => { clearAdminToken(); setAuthed(false); }}
-            className={btnCls('ghost')}
-          >
-            Log out
-          </button>
+          {status.auth_disabled ? (
+            <span className="text-[10px] font-mono text-gray-600 border border-[#1e1e32] rounded-lg px-2 py-1.5">
+              admin gate off (DRADIS_SETUP_AUTH=off)
+            </span>
+          ) : (
+            <>
+              <button onClick={() => setShowChangePw(v => !v)} className={btnCls('ghost')}>
+                {showChangePw ? 'Cancel' : 'Change password'}
+              </button>
+              <button
+                onClick={() => { clearAdminToken(); setAuthed(false); }}
+                className={btnCls('ghost')}
+              >
+                Log out
+              </button>
+            </>
+          )}
         </div>
       </div>
 
