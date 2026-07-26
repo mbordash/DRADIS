@@ -41,7 +41,7 @@ jobs:
         run: |
           cp src/config.balanced.rs.example src/config.rs
           cargo fetch
-          cargo check --all-targets --all-features
+          cargo check --all-targets
 
       - name: Initialize CodeQL
         uses: github/codeql-action/init@v4

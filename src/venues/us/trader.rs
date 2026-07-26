@@ -678,7 +678,7 @@ async fn dispatch_signal(
             // open-orders surface, then drop the strategy's phantom guard.
             let mut acted = false;
             let open = venue.open_orders().await.unwrap_or_default();
-            for tok in &tokens {
+            for tok in tokens {
                 for ord in open.iter().filter(|o| &o.market == tok) {
                     if let Err(e) = venue.cancel(ord.order_id.clone()).await {
                         warn!("[{strategy_name}] maker quote-pull cancel failed for {} ({}): {e}", ord.order_id, tok);
