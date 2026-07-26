@@ -417,6 +417,26 @@ pub fn spawn_cleanup_task(
                             let vc = if orphan.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                             let mut rehedged = false;
 
+                            // PARTIAL-FILL GUARD (2026-07-26 trade 296): the recorded share
+                            // count can be the full order size when only a sliver actually
+                            // matched (fill-confirm doesn't sync shares). Sizing the FAK off
+                            // the stale count draws "not enough balance" 400s and the real
+                            // shares ride to $0 settlement. Verify on-chain and size from
+                            // the smaller figure.
+                            let orphan = {
+                                let onchain = crate::helpers::balance::onchain_balance_for_token(
+                                    &trading_client, &orphan.token_id).await;
+                                if onchain > dec!(0) && onchain < orphan.shares {
+                                    warn!("⚖️ ORPHAN EXIT: token {} recorded {} shares but on-chain {} — sizing from on-chain",
+                                          orphan.token_id, orphan.shares, onchain);
+                                    crate::tasks::cleanup::OrphanExit { shares: onchain, ..orphan }
+                                } else {
+                                    // onchain == 0 → lookup failure or nothing held; try the
+                                    // recorded count (a 400 is harmless; next 5-min sweep retries).
+                                    orphan
+                                }
+                            };
+
                             if let Some(paired_id) = orphan.paired_token_id {
                                 let paired_ask = if paired_id == hourly_yes_token {
                                     yes_price_rx.borrow().2

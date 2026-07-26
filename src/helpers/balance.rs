@@ -689,10 +689,24 @@ pub async fn arb_pair_fill_monitor(
 
     // Match the filled leg's confirmed share count AND entry price so we can compute a
     // breakeven ceiling — without this we'd cap at a fixed $0.99 and could lock in a loss.
-    let (filled_shares, filled_avg_entry) = positions.lock().await
+    let (filled_shares_recorded, filled_avg_entry) = positions.lock().await
         .get(&(strategy_name.clone(), filled_market.clone()))
         .map(|p| (p.shares, p.avg_entry))
         .unwrap_or((dec!(0), dec!(0)));
+    // PARTIAL-FILL GUARD (2026-07-26 trade 296): fill-confirm stamps a leg "filled"
+    // on ANY matched size, so the recorded count can be the full order size while
+    // only a sliver settled on-chain (16.48 recorded vs 1.47 held). Sizing the
+    // flatten/re-hedge off the recorded count draws a "not enough balance" 400 and
+    // the naked sliver rides to $0. Always trust the on-chain balance when it's
+    // smaller than the recorded count.
+    let filled_onchain = onchain_balance_for_token(&client, &filled_market).await;
+    let filled_shares = if filled_onchain > dec!(0) && filled_onchain < filled_shares_recorded {
+        warn!("⚖️ ARB ARBITER [{}]: filled leg {} partial fill — recorded {} but on-chain {} — sizing repair from on-chain",
+              strategy_name, filled_token, filled_shares_recorded, filled_onchain);
+        filled_onchain
+    } else {
+        filled_shares_recorded
+    };
     let fak_qty = if filled_shares >= crate::config::MIN_ORDER_SHARES {
         filled_shares
     } else {
