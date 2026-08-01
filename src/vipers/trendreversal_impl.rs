@@ -391,14 +391,14 @@ impl Strategy for TrendReversalStrategyImpl {
         // squeeze → trend exhaustion). Disabled by default; inert on no-data
         // (cvd/oi = 0 → neutral). All-asset. Mirrors the drift-alignment gates.
         let deriv_cvd = ctx.snapshot.cvd_ratio;
-        let deriv_oi_unwind = config::DERIV_GATE_ENABLED
-            && ctx.snapshot.oi_delta_pct <= config::DERIV_OI_UNWIND_BLOCK;
-        let deriv_blocks_bull = config::DERIV_GATE_ENABLED
+        let deriv_oi_unwind = dc.trendcapture_deriv_gate_enabled
+            && ctx.snapshot.oi_delta_pct <= dc.trendcapture_deriv_oi_unwind_block;
+        let deriv_blocks_bull = dc.trendcapture_deriv_gate_enabled
             && (deriv_oi_unwind
-                || (deriv_cvd > dec!(0) && deriv_cvd <= dec!(1) - config::DERIV_CVD_CONFIRM_MARGIN));
-        let deriv_blocks_bear = config::DERIV_GATE_ENABLED
+                || (deriv_cvd > dec!(0) && deriv_cvd <= dec!(1) - dc.trendcapture_deriv_cvd_confirm_margin));
+        let deriv_blocks_bear = dc.trendcapture_deriv_gate_enabled
             && (deriv_oi_unwind
-                || (deriv_cvd > dec!(0) && deriv_cvd >= dec!(1) + config::DERIV_CVD_CONFIRM_MARGIN));
+                || (deriv_cvd > dec!(0) && deriv_cvd >= dec!(1) + dc.trendcapture_deriv_cvd_confirm_margin));
 
         // ══ BULL entry: buy YES when trend is strongly upward ════════════════
         if drift_10m >= bull_drift_10m_thr

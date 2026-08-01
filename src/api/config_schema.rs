@@ -176,6 +176,12 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Hard emergency stop-loss overriding the min-hold window.").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "momentum_min_secs_to_expiry_for_entry", "Min Secs to Expiry", "secs", true,
             "Don't enter with fewer than this many seconds left.").min(0.0).step(1.0).unit("s"));
+        v.push(F::new(g, e, "momentum_deriv_gate_enabled", "Deriv Gate", "bool", true,
+            "Derivatives-Raptor confirmation gate: block entries the perp book contradicts (counter CVD flow or hard OI unwind). Inert when OI/CVD report no data."));
+        v.push(F::new(g, e, "momentum_deriv_cvd_confirm_margin", "Deriv CVD Margin", "decimal", true,
+            "Distance from neutral CVD ratio 1.0 that blocks the contradicted direction (0.15 ⇒ ≤0.85 blocks bulls, ≥1.15 blocks bears).").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "momentum_deriv_oi_unwind_block", "Deriv OI Unwind Block", "decimal", true,
+            "OI delta at/below which hard de-leveraging blocks BOTH directions (−0.05 = −5% per poll).").range(-1.0, 0.0).step(0.01));
     }
 
     // ── Maker ─────────────────────────────────────────────────────────────────
@@ -308,6 +314,12 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Adverse drift fraction that signals the fade thesis is breaking (exit).").range(0.0, 0.1).step(0.0005));
         v.push(F::new(g, e, "trendcapture_strike_gap_pct", "Strike Gap", "decimal", true,
             "Minimum oracle-vs-strike gap (fraction) required to enter.").range(0.0, 0.1).step(0.0005));
+        v.push(F::new(g, e, "trendcapture_deriv_gate_enabled", "Deriv Gate", "bool", true,
+            "Derivatives-Raptor confirmation gate: block entries the perp book contradicts (counter CVD flow or hard OI unwind). Inert when OI/CVD report no data."));
+        v.push(F::new(g, e, "trendcapture_deriv_cvd_confirm_margin", "Deriv CVD Margin", "decimal", true,
+            "Distance from neutral CVD ratio 1.0 that blocks the contradicted direction (0.15 ⇒ ≤0.85 blocks bulls, ≥1.15 blocks bears).").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "trendcapture_deriv_oi_unwind_block", "Deriv OI Unwind Block", "decimal", true,
+            "OI delta at/below which hard de-leveraging blocks BOTH directions (−0.05 = −5% per poll).").range(-1.0, 0.0).step(0.01));
         v.push(F::new(g, e, "trendcapture_take_profit_ceiling", "Take-Profit Ceiling", "price", true,
             "Cap the take-profit target token price at this level.").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "trendcapture_catastrophic_sl_pct", "Catastrophic Stop", "pct", true,

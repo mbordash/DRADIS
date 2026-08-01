@@ -71,7 +71,9 @@ pub fn register_squadron_config_handle(squadron_id: &str, handle: Arc<RwLock<Dyn
 // defaults — clobbering any operator customisation made in the previous session.
 fn default_arb_max_leg_price()             -> Decimal { config::ARBITRAGE_MAX_LEG_PRICE             }
 fn default_arb_max_leg_obi()               -> Decimal { config::ARBITRAGE_MAX_LEG_OBI               }
-fn default_arb_max_obi_asymmetry()         -> Decimal { config::ARBITRAGE_MAX_OBI_ASYMMETRY         }
+fn default_deriv_gate_enabled()            -> bool    { config::DERIV_GATE_ENABLED                  }
+fn default_deriv_cvd_confirm_margin()      -> Decimal { config::DERIV_CVD_CONFIRM_MARGIN            }
+fn default_deriv_oi_unwind_block()         -> Decimal { config::DERIV_OI_UNWIND_BLOCK               }fn default_arb_max_obi_asymmetry()         -> Decimal { config::ARBITRAGE_MAX_OBI_ASYMMETRY         }
 fn default_arb_min_leg_conviction()        -> Decimal { config::ARBITRAGE_MIN_LEG_CONVICTION        }
 fn default_arb_fak_rehedge_buffer()        -> Decimal { config::ARB_FAK_REHEDGE_BUFFER              }
 fn default_arb_max_rescue_cost()           -> Decimal { config::ARB_MAX_RESCUE_COST                 }
@@ -255,6 +257,18 @@ pub struct DynamicConfig {
     pub momentum_obi_adverse_block:    Decimal,
     #[serde(default = "default_momentum_obi_exhaustion_block")]
     pub momentum_obi_exhaustion_block: Decimal,
+    /// Derivatives Raptor confirmation gate — blocks entries the perp book
+    /// actively contradicts (counter-taker CVD or hard OI unwind). Inert on
+    /// no-data (zero = neutral). Off by default (observe-first).
+    #[serde(default = "default_deriv_gate_enabled")]
+    pub momentum_deriv_gate_enabled:   bool,
+    /// Distance from neutral CVD ratio 1.0 that blocks the contradicted
+    /// direction: 0.15 ⇒ cvd ≤ 0.85 blocks bulls, cvd ≥ 1.15 blocks bears.
+    #[serde(default = "default_deriv_cvd_confirm_margin")]
+    pub momentum_deriv_cvd_confirm_margin: Decimal,
+    /// OI delta at/below which hard de-leveraging blocks BOTH directions.
+    #[serde(default = "default_deriv_oi_unwind_block")]
+    pub momentum_deriv_oi_unwind_block: Decimal,
     #[serde(default = "default_momentum_take_profit_ceiling")]
     pub momentum_take_profit_ceiling:  Decimal,
     #[serde(default = "default_momentum_catastrophic_sl_pct")]
@@ -351,6 +365,13 @@ pub struct DynamicConfig {
     pub trendcapture_max_entry_ask_sum:    Decimal,
     #[serde(default = "default_trendcapture_obi_adverse_block")]
     pub trendcapture_obi_adverse_block:    Decimal,
+    /// Derivatives Raptor confirmation gate (see `momentum_deriv_gate_enabled`).
+    #[serde(default = "default_deriv_gate_enabled")]
+    pub trendcapture_deriv_gate_enabled:   bool,
+    #[serde(default = "default_deriv_cvd_confirm_margin")]
+    pub trendcapture_deriv_cvd_confirm_margin: Decimal,
+    #[serde(default = "default_deriv_oi_unwind_block")]
+    pub trendcapture_deriv_oi_unwind_block: Decimal,
     #[serde(default = "default_trendcapture_obi_exhaustion_block")]
     pub trendcapture_obi_exhaustion_block: Decimal,
     #[serde(default = "default_trendcapture_max_token_spread_pct")]
@@ -450,6 +471,9 @@ impl Default for DynamicConfig {
             momentum_max_entry_ask_sum:    config::MOMENTUM_MAX_ENTRY_ASK_SUM,
             momentum_obi_adverse_block:    config::MOMENTUM_OBI_ADVERSE_BLOCK,
             momentum_obi_exhaustion_block: config::MOMENTUM_OBI_EXHAUSTION_BLOCK,
+            momentum_deriv_gate_enabled:       config::DERIV_GATE_ENABLED,
+            momentum_deriv_cvd_confirm_margin: config::DERIV_CVD_CONFIRM_MARGIN,
+            momentum_deriv_oi_unwind_block:    config::DERIV_OI_UNWIND_BLOCK,
             momentum_take_profit_ceiling:  config::MOMENTUM_TAKE_PROFIT_CEILING,
             momentum_catastrophic_sl_pct:  config::MOMENTUM_CATASTROPHIC_SL_PCT,
             momentum_min_secs_to_expiry_for_entry: config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY,
@@ -504,6 +528,9 @@ impl Default for DynamicConfig {
             trendcapture_min_entry_price:      config::TRENDCAPTURE_MIN_ENTRY_PRICE,
             trendcapture_max_entry_ask_sum:    config::TRENDCAPTURE_MAX_ENTRY_ASK_SUM,
             trendcapture_obi_adverse_block:    config::TRENDCAPTURE_OBI_ADVERSE_BLOCK,
+            trendcapture_deriv_gate_enabled:       config::DERIV_GATE_ENABLED,
+            trendcapture_deriv_cvd_confirm_margin: config::DERIV_CVD_CONFIRM_MARGIN,
+            trendcapture_deriv_oi_unwind_block:    config::DERIV_OI_UNWIND_BLOCK,
             trendcapture_obi_exhaustion_block: config::TRENDCAPTURE_OBI_EXHAUSTION_BLOCK,
             trendcapture_max_token_spread_pct: config::TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT,
             trendcapture_reversal_drift_pct:   config::TRENDCAPTURE_REVERSAL_DRIFT_PCT,
