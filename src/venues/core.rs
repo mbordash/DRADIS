@@ -224,5 +224,17 @@ pub trait Execution: Send + Sync {
     fn subscribe_fills(&self) -> Option<FillStream> {
         None
     }
+
+    /// Best ask price currently resting on `market`'s book, if the venue can
+    /// report it cheaply.
+    ///
+    /// Consulted by the shared lifecycle's naked-leg handler to decide whether
+    /// an economical re-hedge (buy the missing partner leg) beats a forced
+    /// flatten. The default `None` means "book unknown" — the lifecycle then
+    /// falls straight through to the flatten path, so venues without a quote
+    /// surface keep today's behavior.
+    async fn best_ask(&self, _market: &MarketId) -> Result<Option<Decimal>> {
+        Ok(None)
+    }
 }
 

@@ -303,8 +303,9 @@ async fn trade_one_market(
     // Shared, venue-neutral order lifecycle engine (Option C). Drives fill-confirm,
     // stale-cancel, and naked-leg flatten off the `Execution` trait surface.
     let lifecycle = Arc::new(OrderLifecycle::new(LifecycleConfig::us()));
-    // Upgrade fill confirmation to event-precise if the venue exposes a feed
-    // (no-op today: UsRetailVenue::subscribe_fills returns None → poll fallback).
+    // Upgrade fill confirmation to event-precise via the venue's private
+    // account feed (`/v1/ws/private` → `subscribe_fills`); reconcile polling
+    // remains the cancel/flatten path and the fallback backstop.
     let _fill_listener = lifecycle.spawn_fill_listener(Arc::clone(&venue), Arc::clone(&positions));
     let market_started_at = Utc::now();
 

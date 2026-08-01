@@ -32,7 +32,7 @@ use std::str::FromStr;
 use tracing::{debug, info};
 
 use crate::venues::core::{
-    Execution, Fill, MarketId, OrderId, OrderIntent, Position, Side, TimeInForce,
+    Execution, Fill, FillStream, MarketId, OrderId, OrderIntent, Position, Side, TimeInForce,
 };
 
 use auth::UsAuth;
@@ -58,6 +58,10 @@ pub struct UsRetailVenue {
     /// Shared HTTP client — used for raw market-discovery requests that bypass
     /// the SDK's typed deserialisers (which are too strict for the live API).
     http: Arc<reqwest::Client>,
+    /// Fan-out sender for the private account fill feed (`/v1/ws/private`).
+    /// The pump task is spawned in [`Self::connect`] and lives for the venue's
+    /// lifetime; [`Execution::subscribe_fills`] hands out receivers.
+    fills_tx: tokio::sync::broadcast::Sender<crate::venues::core::FillEvent>,
 }
 
 impl UsRetailVenue {
@@ -75,7 +79,7 @@ impl UsRetailVenue {
             .build()
             .map_err(|e| anyhow!("US retail SDK client bootstrap failed: {e}"))?;
 
-        let venue = Self { client, base_url, auth: Arc::new(auth), http };
+        let venue = Self { client, base_url, auth: Arc::new(auth), http, fills_tx: tokio::sync::broadcast::channel(256).0 };
 
         venue.health_check().await.context("US retail health check failed")?;
         // Validate the Ed25519 API key with a signed balances probe. We use the
@@ -87,6 +91,16 @@ impl UsRetailVenue {
             .await
             .context("US retail auth validation failed (signed account balance probe)")?;
         info!("✅ Authenticated on Polymarket US. Key ID: {}", venue.auth.key_id());
+
+        // Start the account-wide private fill feed (spec §4.2). It outlives any
+        // single market patrol — rotations keep the same venue handle — so it is
+        // spawned once here with a never-cancelled token.
+        ws::spawn_private_fill_feed(
+            ws::private_ws_url_from_base(&venue.base_url),
+            Arc::clone(&venue.auth),
+            venue.fills_tx.clone(),
+            tokio_util::sync::CancellationToken::new(),
+        );
 
         Ok(venue)
     }
@@ -411,6 +425,23 @@ impl Execution for UsRetailVenue {
             });
         }
         Ok(out)
+    }
+
+    fn subscribe_fills(&self) -> Option<FillStream> {
+        Some(self.fills_tx.subscribe())
+    }
+
+    async fn best_ask(&self, market: &MarketId) -> Result<Option<Decimal>> {
+        let bbo = self
+            .client
+            .markets()
+            .bbo(market.as_str())
+            .await
+            .with_context(|| format!("bbo query failed for {market}"))?;
+        Ok(bbo
+            .ask
+            .and_then(|lvl| Decimal::from_str(lvl.price.trim()).ok())
+            .filter(|p| *p > Decimal::ZERO))
     }
 }
 

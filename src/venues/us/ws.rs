@@ -28,6 +28,7 @@ use tungstenite::http::Uri;
 use tungstenite::ClientRequestBuilder;
 
 use crate::state::PriceState;
+use crate::venues::core::{FillEvent, MarketId, OrderId, Side};
 use crate::venues::us::auth::UsAuth;
 
 /// Drop order-book frames whose exchange timestamp lags wall-clock by more than
@@ -36,6 +37,8 @@ pub const STALE_FRAME_MS: i64 = 200;
 
 /// Market-data WS path appended to the venue's WS base URL.
 const MARKETS_WS_PATH: &str = "/v1/ws/markets";
+/// Private account-feed WS path (order matches / fills — spec §4.2).
+const PRIVATE_WS_PATH: &str = "/v1/ws/private";
 /// Reconnect backoff after a socket error / sequence gap.
 const RECONNECT_DELAY_SECS: u64 = 5;
 
@@ -129,7 +132,7 @@ pub fn spawn_market_feed(
                 return;
             }
 
-            let request = match authed_request(&ws_url, &auth) {
+            let request = match authed_request(&ws_url, &auth, MARKETS_WS_PATH) {
                 Ok(r) => r,
                 Err(e) => {
                     warn!("⚠️ US WS request build failed for {symbol}: {e}. Retrying in {RECONNECT_DELAY_SECS}s…");
@@ -242,15 +245,177 @@ async fn wait_or_cancel(cancel: &CancellationToken, secs: u64) -> bool {
     }
 }
 
+/// Derive the `wss://…/v1/ws/private` account-feed URL from the REST base.
+pub fn private_ws_url_from_base(base_url: &str) -> String {
+    let host = base_url
+        .strip_prefix("https://")
+        .or_else(|| base_url.strip_prefix("http://"))
+        .unwrap_or(base_url);
+    let scheme = if base_url.starts_with("http://") { "ws://" } else { "wss://" };
+    format!("{scheme}{host}{PRIVATE_WS_PATH}")
+}
+
+/// One `private_orders` execution event (spec §4.2). Numeric quantities arrive
+/// as JSON numbers; `fill_price` as a decimal string.
+#[derive(Debug, Clone, Deserialize)]
+struct PrivateOrderEvent {
+    #[serde(default)]
+    channel: String,
+    #[serde(default)]
+    event_type: String,
+    #[serde(default)]
+    order_id: String,
+    #[serde(default)]
+    symbol: String,
+    #[serde(default)]
+    side: String,
+    #[serde(default)]
+    fill_price: String,
+    #[serde(default)]
+    fill_quantity: u64,
+    #[serde(default)]
+    remaining_quantity: i64,
+}
+
+/// Map a `private_orders` event to the venue-neutral [`FillEvent`], if it
+/// describes an actual match. Ack/cancel/reject lifecycle noise returns `None`.
+fn private_event_to_fill(ev: &PrivateOrderEvent) -> Option<FillEvent> {
+    if ev.channel != "private_orders" || ev.symbol.is_empty() {
+        return None;
+    }
+    // Only match events carry fill state worth confirming.
+    let is_fill = matches!(
+        ev.event_type.as_str(),
+        "ORDER_FILLED" | "ORDER_PARTIALLY_FILLED" | "FILL" | "MATCH"
+    ) || ev.fill_quantity > 0;
+    if !is_fill || ev.fill_quantity == 0 {
+        return None;
+    }
+    Some(FillEvent {
+        order_id: OrderId(ev.order_id.clone()),
+        market: MarketId::new(ev.symbol.clone()),
+        side: if ev.side.eq_ignore_ascii_case("sell") { Side::Sell } else { Side::Buy },
+        filled: Decimal::from(ev.fill_quantity),
+        price: Decimal::from_str(ev.fill_price.trim()).unwrap_or(Decimal::ZERO),
+        complete: ev.remaining_quantity <= 0,
+    })
+}
+
+/// Spawn the auto-reconnecting private account feed (`/v1/ws/private`).
+///
+/// Pushes venue-neutral [`FillEvent`]s into the broadcast `tx` so the shared
+/// `OrderLifecycle` fill listener confirms fills **event-precisely** instead of
+/// at positions-poll granularity (the gateway spec §4 forbids polling for
+/// execution logic). The account feed is squadron-agnostic: it lives for the
+/// venue's lifetime and survives market rotations.
+///
+/// Fill events are *facts* (unlike order-book quotes), so no staleness rejection
+/// is applied — a late event still describes a real match, and the reconcile
+/// poll backstop already tolerates duplicates (confirmation is idempotent).
+pub fn spawn_private_fill_feed(
+    ws_url: String,
+    auth: Arc<UsAuth>,
+    tx: tokio::sync::broadcast::Sender<FillEvent>,
+    cancel: CancellationToken,
+) {
+    tokio::spawn(async move {
+        loop {
+            if cancel.is_cancelled() {
+                return;
+            }
+
+            let request = match authed_request(&ws_url, &auth, PRIVATE_WS_PATH) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!("⚠️ US private WS request build failed: {e}. Retrying in {RECONNECT_DELAY_SECS}s…");
+                    if wait_or_cancel(&cancel, RECONNECT_DELAY_SECS).await {
+                        return;
+                    }
+                    continue;
+                }
+            };
+
+            let stream = match tokio_tungstenite::connect_async(request).await {
+                Ok((s, _)) => s,
+                Err(e) => {
+                    warn!("⚠️ US private WS connect failed: {e}. Retrying in {RECONNECT_DELAY_SECS}s…");
+                    if wait_or_cancel(&cancel, RECONNECT_DELAY_SECS).await {
+                        return;
+                    }
+                    continue;
+                }
+            };
+            let (mut write, mut read) = stream.split();
+
+            let frame = SubscribeFrame {
+                action: "subscribe",
+                channels: vec!["private_orders"],
+                symbols: vec![],
+            };
+            let sub = match serde_json::to_string(&frame) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("⚠️ US private WS subscribe encode failed: {e}");
+                    return;
+                }
+            };
+            if let Err(e) = write.send(Message::Text(sub.into())).await {
+                warn!("⚠️ US private WS subscribe send failed: {e}. Reconnecting…");
+                if wait_or_cancel(&cancel, RECONNECT_DELAY_SECS).await {
+                    return;
+                }
+                continue;
+            }
+            info!("✅ US private WS subscribed (private_orders fills feed)");
+
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = cancel.cancelled() => return,
+                    msg = read.next() => {
+                        let msg = match msg {
+                            Some(Ok(m))  => m,
+                            Some(Err(e)) => { warn!("⚠️ US private WS stream error: {e}. Restarting…"); break; }
+                            None         => { warn!("⚠️ US private WS closed. Restarting…"); break; }
+                        };
+                        let text = match msg {
+                            Message::Text(t)   => t.to_string(),
+                            Message::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
+                            Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => continue,
+                            Message::Close(_)  => { warn!("⚠️ US private WS close frame. Restarting…"); break; }
+                        };
+
+                        let ev: PrivateOrderEvent = match serde_json::from_str(&text) {
+                            Ok(e)  => e,
+                            Err(_) => continue, // control/ack frame
+                        };
+                        if let Some(fill) = private_event_to_fill(&ev) {
+                            debug!("📥 US fill event: {} {} filled={} remaining={}",
+                                ev.event_type, fill.market, fill.filled, ev.remaining_quantity);
+                            // Send fails only when no lifecycle listener is
+                            // subscribed yet — safe to drop (reconcile backstop).
+                            let _ = tx.send(fill);
+                        }
+                    }
+                }
+            }
+
+            if wait_or_cancel(&cancel, RECONNECT_DELAY_SECS).await {
+                return;
+            }
+        }
+    });
+}
+
 /// Build a WS handshake request carrying freshly-signed `X-PM-*` auth headers.
 ///
 /// The signature covers `GET` + the WS path (`/v1/ws/markets`), matching the
 /// REST signing scheme so the gateway accepts the upgrade. Re-signing per call
 /// keeps the timestamp inside the gateway's replay window across reconnects.
-fn authed_request(ws_url: &str, auth: &UsAuth) -> anyhow::Result<ClientRequestBuilder> {
+fn authed_request(ws_url: &str, auth: &UsAuth, path: &str) -> anyhow::Result<ClientRequestBuilder> {
     let uri: Uri = ws_url.parse()?;
     let mut builder = ClientRequestBuilder::new(uri);
-    for (name, value) in auth.signed_headers("GET", MARKETS_WS_PATH) {
+    for (name, value) in auth.signed_headers("GET", path) {
         builder = builder.with_header(name, value);
     }
     Ok(builder)
