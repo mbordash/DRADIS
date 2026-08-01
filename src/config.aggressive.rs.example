@@ -200,6 +200,7 @@ pub const MAKER_GATE_DWELL_SECS: i64 = 10;
 
 // ── Horizon Raptor maker gate (2026-07-21, observe-first) ───────────────────
 /// Master switch: false = observe-only (log "would veto", never suppress).
+/// Aggressive: observe-only — accepts adverse-selection risk to maximize quote uptime.
 pub const MAKER_HORIZON_GATE_ENFORCE: bool = false;
 /// Suppress BOTH maker sides when UVXY 5s velocity exceeds this ($/5s).
 pub const MAKER_HORIZON_VIX_VEL_MAX: Decimal = dec!(0.15);
