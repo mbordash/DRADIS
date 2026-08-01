@@ -1990,18 +1990,88 @@ async fn fetch_sports_markets_by_tags(
     out
 }
 
-/// Fetch markets for US venue (placeholder — returns empty until US market discovery is wired).
-#[cfg(not(feature = "intl_clob"))]
+/// Fetch markets for the US retail venue via `UsRetailVenue::discover_binary_markets`.
+///
+/// The venue handle is connected once (env credentials) and cached for the API
+/// process lifetime. Crypto is rejected upstream (`deploy_squadron` blocks it and
+/// the region endpoint hides it), so every discovered binary market is offered
+/// under the requested class. Markets missing a close time degrade to
+/// "always open" (venue convention) and pass the expiry filter.
+#[cfg(all(not(feature = "intl_clob"), feature = "us_retail"))]
+async fn fetch_markets_by_type(
+    http: &reqwest::Client,
+    market_type: &str,
+    max_expiry_secs: i64,
+    min_liquidity: f64,
+) -> Vec<AvailableMarket> {
+    use crate::venues::us::UsRetailVenue;
+    static US_VENUE: tokio::sync::OnceCell<Option<std::sync::Arc<UsRetailVenue>>> =
+        tokio::sync::OnceCell::const_new();
+
+    let venue = US_VENUE.get_or_init(|| {
+        let http = std::sync::Arc::new(http.clone());
+        async move {
+            match UsRetailVenue::connect(http).await {
+                Ok(v) => Some(std::sync::Arc::new(v)),
+                Err(e) => {
+                    warn!("US venue connect failed for market discovery: {e:#}");
+                    None
+                }
+            }
+        }
+    }).await;
+
+    let Some(venue) = venue else {
+        return Vec::new();
+    };
+
+    let pairs = match venue.discover_binary_markets().await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("US venue market discovery failed: {e:#}");
+            return Vec::new();
+        }
+    };
+
+    let now = chrono::Utc::now();
+    let mut out: Vec<AvailableMarket> = pairs
+        .into_iter()
+        .filter(|p| p.volume >= min_liquidity)
+        .filter(|p| match p.close_time {
+            Some(ct) => {
+                let secs_left = (ct - now).num_seconds();
+                secs_left >= 300 && secs_left <= max_expiry_secs
+            }
+            None => true, // no endDate → venue treats as always open
+        })
+        .map(|p| AvailableMarket {
+            condition_id: p.slug,
+            question: p.question,
+            market_class: market_type.to_string(),
+            end_date: p.close_time.map(|ct| ct.to_rfc3339()),
+            liquidity: p.volume,
+            tokens: AvailableMarketTokens {
+                yes_id: p.long.to_string(),
+                no_id: p.short.to_string(),
+            },
+        })
+        .collect();
+
+    out.sort_by(|a, b| b.liquidity.partial_cmp(&a.liquidity).unwrap_or(std::cmp::Ordering::Equal));
+    out.truncate(50);
+    info!("📊 fetch_markets_by_type: found {} US markets for type '{}'", out.len(), market_type);
+    out
+}
+
+/// No venue features compiled in — market discovery unavailable.
+#[cfg(not(any(feature = "intl_clob", feature = "us_retail")))]
 async fn fetch_markets_by_type(
     _http: &reqwest::Client,
     market_type: &str,
     _max_expiry_secs: i64,
     _min_liquidity: f64,
 ) -> Vec<AvailableMarket> {
-    // US venue market discovery requires the retail client to be initialized.
-    // For now, return an empty list — the UI will show "No markets available".
-    // Future: wire up crate::venues::us::UsRetailVenue::discover_binary_markets()
-    warn!("US venue market fetch not yet implemented for type '{}'", market_type);
+    warn!("Market discovery unavailable for type '{}' — no venue feature compiled in", market_type);
     Vec::new()
 }
 
@@ -2020,6 +2090,10 @@ struct DeploySquadronRequest {
     raptors: Vec<String>,
     #[serde(default)]
     vipers: Vec<String>,
+    /// Per-viper capital budgets: viper kind id → max-exposure USDC.
+    /// Applied to the squadron's `DynamicConfig` `*_max_exposure_usdc` fields at spawn.
+    #[serde(default)]
+    viper_budgets: std::collections::HashMap<String, f64>,
 }
 
 /// Response for POST /api/squadrons/deploy.
@@ -2114,7 +2188,7 @@ async fn deploy_squadron(
     );
     
     // Store deployment request in the database for CAG to pick up
-    if let Err(e) = crate::helpers::db::queue_deployment(&deployment_id, &market_id, &req.market_type, &raptors, &vipers).await {
+    if let Err(e) = crate::helpers::db::queue_deployment(&deployment_id, &market_id, &req.market_type, &raptors, &vipers, &req.viper_budgets).await {
         error!("Failed to queue deployment: {}", e);
         return Json(DeploySquadronResponse {
             success: false,

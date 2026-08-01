@@ -258,6 +258,43 @@ function ConfigChecklist({ title, items, selected, onToggle }: ConfigChecklistPr
   );
 }
 
+// ── Manual Mode: Per-Viper Capital Budgets ────────────────────────────────────
+
+interface ViperBudgetsProps {
+  vipers: { id: string; display: string }[];
+  budgets: Record<string, string>;
+  onChange: (id: string, value: string) => void;
+}
+
+/** USDC max-exposure input per selected viper. Blank = keep squadron default. */
+function ViperBudgets({ vipers, budgets, onChange }: ViperBudgetsProps) {
+  if (vipers.length === 0) return null;
+  return (
+    <div className="space-y-2">
+      <span className="text-xs font-mono text-gray-400">Viper Capital Budgets (USDC max exposure — blank keeps defaults)</span>
+      <div className="bg-[#0a0a14] rounded-lg border border-[#1e1e32] p-2 grid grid-cols-2 gap-2">
+        {vipers.map(v => (
+          <label key={v.id} className="flex items-center gap-2 px-2 py-1">
+            <span className="text-xs font-mono text-gray-300 flex-1">{v.display}</span>
+            <div className="flex items-center gap-1">
+              <span className="text-[10px] font-mono text-gray-500">$</span>
+              <input
+                type="number"
+                min="0"
+                step="1"
+                placeholder="default"
+                value={budgets[v.id] ?? ''}
+                onChange={e => onChange(v.id, e.target.value)}
+                className="w-20 bg-[#12121f] border border-[#1e1e32] rounded px-2 py-1 text-xs font-mono text-gray-200 text-right focus:outline-none focus:border-green-500/50"
+              />
+            </div>
+          </label>
+        ))}
+      </div>
+    </div>
+  );
+}
+
 // ── Main Modal ────────────────────────────────────────────────────────────────
 
 interface DeploySquadronModalProps {
@@ -275,6 +312,7 @@ export default function DeploySquadronModal({ isOpen, onClose, onDeployed }: Dep
   const [selectedMarket, setSelectedMarket] = useState<string | null>(null);
   const [selectedRaptors, setSelectedRaptors] = useState<Set<string>>(new Set());
   const [selectedVipers, setSelectedVipers] = useState<Set<string>>(new Set());
+  const [viperBudgets, setViperBudgets] = useState<Record<string, string>>({});
   
   // Deployment state
   const [deploying, setDeploying] = useState(false);
@@ -330,6 +368,7 @@ export default function DeploySquadronModal({ isOpen, onClose, onDeployed }: Dep
       setSelectedMarket(null);
       setSelectedRaptors(new Set());
       setSelectedVipers(new Set());
+      setViperBudgets({});
       setError(null);
     }
   }, [isOpen]);
@@ -353,12 +392,25 @@ export default function DeploySquadronModal({ isOpen, onClose, onDeployed }: Dep
     });
   }, []);
 
+  const setViperBudget = useCallback((id: string, value: string) => {
+    setViperBudgets(prev => ({ ...prev, [id]: value }));
+  }, []);
+
   // Deploy handler
   const handleDeploy = useCallback(async () => {
     if (!selectedType) return;
     
     setDeploying(true);
     setError(null);
+    
+    // Collect valid budgets for selected vipers only (blank = keep default)
+    const budgets: Record<string, number> = {};
+    if (mode === 'manual') {
+      for (const id of selectedVipers) {
+        const parsed = parseFloat(viperBudgets[id] ?? '');
+        if (Number.isFinite(parsed) && parsed >= 0) budgets[id] = parsed;
+      }
+    }
     
     try {
       const response = await deploySquadron({
@@ -368,6 +420,7 @@ export default function DeploySquadronModal({ isOpen, onClose, onDeployed }: Dep
         market_id: mode === 'manual' ? selectedMarket ?? undefined : undefined,
         raptors: mode === 'manual' ? Array.from(selectedRaptors) : undefined,
         vipers: mode === 'manual' ? Array.from(selectedVipers) : undefined,
+        viper_budgets: Object.keys(budgets).length > 0 ? budgets : undefined,
       });
       
       if (response.success && response.squadron_id) {
@@ -500,6 +553,13 @@ export default function DeploySquadronModal({ isOpen, onClose, onDeployed }: Dep
                       onToggle={toggleViper}
                     />
                   </div>
+
+                  {/* Per-Viper Capital Budgets */}
+                  <ViperBudgets
+                    vipers={vipers.filter(v => selectedVipers.has(v.id)).map(v => ({ id: v.id, display: v.display }))}
+                    budgets={viperBudgets}
+                    onChange={setViperBudget}
+                  />
                 </>
               )}
             </>

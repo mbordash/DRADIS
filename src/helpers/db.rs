@@ -431,6 +431,7 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
             market_type  TEXT    NOT NULL,   -- 'crypto' | 'sports' | 'politics'
             raptors      TEXT    NOT NULL,   -- JSON array of raptor kind IDs
             vipers       TEXT    NOT NULL,   -- JSON array of viper kind IDs
+            viper_budgets TEXT,              -- JSON object: viper kind → max-exposure USDC
             status       TEXT    NOT NULL DEFAULT 'pending',  -- pending | processing | deployed | failed
             squadron_id  TEXT,               -- populated once deployed
             error        TEXT,               -- populated on failure
@@ -438,6 +439,12 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
             updated_at   TEXT    NOT NULL DEFAULT (datetime('now'))
         )"
     ).execute(pool).await?;
+
+    // Migration for queues created before per-viper deploy budgets existed
+    // (no-op-safe: duplicate-column error is silently suppressed).
+    let _ = sqlx::query(
+        "ALTER TABLE deployment_queue ADD COLUMN viper_budgets TEXT"
+    ).execute(pool).await;
 
     seed_market_taxonomy(pool).await?;
 
@@ -1124,6 +1131,7 @@ pub async fn queue_deployment(
     market_type: &str,
     raptors: &[String],
     vipers: &[String],
+    viper_budgets: &std::collections::HashMap<String, f64>,
 ) -> Result<()> {
     let Some(pool) = pool() else {
         return Err(anyhow::anyhow!("DB pool not initialized"));
@@ -1131,30 +1139,48 @@ pub async fn queue_deployment(
     
     let raptors_json = serde_json::to_string(raptors)?;
     let vipers_json = serde_json::to_string(vipers)?;
+    let budgets_json = if viper_budgets.is_empty() {
+        None
+    } else {
+        Some(serde_json::to_string(viper_budgets)?)
+    };
     
     sqlx::query(
-        "INSERT INTO deployment_queue (id, market_id, market_type, raptors, vipers, status)
-         VALUES (?, ?, ?, ?, ?, 'pending')"
+        "INSERT INTO deployment_queue (id, market_id, market_type, raptors, vipers, viper_budgets, status)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending')"
     )
     .bind(deployment_id)
     .bind(market_id)
     .bind(market_type)
     .bind(&raptors_json)
     .bind(&vipers_json)
+    .bind(&budgets_json)
     .execute(pool).await?;
     
     info!(deployment_id, market_id, market_type, "📋 Deployment request queued");
     Ok(())
 }
 
+/// One pending squadron-deployment request from the `deployment_queue` table.
+#[derive(Debug, Clone)]
+pub struct PendingDeployment {
+    pub id: String,
+    pub market_id: String,
+    pub market_type: String,
+    pub raptors: Vec<String>,
+    pub vipers: Vec<String>,
+    /// Per-viper capital budgets (viper kind → max-exposure USDC) set at deploy time.
+    pub viper_budgets: std::collections::HashMap<String, f64>,
+}
+
 /// Fetch pending deployment requests from the queue.
-pub async fn fetch_pending_deployments() -> Vec<(String, String, String, Vec<String>, Vec<String>)> {
+pub async fn fetch_pending_deployments() -> Vec<PendingDeployment> {
     let Some(pool) = pool() else {
         return Vec::new();
     };
     
     sqlx::query(
-        "SELECT id, market_id, market_type, raptors, vipers FROM deployment_queue
+        "SELECT id, market_id, market_type, raptors, vipers, viper_budgets FROM deployment_queue
          WHERE status = 'pending' ORDER BY created_at ASC LIMIT 10"
     )
     .fetch_all(pool).await.ok()
@@ -1164,9 +1190,13 @@ pub async fn fetch_pending_deployments() -> Vec<(String, String, String, Vec<Str
         let market_type = r.try_get::<String, _>(2).ok()?;
         let raptors_json = r.try_get::<String, _>(3).ok()?;
         let vipers_json = r.try_get::<String, _>(4).ok()?;
+        let budgets_json = r.try_get::<Option<String>, _>(5).ok().flatten();
         let raptors: Vec<String> = serde_json::from_str(&raptors_json).ok()?;
         let vipers: Vec<String> = serde_json::from_str(&vipers_json).ok()?;
-        Some((id, market_id, market_type, raptors, vipers))
+        let viper_budgets = budgets_json
+            .and_then(|j| serde_json::from_str(&j).ok())
+            .unwrap_or_default();
+        Some(PendingDeployment { id, market_id, market_type, raptors, vipers, viper_budgets })
     }).collect())
     .unwrap_or_default()
 }

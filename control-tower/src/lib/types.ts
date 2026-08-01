@@ -445,6 +445,8 @@ export interface DeploySquadronRequest {
   market_id?: string;
   raptors?: string[];
   vipers?: string[];
+  /** Per-viper capital budgets: viper kind id → max-exposure USDC. */
+  viper_budgets?: Record<string, number>;
 }
 
 /** Response from POST /api/squadrons/deploy. */

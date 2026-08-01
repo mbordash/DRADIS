@@ -84,6 +84,7 @@ where
         no_token: &str,
         _raptors: &[String],
         _vipers: &[String],
+        viper_budgets: &HashMap<String, f64>,
     ) -> Result<tokio::task::JoinHandle<()>, String> {
         info!(
             squadron_id = %squadron_id,
@@ -128,9 +129,14 @@ where
         // Classify and link
         squadron.classify_and_link().await;
 
-        // Load squadron-scoped dynamic config
+        // Load squadron-scoped dynamic config, then apply any per-viper capital
+        // budgets chosen at deploy time (persisted so restarts keep them).
         let squadron_cfg = DynamicConfig::load_or_init_for_squadron(&squadron.id).await;
-        let dynamic_config = Arc::new(RwLock::new((*squadron_cfg).clone()));
+        let mut cfg = (*squadron_cfg).clone();
+        if apply_viper_budgets(&mut cfg, viper_budgets) {
+            cfg.save_for_squadron(&squadron.id).await;
+        }
+        let dynamic_config = Arc::new(RwLock::new(cfg));
         crate::helpers::dynamic_config::register_squadron_config_handle(
             &squadron.id,
             Arc::clone(&dynamic_config),
@@ -214,6 +220,46 @@ where
     }
 }
 
+/// Apply deploy-time per-viper capital budgets to a squadron's `DynamicConfig`.
+///
+/// Maps each viper kind id (taxonomy `viper_kind.id`) to its `*_max_exposure_usdc`
+/// field. Returns `true` if any budget was applied (caller persists the config).
+/// Unknown kinds and non-finite/negative amounts are ignored with a warning.
+fn apply_viper_budgets(
+    cfg: &mut DynamicConfig,
+    budgets: &HashMap<String, f64>,
+) -> bool {
+    let mut applied = false;
+    for (kind, usdc) in budgets {
+        if !usdc.is_finite() || *usdc < 0.0 {
+            warn!("Ignoring invalid deploy budget for viper '{}': {}", kind, usdc);
+            continue;
+        }
+        let Ok(amount) = rust_decimal::Decimal::try_from(*usdc) else {
+            warn!("Ignoring unrepresentable deploy budget for viper '{}': {}", kind, usdc);
+            continue;
+        };
+        let slot = match kind.as_str() {
+            "arbitrage"    => &mut cfg.arbitrage_max_exposure_usdc,
+            "time_decay"   => &mut cfg.time_decay_max_exposure_usdc,
+            "momentum"     => &mut cfg.momentum_max_exposure_usdc,
+            "maker"        => &mut cfg.maker_max_exposure_usdc,
+            "basis"        => &mut cfg.basis_max_exposure_usdc,
+            "gboost"       => &mut cfg.gboost_max_exposure_usdc,
+            "trendcapture" => &mut cfg.trendcapture_max_exposure_usdc,
+            "convergence"  => &mut cfg.convergence_max_exposure_usdc,
+            other => {
+                warn!("Unknown viper kind '{}' in deploy budgets — skipped", other);
+                continue;
+            }
+        };
+        *slot = amount;
+        info!("💰 Deploy budget: {} max exposure set to ${}", kind, amount);
+        applied = true;
+    }
+    applied
+}
+
 /// Market info needed for squadron spawning.
 pub struct MarketInfo {
     pub question: String,
@@ -278,7 +324,10 @@ where
         
         info!("📋 Admiral Adama: {} pending deployment(s) found", pending.len());
         
-        for (deployment_id, market_id, market_type, raptors, vipers) in pending {
+        for dep in pending {
+            let crate::helpers::db::PendingDeployment {
+                id: deployment_id, market_id, market_type, raptors, vipers, viper_budgets,
+            } = dep;
             // Mark as processing
             if let Err(e) = crate::helpers::db::update_deployment_status(
                 &deployment_id, "processing", None, None
@@ -321,6 +370,7 @@ where
                 &market_info.no_token,
                 &raptors,
                 &vipers,
+                &viper_budgets,
             ).await {
                 Ok(handle) => {
                     // Register in CAG with the JoinHandle

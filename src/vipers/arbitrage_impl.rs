@@ -523,8 +523,12 @@ impl Strategy for ArbitrageStrategyImpl {
         };
         if let Some((pos, token, bid, fee_bps, leg)) = single_leg {
             let age_secs = (chrono::Utc::now() - pos.opened_at).num_seconds();
+            #[cfg(feature = "intl_clob")]
             let arbiter_window =
                 crate::helpers::balance::MAX_WAIT_SECS_WINDOW + 60; // grace margin
+            // helpers::balance is intl-only; mirror MAX_WAIT_SECS_WINDOW for US builds.
+            #[cfg(not(feature = "intl_clob"))]
+            let arbiter_window = 600 + 60;
             if pos.fill_confirmed_at.is_some() && age_secs > arbiter_window && bid > Decimal::ZERO {
                 info!(
                     " Arb naked-leg flatten — holding only {} leg ({} shares, age {}s) \
