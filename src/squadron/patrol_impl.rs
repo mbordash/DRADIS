@@ -615,6 +615,9 @@ impl Squadron {
                                                       held, sn, config::EXIT_RETRY_COOLDOWN_SECS);
                                                 if let Some(p) = positions.lock().await.get_mut(&pos_key) { p.shares = held; }
                                                 last_trade_time.insert(sn.clone(), Instant::now());
+                                                // Bug #6: placement was rejected — clear the viper's exit-signal
+                                                // cooldown so it can re-emit the exit after EXIT_RETRY_COOLDOWN.
+                                                if let Some(strat) = strategies.iter().find(|s| s.name() == sn) { strat.on_exit_order_failed(&tid_m); }
                                                 continue;
                                             }
                                             // (a?) on-chain also reads 0 — but the balance endpoint
@@ -637,6 +640,8 @@ impl Squadron {
                                                 warn!("⚠️ EXIT rejected [{}] but fill confirmed <{}s ago: settlement lag (balance endpoint not caught up) — holding position, retrying exit in {}s",
                                                       sn, config::FRESH_FILL_SETTLEMENT_GRACE_SECS, config::EXIT_RETRY_COOLDOWN_SECS);
                                                 last_trade_time.insert(sn.clone(), Instant::now());
+                                                // Bug #6: placement was rejected — clear the viper's exit-signal cooldown.
+                                                if let Some(strat) = strategies.iter().find(|s| s.name() == sn) { strat.on_exit_order_failed(&tid_m); }
                                                 continue;
                                             }
                                             // (a) confirmed gone on-chain — book the exit NOW at the estimated
@@ -674,6 +679,12 @@ impl Squadron {
                                             }
                                         } else {
                                             consecutive_failures += 1;
+                                            // Bug #6: genuine placement rejection (never reached the book) —
+                                            // clear the viper's exit-signal cooldown so the rejected attempt
+                                            // doesn't suppress the next legitimate exit. FAK misses above are
+                                            // NOT cleared: those placed successfully and the cooldown
+                                            // intentionally paces re-fires there.
+                                            if let Some(strat) = strategies.iter().find(|s| s.name() == sn) { strat.on_exit_order_failed(&tid_m); }
                                         }
                                         continue;
                                     }

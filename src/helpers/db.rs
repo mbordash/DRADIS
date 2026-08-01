@@ -121,6 +121,24 @@ pub fn pool_for_opt(asset: Option<&str>) -> Option<SqlitePool> {
     }
 }
 
+/// Like [`pool_for_opt`], but retries briefly when the pool is missing so API
+/// handlers that fire during process startup don't error while pool init is
+/// still in flight (roadmap bug #7: the API server can bind before all asset
+/// pools are initialised — e.g. the `us` pool inits after venue connect).
+/// Steady-state cost is zero: the first attempt succeeds once pools exist.
+pub async fn pool_for_opt_retry(asset: Option<&str>) -> Option<SqlitePool> {
+    const ATTEMPTS: u32 = 6;
+    for attempt in 0..ATTEMPTS {
+        if let Some(p) = pool_for_opt(asset) {
+            return Some(p);
+        }
+        if attempt + 1 < ATTEMPTS {
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+    None
+}
+
 /// Return the lowercase asset names for all initialised pools, sorted
 /// alphabetically.  Used by `GET /api/assets` to tell the Control Tower
 /// which asset views are available.

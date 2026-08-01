@@ -557,7 +557,7 @@ async fn get_pnl_history(Query(q): Query<AssetQuery>) -> Response {
 
     // If asset is specified, return single-asset history (legacy behavior)
     if let Some(asset_name) = q.asset.as_deref() {
-        match db::pool_for_opt(Some(asset_name)) {
+        match db::pool_for_opt_retry(Some(asset_name)).await {
             Some(pool) => {
                 let history = db::get_pnl_history(&pool, limit).await;
                 debug!("Successfully retrieved PNL history for asset: {}", asset_name);
@@ -754,7 +754,7 @@ async fn get_telemetry_history(
 async fn get_trades(Query(q): Query<AssetQuery>) -> Response {
     debug!("Received GET /api/trades request with limit: {:?}", q.limit);
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
-    match db::pool_for_opt(q.asset.as_deref()) {
+    match db::pool_for_opt_retry(q.asset.as_deref()).await {
         Some(pool) => {
             let trades = db::get_recent_trades(&pool, limit).await;
             debug!("Successfully retrieved trades");
@@ -774,7 +774,7 @@ async fn get_trades(Query(q): Query<AssetQuery>) -> Response {
 /// of in-flight positions even before they appear as completed trades.
 async fn get_open_positions(Query(q): Query<AssetQuery>) -> Response {
     debug!("Received GET /api/positions request");
-    match db::pool_for_opt(q.asset.as_deref()) {
+    match db::pool_for_opt_retry(q.asset.as_deref()).await {
         Some(pool) => {
             let positions = db::get_open_positions(&pool).await;
             Json(positions).into_response()
@@ -791,7 +791,7 @@ async fn get_open_positions(Query(q): Query<AssetQuery>) -> Response {
 /// Returns only pending positions (Viper Launches) - orders placed but not yet confirmed on-chain.
 async fn get_pending_positions(Query(q): Query<AssetQuery>) -> Response {
     debug!("Received GET /api/positions/pending request");
-    match db::pool_for_opt(q.asset.as_deref()) {
+    match db::pool_for_opt_retry(q.asset.as_deref()).await {
         Some(pool) => {
             let positions = db::get_pending_positions(&pool).await;
             Json(positions).into_response()
@@ -808,7 +808,7 @@ async fn get_pending_positions(Query(q): Query<AssetQuery>) -> Response {
 /// Returns only confirmed positions (Viper Missions In-Flight) - verified on-chain.
 async fn get_confirmed_positions(Query(q): Query<AssetQuery>) -> Response {
     debug!("Received GET /api/positions/confirmed request");
-    match db::pool_for_opt(q.asset.as_deref()) {
+    match db::pool_for_opt_retry(q.asset.as_deref()).await {
         Some(pool) => {
             let positions = db::get_confirmed_positions(&pool).await;
             Json(positions).into_response()
@@ -825,7 +825,7 @@ async fn get_confirmed_positions(Query(q): Query<AssetQuery>) -> Response {
 /// Purges a specific row from `open_positions` by token_id (decimal U256 string).
 async fn delete_open_position(Path(token_id): Path<String>, Query(q): Query<AssetQuery>) -> Response {
     debug!("Received DELETE /api/positions/{}", token_id);
-    let pool = match db::pool_for_opt(q.asset.as_deref()) {
+    let pool = match db::pool_for_opt_retry(q.asset.as_deref()).await {
         Some(p) => p,
         None => {
             error!("Database pool not available for DELETE /api/positions");
@@ -1111,7 +1111,7 @@ async fn manual_exit(
 /// Each row: { id, ts, model, trade_count, session_pnl, analysis }
 async fn get_llm_recommendations(Query(q): Query<AssetQuery>) -> Response {    debug!("Received GET /api/llm/recommendations request with limit: {:?}", q.limit);
     let limit = q.limit.unwrap_or(10).clamp(1, 50);
-    match db::pool_for_opt(q.asset.as_deref()) {
+    match db::pool_for_opt_retry(q.asset.as_deref()).await {
         Some(pool) => {
             let recs = db::get_recent_llm_recommendations(&pool, limit).await;
             debug!("Successfully retrieved {} LLM recommendations", recs.len());
@@ -1481,7 +1481,9 @@ async fn get_squadron_config(
         }
     }
 
-    match db::pool() {
+    // Retry-aware: this endpoint is polled by the dashboard immediately at boot,
+    // before the primary pool may have initialised (roadmap bug #7).
+    match db::pool_for_opt_retry(None).await {
         Some(pool) => {
             if let Some(json) = db::squadron_config_get(&pool, &id).await {
                 match serde_json::from_str::<DynamicConfig>(&json) {

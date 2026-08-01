@@ -734,7 +734,28 @@ pub fn spawn_lifecycle_task(
                 _ = ticker.tick() => {
                     let flattened = lifecycle.reconcile(venue.as_ref(), &positions).await;
                     for leg in flattened {
-                        let pnl = (leg.exit_price - leg.avg_entry) * leg.shares;
+                        // Bug #9 hardening: the in-memory position map's avg_entry can be
+                        // stale (e.g. adopted/topped-up fills). Cross-check against the DB
+                        // open_positions row — written at entry and chain-stamped — and
+                        // prefer it when the two diverge, logging the divergence so ghost
+                        // validation can quantify how often the map drifts.
+                        let tid_str = leg.token_id.to_string();
+                        let avg_entry = match db::pool_for(&asset) {
+                            Some(p) => match db::lookup_open_position_strategy(&p, &tid_str).await {
+                                Some((db_entry, _)) if db_entry > dec!(0) => {
+                                    if db_entry != leg.avg_entry {
+                                        warn!(
+                                            " [{strategy}] flatten avg_entry divergence: position map ${map:.4} vs DB ${db:.4} — using DB",
+                                            strategy = leg.strategy, map = leg.avg_entry, db = db_entry,
+                                        );
+                                    }
+                                    db_entry
+                                }
+                                _ => leg.avg_entry,
+                            },
+                            None => leg.avg_entry,
+                        };
+                        let pnl = (leg.exit_price - avg_entry) * leg.shares;
                         // Resolve the leg's real YES/NO outcome from the entries
                         // table so the trade isn't mislabelled "Sell" (the bare order
                         // direction). The venue-neutral lifecycle only knows token ids.
@@ -748,14 +769,13 @@ pub fn spawn_lifecycle_task(
                             " [{strategy}] lifecycle flatten recorded: {market} entry={entry:.4} exit={exit:.4} shares={shares} pnl={pnl:.4}",
                             strategy = leg.strategy,
                             market   = leg.market_name,
-                            entry    = leg.avg_entry,
+                            entry    = avg_entry,
                             exit     = leg.exit_price,
                             shares   = leg.shares,
                         );
                         let asset_c    = asset.clone();
                         let strat      = leg.strategy.clone();
                         let market     = leg.market_name.clone();
-                        let avg_entry  = leg.avg_entry;
                         let exit_price = leg.exit_price;
                         let shares     = leg.shares;
                         // Book synchronously (awaited, not a detached spawn): a container
@@ -774,6 +794,12 @@ pub fn spawn_lifecycle_task(
                             pnl,
                             "LifecycleFlatten".to_string(),
                         ).await;
+                        // Close the open_positions row now that the flatten is booked, so a
+                        // stale row can't linger until the next chain-sync purge and tempt
+                        // ChainReconcile into inventing a second exit for the same leg.
+                        if let Some(p) = db::pool_for(&asset) {
+                            db::close_open_position(&p, &leg.strategy, &tid_str).await;
+                        }
                     }
                 }
             }

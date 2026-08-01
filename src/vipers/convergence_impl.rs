@@ -555,4 +555,13 @@ impl Strategy for ConvergenceStrategyImpl {
     fn venue(&self) -> &'static str { "Hourly" }
     fn max_exposure(&self) -> Decimal { config::CONVERGENCE_MAX_EXPOSURE_USDC }
     fn risk_model(&self) -> &'static str { "Macro conviction (pulse+CVD+OI)" }
+
+    /// Exit order was rejected at placement — clear the soft-exit cooldown so
+    /// the rejected attempt does not suppress the next discretionary exit
+    /// (roadmap bug #6). Safety exits were never gated by this cooldown.
+    fn on_exit_order_failed(&self, _token_id: &crate::venues::core::MarketId) {
+        if let Ok(mut last) = self.last_exit_signal_at.lock() {
+            *last = None;
+        }
+    }
 }

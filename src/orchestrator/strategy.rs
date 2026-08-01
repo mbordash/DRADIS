@@ -80,4 +80,13 @@ pub trait Strategy: Send + Sync {
     /// Risk model label shown in the startup attachment log.
     /// Default: "Unknown"
     fn risk_model(&self) -> &'static str { "Unknown" }
+
+    /// Notify the strategy that an exit order it emitted was REJECTED at
+    /// placement (never reached the book). Strategies that arm an exit-signal
+    /// cooldown at emission time should clear it here so a rejected order does
+    /// not eat the cooldown window and suppress the next legitimate exit
+    /// (roadmap bug #6). NOT called on FAK misses — those are successful
+    /// placements and the cooldown intentionally paces re-fires there.
+    /// Default: no-op.
+    fn on_exit_order_failed(&self, _token_id: &crate::venues::core::MarketId) {}
 }

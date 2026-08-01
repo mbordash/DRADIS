@@ -885,6 +885,15 @@ impl Strategy for TrendReversalStrategyImpl {
     fn risk_model(&self) -> &'static str {
         if config::TRENDREVERSAL_MODE { "Drift fade (mean-reversion)" } else { "One-sided drift" }
     }
+
+    /// Exit order was rejected at placement — clear the soft-exit cooldown so
+    /// the rejected attempt does not suppress the next discretionary exit
+    /// (roadmap bug #6). Safety exits were never gated by this cooldown.
+    fn on_exit_order_failed(&self, _token_id: &MarketId) {
+        if let Ok(mut last) = self.last_exit_signal_at.lock() {
+            *last = None;
+        }
+    }
 }
 
 impl TrendReversalStrategyImpl {

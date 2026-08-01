@@ -46,20 +46,56 @@ pub async fn run_market_monitor(
     market_tx: watch::Sender<MarketState>,
 ) {
     let mut interval = tokio::time::interval(std::time::Duration::from_secs(90));
+    // A widened (180 s) scan overruns the 90 s tick; don't burst-fire the missed
+    // ticks afterwards — just resume the normal cadence.
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    // Escalating backoff for Gamma API stalls (roadmap bug #8).
+    // 1st timeout → retry next tick at the normal 90 s cap; 2nd → widen the cap
+    // to 180 s (slow-but-alive API); 3rd+ → circuit-break: log ONE warn and skip
+    // the next few ticks entirely so a struggling API isn't hammered and the log
+    // isn't spammed every 90 s. Any successful scan resets the breaker.
+    let mut consecutive_timeouts: u32 = 0;
+    let mut skip_ticks: u32 = 0;
     loop {
         interval.tick().await;
+        if skip_ticks > 0 {
+            skip_ticks -= 1;
+            continue;
+        }
         // Hard cap on market scan — see MARKET_SCAN_TIMEOUT_SECS comment above.
+        // Widened to 2× once the API has already shown one consecutive stall.
+        let scan_cap_secs = if consecutive_timeouts >= 1 {
+            MARKET_SCAN_TIMEOUT_SECS * 2
+        } else {
+            MARKET_SCAN_TIMEOUT_SECS
+        };
         let scan_result = tokio::time::timeout(
-            std::time::Duration::from_secs(MARKET_SCAN_TIMEOUT_SECS),
+            std::time::Duration::from_secs(scan_cap_secs),
             get_market_pair(&http, &crypto_filter),
         ).await;
         let (candidate, maker_candidate) = match scan_result {
-            Ok(pair) => pair,
+            Ok(pair) => {
+                if consecutive_timeouts > 0 {
+                    info!("✅ Market monitor: Gamma API recovered after {} timed-out scan(s)", consecutive_timeouts);
+                }
+                consecutive_timeouts = 0;
+                pair
+            }
             Err(_) => {
-                tracing::warn!(
-                    "⚠️ Market monitor: get_market_pair timed out after {}s — skipping this poll cycle",
-                    MARKET_SCAN_TIMEOUT_SECS
-                );
+                consecutive_timeouts += 1;
+                if consecutive_timeouts >= 3 {
+                    // Circuit-break: stand down for 3 ticks (~4.5 min) before probing again.
+                    skip_ticks = 3;
+                    tracing::warn!(
+                        "🚨 Market monitor circuit-break: get_market_pair timed out {} consecutive times (cap {}s) — pausing scans for {} ticks",
+                        consecutive_timeouts, scan_cap_secs, skip_ticks
+                    );
+                } else {
+                    tracing::warn!(
+                        "⚠️ Market monitor: get_market_pair timed out after {}s ({} consecutive) — retrying next poll cycle",
+                        scan_cap_secs, consecutive_timeouts
+                    );
+                }
                 continue;
             }
         };
