@@ -421,7 +421,9 @@ fn rehedge_limit_if_viable(ask: Decimal, filled_avg_entry: Decimal, buffer: Deci
 mod tests {
     use super::*;
 
-    const BUF: Decimal = crate::config::ARB_FAK_REHEDGE_BUFFER; // 0.02
+    // Explicit buffer literal — tests verify the helper's math, deliberately
+    // independent of the tunable `config::ARB_FAK_REHEDGE_BUFFER` value.
+    const BUF: Decimal = dec!(0.02);
 
     #[test]
     fn rehedge_viable_when_pair_cost_clears_payout() {
