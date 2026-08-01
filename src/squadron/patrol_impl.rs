@@ -617,6 +617,28 @@ impl Squadron {
                                                 last_trade_time.insert(sn.clone(), Instant::now());
                                                 continue;
                                             }
+                                            // (a?) on-chain also reads 0 — but the balance endpoint
+                                            // ITSELF lags settlement, so a freshly-adopted fill can
+                                            // read 0 both on the exchange AND here (2026-07-30/31
+                                            // trades 308/310: ToxicFill fired seconds after quote-pull
+                                            // fill adoption, both checks read 0, an est. exit was
+                                            // booked — then the surviving shares were sold again later
+                                            // and the same loss was recorded twice). If the fill was
+                                            // confirmed within the settlement grace window, trust the
+                                            // fill over the balance reads: hold and retry.
+                                            let fill_is_fresh = {
+                                                let map = positions.lock().await;
+                                                map.get(&pos_key)
+                                                    .and_then(|p| p.fill_confirmed_at)
+                                                    .map(|fc| (Utc::now() - fc).num_seconds() < config::FRESH_FILL_SETTLEMENT_GRACE_SECS)
+                                                    .unwrap_or(false)
+                                            };
+                                            if fill_is_fresh {
+                                                warn!("⚠️ EXIT rejected [{}] but fill confirmed <{}s ago: settlement lag (balance endpoint not caught up) — holding position, retrying exit in {}s",
+                                                      sn, config::FRESH_FILL_SETTLEMENT_GRACE_SECS, config::EXIT_RETRY_COOLDOWN_SECS);
+                                                last_trade_time.insert(sn.clone(), Instant::now());
+                                                continue;
+                                            }
                                             // (a) confirmed gone on-chain — book the exit NOW at the estimated
                                             // price and close the DB row.
                                             // The old path credited session P&L silently with no trade record
@@ -1241,18 +1263,39 @@ impl Squadron {
                                         info!("👻 GHOST_MODE MakerCancel [{}]: {} (simulated quote-pull)", sn, tok);
                                         dec!(0)
                                     } else {
-                                        let m = crate::helpers::balance::cancel_resting_orders_for_token(&trading_client, &tok).await;
+                                        let (order_found, m) = crate::helpers::balance::cancel_resting_orders_for_token(&trading_client, &tok).await;
                                         // ── Complete-fill guard ──────────────────────────
                                         // A quote that FULLY filled vanishes from the CLOB
                                         // open-orders list, so the cancel sweep reports zero
                                         // matched (2026-07-24 trade 288: an 8-share YES fill
                                         // was dropped as "unfilled", re-adopted under the
                                         // WRONG strategy at market switch, and SL'd −$0.40).
-                                        // When nothing was matched, cross-check the on-chain
-                                        // balance before discarding the position.
-                                        if m < config::MIN_ORDER_SHARES {
-                                            crate::helpers::balance::onchain_balance_for_token(&trading_client, &tok).await
-                                        } else { m }
+                                        // When the order is GONE, cross-check the on-chain
+                                        // balance — WITH settlement-lag retries, because the
+                                        // balance endpoint lags a fresh fill by up to ~15s
+                                        // (2026-07-29 trade 300: fill landed <10s before the
+                                        // pull, a single immediate balance check read 0, the
+                                        // position was dropped and rode unmanaged to $0
+                                        // settlement, −$3.84).
+                                        if m >= config::MIN_ORDER_SHARES {
+                                            m
+                                        } else if !order_found {
+                                            let mut held = crate::helpers::balance::onchain_balance_for_token(&trading_client, &tok).await;
+                                            let mut attempt = 1u32;
+                                            while held < config::MIN_ORDER_SHARES && attempt < config::SETTLEMENT_LAG_RETRY_ATTEMPTS {
+                                                tokio::time::sleep(std::time::Duration::from_secs(config::SETTLEMENT_LAG_RETRY_DELAY_SECS)).await;
+                                                held = crate::helpers::balance::onchain_balance_for_token(&trading_client, &tok).await;
+                                                attempt += 1;
+                                                if held >= config::MIN_ORDER_SHARES {
+                                                    warn!("⚠️ Maker quote-pull [{}]: {} — balance appeared on retry {} ({:.4} shares): settlement lag confirmed", sn, tok, attempt, held);
+                                                }
+                                            }
+                                            held
+                                        } else {
+                                            // Order was found on the book and cancelled with
+                                            // sub-threshold matched size — genuinely unfilled.
+                                            m
+                                        }
                                     };
                                     // ── Fill-adoption guard ───────────────────────────────
                                     // A resting quote can partially or fully fill in the

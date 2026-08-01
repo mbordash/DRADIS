@@ -716,6 +716,19 @@ pub const STOP_LOSS_COOLDOWN_SECS: u64 = 180;
 /// This prevents log floods and API hammering when FAK exits fail due to thin books.
 pub const EXIT_RETRY_COOLDOWN_SECS: u64 = 5;
 
+/// Balance re-check attempts when a maker quote-pull finds the resting order GONE but the
+/// on-chain balance reads zero (fully-filled order + settlement lag). Aggressive: 3 attempts
+/// (~10s window) — accepts slightly more residual risk to keep the signal loop snappy.
+pub const SETTLEMENT_LAG_RETRY_ATTEMPTS: u32 = 3;
+
+/// Seconds between successive balance re-checks in the quote-pull settlement-lag loop.
+pub const SETTLEMENT_LAG_RETRY_DELAY_SECS: u64 = 5;
+
+/// Exit FAK "not enough balance" rejections within this many seconds of fill confirmation
+/// are always treated as settlement lag (hold + retry), never booked as est. exits.
+/// Aggressive: 60s — shortest grace, frees the slot sooner.
+pub const FRESH_FILL_SETTLEMENT_GRACE_SECS: i64 = 60;
+
 /// Cooldown after a post-only maker quote is rejected for crossing the book.
 /// Prevents tick-rate re-quote hammering while the book stays crossed.
 /// Aggressive: short cooldown — get back on the book quickly.

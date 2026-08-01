@@ -244,16 +244,22 @@ pub async fn onchain_balance_for_token(
 /// Used by the Maker's book-turn quote-pull (patrol `MakerCancel` handling) to pull
 /// an UNFILLED resting quote before informed flow picks it off. Resolves the
 /// on-chain U256 from the venue-neutral `MarketId`, then delegates to
-/// [`cancel_resting_orders`]. Returns the total shares already MATCHED on the
-/// cancelled order(s) — non-zero means a partial fill landed before the pull and
-/// the caller must adopt those shares as a live position instead of dropping them.
+/// [`cancel_resting_orders`]. Returns `(order_found, matched)`:
+/// - `order_found` is true when at least one resting order was still on the book
+///   (it was cancelled). False means the order VANISHED — either it fully filled
+///   (shares held but possibly not yet visible on the balance endpoint) or it was
+///   never resting; callers must NOT treat this as "unfilled" without re-checking
+///   the on-chain balance with settlement-lag retries.
+/// - `matched` is the total shares already MATCHED on the cancelled order(s) —
+///   non-zero means a partial fill landed before the pull and the caller must
+///   adopt those shares as a live position instead of dropping them.
 pub async fn cancel_resting_orders_for_token(
     client: &Arc<ClobClient<Authenticated<Normal>>>,
     token_id: &MarketId,
-) -> Decimal {
+) -> (bool, Decimal) {
     match u256_from_market_id(token_id) {
-        Ok(u) => cancel_resting_orders(client, u).await.1,
-        Err(_) => dec!(0),
+        Ok(u) => cancel_resting_orders(client, u).await,
+        Err(_) => (false, dec!(0)),
     }
 }
 
@@ -357,35 +363,23 @@ pub async fn reconcile_orphaned_positions(
         };
 
         // Determine which strategy should own this position.
-        // Priority: (1) strategy recorded in the entry log, (2) first in adoption_order.
-        let adopted_strategy = if let Some(ref logged) = logged_strategy {
-            // Verify the strategy isn't already tracking this token before using it.
+        // Priority: (1) strategy recorded in the entry log, (2) MakerStrategy when the
+        // token belongs to the maker market (side_label carries "(maker)") — adopting a
+        // maker fill under whichever strategy happens to be first in adoption_order
+        // applies the wrong TP/SL (2026-07-30 trade 304: a maker fill adopted under
+        // MomentumStrategy was stop-lossed the same second at −37%), (3) first available
+        // strategy in adoption_order.
+        let adopted_strategy = {
+            let mut candidates: Vec<String> = Vec::new();
+            if let Some(ref logged) = logged_strategy {
+                candidates.push(logged.clone());
+            }
+            if side_label.contains("maker") {
+                candidates.push("MakerStrategy".to_string());
+            }
+            candidates.extend(adoption_order.iter().cloned());
             let map = positions.lock().await;
-            if !map.contains_key(&(logged.clone(), market.clone())) {
-                Some(logged.clone())
-            } else {
-                // Logged strategy already has this token — fall back to adoption_order.
-                drop(map);
-                let mut fallback = None;
-                for s in adoption_order {
-                    let map = positions.lock().await;
-                    if !map.contains_key(&(s.clone(), market.clone())) {
-                        fallback = Some(s.clone());
-                        break;
-                    }
-                }
-                fallback
-            }
-        } else {
-            let mut fallback = None;
-            for s in adoption_order {
-                let map = positions.lock().await;
-                if !map.contains_key(&(s.clone(), market.clone())) {
-                    fallback = Some(s.clone());
-                    break;
-                }
-            }
-            fallback
+            candidates.into_iter().find(|s| !map.contains_key(&(s.clone(), market.clone())))
         };
 
         if let Some(strategy_name) = adopted_strategy {
