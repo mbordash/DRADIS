@@ -859,6 +859,11 @@ impl Strategy for MakerStrategyImpl {
             // position) is still cut. See MAKER_CATASTROPHIC_SL_MULT.
             let catastrophic_pct = effective_stop_pct * config::MAKER_CATASTROPHIC_SL_MULT;
             if profit_pct <= -catastrophic_pct {
+                // Loss exits arm the same re-entry lockout as ToxicFill: without it the
+                // maker re-quotes the falling side within 1s of the stop (2026-08-02:
+                // 24-share NO re-quote placed 1s after a −15% SL, saved only by the
+                // oracle-drift pull 52s later).
+                arm_maker_toxic_cooldown(token_id.as_str());
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
                         token_id: token_id.clone(),
@@ -899,6 +904,8 @@ impl Strategy for MakerStrategyImpl {
                 && secs_since_fill >= config::MAKER_MIN_HOLD_SECS_BEFORE_STOP
                 && profit_pct <= -effective_stop_pct
             {
+                // Same re-entry lockout as the catastrophic stop above.
+                arm_maker_toxic_cooldown(token_id.as_str());
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
                         token_id: token_id.clone(),                        price: bid,
