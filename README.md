@@ -1,6 +1,6 @@
 # DRADIS
 
-> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Polymarket. Eight autonomous Viper strategies, a Raptor recon layer (Price, Funding, Derivatives, Tide "Institutional Pulse", Horizon "TradFi Velocity", and a venue-neutral Sports line-movement scout), a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor that delivers optimization recommendations via Ollama (local or remote) + Telegram & OpenClaw.
+> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Polymarket. Eight autonomous Viper strategies, a Raptor recon layer (Price, Funding, Derivatives, Tide "Institutional Pulse", Horizon "TradFi Velocity", and a venue-neutral Sports line-movement scout), a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor (Ollama local/remote, OpenAI-compatible, or Anthropic) that delivers optimization recommendations via Telegram & OpenClaw — and can propose or autonomously apply live config changes under a tiered, guard-railed autonomy policy.
 
 ![Rust](https://img.shields.io/badge/Rust-1.95+-orange?logo=rust&logoColor=white)
 ![Tokio](https://img.shields.io/badge/Tokio-async%20runtime-darkgreen?logo=rust&logoColor=white)
@@ -250,6 +250,10 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 | `/api/taxonomy/vipers` | GET | Viper kinds for market class |
 | `/api/telemetry` | GET | Live Raptor signal snapshots |
 | `/api/llm/recommendations` | GET | Recent LLM Advisor analyses |
+| `/api/llm/actions` | GET | AI config-change audit trail (proposed/applied/rejected/…) |
+| `/api/llm/actions/{id}/approve` | POST | Approve a proposed AI change (revalidated, then applied) |
+| `/api/llm/actions/{id}/reject` | POST | Reject a proposed AI change |
+| `/api/setup/autonomy` | GET/PUT | AI autonomy tier, kill switch, breaker reset (admin-gated) |
 
 All data endpoints accept `?asset=btc` query param to scope to a specific asset pool.
 
@@ -393,7 +397,8 @@ DRADIS ships with a real-time web dashboard called **Control Tower** built on Ne
 | **Telemetry**      | Live Raptor macro cards — **Tide** (ETF premium, institutional pulse), **Horizon** (TradFi velocity, VIX proxy), greyed outside US market hours |
 | **Trade Log**      | Last N completed trades with strategy, side, entry/exit prices, shares, P&L, exit reason         |
 | **CAG Registry**   | Active squadrons with market, state, deployed time, and **+ Deploy** button                      |
-| **Setup**          | Admin-gated credential management — venue keys, RPC, Alpaca, Telegram — with test-connection buttons and one-click engine restart |
+| **AI Actions**     | Full audit trail of LLM-proposed config changes — status lifecycle, delta %, tier, outcome score — with inline apply/reject for pending proposals |
+| **Setup**          | Admin-gated credential management — venue keys, RPC, Alpaca, Telegram — with test-connection buttons, one-click engine restart, and the **AI Autonomy** panel (tier selector, kill switch, circuit-breaker reset) |
 
 ### Live Config Editing
 
@@ -481,6 +486,49 @@ LLM_API_KEY=sk-ant-...
 LLM_MODEL=claude-haiku-4-5
 ```
 
+### AI-Authored Config Patches (Autonomy Tiers)
+
+Beyond prose recommendations, the advisor appends a machine-readable block of
+proposed `DynamicConfig` changes to each analysis. Every proposal is validated
+against the config schema (exact keys, type coercion, min/max clamping, max 4
+per cycle), recorded in the `llm_actions` audit table, and TTL-bound (30 min —
+stale advice never applies). What happens next depends on the autonomy tier,
+set live from **Setup → AI Autonomy** (no restart):
+
+| Tier | Name | Behaviour |
+|------|------|-----------|
+| 1 | **Recommend** | Nothing auto-applies. Proposals queue in the dashboard; a human presses **apply** (revalidated against the *current* config first) or **reject**. |
+| 2 | **Limited** | Safe changes apply immediately: schema-clamped, per-field delta capped (±20% default), rate-limited (1 batch/hour default), **never money fields** (`*_usdc`, budgets, collateral). Everything else queues for approval. |
+| 3 | **Autonomous** | The AI applies its changes directly (still schema-clamped; `ghost_mode` flips always require a human). |
+
+Guardrails at every tier:
+
+- **Kill switch** — one click in Setup (or `LLM_AUTONOMY_KILL=1`) forces recommend-only.
+- **Circuit breaker** — if session P&L draws down past `LLM_BREAKER_DRAWDOWN_USDC`
+  (default $25) within the watch window after an auto-apply, all recent AI changes
+  are reverted via their stored inverse patches, autonomy is demoted to tier 1
+  until an operator resets it, and a Telegram alert fires.
+- **Full audit trail** — the **AI Actions** tab shows every proposal's lifecycle
+  (`proposed → applied / rejected / expired / reverted / failed`), and each
+  applied change is outcome-scored (session-P&L delta after
+  `LLM_OUTCOME_HORIZON_SECS`, default 2h). Rejections, reverts, and scores are
+  injected back into future prompts as few-shot examples, so the model learns
+  from its own track record.
+
+All tiers run identically in LIVE and GHOST mode (each action is stamped with
+the mode), so you can audition tier 2/3 behaviour risk-free in ghost first.
+
+```bash
+# Autonomy knobs (.env — all optional, shown with defaults)
+LLM_AUTONOMY_TIER=1              # 1 recommend / 2 limited / 3 autonomous
+LLM_AUTONOMY_KILL=0              # 1 = hard stop for all auto-applies
+LLM_MAX_PATCHES_PER_HOUR=1       # tier-2 rate limit (applied batches/hour)
+LLM_MAX_DELTA_PCT=0.20           # tier-2 per-field relative delta cap
+LLM_BREAKER_DRAWDOWN_USDC=25.0   # P&L drawdown that trips the breaker
+LLM_BREAKER_WINDOW_SECS=14400    # how far back applied changes are watched
+LLM_OUTCOME_HORIZON_SECS=7200    # when applied changes get outcome-scored
+```
+
 ---
 
 ## ️ Safety Systems
@@ -490,6 +538,7 @@ LLM_MODEL=claude-haiku-4-5
 - **Orphaned pair detection**: Arbiter waits 5s after first-leg confirm before acting on a missing second leg. TimeDecay GTC bids are given the full theta window (up to 30 min) before a resting order is declared orphaned.
 - **Rescue-profit gate**: Arbitrage entries are blocked when a single-leg failure cannot be rescued into profit (`yes_rescue_cost` or `no_rescue_cost ≥ $1.00` including fees and rehedge buffer).
 - **Fee Gates**: Blocks Taker Vipers from entering high-fee (10%+) markets.
+- **AI autonomy guardrails**: LLM-authored config changes are schema-clamped at every tier, money fields never auto-apply below full autonomy, and a P&L circuit breaker reverts recent AI changes and demotes to recommend-only on a drawdown (see [LLM Advisor](#llm-advisor)).
 - **Chain-sync**: Startup and periodic reconciliation against on-chain wallet state — stale DB rows purged, missing positions re-adopted with correct side labels.
 
 ---
