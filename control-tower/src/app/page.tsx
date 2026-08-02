@@ -13,7 +13,7 @@ import TradelogPage    from '@/components/TradelogPage';
 import SetupPage       from '@/components/SetupPage';
 import AiActionsPage   from '@/components/AiActionsPage';
 import ErrorBoundary   from '@/components/ErrorBoundary';
-import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, approveLlmAction, rejectLlmAction, getPortfolioValue, getSquadrons } from '@/lib/api';
+import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getSquadrons } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
 import type { DynamicConfig, SquadronSummary } from '@/lib/types';
 
@@ -370,10 +370,10 @@ export default function DashboardPage() {
     useSWR('llmRecs', () => getLlmRecommendations(10), { refreshInterval: 300_000 });
 
   // AI config proposals awaiting approval — poll faster (30 s): they're
-  // TTL-bound and actionable, unlike the prose recommendations above.
-  const { data: llmActions, mutate: mutateLlmActions } =
+  // TTL-bound; the Main strip shows a count, the AI Actions view the detail.
+  const { data: llmActions } =
     useSWR('llmActions', () => getLlmActions(100), { refreshInterval: 30_000 });
-  const pendingLlmActions = (llmActions ?? []).filter(a => a.status === 'proposed');
+  const pendingLlmCount = (llmActions ?? []).filter(a => a.status === 'proposed').length;
 
   // Portfolio value: collateral + live mark-to-market on open positions.
   // Refresh every 30 s so the number stays fresh without hammering Polymarket CLOB.
@@ -638,14 +638,13 @@ export default function DashboardPage() {
           />
         </div>
 
-        {/* ── LLM Advisor ───────────────────────────────────────────────── */}
+        {/* ── LLM Advisor (summary strip — detail lives in AI Actions) ──── */}
         <LlmAdvisorCard
           recommendations={llmRecs ?? []}
           isLoading={llmLoading}
           advisorEnabled={true}
-          pendingActions={pendingLlmActions}
-          onApproveAction={async (id) => { await approveLlmAction(id); await mutateLlmActions(); }}
-          onRejectAction={async (id) => { await rejectLlmAction(id); await mutateLlmActions(); }}
+          pendingCount={pendingLlmCount}
+          onGoToActions={() => setActiveView('ai')}
         />
 
         {/* ── CAG Squadron Registry ─────────────────────────────────────── */}
