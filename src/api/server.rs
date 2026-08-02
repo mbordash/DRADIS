@@ -26,7 +26,7 @@
 use axum::{
     Router,
     routing::{get, delete},
-    extract::{State, Query, Path, Request},
+    extract::{State, Query, Path, Path as AxumPath, Request},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -1121,6 +1121,118 @@ async fn get_llm_recommendations(Query(q): Query<AssetQuery>) -> Response {    d
             error!("Database pool not available for GET /api/llm/recommendations");
             Json(Vec::<db::LlmRecommendationRow>::new()).into_response()
         },
+    }
+}
+
+// ─── LLM autonomy: action queue + approval flow (Epic S4) ────────────────────
+
+/// GET /api/llm/actions?limit=100
+///
+/// The AI action audit trail, newest first (proposed/applied/rejected/
+/// expired/reverted/failed). Sweeps TTL-expired proposals first so the
+/// approval queue never shows stale rows.
+async fn get_llm_actions(Query(q): Query<AssetQuery>) -> Response {
+    let limit = q.limit.unwrap_or(100).clamp(1, 500);
+    match db::pool() {
+        Some(pool) => {
+            db::expire_stale_llm_actions(&pool).await;
+            Json(db::fetch_llm_actions(&pool, limit).await).into_response()
+        }
+        None => Json(Vec::<db::LlmActionRow>::new()).into_response(),
+    }
+}
+
+/// POST /api/llm/actions/{id}/approve
+///
+/// Human approval for a `proposed` change (tier 1, or a tier-2/3 hold).
+/// The stored value is REVALIDATED against the *current* config and schema —
+/// market conditions and config may have moved since the LLM proposed it —
+/// then applied via the same hot-patch path as PATCH /api/config.
+async fn approve_llm_action(
+    State(s): State<ApiState>,
+    AxumPath(id): AxumPath<i64>,
+) -> Response {
+    use crate::helpers::llm_patch::{self, RawProposal};
+    info!("📥 Received POST /api/llm/actions/{id}/approve");
+    let Some(pool) = db::pool() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "database unavailable").into_response();
+    };
+    db::expire_stale_llm_actions(&pool).await;
+    let Some(row) = db::fetch_llm_action_by_id(&pool, id).await else {
+        return (StatusCode::NOT_FOUND, "no such action").into_response();
+    };
+    if row.status != "proposed" {
+        return (
+            StatusCode::CONFLICT,
+            format!("action is '{}', only 'proposed' actions can be approved", row.status),
+        ).into_response();
+    }
+
+    // Re-validate against the live config (apply-time revalidation).
+    let current = s.config_rx.borrow().clone();
+    let to: serde_json::Value = serde_json::from_str(&row.to_value)
+        .unwrap_or(serde_json::Value::String(row.to_value.clone()));
+    let raw = RawProposal { field: row.field.clone(), to, reason: row.reason.clone() };
+    let batch = llm_patch::validate_proposals(vec![raw], &current);
+    let Some(change) = batch.accepted.first() else {
+        let why = batch.rejected.first()
+            .map(|r| r.why.clone())
+            .unwrap_or_else(|| "no longer valid against current config".into());
+        let detail = format!("approval failed revalidation: {why}");
+        db::update_llm_action_status(&pool, id, "rejected", Some(&detail), None).await;
+        return (StatusCode::CONFLICT, detail).into_response();
+    };
+
+    let patch = serde_json::json!({ change.key.clone(): change.to.clone() }).to_string();
+    match DynamicConfig::apply_patch_as(&current, &patch, "llm_approved").await {
+        Ok(new_cfg) => {
+            let _ = s.config_tx.send(new_cfg);
+            let inverse = serde_json::json!({ change.key.clone(): change.from.clone() }).to_string();
+            let pnl = db::get_pnl_history(&pool, 1).await.first()
+                .and_then(|p| p.session_pnl.parse::<f64>().ok())
+                .unwrap_or(0.0);
+            let detail = format!(
+                "approved by operator{}",
+                if change.clamped { " (re-clamped to schema bounds)" } else { "" },
+            );
+            db::mark_llm_action_applied(&pool, id, &detail, &inverse, pnl).await;
+            info!("✅ LLM action {id} approved & applied: {} → {}", change.key, change.to);
+            match db::fetch_llm_action_by_id(&pool, id).await {
+                Some(updated) => Json(updated).into_response(),
+                None => StatusCode::OK.into_response(),
+            }
+        }
+        Err(e) => {
+            let detail = format!("apply error: {e}");
+            db::update_llm_action_status(&pool, id, "failed", Some(&detail), None).await;
+            error!("❌ LLM action {id} approve failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, detail).into_response()
+        }
+    }
+}
+
+/// POST /api/llm/actions/{id}/reject
+///
+/// Human rejection of a `proposed` change. Rejected rows feed the few-shot
+/// retraining corpus (S7) as negative examples.
+async fn reject_llm_action(AxumPath(id): AxumPath<i64>) -> Response {
+    info!("📥 Received POST /api/llm/actions/{id}/reject");
+    let Some(pool) = db::pool() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "database unavailable").into_response();
+    };
+    let Some(row) = db::fetch_llm_action_by_id(&pool, id).await else {
+        return (StatusCode::NOT_FOUND, "no such action").into_response();
+    };
+    if row.status != "proposed" {
+        return (
+            StatusCode::CONFLICT,
+            format!("action is '{}', only 'proposed' actions can be rejected", row.status),
+        ).into_response();
+    }
+    db::update_llm_action_status(&pool, id, "rejected", Some("rejected by operator"), None).await;
+    match db::fetch_llm_action_by_id(&pool, id).await {
+        Some(updated) => Json(updated).into_response(),
+        None => StatusCode::OK.into_response(),
     }
 }
 
@@ -2331,6 +2443,9 @@ pub async fn run_api_server(
         .route("/api/telemetry/history",     get(get_telemetry_history))
         .route("/api/portfolio",             get(get_portfolio_value))
         .route("/api/llm/recommendations",   get(get_llm_recommendations))
+        .route("/api/llm/actions",           get(get_llm_actions))
+        .route("/api/llm/actions/{id}/approve", axum::routing::post(approve_llm_action))
+        .route("/api/llm/actions/{id}/reject",  axum::routing::post(reject_llm_action))
         // ── Phase 3d: Squadron registry endpoints ──────────────────────────
         .route("/api/squadrons",             get(get_squadrons))
         .route("/api/squadrons/{id}",        get(get_squadron_by_id))

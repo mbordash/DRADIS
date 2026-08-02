@@ -12,7 +12,7 @@ import SquadronDetailView from '@/components/SquadronDetailView';
 import TradelogPage    from '@/components/TradelogPage';
 import SetupPage       from '@/components/SetupPage';
 import ErrorBoundary   from '@/components/ErrorBoundary';
-import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getPortfolioValue, getSquadrons } from '@/lib/api';
+import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, approveLlmAction, rejectLlmAction, getPortfolioValue, getSquadrons } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
 import type { DynamicConfig, SquadronSummary } from '@/lib/types';
 
@@ -325,6 +325,12 @@ export default function DashboardPage() {
   const { data: llmRecs, isLoading: llmLoading } =
     useSWR('llmRecs', () => getLlmRecommendations(10), { refreshInterval: 300_000 });
 
+  // AI config proposals awaiting approval — poll faster (30 s): they're
+  // TTL-bound and actionable, unlike the prose recommendations above.
+  const { data: llmActions, mutate: mutateLlmActions } =
+    useSWR('llmActions', () => getLlmActions(100), { refreshInterval: 30_000 });
+  const pendingLlmActions = (llmActions ?? []).filter(a => a.status === 'proposed');
+
   // Portfolio value: collateral + live mark-to-market on open positions.
   // Refresh every 30 s so the number stays fresh without hammering Polymarket CLOB.
   const { data: portfolio, isLoading: portfolioLoading } =
@@ -579,6 +585,9 @@ export default function DashboardPage() {
           recommendations={llmRecs ?? []}
           isLoading={llmLoading}
           advisorEnabled={true}
+          pendingActions={pendingLlmActions}
+          onApproveAction={async (id) => { await approveLlmAction(id); await mutateLlmActions(); }}
+          onRejectAction={async (id) => { await rejectLlmAction(id); await mutateLlmActions(); }}
         />
 
         {/* ── CAG Squadron Registry ─────────────────────────────────────── */}

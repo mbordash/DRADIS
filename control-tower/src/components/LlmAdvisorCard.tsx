@@ -1,12 +1,16 @@
 'use client';
 
 import { useState } from 'react';
-import type { LlmRecommendationRow } from '@/lib/types';
+import type { LlmRecommendationRow, LlmActionRow } from '@/lib/types';
 
 interface Props {
   recommendations: LlmRecommendationRow[];
   isLoading: boolean;
   advisorEnabled: boolean;
+  /** Pending AI config proposals awaiting human approval (status 'proposed'). */
+  pendingActions?: LlmActionRow[];
+  onApproveAction?: (id: number) => Promise<void>;
+  onRejectAction?: (id: number) => Promise<void>;
 }
 
 /** Format an ISO timestamp to a short local string, e.g. "May 11, 14:32" */
@@ -22,10 +26,28 @@ function fmtTs(iso: string): string {
   }
 }
 
-export default function LlmAdvisorCard({ recommendations, isLoading, advisorEnabled }: Props) {
+export default function LlmAdvisorCard({
+  recommendations, isLoading, advisorEnabled,
+  pendingActions = [], onApproveAction, onRejectAction,
+}: Props) {
   const [idx, setIdx] = useState(0);
   const [dismissed, setDismissed] = useState<Set<number>>(new Set());
   const [expanded, setExpanded] = useState(false);
+  const [busyIds, setBusyIds] = useState<Set<number>>(new Set());
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  const runAction = async (id: number, fn?: (id: number) => Promise<void>) => {
+    if (!fn) return;
+    setActionError(null);
+    setBusyIds(prev => new Set(prev).add(id));
+    try {
+      await fn(id);
+    } catch (e) {
+      setActionError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setBusyIds(prev => { const n = new Set(prev); n.delete(id); return n; });
+    }
+  };
 
   // Filter out dismissed recommendations
   const visible = recommendations.filter(r => !dismissed.has(r.id));
@@ -115,6 +137,67 @@ export default function LlmAdvisorCard({ recommendations, isLoading, advisorEnab
           </div>
         )}
       </div>
+
+      {/* ── Pending AI config proposals (tier-1 approval queue) ─────────── */}
+      {pendingActions.length > 0 && (
+        <div className="card p-4 mb-3 border border-amber-500/20">
+          <div className="flex items-center gap-2 mb-3">
+            <p className="text-xs font-mono text-amber-400">
+              ⏳ {pendingActions.length} config change{pendingActions.length !== 1 ? 's' : ''} awaiting approval
+            </p>
+            {actionError && (
+              <span className="text-[10px] font-mono text-red-400 truncate" title={actionError}>
+                {actionError}
+              </span>
+            )}
+          </div>
+          <div className="space-y-2">
+            {pendingActions.map(a => {
+              const busy = busyIds.has(a.id);
+              const expMs = Date.parse(a.expires_at) - Date.now();
+              const expMin = Math.max(0, Math.floor(expMs / 60_000));
+              return (
+                <div key={a.id} className="flex flex-wrap items-center gap-2 text-xs font-mono bg-[#13131f] border border-[#1e1e32] rounded px-2 py-1.5">
+                  <span className="text-gray-300">{a.field}</span>
+                  <span className="text-gray-600">{a.from_value.replaceAll('"', '')}</span>
+                  <span className="text-gray-600">→</span>
+                  <span className="text-violet-300">{a.to_value.replaceAll('"', '')}</span>
+                  {a.delta_pct != null && (
+                    <span className={a.delta_pct >= 0 ? 'text-green-500' : 'text-red-500'}>
+                      {a.delta_pct >= 0 ? '+' : ''}{(a.delta_pct * 100).toFixed(1)}%
+                    </span>
+                  )}
+                  {a.clamped && (
+                    <span className="text-[10px] bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded px-1">clamped</span>
+                  )}
+                  <span className="text-gray-500 basis-full sm:basis-auto sm:flex-1 truncate" title={a.reason}>
+                    {a.reason}
+                  </span>
+                  <span className="text-[10px] text-gray-600" title={`expires ${fmtTs(a.expires_at)}`}>
+                    {expMin}m left
+                  </span>
+                  <button
+                    onClick={() => runAction(a.id, onApproveAction)}
+                    disabled={busy || !onApproveAction}
+                    className="px-2 py-0.5 rounded bg-green-500/10 text-green-400 border border-green-500/20 hover:bg-green-500/20 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                    title="Revalidate against current config and apply"
+                  >
+                    {busy ? '…' : 'apply'}
+                  </button>
+                  <button
+                    onClick={() => runAction(a.id, onRejectAction)}
+                    disabled={busy || !onRejectAction}
+                    className="px-2 py-0.5 rounded bg-red-500/10 text-red-400 border border-red-500/20 hover:bg-red-500/20 disabled:opacity-30 disabled:cursor-not-allowed transition-colors"
+                    title="Reject this proposal"
+                  >
+                    reject
+                  </button>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Card body */}
       <div className="card p-4">

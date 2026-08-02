@@ -1,4 +1,4 @@
-import type { DynamicConfig, ConfigFieldSchema, PnlSnapshotRow, TradeRow, OpenPositionRow, LlmRecommendationRow, ViperDef, StatusResponse, PortfolioValue, SquadronSummary, TelemetrySnapshot, TelemetrySample } from './types';
+import type { DynamicConfig, ConfigFieldSchema, PnlSnapshotRow, TradeRow, OpenPositionRow, LlmRecommendationRow, LlmActionRow, ViperDef, StatusResponse, PortfolioValue, SquadronSummary, TelemetrySnapshot, TelemetrySample } from './types';
 
 // In development, NEXT_PUBLIC_API_URL=http://localhost:9000 (set in .env.local)
 // hits the DRADIS API directly.
@@ -126,6 +126,27 @@ export async function getLlmRecommendations(limit = 10, asset?: string): Promise
   const url = withAsset(`${BASE}/api/llm/recommendations?limit=${limit}`, asset);
   const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/llm/recommendations → ${res.status}`);
+  return res.json();
+}
+
+/** AI action audit trail, newest first (proposed/applied/rejected/…). */
+export async function getLlmActions(limit = 100): Promise<LlmActionRow[]> {
+  const res = await fetch(`${BASE}/api/llm/actions?limit=${limit}`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/llm/actions → ${res.status}`);
+  return res.json();
+}
+
+/** Approve a proposed AI config change — revalidated server-side, then applied. */
+export async function approveLlmAction(id: number): Promise<LlmActionRow> {
+  const res = await fetch(`${BASE}/api/llm/actions/${id}/approve`, { method: 'POST', cache: 'no-store' });
+  if (!res.ok) throw new Error(`POST /api/llm/actions/${id}/approve → ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+/** Reject a proposed AI config change. */
+export async function rejectLlmAction(id: number): Promise<LlmActionRow> {
+  const res = await fetch(`${BASE}/api/llm/actions/${id}/reject`, { method: 'POST', cache: 'no-store' });
+  if (!res.ok) throw new Error(`POST /api/llm/actions/${id}/reject → ${res.status}: ${await res.text()}`);
   return res.json();
 }
 

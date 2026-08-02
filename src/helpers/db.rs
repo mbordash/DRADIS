@@ -2586,6 +2586,18 @@ fn llm_action_from_row(r: &sqlx::sqlite::SqliteRow) -> Option<LlmActionRow> {
     })
 }
 
+/// Single action by rowid — the approval endpoints' lookup.
+pub async fn fetch_llm_action_by_id(pool: &SqlitePool, id: i64) -> Option<LlmActionRow> {
+    match sqlx::query("SELECT * FROM llm_actions WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+    {
+        Ok(row) => row.as_ref().and_then(llm_action_from_row),
+        Err(e) => { error!("❌ DB fetch_llm_action_by_id({id}) failed: {e}"); None }
+    }
+}
+
 /// Most recent actions, newest first — feeds the AI Actions view.
 pub async fn fetch_llm_actions(pool: &SqlitePool, limit: i64) -> Vec<LlmActionRow> {
     match sqlx::query("SELECT * FROM llm_actions ORDER BY id DESC LIMIT ?")

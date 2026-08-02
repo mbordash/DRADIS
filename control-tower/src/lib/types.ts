@@ -191,6 +191,31 @@ export interface LlmRecommendationRow {
   is_current_session: boolean;  // true when generated in the currently-running session
 }
 
+/** One row of the llm_actions audit trail — a proposed AI config change. */
+export interface LlmActionRow {
+  id:             number;
+  batch_id:       string;
+  session_id:     string;
+  ts:             string;   // ISO 8601
+  expires_at:     string;   // ISO 8601 — proposal TTL
+  model:          string;
+  tier:           number;   // 1 recommend / 2 limited / 3 autonomous
+  ghost_mode:     boolean;
+  field:          string;   // serde config key
+  from_value:     string;   // JSON-encoded current value at proposal time
+  to_value:       string;   // JSON-encoded proposed value
+  clamped:        boolean;
+  delta_pct:      number | null;
+  reason:         string;
+  status:         'proposed' | 'approved' | 'applied' | 'rejected' | 'expired' | 'reverted' | 'failed';
+  status_detail:  string | null;
+  status_ts:      string | null;
+  inverse_patch:  string | null;
+  pnl_at_apply:   number | null;
+  outcome_score:  number | null;
+  outcome_detail: string | null;
+}
+
 /** Connection health + live signal snapshot for one asset's Binance Raptors. */
 export interface AssetRaptorHealth {
   price_connected:   boolean;  // Price Raptor (Binance Spot WS) is live
