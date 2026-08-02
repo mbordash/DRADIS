@@ -2735,6 +2735,46 @@ pub async fn fetch_llm_actions_applied_since(pool: &SqlitePool, since: &str) -> 
     }
 }
 
+/// Applied/reverted actions that are due for outcome scoring: they carry a
+/// P&L baseline, have no score yet, and their apply/revert happened at or
+/// before `before_ts` (the scoring horizon has elapsed).
+pub async fn fetch_llm_actions_needing_outcome(pool: &SqlitePool, before_ts: &str) -> Vec<LlmActionRow> {
+    match sqlx::query(
+        "SELECT * FROM llm_actions
+         WHERE status IN ('applied', 'reverted')
+           AND pnl_at_apply IS NOT NULL
+           AND outcome_score IS NULL
+           AND status_ts <= ?
+         ORDER BY id"
+    )
+    .bind(before_ts)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows.iter().filter_map(llm_action_from_row).collect(),
+        Err(e) => { error!("❌ DB fetch_llm_actions_needing_outcome failed: {}", e); vec![] }
+    }
+}
+
+/// Recent actions with a learnable outcome — operator rejections, breaker
+/// reverts, and scored applies — newest first. Feeds the few-shot section of
+/// the advisor prompt so the model learns from its own track record.
+pub async fn fetch_llm_fewshot_examples(pool: &SqlitePool, limit: i64) -> Vec<LlmActionRow> {
+    match sqlx::query(
+        "SELECT * FROM llm_actions
+         WHERE status IN ('rejected', 'reverted')
+            OR outcome_score IS NOT NULL
+         ORDER BY id DESC LIMIT ?"
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows.iter().filter_map(llm_action_from_row).collect(),
+        Err(e) => { error!("❌ DB fetch_llm_fewshot_examples failed: {}", e); vec![] }
+    }
+}
+
 /// Record the measured outcome of an applied action (few-shot corpus, S7).
 pub async fn set_llm_action_outcome(
     pool: &SqlitePool,
@@ -3021,5 +3061,39 @@ mod llm_actions_tests {
         assert!(set_llm_action_outcome(&pool, ids[0], -0.42, "strategy PnL -$0.42 over 4h window").await);
         let row = fetch_llm_actions(&pool, 10).await.into_iter().find(|a| a.id == ids[0]).unwrap();
         assert_eq!(row.outcome_score, Some(-0.42));
+    }
+
+    #[tokio::test]
+    async fn outcome_scoring_and_fewshot_queries() {
+        let pool = mem_pool().await;
+        let ids = record_llm_action_batch(&pool, "b6", "m", 2, false, 1800, &sample_batch()).await;
+        let id = ids[0];
+
+        // Applied with a P&L baseline → shows up as due once past the horizon.
+        assert!(mark_llm_action_applied(&pool, id, "tier2 auto", r#"{"arbitrage_profit_threshold":"0.01"}"#, 10.0).await);
+        let row = fetch_llm_action_by_id(&pool, id).await.unwrap();
+        assert_eq!(row.pnl_at_apply, Some(10.0));
+
+        // Horizon in the future → due now.
+        let future = (Utc::now() + chrono::Duration::hours(1)).to_rfc3339();
+        let due = fetch_llm_actions_needing_outcome(&pool, &future).await;
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, id);
+        // Horizon in the past → not yet due.
+        let past = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        assert!(fetch_llm_actions_needing_outcome(&pool, &past).await.is_empty());
+
+        // Once scored it drops out of the due set and joins the few-shot corpus
+        // (which also carries the validation-reject from the sample batch).
+        assert!(set_llm_action_outcome(&pool, id, 2.5, "P&L +$2.50").await);
+        assert!(fetch_llm_actions_needing_outcome(&pool, &future).await.is_empty());
+        let fewshot = fetch_llm_fewshot_examples(&pool, 10).await;
+        assert_eq!(fewshot.len(), 2);
+        assert!(fewshot.iter().any(|a| a.id == id && a.outcome_score == Some(2.5)));
+        assert!(fewshot.iter().any(|a| a.status == "rejected"));
+
+        // Rate-limit counter sees the applied batch.
+        let hour_ago = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        assert_eq!(count_llm_batches_applied_since(&pool, &hour_ago).await, 1);
     }
 }

@@ -80,6 +80,22 @@ fn autonomy_tier() -> i64 {
         .unwrap_or(1)
 }
 
+/// How long after an apply/revert an action's outcome is scored (env
+/// `LLM_OUTCOME_HORIZON_SECS`, default 2h). The score is the session-P&L
+/// delta over that window — crude but honest, and it feeds the few-shot
+/// track record injected into future prompts.
+fn outcome_horizon_secs() -> i64 {
+    std::env::var("LLM_OUTCOME_HORIZON_SECS")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|s| *s >= 60)
+        .unwrap_or(7200)
+}
+
+/// Few-shot examples injected into the prompt (rejections, reverts, scored
+/// applies). Kept small — each line costs prompt budget on local models.
+const LLM_FEWSHOT_EXAMPLES: i64 = 6;
+
 // ── Ollama API types ──────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -439,6 +455,7 @@ fn build_user_prompt(
     starting_collateral: rust_decimal::Decimal,
     session_id: &str,
     dyn_cfg: &DynamicConfig,
+    fewshot: &[db::LlmActionRow],
 ) -> String {
     let mut lines = Vec::new();
 
@@ -668,6 +685,36 @@ fn build_user_prompt(
             (None, None) => String::new(),
         };
         lines.push(format!("{} = {}{}", f.key, current, bounds));
+    }
+
+    // ── Prior proposal track record (few-shot, S7) ────────────────────────────
+    // The model's own history: what got applied and how it scored, what a
+    // human rejected, what the circuit breaker undid. Explicit instruction to
+    // learn from it rather than repeat mistakes.
+    if !fewshot.is_empty() {
+        lines.push(String::new());
+        lines.push("== Prior Proposal Outcomes ==".to_string());
+        lines.push("Your recent config proposals and their results. Do NOT repeat rejected or reverted changes; favour patterns that scored positive:".to_string());
+        for a in fewshot {
+            let change = format!(
+                "{}: {} -> {}",
+                a.field,
+                a.from_value.trim_matches('"'),
+                a.to_value.trim_matches('"'),
+            );
+            let result = match a.status.as_str() {
+                "reverted" => "REVERTED by circuit breaker (P&L drawdown after apply)".to_string(),
+                "rejected" => format!(
+                    "REJECTED — {}",
+                    a.status_detail.as_deref().unwrap_or(&a.reason),
+                ),
+                _ => match a.outcome_score {
+                    Some(s) => format!("applied, P&L {}{:.2} over the scoring window", if s >= 0.0 { "+$" } else { "-$" }, s.abs()),
+                    None => "applied, outcome pending".to_string(),
+                },
+            };
+            lines.push(format!("- {} — {}", change, result));
+        }
     }
 
     lines.join("\n")
@@ -1016,6 +1063,31 @@ pub async fn run_llm_advisor_loop(
             }
         }
 
+        // ── Outcome scoring (S7) ─────────────────────────────────────────────
+        // Applied/reverted actions past the horizon get scored with the
+        // session-P&L delta since their apply. Scores surface in the AI
+        // Actions view and become the few-shot track record below.
+        {
+            use rust_decimal::prelude::ToPrimitive;
+            let pnl_now = current_pnl.to_f64().unwrap_or(0.0);
+            let horizon = outcome_horizon_secs();
+            let before = (chrono::Utc::now() - chrono::Duration::seconds(horizon)).to_rfc3339();
+            for a in db::fetch_llm_actions_needing_outcome(&primary_pool, &before).await {
+                let base = a.pnl_at_apply.unwrap_or(pnl_now);
+                let score = pnl_now - base;
+                let detail = format!(
+                    "session P&L Δ ${:.2} over ≥{}h since {} ({})",
+                    score, horizon / 3600, a.status, a.field,
+                );
+                db::set_llm_action_outcome(&primary_pool, a.id, score, &detail).await;
+                info!("🤖 LLM Advisor: outcome scored #{} {} → {:+.2}", a.id, a.field, score);
+            }
+        }
+
+        // Track record for the prompt: recent rejections, reverts, and scored
+        // applies — the model learns what worked and what got shot down.
+        let fewshot = db::fetch_llm_fewshot_examples(&primary_pool, LLM_FEWSHOT_EXAMPLES).await;
+
         let session_trade_count = all_session_trades.len();
         let total_trade_count = session_trade_count
             + prior_trades.as_ref().map(|p| p.len()).unwrap_or(0);
@@ -1041,6 +1113,7 @@ pub async fn run_llm_advisor_loop(
             collateral,
             &session_id,
             &dyn_cfg,
+            &fewshot,
         );
 
         info!(
