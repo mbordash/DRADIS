@@ -28,6 +28,7 @@ const TEST_KINDS: Record<string, { kind: string; label: string; keys: string[] }
   us_keys:     { kind: 'us_keys',     label: 'Test API keys', keys: ['POLYMARKET_US_KEY_ID', 'POLYMARKET_US_SECRET_KEY'] },
   alpaca:      { kind: 'alpaca',      label: 'Test Alpaca', keys: ['ALPACA_API_KEY_ID', 'ALPACA_API_SECRET_KEY'] },
   telegram:    { kind: 'telegram',    label: 'Test Telegram', keys: ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'] },
+  llm:         { kind: 'llm',         label: 'Test LLM', keys: ['LLM_PROVIDER', 'OLLAMA_URL', 'OLLAMA_MODEL', 'LLM_API_BASE', 'LLM_API_KEY', 'LLM_MODEL'] },
 };
 
 // Group layout: section title → credential keys + test kind.
@@ -46,6 +47,7 @@ function groupsForVenue(venue: 'intl' | 'us') {
   groups.push(
     { title: 'Alpaca Market Data', blurb: 'Used by the Tide raptor for US equities session data (optional).', keys: ['ALPACA_API_KEY_ID', 'ALPACA_API_SECRET_KEY'], test: 'alpaca' },
     { title: 'Telegram Alerts', blurb: 'Bot token + chat ID for trade notifications (optional).', keys: ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'], test: 'telegram' },
+    { title: 'LLM Advisor', blurb: 'Provider: ollama (local/remote, no key — set Ollama URL + model) or a hosted API: openai-compatible / anthropic (set API base, key, model). Applies on restart.', keys: ['LLM_PROVIDER', 'OLLAMA_URL', 'OLLAMA_MODEL', 'LLM_API_BASE', 'LLM_API_KEY', 'LLM_MODEL'], test: 'llm' },
   );
   return groups;
 }
@@ -193,7 +195,7 @@ function CredentialGroup({
               </span>
             </div>
             <input
-              type={c.key.includes('URL') || c.key.includes('CHAT_ID') ? 'text' : 'password'}
+              type={/URL|CHAT_ID|PROVIDER|MODEL|BASE/.test(c.key) ? 'text' : 'password'}
               className={inputCls}
               placeholder={c.set ? '•••••••• (leave blank to keep current)' : 'Enter value'}
               value={drafts[c.key] ?? ''}

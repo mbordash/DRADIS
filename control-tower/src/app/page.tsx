@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import useSWR from 'swr';
 import dynamic from 'next/dynamic';
 
@@ -231,37 +231,79 @@ function PortfolioValueBanner({
 
 type AppView = 'main' | 'telemetry' | 'tradelog' | 'ai' | 'setup';
 
-function NavTabs({
+const VIEW_DEFS: { id: AppView; label: string; icon: string }[] = [
+  { id: 'main',      label: 'Main',       icon: '🗺️' },
+  { id: 'telemetry', label: 'Telemetry',  icon: '📡' },
+  { id: 'tradelog',  label: 'Tradelog',   icon: '📋' },
+  { id: 'ai',        label: 'AI Actions', icon: '🤖' },
+  { id: 'setup',     label: 'Setup',      icon: '⚙️' },
+];
+
+/** Compact main-menu dropdown — replaces the row of nav tabs so the header
+ *  stays narrow as views are added. */
+function NavMenu({
   active,
   onChange,
 }: {
   active: AppView;
   onChange: (v: AppView) => void;
 }) {
-  const tabs: { id: AppView; label: string; icon: string }[] = [
-    { id: 'main',      label: 'Main',      icon: '🗺️' },
-    { id: 'telemetry', label: 'Telemetry', icon: '📡' },
-    { id: 'tradelog',  label: 'Tradelog',  icon: '📋' },
-    { id: 'ai',        label: 'AI Actions', icon: '🤖' },
-    { id: 'setup',     label: 'Setup',     icon: '⚙️' },
-  ];
+  const [open, setOpen] = useState(false);
+  const ref = useRef<HTMLDivElement>(null);
+
+  // Close on outside click / Escape.
+  useEffect(() => {
+    if (!open) return;
+    const onClick = (e: MouseEvent) => {
+      if (ref.current && !ref.current.contains(e.target as Node)) setOpen(false);
+    };
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') setOpen(false); };
+    document.addEventListener('mousedown', onClick);
+    document.addEventListener('keydown', onKey);
+    return () => {
+      document.removeEventListener('mousedown', onClick);
+      document.removeEventListener('keydown', onKey);
+    };
+  }, [open]);
+
+  const current = VIEW_DEFS.find(v => v.id === active) ?? VIEW_DEFS[0];
+
   return (
-    <div className="flex items-center gap-1">
-      {tabs.map(t => (
-        <button
-          key={t.id}
-          onClick={() => onChange(t.id)}
-          className={[
-            'flex items-center gap-1.5 text-xs font-mono px-3 py-1.5 rounded-lg border transition-colors',
-            active === t.id
-              ? 'bg-indigo-500/20 border-indigo-500/40 text-indigo-300'
-              : 'bg-[#13131f] border-[#1e1e32] text-gray-500 hover:border-gray-600 hover:text-gray-300',
-          ].join(' ')}
+    <div className="relative" ref={ref}>
+      <button
+        onClick={() => setOpen(v => !v)}
+        className="flex items-center gap-1.5 text-xs font-mono px-3 py-1.5 rounded-lg border bg-indigo-500/20 border-indigo-500/40 text-indigo-300 hover:bg-indigo-500/30 transition-colors"
+        aria-haspopup="menu"
+        aria-expanded={open}
+      >
+        <span>{current.icon}</span>
+        <span>{current.label}</span>
+        <span className={`text-[9px] transition-transform ${open ? 'rotate-180' : ''}`}>▼</span>
+      </button>
+      {open && (
+        <div
+          role="menu"
+          className="absolute left-0 top-full mt-1 min-w-[11rem] rounded-lg border border-[#1e1e32] bg-[#0d0d16] shadow-xl shadow-black/50 py-1 z-50"
         >
-          <span>{t.icon}</span>
-          <span>{t.label}</span>
-        </button>
-      ))}
+          {VIEW_DEFS.map(t => (
+            <button
+              key={t.id}
+              role="menuitem"
+              onClick={() => { onChange(t.id); setOpen(false); }}
+              className={[
+                'w-full flex items-center gap-2 text-left text-xs font-mono px-3 py-2 transition-colors',
+                active === t.id
+                  ? 'bg-indigo-500/15 text-indigo-300'
+                  : 'text-gray-400 hover:bg-[#13131f] hover:text-gray-200',
+              ].join(' ')}
+            >
+              <span>{t.icon}</span>
+              <span>{t.label}</span>
+              {active === t.id && <span className="ml-auto text-[9px]">✓</span>}
+            </button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -387,7 +429,7 @@ export default function DashboardPage() {
                 <span className="font-mono font-bold text-lg tracking-wide text-indigo-400">DRADIS</span>
                 <span className="text-gray-600 text-lg">|</span>
               </div>
-              <NavTabs active={activeView} onChange={(v) => { setActiveView(v); setFocusedSquadronId(null); }} />
+              <NavMenu active={activeView} onChange={(v) => { setActiveView(v); setFocusedSquadronId(null); }} />
             </div>
 
             {/* Center — BSG motto */}
@@ -447,7 +489,7 @@ export default function DashboardPage() {
               <span className="font-mono font-bold text-lg tracking-wide text-indigo-400">DRADIS</span>
               <span className="text-gray-600 text-lg">|</span>
             </div>
-            <NavTabs active={activeView} onChange={setActiveView} />
+            <NavMenu active={activeView} onChange={setActiveView} />
           </div>
 
           {/* Center — BSG motto */}

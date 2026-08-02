@@ -71,6 +71,12 @@ const MANAGED_KEYS: &[(&str, &str, &str)] = &[
     ("ALPACA_API_SECRET_KEY",    "Alpaca API secret key",         "shared"),
     ("TELEGRAM_BOT_TOKEN",       "Telegram bot token",            "shared"),
     ("TELEGRAM_CHAT_ID",         "Telegram chat ID",              "shared"),
+    ("LLM_PROVIDER",             "LLM provider (ollama | openai | anthropic)", "shared"),
+    ("OLLAMA_URL",               "Ollama URL (local or remote)",  "shared"),
+    ("OLLAMA_MODEL",             "Ollama model",                  "shared"),
+    ("LLM_API_BASE",             "Hosted LLM API base URL",       "shared"),
+    ("LLM_API_KEY",              "Hosted LLM API key",            "shared"),
+    ("LLM_MODEL",                "Hosted LLM model",              "shared"),
 ];
 
 // ─── Secrets file I/O ────────────────────────────────────────────────────────
@@ -418,6 +424,7 @@ async fn test_connection(Json(body): Json<TestRequest>) -> Response {
         "polygon_rpc" => test_polygon_rpc(&body).await,
         "telegram" => test_telegram(&body).await,
         "alpaca" => test_alpaca(&body).await,
+        "llm" => test_llm(&body).await,
         #[cfg(feature = "us_retail")]
         "us_keys" => test_us_keys(&body).await,
         other => Err(format!("unknown or unsupported test kind '{}' for this build", other)),
@@ -518,6 +525,85 @@ async fn test_alpaca(body: &TestRequest) -> Result<serde_json::Value, String> {
         return Err(format!("Alpaca rejected the keys (HTTP {})", resp.status()));
     }
     Ok(json!({"feed": "IEX", "probe": "SPY latest trade"}))
+}
+
+/// Validate the LLM Advisor provider settings with a cheap live probe:
+/// - ollama    → GET {url}/api/tags, and confirm the model is pulled
+/// - openai    → GET {base}/models with bearer auth
+/// - anthropic → 1-token POST /v1/messages round-trip
+async fn test_llm(body: &TestRequest) -> Result<serde_json::Value, String> {
+    let provider = test_cred(body, "LLM_PROVIDER")
+        .unwrap_or_else(|| crate::config::LLM_PROVIDER.to_string())
+        .trim().to_ascii_lowercase();
+    let client = reqwest::Client::new();
+    let timeout = std::time::Duration::from_secs(15);
+    match provider.as_str() {
+        "ollama" => {
+            let url = test_cred(body, "OLLAMA_URL")
+                .unwrap_or_else(|| crate::config::LLM_OLLAMA_URL.to_string());
+            let model = test_cred(body, "OLLAMA_MODEL")
+                .unwrap_or_else(|| crate::config::LLM_OLLAMA_MODEL.to_string());
+            let resp: serde_json::Value = tokio::time::timeout(
+                timeout,
+                client.get(format!("{}/api/tags", url.trim_end_matches('/'))).send(),
+            ).await.map_err(|_| "Ollama request timed out (15s)".to_string())?
+                .map_err(|e| format!("Ollama unreachable at {}: {}", url, e))?
+                .json().await.map_err(|e| format!("Ollama returned non-JSON: {}", e))?;
+            let models: Vec<String> = resp.get("models").and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|m| m.get("name").and_then(|n| n.as_str()).map(String::from)).collect())
+                .unwrap_or_default();
+            let pulled = models.iter().any(|m| m == &model || m.starts_with(&format!("{model}:")));
+            if !pulled {
+                return Err(format!(
+                    "Ollama is up but model '{}' is not pulled (available: {})",
+                    model, if models.is_empty() { "none".to_string() } else { models.join(", ") },
+                ));
+            }
+            Ok(json!({"provider": "ollama", "url": url, "model": model}))
+        }
+        "openai" => {
+            let key = test_cred(body, "LLM_API_KEY").ok_or("LLM_API_KEY not provided or stored")?;
+            let base = test_cred(body, "LLM_API_BASE")
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+            let resp = tokio::time::timeout(
+                timeout,
+                client.get(format!("{}/models", base.trim_end_matches('/')))
+                    .bearer_auth(key.trim())
+                    .send(),
+            ).await.map_err(|_| "LLM API request timed out (15s)".to_string())?
+                .map_err(|e| format!("LLM API unreachable at {}: {}", base, e))?;
+            if !resp.status().is_success() {
+                return Err(format!("LLM API rejected the key (HTTP {})", resp.status()));
+            }
+            Ok(json!({"provider": "openai", "base": base, "auth": "accepted"}))
+        }
+        "anthropic" => {
+            let key = test_cred(body, "LLM_API_KEY").ok_or("LLM_API_KEY not provided or stored")?;
+            let model = test_cred(body, "LLM_MODEL").ok_or("LLM_MODEL not provided or stored")?;
+            let base = test_cred(body, "LLM_API_BASE")
+                .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+            let resp = tokio::time::timeout(
+                timeout,
+                client.post(format!("{}/v1/messages", base.trim_end_matches('/')))
+                    .header("x-api-key", key.trim())
+                    .header("anthropic-version", "2023-06-01")
+                    .json(&json!({
+                        "model": model.trim(),
+                        "max_tokens": 1,
+                        "messages": [{"role": "user", "content": "ping"}],
+                    }))
+                    .send(),
+            ).await.map_err(|_| "Anthropic request timed out (15s)".to_string())?
+                .map_err(|e| format!("Anthropic unreachable at {}: {}", base, e))?;
+            if !resp.status().is_success() {
+                let status = resp.status();
+                let detail = resp.text().await.unwrap_or_default();
+                return Err(format!("Anthropic rejected the request (HTTP {}): {}", status, detail));
+            }
+            Ok(json!({"provider": "anthropic", "model": model, "auth": "accepted"}))
+        }
+        other => Err(format!("unknown LLM provider '{}' — use ollama, openai, or anthropic", other)),
+    }
 }
 
 /// Validate US venue keys by constructing the SDK auth from the candidate values.
