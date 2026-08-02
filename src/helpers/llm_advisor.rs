@@ -1,4 +1,4 @@
-/// LLM Advisor — periodic trade analysis with Ollama + Telegram recommendations.
+/// LLM Advisor — periodic trade analysis with pluggable LLM providers + Telegram recommendations.
 ///
 /// ── Overview ─────────────────────────────────────────────────────────────────
 /// A background task that wakes every LLM_ADVISOR_INTERVAL_SECS and analyses
@@ -26,15 +26,21 @@
 ///
 /// ── Configuration ────────────────────────────────────────────────────────────
 ///   config.rs:       ENABLE_LLM_ADVISOR, LLM_ADVISOR_INTERVAL_SECS,
-///                    LLM_ADVISOR_TRADES_LOOKBACK, LLM_OLLAMA_URL, LLM_OLLAMA_MODEL
-///   env overrides:   OLLAMA_URL, OLLAMA_MODEL  (override the defaults above)
+///                    LLM_ADVISOR_TRADES_LOOKBACK, LLM_PROVIDER,
+///                    LLM_OLLAMA_URL, LLM_OLLAMA_MODEL
+///   env overrides:   LLM_PROVIDER=ollama|openai|anthropic (default ollama)
+///                    ollama:    OLLAMA_URL, OLLAMA_MODEL
+///                    openai:    LLM_API_BASE, LLM_API_KEY, LLM_MODEL
+///                    anthropic: LLM_API_BASE, LLM_API_KEY, LLM_MODEL
 ///   Telegram creds:  TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID  (same as rest of bot)
 ///
 /// ── Bring Your Own LLM ───────────────────────────────────────────────────────
-/// The advisor uses the Ollama /api/chat endpoint (OpenAI-compatible).
-/// Any model running in Ollama works.  Recommended: llama3.2, mistral, qwen2.5.
-/// Point OLLAMA_URL at a remote host for GPU-accelerated inference when running
-/// DRADIS on a headless cloud VPS.
+/// Default provider is Ollama's /api/chat — any local model works (recommended:
+/// llama3.2, mistral, qwen2.5); point OLLAMA_URL at a remote host for GPU
+/// inference.  Alternatively set LLM_PROVIDER=openai for any OpenAI-compatible
+/// endpoint (OpenAI, Groq, Together, OpenRouter, vLLM, LM Studio…) or
+/// LLM_PROVIDER=anthropic for Claude.  API keys live in the environment only —
+/// never persisted to DB/config and never logged.
 
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -63,7 +69,7 @@ const LLM_ADVISOR_PRIOR_SESSION_SUPPLEMENT: i64 = 5;
 #[derive(Serialize)]
 struct OllamaRequest {
     model: String,
-    messages: Vec<OllamaMessage>,
+    messages: Vec<ChatMessage>,
     stream: bool,
     /// Optional generation parameters — keep output focused and concise.
     options: OllamaOptions,
@@ -81,15 +87,206 @@ struct OllamaOptions {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-struct OllamaMessage {
+struct ChatMessage {
     role: String,
     content: String,
 }
 
 #[derive(Deserialize)]
 struct OllamaResponse {
-    message: OllamaMessage,
+    message: ChatMessage,
     done_reason: Option<String>,
+}
+
+// ── Provider abstraction ──────────────────────────────────────────────────────
+
+/// Where advisor inference runs. Resolved once at startup from `LLM_PROVIDER`
+/// (env) falling back to `config::LLM_PROVIDER`. API keys are read from the
+/// environment only and are never logged, persisted, or echoed to Telegram.
+#[derive(Clone)]
+enum LlmProvider {
+    /// Local or remote Ollama (`/api/chat`). No API key.
+    Ollama { base_url: String, model: String },
+    /// Any OpenAI-compatible endpoint (`{base}/chat/completions`):
+    /// OpenAI, Groq, Together, OpenRouter, vLLM, LM Studio…
+    OpenAiCompatible { base_url: String, api_key: String, model: String },
+    /// Anthropic Messages API (`{base}/v1/messages`).
+    Anthropic { base_url: String, api_key: String, model: String },
+}
+
+/// Uniform inference result across providers.
+struct LlmReply {
+    content: String,
+    /// True when the provider reports the output was cut by the token cap.
+    truncated_by_length: bool,
+}
+
+impl LlmProvider {
+    /// Resolve provider + connection settings from the environment.
+    ///
+    /// Env surface:
+    ///   LLM_PROVIDER = ollama | openai | anthropic   (default: config::LLM_PROVIDER)
+    ///   ollama:    OLLAMA_URL, OLLAMA_MODEL          (existing vars, unchanged)
+    ///   openai:    LLM_API_BASE (default https://api.openai.com/v1),
+    ///              LLM_API_KEY (required), LLM_MODEL (required)
+    ///   anthropic: LLM_API_BASE (default https://api.anthropic.com),
+    ///              LLM_API_KEY (required), LLM_MODEL (required)
+    fn from_env() -> anyhow::Result<Self> {
+        let provider = std::env::var("LLM_PROVIDER")
+            .unwrap_or_else(|_| config::LLM_PROVIDER.to_string())
+            .trim()
+            .to_ascii_lowercase();
+        match provider.as_str() {
+            "" | "ollama" => Ok(Self::Ollama {
+                base_url: std::env::var("OLLAMA_URL")
+                    .unwrap_or_else(|_| config::LLM_OLLAMA_URL.to_string()),
+                model: std::env::var("OLLAMA_MODEL")
+                    .unwrap_or_else(|_| config::LLM_OLLAMA_MODEL.to_string()),
+            }),
+            "openai" | "openai-compatible" => Ok(Self::OpenAiCompatible {
+                base_url: std::env::var("LLM_API_BASE")
+                    .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
+                api_key: require_api_key(&provider)?,
+                model: require_model(&provider)?,
+            }),
+            "anthropic" => Ok(Self::Anthropic {
+                base_url: std::env::var("LLM_API_BASE")
+                    .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),
+                api_key: require_api_key(&provider)?,
+                model: require_model(&provider)?,
+            }),
+            other => Err(anyhow::anyhow!(
+                "unknown LLM_PROVIDER '{other}' (expected: ollama | openai | anthropic)"
+            )),
+        }
+    }
+
+    fn name(&self) -> &'static str {
+        match self {
+            Self::Ollama { .. } => "ollama",
+            Self::OpenAiCompatible { .. } => "openai",
+            Self::Anthropic { .. } => "anthropic",
+        }
+    }
+
+    fn model(&self) -> &str {
+        match self {
+            Self::Ollama { model, .. }
+            | Self::OpenAiCompatible { model, .. }
+            | Self::Anthropic { model, .. } => model,
+        }
+    }
+
+    /// Endpoint shown in logs — never includes the API key.
+    fn display_url(&self) -> &str {
+        match self {
+            Self::Ollama { base_url, .. }
+            | Self::OpenAiCompatible { base_url, .. }
+            | Self::Anthropic { base_url, .. } => base_url,
+        }
+    }
+
+    /// Suggested single-inference timeout. Local CPU Ollama needs minutes
+    /// (measured ~360–400s); hosted APIs answer in seconds — a tight timeout
+    /// keeps retry cycles short.
+    fn inference_timeout(&self) -> Duration {
+        match self {
+            Self::Ollama { .. } => Duration::from_secs(config::LLM_INFERENCE_TIMEOUT_SECS),
+            _ => Duration::from_secs(120),
+        }
+    }
+
+    /// Cheap pre-flight reachability probe (no inference). For hosted APIs a
+    /// TCP+TLS handshake failure is caught by the short connect_timeout on the
+    /// inference call itself, so only Ollama gets a dedicated endpoint probe.
+    async fn probe(&self, probe_client: &Client) -> anyhow::Result<()> {
+        match self {
+            Self::Ollama { base_url, .. } => {
+                let url = format!("{}/api/tags", base_url.trim_end_matches('/'));
+                let resp = probe_client.get(&url).send().await?;
+                if resp.status().is_success() {
+                    Ok(())
+                } else {
+                    Err(anyhow::anyhow!("Ollama /api/tags returned HTTP {}", resp.status()))
+                }
+            }
+            _ => Ok(()),
+        }
+    }
+
+    async fn chat(&self, client: &Client, user_prompt: &str) -> anyhow::Result<LlmReply> {
+        match self {
+            Self::Ollama { base_url, model } => {
+                call_ollama(client, base_url, model, user_prompt).await
+            }
+            Self::OpenAiCompatible { base_url, api_key, model } => {
+                call_openai_compatible(client, base_url, api_key, model, user_prompt).await
+            }
+            Self::Anthropic { base_url, api_key, model } => {
+                call_anthropic(client, base_url, api_key, model, user_prompt).await
+            }
+        }
+    }
+}
+
+fn require_api_key(provider: &str) -> anyhow::Result<String> {
+    std::env::var("LLM_API_KEY")
+        .ok()
+        .map(|k| k.trim().to_string())
+        .filter(|k| !k.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("LLM_PROVIDER={provider} requires the LLM_API_KEY env var"))
+}
+
+fn require_model(provider: &str) -> anyhow::Result<String> {
+    std::env::var("LLM_MODEL")
+        .ok()
+        .map(|m| m.trim().to_string())
+        .filter(|m| !m.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("LLM_PROVIDER={provider} requires the LLM_MODEL env var (e.g. gpt-4o-mini, claude-haiku-4-5)"))
+}
+
+// ── OpenAI-compatible API types ───────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct OpenAiRequest {
+    model: String,
+    messages: Vec<ChatMessage>,
+    max_tokens: u32,
+    temperature: f32,
+}
+
+#[derive(Deserialize)]
+struct OpenAiResponse {
+    choices: Vec<OpenAiChoice>,
+}
+
+#[derive(Deserialize)]
+struct OpenAiChoice {
+    message: ChatMessage,
+    finish_reason: Option<String>,
+}
+
+// ── Anthropic API types ───────────────────────────────────────────────────────
+
+#[derive(Serialize)]
+struct AnthropicRequest {
+    model: String,
+    system: String,
+    messages: Vec<ChatMessage>,
+    max_tokens: u32,
+    temperature: f32,
+}
+
+#[derive(Deserialize)]
+struct AnthropicResponse {
+    content: Vec<AnthropicContent>,
+    stop_reason: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AnthropicContent {
+    #[serde(default)]
+    text: String,
 }
 
 // ── System prompt ─────────────────────────────────────────────────────────────
@@ -404,44 +601,38 @@ fn build_user_prompt(
     lines.join("\n")
 }
 
-// ── Ollama API call ───────────────────────────────────────────────────────────
+// ── Provider API calls ────────────────────────────────────────────────────────
 
-/// Quick reachability probe: GET /api/tags with a short timeout.
-/// Returns Ok(()) if Ollama is up, Err otherwise.
-async fn probe_ollama(probe_client: &Client, ollama_base_url: &str) -> anyhow::Result<()> {
-    let url = format!("{}/api/tags", ollama_base_url.trim_end_matches('/'));
-    let resp = probe_client.get(&url).send().await?;
-    if resp.status().is_success() {
-        Ok(())
-    } else {
-        Err(anyhow::anyhow!("Ollama /api/tags returned HTTP {}", resp.status()))
-    }
-}
+/// Output token cap shared by all providers (Ollama `num_predict`,
+/// OpenAI/Anthropic `max_tokens`) — sized for the ≤250-word structured report.
+const LLM_MAX_OUTPUT_TOKENS: u32 = 900;
+/// Low temperature: consistent, factual recommendations.
+const LLM_TEMPERATURE: f32 = 0.3;
 
 async fn call_ollama(
     client: &Client,
     ollama_base_url: &str,
     model: &str,
     user_prompt: &str,
-) -> anyhow::Result<OllamaResponse> {
+) -> anyhow::Result<LlmReply> {
     let url = format!("{}/api/chat", ollama_base_url.trim_end_matches('/'));
 
     let request = OllamaRequest {
         model: model.to_string(),
         messages: vec![
-            OllamaMessage {
+            ChatMessage {
                 role: "system".to_string(),
                 content: system_prompt(),
             },
-            OllamaMessage {
+            ChatMessage {
                 role: "user".to_string(),
                 content: user_prompt.to_string(),
             },
         ],
         stream: false,
         options: OllamaOptions {
-            num_predict: 900,
-            temperature: 0.3, // Low temperature: consistent, factual recommendations
+            num_predict: LLM_MAX_OUTPUT_TOKENS,
+            temperature: LLM_TEMPERATURE,
             num_ctx: 3072,     // Room for prompt + full recommendation without frequent length stops
         },
     };
@@ -458,9 +649,105 @@ async fn call_ollama(
         return Err(anyhow::anyhow!("Ollama HTTP {}: {}", status, body));
     }
 
-    let mut ollama_resp: OllamaResponse = resp.json().await?;
-    ollama_resp.message.content = ollama_resp.message.content.trim().to_string();
-    Ok(ollama_resp)
+    let ollama_resp: OllamaResponse = resp.json().await?;
+    Ok(LlmReply {
+        content: ollama_resp.message.content.trim().to_string(),
+        truncated_by_length: matches!(ollama_resp.done_reason.as_deref(), Some("length")),
+    })
+}
+
+async fn call_openai_compatible(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    user_prompt: &str,
+) -> anyhow::Result<LlmReply> {
+    let url = format!("{}/chat/completions", base_url.trim_end_matches('/'));
+
+    let request = OpenAiRequest {
+        model: model.to_string(),
+        messages: vec![
+            ChatMessage { role: "system".to_string(), content: system_prompt() },
+            ChatMessage { role: "user".to_string(), content: user_prompt.to_string() },
+        ],
+        max_tokens: LLM_MAX_OUTPUT_TOKENS,
+        temperature: LLM_TEMPERATURE,
+    };
+
+    let resp = client
+        .post(&url)
+        .bearer_auth(api_key)
+        .json(&request)
+        .send()
+        .await?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        // Body may echo request details but never the key; safe to surface.
+        return Err(anyhow::anyhow!("OpenAI-compatible HTTP {}: {}", status, body));
+    }
+
+    let parsed: OpenAiResponse = resp.json().await?;
+    let choice = parsed
+        .choices
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("OpenAI-compatible response had no choices"))?;
+    Ok(LlmReply {
+        content: choice.message.content.trim().to_string(),
+        truncated_by_length: matches!(choice.finish_reason.as_deref(), Some("length")),
+    })
+}
+
+async fn call_anthropic(
+    client: &Client,
+    base_url: &str,
+    api_key: &str,
+    model: &str,
+    user_prompt: &str,
+) -> anyhow::Result<LlmReply> {
+    let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
+
+    let request = AnthropicRequest {
+        model: model.to_string(),
+        system: system_prompt(),
+        messages: vec![ChatMessage { role: "user".to_string(), content: user_prompt.to_string() }],
+        max_tokens: LLM_MAX_OUTPUT_TOKENS,
+        temperature: LLM_TEMPERATURE,
+    };
+
+    let resp = client
+        .post(&url)
+        .header("x-api-key", api_key)
+        .header("anthropic-version", "2023-06-01")
+        .json(&request)
+        .send()
+        .await?;
+
+    let status = resp.status();
+    if !status.is_success() {
+        let body = resp.text().await.unwrap_or_default();
+        return Err(anyhow::anyhow!("Anthropic HTTP {}: {}", status, body));
+    }
+
+    let parsed: AnthropicResponse = resp.json().await?;
+    let content = parsed
+        .content
+        .iter()
+        .map(|c| c.text.as_str())
+        .collect::<Vec<_>>()
+        .join("")
+        .trim()
+        .to_string();
+    if content.is_empty() {
+        return Err(anyhow::anyhow!("Anthropic response had no text content"));
+    }
+    Ok(LlmReply {
+        content,
+        truncated_by_length: matches!(parsed.stop_reason.as_deref(), Some("max_tokens")),
+    })
 }
 
 // ── Main advisor loop ─────────────────────────────────────────────────────────
@@ -494,34 +781,42 @@ pub async fn run_llm_advisor_loop(
         return;
     }
 
-    // Resolve Ollama connection settings — env vars override compile-time defaults.
-    let ollama_url = std::env::var("OLLAMA_URL")
-        .unwrap_or_else(|_| config::LLM_OLLAMA_URL.to_string());
-    let ollama_model = std::env::var("OLLAMA_MODEL")
-        .unwrap_or_else(|_| config::LLM_OLLAMA_MODEL.to_string());
+    // Resolve the LLM provider (ollama / openai / anthropic) from the environment.
+    // Misconfiguration (unknown provider, missing key/model) disables the advisor
+    // loudly rather than hammering a broken endpoint every interval.
+    let provider = match LlmProvider::from_env() {
+        Ok(p) => p,
+        Err(e) => {
+            error!("🤖 LLM Advisor: provider misconfigured — advisor disabled: {}", e);
+            return;
+        }
+    };
 
     info!(
-        "🤖 LLM Advisor started (CAG multi-asset mode) — model: {} @ {} | interval: {}s | session: {}",
-        ollama_model,
-        ollama_url,
+        "🤖 LLM Advisor started (CAG multi-asset mode) — provider: {} | model: {} @ {} | interval: {}s | session: {}",
+        provider.name(),
+        provider.model(),
+        provider.display_url(),
         config::LLM_ADVISOR_INTERVAL_SECS,
         db::current_session_id(),
     );
 
     // Two HTTP clients with different timeout profiles:
     //
-    // probe_client — used for the pre-flight GET /api/tags health-check.
+    // probe_client — used for the pre-flight health-check (Ollama GET /api/tags;
+    //   hosted APIs skip the probe — their short connect_timeout catches outages).
     //   connect_timeout: 5 s  (fail fast if the container/host is unreachable)
     //   timeout:        10 s  (total; /api/tags returns in <1 s when healthy)
     //
-    // inference_client — used for the actual POST /api/chat.
-    //   connect_timeout: 10 s  (fast TCP failure; prevents silent hangs)
-    //   timeout:        480 s  (LLM_INFERENCE_TIMEOUT_SECS — measured on t3.large
-    //                           qwen2.5:3b takes ~360–400s; 480s gives a 20% buffer)
+    // inference_client — used for the actual chat call. Timeout is per-provider:
+    //   Ollama: LLM_INFERENCE_TIMEOUT_SECS (480 s — measured on t3.large,
+    //           qwen2.5:3b takes ~360–400s; 480s gives a 20% buffer).
+    //   Hosted APIs (openai/anthropic): 120 s — they answer in seconds, and a
+    //           tight timeout keeps retry cycles short.
     //
-    // Previously the timeout was 360s — exactly at the model's natural completion
-    // time — causing every first attempt to time out, triggering needless retry cycles
-    // that collectively consumed 12–17 min of a 30-min advisory interval.
+    // Previously the Ollama timeout was 360s — exactly at the model's natural
+    // completion time — causing every first attempt to time out, triggering
+    // needless retry cycles that consumed 12–17 min of a 30-min advisory interval.
     let probe_client = Client::builder()
         .connect_timeout(Duration::from_secs(5))
         .timeout(Duration::from_secs(10))
@@ -530,7 +825,7 @@ pub async fn run_llm_advisor_loop(
 
     let http_client = Client::builder()
         .connect_timeout(Duration::from_secs(10))
-        .timeout(Duration::from_secs(config::LLM_INFERENCE_TIMEOUT_SECS))
+        .timeout(provider.inference_timeout())
         .build()
         .unwrap_or_default();
 
@@ -633,13 +928,13 @@ pub async fn run_llm_advisor_loop(
         let total_trade_count = session_trade_count
             + prior_trades.as_ref().map(|p| p.len()).unwrap_or(0);
 
-        // ── Pre-flight: verify Ollama is reachable before a 6-min inference call ──
-        // Uses the fast probe_client (5 s connect / 10 s total).
-        // On failure we skip this cycle entirely rather than blocking the loop.
-        if let Err(e) = probe_ollama(&probe_client, &ollama_url).await {
+        // ── Pre-flight: verify the provider is reachable before a long inference ──
+        // Ollama gets a real endpoint probe (GET /api/tags, fast probe_client);
+        // hosted APIs skip it. On failure we skip this cycle rather than block.
+        if let Err(e) = provider.probe(&probe_client).await {
             warn!(
-                "🤖 LLM Advisor: Ollama unreachable at {} — skipping cycle ({})",
-                ollama_url, e
+                "🤖 LLM Advisor: {} unreachable at {} — skipping cycle ({})",
+                provider.name(), provider.display_url(), e
             );
             continue;
         }
@@ -657,8 +952,9 @@ pub async fn run_llm_advisor_loop(
         );
 
         info!(
-            "🤖 LLM Advisor: calling {} for session {} ({} session + {} prior trades, P&L ${:.2})...",
-            ollama_model,
+            "🤖 LLM Advisor: calling {} ({}) for session {} ({} session + {} prior trades, P&L ${:.2})...",
+            provider.model(),
+            provider.name(),
             &session_id[..16.min(session_id.len())],
             session_trade_count,
             total_trade_count - session_trade_count,
@@ -677,15 +973,15 @@ pub async fn run_llm_advisor_loop(
                 );
                 tokio::time::sleep(Duration::from_secs(30)).await;
             }
-            match call_ollama(&http_client, &ollama_url, &ollama_model, &user_prompt).await {
-                Ok(resp) => {
-                    if matches!(resp.done_reason.as_deref(), Some("length")) {
+            match provider.chat(&http_client, &user_prompt).await {
+                Ok(reply) => {
+                    if reply.truncated_by_length {
                         warn!(
-                            "🤖 LLM Advisor: output hit Ollama length cap (num_predict={}) — consider increasing if recommendations still end mid-thought",
-                            900,
+                            "🤖 LLM Advisor: output hit the {}-token output cap — consider increasing if recommendations still end mid-thought",
+                            LLM_MAX_OUTPUT_TOKENS,
                         );
                     }
-                    analysis_opt = Some(resp.message.content);
+                    analysis_opt = Some(reply.content);
                     break;
                 }
                 Err(e) => {
@@ -703,7 +999,7 @@ pub async fn run_llm_advisor_loop(
                 // Write to primary pool (main CAG dashboard reads from there).
                 db::record_llm_recommendation(
                     &primary_pool,
-                    &ollama_model,
+                    provider.model(),
                     total_trade_count as i64,
                     current_pnl,
                     &analysis,
@@ -728,8 +1024,8 @@ pub async fn run_llm_advisor_loop(
             }
             None => {
                 error!(
-                    "🤖 LLM Advisor: Ollama call failed after {} retries ({}@{}): {}",
-                    MAX_RETRIES, ollama_model, ollama_url, last_err
+                    "🤖 LLM Advisor: {} call failed after {} retries ({}@{}): {}",
+                    provider.name(), MAX_RETRIES, provider.model(), provider.display_url(), last_err
                 );
             }
         }

@@ -452,21 +452,33 @@ CT_PASSWORD=your-strong-password
 
 ## LLM Advisor
 
-Optional background task. Every `LLM_ADVISOR_INTERVAL_SECS` (default: 30 min) it fetches recent trades from SQLite, analyzes them with a local Ollama model, and posts plain-English optimization recommendations to Telegram.
+Optional background task. Every `LLM_ADVISOR_INTERVAL_SECS` (default: 30 min) it fetches recent trades from SQLite, analyzes them with an LLM, and posts plain-English optimization recommendations to Telegram. Defaults to a local Ollama model; remote providers are supported via env vars.
 
 ```rust
 // src/config.rs
 pub const ENABLE_LLM_ADVISOR: bool = true;
 pub const LLM_ADVISOR_INTERVAL_SECS: u64 = 1800;
 pub const LLM_ADVISOR_TRADES_LOOKBACK: i64 = 20;
+pub const LLM_PROVIDER: &str = "ollama";
 pub const LLM_OLLAMA_URL: &str = "http://localhost:11434";
 pub const LLM_OLLAMA_MODEL: &str = "llama3.2";
 ```
 
 ```bash
-# Override at runtime without rebuilding
+# Ollama (default) — override at runtime without rebuilding
 OLLAMA_URL=http://192.168.1.10:11434
 OLLAMA_MODEL=mistral
+
+# Any OpenAI-compatible provider (OpenAI, Groq, Together, OpenRouter, vLLM, LM Studio…)
+LLM_PROVIDER=openai
+LLM_API_BASE=https://api.openai.com/v1   # optional; default shown
+LLM_API_KEY=sk-...                       # env only — never persisted or logged
+LLM_MODEL=gpt-4o-mini
+
+# Anthropic
+LLM_PROVIDER=anthropic
+LLM_API_KEY=sk-ant-...
+LLM_MODEL=claude-haiku-4-5
 ```
 
 ---

@@ -838,6 +838,12 @@ pub const LLM_OLLAMA_URL: &str = "http://localhost:11434";
 /// Default Ollama model.  Override with `OLLAMA_MODEL` env var.
 pub const LLM_OLLAMA_MODEL: &str = "llama3.2";
 
+/// Default LLM provider for the advisor. Override with the `LLM_PROVIDER` env var.
+///   "ollama"    — local/remote Ollama (default; no API key)
+///   "openai"    — any OpenAI-compatible endpoint; needs LLM_API_KEY + LLM_MODEL
+///   "anthropic" — Anthropic API; needs LLM_API_KEY + LLM_MODEL
+pub const LLM_PROVIDER: &str = "ollama";
+
 
 // ============================================================================
 // API ENDPOINTS AND URLS
