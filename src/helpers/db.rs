@@ -338,6 +338,7 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
             status_detail TEXT,
             status_ts     TEXT,
             inverse_patch TEXT,
+            pnl_at_apply  REAL,
             outcome_score REAL,
             outcome_detail TEXT
         )"
@@ -478,6 +479,12 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
     // (no-op-safe: duplicate-column error is silently suppressed).
     let _ = sqlx::query(
         "ALTER TABLE deployment_queue ADD COLUMN viper_budgets TEXT"
+    ).execute(pool).await;
+
+    // Migration for llm_actions tables created before the circuit breaker
+    // recorded a P&L baseline at apply time.
+    let _ = sqlx::query(
+        "ALTER TABLE llm_actions ADD COLUMN pnl_at_apply REAL"
     ).execute(pool).await;
 
     seed_market_taxonomy(pool).await?;
@@ -2485,6 +2492,8 @@ pub struct LlmActionRow {
     pub status_ts: Option<String>,
     /// JSON merge-patch restoring the pre-apply value (set when applied).
     pub inverse_patch: Option<String>,
+    /// Session P&L (USDC) at apply time — circuit-breaker drawdown baseline.
+    pub pnl_at_apply: Option<f64>,
     pub outcome_score: Option<f64>,
     pub outcome_detail: Option<String>,
 }
@@ -2571,6 +2580,7 @@ fn llm_action_from_row(r: &sqlx::sqlite::SqliteRow) -> Option<LlmActionRow> {
         status_detail: r.try_get("status_detail").ok(),
         status_ts:     r.try_get("status_ts").ok(),
         inverse_patch: r.try_get("inverse_patch").ok(),
+        pnl_at_apply:  r.try_get("pnl_at_apply").ok(),
         outcome_score: r.try_get("outcome_score").ok(),
         outcome_detail: r.try_get("outcome_detail").ok(),
     })
@@ -2649,6 +2659,67 @@ pub async fn expire_stale_llm_actions(pool: &SqlitePool) -> i64 {
     {
         Ok(r) => r.rows_affected() as i64,
         Err(e) => { error!("❌ DB expire_stale_llm_actions failed: {}", e); 0 }
+    }
+}
+
+/// Mark an action applied: stamps status/inverse and the session-P&L baseline
+/// used by the autonomy circuit breaker to measure post-apply drawdown.
+pub async fn mark_llm_action_applied(
+    pool: &SqlitePool,
+    id: i64,
+    detail: &str,
+    inverse_patch: &str,
+    pnl_at_apply: f64,
+) -> bool {
+    match sqlx::query(
+        "UPDATE llm_actions
+         SET status = 'applied', status_detail = ?, status_ts = ?,
+             inverse_patch = ?, pnl_at_apply = ?
+         WHERE id = ?"
+    )
+    .bind(detail)
+    .bind(Utc::now().to_rfc3339())
+    .bind(inverse_patch)
+    .bind(pnl_at_apply)
+    .bind(id)
+    .execute(pool)
+    .await
+    {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => { error!("❌ DB mark_llm_action_applied({id}) failed: {e}"); false }
+    }
+}
+
+/// Number of distinct proposal batches applied since `since` (RFC 3339).
+/// Backs the tier-2 rate limit (default: 1 batch per hour).
+pub async fn count_llm_batches_applied_since(pool: &SqlitePool, since: &str) -> i64 {
+    match sqlx::query(
+        "SELECT COUNT(DISTINCT batch_id) AS n FROM llm_actions
+         WHERE status = 'applied' AND status_ts >= ?"
+    )
+    .bind(since)
+    .fetch_one(pool)
+    .await
+    {
+        Ok(r) => r.try_get::<i64, _>("n").unwrap_or(0),
+        Err(e) => { error!("❌ DB count_llm_batches_applied_since failed: {}", e); 0 }
+    }
+}
+
+/// All actions still in `applied` status whose apply timestamp is at or after
+/// `since` (RFC 3339), newest first — the circuit breaker's revert set.
+pub async fn fetch_llm_actions_applied_since(pool: &SqlitePool, since: &str) -> Vec<LlmActionRow> {
+    match sqlx::query(
+        "SELECT * FROM llm_actions
+         WHERE status = 'applied' AND status_ts >= ?
+         ORDER BY id DESC"
+    )
+    .bind(since)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows.iter().filter_map(llm_action_from_row).collect(),
+        Err(e) => { error!("❌ DB fetch_llm_actions_applied_since failed: {}", e); vec![] }
     }
 }
 

@@ -674,6 +674,13 @@ impl DynamicConfig {
     /// The watch::Sender should then broadcast the returned Arc so all in-flight
     /// tick contexts pick up the new values on the next 50ms interval.
     pub async fn apply_patch(current: &Arc<Self>, patch_json: &str) -> Result<Arc<Self>> {
+        Self::apply_patch_as(current, patch_json, "operator").await
+    }
+
+    /// Like [`Self::apply_patch`] but with explicit attribution for the
+    /// `config_history` trail (e.g. `"llm_advisor"` for autonomy-tier applies,
+    /// `"llm_breaker"` for circuit-breaker reverts).
+    pub async fn apply_patch_as(current: &Arc<Self>, patch_json: &str, actor: &str) -> Result<Arc<Self>> {
         let mut value = serde_json::to_value(current.as_ref())?;
         let patch: serde_json::Value = serde_json::from_str(patch_json)?;
 
@@ -685,8 +692,8 @@ impl DynamicConfig {
         }
 
         let updated: DynamicConfig = serde_json::from_value(value)?;
-        updated.save_as("operator").await;
-        info!("⚙️  DynamicConfig hot-patched and persisted");
+        updated.save_as(actor).await;
+        info!("⚙️  DynamicConfig hot-patched and persisted (by {actor})");
         Ok(Arc::new(updated))
     }
 

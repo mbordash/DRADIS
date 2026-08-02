@@ -838,6 +838,7 @@ pub async fn run_llm_advisor_loop(
     session_pnl: Arc<Mutex<rust_decimal::Decimal>>,
     starting_collateral: Arc<Mutex<rust_decimal::Decimal>>,
     mut config_rx: tokio::sync::watch::Receiver<Arc<DynamicConfig>>,
+    config_tx: Arc<tokio::sync::watch::Sender<Arc<DynamicConfig>>>,
 ) {
     // Resolve the enable flag: the ENABLE_LLM_ADVISOR env var (if set) overrides
     // the compile-time default. This lets a single binary run the advisor on the
@@ -996,6 +997,25 @@ pub async fn run_llm_advisor_loop(
         let collateral = *starting_collateral.lock().await;
         let dyn_cfg = config_rx.borrow_and_update().clone();
 
+        // ── Autonomy circuit breaker (S3) ────────────────────────────────────
+        // Every cycle, check whether session P&L has drawn down past the
+        // breaker threshold since any auto-applied change; if so revert them,
+        // demote to tier 1, and alert.
+        {
+            use rust_decimal::prelude::ToPrimitive;
+            let knobs = crate::helpers::llm_policy::PolicyKnobs::from_env();
+            if let Some(alert) = crate::helpers::llm_policy::circuit_breaker_check(
+                &primary_pool,
+                &config_tx,
+                current_pnl.to_f64().unwrap_or(0.0),
+                &knobs,
+            ).await {
+                if !tg_token.is_empty() && !tg_chat_id.is_empty() {
+                    let _ = notifications::send_notification(&tg_token, &tg_chat_id, &alert).await;
+                }
+            }
+        }
+
         let session_trade_count = all_session_trades.len();
         let total_trade_count = session_trade_count
             + prior_trades.as_ref().map(|p| p.len()).unwrap_or(0);
@@ -1073,6 +1093,8 @@ pub async fn run_llm_advisor_loop(
                 // the approval flow (S4) and the few-shot corpus (S7). Tiered
                 // application is the policy engine's job (S3).
                 use crate::helpers::llm_patch;
+                use crate::helpers::llm_policy;
+                let mut policy_note: Option<String> = None;
                 let expired = db::expire_stale_llm_actions(&primary_pool).await;
                 if expired > 0 {
                     info!("🤖 LLM Advisor: {} stale proposal(s) expired (TTL {}s)", expired, LLM_PROPOSAL_TTL_SECS);
@@ -1112,6 +1134,20 @@ pub async fn run_llm_advisor_loop(
                                 "🤖 LLM Advisor: {} recorded {} proposed / {} rejected change(s) (tier {})",
                                 batch_id, ids.len(), batch.rejected.len(), autonomy_tier(),
                             );
+
+                            // ── Policy engine (S3): tier enforcement ─────────
+                            use rust_decimal::prelude::ToPrimitive;
+                            let knobs = llm_policy::PolicyKnobs::from_env();
+                            let outcome = llm_policy::enforce_batch(
+                                &primary_pool,
+                                &batch,
+                                &ids,
+                                autonomy_tier(),
+                                &config_tx,
+                                current_pnl.to_f64().unwrap_or(0.0),
+                                &knobs,
+                            ).await;
+                            policy_note = outcome.summary_line();
                         }
                     }
                 }
@@ -1119,6 +1155,10 @@ pub async fn run_llm_advisor_loop(
                 // Human-facing prose (Telegram/log) without the machine block;
                 // the DB record keeps the full raw response for the audit trail.
                 let prose = llm_patch::strip_proposal_block(&analysis);
+                let prose = match &policy_note {
+                    Some(note) => format!("{prose}\n\n{note}"),
+                    None => prose,
+                };
 
                 // Persist to SQLite — tagged with current session_id so the
                 // Control Tower can mark prior-session recommendations as stale.

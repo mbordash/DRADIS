@@ -706,6 +706,7 @@ async fn run() -> Result<()> {
             session.total_pnl.clone(),
             session.starting_collateral.clone(),
             config_rx.clone(),
+            Arc::clone(&config_tx),
         ));
     }
 
