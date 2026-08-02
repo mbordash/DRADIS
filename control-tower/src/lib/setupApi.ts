@@ -143,6 +143,30 @@ export async function testConnection(
   }
 }
 
+/** AI autonomy state: tier, kill switch, breaker, and effective policy knobs. */
+export interface AutonomyStatus {
+  tier: 1 | 2 | 3;
+  kill_switch: boolean;
+  breaker_demoted: boolean;
+  max_patches_per_hour: number;
+  max_delta_pct: number;
+  breaker_drawdown_usdc: number;
+  breaker_window_secs: number;
+}
+
+export function getAutonomy(): Promise<AutonomyStatus> {
+  return request('/api/setup/autonomy');
+}
+
+/** Set tier / kill switch (applies live, persisted) or clear a breaker demotion. */
+export function putAutonomy(body: {
+  tier?: number;
+  kill_switch?: boolean;
+  reset_breaker?: boolean;
+}): Promise<AutonomyStatus> {
+  return request('/api/setup/autonomy', { method: 'PUT', body: JSON.stringify(body) });
+}
+
 export function restartEngine(): Promise<{ ok: boolean; message: string }> {
   return request('/api/setup/restart', { method: 'POST' });
 }

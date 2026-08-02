@@ -14,9 +14,10 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  SetupStatus, CredentialInfo, TestResult,
+  SetupStatus, CredentialInfo, TestResult, AutonomyStatus,
   getSetupStatus, getCredentials, putCredentials, testConnection,
   login, setAdminPassword, restartEngine,
+  getAutonomy, putAutonomy,
   getAdminToken, clearAdminToken, SetupApiError,
 } from '@/lib/setupApi';
 
@@ -213,6 +214,119 @@ function CredentialGroup({
           {result.ok
             ? `✓ Connection OK (${result.ms}ms)${result.details ? ' — ' + Object.entries(result.details).map(([k, v]) => `${k}: ${v}`).join(', ') : ''}`
             : `✗ ${result.error}`}
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ── AI autonomy panel ─────────────────────────────────────────────────────────
+
+const TIER_DEFS: { tier: 1 | 2 | 3; name: string; blurb: string }[] = [
+  { tier: 1, name: 'Recommend', blurb: 'AI proposes config changes; nothing applies until you press apply. Proposals expire after 30 min.' },
+  { tier: 2, name: 'Limited', blurb: 'Safe changes auto-apply: schema-clamped, delta-capped, rate-limited, never money fields. The rest queue for approval.' },
+  { tier: 3, name: 'Autonomous', blurb: 'AI applies its changes directly (still schema-clamped; mode flips excluded). Circuit breaker reverts + demotes on a P&L drawdown.' },
+];
+
+function AutonomyPanel({ onAuthError }: { onAuthError: () => void }) {
+  const [state, setState] = useState<AutonomyStatus | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const load = useCallback(async () => {
+    try { setState(await getAutonomy()); }
+    catch (err) {
+      if (err instanceof SetupApiError && err.status === 401) onAuthError();
+      else setError(err instanceof Error ? err.message : 'Failed to load autonomy state');
+    }
+  }, [onAuthError]);
+
+  useEffect(() => { load(); }, [load]);
+
+  const update = async (body: { tier?: number; kill_switch?: boolean; reset_breaker?: boolean }) => {
+    setBusy(true);
+    setError(null);
+    try { setState(await putAutonomy(body)); }
+    catch (err) {
+      if (err instanceof SetupApiError && err.status === 401) onAuthError();
+      else setError(err instanceof Error ? err.message : 'Update failed');
+    }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <div className="bg-[#13131f] border border-[#1e1e32] rounded-xl p-5 space-y-4">
+      <div className="flex items-start justify-between gap-3">
+        <div>
+          <h3 className="text-sm font-mono text-gray-200">🤖 AI Autonomy</h3>
+          <p className="text-xs text-gray-500 mt-0.5">
+            How much control the LLM Advisor has over live config. Changes apply immediately — no restart.
+            Every AI action is logged and TTL-bound; schema bounds are enforced at every tier.
+          </p>
+        </div>
+        {state && (
+          <button
+            onClick={() => update({ kill_switch: !state.kill_switch })}
+            disabled={busy}
+            className={btnCls(state.kill_switch ? 'primary' : 'danger') + ' shrink-0'}
+            title="Hard stop: no auto-applies at any tier; proposals still queue"
+          >
+            {state.kill_switch ? '▶ Resume autonomy' : '⛔ Kill switch'}
+          </button>
+        )}
+      </div>
+
+      {!state ? (
+        <p className="text-xs text-gray-600 font-mono">Loading…</p>
+      ) : (
+        <>
+          {state.kill_switch && (
+            <div className="text-xs font-mono rounded-lg px-3 py-2 bg-rose-500/10 border border-rose-500/30 text-rose-300">
+              ⛔ Kill switch engaged — all AI changes queue for human approval regardless of tier.
+            </div>
+          )}
+          {state.breaker_demoted && (
+            <div className="flex items-center justify-between gap-2 text-xs font-mono rounded-lg px-3 py-2 bg-amber-500/10 border border-amber-500/30 text-amber-300">
+              <span>🧯 Circuit breaker tripped — autonomy demoted to Recommend after a P&L drawdown. Review reverted changes before resetting.</span>
+              <button onClick={() => update({ reset_breaker: true })} disabled={busy} className={btnCls('ghost') + ' shrink-0'}>
+                Reset breaker
+              </button>
+            </div>
+          )}
+          <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            {TIER_DEFS.map(t => {
+              const active = state.tier === t.tier;
+              return (
+                <button
+                  key={t.tier}
+                  onClick={() => update({ tier: t.tier })}
+                  disabled={busy || active}
+                  className={[
+                    'text-left rounded-lg border px-3 py-2.5 transition-colors disabled:cursor-default',
+                    active
+                      ? 'bg-indigo-500/15 border-indigo-500/50'
+                      : 'bg-[#0d0d16] border-[#1e1e32] hover:border-gray-600',
+                  ].join(' ')}
+                >
+                  <p className={`text-xs font-mono ${active ? 'text-indigo-300' : 'text-gray-300'}`}>
+                    {t.tier} · {t.name}{active ? ' ✓' : ''}
+                  </p>
+                  <p className="text-[11px] text-gray-500 mt-1 leading-snug">{t.blurb}</p>
+                </button>
+              );
+            })}
+          </div>
+          <p className="text-[11px] text-gray-600 font-mono">
+            Guardrails: max {state.max_patches_per_hour} patch batch/h · ±{Math.round(state.max_delta_pct * 100)}% per field (tier 2)
+            {' '}· breaker: ${state.breaker_drawdown_usdc.toFixed(0)} drawdown / {Math.round(state.breaker_window_secs / 3600)}h window.
+            Applies in both LIVE and GHOST modes.
+          </p>
+        </>
+      )}
+
+      {error && (
+        <div className="text-xs font-mono rounded-lg px-3 py-2 bg-rose-500/10 border border-rose-500/30 text-rose-300">
+          ✗ {error}
         </div>
       )}
     </div>
@@ -416,6 +530,8 @@ export default function SetupPage() {
       ) : (
         <div className="text-center text-gray-500 font-mono text-sm py-8">Loading credentials…</div>
       )}
+
+      <AutonomyPanel onAuthError={() => { clearAdminToken(); setAuthed(false); }} />
 
       <div className="flex items-center justify-end gap-2 border-t border-[#1e1e32] pt-4">
         <button onClick={save} disabled={!dirty || saving} className={btnCls('primary')}>

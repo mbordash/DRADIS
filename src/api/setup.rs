@@ -545,6 +545,71 @@ async fn restart() -> Response {
     Json(json!({"ok": true, "message": "restarting — back in ~30-60s"})).into_response()
 }
 
+// ─── AI autonomy (LLM config-patch policy) ───────────────────────────────────
+
+/// GET /api/setup/autonomy — current autonomy tier, kill switch, breaker state,
+/// and the effective policy knobs. Values live in env (secrets-file backed) and
+/// are re-read by the policy engine every advisory cycle, so changes here apply
+/// live — no restart needed.
+async fn get_autonomy() -> Response {
+    use crate::helpers::llm_policy::{breaker_demoted, PolicyKnobs};
+    let knobs = PolicyKnobs::from_env();
+    let tier = std::env::var("LLM_AUTONOMY_TIER")
+        .ok().and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|t| (1..=3).contains(t))
+        .unwrap_or(1);
+    Json(json!({
+        "tier": tier,
+        "kill_switch": knobs.kill_switch,
+        "breaker_demoted": breaker_demoted(),
+        "max_patches_per_hour": knobs.max_batches_per_hour,
+        "max_delta_pct": knobs.max_delta_pct,
+        "breaker_drawdown_usdc": knobs.breaker_drawdown_usdc,
+        "breaker_window_secs": knobs.breaker_window_secs,
+    })).into_response()
+}
+
+#[derive(Deserialize)]
+struct PutAutonomy {
+    tier: Option<i64>,
+    kill_switch: Option<bool>,
+    /// Clear a circuit-breaker demotion after reviewing the reverted changes.
+    reset_breaker: Option<bool>,
+}
+
+/// PUT /api/setup/autonomy — set the autonomy tier and/or kill switch
+/// (persisted to the secrets file, applied to process env immediately), and
+/// optionally reset a circuit-breaker demotion.
+async fn put_autonomy(Json(body): Json<PutAutonomy>) -> Response {
+    if let Some(t) = body.tier {
+        if !(1..=3).contains(&t) {
+            return (StatusCode::BAD_REQUEST,
+                    Json(json!({"error": "tier must be 1, 2, or 3"}))).into_response();
+        }
+    }
+    let mut map = read_secrets();
+    if let Some(t) = body.tier {
+        map.insert("LLM_AUTONOMY_TIER".to_string(), t.to_string());
+        std::env::set_var("LLM_AUTONOMY_TIER", t.to_string());
+        info!("🤖 Setup: LLM autonomy tier set to {} via UI", t);
+    }
+    if let Some(k) = body.kill_switch {
+        let v = if k { "1" } else { "0" };
+        map.insert("LLM_AUTONOMY_KILL".to_string(), v.to_string());
+        std::env::set_var("LLM_AUTONOMY_KILL", v);
+        info!("🤖 Setup: LLM autonomy kill switch {} via UI", if k { "ENGAGED" } else { "cleared" });
+    }
+    if body.reset_breaker == Some(true) {
+        crate::helpers::llm_policy::reset_breaker_demotion();
+        info!("🧯 Setup: LLM autonomy circuit-breaker demotion cleared via UI");
+    }
+    if (body.tier.is_some() || body.kill_switch.is_some()) && write_secrets(&map).is_err() {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": "failed to persist autonomy settings"}))).into_response();
+    }
+    get_autonomy().await
+}
+
 // ─── Router ──────────────────────────────────────────────────────────────────
 
 /// Routes that require an admin session (or first-boot wizard mode).
@@ -556,6 +621,7 @@ pub fn admin_routes() -> Router {
         .route("/api/setup/admin",       post(set_admin))
         .route("/api/setup/test",        post(test_connection))
         .route("/api/setup/restart",     post(restart))
+        .route("/api/setup/autonomy",    get(get_autonomy).put(put_autonomy))
         .layer(axum::middleware::from_fn(require_admin))
 }
 
