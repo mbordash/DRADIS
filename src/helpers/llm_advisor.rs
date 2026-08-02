@@ -392,7 +392,23 @@ Session P&L: [value]  |  Trades analysed: [n]
 🟢 KEEP ENABLED: [comma-separated strategy names]
 🔴 CONSIDER DISABLING: [comma-separated strategy names, or "none"]
 
-Keep the entire response under 250 words."#.to_string()
+After the report, append EXACTLY ONE fenced json block translating your
+recommendations into machine-applicable changes:
+
+```json
+{"proposals":[{"field":"<exact key>","to":<value>,"reason":"<short reason>"}]}
+```
+
+Proposal rules (strict):
+- "field" MUST be copied verbatim from the "== Machine-Editable Keys ==" list
+  in the user message. Any other key is discarded.
+- "to" is a plain JSON number for numeric keys (fractions, not percent strings:
+  8% → 0.08) or true/false for boolean keys.
+- Maximum 4 proposals; stay within the [min..max] shown for the key.
+- If you have no config changes to propose, emit {"proposals":[]}.
+- The json block must be the LAST thing in your reply.
+
+Keep the entire response under 250 words (excluding the json block)."#.to_string()
 }
 
 // ── Prompt builder ────────────────────────────────────────────────────────────
@@ -598,6 +614,46 @@ fn build_user_prompt(
         lines.push("Note: these positions are open and awaiting exit/settlement. Account for them in your P&L and risk assessment.".to_string());
     }
 
+    // ── Machine-editable key list for the proposals json block ────────────────
+    // Exact serde keys + current values + allowed bounds, restricted to Basic
+    // (non-advanced) fields of Global + currently-enabled vipers to keep the
+    // prompt compact for small local models. Values are the RAW config values
+    // (fractions, not display percentages).
+    lines.push(String::new());
+    lines.push("== Machine-Editable Keys ==".to_string());
+    lines.push("Use ONLY these exact keys in the proposals json block (key = current [min..max]):".to_string());
+    let cfg_json = serde_json::to_value(dyn_cfg).unwrap_or(serde_json::Value::Null);
+    for f in crate::api::config_schema::config_schema() {
+        if f.advanced {
+            continue;
+        }
+        // Skip fields of disabled vipers — proposing into a dormant strategy
+        // wastes the 4-change budget (enable flags themselves stay listed).
+        if let Some(enable_key) = f.enable_key {
+            let enabled = cfg_json
+                .get(enable_key)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            if !enabled && f.key != enable_key {
+                continue;
+            }
+        }
+        let current = cfg_json
+            .get(f.key)
+            .map(|v| match v {
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .unwrap_or_else(|| "?".to_string());
+        let bounds = match (f.min, f.max) {
+            (Some(mn), Some(mx)) => format!(" [{mn}..{mx}]"),
+            (Some(mn), None) => format!(" [min {mn}]"),
+            (None, Some(mx)) => format!(" [max {mx}]"),
+            (None, None) => String::new(),
+        };
+        lines.push(format!("{} = {}{}", f.key, current, bounds));
+    }
+
     lines.join("\n")
 }
 
@@ -633,7 +689,7 @@ async fn call_ollama(
         options: OllamaOptions {
             num_predict: LLM_MAX_OUTPUT_TOKENS,
             temperature: LLM_TEMPERATURE,
-            num_ctx: 3072,     // Room for prompt + full recommendation without frequent length stops
+            num_ctx: 4096,     // Room for prompt + machine-editable key list + full recommendation
         },
     };
 
@@ -994,6 +1050,37 @@ pub async fn run_llm_advisor_loop(
             Some(analysis) => {
                 info!("🤖 LLM Advisor: analysis received ({} chars)", analysis.len());
 
+                // ── Config patch proposals (Epic S1) ──────────────────────────
+                // Extract + validate the machine block. Malformed proposals never
+                // block the prose report. The validated batch is logged here;
+                // persistence + tiered application land with S2/S3.
+                use crate::helpers::llm_patch;
+                match llm_patch::proposals_from_response(&analysis, &dyn_cfg) {
+                    None => info!("🤖 LLM Advisor: no proposal block in response"),
+                    Some(Err(e)) => warn!("🤖 LLM Advisor: proposal block rejected — {}", e),
+                    Some(Ok(batch)) => {
+                        for c in &batch.accepted {
+                            info!(
+                                "🤖 LLM Advisor: proposal ✔ {}: {} → {}{}{} — {}",
+                                c.key, c.from, c.to,
+                                if c.clamped { " (clamped to schema bounds)" } else { "" },
+                                c.delta_pct.map(|d| format!(" [{:+.1}%]", d * 100.0)).unwrap_or_default(),
+                                c.reason,
+                            );
+                        }
+                        for r in &batch.rejected {
+                            warn!("🤖 LLM Advisor: proposal ✖ {} → {}: {}", r.field, r.to, r.why);
+                        }
+                        if batch.is_empty() {
+                            info!("🤖 LLM Advisor: proposal block present but empty");
+                        }
+                    }
+                }
+
+                // Human-facing prose (Telegram/log) without the machine block;
+                // the DB record keeps the full raw response for the audit trail.
+                let prose = llm_patch::strip_proposal_block(&analysis);
+
                 // Persist to SQLite — tagged with current session_id so the
                 // Control Tower can mark prior-session recommendations as stale.
                 // Write to primary pool (main CAG dashboard reads from there).
@@ -1006,10 +1093,10 @@ pub async fn run_llm_advisor_loop(
                 ).await;
 
                 // Telegram has a 4096-char limit per message; truncate with notice if needed.
-                let message = if analysis.len() > 4000 {
-                    format!("{}\n\n[truncated — full response in logs]", &analysis[..3980])
+                let message = if prose.len() > 4000 {
+                    format!("{}\n\n[truncated — full response in logs]", &prose[..3980])
                 } else {
-                    analysis.clone()
+                    prose.clone()
                 };
 
                 if !tg_token.is_empty() && !tg_chat_id.is_empty() {
@@ -1019,7 +1106,7 @@ pub async fn run_llm_advisor_loop(
                     }
                 } else {
                     warn!("🤖 LLM Advisor: no Telegram creds set (TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID)");
-                    info!("🤖 LLM Advisor output:\n{}", analysis);
+                    info!("🤖 LLM Advisor output:\n{}", prose);
                 }
             }
             None => {
