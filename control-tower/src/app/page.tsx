@@ -11,6 +11,7 @@ import SquadronsPanel  from '@/components/SquadronsPanel';
 import SquadronDetailView from '@/components/SquadronDetailView';
 import TradelogPage    from '@/components/TradelogPage';
 import SetupPage       from '@/components/SetupPage';
+import AiActionsPage   from '@/components/AiActionsPage';
 import ErrorBoundary   from '@/components/ErrorBoundary';
 import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, approveLlmAction, rejectLlmAction, getPortfolioValue, getSquadrons } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
@@ -228,7 +229,7 @@ function PortfolioValueBanner({
 
 // ── Top-level nav ─────────────────────────────────────────────────────────────
 
-type AppView = 'main' | 'telemetry' | 'tradelog' | 'setup';
+type AppView = 'main' | 'telemetry' | 'tradelog' | 'ai' | 'setup';
 
 function NavTabs({
   active,
@@ -241,6 +242,7 @@ function NavTabs({
     { id: 'main',      label: 'Main',      icon: '🗺️' },
     { id: 'telemetry', label: 'Telemetry', icon: '📡' },
     { id: 'tradelog',  label: 'Tradelog',  icon: '📋' },
+    { id: 'ai',        label: 'AI Actions', icon: '🤖' },
     { id: 'setup',     label: 'Setup',     icon: '⚙️' },
   ];
   return (
@@ -498,6 +500,20 @@ export default function DashboardPage() {
           {config?.ghost_mode && <GhostBanner ghost />}
           <ErrorBoundary label="Telemetry">
             <TelemetryPage availableAssets={availableAssets} />
+          </ErrorBoundary>
+          <footer className="text-center text-xs text-gray-700 pb-4 font-mono">
+            DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}
+            <span className="text-gray-600">So say we all.</span>
+          </footer>
+        </main>
+      )}
+
+      {/* ── AI Actions view ────────────────────────────────────────────────── */}
+      {activeView === 'ai' && (
+        <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+          {config?.ghost_mode && <GhostBanner ghost />}
+          <ErrorBoundary label="AI Actions">
+            <AiActionsPage />
           </ErrorBoundary>
           <footer className="text-center text-xs text-gray-700 pb-4 font-mono">
             DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}
