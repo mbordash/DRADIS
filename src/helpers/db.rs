@@ -312,6 +312,40 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
         )"
     ).execute(pool).await?;
 
+    // llm_actions: LLM-authored config patch proposals — one row per proposed
+    // field change, grouped by batch_id (one advisory cycle). Drives the
+    // approval flow, autonomy policy engine, AI Actions view, and the few-shot
+    // retraining corpus. Status lifecycle:
+    //   proposed → approved → applied → (reverted)
+    //   proposed → rejected | expired      applied → failed (apply error)
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS llm_actions (
+            id            INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_id      TEXT    NOT NULL,
+            session_id    TEXT    NOT NULL,
+            ts            TEXT    NOT NULL,
+            expires_at    TEXT    NOT NULL,
+            model         TEXT    NOT NULL,
+            tier          INTEGER NOT NULL,
+            ghost_mode    INTEGER NOT NULL,
+            field         TEXT    NOT NULL,
+            from_value    TEXT    NOT NULL,
+            to_value      TEXT    NOT NULL,
+            clamped       INTEGER NOT NULL DEFAULT 0,
+            delta_pct     REAL,
+            reason        TEXT    NOT NULL DEFAULT '',
+            status        TEXT    NOT NULL DEFAULT 'proposed',
+            status_detail TEXT,
+            status_ts     TEXT,
+            inverse_patch TEXT,
+            outcome_score REAL,
+            outcome_detail TEXT
+        )"
+    ).execute(pool).await?;
+    sqlx::query(
+        "CREATE INDEX IF NOT EXISTS idx_llm_actions_status ON llm_actions (status, expires_at)"
+    ).execute(pool).await?;
+
     // sessions: one row per process start — the anchor for scoping all queries.
     // session_id = RFC-3339 startup timestamp (stable, readable, sortable).
     sqlx::query(
@@ -2425,6 +2459,218 @@ pub async fn get_recent_llm_recommendations(pool: &SqlitePool, limit: i64) -> Ve
     }
 }
 
+// ── llm_actions: LLM-authored config patch audit trail (Epic S2) ─────────────
+
+/// One row of the `llm_actions` audit trail — a single proposed field change.
+#[derive(Debug, Clone, Serialize)]
+pub struct LlmActionRow {
+    pub id: i64,
+    pub batch_id: String,
+    pub session_id: String,
+    pub ts: String,
+    pub expires_at: String,
+    pub model: String,
+    /// Autonomy tier active when proposed (1 = approval, 2 = limited, 3 = autonomous).
+    pub tier: i64,
+    pub ghost_mode: bool,
+    pub field: String,
+    pub from_value: String,
+    pub to_value: String,
+    pub clamped: bool,
+    pub delta_pct: Option<f64>,
+    pub reason: String,
+    /// proposed | approved | applied | rejected | expired | reverted | failed
+    pub status: String,
+    pub status_detail: Option<String>,
+    pub status_ts: Option<String>,
+    /// JSON merge-patch restoring the pre-apply value (set when applied).
+    pub inverse_patch: Option<String>,
+    pub outcome_score: Option<f64>,
+    pub outcome_detail: Option<String>,
+}
+
+/// Persist one advisory cycle's proposal batch: every accepted change lands as
+/// `proposed`, every validation reject as `rejected` (with the reason) so the
+/// few-shot corpus sees both. Returns the ids of the `proposed` rows.
+pub async fn record_llm_action_batch(
+    pool: &SqlitePool,
+    batch_id: &str,
+    model: &str,
+    tier: i64,
+    ghost_mode: bool,
+    ttl_secs: i64,
+    batch: &crate::helpers::llm_patch::ProposalBatch,
+) -> Vec<i64> {
+    let ts = Utc::now();
+    let expires_at = (ts + chrono::Duration::seconds(ttl_secs)).to_rfc3339();
+    let ts = ts.to_rfc3339();
+    let sid = current_session_id();
+    let mut ids = Vec::new();
+
+    for c in &batch.accepted {
+        match sqlx::query(
+            "INSERT INTO llm_actions
+               (batch_id, session_id, ts, expires_at, model, tier, ghost_mode,
+                field, from_value, to_value, clamped, delta_pct, reason, status)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed')"
+        )
+        .bind(batch_id).bind(sid).bind(&ts).bind(&expires_at).bind(model)
+        .bind(tier).bind(ghost_mode)
+        .bind(&c.key)
+        .bind(c.from.to_string())
+        .bind(c.to.to_string())
+        .bind(c.clamped)
+        .bind(c.delta_pct)
+        .bind(&c.reason)
+        .execute(pool)
+        .await {
+            Ok(r) => ids.push(r.last_insert_rowid()),
+            Err(e) => error!("❌ DB llm_actions insert failed for {}: {}", c.key, e),
+        }
+    }
+
+    for r in &batch.rejected {
+        if let Err(e) = sqlx::query(
+            "INSERT INTO llm_actions
+               (batch_id, session_id, ts, expires_at, model, tier, ghost_mode,
+                field, from_value, to_value, reason, status, status_detail, status_ts)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, '', 'rejected', ?, ?)"
+        )
+        .bind(batch_id).bind(sid).bind(&ts).bind(&expires_at).bind(model)
+        .bind(tier).bind(ghost_mode)
+        .bind(&r.field)
+        .bind(r.to.to_string())
+        .bind(&r.why)
+        .bind(&ts)
+        .execute(pool)
+        .await {
+            error!("❌ DB llm_actions reject-insert failed for {}: {}", r.field, e);
+        }
+    }
+
+    ids
+}
+
+fn llm_action_from_row(r: &sqlx::sqlite::SqliteRow) -> Option<LlmActionRow> {
+    Some(LlmActionRow {
+        id:            r.try_get("id").ok()?,
+        batch_id:      r.try_get("batch_id").ok()?,
+        session_id:    r.try_get("session_id").ok()?,
+        ts:            r.try_get("ts").ok()?,
+        expires_at:    r.try_get("expires_at").ok()?,
+        model:         r.try_get("model").ok()?,
+        tier:          r.try_get("tier").ok()?,
+        ghost_mode:    r.try_get::<i64, _>("ghost_mode").ok()? != 0,
+        field:         r.try_get("field").ok()?,
+        from_value:    r.try_get("from_value").ok()?,
+        to_value:      r.try_get("to_value").ok()?,
+        clamped:       r.try_get::<i64, _>("clamped").ok()? != 0,
+        delta_pct:     r.try_get("delta_pct").ok(),
+        reason:        r.try_get("reason").ok()?,
+        status:        r.try_get("status").ok()?,
+        status_detail: r.try_get("status_detail").ok(),
+        status_ts:     r.try_get("status_ts").ok(),
+        inverse_patch: r.try_get("inverse_patch").ok(),
+        outcome_score: r.try_get("outcome_score").ok(),
+        outcome_detail: r.try_get("outcome_detail").ok(),
+    })
+}
+
+/// Most recent actions, newest first — feeds the AI Actions view.
+pub async fn fetch_llm_actions(pool: &SqlitePool, limit: i64) -> Vec<LlmActionRow> {
+    match sqlx::query("SELECT * FROM llm_actions ORDER BY id DESC LIMIT ?")
+        .bind(limit)
+        .fetch_all(pool)
+        .await
+    {
+        Ok(rows) => rows.iter().filter_map(llm_action_from_row).collect(),
+        Err(e) => { error!("❌ DB fetch_llm_actions failed: {}", e); vec![] }
+    }
+}
+
+/// Actions awaiting a decision (tier-1 approval queue): `proposed` and unexpired.
+pub async fn fetch_pending_llm_actions(pool: &SqlitePool) -> Vec<LlmActionRow> {
+    let now = Utc::now().to_rfc3339();
+    match sqlx::query(
+        "SELECT * FROM llm_actions WHERE status = 'proposed' AND expires_at > ? ORDER BY id"
+    )
+    .bind(&now)
+    .fetch_all(pool)
+    .await
+    {
+        Ok(rows) => rows.iter().filter_map(llm_action_from_row).collect(),
+        Err(e) => { error!("❌ DB fetch_pending_llm_actions failed: {}", e); vec![] }
+    }
+}
+
+/// Advance an action's status (stamps status_ts; optional detail and inverse
+/// patch — the inverse is recorded when the change is actually applied).
+/// Returns true when a row was updated.
+pub async fn update_llm_action_status(
+    pool: &SqlitePool,
+    id: i64,
+    status: &str,
+    detail: Option<&str>,
+    inverse_patch: Option<&str>,
+) -> bool {
+    match sqlx::query(
+        "UPDATE llm_actions
+         SET status = ?, status_detail = ?, status_ts = ?,
+             inverse_patch = COALESCE(?, inverse_patch)
+         WHERE id = ?"
+    )
+    .bind(status)
+    .bind(detail)
+    .bind(Utc::now().to_rfc3339())
+    .bind(inverse_patch)
+    .bind(id)
+    .execute(pool)
+    .await
+    {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => { error!("❌ DB update_llm_action_status({id}→{status}) failed: {e}"); false }
+    }
+}
+
+/// Expire stale `proposed` actions (market context has moved on). Returns the
+/// number of rows expired. Called before serving the approval queue and at the
+/// start of each advisory cycle.
+pub async fn expire_stale_llm_actions(pool: &SqlitePool) -> i64 {
+    let now = Utc::now().to_rfc3339();
+    match sqlx::query(
+        "UPDATE llm_actions
+         SET status = 'expired', status_detail = 'TTL elapsed before approval', status_ts = ?
+         WHERE status = 'proposed' AND expires_at <= ?"
+    )
+    .bind(&now)
+    .bind(&now)
+    .execute(pool)
+    .await
+    {
+        Ok(r) => r.rows_affected() as i64,
+        Err(e) => { error!("❌ DB expire_stale_llm_actions failed: {}", e); 0 }
+    }
+}
+
+/// Record the measured outcome of an applied action (few-shot corpus, S7).
+pub async fn set_llm_action_outcome(
+    pool: &SqlitePool,
+    id: i64,
+    score: f64,
+    detail: &str,
+) -> bool {
+    match sqlx::query("UPDATE llm_actions SET outcome_score = ?, outcome_detail = ? WHERE id = ?")
+        .bind(score)
+        .bind(detail)
+        .bind(id)
+        .execute(pool)
+        .await
+    {
+        Ok(r) => r.rows_affected() > 0,
+        Err(e) => { error!("❌ DB set_llm_action_outcome failed: {}", e); false }
+    }
+}
+
 
 #[cfg(test)]
 mod reconcile_tests {
@@ -2592,5 +2838,105 @@ mod reconcile_tests {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE market = 'MarketG'")
             .fetch_one(&pool).await.unwrap();
         assert_eq!(n, 1);
+    }
+}
+
+#[cfg(test)]
+mod llm_actions_tests {
+    use super::*;
+    use crate::helpers::llm_patch::{ProposalBatch, RejectedProposal, ValidatedChange};
+
+    async fn mem_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        init_schema(&pool).await.expect("init schema");
+        pool
+    }
+
+    fn sample_batch() -> ProposalBatch {
+        ProposalBatch {
+            accepted: vec![ValidatedChange {
+                key: "arbitrage_profit_threshold".into(),
+                from: serde_json::json!("0.01"),
+                to: serde_json::json!("0.02"),
+                clamped: false,
+                delta_pct: Some(1.0),
+                reason: "wider edge required".into(),
+            }],
+            rejected: vec![RejectedProposal {
+                field: "not_a_field".into(),
+                to: serde_json::json!(1),
+                why: "unknown field (not in config schema)".into(),
+            }],
+        }
+    }
+
+    #[tokio::test]
+    async fn batch_persists_proposed_and_rejected() {
+        let pool = mem_pool().await;
+        let ids = record_llm_action_batch(&pool, "b1", "test-model", 1, true, 1800, &sample_batch()).await;
+        assert_eq!(ids.len(), 1);
+
+        let all = fetch_llm_actions(&pool, 10).await;
+        assert_eq!(all.len(), 2);
+        assert!(all.iter().any(|a| a.status == "proposed" && a.field == "arbitrage_profit_threshold"));
+        assert!(all.iter().any(|a| a.status == "rejected" && a.field == "not_a_field"));
+
+        let pending = fetch_pending_llm_actions(&pool).await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, ids[0]);
+        assert!(pending[0].ghost_mode);
+        assert_eq!(pending[0].tier, 1);
+    }
+
+    #[tokio::test]
+    async fn status_lifecycle_and_inverse_patch() {
+        let pool = mem_pool().await;
+        let ids = record_llm_action_batch(&pool, "b2", "m", 2, false, 1800, &sample_batch()).await;
+        let id = ids[0];
+
+        assert!(update_llm_action_status(&pool, id, "approved", None, None).await);
+        assert!(fetch_pending_llm_actions(&pool).await.is_empty());
+
+        let inverse = r#"{"arbitrage_profit_threshold":"0.01"}"#;
+        assert!(update_llm_action_status(&pool, id, "applied", Some("tier2 auto"), Some(inverse)).await);
+        let row = fetch_llm_actions(&pool, 10).await.into_iter().find(|a| a.id == id).unwrap();
+        assert_eq!(row.status, "applied");
+        assert_eq!(row.inverse_patch.as_deref(), Some(inverse));
+
+        // A later status change must not erase the stored inverse (COALESCE).
+        assert!(update_llm_action_status(&pool, id, "reverted", Some("operator"), None).await);
+        let row = fetch_llm_actions(&pool, 10).await.into_iter().find(|a| a.id == id).unwrap();
+        assert_eq!(row.status, "reverted");
+        assert_eq!(row.inverse_patch.as_deref(), Some(inverse));
+    }
+
+    #[tokio::test]
+    async fn ttl_expiry_sweeps_only_stale_proposed() {
+        let pool = mem_pool().await;
+        // Already expired (negative TTL) + still fresh.
+        record_llm_action_batch(&pool, "b3", "m", 1, true, -5, &sample_batch()).await;
+        let fresh = record_llm_action_batch(&pool, "b4", "m", 1, true, 1800, &sample_batch()).await;
+
+        assert_eq!(expire_stale_llm_actions(&pool).await, 1);
+        let pending = fetch_pending_llm_actions(&pool).await;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, fresh[0]);
+
+        let expired = fetch_llm_actions(&pool, 10).await
+            .into_iter().find(|a| a.status == "expired").unwrap();
+        assert_eq!(expired.status_detail.as_deref(), Some("TTL elapsed before approval"));
+    }
+
+    #[tokio::test]
+    async fn outcome_recorded() {
+        let pool = mem_pool().await;
+        let ids = record_llm_action_batch(&pool, "b5", "m", 3, false, 1800, &sample_batch()).await;
+        assert!(set_llm_action_outcome(&pool, ids[0], -0.42, "strategy PnL -$0.42 over 4h window").await);
+        let row = fetch_llm_actions(&pool, 10).await.into_iter().find(|a| a.id == ids[0]).unwrap();
+        assert_eq!(row.outcome_score, Some(-0.42));
     }
 }

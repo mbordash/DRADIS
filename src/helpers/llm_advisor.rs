@@ -64,6 +64,22 @@ const LLM_ADVISOR_MIN_SESSION_TRADES: usize = 5;
 /// Kept low (5) to avoid prompt bloat — a 3b CPU model struggles past ~1500 input tokens.
 const LLM_ADVISOR_PRIOR_SESSION_SUPPLEMENT: i64 = 5;
 
+/// How long a `proposed` config change stays actionable before auto-expiring.
+/// Markets move fast — approving an hour-old proposal applies advice computed
+/// against conditions that no longer exist. One advisory interval is the ceiling.
+const LLM_PROPOSAL_TTL_SECS: i64 = 1800;
+
+/// Autonomy tier stamped on proposals (1 = human approval, 2 = limited
+/// auto-apply, 3 = autonomous). Env placeholder until the Setup-view control
+/// ships (Epic S5); the policy engine (S3) is the sole enforcement point.
+fn autonomy_tier() -> i64 {
+    std::env::var("LLM_AUTONOMY_TIER")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|t| (1..=3).contains(t))
+        .unwrap_or(1)
+}
+
 // ── Ollama API types ──────────────────────────────────────────────────────────
 
 #[derive(Serialize)]
@@ -1050,11 +1066,17 @@ pub async fn run_llm_advisor_loop(
             Some(analysis) => {
                 info!("🤖 LLM Advisor: analysis received ({} chars)", analysis.len());
 
-                // ── Config patch proposals (Epic S1) ──────────────────────────
+                // ── Config patch proposals (S1 parse / S2 persist) ────────────
                 // Extract + validate the machine block. Malformed proposals never
-                // block the prose report. The validated batch is logged here;
-                // persistence + tiered application land with S2/S3.
+                // block the prose report. Accepted changes land as `proposed`
+                // rows (TTL-bound), validation rejects as `rejected` — both feed
+                // the approval flow (S4) and the few-shot corpus (S7). Tiered
+                // application is the policy engine's job (S3).
                 use crate::helpers::llm_patch;
+                let expired = db::expire_stale_llm_actions(&primary_pool).await;
+                if expired > 0 {
+                    info!("🤖 LLM Advisor: {} stale proposal(s) expired (TTL {}s)", expired, LLM_PROPOSAL_TTL_SECS);
+                }
                 match llm_patch::proposals_from_response(&analysis, &dyn_cfg) {
                     None => info!("🤖 LLM Advisor: no proposal block in response"),
                     Some(Err(e)) => warn!("🤖 LLM Advisor: proposal block rejected — {}", e),
@@ -1073,6 +1095,23 @@ pub async fn run_llm_advisor_loop(
                         }
                         if batch.is_empty() {
                             info!("🤖 LLM Advisor: proposal block present but empty");
+                        } else {
+                            let batch_id = format!(
+                                "batch-{}", chrono::Utc::now().format("%Y%m%dT%H%M%S%.3fZ")
+                            );
+                            let ids = db::record_llm_action_batch(
+                                &primary_pool,
+                                &batch_id,
+                                provider.model(),
+                                autonomy_tier(),
+                                dyn_cfg.ghost_mode,
+                                LLM_PROPOSAL_TTL_SECS,
+                                &batch,
+                            ).await;
+                            info!(
+                                "🤖 LLM Advisor: {} recorded {} proposed / {} rejected change(s) (tier {})",
+                                batch_id, ids.len(), batch.rejected.len(), autonomy_tier(),
+                            );
                         }
                     }
                 }
