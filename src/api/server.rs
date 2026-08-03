@@ -352,7 +352,7 @@ pub struct ApiState {
     pub api_key: Option<String>,
     /// When true (`DRADIS_READ_ONLY=true`), every mutating request (any method
     /// other than GET/HEAD) is rejected with 403. Powers the public read-only
-    /// demo at dradis.live — the live raptor telemetry streams, but no visitor
+    /// demo at demo.dradis.live — the live raptor telemetry streams, but no visitor
     /// can patch config, toggle vipers, or exit positions.
     pub read_only: bool,
     /// Gnosis Safe wallet address — used by POST /api/positions/sync to fetch live
