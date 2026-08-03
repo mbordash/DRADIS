@@ -238,10 +238,16 @@ pub fn validate_proposals(raw: Vec<RawProposal>, current: &DynamicConfig) -> Pro
         }
 
         let Some(field) = schema.iter().find(|f| f.key == p.field) else {
+            // Suggest the closest real key so the few-shot loop can teach the
+            // model the correct name instead of letting it repeat the mistake.
+            let why = match closest_key(&p.field, &schema) {
+                Some(k) => format!("unknown field (not in config schema); did you mean \"{k}\"?"),
+                None => "unknown field (not in config schema)".into(),
+            };
             batch.rejected.push(RejectedProposal {
                 field: p.field,
                 to: p.to,
-                why: "unknown field (not in config schema)".into(),
+                why,
             });
             continue;
         };
@@ -293,6 +299,46 @@ pub fn proposals_from_response(
 }
 
 // ── Coercion helpers ──────────────────────────────────────────────────────────
+
+/// Best-effort nearest schema key for an unknown proposed field, used to make
+/// rejection messages self-correcting via the few-shot loop. Prefers
+/// prefix/containment matches (e.g. `maker_min_entry` → `maker_min_entry_price`),
+/// then falls back to small edit distance.
+fn closest_key(proposed: &str, schema: &[ConfigFieldSchema]) -> Option<&'static str> {
+    let p = proposed.to_ascii_lowercase();
+    if p.is_empty() {
+        return None;
+    }
+    // Containment either way (truncated or over-specified names).
+    if let Some(f) = schema
+        .iter()
+        .filter(|f| f.key.starts_with(&p) || p.starts_with(f.key) || f.key.contains(&p))
+        .min_by_key(|f| f.key.len().abs_diff(p.len()))
+    {
+        return Some(f.key);
+    }
+    // Fall back to edit distance for typos (cap keeps suggestions sane).
+    schema
+        .iter()
+        .map(|f| (edit_distance(&p, f.key), f.key))
+        .filter(|(d, _)| *d <= 4)
+        .min_by_key(|(d, _)| *d)
+        .map(|(_, k)| k)
+}
+
+fn edit_distance(a: &str, b: &str) -> usize {
+    let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
+    let mut prev: Vec<usize> = (0..=b.len()).collect();
+    for (i, ca) in a.iter().enumerate() {
+        let mut cur = vec![i + 1];
+        for (j, cb) in b.iter().enumerate() {
+            let cost = usize::from(ca != cb);
+            cur.push((prev[j] + cost).min(prev[j + 1] + 1).min(cur[j] + 1));
+        }
+        prev = cur;
+    }
+    prev[b.len()]
+}
 
 /// Encode the LLM's target value into the field's JSON representation,
 /// clamping numerics to schema bounds. Returns `(encoded, was_clamped)`.
@@ -420,6 +466,23 @@ mod tests {
         assert!(batch.accepted.is_empty());
         assert_eq!(batch.rejected.len(), 1);
         assert!(batch.rejected[0].why.contains("unknown field"));
+    }
+
+    #[test]
+    fn unknown_field_suggests_closest_key() {
+        // The historical repeat offender: truncated `maker_min_entry`.
+        let raw = vec![RawProposal {
+            field: "maker_min_entry".into(),
+            to: serde_json::json!(0.01),
+            reason: String::new(),
+        }];
+        let batch = validate_proposals(raw, &cfg());
+        assert_eq!(batch.rejected.len(), 1);
+        assert!(
+            batch.rejected[0].why.contains("did you mean \"maker_min_entry_price\""),
+            "got: {}",
+            batch.rejected[0].why
+        );
     }
 
     #[test]
