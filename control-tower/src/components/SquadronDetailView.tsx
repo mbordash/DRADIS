@@ -277,6 +277,14 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
       </div>
 
       {/* ── Performance stats for this squadron/asset ─────────────────────── */}
+      {(() => {
+        const pnls = (trades ?? [])
+          .map((t) => parseFloat(t.pnl))
+          .filter((v) => Number.isFinite(v));
+        const wins = pnls.filter((v) => v > 0).length;
+        const winRate = pnls.length > 0 ? (wins / pnls.length) * 100 : null;
+        const avgPnl = pnls.length > 0 ? pnls.reduce((a, b) => a + b, 0) / pnls.length : null;
+        return (
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <div className="card px-4 py-3 flex flex-col gap-1">
           <span className="label-muted">Completed Trades</span>
@@ -290,15 +298,25 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
         </div>
         <div className="card px-4 py-3 flex flex-col gap-1">
           <span className="label-muted">Win Rate</span>
-          <span className="stat-value text-gray-600">—</span>
-          <span className="text-xs text-gray-500">coming soon</span>
+          <span className={`stat-value ${winRate === null ? 'text-gray-600' : winRate >= 50 ? 'text-emerald-300' : 'text-amber-300'}`}>
+            {tradesLoading || winRate === null ? '—' : `${winRate.toFixed(0)}%`}
+          </span>
+          <span className="text-xs text-gray-500">
+            {winRate === null ? 'no closed trades' : `${wins}/${pnls.length} profitable`}
+          </span>
         </div>
         <div className="card px-4 py-3 flex flex-col gap-1">
           <span className="label-muted">Avg Trade P&L</span>
-          <span className="stat-value text-gray-600">—</span>
-          <span className="text-xs text-gray-500">coming soon</span>
+          <span className={`stat-value ${avgPnl === null ? 'text-gray-600' : avgPnl >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
+            {tradesLoading || avgPnl === null ? '—' : `${avgPnl >= 0 ? '+' : '−'}$${Math.abs(avgPnl).toFixed(2)}`}
+          </span>
+          <span className="text-xs text-gray-500">
+            {avgPnl === null ? 'no closed trades' : 'per closed trade'}
+          </span>
         </div>
       </div>
+        );
+      })()}
 
       {/* ── Viper Strategies ──────────────────────────────────────────────── */}
       <section>

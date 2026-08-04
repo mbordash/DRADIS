@@ -359,7 +359,12 @@ impl Squadron {
                 .strip_suffix("Strategy")
                 .unwrap_or(&sn)
                 .to_lowercase()
-                .replace("timedecay", "time_decay");
+                .replace("timedecay", "time_decay")
+                // The TrendReversal strategy (formerly TrendCapture) keeps the
+                // "trendcapture" key everywhere else (viper-kind registry, UI
+                // statusKey, enable_trendcapture) — publish under the same key so
+                // the Control Tower card resolves its attached market.
+                .replace("trendreversal", "trendcapture");
             strategy_markets_map.insert(status_key, market_name_attached.clone());
             info!(
                 "  - {} => venue={} | market=\"{}\" | budget=${} | risk={}",

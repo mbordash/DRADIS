@@ -342,17 +342,17 @@ export default function DashboardPage() {
   const { data: openPositions, isLoading: positionsLoading } =
     useSWR(['positions', asset], () => getOpenPositions(asset), { refreshInterval: 15_000 });
 
-  // For chart markers: fetch ALL trades/positions across all assets (not filtered by selected asset)
+  // For chart markers: fetch ALL trades/positions across all assets (not filtered by selected asset).
+  // The asset list is part of the SWR key: a static key would cache the initial []
+  // result (assets not loaded yet) and markers wouldn't render until the 15s refresh.
   const { data: allTrades } =
-    useSWR('trades-all', async () => {
-      if (availableAssets.length === 0) return [];
+    useSWR(availableAssets.length > 0 ? ['trades-all', ...availableAssets] : null, async () => {
       const results = await Promise.all(availableAssets.map(a => getTrades(60, a)));
       return results.flat();
     }, { refreshInterval: 15_000 });
 
   const { data: allOpenPositions } =
-    useSWR('positions-all', async () => {
-      if (availableAssets.length === 0) return [];
+    useSWR(availableAssets.length > 0 ? ['positions-all', ...availableAssets] : null, async () => {
       const results = await Promise.all(availableAssets.map(a => getOpenPositions(a)));
       return results.flat();
     }, { refreshInterval: 15_000 });
