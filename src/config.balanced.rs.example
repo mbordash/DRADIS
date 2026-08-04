@@ -185,7 +185,7 @@ pub const ENABLE_MAKER_TRADING: bool = true;
 pub const MAKER_VELOCITY_BIAS_THRESHOLD: Decimal = dec!(25.0);
 /// Oracle-drift quote pull: cancel unfilled resting quote on adverse oracle move.
 /// The oracle leads OBI by minutes — pulls stale quotes before informed takers arrive.
-pub const MAKER_ORACLE_DRIFT_PULL_FRAC: Decimal = dec!(0.0005);
+pub const MAKER_ORACLE_DRIFT_PULL_FRAC: Decimal = dec!(0.0003); // 08-04: tightened from 0.0005 — prod fills won the cancel race at 5 bps (4/4 on 08-04).
 /// Gate-dwell: gates must pass continuously this long before quoting.
 /// Blocks quoting into gate flicker during directional moves (instant-fill toxicity).
 pub const MAKER_GATE_DWELL_SECS: i64 = 15;
