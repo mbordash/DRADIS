@@ -187,9 +187,9 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
            ┌─────────────┼───────────────┬───────────────┬──────────────┐
            ▼             ▼               ▼               ▼              ▼
     ┌────────────┐ ┌──────────┐ ┌───────────────┐ ┌────────────┐ ┌──────────────┐
-    │ Momentum   │ │  Maker   │ │  Arbitrage /  │ │   GBoost   │ │ TrendCapture │
-    │   Viper    │ │  Viper   │ │  TimeDecay /  │ │    Viper   │ │    Viper     │
-    │            │ │          │ │  Basis Vipers │ │   (ML)     │ │ (drift/trend)│
+    │ Momentum/  │ │  Maker   │ │  Arbitrage /  │ │   GBoost   │ │ TrendCapture │
+    │ FairValue  │ │  Viper   │ │  TimeDecay /  │ │    Viper   │ │    Viper     │
+    │   Viper    │ │          │ │  Basis Vipers │ │   (ML)     │ │ (drift/trend)│
     └──────┬─────┘ └────┬─────┘ └──────┬────────┘ └─────┬──────┘ └──────┬───────┘
            └────────────┼──────────────┴────────────────┴───────────────┘
                         ▼
@@ -287,15 +287,16 @@ The **Sports Raptor** is the first non-crypto scout: a single venue-neutral inst
 
 Eight specialized Viper strategy classes. Each Viper is an autonomous tactical unit with its own capital budget, position book, and entry/exit logic.
 
-| Viper            | Venue        | Description                                                                                                                                 |
-|------------------|--------------|---------------------------------------------------------------------------------------------------------------------------------------------|
-| **Momentum**     | Hourly       | Detects high-velocity Binance moves and strikes Polymarket before it reprices                                                               |
-| **Maker**        | Window       | Dual-sided passive bids on YES+NO, capturing the spread while managing net exposure                                                         |
-| **Arbitrage**    | Window/Daily | Buys both YES+NO when combined asks are < $1.00 (net of fees)                                                                               |
-| **Time Decay**   | Hourly       | Posts resting GTC maker bids during the theta window; settles at $1.00 at 0% fee                                                            |
-| **Basis**        | Window       | Fades retail skew using Binance funding rates as smart-money confirmation                                                                   |
-| **GBoost**       | Window/Daily | Online gradient-boosted ML model retraining continuously on live orderbook + Raptor features                                                |
-| **TrendCapture** | Window/Daily | Exploits sustained multi-minute oracle drift (10m + 60m) before Polymarket reprices; Kelly-fractional sizing, OBI veto, trend-reversal exit |
+| Viper            | Venue        | Description                                                                                                                                                                               |
+|------------------|--------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| **Momentum**     | Hourly       | Detects high-velocity Binance moves and strikes Polymarket before it reprices                                                                                                             |
+| **Maker**        | Window       | Dual-sided passive bids on YES+NO, capturing the spread while managing net exposure                                                                                                       |
+| **Arbitrage**    | Window/Daily | Buys both YES+NO when combined asks are < $1.00 (net of fees)                                                                                                                             |
+| **Time Decay**   | Hourly       | Posts resting GTC maker bids during the theta window; settles at $1.00 at 0% fee                                                                                                          |
+| **Basis**        | Window       | Fades retail skew using Binance funding rates as smart-money confirmation                                                                                                                 |
+| **GBoost**       | Window/Daily | Online gradient-boosted ML model retraining continuously on live orderbook + Raptor features                                                                                              |
+| **TrendCapture** | Window/Daily | Exploits sustained multi-minute oracle drift (10m + 60m) before Polymarket reprices; Kelly-fractional sizing, OBI veto, trend-reversal exit                                               |
+| **FairValue**    | Window/Daily | Compare fair value of asset, compare market ask, enter when discount exceeds margin                                                                                                       |
 | **Convergence**  | Hourly       | Macro-conviction directional Viper — opens YES/NO only when the Tide institutional pulse, Derivatives CVD, and OI all agree on a direction. BTC-only, US-cash-hours-only, fixed tiny size |
 
 Build your own: [CUSTOM_STRATEGY.md](docs/CUSTOM_STRATEGY.md).
