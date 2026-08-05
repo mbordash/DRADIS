@@ -1,6 +1,6 @@
 # DRADIS
 
-> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Polymarket. Eight autonomous Viper strategies, a Raptor recon layer (Price, Funding, Derivatives, Tide "Institutional Pulse", Horizon "TradFi Velocity", and a venue-neutral Sports line-movement scout), a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor (Ollama local/remote, OpenAI-compatible, or Anthropic) that delivers optimization recommendations via Telegram & OpenClaw — and can propose or autonomously apply live config changes under a tiered, guard-railed autonomy policy.
+> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Polymarket. Nine autonomous Viper strategies, a Raptor recon layer (Price, Funding, Derivatives, Tide "Institutional Pulse", Horizon "TradFi Velocity", and a venue-neutral Sports line-movement scout), a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor (Ollama local/remote, OpenAI-compatible, or Anthropic) that delivers optimization recommendations via Telegram & OpenClaw — and can propose or autonomously apply live config changes under a tiered, guard-railed autonomy policy.
 
 ![Rust](https://img.shields.io/badge/Rust-1.95+-orange?logo=rust&logoColor=white)
 ![Tokio](https://img.shields.io/badge/Tokio-async%20runtime-darkgreen?logo=rust&logoColor=white)
@@ -285,7 +285,7 @@ The **Sports Raptor** is the first non-crypto scout: a single venue-neutral inst
 
 ## ✈️ Viper Wing (`src/vipers/`)
 
-Eight specialized Viper strategy classes. Each Viper is an autonomous tactical unit with its own capital budget, position book, and entry/exit logic.
+Nine specialized Viper strategy classes. Each Viper is an autonomous tactical unit with its own capital budget, position book, and entry/exit logic.
 
 | Viper            | Venue        | Description                                                                                                                                                                               |
 |------------------|--------------|-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
@@ -321,7 +321,7 @@ Markets are classified into domains that determine which Raptors and Vipers are 
 
 | Market Class | Raptors | Vipers |
 |--------------|---------|--------|
-| `crypto` | Price, Funding, Derivatives, Tide | All eight Vipers |
+| `crypto` | Price, Funding, Derivatives, Tide | All nine Vipers |
 | `sports` | Sports (line movement) | Arbitrage, Maker (venue-agnostic) |
 | `politics` | Politics (roadmap) | Arbitrage, Maker (venue-agnostic) |
 
@@ -331,7 +331,7 @@ Classification is data-driven via the `market_class_rule` table — add a new ma
 
 | Preset          | Raptors         | Vipers                             |
 |-----------------|-----------------|------------------------------------|
-| `full_wing`     | Price + Funding + Derivatives + Tide | All eight Vipers (current default) |
+| `full_wing`     | Price + Funding + Derivatives + Tide | All nine Vipers (current default) |
 | `momentum_only` | Price only      | Momentum + GBoost                  |
 | `arb_wing`      | Price + Funding | Arbitrage + Basis                  |
 
@@ -405,7 +405,7 @@ DRADIS ships with a real-time web dashboard called **Control Tower** built on Ne
 
 Every parameter in the Viper cards maps directly to the runtime `DynamicConfig`. Editing a value sends `PATCH /api/config` — **no restart required**. Changes take effect on the next 50ms tick.
 
-> **Hot-Enable Design** — All eight Vipers are always instantiated at startup. The `DynamicConfig` enable flags are the sole runtime gate. Toggle any Viper on or off during a live session with immediate effect.
+> **Hot-Enable Design** — All nine Vipers are always instantiated at startup. The `DynamicConfig` enable flags are the sole runtime gate. Toggle any Viper on or off during a live session with immediate effect.
 
 ### Setup Tab — No-Shell Credential Management
 
@@ -615,8 +615,8 @@ POLYGON_RPC_URL=https://polygon-mainnet.g.alchemy.com/v2/YOUR_API_KEY
 | Profile      | File                                 | Wallet    | Risk   | Vipers            |
 |--------------|--------------------------------------|-----------|--------|-------------------|
 | Conservative | `src/config.conservative.rs.example` | < $100    | Low    | Maker, Time Decay |
-| Balanced     | `src/config.balanced.rs.example`     | $100–$300 | Medium | All eight         |
-| Aggressive   | `src/config.aggressive.rs.example`   | $200+     | High   | All eight         |
+| Balanced     | `src/config.balanced.rs.example`     | $100–$300 | Medium | All nine          |
+| Aggressive   | `src/config.aggressive.rs.example`   | $200+     | High   | All nine          |
 
 ```bash
 cp src/config.balanced.rs.example src/config.rs
@@ -703,7 +703,7 @@ DRADIS_API_KEY=replace-with-a-strong-random-secret
 
 ## FAQ
 
-**Why Rust?** Fearless concurrency — evaluating eight Vipers every 50ms needs a multi-threaded runtime with no GIL or GC pauses.
+**Why Rust?** Fearless concurrency — evaluating nine Vipers every 50ms needs a multi-threaded runtime with no GIL or GC pauses.
 
 **Can I trade multiple assets at once?** Yes — set `ASSETS=btc,eth,sol` in `.env`. Each asset runs its own independent patrol loop (raptors, session state, LLM advisor, SQLite DB) inside a `tokio::spawn`ed task. The wallet, CLOB client, and API server are shared. Each asset writes to its own DB file (`logs/btc-dradis.db`, `logs/eth-dradis.db`, etc.); pass `?asset=eth` to any API endpoint to scope results to that asset.
 
@@ -719,7 +719,7 @@ rm -f logs/gboost_model_*.json
 ```
 The safe pattern: bump the suffix in `GBOOST_MODEL_PATH` (e.g. `v14f` → `v15f`) when adding a new feature in `src/vipers/gboost_impl.rs`.
 
-**Can I enable a Viper mid-session?** Yes — all eight are always instantiated. Toggle via Control Tower or `PATCH /api/config`. Takes effect on the next 50ms tick.
+**Can I enable a Viper mid-session?** Yes — all nine are always instantiated. Toggle via Control Tower or `PATCH /api/config`. Takes effect on the next 50ms tick.
 
 **Does DRADIS support the US Polymarket API?** Yes.  Polymarket's **US platform** is a separate, custodial, CFTC-regulated exchange with web2 auth (API key / secret / session token) and string/UUID market IDs. We have **venue abstraction** so a build can target either market via a Cargo feature flag (`intl_clob` default, `us_retail` available) — single-venue per binary, so the US deployment carries none of the Polygon crypto weight and stays inside its own regulatory/network footprint. Start a US build with `VENUE=us ./start-local.sh`.
 
