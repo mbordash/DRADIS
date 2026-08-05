@@ -362,6 +362,30 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Upper edge of the ~0.50 coin-flip band where entries are skipped.").range(0.0, 1.0).step(0.01));
     }
 
+    // ── FairValue ─────────────────────────────────────────────────────────────
+    {
+        let g = "FairValue"; let e = Some("enable_fairvalue");
+        v.push(F::new(g, e, "enable_fairvalue", "Enabled", "bool", false,
+            "Analytic binary pricing Φ(ln(S/K)/σ√T): buys sides trading at a discount to model fair value; snipes settlements."));
+        v.push(F::new(g, e, "fairvalue_trade_size_usdc", "Size", "usd", false,
+            "Fixed entry size per position.").min(0.0).step(0.5).unit("USDC"));
+        v.push(F::new(g, e, "fairvalue_max_exposure_usdc", "Max Exposure", "usd", false,
+            "Hard cap on total FairValue capital at risk.").min(0.0).step(0.5).unit("USDC"));
+        v.push(F::new(g, e, "fairvalue_stop_loss_pct", "Stop Loss", "pct", false,
+            "Entry-relative stop loss (0.12 = 12%). Catastrophic bypass at 2× this.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "fairvalue_target_profit_pct", "Take Profit", "pct", false,
+            "Entry-relative take profit (0.20 = 20%). Skipped in favor of fee-free settlement when the model is ≥0.90 near expiry.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "fairvalue_base_edge", "Base Edge", "price", false,
+            "Required (fair − ask − fee) edge mid-session; tapers to Min Edge inside the final 30 min.").range(0.0, 0.5).step(0.005));
+        // Advanced
+        v.push(F::new(g, e, "fairvalue_min_edge", "Min Edge", "price", true,
+            "Edge floor at expiry — the settlement-snipe requirement.").range(0.0, 0.5).step(0.005));
+        v.push(F::new(g, e, "fairvalue_max_entry_price", "Max Entry", "price", true,
+            "Highest token ask the strategy will pay (0.985 admits settlement snipes).").range(0.0, 1.0).step(0.005));
+        v.push(F::new(g, e, "fairvalue_min_entry_price", "Min Entry", "price", true,
+            "Lowest token ask the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
+    }
+
     v
 }
 

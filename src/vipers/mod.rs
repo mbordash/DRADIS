@@ -11,6 +11,7 @@ pub mod basis_impl;
 pub mod gboost_impl;
 pub mod trendreversal_impl;
 pub mod convergence_impl;
+pub mod fairvalue_impl;
 
 use rust_decimal::Decimal;
 use crate::config;

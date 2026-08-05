@@ -7,6 +7,7 @@ use crate::vipers::basis_impl::BasisStrategyImpl;
 use crate::vipers::gboost_impl::GboostStrategyImpl;
 use crate::vipers::trendreversal_impl::TrendReversalStrategyImpl;
 use crate::vipers::convergence_impl::ConvergenceStrategyImpl;
+use crate::vipers::fairvalue_impl::FairValueStrategyImpl;
 use crate::config;
 use rust_decimal_macros::dec;
 use tracing::info;
@@ -73,6 +74,14 @@ impl StrategyRegistry {
             config::CONVERGENCE_TARGET_PROFIT_PERCENT * dec!(100),
             config::CONVERGENCE_STOP_LOSS_PERCENT * dec!(100),
         );
+        info!(
+            "   FairValue   | base_edge={} min_edge={} taper={}s | pin={}σ/{}s | size=${} max_exp=${} | TP={}% SL={}%",
+            config::FAIRVALUE_BASE_EDGE, config::FAIRVALUE_MIN_EDGE, config::FAIRVALUE_EDGE_TAPER_SECS,
+            config::FAIRVALUE_PIN_MIN_SIGMA, config::FAIRVALUE_PIN_GUARD_SECS,
+            config::FAIRVALUE_TRADE_SIZE_USDC, config::FAIRVALUE_MAX_EXPOSURE_USDC,
+            config::FAIRVALUE_TARGET_PROFIT_PERCENT * dec!(100),
+            config::FAIRVALUE_STOP_LOSS_PERCENT * dec!(100),
+        );
     }
 
     /// Create a vector of ALL strategy instances.
@@ -89,6 +98,7 @@ impl StrategyRegistry {
             Box::new(GboostStrategyImpl::default())        as Box<dyn Strategy>,
             Box::new(TrendReversalStrategyImpl::new())      as Box<dyn Strategy>,
             Box::new(ConvergenceStrategyImpl::new())       as Box<dyn Strategy>,
+            Box::new(FairValueStrategyImpl::new())         as Box<dyn Strategy>,
         ]
     }
 
@@ -124,6 +134,7 @@ impl StrategyRegistry {
             "GboostStrategy",
             "TrendReversalStrategy",
             "ConvergenceStrategy",
+            "FairValueStrategy",
         ]
         .into_iter().map(|s| s.to_string()).collect()
     }

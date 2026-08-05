@@ -167,6 +167,27 @@ fn arm_maker_toxic_cooldown(token_id: &str) {
     reg.insert(token_id.to_string(), Instant::now());
 }
 
+/// Per-token throttle for the ToxicFill-exit log line. The exit signal legitimately
+/// re-fires every 50ms tick while the patrol's EXIT_RETRY_COOLDOWN holds the actual
+/// FAK attempt back (e.g. settlement-lag retries), which flooded 186 identical INFO
+/// lines in 77s on 2026-08-05. Returns true at most once per 5s per token.
+fn maker_toxic_log_permitted(token_id: &str) -> bool {
+    static REG: std::sync::OnceLock<std::sync::Mutex<HashMap<String, Instant>>> =
+        std::sync::OnceLock::new();
+    let reg = REG.get_or_init(|| std::sync::Mutex::new(HashMap::new()));
+    let mut reg = match reg.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match reg.get(token_id) {
+        Some(t) if t.elapsed().as_secs() < 5 => false,
+        _ => {
+            reg.insert(token_id.to_string(), Instant::now());
+            true
+        }
+    }
+}
+
 /// Returns true if `token_id` is still within its post-ToxicFill re-entry cooldown
 /// (i.e. fewer than `cooldown_secs` have elapsed since the last toxic exit).  A
 /// non-positive `cooldown_secs` disables the gate.  Expired entries are pruned on read.
@@ -804,10 +825,12 @@ impl Strategy for MakerStrategyImpl {
                     arm_maker_toxic_cooldown(token_id.as_str());
                     clear_maker_quote_oracle_baseline(token_id.as_str());
                     if position.fill_confirmed_at.is_some() {
-                        tracing::info!(
-                            "⚡ Maker ToxicFill exit triggered: OBI={:.2} (threshold={:.2}) | bid=${:.4} | re-entry locked {}s",
-                            obi, dc.maker_toxic_flow_exit_obi, bid, dc.maker_toxic_reentry_cooldown_secs
-                        );
+                        if maker_toxic_log_permitted(token_id.as_str()) {
+                            tracing::info!(
+                                "⚡ Maker ToxicFill exit triggered: OBI={:.2} (threshold={:.2}) | bid=${:.4} | re-entry locked {}s",
+                                obi, dc.maker_toxic_flow_exit_obi, bid, dc.maker_toxic_reentry_cooldown_secs
+                            );
+                        }
                         return Ok(StrategySignal::Exit {
                             params: OrderParams {
                                 token_id: token_id.clone(),

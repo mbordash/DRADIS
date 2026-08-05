@@ -14,6 +14,17 @@ export interface DynamicConfig {
   enable_gboost:       boolean;
   enable_trendcapture: boolean;
   enable_convergence:  boolean;
+  enable_fairvalue:    boolean;
+
+  // FairValue Viper
+  fairvalue_trade_size_usdc:   string;
+  fairvalue_max_exposure_usdc: string;
+  fairvalue_base_edge:         string;
+  fairvalue_min_edge:          string;
+  fairvalue_min_entry_price:   string;
+  fairvalue_max_entry_price:   string;
+  fairvalue_target_profit_pct: string;
+  fairvalue_stop_loss_pct:     string;
 
   // Arbitrage Viper
   arbitrage_position_size_usdc: string;

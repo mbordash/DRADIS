@@ -309,5 +309,12 @@ export const VIPER_DEFS: ViperDef[] = [
     statusKey: 'convergence',
     description: 'Macro-conviction directional (BTC-only): enters on aligned Institutional Pulse + CVD/OI during US hours',
   },
+  {
+    name: 'FairValue',
+    enableKey: 'enable_fairvalue',
+    accentColor: 'amber',
+    statusKey: 'fairvalue',
+    description: 'Analytic binary pricing Φ(ln(S/K)/σ√T) — buys sides trading at a discount to model fair value; snipes settlements',
+  },
 ];
 

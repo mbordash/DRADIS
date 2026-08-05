@@ -217,6 +217,33 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_entry_signals_strategy_ts ON entry_signals(strategy, ts)")
         .execute(pool).await;
 
+    // gboost_vetoes: shadow-log of every entry-eligible GBoost signal rejected by a
+    // quality gate (2026-08-05). The model matured but the accumulated gate stack was
+    // vetoing 100% of eligible signals (38/38 in one 20h window) — with zero trades
+    // there is no evidence for which gates block winners vs. save losses. Each row
+    // captures the would-be entry so its hypothetical outcome can be scored after
+    // market settlement, turning gate calibration into a data problem.
+    // Score offline by joining market/condition_id to the market's final resolution.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS gboost_vetoes (
+            id             INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts             TEXT    NOT NULL,
+            session_id     TEXT    NOT NULL DEFAULT '',
+            market         TEXT    NOT NULL,
+            condition_id   TEXT    NOT NULL,
+            side           TEXT    NOT NULL,
+            token_id       TEXT    NOT NULL,
+            ask_price      TEXT    NOT NULL,
+            p_up           REAL    NOT NULL,
+            veto_reason    TEXT    NOT NULL,
+            oracle_price   TEXT    NOT NULL,
+            drift_60m      TEXT    NOT NULL,
+            secs_to_expiry INTEGER NOT NULL
+        )"
+    ).execute(pool).await?;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_gboost_vetoes_ts ON gboost_vetoes(ts)")
+        .execute(pool).await;
+
     // signals_json: per-viper gate/decision state captured at entry (JSON blob).
     // The generic columns above answer "what did the market look like?"; this column
     // answers "what did the STRATEGY see and decide?" — model probabilities, gate
@@ -536,6 +563,7 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
         ("time_decay",   "TimeDecay",    0),
         ("trendcapture", "TrendReversal", 0),
         ("convergence",  "Convergence",  0),
+        ("fairvalue",    "FairValue",    0),
     ] {
         sqlx::query("INSERT OR IGNORE INTO viper_kind (id, display, venue_agnostic) VALUES (?, ?, ?)")
             .bind(id).bind(display).bind(agnostic).execute(pool).await?;
@@ -561,7 +589,7 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
     for (class, viper) in [
         ("crypto", "arbitrage"), ("crypto", "maker"), ("crypto", "momentum"),
         ("crypto", "gboost"),    ("crypto", "basis"), ("crypto", "time_decay"),
-        ("crypto", "trendcapture"), ("crypto", "convergence"),
+        ("crypto", "trendcapture"), ("crypto", "convergence"), ("crypto", "fairvalue"),
         ("sports",   "arbitrage"), ("sports",   "maker"),
         ("politics", "arbitrage"), ("politics", "maker"),
         ("unknown",  "arbitrage"), ("unknown",  "maker"),
@@ -901,6 +929,48 @@ pub async fn record_entry_signal_db(pool: &SqlitePool, row: &EntrySignalRow) {
     .execute(pool)
     .await {
         error!("❌ DB entry_signal write failed: {}", e);
+    }
+}
+
+/// Shadow-log a vetoed (entry-eligible but gate-rejected) GBoost signal.
+/// Fire-and-forget from the veto path — see gboost_vetoes table comment.
+#[allow(clippy::too_many_arguments)]
+pub async fn record_gboost_veto_db(
+    pool: &SqlitePool,
+    market: &str,
+    condition_id: &str,
+    side: &str,
+    token_id: &str,
+    ask_price: &str,
+    p_up: f64,
+    veto_reason: &str,
+    oracle_price: &str,
+    drift_60m: &str,
+    secs_to_expiry: i64,
+) {
+    let ts = Utc::now().to_rfc3339();
+    let sid = current_session_id();
+    if let Err(e) = sqlx::query(
+        "INSERT INTO gboost_vetoes
+            (ts, session_id, market, condition_id, side, token_id, ask_price,
+             p_up, veto_reason, oracle_price, drift_60m, secs_to_expiry)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+    )
+    .bind(&ts)
+    .bind(sid)
+    .bind(market)
+    .bind(condition_id)
+    .bind(side)
+    .bind(token_id)
+    .bind(ask_price)
+    .bind(p_up)
+    .bind(veto_reason)
+    .bind(oracle_price)
+    .bind(drift_60m)
+    .bind(secs_to_expiry)
+    .execute(pool)
+    .await {
+        error!("❌ DB gboost_veto write failed: {}", e);
     }
 }
 

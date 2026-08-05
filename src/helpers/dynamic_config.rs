@@ -86,6 +86,15 @@ fn default_trendcapture_target_profit()    -> Decimal { config::TRENDCAPTURE_TAR
 fn default_trendcapture_max_entry_price()  -> Decimal { config::TRENDCAPTURE_MAX_ENTRY_PRICE         }
 
 fn default_convergence_enable()            -> bool    { config::ENABLE_CONVERGENCE_TRADING            }
+fn default_fairvalue_enable()              -> bool    { config::ENABLE_FAIRVALUE_TRADING              }
+fn default_fairvalue_trade_size()          -> Decimal { config::FAIRVALUE_TRADE_SIZE_USDC             }
+fn default_fairvalue_max_exposure()        -> Decimal { config::FAIRVALUE_MAX_EXPOSURE_USDC           }
+fn default_fairvalue_base_edge()           -> Decimal { config::FAIRVALUE_BASE_EDGE                   }
+fn default_fairvalue_min_edge()            -> Decimal { config::FAIRVALUE_MIN_EDGE                    }
+fn default_fairvalue_min_entry_price()     -> Decimal { config::FAIRVALUE_MIN_ENTRY_PRICE             }
+fn default_fairvalue_max_entry_price()     -> Decimal { config::FAIRVALUE_MAX_ENTRY_PRICE             }
+fn default_fairvalue_target_profit()       -> Decimal { config::FAIRVALUE_TARGET_PROFIT_PERCENT       }
+fn default_fairvalue_stop_loss()           -> Decimal { config::FAIRVALUE_STOP_LOSS_PERCENT           }
 fn default_convergence_position_size()     -> Decimal { config::CONVERGENCE_POSITION_SIZE_USDC        }
 fn default_convergence_max_exposure()      -> Decimal { config::CONVERGENCE_MAX_EXPOSURE_USDC         }
 fn default_convergence_stop_loss()         -> Decimal { config::CONVERGENCE_STOP_LOSS_PERCENT         }
@@ -387,6 +396,26 @@ pub struct DynamicConfig {
     #[serde(default = "default_trendreversal_mode")]
     pub trendreversal_mode:                bool,
 
+    // ── FairValue Viper (2026-08-05) ──────────────────────────────────────────
+    #[serde(default = "default_fairvalue_enable")]
+    pub enable_fairvalue:                 bool,
+    #[serde(default = "default_fairvalue_trade_size")]
+    pub fairvalue_trade_size_usdc:        Decimal,
+    #[serde(default = "default_fairvalue_max_exposure")]
+    pub fairvalue_max_exposure_usdc:      Decimal,
+    #[serde(default = "default_fairvalue_base_edge")]
+    pub fairvalue_base_edge:              Decimal,
+    #[serde(default = "default_fairvalue_min_edge")]
+    pub fairvalue_min_edge:               Decimal,
+    #[serde(default = "default_fairvalue_min_entry_price")]
+    pub fairvalue_min_entry_price:        Decimal,
+    #[serde(default = "default_fairvalue_max_entry_price")]
+    pub fairvalue_max_entry_price:        Decimal,
+    #[serde(default = "default_fairvalue_target_profit")]
+    pub fairvalue_target_profit_pct:      Decimal,
+    #[serde(default = "default_fairvalue_stop_loss")]
+    pub fairvalue_stop_loss_pct:          Decimal,
+
     // ── Convergence Viper ─────────────────────────────────────────────────────
     #[serde(default = "default_convergence_enable")]
     pub enable_convergence:               bool,
@@ -538,6 +567,16 @@ impl Default for DynamicConfig {
             trendcapture_take_profit_ceiling:  config::TRENDCAPTURE_TAKE_PROFIT_CEILING,
             trendcapture_catastrophic_sl_pct:  config::TRENDCAPTURE_CATASTROPHIC_SL_PCT,
             trendreversal_mode:                config::TRENDREVERSAL_MODE,
+
+            enable_fairvalue:                 config::ENABLE_FAIRVALUE_TRADING,
+            fairvalue_trade_size_usdc:        config::FAIRVALUE_TRADE_SIZE_USDC,
+            fairvalue_max_exposure_usdc:      config::FAIRVALUE_MAX_EXPOSURE_USDC,
+            fairvalue_base_edge:              config::FAIRVALUE_BASE_EDGE,
+            fairvalue_min_edge:               config::FAIRVALUE_MIN_EDGE,
+            fairvalue_min_entry_price:        config::FAIRVALUE_MIN_ENTRY_PRICE,
+            fairvalue_max_entry_price:        config::FAIRVALUE_MAX_ENTRY_PRICE,
+            fairvalue_target_profit_pct:      config::FAIRVALUE_TARGET_PROFIT_PERCENT,
+            fairvalue_stop_loss_pct:          config::FAIRVALUE_STOP_LOSS_PERCENT,
 
             enable_convergence:               config::ENABLE_CONVERGENCE_TRADING,
             convergence_position_size_usdc:   config::CONVERGENCE_POSITION_SIZE_USDC,

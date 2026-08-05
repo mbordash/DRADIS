@@ -463,6 +463,13 @@ pub struct GboostStrategyImpl {
     /// eval loop never floods. This reveals why GBoost isn't trading despite the
     /// model being confident.
     last_veto_log_at: Arc<StdMutex<Option<Instant>>>,
+    /// Entry-signal persistence streak (anti-whipsaw, 2026-08-05):
+    /// (condition_id, is_yes_side, first_seen, last_seen). The model can flip
+    /// P(UP) between 1.000 and 0.000 within minutes (observed 10:30→10:34→10:46
+    /// on 2026-08-05); requiring the side-eligibility to hold continuously for
+    /// GBOOST_ENTRY_PERSISTENCE_SECS filters momentum flicker from real signal.
+    /// A side flip or a sighting gap > GBOOST_SIGNAL_CONTINUITY_GAP_SECS resets.
+    entry_signal_streak: Arc<StdMutex<Option<(String, bool, Instant, Instant)>>>,
     /// EMA state for the OBI quality gates, one slot per (venue, side) — see
     /// OBI_SLOT_* constants. Each slot stores (ema_value, last_update_instant).
     /// Smoothing rationale: instantaneous OBI on thin books is quote-flicker noise
@@ -610,6 +617,7 @@ impl GboostStrategyImpl {
             market_hold_locks: Arc::new(StdMutex::new(std::collections::HashMap::new())),
             last_pred_log_at: Arc::new(StdMutex::new(None)),
             last_veto_log_at: Arc::new(StdMutex::new(None)),
+            entry_signal_streak: Arc::new(StdMutex::new(None)),
             obi_ema: Arc::new(StdMutex::new([None; 4])),
         }
     }
@@ -1449,10 +1457,58 @@ impl Strategy for GboostStrategyImpl {
             }
         }
 
+        // ── Entry-signal persistence debounce (anti-whipsaw, 2026-08-05) ─────
+        // Observed the model flipping P(UP) 1.000 → 0.000 → 1.000 within 16 min:
+        // it tracks instantaneous momentum, not settlement. Require the SAME side
+        // to stay entry-eligible continuously for GBOOST_ENTRY_PERSISTENCE_SECS
+        // before an entry is allowed. Brief dips below threshold are tolerated up
+        // to GBOOST_SIGNAL_CONTINUITY_GAP_SECS; a side flip resets the clock.
+        // Checked as the LAST gate in each entry block (mirrors Convergence's
+        // debounce) so the veto shadow-log still records which hard gate binds.
+        let signal_persisted = {
+            let now = Instant::now();
+            let mut streak = self.entry_signal_streak.lock().unwrap();
+            if entry_eligible {
+                let is_yes = p_yes_up >= entry_thresh;
+                match streak.as_mut() {
+                    Some((cid, dir, first_seen, last_seen))
+                        if *cid == target_market.condition_id
+                            && *dir == is_yes
+                            && last_seen.elapsed().as_secs()
+                                <= config::GBOOST_SIGNAL_CONTINUITY_GAP_SECS =>
+                    {
+                        *last_seen = now;
+                        first_seen.elapsed().as_secs() >= config::GBOOST_ENTRY_PERSISTENCE_SECS
+                    }
+                    _ => {
+                        // First sighting, side flip, market rotation, or stale streak.
+                        *streak = Some((target_market.condition_id.clone(), is_yes, now, now));
+                        false
+                    }
+                }
+            } else {
+                // Below threshold: leave the streak alone — the continuity gap
+                // tolerates brief dips; a long lapse expires it naturally.
+                false
+            }
+        };
+
+        // Would-be entry parameters for the veto shadow-log (side the model wants).
+        let (veto_side, veto_token, veto_ask) = if p_yes_up >= entry_thresh {
+            ("YES", target_market.yes_token.clone(), target_snapshot.yes_ask)
+        } else {
+            ("NO", target_market.no_token.clone(), target_snapshot.no_ask)
+        };
+        let veto_secs_to_expiry = target_market.market_close_time
+            .map(|ct| (ct - Utc::now()).num_seconds())
+            .unwrap_or(-1);
+
         // Rate-limited INFO log naming which quality gate rejects an entry-eligible
         // signal. Only fires when the model cleared the threshold (entry_eligible),
         // so it isolates exactly why a confident GBoost signal did not become a trade.
         // Shares the GBOOST_PRED_LOG_INTERVAL_SECS cadence to avoid per-tick flooding.
+        // Also shadow-logs the vetoed would-be entry to the gboost_vetoes table (same
+        // throttle) so gate quality can be scored against settlement outcomes.
         macro_rules! veto {
             ($reason:expr) => {{
                 if entry_eligible {
@@ -1460,7 +1516,23 @@ impl Strategy for GboostStrategyImpl {
                     let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::GBOOST_PRED_LOG_INTERVAL_SECS);
                     if due {
                         *last = Some(Instant::now());
-                        tracing::info!(" GBoost eligible-but-VETOED [{}] | P(UP)={:.3}", $reason, p_yes_up);
+                        let reason = $reason.to_string();
+                        tracing::info!(" GBoost eligible-but-VETOED [{}] | P(UP)={:.3}", reason, p_yes_up);
+                        if let Some(pool) = crate::helpers::db::pool() {
+                            let pool = pool.clone();
+                            let market_name  = target_market.market_name.clone();
+                            let condition_id = target_market.condition_id.clone();
+                            let token_id     = veto_token.clone();
+                            let ask          = veto_ask.to_string();
+                            let oracle       = ctx.snapshot.oracle_price.to_string();
+                            let drift        = ctx.snapshot.oracle_drift_60m.to_string();
+                            tokio::spawn(async move {
+                                crate::helpers::db::record_gboost_veto_db(
+                                    &pool, &market_name, &condition_id, veto_side, token_id.as_str(),
+                                    &ask, p_yes_up, &reason, &oracle, &drift, veto_secs_to_expiry,
+                                ).await;
+                            });
+                        }
                     }
                 }
                 return Ok(StrategySignal::NoSignal);
@@ -1672,6 +1744,10 @@ impl Strategy for GboostStrategyImpl {
                     veto!(format!("net profit too low (est ${:.2} < min ${:.2})", net_expected, dc.gboost_min_net_profit_usdc));
                 }
             }
+            // ── Persistence debounce (final gate) ─────────────────────────────
+            if !signal_persisted {
+                veto!(format!("persistence debounce (signal must hold {}s)", config::GBOOST_ENTRY_PERSISTENCE_SECS));
+            }
             let shares = trade_usdc / price;
             tracing::info!(
                 " GBoost YES entry: P(UP)={:.3} | ask=${:.4} shares={:.2} usdc={:.2} vol={:.2}",
@@ -1799,6 +1875,10 @@ impl Strategy for GboostStrategyImpl {
                 if net_expected < dc.gboost_min_net_profit_usdc {
                     veto!(format!("net profit too low (est ${:.2} < min ${:.2})", net_expected, dc.gboost_min_net_profit_usdc));
                 }
+            }
+            // ── Persistence debounce (final gate) ─────────────────────────────
+            if !signal_persisted {
+                veto!(format!("persistence debounce (signal must hold {}s)", config::GBOOST_ENTRY_PERSISTENCE_SECS));
             }
             let shares = trade_usdc / price;
             tracing::info!(

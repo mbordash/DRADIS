@@ -448,8 +448,12 @@ pub const GBOOST_NUM_THREADS: usize = 2;
 pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.78); // 2026-06-30: lowered (0.88 startup default produced zero trades in 13d)
 pub const GBOOST_PRED_LOG_INTERVAL_SECS: u64 = 120; // periodic P(UP) conviction diagnostic
 pub const GBOOST_POST_EXIT_COOLDOWN_SECS: i64 = 300;
-/// Conservative: tighter OBI gate — don't enter unless book is near neutral or favorable.
-pub const GBOOST_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.25); // already at floor; confirmed 2026-05-08
+/// Conservative: tightest OBI gate (2026-08-05: modest loosening from -0.25 with debounce protection).
+pub const GBOOST_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.40);
+/// Entry-signal persistence debounce (2026-08-05): same side must stay eligible this long.
+/// Conservative: longest hold — demands sustained conviction.
+pub const GBOOST_ENTRY_PERSISTENCE_SECS: u64 = 180;
+pub const GBOOST_SIGNAL_CONTINUITY_GAP_SECS: u64 = 30;
 /// OBI EMA smoothing (2026-07-14). Conservative: longer tau demands sustained book support.
 pub const GBOOST_OBI_EMA_TAU_SECS: f64 = 90.0;
 pub const GBOOST_OBI_EMA_STALE_SECS: f64 = 30.0;
@@ -656,6 +660,42 @@ pub const MERGE_COOLDOWN_SECS: u64 = 120;
 pub const MIN_MERGE_SHARES: Decimal = dec!(1.0);
 pub const MIN_MERGE_RATIO: Decimal = dec!(0.05);
 
+
+// ============================================================================
+// FAIRVALUE STRATEGY PARAMETERS (2026-08-05)
+// ============================================================================
+// Analytic binary pricing: fair P(up) = Φ( ln(S/K) / (σ·√T) ). See config.rs.
+
+pub const ENABLE_FAIRVALUE_TRADING: bool = true;
+pub const FAIRVALUE_TRADE_SIZE_USDC: Decimal = dec!(3);
+pub const FAIRVALUE_MAX_EXPOSURE_USDC: Decimal = dec!(6);
+/// Aggressive: widest edge requirement — only strong mispricings.
+pub const FAIRVALUE_BASE_EDGE: Decimal = dec!(0.10);
+pub const FAIRVALUE_MIN_EDGE: Decimal = dec!(0.03);
+pub const FAIRVALUE_EDGE_TAPER_SECS: i64 = 1800;
+pub const FAIRVALUE_PIN_GUARD_SECS: i64 = 600;
+/// Aggressive: demands 2σ strike distance in the endgame.
+pub const FAIRVALUE_PIN_MIN_SIGMA: f64 = 2.0;
+pub const FAIRVALUE_MIN_ENTRY_PRICE: Decimal = dec!(0.10);
+pub const FAIRVALUE_MAX_ENTRY_PRICE: Decimal = dec!(0.985);
+pub const FAIRVALUE_MIN_SECS_TO_EXPIRY: i64 = 90;
+pub const FAIRVALUE_VOL_SAMPLE_SECS: u64 = 15;
+pub const FAIRVALUE_VOL_WINDOW_SECS: u64 = 3600;
+pub const FAIRVALUE_MIN_VOL_SAMPLES: usize = 40;
+/// Aggressive: longest debounce — demands sustained edge.
+pub const FAIRVALUE_ENTRY_PERSISTENCE_SECS: u64 = 90;
+pub const FAIRVALUE_SIGNAL_CONTINUITY_GAP_SECS: u64 = 20;
+pub const FAIRVALUE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.20);
+pub const FAIRVALUE_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
+pub const FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 120;
+pub const FAIRVALUE_MODEL_REVERSAL_EXIT_PROB: f64 = 0.45;
+pub const FAIRVALUE_SETTLE_HOLD_SECS: i64 = 600;
+pub const FAIRVALUE_SETTLE_HOLD_MIN_PROB: f64 = 0.95;
+pub const FAIRVALUE_BAIL_SECS: i64 = 120;
+pub const FAIRVALUE_BAIL_PROB: f64 = 0.80;
+pub const FAIRVALUE_MIN_EXIT_BID: Decimal = dec!(0.05);
+pub const FAIRVALUE_MAX_SNAPSHOT_AGE_SECS: i64 = 10;
+pub const FAIRVALUE_POST_EXIT_COOLDOWN_SECS: i64 = 600;
 
 // ============================================================================
 // TIME DECAY (THETA) STRATEGY PARAMETERS
