@@ -66,6 +66,10 @@ struct FairValueGlobals {
     exit_cooldowns: StdMutex<HashMap<String, Instant>>,
     /// Throttle for the periodic fair-vs-market diagnostic log.
     last_diag_log_at: StdMutex<Option<Instant>>,
+    /// Throttle for the entry-signal info log (signal can re-fire every tick).
+    last_entry_log_at: StdMutex<Option<Instant>>,
+    /// Stop-loss circuit breaker: SL exits per condition_id this process life.
+    sl_counts: StdMutex<HashMap<String, u32>>,
 }
 
 fn globals() -> &'static FairValueGlobals {
@@ -75,6 +79,8 @@ fn globals() -> &'static FairValueGlobals {
         signal_streak:    StdMutex::new(None),
         exit_cooldowns:   StdMutex::new(HashMap::new()),
         last_diag_log_at: StdMutex::new(None),
+        last_entry_log_at: StdMutex::new(None),
+        sl_counts:        StdMutex::new(HashMap::new()),
     })
 }
 
@@ -118,15 +124,23 @@ impl FairValueStrategyImpl {
         };
         let prices: Vec<f64> = samples.iter().map(|(_, p)| *p).collect();
         sigma_per_sqrt_sec(&prices, span_secs, config::FAIRVALUE_MIN_VOL_SAMPLES)
+            // σ floor: a quiet sampling hour must not make the model delusional
+            // about a multi-hour horizon (see FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC).
+            .map(|s| s.max(config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC))
     }
 
-    /// Time-scaled edge requirement: BASE_EDGE at ≥ EDGE_TAPER_SECS out,
-    /// tapering linearly to MIN_EDGE at expiry.
+    /// Time-scaled edge requirement: linear taper MIN_EDGE→BASE_EDGE inside the
+    /// taper horizon, then √(T/taper) growth beyond it (capped) — the further
+    /// out settlement is, the less the 1-hour realized-vol window can be
+    /// trusted, so mid-session entries on daily markets need a much larger
+    /// discount than endgame entries.
     fn required_edge(dc: &crate::helpers::dynamic_config::DynamicConfig, secs_left: i64) -> Decimal {
         let base = dc.fairvalue_base_edge;
         let min = dc.fairvalue_min_edge;
         if secs_left >= config::FAIRVALUE_EDGE_TAPER_SECS {
-            return base;
+            let scale = (secs_left as f64 / config::FAIRVALUE_EDGE_TAPER_SECS as f64).sqrt();
+            let scaled = base * Decimal::from_f64_retain(scale).unwrap_or(dec!(1));
+            return scaled.min(config::FAIRVALUE_EDGE_HORIZON_CAP).max(base);
         }
         let frac = Decimal::from(secs_left.max(0)) / Decimal::from(config::FAIRVALUE_EDGE_TAPER_SECS);
         min + (base - min) * frac
@@ -188,7 +202,8 @@ impl FairValueStrategyImpl {
         };
         let prices: Vec<f64> = samples.iter().map(|(_, p)| *p).collect();
         drop(samples);
-        let sigma = sigma_per_sqrt_sec(&prices, span_secs, config::FAIRVALUE_MIN_VOL_SAMPLES)?;
+        let sigma = sigma_per_sqrt_sec(&prices, span_secs, config::FAIRVALUE_MIN_VOL_SAMPLES)?
+            .max(config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC);
         let fair_yes = fair_yes_probability(spot, strike, sigma, secs_left as f64)?;
         Some(if token_is_yes { fair_yes } else { 1.0 - fair_yes })
     }
@@ -314,6 +329,19 @@ impl Strategy for FairValueStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── Stop-loss circuit breaker: model is miscalibrated for this market ─
+        {
+            let counts = match globals().sl_counts.lock() {
+                Ok(g) => g,
+                Err(p) => p.into_inner(),
+            };
+            if counts.get(&market.condition_id).copied().unwrap_or(0)
+                >= config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET
+            {
+                return Ok(StrategySignal::NoSignal);
+            }
+        }
+
         // ── No pyramiding: one position per market ───────────────────────────
         // ── Exposure cap ──────────────────────────────────────────────────────
         {
@@ -363,21 +391,29 @@ impl Strategy for FairValueStrategyImpl {
 
         let side = if want_yes { "YES" } else { "NO" };
         let shares = (dc.fairvalue_trade_size_usdc / fee_headroom) / ask;
-        tracing::info!(
-            " FairValue {} entry: fair={:.3} ask=${:.2} edge={:+.3} (req {:.3}) | d={:+.2}σ T={}s | shares={:.2}",
-            side, if want_yes { fair_yes } else { 1.0 - fair_yes }, ask, edge, req_edge, d_sigma, secs_left, shares,
-        );
-        crate::helpers::metrics::stash_entry_signals_json(token_id.as_str(), serde_json::json!({
-            "viper": "FairValue",
-            "side": side,
-            "fair_yes": fair_yes,
-            "d_sigma": d_sigma,
-            "sigma_per_sqrt_sec": sigma,
-            "secs_left": secs_left,
-            "ask": ask.to_string(),
-            "edge": edge.to_string(),
-            "required_edge": req_edge.to_string(),
-        }));
+        {
+            // Throttled: a passed persistence gate re-fires every tick.
+            let mut last = globals().last_entry_log_at.lock().unwrap();
+            let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::FAIRVALUE_ENTRY_LOG_THROTTLE_SECS);
+            if due {
+                *last = Some(Instant::now());
+                tracing::info!(
+                    " FairValue {} entry: fair={:.3} ask=${:.2} edge={:+.3} (req {:.3}) | d={:+.2}σ T={}s | shares={:.2}",
+                    side, if want_yes { fair_yes } else { 1.0 - fair_yes }, ask, edge, req_edge, d_sigma, secs_left, shares,
+                );
+                crate::helpers::metrics::stash_entry_signals_json(token_id.as_str(), serde_json::json!({
+                    "viper": "FairValue",
+                    "side": side,
+                    "fair_yes": fair_yes,
+                    "d_sigma": d_sigma,
+                    "sigma_per_sqrt_sec": sigma,
+                    "secs_left": secs_left,
+                    "ask": ask.to_string(),
+                    "edge": edge.to_string(),
+                    "required_edge": req_edge.to_string(),
+                }));
+            }
+        }
 
         Ok(StrategySignal::Entry {
             params: OrderParams {
@@ -502,6 +538,20 @@ impl Strategy for FairValueStrategyImpl {
                     continue;
                 }
                 self.arm_cooldown(token_id.as_str());
+                {
+                    let mut counts = match globals().sl_counts.lock() {
+                        Ok(g) => g,
+                        Err(p) => p.into_inner(),
+                    };
+                    let n = counts.entry(market.condition_id.clone()).or_insert(0);
+                    *n += 1;
+                    if *n >= config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET {
+                        tracing::warn!(
+                            " FairValue circuit breaker: {} SL exits on \"{}\" — no further entries this market",
+                            n, market.market_name
+                        );
+                    }
+                }
                 return Ok(StrategySignal::Exit {
                     params: exit_params(bid),
                     reason: if catastrophic {

@@ -673,6 +673,14 @@ pub const FAIRVALUE_MAX_EXPOSURE_USDC: Decimal = dec!(6);
 pub const FAIRVALUE_BASE_EDGE: Decimal = dec!(0.10);
 pub const FAIRVALUE_MIN_EDGE: Decimal = dec!(0.03);
 pub const FAIRVALUE_EDGE_TAPER_SECS: i64 = 1800;
+// Horizon-scaled edge: beyond the taper, req edge grows as sqrt(T/taper), capped.
+pub const FAIRVALUE_EDGE_HORIZON_CAP: Decimal = dec!(0.30);
+// Floor on sigma per sqrt-second — a quiet sampling hour must not collapse the model.
+pub const FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC: f64 = 5.0e-5;
+// Circuit breaker: stop entering a market after this many stop-loss exits on it.
+pub const FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET: u32 = 1;
+// Throttle for the entry-signal info log.
+pub const FAIRVALUE_ENTRY_LOG_THROTTLE_SECS: u64 = 30;
 pub const FAIRVALUE_PIN_GUARD_SECS: i64 = 600;
 /// Aggressive: demands 2σ strike distance in the endgame.
 pub const FAIRVALUE_PIN_MIN_SIGMA: f64 = 2.0;
