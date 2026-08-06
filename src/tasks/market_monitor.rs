@@ -40,6 +40,43 @@ pub type MarketState = (
     String,                      // condition_id (NEW)
 );
 
+/// Resolve the maker/daily candidate's strike price before broadcasting it.
+///
+/// The CAG only resolves the maker strike ONCE at startup; every market-switch
+/// broadcast used to send the maker candidate with `strike_price: None`, which
+/// silently disabled strike-dependent vipers (FairValue, Basis) on the daily
+/// venue after the first hourly rotation. Reuse the previous candidate's strike
+/// when the maker market itself hasn't changed (avoids redundant API calls).
+async fn resolve_maker_strike(
+    http: &reqwest::Client,
+    crypto_filter: &str,
+    prev: Option<&MarketCandidate>,
+    mk: &mut MarketCandidate,
+) {
+    if mk.strike_price.is_some() {
+        return;
+    }
+    if let Some(s) = prev
+        .filter(|p| p.yes_token == mk.yes_token)
+        .and_then(|p| p.strike_price)
+    {
+        mk.strike_price = Some(s);
+        return;
+    }
+    let mut strike = crate::helpers::market::extract_strike_price(&mk.name);
+    if strike.is_none() {
+        strike = fetch_historical_strike_price(http, crypto_filter, &mk.description).await;
+    }
+    if strike.is_none() {
+        strike = fetch_historical_strike_price(http, crypto_filter, &mk.name).await;
+    }
+    mk.strike_price = strike;
+    match strike {
+        Some(s) => info!("✅ Maker market strike price resolved (monitor): ${}", s),
+        None => tracing::warn!("⚠️ Maker market strike price unresolved for \"{}\"", mk.name),
+    }
+}
+
 pub async fn run_market_monitor(
     http: Arc<reqwest::Client>,
     crypto_filter: String,
@@ -73,7 +110,7 @@ pub async fn run_market_monitor(
             std::time::Duration::from_secs(scan_cap_secs),
             get_market_pair(&http, &crypto_filter),
         ).await;
-        let (candidate, maker_candidate) = match scan_result {
+        let (candidate, mut maker_candidate) = match scan_result {
             Ok(pair) => {
                 if consecutive_timeouts > 0 {
                     info!("✅ Market monitor: Gamma API recovered after {} timed-out scan(s)", consecutive_timeouts);
@@ -111,7 +148,10 @@ pub async fn run_market_monitor(
                 if let Some(ref mk) = maker_candidate {
                     info!("🏦 Maker market updated: \"{}\"", mk.name);
                 }
-                let (y, n, nm, ct, sp, ds, _, cid) = market_tx.borrow().clone();
+                let (y, n, nm, ct, sp, ds, prev_mk, cid) = market_tx.borrow().clone();
+                if let Some(ref mut mk) = maker_candidate {
+                    resolve_maker_strike(&http, &crypto_filter, prev_mk.as_ref(), mk).await;
+                }
                 let _ = market_tx.send((y, n, nm, ct, sp, ds, maker_candidate, cid));
             }
             continue;
@@ -159,6 +199,10 @@ pub async fn run_market_monitor(
         }
         if strike.is_none() {
             strike = fetch_strike_price_from_close_time(&http, &crypto_filter, candidate.close_time).await;
+        }
+        if let Some(ref mut mk) = maker_candidate {
+            let prev_mk = market_tx.borrow().6.clone();
+            resolve_maker_strike(&http, &crypto_filter, prev_mk.as_ref(), mk).await;
         }
         let _ = market_tx.send((
             candidate.yes_token, candidate.no_token,

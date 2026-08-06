@@ -694,7 +694,7 @@ pub const FAIRVALUE_SETTLE_HOLD_MIN_PROB: f64 = 0.95;
 pub const FAIRVALUE_BAIL_SECS: i64 = 120;
 pub const FAIRVALUE_BAIL_PROB: f64 = 0.80;
 pub const FAIRVALUE_MIN_EXIT_BID: Decimal = dec!(0.05);
-pub const FAIRVALUE_MAX_SNAPSHOT_AGE_SECS: i64 = 10;
+pub const FAIRVALUE_MAX_SNAPSHOT_AGE_SECS: i64 = 900; // daily book is quiet; FAK orders can't fill vs phantom quotes
 pub const FAIRVALUE_POST_EXIT_COOLDOWN_SECS: i64 = 600;
 
 // ============================================================================

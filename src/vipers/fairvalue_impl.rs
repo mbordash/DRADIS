@@ -41,7 +41,7 @@ use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
 use chrono::Utc;
 use std::collections::{HashMap, VecDeque};
-use std::sync::Mutex as StdMutex;
+use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::Instant;
 
 use crate::orchestrator::{Strategy, StrategyContext};
@@ -51,7 +51,12 @@ use crate::config;
 use crate::helpers::volatility::{fair_yes_probability, sigma_per_sqrt_sec};
 use crate::venues::core::TimeInForce;
 
-pub struct FairValueStrategyImpl {
+/// All FairValue state is PROCESS-GLOBAL, not per-instance: strategy objects
+/// are recreated on every market rotation (`create_all_strategies()` in
+/// patrol_impl), which would otherwise wipe the vol sampler mid-warmup every
+/// ~25-35 min and reset persistence streaks / exit cooldowns. Same pattern as
+/// gboost_label_pool and the Maker baselines.
+struct FairValueGlobals {
     /// Self-sampled oracle price history: (sample time, price). One sample per
     /// FAIRVALUE_VOL_SAMPLE_SECS, pruned past FAIRVALUE_VOL_WINDOW_SECS.
     vol_samples: StdMutex<VecDeque<(Instant, f64)>>,
@@ -63,6 +68,18 @@ pub struct FairValueStrategyImpl {
     last_diag_log_at: StdMutex<Option<Instant>>,
 }
 
+fn globals() -> &'static FairValueGlobals {
+    static G: OnceLock<FairValueGlobals> = OnceLock::new();
+    G.get_or_init(|| FairValueGlobals {
+        vol_samples:      StdMutex::new(VecDeque::new()),
+        signal_streak:    StdMutex::new(None),
+        exit_cooldowns:   StdMutex::new(HashMap::new()),
+        last_diag_log_at: StdMutex::new(None),
+    })
+}
+
+pub struct FairValueStrategyImpl;
+
 impl Default for FairValueStrategyImpl {
     fn default() -> Self {
         Self::new()
@@ -71,18 +88,13 @@ impl Default for FairValueStrategyImpl {
 
 impl FairValueStrategyImpl {
     pub fn new() -> Self {
-        Self {
-            vol_samples:      StdMutex::new(VecDeque::new()),
-            signal_streak:    StdMutex::new(None),
-            exit_cooldowns:   StdMutex::new(HashMap::new()),
-            last_diag_log_at: StdMutex::new(None),
-        }
+        Self
     }
 
     /// Feed the vol sampler and return σ per √second, or None during warmup /
     /// frozen oracle.
     fn update_and_read_sigma(&self, oracle_price: f64) -> Option<f64> {
-        let mut samples = match self.vol_samples.lock() {
+        let mut samples = match globals().vol_samples.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
@@ -126,7 +138,7 @@ impl FairValueStrategyImpl {
     }
 
     fn cooldown_active(&self, token_id: &str) -> bool {
-        let mut reg = match self.exit_cooldowns.lock() {
+        let mut reg = match globals().exit_cooldowns.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
@@ -140,7 +152,7 @@ impl FairValueStrategyImpl {
     }
 
     fn arm_cooldown(&self, token_id: &str) {
-        let mut reg = match self.exit_cooldowns.lock() {
+        let mut reg = match globals().exit_cooldowns.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
@@ -166,7 +178,7 @@ impl FairValueStrategyImpl {
             return Some(if yes_won == token_is_yes { 1.0 } else { 0.0 });
         }
         // Read σ without feeding a new sample (entry path owns the sampler cadence).
-        let samples = match self.vol_samples.lock() {
+        let samples = match globals().vol_samples.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
@@ -193,6 +205,15 @@ impl Strategy for FairValueStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── Vol sampler feed (BEFORE structural gates) ───────────────────────
+        // Warmup must progress even while the venue/strike is temporarily
+        // unavailable, otherwise structural hiccups also stall the sampler.
+        let spot = match ctx.snapshot.oracle_price.to_f64() {
+            Some(s) if s > 0.0 => s,
+            _ => return Ok(StrategySignal::NoSignal),
+        };
+        let sigma_opt = self.update_and_read_sigma(spot);
+
         // ── Venue: prefer the Window/Daily maker venue (lower fees, has strike) ──
         let (market, snap) = if let (Some(mk_mkt), Some(mk_snap)) = (&ctx.maker_market, &ctx.maker_snapshot) {
             (mk_mkt, mk_snap)
@@ -217,14 +238,24 @@ impl Strategy for FairValueStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
-        // ── Model inputs: spot + self-sampled realized vol ───────────────────
-        let spot = match ctx.snapshot.oracle_price.to_f64() {
-            Some(s) if s > 0.0 => s,
-            _ => return Ok(StrategySignal::NoSignal),
-        };
-        let sigma = match self.update_and_read_sigma(spot) {
+        // ── Model inputs: self-sampled realized vol (sampled above) ──────────
+        let sigma = match sigma_opt {
             Some(s) => s, // warmup complete, oracle alive
-            None => return Ok(StrategySignal::NoSignal),
+            None => {
+                // Warmup visibility: without this the viper is totally silent
+                // for the first FAIRVALUE_MIN_VOL_SAMPLES × SAMPLE_SECS.
+                let mut last = globals().last_diag_log_at.lock().unwrap();
+                let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::GBOOST_PRED_LOG_INTERVAL_SECS);
+                if due {
+                    *last = Some(Instant::now());
+                    let n = globals().vol_samples.lock().map(|s| s.len()).unwrap_or(0);
+                    tracing::info!(
+                        " FairValue: vol warmup {}/{} samples ({}s cadence)",
+                        n, config::FAIRVALUE_MIN_VOL_SAMPLES, config::FAIRVALUE_VOL_SAMPLE_SECS,
+                    );
+                }
+                return Ok(StrategySignal::NoSignal);
+            }
         };
 
         // ── Fair value ────────────────────────────────────────────────────────
@@ -254,7 +285,7 @@ impl Strategy for FairValueStrategyImpl {
 
         // ── Periodic diagnostic (calibration visibility, throttled) ──────────
         {
-            let mut last = self.last_diag_log_at.lock().unwrap();
+            let mut last = globals().last_diag_log_at.lock().unwrap();
             let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::GBOOST_PRED_LOG_INTERVAL_SECS);
             if due {
                 *last = Some(Instant::now());
@@ -310,7 +341,7 @@ impl Strategy for FairValueStrategyImpl {
         // ── Edge persistence debounce (anti ask-flicker) ─────────────────────
         let persisted = {
             let now = Instant::now();
-            let mut streak = self.signal_streak.lock().unwrap();
+            let mut streak = globals().signal_streak.lock().unwrap();
             match streak.as_mut() {
                 Some((cid, dir, first_seen, last_seen))
                     if *cid == market.condition_id
