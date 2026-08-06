@@ -241,6 +241,9 @@ pub fn validate_proposals(raw: Vec<RawProposal>, current: &DynamicConfig) -> Pro
             // Suggest the closest real key so the few-shot loop can teach the
             // model the correct name instead of letting it repeat the mistake.
             let why = match closest_key(&p.field, &schema) {
+                Some(k) if schema.iter().any(|f| f.key == k && f.advanced) => format!(
+                    "unknown field (not in config schema); closest is \"{k}\", which is advanced and not tunable by the advisor"
+                ),
                 Some(k) => format!("unknown field (not in config schema); did you mean \"{k}\"?"),
                 None => "unknown field (not in config schema)".into(),
             };
@@ -251,6 +254,18 @@ pub fn validate_proposals(raw: Vec<RawProposal>, current: &DynamicConfig) -> Pro
             });
             continue;
         };
+
+        // Advanced fields are excluded from the Machine-Editable Keys list the
+        // advisor is shown; enforce that policy here too so a correctly-spelled
+        // advanced key can't slip through the tuner.
+        if field.advanced {
+            batch.rejected.push(RejectedProposal {
+                field: p.field,
+                to: p.to,
+                why: "advanced field — not tunable by the advisor (human-only via the UI)".into(),
+            });
+            continue;
+        }
 
         let Some(from) = current_json.get(field.key).cloned() else {
             batch.rejected.push(RejectedProposal {
@@ -479,7 +494,28 @@ mod tests {
         let batch = validate_proposals(raw, &cfg());
         assert_eq!(batch.rejected.len(), 1);
         assert!(
-            batch.rejected[0].why.contains("did you mean \"maker_min_entry_price\""),
+            batch.rejected[0]
+                .why
+                .contains("closest is \"maker_min_entry_price\", which is advanced"),
+            "got: {}",
+            batch.rejected[0].why
+        );
+    }
+
+    #[test]
+    fn advanced_field_rejected_even_when_spelled_correctly() {
+        // Advanced fields are excluded from the advisor's Machine-Editable
+        // Keys list; the validator must enforce the same policy.
+        let raw = vec![RawProposal {
+            field: "maker_min_entry_price".into(),
+            to: serde_json::json!(0.01),
+            reason: String::new(),
+        }];
+        let batch = validate_proposals(raw, &cfg());
+        assert_eq!(batch.accepted.len(), 0);
+        assert_eq!(batch.rejected.len(), 1);
+        assert!(
+            batch.rejected[0].why.contains("advanced field"),
             "got: {}",
             batch.rejected[0].why
         );

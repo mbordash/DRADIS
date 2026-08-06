@@ -574,7 +574,7 @@ fn build_user_prompt(
         dyn_cfg.enable_trendcapture,
     ));
     lines.push(format!(
-        "Momentum: stop_loss={:.0}%, target_profit={:.0}%, min_trade=${}, max_trade=${}, max_exposure=${}",
+        "Momentum: momentum_stop_loss_pct={:.0}%, momentum_target_profit_pct={:.0}%, momentum_min_trade_size_usdc=${}, momentum_max_trade_size_usdc=${}, momentum_max_exposure_usdc=${}",
         dyn_cfg.momentum_stop_loss_pct * rust_decimal::Decimal::ONE_HUNDRED,
         dyn_cfg.momentum_target_profit_pct * rust_decimal::Decimal::ONE_HUNDRED,
         dyn_cfg.momentum_min_trade_size_usdc,
@@ -589,34 +589,34 @@ fn build_user_prompt(
         config::MAX_MOMENTUM_ENTRY_PRICE,
     ));
     lines.push(format!(
-        "Maker: max_entry=${}, min_entry=${}, stop_loss={:.0}%, target_profit={:.0}%, max_exposure=${}",
+        "Maker: maker_max_entry_price=${}, maker_min_entry_price=${}, maker_stop_loss_pct={:.0}%, maker_target_profit_pct={:.0}%, maker_max_exposure_usdc=${}",
         dyn_cfg.maker_max_entry_price, dyn_cfg.maker_min_entry_price,
         dyn_cfg.maker_stop_loss_pct * rust_decimal::Decimal::ONE_HUNDRED,
         dyn_cfg.maker_target_profit_pct * rust_decimal::Decimal::ONE_HUNDRED,
         dyn_cfg.maker_max_exposure_usdc,
     ));
     lines.push(format!(
-        "GBoost: entry_threshold={}, stop_loss={:.0}%, target_profit={:.0}%, max_exposure=${}",
+        "GBoost: gboost_entry_threshold={}, gboost_stop_loss_pct={:.0}%, gboost_target_profit_pct={:.0}%, gboost_max_exposure_usdc=${}",
         dyn_cfg.gboost_entry_threshold,
         dyn_cfg.gboost_stop_loss_pct * rust_decimal::Decimal::ONE_HUNDRED,
         dyn_cfg.gboost_target_profit_pct * rust_decimal::Decimal::ONE_HUNDRED,
         dyn_cfg.gboost_max_exposure_usdc,
     ));
     lines.push(format!(
-        "Basis: stop_loss={:.0}%, target_profit={:.0}%, max_exposure=${}",
+        "Basis: basis_stop_loss_pct={:.0}%, basis_target_profit_pct={:.0}%, basis_max_exposure_usdc=${}",
         dyn_cfg.basis_stop_loss_pct * rust_decimal::Decimal::ONE_HUNDRED,
         dyn_cfg.basis_target_profit_pct * rust_decimal::Decimal::ONE_HUNDRED,
         dyn_cfg.basis_max_exposure_usdc,
     ));
     lines.push(format!(
-        "TimeDecay: position_size=${}, stop_loss={:.0}%, max_entry=${}, max_exposure=${}",
+        "TimeDecay: time_decay_position_size_usdc=${}, time_decay_stop_loss_pct={:.0}%, time_decay_max_entry_price=${}, time_decay_max_exposure_usdc=${}",
         dyn_cfg.time_decay_position_size_usdc,
         dyn_cfg.time_decay_stop_loss_pct * rust_decimal::Decimal::ONE_HUNDRED,
         dyn_cfg.time_decay_max_entry_price,
         dyn_cfg.time_decay_max_exposure_usdc,
     ));
     lines.push(format!(
-        "TrendCapture: stop_loss={:.0}%, target_profit={:.0}%, min_trade=${}, max_trade=${}, max_entry=${}, max_exposure=${}",
+        "TrendCapture: trendcapture_stop_loss_pct={:.0}%, trendcapture_target_profit_pct={:.0}%, trendcapture_min_trade_size_usdc=${}, trendcapture_max_trade_size_usdc=${}, trendcapture_max_entry_price=${}, trendcapture_max_exposure_usdc=${}",
         dyn_cfg.trendcapture_stop_loss_pct * rust_decimal::Decimal::ONE_HUNDRED,
         dyn_cfg.trendcapture_target_profit_pct * rust_decimal::Decimal::ONE_HUNDRED,
         dyn_cfg.trendcapture_min_trade_size_usdc,
@@ -655,7 +655,7 @@ fn build_user_prompt(
     lines.push(String::new());
     lines.push("== Machine-Editable Keys ==".to_string());
     lines.push("Use ONLY these exact keys in the proposals json block (key = current [min..max]):".to_string());
-    lines.push("(The prose summary above uses abbreviated names for read-only context — those are NOT valid keys. A parameter not listed below cannot be changed; do not propose it.)".to_string());
+    lines.push("(A parameter not listed below cannot be changed; do not propose it.)".to_string());
     let cfg_json = serde_json::to_value(dyn_cfg).unwrap_or(serde_json::Value::Null);
     for f in crate::api::config_schema::config_schema() {
         if f.advanced {
