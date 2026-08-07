@@ -65,8 +65,18 @@ export default function AlphaGate({
             <h3 className="text-sm font-mono text-red-300">⚠️ Alpha software · real-money risk</h3>
             <ul className="text-xs text-red-200/90 space-y-1 list-disc pl-4">
               <li>DRADIS is <strong>experimental alpha software</strong>. It places live orders with real funds and can <strong>lose some or all of the capital</strong> you give it access to.</li>
-              <li>Bugs, venue outages, market conditions, or misconfiguration can produce unexpected trades and losses. Start in GHOST mode and with money you can afford to lose entirely.</li>
+              <li>Automated trading involves substantial risk of loss: software bugs, network latency, API rate limits, venue outages, slippage, or misconfiguration can produce unintended trades and <strong>total loss of deployed capital</strong>. Start in GHOST mode and with money you can afford to lose entirely.</li>
               <li>Provided under the GPLv3 <strong>without warranty of any kind</strong>. Nothing here is financial advice.</li>
+            </ul>
+          </div>
+
+          {/* ── Legal status ─────────────────────────────────────────────── */}
+          <div className="bg-[#0e0e18] border border-[#1e1e32] rounded-xl p-4 space-y-2">
+            <h3 className="text-sm font-mono text-gray-300">📜 Software, not a financial service</h3>
+            <ul className="text-xs text-gray-400 space-y-1 list-disc pl-4">
+              <li><strong className="text-gray-300">Non-custodial:</strong> DRADIS is self-hosted software. Your private keys, API keys, and funds stay exclusively on this instance under your control — the developers never store, access, or take custody of them.</li>
+              <li><strong className="text-gray-300">Not a broker or adviser:</strong> this is a self-hosted automation tool. The developers are not acting as a broker, dealer, investment adviser, or money transmitter, and no strategy signal or AI recommendation produced by the engine constitutes financial or investment advice.</li>
+              <li><strong className="text-gray-300">Limitation of liability:</strong> to the maximum extent permitted by law, the developers and contributors are not liable for any direct, indirect, incidental, special, consequential, or punitive damages — including loss of funds, profits, or data — arising from use of, or inability to use, this software.</li>
             </ul>
           </div>
 
@@ -108,7 +118,7 @@ export default function AlphaGate({
           <div className="space-y-2.5">
             <label className="flex items-start gap-2.5 text-xs text-gray-300 cursor-pointer">
               <input type="checkbox" className={checkboxCls} checked={riskOk} onChange={e => setRiskOk(e.target.checked)} />
-              <span>I understand this is alpha software that trades real money and can lose it, is provided without warranty or support, and I accept these risks.</span>
+              <span>I understand this is alpha software that trades real money and can lose it, is provided without warranty or support, and I accept these risks and the non-custodial, no-advice, and limitation-of-liability terms above.</span>
             </label>
             <label className="flex items-start gap-2.5 text-xs text-gray-300 cursor-pointer">
               <input type="checkbox" className={checkboxCls} checked={jurisdictionOk} onChange={e => setJurisdictionOk(e.target.checked)} />
