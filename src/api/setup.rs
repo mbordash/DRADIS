@@ -272,7 +272,7 @@ async fn get_status() -> Response {
     };
     let venue = build_venue();
     let venue_configured = match venue {
-        "intl" => env_set("POLYMARKET_PRIVATE_KEY"),
+        "intl" => env_set("POLYMARKET_PRIVATE_KEY") && env_set("POLYGON_RPC_URL"),
         _      => env_set("POLYMARKET_US_KEY_ID") && env_set("POLYMARKET_US_SECRET_KEY"),
     };
     Json(json!({

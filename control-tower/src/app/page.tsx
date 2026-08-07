@@ -15,6 +15,7 @@ import AiActionsPage   from '@/components/AiActionsPage';
 import ErrorBoundary   from '@/components/ErrorBoundary';
 import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getSquadrons } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
+import { getSetupStatus } from '@/lib/setupApi';
 import type { DynamicConfig, SquadronSummary } from '@/lib/types';
 
 // Recharts must be loaded client-side only
@@ -384,6 +385,10 @@ export default function DashboardPage() {
   const { data: squadrons, isLoading: squadronsLoading } =
     useSWR('squadrons', getSquadrons, { refreshInterval: 10_000 });
 
+  // Setup state — drives the "engine idle, complete Setup" first-run banner.
+  const { data: setupStatus } =
+    useSWR(!DEMO_MODE ? 'setupStatus' : null, getSetupStatus, { refreshInterval: 60_000 });
+
   // ── Stats derived from P&L history ──────────────────────────────────────────
   const latestSnap  = pnl?.[0];
   const oldestSnap  = pnl?.[pnl.length - 1];
@@ -523,6 +528,19 @@ export default function DashboardPage() {
           </div>
         </div>
       </header>
+
+      {/* ── First-run: venue credentials missing — engine is idle ─────────── */}
+      {setupStatus && !setupStatus.venue_configured && activeView !== 'setup' && (
+        <div className="max-w-7xl mx-auto px-4 sm:px-6 pt-4">
+          <button
+            onClick={() => setActiveView('setup')}
+            className="w-full text-left bg-amber-500/10 border border-amber-500/30 rounded-xl px-4 py-3 text-xs font-mono text-amber-300 hover:bg-amber-500/20 transition-colors"
+          >
+            ⚠️ ENGINE IDLE — venue credentials not configured. DRADIS is running but cannot
+            trade. Click here to open Setup, enter your credentials, and restart the engine.
+          </button>
+        </div>
+      )}
 
       {/* ── Tradelog view ──────────────────────────────────────────────────── */}
       {activeView === 'tradelog' && (

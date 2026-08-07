@@ -422,6 +422,29 @@ async fn run() -> Result<()> {
     // ── Intl CLOB bootstrap (self-custody EIP-712 over Polygon) ──────────────
     #[cfg(feature = "intl_clob")]
     {
+    // ── A1: zero-credential graceful boot ────────────────────────────────────
+    // AMI first-run: the box comes up with no keys. Instead of crashing (which
+    // would take the Setup UI down with us), bring the Control Tower API up
+    // with a zero Safe address and park — the operator completes the Setup
+    // view, which persists secrets.env and calls POST /api/setup/restart.
+    let intl_creds_present = env::var("POLYMARKET_PRIVATE_KEY").map(|v| !v.is_empty()).unwrap_or(false)
+        && env::var("POLYGON_RPC_URL").map(|v| !v.is_empty()).unwrap_or(false);
+    if !intl_creds_present {
+        tracing::warn!(
+            "⚠️ Intl venue credentials missing (POLYMARKET_PRIVATE_KEY / POLYGON_RPC_URL) — \
+             engine idle; complete the Control Tower Setup view, then restart."
+        );
+        tokio::spawn(dradis::api::server::run_api_server(
+            Arc::clone(&config_tx),
+            config_rx.clone(),
+            markets_rx,
+            raptor_health_rx,
+            alloy::primitives::Address::ZERO,
+            cag.clone(),
+        ));
+        std::future::pending::<()>().await;
+        unreachable!();
+    }
     let polygon_rpc_url = env::var("POLYGON_RPC_URL")
         .map_err(|_| anyhow::anyhow!("❌ POLYGON_RPC_URL not set in .env. Required for auto-settlement transactions. Use a paid RPC service like Helius (https://www.helius-rpc.com) or QuickNode. Example: POLYGON_RPC_URL=https://mainnet.helius-rpc.com/?api-key=YOUR_KEY"))?;
 
@@ -431,7 +454,27 @@ async fn run() -> Result<()> {
     // the bootstrap that previously lived inline here (see VENUE_ABSTRACTION.md).
     // The raw infra is re-exposed via accessors so the settlement provider,
     // RunArgs, and startup balance/cancel flows below stay unchanged.
-    let venue = Arc::new(IntlClobVenue::connect(Arc::clone(&shared_http)).await?);
+    // Best-effort: a connect failure (bad key, CLOB outage) parks with the
+    // Setup UI live — same recovery path as missing credentials.
+    let venue = match IntlClobVenue::connect(Arc::clone(&shared_http)).await {
+        Ok(v) => Arc::new(v),
+        Err(e) => {
+            tracing::error!(
+                "❌ Intl venue connect failed ({e:#}) — engine idle; check credentials \
+                 in the Control Tower Setup view, then restart."
+            );
+            tokio::spawn(dradis::api::server::run_api_server(
+                Arc::clone(&config_tx),
+                config_rx.clone(),
+                markets_rx,
+                raptor_health_rx,
+                alloy::primitives::Address::ZERO,
+                cag.clone(),
+            ));
+            std::future::pending::<()>().await;
+            unreachable!();
+        }
+    };
     let signer         = venue.signer().clone();
     let eoa_address    = venue.eoa_address();
     let safe_address   = venue.safe_address();
