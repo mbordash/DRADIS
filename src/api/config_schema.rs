@@ -280,6 +280,12 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Don't enter with fewer than this many seconds left.").min(0.0).step(1.0).unit("s"));
         v.push(F::new(g, e, "gboost_signal_exit_threshold", "Signal Exit Threshold", "decimal", true,
             "Exit when classifier probability decays to/below this level.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "gboost_concept_drift_threshold", "Drift Threshold", "decimal", true,
+            "Chi-squared drift score above which a retrain counts toward suppression. Calibrated for drift window 400: normal BTC intraday vol scores 15–21, genuine regime collapse 22+.").range(1.0, 100.0).step(0.5));
+        v.push(F::new(g, e, "gboost_drift_consecutive_required", "Drift Consecutive Required", "int", true,
+            "Consecutive above-threshold retrains required before entries are suppressed.").range(1.0, 10.0).step(1.0));
+        v.push(F::new(g, e, "gboost_drift_stable_clear_required", "Drift Stable Clear Required", "int", true,
+            "Consecutive below-threshold retrains required before suppression is lifted.").range(1.0, 10.0).step(1.0));
     }
 
     // ── TrendReversal ─────────────────────────────────────────────────────────────

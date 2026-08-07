@@ -512,13 +512,17 @@ pub const GBOOST_MIN_HOLDING_LOCK_SECS: i64 = 180;
 /// When the live data distribution deviates
 /// significantly from the training distribution (as measured by perpetual's leaf-node
 /// chi-squared statistic), GBoost entries are suppressed until the next retrain.
-/// Balanced: 5.0 — chi2(df=1) between p95 (3.84) and p99 (6.63); catches real shifts
-/// without over-triggering on normal intra-session variance.
-pub const GBOOST_CONCEPT_DRIFT_THRESHOLD: f32 = 5.0;
+/// Balanced: 22.0 — recalibrated from live sessions (2026-06-17): normal BTC
+/// intraday volatility scores 15–21; only genuine regime collapse (book
+/// near-resolution, liquidity withdrawal) scores 22+. The old 5.0 textbook-chi2
+/// value suppressed GBoost on ordinary vol for entire sessions.
+/// NOTE: this scale is only valid with GBOOST_DRIFT_WINDOW = 400.
+pub const GBOOST_CONCEPT_DRIFT_THRESHOLD: Decimal = dec!(22.0);
 
 /// Number of recent history snapshots used for the post-retrain drift check.
-/// Balanced: 200 ticks (~3 min at normal cadence).
-pub const GBOOST_DRIFT_WINDOW: usize = 200;
+/// 400 ticks (~3-4 min at the 500ms decimated cadence) — the drift-score scale
+/// the thresholds above are calibrated against; do not shrink independently.
+pub const GBOOST_DRIFT_WINDOW: usize = 400;
 
 /// Number of consecutive retrains above GBOOST_CONCEPT_DRIFT_THRESHOLD required
 /// before GBoost entries are suppressed.  A single retrain below the threshold
@@ -528,8 +532,9 @@ pub const GBOOST_DRIFT_WINDOW: usize = 200;
 pub const GBOOST_DRIFT_CONSECUTIVE_REQUIRED: usize = 3;
 
 /// Number of consecutive BELOW-threshold retrains to clear drift suppression.
-/// Balanced: 3 — matches the standard config; confirms regime stability before re-enabling entries.
-pub const GBOOST_DRIFT_STABLE_CLEAR_REQUIRED: usize = 3;
+/// Balanced: 2 — two consecutive below-threshold retrains (~60s) confirm the
+/// regime has restabilised; longer waits kept GBoost suppressed after transients.
+pub const GBOOST_DRIFT_STABLE_CLEAR_REQUIRED: usize = 2;
 
 // ============================================================================
 // TRENDCAPTURE STRATEGY PARAMETERS

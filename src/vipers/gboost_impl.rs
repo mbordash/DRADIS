@@ -661,7 +661,7 @@ impl GboostStrategyImpl {
     ///      sparse.  Label: oracle price higher GBOOST_LABEL_HORIZON_SECS later → 1.0.
     ///      This breaks the chicken-and-egg deadlock that prevents the model from ever
     ///      reaching the minimum sample count required to produce its first predictions.
-    fn maybe_retrain(&self) {
+    fn maybe_retrain(&self, dc: &crate::helpers::dynamic_config::DynamicConfig) {
         if self.is_training.load(Ordering::Relaxed) { return; }
 
         // ── Degenerate-retrain backoff ─────────────────────────────────────────
@@ -855,6 +855,13 @@ impl GboostStrategyImpl {
         let consecutive_drift_counter = Arc::clone(&self.consecutive_drift_above_threshold);
         let consecutive_stable_counter = Arc::clone(&self.consecutive_stable_retrains);
 
+        // Hot-tunable drift knobs (bug #10): snapshot the current DynamicConfig
+        // values so the async retrain closure uses the operator/profile-tuned
+        // settings rather than compile-time consts.
+        let drift_threshold: f32 = dc.gboost_concept_drift_threshold.to_f32().unwrap_or(22.0);
+        let drift_consecutive_required  = dc.gboost_drift_consecutive_required.max(1) as usize;
+        let drift_stable_clear_required = dc.gboost_drift_stable_clear_required.max(1) as usize;
+
         // Capture a window of recent snapshots for concept-drift evaluation.
         // Oldest-first order (same as extract_features expects for prev_s).
         let history_for_drift: Vec<MarketSnapshot> = {
@@ -923,41 +930,41 @@ impl GboostStrategyImpl {
                     // vs. the training distribution.  A high chi-squared score means the
                     // current market regime is outside what the model was trained on.
                     //
-                    // Suppression: requires GBOOST_DRIFT_CONSECUTIVE_REQUIRED consecutive
+                    // Suppression: requires gboost_drift_consecutive_required consecutive
                     // above-threshold retrains to activate.
                     //
-                    // Clearing: requires GBOOST_DRIFT_STABLE_CLEAR_REQUIRED consecutive
+                    // Clearing: requires gboost_drift_stable_clear_required consecutive
                     // BELOW-threshold retrains before suppression is lifted.  A single
                     // below-threshold "blink" during a genuine regime change used to
                     // unlock entries prematurely; the stable-retrain requirement ensures
                     // the model has genuinely recaptured the distribution.
                     *last_concept_drift_score.lock().unwrap() = drift_score;
-                    if drift_score > config::GBOOST_CONCEPT_DRIFT_THRESHOLD {
+                    if drift_score > drift_threshold {
                         // Above threshold: increment drift counter, reset stable counter.
                         let mut count = consecutive_drift_counter.lock().unwrap();
                         let mut stable = consecutive_stable_counter.lock().unwrap();
                         *count += 1;
                         *stable = 0; // any above-threshold retrain resets the stable streak
-                        if *count >= config::GBOOST_DRIFT_CONSECUTIVE_REQUIRED {
+                        if *count >= drift_consecutive_required {
                             tracing::warn!(
                                 "⚠️ GBoost: concept drift confirmed ({} consecutive retrains, \
                                  latest score={:.2} > threshold {:.2}) — suppressing entries \
                                  until {} consecutive stable retrains recapture regime",
-                                *count, drift_score, config::GBOOST_CONCEPT_DRIFT_THRESHOLD,
-                                config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED
+                                *count, drift_score, drift_threshold,
+                                drift_stable_clear_required
                             );
                             concept_drift_suppressed.store(true, Ordering::Relaxed);
                         } else {
                             tracing::warn!(
                                 "⚠️ GBoost: drift spike #{} (score={:.2} > threshold {:.2}) — \
                                  watching for {} consecutive trigger before suppressing",
-                                *count, drift_score, config::GBOOST_CONCEPT_DRIFT_THRESHOLD,
-                                config::GBOOST_DRIFT_CONSECUTIVE_REQUIRED
+                                *count, drift_score, drift_threshold,
+                                drift_consecutive_required
                             );
                         }
                     } else {
                         // Below threshold: reset drift counter, increment stable counter.
-                        // Only clear suppression after GBOOST_DRIFT_STABLE_CLEAR_REQUIRED
+                        // Only clear suppression after gboost_drift_stable_clear_required
                         // consecutive stable retrains — prevents premature unlock on a
                         // single below-threshold tick during a sustained regime change.
                         let mut drift_count = consecutive_drift_counter.lock().unwrap();
@@ -965,25 +972,25 @@ impl GboostStrategyImpl {
                         *drift_count = 0;
                         *stable += 1;
                         if concept_drift_suppressed.load(Ordering::Relaxed) {
-                            if *stable >= config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED {
+                            if *stable >= drift_stable_clear_required {
                                 tracing::info!(
                                     "✅ GBoost: concept drift cleared after {} consecutive stable \
                                      retrains (latest score={:.2} ≤ threshold {:.2}) — resuming entries",
-                                    *stable, drift_score, config::GBOOST_CONCEPT_DRIFT_THRESHOLD
+                                    *stable, drift_score, drift_threshold
                                 );
                                 concept_drift_suppressed.store(false, Ordering::Relaxed);
                             } else {
                                 tracing::info!(
                                     "⏳ GBoost: drift below threshold (score={:.2} ≤ {:.2}) but \
                                      suppression held — {}/{} stable retrains required",
-                                    drift_score, config::GBOOST_CONCEPT_DRIFT_THRESHOLD,
-                                    *stable, config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED
+                                    drift_score, drift_threshold,
+                                    *stable, drift_stable_clear_required
                                 );
                             }
                         } else {
                             tracing::debug!(
                                 " GBoost: drift below threshold (score={:.2}), stable streak: {}/{}",
-                                drift_score, *stable, config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED
+                                drift_score, *stable, drift_stable_clear_required
                             );
                         }
                     }
@@ -1242,7 +1249,7 @@ impl Strategy for GboostStrategyImpl {
             ctx.snapshot.clone()
         };
         self.push_snapshot(training_snapshot);
-        self.maybe_retrain();
+        self.maybe_retrain(&ctx.dynamic_config);
 
         let dc = &ctx.dynamic_config;
         if !dc.enable_gboost {

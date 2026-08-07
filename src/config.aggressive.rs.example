@@ -530,18 +530,23 @@ pub const GBOOST_MIN_HOLDING_LOCK_SECS: i64 = 120;
 ///  When the live data distribution deviates
 /// significantly from the training distribution (as measured by perpetual's leaf-node
 /// chi-squared statistic), GBoost entries are suppressed until the next retrain.
-/// Aggressive: 7.0 — only blocks on very strong regime shifts (~p99 chi2 level).
-pub const GBOOST_CONCEPT_DRIFT_THRESHOLD: f32 = 7.0;
+/// Aggressive: 25.0 — recalibrated to the live-session drift-score scale (22.0
+/// balanced baseline); only suppresses on unmistakable regime collapse, accepting
+/// more regime risk in exchange for more entries.
+/// NOTE: this scale is only valid with GBOOST_DRIFT_WINDOW = 400.
+pub const GBOOST_CONCEPT_DRIFT_THRESHOLD: Decimal = dec!(25.0);
 
 /// Number of recent history snapshots used for the post-retrain drift check.
-/// Aggressive: 200 ticks (~3 min at normal cadence) — same as default.
-pub const GBOOST_DRIFT_WINDOW: usize = 200;
+/// 400 ticks (~3-4 min at the 500ms decimated cadence) — the drift-score scale
+/// the thresholds above are calibrated against; do not shrink independently.
+pub const GBOOST_DRIFT_WINDOW: usize = 400;
 
 /// Number of consecutive retrains above GBOOST_CONCEPT_DRIFT_THRESHOLD required
 /// before GBoost entries are suppressed.  A single retrain below the threshold
 /// resets the counter and clears suppression.
-/// Aggressive: 2 — allows one transient spike before suppressing.
-pub const GBOOST_DRIFT_CONSECUTIVE_REQUIRED: usize = 2;
+/// Aggressive: 3 — with the higher 25.0 threshold, even aggressive keeps the
+/// three-consecutive confirmation; single 25+ spikes still occur on order-flow shocks.
+pub const GBOOST_DRIFT_CONSECUTIVE_REQUIRED: usize = 3;
 
 /// Number of consecutive BELOW-threshold retrains to clear drift suppression.
 /// Aggressive: 2 — clear suppression faster to allow more entries after brief regime shifts.

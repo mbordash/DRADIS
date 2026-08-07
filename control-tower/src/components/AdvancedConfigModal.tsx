@@ -51,7 +51,11 @@ function AdvancedRow({ field, config, onPatch, disabled }: RowProps) {
     if (next === stored) { setDraft(next); return; }
     setSaving(true);
     try {
-      await onPatch({ [field.key]: next } as unknown as Partial<DynamicConfig>);
+      // Integer fields (i64 in DynamicConfig) must be sent as JSON numbers —
+      // serde rejects "300" (string) for an i64. Decimal fields stay strings
+      // to avoid f64 precision drift.
+      const isInt = field.type === 'int' || field.type === 'secs';
+      await onPatch({ [field.key]: isInt ? Math.round(clamped) : next } as unknown as Partial<DynamicConfig>);
     } finally {
       setSaving(false);
     }

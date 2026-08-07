@@ -536,24 +536,28 @@ pub const GBOOST_MIN_HOLDING_LOCK_SECS: i64 = 300;
 ///  When the live data distribution deviates
 /// significantly from the training distribution (as measured by perpetual's leaf-node
 /// chi-squared statistic), GBoost entries are suppressed until the next retrain.
-/// Conservative: 4.0 — slightly below p95 chi2(df=1)=3.84; blocks on moderate
-/// distributional shift to protect capital.
-pub const GBOOST_CONCEPT_DRIFT_THRESHOLD: f32 = 4.0;
+/// Conservative: 20.0 — recalibrated to the live-session drift-score scale (see
+/// the standard config's 22.0 baseline note: normal BTC intraday vol scores
+/// 15–21; genuine regime collapse scores 22+). Conservative suppresses slightly
+/// earlier than balanced to protect capital.
+/// NOTE: this scale is only valid with GBOOST_DRIFT_WINDOW = 400.
+pub const GBOOST_CONCEPT_DRIFT_THRESHOLD: Decimal = dec!(20.0);
 
 /// Number of recent history snapshots used for the post-retrain drift check.
-/// Conservative: 300 ticks (~5 min) — larger window for a more stable chi-squared estimate.
-pub const GBOOST_DRIFT_WINDOW: usize = 300;
+/// 400 ticks (~3-4 min at the 500ms decimated cadence) — the drift-score scale
+/// the thresholds above are calibrated against; do not shrink independently.
+pub const GBOOST_DRIFT_WINDOW: usize = 400;
 
 /// Number of consecutive retrains above GBOOST_CONCEPT_DRIFT_THRESHOLD required
 /// before GBoost entries are suppressed.  A single retrain below the threshold
 /// resets the counter and clears suppression.
-/// Conservative: 4 — very patient; suppresses only on sustained regime shifts to
-/// avoid locking out GBoost during brief liquidity events.
-pub const GBOOST_DRIFT_CONSECUTIVE_REQUIRED: usize = 4;
+/// Conservative: 3 — one transient spike (order-flow shock, rapid BTC move) is
+/// tolerated; three consecutive 20+ scores means the regime has genuinely shifted.
+pub const GBOOST_DRIFT_CONSECUTIVE_REQUIRED: usize = 3;
 
 /// Number of consecutive BELOW-threshold retrains to clear drift suppression.
-/// Conservative: 5 — requires extended stability before re-enabling entries after drift.
-pub const GBOOST_DRIFT_STABLE_CLEAR_REQUIRED: usize = 5;
+/// Conservative: 3 — requires extended stability before re-enabling entries after drift.
+pub const GBOOST_DRIFT_STABLE_CLEAR_REQUIRED: usize = 3;
 
 // ============================================================================
 // TRENDCAPTURE STRATEGY PARAMETERS

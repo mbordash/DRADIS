@@ -107,6 +107,9 @@ export interface DynamicConfig {
   gboost_min_net_profit_usdc:   string;
   gboost_min_secs_to_expiry:    number;
   gboost_signal_exit_threshold: string;
+  gboost_concept_drift_threshold: string;
+  gboost_drift_consecutive_required: number;
+  gboost_drift_stable_clear_required: number;
 
   // TrendCapture Viper
   trendcapture_min_trade_size_usdc: string;
@@ -148,7 +151,7 @@ export interface ConfigFieldSchema {
   group:       string;          // viper name or "Global"
   enable_key:  string | null;   // owning viper enable flag (null for global)
   label:       string;
-  type:        'usd' | 'price' | 'pct' | 'decimal' | 'secs' | 'bool';
+  type:        'usd' | 'price' | 'pct' | 'decimal' | 'secs' | 'int' | 'bool';
   unit:        string | null;
   min:         number | null;
   max:         number | null;

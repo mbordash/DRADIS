@@ -171,6 +171,9 @@ fn default_gboost_min_edge_from_fair()      -> Decimal { config::GBOOST_MIN_EDGE
 fn default_gboost_min_net_profit_usdc()     -> Decimal { config::GBOOST_MIN_NET_PROFIT_USDC            }
 fn default_gboost_min_secs_to_expiry()      -> i64     { config::GBOOST_MIN_SECS_TO_EXPIRY             }
 fn default_gboost_signal_exit_threshold()   -> Decimal { config::GBOOST_SIGNAL_EXIT_THRESHOLD          }
+fn default_gboost_concept_drift_threshold() -> Decimal { config::GBOOST_CONCEPT_DRIFT_THRESHOLD        }
+fn default_gboost_drift_consecutive_required()  -> i64 { config::GBOOST_DRIFT_CONSECUTIVE_REQUIRED as i64 }
+fn default_gboost_drift_stable_clear_required() -> i64 { config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED as i64 }
 
 fn default_trendcapture_min_entry_price()      -> Decimal { config::TRENDCAPTURE_MIN_ENTRY_PRICE          }
 fn default_trendcapture_max_entry_ask_sum()    -> Decimal { config::TRENDCAPTURE_MAX_ENTRY_ASK_SUM        }
@@ -371,6 +374,17 @@ pub struct DynamicConfig {
     pub gboost_min_secs_to_expiry:    i64,
     #[serde(default = "default_gboost_signal_exit_threshold")]
     pub gboost_signal_exit_threshold: Decimal,
+    /// Chi-squared drift score above which a retrain counts toward suppression.
+    /// Scale is calibrated against GBOOST_DRIFT_WINDOW=400 live sessions: normal
+    /// BTC intraday vol scores 15–21, genuine regime collapse 22+ (bug #10).
+    #[serde(default = "default_gboost_concept_drift_threshold")]
+    pub gboost_concept_drift_threshold: Decimal,
+    /// Consecutive above-threshold retrains required to activate suppression.
+    #[serde(default = "default_gboost_drift_consecutive_required")]
+    pub gboost_drift_consecutive_required: i64,
+    /// Consecutive below-threshold retrains required to clear suppression.
+    #[serde(default = "default_gboost_drift_stable_clear_required")]
+    pub gboost_drift_stable_clear_required: i64,
 
     // ── TrendCapture Viper ────────────────────────────────────────────────────
     #[serde(default = "default_trendcapture_min_trade_size")]
@@ -564,6 +578,9 @@ impl Default for DynamicConfig {
             gboost_min_net_profit_usdc:   config::GBOOST_MIN_NET_PROFIT_USDC,
             gboost_min_secs_to_expiry:    config::GBOOST_MIN_SECS_TO_EXPIRY,
             gboost_signal_exit_threshold: config::GBOOST_SIGNAL_EXIT_THRESHOLD,
+            gboost_concept_drift_threshold: config::GBOOST_CONCEPT_DRIFT_THRESHOLD,
+            gboost_drift_consecutive_required: config::GBOOST_DRIFT_CONSECUTIVE_REQUIRED as i64,
+            gboost_drift_stable_clear_required: config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED as i64,
 
             trendcapture_min_trade_size_usdc: config::TRENDCAPTURE_MIN_TRADE_SIZE_USDC,
             trendcapture_max_trade_size_usdc: config::TRENDCAPTURE_MAX_TRADE_SIZE_USDC,
