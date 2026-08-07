@@ -254,6 +254,8 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 | `/api/llm/actions/{id}/approve` | POST | Approve a proposed AI change (revalidated, then applied) |
 | `/api/llm/actions/{id}/reject` | POST | Reject a proposed AI change |
 | `/api/setup/autonomy` | GET/PUT | AI autonomy tier, kill switch, breaker reset (admin-gated) |
+| `/api/setup/export` | GET | Download portable config bundle — secrets + global/squadron configs (admin-gated) |
+| `/api/setup/import` | POST | Restore a config bundle on a new instance; restart applies (admin-gated) |
 
 All data endpoints accept `?asset=btc` query param to scope to a specific asset pool.
 

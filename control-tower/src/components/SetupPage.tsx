@@ -18,6 +18,7 @@ import {
   getSetupStatus, getCredentials, putCredentials, testConnection,
   login, setAdminPassword, restartEngine,
   getAutonomy, putAutonomy,
+  exportBundle, importBundle,
   getAdminToken, clearAdminToken, SetupApiError,
 } from '@/lib/setupApi';
 
@@ -534,6 +535,64 @@ export default function SetupPage() {
       )}
 
       <AutonomyPanel onAuthError={() => { clearAdminToken(); setAuthed(false); }} />
+
+      {/* ── Config bundle export / import (instance migration) ────────────── */}
+      <div className="bg-[#13131f] border border-[#1e1e32] rounded-xl p-4 space-y-3">
+        <div>
+          <h3 className="text-sm font-mono text-gray-200">📦 Instance Migration</h3>
+          <p className="text-xs text-gray-500 mt-0.5">
+            Export this instance&apos;s full configuration — credentials, admin password,
+            global + squadron configs — as a single bundle, then import it on a new
+            instance (e.g. a newer AMI) and restart. The bundle contains secrets; store it safely.
+          </p>
+        </div>
+        <div className="flex items-center gap-2">
+          <button
+            className={btnCls('ghost')}
+            onClick={async () => {
+              try {
+                const blob = await exportBundle();
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = 'dradis-config-bundle.json';
+                a.click();
+                URL.revokeObjectURL(url);
+                setNotice({ kind: 'ok', text: 'Bundle downloaded — treat it as a secret.' });
+              } catch (e) {
+                setNotice({ kind: 'err', text: e instanceof Error ? e.message : 'Export failed' });
+              }
+            }}
+          >
+            ⬇ Export bundle
+          </button>
+          <label className={btnCls('ghost') + ' cursor-pointer'}>
+            ⬆ Import bundle…
+            <input
+              type="file"
+              accept="application/json,.json"
+              className="hidden"
+              onChange={async (e) => {
+                const file = e.target.files?.[0];
+                e.target.value = '';
+                if (!file) return;
+                if (!window.confirm('Import this bundle? Existing credentials and configs will be overwritten, then the engine needs a restart.')) return;
+                try {
+                  const text = await file.text();
+                  const r = await importBundle(text);
+                  setNotice({
+                    kind: 'ok',
+                    text: `Imported ${r.secrets_imported} secret(s), global config: ${r.dynamic_config_restored ? 'yes' : 'no'}, ${r.squadron_configs_restored} squadron config(s). Restart the engine to apply.`,
+                  });
+                  loadCreds();
+                } catch (err) {
+                  setNotice({ kind: 'err', text: err instanceof Error ? err.message : 'Import failed' });
+                }
+              }}
+            />
+          </label>
+        </div>
+      </div>
 
       <div className="flex items-center justify-end gap-2 border-t border-[#1e1e32] pt-4">
         <button onClick={save} disabled={!dirty || saving} className={btnCls('primary')}>

@@ -631,6 +631,167 @@ async fn restart() -> Response {
     Json(json!({"ok": true, "message": "restarting — back in ~30-60s"})).into_response()
 }
 
+// ─── Config export / import (AMI upgrade path) ───────────────────────────────
+
+/// Bundle format version. Bump when the bundle *structure* changes (not when
+/// DynamicConfig gains fields — serde defaults absorb those transparently).
+const BUNDLE_SCHEMA_VERSION: u32 = 1;
+
+/// GET /api/setup/export — download a portable config bundle for migrating to
+/// a new instance (AMI upgrade path). Contains the managed secrets (including
+/// the admin password hash so the login carries over), the global
+/// DynamicConfig, and every squadron config. Admin-gated; treat the file as
+/// sensitive — it holds keys.
+async fn export_bundle() -> Response {
+    let secrets = read_secrets();
+    // Everything in the secrets file except the session-signing key (a new box
+    // mints its own; carrying it over has no benefit).
+    let secrets_out: BTreeMap<&String, &String> = secrets
+        .iter()
+        .filter(|(k, _)| k.as_str() != "DRADIS_SESSION_KEY")
+        .collect();
+
+    let mut dynamic_config = serde_json::Value::Null;
+    let mut squadrons = serde_json::Map::new();
+    if let Some(pool) = crate::helpers::db::pool() {
+        if let Some(json) = crate::helpers::db::config_get(pool, "dynamic_config").await {
+            dynamic_config = serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+        }
+        for sid in crate::helpers::db::squadron_config_list(pool).await {
+            if let Some(json) = crate::helpers::db::squadron_config_get(pool, &sid).await {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&json) {
+                    squadrons.insert(sid, v);
+                }
+            }
+        }
+    }
+
+    let bundle = json!({
+        "kind": "dradis-config-bundle",
+        "schema_version": BUNDLE_SCHEMA_VERSION,
+        "exported_at": chrono::Utc::now().to_rfc3339(),
+        "venue": build_venue(),
+        "app_version": env!("CARGO_PKG_VERSION"),
+        "secrets": secrets_out,
+        "dynamic_config": dynamic_config,
+        "squadron_configs": squadrons,
+    });
+    info!("📦 Setup: config bundle exported ({} secrets, {} squadron configs)",
+          secrets.len().saturating_sub(1), bundle["squadron_configs"].as_object().map(|o| o.len()).unwrap_or(0));
+
+    (
+        [
+            ("content-type", "application/json"),
+            ("content-disposition", "attachment; filename=\"dradis-config-bundle.json\""),
+        ],
+        bundle.to_string(),
+    ).into_response()
+}
+
+#[derive(Deserialize)]
+struct ImportBundle {
+    kind: Option<String>,
+    schema_version: Option<u32>,
+    venue: Option<String>,
+    #[serde(default)]
+    secrets: BTreeMap<String, String>,
+    #[serde(default)]
+    dynamic_config: serde_json::Value,
+    #[serde(default)]
+    squadron_configs: serde_json::Map<String, serde_json::Value>,
+}
+
+/// POST /api/setup/import — restore a bundle produced by `export_bundle` on a
+/// (typically fresh) instance. Secrets are merged into the managed file and
+/// process env; configs are round-tripped through `DynamicConfig` so fields
+/// added since the export pick up defaults and removed fields are dropped
+/// (serde is the migration subroutine). Follow with POST /api/setup/restart.
+async fn import_bundle(Json(bundle): Json<ImportBundle>) -> Response {
+    if bundle.kind.as_deref() != Some("dradis-config-bundle") {
+        return (StatusCode::BAD_REQUEST,
+                Json(json!({"error": "not a DRADIS config bundle"}))).into_response();
+    }
+    let ver = bundle.schema_version.unwrap_or(0);
+    if ver == 0 || ver > BUNDLE_SCHEMA_VERSION {
+        return (StatusCode::BAD_REQUEST,
+                Json(json!({"error": format!(
+                    "unsupported bundle schema_version {ver} (this build supports 1..={BUNDLE_SCHEMA_VERSION})")}))).into_response();
+    }
+    // Venue mismatch is a hard error: an intl bundle restored onto a US AMI
+    // (or vice versa) would carry the wrong credential set.
+    if let Some(v) = bundle.venue.as_deref() {
+        if v != build_venue() {
+            return (StatusCode::BAD_REQUEST,
+                    Json(json!({"error": format!(
+                        "bundle is for the '{v}' venue build but this instance is '{}'", build_venue())}))).into_response();
+        }
+    }
+
+    // ── Secrets: merge managed + internal admin hash; never the session key ──
+    let mut map = read_secrets();
+    let mut imported_secrets = 0usize;
+    for (k, v) in &bundle.secrets {
+        let allowed = MANAGED_KEYS.iter().any(|(mk, _, _)| mk == k)
+            || k == "DRADIS_ADMIN_HASH"
+            || k.starts_with("LLM_");   // autonomy knobs persisted by put_autonomy
+        if !allowed || v.is_empty() { continue; }
+        map.insert(k.clone(), v.clone());
+        std::env::set_var(k, v);
+        imported_secrets += 1;
+    }
+    if let Err(e) = write_secrets(&map) {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("could not persist secrets: {e}")}))).into_response();
+    }
+
+    // ── Configs: validate through the current schema, then persist ──────────
+    let mut config_restored = false;
+    let mut squadrons_restored = 0usize;
+    if let Some(pool) = crate::helpers::db::pool() {
+        if bundle.dynamic_config.is_object() {
+            match serde_json::from_value::<crate::helpers::dynamic_config::DynamicConfig>(bundle.dynamic_config.clone()) {
+                Ok(cfg) => {
+                    if let Ok(migrated) = serde_json::to_string(&cfg) {
+                        let old = crate::helpers::db::config_get(pool, "dynamic_config").await;
+                        crate::helpers::db::config_set(pool, "dynamic_config", &migrated).await;
+                        crate::helpers::db::record_config_change(
+                            pool, "bundle_import", "full_snapshot", old.as_deref(), &migrated).await;
+                        config_restored = true;
+                    }
+                }
+                Err(e) => {
+                    return (StatusCode::BAD_REQUEST,
+                            Json(json!({"error": format!("dynamic_config invalid: {e}")}))).into_response();
+                }
+            }
+        }
+        for (sid, v) in &bundle.squadron_configs {
+            match serde_json::from_value::<crate::helpers::dynamic_config::DynamicConfig>(v.clone()) {
+                Ok(cfg) => {
+                    if let Ok(migrated) = serde_json::to_string(&cfg) {
+                        crate::helpers::db::squadron_config_set(pool, sid, &migrated).await;
+                        squadrons_restored += 1;
+                    }
+                }
+                Err(e) => warn!("⚠️ Bundle import: squadron '{}' config invalid — skipped: {}", sid, e),
+            }
+        }
+    } else if bundle.dynamic_config.is_object() || !bundle.squadron_configs.is_empty() {
+        return (StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "DB not ready — configs cannot be restored yet (secrets were saved)"}))).into_response();
+    }
+
+    info!("📦 Setup: bundle imported — {} secret(s), global config: {}, {} squadron config(s). Restart to apply.",
+          imported_secrets, config_restored, squadrons_restored);
+    Json(json!({
+        "ok": true,
+        "secrets_imported": imported_secrets,
+        "dynamic_config_restored": config_restored,
+        "squadron_configs_restored": squadrons_restored,
+        "restart_required": true,
+    })).into_response()
+}
+
 // ─── AI autonomy (LLM config-patch policy) ───────────────────────────────────
 
 /// GET /api/setup/autonomy — current autonomy tier, kill switch, breaker state,
@@ -707,6 +868,8 @@ pub fn admin_routes() -> Router {
         .route("/api/setup/admin",       post(set_admin))
         .route("/api/setup/test",        post(test_connection))
         .route("/api/setup/restart",     post(restart))
+        .route("/api/setup/export",      get(export_bundle))
+        .route("/api/setup/import",      post(import_bundle))
         .route("/api/setup/autonomy",    get(get_autonomy).put(put_autonomy))
         .layer(axum::middleware::from_fn(require_admin))
 }
@@ -721,6 +884,32 @@ pub fn public_routes() -> Router {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The bundle migration guarantee: a config exported from an OLDER build
+    /// (fields added since then carry `#[serde(default)]` — repo convention)
+    /// or a NEWER build (extra fields → ignored by serde) must deserialize
+    /// into the current DynamicConfig schema.
+    #[test]
+    fn bundle_config_migration_roundtrip() {
+        let current = crate::helpers::dynamic_config::DynamicConfig::default();
+        let mut old = serde_json::to_value(&current).unwrap();
+        let obj = old.as_object_mut().unwrap();
+        // Old export: a field added later (has #[serde(default)]) is absent…
+        assert!(obj.remove("maker_min_spread").is_some());
+        // …and a future export carries a field this build doesn't know.
+        obj.insert("field_from_the_future".into(), serde_json::json!(42));
+        obj.insert("ghost_mode".into(), serde_json::json!(true));
+
+        let cfg: crate::helpers::dynamic_config::DynamicConfig =
+            serde_json::from_value(old).expect("cross-version config must deserialize");
+        assert!(cfg.ghost_mode);
+        // Missing defaulted field picked up its compile-time default.
+        assert_eq!(cfg.maker_min_spread, crate::config::MAKER_MIN_SPREAD);
+
+        // Round-trip through the current schema drops the unknown field.
+        let migrated = serde_json::to_value(&cfg).unwrap();
+        assert!(migrated.get("field_from_the_future").is_none());
+    }
 
     #[test]
     fn token_roundtrip_and_expiry() {

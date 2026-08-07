@@ -170,3 +170,25 @@ export function putAutonomy(body: {
 export function restartEngine(): Promise<{ ok: boolean; message: string }> {
   return request('/api/setup/restart', { method: 'POST' });
 }
+
+// ── Config bundle export / import (AMI upgrade path) ─────────────────────────
+
+export interface ImportResult {
+  ok: boolean;
+  secrets_imported: number;
+  dynamic_config_restored: boolean;
+  squadron_configs_restored: number;
+  restart_required: boolean;
+}
+
+/** Download the portable config bundle (secrets + configs). Sensitive file. */
+export async function exportBundle(): Promise<Blob> {
+  const res = await fetch(`${BASE}/api/setup/export`, { headers: authHeaders() });
+  if (!res.ok) throw new Error(`export failed: HTTP ${res.status}`);
+  return res.blob();
+}
+
+/** Restore a bundle produced by exportBundle. Follow with restartEngine(). */
+export function importBundle(bundleJson: string): Promise<ImportResult> {
+  return request('/api/setup/import', { method: 'POST', body: bundleJson });
+}
