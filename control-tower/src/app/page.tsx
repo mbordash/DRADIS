@@ -12,6 +12,7 @@ import SquadronDetailView from '@/components/SquadronDetailView';
 import TradelogPage    from '@/components/TradelogPage';
 import SetupPage       from '@/components/SetupPage';
 import AiActionsPage   from '@/components/AiActionsPage';
+import AlphaGate       from '@/components/AlphaGate';
 import ErrorBoundary   from '@/components/ErrorBoundary';
 import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getSquadrons } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
@@ -386,8 +387,17 @@ export default function DashboardPage() {
     useSWR('squadrons', getSquadrons, { refreshInterval: 10_000 });
 
   // Setup state — drives the "engine idle, complete Setup" first-run banner.
-  const { data: setupStatus } =
+  const { data: setupStatus, mutate: mutateSetupStatus } =
     useSWR(!DEMO_MODE ? 'setupStatus' : null, getSetupStatus, { refreshInterval: 60_000 });
+
+  // Blocking first-run overlay until the alpha/jurisdiction acknowledgment is recorded.
+  const alphaGate = setupStatus && !setupStatus.alpha_ack ? (
+    <AlphaGate
+      venue={setupStatus.venue}
+      appVersion={setupStatus.app_version}
+      onAcknowledged={() => mutateSetupStatus()}
+    />
+  ) : null;
 
   // ── Stats derived from P&L history ──────────────────────────────────────────
   const latestSnap  = pnl?.[0];
@@ -426,6 +436,7 @@ export default function DashboardPage() {
   if (focusedSquadron) {
     return (
       <div className="min-h-screen bg-[#0a0a12]">
+        {alphaGate}
         <header className="sticky top-0 z-10 border-b border-[#1e1e32] bg-[#0a0a12]/90 backdrop-blur-sm px-6 py-3">
           <div className="max-w-7xl mx-auto relative flex items-center justify-between gap-4">
             {/* Logo + nav */}
@@ -485,6 +496,7 @@ export default function DashboardPage() {
 
   return (
     <div className="min-h-screen bg-[#0a0a12]">
+      {alphaGate}
       {/* ── Header ─────────────────────────────────────────────────────────── */}
       <header className="sticky top-0 z-10 border-b border-[#1e1e32] bg-[#0a0a12]/90 backdrop-blur-sm px-6 py-3">
         <div className="max-w-7xl mx-auto relative flex items-center justify-between gap-4">
@@ -492,6 +504,11 @@ export default function DashboardPage() {
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-1.5">
               <span className="font-mono font-bold text-lg tracking-wide text-indigo-400">DRADIS</span>
+              {!DEMO_MODE && (
+                <span className="text-[9px] font-mono font-bold tracking-widest bg-amber-500/20 text-amber-400 border border-amber-500/30 rounded px-1.5 py-0.5" title="DRADIS is alpha software — trade only with funds you can afford to lose.">
+                  ALPHA
+                </span>
+              )}
               <span className="text-gray-600 text-lg">|</span>
             </div>
             <NavMenu active={activeView} onChange={setActiveView} />

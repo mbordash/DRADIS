@@ -691,6 +691,32 @@ export default function SetupPage() {
         </div>
       </div>
 
+      {/* ── Alpha support policy ───────────────────────────────────────────── */}
+      <div className="bg-[#13131f] border border-[#1e1e32] rounded-xl p-4 space-y-2">
+        <h3 className="text-sm font-mono text-gray-200">🧪 Alpha Support</h3>
+        <p className="text-xs text-gray-500">
+          DRADIS is in alpha — <span className="text-gray-400">support is not included</span> during
+          this phase. For setup help, ask an AI assistant (ChatGPT, Gemini, Claude): paste the README
+          and your question — they are very good at this.
+        </p>
+        <div className="flex flex-wrap items-center gap-2 pt-1">
+          <a
+            href="https://github.com/mbordash/DRADIS/issues"
+            target="_blank" rel="noreferrer"
+            className={btnCls('ghost')}
+          >
+            🐛 Report a bug (GitHub Issues)
+          </a>
+          <a
+            href="https://github.com/mbordash/DRADIS/discussions"
+            target="_blank" rel="noreferrer"
+            className={btnCls('ghost')}
+          >
+            💡 Request a feature (Discussions)
+          </a>
+        </div>
+      </div>
+
       <div className="flex items-center justify-end gap-2 border-t border-[#1e1e32] pt-4">
         <button onClick={save} disabled={!dirty || saving} className={btnCls('primary')}>
           {saving ? 'Saving…' : 'Save changes'}

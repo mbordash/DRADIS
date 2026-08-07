@@ -16,6 +16,8 @@ export interface SetupStatus {
   admin_set: boolean;
   auth_disabled: boolean;
   venue_configured: boolean;
+  alpha_ack: boolean;
+  app_version: string;
 }
 
 export interface CredentialInfo {
@@ -89,6 +91,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
 export function getSetupStatus(): Promise<SetupStatus> {
   return request('/api/setup/status');
+}
+
+/** Record the one-time alpha risk + jurisdiction acknowledgment (public route). */
+export function acknowledgeAlpha(): Promise<{ ok: boolean; already_acknowledged: boolean }> {
+  return request('/api/setup/acknowledge', { method: 'POST' });
 }
 
 export async function login(password: string): Promise<void> {

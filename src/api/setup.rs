@@ -262,6 +262,17 @@ fn build_venue() -> &'static str {
     { "us" }
 }
 
+/// DB key for the one-time alpha/jurisdiction acknowledgment record.
+const ALPHA_ACK_KEY: &str = "alpha_jurisdiction_ack";
+
+/// Has the operator recorded the alpha risk + jurisdiction acknowledgment?
+async fn alpha_acknowledged() -> bool {
+    match crate::helpers::db::pool() {
+        Some(pool) => crate::helpers::db::config_get(pool, ALPHA_ACK_KEY).await.is_some(),
+        None => false,
+    }
+}
+
 /// GET /api/setup/status — first-boot / configuration state. No secrets exposed;
 /// safe for the UI to call before login.
 async fn get_status() -> Response {
@@ -280,8 +291,34 @@ async fn get_status() -> Response {
         "admin_set": admin_hash().is_some(),
         "auth_disabled": setup_auth_disabled(),
         "venue_configured": venue_configured,
+        "alpha_ack": alpha_acknowledged().await,
+        "app_version": env!("CARGO_PKG_VERSION"),
         "restart_pending": false,
     })).into_response()
+}
+
+/// POST /api/setup/acknowledge — record the one-time alpha risk + jurisdiction
+/// acknowledgment. Public (shown before login on first boot); write-once and
+/// non-sensitive: it only records acceptance with a timestamp — it never
+/// unlocks anything a fresh instance wouldn't already allow.
+async fn acknowledge_alpha() -> Response {
+    let Some(pool) = crate::helpers::db::pool() else {
+        return (StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error": "DB not ready — try again shortly"}))).into_response();
+    };
+    if let Some(existing) = crate::helpers::db::config_get(pool, ALPHA_ACK_KEY).await {
+        // Idempotent: first acknowledgment is the record of legal significance.
+        let rec: serde_json::Value = serde_json::from_str(&existing).unwrap_or(json!({}));
+        return Json(json!({"ok": true, "already_acknowledged": true, "record": rec})).into_response();
+    }
+    let record = json!({
+        "acknowledged_at": chrono::Utc::now().to_rfc3339(),
+        "venue": build_venue(),
+        "app_version": env!("CARGO_PKG_VERSION"),
+    });
+    crate::helpers::db::config_set(pool, ALPHA_ACK_KEY, &record.to_string()).await;
+    info!("⚠️ Alpha risk + jurisdiction acknowledgment recorded: {}", record);
+    Json(json!({"ok": true, "already_acknowledged": false, "record": record})).into_response()
 }
 
 /// GET /api/setup/credentials — masked inventory of managed keys. Never returns
@@ -936,6 +973,7 @@ pub fn admin_routes() -> Router {
 pub fn public_routes() -> Router {
     Router::new()
         .route("/api/setup/status", get(get_status))
+        .route("/api/setup/acknowledge", post(acknowledge_alpha))
         .route("/api/auth/login",   post(login))
 }
 
