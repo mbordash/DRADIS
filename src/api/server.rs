@@ -2318,6 +2318,41 @@ async fn deploy_squadron(
         }).into_response();
     }
     
+    // ── Duplicate-squadron guard ─────────────────────────────────────────────
+    // The engine's identity model is one squadron per asset/market-class:
+    // session state, SQLite pools, dynamic config, and the viper status
+    // registry are all keyed by asset (crypto_filter). A second squadron for
+    // the same class would silently interleave state with the first. Reject
+    // until squadron identity is first-class (see roadmap: A/B experiments).
+    {
+        let mut summaries = _s.cag.list_squadrons();
+        for sq in &mut summaries {
+            // Registry copies carry an empty market_class; resolve it so a
+            // "crypto" deploy also matches boot-time BTC/ETH squadrons.
+            enrich_taxonomy(sq).await;
+        }
+        let dup_active = summaries.iter().any(|sq| {
+            (sq.asset.eq_ignore_ascii_case(&req.market_type)
+                || sq.market_class.eq_ignore_ascii_case(&req.market_type))
+                && sq.state != "STOOD_DOWN"
+        });
+        let dup_queued = crate::helpers::db::fetch_pending_deployments().await
+            .iter()
+            .any(|d| d.market_type.eq_ignore_ascii_case(&req.market_type));
+        if dup_active || dup_queued {
+            return Json(DeploySquadronResponse {
+                success: false,
+                squadron_id: None,
+                error: Some(format!(
+                    "A {} squadron is already {} — stand it down before deploying another. \
+                     (One squadron per market class; run a second DRADIS instance for side-by-side experiments.)",
+                    req.market_type,
+                    if dup_active { "active" } else { "queued for deployment" },
+                )),
+            }).into_response();
+        }
+    }
+
     // For Quick mode, auto-select a market
     let market_id = if req.mode == "quick" {
         // Fetch available markets and pick the best one (highest liquidity)
