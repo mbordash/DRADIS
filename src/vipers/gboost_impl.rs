@@ -1252,15 +1252,20 @@ impl Strategy for GboostStrategyImpl {
         self.maybe_retrain(&ctx.dynamic_config);
 
         let dc = &ctx.dynamic_config;
+        // "Why no trades?" registry feed for gates above the veto! macro.
+        let idle = |r: &str| crate::helpers::viper_status::report_reason(&self.name(), r);
         if !dc.enable_gboost {
+            idle("disabled in config");
             return Ok(StrategySignal::NoSignal);
         }
         if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
+            idle("session drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Gate: market must be mature enough for orderbook features to be stable ──
         if (Utc::now() - ctx.market_started_at).num_seconds() < config::GBOOST_MIN_MARKET_AGE_SECS {
+            idle("market too young");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -1280,6 +1285,7 @@ impl Strategy for GboostStrategyImpl {
                     " GBoost entry blocked: hourly book degenerate (ask_sum={:.3} bid_sum={:.3})",
                     hourly_ask_sum, hourly_bid_sum
                 );
+                idle("hourly book degenerate");
                 return Ok(StrategySignal::NoSignal);
             }
 
@@ -1300,6 +1306,7 @@ impl Strategy for GboostStrategyImpl {
                     hourly_yes_bid_f, config::GBOOST_MIN_HOURLY_YES_BID,
                     hourly_yes_ask_f, config::GBOOST_MAX_HOURLY_YES_ASK,
                 );
+                idle("hourly market near-resolved");
                 return Ok(StrategySignal::NoSignal);
             }
 
@@ -1323,6 +1330,7 @@ impl Strategy for GboostStrategyImpl {
                     hourly_yes_ask_f, hourly_strong_down,
                     trend_block
                 );
+                idle("hourly strong trend");
                 return Ok(StrategySignal::NoSignal);
             }
         }
@@ -1382,6 +1390,7 @@ impl Strategy for GboostStrategyImpl {
                 " GBoost entry blocked: target book too wide (ask_sum={:.3} > max {:.3})",
                 target_ask_sum, config::GBOOST_MAX_TARGET_ASK_SUM
             );
+            idle("target book too wide");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -1396,6 +1405,7 @@ impl Strategy for GboostStrategyImpl {
                 " GBoost entry blocked: target snapshot too stale ({}s > max {}s)",
                 target_snap_age, config::GBOOST_MAX_SNAPSHOT_AGE_SECS
             );
+            idle("target snapshot stale");
             return Ok(StrategySignal::NoSignal);
         }
         // Also gate on hourly snapshot staleness when trading the daily market.
@@ -1406,17 +1416,20 @@ impl Strategy for GboostStrategyImpl {
                     " GBoost entry blocked: hourly snapshot too stale ({}s > max {}s)",
                     hourly_snap_age, config::GBOOST_MAX_SNAPSHOT_AGE_SECS
                 );
+                idle("hourly snapshot stale");
                 return Ok(StrategySignal::NoSignal);
             }
         }
 
         if let Some(close_time) = target_market.market_close_time {
             if (close_time - Utc::now()).num_seconds() < dc.gboost_min_secs_to_expiry {
+                idle("too close to expiry");
                 return Ok(StrategySignal::NoSignal);
             }
         }
         // ── Gate: sufficient collateral ───────────────────────────────────────
         if ctx.available_collateral < dc.gboost_max_exposure_usdc {
+            idle("insufficient collateral");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -1437,7 +1450,7 @@ impl Strategy for GboostStrategyImpl {
 
         let p_yes_up = match self.predict(predict_snapshot) {
             Some(p) => p,
-            None    => return Ok(StrategySignal::NoSignal),
+            None    => { idle("model warming up"); return Ok(StrategySignal::NoSignal) },
         };
 
         // ── Diagnostic: periodic prediction-confidence visibility ────────────
@@ -1518,6 +1531,8 @@ impl Strategy for GboostStrategyImpl {
         // throttle) so gate quality can be scored against settlement outcomes.
         macro_rules! veto {
             ($reason:expr) => {{
+                // Unthrottled, cheap: feed the "why no trades?" registry every tick.
+                crate::helpers::viper_status::report_reason(&self.name(), &$reason.to_string());
                 if entry_eligible {
                     let mut last = self.last_veto_log_at.lock().unwrap();
                     let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::GBOOST_PRED_LOG_INTERVAL_SECS);

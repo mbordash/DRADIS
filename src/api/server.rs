@@ -569,6 +569,15 @@ async fn get_latency() -> Response {
     Json(crate::helpers::latency::snapshot()).into_response()
 }
 
+/// GET /api/vipers/status
+///
+/// Per-viper "why aren't we trading?" registry: last evaluation time/outcome
+/// per strategy plus the most recent named veto reason from instrumented
+/// vipers. Feeds the Control Tower Viper Activity panel.
+async fn get_vipers_status() -> Response {
+    Json(crate::helpers::viper_status::snapshot()).into_response()
+}
+
 /// GET /api/trades/export?asset=btc
 ///
 /// Full tradelog as a CSV download (oldest first) for tax reporting or
@@ -2514,6 +2523,7 @@ pub async fn run_api_server(
         .route("/api/trades/export",         get(export_trades))
         .route("/api/logs",                  get(get_logs))
         .route("/api/latency",               get(get_latency))
+        .route("/api/vipers/status",         get(get_vipers_status))
         .route("/api/positions",             get(get_open_positions))
         .route("/api/positions/pending",     get(get_pending_positions))
         .route("/api/positions/confirmed",   get(get_confirmed_positions))

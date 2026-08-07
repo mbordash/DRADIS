@@ -16,6 +16,7 @@ import ConsolePage     from '@/components/ConsolePage';
 import AlphaGate       from '@/components/AlphaGate';
 import ErrorBoundary   from '@/components/ErrorBoundary';
 import Footer          from '@/components/Footer';
+import ViperActivityPanel from '@/components/ViperActivityPanel';
 import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getSquadrons } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
 import { getSetupStatus } from '@/lib/setupApi';
@@ -689,6 +690,9 @@ export default function DashboardPage() {
             onSquadronClick={handleSquadronClick}
           />
         </section>
+
+        {/* ── Viper Activity ("why no trades?") ─────────────────────────── */}
+        <ViperActivityPanel />
 
         {/* Footer */}
         <Footer />

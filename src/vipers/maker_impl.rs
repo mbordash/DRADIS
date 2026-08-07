@@ -300,6 +300,9 @@ impl MakerStrategyImpl {
     /// key (not the detail) keeps the 50 ms tick loop from flooding the log when
     /// live prices fluctuate.
     async fn log_gate(&self, key: &str, detail: &str) {
+        // Unthrottled: feed the "why no trades?" registry with the human-readable
+        // gate detail every time a gate rejects (GET /api/vipers/status).
+        crate::helpers::viper_status::report_reason("MakerStrategy", detail);
         let mut guard = self.last_gate_log.lock().await;
         let should_log = match guard.as_ref() {
             Some((prev_key, at)) => {
@@ -324,11 +327,13 @@ impl Strategy for MakerStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
         if !dc.enable_maker {
+            crate::helpers::viper_status::report_reason("MakerStrategy", "disabled in config");
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Global Risk Check ────────────────────────────────────────────────
         if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
+            crate::helpers::viper_status::report_reason("MakerStrategy", "session drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
 

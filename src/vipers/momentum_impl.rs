@@ -46,6 +46,7 @@ impl Strategy for MomentumStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
         if !dc.enable_momentum {
+            crate::helpers::viper_status::report_reason(&self.name(), "disabled in config");
             return Ok(StrategySignal::NoSignal);
         }
 

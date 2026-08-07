@@ -111,12 +111,16 @@ impl Default for TrendReversalStrategyImpl {
 impl Strategy for TrendReversalStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
+        // "Why no trades?" registry feed (GET /api/vipers/status).
+        let idle = |r: &str| crate::helpers::viper_status::report_reason(&self.name(), r);
         if !dc.enable_trendcapture {
+            idle("disabled in config");
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Global drawdown guard ────────────────────────────────────────────
         if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
+            idle("session drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -133,6 +137,7 @@ impl Strategy for TrendReversalStrategyImpl {
         if snap_age > config::TRENDCAPTURE_MAX_SNAPSHOT_AGE_SECS {
             debug!(" TrendCapture blocked: snapshot stale ({}s > {}s)",
                 snap_age, config::TRENDCAPTURE_MAX_SNAPSHOT_AGE_SECS);
+            idle("snapshot stale");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -142,6 +147,7 @@ impl Strategy for TrendReversalStrategyImpl {
         let drift_10m = ctx.snapshot.oracle_drift_10m;
         let drift_60m = ctx.snapshot.oracle_drift_60m;
         if drift_10m == dec!(0) {
+            idle("oracle drift history warming up");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -151,6 +157,7 @@ impl Strategy for TrendReversalStrategyImpl {
             if s < config::TRENDCAPTURE_MIN_SECS_TO_EXPIRY {
                 debug!(" TrendCapture blocked: only {}s to expiry (min {}s)",
                     s, config::TRENDCAPTURE_MIN_SECS_TO_EXPIRY);
+                idle("too close to expiry");
                 return Ok(StrategySignal::NoSignal);
             }
             // Upper bound: a 10m/60m drift signal has no directional relevance to a
@@ -159,6 +166,7 @@ impl Strategy for TrendReversalStrategyImpl {
             if s > config::TRENDCAPTURE_MAX_SECS_TO_EXPIRY {
                 debug!(" TrendCapture blocked: {}s to expiry exceeds max {}s (drift signal horizon mismatch)",
                     s, config::TRENDCAPTURE_MAX_SECS_TO_EXPIRY);
+                idle("too far from expiry (drift horizon mismatch)");
                 return Ok(StrategySignal::NoSignal);
             }
             Some(s)
@@ -178,6 +186,7 @@ impl Strategy for TrendReversalStrategyImpl {
         // ── Market warmup gate ────────────────────────────────────────────────
         let secs_since_market_start = (Utc::now() - ctx.market_started_at).num_seconds();
         if secs_since_market_start < config::TRENDCAPTURE_MARKET_WARMUP_SECS {
+            idle("market warmup");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -186,6 +195,7 @@ impl Strategy for TrendReversalStrategyImpl {
         if ask_sum > dc.trendcapture_max_entry_ask_sum {
             debug!(" TrendCapture spread gate: ask_sum={:.3} > max {:.3} — book too wide",
                 ask_sum, dc.trendcapture_max_entry_ask_sum);
+            idle("book too wide");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -193,6 +203,7 @@ impl Strategy for TrendReversalStrategyImpl {
         let yes_ask = snap.yes_ask;
         let no_ask  = snap.no_ask;
         if yes_ask < effective_min_price && no_ask < effective_min_price {
+            idle("asks below entry price floor");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -208,6 +219,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 .sum::<Decimal>()
         };
         if current_exposure >= dc.trendcapture_max_exposure_usdc {
+            idle("exposure cap reached");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -257,6 +269,7 @@ impl Strategy for TrendReversalStrategyImpl {
                     if blocked {
                         debug!(" TrendReversal cascade guard: recent SL on '{}' {} within {}s — standing aside (persistent, survives restart)",
                             market.market_name, side, config::TRENDCAPTURE_POST_EXIT_COOLDOWN_SECS);
+                        idle("cascade guard (recent stop-loss)");
                         return Ok(StrategySignal::NoSignal);
                     }
                 }
@@ -620,6 +633,7 @@ impl Strategy for TrendReversalStrategyImpl {
 
         drop(cooldowns);
         drop(consec);
+        idle("no reversal setup (drift below trigger)");
         Ok(StrategySignal::NoSignal)
     }
 

@@ -36,12 +36,22 @@ pub async fn evaluate_strategies(
         // Evaluate entry
         match strategy.evaluate_entry(ctx).await {
             Ok(signal) => {
+                crate::helpers::viper_status::record_eval(
+                    &strategy_name,
+                    if matches!(signal, StrategySignal::NoSignal) {
+                        crate::helpers::viper_status::EvalOutcome::NoSignal
+                    } else {
+                        crate::helpers::viper_status::EvalOutcome::Signal
+                    },
+                );
                 if !matches!(signal, StrategySignal::NoSignal) {
                     debug!("📍 {} entry signal: {:?}", strategy_name, signal);
                     entry_signals.push((strategy_name.clone(), signal));
                 }
             }
             Err(e) => {
+                crate::helpers::viper_status::record_eval(
+                    &strategy_name, crate::helpers::viper_status::EvalOutcome::Error);
                 warn!("⚠️ {} entry evaluation error: {}", strategy_name, e);
             }
         }
@@ -117,6 +127,8 @@ pub async fn execute_strategies_concurrent(
             Ok(pair) => pair,
             Err(_) => {
                 warn!("⚠️ {} evaluation timed out after {}ms — skipping this tick", strategy_name, timeout_ms);
+                crate::helpers::viper_status::record_eval(
+                    &strategy_name, crate::helpers::viper_status::EvalOutcome::Timeout);
                 let label = strategy_name.trim_end_matches("Strategy");
                 info_parts.push(format!("{}:⏱️⏱️", label));
                 continue;
@@ -131,6 +143,16 @@ pub async fn execute_strategies_concurrent(
         // Handle entry result
         match entry_result {
             Ok(signal) => {
+                // "Why aren't we trading?" registry: record liveness + outcome
+                // for every viper every tick (GET /api/vipers/status).
+                crate::helpers::viper_status::record_eval(
+                    &strategy_name,
+                    if matches!(signal, StrategySignal::NoSignal) {
+                        crate::helpers::viper_status::EvalOutcome::NoSignal
+                    } else {
+                        crate::helpers::viper_status::EvalOutcome::Signal
+                    },
+                );
                 if !matches!(signal, StrategySignal::NoSignal) {
                     entry_tag = "🟩";
                     // Signal detail at DEBUG — actual placement is logged at INFO by main.rs (📥 ENTRY)
@@ -140,6 +162,8 @@ pub async fn execute_strategies_concurrent(
             }
             Err(e) => {
                 entry_tag = "🔴";
+                crate::helpers::viper_status::record_eval(
+                    &strategy_name, crate::helpers::viper_status::EvalOutcome::Error);
                 warn!("⚠️ {} entry evaluation error: {}", strategy_name, e);
             }
         }

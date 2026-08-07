@@ -213,10 +213,14 @@ impl FairValueStrategyImpl {
 impl Strategy for FairValueStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
+        // "Why no trades?" registry feed (GET /api/vipers/status).
+        let idle = |r: &str| crate::helpers::viper_status::report_reason(&self.name(), r);
         if !dc.enable_fairvalue {
+            idle("disabled in config");
             return Ok(StrategySignal::NoSignal);
         }
         if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
+            idle("session drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -225,7 +229,7 @@ impl Strategy for FairValueStrategyImpl {
         // unavailable, otherwise structural hiccups also stall the sampler.
         let spot = match ctx.snapshot.oracle_price.to_f64() {
             Some(s) if s > 0.0 => s,
-            _ => return Ok(StrategySignal::NoSignal),
+            _ => { idle("no oracle price"); return Ok(StrategySignal::NoSignal) },
         };
         let sigma_opt = self.update_and_read_sigma(spot);
 
@@ -239,17 +243,19 @@ impl Strategy for FairValueStrategyImpl {
         // ── Structural requirements ──────────────────────────────────────────
         let strike = match market.strike_price.and_then(|s| s.to_f64()) {
             Some(s) if s > 0.0 => s,
-            _ => return Ok(StrategySignal::NoSignal),
+            _ => { idle("market has no strike price"); return Ok(StrategySignal::NoSignal) },
         };
         let secs_left = match market.market_close_time {
             Some(ct) => (ct - Utc::now()).num_seconds(),
-            None => return Ok(StrategySignal::NoSignal),
+            None => { idle("market has no close time"); return Ok(StrategySignal::NoSignal) },
         };
         if secs_left < config::FAIRVALUE_MIN_SECS_TO_EXPIRY {
+            idle("too close to expiry");
             return Ok(StrategySignal::NoSignal);
         }
         let snap_age = (Utc::now() - snap.timestamp).num_seconds();
         if snap_age > config::FAIRVALUE_MAX_SNAPSHOT_AGE_SECS {
+            idle("snapshot stale");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -269,6 +275,7 @@ impl Strategy for FairValueStrategyImpl {
                         n, config::FAIRVALUE_MIN_VOL_SAMPLES, config::FAIRVALUE_VOL_SAMPLE_SECS,
                     );
                 }
+                idle("vol warmup in progress");
                 return Ok(StrategySignal::NoSignal);
             }
         };
@@ -276,7 +283,7 @@ impl Strategy for FairValueStrategyImpl {
         // ── Fair value ────────────────────────────────────────────────────────
         let fair_yes = match fair_yes_probability(spot, strike, sigma, secs_left as f64) {
             Some(p) => p,
-            None => return Ok(StrategySignal::NoSignal),
+            None => { idle("fair value not computable"); return Ok(StrategySignal::NoSignal) },
         };
         let d_sigma = (spot / strike).ln() / (sigma * (secs_left as f64).sqrt());
 
@@ -320,12 +327,15 @@ impl Strategy for FairValueStrategyImpl {
             (false, no_edge, snap.no_ask, market.no_token.clone(), market.no_fee_bps as u16)
         };
         if edge < req_edge || pin_blocked {
+            idle(if pin_blocked { "pin-risk guard (endgame coin-flip)" } else { "edge below required" });
             return Ok(StrategySignal::NoSignal);
         }
         if ask < dc.fairvalue_min_entry_price || ask > dc.fairvalue_max_entry_price {
+            idle("ask outside entry price band");
             return Ok(StrategySignal::NoSignal);
         }
         if self.cooldown_active(token_id.as_str()) {
+            idle("post-exit cooldown active");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -338,6 +348,7 @@ impl Strategy for FairValueStrategyImpl {
             if counts.get(&market.condition_id).copied().unwrap_or(0)
                 >= config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET
             {
+                idle("stop-loss circuit breaker tripped");
                 return Ok(StrategySignal::NoSignal);
             }
         }
@@ -349,6 +360,7 @@ impl Strategy for FairValueStrategyImpl {
             if pos_map.contains_key(&("FairValueStrategy".to_string(), market.yes_token.clone()))
                 || pos_map.contains_key(&("FairValueStrategy".to_string(), market.no_token.clone()))
             {
+                idle("position already open (no pyramiding)");
                 return Ok(StrategySignal::NoSignal);
             }
             let current_exposure: Decimal = pos_map.iter()
@@ -356,6 +368,7 @@ impl Strategy for FairValueStrategyImpl {
                 .map(|(_, p)| p.shares * p.avg_entry)
                 .sum();
             if current_exposure + dc.fairvalue_trade_size_usdc > dc.fairvalue_max_exposure_usdc {
+                idle("exposure cap reached");
                 return Ok(StrategySignal::NoSignal);
             }
         }
@@ -363,6 +376,7 @@ impl Strategy for FairValueStrategyImpl {
         // ── Balance gate (fee headroom, mirrors Basis) ───────────────────────
         let fee_headroom = dec!(1) + Decimal::from(fee_bps) / dec!(10000);
         if ctx.available_collateral < dc.fairvalue_trade_size_usdc {
+            idle("insufficient collateral");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -386,6 +400,7 @@ impl Strategy for FairValueStrategyImpl {
             }
         };
         if !persisted {
+            idle("edge persistence debounce");
             return Ok(StrategySignal::NoSignal);
         }
 

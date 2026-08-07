@@ -98,6 +98,24 @@ export async function getLatency(): Promise<LatencySnapshot> {
   return res.json();
 }
 
+export interface ViperStatusRow {
+  strategy: string;
+  last_eval_at: string;
+  last_eval_secs_ago: number;
+  last_outcome: 'signal' | 'no_signal' | 'error' | 'timeout';
+  last_reason: string | null;
+  last_reason_secs_ago: number | null;
+  last_signal_at: string | null;
+  last_signal_secs_ago: number | null;
+}
+
+/** Per-viper "why aren't we trading?" status registry. */
+export async function getVipersStatus(): Promise<ViperStatusRow[]> {
+  const res = await fetch(`${BASE}/api/vipers/status`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/vipers/status → ${res.status}`);
+  return res.json();
+}
+
 /**
  * Download the full tradelog as one CSV. Multi-asset deployments keep one
  * DB per asset, so fetch each asset's export and merge them client-side
