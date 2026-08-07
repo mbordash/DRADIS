@@ -12,10 +12,13 @@ RUN rustup target add x86_64-unknown-linux-musl
 WORKDIR /app
 
 # ── Dependency caching layer ────────────────────────────────────────────────
+# DRADIS_FEATURES selects the venue build. Default (empty) = intl_clob.
+# US retail: --build-arg DRADIS_FEATURES="--no-default-features --features us_retail"
+ARG DRADIS_FEATURES=""
 COPY Cargo.toml Cargo.lock ./
 
 RUN mkdir -p src && echo "fn main() {}" > src/main.rs && \
-    cargo build --release --target x86_64-unknown-linux-musl && \
+    cargo build --release --target x86_64-unknown-linux-musl $DRADIS_FEATURES && \
     rm -rf src \
            target/x86_64-unknown-linux-musl/release/.fingerprint/dradis-* \
            target/x86_64-unknown-linux-musl/release/deps/dradis-* \
@@ -25,7 +28,7 @@ RUN mkdir -p src && echo "fn main() {}" > src/main.rs && \
 # ── Application source ──────────────────────────────────────────────────────
 COPY src ./src
 RUN touch src/main.rs && \
-    cargo build --release --target x86_64-unknown-linux-musl && \
+    cargo build --release --target x86_64-unknown-linux-musl $DRADIS_FEATURES && \
     strip target/x86_64-unknown-linux-musl/release/dradis && \
     cp target/x86_64-unknown-linux-musl/release/dradis /dradis-bin && \
     rm -rf target /usr/local/cargo/registry /usr/local/cargo/git

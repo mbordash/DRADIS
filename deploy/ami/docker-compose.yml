@@ -1,0 +1,43 @@
+# DRADIS engine + Control Tower — AMI runtime stack.
+#
+# Installed to /opt/dradis on the AMI; started by dradis.service on boot.
+# /opt/dradis/.env is generated on first boot by dradis-firstboot.sh:
+#   CT_USERNAME / CT_PASSWORD  — Control Tower login (password = EC2 instance ID)
+#   DRADIS_API_KEY             — random; CT proxy → engine auth
+#
+# The engine API (9000) binds to localhost only — the Control Tower proxy on
+# port 80 is the sole public surface. Operator credentials are entered through
+# the Setup view and persist in /opt/dradis/data/secrets.env.
+
+services:
+  dradis:
+    image: dradis-engine:latest
+    container_name: dradis
+    restart: always
+    env_file: .env
+    environment:
+      - API_PORT=9000
+      - DRADIS_DATA_DIR=/app/data
+      - ASSETS=btc
+    volumes:
+      - ./data:/app/data
+    ports:
+      - "127.0.0.1:9000:9000"
+    networks: [dradis-net]
+
+  control-tower:
+    image: dradis-control-tower:latest
+    container_name: dradis-ct
+    restart: always
+    env_file: .env
+    environment:
+      - DRADIS_API_URL=http://dradis:9000
+      - NEXT_PUBLIC_DEPLOYMENT_ENV=production
+    ports:
+      - "80:3002"
+    depends_on: [dradis]
+    networks: [dradis-net]
+
+networks:
+  dradis-net:
+    driver: bridge
