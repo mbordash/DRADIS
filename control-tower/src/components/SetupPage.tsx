@@ -296,7 +296,7 @@ function ProfilesPanel({ onAuthError }: { onAuthError: () => void }) {
             <div key={name} className={`border rounded-lg p-4 flex flex-col gap-2 bg-[#0e0e18] transition-colors ${PROFILE_ACCENTS[name] ?? 'border-[#1e1e32]'}`}>
               <div className="text-sm font-mono text-gray-100">
                 {p.label}
-                {name === 'balanced' && <span className="ml-2 text-[10px] text-sky-400">RECOMMENDED</span>}
+                {name === 'conservative' && <span className="ml-2 text-[10px] text-emerald-400">RECOMMENDED START</span>}
               </div>
               <p className="text-xs text-gray-500 flex-1">{p.description}</p>
               <ul className="text-[11px] font-mono text-gray-400 space-y-0.5">

@@ -24,8 +24,8 @@ PROFILES = {
 }
 
 DESCRIPTIONS = {
-    "conservative": "Capital preservation first: smaller position sizes, tighter stops, fewer concurrent strategies enabled.",
-    "balanced":     "The recommended starting point: moderate sizing and risk limits across all core strategies.",
+    "conservative": "The recommended starting point: capital preservation first — smaller position sizes, tighter stops, fewer concurrent strategies. Build confidence here, then move up the risk ramp.",
+    "balanced":     "The next step up: moderate sizing and risk limits across all core strategies.",
     "aggressive":   "Maximum opportunity capture: larger sizes, wider stops, all strategies enabled. Expect higher drawdowns.",
 }
 
