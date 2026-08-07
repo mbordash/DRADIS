@@ -56,6 +56,23 @@ fn squadron_config_registry() -> &'static Mutex<HashMap<String, Arc<RwLock<Dynam
     SQUADRON_CONFIG_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// The GLOBAL config broadcast sender, registered once by `run_api_server`.
+/// Lets routes outside the ApiState graph (e.g. the Setup profile picker)
+/// hot-apply a global config change: read current via `.borrow()`, merge,
+/// persist, then `.send()` so all strategy tick loops pick it up within 50 ms.
+static GLOBAL_CONFIG_TX: OnceLock<Arc<tokio::sync::watch::Sender<Arc<DynamicConfig>>>> =
+    OnceLock::new();
+
+/// Register the global config broadcast sender (idempotent; first wins).
+pub fn register_global_config_tx(tx: Arc<tokio::sync::watch::Sender<Arc<DynamicConfig>>>) {
+    let _ = GLOBAL_CONFIG_TX.set(tx);
+}
+
+/// The registered global config sender, if the API server has booted.
+pub fn global_config_tx() -> Option<&'static Arc<tokio::sync::watch::Sender<Arc<DynamicConfig>>>> {
+    GLOBAL_CONFIG_TX.get()
+}
+
 /// Register (or replace) the live config handle a running squadron's patrol loop
 /// reads each tick.  Called once per squadron deploy / market rotation.
 pub fn register_squadron_config_handle(squadron_id: &str, handle: Arc<RwLock<DynamicConfig>>) {

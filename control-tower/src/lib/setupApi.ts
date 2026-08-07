@@ -192,3 +192,20 @@ export async function exportBundle(): Promise<Blob> {
 export function importBundle(bundleJson: string): Promise<ImportResult> {
   return request('/api/setup/import', { method: 'POST', body: bundleJson });
 }
+
+// ── Risk-posture config profiles ──────────────────────────────────────────────
+
+export interface ConfigProfile {
+  label: string;
+  description: string;
+  values: Record<string, unknown>;
+}
+
+export function getProfiles(): Promise<{ schema_version: number; profiles: Record<string, ConfigProfile> }> {
+  return request('/api/setup/profiles');
+}
+
+/** Apply a named profile to the live global config (audited, no restart). */
+export function applyProfile(name: string): Promise<{ ok: boolean; profile: string; fields_applied: number }> {
+  return request('/api/setup/profiles/apply', { method: 'POST', body: JSON.stringify({ name }) });
+}

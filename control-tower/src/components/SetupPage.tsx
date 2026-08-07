@@ -19,6 +19,7 @@ import {
   login, setAdminPassword, restartEngine,
   getAutonomy, putAutonomy,
   exportBundle, importBundle,
+  getProfiles, applyProfile, ConfigProfile,
   getAdminToken, clearAdminToken, SetupApiError,
 } from '@/lib/setupApi';
 
@@ -230,6 +231,100 @@ const TIER_DEFS: { tier: 1 | 2 | 3; name: string; blurb: string }[] = [
   { tier: 2, name: 'Limited', blurb: 'Safe changes auto-apply: schema-clamped, delta-capped, rate-limited, never money fields. The rest queue for approval.' },
   { tier: 3, name: 'Autonomous', blurb: 'AI applies its changes directly (still schema-clamped; mode flips excluded). Circuit breaker reverts + demotes on a P&L drawdown.' },
 ];
+
+// A few headline numbers per profile so the picker communicates real differences.
+const PROFILE_HIGHLIGHTS: { key: string; label: string; fmt?: (v: unknown) => string }[] = [
+  { key: 'time_decay_stop_loss_pct', label: 'TD stop', fmt: v => `${(parseFloat(String(v)) * 100).toFixed(1)}%` },
+  { key: 'momentum_stop_loss_pct',   label: 'Momentum stop', fmt: v => `${(parseFloat(String(v)) * 100).toFixed(1)}%` },
+  { key: 'maker_min_spread',         label: 'Maker min spread', fmt: v => `${(parseFloat(String(v)) * 100).toFixed(0)}¢` },
+  { key: 'arbitrage_max_exposure_usdc', label: 'Arb exposure', fmt: v => `$${v}` },
+];
+
+const PROFILE_ACCENTS: Record<string, string> = {
+  conservative: 'border-emerald-800/60 hover:border-emerald-500/60',
+  balanced:     'border-sky-800/60 hover:border-sky-500/60',
+  aggressive:   'border-amber-800/60 hover:border-amber-500/60',
+};
+
+function ProfilesPanel({ onAuthError }: { onAuthError: () => void }) {
+  const [profiles, setProfiles] = useState<Record<string, ConfigProfile> | null>(null);
+  const [busy, setBusy] = useState<string | null>(null);
+  const [notice, setNotice] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+
+  useEffect(() => {
+    getProfiles()
+      .then(r => setProfiles(r.profiles))
+      .catch(err => {
+        if (err instanceof SetupApiError && err.status === 401) onAuthError();
+        else setNotice({ kind: 'err', text: err instanceof Error ? err.message : 'Failed to load profiles' });
+      });
+  }, [onAuthError]);
+
+  const apply = async (name: string) => {
+    if (!window.confirm(`Apply the ${name} profile? This overwrites the current global strategy config (audited in config history). Squadron-specific configs are not touched.`)) return;
+    setBusy(name);
+    setNotice(null);
+    try {
+      const r = await applyProfile(name);
+      setNotice({ kind: 'ok', text: `Applied '${r.profile}' — ${r.fields_applied} settings live now (no restart needed).` });
+    } catch (err) {
+      if (err instanceof SetupApiError && err.status === 401) onAuthError();
+      else setNotice({ kind: 'err', text: err instanceof Error ? err.message : 'Apply failed' });
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  return (
+    <div className="bg-[#13131f] border border-[#1e1e32] rounded-xl p-5 space-y-4">
+      <div>
+        <h3 className="text-sm font-mono text-gray-200">🎛️ Risk Profile</h3>
+        <p className="text-xs text-gray-500 mt-0.5">
+          Seed the global strategy config from a curated preset. Applies live to the
+          running engine and is recorded in config history — individual settings can
+          still be tuned afterwards in the Config view.
+        </p>
+      </div>
+      {notice && (
+        <div className={`text-xs font-mono rounded-lg px-3 py-2 ${notice.kind === 'ok' ? 'bg-emerald-950/50 text-emerald-300' : 'bg-red-950/50 text-red-300'}`}>
+          {notice.text}
+        </div>
+      )}
+      {profiles ? (
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+          {Object.entries(profiles).map(([name, p]) => (
+            <div key={name} className={`border rounded-lg p-4 flex flex-col gap-2 bg-[#0e0e18] transition-colors ${PROFILE_ACCENTS[name] ?? 'border-[#1e1e32]'}`}>
+              <div className="text-sm font-mono text-gray-100">
+                {p.label}
+                {name === 'balanced' && <span className="ml-2 text-[10px] text-sky-400">RECOMMENDED</span>}
+              </div>
+              <p className="text-xs text-gray-500 flex-1">{p.description}</p>
+              <ul className="text-[11px] font-mono text-gray-400 space-y-0.5">
+                {PROFILE_HIGHLIGHTS.map(h => (
+                  h.key in p.values ? (
+                    <li key={h.key} className="flex justify-between">
+                      <span className="text-gray-600">{h.label}</span>
+                      <span>{h.fmt ? h.fmt(p.values[h.key]) : String(p.values[h.key])}</span>
+                    </li>
+                  ) : null
+                ))}
+              </ul>
+              <button
+                className={btnCls('ghost') + ' mt-1'}
+                disabled={busy !== null}
+                onClick={() => apply(name)}
+              >
+                {busy === name ? 'Applying…' : `Apply ${p.label}`}
+              </button>
+            </div>
+          ))}
+        </div>
+      ) : (
+        <div className="text-xs text-gray-600 font-mono">Loading profiles…</div>
+      )}
+    </div>
+  );
+}
 
 function AutonomyPanel({ onAuthError }: { onAuthError: () => void }) {
   const [state, setState] = useState<AutonomyStatus | null>(null);
@@ -533,6 +628,8 @@ export default function SetupPage() {
       ) : (
         <div className="text-center text-gray-500 font-mono text-sm py-8">Loading credentials…</div>
       )}
+
+      <ProfilesPanel onAuthError={() => { clearAdminToken(); setAuthed(false); }} />
 
       <AutonomyPanel onAuthError={() => { clearAdminToken(); setAuthed(false); }} />
 

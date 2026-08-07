@@ -2394,6 +2394,9 @@ pub async fn run_api_server(
         .and_then(|p| p.parse::<u16>().ok())
         .unwrap_or(9000);
 
+    // Expose the config broadcast to routes outside ApiState (Setup profile picker).
+    crate::helpers::dynamic_config::register_global_config_tx(Arc::clone(&config_tx));
+
     let api_key = std::env::var("DRADIS_API_KEY").ok();
     if api_key.is_some() {
         tracing::info!(" API key authentication enabled (DRADIS_API_KEY is set)");
