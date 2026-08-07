@@ -82,6 +82,22 @@ export async function getLogs(tail = 500): Promise<{ count: number; lines: strin
   return res.json();
 }
 
+export interface LatencySnapshot {
+  venue: string;
+  ok: boolean;
+  probed: boolean;
+  last_ms: number | null;
+  p50_ms: number | null;
+  samples: number;
+}
+
+/** Rolling engine→venue round-trip latency (footer meter). */
+export async function getLatency(): Promise<LatencySnapshot> {
+  const res = await fetch(`${BASE}/api/latency`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/latency → ${res.status}`);
+  return res.json();
+}
+
 /**
  * Download the full tradelog as one CSV. Multi-asset deployments keep one
  * DB per asset, so fetch each asset's export and merge them client-side

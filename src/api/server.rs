@@ -560,6 +560,15 @@ struct LogsQuery {
     tail: Option<usize>,
 }
 
+/// GET /api/latency
+///
+/// Rolling round-trip latency from the engine host to the trading venue
+/// (CLOB on intl builds, US venue API on US builds) — the Control Tower
+/// footer meter. Measured server-side; see helpers::latency.
+async fn get_latency() -> Response {
+    Json(crate::helpers::latency::snapshot()).into_response()
+}
+
 /// GET /api/trades/export?asset=btc
 ///
 /// Full tradelog as a CSV download (oldest first) for tax reporting or
@@ -2484,6 +2493,9 @@ pub async fn run_api_server(
     // scrubable history that survives browser reloads.
     tokio::spawn(run_telemetry_sampler(raptor_health_rx, telemetry_history));
 
+    // Venue latency probe — feeds GET /api/latency (Control Tower footer meter).
+    tokio::spawn(crate::helpers::latency::run_latency_probe());
+
     // /api/health is intentionally public — no API key required.
     // Docker HEALTHCHECK, load balancers, and uptime monitors all probe this
     // endpoint without credentials; gating it would mark every container unhealthy.
@@ -2501,6 +2513,7 @@ pub async fn run_api_server(
         .route("/api/trades",                get(get_trades))
         .route("/api/trades/export",         get(export_trades))
         .route("/api/logs",                  get(get_logs))
+        .route("/api/latency",               get(get_latency))
         .route("/api/positions",             get(get_open_positions))
         .route("/api/positions/pending",     get(get_pending_positions))
         .route("/api/positions/confirmed",   get(get_confirmed_positions))

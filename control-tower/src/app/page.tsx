@@ -15,6 +15,7 @@ import AiActionsPage   from '@/components/AiActionsPage';
 import ConsolePage     from '@/components/ConsolePage';
 import AlphaGate       from '@/components/AlphaGate';
 import ErrorBoundary   from '@/components/ErrorBoundary';
+import Footer          from '@/components/Footer';
 import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getSquadrons } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
 import { getSetupStatus } from '@/lib/setupApi';
@@ -485,10 +486,7 @@ export default function DashboardPage() {
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <SquadronDetailView squadron={focusedSquadron} onBack={handleBackToCag} />
-          <footer className="text-center text-xs text-gray-700 pb-4 font-mono mt-12">
-            DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}
-            <span className="text-gray-600">So say we all.</span>
-          </footer>
+          <div className="mt-12"><Footer /></div>
         </main>
       </div>
     );
@@ -561,10 +559,7 @@ export default function DashboardPage() {
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <TradelogPage availableAssets={availableAssets} />
-          <footer className="text-center text-xs text-gray-700 pb-4 font-mono">
-            DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}
-            <span className="text-gray-600">So say we all.</span>
-          </footer>
+          <Footer />
         </main>
       )}
 
@@ -575,10 +570,7 @@ export default function DashboardPage() {
           <ErrorBoundary label="Telemetry">
             <TelemetryPage availableAssets={availableAssets} />
           </ErrorBoundary>
-          <footer className="text-center text-xs text-gray-700 pb-4 font-mono">
-            DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}
-            <span className="text-gray-600">So say we all.</span>
-          </footer>
+          <Footer />
         </main>
       )}
 
@@ -589,10 +581,7 @@ export default function DashboardPage() {
           <ErrorBoundary label="AI Actions">
             <AiActionsPage />
           </ErrorBoundary>
-          <footer className="text-center text-xs text-gray-700 pb-4 font-mono">
-            DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}
-            <span className="text-gray-600">So say we all.</span>
-          </footer>
+          <Footer />
         </main>
       )}
 
@@ -602,10 +591,7 @@ export default function DashboardPage() {
           <ErrorBoundary label="Console">
             <ConsolePage />
           </ErrorBoundary>
-          <footer className="text-center text-xs text-gray-700 pb-4 font-mono">
-            DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}
-            <span className="text-gray-600">So say we all.</span>
-          </footer>
+          <Footer />
         </main>
       )}
 
@@ -615,10 +601,7 @@ export default function DashboardPage() {
           <ErrorBoundary label="Setup">
             <SetupPage />
           </ErrorBoundary>
-          <footer className="text-center text-xs text-gray-700 pb-4 font-mono">
-            DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}
-            <span className="text-gray-600">So say we all.</span>
-          </footer>
+          <Footer />
         </main>
       )}
 
@@ -708,10 +691,7 @@ export default function DashboardPage() {
         </section>
 
         {/* Footer */}
-        <footer className="text-center text-xs text-gray-700 pb-4 font-mono">
-          DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}
-          <span className="text-gray-600">So say we all.</span>
-        </footer>
+        <Footer />
       </main>
       )}
     </div>

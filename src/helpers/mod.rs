@@ -20,6 +20,7 @@ pub mod llm_policy;
 pub mod volatility;
 pub mod watchdog;
 pub mod logbuf;
+pub mod latency;
 
 pub use price::*;
 pub use json::*;
