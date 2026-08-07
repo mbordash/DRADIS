@@ -1253,7 +1253,7 @@ impl Strategy for GboostStrategyImpl {
 
         let dc = &ctx.dynamic_config;
         // "Why no trades?" registry feed for gates above the veto! macro.
-        let idle = |r: &str| crate::helpers::viper_status::report_reason(&self.name(), r);
+        let idle = |r: &str| crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), r);
         if !dc.enable_gboost {
             idle("disabled in config");
             return Ok(StrategySignal::NoSignal);
@@ -1532,7 +1532,7 @@ impl Strategy for GboostStrategyImpl {
         macro_rules! veto {
             ($reason:expr) => {{
                 // Unthrottled, cheap: feed the "why no trades?" registry every tick.
-                crate::helpers::viper_status::report_reason(&self.name(), &$reason.to_string());
+                crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), &$reason.to_string());
                 if entry_eligible {
                     let mut last = self.last_veto_log_at.lock().unwrap();
                     let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::GBOOST_PRED_LOG_INTERVAL_SECS);

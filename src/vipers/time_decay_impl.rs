@@ -58,7 +58,7 @@ impl Strategy for TimeDecayStrategyImpl {
         let dc = &ctx.dynamic_config; // hot-reloadable snapshot for this tick
 
         if !dc.enable_time_decay {
-            crate::helpers::viper_status::report_reason(&self.name(), "disabled in config");
+            crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), "disabled in config");
             return Ok(StrategySignal::NoSignal);
         }
 

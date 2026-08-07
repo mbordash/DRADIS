@@ -99,6 +99,7 @@ export async function getLatency(): Promise<LatencySnapshot> {
 }
 
 export interface ViperStatusRow {
+  asset: string;
   strategy: string;
   last_eval_at: string;
   last_eval_secs_ago: number;
@@ -109,9 +110,10 @@ export interface ViperStatusRow {
   last_signal_secs_ago: number | null;
 }
 
-/** Per-viper "why aren't we trading?" status registry. */
-export async function getVipersStatus(): Promise<ViperStatusRow[]> {
-  const res = await fetch(`${BASE}/api/vipers/status`, { cache: 'no-store' });
+/** Per-viper "why aren't we trading?" registry. Omit `asset` for all squadrons. */
+export async function getVipersStatus(asset?: string): Promise<ViperStatusRow[]> {
+  const url = withAsset(`${BASE}/api/vipers/status`, asset);
+  const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/vipers/status → ${res.status}`);
   return res.json();
 }

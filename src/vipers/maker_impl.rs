@@ -299,10 +299,10 @@ impl MakerStrategyImpl {
     /// has passed since the last emit for the same key.  Throttling on the stable
     /// key (not the detail) keeps the 50 ms tick loop from flooding the log when
     /// live prices fluctuate.
-    async fn log_gate(&self, key: &str, detail: &str) {
+    async fn log_gate(&self, asset: &str, key: &str, detail: &str) {
         // Unthrottled: feed the "why no trades?" registry with the human-readable
         // gate detail every time a gate rejects (GET /api/vipers/status).
-        crate::helpers::viper_status::report_reason("MakerStrategy", detail);
+        crate::helpers::viper_status::report_reason(asset, "MakerStrategy", detail);
         let mut guard = self.last_gate_log.lock().await;
         let should_log = match guard.as_ref() {
             Some((prev_key, at)) => {
@@ -327,13 +327,13 @@ impl Strategy for MakerStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
         if !dc.enable_maker {
-            crate::helpers::viper_status::report_reason("MakerStrategy", "disabled in config");
+            crate::helpers::viper_status::report_reason(&ctx.crypto_filter, "MakerStrategy", "disabled in config");
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Global Risk Check ────────────────────────────────────────────────
         if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
-            crate::helpers::viper_status::report_reason("MakerStrategy", "session drawdown limit hit");
+            crate::helpers::viper_status::report_reason(&ctx.crypto_filter, "MakerStrategy", "session drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -351,7 +351,7 @@ impl Strategy for MakerStrategyImpl {
         if secs_since_market_start < config::MAKER_MIN_MARKET_AGE_SECS {
             maker_gate_streak_secs(market.yes_token.as_str(), false);
             maker_gate_streak_secs(market.no_token.as_str(), false);
-            self.log_gate("market_age", &format!(
+            self.log_gate(&ctx.crypto_filter, "market_age", &format!(
                 "market_age {}s < min {}s",
                 secs_since_market_start, config::MAKER_MIN_MARKET_AGE_SECS
             )).await;
@@ -364,7 +364,7 @@ impl Strategy for MakerStrategyImpl {
             if secs_to_expiry < dc.maker_min_secs_to_expiry {
                 maker_gate_streak_secs(market.yes_token.as_str(), false);
                 maker_gate_streak_secs(market.no_token.as_str(), false);
-                self.log_gate("expiry", &format!(
+                self.log_gate(&ctx.crypto_filter, "expiry", &format!(
                     "secs_to_expiry {}s < min {}s",
                     secs_to_expiry, dc.maker_min_secs_to_expiry
                 )).await;
@@ -373,7 +373,7 @@ impl Strategy for MakerStrategyImpl {
         } else {
             maker_gate_streak_secs(market.yes_token.as_str(), false);
             maker_gate_streak_secs(market.no_token.as_str(), false);
-            self.log_gate("no_close_time", "no market_close_time").await;
+            self.log_gate(&ctx.crypto_filter, "no_close_time", "no market_close_time").await;
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -391,7 +391,7 @@ impl Strategy for MakerStrategyImpl {
         if !yes_book_ok && !no_book_ok {
             maker_gate_streak_secs(market.yes_token.as_str(), false);
             maker_gate_streak_secs(market.no_token.as_str(), false);
-            self.log_gate("book_imbalance", &format!(
+            self.log_gate(&ctx.crypto_filter, "book_imbalance", &format!(
                 "book_imbalance both sides (ratio>{:.1}): yes_bidD={:.0} yes_askD={:.0} | no_bidD={:.0} no_askD={:.0}",
                 dc.maker_max_book_imbalance_ratio,
                 snapshot.yes_bid_depth, snapshot.yes_ask_depth,
@@ -598,7 +598,7 @@ impl Strategy for MakerStrategyImpl {
                     snapshot.no_ask, yes_bid, velocity_bias_strong_positive, dc,
                 ).unwrap_or(("unknown", "unknown".to_string())),
             };
-            self.log_gate(
+            self.log_gate(&ctx.crypto_filter, 
                 &format!("noqual:{}/{}", yes_key, no_key),
                 &format!("no side qualifies | YES: {} | NO: {}", yes_detail, no_detail),
             ).await;
@@ -615,7 +615,7 @@ impl Strategy for MakerStrategyImpl {
         let net_exposure  = (projected_yes - projected_no).abs();
 
         if net_exposure > dc.maker_max_exposure_usdc {
-            self.log_gate("net_exposure", &format!(
+            self.log_gate(&ctx.crypto_filter, "net_exposure", &format!(
                 "net_exposure ${:.2} > max ${:.2}",
                 net_exposure, dc.maker_max_exposure_usdc
             )).await;
@@ -637,7 +637,7 @@ impl Strategy for MakerStrategyImpl {
         };
 
         if final_yes.is_none() && final_no.is_none() {
-            self.log_gate("combined_bid", "combined_bid guard suppressed both sides").await;
+            self.log_gate(&ctx.crypto_filter, "combined_bid", "combined_bid guard suppressed both sides").await;
             return Ok(StrategySignal::NoSignal);
         }
 

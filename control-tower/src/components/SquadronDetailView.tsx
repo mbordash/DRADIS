@@ -12,6 +12,7 @@ import {
   VIPER_DEFS,
 } from '@/lib/api';
 import ViperCard from '@/components/ViperCard';
+import ViperActivityPanel from '@/components/ViperActivityPanel';
 import OpenPositionsCard from '@/components/OpenPositionsCard';
 import { DEMO_MODE } from '@/lib/demo';
 
@@ -363,6 +364,9 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
           </div>
         )}
       </section>
+
+      {/* ── Viper Activity ("why no trades?") for this squadron ──────────── */}
+      <ViperActivityPanel asset={asset} />
 
       {/* ── Open Positions & Trades ───────────────────────────────────────── */}
       <section>

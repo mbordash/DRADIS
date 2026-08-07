@@ -214,7 +214,7 @@ impl Strategy for FairValueStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
         // "Why no trades?" registry feed (GET /api/vipers/status).
-        let idle = |r: &str| crate::helpers::viper_status::report_reason(&self.name(), r);
+        let idle = |r: &str| crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), r);
         if !dc.enable_fairvalue {
             idle("disabled in config");
             return Ok(StrategySignal::NoSignal);

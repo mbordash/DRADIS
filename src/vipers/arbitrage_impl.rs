@@ -50,7 +50,7 @@ impl Strategy for ArbitrageStrategyImpl {
         let dc = &ctx.dynamic_config;
 
         if !dc.enable_arbitrage {
-            crate::helpers::viper_status::report_reason(&self.name(), "disabled in config");
+            crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), "disabled in config");
             return Ok(StrategySignal::NoSignal);
         }
 

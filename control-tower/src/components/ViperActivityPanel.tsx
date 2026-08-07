@@ -38,8 +38,8 @@ function outcomeBadge(row: ViperStatusRow) {
   }
 }
 
-export default function ViperActivityPanel() {
-  const { data, isLoading } = useSWR('vipers-status', getVipersStatus, {
+export default function ViperActivityPanel({ asset }: { asset: string }) {
+  const { data, isLoading } = useSWR(['vipers-status', asset], () => getVipersStatus(asset), {
     refreshInterval: 10_000,
     revalidateOnFocus: false,
   });
@@ -53,7 +53,7 @@ export default function ViperActivityPanel() {
       <div className="flex items-center justify-between mb-3">
         <p className="label-muted">Viper Activity</p>
         <span className="text-xs text-gray-600 font-mono">
-          Why isn&apos;t it trading? Holding reasons update live
+          {asset.toUpperCase()} squadron · why isn&apos;t it trading?
         </span>
       </div>
       <div className="card p-0 overflow-x-auto">
@@ -108,5 +108,46 @@ export default function ViperActivityPanel() {
         )}
       </div>
     </section>
+  );
+}
+
+/**
+ * One-line CAG-level rollup: "N/N vipers alive across all squadrons".
+ * Overview answers "is anything wrong anywhere?"; the per-squadron panel
+ * (in the squadron detail view) carries the diagnostic detail.
+ */
+export function ViperHealthStrip() {
+  const { data } = useSWR('vipers-status-all', () => getVipersStatus(), {
+    refreshInterval: 15_000,
+    revalidateOnFocus: false,
+  });
+
+  if (!data || data.length === 0) return null;
+
+  const active = data.filter((r) => r.last_reason !== 'disabled in config');
+  const alive = active.filter(
+    (r) => r.last_eval_secs_ago <= 120 && r.last_outcome !== 'error' && r.last_outcome !== 'timeout',
+  );
+  const troubled = active.length - alive.length;
+  const squadrons = new Set(data.map((r) => r.asset)).size;
+  // Up to 3 distinct holding reasons for a quick "why quiet?" glance.
+  const reasons = [...new Set(alive.map((r) => r.last_reason).filter(Boolean))].slice(0, 3);
+
+  const ok = troubled === 0;
+  return (
+    <div
+      className={`card px-4 py-2 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs font-mono ${ok ? 'text-gray-500' : 'text-red-400'}`}
+      title="Per-squadron detail: click a squadron below → Viper Activity"
+    >
+      <span>{ok ? '🟢' : '🔴'}</span>
+      <span className={ok ? 'text-gray-400' : ''}>
+        {alive.length}/{active.length} vipers alive
+        {squadrons > 1 ? ` across ${squadrons} squadrons` : ''}
+      </span>
+      {!ok && <span>{troubled} stale/error — check squadron detail</span>}
+      {ok && reasons.length > 0 && (
+        <span className="text-gray-600 truncate">holding: {reasons.join(' · ')}</span>
+      )}
+    </div>
   );
 }

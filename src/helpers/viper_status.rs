@@ -41,20 +41,26 @@ struct ViperStatus {
     last_signal_at: Option<DateTime<Utc>>,
 }
 
-static REGISTRY: OnceLock<Mutex<HashMap<String, ViperStatus>>> = OnceLock::new();
+/// Registry key: (asset/squadron e.g. "btc", strategy name). Vipers are owned
+/// by squadrons — two squadrons running the same viper are distinct instances.
+static REGISTRY: OnceLock<Mutex<HashMap<(String, String), ViperStatus>>> = OnceLock::new();
 
-fn registry() -> &'static Mutex<HashMap<String, ViperStatus>> {
+fn registry() -> &'static Mutex<HashMap<(String, String), ViperStatus>> {
     REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+fn key(asset: &str, strategy: &str) -> (String, String) {
+    (asset.to_lowercase(), strategy.to_string())
+}
+
 /// Record the outcome of one entry evaluation (called by the executor per tick).
-pub fn record_eval(strategy: &str, outcome: EvalOutcome) {
+pub fn record_eval(asset: &str, strategy: &str, outcome: EvalOutcome) {
     let now = Utc::now();
     let mut map = match registry().lock() {
         Ok(m) => m,
         Err(p) => p.into_inner(),
     };
-    let entry = map.entry(strategy.to_string()).or_insert_with(|| ViperStatus {
+    let entry = map.entry(key(asset, strategy)).or_insert_with(|| ViperStatus {
         last_eval_at: now,
         last_outcome: outcome,
         last_reason: None,
@@ -73,13 +79,13 @@ pub fn record_eval(strategy: &str, outcome: EvalOutcome) {
 
 /// Report the named gate that vetoed the current entry attempt.
 /// Called from inside instrumented vipers' entry gates; cheap overwrite.
-pub fn report_reason(strategy: &str, reason: &str) {
+pub fn report_reason(asset: &str, strategy: &str, reason: &str) {
     let now = Utc::now();
     let mut map = match registry().lock() {
         Ok(m) => m,
         Err(p) => p.into_inner(),
     };
-    let entry = map.entry(strategy.to_string()).or_insert_with(|| ViperStatus {
+    let entry = map.entry(key(asset, strategy)).or_insert_with(|| ViperStatus {
         last_eval_at: now,
         last_outcome: EvalOutcome::NoSignal,
         last_reason: None,
@@ -93,6 +99,8 @@ pub fn report_reason(strategy: &str, reason: &str) {
 /// One viper's status row as served by `GET /api/vipers/status`.
 #[derive(Serialize)]
 pub struct ViperStatusView {
+    /// Owning squadron's asset (lowercase, e.g. "btc").
+    pub asset: String,
     pub strategy: String,
     pub last_eval_at: String,
     pub last_eval_secs_ago: i64,
@@ -103,14 +111,19 @@ pub struct ViperStatusView {
     pub last_signal_secs_ago: Option<i64>,
 }
 
-/// Snapshot of every viper seen since startup, sorted by strategy name.
-pub fn snapshot() -> Vec<ViperStatusView> {
+/// Snapshot of vipers seen since startup, sorted by (asset, strategy).
+/// `asset_filter` limits to one squadron's asset; None returns all squadrons.
+pub fn snapshot(asset_filter: Option<&str>) -> Vec<ViperStatusView> {
     let now = Utc::now();
+    let filter = asset_filter.map(|a| a.to_lowercase());
     let map = match registry().lock() {
         Ok(m) => m,
         Err(p) => p.into_inner(),
     };
-    let mut rows: Vec<ViperStatusView> = map.iter().map(|(name, st)| ViperStatusView {
+    let mut rows: Vec<ViperStatusView> = map.iter()
+        .filter(|((asset, _), _)| filter.as_deref().is_none_or(|f| f == asset))
+        .map(|((asset, name), st)| ViperStatusView {
+        asset: asset.clone(),
         strategy: name.clone(),
         last_eval_at: st.last_eval_at.to_rfc3339(),
         last_eval_secs_ago: (now - st.last_eval_at).num_seconds(),
@@ -120,7 +133,7 @@ pub fn snapshot() -> Vec<ViperStatusView> {
         last_signal_at: st.last_signal_at.map(|t| t.to_rfc3339()),
         last_signal_secs_ago: st.last_signal_at.map(|t| (now - t).num_seconds()),
     }).collect();
-    rows.sort_by(|a, b| a.strategy.cmp(&b.strategy));
+    rows.sort_by(|a, b| (a.asset.as_str(), a.strategy.as_str()).cmp(&(b.asset.as_str(), b.strategy.as_str())));
     rows
 }
 
@@ -130,21 +143,27 @@ mod tests {
 
     #[test]
     fn records_and_snapshots() {
-        record_eval("TestStrategyA", EvalOutcome::NoSignal);
-        report_reason("TestStrategyA", "edge below required");
-        let snap = snapshot();
+        record_eval("BTC", "TestStrategyA", EvalOutcome::NoSignal);
+        report_reason("BTC", "TestStrategyA", "edge below required");
+        // Same viper under a different squadron is a distinct instance.
+        record_eval("eth", "TestStrategyA", EvalOutcome::Signal);
+        let snap = snapshot(Some("btc"));
+        assert!(snap.iter().all(|r| r.asset == "btc"));
         let row = snap.iter().find(|r| r.strategy == "TestStrategyA").unwrap();
         assert_eq!(row.last_outcome, EvalOutcome::NoSignal);
         assert_eq!(row.last_reason.as_deref(), Some("edge below required"));
         assert!(row.last_eval_secs_ago >= 0);
+        let eth = snapshot(Some("eth"));
+        let eth_row = eth.iter().find(|r| r.strategy == "TestStrategyA").unwrap();
+        assert_eq!(eth_row.last_outcome, EvalOutcome::Signal);
     }
 
     #[test]
     fn signal_clears_stale_reason() {
-        record_eval("TestStrategyB", EvalOutcome::NoSignal);
-        report_reason("TestStrategyB", "cooldown");
-        record_eval("TestStrategyB", EvalOutcome::Signal);
-        let snap = snapshot();
+        record_eval("btc", "TestStrategyB", EvalOutcome::NoSignal);
+        report_reason("btc", "TestStrategyB", "cooldown");
+        record_eval("btc", "TestStrategyB", EvalOutcome::Signal);
+        let snap = snapshot(None);
         let row = snap.iter().find(|r| r.strategy == "TestStrategyB").unwrap();
         assert_eq!(row.last_outcome, EvalOutcome::Signal);
         assert!(row.last_reason.is_none());

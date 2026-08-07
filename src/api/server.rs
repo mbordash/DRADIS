@@ -569,13 +569,14 @@ async fn get_latency() -> Response {
     Json(crate::helpers::latency::snapshot()).into_response()
 }
 
-/// GET /api/vipers/status
+/// GET /api/vipers/status?asset=btc
 ///
-/// Per-viper "why aren't we trading?" registry: last evaluation time/outcome
-/// per strategy plus the most recent named veto reason from instrumented
-/// vipers. Feeds the Control Tower Viper Activity panel.
-async fn get_vipers_status() -> Response {
-    Json(crate::helpers::viper_status::snapshot()).into_response()
+/// Per-viper "why aren't we trading?" registry, keyed by (squadron asset,
+/// strategy): last evaluation time/outcome plus the most recent named veto
+/// reason from instrumented vipers. Omit `asset` for all squadrons (CAG
+/// rollup); pass it for one squadron's detail view.
+async fn get_vipers_status(Query(q): Query<AssetQuery>) -> Response {
+    Json(crate::helpers::viper_status::snapshot(q.asset.as_deref())).into_response()
 }
 
 /// GET /api/trades/export?asset=btc
