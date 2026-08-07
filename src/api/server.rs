@@ -544,6 +544,68 @@ async fn patch_config(State(s): State<ApiState>, body: String) -> Response {
     }
 }
 
+/// GET /api/logs?tail=500
+///
+/// Recent engine log lines (oldest first) from the in-memory ring buffer —
+/// the Control Tower Console view. No Docker socket or file access involved;
+/// see helpers::logbuf.
+async fn get_logs(Query(q): Query<LogsQuery>) -> Response {
+    let tail = q.tail.unwrap_or(500).clamp(1, 2000);
+    let lines = crate::helpers::logbuf::tail(tail);
+    Json(serde_json::json!({ "count": lines.len(), "lines": lines })).into_response()
+}
+
+#[derive(Deserialize)]
+struct LogsQuery {
+    tail: Option<usize>,
+}
+
+/// GET /api/trades/export?asset=btc
+///
+/// Full tradelog as a CSV download (oldest first) for tax reporting or
+/// offline review. Same per-asset DB selection as /api/trades.
+async fn export_trades(Query(q): Query<AssetQuery>) -> Response {
+    let Some(pool) = db::pool_for_opt_retry(q.asset.as_deref()).await else {
+        error!("Database pool not available for GET /api/trades/export");
+        return (StatusCode::SERVICE_UNAVAILABLE, "database not ready").into_response();
+    };
+    let trades = db::get_all_trades(&pool).await;
+
+    // Minimal CSV escaping: quote any field containing comma/quote/newline.
+    fn esc(s: &str) -> String {
+        if s.contains([',', '"', '\n', '\r']) {
+            format!("\"{}\"", s.replace('"', "\"\""))
+        } else {
+            s.to_string()
+        }
+    }
+
+    let mut csv = String::with_capacity(trades.len() * 96 + 128);
+    csv.push_str("timestamp,strategy,market,side,entry_price,exit_price,shares,pnl_usdc,exit_reason\n");
+    for t in &trades {
+        csv.push_str(&format!(
+            "{},{},{},{},{},{},{},{},{}\n",
+            esc(&t.ts), esc(&t.strategy), esc(&t.market), esc(&t.side),
+            esc(&t.entry_price), esc(&t.exit_price), esc(&t.shares),
+            esc(&t.pnl), esc(&t.reason),
+        ));
+    }
+
+    let filename = format!(
+        "dradis-tradelog-{}{}.csv",
+        q.asset.as_deref().map(|a| format!("{a}-")).unwrap_or_default(),
+        chrono::Utc::now().format("%Y%m%d"),
+    );
+    info!("📄 Tradelog export: {} trades → {}", trades.len(), filename);
+    (
+        [
+            ("content-type", "text/csv; charset=utf-8".to_string()),
+            ("content-disposition", format!("attachment; filename=\"{filename}\"")),
+        ],
+        csv,
+    ).into_response()
+}
+
 /// GET /api/pnl/history?limit=200&asset=btc
 ///
 /// Returns up to `limit` P&L snapshots, newest first.
@@ -2437,6 +2499,8 @@ pub async fn run_api_server(
         .route("/api/config/schema",         get(get_config_schema))
         .route("/api/pnl/history",           get(get_pnl_history))
         .route("/api/trades",                get(get_trades))
+        .route("/api/trades/export",         get(export_trades))
+        .route("/api/logs",                  get(get_logs))
         .route("/api/positions",             get(get_open_positions))
         .route("/api/positions/pending",     get(get_pending_positions))
         .route("/api/positions/confirmed",   get(get_confirmed_positions))

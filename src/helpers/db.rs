@@ -2294,6 +2294,31 @@ pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
     }
 }
 
+/// Every completed trade, oldest first — backs the tradelog CSV export
+/// (tax reporting / offline review). No LIMIT: this table grows by a few
+/// hundred rows a day at most, so a full scan stays trivially cheap.
+pub async fn get_all_trades(pool: &SqlitePool) -> Vec<TradeRow> {
+    match sqlx::query(
+        "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason
+         FROM trades ORDER BY ts ASC"
+    )
+    .fetch_all(pool)
+    .await {
+        Ok(rows) => rows.into_iter().filter_map(|r| Some(TradeRow {
+            ts:          r.try_get::<String, _>(0).ok()?,
+            strategy:    r.try_get::<String, _>(1).ok()?,
+            market:      r.try_get::<String, _>(2).ok()?,
+            side:        r.try_get::<String, _>(3).ok()?,
+            entry_price: r.try_get::<String, _>(4).ok()?,
+            exit_price:  r.try_get::<String, _>(5).ok()?,
+            shares:      r.try_get::<String, _>(6).ok()?,
+            pnl:         r.try_get::<String, _>(7).ok()?,
+            reason:      r.try_get::<String, _>(8).ok()?,
+        })).collect(),
+        Err(e) => { error!("❌ DB get_all_trades failed: {}", e); vec![] }
+    }
+}
+
 /// Return all open positions across all sessions (inserted on entry, deleted on exit).
 /// Rows are explicitly deleted when a position is closed, so every surviving row is
 /// a live open position — even if a restart created a new session_id since entry.

@@ -75,6 +75,37 @@ export async function getTrades(limit = 60, asset?: string): Promise<TradeRow[]>
   return res.json();
 }
 
+/** Recent engine log lines (oldest first) from the in-memory ring buffer. */
+export async function getLogs(tail = 500): Promise<{ count: number; lines: string[] }> {
+  const res = await fetch(`${BASE}/api/logs?tail=${tail}`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/logs → ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Download the full tradelog as one CSV. Multi-asset deployments keep one
+ * DB per asset, so fetch each asset's export and merge them client-side
+ * with a leading `asset` column (prepending to each line is quote-safe).
+ */
+export async function downloadTradelogCsv(assets: string[]): Promise<void> {
+  const list = assets.length > 0 ? assets : ['btc'];
+  const merged: string[] = [];
+  for (const asset of list) {
+    const res = await fetch(withAsset(`${BASE}/api/trades/export`, asset), { cache: 'no-store' });
+    if (!res.ok) throw new Error(`GET /api/trades/export (${asset}) → ${res.status}`);
+    const lines = (await res.text()).split('\n').filter(l => l.length > 0);
+    if (merged.length === 0 && lines.length > 0) merged.push(`asset,${lines[0]}`);
+    for (const line of lines.slice(1)) merged.push(`${asset},${line}`);
+  }
+  const blob = new Blob([merged.join('\n') + '\n'], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `dradis-tradelog-${new Date().toISOString().slice(0, 10)}.csv`;
+  a.click();
+  URL.revokeObjectURL(url);
+}
+
 export async function getOpenPositions(asset?: string): Promise<OpenPositionRow[]> {
   const url = withAsset(`${BASE}/api/positions`, asset);
   const res = await fetch(url, { cache: 'no-store' });

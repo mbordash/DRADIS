@@ -3,7 +3,7 @@
 import { useState, useMemo } from 'react';
 import useSWR from 'swr';
 import type { TradeRow, OpenPositionRow } from '@/lib/types';
-import { getTrades, getOpenPositions } from '@/lib/api';
+import { getTrades, getOpenPositions, downloadTradelogCsv } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -264,6 +264,32 @@ interface Props {
   availableAssets: string[];
 }
 
+/** Download the complete trade history (all assets) as one CSV — tax
+ *  reporting / offline review. A trade record, not a tax document. */
+function ExportCsvButton({ assets }: { assets: string[] }) {
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(false);
+
+  const run = async () => {
+    setBusy(true);
+    setErr(false);
+    try { await downloadTradelogCsv(assets); }
+    catch { setErr(true); }
+    finally { setBusy(false); }
+  };
+
+  return (
+    <button
+      onClick={run}
+      disabled={busy}
+      title="Download the complete trade history (all assets, all filters ignored) as CSV. A trade record for tax prep or review — not a tax document; cost-basis treatment is your accountant's call."
+      className="px-2.5 py-1 rounded-lg text-xs font-mono border border-[#1e1e32] text-gray-500 hover:text-gray-300 hover:border-indigo-500/40 transition-colors disabled:opacity-40"
+    >
+      {busy ? 'Exporting…' : err ? '⚠ Export failed — retry' : '⬇ Export CSV'}
+    </button>
+  );
+}
+
 export default function TradelogPage({ availableAssets }: Props) {
   // ── Filters ──────────────────────────────────────────────────────────────────
   const [assetFilter,    setAssetFilter]    = useState<string>('all');
@@ -436,10 +462,13 @@ export default function TradelogPage({ availableAssets }: Props) {
             <span className="text-indigo-400 text-base">📋</span>
             <p className="label-muted">Mission Tradelog</p>
           </div>
-          <span className="text-xs font-mono text-gray-600">
-            {isLoading ? 'Loading…' : `${filtered.length} entries`}
-            {filtered.length < allEntries.length && ` (filtered from ${allEntries.length})`}
-          </span>
+          <div className="flex items-center gap-3">
+            <ExportCsvButton assets={assets} />
+            <span className="text-xs font-mono text-gray-600">
+              {isLoading ? 'Loading…' : `${filtered.length} entries`}
+              {filtered.length < allEntries.length && ` (filtered from ${allEntries.length})`}
+            </span>
+          </div>
         </div>
 
         {isLoading ? (

@@ -205,6 +205,9 @@ async fn run() -> Result<()> {
     tracing_subscriber::fmt()
         .with_timer(EasternTime)
         .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        // Tee every formatted line into the in-memory ring that backs the
+        // Control Tower Console view (GET /api/logs) — stdout is unchanged.
+        .with_writer(dradis::helpers::logbuf::TeeMakeWriter)
         .init();
     ring::default_provider().install_default().expect("rustls provider");
     print_banner();

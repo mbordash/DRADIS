@@ -12,6 +12,7 @@ import SquadronDetailView from '@/components/SquadronDetailView';
 import TradelogPage    from '@/components/TradelogPage';
 import SetupPage       from '@/components/SetupPage';
 import AiActionsPage   from '@/components/AiActionsPage';
+import ConsolePage     from '@/components/ConsolePage';
 import AlphaGate       from '@/components/AlphaGate';
 import ErrorBoundary   from '@/components/ErrorBoundary';
 import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getSquadrons } from '@/lib/api';
@@ -231,13 +232,14 @@ function PortfolioValueBanner({
 
 // ── Top-level nav ─────────────────────────────────────────────────────────────
 
-type AppView = 'main' | 'telemetry' | 'tradelog' | 'ai' | 'setup';
+type AppView = 'main' | 'telemetry' | 'tradelog' | 'ai' | 'console' | 'setup';
 
 const VIEW_DEFS: { id: AppView; label: string; icon: string }[] = [
   { id: 'main',      label: 'Main',       icon: '🗺️' },
   { id: 'telemetry', label: 'Telemetry',  icon: '📡' },
   { id: 'tradelog',  label: 'Tradelog',   icon: '📋' },
   { id: 'ai',        label: 'AI Actions', icon: '🤖' },
+  { id: 'console',   label: 'Console',    icon: '🖥️' },
   { id: 'setup',     label: 'Setup',      icon: '⚙️' },
 ];
 
@@ -504,11 +506,6 @@ export default function DashboardPage() {
           <div className="flex items-center gap-3">
             <div className="flex items-center gap-1.5">
               <span className="font-mono font-bold text-lg tracking-wide text-indigo-400">DRADIS</span>
-              {!DEMO_MODE && (
-                <span className="text-[9px] font-mono font-bold tracking-widest bg-amber-500/20 text-amber-400 border border-amber-500/30 rounded px-1.5 py-0.5" title="DRADIS is early-access software provided AS IS — trade only with funds you can afford to lose.">
-                  EARLY ACCESS
-                </span>
-              )}
               <span className="text-gray-600 text-lg">|</span>
             </div>
             <NavMenu active={activeView} onChange={setActiveView} />
@@ -591,6 +588,19 @@ export default function DashboardPage() {
           {config?.ghost_mode && <GhostBanner ghost />}
           <ErrorBoundary label="AI Actions">
             <AiActionsPage />
+          </ErrorBoundary>
+          <footer className="text-center text-xs text-gray-700 pb-4 font-mono">
+            DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}
+            <span className="text-gray-600">So say we all.</span>
+          </footer>
+        </main>
+      )}
+
+      {/* ── Console view ───────────────────────────────────────────────────── */}
+      {activeView === 'console' && (
+        <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
+          <ErrorBoundary label="Console">
+            <ConsolePage />
           </ErrorBoundary>
           <footer className="text-center text-xs text-gray-700 pb-4 font-mono">
             DRADIS Control Tower  Polymarket CLOB Orchestrator {' '}
