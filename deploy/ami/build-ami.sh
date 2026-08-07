@@ -161,7 +161,7 @@ AWS ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
 
 AMI_ID=$(AWS ec2 create-image --instance-id "$INSTANCE_ID" \
     --name "$AMI_NAME" \
-    --description "DRADIS $([ "$VENUE" = intl ] && echo International || echo US) — autonomous prediction-market trading engine (alpha)" \
+    --description "DRADIS $([ "$VENUE" = intl ] && echo International || echo US) — self-hosted, non-custodial automated prediction-market trading engine (provided AS IS)" \
     --query 'ImageId' --output text)
 echo "AMI: $AMI_ID — waiting for 'available'…"
 AWS ec2 wait image-available --image-ids "$AMI_ID"

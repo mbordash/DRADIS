@@ -317,7 +317,7 @@ async fn acknowledge_alpha() -> Response {
         "app_version": env!("CARGO_PKG_VERSION"),
     });
     crate::helpers::db::config_set(pool, ALPHA_ACK_KEY, &record.to_string()).await;
-    info!("⚠️ Alpha risk + jurisdiction acknowledgment recorded: {}", record);
+    info!("⚠️ Early-access risk + jurisdiction acknowledgment recorded: {}", record);
     Json(json!({"ok": true, "already_acknowledged": false, "record": record})).into_response()
 }
 

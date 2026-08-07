@@ -691,12 +691,12 @@ export default function SetupPage() {
         </div>
       </div>
 
-      {/* ── Alpha support policy ───────────────────────────────────────────── */}
+      {/* ── Support policy ─────────────────────────────────────────────────── */}
       <div className="bg-[#13131f] border border-[#1e1e32] rounded-xl p-4 space-y-2">
-        <h3 className="text-sm font-mono text-gray-200">🧪 Alpha Support</h3>
+        <h3 className="text-sm font-mono text-gray-200">🧪 Support</h3>
         <p className="text-xs text-gray-500">
-          DRADIS is in alpha — <span className="text-gray-400">support is not included</span> during
-          this phase. For setup help, ask an AI assistant (ChatGPT, Gemini, Claude): paste the README
+          DRADIS is community-supported — <span className="text-gray-400">individual support is not
+          included</span>. For setup help, ask an AI assistant (ChatGPT, Gemini, Claude): paste the README
           and your question — they are very good at this.
         </p>
         <div className="flex flex-wrap items-center gap-2 pt-1">

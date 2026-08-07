@@ -52,7 +52,7 @@ export default function AlphaGate({
         <div className="w-full max-w-2xl bg-[#13131f] border border-amber-500/40 rounded-2xl p-6 sm:p-8 space-y-5 shadow-2xl">
           <div className="flex items-center gap-3">
             <span className="text-[10px] font-mono font-bold tracking-widest bg-amber-500 text-black rounded px-2 py-1">
-              ALPHA
+              EARLY ACCESS
             </span>
             <h2 className="text-lg font-mono text-gray-100">
               DRADIS {venue === 'intl' ? 'International' : 'US'}
@@ -62,9 +62,9 @@ export default function AlphaGate({
 
           {/* ── Risk ─────────────────────────────────────────────────────── */}
           <div className="bg-red-950/40 border border-red-500/30 rounded-xl p-4 space-y-2">
-            <h3 className="text-sm font-mono text-red-300">⚠️ Alpha software · real-money risk</h3>
+            <h3 className="text-sm font-mono text-red-300">⚠️ Real-money risk</h3>
             <ul className="text-xs text-red-200/90 space-y-1 list-disc pl-4">
-              <li>DRADIS is <strong>experimental alpha software</strong>. It places live orders with real funds and can <strong>lose some or all of the capital</strong> you give it access to.</li>
+              <li>DRADIS is <strong>early-access software provided AS IS</strong>. It places live orders with real funds and can <strong>lose some or all of the capital</strong> you give it access to.</li>
               <li>Automated trading involves substantial risk of loss: software bugs, network latency, API rate limits, venue outages, slippage, or misconfiguration can produce unintended trades and <strong>total loss of deployed capital</strong>. Start in GHOST mode and with money you can afford to lose entirely.</li>
               <li>Provided under the GPLv3 <strong>without warranty of any kind</strong>. Nothing here is financial advice.</li>
             </ul>
@@ -101,11 +101,11 @@ export default function AlphaGate({
             )}
           </div>
 
-          {/* ── Alpha support policy ─────────────────────────────────────── */}
+          {/* ── Support policy ───────────────────────────────────────────── */}
           <div className="bg-[#0e0e18] border border-[#1e1e32] rounded-xl p-4 space-y-2">
-            <h3 className="text-sm font-mono text-gray-300">🧪 During the alpha, support is not included</h3>
+            <h3 className="text-sm font-mono text-gray-300">🧪 Community-supported software</h3>
             <ul className="text-xs text-gray-400 space-y-1 list-disc pl-4">
-              <li>For setup help, ask an AI assistant (ChatGPT, Gemini, Claude) — paste in the README and your question; they are very good at this.</li>
+              <li>Individual support is not included. For setup help, ask an AI assistant (ChatGPT, Gemini, Claude) — paste in the README and your question; they are very good at this.</li>
               <li>Report bugs via{' '}
                 <a href={`${REPO_URL}/issues`} target="_blank" rel="noreferrer" className="text-sky-400 hover:underline">GitHub Issues</a>{' '}
                 and request enhancements via{' '}
@@ -118,7 +118,7 @@ export default function AlphaGate({
           <div className="space-y-2.5">
             <label className="flex items-start gap-2.5 text-xs text-gray-300 cursor-pointer">
               <input type="checkbox" className={checkboxCls} checked={riskOk} onChange={e => setRiskOk(e.target.checked)} />
-              <span>I understand this is alpha software that trades real money and can lose it, is provided without warranty or support, and I accept these risks and the non-custodial, no-advice, and limitation-of-liability terms above.</span>
+              <span>I understand this software trades real money and can lose it, is provided AS IS without warranty or individual support, and I accept these risks and the non-custodial, no-advice, and limitation-of-liability terms above.</span>
             </label>
             <label className="flex items-start gap-2.5 text-xs text-gray-300 cursor-pointer">
               <input type="checkbox" className={checkboxCls} checked={jurisdictionOk} onChange={e => setJurisdictionOk(e.target.checked)} />

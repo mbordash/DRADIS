@@ -505,8 +505,8 @@ export default function DashboardPage() {
             <div className="flex items-center gap-1.5">
               <span className="font-mono font-bold text-lg tracking-wide text-indigo-400">DRADIS</span>
               {!DEMO_MODE && (
-                <span className="text-[9px] font-mono font-bold tracking-widest bg-amber-500/20 text-amber-400 border border-amber-500/30 rounded px-1.5 py-0.5" title="DRADIS is alpha software — trade only with funds you can afford to lose.">
-                  ALPHA
+                <span className="text-[9px] font-mono font-bold tracking-widest bg-amber-500/20 text-amber-400 border border-amber-500/30 rounded px-1.5 py-0.5" title="DRADIS is early-access software provided AS IS — trade only with funds you can afford to lose.">
+                  EARLY ACCESS
                 </span>
               )}
               <span className="text-gray-600 text-lg">|</span>
