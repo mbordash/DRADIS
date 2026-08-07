@@ -71,10 +71,13 @@ impl UsRetailVenue {
         let base_url = std::env::var(ENV_BASE_URL)
             .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string());
         let auth = UsAuth::from_env().context("US retail auth bootstrap failed")?;
+        // NOTE: the shared `http` client is reqwest 0.13 (workspace) while the
+        // polymarket-us SDK still pins reqwest 0.12 — the two `Client` types
+        // don't unify, so the SDK builds its own internal client. The shared
+        // client is still used for every non-SDK call on this venue.
         let client = PolymarketUsClient::builder()
             .api_base_url(base_url.clone())
             .gateway_base_url(base_url.clone())
-            .http_client(http.as_ref().clone())
             .auth(auth.clone())
             .build()
             .map_err(|e| anyhow!("US retail SDK client bootstrap failed: {e}"))?;
