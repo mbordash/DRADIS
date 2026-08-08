@@ -39,6 +39,9 @@ use auth::UsAuth;
 
 /// Default authenticated API base (per developer portal).
 const DEFAULT_BASE_URL: &str = "https://api.polymarket.us";
+/// Public (unauthenticated) gateway host — the SDK routes public reference
+/// endpoints like `/v1/search` here; they 404 on the authenticated api host.
+const GATEWAY_BASE_URL: &str = "https://gateway.polymarket.us";
 /// Override the gateway base URL (staging / mock).
 const ENV_BASE_URL: &str = "POLYMARKET_US_BASE_URL";
 /// Minimum cumulative volume (USD) a market must have to be considered for
@@ -288,14 +291,11 @@ impl UsRetailVenue {
         let mut event_slugs: Vec<String> = Vec::new();
 
         for q in QUERIES {
-            let path = "/v1/search";
-            let url = format!("{}{}?query={}&status=active&limit=100", self.base_url, path, q);
-            let signed = self.auth.signed_headers("GET", path);
+            // /v1/search is public and lives on the gateway host (no auth —
+            // it 404s on the authenticated api host).
+            let url = format!("{GATEWAY_BASE_URL}/v1/search?query={q}&status=active&limit=100");
             let response = self.http
                 .get(&url)
-                .header(signed[0].0, &signed[0].1)
-                .header(signed[1].0, &signed[1].1)
-                .header(signed[2].0, &signed[2].1)
                 .header("Content-Type", "application/json")
                 .send()
                 .await
