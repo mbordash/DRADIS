@@ -199,7 +199,7 @@ function SignalChart<R extends { time: string }>({
                   borderRadius: 8, fontSize: 11, fontFamily: 'monospace',
                 }}
                 labelStyle={{ color: '#9ca3af' }}
-                formatter={(v: number, name: string) => [fmtY(v), name]}
+                formatter={(v, name) => [fmtY(Number(v)), String(name)]}
               />
               {zeroLine && <ReferenceLine y={0} stroke="#374151" strokeDasharray="4 4" />}
               {typeof refY === 'number' && (
