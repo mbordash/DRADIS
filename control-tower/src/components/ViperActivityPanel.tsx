@@ -67,7 +67,7 @@ export default function ViperActivityPanel({ asset }: { asset: string }) {
                 <th className="text-left px-3 py-2 font-normal">Viper</th>
                 <th className="text-left px-3 py-2 font-normal">Status</th>
                 <th className="text-left px-3 py-2 font-normal">Holding because</th>
-                <th className="text-right px-3 py-2 font-normal">Last signal</th>
+                <th className="text-right px-3 py-2 font-normal" title="When this viper last emitted a trade signal (entry/exit). Vipers consume raptor intel every tick regardless.">Last trade signal</th>
               </tr>
             </thead>
             <tbody>
@@ -101,7 +101,7 @@ export default function ViperActivityPanel({ asset }: { asset: string }) {
                       )}
                     </td>
                     <td className="px-3 py-2 text-right text-gray-500" title={row.last_signal_at ?? undefined}>
-                      {row.last_signal_secs_ago !== null ? fmtAgo(row.last_signal_secs_ago) : 'none this session'}
+                      {row.last_signal_secs_ago !== null ? fmtAgo(row.last_signal_secs_ago) : 'no trades yet'}
                     </td>
                   </tr>
                 );
