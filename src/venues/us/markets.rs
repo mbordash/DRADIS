@@ -17,6 +17,12 @@ use chrono::{DateTime, Utc};
 pub struct UsMarketPair {
     pub slug: String,
     pub question: String,
+    /// Venue category hint (e.g. `crypto`, `sports`) — feeds the shared
+    /// market-class taxonomy so the trader can route pairs to the right wing.
+    pub category: String,
+    /// Venue long-form description — scanned as a strike-price fallback for
+    /// crypto markets whose question omits the threshold.
+    pub description: String,
     /// `LONG` (YES) leg symbol.
     pub long: MarketId,
     /// `SHORT` (NO) leg symbol.
@@ -123,6 +129,8 @@ pub fn pair_markets(markets: Vec<types::UsMarket>) -> Vec<UsMarketPair> {
             out.push(UsMarketPair {
                 slug: m.slug,
                 question: m.question,
+                category: m.category,
+                description: m.description,
                 long: MarketId::new(l),
                 short: MarketId::new(s),
                 close_time: parse_close_time(&m.end_date),

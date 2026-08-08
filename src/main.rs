@@ -405,6 +405,14 @@ async fn run() -> Result<()> {
                 ).await {
                     tracing::warn!("⚠️ US DB pool init failed (dashboard disabled): {e}");
                 }
+                // Second pool for the crypto wing so its squadron gets its own
+                // asset scope (positions, P&L, viper status) in the dashboard.
+                if let Err(e) = dradis::helpers::db::init_for_asset(
+                    dradis::venues::us::trader::US_CRYPTO_ASSET,
+                    "logs/us-crypto-dradis.db",
+                ).await {
+                    tracing::warn!("⚠️ US crypto DB pool init failed (crypto wing dashboard disabled): {e}");
+                }
                 dradis::venues::us::trader::run_us_trader(
                     venue,
                     cag.clone(),

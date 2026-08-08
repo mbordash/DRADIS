@@ -84,7 +84,14 @@ impl ConvergenceStrategyImpl {
     }
 
     fn is_btc(ctx: &StrategyContext) -> bool {
-        ctx.crypto_filter.eq_ignore_ascii_case("btc")
+        // Intl squadrons carry the underlying in crypto_filter ("BTC"); US
+        // crypto-wing squadrons carry a venue key ("US-CRYPTO"), so fall back
+        // to the market name to recognize a BTC market there.
+        if ctx.crypto_filter.eq_ignore_ascii_case("btc") {
+            return true;
+        }
+        let name = ctx.market.market_name.to_lowercase();
+        name.contains("btc") || name.contains("bitcoin")
     }
 
     fn record_exit(&self, token_id: &MarketId) {

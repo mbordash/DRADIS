@@ -5,6 +5,41 @@ use regex::Regex;
 use std::str::FromStr as _;
 use tracing::debug;
 
+/// Extract a strike price from a market's question text (e.g. "$115,000" /
+/// "above 115000" / "[BTC 115,000]"). Venue-neutral: shared by the intl
+/// discovery pipeline and the US crypto wing. Requires the value to exceed 100
+/// so share prices / percentages never false-match.
+pub fn extract_strike_price(market_name: &str) -> Option<Decimal> {
+    let lower_name = market_name.to_lowercase();
+    let re1 = Regex::new(r"(?:\$|above\s|below\s|at\s)(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{3,}(?:\.\d+)?)").unwrap();
+    if let Some(cap) = re1.captures(&lower_name) {
+        if let Some(num_str) = cap.get(1) {
+            let cleaned = num_str.as_str().replace(",", "");
+            if let Ok(price) = Decimal::from_str(&cleaned) {
+                if price > Decimal::from(100) { return Some(price); }
+            }
+        }
+    }
+    let re2 = Regex::new(r"\[(?:BTC|ETH|SOL)?\s*(\d{1,3}(?:,\d{3})+(?:\.\d+)?|\d{3,}(?:\.\d+)?)\]").unwrap();
+    if let Some(cap) = re2.captures(&lower_name) {
+        if let Some(num_str) = cap.get(1) {
+            let cleaned = num_str.as_str().replace(",", "");
+            if let Ok(price) = Decimal::from_str(&cleaned) {
+                if price > Decimal::from(100) { return Some(price); }
+            }
+        }
+    }
+    let re3 = Regex::new(r"\bat\s+(\d+(?:\.\d+)?)(?:\s|$)").unwrap();
+    if let Some(cap) = re3.captures(&lower_name) {
+        if let Some(num_str) = cap.get(1) {
+            if let Ok(price) = Decimal::from_str(num_str.as_str()) {
+                if price > Decimal::from(100) { return Some(price); }
+            }
+        }
+    }
+    None
+}
+
 /// Fetch strike price from Binance using market close time as reference
 pub async fn fetch_strike_price_from_close_time(
     http: &reqwest::Client,

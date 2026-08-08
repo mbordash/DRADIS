@@ -27,7 +27,7 @@
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use chrono::Utc;
@@ -36,19 +36,23 @@ use rust_decimal_macros::dec;
 use tokio::sync::{watch, Mutex};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::api::server::AssetRaptorHealth;
 use crate::cag::Cag;
 use crate::helpers::db;
 use crate::helpers::dynamic_config::DynamicConfig;
+use crate::helpers::time::{extract_strike_price, fetch_historical_strike_price};
 use crate::helpers::metrics;
 use crate::orchestrator::{
     aggregate_and_resolve_signals, evaluate_strategies, Strategy, StrategyContext,
     StrategyRegistry,
 };
 use crate::squadron::{CryptoAsset, Squadron, SquadronConfig, SquadronRaptors, SquadronState};
+use crate::raptors::derivatives::DerivativesSnapshot;
+use crate::raptors::horizon::HorizonSnapshot;
 use crate::raptors::sports::SportsSnapshot;
+use crate::raptors::tide::TideSnapshot;
 use crate::state::{
     MarketConfig, MarketPhase, MarketSnapshot, OrderParams, Position, PositionMap, PriceState,
     StrategySignal,
@@ -86,6 +90,218 @@ const MARKET_RESCAN_SECS: u64 = 300; // 5 minutes
 /// the current one. Prevents thrashing between near-equal markets.
 const ROTATION_VOLUME_THRESHOLD: f64 = 10_000.0;
 pub const US_ASSET: &str = "us";
+/// Asset key for the US crypto wing — its own DB pool, squadron id, and
+/// viper-status scope so the sports and crypto squadrons never collide.
+pub const US_CRYPTO_ASSET: &str = "us-crypto";
+
+/// Which market domain a US trading wing hunts. The venue runs one wing per
+/// domain concurrently: the general wing keeps the original behaviour (sports /
+/// politics / anything non-crypto → order-book vipers), while the crypto wing
+/// targets crypto-class markets and feeds them the full Raptor intelligence
+/// stack so all nine vipers can fly.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Wing {
+    General,
+    Crypto,
+}
+
+impl Wing {
+    fn asset(self) -> &'static str {
+        match self {
+            Wing::General => US_ASSET,
+            Wing::Crypto => US_CRYPTO_ASSET,
+        }
+    }
+    fn label(self) -> &'static str {
+        match self {
+            Wing::General => "general",
+            Wing::Crypto => "crypto",
+        }
+    }
+}
+
+/// Cloneable bundle of live Raptor signal receivers for one crypto underlying.
+///
+/// The raptors themselves (Binance WS/REST, Alpaca IEX) are venue-neutral and
+/// process-lifetime — spawned lazily on the first crypto market for an
+/// underlying and shared by every subsequent market on it (see
+/// [`raptor_stack_for`]).
+#[derive(Clone)]
+struct CryptoRaptors {
+    oracle: watch::Receiver<Decimal>,
+    /// (5 s velocity, 1 s velocity, acceleration)
+    velocity: watch::Receiver<(Decimal, Decimal, Decimal)>,
+    /// (60-min drift, 10-min drift, normalized realized vol)
+    drift: watch::Receiver<(Decimal, Decimal, Decimal)>,
+    funding: watch::Receiver<Decimal>,
+    derivatives: watch::Receiver<DerivativesSnapshot>,
+    tide: Option<watch::Receiver<TideSnapshot>>,
+    horizon: Option<watch::Receiver<HorizonSnapshot>>,
+}
+
+/// Process-lifetime registry of spawned raptor stacks, keyed by lowercase
+/// underlying symbol (`"btc"`). Prevents duplicate Binance/Alpaca connections
+/// across market rotations.
+static CRYPTO_RAPTOR_STACKS: OnceLock<std::sync::Mutex<HashMap<String, CryptoRaptors>>> =
+    OnceLock::new();
+
+/// Supervised task spawn (respawn-on-exit/panic), mirroring `main.rs`'s intl
+/// raptor supervision so a Binance disconnect or panic never silently kills a
+/// signal feed.
+fn spawn_supervised<F, Fut>(name: &'static str, factory: F)
+where
+    F: Fn() -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        loop {
+            match tokio::spawn(factory()).await {
+                Ok(()) => warn!("⚠️ Supervised feed '{name}' exited unexpectedly — respawning in 5s"),
+                Err(e) if e.is_panic() => {
+                    error!("💥 Supervised feed '{name}' PANICKED — respawning in 5s: {e:?}")
+                }
+                Err(e) => warn!("⚠️ Supervised feed '{name}' terminated ({e:?}) — respawning in 5s"),
+            }
+            tokio::time::sleep(Duration::from_secs(5)).await;
+        }
+    });
+}
+
+/// Get (or lazily spawn) the full Raptor stack for a crypto underlying.
+///
+/// Spawns Price (Binance WS), Funding (FAPI), and Derivatives (FAPI) raptors
+/// for any underlying; BTC additionally gets the Tide + Horizon macro raptors
+/// (Alpaca IEX — degrade to defaults without `ALPACA_API_KEY_ID`). Identical
+/// wiring to the intl per-asset bootstrap in `main.rs`.
+fn raptor_stack_for(
+    underlying: &str,
+    raptor_health_tx: &Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
+) -> CryptoRaptors {
+    let registry = CRYPTO_RAPTOR_STACKS.get_or_init(Default::default);
+    let mut map = registry.lock().expect("raptor stack registry poisoned");
+    if let Some(stack) = map.get(underlying) {
+        return stack.clone();
+    }
+
+    info!("🦖 Spawning crypto Raptor stack for '{underlying}' (US crypto wing)");
+    let http = Arc::new(reqwest::Client::new());
+
+    let (oracle_tx, oracle_rx) = watch::channel(dec!(0));
+    let (velocity_tx, velocity_rx) = watch::channel((dec!(0), dec!(0), dec!(0)));
+    let (drift_tx, drift_rx) = watch::channel((dec!(0), dec!(0), dec!(0)));
+    let (funding_tx, funding_rx) = watch::channel(dec!(0));
+    let (deriv_tx, deriv_rx) = watch::channel(DerivativesSnapshot::default());
+
+    {
+        let asset = underlying.to_string();
+        let health = Arc::clone(raptor_health_tx);
+        spawn_supervised("us-price-raptor", move || {
+            crate::raptors::price::run_price_raptor(
+                asset.clone(), oracle_tx.clone(), velocity_tx.clone(), drift_tx.clone(),
+                Arc::clone(&health),
+            )
+        });
+    }
+    {
+        let asset = underlying.to_string();
+        let http_c = Arc::clone(&http);
+        let health = Arc::clone(raptor_health_tx);
+        spawn_supervised("us-funding-raptor", move || {
+            crate::raptors::funding::run_funding_raptor(
+                Arc::clone(&http_c), asset.clone(), funding_tx.clone(), Arc::clone(&health),
+            )
+        });
+    }
+    {
+        let asset = underlying.to_string();
+        let http_c = Arc::clone(&http);
+        let health = Arc::clone(raptor_health_tx);
+        spawn_supervised("us-derivatives-raptor", move || {
+            crate::raptors::derivatives::run_derivatives_raptor(
+                Arc::clone(&http_c), asset.clone(), deriv_tx.clone(), Arc::clone(&health),
+            )
+        });
+    }
+
+    // Tide + Horizon are BTC-only macro raptors sharing one Alpaca connection.
+    let (tide, horizon) = if underlying == "btc" {
+        let shared_quotes = crate::raptors::tide::new_shared_quote_map();
+        let (tide_tx, tide_rx) = watch::channel(TideSnapshot::default());
+        {
+            let oracle_rx_c = oracle_rx.clone();
+            let health = Arc::clone(raptor_health_tx);
+            let quotes = Arc::clone(&shared_quotes);
+            spawn_supervised("us-tide-raptor", move || {
+                crate::raptors::tide::run_tide_raptor(
+                    oracle_rx_c.clone(), tide_tx.clone(), Arc::clone(&health), Arc::clone(&quotes),
+                )
+            });
+        }
+        let (horizon_tx, horizon_rx) = watch::channel(HorizonSnapshot::default());
+        {
+            let velocity_rx_c = velocity_rx.clone();
+            let health = Arc::clone(raptor_health_tx);
+            let quotes = Arc::clone(&shared_quotes);
+            spawn_supervised("us-horizon-raptor", move || {
+                crate::raptors::horizon::run_horizon_raptor(
+                    Arc::clone(&quotes), velocity_rx_c.clone(), horizon_tx.clone(), Arc::clone(&health),
+                )
+            });
+        }
+        (Some(tide_rx), Some(horizon_rx))
+    } else {
+        (None, None)
+    };
+
+    let stack = CryptoRaptors {
+        oracle: oracle_rx,
+        velocity: velocity_rx,
+        drift: drift_rx,
+        funding: funding_rx,
+        derivatives: deriv_rx,
+        tide,
+        horizon,
+    };
+    map.insert(underlying.to_string(), stack.clone());
+    stack
+}
+
+/// Detect the crypto underlying of a market from token-delimited words in its
+/// slug + question (`"bitcoin-up-or-down-…"` → `"btc"`). Token-based so `"eth"`
+/// never matches inside `"whether"` nor `"sol"` inside `"resolution"`.
+fn detect_underlying(pair: &super::markets::UsMarketPair) -> Option<&'static str> {
+    let text = format!("{} {}", pair.slug, pair.question).to_ascii_lowercase();
+    for token in text.split(|c: char| !c.is_ascii_alphanumeric()) {
+        match token {
+            "btc" | "bitcoin" => return Some("btc"),
+            "eth" | "ethereum" => return Some("eth"),
+            "sol" | "solana" => return Some("sol"),
+            "xrp" | "ripple" => return Some("xrp"),
+            _ => {}
+        }
+    }
+    None
+}
+
+/// Whether a discovered US market belongs to the crypto domain.
+///
+/// Primary: the shared, data-driven market-class taxonomy (`classify_market` —
+/// same rule table intl uses, matching venue category / leg-symbol tokens /
+/// slug). Fallback: underlying detection from the slug + question tokens, so a
+/// gateway with empty category metadata still routes correctly.
+async fn pair_is_crypto(pair: &super::markets::UsMarketPair) -> bool {
+    if let Some(pool) = db::pool() {
+        let symbols = [pair.long.as_str(), pair.short.as_str()];
+        let class = db::classify_market(pool, &pair.category, &symbols, &pair.slug).await;
+        if class == "crypto" {
+            return true;
+        }
+        if class != "unknown" {
+            return false; // confidently classified as another domain
+        }
+    }
+    detect_underlying(pair).is_some()
+}
 
 /// Why a single-market trading session ended — drives the outer rotation loop.
 enum MarketOutcome {
@@ -117,6 +333,36 @@ pub async fn run_us_trader(
     let filter = std::env::var(ENV_MARKET_FILTER).ok().filter(|s| !s.is_empty());
     info!("🇺🇸 US trader starting — market filter={filter:?}");
 
+    // Two concurrent wings over the same venue connection: the general wing
+    // (sports/politics — original behaviour, asset "us") and the crypto wing
+    // (crypto-class markets + full Raptor stack → all nine vipers, asset
+    // "us-crypto"). Each has its own squadron, DB pool, and rotation loop.
+    tokio::join!(
+        run_wing(
+            Wing::General, &venue, &cag, &raptor_health_tx, &markets_tx,
+            &process_heartbeat_secs, &sports_rx, &filter, &cancel,
+        ),
+        run_wing(
+            Wing::Crypto, &venue, &cag, &raptor_health_tx, &markets_tx,
+            &process_heartbeat_secs, &sports_rx, &filter, &cancel,
+        ),
+    );
+}
+
+/// Run one wing's market rotation loop until `cancel` fires: select a market
+/// in the wing's domain, trade it until it closes, re-discover the next one.
+#[allow(clippy::too_many_arguments)]
+async fn run_wing(
+    wing: Wing,
+    venue: &Arc<UsRetailVenue>,
+    cag: &Cag,
+    raptor_health_tx: &Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
+    markets_tx: &Arc<watch::Sender<HashMap<String, String>>>,
+    process_heartbeat_secs: &Arc<AtomicU64>,
+    sports_rx: &watch::Receiver<SportsSnapshot>,
+    filter: &Option<String>,
+    cancel: &CancellationToken,
+) {
     // ── Idle-time snapshot heartbeat ─────────────────────────────────────────
     // Market discovery can spin for hours off-hours (5-min retries), during
     // which trade_one_market — and its 30 s sync_dashboard — never runs. The
@@ -125,8 +371,8 @@ pub async fn run_us_trader(
     // This task writes a fresh snapshot every 60 s whenever the trade loop is
     // NOT active; the trade loop's own 30 s sync takes over when it is.
     let trading_active = Arc::new(AtomicBool::new(false));
-    if let Some(snap_pool) = db::pool_for(US_ASSET) {
-        let venue_bg = Arc::clone(&venue);
+    if let Some(snap_pool) = db::pool_for(wing.asset()) {
+        let venue_bg = Arc::clone(venue);
         let active_bg = Arc::clone(&trading_active);
         let cancel_bg = cancel.clone();
         tokio::spawn(async move {
@@ -150,7 +396,7 @@ pub async fn run_us_trader(
         }
 
         // ── Select a tradeable market (retry until one matches or cancelled) ──
-        let pair = match select_market(&venue, &filter, &cancel, &process_heartbeat_secs).await {
+        let pair = match select_market(venue, filter, cancel, process_heartbeat_secs, wing).await {
             Some(p) => p,
             None => return, // cancelled during discovery
         };
@@ -162,13 +408,14 @@ pub async fn run_us_trader(
 
         trading_active.store(true, AtomicOrdering::Relaxed);
         let outcome = trade_one_market(
-            &venue,
-            &cag,
-            &raptor_health_tx,
-            &markets_tx,
-            &process_heartbeat_secs,
-            &sports_rx,
+            venue,
+            cag,
+            raptor_health_tx,
+            markets_tx,
+            process_heartbeat_secs,
+            sports_rx,
             &market_cancel,
+            wing,
             pair,
         ).await;
         trading_active.store(false, AtomicOrdering::Relaxed);
@@ -179,14 +426,14 @@ pub async fn run_us_trader(
         match outcome {
             MarketOutcome::Cancelled => return,
             MarketOutcome::BetterMarketFound => {
-                info!("🔀 US market rotation — hotter market found, switching");
+                info!("🔀 US {} wing rotation — hotter market found, switching", wing.label());
                 // No pause: the new market is already live and liquid.
             }
             MarketOutcome::Closed => {
-                info!("🔁 US market closed — rotating to next market");
+                info!("🔁 US {} wing market closed — rotating to next market", wing.label());
                 // Brief pause so we don't hammer discovery the instant a market
                 // resolves (its replacement may not be listed yet).
-                if wait_or_cancel(&cancel, DISCOVERY_RETRY_SECS).await {
+                if wait_or_cancel(cancel, DISCOVERY_RETRY_SECS).await {
                     return;
                 }
             }
@@ -202,6 +449,7 @@ async fn select_market(
     filter: &Option<String>,
     cancel: &CancellationToken,
     process_heartbeat_secs: &AtomicU64,
+    wing: Wing,
 ) -> Option<super::markets::UsMarketPair> {
     loop {
         if cancel.is_cancelled() {
@@ -226,12 +474,30 @@ async fn select_market(
                 // entering — no point committing capital we can't work first.
                 let now = Utc::now();
                 let total_pairs = markets.len();
-                let tradeable: Vec<_> = markets.into_iter()
+                let mut tradeable: Vec<_> = markets.into_iter()
                     .filter(|m| match m.close_time {
                         Some(c) => (c - now).num_seconds() > MIN_TIME_TO_CLOSE_SECS,
                         None => true, // always-open market
                     })
                     .collect();
+
+                // Partition by market domain so each wing hunts its own class:
+                // the crypto wing takes crypto-class markets, the general wing
+                // takes everything else (avoids both wings trading one market).
+                let before_class = tradeable.len();
+                let mut classed = Vec::with_capacity(tradeable.len());
+                for m in tradeable.drain(..) {
+                    if pair_is_crypto(&m).await == (wing == Wing::Crypto) {
+                        classed.push(m);
+                    }
+                }
+                let tradeable = classed;
+                if tradeable.is_empty() && before_class > 0 {
+                    info!(
+                        "US {} wing: {before_class} tradeable pair(s), none in this wing's domain — retrying",
+                        wing.label()
+                    );
+                }
 
                 if tradeable.is_empty() {
                     warn!(
@@ -279,13 +545,43 @@ async fn trade_one_market(
     process_heartbeat_secs: &AtomicU64,
     sports_rx: &watch::Receiver<SportsSnapshot>,
     cancel: &CancellationToken,
+    wing: Wing,
     pair: super::markets::UsMarketPair,
 ) -> MarketOutcome {
+    let asset = wing.asset();
+
+    // ── Crypto wing: Raptor intelligence + strike price ──────────────────────
+    // Spawn (or reuse) the live Raptor stack for the market's underlying and
+    // parse the strike from the question (fallback: historical price lookup at
+    // the timestamp in the description — same chain intl uses). These feed the
+    // oracle/velocity/funding/derivatives snapshot fields the intelligence-
+    // driven vipers (Momentum, GBoost, Basis, FairValue, …) gate on.
+    let (raptors, strike_price) = if wing == Wing::Crypto {
+        let underlying = detect_underlying(&pair).unwrap_or("btc");
+        let stack = raptor_stack_for(underlying, raptor_health_tx);
+        let mut strike = extract_strike_price(&pair.question);
+        if strike.is_none() {
+            let http = reqwest::Client::new();
+            let sym = underlying.to_uppercase();
+            strike = fetch_historical_strike_price(&http, &sym, &pair.description).await;
+            if strike.is_none() {
+                strike = fetch_historical_strike_price(&http, &sym, &pair.question).await;
+            }
+        }
+        info!(
+            "🧠 US crypto wing: underlying={underlying} strike={strike:?} for \"{}\"",
+            pair.question
+        );
+        (Some(stack), strike)
+    } else {
+        (None, None)
+    };
+
     // ── Register a squadron with the CAG so the Control Tower lists it ────────
     // The US venue runs a standalone arb loop (no intl-style patrol), but the
     // dashboard reads squadrons from the CAG registry — so without this the UI
     // shows zero squadrons even though the venue is live.
-    let squadron = register_us_squadron(cag, &pair, sports_rx.clone());
+    let squadron = register_us_squadron(cag, &pair, sports_rx.clone(), wing, raptors.as_ref(), strike_price);
     let squadron_id = squadron.id.clone();
 
     // Seed the squadron's Viper config so the detail view's strategy cards render.
@@ -322,7 +618,7 @@ async fn trade_one_market(
         no_token: pair.short.clone(),
         market_name: pair.question.clone(),
         market_close_time: pair.close_time,
-        strike_price: None,
+        strike_price,
         is_neg_risk: false,
         condition_id: String::new(),
         yes_fee_bps: 0,
@@ -340,7 +636,7 @@ async fn trade_one_market(
 
     // Publish Raptor telemetry + active market so the squadron detail panels
     // populate (both feed `/api/status`).
-    publish_us_raptor_health(raptor_health_tx, true);
+    publish_us_raptor_health(raptor_health_tx, asset, true);
     publish_us_strategy_market(markets_tx, &viper_kinds, &pair.question);
 
     // ── Stream both legs' order books (tied to the per-market cancel token) ───
@@ -353,7 +649,7 @@ async fn trade_one_market(
     ws::spawn_market_feed(ws_url, pair.short.as_str().to_string(), ws_auth, short_tx, cancel.clone());
 
     // ── Dashboard + strategy-context state ───────────────────────────────────
-    let pool = db::pool_for(US_ASSET);
+    let pool = db::pool_for(asset);
     let starting = venue.collateral().await.unwrap_or(Decimal::ZERO);
     let mut available_collateral = starting;
     let mut session_pnl = Decimal::ZERO;
@@ -383,7 +679,7 @@ async fn trade_one_market(
                 info!("US trader: cancelled — standing down");
                 lifecycle.cancel_all(venue.as_ref()).await;
                 cag.update_state(&squadron_id, SquadronState::StoodDown);
-                publish_us_raptor_health(raptor_health_tx, false);
+                publish_us_raptor_health(raptor_health_tx, asset, false);
                 return MarketOutcome::Cancelled;
             }
             _ = dash_tick.tick() => {
@@ -415,7 +711,7 @@ async fn trade_one_market(
                                 );
                                 lifecycle.cancel_all(venue.as_ref()).await;
                                 cag.update_state(&squadron_id, SquadronState::StoodDown);
-                                publish_us_raptor_health(raptor_health_tx, false);
+                                publish_us_raptor_health(raptor_health_tx, asset, false);
                                 return MarketOutcome::BetterMarketFound;
                             }
                         }
@@ -444,7 +740,7 @@ async fn trade_one_market(
                     let shares     = leg.shares;
                     tokio::spawn(async move {
                         metrics::record_trade(
-                            US_ASSET,
+                            asset,
                             strat,
                             market,
                             "Sell".to_string(),
@@ -470,7 +766,7 @@ async fn trade_one_market(
                 info!("🏁 US market \"{}\" reached close — standing down to rotate", market_cfg.market_name);
                 lifecycle.cancel_all(venue.as_ref()).await;
                 cag.update_state(&squadron_id, SquadronState::StoodDown);
-                publish_us_raptor_health(raptor_health_tx, false);
+                publish_us_raptor_health(raptor_health_tx, asset, false);
                 return MarketOutcome::Closed;
             }
             MarketPhase::WindingDown => {
@@ -491,10 +787,12 @@ async fn trade_one_market(
             continue;
         }
 
-        // Build a venue-neutral snapshot from both legs' live books. The US feed
-        // has no oracle/velocity/funding inputs, so those fields are zero — the
-        // order-book-only vipers (arbitrage/maker) don't read them.
-        let snapshot = build_snapshot(&long_rx, &short_rx);
+        // Build a venue-neutral snapshot from both legs' live books. The crypto
+        // wing enriches it with live Raptor intelligence (oracle, velocity,
+        // funding, derivatives, macro) so the full viper suite can gate; the
+        // general wing's raptor fields stay zero — its order-book vipers
+        // (arbitrage/maker) don't read them.
+        let snapshot = build_snapshot(&long_rx, &short_rx, raptors.as_ref(), &market_cfg);
 
         let ctx = StrategyContext {
             market: market_cfg.clone(),
@@ -502,7 +800,7 @@ async fn trade_one_market(
             positions: positions.clone(),
             session_pnl,
             starting_collateral: starting,
-            crypto_filter: US_ASSET.to_uppercase(),
+            crypto_filter: asset.to_uppercase(),
             market_started_at,
             // The US venue has no hourly/daily split — the single discovered
             // market IS the venue. Arbitrage (venue = "Window/Daily") refuses
@@ -573,21 +871,27 @@ fn strategy_name_to_kind(name: &str) -> &'static str {
         "TimeDecayStrategy"    => "time_decay",
         "BasisStrategy"        => "basis",
         "GboostStrategy"       => "gboost",
+        "ConvergenceStrategy"  => "convergence",
+        "FairValueStrategy"    => "fairvalue",
         "TrendReversalStrategy" => "trendcapture",
         "TrendCaptureStrategy" => "trendcapture", // legacy alias (pre-rename positions)
         _ => "",
     }
 }
 
-/// Build a venue-neutral [`MarketSnapshot`] from the two US leg feeds.
+/// Build a venue-neutral [`MarketSnapshot`] from the two US leg feeds, enriched
+/// with live Raptor intelligence when the wing has a stack attached.
 /// `PriceState` layout: `(best_bid, bid_depth, best_ask, ask_depth, ts)`.
 fn build_snapshot(
     long_rx: &watch::Receiver<PriceState>,
     short_rx: &watch::Receiver<PriceState>,
+    raptors: Option<&CryptoRaptors>,
+    market: &MarketConfig,
 ) -> MarketSnapshot {
     let (yb, ybd, ya, yad) = { let b = long_rx.borrow();  (b.0, b.1, b.2, b.3) };
     let (nb, nbd, na, nad) = { let b = short_rx.borrow(); (b.0, b.1, b.2, b.3) };
-    MarketSnapshot {
+    let now = Utc::now();
+    let mut snap = MarketSnapshot {
         yes_bid: yb, yes_bid_depth: ybd, yes_ask: ya, yes_ask_depth: yad,
         no_bid:  nb, no_bid_depth:  nbd, no_ask:  na, no_ask_depth:  nad,
         oracle_price: dec!(0), velocity: dec!(0), velocity_1s: dec!(0), acceleration: dec!(0),
@@ -597,8 +901,41 @@ fn build_snapshot(
         tradfi_velocity: dec!(0), macro_coherence: dec!(0),
         vix_proxy: dec!(0), vix_velocity: dec!(0),
         oi_delta_pct: dec!(0), cvd_ratio: dec!(0),
-        secs_to_expiry: 0, timestamp: Utc::now(),
+        secs_to_expiry: market
+            .market_close_time
+            .map(|c| (c - now).num_seconds().max(0))
+            .unwrap_or(0),
+        timestamp: now,
+    };
+    // Same channel → field mapping the intl patrol uses (patrol_impl.rs).
+    if let Some(r) = raptors {
+        snap.oracle_price = *r.oracle.borrow();
+        let (vel, vel_1s, accel) = *r.velocity.borrow();
+        snap.velocity = vel;
+        snap.velocity_1s = vel_1s;
+        snap.acceleration = accel;
+        let (drift_60m, drift_10m, hist_vol) = *r.drift.borrow();
+        snap.oracle_drift_60m = drift_60m;
+        snap.oracle_drift_10m = drift_10m;
+        snap.hist_vol = hist_vol;
+        snap.funding_rate = *r.funding.borrow();
+        let deriv = r.derivatives.borrow().clone();
+        snap.oi_delta_pct = deriv.oi_delta_pct;
+        snap.cvd_ratio = deriv.cvd_ratio;
+        if let Some(tide) = &r.tide {
+            let t = tide.borrow().clone();
+            snap.institutional_pulse = t.institutional_pulse;
+            snap.tide_coherence = t.coherence;
+        }
+        if let Some(horizon) = &r.horizon {
+            let h = horizon.borrow().clone();
+            snap.tradfi_velocity = h.tradfi_velocity;
+            snap.macro_coherence = h.macro_coherence;
+            snap.vix_proxy = h.vix_proxy;
+            snap.vix_velocity = h.vix_velocity;
+        }
     }
+    snap
 }
 
 /// Map a viper's venue-neutral [`OrderParams`] to a venue [`OrderIntent`],
@@ -828,44 +1165,69 @@ async fn wait_or_cancel(cancel: &CancellationToken, secs: u64) -> bool {
 }
 
 
-/// Assemble and register a single arb-wing squadron for the selected US market
-/// so it appears in the Control Tower's CAG squadron list.
+/// Assemble and register a single squadron for the selected US market so it
+/// appears in the Control Tower's CAG squadron list.
 ///
-/// The US venue doesn't use the intl patrol/Raptor pipeline, so the signal
-/// receivers are placeholder watch channels — they exist only to satisfy the
-/// `SquadronRaptors` shape and are never read by the US arb loop. Returns the
-/// registered [`Squadron`] so the caller can classify it and drive its
-/// lifecycle state (`Patrolling` / `StoodDown`).
+/// The general wing gets placeholder signal channels (its arb loop reads prices
+/// from the WS feed, not from Raptors); the crypto wing attaches the live
+/// Raptor stack so the squadron detail view and downstream consumers see the
+/// real intelligence feeds.
 fn register_us_squadron(
     cag: &Cag,
     pair: &super::markets::UsMarketPair,
     sports_rx: watch::Receiver<SportsSnapshot>,
+    wing: Wing,
+    crypto_raptors: Option<&CryptoRaptors>,
+    strike_price: Option<Decimal>,
 ) -> Squadron {
-    // Placeholder signal channels (US arb loop reads prices from the WS feed,
-    // not from Raptors). Receivers stay valid after the senders drop.
-    let (_, oracle_rx) = watch::channel(Decimal::ZERO);
-    let (_, velocity_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
-    let (_, drift_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
-    // The venue-neutral Sports Raptor IS a real feed on the US build — attach it
-    // so its observe-only line-movement signal is available to US squadrons.
-    let mut raptors = SquadronRaptors::price_only(oracle_rx, velocity_rx, drift_rx);
-    raptors.sports = Some(sports_rx);
+    let raptors = match crypto_raptors {
+        Some(r) => SquadronRaptors::full(
+            r.oracle.clone(),
+            r.velocity.clone(),
+            r.drift.clone(),
+            r.funding.clone(),
+            r.derivatives.clone(),
+            r.tide.clone(),
+            r.horizon.clone(),
+            Some(sports_rx),
+        ),
+        None => {
+            // Placeholder signal channels (the general wing reads prices from
+            // the WS feed). Receivers stay valid after the senders drop.
+            let (_, oracle_rx) = watch::channel(Decimal::ZERO);
+            let (_, velocity_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
+            let (_, drift_rx) = watch::channel((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
+            // The venue-neutral Sports Raptor IS a real feed on the US build —
+            // attach it so its observe-only line-movement signal is available.
+            let mut r = SquadronRaptors::price_only(oracle_rx, velocity_rx, drift_rx);
+            r.sports = Some(sports_rx);
+            r
+        }
+    };
 
     let market = MarketConfig {
         yes_token: pair.long.clone(),
         no_token: pair.short.clone(),
         market_name: pair.question.clone(),
+        // Deliberately None: the squadron id derives from `{asset}-{cadence}`
+        // and is the persistence key for operator config — a real close_time
+        // would flip "us-open" → "us-hourly" per market and orphan saved
+        // config. The trading loop's own market_cfg carries the real close.
         market_close_time: None,
-        strike_price: None,
+        strike_price,
         is_neg_risk: false,
         condition_id: String::new(),
         yes_fee_bps: 0,
         no_fee_bps: 0,
     };
 
+    let name = match wing {
+        Wing::General => "US Retail Arb",
+        Wing::Crypto => "US Crypto Squadron",
+    };
     let squadron = Squadron::new(
-        CryptoAsset::Custom(US_ASSET.to_uppercase()),
-        SquadronConfig::arb_wing("US Retail Arb"),
+        CryptoAsset::Custom(wing.asset().to_uppercase()),
+        SquadronConfig::arb_wing(name),
         market,
         raptors,
     );
@@ -901,15 +1263,18 @@ async fn seed_squadron_config(squadron_id: &str) {
 
 /// Publish the US venue's Raptor telemetry into the `/api/status` health map.
 ///
-/// Keyed by the `us` asset slug so the squadron detail panel finds it. The US
-/// order-book WS feed is the price source; there is no separate funding raptor,
-/// so both flags track the same `connected` state.
+/// Keyed by the wing's asset slug so the squadron detail panel finds it. The US
+/// order-book WS feed is the price source for both wings (the crypto wing's
+/// real raptors additionally publish under their own underlying key, e.g.
+/// "btc"); there is no separate funding raptor for the general wing, so both
+/// flags track the same `connected` state.
 fn publish_us_raptor_health(
     tx: &watch::Sender<HashMap<String, AssetRaptorHealth>>,
+    asset: &str,
     connected: bool,
 ) {
     tx.send_modify(|map| {
-        let h = map.entry(US_ASSET.to_string()).or_default();
+        let h = map.entry(asset.to_string()).or_default();
         h.price_connected = connected;
         h.funding_connected = connected;
     });

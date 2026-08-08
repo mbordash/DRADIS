@@ -596,12 +596,10 @@ function ClassNav({
 }
 
 export default function TelemetryPage({ availableAssets, venue }: { availableAssets: string[]; venue?: 'intl' | 'us' }) {
-  // The US retail venue has no crypto markets — hide the Crypto tab and land on Sports.
+  // US builds run a crypto wing (Polymarket US lists crypto markets), so the
+  // Crypto tab stays visible — but Sports remains the default landing tab.
   const isUs = venue === 'us';
-  const classes = useMemo(
-    () => (isUs ? TELEMETRY_CLASSES.filter(c => c.id !== 'crypto') : TELEMETRY_CLASSES),
-    [isUs],
-  );
+  const classes = TELEMETRY_CLASSES;
   const assets = availableAssets.length ? availableAssets : ['btc'];
   const [selectedAsset, setSelectedAsset] = useState<string>('');
   const asset = selectedAsset || assets[0];
@@ -610,9 +608,15 @@ export default function TelemetryPage({ availableAssets, venue }: { availableAss
   const [live, setLive] = useState(true);
   const [range, setRange] = useState<{ startIndex: number; endIndex: number } | null>(null);
   const [assetClass, setAssetClass] = useState<TelemetryClass>(isUs ? 'sports' : 'crypto');
-  // setupStatus loads async — if the venue resolves to US after mount, leave a
-  // crypto default (now hidden) behind.
-  useEffect(() => { if (isUs && assetClass === 'crypto') setAssetClass('sports'); }, [isUs, assetClass]);
+  // setupStatus loads async — if the venue resolves to US after mount, move the
+  // initial crypto default over to the US landing tab (Sports) once.
+  const [usDefaultApplied, setUsDefaultApplied] = useState(false);
+  useEffect(() => {
+    if (isUs && !usDefaultApplied) {
+      setUsDefaultApplied(true);
+      if (assetClass === 'crypto') setAssetClass('sports');
+    }
+  }, [isUs, usDefaultApplied, assetClass]);
 
   const limit = windowMins * SAMPLES_PER_MIN;
 
