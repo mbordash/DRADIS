@@ -434,7 +434,7 @@ export function fieldUnit(type: FieldType): string {
 export type MarketType = 'crypto' | 'sports' | 'politics';
 
 /** Deployment region determines available market types. */
-export type DeploymentRegion = 'us' | 'intl';
+export type DeploymentRegion = 'us' | 'intl' | 'kalshi';
 
 /** Response from GET /api/deployment/region. */
 export interface DeploymentRegionInfo {

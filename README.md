@@ -52,12 +52,12 @@ cp src/config.balanced.rs.example src/config.rs   # or conservative/aggressive
 ```
 
 ```bash
-# 2. Start intl OR US locally (builds Rust engine + Control Tower)
+# 2. Select the appropriate venue (builds Rust engine + Control Tower)
 
-# Start INTL clob default
+# Start Polymarket INTL clob default
 ./start-local.sh                  # Intl CLOB, BTC (default)
 
-# Or start US API
+# Or start Polymarket US API
 VENUE=us ./start-local.sh        # US Retail venue (us_retail build)
 
 # Or start Kalshi (demo-friendly — see Kalshi configuration below)
@@ -82,7 +82,7 @@ After ~5 minutes the stack is live:
 
 ---
 
-##  Choosing a venue (Intl CLOB vs US Retail vs Kalshi)
+##  Choosing a venue 
 
 DRADIS compiles for **exactly one** execution venue, chosen at build time via a Cargo
 feature. All venues share the same strategy/abstraction layers through the venue-neutral
@@ -99,11 +99,11 @@ dependencies are stripped from the binary.
 ### Start locally
 
 ```bash
-# Intl CLOB (default)
+# Polymarket Intl CLOB (default)
 ./start-local.sh                  # BTC
 ./start-local.sh eth              # ETH
 
-# US Retail
+# Polymarket US Retail
 VENUE=us ./start-local.sh
 
 # Kalshi
@@ -478,11 +478,11 @@ The **+ Deploy** button in the CAG Registry panel opens the Squadron Builder mod
 
 **Regional restrictions:**
 
-| Deployment | Available Market Types |
-|------------|------------------------|
-| US (`us_retail`) | Politics, Sports |
-| Kalshi (`kalshi`) | Crypto |
-| INTL (`intl_clob`) | Politics, Sports, Crypto |
+| Deployment | Squadron Builder Market Types | Notes |
+|------------|-------------------------------|-------|
+| US (`us_retail`) | Politics, Sports | Crypto runs as an auto-managed wing (`us-crypto` squadron) — deployed by the trader loop, not the builder |
+| Kalshi (`kalshi`) | Crypto | Kalshi lists sports/politics too, but DRADIS's Kalshi loop is crypto-first (15-min/hourly ladders) |
+| INTL (`intl_clob`) | Politics, Sports, Crypto | |
 
 **Deployment flow:**
 ```
@@ -608,12 +608,22 @@ LLM_OUTCOME_HORIZON_SECS=7200    # when applied changes get outcome-scored
 ## Setup
 
 ### Requirements
+
+**All builds:**
 - Rust 1.95+ (or Docker)
-- A Polygon wallet with USDC and MATIC
-- **A paid Polygon RPC endpoint** (required for auto-settlement)
 - Telegram bot token (optional)
 - Alpaca API key/secret (optional — free tier; powers both **Tide** and **Horizon** Raptors from one connection. Without it both cards stay idle.)
 - The Odds API key (optional — free tier; only needed for the **Sports Raptor**'s line-movement feed. Without it the Sports Raptor pill stays idle.)
+
+**International build (`intl_clob`) only:**
+- A Polygon wallet with USDC and MATIC
+- **A paid Polygon RPC endpoint** (required for auto-settlement)
+
+**US Retail build (`us_retail`) only:**
+- Polymarket US developer-portal API key (Key ID + Ed25519 Secret Key) — no wallet or RPC needed
+
+**Kalshi build (`kalshi`) only:**
+- Kalshi API key (Key ID + RSA private key PEM) — no wallet or RPC needed; start with [demo.kalshi.co](https://demo.kalshi.co) paper trading
 
 ### Tide + Horizon Raptors (Alpaca IEX) — optional
 

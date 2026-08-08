@@ -1761,15 +1761,19 @@ struct DeploymentRegionResponse {
 /// GET /api/deployment/region
 ///
 /// Returns the deployment region and available market types based on feature flags.
-/// US deployment (default): politics, sports only
+/// US deployment: politics, sports only (crypto wing is auto-managed)
+/// Kalshi deployment: crypto only
 /// INTL deployment (intl_clob feature): politics, sports, crypto
 async fn get_deployment_region() -> Response {
     debug!("Received GET /api/deployment/region");
     
     #[cfg(feature = "intl_clob")]
     let (region, types) = ("intl", vec!["politics", "sports", "crypto"]);
-    
-    #[cfg(not(feature = "intl_clob"))]
+
+    #[cfg(all(not(feature = "intl_clob"), feature = "kalshi"))]
+    let (region, types) = ("kalshi", vec!["crypto"]);
+
+    #[cfg(all(not(feature = "intl_clob"), not(feature = "kalshi")))]
     let (region, types) = ("us", vec!["politics", "sports"]);
     
     Json(DeploymentRegionResponse {
@@ -2395,8 +2399,18 @@ async fn deploy_squadron(
 ) -> Response {
     info!("📥 POST /api/squadrons/deploy: mode={}, type={}", req.mode, req.market_type);
     
-    // Validate market type against deployment region
-    #[cfg(not(feature = "intl_clob"))]
+    // Validate market type against deployment region.
+    // Kalshi is crypto-only; US is politics/sports (its crypto wing is
+    // auto-managed by the trader loop, not deployable from the builder).
+    #[cfg(all(not(feature = "intl_clob"), feature = "kalshi"))]
+    if req.market_type != "crypto" {
+        return Json(DeploySquadronResponse {
+            success: false,
+            squadron_id: None,
+            error: Some("Only crypto markets are available in the Kalshi deployment".to_string()),
+        }).into_response();
+    }
+    #[cfg(all(not(feature = "intl_clob"), not(feature = "kalshi")))]
     if req.market_type == "crypto" {
         return Json(DeploySquadronResponse {
             success: false,
