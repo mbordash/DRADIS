@@ -239,6 +239,37 @@ impl UsRetailVenue {
         }
 
         let raw_total = all_markets.len();
+
+        // Category census — one line showing the gateway's actual taxonomy, so
+        // a category filter that the server ignores (or names differently) is
+        // immediately visible in the logs instead of silently returning the
+        // wrong domain.
+        {
+            let mut census: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+            for m in &all_markets {
+                let key = if m.category.is_empty() { "(empty)" } else { m.category.as_str() };
+                *census.entry(key).or_default() += 1;
+            }
+            let mut counts: Vec<_> = census.into_iter().collect();
+            counts.sort_by(|a, b| b.1.cmp(&a.1));
+            let summary: Vec<String> = counts.iter().take(12)
+                .map(|(c, n)| format!("{c}={n}"))
+                .collect();
+            info!("US market discovery: categories seen: {}", summary.join(", "));
+            if !categories.is_empty() {
+                let requested: Vec<String> = categories.iter().map(|c| c.to_lowercase()).collect();
+                let foreign = all_markets.iter()
+                    .filter(|m| !requested.contains(&m.category.to_lowercase()))
+                    .count();
+                if foreign > 0 {
+                    tracing::warn!(
+                        "US market discovery: requested categories {categories:?} but {foreign}/{raw_total} \
+                         markets came back with other categories — gateway may ignore the filter"
+                    );
+                }
+            }
+        }
+
         let pairs = markets::pair_markets(all_markets);
         info!(
             "US market discovery: {raw_total} raw markets across {page} page(s) → {} tradeable pairs",
