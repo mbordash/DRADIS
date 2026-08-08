@@ -43,16 +43,24 @@ The system is organized around four BSG-inspired tactical layers:
 # 1. Clone and configure
 git clone https://github.com/youruser/dradis.git && cd dradis
 cp .env.example .env          # fill in POLYMARKET_PRIVATE_KEY, POLYGON_RPC_URL, TELEGRAM tokens, etc.
+
+# If deploying remotely:
 cp deploy-multi.sh.example deploy-multi.sh  # fill in HOST, USER, KEY
+
 # choose one config profile and copy it into src/config.rs before building
 cp src/config.balanced.rs.example src/config.rs   # or conservative/aggressive
 ```
 
 ```bash
-# 2. Start locally (builds Rust engine + Control Tower)
+# 2. Start intl OR US locally (builds Rust engine + Control Tower)
+
+# Start INTL clob default
 ./start-local.sh                  # Intl CLOB, BTC (default)
-./start-local.sh eth              # Intl CLOB, ETH
+
+# Or start US API
 VENUE=us ./start-local.sh        # US Retail venue (us_retail build)
+
+# optionally start with verbose logging
 RUST_LOG=debug ./start-local.sh  # verbose logging
 
 tail -f logs/dradis-local.log
