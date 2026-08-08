@@ -26,7 +26,7 @@
 //! Option C convergence.)
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering as AtomicOrdering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -117,6 +117,33 @@ pub async fn run_us_trader(
     let filter = std::env::var(ENV_MARKET_FILTER).ok().filter(|s| !s.is_empty());
     info!("🇺🇸 US trader starting — market filter={filter:?}");
 
+    // ── Idle-time snapshot heartbeat ─────────────────────────────────────────
+    // Market discovery can spin for hours off-hours (5-min retries), during
+    // which trade_one_market — and its 30 s sync_dashboard — never runs. The
+    // dashboard then serves the stale last-session snapshot (2026-08-08: a
+    // June baseline showed "$120.00 ▲ $0.00" while the balance card sat empty).
+    // This task writes a fresh snapshot every 60 s whenever the trade loop is
+    // NOT active; the trade loop's own 30 s sync takes over when it is.
+    let trading_active = Arc::new(AtomicBool::new(false));
+    if let Some(snap_pool) = db::pool_for(US_ASSET) {
+        let venue_bg = Arc::clone(&venue);
+        let active_bg = Arc::clone(&trading_active);
+        let cancel_bg = cancel.clone();
+        tokio::spawn(async move {
+            let starting = venue_bg.collateral().await.unwrap_or(Decimal::ZERO);
+            let mut tick = tokio::time::interval(Duration::from_secs(60));
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = cancel_bg.cancelled() => return,
+                    _ = tick.tick() => {}
+                }
+                if active_bg.load(AtomicOrdering::Relaxed) { continue; }
+                sync_dashboard(venue_bg.as_ref(), &snap_pool, starting).await;
+            }
+        });
+    }
+
     loop {
         if cancel.is_cancelled() {
             return;
@@ -133,6 +160,7 @@ pub async fn run_us_trader(
         // completes automatically if the global `cancel` fires.
         let market_cancel = cancel.child_token();
 
+        trading_active.store(true, AtomicOrdering::Relaxed);
         let outcome = trade_one_market(
             &venue,
             &cag,
@@ -143,6 +171,7 @@ pub async fn run_us_trader(
             &market_cancel,
             pair,
         ).await;
+        trading_active.store(false, AtomicOrdering::Relaxed);
 
         // Tear down this market's feeds before re-discovering.
         market_cancel.cancel();

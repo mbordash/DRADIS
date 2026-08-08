@@ -569,7 +569,7 @@ export default function DashboardPage() {
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <ErrorBoundary label="Telemetry">
-            <TelemetryPage availableAssets={availableAssets} />
+            <TelemetryPage availableAssets={availableAssets} venue={setupStatus?.venue} />
           </ErrorBoundary>
           <Footer />
         </main>

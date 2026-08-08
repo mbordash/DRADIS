@@ -560,14 +560,15 @@ const TELEMETRY_CLASSES: { id: TelemetryClass; label: string; icon: string; read
 ];
 
 function ClassNav({
-  active, onChange,
+  active, onChange, classes,
 }: {
   active: TelemetryClass;
   onChange: (c: TelemetryClass) => void;
+  classes: typeof TELEMETRY_CLASSES;
 }) {
   return (
     <div className="flex items-center gap-1.5">
-      {TELEMETRY_CLASSES.map(c => {
+      {classes.map(c => {
         const isActive = c.id === active;
         return (
           <button
@@ -594,7 +595,13 @@ function ClassNav({
   );
 }
 
-export default function TelemetryPage({ availableAssets }: { availableAssets: string[] }) {
+export default function TelemetryPage({ availableAssets, venue }: { availableAssets: string[]; venue?: 'intl' | 'us' }) {
+  // The US retail venue has no crypto markets — hide the Crypto tab and land on Sports.
+  const isUs = venue === 'us';
+  const classes = useMemo(
+    () => (isUs ? TELEMETRY_CLASSES.filter(c => c.id !== 'crypto') : TELEMETRY_CLASSES),
+    [isUs],
+  );
   const assets = availableAssets.length ? availableAssets : ['btc'];
   const [selectedAsset, setSelectedAsset] = useState<string>('');
   const asset = selectedAsset || assets[0];
@@ -602,7 +609,10 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
   const [windowMins, setWindowMins] = useState(15);
   const [live, setLive] = useState(true);
   const [range, setRange] = useState<{ startIndex: number; endIndex: number } | null>(null);
-  const [assetClass, setAssetClass] = useState<TelemetryClass>('crypto');
+  const [assetClass, setAssetClass] = useState<TelemetryClass>(isUs ? 'sports' : 'crypto');
+  // setupStatus loads async — if the venue resolves to US after mount, leave a
+  // crypto default (now hidden) behind.
+  useEffect(() => { if (isUs && assetClass === 'crypto') setAssetClass('sports'); }, [isUs, assetClass]);
 
   const limit = windowMins * SAMPLES_PER_MIN;
 
@@ -658,7 +668,7 @@ export default function TelemetryPage({ availableAssets }: { availableAssets: st
       {/* Asset-class sub-navigation */}
       <div className="flex items-center gap-3 flex-wrap">
         <p className="label-muted text-xs">📡 Telemetry</p>
-        <ClassNav active={assetClass} onChange={setAssetClass} />
+        <ClassNav active={assetClass} onChange={setAssetClass} classes={classes} />
       </div>
 
       {assetClass === 'crypto' && (
