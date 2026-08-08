@@ -60,6 +60,9 @@ cp src/config.balanced.rs.example src/config.rs   # or conservative/aggressive
 # Or start US API
 VENUE=us ./start-local.sh        # US Retail venue (us_retail build)
 
+# Or start Kalshi (demo-friendly — see Kalshi configuration below)
+VENUE=kalshi ./start-local.sh    # Kalshi venue (kalshi build)
+
 # optionally start with verbose logging
 RUST_LOG=debug ./start-local.sh  # verbose logging
 
@@ -79,18 +82,19 @@ After ~5 minutes the stack is live:
 
 ---
 
-##  Choosing a venue (Intl CLOB vs US Retail)
+##  Choosing a venue (Intl CLOB vs US Retail vs Kalshi)
 
 DRADIS compiles for **exactly one** execution venue, chosen at build time via a Cargo
-feature. Both share the same strategy/abstraction layers through the venue-neutral
+feature. All venues share the same strategy/abstraction layers through the venue-neutral
 `Execution` trait (`src/venues/core.rs`) and the shared `OrderLifecycle` reconciler
-(`src/venues/lifecycle.rs`); only the venue module differs, so the unused venue's
+(`src/venues/lifecycle.rs`); only the venue module differs, so the unused venues'
 dependencies are stripped from the binary.
 
 | Feature              | Venue                              | Auth                                   | Gateway                              |
 |----------------------|------------------------------------|----------------------------------------|--------------------------------------|
 | `intl_clob` *(default)* | Polymarket International (self-custody) | EOA wallet + EIP-712 over Polygon      | `clob.polymarket.com`                |
 | `us_retail`          | Polymarket US (custodial, CFTC)    | Ed25519 challenge-response → JWT        | `api.prod.polymarketexchange.com`    |
+| `kalshi`             | Kalshi (custodial, CFTC)           | RSA-PSS request signing                 | `external-api.kalshi.com` (demo: `external-api.demo.kalshi.co`) |
 
 ### Start locally
 
@@ -101,6 +105,9 @@ dependencies are stripped from the binary.
 
 # US Retail
 VENUE=us ./start-local.sh
+
+# Kalshi
+VENUE=kalshi ./start-local.sh
 ```
 
 ### Build manually
@@ -113,6 +120,10 @@ cargo test
 # US Retail
 cargo build  --release --no-default-features --features us_retail
 cargo test            --no-default-features --features us_retail
+
+# Kalshi
+cargo build  --release --no-default-features --features kalshi
+cargo test            --no-default-features --features kalshi
 ```
 
 ### US Retail configuration (`.env`)
@@ -132,8 +143,37 @@ ASSETS=us                          # keep the dashboard pool tidy (US data lives
 > **arbitrage** strategy — discover a binary market → stream both legs over WebSocket →
 > buy `YES`+`NO` for < $1 via an **engine-atomic** batched order (`/v1/orders/batched`) →
 > reconcile via `OrderLifecycle`. Open positions and portfolio P&L appear in the Control Tower under the **`us`**
-> asset selector. The Control Tower API stays live on `:9000` regardless. Crypto-hourly
-> strategies (Momentum/Maker/GBoost) remain intl-only for now.
+> asset selector. The Control Tower API stays live on `:9000` regardless. A second
+> **crypto wing** (`us-crypto` asset) hunts crypto-class markets with the full Raptor
+> stack, so all nine Vipers fly on them.
+
+### Kalshi configuration (`.env`)
+
+Kalshi signs every request locally with **RSA-PSS** — create an API key in your
+account settings (Key ID + downloadable RSA private key PEM, shown once).
+
+**Try it risk-free on the demo exchange** — [demo.kalshi.co](https://demo.kalshi.co)
+is a full paper-trading environment with play money and the same live crypto markets;
+demo credentials are separate from production.
+
+```bash
+KALSHI_API_KEY_ID=<key-id-uuid>          # from account settings (REQUIRED)
+KALSHI_PRIVATE_KEY_PATH=data/kalshi-key.pem  # downloaded PEM (REQUIRED; or KALSHI_PRIVATE_KEY=<pem contents>)
+KALSHI_DEMO=1                            # 1 = demo.kalshi.co paper trading, unset = production
+# optional:
+KALSHI_SERIES=KXBTC15M,KXBTCD,KXETH15M,KXETHD  # crypto series to hunt (default shown)
+KALSHI_MARKET_FILTER=bitcoin             # optional ticker/title substring to pick a market
+ASSETS=kalshi                            # keep the dashboard pool tidy (data in logs/kalshi-dradis.db)
+```
+
+> **Kalshi status:** the loop (`src/venues/kalshi/trader.rs`) is **crypto-first** —
+> it discovers the hottest open market across the configured series (15-minute and
+> hourly BTC/ETH by default), classifies it via the shared taxonomy, and flies **all
+> nine Vipers** with the full Raptor intelligence stack. Order books stream over the
+> authenticated WebSocket (`orderbook_delta` with sequence-gap recovery) and fills
+> confirm event-precisely via the private `fill` channel. Kalshi's quadratic taker
+> fee (max 1.75¢/contract at P=0.50) is priced into Viper edge thresholds. Positions
+> and P&L appear under the **`kalshi`** asset selector.
 
 ---
 
@@ -441,6 +481,7 @@ The **+ Deploy** button in the CAG Registry panel opens the Squadron Builder mod
 | Deployment | Available Market Types |
 |------------|------------------------|
 | US (`us_retail`) | Politics, Sports |
+| Kalshi (`kalshi`) | Crypto |
 | INTL (`intl_clob`) | Politics, Sports, Crypto |
 
 **Deployment flow:**
@@ -652,6 +693,9 @@ cp src/config.balanced.rs.example src/config.rs
 # US Retail venue
 VENUE=us ./start-local.sh
 
+# Kalshi venue
+VENUE=kalshi ./start-local.sh
+
 tail -f logs/dradis-local.log
 ./stop-local.sh
 ```
@@ -731,9 +775,9 @@ The safe pattern: bump the suffix in `GBOOST_MODEL_PATH` (e.g. `v14f` → `v15f`
 
 **Can I enable a Viper mid-session?** Yes — all nine are always instantiated. Toggle via Control Tower or `PATCH /api/config`. Takes effect on the next 50ms tick.
 
-**Does DRADIS support the US Polymarket API?** Yes.  Polymarket's **US platform** is a separate, custodial, CFTC-regulated exchange with web2 auth (API key / secret / session token) and string/UUID market IDs. We have **venue abstraction** so a build can target either market via a Cargo feature flag (`intl_clob` default, `us_retail` available) — single-venue per binary, so the US deployment carries none of the Polygon crypto weight and stays inside its own regulatory/network footprint. Start a US build with `VENUE=us ./start-local.sh`.
+**Does DRADIS support the US Polymarket API?** Yes.  Polymarket's **US platform** is a separate, custodial, CFTC-regulated exchange with web2 auth (API key / secret / session token) and string/UUID market IDs. We have **venue abstraction** so a build targets one venue via a Cargo feature flag (`intl_clob` default, `us_retail`, `kalshi`) — single-venue per binary, so the US deployment carries none of the Polygon crypto weight and stays inside its own regulatory/network footprint. Start a US build with `VENUE=us ./start-local.sh`.
 
-**What about Kalshi?** Not yet implemented, but the venue abstraction layer (`Execution` trait + `OrderLifecycle`) is complete, so adding Kalshi is a matter of implementing one trait. We will review PRs from the community if offered.
+**What about Kalshi?** Fully supported. Build with `--features kalshi` (or `VENUE=kalshi ./start-local.sh`) — RSA-PSS signed REST + WebSocket, crypto-first trading loop over Kalshi's 15-minute and hourly BTC/ETH series, all nine Vipers with the full Raptor stack, and event-precise fill confirmation. Paper-trade it risk-free against [demo.kalshi.co](https://demo.kalshi.co) with `KALSHI_DEMO=1`. See "Kalshi configuration" above.
 
 **Control Tower shows "Offline"?** Check: (1) DRADIS running? (2) `curl http://localhost:9000/api/health`? (3) Docker — same `dradis-net` network?
 
