@@ -126,7 +126,7 @@ cargo build  --release --no-default-features --features kalshi
 cargo test            --no-default-features --features kalshi
 ```
 
-### US Retail configuration (`.env`)
+### Polymarket US Retail configuration (`.env`)
 
 ```bash
 POLYMARKET_US_KEY_ID=<key-id-uuid>      # developer-portal Key ID (X-PM-Access-Key)
@@ -139,7 +139,7 @@ POLYMARKET_US_MARKET_FILTER=chiefs # optional slug/question substring to pick a 
 ASSETS=us                          # keep the dashboard pool tidy (US data lives in logs/us-dradis.db)
 ```
 
-> **US Retail status:** the MVP loop (`src/venues/us/trader.rs`) runs the venue-agnostic
+> **Polymarket US Retail status:** the MVP loop (`src/venues/us/trader.rs`) runs the venue-agnostic
 > **arbitrage** strategy — discover a binary market → stream both legs over WebSocket →
 > buy `YES`+`NO` for < $1 via an **engine-atomic** batched order (`/v1/orders/batched`) →
 > reconcile via `OrderLifecycle`. Open positions and portfolio P&L appear in the Control Tower under the **`us`**
