@@ -172,7 +172,9 @@ function SquadronInfoCard({ squadron }: { squadron: SquadronSummary }) {
           <span className="text-gray-400">{new Date(squadron.deployed_at).toLocaleString()}</span>
         </div>
         <div className="flex flex-col gap-1 pt-2 border-t border-[#1e1e32]">
-          <span className="text-gray-500">Primary Market (Hourly)</span>
+          <span className="text-gray-500">
+            {squadron.asset.toLowerCase() === 'us' ? 'Active Market' : 'Primary Market (Hourly)'}
+          </span>
           <span className="text-gray-300 text-[11px] break-words">{squadron.market_name}</span>
         </div>
         {squadron.maker_market_name && (

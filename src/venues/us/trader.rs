@@ -498,14 +498,19 @@ async fn trade_one_market(
 
         let ctx = StrategyContext {
             market: market_cfg.clone(),
-            snapshot,
+            snapshot: snapshot.clone(),
             positions: positions.clone(),
             session_pnl,
             starting_collateral: starting,
             crypto_filter: US_ASSET.to_uppercase(),
             market_started_at,
-            maker_market: None,
-            maker_snapshot: None,
+            // The US venue has no hourly/daily split — the single discovered
+            // market IS the venue. Arbitrage (venue = "Window/Daily") refuses
+            // to run without a maker market (intl orphan-loss guard), so feed
+            // it the same market/snapshot rather than None, which left it
+            // permanently idle ("no daily/window venue available", 2026-08-08).
+            maker_market: Some(market_cfg.clone()),
+            maker_snapshot: Some(snapshot),
             available_collateral,
             dynamic_config: dyn_cfg.clone(),
             arb_market_lockouts: None,
