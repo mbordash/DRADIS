@@ -157,6 +157,7 @@ mod tests {
             id: String::new(),
             slug: slug.to_string(),
             question: format!("Q {slug}?"),
+            title: String::new(),
             status: status.to_string(),
             category: String::new(),
             start_date: String::new(),

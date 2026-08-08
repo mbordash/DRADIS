@@ -284,11 +284,15 @@ impl UsRetailVenue {
     /// Crypto market discovery via `GET /v1/search` (the gateway ignores the
     /// `categories=` filter on `/v1/markets`, see 2026-08-08 field logs).
     ///
-    /// Two-step: text-search for crypto events → fetch their full market
-    /// records via `/v1/markets?eventSlug=…` (repeated params, SDK-confirmed).
+    /// The search response embeds full market records (`marketSides` included),
+    /// so we pair directly from it — the api host also ignores the `eventSlug=`
+    /// filter on `/v1/markets`, so a second fetch would return random sports
+    /// markets (2026-08-08: 200 raw, "World Series Champion", zero crypto).
     pub async fn discover_crypto_markets_via_search(&self) -> Result<Vec<markets::UsMarketPair>> {
         const QUERIES: &[&str] = &["bitcoin", "ethereum", "solana", "xrp", "crypto"];
-        let mut event_slugs: Vec<String> = Vec::new();
+        let mut event_count = 0usize;
+        let mut all_markets: Vec<types::UsMarket> = Vec::new();
+        let mut seen_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
         for q in QUERIES {
             // /v1/search is public and lives on the gateway host (no auth —
@@ -318,60 +322,37 @@ impl UsRetailVenue {
             let hits = parsed.events.len();
             let mut added = 0usize;
             for ev in parsed.events {
-                if ev.closed || ev.slug.is_empty() {
+                if ev.closed {
                     continue;
                 }
-                if !event_slugs.contains(&ev.slug) {
-                    event_slugs.push(ev.slug);
+                for mut m in ev.markets {
+                    if m.slug.is_empty() || !seen_slugs.insert(m.slug.clone()) {
+                        continue;
+                    }
+                    // Templated events blank the variant into the question
+                    // ("Will Bitcoin be above ___ in 2026?") and put the real
+                    // value in `title` ("$200,000"). Merge them so display and
+                    // strike extraction see the full question.
+                    if !m.title.is_empty() {
+                        if m.question.contains("___") {
+                            m.question = m.question.replace("___", &m.title);
+                        } else if !m.question.contains(&m.title) {
+                            m.question = format!("{} — {}", m.question, m.title);
+                        }
+                    }
+                    all_markets.push(m);
                     added += 1;
                 }
+                event_count += 1;
             }
-            info!("US crypto search '{q}': {hits} events, {added} new active slugs");
-        }
-
-        if event_slugs.is_empty() {
-            info!("US crypto search: no active crypto events found on the gateway");
-            return Ok(Vec::new());
-        }
-
-        // Fetch full market records for the found events, in slug batches
-        // (URL-length safety). No volume floor — hourly crypto markets rotate
-        // and start near zero volume.
-        let mut all_markets: Vec<types::UsMarket> = Vec::new();
-        for chunk in event_slugs.chunks(20) {
-            let path = "/v1/markets";
-            let slug_params: String = chunk.iter()
-                .map(|s| format!("&eventSlug={s}"))
-                .collect();
-            let url = format!("{}{}?limit=200&closed=false{}", self.base_url, path, slug_params);
-            let signed = self.auth.signed_headers("GET", path);
-            let response = self.http
-                .get(&url)
-                .header(signed[0].0, &signed[0].1)
-                .header(signed[1].0, &signed[1].1)
-                .header(signed[2].0, &signed[2].1)
-                .header("Content-Type", "application/json")
-                .send()
-                .await
-                .context("markets-by-eventSlug HTTP request failed")?;
-            let http_status = response.status();
-            let text = response.text().await.context("markets-by-eventSlug response read failed")?;
-            if !http_status.is_success() {
-                tracing::warn!("US markets-by-eventSlug returned HTTP {http_status}: {}",
-                    text.chars().take(200).collect::<String>());
-                continue;
-            }
-            match serde_json::from_str::<types::MarketsResponse>(&text) {
-                Ok(parsed) => all_markets.extend(parsed.markets),
-                Err(e) => tracing::warn!("US markets-by-eventSlug JSON parse failed: {e}"),
-            }
+            info!("US crypto search '{q}': {hits} events, {added} new markets");
         }
 
         let raw_total = all_markets.len();
         let pairs = markets::pair_markets(all_markets);
         info!(
-            "US crypto search discovery: {} event slug(s) → {raw_total} raw markets → {} tradeable pairs",
-            event_slugs.len(), pairs.len()
+            "US crypto search discovery: {event_count} active event(s) → {raw_total} raw markets → {} tradeable pairs",
+            pairs.len()
         );
         Ok(pairs)
     }

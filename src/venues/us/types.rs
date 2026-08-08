@@ -42,6 +42,11 @@ pub struct UsMarket {
     pub slug: String,
     #[serde(default)]
     pub question: String,
+    /// Variant label within a templated event (e.g. `"$200,000"` for the
+    /// question `"Will Bitcoin be above ___ in 2026?"`). Empty on classic
+    /// standalone markets.
+    #[serde(default)]
+    pub title: String,
     #[serde(default)]
     pub status: String,
     #[serde(default)]
@@ -292,6 +297,10 @@ pub struct SearchResponse {
 }
 
 /// Lenient event record from search — only the fields discovery needs.
+///
+/// Search embeds full market records (same shape as `/v1/markets`, including
+/// `marketSides` with `identifier`/`long`) — discovery uses these directly
+/// because the api host ignores the `eventSlug=` filter on `/v1/markets`.
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct SearchEvent {
     #[serde(default)]
@@ -302,6 +311,8 @@ pub struct SearchEvent {
     pub active: bool,
     #[serde(default)]
     pub closed: bool,
+    #[serde(default)]
+    pub markets: Vec<UsMarket>,
 }
 
 
