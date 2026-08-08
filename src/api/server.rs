@@ -2267,8 +2267,84 @@ async fn fetch_markets_by_type(
     out
 }
 
+/// Fetch markets for the Kalshi venue across its configured crypto series.
+///
+/// Public endpoints (no credentials needed for discovery). Only crypto-class
+/// markets exist in the hunted series, so non-crypto requests return empty.
+#[cfg(all(not(feature = "intl_clob"), not(feature = "us_retail"), feature = "kalshi"))]
+async fn fetch_markets_by_type(
+    _http: &reqwest::Client,
+    market_type: &str,
+    max_expiry_secs: i64,
+    min_liquidity: f64,
+) -> Vec<AvailableMarket> {
+    use crate::venues::kalshi::KalshiVenue;
+    if market_type != "crypto" {
+        return Vec::new(); // Kalshi wing hunts crypto series only (for now)
+    }
+    static KALSHI_VENUE: tokio::sync::OnceCell<Option<std::sync::Arc<KalshiVenue>>> =
+        tokio::sync::OnceCell::const_new();
+    let venue = KALSHI_VENUE.get_or_init(|| async {
+        match KalshiVenue::from_env() {
+            Ok(v) => Some(std::sync::Arc::new(v)),
+            Err(e) => {
+                warn!("Kalshi venue init failed for market discovery: {e:#}");
+                None
+            }
+        }
+    }).await;
+    let Some(venue) = venue else { return Vec::new() };
+
+    let now = chrono::Utc::now();
+    let mut out: Vec<AvailableMarket> = Vec::new();
+    for series in ["KXBTC15M", "KXBTCD", "KXETH15M", "KXETHD"] {
+        let markets = match venue.markets_for_series(series).await {
+            Ok(m) => m,
+            Err(e) => {
+                warn!("Kalshi market discovery failed for {series}: {e:#}");
+                continue;
+            }
+        };
+        for m in markets {
+            let close = m.close_time_utc();
+            let volume = crate::venues::kalshi::types::fp(&m.volume_fp)
+                .and_then(|d| f64::try_from(d).ok())
+                .unwrap_or(0.0);
+            if volume < min_liquidity {
+                continue;
+            }
+            if let Some(ct) = close {
+                let secs_left = (ct - now).num_seconds();
+                if secs_left < 300 || secs_left > max_expiry_secs {
+                    continue;
+                }
+            }
+            let question = if m.yes_sub_title.is_empty() {
+                m.title.clone()
+            } else {
+                format!("{} — {}", m.title, m.yes_sub_title)
+            };
+            out.push(AvailableMarket {
+                condition_id: m.ticker.clone(),
+                question,
+                market_class: market_type.to_string(),
+                end_date: close.map(|ct| ct.to_rfc3339()),
+                liquidity: volume,
+                tokens: AvailableMarketTokens {
+                    yes_id: crate::venues::kalshi::leg_id(&m.ticker, true),
+                    no_id: crate::venues::kalshi::leg_id(&m.ticker, false),
+                },
+            });
+        }
+    }
+    out.sort_by(|a, b| b.liquidity.partial_cmp(&a.liquidity).unwrap_or(std::cmp::Ordering::Equal));
+    out.truncate(50);
+    info!("📊 fetch_markets_by_type: found {} Kalshi markets for type '{}'", out.len(), market_type);
+    out
+}
+
 /// No venue features compiled in — market discovery unavailable.
-#[cfg(not(any(feature = "intl_clob", feature = "us_retail")))]
+#[cfg(not(any(feature = "intl_clob", feature = "us_retail", feature = "kalshi")))]
 async fn fetch_markets_by_type(
     _http: &reqwest::Client,
     market_type: &str,
