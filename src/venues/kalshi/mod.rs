@@ -283,3 +283,25 @@ mod tests {
         assert_eq!(split_market_id("KXBTC-X"), ("KXBTC-X".to_string(), true));
     }
 }
+// Live smoke test vs demo.kalshi.co — run with: cargo test --features kalshi kalshi_demo_live_smoke -- --ignored --nocapture
+#[cfg(test)]
+#[tokio::test]
+#[ignore]
+async fn kalshi_demo_live_smoke() {
+    dotenv::dotenv().ok();
+    let v = crate::venues::kalshi::KalshiVenue::from_env().expect("venue");
+    use crate::venues::core::Execution;
+    let bal = v.collateral().await.expect("balance");
+    println!("BALANCE: {bal}");
+    let pos = v.positions().await.expect("positions");
+    println!("POSITIONS: {}", pos.len());
+    let oo = v.open_orders().await.expect("open orders");
+    println!("OPEN ORDERS: {}", oo.len());
+    let mkts = v.markets_for_series("KXBTC15M").await.expect("markets");
+    println!("KXBTC15M open markets: {}", mkts.len());
+    if let Some(m) = mkts.first() {
+        println!("first: {} strike={:?} close={:?}", m.ticker, m.strike(), m.close_time_utc());
+        let ask = v.best_ask(&crate::venues::core::MarketId::new(crate::venues::kalshi::leg_id(&m.ticker, true))).await.expect("ask");
+        println!("best yes ask: {ask:?}");
+    }
+}
