@@ -255,6 +255,7 @@ where
         last_stop_loss_time:    HashMap::new(),
         last_expiry_exit_time:  HashMap::new(),
         last_exit_attempt_time: HashMap::new(),
+        consecutive_stop_losses: HashMap::new(),
     };
 
     // ── Market-rotation loop ──────────────────────────────────────────────────

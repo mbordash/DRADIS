@@ -122,5 +122,9 @@ pub struct PatrolContext<P> {
     pub last_expiry_exit_time: HashMap<String, Instant>,
     /// Last FAK-miss exit attempt per strategy — throttles retry log floods.
     pub last_exit_attempt_time: HashMap<String, Instant>,
+    /// Consecutive stop-loss closes per strategy — escalates the re-entry
+    /// cooldown (180s → 360s → 720s → …, capped at 1h). Reset on any
+    /// non-stop-loss close (TP, expiry, skew-collapse).
+    pub consecutive_stop_losses: HashMap<String, u32>,
 }
 

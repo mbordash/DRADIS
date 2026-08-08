@@ -131,6 +131,7 @@ impl Squadron {
         let last_stop_loss_time    = &mut ctx.last_stop_loss_time;
         let last_expiry_exit_time  = &mut ctx.last_expiry_exit_time;
         let last_exit_attempt_time = &mut ctx.last_exit_attempt_time;
+        let consecutive_stop_losses = &mut ctx.consecutive_stop_losses;
 
         // Market rotation CIDs
         let current_hourly_cid = self.market.condition_id.clone();
@@ -671,6 +672,12 @@ impl Squadron {
                                                         format!("{} (ExitUnverified: est. price — sell rejected, shares gone)", reason),
                                                     ).await;
                                                     if let Some(pool) = db::pool_for(&asset_lc) { db::close_open_position(&pool, &sn, &tid_m.to_string()).await; }
+                                                } else {
+                                                    // Entry fill never confirmed and the shares read gone — nothing
+                                                    // verifiable to record. Log loudly so this is never a silent
+                                                    // trade-count mismatch (silent path found 2026-08-08).
+                                                    warn!("⚠️ EXIT rejected [{}] (\"{}\"): position dropped without a confirmed entry fill — no trade recorded",
+                                                          sn, es.chars().take(80).collect::<String>());
                                                 }
                                                 token_ownership.lock().await.remove(&tid_m);
                                             }
@@ -684,6 +691,10 @@ impl Squadron {
                                             }
                                         } else {
                                             consecutive_failures += 1;
+                                            // Silent path found 2026-08-08: four winning TP exits vanished
+                                            // here with no log — always say WHY the placement failed.
+                                            warn!("⚠️ EXIT order placement failed [{}] (\"{}\"): position held, will retry after cooldown",
+                                                  sn, es.chars().take(120).collect::<String>());
                                             // Bug #6: genuine placement rejection (never reached the book) —
                                             // clear the viper's exit-signal cooldown so the rejected attempt
                                             // doesn't suppress the next legitimate exit. FAK misses above are
@@ -764,6 +775,7 @@ impl Squadron {
                                                         // All balance reads failed — we can't confirm the fill. Re-insert the
                                                         // position (no PnL credit, no DB write) so a later exit retry
                                                         // reconciles it, instead of leaking it out of the position map.
+                                                        warn!("⚠️ FAK verify [{}]: all balance reads failed — fill unknown; re-inserting {:.4} shares for retry (no PnL booked)", sn_async, rs_m);
                                                         let mut map = ps.lock().await;
                                                         map.entry((sn_async.clone(), tid_async.clone())).or_insert_with(|| Position { shares: rs_m, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name.clone(), pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
                                                         return;
@@ -840,15 +852,22 @@ impl Squadron {
                                             }
                                         }
                                     }
-                                    info!("📊 Position closed [{}]: PnL ${:.4}", sn, pnl_m + paired_pnl);
-                                    if reason.to_lowercase().contains("sl")
-                                        || reason.to_lowercase().contains("stop")
-                                        || reason.to_lowercase().contains("toxic")
-                                        || reason.to_lowercase().contains("skewcollapse")
+                                    info!("📊 Exit order placed [{}]: est. PnL ${:.4} — awaiting fill verification", sn, pnl_m + paired_pnl);
+                                    let reason_lc = reason.to_lowercase();
+                                    if reason_lc.contains("sl")
+                                        || reason_lc.contains("stop")
+                                        || reason_lc.contains("toxic")
+                                        || reason_lc.contains("skewcollapse")
                                     {
                                         last_stop_loss_time.insert(sn.clone(), Instant::now());
+                                        // Loss streak → escalating re-entry cooldown (2026-08-08:
+                                        // Basis revenge-traded the same falling market 20x).
+                                        let c = consecutive_stop_losses.entry(sn.clone()).or_insert(0);
+                                        *c += 1;
+                                    } else {
+                                        consecutive_stop_losses.insert(sn.clone(), 0);
                                     }
-                                    if reason.to_lowercase().contains("expir") { last_expiry_exit_time.insert(sn.clone(), Instant::now()); }
+                                    if reason_lc.contains("expir") { last_expiry_exit_time.insert(sn.clone(), Instant::now()); }
                                     last_trade_time.insert(sn.clone(), Instant::now());
                                     { let tok = tg_token.clone(); let cid = tg_chat_id.clone(); let msg = format!("🔴 EXIT [{}] {} | bid=${:.4} | reason: {} | Session PnL: ${:.4}", sn, params.market_name, params.price, reason, *total_pnl.lock().await); tokio::spawn(async move { let _ = send_notification(&tok, &cid, &msg).await; }); }
                                     { let session_pnl = *total_pnl.lock().await; tweet_trade(tw_api_key.clone(), tw_api_secret.clone(), tw_access_token.clone(), tw_access_token_secret.clone(), sn.clone(), params.market_name.clone(), re_m, params.price, reason.clone(), pnl_m + paired_pnl, session_pnl); }
@@ -872,7 +891,13 @@ impl Squadron {
                                 };
                                 if let Some(close_time) = target_market_close_time { if (close_time - Utc::now()).num_seconds() < config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY { continue; } }
                                 if let Some(lt) = last_trade_time.get(&sn) { if lt.elapsed() < Duration::from_secs(config::TRADE_COOLDOWN_SECS as u64) { continue; } }
-                                if let Some(lt) = last_stop_loss_time.get(&sn) { if lt.elapsed() < Duration::from_secs(config::STOP_LOSS_COOLDOWN_SECS) { continue; } }
+                                if let Some(lt) = last_stop_loss_time.get(&sn) {
+                                    // Escalate with the loss streak: 180s → 360s → 720s → 1440s, capped 1h.
+                                    let streak = consecutive_stop_losses.get(&sn).copied().unwrap_or(0);
+                                    let mult = 1u64 << streak.saturating_sub(1).min(5);
+                                    let cd = (config::STOP_LOSS_COOLDOWN_SECS * mult).min(3600);
+                                    if lt.elapsed() < Duration::from_secs(cd) { continue; }
+                                }
                                 if let Some(lt) = last_expiry_exit_time.get(&sn) { if lt.elapsed() < Duration::from_secs(300) { continue; } }
 
                                 {

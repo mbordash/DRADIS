@@ -378,11 +378,21 @@ impl Strategy for BasisStrategyImpl {
                 });
             }
 
-            if profit_margin <= -dc.basis_stop_loss_pct
-                && (profit_margin <= -dc.basis_catastrophic_sl_pct
-                    || secs_held >= config::BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS)
-            {
-                let is_catastrophic = profit_margin <= -dc.basis_catastrophic_sl_pct;
+            if profit_margin <= -dc.basis_stop_loss_pct {
+                // The catastrophic (min-hold-bypass) trigger marks to the book MID,
+                // not the bid: a fresh entry pays the spread and is born ~spread%
+                // underwater at the bid, which fired the bypass 1-2s after entry
+                // (2026-08-08, -6.25% @ 1s). The regular SL still marks to bid.
+                let position_ask = if token_id == &target_market.yes_token { snap.yes_ask } else { snap.no_ask };
+                let mid_margin = if position_ask > dec!(0) && position_ask < dec!(1) {
+                    ((position_bid + position_ask) / dec!(2) - avg_entry) / avg_entry
+                } else {
+                    profit_margin
+                };
+                let is_catastrophic = mid_margin <= -dc.basis_catastrophic_sl_pct;
+                if !is_catastrophic && secs_held < config::BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS {
+                    continue;
+                }
                 // EMERGENCY FIX: If the bid is too low, assume FAK will miss and defer exit.
                 // This prevents repeated exit attempts at unfillable prices, which causes log floods.
                 if position_bid < config::BASIS_MIN_STOP_LOSS_EXIT_BID {
