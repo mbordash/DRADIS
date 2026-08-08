@@ -15,6 +15,7 @@ import { getVipersStatus, ViperStatusRow } from '@/lib/api';
 
 function fmtAgo(secs: number | null): string {
   if (secs === null) return '—';
+  if (secs < 5) return 'just now';
   if (secs < 60) return `${secs}s ago`;
   if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
   if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
@@ -94,7 +95,9 @@ export default function ViperActivityPanel({ asset }: { asset: string }) {
                           <span className="text-gray-600"> · {fmtAgo(row.last_reason_secs_ago)}</span>
                         </>
                       ) : (
-                        <span className="text-gray-600">no veto reported</span>
+                        <span className="text-gray-600" title="This viper is evaluating every tick but its entry gates don't report named holding reasons yet.">
+                          evaluating (gates not instrumented)
+                        </span>
                       )}
                     </td>
                     <td className="px-3 py-2 text-right text-gray-500" title={row.last_signal_at ?? undefined}>
