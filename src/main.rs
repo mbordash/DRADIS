@@ -39,7 +39,7 @@ use dradis::config;
 use dradis::squadron::{SquadronRaptors};
 #[cfg(feature = "intl_clob")]
 use dradis::cag::{Cag, SessionState, RunArgs, run_market_loop};
-#[cfg(feature = "us_retail")]
+#[cfg(not(feature = "intl_clob"))]
 use dradis::cag::Cag;
 #[cfg(feature = "intl_clob")]
 use dradis::venues::intl::IntlClobVenue;
@@ -428,6 +428,31 @@ async fn run() -> Result<()> {
                 std::future::pending::<()>().await;
             }
         }
+    }
+
+    // ── Kalshi bootstrap (Control Tower + venue probe; trader lands next) ────
+    #[cfg(feature = "kalshi")]
+    {
+        tokio::spawn(dradis::api::server::run_api_server(
+            Arc::clone(&config_tx),
+            config_rx.clone(),
+            markets_rx,
+            raptor_health_rx,
+            cag.clone(),
+        ));
+
+        match dradis::venues::kalshi::KalshiVenue::from_env() {
+            Ok(_venue) => {
+                tracing::info!("✅ Kalshi venue initialized — trading loop lands in the next step");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "⚠️ Kalshi venue init skipped (Control Tower still live): {e:#}. \
+                     Set KALSHI_API_KEY_ID + KALSHI_PRIVATE_KEY_PATH (and KALSHI_DEMO=1 for paper trading)."
+                );
+            }
+        }
+        std::future::pending::<()>().await;
     }
 
     // ── Intl CLOB bootstrap (self-custody EIP-712 over Polygon) ──────────────

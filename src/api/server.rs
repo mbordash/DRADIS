@@ -1351,7 +1351,7 @@ struct PortfolioValue {
 async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
     debug!("Received GET /api/portfolio request");
     // `s` is only consulted for the intl on-chain balance probe below.
-    #[cfg(feature = "us_retail")]
+    #[cfg(not(feature = "intl_clob"))]
     let _ = &s;
 
     use rust_decimal::Decimal;
@@ -1362,8 +1362,9 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
 
     // Fetch live wallet collateral as ground truth (10s timeout)
     // US custodial venue exposes no on-chain wallet balance here yet (Step 3b);
-    // fall back to the DB-tracked collateral snapshot below.
-    #[cfg(feature = "us_retail")]
+    // fall back to the DB-tracked collateral snapshot below. (Same for Kalshi
+    // until its Execution::collateral is threaded into this endpoint.)
+    #[cfg(not(feature = "intl_clob"))]
     let live_collateral: Option<Decimal> = None;
     #[cfg(feature = "intl_clob")]
     let live_collateral = {

@@ -15,6 +15,9 @@ pub mod intl;
 #[cfg(feature = "us_retail")]
 pub mod us;
 
+#[cfg(feature = "kalshi")]
+pub mod kalshi;
+
 // ── Compile-time venue selection (D3) ────────────────────────────────────────
 
 /// The concrete venue this binary was compiled for. Resolves to a single type
@@ -25,9 +28,16 @@ pub type ActiveVenue = crate::venues::intl::IntlClobVenue;
 #[cfg(feature = "us_retail")]
 pub type ActiveVenue = crate::venues::us::UsRetailVenue;
 
-#[cfg(all(feature = "intl_clob", feature = "us_retail"))]
-compile_error!("Pick exactly one venue: intl_clob OR us_retail");
+#[cfg(feature = "kalshi")]
+pub type ActiveVenue = crate::venues::kalshi::KalshiVenue;
 
-#[cfg(not(any(feature = "intl_clob", feature = "us_retail")))]
-compile_error!("Pick a venue: --features intl_clob | us_retail");
+#[cfg(any(
+    all(feature = "intl_clob", feature = "us_retail"),
+    all(feature = "intl_clob", feature = "kalshi"),
+    all(feature = "us_retail", feature = "kalshi"),
+))]
+compile_error!("Pick exactly one venue: intl_clob OR us_retail OR kalshi");
+
+#[cfg(not(any(feature = "intl_clob", feature = "us_retail", feature = "kalshi")))]
+compile_error!("Pick a venue: --features intl_clob | us_retail | kalshi");
 
