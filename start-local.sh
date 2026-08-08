@@ -72,6 +72,32 @@ fi
 
 mkdir -p logs
 
+# ── Clean up any previous session ─────────────────────────────────────────────
+# A prior run may still be alive (Ctrl+C only stops the UI foreground process;
+# the dradis binary keeps running). A stale binary holding :$API_PORT would
+# silently serve the dashboard from the OLD build while the new one fails to
+# bind — observed 2026-08-08 with three concurrent dradis processes.
+if [ -f ".dradis-local.pid" ]; then
+    OLD_PID=$(cat .dradis-local.pid)
+    if kill -0 "$OLD_PID" 2>/dev/null; then
+        echo "🧹 Stopping previous DRADIS (PID $OLD_PID)..."
+        kill "$OLD_PID" 2>/dev/null || true
+        sleep 1
+    fi
+    rm -f .dradis-local.pid
+fi
+STALE=$(lsof -ti :"$API_PORT" 2>/dev/null || true)
+if [ -n "$STALE" ]; then
+    echo "🧹 Freeing :$API_PORT (stale PID(s): $STALE)..."
+    kill $STALE 2>/dev/null || true
+    sleep 1
+    # Escalate only if still holding the port
+    STALE=$(lsof -ti :"$API_PORT" 2>/dev/null || true)
+    [ -n "$STALE" ] && kill -9 $STALE 2>/dev/null || true
+fi
+# Any other lingering local dradis binaries (port may differ or never bound)
+pkill -f "target/release/dradis" 2>/dev/null && echo "🧹 Killed lingering dradis binary" || true
+
 # Rotate previous log so each session starts clean
 if [ -f "logs/dradis-local.log" ]; then
     mv "logs/dradis-local.log" "logs/dradis-local.log.prev"
