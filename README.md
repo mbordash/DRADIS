@@ -1,6 +1,6 @@
 # DRADIS
 
-> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Polymarket. Nine autonomous Viper strategies, a Raptor recon layer (Price, Funding, Derivatives, Tide "Institutional Pulse", Horizon "TradFi Velocity", and a venue-neutral Sports line-movement scout), a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor (Ollama local/remote, OpenAI-compatible, or Anthropic) that delivers optimization recommendations via Telegram & OpenClaw — and can propose or autonomously apply live config changes under a tiered, guard-railed autonomy policy.
+> **Direct Reaction And Dynamic Intelligence System** — Low-latency Rust prediction-market trading bot for Kalshi & Polymarket. Nine autonomous Viper strategies, a Raptor recon layer (Price, Funding, Derivatives, Tide "Institutional Pulse", Horizon "TradFi Velocity", and a venue-neutral Sports line-movement scout), a Squadron deployment framework, a CAG async dispatch layer with concurrent multi-asset support, a real-time Next.js Control Tower, and an LLM Advisor (Ollama local/remote, OpenAI-compatible, or Anthropic) that delivers optimization recommendations via Telegram & OpenClaw — and can propose or autonomously apply live config changes under a tiered, guard-railed autonomy policy.
 
 ![Rust](https://img.shields.io/badge/Rust-1.95+-orange?logo=rust&logoColor=white)
 ![Tokio](https://img.shields.io/badge/Tokio-async%20runtime-darkgreen?logo=rust&logoColor=white)
