@@ -623,6 +623,13 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
         ("btc", "symbol_token", "crypto", 20),
         ("eth", "symbol_token", "crypto", 20),
         ("sol", "symbol_token", "crypto", 20),
+        // crypto names in the market title/slug (Kalshi symbols tokenize as
+        // "kxbtcd"/"kxbtc15m" — no bare "btc" token — but titles name the coin)
+        ("bitcoin",  "slug", "crypto", 30),
+        ("ethereum", "slug", "crypto", 30),
+        ("solana",   "slug", "crypto", 30),
+        ("xrp",      "slug", "crypto", 30),
+        ("dogecoin", "slug", "crypto", 30),
     ];
     for (pattern, kind, class, prio) in rules {
         sqlx::query(

@@ -6,6 +6,7 @@
 #   ./start-local.sh             # intl CLOB, BTC (default)
 #   ./start-local.sh eth         # intl CLOB, ETH
 #   VENUE=us ./start-local.sh    # US Retail venue (us_retail build)
+#   VENUE=kalshi ./start-local.sh # Kalshi venue (kalshi build)
 #   RUST_LOG=debug ./start-local.sh
 #
 # Venue selection (VENUE env var):
@@ -34,13 +35,18 @@ case "$VENUE" in
         CARGO_FEATURE_ARGS=(--no-default-features --features us_retail)
         echo "🚀 Starting DRADIS + Control Tower locally (VENUE=us — US Retail)"
         ;;
+    kalshi)
+        VENUE=kalshi
+        CARGO_FEATURE_ARGS=(--no-default-features --features kalshi)
+        echo "🚀 Starting DRADIS + Control Tower locally (VENUE=kalshi — Kalshi)"
+        ;;
     intl|intl_clob)
         VENUE=intl
         CARGO_FEATURE_ARGS=()
         echo "🚀 Starting DRADIS + Control Tower locally (VENUE=intl, CRYPTO=$CRYPTO)"
         ;;
     *)
-        echo "❌  Unknown VENUE='$VENUE'. Use VENUE=intl (default) or VENUE=us."
+        echo "❌  Unknown VENUE='$VENUE'. Use VENUE=intl (default), VENUE=us, or VENUE=kalshi."
         exit 1
         ;;
 esac
@@ -113,6 +119,12 @@ if [ "$VENUE" = "us" ]; then
     RUST_LOG=${RUST_LOG:-info,dradis=info} \
     API_PORT=$API_PORT \
     ASSETS=${ASSETS:-us} \
+        ./target/release/dradis >> logs/dradis-local.log 2>&1 &
+elif [ "$VENUE" = "kalshi" ]; then
+    echo "🦀 Starting DRADIS (Kalshi, API on :$API_PORT)..."
+    RUST_LOG=${RUST_LOG:-info,dradis=info} \
+    API_PORT=$API_PORT \
+    ASSETS=${ASSETS:-kalshi} \
         ./target/release/dradis >> logs/dradis-local.log 2>&1 &
 else
     echo "🦀 Starting DRADIS (GHOST_MODE, API on :$API_PORT)..."

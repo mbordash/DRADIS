@@ -442,14 +442,37 @@ async fn run() -> Result<()> {
         ));
 
         match dradis::venues::kalshi::KalshiVenue::from_env() {
-            Ok(_venue) => {
-                tracing::info!("✅ Kalshi venue initialized — trading loop lands in the next step");
+            Ok(venue) => {
+                let venue = Arc::new(venue);
+                use dradis::venues::core::Execution as _;
+                match venue.collateral().await {
+                    Ok(c)  => tracing::info!("✅ Kalshi venue connected — balance ${:.2}", c),
+                    Err(e) => tracing::warn!("⚠️ Kalshi connected but balance query failed: {e}"),
+                }
+                // Dedicated DB pool so the Control Tower shows the Kalshi venue
+                // under its own asset selector (positions, portfolio P&L).
+                if let Err(e) = dradis::helpers::db::init_for_asset(
+                    dradis::venues::kalshi::trader::KALSHI_ASSET,
+                    "logs/kalshi-dradis.db",
+                ).await {
+                    tracing::warn!("⚠️ Kalshi DB pool init failed (dashboard disabled): {e}");
+                }
+                let cancel = tokio_util::sync::CancellationToken::new();
+                dradis::venues::kalshi::trader::run_kalshi_trader(
+                    venue,
+                    cag.clone(),
+                    Arc::clone(&raptor_health_tx),
+                    Arc::clone(&markets_tx),
+                    Arc::clone(&process_heartbeat_secs),
+                    cancel,
+                ).await;
             }
             Err(e) => {
                 tracing::warn!(
                     "⚠️ Kalshi venue init skipped (Control Tower still live): {e:#}. \
                      Set KALSHI_API_KEY_ID + KALSHI_PRIVATE_KEY_PATH (and KALSHI_DEMO=1 for paper trading)."
                 );
+                std::future::pending::<()>().await;
             }
         }
         std::future::pending::<()>().await;
