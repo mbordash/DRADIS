@@ -167,6 +167,10 @@ impl Execution for KalshiVenue {
         Ok(out)
     }
 
+    fn subscribe_fills(&self) -> Option<crate::venues::core::FillStream> {
+        Some(self.fills_tx.subscribe())
+    }
+
     async fn best_ask(&self, market: &MarketId) -> Result<Option<Decimal>> {
         let (ticker, is_yes) = split_market_id(market.as_str());
         let book = self.orderbook(&ticker).await?;

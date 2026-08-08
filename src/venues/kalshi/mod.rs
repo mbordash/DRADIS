@@ -18,6 +18,7 @@
 pub mod auth;
 pub mod orders;
 pub mod types;
+pub mod ws;
 
 use anyhow::Context;
 
@@ -73,6 +74,9 @@ pub struct KalshiVenue {
     pub(crate) base_url: String,
     /// Path prefix for signing (base URL minus scheme+host), e.g. `/trade-api/v2`.
     pub(crate) api_root: String,
+    /// Venue-lifetime fill fan-out; [`crate::venues::core::Execution::subscribe_fills`]
+    /// hands out receivers, [`Self::start_fill_feed`] pumps it from the WS.
+    pub(crate) fills_tx: tokio::sync::broadcast::Sender<crate::venues::core::FillEvent>,
 }
 
 impl KalshiVenue {
@@ -92,7 +96,13 @@ impl KalshiVenue {
             http: reqwest::Client::new(),
             base_url: base,
             api_root,
+            fills_tx: tokio::sync::broadcast::channel(256).0,
         })
+    }
+
+    /// Spawn the venue-lifetime private fill feed (WS `fill` channel).
+    pub fn start_fill_feed(&self, cancel: tokio_util::sync::CancellationToken) {
+        ws::spawn_fill_feed(ws_url(), self.auth.clone(), self.fills_tx.clone(), cancel);
     }
 
     // ── Signed HTTP helpers ──────────────────────────────────────────────────
