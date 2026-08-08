@@ -134,6 +134,23 @@ impl UsRetailVenue {
     /// into our own lenient `types::MarketsResponse` where `outcomes: Value` accepts
     /// any JSON shape without error.
     pub async fn discover_binary_markets(&self) -> Result<Vec<markets::UsMarketPair>> {
+        self.discover_binary_markets_filtered(&[], None).await
+    }
+
+    /// Category-filtered variant of [`Self::discover_binary_markets`].
+    ///
+    /// `categories` maps to the gateway's repeated `categories=` query params
+    /// (SDK: `MarketsListParams.categories`); empty = no category filter.
+    /// `min_volume` overrides the default volume floor — the crypto wing passes
+    /// `Some(0.0)` because hourly crypto markets rotate every hour and start
+    /// near zero volume, so the sports-tuned floor (plus `orderBy=closed`
+    /// pagination dominated by thousands of sports listings) buried them
+    /// entirely (2026-08-08: 3000 pairs discovered, zero crypto).
+    pub async fn discover_binary_markets_filtered(
+        &self,
+        categories: &[&str],
+        min_volume: Option<f64>,
+    ) -> Result<Vec<markets::UsMarketPair>> {
         const PAGE_LIMIT: usize = 200;
         const MAX_PAGES: usize = 20; // safety cap — the API may cycle
         let path = "/v1/markets";
@@ -153,13 +170,20 @@ impl UsRetailVenue {
                 .format("%Y-%m-%dT%H:%M:%SZ");
             let end_min = now.format("%Y-%m-%dT%H:%M:%SZ");
             let end_max = (now + chrono::Duration::days(21)).format("%Y-%m-%dT%H:%M:%SZ");
-            let min_vol = std::env::var(ENV_MIN_VOLUME)
-                .ok()
-                .and_then(|v| v.parse::<f64>().ok())
-                .unwrap_or(DEFAULT_MIN_VOLUME);
+            let min_vol = min_volume.unwrap_or_else(|| {
+                std::env::var(ENV_MIN_VOLUME)
+                    .ok()
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(DEFAULT_MIN_VOLUME)
+            });
+            let category_params: String = categories
+                .iter()
+                .map(|c| format!("&categories={c}"))
+                .collect();
             let url = format!(
-                "{}{}?startDateMin={}&endDateMin={}&endDateMax={}&volumeNumMin={}&orderBy=closed&limit={}&page={}",
-                self.base_url, path, start_min, end_min, end_max, min_vol, PAGE_LIMIT, page
+                "{}{}?startDateMin={}&endDateMin={}&endDateMax={}&volumeNumMin={}&orderBy=closed&limit={}&page={}{}",
+                self.base_url, path, start_min, end_min, end_max, min_vol, PAGE_LIMIT, page,
+                category_params
             );
             // Auth headers are signed against the path only (no query string).
             let signed = self.auth.signed_headers("GET", path);

@@ -118,6 +118,23 @@ impl Wing {
             Wing::Crypto => "crypto",
         }
     }
+    /// Wing-appropriate market discovery. The crypto wing queries the gateway
+    /// with `categories=crypto` and no volume floor — hourly crypto markets
+    /// rotate every hour and start near zero volume, so the sports-tuned
+    /// default query never surfaced them (3000 pairs, zero crypto, 2026-08-08).
+    async fn discover(
+        self,
+        venue: &UsRetailVenue,
+    ) -> anyhow::Result<Vec<super::markets::UsMarketPair>> {
+        match self {
+            Wing::General => venue.discover_binary_markets().await,
+            Wing::Crypto => {
+                venue
+                    .discover_binary_markets_filtered(&["crypto"], Some(0.0))
+                    .await
+            }
+        }
+    }
 }
 
 /// Cloneable bundle of live Raptor signal receivers for one crypto underlying.
@@ -458,7 +475,7 @@ async fn select_market(
         // Keep the OS watchdog satisfied while we poll for a tradeable market —
         // discovery can legitimately take many minutes (off-hours, thin slate).
         touch_heartbeat(process_heartbeat_secs);
-        match venue.discover_binary_markets().await {
+        match wing.discover(venue).await {
             Ok(markets) if !markets.is_empty() => {
                 info!(
                     "📊 Discovered {} binary markets. First 5: {}",
@@ -699,10 +716,18 @@ async fn trade_one_market(
                 if has_positions {
                     continue;
                 }
-                match venue.discover_binary_markets().await {
+                match wing.discover(venue).await {
                     Ok(mut candidates) if !candidates.is_empty() => {
-                        // Best market by volume, excluding the one we're already on.
+                        // Best market by volume, excluding the one we're already
+                        // on and anything outside this wing's domain.
                         candidates.retain(|m| m.slug != pair.slug);
+                        let mut domain_candidates = Vec::with_capacity(candidates.len());
+                        for m in candidates.drain(..) {
+                            if pair_is_crypto(&m).await == (wing == Wing::Crypto) {
+                                domain_candidates.push(m);
+                            }
+                        }
+                        let candidates = domain_candidates;
                         if let Some(best) = candidates.iter().max_by(|a, b| a.volume.partial_cmp(&b.volume).unwrap_or(std::cmp::Ordering::Equal)) {
                             if best.volume > pair.volume + ROTATION_VOLUME_THRESHOLD {
                                 info!(
