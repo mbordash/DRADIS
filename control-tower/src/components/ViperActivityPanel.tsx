@@ -95,8 +95,8 @@ export default function ViperActivityPanel({ asset }: { asset: string }) {
                           <span className="text-gray-600"> · {fmtAgo(row.last_reason_secs_ago)}</span>
                         </>
                       ) : (
-                        <span className="text-gray-600" title="This viper is evaluating every tick but its entry gates don't report named holding reasons yet.">
-                          evaluating (gates not instrumented)
+                        <span className="text-gray-600" title="No veto recorded — the viper recently signaled or just started evaluating.">
+                          no active veto
                         </span>
                       )}
                     </td>

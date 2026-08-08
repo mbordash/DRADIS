@@ -34,13 +34,16 @@ pub struct BasisStrategyImpl;
 impl Strategy for BasisStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
+        // "Why no trades?" registry feed (GET /api/vipers/status).
+        let idle = |r: &str| crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), r);
         if !dc.enable_basis {
-            crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), "disabled in config");
+            idle("disabled in config");
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Global Risk Check ────────────────────────────────────────────────
         if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
+            idle("session drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -55,6 +58,7 @@ impl Strategy for BasisStrategyImpl {
         if let Some(close_time) = market.market_close_time {
             let secs_left = (close_time - Utc::now()).num_seconds();
             if secs_left < dc.basis_min_secs_to_expiry {
+                idle("too close to expiry");
                 return Ok(StrategySignal::NoSignal);
             }
         }
@@ -65,18 +69,20 @@ impl Strategy for BasisStrategyImpl {
         // GBoost and TimeDecay both gate on snapshot age; same protection here.
         let snap_age = (Utc::now() - snap.timestamp).num_seconds();
         if snap_age > config::BASIS_MAX_SNAPSHOT_AGE_SECS {
+            idle("snapshot stale");
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Require a known strike price ─────────────────────────────────────
         let strike = match market.strike_price {
             Some(s) => s,
-            None => return Ok(StrategySignal::NoSignal),
+            None => { idle("market has no strike price"); return Ok(StrategySignal::NoSignal) },
         };
 
         // ── Fee gate: skip high-fee markets ──────────────────────────────────
         let max_fee = market.yes_fee_bps.max(market.no_fee_bps);
         if max_fee > config::BASIS_MAX_TAKER_FEE_BPS {
+            idle("market fees too high");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -87,11 +93,13 @@ impl Strategy for BasisStrategyImpl {
 
         // ── Gate 1: Binance is flat ──────────────────────────────────────────
         if ctx.snapshot.velocity.abs() >= max_velocity {
+            idle("underlying moving too fast");
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Gate 2: Oracle near strike ───────────────────────────────────────
         if (ctx.snapshot.oracle_price - strike).abs() >= oracle_buffer {
+            idle("oracle too far from strike");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -99,12 +107,14 @@ impl Strategy for BasisStrategyImpl {
         let yes_mid = if snap.yes_bid > dec!(0) && snap.yes_ask < dec!(1) {
             (snap.yes_bid + snap.yes_ask) / dec!(2)
         } else {
+            idle("degenerate book (no usable mid)");
             return Ok(StrategySignal::NoSignal);
         };
         let skew = yes_mid - dec!(0.50);
 
         // ── Gate 3: Skew must exceed entry threshold ──────────────────────────
         if skew.abs() < dc.basis_entry_skew_threshold {
+            idle("skew below entry threshold");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -128,6 +138,7 @@ impl Strategy for BasisStrategyImpl {
                 || (skew < dec!(0) && ctx.snapshot.institutional_pulse <= -config::BASIS_TIDE_PULSE_THRESHOLD)
             )
         {
+            idle("institutional tide contradicts fade");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -143,6 +154,7 @@ impl Strategy for BasisStrategyImpl {
         // This prevents 400 rejections from firing every 60s when the balance is depleted.
         let min_required = dc.basis_min_trade_size_usdc / no_fee_headroom.min(yes_fee_headroom);
         if ctx.available_collateral < min_required {
+            idle("insufficient collateral");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -156,6 +168,7 @@ impl Strategy for BasisStrategyImpl {
         };
 
         if current_exposure + trade_size > dc.basis_max_exposure_usdc {
+            idle("exposure cap reached");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -163,6 +176,7 @@ impl Strategy for BasisStrategyImpl {
         if skew > dec!(0) {
             // YES overpriced → fade by buying NO
             if !funding_confirms_no_trade && !extreme_skew_bypass {
+                idle("funding rate does not confirm fade");
                 return Ok(StrategySignal::NoSignal);
             }
 
@@ -198,6 +212,7 @@ impl Strategy for BasisStrategyImpl {
             }
 
             if target_price > dc.basis_max_entry_price {
+                idle("entry price above cap");
                 return Ok(StrategySignal::NoSignal);
             }
 
@@ -231,6 +246,7 @@ impl Strategy for BasisStrategyImpl {
         } else {
             // NO overpriced → fade by buying YES
             if !funding_confirms_yes_trade && !extreme_skew_bypass {
+                idle("funding rate does not confirm fade");
                 return Ok(StrategySignal::NoSignal);
             }
 
@@ -265,6 +281,7 @@ impl Strategy for BasisStrategyImpl {
             }
 
             if target_price > dc.basis_max_entry_price {
+                idle("entry price above cap");
                 return Ok(StrategySignal::NoSignal);
             }
 

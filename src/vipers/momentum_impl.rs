@@ -45,13 +45,16 @@ impl Default for MomentumStrategyImpl {
 impl Strategy for MomentumStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
+        // "Why no trades?" registry feed (GET /api/vipers/status).
+        let idle = |r: &str| crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), r);
         if !dc.enable_momentum {
-            crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), "disabled in config");
+            idle("disabled in config");
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Global Risk Check ────────────────────────────────────────────────
         if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
+            idle("session drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -85,12 +88,14 @@ impl Strategy for MomentumStrategyImpl {
                 let cvd_contradicts = cvd > dec!(0) && cvd <= dec!(1) - dc.momentum_deriv_cvd_confirm_margin;
                 if cvd_contradicts || oi_unwind {
                     debug!(" Momentum deriv-gate blocked BULL: cvd={:.2} oi_unwind={}", cvd, oi_unwind);
+                    idle("derivatives flow contradicts move");
                     return Ok(StrategySignal::NoSignal);
                 }
             } else if velocity < dec!(0) {
                 let cvd_contradicts = cvd > dec!(0) && cvd >= dec!(1) + dc.momentum_deriv_cvd_confirm_margin;
                 if cvd_contradicts || oi_unwind {
                     debug!(" Momentum deriv-gate blocked BEAR: cvd={:.2} oi_unwind={}", cvd, oi_unwind);
+                    idle("derivatives flow contradicts move");
                     return Ok(StrategySignal::NoSignal);
                 }
             }
@@ -112,6 +117,7 @@ impl Strategy for MomentumStrategyImpl {
         };
 
         if current_exposure + trade_size > dc.momentum_max_exposure_usdc {
+            idle("exposure cap reached");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -147,6 +153,7 @@ impl Strategy for MomentumStrategyImpl {
             if secs_left < dc.momentum_min_secs_to_expiry_for_entry {
                 debug!(" Momentum entry blocked: only {}s to expiry (min {}s)",
                     secs_left, dc.momentum_min_secs_to_expiry_for_entry);
+                idle("too close to expiry");
                 return Ok(StrategySignal::NoSignal);
             }
         }
@@ -167,6 +174,7 @@ impl Strategy for MomentumStrategyImpl {
         if secs_since_market_start < config::MOMENTUM_MARKET_WARMUP_SECS {
             debug!(" Momentum entry blocked: market warmup period ({}s < {}s min)",
                 secs_since_market_start, config::MOMENTUM_MARKET_WARMUP_SECS);
+            idle("market warmup");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -175,6 +183,7 @@ impl Strategy for MomentumStrategyImpl {
         if snap_age > config::MOMENTUM_MAX_SNAPSHOT_AGE_SECS {
             debug!(" Momentum entry blocked: snapshot too stale ({}s > max {}s)",
                 snap_age, config::MOMENTUM_MAX_SNAPSHOT_AGE_SECS);
+            idle("snapshot stale");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -183,6 +192,7 @@ impl Strategy for MomentumStrategyImpl {
         if ask_sum > dc.momentum_max_entry_ask_sum {
             debug!(" Momentum spread gate: ask_sum={:.3} > max {:.3} — book too wide",
                 ask_sum, dc.momentum_max_entry_ask_sum);
+            idle("book too wide");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -197,6 +207,7 @@ impl Strategy for MomentumStrategyImpl {
         if yes_ask < dc.momentum_min_entry_price && no_ask < dc.momentum_min_entry_price {
             debug!(" Momentum min-price blocked: yes_ask={:.3} no_ask={:.3} both below floor {:.3}",
                 yes_ask, no_ask, dc.momentum_min_entry_price);
+            idle("asks below entry price floor");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -418,6 +429,13 @@ impl Strategy for MomentumStrategyImpl {
             }
         }
 
+        // Fall-through: no velocity trigger fired (the common quiet-market case),
+        // or a trigger fired but a directional gate (OBI/drift/window/price) held.
+        if velocity.abs() <= threshold {
+            idle("velocity below trigger");
+        } else {
+            idle("spike blocked by entry gates (OBI/drift/price)");
+        }
         Ok(StrategySignal::NoSignal)
     }
 

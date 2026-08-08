@@ -49,13 +49,16 @@ impl Strategy for ArbitrageStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
 
+        // "Why no trades?" registry feed (GET /api/vipers/status).
+        let idle = |r: &str| crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), r);
         if !dc.enable_arbitrage {
-            crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), "disabled in config");
+            idle("disabled in config");
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Global Risk Check ────────────────────────────────────────────────
         if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
+            idle("session drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -77,6 +80,7 @@ impl Strategy for ArbitrageStrategyImpl {
             (ctx.maker_market.as_ref(), ctx.maker_snapshot.as_ref())
         else {
             debug!(" Arb skipped — no maker (daily/window) venue available; refusing hourly fallback");
+            idle("no daily/window venue available");
             return Ok(StrategySignal::NoSignal);
         };
 
@@ -96,6 +100,7 @@ impl Strategy for ArbitrageStrategyImpl {
                 " Arb skipped — locked/inverted spread: YES {:.3}/{:.3}  NO {:.3}/{:.3}",
                 yes_bid, yes_ask, no_bid, no_ask
             );
+            idle("locked/inverted spread");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -103,6 +108,7 @@ impl Strategy for ArbitrageStrategyImpl {
         if !is_maker_arb_profitable(yes_bid, no_bid, dc.arbitrage_profit_threshold) {
             // Condition broke — reset the persistence clock.
             *self.profitable_since.lock().unwrap() = None;
+            idle("no profitable spread");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -123,6 +129,7 @@ impl Strategy for ArbitrageStrategyImpl {
                             " Arb debounce — profitable quote held {}s < {}s required",
                             held, crate::config::ARB_QUOTE_PERSISTENCE_SECS
                         );
+                        idle("quote-persistence debounce");
                         return Ok(StrategySignal::NoSignal);
                     }
                     // Persisted long enough — fall through to the remaining gates.
@@ -131,6 +138,7 @@ impl Strategy for ArbitrageStrategyImpl {
                     // First sighting (or market rotated) — start the clock.
                     *guard = Some((market.condition_id.clone(), Instant::now()));
                     debug!(" Arb debounce — profitable quote first seen, starting persistence clock");
+                    idle("quote-persistence debounce");
                     return Ok(StrategySignal::NoSignal);
                 }
             }
@@ -154,6 +162,7 @@ impl Strategy for ArbitrageStrategyImpl {
                  (near-coin-flip market; leg-fill is directional → orphan risk)",
                 dominant_leg_bid, dc.arbitrage_min_leg_conviction
             );
+            idle("near-coin-flip market (conviction gate)");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -170,6 +179,7 @@ impl Strategy for ArbitrageStrategyImpl {
         // Re-validate profitability at the capped prices — if we had to lower
         // the bid(s) the spread may no longer cover the threshold.
         if !is_maker_arb_profitable(safe_yes_bid, safe_no_bid, dc.arbitrage_profit_threshold) {
+            idle("spread unprofitable at safe bids");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -186,6 +196,7 @@ impl Strategy for ArbitrageStrategyImpl {
                 " Arb liquidity gap too wide — YES gap {:.3} NO gap {:.3} (max {:.3}) — skipping",
                 yes_fill_gap, no_fill_gap, dc.arbitrage_max_fill_gap
             );
+            idle("liquidity gap too wide");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -221,6 +232,7 @@ impl Strategy for ArbitrageStrategyImpl {
                  (undecided/near-coin-flip market)",
                 complement_ask, dc.arbitrage_max_leg_price
             );
+            idle("market undecided (complement ask ceiling)");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -274,6 +286,7 @@ impl Strategy for ArbitrageStrategyImpl {
                      (complement bid unlikely to fill → unhedged entry)",
                     complement_obi, dc.arbitrage_max_leg_obi
                 );
+                idle("complement leg unlikely to fill (OBI)");
                 return Ok(StrategySignal::NoSignal);
             }
         } else {
@@ -284,6 +297,7 @@ impl Strategy for ArbitrageStrategyImpl {
                     " Arb price-cap fallback (no depth data) — complement bid {:.3} > limit {:.3} — skipping",
                     complement_bid, dc.arbitrage_max_leg_price
                 );
+                idle("no depth data; complement over price cap");
                 return Ok(StrategySignal::NoSignal);
             }
         }
@@ -306,6 +320,7 @@ impl Strategy for ArbitrageStrategyImpl {
                  (single-leg orphan materially unrecoverable at live asks)",
                 yes_rescue_cost, no_rescue_cost, dc.arb_max_rescue_cost
             );
+            idle("orphan rescue too costly");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -322,6 +337,7 @@ impl Strategy for ArbitrageStrategyImpl {
                 " Arb skipped — available collateral ${:.2} < required ${:.2}",
                 ctx.available_collateral, trade_size * dec!(1.05)
             );
+            idle("insufficient collateral");
             return Ok(StrategySignal::NoSignal);
         }
         // ── Per-market re-entry lockout ──────────────────────────────────────
@@ -335,6 +351,7 @@ impl Strategy for ArbitrageStrategyImpl {
             let locked = locks.lock().await;
             if locked.contains(&market.yes_token) || locked.contains(&market.no_token) {
                 debug!(" Arb skipped — market already traded this session (re-entry lockout)");
+                idle("re-entry lockout (already traded market)");
                 return Ok(StrategySignal::NoSignal);
             }
         }
@@ -355,6 +372,7 @@ impl Strategy for ArbitrageStrategyImpl {
                 || pos_map.contains_key(&(STRATEGY_NAME.to_string(), market.no_token.clone()))
             {
                 debug!(" Arb skipped — already hold YES or NO leg for this market");
+                idle("position already open on this market");
                 return Ok(StrategySignal::NoSignal);
             }
 
@@ -364,6 +382,7 @@ impl Strategy for ArbitrageStrategyImpl {
                 .sum::<Decimal>()
         };
         if current_exposure + trade_size > dc.arbitrage_max_exposure_usdc {
+            idle("exposure cap reached");
             return Ok(StrategySignal::NoSignal);
         }
 

@@ -117,22 +117,27 @@ impl Default for ConvergenceStrategyImpl {
 impl Strategy for ConvergenceStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config;
+        // "Why no trades?" registry feed (GET /api/vipers/status).
+        let idle = |r: &str| crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), r);
         if !dc.enable_convergence {
-            crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), "disabled in config");
+            idle("disabled in config");
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Global risk + scope gates ─────────────────────────────────────────
         if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
+            idle("session drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
         // BTC-only: institutional_pulse has no ETH/SOL analog.
         if !Self::is_btc(ctx) {
+            idle("BTC-only strategy (no ETF tide for this asset)");
             return Ok(StrategySignal::NoSignal);
         }
         // Market maturation — avoid the thin, noisy book at market open.
         let secs_since_start = (Utc::now() - ctx.market_started_at).num_seconds();
         if secs_since_start < config::CONVERGENCE_MARKET_WARMUP_SECS {
+            idle("market warmup");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -150,16 +155,19 @@ impl Strategy for ConvergenceStrategyImpl {
         let want_bull = pulse >= dc.convergence_pulse_threshold;
         let want_bear = pulse <= -dc.convergence_pulse_threshold;
         if !want_bull && !want_bear {
+            idle("no institutional pulse (or outside US hours)");
             return Ok(StrategySignal::NoSignal);
         }
 
         // The three ETFs must cohere.
         if coh < dc.convergence_coherence_min {
+            idle("ETF tide not coherent");
             return Ok(StrategySignal::NoSignal);
         }
 
         // Open interest must not be unwinding (de-leveraging / squeeze).
         if oi < config::CONVERGENCE_OI_MIN_BUILD {
+            idle("open interest unwinding");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -175,6 +183,7 @@ impl Strategy for ConvergenceStrategyImpl {
         {
             debug!(" Convergence blocked: 60m drift exhausted ({:.0} vs ±{:.0}) — move already priced in",
                 drift_60m, exhaustion_thr);
+            idle("60m drift exhausted (move priced in)");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -186,6 +195,7 @@ impl Strategy for ConvergenceStrategyImpl {
             cvd > dec!(0) && cvd <= dec!(1) - dc.convergence_cvd_confirm_margin
         };
         if !cvd_confirms {
+            idle("taker flow (CVD) does not confirm");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -210,6 +220,7 @@ impl Strategy for ConvergenceStrategyImpl {
         if obi_adverse {
             debug!(" Convergence blocked: adverse OBI (obi_yes={:.2}, want_bull={}) — book stacked against entry",
                 obi_yes, want_bull);
+            idle("book stacked against entry (OBI)");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -240,6 +251,7 @@ impl Strategy for ConvergenceStrategyImpl {
             if !held_long_enough {
                 debug!(" Convergence debounce: signal must persist {}s before entry",
                     config::CONVERGENCE_ENTRY_PERSISTENCE_SECS);
+                idle("signal persistence debounce");
                 return Ok(StrategySignal::NoSignal);
             }
         }
@@ -253,6 +265,7 @@ impl Strategy for ConvergenceStrategyImpl {
 
         // ── Price / spread gates ──────────────────────────────────────────────
         if ask < dc.convergence_min_entry_price || ask > dc.convergence_max_entry_price {
+            idle("ask outside entry price band");
             return Ok(StrategySignal::NoSignal);
         }
         // Coin-flip skip band: avoid the ~$0.50 zone (max binary uncertainty, most
@@ -263,12 +276,14 @@ impl Strategy for ConvergenceStrategyImpl {
         {
             debug!(" Convergence blocked: ask {:.3} in coin-flip skip band [{:.2}, {:.2}]",
                 ask, dc.convergence_skip_band_low, dc.convergence_skip_band_high);
+            idle("coin-flip price band");
             return Ok(StrategySignal::NoSignal);
         }
         let spread = if ask > dec!(0) { (ask - bid) / ask } else { Decimal::ONE };
         if spread > dc.convergence_max_token_spread_pct {
             debug!(" Convergence blocked: spread {:.1}% > max (ask={:.3} bid={:.3})",
                 spread * dec!(100), ask, bid);
+            idle("spread too wide");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -276,6 +291,7 @@ impl Strategy for ConvergenceStrategyImpl {
         if let Ok(map) = self.post_exit_cooldown.lock() {
             if let Some(t) = map.get(&token_id) {
                 if t.elapsed().as_secs() < config::CONVERGENCE_POST_EXIT_COOLDOWN_SECS {
+                    idle("post-exit cooldown");
                     return Ok(StrategySignal::NoSignal);
                 }
             }
@@ -291,6 +307,7 @@ impl Strategy for ConvergenceStrategyImpl {
                 if t.elapsed().as_secs() < config::CONVERGENCE_STOP_MARKET_COOLDOWN_SECS {
                     debug!(" Convergence blocked: market in post-stop cooldown ({}s left)",
                         config::CONVERGENCE_STOP_MARKET_COOLDOWN_SECS.saturating_sub(t.elapsed().as_secs()));
+                    idle("post-stop market cooldown");
                     return Ok(StrategySignal::NoSignal);
                 }
             }
@@ -306,10 +323,12 @@ impl Strategy for ConvergenceStrategyImpl {
                 exposure += pos.shares * pos.avg_entry;
                 // Don't stack a second position on either leg of this market.
                 if tok == &market.yes_token || tok == &market.no_token {
+                    idle("position already open on this market");
                     return Ok(StrategySignal::NoSignal);
                 }
             }
             if exposure + size > dc.convergence_max_exposure_usdc {
+                idle("exposure cap reached");
                 return Ok(StrategySignal::NoSignal);
             }
         }
@@ -322,6 +341,7 @@ impl Strategy for ConvergenceStrategyImpl {
         let secs_left = market.market_close_time.map(|ct| (ct - Utc::now()).num_seconds());
         if let Some(reason) = crate::vipers::entry_liquidity_gate(secs_left, intended_shares, exit_bid_depth) {
             debug!(" Convergence blocked: {}", reason);
+            idle(&reason);
             return Ok(StrategySignal::NoSignal);
         }
 

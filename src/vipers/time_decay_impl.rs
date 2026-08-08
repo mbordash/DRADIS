@@ -57,13 +57,16 @@ impl Strategy for TimeDecayStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config; // hot-reloadable snapshot for this tick
 
+        // "Why no trades?" registry feed (GET /api/vipers/status).
+        let idle = |r: &str| crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), r);
         if !dc.enable_time_decay {
-            crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), "disabled in config");
+            idle("disabled in config");
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Global Risk Check ────────────────────────────────────────────────
         if is_drawdown_limit_hit(ctx.session_pnl, ctx.starting_collateral) {
+            idle("session drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -71,22 +74,25 @@ impl Strategy for TimeDecayStrategyImpl {
 
         let seconds_to_expiry = match market.market_close_time {
             Some(close_time) => (close_time - Utc::now()).num_seconds(),
-            None => return Ok(StrategySignal::NoSignal),
+            None => { idle("market has no close time"); return Ok(StrategySignal::NoSignal) },
         };
 
         // ── Theta window gate (uses dynamic min/max secs) ────────────────────
         if seconds_to_expiry < dc.time_decay_min_secs_to_expiry
             || seconds_to_expiry > dc.time_decay_max_secs_to_expiry
         {
+            idle("outside theta window (expiry timing)");
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Oracle Volatility Gate ────────────────────────────────────────────
         let (max_fast_vel, max_slow_drift) = TimeDecayStrategy::iv_thresholds(ctx.snapshot.oracle_price, dc.time_decay_max_fast_velocity_pct, dc.time_decay_max_slow_drift_pct);
         if ctx.snapshot.velocity.abs() > max_fast_vel {
+            idle("underlying moving too fast");
             return Ok(StrategySignal::NoSignal);
         }
         if ctx.snapshot.oracle_drift_60m.abs() > max_slow_drift {
+            idle("60m drift too large");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -101,6 +107,7 @@ impl Strategy for TimeDecayStrategyImpl {
                 "🚫 TimeDecay entry blocked: snapshot too stale ({}s > max {}s)",
                 snapshot_age_secs, config::TIME_DECAY_MAX_SNAPSHOT_AGE_SECS
             );
+            idle("snapshot stale");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -128,6 +135,7 @@ impl Strategy for TimeDecayStrategyImpl {
         // from silently bypassing the gate.  The config constant is the hard floor.
         let obi_block = dc.time_decay_obi_adverse_block.max(config::TIME_DECAY_OBI_ADVERSE_BLOCK);
         if yes_obi < obi_block || no_obi < obi_block {
+            idle("adverse book imbalance (OBI)");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -139,14 +147,17 @@ impl Strategy for TimeDecayStrategyImpl {
         // TimeDecay only makes sense in the symmetric zone where BOTH legs are near 0.50.
         let max_entry = dc.time_decay_max_entry_price.min(config::TIME_DECAY_MAX_ENTRY_PRICE);
         if yes_bid > max_entry || yes_bid < dc.time_decay_min_entry_price {
+            idle("market skewed (YES leg outside symmetric band)");
             return Ok(StrategySignal::NoSignal);
         }
         if no_bid > max_entry || no_bid < dc.time_decay_min_entry_price {
+            idle("market skewed (NO leg outside symmetric band)");
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Pre-entry convergence check ───────────────────────────────────────
         if yes_bid + no_bid >= dc.time_decay_convergence_exit_bid {
+            idle("already converged (no theta left)");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -165,6 +176,7 @@ impl Strategy for TimeDecayStrategyImpl {
                     .sum::<Decimal>()
             };
             if current_exposure + trade_size > dc.time_decay_max_exposure_usdc {
+                idle("exposure cap reached");
                 return Ok(StrategySignal::NoSignal);
             }
 
@@ -209,6 +221,7 @@ impl Strategy for TimeDecayStrategyImpl {
                 }),
             });
         }
+        idle("theta below minimum net profit");
         Ok(StrategySignal::NoSignal)
     }
 
