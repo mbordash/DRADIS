@@ -670,6 +670,16 @@ async fn get_pnl_history(Query(q): Query<AssetQuery>) -> Response {
         }
     }
 
+    // Base the timeline on the asset with the freshest snapshot — NOT simply
+    // assets[0]. On the US build both "btc" (primary DB, never written) and
+    // "us" pools exist; "btc" sorts first with zero rows in the 24h window,
+    // which returned an empty global history while the us pool had data
+    // (2026-08-08: empty balance card next to a live $120 portfolio value).
+    all_snapshots.sort_by(|a, b| {
+        let latest = |s: &Vec<db::PnlSnapshotRow>| s.first().map(|r| r.ts.clone());
+        latest(&b.1).cmp(&latest(&a.1))
+    });
+
     if all_snapshots.is_empty() {
         warn!("GET /api/pnl/history (global): no snapshots from any asset");
         return Json(Vec::<db::PnlSnapshotRow>::new()).into_response();
