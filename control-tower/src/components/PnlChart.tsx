@@ -420,13 +420,13 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
               strokeWidth={0}
               isAnimationActive={false}
               dot={(props: any) => {
-                if (props.payload.positionDot === undefined) return <g />;
+                if (props.payload.positionDot === undefined) return <g key={props.key} />;
                 const { cx, cy, payload } = props;
                 const isActive = markerTip?.kind === 'position' &&
                   markerTip.data.position === payload._positionMarker?.position;
                 return (
                   <g
-                    key={`pos-${cx}-${cy}`}
+                    key={props.key}
                     style={{ cursor: 'pointer' }}
                     onMouseEnter={(e) => {
                       const rect = chartContainerRef.current?.getBoundingClientRect();
@@ -452,7 +452,7 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
               strokeWidth={0}
               isAnimationActive={false}
               dot={(props: any) => {
-                if (props.payload.tradeDot === undefined) return <g />;
+                if (props.payload.tradeDot === undefined) return <g key={props.key} />;
                 const { cx, cy, payload } = props;
                 const pnl = payload._tradeMarker?.pnl ?? 0;
                 const color = pnl > 0 ? '#10b981' : pnl < 0 ? '#ef4444' : '#6b7280';
@@ -460,7 +460,7 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
                   markerTip.data.trade === payload._tradeMarker?.trade;
                 return (
                   <g
-                    key={`trade-${cx}-${cy}`}
+                    key={props.key}
                     style={{ cursor: 'pointer' }}
                     onMouseEnter={(e) => {
                       const rect = chartContainerRef.current?.getBoundingClientRect();
