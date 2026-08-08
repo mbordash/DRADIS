@@ -118,21 +118,19 @@ impl Wing {
             Wing::Crypto => "crypto",
         }
     }
-    /// Wing-appropriate market discovery. The crypto wing queries the gateway
-    /// with `categories=crypto` and no volume floor — hourly crypto markets
-    /// rotate every hour and start near zero volume, so the sports-tuned
-    /// default query never surfaced them (3000 pairs, zero crypto, 2026-08-08).
+    /// Wing-appropriate market discovery. The crypto wing goes through
+    /// `/v1/search` → `/v1/markets?eventSlug=…` because the gateway ignores
+    /// the `categories=` filter on `/v1/markets`, and the sports-dominated
+    /// default query never surfaced crypto (3000 pairs, zero crypto,
+    /// 2026-08-08). No volume floor — hourly crypto markets rotate and start
+    /// near zero volume.
     async fn discover(
         self,
         venue: &UsRetailVenue,
     ) -> anyhow::Result<Vec<super::markets::UsMarketPair>> {
         match self {
             Wing::General => venue.discover_binary_markets().await,
-            Wing::Crypto => {
-                venue
-                    .discover_binary_markets_filtered(&["crypto"], Some(0.0))
-                    .await
-            }
+            Wing::Crypto => venue.discover_crypto_markets_via_search().await,
         }
     }
 }

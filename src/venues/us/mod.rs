@@ -278,6 +278,104 @@ impl UsRetailVenue {
         Ok(pairs)
     }
 
+    /// Crypto market discovery via `GET /v1/search` (the gateway ignores the
+    /// `categories=` filter on `/v1/markets`, see 2026-08-08 field logs).
+    ///
+    /// Two-step: text-search for crypto events → fetch their full market
+    /// records via `/v1/markets?eventSlug=…` (repeated params, SDK-confirmed).
+    pub async fn discover_crypto_markets_via_search(&self) -> Result<Vec<markets::UsMarketPair>> {
+        const QUERIES: &[&str] = &["bitcoin", "ethereum", "solana", "xrp", "crypto"];
+        let mut event_slugs: Vec<String> = Vec::new();
+
+        for q in QUERIES {
+            let path = "/v1/search";
+            let url = format!("{}{}?query={}&status=active&limit=100", self.base_url, path, q);
+            let signed = self.auth.signed_headers("GET", path);
+            let response = self.http
+                .get(&url)
+                .header(signed[0].0, &signed[0].1)
+                .header(signed[1].0, &signed[1].1)
+                .header(signed[2].0, &signed[2].1)
+                .header("Content-Type", "application/json")
+                .send()
+                .await
+                .with_context(|| format!("search HTTP request failed (query={q})"))?;
+            let http_status = response.status();
+            let text = response.text().await.context("search response read failed")?;
+            if !http_status.is_success() {
+                tracing::warn!("US search '{q}' returned HTTP {http_status}: {}",
+                    text.chars().take(200).collect::<String>());
+                continue;
+            }
+            let parsed: types::SearchResponse = match serde_json::from_str(&text) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::warn!("US search '{q}' JSON parse failed: {e} — body: {}",
+                        text.chars().take(200).collect::<String>());
+                    continue;
+                }
+            };
+            let hits = parsed.events.len();
+            let mut added = 0usize;
+            for ev in parsed.events {
+                if ev.closed || ev.slug.is_empty() {
+                    continue;
+                }
+                if !event_slugs.contains(&ev.slug) {
+                    event_slugs.push(ev.slug);
+                    added += 1;
+                }
+            }
+            info!("US crypto search '{q}': {hits} events, {added} new active slugs");
+        }
+
+        if event_slugs.is_empty() {
+            info!("US crypto search: no active crypto events found on the gateway");
+            return Ok(Vec::new());
+        }
+
+        // Fetch full market records for the found events, in slug batches
+        // (URL-length safety). No volume floor — hourly crypto markets rotate
+        // and start near zero volume.
+        let mut all_markets: Vec<types::UsMarket> = Vec::new();
+        for chunk in event_slugs.chunks(20) {
+            let path = "/v1/markets";
+            let slug_params: String = chunk.iter()
+                .map(|s| format!("&eventSlug={s}"))
+                .collect();
+            let url = format!("{}{}?limit=200&closed=false{}", self.base_url, path, slug_params);
+            let signed = self.auth.signed_headers("GET", path);
+            let response = self.http
+                .get(&url)
+                .header(signed[0].0, &signed[0].1)
+                .header(signed[1].0, &signed[1].1)
+                .header(signed[2].0, &signed[2].1)
+                .header("Content-Type", "application/json")
+                .send()
+                .await
+                .context("markets-by-eventSlug HTTP request failed")?;
+            let http_status = response.status();
+            let text = response.text().await.context("markets-by-eventSlug response read failed")?;
+            if !http_status.is_success() {
+                tracing::warn!("US markets-by-eventSlug returned HTTP {http_status}: {}",
+                    text.chars().take(200).collect::<String>());
+                continue;
+            }
+            match serde_json::from_str::<types::MarketsResponse>(&text) {
+                Ok(parsed) => all_markets.extend(parsed.markets),
+                Err(e) => tracing::warn!("US markets-by-eventSlug JSON parse failed: {e}"),
+            }
+        }
+
+        let raw_total = all_markets.len();
+        let pairs = markets::pair_markets(all_markets);
+        info!(
+            "US crypto search discovery: {} event slug(s) → {raw_total} raw markets → {} tradeable pairs",
+            event_slugs.len(), pairs.len()
+        );
+        Ok(pairs)
+    }
+
     /// Public connectivity probe (`GET /v1/health`, no auth).
     pub async fn health_check(&self) -> Result<()> {
         let body = self.client.health().await.context("health request failed")?;

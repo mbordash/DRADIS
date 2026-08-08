@@ -282,6 +282,28 @@ pub struct PortfolioResponse {
 
 }
 
+// ─── Event search (GET /v1/search) ───────────────────────────────────────────
+
+/// Response envelope for `GET /v1/search` — events matching a text query.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SearchResponse {
+    #[serde(default)]
+    pub events: Vec<SearchEvent>,
+}
+
+/// Lenient event record from search — only the fields discovery needs.
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct SearchEvent {
+    #[serde(default)]
+    pub slug: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub active: bool,
+    #[serde(default)]
+    pub closed: bool,
+}
+
 
 
 
