@@ -9,9 +9,10 @@
 /// │ rate > 0      │ Longs paying shorts — bullish smart-money lean     │
 /// │ rate = 0      │ Neutral, or Binance FAPI unreachable (geo-block)   │
 ///
-/// Falls back to `dec!(0)` silently if Binance FAPI is unreachable (e.g.
-/// geo-block on the server).  Primary URL is `fapi.binance.com`; on failure
-/// retries against the regional mirror `fapi.binance.us`.
+/// Falls back to `dec!(0)` silently if no source is reachable.  Primary URL is
+/// `fapi.binance.com`; on failure retries OKX (`BTC-USDT-SWAP` funding rate),
+/// which is reachable from US IPs where Binance FAPI is geo-blocked (451).
+/// (`fapi.binance.us` does not exist — Binance.US has no futures.)
 use std::str::FromStr;
 use std::sync::Arc;
 use std::collections::HashMap;
@@ -35,15 +36,22 @@ pub async fn run_funding_raptor(
         "sol" => "SOLUSDT",
         _     => "BTCUSDT",
     };
-    // Primary: Binance FAPI (futures). Fallback: Binance FAPI regional mirror.
+    let okx_inst = match crypto_filter.as_str() {
+        "eth" => "ETH-USDT-SWAP",
+        "sol" => "SOL-USDT-SWAP",
+        _     => "BTC-USDT-SWAP",
+    };
+    // Primary: Binance FAPI (futures). Fallback: OKX (US-reachable).
     let url_primary  = format!("https://fapi.binance.com/fapi/v1/premiumIndex?symbol={}", symbol);
-    let url_fallback = format!("https://fapi.binance.us/fapi/v1/premiumIndex?symbol={}", symbol);
+    let url_fallback = format!("https://www.okx.com/api/v5/public/funding-rate?instId={}", okx_inst);
 
     let mut consecutive_failures: u32 = 0;
 
     loop {
-        let result = try_fetch_funding(&http, &url_primary).await
-            .or(try_fetch_funding(&http, &url_fallback).await);
+        let result = match try_fetch_funding(&http, &url_primary).await {
+            Some(rate) => Some(rate),
+            None => try_fetch_funding_okx(&http, &url_fallback).await,
+        };
 
         match result {
             Some(rate) => {
@@ -86,5 +94,19 @@ async fn try_fetch_funding(http: &reqwest::Client, url: &str) -> Option<Decimal>
 
     let v = resp.json::<serde_json::Value>().await.ok()?;
     let rate_str = v.get("lastFundingRate").and_then(|r| r.as_str())?;
+    Decimal::from_str(rate_str).ok()
+}
+
+/// OKX fallback: `GET /api/v5/public/funding-rate?instId=…` with a 5s timeout.
+/// Response: `{"code":"0","data":[{"fundingRate":"0.0000249",…}]}`.
+async fn try_fetch_funding_okx(http: &reqwest::Client, url: &str) -> Option<Decimal> {
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        http.get(url).send(),
+    ).await.ok()?.ok()?;
+
+    let v = resp.json::<serde_json::Value>().await.ok()?;
+    let rate_str = v.get("data")?.as_array()?.first()?
+        .get("fundingRate")?.as_str()?;
     Decimal::from_str(rate_str).ok()
 }

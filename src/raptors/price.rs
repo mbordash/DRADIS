@@ -49,7 +49,14 @@ pub async fn run_price_raptor(
         "sol" => "solusdt",
         _     => "btcusdt",
     };
-    let url_str = format!("wss://stream.binance.com:9443/ws/{}@ticker", binance_pair);
+    // Host rotation: binance.com is geo-blocked (HTTP 451) from US IPs; the
+    // data-only mirror data-stream.binance.vision serves the same ticker
+    // stream without restriction. Rotate hosts on each failed connect.
+    let ws_urls = [
+        format!("wss://stream.binance.com:9443/ws/{}@ticker", binance_pair),
+        format!("wss://data-stream.binance.vision/ws/{}@ticker", binance_pair),
+    ];
+    let mut ws_url_idx = 0usize;
     let mut price_history: VecDeque<(Instant, Decimal)> = VecDeque::new();
     let mut price_history_60m: VecDeque<(Instant, Decimal)> = VecDeque::new();
     let mut price_history_10m: VecDeque<(Instant, Decimal)> = VecDeque::new();
@@ -64,9 +71,12 @@ pub async fn run_price_raptor(
         // Bounded connect: an unbounded `connect_async().await` can hang forever on a
         // half-open TCP path or geo-block, silently wedging the task with no reconnect
         // and no log (observed 2026-07-07 — oracle price frozen for ~10h). Cap it.
-        let conn = tokio_timeout(Duration::from_secs(20), connect_async(&url_str)).await;
+        let url_str = &ws_urls[ws_url_idx];
+        let conn = tokio_timeout(Duration::from_secs(20), connect_async(url_str)).await;
+        let mut connected = false;
         if let Ok(Ok((mut ws_stream, _))) = conn {
-            info!(" Price Raptor connected to Binance for {}", binance_pair.to_uppercase());
+            connected = true;
+            info!(" Price Raptor connected to Binance for {} via {}", binance_pair.to_uppercase(), url_str);
             // Mark price raptor as healthy for this asset.
             raptor_health_tx.send_modify(|map| {
                 map.entry(crypto_filter.clone()).or_default().price_connected = true;
@@ -232,6 +242,12 @@ pub async fn run_price_raptor(
             }
         }
         warn!("⚠️ Price Raptor disconnected. Reconnecting in 5s...");
+        // Rotate hosts only when the *connect* itself failed (e.g. HTTP 451
+        // geo-block from US IPs — data-stream.binance.vision is the open
+        // mirror). A mid-stream drop on a working host stays on that host.
+        if !connected {
+            ws_url_idx = (ws_url_idx + 1) % ws_urls.len();
+        }
         // Mark price raptor as offline while reconnecting.
         raptor_health_tx.send_modify(|map| {
             map.entry(crypto_filter.clone()).or_default().price_connected = false;
