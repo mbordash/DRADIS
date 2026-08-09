@@ -307,6 +307,10 @@ pub const BASIS_STOP_LOSS_PERCENT: Decimal = dec!(0.08);
 pub const BASIS_CATASTROPHIC_SL_PCT: Decimal = dec!(0.12); // bypasses min-hold guard on deep drawdown
 pub const BASIS_SKEW_COLLAPSE_THRESHOLD: Decimal = dec!(0.02);
 pub const BASIS_MIN_SECS_TO_EXPIRY: i64 = 900;
+pub const BASIS_MAX_SPREAD_PCT: Decimal = dec!(0.08);
+pub const BASIS_LOSS_LOCKOUT_COUNT: i64 = 3;
+pub const BASIS_LOSS_LOCKOUT_SECS: i64 = 1800;
+pub const BASIS_EXTREME_SKEW_BYPASS: bool = false;
 /// Minimum best-bid required to fire a basis forced-exit near expiry.
 pub const BASIS_EXPIRY_MIN_EXIT_BID: Decimal = dec!(0.10);
 pub const BASIS_MIN_TRADE_SIZE_USDC: Decimal = dec!(5.0);

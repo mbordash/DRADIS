@@ -94,7 +94,7 @@ impl StrategyRegistry {
             Box::new(ArbitrageStrategyImpl::default())                as Box<dyn Strategy>,
             Box::new(TimeDecayStrategyImpl)                as Box<dyn Strategy>,
             Box::new(MakerStrategyImpl::new())             as Box<dyn Strategy>,
-            Box::new(BasisStrategyImpl)                    as Box<dyn Strategy>,
+            Box::new(BasisStrategyImpl::new())             as Box<dyn Strategy>,
             Box::new(GboostStrategyImpl::default())        as Box<dyn Strategy>,
             Box::new(TrendReversalStrategyImpl::new())      as Box<dyn Strategy>,
             Box::new(ConvergenceStrategyImpl::new())       as Box<dyn Strategy>,

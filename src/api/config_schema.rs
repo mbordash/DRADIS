@@ -246,6 +246,14 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Hard emergency stop-loss overriding the min-hold window.").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "basis_min_secs_to_expiry", "Min Secs to Expiry", "secs", true,
             "Don't enter with fewer than this many seconds left.").min(0.0).step(1.0).unit("s"));
+        v.push(F::new(g, e, "basis_max_spread_pct", "Max Entry Spread", "pct", true,
+            "Skip entries when the entry-side book spread exceeds this fraction of mid — wide books birth positions straight into the catastrophic stop.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "basis_loss_lockout_count", "Loss Lockout Count", "int", true,
+            "Stop-loss exits on one token before re-entry locks out (0 = disabled). Prevents grinding a trend day one stop at a time.").min(0.0).step(1.0));
+        v.push(F::new(g, e, "basis_loss_lockout_secs", "Loss Lockout Duration", "secs", true,
+            "How long a token stays locked out after hitting the loss-lockout count.").min(0.0).step(60.0).unit("s"));
+        v.push(F::new(g, e, "basis_extreme_skew_bypass", "Extreme Skew Bypass", "bool", true,
+            "Allow entries without funding confirmation at 2× skew threshold. Off by default — extreme skew on daily markets is usually the trend, not mispricing."));
     }
 
     // ── GBoost ────────────────────────────────────────────────────────────────

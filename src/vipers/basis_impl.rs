@@ -22,13 +22,54 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use chrono::Utc;
 
+use std::collections::HashMap;
+use std::sync::Mutex;
+use std::time::Instant;
+
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
 use crate::venues::core::TimeInForce;
 
-pub struct BasisStrategyImpl;
+pub struct BasisStrategyImpl {
+    /// Stop-loss tally per token: (consecutive SL count, time of last SL).
+    /// Feeds the post-loss lockout gate — after N stops on one token, entries
+    /// on that token are blocked for the lockout window. A take-profit or
+    /// rejected exit order clears/decrements the tally.
+    loss_book: Mutex<HashMap<String, (i64, Instant)>>,
+}
+
+impl BasisStrategyImpl {
+    pub fn new() -> Self {
+        Self { loss_book: Mutex::new(HashMap::new()) }
+    }
+
+    /// True if `token` is currently locked out from re-entry.
+    fn locked_out(&self, token: &str, count: i64, secs: i64) -> bool {
+        if count <= 0 { return false; }
+        let book = self.loss_book.lock().unwrap();
+        match book.get(token) {
+            Some((n, at)) => *n >= count && (at.elapsed().as_secs() as i64) < secs,
+            None => false,
+        }
+    }
+
+    fn record_stop_loss(&self, token: &str) {
+        let mut book = self.loss_book.lock().unwrap();
+        let e = book.entry(token.to_string()).or_insert((0, Instant::now()));
+        e.0 += 1;
+        e.1 = Instant::now();
+    }
+
+    fn clear_losses(&self, token: &str) {
+        self.loss_book.lock().unwrap().remove(token);
+    }
+}
+
+impl Default for BasisStrategyImpl {
+    fn default() -> Self { Self::new() }
+}
 
 #[async_trait]
 impl Strategy for BasisStrategyImpl {
@@ -118,12 +159,36 @@ impl Strategy for BasisStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── Gate 3b: Entry-side spread ────────────────────────────────────────
+        // A taker entry fills near the ask while the exit marks to the bid; on a
+        // wide book the position is born ~spread% underwater and trips the
+        // catastrophic SL immediately (2026-08-09: NO @ 0.32, bid 0.20 → −37.5% @ 0s).
+        let (entry_bid, entry_ask, entry_token) = if skew > dec!(0) {
+            (snap.no_bid, snap.no_ask, market.no_token.as_str())
+        } else {
+            (snap.yes_bid, snap.yes_ask, market.yes_token.as_str())
+        };
+        let entry_mid = (entry_bid + entry_ask) / dec!(2);
+        if entry_mid <= dec!(0) || (entry_ask - entry_bid) / entry_mid > dc.basis_max_spread_pct {
+            idle("entry-side spread too wide");
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Gate 3c: Post-loss lockout ────────────────────────────────────────
+        // After N stop-losses on this token, the "mispricing" is a trend —
+        // stand aside until the lockout expires or the market rotates.
+        if self.locked_out(entry_token, dc.basis_loss_lockout_count, dc.basis_loss_lockout_secs) {
+            idle("post-loss lockout (repeated stops on this market)");
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Gate 4: Funding rate confirmation ────────────────────────────────
         let funding_confirms_no_trade = skew > dec!(0) // YES over-priced
             && ctx.snapshot.funding_rate < config::BASIS_NEGATIVE_FUNDING_THRESHOLD;
         let funding_confirms_yes_trade = skew < dec!(0) // NO over-priced
             && ctx.snapshot.funding_rate > config::BASIS_POSITIVE_FUNDING_THRESHOLD;
-        let extreme_skew_bypass = skew.abs() >= dc.basis_entry_skew_threshold * dec!(2);
+        let extreme_skew_bypass = dc.basis_extreme_skew_bypass
+            && skew.abs() >= dc.basis_entry_skew_threshold * dec!(2);
 
         // ── Gate 4b: Institutional-tide contradiction veto ────────────────────
         // Basis fades retail skew; the Tide Raptor reports where institutions are
@@ -360,6 +425,7 @@ impl Strategy for BasisStrategyImpl {
             let current_skew = (yes_mid - dec!(0.50)).abs();
 
             if profit_margin >= dc.basis_target_profit_pct {
+                self.clear_losses(token_id.as_str());
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
                         token_id: token_id.clone(),
@@ -402,6 +468,11 @@ impl Strategy for BasisStrategyImpl {
                     );
                     return Ok(StrategySignal::NoSignal);
                 }
+
+                // Feed the post-loss lockout tally. Recorded at signal time
+                // (same convention as TrendReversal's exit cooldown);
+                // `on_exit_order_failed` rolls it back on placement rejection.
+                self.record_stop_loss(token_id.as_str());
 
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
@@ -483,6 +554,16 @@ impl Strategy for BasisStrategyImpl {
 
     fn status(&self) -> StrategyStatus { StrategyStatus::Active }
     fn name(&self) -> String { "BasisStrategy".to_string() }
+
+    /// Patrol reports a rejected exit placement — the stop never executed, so
+    /// roll back the loss-lockout tally bump made at signal time.
+    fn on_exit_order_failed(&self, token_id: &crate::venues::core::MarketId) {
+        let mut book = self.loss_book.lock().unwrap();
+        if let Some(e) = book.get_mut(token_id.as_str()) {
+            e.0 -= 1;
+            if e.0 <= 0 { book.remove(token_id.as_str()); }
+        }
+    }
     fn venue(&self) -> &'static str { "Window/Daily" }
     fn max_exposure(&self) -> rust_decimal::Decimal { crate::config::BASIS_MAX_EXPOSURE_USDC }
     fn risk_model(&self) -> &'static str { "Gross one-sided" }

@@ -126,6 +126,10 @@ fn default_basis_entry_skew_threshold()     -> Decimal { config::BASIS_ENTRY_SKE
 fn default_basis_skew_collapse_threshold()  -> Decimal { config::BASIS_SKEW_COLLAPSE_THRESHOLD         }
 fn default_basis_catastrophic_sl_pct()      -> Decimal { config::BASIS_CATASTROPHIC_SL_PCT             }
 fn default_basis_min_secs_to_expiry()       -> i64     { config::BASIS_MIN_SECS_TO_EXPIRY              }
+fn default_basis_max_spread_pct()           -> Decimal { config::BASIS_MAX_SPREAD_PCT                  }
+fn default_basis_loss_lockout_count()       -> i64     { config::BASIS_LOSS_LOCKOUT_COUNT              }
+fn default_basis_loss_lockout_secs()        -> i64     { config::BASIS_LOSS_LOCKOUT_SECS               }
+fn default_basis_extreme_skew_bypass()      -> bool    { config::BASIS_EXTREME_SKEW_BYPASS             }
 
 fn default_convergence_min_entry_price()    -> Decimal { config::CONVERGENCE_MIN_ENTRY_PRICE           }
 fn default_convergence_pulse_threshold()    -> Decimal { config::CONVERGENCE_PULSE_THRESHOLD           }
@@ -350,6 +354,14 @@ pub struct DynamicConfig {
     pub basis_catastrophic_sl_pct:     Decimal,
     #[serde(default = "default_basis_min_secs_to_expiry")]
     pub basis_min_secs_to_expiry:      i64,
+    #[serde(default = "default_basis_max_spread_pct")]
+    pub basis_max_spread_pct:          Decimal,
+    #[serde(default = "default_basis_loss_lockout_count")]
+    pub basis_loss_lockout_count:      i64,
+    #[serde(default = "default_basis_loss_lockout_secs")]
+    pub basis_loss_lockout_secs:       i64,
+    #[serde(default = "default_basis_extreme_skew_bypass")]
+    pub basis_extreme_skew_bypass:     bool,
 
     // ── GBoost Viper ──────────────────────────────────────────────────────────
     pub gboost_entry_threshold:   Decimal,
@@ -564,6 +576,10 @@ impl Default for DynamicConfig {
             basis_skew_collapse_threshold: config::BASIS_SKEW_COLLAPSE_THRESHOLD,
             basis_catastrophic_sl_pct:     config::BASIS_CATASTROPHIC_SL_PCT,
             basis_min_secs_to_expiry:      config::BASIS_MIN_SECS_TO_EXPIRY,
+            basis_max_spread_pct:          config::BASIS_MAX_SPREAD_PCT,
+            basis_loss_lockout_count:      config::BASIS_LOSS_LOCKOUT_COUNT,
+            basis_loss_lockout_secs:       config::BASIS_LOSS_LOCKOUT_SECS,
+            basis_extreme_skew_bypass:     config::BASIS_EXTREME_SKEW_BYPASS,
 
             gboost_entry_threshold:   config::GBOOST_ENTRY_THRESHOLD,
             gboost_stop_loss_pct:     config::GBOOST_STOP_LOSS_PERCENT,
