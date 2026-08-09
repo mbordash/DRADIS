@@ -615,11 +615,11 @@ LLM_OUTCOME_HORIZON_SECS=7200    # when applied changes get outcome-scored
 - Alpaca API key/secret (optional — free tier; powers both **Tide** and **Horizon** Raptors from one connection. Without it both cards stay idle.)
 - The Odds API key (optional — free tier; only needed for the **Sports Raptor**'s line-movement feed. Without it the Sports Raptor pill stays idle.)
 
-**International build (`intl_clob`) only:**
+**Polymarket International build (`intl_clob`) only:**
 - A Polygon wallet with USDC and MATIC
 - **A paid Polygon RPC endpoint** (required for auto-settlement)
 
-**US Retail build (`us_retail`) only:**
+**Polymarket US Retail build (`us_retail`) only:**
 - Polymarket US developer-portal API key (Key ID + Ed25519 Secret Key) — no wallet or RPC needed
 
 **Kalshi build (`kalshi`) only:**
