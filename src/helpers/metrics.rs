@@ -7,7 +7,7 @@ use rust_decimal_macros::dec;
 use chrono::{DateTime, Utc};
 use tracing::info;
 use crate::helpers::db;
-use crate::state::MarketSnapshot;
+use crate::state::{MarketSnapshot, TradeScope};
 
 /// Process-global stash for per-viper gate/decision state, keyed by token_id.
 /// A viper calls `stash_entry_signals_json` immediately before returning an Entry
@@ -45,7 +45,7 @@ fn take_entry_signals_json(token_id: &str) -> Option<String> {
 ///
 /// `asset` — lowercase crypto symbol, e.g. `"btc"`.  Drives the SQLite pool selection.
 pub async fn record_trade(
-    asset: &str,
+    scope: &TradeScope,
     strategy: String,
     market: String,
     side: String,
@@ -55,13 +55,13 @@ pub async fn record_trade(
     profit_usdc: Decimal,
     reason: String,
 ) {
-    record_trade_with_timestamp(asset, strategy, market, side, entry_price, exit_price, shares, profit_usdc, reason, None).await;
+    record_trade_with_timestamp(scope, strategy, market, side, entry_price, exit_price, shares, profit_usdc, reason, None).await;
 }
 
 /// Record a trade with an explicit timestamp (for retrospective settlements).
 /// If `timestamp` is None, uses current time.
 pub async fn record_trade_with_timestamp(
-    asset: &str,
+    scope: &TradeScope,
     strategy: String,
     market: String,
     side: String,
@@ -72,18 +72,23 @@ pub async fn record_trade_with_timestamp(
     reason: String,
     timestamp: Option<DateTime<Utc>>,
 ) {
-    if let Some(pool) = db::pool_for(asset) {
-        db::record_trade_db(&pool, &strategy, &market, &side, entry_price, exit_price, shares, profit_usdc, &reason, timestamp).await;
-        info!("📊 Trade recorded to database: {} {} {}", strategy, market, side);
+    if let Some(pool) = db::pool_for(&scope.shard) {
+        db::record_trade_db(&pool, scope, &strategy, &market, &side, entry_price, exit_price, shares, profit_usdc, &reason, timestamp).await;
+        info!("📊 Trade recorded to database: {} {} {} [venue={} class={} underlying={}]",
+            strategy, market, side,
+            if scope.venue.is_empty() { db::venue_for_shard(&scope.shard) } else { scope.venue.clone() },
+            scope.market_class.as_deref().unwrap_or("-"),
+            scope.underlying.as_deref().unwrap_or("-"));
     }
 }
 
 /// Records a position entry event to the database for recovery after bot restarts.
 ///
-/// `asset` — lowercase crypto symbol, e.g. `"btc"`.  Drives SQLite pool selection.
+/// `scope` — the trade's filing dimensions. `scope.shard` drives SQLite pool
+/// selection; venue/class/underlying are persisted on the row.
 /// `token_id` — stored as decimal string representation (same as U256::to_string()).
 pub async fn record_entry(
-    asset: &str,
+    scope: &TradeScope,
     strategy: String,
     token_id: String,
     market: String,
@@ -91,8 +96,8 @@ pub async fn record_entry(
     entry_price: Decimal,
     shares: Decimal,
 ) {
-    if let Some(pool) = db::pool_for(asset) {
-        db::record_entry_db(&pool, &strategy, &token_id, &market, &side, entry_price, shares).await;
+    if let Some(pool) = db::pool_for(&scope.shard) {
+        db::record_entry_db(&pool, scope, &strategy, &token_id, &market, &side, entry_price, shares).await;
     }
 }
 

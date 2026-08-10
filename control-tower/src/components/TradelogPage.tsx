@@ -13,7 +13,17 @@ type LogStatus = 'launch' | 'inflight' | 'completed';
 interface LogEntry {
   key:       string;
   ts:        Date;
-  asset:     string;
+  /**
+   * Which database the row came from. A *storage* location, not a market
+   * attribute — it holds an underlying symbol on the intl CLOB but a venue name
+   * on Kalshi and US. Displayed as "Book", never as the asset. The real
+   * attributes are `venue` / `marketClass` / `underlying` below.
+   */
+  shard:     string;
+  venue:       string | null;
+  marketClass: string | null;
+  /** Null for markets with no underlying instrument (sports, politics). */
+  underlying:  string | null;
   status:    LogStatus;
   strategy:  string;
   market:    string;
@@ -38,6 +48,27 @@ const ASSET_COLOR: Record<string, string> = {
 };
 
 const ASSET_EMOJI: Record<string, string> = { btc: '₿', eth: 'Ξ', sol: '◎' };
+
+const VENUE_LABEL: Record<string, string> = {
+  'kalshi':          'Kalshi',
+  'polymarket-us':   'Poly US',
+  'polymarket-intl': 'Poly Intl',
+};
+
+const CLASS_EMOJI: Record<string, string> = {
+  crypto: '₿', sports: '🏈', politics: '🏛', unknown: '◈',
+};
+
+/**
+ * What to show for the market's subject. Crypto markets have an underlying
+ * symbol; sports and politics genuinely do not, so they show their class
+ * instead of an invented ticker.
+ */
+function subjectBadge(e: LogEntry): string {
+  if (e.underlying)  return `${ASSET_EMOJI[e.underlying] ?? '◈'} ${e.underlying.toUpperCase()}`;
+  if (e.marketClass) return `${CLASS_EMOJI[e.marketClass] ?? '◈'} ${e.marketClass.toUpperCase()}`;
+  return '—';
+}
 
 const STATUS_META: Record<LogStatus, { icon: string; label: string; color: string }> = {
   launch:    { icon: '🚀', label: 'Launch',    color: 'text-blue-400' },
@@ -84,14 +115,17 @@ function TipCell({ full, maxChars, className = '' }: { full: string; maxChars: n
 }
 
 // Convert API data → LogEntry array for one asset
-function assetToEntries(asset: string, trades: TradeRow[], positions: OpenPositionRow[]): LogEntry[] {
+function assetToEntries(shard: string, trades: TradeRow[], positions: OpenPositionRow[]): LogEntry[] {
   const entries: LogEntry[] = [];
 
   for (const t of trades) {
     entries.push({
-      key:        `${asset}-completed-${t.ts}-${t.market}`,
+      key:        `${shard}-completed-${t.ts}-${t.market}`,
       ts:         new Date(t.ts),
-      asset,
+      shard,
+      venue:       t.venue ?? null,
+      marketClass: t.market_class ?? null,
+      underlying:  t.underlying ?? null,
       status:     'completed',
       strategy:   t.strategy,
       market:     t.market,
@@ -113,9 +147,14 @@ function assetToEntries(asset: string, trades: TradeRow[], positions: OpenPositi
     const shares = parseFloat(p.shares);
     const unrealized = fmtUnrealized(entry, cur, shares);
     entries.push({
-      key:         `${asset}-${status}-${p.ts}-${p.token_id}`,
+      key:         `${shard}-${status}-${p.ts}-${p.token_id}`,
       ts:          new Date(p.ts),
-      asset,
+      shard,
+      // open_positions carries no filing columns yet; the shard is the
+      // underlying on the intl venue and a venue name elsewhere.
+      venue:       null,
+      marketClass: null,
+      underlying:  ASSET_EMOJI[shard] ? shard : null,
       status,
       strategy:    p.strategy,
       market:      p.market,
@@ -221,7 +260,8 @@ function RtbModal({
           🛬 Return to Base Confirmation
         </h3>
         <div className="space-y-2 text-sm text-gray-300 mb-5">
-          <p><strong className="text-white">Asset:</strong> {entry.asset.toUpperCase()}</p>
+          <p><strong className="text-white">Venue:</strong> {entry.venue ? (VENUE_LABEL[entry.venue] ?? entry.venue) : entry.shard.toUpperCase()}</p>
+          <p><strong className="text-white">Subject:</strong> {subjectBadge(entry)}</p>
           <p><strong className="text-white">Market:</strong> {truncate(entry.market, 60)}</p>
           <p>
             <strong className="text-white">Side:</strong>{' '}
@@ -360,7 +400,7 @@ export default function TradelogPage({ availableAssets }: Props) {
   // ── Apply filters ────────────────────────────────────────────────────────────
   const filtered = useMemo(() => {
     return allEntries.filter(e => {
-      if (assetFilter    !== 'all' && e.asset                        !== assetFilter)    return false;
+      if (assetFilter    !== 'all' && e.shard                        !== assetFilter)    return false;
       if (statusFilter   !== 'all' && e.status                       !== statusFilter)   return false;
       if (strategyFilter !== 'all' && shortStrategy(e.strategy)      !== strategyFilter) return false;
       if (sideFilter     !== 'all' && e.side.toUpperCase()           !== sideFilter)     return false;
@@ -379,7 +419,9 @@ export default function TradelogPage({ availableAssets }: Props) {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           token_id:          rtbEntry.rawPosition.token_id,
-          asset:             rtbEntry.asset,
+          // The API's `asset` field is the shard/pool selector, not a market
+          // attribute — keep sending the shard under its wire name.
+          asset:             rtbEntry.shard,
           strategy:          rtbEntry.rawPosition.strategy,
           market:            rtbEntry.rawPosition.market,
           side:              rtbEntry.rawPosition.side,
@@ -412,7 +454,10 @@ export default function TradelogPage({ availableAssets }: Props) {
       <div className="card px-4 py-3 space-y-3">
         <div className="flex flex-wrap items-center gap-2">
           {/* Asset */}
-          <span className="text-xs text-gray-500 font-mono mr-1">Asset:</span>
+          <span
+            className="text-xs text-gray-500 font-mono mr-1 cursor-help"
+            title="Which database the rows come from. On the intl venue this is the underlying asset; on Kalshi and US it is the venue."
+          >Book:</span>
           <FilterPill label="All"         active={assetFilter === 'all'} onClick={() => setAssetFilter('all')} />
           {assets.map(a => (
             <FilterPill
@@ -484,7 +529,7 @@ export default function TradelogPage({ availableAssets }: Props) {
             <table className="w-full text-xs font-mono">
               <thead>
                 <tr className="border-b border-[#1e1e32]">
-                  {['Time', 'Asset', 'Status', 'Strategy', 'Market', 'Side', 'Entry', 'Cur / Exit', 'Shares', 'P&L', 'Reason / Mode'].map(h => (
+                  {['Time', 'Venue', 'Subject', 'Status', 'Strategy', 'Market', 'Side', 'Entry', 'Cur / Exit', 'Shares', 'P&L', 'Reason / Mode'].map(h => (
                     <th key={h} className="px-3 py-2 text-left text-gray-500 font-normal whitespace-nowrap">
                       {h}
                     </th>
@@ -496,7 +541,7 @@ export default function TradelogPage({ availableAssets }: Props) {
                 {filtered.map(e => {
                   const isLong   = ['YES', 'UP', 'BUY'].includes(e.side.toUpperCase());
                   const sm       = STATUS_META[e.status];
-                  const assetCls = ASSET_COLOR[e.asset] ?? 'bg-gray-500/10 text-gray-300 border-gray-500/20';
+                  const assetCls = ASSET_COLOR[e.underlying ?? ''] ?? 'bg-gray-500/10 text-gray-300 border-gray-500/20';
                   const isOpen   = e.status !== 'completed';
 
                   return (
@@ -515,10 +560,17 @@ export default function TradelogPage({ availableAssets }: Props) {
                         }
                       </td>
 
-                      {/* Asset */}
-                      <td className="px-3 py-2">
+                      {/* Venue */}
+                      <td className="px-3 py-2 whitespace-nowrap">
+                        <span className="inline-block px-1.5 py-0.5 text-[10px] font-bold rounded border bg-slate-500/10 text-slate-300 border-slate-500/20">
+                          {e.venue ? (VENUE_LABEL[e.venue] ?? e.venue) : '—'}
+                        </span>
+                      </td>
+
+                      {/* Subject: underlying, or market class when there is none */}
+                      <td className="px-3 py-2 whitespace-nowrap">
                         <span className={`inline-block px-1.5 py-0.5 text-[10px] font-bold rounded border ${assetCls}`}>
-                          {ASSET_EMOJI[e.asset] ?? '◈'} {e.asset.toUpperCase()}
+                          {subjectBadge(e)}
                         </span>
                       </td>
 

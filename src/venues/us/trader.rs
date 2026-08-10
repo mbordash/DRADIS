@@ -54,6 +54,7 @@ use crate::raptors::horizon::HorizonSnapshot;
 use crate::raptors::sports::SportsSnapshot;
 use crate::raptors::tide::TideSnapshot;
 use crate::state::{
+    TradeScope,
     MarketConfig, MarketPhase, MarketSnapshot, OrderParams, Position, PositionMap, PriceState,
     StrategySignal,
 };
@@ -89,7 +90,11 @@ const MARKET_RESCAN_SECS: u64 = 300; // 5 minutes
 /// Rotate to a new market only when it has at least this much more volume than
 /// the current one. Prevents thrashing between near-equal markets.
 const ROTATION_VOLUME_THRESHOLD: f64 = 10_000.0;
+/// SQLite shard key for the US general wing (storage identity, not an asset).
 pub const US_ASSET: &str = "us";
+/// Runtime venue identity persisted on every trade and entry row. Both US
+/// wings share one venue; they differ by shard and market class.
+pub const US_VENUE: &str = "polymarket-us";
 /// Asset key for the US crypto wing — its own DB pool, squadron id, and
 /// viper-status scope so the sports and crypto squadrons never collide.
 pub const US_CRYPTO_ASSET: &str = "us-crypto";
@@ -571,8 +576,10 @@ async fn trade_one_market(
     // the timestamp in the description — same chain intl uses). These feed the
     // oracle/velocity/funding/derivatives snapshot fields the intelligence-
     // driven vipers (Momentum, GBoost, Basis, FairValue, …) gate on.
+    let mut detected_underlying: Option<String> = None;
     let (raptors, strike_price) = if wing == Wing::Crypto {
         let underlying = detect_underlying(&pair).unwrap_or("btc");
+        detected_underlying = Some(underlying.to_string());
         let stack = raptor_stack_for(underlying, raptor_health_tx);
         let mut strike = extract_strike_price(&pair.question);
         if strike.is_none() {
@@ -605,6 +612,15 @@ async fn trade_one_market(
     // Classify the market's domain and link it to its eligible raptors/vipers via
     // the shared, venue-neutral taxonomy (same path intl uses).
     let market_class = squadron.classify_and_link().await;
+    // Filing dimensions for this market's rows. The general wing hunts sports
+    // and politics, which have no underlying instrument at all — `None` here is
+    // the correct value, not a missing one.
+    let scope = TradeScope::new(
+        asset,
+        US_VENUE,
+        Some(market_class.clone()),
+        detected_underlying.clone(),
+    );
 
     // Rename the squadron to describe what it hunts (its market class).
     cag.update_name(&squadron_id, us_squadron_name(&market_class));
@@ -761,9 +777,10 @@ async fn trade_one_market(
                     let avg_entry  = leg.avg_entry;
                     let exit_price = leg.exit_price;
                     let shares     = leg.shares;
+                    let scope_t = scope.clone();
                     tokio::spawn(async move {
                         metrics::record_trade(
-                            asset,
+                            &scope_t,
                             strat,
                             market,
                             "Sell".to_string(),
@@ -849,7 +866,7 @@ async fn trade_one_market(
 
         let mut acted = false;
         for (strategy_name, signal) in signals {
-            if dispatch_signal(venue.as_ref(), &pool, &positions, &lifecycle, asset, &strategy_name, &signal, starting).await {
+            if dispatch_signal(venue.as_ref(), &pool, &positions, &lifecycle, &scope, &strategy_name, &signal, starting).await {
                 acted = true;
             }
         }
@@ -1023,7 +1040,7 @@ async fn dispatch_signal(
     pool: &Option<sqlx::SqlitePool>,
     positions: &Arc<Mutex<PositionMap>>,
     lifecycle: &OrderLifecycle,
-    asset: &'static str,
+    scope: &TradeScope,
     strategy_name: &str,
     signal: &StrategySignal,
     starting: Decimal,
@@ -1034,8 +1051,8 @@ async fn dispatch_signal(
                 info!("👻 [{strategy_name}] ghost entry pair: {} + {}", params.token_id, pp.token_id);
                 record_guard(positions, strategy_name, params, Some(&pp.token_id)).await;
                 record_guard(positions, strategy_name, pp, Some(&params.token_id)).await;
-                record_entry(pool, asset, strategy_name, params).await;
-                record_entry(pool, asset, strategy_name, pp).await;
+                record_entry(pool, scope, strategy_name, params).await;
+                record_entry(pool, scope, strategy_name, pp).await;
                 return true;
             }
             let legs = [
@@ -1052,8 +1069,8 @@ async fn dispatch_signal(
                     // lifecycle (fill-confirm / stale-cancel / naked-leg hedge).
                     lifecycle.track(&a, strategy_name, params.order_type, Some(pp.token_id.clone())).await;
                     lifecycle.track(&b, strategy_name, pp.order_type, Some(params.token_id.clone())).await;
-                    record_entry(pool, asset, strategy_name, params).await;
-                    record_entry(pool, asset, strategy_name, pp).await;
+                    record_entry(pool, scope, strategy_name, params).await;
+                    record_entry(pool, scope, strategy_name, pp).await;
                     if let Some(p) = pool { sync_dashboard(venue, p, Some(positions), starting).await; }
                     true
                 }
@@ -1061,12 +1078,12 @@ async fn dispatch_signal(
             }
         }
         StrategySignal::Entry { params, pair_params: None } => {
-            dispatch_single(venue, pool, positions, lifecycle, asset, strategy_name, params, Side::Buy, starting).await
+            dispatch_single(venue, pool, positions, lifecycle, scope, strategy_name, params, Side::Buy, starting).await
         }
         StrategySignal::MakerQuote { yes, no } => {
             let mut acted = false;
             for q in [yes.as_ref(), no.as_ref()].into_iter().flatten() {
-                if dispatch_single(venue, pool, positions, lifecycle, asset, strategy_name, q, Side::Buy, starting).await {
+                if dispatch_single(venue, pool, positions, lifecycle, scope, strategy_name, q, Side::Buy, starting).await {
                     acted = true;
                 }
             }
@@ -1101,9 +1118,9 @@ async fn dispatch_signal(
                 .await
                 .get(&(strategy_name.to_string(), params.token_id.clone()))
                 .map(|p| (p.avg_entry, p.shares));
-            let acted = dispatch_single(venue, pool, positions, lifecycle, asset, strategy_name, params, Side::Sell, starting).await;
+            let acted = dispatch_single(venue, pool, positions, lifecycle, scope, strategy_name, params, Side::Sell, starting).await;
             if acted {
-                record_round_trip(pool, asset, strategy_name, params, entered, reason).await;
+                record_round_trip(pool, scope, strategy_name, params, entered, reason).await;
             }
             // Clear this strategy's guard for the leg (and the paired leg, if any)
             // so it can re-enter later.
@@ -1130,7 +1147,7 @@ async fn dispatch_single(
     pool: &Option<sqlx::SqlitePool>,
     positions: &Arc<Mutex<PositionMap>>,
     lifecycle: &OrderLifecycle,
-    asset: &'static str,
+    scope: &TradeScope,
     strategy_name: &str,
     params: &OrderParams,
     side: Side,
@@ -1141,7 +1158,7 @@ async fn dispatch_single(
             params.token_id, params.price, params.shares);
         if matches!(side, Side::Buy) {
             record_guard(positions, strategy_name, params, None).await;
-            record_entry(pool, asset, strategy_name, params).await;
+            record_entry(pool, scope, strategy_name, params).await;
         }
         return true;
     }
@@ -1152,7 +1169,7 @@ async fn dispatch_single(
             if matches!(side, Side::Buy) {
                 record_guard(positions, strategy_name, params, None).await;
                 lifecycle.track(&f, strategy_name, params.order_type, None).await;
-                record_entry(pool, asset, strategy_name, params).await;
+                record_entry(pool, scope, strategy_name, params).await;
             }
             if let Some(p) = pool { sync_dashboard(venue, p, Some(positions), starting).await; }
             true
@@ -1168,13 +1185,13 @@ async fn dispatch_single(
 /// viper owns it — every live position was mislabelled as ArbitrageStrategy.
 async fn record_entry(
     pool: &Option<sqlx::SqlitePool>,
-    asset: &'static str,
+    scope: &TradeScope,
     strategy_name: &str,
     params: &OrderParams,
 ) {
     let side = side_label(params.token_id.as_str());
     metrics::record_entry(
-        asset,
+        scope,
         strategy_name.to_string(),
         params.token_id.to_string(),
         params.market_name.clone(),
@@ -1208,7 +1225,7 @@ async fn record_entry(
 /// verifiable cost basis and we log loudly rather than invent P&L.
 async fn record_round_trip(
     pool: &Option<sqlx::SqlitePool>,
-    asset: &'static str,
+    scope: &TradeScope,
     strategy_name: &str,
     params: &OrderParams,
     entered: Option<(Decimal, Decimal)>,
@@ -1224,7 +1241,7 @@ async fn record_round_trip(
     let shares = shares.min(params.shares).max(Decimal::ZERO);
     let pnl = (params.price - avg_entry) * shares;
     metrics::record_trade(
-        asset,
+        scope,
         strategy_name.to_string(),
         params.market_name.clone(),
         side_label(params.token_id.as_str()).to_string(),

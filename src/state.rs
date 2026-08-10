@@ -17,6 +17,66 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
+// ─── Trade filing dimensions ─────────────────────────────────────────────────
+
+/// The dimensions a trade or entry row is filed under.
+///
+/// These were historically collapsed into a single `asset: &str` parameter that
+/// meant different things on different venues — `btc`/`eth`/`sol` on the intl
+/// CLOB, but `us`, `us-crypto`, `kalshi` elsewhere. The Control Tower rendered
+/// that value under an "Asset" column, so a Kalshi BTC trade displayed as asset
+/// "KALSHI", and BTC vs ETH trades on the same venue were indistinguishable
+/// because they shared one shard. Splitting the concepts apart makes each field
+/// answer exactly one question.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TradeScope {
+    /// SQLite pool selector — a *storage location*, not a market attribute.
+    /// One database file per shard; several assets may share one.
+    pub shard: String,
+    /// Which exchange executed this. Empty means "resolve from the shard
+    /// registry" (see `db::venue_for_shard`).
+    pub venue: String,
+    /// Market taxonomy: `crypto` | `sports` | `politics` | `unknown`.
+    /// `None` on reconciliation paths that recover a row without a live
+    /// squadron to ask.
+    pub market_class: Option<String>,
+    /// Underlying symbol (`btc`, `eth`, `sol`).
+    ///
+    /// `None` is a first-class value, not a gap: a market like "will the Chiefs
+    /// win" or "who takes the Senate" has no underlying instrument. Any design
+    /// that forces a symbol here has to invent one.
+    pub underlying: Option<String>,
+}
+
+impl TradeScope {
+    pub fn new(
+        shard: impl Into<String>,
+        venue: impl Into<String>,
+        market_class: Option<String>,
+        underlying: Option<String>,
+    ) -> Self {
+        Self { shard: shard.into(), venue: venue.into(), market_class, underlying }
+    }
+
+    /// Scope for paths that know only which database to write to — chain-sync
+    /// reconciliation, retrospective settlement booking, API backfill. The venue
+    /// still resolves from the shard registry; class and underlying stay `NULL`
+    /// rather than being guessed.
+    pub fn shard_only(shard: impl Into<String>) -> Self {
+        Self { shard: shard.into(), venue: String::new(), market_class: None, underlying: None }
+    }
+
+    /// Convenience for crypto markets, where the underlying and the taxonomy
+    /// class are both known up front.
+    pub fn crypto(
+        shard: impl Into<String>,
+        venue: impl Into<String>,
+        underlying: impl Into<String>,
+    ) -> Self {
+        Self::new(shard, venue, Some("crypto".to_string()), Some(underlying.into()))
+    }
+}
+
 /// Cooldown map keyed by an opaque fingerprint string → expiry `Instant`.
 pub type PhantomCooldowns = Arc<Mutex<HashMap<String, Instant>>>;
 /// Set of market ids that have been flattened/abandoned and must not be re-hedged.

@@ -565,7 +565,8 @@ pub fn spawn_cleanup_task(
                                                                         db::confirm_position_status(&pool, "ArbitrageStrategy", &rh_tid).await;
                                                                     }
                                                                     metrics::record_entry(
-                                                                        &rh_asset,
+                                                                        &crate::state::TradeScope::crypto(
+                                                                            &rh_asset, crate::venues::intl::INTL_VENUE, &rh_asset),
                                                                         "ArbitrageStrategy".to_string(),
                                                                         rh_tid.clone(), rh_mkt.clone(), rh_sd.clone(),
                                                                         rh_ep, rh_sh,
@@ -784,7 +785,8 @@ pub fn spawn_lifecycle_task(
                         // (the invisible half of the 2026-07-03 arb orphan). Awaiting here
                         // guarantees the flatten is persisted before we move on.
                         metrics::record_trade(
-                            &asset_c,
+                            &crate::state::TradeScope::crypto(
+                                &asset_c, crate::venues::intl::INTL_VENUE, &asset_c),
                             strat,
                             market,
                             side,

@@ -43,7 +43,7 @@ use crate::raptors::tide::TideSnapshot;
 use crate::squadron::{CryptoAsset, Squadron, SquadronConfig, SquadronRaptors, SquadronState};
 use crate::state::{
     MarketConfig, MarketPhase, MarketSnapshot, OrderParams, Position, PositionMap, PriceState,
-    StrategySignal,
+    StrategySignal, TradeScope,
 };
 use crate::venues::core::{Execution, MarketId, OrderIntent, Side};
 use crate::venues::lifecycle::{LifecycleConfig, OrderLifecycle};
@@ -73,7 +73,12 @@ const MARKET_RESCAN_SECS: u64 = 120;
 const ROTATION_VOLUME_THRESHOLD: f64 = 5_000.0;
 /// Conservative quadratic-fee ceiling (1.75¢/contract at P=0.5) in bps.
 const KALSHI_FEE_BPS: u16 = 175;
+/// SQLite shard key for this venue. A *storage* identity — every Kalshi
+/// squadron writes here regardless of underlying, so it must not be shown as
+/// the market's asset. Use `KALSHI_VENUE` / `TradeScope` for that.
 pub const KALSHI_ASSET: &str = "kalshi";
+/// Runtime venue identity persisted on every trade and entry row.
+pub const KALSHI_VENUE: &str = "kalshi";
 
 /// Market cadence derived from the series ticker suffix.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -513,6 +518,15 @@ async fn trade_one_market(
     db::alias_pool(pair.underlying, asset);
     seed_squadron_config(&squadron_id).await;
     let market_class = squadron.classify_and_link().await;
+    // Filing dimensions for every row this market writes. `asset` above is
+    // only the shard (one DB for all Kalshi squadrons); venue, class and
+    // underlying are the attributes that actually describe the trade.
+    let scope = TradeScope::new(
+        asset,
+        KALSHI_VENUE,
+        Some(market_class.clone()),
+        Some(pair.underlying.to_string()),
+    );
 
     let viper_kinds = match db::pool() {
         Some(p) => db::vipers_for_class(p, &market_class).await,
@@ -665,9 +679,10 @@ async fn trade_one_market(
                     let strat  = leg.strategy.clone();
                     let market = leg.market_name.clone();
                     let (avg_entry, exit_price, shares) = (leg.avg_entry, leg.exit_price, leg.shares);
+                    let scope_t = scope.clone();
                     tokio::spawn(async move {
                         metrics::record_trade(
-                            asset, strat, market, "Sell".to_string(),
+                            &scope_t, strat, market, "Sell".to_string(),
                             avg_entry, exit_price, shares, pnl,
                             "LifecycleFlatten".to_string(),
                         ).await;
@@ -752,7 +767,7 @@ async fn trade_one_market(
 
         let mut acted = false;
         for (strategy_name, signal) in signals {
-            if dispatch_signal(venue.as_ref(), &pool, &positions, &lifecycle, &strategy_name, &signal, starting).await {
+            if dispatch_signal(venue.as_ref(), &pool, &scope, &positions, &lifecycle, &strategy_name, &signal, starting).await {
                 acted = true;
             }
         }
@@ -909,6 +924,7 @@ async fn record_guard(
 async fn dispatch_signal(
     venue: &KalshiVenue,
     pool: &Option<sqlx::SqlitePool>,
+    scope: &TradeScope,
     positions: &Arc<Mutex<PositionMap>>,
     lifecycle: &OrderLifecycle,
     strategy_name: &str,
@@ -921,8 +937,8 @@ async fn dispatch_signal(
                 info!("👻 [{strategy_name}] ghost entry pair: {} + {}", params.token_id, pp.token_id);
                 record_guard(positions, strategy_name, params, Some(&pp.token_id)).await;
                 record_guard(positions, strategy_name, pp, Some(&params.token_id)).await;
-                record_entry(pool, strategy_name, params).await;
-                record_entry(pool, strategy_name, pp).await;
+                record_entry(pool, scope, strategy_name, params).await;
+                record_entry(pool, scope, strategy_name, pp).await;
                 return true;
             }
             let legs = [
@@ -937,8 +953,8 @@ async fn dispatch_signal(
                     record_guard(positions, strategy_name, pp, Some(&params.token_id)).await;
                     lifecycle.track(&a, strategy_name, params.order_type, Some(pp.token_id.clone())).await;
                     lifecycle.track(&b, strategy_name, pp.order_type, Some(params.token_id.clone())).await;
-                    record_entry(pool, strategy_name, params).await;
-                    record_entry(pool, strategy_name, pp).await;
+                    record_entry(pool, scope, strategy_name, params).await;
+                    record_entry(pool, scope, strategy_name, pp).await;
                     if let Some(p) = pool { sync_dashboard(venue, p, positions, starting).await; }
                     true
                 }
@@ -946,12 +962,12 @@ async fn dispatch_signal(
             }
         }
         StrategySignal::Entry { params, pair_params: None } => {
-            dispatch_single(venue, pool, positions, lifecycle, strategy_name, params, Side::Buy, starting).await
+            dispatch_single(venue, pool, scope, positions, lifecycle, strategy_name, params, Side::Buy, starting).await
         }
         StrategySignal::MakerQuote { yes, no } => {
             let mut acted = false;
             for q in [yes.as_ref(), no.as_ref()].into_iter().flatten() {
-                if dispatch_single(venue, pool, positions, lifecycle, strategy_name, q, Side::Buy, starting).await {
+                if dispatch_single(venue, pool, scope, positions, lifecycle, strategy_name, q, Side::Buy, starting).await {
                     acted = true;
                 }
             }
@@ -989,7 +1005,7 @@ async fn dispatch_signal(
                 .await
                 .get(&(strategy_name.to_string(), params.token_id.clone()))
                 .map(|p| (p.avg_entry, p.shares));
-            let acted = dispatch_single(venue, pool, positions, lifecycle, strategy_name, params, Side::Sell, starting).await;
+            let acted = dispatch_single(venue, pool, scope, positions, lifecycle, strategy_name, params, Side::Sell, starting).await;
             if !acted {
                 // Nothing traded — we still own it. Dropping the position here is
                 // what abandoned a live stop-loss to expire worthless on
@@ -1001,7 +1017,7 @@ async fn dispatch_signal(
                 arm_exit_retry_backoff(strategy_name, params.token_id.as_str());
                 return false;
             }
-            record_round_trip(pool, strategy_name, params, entered, reason).await;
+            record_round_trip(pool, scope, strategy_name, params, entered, reason).await;
             clear_exit_retry_backoff(strategy_name, params.token_id.as_str());
             let mut map = positions.lock().await;
             map.remove(&(strategy_name.to_string(), params.token_id.clone()));
@@ -1051,6 +1067,7 @@ fn clear_exit_retry_backoff(strategy_name: &str, token_id: &str) {
 async fn dispatch_single(
     venue: &KalshiVenue,
     pool: &Option<sqlx::SqlitePool>,
+    scope: &TradeScope,
     positions: &Arc<Mutex<PositionMap>>,
     lifecycle: &OrderLifecycle,
     strategy_name: &str,
@@ -1063,7 +1080,7 @@ async fn dispatch_single(
             params.token_id, params.price, params.shares);
         if matches!(side, Side::Buy) {
             record_guard(positions, strategy_name, params, None).await;
-            record_entry(pool, strategy_name, params).await;
+            record_entry(pool, scope, strategy_name, params).await;
         }
         return true;
     }
@@ -1087,7 +1104,7 @@ async fn dispatch_single(
             if matches!(side, Side::Buy) {
                 record_guard(positions, strategy_name, params, None).await;
                 lifecycle.track(&f, strategy_name, params.order_type, None).await;
-                record_entry(pool, strategy_name, params).await;
+                record_entry(pool, scope, strategy_name, params).await;
             }
             if let Some(p) = pool { sync_dashboard(venue, p, positions, starting).await; }
             true
@@ -1101,10 +1118,15 @@ async fn dispatch_single(
 /// Without this the Control Tower's positions panel had to fall back on
 /// [`sync_dashboard`]'s venue sweep, which knows the ticker but not which viper
 /// owns it — every live position was mislabelled as ArbitrageStrategy.
-async fn record_entry(pool: &Option<sqlx::SqlitePool>, strategy_name: &str, params: &OrderParams) {
+async fn record_entry(
+    pool: &Option<sqlx::SqlitePool>,
+    scope: &TradeScope,
+    strategy_name: &str,
+    params: &OrderParams,
+) {
     let side = side_label(params.token_id.as_str());
     metrics::record_entry(
-        KALSHI_ASSET,
+        scope,
         strategy_name.to_string(),
         params.token_id.to_string(),
         params.market_name.clone(),
@@ -1138,6 +1160,7 @@ async fn record_entry(pool: &Option<sqlx::SqlitePool>, strategy_name: &str, para
 /// verifiable cost basis and we log loudly rather than invent P&L.
 async fn record_round_trip(
     pool: &Option<sqlx::SqlitePool>,
+    scope: &TradeScope,
     strategy_name: &str,
     params: &OrderParams,
     entered: Option<(Decimal, Decimal)>,
@@ -1153,7 +1176,7 @@ async fn record_round_trip(
     let shares = shares.min(params.shares).max(Decimal::ZERO);
     let pnl = (params.price - avg_entry) * shares;
     metrics::record_trade(
-        KALSHI_ASSET,
+        scope,
         strategy_name.to_string(),
         params.market_name.clone(),
         side_label(params.token_id.as_str()).to_string(),

@@ -27,6 +27,7 @@ use serde::Serialize;
 use tracing::{error, info, debug, warn};
 
 use crate::config;
+use crate::state::TradeScope;
 
 // ─── Shared pool ────────────────────────────────────────────────────────────
 
@@ -42,6 +43,53 @@ static DB_POOLS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, Sql
 /// Convenience accessor for the per-asset pool map (lazy-initialised on first call).
 fn pools_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, SqlitePool>> {
     DB_POOLS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// shard key → owning venue, populated by `init_shard`.
+fn shard_venues() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static V: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    V.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// database file path → owning venue, populated by `init_shard`.
+///
+/// Reconciliation paths inside this module hold a `SqlitePool` but no shard key,
+/// and threading one through every caller (including the settlement and purge
+/// helpers) would be churn for no gain. One file is one shard is one venue, so
+/// the file path recovers the venue exactly.
+fn path_venues() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    static V: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+        std::sync::OnceLock::new();
+    V.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Venue that owns whatever database this pool is connected to.
+pub fn venue_for_pool(pool: &SqlitePool) -> String {
+    let file = pool.connect_options().get_filename().to_string_lossy().to_string();
+    path_venues()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&file).cloned())
+        .unwrap_or_default()
+}
+
+/// Which venue owns a shard. Empty string when the shard was initialised
+/// without one (tests, or the legacy `init_for_asset` path).
+pub fn venue_for_shard(shard: &str) -> String {
+    shard_venues()
+        .lock()
+        .ok()
+        .and_then(|m| m.get(&shard.to_lowercase()).cloned())
+        .unwrap_or_default()
+}
+
+/// The venue to file a row under: whatever the caller stated, else the venue
+/// bound to the shard at init. `None` (rather than `""`) when neither is known,
+/// so the column stays honestly NULL instead of holding an empty string.
+fn resolved_venue(scope: &TradeScope) -> Option<String> {
+    let v = if scope.venue.is_empty() { venue_for_shard(&scope.shard) } else { scope.venue.clone() };
+    (!v.is_empty()).then_some(v)
 }
 
 /// The session ID for the current process lifetime.  Set once by `init_session()`
@@ -63,6 +111,16 @@ pub fn current_session_id() -> &'static str {
 ///
 /// `asset` should be a lowercase symbol, e.g. `"btc"`, `"eth"`, `"sol"`.
 pub async fn init_for_asset(asset: &str, path: &str) -> Result<()> {
+    init_shard(asset, path, "").await
+}
+
+/// Initialise a shard and record which venue owns it.
+///
+/// The shard key ("asset") is a storage location, not a market attribute — it is
+/// an underlying symbol on the intl CLOB but a venue name elsewhere. Binding the
+/// venue here means every write path gets the venue right without threading it
+/// through, including reconciliation paths that only know the shard.
+pub async fn init_shard(shard: &str, path: &str, venue: &str) -> Result<()> {
     let url = format!("sqlite://{}?mode=rwc", path);
     let pool = SqlitePoolOptions::new()
         .max_connections(5)
@@ -70,9 +128,19 @@ pub async fn init_for_asset(asset: &str, path: &str) -> Result<()> {
         .await?;
     init_schema(&pool).await?;
     run_migrations(&pool).await;
+    if !venue.is_empty() {
+        shard_venues()
+            .lock()
+            .unwrap()
+            .insert(shard.to_lowercase(), venue.to_string());
+        let file = pool.connect_options().get_filename().to_string_lossy().to_string();
+        path_venues().lock().unwrap().insert(file, venue.to_string());
+        backfill_venue(&pool, venue).await;
+    }
 
     // Register in per-asset map.
-    pools_map().lock().unwrap().insert(asset.to_string(), pool.clone());
+    pools_map().lock().unwrap().insert(shard.to_string(), pool.clone());
+    let asset = shard;
 
     // First successful call → claim the primary-pool slot (subsequent calls
     // return Err from OnceLock::set which we intentionally discard).
@@ -730,6 +798,47 @@ async fn run_migrations(pool: &SqlitePool) {
     // squadron's config so the UI/resolver can read it without re-classifying.
     let _ = sqlx::query("ALTER TABLE squadron_configs ADD COLUMN market_class TEXT NOT NULL DEFAULT 'unknown'")
         .execute(pool).await;
+
+    // Trade filing dimensions. Until now the only discriminator on a trade row
+    // was which database file it lived in — the shard key the UI mislabelled as
+    // "Asset". That cannot express "a sports market has no underlying", and it
+    // could not tell a Kalshi BTC trade from a Kalshi ETH trade at all, since
+    // both squadrons share the `kalshi` shard. See `state::TradeScope`.
+    //
+    // All three are nullable on purpose: `underlying` is genuinely absent for
+    // sports/politics, and pre-existing rows have no way to recover a class.
+    for table in ["trades", "entries"] {
+        for col in ["venue", "market_class", "underlying"] {
+            let _ = sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {col} TEXT"))
+                .execute(pool).await;
+        }
+    }
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_trades_venue_ts ON trades(venue, ts)")
+        .execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_trades_class_ts ON trades(market_class, ts)")
+        .execute(pool).await;
+}
+
+/// Stamp the owning venue onto rows written before the `venue` column existed.
+///
+/// Safe and idempotent: one shard maps to exactly one venue, so every legacy row
+/// in this file belongs to `venue` by construction. Only `venue` is backfilled —
+/// `market_class` and `underlying` are left NULL rather than guessed, so a NULL
+/// reads honestly as "recorded before we tracked this".
+async fn backfill_venue(pool: &SqlitePool, venue: &str) {
+    for table in ["trades", "entries"] {
+        match sqlx::query(&format!("UPDATE {table} SET venue = ? WHERE venue IS NULL"))
+            .bind(venue)
+            .execute(pool)
+            .await
+        {
+            Ok(r) if r.rows_affected() > 0 => {
+                info!("🏷️  Backfilled venue='{}' on {} legacy {} row(s)", venue, r.rows_affected(), table);
+            }
+            Ok(_) => {}
+            Err(e) => warn!("⚠️ venue backfill failed on {table}: {e}"),
+        }
+    }
 }
 
 // ─── Session lifecycle ───────────────────────────────────────────────────────
@@ -791,8 +900,10 @@ pub async fn close_session() {
 
 // ─── Trade / Entry writes ────────────────────────────────────────────────────
 
+#[allow(clippy::too_many_arguments)]
 pub async fn record_trade_db(
     pool: &SqlitePool,
+    scope: &TradeScope,
     strategy: &str,
     market: &str,
     side: &str,
@@ -805,9 +916,11 @@ pub async fn record_trade_db(
 ) {
     let ts = timestamp.unwrap_or_else(|| Utc::now()).to_rfc3339();
     let sid = current_session_id();
+    let venue = resolved_venue(scope);
     if let Err(e) = sqlx::query(
-        "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id,
+                             venue, market_class, underlying)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&ts)
     .bind(strategy)
@@ -819,6 +932,9 @@ pub async fn record_trade_db(
     .bind(pnl.to_string())
     .bind(reason)
     .bind(sid)
+    .bind(venue)
+    .bind(scope.market_class.clone())
+    .bind(scope.underlying.clone())
     .execute(pool)
     .await {
         error!("❌ DB trade write failed: {}", e);
@@ -888,8 +1004,10 @@ pub async fn record_settlement_trade_idempotent(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn record_entry_db(
     pool: &SqlitePool,
+    scope: &TradeScope,
     strategy: &str,
     token_id: &str,
     market: &str,
@@ -899,9 +1017,11 @@ pub async fn record_entry_db(
 ) {
     let ts = Utc::now().to_rfc3339();
     let sid = current_session_id();
+    let venue = resolved_venue(scope);
     if let Err(e) = sqlx::query(
-        "INSERT INTO entries (ts, strategy, token_id, market, side, entry_price, shares, session_id)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)"
+        "INSERT INTO entries (ts, strategy, token_id, market, side, entry_price, shares, session_id,
+                              venue, market_class, underlying)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&ts)
     .bind(strategy)
@@ -911,6 +1031,9 @@ pub async fn record_entry_db(
     .bind(entry_price.to_string())
     .bind(shares.to_string())
     .bind(sid)
+    .bind(venue)
+    .bind(scope.market_class.clone())
+    .bind(scope.underlying.clone())
     .execute(pool)
     .await {
         error!("❌ DB entry write failed: {}", e);
@@ -2042,7 +2165,10 @@ pub async fn purge_stale_open_positions(
                             "ChainReconcile: closed off-strategy (est. @ ${:.4} last mark)",
                             exit_px
                         );
-                        record_trade_db(pool, &strategy, &market, &side, entry, exit_px, qty, pnl, &reason, None).await;
+                        // Reconciliation knows the book but not the market's class or
+                        // underlying — leave those NULL rather than guessing.
+                        let scope = TradeScope::new("", venue_for_pool(pool), None, None);
+                        record_trade_db(pool, &scope, &strategy, &market, &side, entry, exit_px, qty, pnl, &reason, None).await;
                         info!(
                             "🧾 Ledger reconcile: booked off-strategy exit — {} {} {} | {} sh entry=${:.4} exit=${:.4} → pnl=${:.4}",
                             strategy, market, side, qty, entry, exit_px, pnl
@@ -2236,6 +2362,14 @@ pub struct TradeRow {
     pub shares: String,
     pub pnl: String,
     pub reason: String,
+    /// Exchange that executed the trade. `None` on rows written before the
+    /// column existed and whose shard had no registered venue.
+    pub venue: Option<String>,
+    /// `crypto` | `sports` | `politics` | `unknown`; `None` on legacy rows.
+    pub market_class: Option<String>,
+    /// Underlying symbol. `None` is meaningful — sports and politics markets
+    /// have no underlying instrument.
+    pub underlying: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2324,7 +2458,8 @@ pub async fn recent_stop_loss_exists(
 /// Return the most recent `limit` completed trades, newest first.
 pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
     match sqlx::query(
-        "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason
+        "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
+                venue, market_class, underlying
          FROM trades ORDER BY ts DESC LIMIT ?"
     )
     .bind(limit)
@@ -2340,6 +2475,9 @@ pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
             shares:      r.try_get::<String, _>(6).ok()?,
             pnl:         r.try_get::<String, _>(7).ok()?,
             reason:      r.try_get::<String, _>(8).ok()?,
+            venue:        r.try_get::<Option<String>, _>(9).ok().flatten(),
+            market_class: r.try_get::<Option<String>, _>(10).ok().flatten(),
+            underlying:   r.try_get::<Option<String>, _>(11).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_recent_trades failed: {}", e); vec![] }
     }
@@ -2350,7 +2488,8 @@ pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
 /// hundred rows a day at most, so a full scan stays trivially cheap.
 pub async fn get_all_trades(pool: &SqlitePool) -> Vec<TradeRow> {
     match sqlx::query(
-        "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason
+        "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
+                venue, market_class, underlying
          FROM trades ORDER BY ts ASC"
     )
     .fetch_all(pool)
@@ -2365,6 +2504,9 @@ pub async fn get_all_trades(pool: &SqlitePool) -> Vec<TradeRow> {
             shares:      r.try_get::<String, _>(6).ok()?,
             pnl:         r.try_get::<String, _>(7).ok()?,
             reason:      r.try_get::<String, _>(8).ok()?,
+            venue:        r.try_get::<Option<String>, _>(9).ok().flatten(),
+            market_class: r.try_get::<Option<String>, _>(10).ok().flatten(),
+            underlying:   r.try_get::<Option<String>, _>(11).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_all_trades failed: {}", e); vec![] }
     }
@@ -2465,7 +2607,8 @@ pub async fn get_confirmed_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> 
 pub async fn get_session_trades(pool: &SqlitePool) -> Vec<TradeRow> {
     let sid = current_session_id();
     match sqlx::query(
-        "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason
+        "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
+                venue, market_class, underlying
          FROM trades WHERE session_id = ? ORDER BY ts DESC"
     )
     .bind(sid)
@@ -2481,6 +2624,9 @@ pub async fn get_session_trades(pool: &SqlitePool) -> Vec<TradeRow> {
             shares:      r.try_get::<String, _>(6).ok()?,
             pnl:         r.try_get::<String, _>(7).ok()?,
             reason:      r.try_get::<String, _>(8).ok()?,
+            venue:        r.try_get::<Option<String>, _>(9).ok().flatten(),
+            market_class: r.try_get::<Option<String>, _>(10).ok().flatten(),
+            underlying:   r.try_get::<Option<String>, _>(11).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_session_trades failed: {}", e); vec![] }
     }
@@ -2496,7 +2642,8 @@ pub async fn get_session_trades(pool: &SqlitePool) -> Vec<TradeRow> {
 pub async fn get_previous_session_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
     let sid = current_session_id();
     match sqlx::query(
-        "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason
+        "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
+                venue, market_class, underlying
          FROM trades
          WHERE (session_id IS NULL OR session_id != ?)
          ORDER BY ts DESC LIMIT ?"
@@ -2515,6 +2662,9 @@ pub async fn get_previous_session_trades(pool: &SqlitePool, limit: i64) -> Vec<T
             shares:      r.try_get::<String, _>(6).ok()?,
             pnl:         r.try_get::<String, _>(7).ok()?,
             reason:      r.try_get::<String, _>(8).ok()?,
+            venue:        r.try_get::<Option<String>, _>(9).ok().flatten(),
+            market_class: r.try_get::<Option<String>, _>(10).ok().flatten(),
+            underlying:   r.try_get::<Option<String>, _>(11).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_previous_session_trades failed: {}", e); vec![] }
     }
@@ -2946,6 +3096,74 @@ mod reconcile_tests {
     use super::*;
     use std::collections::HashSet;
 
+    /// A database created before the filing columns existed must gain them, and
+    /// its legacy rows must be stamped with the shard's venue while keeping
+    /// `market_class` / `underlying` NULL rather than guessed.
+    #[tokio::test]
+    async fn legacy_db_gains_filing_columns_and_backfills_venue() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        // Pre-migration shape: no venue / market_class / underlying.
+        sqlx::query(
+            "CREATE TABLE trades (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, strategy TEXT NOT NULL,
+                market TEXT NOT NULL, side TEXT NOT NULL, entry_price TEXT NOT NULL,
+                exit_price TEXT NOT NULL, shares TEXT NOT NULL, pnl TEXT NOT NULL,
+                reason TEXT NOT NULL)"
+        ).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason)
+             VALUES ('2026-08-10T00:00:00Z','FairValueStrategy','BTC $65k','NO','0.33','0.27','8.93','-0.54','SL')"
+        ).execute(&pool).await.unwrap();
+
+        init_schema(&pool).await.unwrap();
+        run_migrations(&pool).await;
+        backfill_venue(&pool, "kalshi").await;
+
+        let row = sqlx::query("SELECT venue, market_class, underlying FROM trades")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(row.try_get::<Option<String>, _>(0).unwrap(), Some("kalshi".to_string()));
+        assert_eq!(row.try_get::<Option<String>, _>(1).unwrap(), None, "class must not be guessed");
+        assert_eq!(row.try_get::<Option<String>, _>(2).unwrap(), None, "underlying must not be guessed");
+    }
+
+    /// A market with no underlying instrument (sports) records NULL, not a
+    /// placeholder symbol — the case the old single "asset" field could not express.
+    #[tokio::test]
+    async fn sports_trade_records_null_underlying() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::new("us", "polymarket-us", Some("sports".into()), None);
+        record_trade_db(&pool, &scope, "MakerStrategy", "Chiefs vs Bills", "YES",
+            dec_of("0.50"), dec_of("0.60"), dec_of("10"), dec_of("1.0"), "TP", None).await;
+
+        let row = sqlx::query("SELECT venue, market_class, underlying FROM trades")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(row.try_get::<Option<String>, _>(0).unwrap(), Some("polymarket-us".to_string()));
+        assert_eq!(row.try_get::<Option<String>, _>(1).unwrap(), Some("sports".to_string()));
+        assert_eq!(row.try_get::<Option<String>, _>(2).unwrap(), None);
+    }
+
+    /// Two underlyings sharing one shard stay distinguishable — the Kalshi case
+    /// where btc-open and eth-open both write to the `kalshi` database.
+    #[tokio::test]
+    async fn shared_shard_keeps_underlyings_distinct() {
+        let pool = mem_pool().await;
+        for u in ["btc", "eth"] {
+            let scope = TradeScope::crypto("kalshi", "kalshi", u);
+            record_trade_db(&pool, &scope, "FairValueStrategy", &format!("{u} market"), "NO",
+                dec_of("0.33"), dec_of("0.40"), dec_of("5"), dec_of("0.35"), "TP", None).await;
+        }
+        let rows: Vec<String> = sqlx::query_scalar(
+            "SELECT underlying FROM trades ORDER BY underlying"
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows, vec!["btc".to_string(), "eth".to_string()]);
+    }
+
+    fn dec_of(s: &str) -> Decimal { s.parse().unwrap() }
+
     async fn mem_pool() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -2998,7 +3216,7 @@ mod reconcile_tests {
     #[tokio::test]
     async fn already_booked_is_not_double_counted() {
         let pool = mem_pool().await;
-        record_trade_db(&pool, "MakerStrategy", "MarketB", "YES",
+        record_trade_db(&pool, &TradeScope::shard_only("test"), "MakerStrategy", "MarketB", "YES",
             Decimal::new(33, 2), Decimal::ONE, Decimal::new(1144, 2),
             Decimal::new(10, 2), "Settlement (auto-redeemed by Polymarket)", None).await;
         insert_open(&pool, "MakerStrategy", "tok2", "MarketB", "YES", "0.33", "11.44", Some("0.40"), "confirmed").await;
@@ -3075,7 +3293,7 @@ mod reconcile_tests {
     async fn resolution_booking_ignores_prior_non_settlement_trades() {
         let pool = mem_pool().await;
         // Morning flatten: same market, same side, same 15 shares, reason ≠ Settlement.
-        record_trade_db(&pool, "ArbitrageStrategy", "MarketF", "YES",
+        record_trade_db(&pool, &TradeScope::shard_only("test"), "ArbitrageStrategy", "MarketF", "YES",
             Decimal::new(90, 2), Decimal::new(89, 2), Decimal::new(15, 0),
             Decimal::new(-15, 2), "Orphan flatten (bid exit)", None).await;
         insert_open(&pool, "ArbitrageStrategy", "tokY2", "MarketF", "YES", "0.90", "15", Some("0.90"), "confirmed").await;

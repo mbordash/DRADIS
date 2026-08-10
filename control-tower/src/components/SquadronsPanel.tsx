@@ -195,10 +195,6 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, 
               <span>+</span>
               <span>Deploy</span>
             </button>
-            {/* Phase badge */}
-            <span className="text-[9px] font-mono text-gray-700 border border-[#1e1e32] rounded px-1.5 py-0.5">
-              Phase 3f
-            </span>
           </div>
         </div>
 

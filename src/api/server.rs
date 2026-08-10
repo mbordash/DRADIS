@@ -1175,8 +1175,10 @@ async fn manual_exit(
     info!(" RTB: Trade recorded — {} shares | entry ${:.4} → exit ${:.4} | P&L ${:.4}",
           shares, entry_price, sell_price, pnl);
 
+    // A manual RTB knows which book to write to but nothing about the market's
+    // taxonomy — file it under the shard's venue and leave the rest NULL.
     metrics::record_trade(
-        &req.asset,
+        &crate::state::TradeScope::shard_only(&req.asset),
         req.strategy.clone(),
         req.market.clone(),
         req.side.clone(),

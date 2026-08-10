@@ -287,6 +287,12 @@ async fn run() -> Result<()> {
     #[cfg(feature = "kalshi")]
     let default_asset = "kalshi";
     #[cfg(not(feature = "kalshi"))]
+    // The venue that owns the per-asset shards created below. Only the intl
+    // CLOB shards by underlying; US and Kalshi register their own shards later.
+    #[cfg(feature = "intl_clob")]
+    const INTL_VENUE_NAME: &str = dradis::venues::intl::INTL_VENUE;
+    #[cfg(not(feature = "intl_clob"))]
+    const INTL_VENUE_NAME: &str = "";
     let default_asset = "btc";
     let crypto_filter = env::var("CRYPTO_FILTER").unwrap_or_else(|_| default_asset.to_string()).to_lowercase();
     let assets: Vec<String> = env::var("ASSETS")
@@ -302,7 +308,8 @@ async fn run() -> Result<()> {
     // callers that use db::pool() (API handlers, LLM advisor, etc.).
     for asset in &assets {
         let db_path = format!("logs/{}-dradis.db", asset);
-        if let Err(e) = db::init_for_asset(asset, &db_path).await {
+        // On the intl CLOB the shard key genuinely is the underlying asset.
+        if let Err(e) = db::init_shard(asset, &db_path, INTL_VENUE_NAME).await {
             tracing::warn!("⚠️  SQLite init failed for {} (metrics will CSV-only): {}", asset, e);
         }
     }
@@ -403,17 +410,19 @@ async fn run() -> Result<()> {
                 let cancel = tokio_util::sync::CancellationToken::new();
                 // Dedicated DB pool so the Control Tower shows the US venue under
                 // the "us" asset selector (positions, portfolio P&L).
-                if let Err(e) = dradis::helpers::db::init_for_asset(
+                if let Err(e) = dradis::helpers::db::init_shard(
                     dradis::venues::us::trader::US_ASSET,
                     "logs/us-dradis.db",
+                    dradis::venues::us::trader::US_VENUE,
                 ).await {
                     tracing::warn!("⚠️ US DB pool init failed (dashboard disabled): {e}");
                 }
                 // Second pool for the crypto wing so its squadron gets its own
                 // asset scope (positions, P&L, viper status) in the dashboard.
-                if let Err(e) = dradis::helpers::db::init_for_asset(
+                if let Err(e) = dradis::helpers::db::init_shard(
                     dradis::venues::us::trader::US_CRYPTO_ASSET,
                     "logs/us-crypto-dradis.db",
+                    dradis::venues::us::trader::US_VENUE,
                 ).await {
                     tracing::warn!("⚠️ US crypto DB pool init failed (crypto wing dashboard disabled): {e}");
                 }
@@ -455,9 +464,10 @@ async fn run() -> Result<()> {
                 }
                 // Dedicated DB pool so the Control Tower shows the Kalshi venue
                 // under its own asset selector (positions, portfolio P&L).
-                if let Err(e) = dradis::helpers::db::init_for_asset(
+                if let Err(e) = dradis::helpers::db::init_shard(
                     dradis::venues::kalshi::trader::KALSHI_ASSET,
                     "logs/kalshi-dradis.db",
+                    dradis::venues::kalshi::trader::KALSHI_VENUE,
                 ).await {
                     tracing::warn!("⚠️ Kalshi DB pool init failed (dashboard disabled): {e}");
                 }

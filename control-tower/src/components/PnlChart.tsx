@@ -171,7 +171,13 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
     return positionTime >= oldestSnapshotTime && positionTime <= newestSnapshotTime;
   });
 
-  // Build marker lookup maps keyed by chart point's time string
+  // Build marker lookup maps keyed by the chart point's RAW timestamp.
+  //
+  // Not `point.time`: that is `fmt()`ed to HH:MM, while snapshots are written
+  // every DASHBOARD_SYNC_SECS (30s). Two points per minute therefore share one
+  // `time` string, and since the dot is painted on every point whose key is in
+  // the map, a single trade rendered *two* overlay markers. `ts` is unique per
+  // point, so each event marks exactly the point it snapped to.
   const tradeMarkerMap = new Map<string, { pnl: number; trade: TradeRow }>();
   const positionMarkerMap = new Map<string, { position: OpenPositionRow }>();
 
@@ -183,7 +189,7 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
       return Math.abs(pointTime - tradeTime) < Math.abs(closestTime - tradeTime) ? point : closest;
     }, chartData[0]);
     if (closestPoint) {
-      tradeMarkerMap.set(closestPoint.time, { pnl: parseFloat(trade.pnl), trade });
+      tradeMarkerMap.set(closestPoint.ts, { pnl: parseFloat(trade.pnl), trade });
     }
   });
 
@@ -195,7 +201,7 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
       return Math.abs(pointTime - positionTime) < Math.abs(closestTime - positionTime) ? point : closest;
     }, chartData[0]);
     if (closestPoint) {
-      positionMarkerMap.set(closestPoint.time, { position });
+      positionMarkerMap.set(closestPoint.ts, { position });
     }
   });
 
@@ -203,10 +209,10 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
   // on the categorical XAxis (Scatter doesn't support categorical axes reliably)
   const chartDataWithMarkers = chartData.map(point => ({
     ...point,
-    tradeDot:    tradeMarkerMap.has(point.time)    ? point.totalValue + yRange * 0.15 : undefined,
-    positionDot: positionMarkerMap.has(point.time) ? point.totalValue + yRange * 0.08 : undefined,
-    _tradeMarker:    tradeMarkerMap.get(point.time),
-    _positionMarker: positionMarkerMap.get(point.time),
+    tradeDot:    tradeMarkerMap.has(point.ts)    ? point.totalValue + yRange * 0.15 : undefined,
+    positionDot: positionMarkerMap.has(point.ts) ? point.totalValue + yRange * 0.08 : undefined,
+    _tradeMarker:    tradeMarkerMap.get(point.ts),
+    _positionMarker: positionMarkerMap.get(point.ts),
   }));
 
   // For legend display (count)

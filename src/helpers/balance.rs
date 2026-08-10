@@ -885,7 +885,8 @@ pub async fn arb_pair_fill_monitor(
             }
             // Record the realized result so the dashboard reflects the true (small) loss.
             crate::helpers::metrics::record_trade(
-                &asset,
+                &crate::state::TradeScope::crypto(
+                    &asset, crate::venues::intl::INTL_VENUE, &asset),
                 strategy_name.clone(),
                 market_name.clone(),
                 filled_side.to_string(),
@@ -963,7 +964,8 @@ pub async fn arb_pair_fill_monitor(
                     // (B) Book synchronously (awaited, not fire-and-forget) so a restart
                     // mid-cleanup cannot drop the record — the July-3 invisibility mode.
                     crate::helpers::metrics::record_trade(
-                        &asset,
+                        &crate::state::TradeScope::crypto(
+                            &asset, crate::venues::intl::INTL_VENUE, &asset),
                         strategy_name.clone(),
                         market_name.clone(),
                         missing_side.to_string(),

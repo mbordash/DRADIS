@@ -177,6 +177,15 @@ export interface TradeRow {
   shares:      string;
   pnl:         string;
   reason:      string;
+  /** Exchange that executed the trade. Null on rows predating the column. */
+  venue?:        string | null;
+  /** 'crypto' | 'sports' | 'politics' | 'unknown'. Null on legacy rows. */
+  market_class?: string | null;
+  /**
+   * Underlying symbol ('btc', 'eth', 'sol'). Null is meaningful, not missing:
+   * sports and politics markets have no underlying instrument.
+   */
+  underlying?:   string | null;
 }
 
 /** A position that has been entered but not yet exited (all strategies, ghost+live). */

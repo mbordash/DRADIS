@@ -10,6 +10,13 @@
 
 pub mod orders;
 
+/// Runtime venue identity persisted on every trade and entry row.
+///
+/// On this venue the SQLite shard key genuinely *is* the underlying asset
+/// (`btc`, `eth`, `sol`), which is why the two were conflated in the first
+/// place. They are still distinct concepts — see `state::TradeScope`.
+pub const INTL_VENUE: &str = "polymarket-intl";
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
