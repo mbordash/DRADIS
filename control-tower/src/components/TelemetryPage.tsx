@@ -6,7 +6,7 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
   ReferenceLine, Brush,
 } from 'recharts';
-import { getTelemetryHistory } from '@/lib/api';
+import { getTelemetryHistory, getTelemetryAssets } from '@/lib/api';
 import type { TelemetrySample } from '@/lib/types';
 
 const POLL_MS = 2000;            // server samples at 2s — match it while live
@@ -600,7 +600,10 @@ export default function TelemetryPage({ availableAssets, venue }: { availableAss
   // Crypto tab stays visible — but Sports remains the default landing tab.
   const isUs = venue === 'us';
   const classes = TELEMETRY_CLASSES;
-  const assets = availableAssets.length ? availableAssets : ['btc'];
+  // Use raptor-specific asset list (crypto underlyings only) rather than the
+  // full DB pool list which may include venue-only entries (e.g. "kalshi").
+  const { data: telemetryAssets } = useSWR('telemetry-assets', getTelemetryAssets, { refreshInterval: 30_000 });
+  const assets = telemetryAssets?.length ? telemetryAssets : (availableAssets.length ? availableAssets : ['btc']);
   const [selectedAsset, setSelectedAsset] = useState<string>('');
   const asset = selectedAsset || assets[0];
 

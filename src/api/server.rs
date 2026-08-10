@@ -838,6 +838,26 @@ async fn get_telemetry_history(
     Json(samples).into_response()
 }
 
+/// GET /api/telemetry/assets
+///
+/// Returns the list of asset keys that have raptor telemetry data (i.e. keys
+/// present in the telemetry history ring buffer). This is the set of crypto
+/// underlyings actively monitored by raptors — distinct from the full DB
+/// pool list returned by `/api/assets`, which also includes venue-only
+/// databases (e.g. "kalshi") that have no raptor signal data.
+async fn get_telemetry_assets(State(s): State<ApiState>) -> Response {
+    let hist = match s.telemetry_history.lock() {
+        Ok(h) => h,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    let mut assets: Vec<String> = hist.keys()
+        .filter(|k| !k.is_empty())
+        .cloned()
+        .collect();
+    assets.sort();
+    Json(assets).into_response()
+}
+
 /// GET /api/trades?limit=100&asset=btc
 ///
 /// Returns up to `limit` completed trades, newest first.
@@ -2668,6 +2688,7 @@ pub async fn run_api_server(
         .route("/api/status",                get(get_status))
         .route("/api/telemetry",             get(get_telemetry))
         .route("/api/telemetry/history",     get(get_telemetry_history))
+        .route("/api/telemetry/assets",      get(get_telemetry_assets))
         .route("/api/portfolio",             get(get_portfolio_value))
         .route("/api/llm/recommendations",   get(get_llm_recommendations))
         .route("/api/llm/actions",           get(get_llm_actions))

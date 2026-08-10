@@ -37,6 +37,12 @@ export async function getAssets(): Promise<string[]> {
   return res.json();
 }
 
+export async function getTelemetryAssets(): Promise<string[]> {
+  const res = await fetch(`${BASE}/api/telemetry/assets`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/telemetry/assets → ${res.status}`);
+  return res.json();
+}
+
 export async function getConfig(): Promise<DynamicConfig> {
   const res = await fetch(`${BASE}/api/config`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/config → ${res.status}`);

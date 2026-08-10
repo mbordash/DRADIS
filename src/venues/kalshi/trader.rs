@@ -62,6 +62,10 @@ const DISCOVERY_RETRY_SECS: u64 = 60; // 15-min markets rotate fast — rescan o
 const DASHBOARD_SYNC_SECS: u64 = 30;
 /// Skip markets closing within this window — not worth committing capital.
 const MIN_TIME_TO_CLOSE_SECS: i64 = 180; // 3 min (15-min cadence needs headroom)
+/// Maximum time-to-close for short-cadence markets (15M): 2 hours.
+const MAX_CLOSE_SHORT_SECS: i64 = 7_200;
+/// Maximum time-to-close for daily markets: 36 hours.
+const MAX_CLOSE_DAILY_SECS: i64 = 129_600;
 const MARKET_RTB_WINDOW_SECS: i64 = 60;
 const LIFECYCLE_SYNC_SECS: u64 = 10;
 const MARKET_RESCAN_SECS: u64 = 120;
@@ -70,6 +74,35 @@ const ROTATION_VOLUME_THRESHOLD: f64 = 5_000.0;
 /// Conservative quadratic-fee ceiling (1.75¢/contract at P=0.5) in bps.
 const KALSHI_FEE_BPS: u16 = 175;
 pub const KALSHI_ASSET: &str = "kalshi";
+
+/// Market cadence derived from the series ticker suffix.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cadence {
+    /// 15-minute markets (`KXBTC15M`).
+    FifteenMin,
+    /// Daily markets (`KXBTCD`).
+    Daily,
+}
+
+impl Cadence {
+    /// Infer cadence from a market ticker string.
+    fn from_ticker(ticker: &str) -> Option<Self> {
+        let t = ticker.to_ascii_uppercase();
+        if t.contains("15M") { return Some(Self::FifteenMin); }
+        if t.contains("D-") || t.ends_with('D') { return Some(Self::Daily); }
+        None
+    }
+
+    /// Maximum time-to-close for this cadence. Markets further out are
+    /// filtered from discovery — they're either far-future listings (demo)
+    /// or long-dated events where intraday strategies don't apply.
+    fn max_close_secs(self) -> i64 {
+        match self {
+            Self::FifteenMin => MAX_CLOSE_SHORT_SECS,
+            Self::Daily      => MAX_CLOSE_DAILY_SECS,
+        }
+    }
+}
 
 /// A tradeable Kalshi market expressed in DRADIS's two-leg shape.
 #[derive(Clone, Debug)]
@@ -85,6 +118,7 @@ pub struct KalshiPair {
     pub volume: f64,
     pub underlying: &'static str,
     pub strike: Option<Decimal>,
+    pub cadence: Option<Cadence>,
 }
 
 fn pair_from_market(m: &KalshiMarket) -> Option<KalshiPair> {
@@ -103,6 +137,7 @@ fn pair_from_market(m: &KalshiMarket) -> Option<KalshiPair> {
             .unwrap_or(0.0),
         strike: m.strike().and_then(|s| Decimal::try_from(s).ok()),
         ticker: m.ticker.clone(),
+        cadence: Cadence::from_ticker(&m.ticker),
         question,
         underlying,
     })
@@ -297,8 +332,8 @@ pub async fn run_kalshi_trader(
             return;
         }
 
-        let pair = match select_market(&venue, &series, &filter, &cancel, &process_heartbeat_secs).await {
-            Some(p) => p,
+        let selection = match select_market(&venue, &series, &filter, &cancel, &process_heartbeat_secs).await {
+            Some(s) => s,
             None => return,
         };
 
@@ -311,7 +346,7 @@ pub async fn run_kalshi_trader(
             &process_heartbeat_secs,
             &series,
             &market_cancel,
-            pair,
+            selection,
         ).await;
         market_cancel.cancel();
 
@@ -350,12 +385,27 @@ async fn discover_pairs(venue: &KalshiVenue, series: &[String]) -> Vec<KalshiPai
         }
     }
     let now = Utc::now();
-    pairs.retain(|p| match p.close_time {
-        Some(c) => (c - now).num_seconds() > MIN_TIME_TO_CLOSE_SECS,
-        None => true,
+    pairs.retain(|p| {
+        let secs = match p.close_time {
+            Some(c) => (c - now).num_seconds(),
+            None => return false, // no close time → skip
+        };
+        if secs < MIN_TIME_TO_CLOSE_SECS {
+            return false; // closing too soon
+        }
+        // Apply cadence-specific max-expiry window.
+        let max = p.cadence.map(|c| c.max_close_secs()).unwrap_or(MAX_CLOSE_DAILY_SECS);
+        secs <= max
     });
     pairs.sort_by(|a, b| b.volume.partial_cmp(&a.volume).unwrap_or(std::cmp::Ordering::Equal));
     pairs
+}
+
+/// Selected primary market and optional daily maker venue.
+struct MarketSelection {
+    primary: KalshiPair,
+    /// Daily market for passive maker/FairValue orders (longer-lived, lower fee).
+    maker: Option<KalshiPair>,
 }
 
 async fn select_market(
@@ -364,7 +414,7 @@ async fn select_market(
     filter: &Option<String>,
     cancel: &CancellationToken,
     process_heartbeat_secs: &AtomicU64,
-) -> Option<KalshiPair> {
+) -> Option<MarketSelection> {
     loop {
         if cancel.is_cancelled() {
             return None;
@@ -378,25 +428,48 @@ async fn select_market(
                 "📊 Kalshi discovered {} tradeable market(s). Top 3: {}",
                 pairs.len(),
                 pairs.iter().take(3)
-                    .map(|p| format!("\"{}\" (vol {:.0})", p.question, p.volume))
+                    .map(|p| format!("\"{}\" ({:?}, vol {:.0})", p.question, p.cadence, p.volume))
                     .collect::<Vec<_>>().join(", ")
             );
-            let selected = match filter {
-                Some(f) => {
-                    let fl = f.to_lowercase();
-                    pairs.into_iter().find(|p| {
-                        p.ticker.to_lowercase().contains(&fl)
-                            || p.question.to_lowercase().contains(&fl)
-                    })
+
+            // Split by cadence: prefer short-cadence (15M) as primary, daily as maker.
+            let (short, daily): (Vec<_>, Vec<_>) = pairs.into_iter()
+                .partition(|p| p.cadence == Some(Cadence::FifteenMin));
+
+            let apply_filter = |candidates: Vec<KalshiPair>| -> Option<KalshiPair> {
+                match filter {
+                    Some(f) => {
+                        let fl = f.to_lowercase();
+                        candidates.into_iter().find(|p| {
+                            p.ticker.to_lowercase().contains(&fl)
+                                || p.question.to_lowercase().contains(&fl)
+                        })
+                    }
+                    None => candidates.into_iter().next(),
                 }
-                None => pairs.into_iter().next(),
             };
-            if let Some(p) = selected {
+
+            // Primary: prefer 15M, fall back to daily.
+            let primary = apply_filter(short.clone())
+                .or_else(|| apply_filter(daily.clone()));
+
+            if let Some(p) = primary {
+                // Maker: pick the best daily market with the same underlying
+                // (skip the primary if it's already daily to avoid self-reference).
+                let maker = daily.into_iter()
+                    .find(|d| d.underlying == p.underlying && d.ticker != p.ticker);
+
                 info!(
-                    "🎯 Kalshi target: \"{}\" [{}] close={:?} strike={:?}",
-                    p.question, p.ticker, p.close_time, p.strike
+                    "🎯 Kalshi primary: \"{}\" [{}] {:?} close={:?} strike={:?}",
+                    p.question, p.ticker, p.cadence, p.close_time, p.strike
                 );
-                return Some(p);
+                if let Some(ref m) = maker {
+                    info!(
+                        "🎯 Kalshi maker:   \"{}\" [{}] {:?} close={:?} strike={:?}",
+                        m.question, m.ticker, m.cadence, m.close_time, m.strike
+                    );
+                }
+                return Some(MarketSelection { primary: p, maker });
             }
             warn!("Kalshi trader: no market matched filter {filter:?} — retrying");
         }
@@ -417,9 +490,11 @@ async fn trade_one_market(
     process_heartbeat_secs: &AtomicU64,
     series: &[String],
     cancel: &CancellationToken,
-    pair: KalshiPair,
+    selection: MarketSelection,
 ) -> MarketOutcome {
     let asset = KALSHI_ASSET;
+    let pair = selection.primary;
+    let maker_pair = selection.maker;
 
     // ── Raptor intelligence for the market's underlying ─────────────────────
     let raptors = raptor_stack_for(pair.underlying, raptor_health_tx);
@@ -464,6 +539,19 @@ async fn trade_one_market(
         yes_fee_bps: KALSHI_FEE_BPS as u32,
         no_fee_bps: KALSHI_FEE_BPS as u32,
     };
+    // Daily maker venue — gives passive orders more time to fill and provides
+    // strike-based pricing for FairValue/Basis vipers.
+    let maker_cfg = maker_pair.as_ref().map(|mp| MarketConfig {
+        yes_token: MarketId::new(leg_id(&mp.ticker, true)),
+        no_token: MarketId::new(leg_id(&mp.ticker, false)),
+        market_name: mp.question.clone(),
+        market_close_time: mp.close_time,
+        strike_price: mp.strike,
+        is_neg_risk: false,
+        condition_id: String::new(),
+        yes_fee_bps: KALSHI_FEE_BPS as u32,
+        no_fee_bps: KALSHI_FEE_BPS as u32,
+    });
     let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
     let lifecycle = Arc::new(OrderLifecycle::new(LifecycleConfig::us()));
     let _fill_listener = lifecycle.spawn_fill_listener(Arc::clone(venue), Arc::clone(&positions));
@@ -474,10 +562,14 @@ async fn trade_one_market(
 
     // ── Stream the market's book (bids-only; asks derived) ──────────────────
     let hub = ws::new_book_hub();
+    let mut book_tickers = vec![pair.ticker.clone()];
+    if let Some(ref mp) = maker_pair {
+        book_tickers.push(mp.ticker.clone());
+    }
     ws::spawn_orderbook_feed(
         super::ws_url(),
         venue.auth.clone(),
-        vec![pair.ticker.clone()],
+        book_tickers,
         hub.clone(),
         cancel.clone(),
     );
@@ -602,6 +694,20 @@ async fn trade_one_market(
             continue;
         }
 
+        // Build maker snapshot from the daily market (if available).
+        let (mk_market, mk_snapshot) = match (&maker_cfg, &maker_pair) {
+            (Some(mcfg), Some(mp)) => {
+                let ms = build_snapshot(&hub, &mp.ticker, &raptors, mcfg).await;
+                if ms.yes_ask.is_zero() && ms.no_ask.is_zero() {
+                    // Maker book not ready — fall back to primary.
+                    (Some(market_cfg.clone()), Some(snapshot.clone()))
+                } else {
+                    (Some(mcfg.clone()), Some(ms))
+                }
+            }
+            _ => (Some(market_cfg.clone()), Some(snapshot.clone())),
+        };
+
         let ctx = StrategyContext {
             market: market_cfg.clone(),
             snapshot: snapshot.clone(),
@@ -610,9 +716,8 @@ async fn trade_one_market(
             starting_collateral: starting,
             crypto_filter: pair.underlying.to_uppercase(),
             market_started_at,
-            // Single discovered market IS the venue (same rationale as US).
-            maker_market: Some(market_cfg.clone()),
-            maker_snapshot: Some(snapshot),
+            maker_market: mk_market,
+            maker_snapshot: mk_snapshot,
             available_collateral,
             dynamic_config: dyn_cfg.clone(),
             arb_market_lockouts: None,
@@ -1031,6 +1136,16 @@ mod tests {
         assert!((p.volume - 1234.0).abs() < 1e-9);
         assert_eq!(p.strike, Some(rust_decimal_macros::dec!(65000)));
         assert!(p.close_time.is_some());
+        assert_eq!(p.cadence, Some(Cadence::FifteenMin));
+    }
+
+    #[test]
+    fn cadence_detection() {
+        assert_eq!(Cadence::from_ticker("KXBTC15M-26AUG081400-00"), Some(Cadence::FifteenMin));
+        assert_eq!(Cadence::from_ticker("KXBTCD-28JAN1222-T99799.99"), Some(Cadence::Daily));
+        assert_eq!(Cadence::from_ticker("KXETH15M-X"), Some(Cadence::FifteenMin));
+        assert_eq!(Cadence::from_ticker("KXETHD-26AUG09"), Some(Cadence::Daily));
+        assert_eq!(Cadence::from_ticker("NONSENSE"), None);
     }
 
     #[test]
