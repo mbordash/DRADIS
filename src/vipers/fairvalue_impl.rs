@@ -112,6 +112,18 @@ fn globals(asset: &str) -> &'static FairValueGlobals {
         .or_insert_with(|| Box::leak(Box::new(FairValueGlobals::new())))
 }
 
+/// Edge value for a leg that cannot be priced (no ask, or an ask outside
+/// `(0, 1)` — an empty or crossed book).
+///
+/// Deliberately **not** `Decimal::MIN`. `rust_decimal` renders into a fixed
+/// 32-char `ArrayString`, and `Decimal::MIN` is 29 digits at scale 0, so the
+/// diagnostic log's `{:+.3}` needs 1 sign + 29 digits + 1 point + 3 padding
+/// zeros = 34 chars and panics with `CapacityError` inside `to_str_internal`.
+/// That took the whole process down the first time a Kalshi leg quoted no ask
+/// (2026-08-10). Any value below −1 sorts under every real edge, since a real
+/// edge is a probability minus a price and cannot leave [−1, 1].
+const NO_EDGE: Decimal = dec!(-100);
+
 pub struct FairValueStrategyImpl;
 
 impl Default for FairValueStrategyImpl {
@@ -326,12 +338,12 @@ impl Strategy for FairValueStrategyImpl {
         let yes_edge = if snap.yes_ask > dec!(0) && snap.yes_ask < dec!(1) {
             fair_yes_dec - snap.yes_ask - Self::fee_frac(snap.yes_ask)
         } else {
-            Decimal::MIN
+            NO_EDGE
         };
         let no_edge = if snap.no_ask > dec!(0) && snap.no_ask < dec!(1) {
             (dec!(1) - fair_yes_dec) - snap.no_ask - Self::fee_frac(snap.no_ask)
         } else {
-            Decimal::MIN
+            NO_EDGE
         };
 
         // ── Periodic diagnostic (calibration visibility, throttled) ──────────
@@ -643,4 +655,37 @@ impl Strategy for FairValueStrategyImpl {
     fn venue(&self) -> &'static str { "Window/Daily" }
     fn max_exposure(&self) -> Decimal { config::FAIRVALUE_MAX_EXPOSURE_USDC }
     fn risk_model(&self) -> &'static str { "Gross one-sided" }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Decimal::MIN` cannot be rendered with a precision specifier.
+    ///
+    /// `rust_decimal` formats into a fixed 32-char `ArrayString`. `Decimal::MIN`
+    /// is 29 digits at scale 0, so `{:+.3}` needs 1 sign + 29 digits + 1 point +
+    /// 3 padding zeros = 34 chars and panics with `CapacityError` inside
+    /// `to_str_internal`. The FairValue diagnostic log formats both edges with
+    /// `{:+.3}`, so a market with no ask on one leg crashed the process
+    /// (observed 2026-08-10 on the Kalshi build).
+    #[test]
+    fn unavailable_edge_sentinel_is_formattable() {
+        let s = format!("{:+.3}", NO_EDGE);
+        assert!(!s.is_empty());
+        // Must still sort below every real edge, which lives in [-1.0, 1.0].
+        assert!(NO_EDGE < dec!(-1));
+    }
+
+    /// Guards the whole diagnostic line, not just the constant — this is the
+    /// exact format string and argument shape that panicked.
+    #[test]
+    fn diagnostic_line_renders_with_both_edges_unavailable() {
+        let line = format!(
+            " FairValue: fair(YES)={:.3} (d={:+.2}σ, σ/√s={:.2e}, T={}s) | yes_ask=${:.2} edge={:+.3} | no_ask=${:.2} edge={:+.3} | req={:.3}{}",
+            0.5_f64, 0.0_f64, 5.0e-5_f64, 2598_i64,
+            dec!(0), NO_EDGE, dec!(0), NO_EDGE, dec!(0.12), "",
+        );
+        assert!(line.contains("FairValue"));
+    }
 }
