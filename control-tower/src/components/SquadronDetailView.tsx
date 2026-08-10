@@ -200,6 +200,10 @@ interface Props {
 
 export default function SquadronDetailView({ squadron, onBack }: Props) {
   const asset = squadron.asset.toLowerCase();
+  // Raptor health is keyed by crypto underlying (btc/eth/sol), which may
+  // differ from the squadron's venue asset (e.g. "kalshi"). Fall back to
+  // asset for older backends that don't send `underlying`.
+  const raptorAsset = (squadron.underlying || asset).toLowerCase();
 
   // Market taxonomy resolved by the backend (data-driven; falls back to the
   // full set if an older backend didn't supply it).
@@ -274,7 +278,7 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
         <RaptorHealthPanel
           raptorKinds={raptorKinds}
           raptors={status?.raptors}
-          asset={asset}
+          asset={raptorAsset}
           marketClass={marketClass}
         />
       </div>

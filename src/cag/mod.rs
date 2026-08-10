@@ -101,6 +101,12 @@ pub struct SquadronSummary {
     /// `enrich_taxonomy()` populates these before the summary is serialised.
     #[serde(default)]
     pub market_class:      String,
+    /// Crypto underlying that feeds this squadron's raptors (e.g. "btc").
+    /// Distinct from `asset` when the venue identity differs from the
+    /// underlying (Kalshi squadron asset is "KALSHI", underlying is "btc").
+    /// The frontend uses this to look up raptor health in the shared map.
+    #[serde(default)]
+    pub underlying:        String,
     /// Implemented raptor kinds meaningful for this squadron's market class.
     #[serde(default)]
     pub raptors:           Vec<String>,
@@ -121,6 +127,7 @@ impl SquadronSummary {
             maker_market_name: None,
             deployed_at:       s.deployed_at,
             market_class:      String::new(),
+            underlying:        s.asset.slug(),
             raptors:           Vec::new(),
             vipers:            Vec::new(),
         }
@@ -324,6 +331,7 @@ impl Cag {
             maker_market_name: None,
             deployed_at:       Utc::now(),
             market_class:      market_type.to_string(),
+            underlying:        market_type.to_lowercase(),
             raptors:           raptors.to_vec(),
             vipers:            vipers.to_vec(),
         };
@@ -381,6 +389,15 @@ impl Cag {
     pub fn update_state(&self, id: &SquadronId, state: SquadronState) {
         if let Some(mut entry) = self.inner.registry.get_mut(id) {
             entry.summary.state = state.to_string();
+        }
+    }
+
+    /// Override the raptor-health lookup key for a squadron whose venue
+    /// identity differs from its crypto underlying (e.g. Kalshi squadron
+    /// asset is "KALSHI" but raptors write under "btc").
+    pub fn set_underlying(&self, id: &SquadronId, underlying: &str) {
+        if let Some(mut entry) = self.inner.registry.get_mut(id) {
+            entry.summary.underlying = underlying.to_string();
         }
     }
 

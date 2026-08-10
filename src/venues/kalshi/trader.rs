@@ -431,6 +431,10 @@ async fn trade_one_market(
     // ── Register the squadron so the Control Tower lists it ─────────────────
     let squadron = register_kalshi_squadron(cag, &pair, &raptors);
     let squadron_id = squadron.id.clone();
+    // The squadron's asset is "KALSHI" (venue identity) but its raptors
+    // are keyed by the crypto underlying (btc/eth/sol). Tell the UI
+    // which raptor health key to read.
+    cag.set_underlying(&squadron_id, pair.underlying);
     seed_squadron_config(&squadron_id).await;
     let market_class = squadron.classify_and_link().await;
 
@@ -465,7 +469,7 @@ async fn trade_one_market(
     let _fill_listener = lifecycle.spawn_fill_listener(Arc::clone(venue), Arc::clone(&positions));
     let market_started_at = Utc::now();
 
-    publish_raptor_health(raptor_health_tx, asset, true);
+    publish_raptor_health(raptor_health_tx, pair.underlying, true);
     publish_strategy_market(markets_tx, &viper_kinds, &pair.question);
 
     // ── Stream the market's book (bids-only; asks derived) ──────────────────
@@ -508,7 +512,7 @@ async fn trade_one_market(
                 info!("Kalshi trader: cancelled — standing down");
                 lifecycle.cancel_all(venue.as_ref()).await;
                 cag.update_state(&squadron_id, SquadronState::StoodDown);
-                publish_raptor_health(raptor_health_tx, asset, false);
+                publish_raptor_health(raptor_health_tx, pair.underlying, false);
                 return MarketOutcome::Cancelled;
             }
             _ = dash_tick.tick() => {
@@ -518,27 +522,6 @@ async fn trade_one_market(
                     session_pnl = total - starting;
                 }
                 dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
-                // Mirror raptor health from the underlying key (e.g. "btc") to
-                // the squadron asset key ("kalshi") so the Control Tower reads
-                // live raptor status correctly. Raptors write under the crypto
-                // underlying; the squadron is keyed by KALSHI_ASSET.
-                raptor_health_tx.send_modify(|map| {
-                    if let Some(src) = map.get(pair.underlying).cloned() {
-                        let dst = map.entry(asset.to_string()).or_default();
-                        dst.deriv_connected   = src.deriv_connected;
-                        dst.open_interest     = src.open_interest;
-                        dst.oi_delta_pct      = src.oi_delta_pct;
-                        dst.cvd_ratio         = src.cvd_ratio;
-                        dst.price_connected   = src.price_connected;
-                        dst.funding_connected = src.funding_connected;
-                        dst.oracle_price      = src.oracle_price;
-                        dst.velocity_5s       = src.velocity_5s;
-                        dst.velocity_1s       = src.velocity_1s;
-                        dst.acceleration      = src.acceleration;
-                        dst.drift_60m         = src.drift_60m;
-                        dst.drift_10m         = src.drift_10m;
-                    }
-                });
                 continue;
             }
             _ = rescan_tick.tick() => {
@@ -556,7 +539,7 @@ async fn trade_one_market(
                         );
                         lifecycle.cancel_all(venue.as_ref()).await;
                         cag.update_state(&squadron_id, SquadronState::StoodDown);
-                        publish_raptor_health(raptor_health_tx, asset, false);
+                        publish_raptor_health(raptor_health_tx, pair.underlying, false);
                         return MarketOutcome::BetterMarketFound;
                     }
                 }
@@ -592,7 +575,7 @@ async fn trade_one_market(
                 info!("🏁 Kalshi market \"{}\" reached close — standing down to rotate", market_cfg.market_name);
                 lifecycle.cancel_all(venue.as_ref()).await;
                 cag.update_state(&squadron_id, SquadronState::StoodDown);
-                publish_raptor_health(raptor_health_tx, asset, false);
+                publish_raptor_health(raptor_health_tx, pair.underlying, false);
                 return MarketOutcome::Closed;
             }
             MarketPhase::WindingDown => {

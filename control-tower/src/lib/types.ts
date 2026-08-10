@@ -361,6 +361,10 @@ export interface SquadronSummary {
   // ── Market taxonomy (data-driven; resolved from the DB join tables) ─────────
   /** Resolved market domain, e.g. "crypto" | "sports" | "politics" | "unknown". */
   market_class?:     string;
+  /** Crypto underlying that feeds this squadron's raptors (e.g. "btc").
+   *  Distinct from `asset` when the venue identity differs from the underlying
+   *  (e.g. Kalshi squadron asset is "KALSHI", underlying is "btc"). */
+  underlying?:       string;
   /** Implemented raptor kinds meaningful for this market class, e.g. ["price","funding"]. */
   raptors?:          string[];
   /** Viper kinds meaningful for this market class, e.g. ["arbitrage","maker"]. */
