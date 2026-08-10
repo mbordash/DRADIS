@@ -506,10 +506,6 @@ async fn trade_one_market(
     // ── Register the squadron so the Control Tower lists it ─────────────────
     let squadron = register_kalshi_squadron(cag, &pair, &raptors);
     let squadron_id = squadron.id.clone();
-    // The squadron's asset is "KALSHI" (venue identity) but its raptors
-    // are keyed by the crypto underlying (btc/eth/sol). Tell the UI
-    // which raptor health key to read.
-    cag.set_underlying(&squadron_id, pair.underlying);
     seed_squadron_config(&squadron_id).await;
     let market_class = squadron.classify_and_link().await;
 
@@ -631,6 +627,7 @@ async fn trade_one_market(
                         );
                         lifecycle.cancel_all(venue.as_ref()).await;
                         cag.update_state(&squadron_id, SquadronState::StoodDown);
+                        cag.remove(&squadron_id);
                         publish_raptor_health(raptor_health_tx, pair.underlying, false);
                         return MarketOutcome::BetterMarketFound;
                     }
@@ -667,6 +664,7 @@ async fn trade_one_market(
                 info!("🏁 Kalshi market \"{}\" reached close — standing down to rotate", market_cfg.market_name);
                 lifecycle.cancel_all(venue.as_ref()).await;
                 cag.update_state(&squadron_id, SquadronState::StoodDown);
+                cag.remove(&squadron_id);
                 publish_raptor_health(raptor_health_tx, pair.underlying, false);
                 return MarketOutcome::Closed;
             }
@@ -1066,8 +1064,15 @@ fn register_kalshi_squadron(cag: &Cag, pair: &KalshiPair, r: &CryptoRaptors) -> 
         no_fee_bps: KALSHI_FEE_BPS as u32,
     };
 
+    // Use the actual crypto underlying (Btc/Eth/Sol) so the squadron
+    // self-classifies as "crypto" and links to the full raptor/viper set.
+    let crypto_asset = match pair.underlying {
+        "eth" => CryptoAsset::Eth,
+        "sol" => CryptoAsset::Sol,
+        _     => CryptoAsset::Btc,
+    };
     let squadron = Squadron::new(
-        CryptoAsset::Custom(KALSHI_ASSET.to_uppercase()),
+        crypto_asset,
         SquadronConfig::arb_wing("Kalshi Crypto Squadron"),
         market,
         raptors,
