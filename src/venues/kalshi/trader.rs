@@ -921,6 +921,8 @@ async fn dispatch_signal(
                 info!("👻 [{strategy_name}] ghost entry pair: {} + {}", params.token_id, pp.token_id);
                 record_guard(positions, strategy_name, params, Some(&pp.token_id)).await;
                 record_guard(positions, strategy_name, pp, Some(&params.token_id)).await;
+                record_entry(pool, strategy_name, params).await;
+                record_entry(pool, strategy_name, pp).await;
                 return true;
             }
             let legs = [
@@ -935,6 +937,8 @@ async fn dispatch_signal(
                     record_guard(positions, strategy_name, pp, Some(&params.token_id)).await;
                     lifecycle.track(&a, strategy_name, params.order_type, Some(pp.token_id.clone())).await;
                     lifecycle.track(&b, strategy_name, pp.order_type, Some(params.token_id.clone())).await;
+                    record_entry(pool, strategy_name, params).await;
+                    record_entry(pool, strategy_name, pp).await;
                     if let Some(p) = pool { sync_dashboard(venue, p, positions, starting).await; }
                     true
                 }

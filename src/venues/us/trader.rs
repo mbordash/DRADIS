@@ -400,7 +400,7 @@ async fn run_wing(
                     _ = tick.tick() => {}
                 }
                 if active_bg.load(AtomicOrdering::Relaxed) { continue; }
-                sync_dashboard(venue_bg.as_ref(), &snap_pool, starting).await;
+                sync_dashboard(venue_bg.as_ref(), &snap_pool, None, starting).await;
             }
         });
     }
@@ -670,7 +670,7 @@ async fn trade_one_market(
     let mut session_pnl = Decimal::ZERO;
     let mut dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
     if let Some(p) = &pool {
-        let (coll, total) = sync_dashboard(venue.as_ref(), p, starting).await;
+        let (coll, total) = sync_dashboard(venue.as_ref(), p, Some(&positions), starting).await;
         available_collateral = coll;
         session_pnl = total - starting;
     }
@@ -699,7 +699,7 @@ async fn trade_one_market(
             }
             _ = dash_tick.tick() => {
                 if let Some(p) = &pool {
-                    let (coll, total) = sync_dashboard(venue.as_ref(), p, starting).await;
+                    let (coll, total) = sync_dashboard(venue.as_ref(), p, Some(&positions), starting).await;
                     available_collateral = coll;
                     session_pnl = total - starting;
                 }
@@ -849,7 +849,7 @@ async fn trade_one_market(
 
         let mut acted = false;
         for (strategy_name, signal) in signals {
-            if dispatch_signal(venue.as_ref(), &pool, &positions, &lifecycle, &strategy_name, &signal, starting).await {
+            if dispatch_signal(venue.as_ref(), &pool, &positions, &lifecycle, asset, &strategy_name, &signal, starting).await {
                 acted = true;
             }
         }
@@ -1023,6 +1023,7 @@ async fn dispatch_signal(
     pool: &Option<sqlx::SqlitePool>,
     positions: &Arc<Mutex<PositionMap>>,
     lifecycle: &OrderLifecycle,
+    asset: &'static str,
     strategy_name: &str,
     signal: &StrategySignal,
     starting: Decimal,
@@ -1033,6 +1034,8 @@ async fn dispatch_signal(
                 info!("👻 [{strategy_name}] ghost entry pair: {} + {}", params.token_id, pp.token_id);
                 record_guard(positions, strategy_name, params, Some(&pp.token_id)).await;
                 record_guard(positions, strategy_name, pp, Some(&params.token_id)).await;
+                record_entry(pool, asset, strategy_name, params).await;
+                record_entry(pool, asset, strategy_name, pp).await;
                 return true;
             }
             let legs = [
@@ -1049,19 +1052,21 @@ async fn dispatch_signal(
                     // lifecycle (fill-confirm / stale-cancel / naked-leg hedge).
                     lifecycle.track(&a, strategy_name, params.order_type, Some(pp.token_id.clone())).await;
                     lifecycle.track(&b, strategy_name, pp.order_type, Some(params.token_id.clone())).await;
-                    if let Some(p) = pool { sync_dashboard(venue, p, starting).await; }
+                    record_entry(pool, asset, strategy_name, params).await;
+                    record_entry(pool, asset, strategy_name, pp).await;
+                    if let Some(p) = pool { sync_dashboard(venue, p, Some(positions), starting).await; }
                     true
                 }
                 Err(e) => { warn!("[{strategy_name}] atomic entry failed: {e}"); false }
             }
         }
         StrategySignal::Entry { params, pair_params: None } => {
-            dispatch_single(venue, pool, positions, lifecycle, strategy_name, params, Side::Buy, starting).await
+            dispatch_single(venue, pool, positions, lifecycle, asset, strategy_name, params, Side::Buy, starting).await
         }
         StrategySignal::MakerQuote { yes, no } => {
             let mut acted = false;
             for q in [yes.as_ref(), no.as_ref()].into_iter().flatten() {
-                if dispatch_single(venue, pool, positions, lifecycle, strategy_name, q, Side::Buy, starting).await {
+                if dispatch_single(venue, pool, positions, lifecycle, asset, strategy_name, q, Side::Buy, starting).await {
                     acted = true;
                 }
             }
@@ -1088,7 +1093,18 @@ async fn dispatch_signal(
         }
         StrategySignal::Exit { params, reason, exit_pair } => {
             info!("🚪 [{strategy_name}] exit ({reason}): {} @ {:.4}", params.token_id, params.price);
-            let acted = dispatch_single(venue, pool, positions, lifecycle, strategy_name, params, Side::Sell, starting).await;
+            // Snapshot the entry BEFORE the sell so the round-trip can be booked
+            // to the tradelog — the guard is cleared below and there is no second
+            // chance to read its cost basis.
+            let entered = positions
+                .lock()
+                .await
+                .get(&(strategy_name.to_string(), params.token_id.clone()))
+                .map(|p| (p.avg_entry, p.shares));
+            let acted = dispatch_single(venue, pool, positions, lifecycle, asset, strategy_name, params, Side::Sell, starting).await;
+            if acted {
+                record_round_trip(pool, asset, strategy_name, params, entered, reason).await;
+            }
             // Clear this strategy's guard for the leg (and the paired leg, if any)
             // so it can re-enter later.
             let mut map = positions.lock().await;
@@ -1114,6 +1130,7 @@ async fn dispatch_single(
     pool: &Option<sqlx::SqlitePool>,
     positions: &Arc<Mutex<PositionMap>>,
     lifecycle: &OrderLifecycle,
+    asset: &'static str,
     strategy_name: &str,
     params: &OrderParams,
     side: Side,
@@ -1124,6 +1141,7 @@ async fn dispatch_single(
             params.token_id, params.price, params.shares);
         if matches!(side, Side::Buy) {
             record_guard(positions, strategy_name, params, None).await;
+            record_entry(pool, asset, strategy_name, params).await;
         }
         return true;
     }
@@ -1134,18 +1152,104 @@ async fn dispatch_single(
             if matches!(side, Side::Buy) {
                 record_guard(positions, strategy_name, params, None).await;
                 lifecycle.track(&f, strategy_name, params.order_type, None).await;
+                record_entry(pool, asset, strategy_name, params).await;
             }
-            if let Some(p) = pool { sync_dashboard(venue, p, starting).await; }
+            if let Some(p) = pool { sync_dashboard(venue, p, Some(positions), starting).await; }
             true
         }
         Err(e) => { warn!("[{strategy_name}] {side:?} order failed: {e}"); false }
     }
 }
 
+/// Persist a new position to `entries` + `open_positions`.
+///
+/// Without this the Control Tower's positions panel had to fall back on
+/// [`sync_dashboard`]'s venue sweep, which knows the instrument but not which
+/// viper owns it — every live position was mislabelled as ArbitrageStrategy.
+async fn record_entry(
+    pool: &Option<sqlx::SqlitePool>,
+    asset: &'static str,
+    strategy_name: &str,
+    params: &OrderParams,
+) {
+    let side = side_label(params.token_id.as_str());
+    metrics::record_entry(
+        asset,
+        strategy_name.to_string(),
+        params.token_id.to_string(),
+        params.market_name.clone(),
+        side.to_string(),
+        params.price,
+        params.shares,
+    ).await;
+    if let Some(p) = pool {
+        // Live entries land as `pending` — the fill is not venue-confirmed yet, and
+        // `purge_stale_open_positions` protects pending rows through its grace
+        // window, so the row survives until `sync_dashboard` sees the holding and
+        // promotes it. Ghost entries have no venue truth to wait for.
+        let status = if params.ghost_mode { "confirmed" } else { "pending" };
+        db::record_open_position_with_status(
+            p, strategy_name, params.token_id.as_str(), &params.market_name,
+            side, params.price, params.shares, params.ghost_mode, status,
+        ).await;
+    }
+}
+
+/// Book a completed round-trip to the `trades` ledger and clear its
+/// `open_positions` row.
+///
+/// The US loop previously recorded a trade only on a lifecycle flatten, so every
+/// ordinary TP/SL/bail exit moved real cash and left no ledger row — the same
+/// gap found on the Kalshi loop on 2026-08-10, where a FairValue round-trip
+/// realised −$1.24 against an empty `trades` table.
+///
+/// `entered` is the (avg_entry, shares) read before the exit order was placed;
+/// `None` means no guard existed for this token, in which case there is no
+/// verifiable cost basis and we log loudly rather than invent P&L.
+async fn record_round_trip(
+    pool: &Option<sqlx::SqlitePool>,
+    asset: &'static str,
+    strategy_name: &str,
+    params: &OrderParams,
+    entered: Option<(Decimal, Decimal)>,
+    reason: &str,
+) {
+    let Some((avg_entry, shares)) = entered else {
+        warn!("⚠️ [{strategy_name}] exit booked for {} with no tracked entry — no trade recorded",
+            params.token_id);
+        return;
+    };
+    // Exit sizing follows the guard, not the signal: a partially-filled entry
+    // must not book P&L on shares we never owned.
+    let shares = shares.min(params.shares).max(Decimal::ZERO);
+    let pnl = (params.price - avg_entry) * shares;
+    metrics::record_trade(
+        asset,
+        strategy_name.to_string(),
+        params.market_name.clone(),
+        side_label(params.token_id.as_str()).to_string(),
+        avg_entry,
+        params.price,
+        shares,
+        pnl,
+        reason.to_string(),
+    ).await;
+    if let Some(p) = pool {
+        db::close_open_position(p, strategy_name, params.token_id.as_str()).await;
+    }
+}
+
 /// Reconcile the Control Tower's view of the US venue: upsert live open positions,
 /// purge settled ones, and write a portfolio P&L snapshot. Returns
 /// `(collateral, total_value)` so the tick loop can feed the strategy context.
-async fn sync_dashboard(venue: &UsRetailVenue, pool: &sqlx::SqlitePool, starting: Decimal) -> (Decimal, Decimal) {
+/// `guards` is the trade loop's live position map when one is running; the idle
+/// heartbeat passes `None` (no viper owns anything while the loop is parked).
+async fn sync_dashboard(
+    venue: &UsRetailVenue,
+    pool: &sqlx::SqlitePool,
+    guards: Option<&Arc<Mutex<PositionMap>>>,
+    starting: Decimal,
+) -> (Decimal, Decimal) {
     let collateral = match venue.collateral().await {
         Ok(c) => c,
         // On a transient collateral read failure, return zero available collateral
@@ -1154,14 +1258,37 @@ async fn sync_dashboard(venue: &UsRetailVenue, pool: &sqlx::SqlitePool, starting
     };
     let positions = venue.positions().await.unwrap_or_default();
 
+    // token → (owning viper, market name) from the live guard map, so a venue
+    // holding is attributed to the viper that opened it. Holdings with no guard
+    // (prior session, manual trade) are adopted under a neutral label rather
+    // than being blamed on a viper that never traded them.
+    let owners: HashMap<String, (String, String)> = match guards {
+        Some(g) => g.lock().await.iter()
+            .map(|((s, t), p)| (t.as_str().to_string(), (s.clone(), p.market_name.clone())))
+            .collect(),
+        None => HashMap::new(),
+    };
+
     let mut live_ids = std::collections::HashSet::new();
     let mut positions_value = Decimal::ZERO;
     for p in &positions {
         let sym = p.market.as_str();
         live_ids.insert(sym.to_string());
-        db::record_open_position(
-            pool, "ArbitrageStrategy", sym, sym, side_label(sym), p.avg_price, p.shares, false,
-        ).await;
+        match owners.get(sym) {
+            // The viper's own entry row already exists — the venue confirming the
+            // holding is what promotes it out of `pending`.
+            Some((strategy, market_name)) => {
+                db::record_open_position(
+                    pool, strategy, sym, market_name, side_label(sym), p.avg_price, p.shares, false,
+                ).await;
+                db::confirm_position_status(pool, strategy, sym).await;
+            }
+            None => {
+                db::record_open_position(
+                    pool, "ChainAdopted", sym, sym, side_label(sym), p.avg_price, p.shares, false,
+                ).await;
+            }
+        }
         positions_value += p.shares * p.avg_price;
     }
     // Drop rows for positions the venue no longer reports (settled to cash).
