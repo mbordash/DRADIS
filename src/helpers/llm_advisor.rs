@@ -913,6 +913,31 @@ pub async fn run_llm_advisor_loop(
         }
     };
 
+    // ── Autonomy scope guard ─────────────────────────────────────────────────
+    // Auto-applies (and human approvals) land on the GLOBAL DynamicConfig via
+    // `apply_patch_as`, but no patrol loop reads that record — squadrons run
+    // their own per-squadron config, and new squadrons seed from compile-time
+    // defaults rather than the global row. Of the 53 non-advanced (advisor-
+    // tunable) schema fields, 52 are viper params that live in squadron config;
+    // the one global field, `ghost_mode`, is held for human approval at every
+    // tier. Tiers 2–3 therefore cannot move a single live strategy parameter.
+    // Warn loudly rather than let the engine look like it is self-tuning.
+    // Fix tracked in ROADMAP.md — "LLM advisor writes to a config no squadron
+    // reads" (re-scope the advisor to run per squadron).
+    let configured_tier = std::env::var("LLM_AUTONOMY_TIER")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .filter(|t| (1..=3).contains(t))
+        .unwrap_or(1);
+    if configured_tier > 1 {
+        warn!(
+            "🤖 LLM autonomy tier {} is configured, but auto-applied changes write the GLOBAL \
+             config, which no squadron reads — live strategy parameters will NOT change. Treat \
+             tiers 2–3 as recommend-only until the advisor is re-scoped per squadron (see ROADMAP).",
+            configured_tier,
+        );
+    }
+
     info!(
         "🤖 LLM Advisor started (CAG multi-asset mode) — provider: {} | model: {} @ {} | interval: {}s | session: {}",
         provider.name(),

@@ -95,6 +95,16 @@ export default function AiActionsPage() {
         </div>
       )}
 
+      {/* Scope caveat — approvals and auto-applies write the global config,
+          which no squadron reads. Until the advisor is re-scoped per squadron
+          (see ROADMAP), an "applied" row does not mean a live strategy changed. */}
+      <div className="mb-3 text-[11px] font-mono rounded-lg px-3 py-2 bg-amber-500/5 border border-amber-500/20 text-amber-300/80">
+        <span className="font-semibold">Scope:</span> approvals apply to the{' '}
+        <span className="text-amber-200">global</span> config, which strategies do not read —
+        squadrons run their own config. An <span className="text-amber-200">applied</span> row here
+        does not change live trading. Edit a squadron&apos;s vipers from its squadron page.
+      </div>
+
       <div className="card p-0 overflow-x-auto">
         {isLoading ? (
           <div className="flex items-center justify-center h-24 text-gray-600 text-sm">Loading AI actions…</div>
