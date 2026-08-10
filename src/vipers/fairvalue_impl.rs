@@ -334,6 +334,26 @@ impl Strategy for FairValueStrategyImpl {
             idle("ask outside entry price band");
             return Ok(StrategySignal::NoSignal);
         }
+
+        // ── Spread guard: never buy into a position that is born stopped out ──
+        // Entry crosses the spread at the ask, but every exit rule below marks
+        // against the bid, so a wide book prices the position under water the
+        // instant it fills. On a thin venue book (Kalshi hourly, 2026-08-10:
+        // bought YES at $0.43 with a $0.28 bid) that showed as −34.9% one tick
+        // after entry — past 2× the stop — so the catastrophic branch dumped it
+        // 30s later and the round-trip realised the spread plus both fees, with
+        // the thesis never given a chance to play out. Refuse any entry whose
+        // immediate mark-to-bid already sits at or below the stop loss.
+        let entry_bid = if want_yes { snap.yes_bid } else { snap.no_bid };
+        if entry_bid <= dec!(0) {
+            idle("no bid — position would have no exit liquidity");
+            return Ok(StrategySignal::NoSignal);
+        }
+        let instant_mark = (entry_bid - ask) / ask;
+        if instant_mark <= -dc.fairvalue_stop_loss_pct {
+            idle("spread too wide (entry would mark below the stop loss)");
+            return Ok(StrategySignal::NoSignal);
+        }
         if self.cooldown_active(token_id.as_str()) {
             idle("post-exit cooldown active");
             return Ok(StrategySignal::NoSignal);
@@ -544,7 +564,14 @@ impl Strategy for FairValueStrategyImpl {
             }
 
             // ── 4. Stop loss (min-hold gated, catastrophic bypass) ───────────
-            let catastrophic = profit_margin <= -(dc.fairvalue_stop_loss_pct * dec!(2));
+            // The catastrophic branch bypasses the min-hold so a genuine crash
+            // isn't ridden down, but it still needs a floor: on a wide book the
+            // very first mark after entry is already 2× the stop purely from the
+            // spread we crossed, and a bid that flickers away for one tick reads
+            // identically. Below the floor, hold and let the normal min-hold
+            // gate decide once the book has had a chance to quote back.
+            let catastrophic = profit_margin <= -(dc.fairvalue_stop_loss_pct * dec!(2))
+                && secs_held >= config::FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS / 2;
             if profit_margin <= -dc.fairvalue_stop_loss_pct
                 && (catastrophic || secs_held >= config::FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS)
             {

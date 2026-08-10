@@ -102,10 +102,54 @@ pub fn pool() -> Option<&'static SqlitePool> {
     DB_POOL.get()
 }
 
-/// Returns a clone of the pool for `asset`, or `None` if that asset has not
-/// been initialised.  `SqlitePool` is cheaply cloneable (Arc-backed).
+/// Alias registry: dashboard asset key → the pool key that actually backs it.
+/// Populated by [`alias_pool`]; consulted by [`pool_for`] only on a miss.
+static POOL_ALIASES: OnceLock<std::sync::Mutex<std::collections::HashMap<String, String>>> =
+    OnceLock::new();
+
+fn pool_aliases() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    POOL_ALIASES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Point `alias` at an already-initialised pool key.
+///
+/// A venue's DB scope and its squadron's asset identity are not always the same
+/// name: the Kalshi venue owns one pool (`"kalshi"`), but its squadron registers
+/// under the crypto underlying (`"btc"`) so the taxonomy classifies it as crypto
+/// and the raptor health map lines up. The Control Tower then queries
+/// `/api/trades?asset=btc` and `/api/positions?asset=btc`, which resolved to no
+/// pool at all — every request logged "Database pool not available" and returned
+/// an empty list, so a filled trade could never appear in the UI.
+///
+/// Aliases are deliberately kept OUT of [`available_assets`] so the asset
+/// selector still lists one entry per real database.
+pub fn alias_pool(alias: &str, target: &str) {
+    let (alias, target) = (alias.to_lowercase(), target.to_lowercase());
+    if alias == target {
+        return;
+    }
+    let mut map = match pool_aliases().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if map.get(&alias).map(|t| t == &target).unwrap_or(false) {
+        return; // already pointed there — stay quiet across market rotations
+    }
+    info!("🔗 DB pool alias: '{alias}' → '{target}'");
+    map.insert(alias, target);
+}
+
+/// Returns a clone of the pool for `asset`, or `None` if that asset has neither
+/// its own pool nor an alias to one.  `SqlitePool` is cheaply cloneable
+/// (Arc-backed).
 pub fn pool_for(asset: &str) -> Option<SqlitePool> {
-    pools_map().lock().ok()?.get(asset).cloned()
+    let asset = asset.to_lowercase();
+    let direct = pools_map().lock().ok()?.get(&asset).cloned();
+    if direct.is_some() {
+        return direct;
+    }
+    let target = pool_aliases().lock().ok()?.get(&asset).cloned()?;
+    pools_map().lock().ok()?.get(&target).cloned()
 }
 
 /// Resolve a pool by optional asset name.
@@ -3063,6 +3107,38 @@ mod reconcile_tests {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE market = 'MarketG'")
             .fetch_one(&pool).await.unwrap();
         assert_eq!(n, 1);
+    }
+}
+
+#[cfg(test)]
+mod pool_alias_tests {
+    use super::*;
+
+    /// A venue whose DB scope differs from its squadron's asset name must still
+    /// resolve: the Control Tower queries by squadron asset, the pool is keyed by
+    /// venue. Without the alias every such request returned "pool not available".
+    #[tokio::test]
+    async fn alias_resolves_to_the_target_pool() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        pools_map().lock().unwrap().insert("aliastest-venue".into(), pool);
+
+        assert!(pool_for("aliastest-venue").is_some());
+        assert!(pool_for("aliastest-underlying").is_none());
+
+        alias_pool("aliastest-underlying", "aliastest-venue");
+        assert!(pool_for("aliastest-underlying").is_some());
+        assert!(pool_for("ALIASTEST-UNDERLYING").is_some(), "lookup is case-insensitive");
+
+        // Aliases must not masquerade as separate databases in the asset picker.
+        assert!(!available_assets().iter().any(|a| a == "aliastest-underlying"));
+
+        // A dangling alias resolves to nothing rather than to the primary pool.
+        alias_pool("aliastest-dangling", "aliastest-missing");
+        assert!(pool_for("aliastest-dangling").is_none());
     }
 }
 

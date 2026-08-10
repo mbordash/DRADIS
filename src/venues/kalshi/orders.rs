@@ -62,10 +62,25 @@ impl KalshiVenue {
                 chrono::Utc::now().timestamp() + intent.expiration_secs as i64
             );
         }
-        let resp: types::OrderResponse = self
+        // Deserialize in two steps so an unexpected response shape can be shown.
+        // Every field of `OrderResponse` is `#[serde(default)]`, so a payload that
+        // doesn't match parses "successfully" into an all-empty order — which then
+        // yields an empty `order_id`, breaking cancel() and lifecycle tracking with
+        // no error anywhere (observed 2026-08-10: "Buy … (order )" on a fill that
+        // did happen). Say so loudly, with the body, instead of trading blind.
+        let raw: serde_json::Value = self
             .post_json("/portfolio/events/orders", &body)
             .await?;
+        let resp: types::OrderResponse = serde_json::from_value(raw.clone())
+            .unwrap_or_default();
         let o = resp.order;
+        if o.order_id.is_empty() {
+            tracing::warn!(
+                "⚠️ Kalshi order response carried no order_id — cancel/lifecycle tracking \
+                 will not work for this order. Raw response: {}",
+                super::truncate(&raw.to_string(), 400)
+            );
+        }
         let requested = intent.quantity;
         let remaining = types::fp(&o.remaining_count_fp).unwrap_or_default();
         let total = types::fp(&o.count_fp).unwrap_or(requested);

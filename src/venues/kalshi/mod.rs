@@ -238,7 +238,7 @@ fn api_root_of(base: &str) -> String {
         .unwrap_or_else(|| "/trade-api/v2".to_string())
 }
 
-fn truncate(s: &str, n: usize) -> String {
+pub(crate) fn truncate(s: &str, n: usize) -> String {
     s.chars().take(n).collect()
 }
 
