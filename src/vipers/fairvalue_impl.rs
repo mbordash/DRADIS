@@ -139,7 +139,7 @@ impl FairValueStrategyImpl {
         let min = dc.fairvalue_min_edge;
         if secs_left >= config::FAIRVALUE_EDGE_TAPER_SECS {
             let scale = (secs_left as f64 / config::FAIRVALUE_EDGE_TAPER_SECS as f64).sqrt();
-            let scaled = base * Decimal::from_f64_retain(scale).unwrap_or(dec!(1));
+            let scaled = base * Decimal::from_f64_retain(scale).map(|d| d.round_dp(10)).unwrap_or(dec!(1));
             return scaled.min(config::FAIRVALUE_EDGE_HORIZON_CAP).max(base);
         }
         let frac = Decimal::from(secs_left.max(0)) / Decimal::from(config::FAIRVALUE_EDGE_TAPER_SECS);
@@ -293,7 +293,7 @@ impl Strategy for FairValueStrategyImpl {
 
         // ── Edge on each side (net of taker entry fee) ───────────────────────
         let req_edge = Self::required_edge(dc, secs_left);
-        let fair_yes_dec = Decimal::from_f64_retain(fair_yes).unwrap_or(dec!(0.5));
+        let fair_yes_dec = Decimal::from_f64_retain(fair_yes).map(|d| d.round_dp(10)).unwrap_or(dec!(0.5));
         let yes_edge = if snap.yes_ask > dec!(0) && snap.yes_ask < dec!(1) {
             fair_yes_dec - snap.yes_ask - Self::fee_frac(snap.yes_ask)
         } else {

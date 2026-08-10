@@ -188,7 +188,7 @@ pub async fn run_price_raptor(
                                                 .iter()
                                                 .map(|(_, p)| p.to_f64().unwrap_or(0.0))
                                                 .collect();
-                                            Decimal::from_f64_retain(normalized_hist_vol(&prices)).unwrap_or(dec!(0))
+                                            Decimal::from_f64_retain(normalized_hist_vol(&prices)).map(|d| d.round_dp(10)).unwrap_or(dec!(0))
                                         };
 
                                         let _ = drift_tx.send((drift_60m, drift_10m, hist_vol_norm));

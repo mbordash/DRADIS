@@ -1138,13 +1138,13 @@ impl GboostStrategyImpl {
                     None => r,
                 };
                 *entry = Some((ema, now));
-                rust_decimal::Decimal::from_f64_retain(ema)
+                rust_decimal::Decimal::from_f64_retain(ema).map(|d| d.round_dp(10))
             }
             None => match *entry {
                 Some((prev, last_at))
                     if now.duration_since(last_at).as_secs_f64() <= config::GBOOST_OBI_EMA_STALE_SECS =>
                 {
-                    rust_decimal::Decimal::from_f64_retain(prev)
+                    rust_decimal::Decimal::from_f64_retain(prev).map(|d| d.round_dp(10))
                 }
                 _ => None,
             },
