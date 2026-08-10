@@ -37,7 +37,6 @@ const WS_SIGN_PATH: &str = "/trade-api/ws/v2";
 pub struct Book {
     pub yes_bids: BTreeMap<Decimal, Decimal>,
     pub no_bids: BTreeMap<Decimal, Decimal>,
-    pub seq: u64,
     /// Set once the first snapshot has arrived.
     pub ready: bool,
 }
@@ -140,6 +139,9 @@ pub fn spawn_orderbook_feed(
             let (mut write, mut read) = stream.split();
 
             // Books must be rebuilt from the fresh snapshots on every (re)connect.
+            // Global seq counter — Kalshi sequences span all subscribed markets
+            // on a single WS connection, so gap detection must be connection-wide.
+            let mut last_seq: u64 = 0;
             {
                 let mut books = hub.write().await;
                 for t in &tickers {
@@ -180,7 +182,7 @@ pub fn spawn_orderbook_feed(
                             Ok(v) => v,
                             Err(_) => continue,
                         };
-                        if !apply_ws_message(&hub, &v).await {
+                        if !apply_ws_message(&hub, &v, &mut last_seq).await {
                             warn!("⚠️ Kalshi WS seq gap detected. Reconnecting for fresh snapshots…");
                             break;
                         }
@@ -194,14 +196,27 @@ pub fn spawn_orderbook_feed(
 
 /// Apply one parsed WS frame to the hub. Returns `false` on a seq gap
 /// (caller must resync by reconnecting).
-async fn apply_ws_message(hub: &BookHub, v: &serde_json::Value) -> bool {
+///
+/// `last_seq` is the **connection-global** sequence counter. Kalshi sequences
+/// span all subscribed markets on one WS connection, so gap detection must
+/// be connection-wide — not per-book.
+async fn apply_ws_message(hub: &BookHub, v: &serde_json::Value, last_seq: &mut u64) -> bool {
     let msg_type = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
+
+    // Global seq check — applies to both snapshots and deltas.
+    let seq = v.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
+    if seq != 0 && *last_seq != 0 && seq != *last_seq + 1 {
+        return false; // gap
+    }
+    if seq != 0 {
+        *last_seq = seq;
+    }
+
     match msg_type {
         "orderbook_snapshot" => {
             let Some(msg) = v.get("msg") else { return true };
             let Some(ticker) = msg.get("market_ticker").and_then(|t| t.as_str()) else { return true };
-            let seq = v.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
-            let mut book = Book { seq, ready: true, ..Default::default() };
+            let mut book = Book { ready: true, ..Default::default() };
             for (field, side) in [("yes_dollars_fp", "yes"), ("no_dollars_fp", "no")] {
                 if let Some(levels) = msg.get(field).and_then(|l| l.as_array()) {
                     for lvl in levels {
@@ -222,7 +237,6 @@ async fn apply_ws_message(hub: &BookHub, v: &serde_json::Value) -> bool {
         "orderbook_delta" => {
             let Some(msg) = v.get("msg") else { return true };
             let Some(ticker) = msg.get("market_ticker").and_then(|t| t.as_str()) else { return true };
-            let seq = v.get("seq").and_then(|s| s.as_u64()).unwrap_or(0);
             let side = msg.get("side").and_then(|s| s.as_str()).unwrap_or("yes");
             let (Some(price), Some(delta)) = (
                 msg.get("price_dollars").and_then(|p| p.as_str()).and_then(fp),
@@ -234,10 +248,6 @@ async fn apply_ws_message(hub: &BookHub, v: &serde_json::Value) -> bool {
             if !book.ready {
                 return true; // delta before snapshot — ignore, snapshot will come
             }
-            if seq != 0 && book.seq != 0 && seq != book.seq + 1 {
-                return false; // gap
-            }
-            book.seq = seq;
             book.apply_delta(side, price, delta);
             true
         }
@@ -392,7 +402,9 @@ mod tests {
     #[tokio::test]
     async fn snapshot_then_delta_maintains_book() {
         let hub = new_book_hub();
-        assert!(apply_ws_message(&hub, &snapshot_frame()).await);
+        let mut seq = 0u64;
+        assert!(apply_ws_message(&hub, &snapshot_frame(), &mut seq).await);
+        assert_eq!(seq, 2);
         {
             let books = hub.read().await;
             let b = books.get("KXBTC15M-TEST").unwrap();
@@ -408,41 +420,43 @@ mod tests {
             "msg": { "market_ticker": "KXBTC15M-TEST", "price_dollars": "0.2200",
                      "delta_fp": "-300.00", "side": "yes" }
         });
-        assert!(apply_ws_message(&hub, &delta).await);
+        assert!(apply_ws_message(&hub, &delta, &mut seq).await);
         // Remove the rest → 0.08 becomes best yes bid.
         let delta2 = serde_json::json!({
             "type": "orderbook_delta", "sid": 2, "seq": 4,
             "msg": { "market_ticker": "KXBTC15M-TEST", "price_dollars": "0.2200",
                      "delta_fp": "-33.00", "side": "yes" }
         });
-        assert!(apply_ws_message(&hub, &delta2).await);
+        assert!(apply_ws_message(&hub, &delta2, &mut seq).await);
         let books = hub.read().await;
         let b = books.get("KXBTC15M-TEST").unwrap();
         assert_eq!(b.best_yes_bid(), Some((dec!(0.08), dec!(300))));
-        assert_eq!(b.seq, 4);
+        assert_eq!(seq, 4);
     }
 
     #[tokio::test]
     async fn seq_gap_detected() {
         let hub = new_book_hub();
-        assert!(apply_ws_message(&hub, &snapshot_frame()).await);
+        let mut seq = 0u64;
+        assert!(apply_ws_message(&hub, &snapshot_frame(), &mut seq).await);
         let gap = serde_json::json!({
             "type": "orderbook_delta", "sid": 2, "seq": 9, // gap: expected 3
             "msg": { "market_ticker": "KXBTC15M-TEST", "price_dollars": "0.0800",
                      "delta_fp": "-1.00", "side": "yes" }
         });
-        assert!(!apply_ws_message(&hub, &gap).await);
+        assert!(!apply_ws_message(&hub, &gap, &mut seq).await);
     }
 
     #[tokio::test]
     async fn delta_for_unknown_market_ignored() {
         let hub = new_book_hub();
+        let mut seq = 0u64;
         let delta = serde_json::json!({
             "type": "orderbook_delta", "sid": 2, "seq": 5,
             "msg": { "market_ticker": "NOPE", "price_dollars": "0.5000",
                      "delta_fp": "10.00", "side": "no" }
         });
-        assert!(apply_ws_message(&hub, &delta).await); // no gap signal, just ignored
+        assert!(apply_ws_message(&hub, &delta, &mut seq).await); // no gap signal, just ignored
     }
 
     #[test]
@@ -508,8 +522,8 @@ async fn kalshi_demo_ws_smoke() {
     let mut ready = 0;
     for t in &tickers {
         if let Some(b) = books.get(t) {
-            println!("{t}: ready={} seq={} yes_bid={:?} yes_ask={:?}",
-                b.ready, b.seq, b.best_yes_bid(), b.best_yes_ask());
+            println!("{t}: ready={} yes_bid={:?} yes_ask={:?}",
+                b.ready, b.best_yes_bid(), b.best_yes_ask());
             if b.ready { ready += 1; }
         }
     }
