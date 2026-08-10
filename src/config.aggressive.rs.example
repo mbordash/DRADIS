@@ -686,6 +686,14 @@ pub const FAIRVALUE_ENTRY_LOG_THROTTLE_SECS: u64 = 30;
 pub const FAIRVALUE_PIN_GUARD_SECS: i64 = 600;
 /// Aggressive: accepts closer-to-strike endgame entries.
 pub const FAIRVALUE_PIN_MIN_SIGMA: f64 = 1.25;
+/// Time-independent coin-flip floor: refuse entries whose |d| is below this at
+/// ANY time to expiry, not just inside the pin-guard window above.
+///
+/// Both catastrophic stop-outs on 2026-08-10 were near-strike entries with 26+
+/// minutes left (d=+0.20sigma T=1578s, d=+0.07sigma T=2477s), each round-tripped
+/// to a -22% loss inside two minutes. The endgame pin guard could not see them.
+/// Calibrated on n=2; revisit once ~20 more round trips have accumulated.
+pub const FAIRVALUE_MIN_ABS_SIGMA: f64 = 0.25;
 pub const FAIRVALUE_MIN_ENTRY_PRICE: Decimal = dec!(0.10);
 pub const FAIRVALUE_MAX_ENTRY_PRICE: Decimal = dec!(0.985);
 pub const FAIRVALUE_MIN_SECS_TO_EXPIRY: i64 = 90;

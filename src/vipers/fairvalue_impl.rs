@@ -329,19 +329,34 @@ impl Strategy for FairValueStrategyImpl {
         let d_sigma = (spot / strike).ln() / (sigma * (secs_left as f64).sqrt());
 
         // ── Pin-risk guard (endgame coin-flip zone) ──────────────────────────
-        let pin_blocked = secs_left < config::FAIRVALUE_PIN_GUARD_SECS
+        // Two separate refusals, both guarding the same hazard — buying a coin
+        // flip — but on different axes:
+        //   * endgame pin: near expiry a strike-hugging spot is unresolvable
+        //   * coin-flip floor: |d| below the threshold is noise at ANY horizon
+        let endgame_pin = secs_left < config::FAIRVALUE_PIN_GUARD_SECS
             && d_sigma.abs() < config::FAIRVALUE_PIN_MIN_SIGMA;
+        let coin_flip = d_sigma.abs() < config::FAIRVALUE_MIN_ABS_SIGMA;
+        let pin_blocked = endgame_pin || coin_flip;
 
         // ── Edge on each side (net of taker entry fee) ───────────────────────
         let req_edge = Self::required_edge(dc, secs_left);
         let fair_yes_dec = Decimal::from_f64_retain(fair_yes).map(|d| d.round_dp(10)).unwrap_or(dec!(0.5));
+        // Edge must clear the ROUND TRIP, not just the entry.
+        //
+        // Charging only the entry fee understated the true hurdle by roughly
+        // half. Measured over five Kalshi round trips on 2026-08-10: gross P&L
+        // −$0.07, fees −$1.05 — the fees were the entire loss. The exit fee is
+        // estimated at the model's own fair value, because that is where the
+        // contract trades if the thesis plays out. Holding to settlement pays
+        // no exit fee at all, so this errs conservative on purpose.
+        let fair_no_dec = dec!(1) - fair_yes_dec;
         let yes_edge = if snap.yes_ask > dec!(0) && snap.yes_ask < dec!(1) {
-            fair_yes_dec - snap.yes_ask - Self::fee_frac(snap.yes_ask)
+            fair_yes_dec - snap.yes_ask - Self::fee_frac(snap.yes_ask) - Self::fee_frac(fair_yes_dec)
         } else {
             NO_EDGE
         };
         let no_edge = if snap.no_ask > dec!(0) && snap.no_ask < dec!(1) {
-            (dec!(1) - fair_yes_dec) - snap.no_ask - Self::fee_frac(snap.no_ask)
+            fair_no_dec - snap.no_ask - Self::fee_frac(snap.no_ask) - Self::fee_frac(fair_no_dec)
         } else {
             NO_EDGE
         };
@@ -356,7 +371,11 @@ impl Strategy for FairValueStrategyImpl {
                     " FairValue: fair(YES)={:.3} (d={:+.2}σ, σ/√s={:.2e}, T={}s) | yes_ask=${:.2} edge={:+.3} | no_ask=${:.2} edge={:+.3} | req={:.3}{}",
                     fair_yes, d_sigma, sigma, secs_left,
                     snap.yes_ask, yes_edge, snap.no_ask, no_edge, req_edge,
-                    if pin_blocked { " [PIN-GUARD]" } else { "" },
+                    match (endgame_pin, coin_flip) {
+                        (true, _) => " [PIN-GUARD]",
+                        (_, true) => " [COIN-FLIP]",
+                        _         => "",
+                    },
                 );
             }
         }
@@ -368,7 +387,11 @@ impl Strategy for FairValueStrategyImpl {
             (false, no_edge, snap.no_ask, market.no_token.clone(), market.no_fee_bps as u16)
         };
         if edge < req_edge || pin_blocked {
-            idle(if pin_blocked { "pin-risk guard (endgame coin-flip)" } else { "edge below required" });
+            idle(match (endgame_pin, coin_flip) {
+                (true, _) => "pin-risk guard (endgame coin-flip)",
+                (_, true) => "coin-flip guard (|d| below floor)",
+                _         => "edge below required",
+            });
             return Ok(StrategySignal::NoSignal);
         }
         if ask < dc.fairvalue_min_entry_price || ask > dc.fairvalue_max_entry_price {
@@ -675,6 +698,43 @@ mod tests {
         assert!(!s.is_empty());
         // Must still sort below every real edge, which lives in [-1.0, 1.0].
         assert!(NO_EDGE < dec!(-1));
+    }
+
+    /// The coin-flip floor must reject the two entries that actually lost money
+    /// on 2026-08-10, and must not depend on time to expiry.
+    #[test]
+    fn coin_flip_floor_rejects_the_real_losing_entries() {
+        // (d_sigma, secs_left) as logged at entry. Both were >25 min from expiry,
+        // so the endgame pin guard (600s) could not see either one.
+        for (d_sigma, secs_left) in [(0.20_f64, 1578_i64), (0.07, 2477)] {
+            let endgame_pin = secs_left < config::FAIRVALUE_PIN_GUARD_SECS
+                && d_sigma.abs() < config::FAIRVALUE_PIN_MIN_SIGMA;
+            let coin_flip = d_sigma.abs() < config::FAIRVALUE_MIN_ABS_SIGMA;
+            assert!(!endgame_pin, "endgame guard should not fire at T={secs_left}s");
+            assert!(coin_flip, "coin-flip floor must reject d={d_sigma}σ");
+        }
+    }
+
+    /// A settlement snipe — the strategy's whole reason for a wide price band —
+    /// must survive the new floor.
+    #[test]
+    fn coin_flip_floor_admits_high_conviction_entries() {
+        let d_sigma = 2.5_f64;
+        assert!(d_sigma.abs() >= config::FAIRVALUE_MIN_ABS_SIGMA);
+    }
+
+    /// Edge must be charged both legs' fees, so the hurdle is strictly higher
+    /// than the old entry-only calculation.
+    #[test]
+    fn edge_is_net_of_round_trip_fees() {
+        // Trade #6: fair(YES)=0.581, ask $0.36.
+        let fair = dec!(0.581);
+        let ask = dec!(0.36);
+        let entry_only = fair - ask - FairValueStrategyImpl::fee_frac(ask);
+        let round_trip = entry_only - FairValueStrategyImpl::fee_frac(fair);
+        assert!(round_trip < entry_only, "round-trip hurdle must exceed entry-only");
+        // The exit fee is material, not a rounding artifact.
+        assert!(entry_only - round_trip > dec!(0.01));
     }
 
     /// Guards the whole diagnostic line, not just the constant — this is the
