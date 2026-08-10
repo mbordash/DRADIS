@@ -554,7 +554,19 @@ async fn trade_one_market(
     let market_started_at = Utc::now();
 
     publish_raptor_health(raptor_health_tx, pair.underlying, true);
-    publish_strategy_market(markets_tx, &viper_kinds, &pair.question);
+    // Map each viper to its preferred venue: "Hourly" vipers → primary (15M),
+    // "Window/Daily" vipers → maker (daily), mirroring the intl/US patrol logic.
+    let maker_name = maker_pair.as_ref().map(|mp| mp.question.as_str()).unwrap_or(&pair.question);
+    markets_tx.send_modify(|map| {
+        for s in &strategies {
+            let key = s.name()
+                .strip_suffix("Strategy").unwrap_or(&s.name()).to_lowercase()
+                .replace("timedecay", "time_decay")
+                .replace("trendreversal", "trendcapture");
+            let market = if s.venue() == "Window/Daily" { maker_name } else { &pair.question };
+            map.insert(key, market.to_string());
+        }
+    });
     if let Some(ref mp) = maker_pair {
         cag.update_maker_market(&squadron_id, mp.question.clone());
     }
