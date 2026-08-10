@@ -53,8 +53,15 @@ fn probe_target() -> (&'static str, String) {
     ("CLOB", format!("{}/time", crate::config::CLOB_API_BASE))
 }
 
+/// Kalshi build probes the Kalshi REST exchange status (public, no auth).
+#[cfg(feature = "kalshi")]
+fn probe_target() -> (&'static str, String) {
+    let base = crate::venues::kalshi::base_url();
+    ("Kalshi API", format!("{}/exchange/status", base))
+}
+
 /// US retail build probes the venue REST health endpoint (public, no auth).
-#[cfg(not(feature = "intl_clob"))]
+#[cfg(not(any(feature = "intl_clob", feature = "kalshi")))]
 fn probe_target() -> (&'static str, String) {
     let base = std::env::var("POLYMARKET_US_BASE_URL")
         .unwrap_or_else(|_| "https://api.polymarket.us".to_string());

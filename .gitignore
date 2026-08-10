@@ -24,6 +24,7 @@ stop-all.sh
 
 # Private notes
 .README
+CLAUDE.md
 
 # Docker
 Dockerfile.*
