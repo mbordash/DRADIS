@@ -393,7 +393,7 @@ pub async fn reconcile_orphaned_positions(
                 market_name: market_name.to_string(),
                 pair_token_id: market.clone(),
                 fill_confirmed_at: Some(Utc::now()),
-                paired_leg_token_id: None, // fixed up below
+                paired_leg_token_id: None, entry_fee: Decimal::ZERO, // fixed up below
             });
 
             let source = if logged_strategy.is_some() { "DB" } else {
@@ -405,7 +405,7 @@ pub async fn reconcile_orphaned_positions(
     }
 
     // ── Wire paired_leg_token_id so the cleanup orphan-detector works ─────────
-    // Each position is inserted above with paired_leg_token_id: None, which means
+    // Each position is inserted above with paired_leg_token_id: None, entry_fee: Decimal::ZERO, which means
     // the cleanup.rs orphan reconciler (which checks `if let Some(paired) = ...`)
     // would never fire for session-adopted positions.
     //
@@ -646,7 +646,7 @@ pub async fn arb_pair_fill_monitor(
                     market_name: ref_pos.market_name.clone(),
                     pair_token_id: missing_market.clone(),
                     fill_confirmed_at: Some(Utc::now()),
-                    paired_leg_token_id: Some(filled_market.clone()),
+                    paired_leg_token_id: Some(filled_market.clone()), entry_fee: Decimal::ZERO,
                 });
             }
         }
@@ -759,7 +759,7 @@ pub async fn arb_pair_fill_monitor(
                             market_name: ref_pos.market_name.clone(),
                             pair_token_id: missing_market.clone(),
                             fill_confirmed_at: Some(Utc::now()),
-                            paired_leg_token_id: Some(filled_market.clone()),
+                            paired_leg_token_id: Some(filled_market.clone()), entry_fee: Decimal::ZERO,
                         });
                     }
                     drop(map);
@@ -887,6 +887,7 @@ pub async fn arb_pair_fill_monitor(
             crate::helpers::metrics::record_trade(
                 &crate::state::TradeScope::crypto(
                     &asset, crate::venues::intl::INTL_VENUE, &asset),
+                Decimal::ZERO,
                 strategy_name.clone(),
                 market_name.clone(),
                 filled_side.to_string(),
@@ -966,6 +967,7 @@ pub async fn arb_pair_fill_monitor(
                     crate::helpers::metrics::record_trade(
                         &crate::state::TradeScope::crypto(
                             &asset, crate::venues::intl::INTL_VENUE, &asset),
+                        Decimal::ZERO,
                         strategy_name.clone(),
                         market_name.clone(),
                         missing_side.to_string(),

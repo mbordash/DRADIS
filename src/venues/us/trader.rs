@@ -781,6 +781,7 @@ async fn trade_one_market(
                     tokio::spawn(async move {
                         metrics::record_trade(
                             &scope_t,
+                            Decimal::ZERO,
                             strat,
                             market,
                             "Sell".to_string(),
@@ -1013,7 +1014,7 @@ async fn record_guard(
             market_name: params.market_name.clone(),
             pair_token_id: params.token_id.clone(),
             fill_confirmed_at: None,
-            paired_leg_token_id: paired.cloned(),
+            paired_leg_token_id: paired.cloned(), entry_fee: Decimal::ZERO,
         },
     );
 }
@@ -1242,6 +1243,8 @@ async fn record_round_trip(
     let pnl = (params.price - avg_entry) * shares;
     metrics::record_trade(
         scope,
+        // Polymarket fees are taken from proceeds and not reported per fill, so no fee is booked on this venue.
+        Decimal::ZERO,
         strategy_name.to_string(),
         params.market_name.clone(),
         side_label(params.token_id.as_str()).to_string(),

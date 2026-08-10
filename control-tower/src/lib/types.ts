@@ -186,6 +186,11 @@ export interface TradeRow {
    * sports and politics markets have no underlying instrument.
    */
   underlying?:   string | null;
+  /**
+   * Total venue fees for the round trip. `pnl` is already NET of this, so
+   * `pnl + fees` recovers the gross figure. Null on rows predating fee capture.
+   */
+  fees?:         string | null;
 }
 
 /** A position that has been entered but not yet exited (all strategies, ghost+live). */

@@ -45,7 +45,7 @@ use crate::state::{
     MarketConfig, MarketPhase, MarketSnapshot, OrderParams, Position, PositionMap, PriceState,
     StrategySignal, TradeScope,
 };
-use crate::venues::core::{Execution, MarketId, OrderIntent, Side};
+use crate::venues::core::{Execution, Fill, MarketId, OrderId, OrderIntent, Side};
 use crate::venues::lifecycle::{LifecycleConfig, OrderLifecycle};
 
 use super::{leg_id, types::KalshiMarket, ws, KalshiVenue};
@@ -682,7 +682,9 @@ async fn trade_one_market(
                     let scope_t = scope.clone();
                     tokio::spawn(async move {
                         metrics::record_trade(
-                            &scope_t, strat, market, "Sell".to_string(),
+                            // Lifecycle flatten legs don't surface a fee through
+                            // OrderLifecycle yet — booked gross, flagged here.
+                            &scope_t, Decimal::ZERO, strat, market, "Sell".to_string(),
                             avg_entry, exit_price, shares, pnl,
                             "LifecycleFlatten".to_string(),
                         ).await;
@@ -904,6 +906,7 @@ async fn record_guard(
     strategy_name: &str,
     params: &OrderParams,
     paired: Option<&MarketId>,
+    entry_fee: Decimal,
 ) {
     let mut map = positions.lock().await;
     map.insert(
@@ -917,6 +920,7 @@ async fn record_guard(
             pair_token_id: params.token_id.clone(),
             fill_confirmed_at: None,
             paired_leg_token_id: paired.cloned(),
+            entry_fee,
         },
     );
 }
@@ -935,8 +939,8 @@ async fn dispatch_signal(
         StrategySignal::Entry { params, pair_params: Some(pp) } => {
             if params.ghost_mode {
                 info!("👻 [{strategy_name}] ghost entry pair: {} + {}", params.token_id, pp.token_id);
-                record_guard(positions, strategy_name, params, Some(&pp.token_id)).await;
-                record_guard(positions, strategy_name, pp, Some(&params.token_id)).await;
+                record_guard(positions, strategy_name, params, Some(&pp.token_id), Decimal::ZERO).await;
+                record_guard(positions, strategy_name, pp, Some(&params.token_id), Decimal::ZERO).await;
                 record_entry(pool, scope, strategy_name, params).await;
                 record_entry(pool, scope, strategy_name, pp).await;
                 return true;
@@ -949,8 +953,8 @@ async fn dispatch_signal(
                 Ok([a, b]) => {
                     info!("✅ [{strategy_name}] entry pair: {} @ {:.4} | {} @ {:.4}",
                         a.order_id, a.price, b.order_id, b.price);
-                    record_guard(positions, strategy_name, params, Some(&pp.token_id)).await;
-                    record_guard(positions, strategy_name, pp, Some(&params.token_id)).await;
+                    record_guard(positions, strategy_name, params, Some(&pp.token_id), a.fee).await;
+                    record_guard(positions, strategy_name, pp, Some(&params.token_id), b.fee).await;
                     lifecycle.track(&a, strategy_name, params.order_type, Some(pp.token_id.clone())).await;
                     lifecycle.track(&b, strategy_name, pp.order_type, Some(params.token_id.clone())).await;
                     record_entry(pool, scope, strategy_name, params).await;
@@ -962,12 +966,17 @@ async fn dispatch_signal(
             }
         }
         StrategySignal::Entry { params, pair_params: None } => {
-            dispatch_single(venue, pool, scope, positions, lifecycle, strategy_name, params, Side::Buy, starting).await
+            dispatch_single(venue, pool, scope, positions, lifecycle, strategy_name, params, Side::Buy, starting)
+                .await
+                .is_some()
         }
         StrategySignal::MakerQuote { yes, no } => {
             let mut acted = false;
             for q in [yes.as_ref(), no.as_ref()].into_iter().flatten() {
-                if dispatch_single(venue, pool, scope, positions, lifecycle, strategy_name, q, Side::Buy, starting).await {
+                if dispatch_single(venue, pool, scope, positions, lifecycle, strategy_name, q, Side::Buy, starting)
+                    .await
+                    .is_some()
+                {
                     acted = true;
                 }
             }
@@ -1004,9 +1013,9 @@ async fn dispatch_signal(
                 .lock()
                 .await
                 .get(&(strategy_name.to_string(), params.token_id.clone()))
-                .map(|p| (p.avg_entry, p.shares));
-            let acted = dispatch_single(venue, pool, scope, positions, lifecycle, strategy_name, params, Side::Sell, starting).await;
-            if !acted {
+                .map(|p| (p.avg_entry, p.shares, p.entry_fee));
+            let exit_fill = dispatch_single(venue, pool, scope, positions, lifecycle, strategy_name, params, Side::Sell, starting).await;
+            let Some(exit_fill) = exit_fill else {
                 // Nothing traded — we still own it. Dropping the position here is
                 // what abandoned a live stop-loss to expire worthless on
                 // 2026-08-10 (KXBTCD-26AUG1003): local state said flat, Kalshi
@@ -1016,8 +1025,8 @@ async fn dispatch_signal(
                     params.token_id);
                 arm_exit_retry_backoff(strategy_name, params.token_id.as_str());
                 return false;
-            }
-            record_round_trip(pool, scope, strategy_name, params, entered, reason).await;
+            };
+            record_round_trip(pool, scope, strategy_name, params, entered, exit_fill.fee, reason).await;
             clear_exit_retry_backoff(strategy_name, params.token_id.as_str());
             let mut map = positions.lock().await;
             map.remove(&(strategy_name.to_string(), params.token_id.clone()));
@@ -1029,7 +1038,7 @@ async fn dispatch_signal(
                     .collect();
                 for k in paired { map.remove(&k); }
             }
-            acted
+            true
         }
         StrategySignal::NoSignal => false,
     }
@@ -1074,15 +1083,22 @@ async fn dispatch_single(
     params: &OrderParams,
     side: Side,
     starting: Decimal,
-) -> bool {
+) -> Option<Fill> {
     if params.ghost_mode {
         info!("👻 [{strategy_name}] ghost {side:?}: {} @ {:.4} × {:.2}",
             params.token_id, params.price, params.shares);
         if matches!(side, Side::Buy) {
-            record_guard(positions, strategy_name, params, None).await;
+            record_guard(positions, strategy_name, params, None, Decimal::ZERO).await;
             record_entry(pool, scope, strategy_name, params).await;
         }
-        return true;
+        // Ghost orders never touch the venue, so there is no fee to book.
+        return Some(Fill {
+            order_id: OrderId(String::new()),
+            market: params.token_id.clone(),
+            filled: params.shares,
+            price: params.price,
+            fee: Decimal::ZERO,
+        });
     }
     match venue.place_order(order_params_to_intent(params, side)).await {
         Ok(f) => {
@@ -1092,9 +1108,9 @@ async fn dispatch_single(
             if f.filled <= Decimal::ZERO {
                 warn!("⚠️ [{strategy_name}] {side:?} {} @ {:.4} filled 0 of {:.2} — no state change (order {})",
                     params.token_id, params.price, params.shares, f.order_id);
-                return false;
+                return None;
             }
-            if f.filled < params.shares {
+            if f.filled < params.shares.round_dp(2) {
                 warn!("⚠️ [{strategy_name}] {side:?} {} partial fill {:.2} of {:.2} — booking full size; \
                        lifecycle reconciliation owns the remainder",
                     params.token_id, f.filled, params.shares);
@@ -1102,14 +1118,14 @@ async fn dispatch_single(
             info!("✅ [{strategy_name}] {side:?} {} @ {:.4} × {:.2} (order {})",
                 params.token_id, f.price, f.filled, f.order_id);
             if matches!(side, Side::Buy) {
-                record_guard(positions, strategy_name, params, None).await;
+                record_guard(positions, strategy_name, params, None, f.fee).await;
                 lifecycle.track(&f, strategy_name, params.order_type, None).await;
                 record_entry(pool, scope, strategy_name, params).await;
             }
             if let Some(p) = pool { sync_dashboard(venue, p, positions, starting).await; }
-            true
+            Some(f)
         }
-        Err(e) => { warn!("[{strategy_name}] {side:?} order failed: {e}"); false }
+        Err(e) => { warn!("[{strategy_name}] {side:?} order failed: {e}"); None }
     }
 }
 
@@ -1158,15 +1174,17 @@ async fn record_entry(
 /// `entered` is the (avg_entry, shares) read before the exit order was placed;
 /// `None` means no guard existed for this token, in which case there is no
 /// verifiable cost basis and we log loudly rather than invent P&L.
+#[allow(clippy::too_many_arguments)]
 async fn record_round_trip(
     pool: &Option<sqlx::SqlitePool>,
     scope: &TradeScope,
     strategy_name: &str,
     params: &OrderParams,
-    entered: Option<(Decimal, Decimal)>,
+    entered: Option<(Decimal, Decimal, Decimal)>,
+    exit_fee: Decimal,
     reason: &str,
 ) {
-    let Some((avg_entry, shares)) = entered else {
+    let Some((avg_entry, shares, entry_fee)) = entered else {
         warn!("⚠️ [{strategy_name}] exit booked for {} with no tracked entry — no trade recorded",
             params.token_id);
         return;
@@ -1174,9 +1192,20 @@ async fn record_round_trip(
     // Exit sizing follows the guard, not the signal: a partially-filled entry
     // must not book P&L on shares we never owned.
     let shares = shares.min(params.shares).max(Decimal::ZERO);
-    let pnl = (params.price - avg_entry) * shares;
+    // Net of BOTH legs' fees. Kalshi's quadratic taker fee runs ~7% of notional
+    // per round trip on a mid-priced contract, against a 20% TP / 10% SL — so a
+    // gross figure systematically flatters every trade. Measured over the five
+    // round trips on 2026-08-10: gross −$0.07, fees −$1.05, actual −$1.12.
+    let fees = entry_fee + exit_fee;
+    let gross = (params.price - avg_entry) * shares;
+    let pnl = gross - fees;
+    if !fees.is_zero() {
+        info!("🧾 [{strategy_name}] round trip {}: gross ${:.4} − fees ${:.4} (entry ${:.4} + exit ${:.4}) = ${:.4}",
+            params.token_id, gross, fees, entry_fee, exit_fee, pnl);
+    }
     metrics::record_trade(
         scope,
+        fees,
         strategy_name.to_string(),
         params.market_name.clone(),
         side_label(params.token_id.as_str()).to_string(),

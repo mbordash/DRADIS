@@ -46,6 +46,7 @@ fn take_entry_signals_json(token_id: &str) -> Option<String> {
 /// `asset` — lowercase crypto symbol, e.g. `"btc"`.  Drives the SQLite pool selection.
 pub async fn record_trade(
     scope: &TradeScope,
+    fees: Decimal,
     strategy: String,
     market: String,
     side: String,
@@ -55,13 +56,14 @@ pub async fn record_trade(
     profit_usdc: Decimal,
     reason: String,
 ) {
-    record_trade_with_timestamp(scope, strategy, market, side, entry_price, exit_price, shares, profit_usdc, reason, None).await;
+    record_trade_with_timestamp(scope, fees, strategy, market, side, entry_price, exit_price, shares, profit_usdc, reason, None).await;
 }
 
 /// Record a trade with an explicit timestamp (for retrospective settlements).
 /// If `timestamp` is None, uses current time.
 pub async fn record_trade_with_timestamp(
     scope: &TradeScope,
+    fees: Decimal,
     strategy: String,
     market: String,
     side: String,
@@ -73,7 +75,7 @@ pub async fn record_trade_with_timestamp(
     timestamp: Option<DateTime<Utc>>,
 ) {
     if let Some(pool) = db::pool_for(&scope.shard) {
-        db::record_trade_db(&pool, scope, &strategy, &market, &side, entry_price, exit_price, shares, profit_usdc, &reason, timestamp).await;
+        db::record_trade_db(&pool, scope, fees, &strategy, &market, &side, entry_price, exit_price, shares, profit_usdc, &reason, timestamp).await;
         info!("📊 Trade recorded to database: {} {} {} [venue={} class={} underlying={}]",
             strategy, market, side,
             if scope.venue.is_empty() { db::venue_for_shard(&scope.shard) } else { scope.venue.clone() },

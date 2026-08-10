@@ -787,6 +787,7 @@ pub fn spawn_lifecycle_task(
                         metrics::record_trade(
                             &crate::state::TradeScope::crypto(
                                 &asset_c, crate::venues::intl::INTL_VENUE, &asset_c),
+                            Decimal::ZERO,
                             strat,
                             market,
                             side,

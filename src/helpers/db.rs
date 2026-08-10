@@ -807,6 +807,10 @@ async fn run_migrations(pool: &SqlitePool) {
     //
     // All three are nullable on purpose: `underlying` is genuinely absent for
     // sports/politics, and pre-existing rows have no way to recover a class.
+    // `fees`: total dollars paid to the venue for the round trip (entry + exit).
+    // `pnl` is stored NET of this; subtracting it back recovers the gross figure.
+    let _ = sqlx::query("ALTER TABLE trades ADD COLUMN fees TEXT")
+        .execute(pool).await;
     for table in ["trades", "entries"] {
         for col in ["venue", "market_class", "underlying"] {
             let _ = sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {col} TEXT"))
@@ -904,6 +908,7 @@ pub async fn close_session() {
 pub async fn record_trade_db(
     pool: &SqlitePool,
     scope: &TradeScope,
+    fees: Decimal,
     strategy: &str,
     market: &str,
     side: &str,
@@ -919,8 +924,8 @@ pub async fn record_trade_db(
     let venue = resolved_venue(scope);
     if let Err(e) = sqlx::query(
         "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id,
-                             venue, market_class, underlying)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                             venue, market_class, underlying, fees)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&ts)
     .bind(strategy)
@@ -935,6 +940,7 @@ pub async fn record_trade_db(
     .bind(venue)
     .bind(scope.market_class.clone())
     .bind(scope.underlying.clone())
+    .bind(fees.to_string())
     .execute(pool)
     .await {
         error!("❌ DB trade write failed: {}", e);
@@ -2168,7 +2174,7 @@ pub async fn purge_stale_open_positions(
                         // Reconciliation knows the book but not the market's class or
                         // underlying — leave those NULL rather than guessing.
                         let scope = TradeScope::new("", venue_for_pool(pool), None, None);
-                        record_trade_db(pool, &scope, &strategy, &market, &side, entry, exit_px, qty, pnl, &reason, None).await;
+                        record_trade_db(pool, &scope, Decimal::ZERO, &strategy, &market, &side, entry, exit_px, qty, pnl, &reason, None).await;
                         info!(
                             "🧾 Ledger reconcile: booked off-strategy exit — {} {} {} | {} sh entry=${:.4} exit=${:.4} → pnl=${:.4}",
                             strategy, market, side, qty, entry, exit_px, pnl
@@ -2370,6 +2376,9 @@ pub struct TradeRow {
     /// Underlying symbol. `None` is meaningful — sports and politics markets
     /// have no underlying instrument.
     pub underlying: Option<String>,
+    /// Total venue fees for the round trip. `pnl` is already net of this;
+    /// `pnl + fees` recovers the gross figure. `None` on pre-fee rows.
+    pub fees: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -2459,7 +2468,7 @@ pub async fn recent_stop_loss_exists(
 pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
     match sqlx::query(
         "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
-                venue, market_class, underlying
+                venue, market_class, underlying, fees
          FROM trades ORDER BY ts DESC LIMIT ?"
     )
     .bind(limit)
@@ -2478,6 +2487,7 @@ pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
             venue:        r.try_get::<Option<String>, _>(9).ok().flatten(),
             market_class: r.try_get::<Option<String>, _>(10).ok().flatten(),
             underlying:   r.try_get::<Option<String>, _>(11).ok().flatten(),
+            fees:         r.try_get::<Option<String>, _>(12).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_recent_trades failed: {}", e); vec![] }
     }
@@ -2489,7 +2499,7 @@ pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
 pub async fn get_all_trades(pool: &SqlitePool) -> Vec<TradeRow> {
     match sqlx::query(
         "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
-                venue, market_class, underlying
+                venue, market_class, underlying, fees
          FROM trades ORDER BY ts ASC"
     )
     .fetch_all(pool)
@@ -2507,6 +2517,7 @@ pub async fn get_all_trades(pool: &SqlitePool) -> Vec<TradeRow> {
             venue:        r.try_get::<Option<String>, _>(9).ok().flatten(),
             market_class: r.try_get::<Option<String>, _>(10).ok().flatten(),
             underlying:   r.try_get::<Option<String>, _>(11).ok().flatten(),
+            fees:         r.try_get::<Option<String>, _>(12).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_all_trades failed: {}", e); vec![] }
     }
@@ -2608,7 +2619,7 @@ pub async fn get_session_trades(pool: &SqlitePool) -> Vec<TradeRow> {
     let sid = current_session_id();
     match sqlx::query(
         "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
-                venue, market_class, underlying
+                venue, market_class, underlying, fees
          FROM trades WHERE session_id = ? ORDER BY ts DESC"
     )
     .bind(sid)
@@ -2627,6 +2638,7 @@ pub async fn get_session_trades(pool: &SqlitePool) -> Vec<TradeRow> {
             venue:        r.try_get::<Option<String>, _>(9).ok().flatten(),
             market_class: r.try_get::<Option<String>, _>(10).ok().flatten(),
             underlying:   r.try_get::<Option<String>, _>(11).ok().flatten(),
+            fees:         r.try_get::<Option<String>, _>(12).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_session_trades failed: {}", e); vec![] }
     }
@@ -2643,7 +2655,7 @@ pub async fn get_previous_session_trades(pool: &SqlitePool, limit: i64) -> Vec<T
     let sid = current_session_id();
     match sqlx::query(
         "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
-                venue, market_class, underlying
+                venue, market_class, underlying, fees
          FROM trades
          WHERE (session_id IS NULL OR session_id != ?)
          ORDER BY ts DESC LIMIT ?"
@@ -2665,6 +2677,7 @@ pub async fn get_previous_session_trades(pool: &SqlitePool, limit: i64) -> Vec<T
             venue:        r.try_get::<Option<String>, _>(9).ok().flatten(),
             market_class: r.try_get::<Option<String>, _>(10).ok().flatten(),
             underlying:   r.try_get::<Option<String>, _>(11).ok().flatten(),
+            fees:         r.try_get::<Option<String>, _>(12).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_previous_session_trades failed: {}", e); vec![] }
     }
@@ -3136,7 +3149,7 @@ mod reconcile_tests {
     async fn sports_trade_records_null_underlying() {
         let pool = mem_pool().await;
         let scope = TradeScope::new("us", "polymarket-us", Some("sports".into()), None);
-        record_trade_db(&pool, &scope, "MakerStrategy", "Chiefs vs Bills", "YES",
+        record_trade_db(&pool, &scope, Decimal::ZERO, "MakerStrategy", "Chiefs vs Bills", "YES",
             dec_of("0.50"), dec_of("0.60"), dec_of("10"), dec_of("1.0"), "TP", None).await;
 
         let row = sqlx::query("SELECT venue, market_class, underlying FROM trades")
@@ -3153,13 +3166,38 @@ mod reconcile_tests {
         let pool = mem_pool().await;
         for u in ["btc", "eth"] {
             let scope = TradeScope::crypto("kalshi", "kalshi", u);
-            record_trade_db(&pool, &scope, "FairValueStrategy", &format!("{u} market"), "NO",
+            record_trade_db(&pool, &scope, Decimal::ZERO, "FairValueStrategy", &format!("{u} market"), "NO",
                 dec_of("0.33"), dec_of("0.40"), dec_of("5"), dec_of("0.35"), "TP", None).await;
         }
         let rows: Vec<String> = sqlx::query_scalar(
             "SELECT underlying FROM trades ORDER BY underlying"
         ).fetch_all(&pool).await.unwrap();
         assert_eq!(rows, vec!["btc".to_string(), "eth".to_string()]);
+    }
+
+    /// Recorded P&L must be net of fees, with the gross figure recoverable.
+    ///
+    /// Reproduces the 2026-08-10 Kalshi round trip that exposed the gap: YES
+    /// @ $0.36 → $0.28 on 8.19 contracts, $0.1318 entry fee + $0.1154 exit fee.
+    /// Booked gross it reads −$0.6552; the collateral actually moved −$0.9024.
+    #[tokio::test]
+    async fn recorded_pnl_is_net_of_fees() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::crypto("kalshi", "kalshi", "btc");
+        let shares = dec_of("8.19");
+        let fees = dec_of("0.1318") + dec_of("0.1154");
+        let gross = (dec_of("0.28") - dec_of("0.36")) * shares;
+        record_trade_db(&pool, &scope, fees, "FairValueStrategy", "BTC $63.9k", "YES",
+            dec_of("0.36"), dec_of("0.28"), shares, gross - fees, "CatastrophicSL", None).await;
+
+        let row = sqlx::query("SELECT pnl, fees FROM trades").fetch_one(&pool).await.unwrap();
+        let pnl: Decimal = row.try_get::<String, _>(0).unwrap().parse().unwrap();
+        let booked_fees: Decimal = row.try_get::<String, _>(1).unwrap().parse().unwrap();
+
+        assert_eq!(booked_fees, fees);
+        assert_eq!(pnl, dec_of("-0.9024"), "net P&L must match the real collateral move");
+        assert_eq!(pnl + booked_fees, gross, "gross must be recoverable from pnl + fees");
+        assert!(pnl < gross, "fees must make the loss larger, never smaller");
     }
 
     fn dec_of(s: &str) -> Decimal { s.parse().unwrap() }
@@ -3216,7 +3254,7 @@ mod reconcile_tests {
     #[tokio::test]
     async fn already_booked_is_not_double_counted() {
         let pool = mem_pool().await;
-        record_trade_db(&pool, &TradeScope::shard_only("test"), "MakerStrategy", "MarketB", "YES",
+        record_trade_db(&pool, &TradeScope::shard_only("test"), Decimal::ZERO, "MakerStrategy", "MarketB", "YES",
             Decimal::new(33, 2), Decimal::ONE, Decimal::new(1144, 2),
             Decimal::new(10, 2), "Settlement (auto-redeemed by Polymarket)", None).await;
         insert_open(&pool, "MakerStrategy", "tok2", "MarketB", "YES", "0.33", "11.44", Some("0.40"), "confirmed").await;
@@ -3293,7 +3331,7 @@ mod reconcile_tests {
     async fn resolution_booking_ignores_prior_non_settlement_trades() {
         let pool = mem_pool().await;
         // Morning flatten: same market, same side, same 15 shares, reason ≠ Settlement.
-        record_trade_db(&pool, &TradeScope::shard_only("test"), "ArbitrageStrategy", "MarketF", "YES",
+        record_trade_db(&pool, &TradeScope::shard_only("test"), Decimal::ZERO, "ArbitrageStrategy", "MarketF", "YES",
             Decimal::new(90, 2), Decimal::new(89, 2), Decimal::new(15, 0),
             Decimal::new(-15, 2), "Orphan flatten (bid exit)", None).await;
         insert_open(&pool, "ArbitrageStrategy", "tokY2", "MarketF", "YES", "0.90", "15", Some("0.90"), "confirmed").await;

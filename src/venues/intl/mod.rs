@@ -261,7 +261,7 @@ impl Execution for IntlClobVenue {
             order_id: OrderId(order_id),
             market: intent.market,
             filled: intent.quantity,
-            price: fill_price,
+            price: fill_price, fee: Decimal::ZERO
         })
     }
 
@@ -295,8 +295,8 @@ impl Execution for IntlClobVenue {
         .await?;
 
         Ok([
-            Fill { order_id: OrderId(id_a), market: a.market, filled: a.quantity, price: a.price },
-            Fill { order_id: OrderId(id_b), market: b.market, filled: b.quantity, price: b.price },
+            Fill { order_id: OrderId(id_a), market: a.market, filled: a.quantity, price: a.price, fee: Decimal::ZERO},
+            Fill { order_id: OrderId(id_b), market: b.market, filled: b.quantity, price: b.price, fee: Decimal::ZERO},
         ])
     }
 

@@ -113,6 +113,13 @@ pub struct Fill {
     pub filled: Decimal,
     /// Price at which the order was placed/filled.
     pub price: Decimal,
+    /// Total fee charged for this fill, in dollars (not per contract).
+    ///
+    /// `Decimal::ZERO` when the venue does not report one. Kalshi's quadratic
+    /// taker fee is material — ~7% of notional per round trip on a mid-priced
+    /// contract — so it has to reach recorded P&L rather than being absorbed
+    /// silently into the collateral balance.
+    pub fee: Decimal,
 }
 
 /// A venue-neutral open position snapshot.

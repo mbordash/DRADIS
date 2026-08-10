@@ -275,6 +275,7 @@ impl OrderLifecycle {
                                     pair_token_id: partner.clone(),
                                     fill_confirmed_at: Some(Utc::now()),
                                     paired_leg_token_id: Some(token.clone()),
+                                    entry_fee: f.fee,
                                 },
                             );
                             continue; // pair completed — no flatten

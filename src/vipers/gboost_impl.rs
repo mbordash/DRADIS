@@ -2252,7 +2252,7 @@ mod tests {
                     market_name: ctx.market.market_name.clone(),
                     pair_token_id: ctx.market.yes_token.clone(),
                     fill_confirmed_at: Some(Utc::now()),
-                    paired_leg_token_id: None,
+                    paired_leg_token_id: None, entry_fee: Decimal::ZERO,
                 },
             );
         }
@@ -2285,7 +2285,7 @@ mod tests {
                     market_name: ctx.market.market_name.clone(),
                     pair_token_id: ctx.market.yes_token.clone(),
                     fill_confirmed_at: Some(Utc::now()),
-                    paired_leg_token_id: None,
+                    paired_leg_token_id: None, entry_fee: Decimal::ZERO,
                 },
             );
         }

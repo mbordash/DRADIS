@@ -678,7 +678,7 @@ impl Squadron {
                                                     *total_pnl.lock().await += pnl3;
                                                     let sid3 = if tid == target_yes_token { "YES".to_string() } else { "NO".to_string() };
                                                     metrics::record_trade(
-                                                        &scope, sn.clone(), params.market_name.clone(), sid3,
+                                                        &scope, Decimal::ZERO, sn.clone(), params.market_name.clone(), sid3,
                                                         p.avg_entry, aep3, p.shares, pnl3,
                                                         format!("{} (ExitUnverified: est. price — sell rejected, shares gone)", reason),
                                                     ).await;
@@ -789,7 +789,7 @@ impl Squadron {
                                                         // reconciles it, instead of leaking it out of the position map.
                                                         warn!("⚠️ FAK verify [{}]: all balance reads failed — fill unknown; re-inserting {:.4} shares for retry (no PnL booked)", sn_async, rs_m);
                                                         let mut map = ps.lock().await;
-                                                        map.entry((sn_async.clone(), tid_async.clone())).or_insert_with(|| Position { shares: rs_m, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name.clone(), pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
+                                                        map.entry((sn_async.clone(), tid_async.clone())).or_insert_with(|| Position { shares: rs_m, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name.clone(), pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None, entry_fee: Decimal::ZERO });
                                                         return;
                                                     }
                                                 };
@@ -809,7 +809,7 @@ impl Squadron {
                                                         warn!("⚠️ PARTIAL EXIT [{}]: FAK filled 0/{:.4} shares (our_rem={:.4}, other_strats={:.4}) — re-inserting for retry.", sn_async, rs_m, our_rem, other_strats_shares);
                                                         let mut map = ps.lock().await;
                                                         if !map.contains_key(&(sn_async.clone(), tid_async.clone())) {
-                                                            map.insert((sn_async.clone(), tid_async.clone()), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
+                                                            map.insert((sn_async.clone(), tid_async.clone()), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None, entry_fee: Decimal::ZERO });
                                                         }
                                                         // 0 fills — no PnL credit, no DB write; position re-inserted for retry.
                                                     } else {
@@ -817,20 +817,20 @@ impl Squadron {
                                                         {
                                                             let mut map = ps.lock().await;
                                                             if !map.contains_key(&(sn_async.clone(), tid_async.clone())) {
-                                                                map.insert((sn_async.clone(), tid_async.clone()), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name.clone(), pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
+                                                                map.insert((sn_async.clone(), tid_async.clone()), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name.clone(), pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None, entry_fee: Decimal::ZERO });
                                                             }
                                                         }
                                                         // Partial fill — credit and record ONLY the filled portion, together.
                                                         let partial_pnl = (aep_exit - re_m) * fill;
                                                         *tp.lock().await += partial_pnl;
-                                                        metrics::record_trade(&scope_t, sn_rec, m_name, sid_m, re_m, aep_exit, fill, partial_pnl, r_m).await;
+                                                        metrics::record_trade(&scope_t, Decimal::ZERO, sn_rec, m_name, sid_m, re_m, aep_exit, fill, partial_pnl, r_m).await;
                                                         if let Some(pool) = db::pool_for(&asset_t) { db::close_open_position(&pool, &sn_async, &tid_async.to_string()).await; }
                                                     }
                                                 } else {
                                                     // Full fill confirmed — credit session PnL and write to DB together.
                                                     info!("✅ FAK exit confirmed [{sn_async}]: {rs_m:.4} shares sold @ ${aep_exit:.4} pnl=${pnl_m:.4}");
                                                     *tp.lock().await += pnl_m;
-                                                    metrics::record_trade(&scope_t, sn_rec, m_name, sid_m, re_m, aep_exit, rs_m, pnl_m, r_m).await;
+                                                    metrics::record_trade(&scope_t, Decimal::ZERO, sn_rec, m_name, sid_m, re_m, aep_exit, rs_m, pnl_m, r_m).await;
                                                     if let Some(pool) = db::pool_for(&asset_t) { db::close_open_position(&pool, &sn_async, &tid_async.to_string()).await; }
                                                 }
                                             });
@@ -855,7 +855,7 @@ impl Squadron {
                                                 token_ownership.lock().await.remove(&other_tid_m);
                                                 {
                                                     let sn_pm = sn.clone(); let m_name = params.market_name.clone(); let sid = if other_tid == target_yes_token { "YES".to_string() } else { "NO".to_string() }; let p_avg = p.avg_entry; let o_bid = actual_other_exit; let p_shares = p.shares; let pn = pnl; let scope_pm = scope.clone();
-                                                    tokio::spawn(async move { metrics::record_trade(&scope_pm, sn_pm, m_name, sid, p_avg, o_bid, p_shares, pn, "Convergence/PairedExit".to_string()).await; });
+                                                    tokio::spawn(async move { metrics::record_trade(&scope_pm, Decimal::ZERO, sn_pm, m_name, sid, p_avg, o_bid, p_shares, pn, "Convergence/PairedExit".to_string()).await; });
                                                 }
                                                 {
                                                     let sn_cp = sn.clone(); let tid_cp = other_tid.to_string(); let asset_c = asset_lc.clone();
@@ -1008,7 +1008,7 @@ impl Squadron {
                                     if positions.lock().await.contains_key(&pos_key) { continue; }
                                     let pos_close_time = target_market_close_time;
                                     let actual_entry_price = if params.post_only { params.price } else { (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE) };
-                                    positions.lock().await.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: token_m.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id.clone()) });
+                                    positions.lock().await.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: token_m.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id.clone()), entry_fee: Decimal::ZERO });
                                     token_ownership.lock().await.insert(token_m.clone(), sn.clone());
                                     let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" };
                                     info!("👻 GHOST_MODE ENTRY {} [{}]: {} | ${:.4} x {:.1} (simulated)", side_g, sn, params.market_name, params.price, params.shares);
@@ -1022,7 +1022,7 @@ impl Squadron {
                                         } else {
                                             (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE)
                                         };
-                                        positions.lock().await.insert((sn.clone(), pp.token_id.clone()), Position { shares: pp.shares, avg_entry: actual_paired_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: Some(token_m.clone()) });
+                                        positions.lock().await.insert((sn.clone(), pp.token_id.clone()), Position { shares: pp.shares, avg_entry: actual_paired_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: Some(token_m.clone()), entry_fee: Decimal::ZERO });
                                         token_ownership.lock().await.insert(pp.token_id.clone(), sn.clone());
                                         let side_gp = if pp.token_id == target_yes_token { "YES" } else { "NO" };
                                         info!("👻 GHOST_MODE ENTRY {} (paired) [{}]: {} | ${:.4} x {:.1} (simulated)", side_gp, sn, pp.market_name, pp.price, pp.shares);
@@ -1035,7 +1035,7 @@ impl Squadron {
                                     {
                                         let mut map = positions.lock().await; if map.contains_key(&pos_key) { continue; }
                                         let pos_close_time = target_market_close_time;
-                                        map.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: token_m.clone(), fill_confirmed_at: None, paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id.clone()) });
+                                        map.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: token_m.clone(), fill_confirmed_at: None, paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id.clone()), entry_fee: Decimal::ZERO });
                                     }
                                     // Claim token in ownership registry immediately — prevents any
                                     // concurrent strategy tick from racing into the same token
@@ -1121,7 +1121,7 @@ impl Squadron {
                                                 });
 
                                         let pp_close_time = target_market_close_time;
-                                        positions.lock().await.insert((sn.clone(), pp_token_m.clone()), Position { shares: pp.shares, avg_entry: actual_pair_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp_token_m.clone(), fill_confirmed_at: None, paired_leg_token_id: Some(token_m.clone()) });
+                                        positions.lock().await.insert((sn.clone(), pp_token_m.clone()), Position { shares: pp.shares, avg_entry: actual_pair_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp_token_m.clone(), fill_confirmed_at: None, paired_leg_token_id: Some(token_m.clone()), entry_fee: Decimal::ZERO });
                                         // Claim paired token in registry.
                                         token_ownership.lock().await.insert(pp_token_m.clone(), sn.clone());
 
@@ -1182,7 +1182,7 @@ impl Squadron {
                                                         order_id: crate::venues::core::OrderId(leg_a_id),
                                                         market: params.token_id.clone(),
                                                         filled: params.shares,
-                                                        price: actual_entry_price,
+                                                        price: actual_entry_price, fee: Decimal::ZERO
                                                     },
                                                     &sn,
                                                     crate::venues::core::TimeInForce::Gtc,
@@ -1193,7 +1193,7 @@ impl Squadron {
                                                         order_id: crate::venues::core::OrderId(leg_b_id),
                                                         market: pp.token_id.clone(),
                                                         filled: pp.shares,
-                                                        price: actual_pair_entry_price,
+                                                        price: actual_pair_entry_price, fee: Decimal::ZERO
                                                     },
                                                     &sn,
                                                     crate::venues::core::TimeInForce::Gtc,
@@ -1241,13 +1241,13 @@ impl Squadron {
                                     { let pending = pending_orders.lock().await; if let Some(expiry) = pending.get(&pk) { if expiry > &Instant::now() { continue; } } }
                                     if config::GHOST_MODE {
                                         if positions.lock().await.contains_key(&pk) { continue; }
-                                        positions.lock().await.insert(pk.clone(), Position { shares: p.shares, avg_entry: p.price, opened_at: Utc::now(), close_time: None, market_name: p.market_name.clone(), pair_token_id: p_token_m.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None });
+                                        positions.lock().await.insert(pk.clone(), Position { shares: p.shares, avg_entry: p.price, opened_at: Utc::now(), close_time: None, market_name: p.market_name.clone(), pair_token_id: p_token_m.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None, entry_fee: Decimal::ZERO });
                                         info!("👻 GHOST_MODE MakerQuote [{}]: {} | shares={:.2}, bid=${:.4} (simulated)", sn, p.market_name, p.shares, p.price);
                                         placed = true;
                                     } else {
                                         if !positions.lock().await.contains_key(&pk) {
                                             info!("📝 MakerQuote [{}]: {} | shares={:.2}, bid=${:.4}", sn, p.market_name, p.shares, p.price);
-                                            positions.lock().await.insert(pk.clone(), Position { shares: p.shares, avg_entry: p.price, opened_at: Utc::now(), close_time: None, market_name: p.market_name.clone(), pair_token_id: p_token_m.clone(), fill_confirmed_at: None, paired_leg_token_id: None });
+                                            positions.lock().await.insert(pk.clone(), Position { shares: p.shares, avg_entry: p.price, opened_at: Utc::now(), close_time: None, market_name: p.market_name.clone(), pair_token_id: p_token_m.clone(), fill_confirmed_at: None, paired_leg_token_id: None, entry_fee: Decimal::ZERO });
                                             token_ownership.lock().await.insert(p_token_m.clone(), sn.clone());
                                             { pending_orders.lock().await.insert(pk.clone(), Instant::now() + Duration::from_secs(3)); }
                                             let _ = tokio::time::timeout(Duration::from_secs(10), crate::helpers::balance::quick_confirm_fill(&trading_client, &sn, &p.token_id, &positions, &p.condition_id, p.order_type.clone())).await;

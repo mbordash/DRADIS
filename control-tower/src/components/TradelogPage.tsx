@@ -24,6 +24,8 @@ interface LogEntry {
   marketClass: string | null;
   /** Null for markets with no underlying instrument (sports, politics). */
   underlying:  string | null;
+  /** Round-trip venue fees. `pnl` is already net of these. Null if uncaptured. */
+  fees:        number | null;
   status:    LogStatus;
   strategy:  string;
   market:    string;
@@ -126,6 +128,7 @@ function assetToEntries(shard: string, trades: TradeRow[], positions: OpenPositi
       venue:       t.venue ?? null,
       marketClass: t.market_class ?? null,
       underlying:  t.underlying ?? null,
+      fees:        t.fees != null ? parseFloat(t.fees) : null,
       status:     'completed',
       strategy:   t.strategy,
       market:     t.market,
@@ -155,6 +158,7 @@ function assetToEntries(shard: string, trades: TradeRow[], positions: OpenPositi
       venue:       null,
       marketClass: null,
       underlying:  ASSET_EMOJI[shard] ? shard : null,
+      fees:        null,
       status,
       strategy:    p.strategy,
       market:      p.market,
@@ -529,7 +533,7 @@ export default function TradelogPage({ availableAssets }: Props) {
             <table className="w-full text-xs font-mono">
               <thead>
                 <tr className="border-b border-[#1e1e32]">
-                  {['Time', 'Venue', 'Subject', 'Status', 'Strategy', 'Market', 'Side', 'Entry', 'Cur / Exit', 'Shares', 'P&L', 'Reason / Mode'].map(h => (
+                  {['Time', 'Venue', 'Subject', 'Status', 'Strategy', 'Market', 'Side', 'Entry', 'Cur / Exit', 'Shares', 'P&L', 'Fees', 'Reason / Mode'].map(h => (
                     <th key={h} className="px-3 py-2 text-left text-gray-500 font-normal whitespace-nowrap">
                       {h}
                     </th>
@@ -630,6 +634,22 @@ export default function TradelogPage({ availableAssets }: Props) {
                         }
                         {isOpen && e.pnl !== null && (
                           <span className="ml-1 text-[10px] text-gray-600">(unrlzd)</span>
+                        )}
+                      </td>
+
+                      {/* Fees — P&L above is already net of these. */}
+                      <td className="px-3 py-2 text-gray-500 whitespace-nowrap">
+                        {e.fees != null && e.fees > 0 ? (
+                          <span
+                            className="cursor-help"
+                            title={`Venue fees for the round trip. P&L is net of this; gross was ${(
+                              (e.pnl ?? 0) + e.fees
+                            ).toFixed(4)}.`}
+                          >
+                            −${e.fees.toFixed(4)}
+                          </span>
+                        ) : (
+                          <span className="text-gray-700">—</span>
                         )}
                       </td>
 

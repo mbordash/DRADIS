@@ -52,11 +52,16 @@ fn tif_str(tif: TimeInForce) -> &'static str {
 impl KalshiVenue {
     async fn place_one(&self, intent: &OrderIntent) -> Result<Fill> {
         let (ticker, side, price) = map_intent(intent);
+        // Kalshi counts are submitted at 2dp, so this — not the raw intent
+        // quantity — is what we actually asked for. Comparing fills against the
+        // unrounded value made every complete fill look partial (8.19 filled vs
+        // 8.19000819… requested), which cried wolf on every single order.
+        let submitted = intent.quantity.round_dp(2);
         let mut body = serde_json::json!({
             "ticker": ticker,
             "client_order_id": uuid_v4(),
             "side": side,
-            "count": format!("{:.2}", intent.quantity),
+            "count": format!("{:.2}", submitted),
             "price": format!("{:.4}", price),
             "time_in_force": tif_str(intent.tif),
             "self_trade_prevention_type": "taker_at_cross",
@@ -81,7 +86,7 @@ impl KalshiVenue {
                 super::truncate(&raw.to_string(), 400)
             );
         }
-        let requested = intent.quantity;
+        let requested = submitted;
         // Never infer a fill. The previous version derived `filled` from
         // `count − remaining` with `count` defaulting to the requested size, so
         // a response carrying neither key read as 100% filled — which is how a
@@ -126,19 +131,21 @@ impl KalshiVenue {
             }
             None => intent.price,
         };
-        if let Some(fee) = types::fp(&o.average_fee_paid) {
-            if !fee.is_zero() && !filled.is_zero() {
-                tracing::info!(
-                    "💸 Kalshi fee: ${:.4}/contract × {:.2} = ${:.4} on {} (not yet in recorded P&L)",
-                    fee, filled, fee * filled, intent.market.as_str(),
-                );
-            }
+        // Kalshi reports the fee per contract; P&L needs the total.
+        let fee_per_contract = types::fp(&o.average_fee_paid).unwrap_or_default();
+        let fee = (fee_per_contract * filled).max(Decimal::ZERO);
+        if !fee.is_zero() {
+            tracing::info!(
+                "💸 Kalshi fee: ${:.4}/contract × {:.2} = ${:.4} on {}",
+                fee_per_contract, filled, fee, intent.market.as_str(),
+            );
         }
         Ok(Fill {
             order_id: OrderId(o.order_id),
             market: intent.market.clone(),
             filled,
             price,
+            fee,
         })
     }
 }

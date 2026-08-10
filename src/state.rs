@@ -120,6 +120,13 @@ pub struct Position {
     /// If Some, this position is part of a hedged pair. Used to detect orphaned positions
     /// when the paired leg fails to fill.
     pub paired_leg_token_id: Option<MarketId>,
+    /// Total fee paid to OPEN this position, in dollars.
+    ///
+    /// Carried on the position because round-trip P&L is booked at exit, long
+    /// after the entry fill is gone. Deliberately kept out of `avg_entry` so
+    /// strategy TP/SL percentages keep measuring price movement rather than
+    /// silently shifting when fees change. `ZERO` on venues that report none.
+    pub entry_fee: Decimal,
 }
 
 /// Compound key for the shared position map: (strategy_name, token_id).

@@ -1179,6 +1179,7 @@ async fn manual_exit(
     // taxonomy — file it under the shard's venue and leave the rest NULL.
     metrics::record_trade(
         &crate::state::TradeScope::shard_only(&req.asset),
+        Decimal::ZERO,
         req.strategy.clone(),
         req.market.clone(),
         req.side.clone(),

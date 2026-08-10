@@ -445,7 +445,7 @@ impl UsRetailVenue {
             order_id: OrderId(ack.order_id),
             market: intent.market.clone(),
             filled: resolve_filled(ack.filled_quantity, intent),
-            price: intent.price,
+            price: intent.price, fee: Decimal::ZERO
         })
     }
 
@@ -525,7 +525,7 @@ impl Execution for UsRetailVenue {
             order_id: OrderId(ack.order_id.clone()),
             market: intent.market.clone(),
             filled: resolve_filled(ack.filled_quantity, intent),
-            price: intent.price,
+            price: intent.price, fee: Decimal::ZERO
         };
         Ok([to_fill(&ack.orders[0], &a), to_fill(&ack.orders[1], &b)])
     }

@@ -31,6 +31,7 @@ fn make_position(token_id: &str) -> Position {
         pair_token_id: MarketId::new(token_id),
         fill_confirmed_at: None,
         paired_leg_token_id: None,
+        entry_fee: rust_decimal::Decimal::ZERO,
     }
 }
 
