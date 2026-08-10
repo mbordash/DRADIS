@@ -408,6 +408,9 @@ export interface ViperDef {
   description: string;
   /** Lower-snake key used in /api/status strategy_markets map */
   statusKey:  string;
+  /** Exact `Strategy::name()` value used to key /api/vipers/status rows.
+   *  Not derivable from `statusKey` — e.g. `trendcapture` ↔ `TrendReversalStrategy`. */
+  strategyName: string;
 }
 
 // ── Conversion helpers ───────────────────────────────────────────────────────

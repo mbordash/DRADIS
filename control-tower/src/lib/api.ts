@@ -331,6 +331,7 @@ export const VIPER_DEFS: ViperDef[] = [
     enableKey: 'enable_arbitrage',
     accentColor: 'teal',
     statusKey: 'arbitrage',
+    strategyName: 'ArbitrageStrategy',
     description: 'Hedged maker bids on YES+NO — captures mispriced spread at 0% fee',
   },
   {
@@ -338,6 +339,7 @@ export const VIPER_DEFS: ViperDef[] = [
     enableKey: 'enable_time_decay',
     accentColor: 'indigo',
     statusKey: 'time_decay',
+    strategyName: 'TimeDecayStrategy',
     description: 'Targets gamma as hourly markets approach expiry',
   },
   {
@@ -345,6 +347,7 @@ export const VIPER_DEFS: ViperDef[] = [
     enableKey: 'enable_momentum',
     accentColor: 'blue',
     statusKey: 'momentum',
+    strategyName: 'MomentumStrategy',
     description: 'Rides Binance oracle velocity bursts',
   },
   {
@@ -352,6 +355,7 @@ export const VIPER_DEFS: ViperDef[] = [
     enableKey: 'enable_maker',
     accentColor: 'emerald',
     statusKey: 'maker',
+    strategyName: 'MakerStrategy',
     description: 'Two-sided resting bids — captures spread + rebates',
   },
   {
@@ -359,6 +363,7 @@ export const VIPER_DEFS: ViperDef[] = [
     enableKey: 'enable_basis',
     accentColor: 'orange',
     statusKey: 'basis',
+    strategyName: 'BasisStrategy',
     description: 'Fades retail-skewed YES/NO implied probabilities',
   },
   {
@@ -366,6 +371,7 @@ export const VIPER_DEFS: ViperDef[] = [
     enableKey: 'enable_gboost',
     accentColor: 'purple',
     statusKey: 'gboost',
+    strategyName: 'GboostStrategy',
     description: 'Online gradient-boosted orderbook classifier',
   },
   {
@@ -373,6 +379,7 @@ export const VIPER_DEFS: ViperDef[] = [
     enableKey: 'enable_trendcapture',
     accentColor: 'rose',
     statusKey: 'trendcapture',
+    strategyName: 'TrendReversalStrategy',
     description: 'Fades priced-in multi-minute oracle drift on Window/Daily markets (mean-reversion)',
   },
   {
@@ -380,6 +387,7 @@ export const VIPER_DEFS: ViperDef[] = [
     enableKey: 'enable_convergence',
     accentColor: 'cyan',
     statusKey: 'convergence',
+    strategyName: 'ConvergenceStrategy',
     description: 'Macro-conviction directional (BTC-only): enters on aligned Institutional Pulse + CVD/OI during US hours',
   },
   {
@@ -387,6 +395,7 @@ export const VIPER_DEFS: ViperDef[] = [
     enableKey: 'enable_fairvalue',
     accentColor: 'amber',
     statusKey: 'fairvalue',
+    strategyName: 'FairValueStrategy',
     description: 'Analytic binary pricing Φ(ln(S/K)/σ√T) — buys sides trading at a discount to model fair value; snipes settlements',
   },
 ];

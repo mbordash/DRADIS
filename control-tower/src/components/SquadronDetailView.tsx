@@ -8,11 +8,11 @@ import {
   getOpenPositions,
   getStatus,
   getSquadronConfig,
+  getVipersStatus,
   patchSquadronConfig,
   VIPER_DEFS,
 } from '@/lib/api';
-import ViperCard from '@/components/ViperCard';
-import ViperActivityPanel from '@/components/ViperActivityPanel';
+import ViperCard, { fmtAgo, STALE_EVAL_SECS } from '@/components/ViperCard';
 import OpenPositionsCard from '@/components/OpenPositionsCard';
 import { DEMO_MODE } from '@/lib/demo';
 
@@ -237,6 +237,24 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
 
   const { data: status } = useSWR('status', getStatus, { refreshInterval: 30_000 });
 
+  // Per-viper liveness + veto reasons, rendered on each ViperCard.
+  const { data: viperStatus } = useSWR(
+    ['vipers-status', asset],
+    () => getVipersStatus(asset),
+    { refreshInterval: 10_000, revalidateOnFocus: false }
+  );
+
+  // Registry rows keyed by `Strategy::name()` — the same key VIPER_DEFS carries.
+  const statusByStrategy = new Map((viperStatus ?? []).map((r) => [r.strategy, r]));
+
+  // The registry holds every viper the engine has evaluated, which is not
+  // necessarily the set that renders as a card (market-class filtering, or a
+  // viper with no VIPER_DEFS entry yet). Surface the remainder rather than
+  // dropping it — an unlisted viper erroring silently is exactly what this
+  // panel exists to catch.
+  const rendered = new Set(activeVipers.map((v) => v.strategyName));
+  const unmapped = (viperStatus ?? []).filter((r) => !rendered.has(r.strategy));
+
 
   // ── Handlers ───────────────────────────────────────────────────────────────
   const handlePatch = useCallback(
@@ -356,6 +374,7 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
                   config={config}
                   onPatch={handlePatch}
                   market={status?.strategy_markets[v.statusKey]}
+                  status={statusByStrategy.get(v.strategyName)}
                 />
               ))}
             </div>
@@ -369,10 +388,27 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
             Loading config…
           </div>
         )}
-      </section>
 
-      {/* ── Viper Activity ("why no trades?") for this squadron ──────────── */}
-      <ViperActivityPanel asset={asset} />
+        {unmapped.length > 0 && (
+          <div className="mt-3 px-4 py-2 rounded-lg border border-amber-500/20 bg-amber-500/5 text-[11px] font-mono text-amber-300/80">
+            <span className="font-semibold">Reporting without a card:</span>{' '}
+            {unmapped.map((r, i) => {
+              const bad = r.last_eval_secs_ago > STALE_EVAL_SECS
+                || r.last_outcome === 'error'
+                || r.last_outcome === 'timeout';
+              return (
+                <span key={r.strategy}>
+                  {i > 0 && ' · '}
+                  <span className={bad ? 'text-red-400' : ''}>
+                    {r.strategy.replace(/Strategy$/, '')}
+                  </span>
+                  <span className="text-gray-500"> (eval {fmtAgo(r.last_eval_secs_ago)})</span>
+                </span>
+              );
+            })}
+          </div>
+        )}
+      </section>
 
       {/* ── Open Positions & Trades ───────────────────────────────────────── */}
       <section>

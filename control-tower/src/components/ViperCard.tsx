@@ -4,7 +4,7 @@ import { useState, useCallback } from 'react';
 import useSWR from 'swr';
 import type { DynamicConfig, ViperDef, ConfigFieldSchema, FieldType } from '@/lib/types';
 import { toDisplay, fromDisplay, fieldUnit } from '@/lib/types';
-import { getConfigSchema } from '@/lib/api';
+import { getConfigSchema, type ViperStatusRow } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
 import AdvancedConfigModal from '@/components/AdvancedConfigModal';
 
@@ -17,6 +17,46 @@ const ACCENT: Record<string, { ring: string; badge: string; dot: string }> = {
   orange:  { ring: 'ring-orange-500/30',  badge: 'bg-orange-500/10 text-orange-300',  dot: 'bg-orange-500'  },
   purple:  { ring: 'ring-purple-500/30',  badge: 'bg-purple-500/10 text-purple-300',  dot: 'bg-purple-500'  },
   cyan:    { ring: 'ring-cyan-500/30',    badge: 'bg-cyan-500/10 text-cyan-300',      dot: 'bg-cyan-500'    },
+};
+
+// ── Runtime status helpers ────────────────────────────────────────────────────
+
+/** Relative age, e.g. "12m ago". */
+export function fmtAgo(secs: number | null | undefined): string {
+  if (secs === null || secs === undefined) return '—';
+  if (secs < 5) return 'just now';
+  if (secs < 60) return `${secs}s ago`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
+  return `${Math.floor(secs / 86400)}d ago`;
+}
+
+/** Evaluations tick sub-second; nothing for 2 minutes means the loop is wedged. */
+export const STALE_EVAL_SECS = 120;
+
+type RuntimeState = 'DISABLED' | 'PENDING' | 'STALE' | 'ERROR' | 'TIMEOUT' | 'ACTIVE';
+
+/**
+ * Collapse config state + the engine's last evaluation into one badge state.
+ * `enabled` comes from DynamicConfig; everything else from /api/vipers/status.
+ * PENDING means the engine has not evaluated this viper since startup — the
+ * registry is in-memory, so it is empty for a few ticks after a restart.
+ */
+export function runtimeState(enabled: boolean, status?: ViperStatusRow): RuntimeState {
+  if (!enabled) return 'DISABLED';
+  if (!status) return 'PENDING';
+  if (status.last_eval_secs_ago > STALE_EVAL_SECS) return 'STALE';
+  if (status.last_outcome === 'error') return 'ERROR';
+  if (status.last_outcome === 'timeout') return 'TIMEOUT';
+  return 'ACTIVE';
+}
+
+const STATE_BADGE: Record<Exclude<RuntimeState, 'ACTIVE'>, { cls: string; title: string }> = {
+  DISABLED: { cls: 'bg-gray-800 text-gray-600', title: 'Turned off in this squadron’s config' },
+  PENDING:  { cls: 'bg-gray-800 text-gray-500', title: 'Enabled, but the engine has not reported an evaluation yet' },
+  STALE:    { cls: 'bg-red-500/10 text-red-400 border border-red-500/30', title: `No evaluation in over ${STALE_EVAL_SECS}s — the patrol loop may be wedged` },
+  ERROR:    { cls: 'bg-red-500/10 text-red-400 border border-red-500/30', title: 'Last evaluate_entry returned an error' },
+  TIMEOUT:  { cls: 'bg-amber-500/10 text-amber-300 border border-amber-500/30', title: 'Last evaluation exceeded the executor timeout' },
 };
 
 // ── Toggle switch ─────────────────────────────────────────────────────────────
@@ -120,9 +160,11 @@ interface Props {
   onPatch: (patch: Partial<DynamicConfig>) => Promise<void>;
   /** Active market name returned by /api/status */
   market?: string;
+  /** This viper's row from /api/vipers/status, if the engine has evaluated it. */
+  status?: ViperStatusRow;
 }
 
-export default function ViperCard({ viper, config, onPatch, market }: Props) {
+export default function ViperCard({ viper, config, onPatch, market, status }: Props) {
   const [toggling, setToggling] = useState(false);
   const [showAdvanced, setShowAdvanced] = useState(false);
   const enabled  = config[viper.enableKey] as boolean;
@@ -176,12 +218,65 @@ export default function ViperCard({ viper, config, onPatch, market }: Props) {
         </div>
       )}
 
-      {/* Status badge */}
-      <span className={`self-start text-xs px-2 py-0.5 rounded-full font-mono ${
-        enabled ? accent.badge : 'bg-gray-800 text-gray-600'
-      }`}>
-        {enabled ? 'ACTIVE' : 'DISABLED'}
-      </span>
+      {/* Runtime status — badge, why it is holding, and when it last signalled.
+          Deliberately sits directly above the params: the gate that vetoed entry
+          ("edge below required") reads next to the knob that would clear it. */}
+      <div className="flex flex-col gap-1.5">
+        <div className="flex items-center gap-2 flex-wrap">
+          {(() => {
+            const state = runtimeState(enabled, status);
+            const badge = state === 'ACTIVE' ? { cls: accent.badge, title: 'Evaluating normally' } : STATE_BADGE[state];
+            return (
+              <span
+                className={`text-xs px-2 py-0.5 rounded-full font-mono ${badge.cls}`}
+                title={badge.title}
+              >
+                {state}
+              </span>
+            );
+          })()}
+          {enabled && status && (
+            <span className="text-[11px] font-mono text-gray-600" title={status.last_eval_at}>
+              eval {fmtAgo(status.last_eval_secs_ago)}
+            </span>
+          )}
+        </div>
+
+        {enabled && (
+          <>
+            <div className="text-[11px] font-mono leading-snug">
+              <span className="text-gray-600">holding: </span>
+              {status?.last_reason ? (
+                <>
+                  <span className="text-gray-400">{status.last_reason}</span>
+                  <span className="text-gray-600"> · {fmtAgo(status.last_reason_secs_ago)}</span>
+                </>
+              ) : (
+                <span
+                  className="text-gray-600"
+                  title={
+                    status
+                      ? 'No veto recorded — this viper recently signalled, or reports liveness only.'
+                      : 'Waiting on the engine’s first evaluation.'
+                  }
+                >
+                  {status ? 'no active veto' : '—'}
+                </span>
+              )}
+            </div>
+            <div className="text-[11px] font-mono leading-snug" title={status?.last_signal_at ?? undefined}>
+              <span className="text-gray-600">last signal: </span>
+              <span className="text-gray-500">
+                {/* No row at all ≠ "never signalled" — the registry resets on
+                    restart, so distinguish unknown (—) from a known absence. */}
+                {!status ? '—' : status.last_signal_secs_ago === null
+                  ? 'none yet'
+                  : fmtAgo(status.last_signal_secs_ago)}
+              </span>
+            </div>
+          </>
+        )}
+      </div>
 
       {/* Params */}
       <div className="flex flex-col">
