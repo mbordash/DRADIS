@@ -555,6 +555,9 @@ async fn trade_one_market(
 
     publish_raptor_health(raptor_health_tx, pair.underlying, true);
     publish_strategy_market(markets_tx, &viper_kinds, &pair.question);
+    if let Some(ref mp) = maker_pair {
+        cag.update_maker_market(&squadron_id, mp.question.clone());
+    }
 
     // ── Stream the market's book (bids-only; asks derived) ──────────────────
     let hub = ws::new_book_hub();

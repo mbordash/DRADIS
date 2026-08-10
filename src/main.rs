@@ -284,7 +284,11 @@ async fn run() -> Result<()> {
     // can be used to name the DB file.  ASSETS=btc,eth,sol overrides CRYPTO_FILTER.
     // The DB global singleton covers the PRIMARY asset only; secondary assets run
     // CSV-only metrics.  Per-asset DB pools are a Phase 3f-7 concern.
-    let crypto_filter = env::var("CRYPTO_FILTER").unwrap_or_else(|_| "btc".to_string()).to_lowercase();
+    #[cfg(feature = "kalshi")]
+    let default_asset = "kalshi";
+    #[cfg(not(feature = "kalshi"))]
+    let default_asset = "btc";
+    let crypto_filter = env::var("CRYPTO_FILTER").unwrap_or_else(|_| default_asset.to_string()).to_lowercase();
     let assets: Vec<String> = env::var("ASSETS")
         .unwrap_or_else(|_| crypto_filter.clone())
         .split(',')
