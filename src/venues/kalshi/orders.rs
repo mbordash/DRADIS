@@ -23,6 +23,11 @@ use crate::venues::core::{
 
 use super::{split_market_id, types, KalshiVenue};
 
+/// Largest gap tolerated between a reported average fill price and the order's
+/// limit price before we distrust the reported value. Taker fills sit at or
+/// inside the limit, so anything wider means the field was misread.
+const MAX_FILL_PRICE_DIVERGENCE: Decimal = rust_decimal_macros::dec!(0.10);
+
 /// Map a neutral intent onto Kalshi's single YES book.
 /// Returns `(ticker, book_side, price_on_yes_book)`.
 fn map_intent(intent: &OrderIntent) -> (String, &'static str, Decimal) {
@@ -62,18 +67,13 @@ impl KalshiVenue {
                 chrono::Utc::now().timestamp() + intent.expiration_secs as i64
             );
         }
-        // Deserialize in two steps so an unexpected response shape can be shown.
-        // Every field of `OrderResponse` is `#[serde(default)]`, so a payload that
-        // doesn't match parses "successfully" into an all-empty order — which then
-        // yields an empty `order_id`, breaking cancel() and lifecycle tracking with
-        // no error anywhere (observed 2026-08-10: "Buy … (order )" on a fill that
-        // did happen). Say so loudly, with the body, instead of trading blind.
+        // The create-order response is flat, not `{"order": …}` — see
+        // `types::order_from_response`. Deserialize in two steps so an
+        // unexpected shape can still be shown in full.
         let raw: serde_json::Value = self
             .post_json("/portfolio/events/orders", &body)
             .await?;
-        let resp: types::OrderResponse = serde_json::from_value(raw.clone())
-            .unwrap_or_default();
-        let o = resp.order;
+        let o = types::order_from_response(&raw);
         if o.order_id.is_empty() {
             tracing::warn!(
                 "⚠️ Kalshi order response carried no order_id — cancel/lifecycle tracking \
@@ -82,13 +82,63 @@ impl KalshiVenue {
             );
         }
         let requested = intent.quantity;
-        let remaining = types::fp(&o.remaining_count_fp).unwrap_or_default();
-        let total = types::fp(&o.count_fp).unwrap_or(requested);
+        // Never infer a fill. The previous version derived `filled` from
+        // `count − remaining` with `count` defaulting to the requested size, so
+        // a response carrying neither key read as 100% filled — which is how a
+        // stop-loss that returned `"fill_count":"0.00"` was booked as a closed
+        // position while the real one sat on Kalshi until it expired worthless
+        // (observed 2026-08-10, KXBTCD-26AUG1003). Unknown means zero.
+        let filled = match o.filled_count() {
+            Some(f) => f,
+            None => {
+                tracing::error!(
+                    "🛑 Kalshi order response had no recognisable fill count — treating as \
+                     UNFILLED. If the order did fill, lifecycle reconciliation must re-adopt \
+                     it. Raw response: {}",
+                    super::truncate(&raw.to_string(), 400)
+                );
+                Decimal::ZERO
+            }
+        };
+        if filled < requested {
+            tracing::warn!(
+                "⚠️ Kalshi partial/zero fill: {} {:?} {} — requested {:.2}, filled {:.2}",
+                intent.market.as_str(), intent.side, ticker, requested, filled,
+            );
+        }
+        // Book the price Kalshi actually traded at, not the limit we asked for.
+        // `average_fill_price` is quoted on the YES book for both legs, so the
+        // NO leg needs the complement. Guard against the convention flipping
+        // under us: a large divergence from the limit means we've misread the
+        // field, and a corrupted entry price would poison every downstream
+        // TP/SL calculation — keep the limit price and say so instead.
+        let (_, is_yes) = split_market_id(intent.market.as_str());
+        let price = match o.avg_fill_price_for_leg(is_yes) {
+            Some(p) if (p - intent.price).abs() <= MAX_FILL_PRICE_DIVERGENCE => p,
+            Some(p) => {
+                tracing::warn!(
+                    "⚠️ Kalshi avg fill ${:.4} diverges >{:.2} from limit ${:.4} on {} — \
+                     keeping limit price for P&L. Raw response: {}",
+                    p, MAX_FILL_PRICE_DIVERGENCE, intent.price, intent.market.as_str(),
+                    super::truncate(&raw.to_string(), 400)
+                );
+                intent.price
+            }
+            None => intent.price,
+        };
+        if let Some(fee) = types::fp(&o.average_fee_paid) {
+            if !fee.is_zero() && !filled.is_zero() {
+                tracing::info!(
+                    "💸 Kalshi fee: ${:.4}/contract × {:.2} = ${:.4} on {} (not yet in recorded P&L)",
+                    fee, filled, fee * filled, intent.market.as_str(),
+                );
+            }
+        }
         Ok(Fill {
             order_id: OrderId(o.order_id),
             market: intent.market.clone(),
-            filled: (total - remaining).max(Decimal::ZERO),
-            price: intent.price,
+            filled,
+            price,
         })
     }
 }
@@ -158,8 +208,8 @@ impl Execution for KalshiVenue {
             .await?;
         let mut out = Vec::new();
         for o in resp.orders {
-            let total = types::fp(&o.count_fp).unwrap_or_default();
-            let remaining = types::fp(&o.remaining_count_fp).unwrap_or_default();
+            let total = o.requested_count().unwrap_or_default();
+            let filled = o.filled_count().unwrap_or_default();
             let price = types::fp(&o.price_dollars).unwrap_or_default();
             // V2 `bid` = buy on the YES book. Express every resting order as a
             // YES-leg order so lifecycle reconciliation has one convention.
@@ -170,7 +220,7 @@ impl Execution for KalshiVenue {
                 side,
                 price,
                 original_qty: total,
-                filled_qty: (total - remaining).max(Decimal::ZERO),
+                filled_qty: filled,
                 tif: match o.time_in_force.as_str() {
                     "fill_or_kill" => TimeInForce::Fok,
                     "immediate_or_cancel" => TimeInForce::Fak,

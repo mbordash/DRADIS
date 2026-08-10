@@ -974,6 +974,12 @@ async fn dispatch_signal(
             acted
         }
         StrategySignal::Exit { params, reason, exit_pair } => {
+            // An exit that didn't fill will re-signal on the very next 50ms tick
+            // (the SL condition is still true), so back off between attempts
+            // rather than hammering the order endpoint 20×/sec.
+            if exit_retry_backed_off(strategy_name, params.token_id.as_str()) {
+                return false;
+            }
             info!("🚪 [{strategy_name}] exit ({reason}): {} @ {:.4}", params.token_id, params.price);
             // Snapshot the entry BEFORE the sell so the round-trip can be booked
             // to the tradelog — the position is dropped from the map below and
@@ -984,9 +990,19 @@ async fn dispatch_signal(
                 .get(&(strategy_name.to_string(), params.token_id.clone()))
                 .map(|p| (p.avg_entry, p.shares));
             let acted = dispatch_single(venue, pool, positions, lifecycle, strategy_name, params, Side::Sell, starting).await;
-            if acted {
-                record_round_trip(pool, strategy_name, params, entered, reason).await;
+            if !acted {
+                // Nothing traded — we still own it. Dropping the position here is
+                // what abandoned a live stop-loss to expire worthless on
+                // 2026-08-10 (KXBTCD-26AUG1003): local state said flat, Kalshi
+                // said long. Keep it and let the next attempt (or lifecycle
+                // reconciliation) close it.
+                warn!("↩️ [{strategy_name}] exit did NOT execute on {} — position retained, will retry",
+                    params.token_id);
+                arm_exit_retry_backoff(strategy_name, params.token_id.as_str());
+                return false;
             }
+            record_round_trip(pool, strategy_name, params, entered, reason).await;
+            clear_exit_retry_backoff(strategy_name, params.token_id.as_str());
             let mut map = positions.lock().await;
             map.remove(&(strategy_name.to_string(), params.token_id.clone()));
             if *exit_pair {
@@ -1001,6 +1017,35 @@ async fn dispatch_signal(
         }
         StrategySignal::NoSignal => false,
     }
+}
+
+/// Minimum gap between retries of an exit that returned no fill.
+const EXIT_RETRY_BACKOFF_SECS: u64 = 5;
+
+fn exit_retry_backoff() -> &'static std::sync::Mutex<HashMap<String, std::time::Instant>> {
+    static B: std::sync::OnceLock<std::sync::Mutex<HashMap<String, std::time::Instant>>> =
+        std::sync::OnceLock::new();
+    B.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+fn exit_retry_backed_off(strategy_name: &str, token_id: &str) -> bool {
+    let map = exit_retry_backoff();
+    let guard = match map.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    guard
+        .get(&format!("{strategy_name}:{token_id}"))
+        .is_some_and(|t| t.elapsed().as_secs() < EXIT_RETRY_BACKOFF_SECS)
+}
+
+fn arm_exit_retry_backoff(strategy_name: &str, token_id: &str) {
+    let map = exit_retry_backoff();
+    let mut guard = match map.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    guard.insert(format!("{strategy_name}:{token_id}"), std::time::Instant::now());
+}
+
+fn clear_exit_retry_backoff(strategy_name: &str, token_id: &str) {
+    let map = exit_retry_backoff();
+    let mut guard = match map.lock() { Ok(g) => g, Err(p) => p.into_inner() };
+    guard.remove(&format!("{strategy_name}:{token_id}"));
 }
 
 async fn dispatch_single(
@@ -1024,8 +1069,21 @@ async fn dispatch_single(
     }
     match venue.place_order(order_params_to_intent(params, side)).await {
         Ok(f) => {
-            info!("✅ [{strategy_name}] {side:?} {} @ {:.4} (order {})",
-                params.token_id, f.price, f.order_id);
+            // A 2xx is not a fill. Kalshi answers 200 with `fill_count: 0` for an
+            // order that crossed nothing, and the old code booked that as done —
+            // phantom positions on entry, abandoned live ones on exit.
+            if f.filled <= Decimal::ZERO {
+                warn!("⚠️ [{strategy_name}] {side:?} {} @ {:.4} filled 0 of {:.2} — no state change (order {})",
+                    params.token_id, params.price, params.shares, f.order_id);
+                return false;
+            }
+            if f.filled < params.shares {
+                warn!("⚠️ [{strategy_name}] {side:?} {} partial fill {:.2} of {:.2} — booking full size; \
+                       lifecycle reconciliation owns the remainder",
+                    params.token_id, f.filled, params.shares);
+            }
+            info!("✅ [{strategy_name}] {side:?} {} @ {:.4} × {:.2} (order {})",
+                params.token_id, f.price, f.filled, f.order_id);
             if matches!(side, Side::Buy) {
                 record_guard(positions, strategy_name, params, None).await;
                 lifecycle.track(&f, strategy_name, params.order_type, None).await;

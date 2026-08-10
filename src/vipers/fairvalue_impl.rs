@@ -51,11 +51,23 @@ use crate::config;
 use crate::helpers::volatility::{fair_yes_probability, sigma_per_sqrt_sec};
 use crate::venues::core::TimeInForce;
 
-/// All FairValue state is PROCESS-GLOBAL, not per-instance: strategy objects
-/// are recreated on every market rotation (`create_all_strategies()` in
-/// patrol_impl), which would otherwise wipe the vol sampler mid-warmup every
-/// ~25-35 min and reset persistence streaks / exit cooldowns. Same pattern as
-/// gboost_label_pool and the Maker baselines.
+/// All FairValue state outlives the strategy object, which is recreated on
+/// every market rotation (`create_all_strategies()` in patrol_impl) and would
+/// otherwise wipe the vol sampler mid-warmup every ~25-35 min and reset
+/// persistence streaks / exit cooldowns. Same pattern as gboost_label_pool and
+/// the Maker baselines.
+///
+/// State is keyed **per asset**, not per process. The CAG runs a squadron per
+/// asset (btc-open, eth-open, …) concurrently, and every one of them evaluates
+/// this strategy against its own oracle. A single shared `vol_samples` deque
+/// therefore interleaved BTC (~$65,000) and ETH (~$1,918) prices, and each
+/// crossover contributed a log-return of ±3.5 to the realized-vol estimate.
+/// That inflated σ by roughly three orders of magnitude (observed 8.32e-2/√s
+/// against a 5.0e-5 floor), which drove `d` to zero and pinned fair value at
+/// exactly 0.500 on every evaluation — turning the model into "buy whichever
+/// leg trades below 50¢" and producing systematic negative-edge entries into
+/// the cheap tail (observed 2026-08-10). `signal_streak` is a single slot and
+/// was likewise clobbered between assets.
 struct FairValueGlobals {
     /// Self-sampled oracle price history: (sample time, price). One sample per
     /// FAIRVALUE_VOL_SAMPLE_SECS, pruned past FAIRVALUE_VOL_WINDOW_SECS.
@@ -72,16 +84,32 @@ struct FairValueGlobals {
     sl_counts: StdMutex<HashMap<String, u32>>,
 }
 
-fn globals() -> &'static FairValueGlobals {
-    static G: OnceLock<FairValueGlobals> = OnceLock::new();
-    G.get_or_init(|| FairValueGlobals {
-        vol_samples:      StdMutex::new(VecDeque::new()),
-        signal_streak:    StdMutex::new(None),
-        exit_cooldowns:   StdMutex::new(HashMap::new()),
-        last_diag_log_at: StdMutex::new(None),
-        last_entry_log_at: StdMutex::new(None),
-        sl_counts:        StdMutex::new(HashMap::new()),
-    })
+impl FairValueGlobals {
+    fn new() -> Self {
+        Self {
+            vol_samples:      StdMutex::new(VecDeque::new()),
+            signal_streak:    StdMutex::new(None),
+            exit_cooldowns:   StdMutex::new(HashMap::new()),
+            last_diag_log_at: StdMutex::new(None),
+            last_entry_log_at: StdMutex::new(None),
+            sl_counts:        StdMutex::new(HashMap::new()),
+        }
+    }
+}
+
+/// Per-asset state, created on first sight of an asset and never dropped.
+/// Leaked deliberately so callers keep the `&'static` borrow the old global
+/// gave them — there are at most a handful of assets per process.
+fn globals(asset: &str) -> &'static FairValueGlobals {
+    static G: OnceLock<StdMutex<HashMap<String, &'static FairValueGlobals>>> = OnceLock::new();
+    let map = G.get_or_init(|| StdMutex::new(HashMap::new()));
+    let mut guard = match map.lock() {
+        Ok(g) => g,
+        Err(p) => p.into_inner(),
+    };
+    *guard
+        .entry(asset.to_ascii_uppercase())
+        .or_insert_with(|| Box::leak(Box::new(FairValueGlobals::new())))
 }
 
 pub struct FairValueStrategyImpl;
@@ -99,8 +127,8 @@ impl FairValueStrategyImpl {
 
     /// Feed the vol sampler and return σ per √second, or None during warmup /
     /// frozen oracle.
-    fn update_and_read_sigma(&self, oracle_price: f64) -> Option<f64> {
-        let mut samples = match globals().vol_samples.lock() {
+    fn update_and_read_sigma(&self, asset: &str, oracle_price: f64) -> Option<f64> {
+        let mut samples = match globals(asset).vol_samples.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
@@ -151,8 +179,8 @@ impl FairValueStrategyImpl {
         config::CRYPTO_FEE_RATE * price * (dec!(1) - price)
     }
 
-    fn cooldown_active(&self, token_id: &str) -> bool {
-        let mut reg = match globals().exit_cooldowns.lock() {
+    fn cooldown_active(&self, asset: &str, token_id: &str) -> bool {
+        let mut reg = match globals(asset).exit_cooldowns.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
@@ -165,8 +193,8 @@ impl FairValueStrategyImpl {
         false
     }
 
-    fn arm_cooldown(&self, token_id: &str) {
-        let mut reg = match globals().exit_cooldowns.lock() {
+    fn arm_cooldown(&self, asset: &str, token_id: &str) {
+        let mut reg = match globals(asset).exit_cooldowns.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
@@ -177,6 +205,7 @@ impl FairValueStrategyImpl {
     /// None when the model can't price (no strike/vol/time).
     fn fair_prob_for_side(
         &self,
+        asset: &str,
         market: &MarketConfig,
         snapshot: &MarketSnapshot,
         token_is_yes: bool,
@@ -192,7 +221,7 @@ impl FairValueStrategyImpl {
             return Some(if yes_won == token_is_yes { 1.0 } else { 0.0 });
         }
         // Read σ without feeding a new sample (entry path owns the sampler cadence).
-        let samples = match globals().vol_samples.lock() {
+        let samples = match globals(asset).vol_samples.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
@@ -231,7 +260,7 @@ impl Strategy for FairValueStrategyImpl {
             Some(s) if s > 0.0 => s,
             _ => { idle("no oracle price"); return Ok(StrategySignal::NoSignal) },
         };
-        let sigma_opt = self.update_and_read_sigma(spot);
+        let sigma_opt = self.update_and_read_sigma(&ctx.crypto_filter, spot);
 
         // ── Venue: prefer the Window/Daily maker venue (lower fees, has strike) ──
         let (market, snap) = if let (Some(mk_mkt), Some(mk_snap)) = (&ctx.maker_market, &ctx.maker_snapshot) {
@@ -265,11 +294,11 @@ impl Strategy for FairValueStrategyImpl {
             None => {
                 // Warmup visibility: without this the viper is totally silent
                 // for the first FAIRVALUE_MIN_VOL_SAMPLES × SAMPLE_SECS.
-                let mut last = globals().last_diag_log_at.lock().unwrap();
+                let mut last = globals(&ctx.crypto_filter).last_diag_log_at.lock().unwrap();
                 let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::GBOOST_PRED_LOG_INTERVAL_SECS);
                 if due {
                     *last = Some(Instant::now());
-                    let n = globals().vol_samples.lock().map(|s| s.len()).unwrap_or(0);
+                    let n = globals(&ctx.crypto_filter).vol_samples.lock().map(|s| s.len()).unwrap_or(0);
                     tracing::info!(
                         " FairValue: vol warmup {}/{} samples ({}s cadence)",
                         n, config::FAIRVALUE_MIN_VOL_SAMPLES, config::FAIRVALUE_VOL_SAMPLE_SECS,
@@ -307,7 +336,7 @@ impl Strategy for FairValueStrategyImpl {
 
         // ── Periodic diagnostic (calibration visibility, throttled) ──────────
         {
-            let mut last = globals().last_diag_log_at.lock().unwrap();
+            let mut last = globals(&ctx.crypto_filter).last_diag_log_at.lock().unwrap();
             let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::GBOOST_PRED_LOG_INTERVAL_SECS);
             if due {
                 *last = Some(Instant::now());
@@ -354,14 +383,14 @@ impl Strategy for FairValueStrategyImpl {
             idle("spread too wide (entry would mark below the stop loss)");
             return Ok(StrategySignal::NoSignal);
         }
-        if self.cooldown_active(token_id.as_str()) {
+        if self.cooldown_active(&ctx.crypto_filter, token_id.as_str()) {
             idle("post-exit cooldown active");
             return Ok(StrategySignal::NoSignal);
         }
 
         // ── Stop-loss circuit breaker: model is miscalibrated for this market ─
         {
-            let counts = match globals().sl_counts.lock() {
+            let counts = match globals(&ctx.crypto_filter).sl_counts.lock() {
                 Ok(g) => g,
                 Err(p) => p.into_inner(),
             };
@@ -403,7 +432,7 @@ impl Strategy for FairValueStrategyImpl {
         // ── Edge persistence debounce (anti ask-flicker) ─────────────────────
         let persisted = {
             let now = Instant::now();
-            let mut streak = globals().signal_streak.lock().unwrap();
+            let mut streak = globals(&ctx.crypto_filter).signal_streak.lock().unwrap();
             match streak.as_mut() {
                 Some((cid, dir, first_seen, last_seen))
                     if *cid == market.condition_id
@@ -428,7 +457,7 @@ impl Strategy for FairValueStrategyImpl {
         let shares = (dc.fairvalue_trade_size_usdc / fee_headroom) / ask;
         {
             // Throttled: a passed persistence gate re-fires every tick.
-            let mut last = globals().last_entry_log_at.lock().unwrap();
+            let mut last = globals(&ctx.crypto_filter).last_entry_log_at.lock().unwrap();
             let due = last.map_or(true, |t| t.elapsed().as_secs() >= config::FAIRVALUE_ENTRY_LOG_THROTTLE_SECS);
             if due {
                 *last = Some(Instant::now());
@@ -499,7 +528,7 @@ impl Strategy for FairValueStrategyImpl {
                 .market_close_time
                 .map(|ct| (ct - Utc::now()).num_seconds())
                 .unwrap_or(i64::MAX);
-            let fair_side = self.fair_prob_for_side(market, snap, token_is_yes);
+            let fair_side = self.fair_prob_for_side(&ctx.crypto_filter, market, snap, token_is_yes);
 
             let exit_params = |price: Decimal| OrderParams {
                 token_id: token_id.clone(),
@@ -519,7 +548,7 @@ impl Strategy for FairValueStrategyImpl {
                 let settle_hold = secs_left < config::FAIRVALUE_SETTLE_HOLD_SECS
                     && fair_side.map_or(false, |p| p >= config::FAIRVALUE_SETTLE_HOLD_MIN_PROB);
                 if !settle_hold {
-                    self.arm_cooldown(token_id.as_str());
+                    self.arm_cooldown(&ctx.crypto_filter, token_id.as_str());
                     return Ok(StrategySignal::Exit {
                         params: exit_params(bid),
                         reason: format!("FairValueTP: bid=${:.4}, profit={:.2}%", bid, profit_margin * dec!(100)),
@@ -535,7 +564,7 @@ impl Strategy for FairValueStrategyImpl {
                 && bid >= config::FAIRVALUE_MIN_EXIT_BID
                 && fair_side.map_or(false, |p| p < config::FAIRVALUE_MODEL_REVERSAL_EXIT_PROB)
             {
-                self.arm_cooldown(token_id.as_str());
+                self.arm_cooldown(&ctx.crypto_filter, token_id.as_str());
                 return Ok(StrategySignal::Exit {
                     params: exit_params(bid),
                     reason: format!(
@@ -552,7 +581,7 @@ impl Strategy for FairValueStrategyImpl {
                 && bid >= config::FAIRVALUE_MIN_EXIT_BID
                 && fair_side.map_or(false, |p| p < config::FAIRVALUE_BAIL_PROB)
             {
-                self.arm_cooldown(token_id.as_str());
+                self.arm_cooldown(&ctx.crypto_filter, token_id.as_str());
                 return Ok(StrategySignal::Exit {
                     params: exit_params(bid),
                     reason: format!(
@@ -579,9 +608,9 @@ impl Strategy for FairValueStrategyImpl {
                     // Unfillable — an FAK into a vaporised bid just floods logs.
                     continue;
                 }
-                self.arm_cooldown(token_id.as_str());
+                self.arm_cooldown(&ctx.crypto_filter, token_id.as_str());
                 {
-                    let mut counts = match globals().sl_counts.lock() {
+                    let mut counts = match globals(&ctx.crypto_filter).sl_counts.lock() {
                         Ok(g) => g,
                         Err(p) => p.into_inner(),
                     };
