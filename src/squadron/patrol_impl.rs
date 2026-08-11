@@ -611,8 +611,31 @@ impl Squadron {
                                 info!("🔴 EXIT [{}]: {} | shares={:.2}, bid=${:.4} | {}", sn, params.market_name, shares, params.price, reason);
                                 let vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
 
+                                // Real average fill price for this exit, derived from the
+                                // venue's matched amounts. `None` until the order returns.
+                                //
+                                // SELL_PRICE_OFFSET only lowers the FAK's LIMIT so it
+                                // reliably sweeps the book — the executed price is the real
+                                // best bid, never the limit. Booking the offset limit as the
+                                // exit price therefore understated every single exit by a
+                                // full tick (2026-08-11 audit: 6 of 6 Maker take-profits
+                                // recorded exactly one tick below their trigger bid, e.g.
+                                // trade 346 logged "gain=5.26%" but booked 2.63%).
+                                // Same class of bug as intl trade 56 (2026-06-21), already
+                                // fixed inside `IntlClobVenue::place_order`.
+                                let mut exit_fill_price: Option<Decimal> = None;
                                 if !config::GHOST_MODE {
-                                    if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &tid, Side::Sell, shares, (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await {
+                                    if let Err(e) = place_limit_order_filled(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &tid, Side::Sell, shares, (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await
+                                        .map(|(_oid, making, taking)| {
+                                            // SELL orientation: making = shares given, taking = USDC received.
+                                            // Ratio is unit-invariant. Clamp to a valid binary price; anything
+                                            // outside means an unexpected orientation → fall back below.
+                                            if making > dec!(0) && taking > dec!(0) {
+                                                let p = taking / making;
+                                                if p > dec!(0) && p <= dec!(1) { exit_fill_price = Some(p); }
+                                            }
+                                        })
+                                    {
                                         let es = e.to_string();
                                         if es.contains("not enough balance") || es.contains("balance: 0") || es.contains("invalid price") {
                                             // The exchange says we don't hold the shares. Two very different
@@ -669,7 +692,7 @@ impl Squadron {
                                             let removed = { let mut map = positions.lock().await; map.remove(&pos_key) };
                                             if let Some(p) = removed {
                                                 if p.fill_confirmed_at.is_some() {
-                                                    let aep3 = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
+                                                    let aep3 = params.price; // est: no fill occurred; observed bid is the best estimate
                                                     let pnl3 = (aep3 - p.avg_entry) * p.shares;
                                                     warn!(
                                                         "⚠️ EXIT rejected by exchange [{}] (\"{}\"): position already gone — booking est. exit @ ${:.4} pnl=${:.4}",
@@ -726,7 +749,7 @@ impl Squadron {
                                             {
                                                 let mut map = positions.lock().await;
                                                 if let Some(p) = map.remove(&pos_key) {
-                                                    let actual_exit_price = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
+                                                    let actual_exit_price = exit_fill_price.unwrap_or(params.price);
                                                     let pnl = (actual_exit_price - p.avg_entry) * p.shares;
 
                                                     re_m = p.avg_entry;
@@ -751,7 +774,7 @@ impl Squadron {
                                             let tid_async = tid_m.clone(); // neutral key moved into the spawn
                                             // Capture all vars needed for deferred DB recording.
                                             let sid_m = if tid == target_yes_token { "YES".to_string() } else { "NO".to_string() };
-                                            let aep_exit = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
+                                            let aep_exit = exit_fill_price.unwrap_or(params.price);
                                             let r_m = reason.clone();
                                             let asset_t = asset_lc.clone();
                                             let scope_t = scope.clone();

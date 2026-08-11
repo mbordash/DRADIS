@@ -161,6 +161,8 @@ fn default_convergence_coherence_min()      -> Decimal { config::CONVERGENCE_COH
 fn default_convergence_cvd_confirm_margin() -> Decimal { config::CONVERGENCE_CVD_CONFIRM_MARGIN        }
 fn default_convergence_max_token_spread_pct() -> Decimal { config::CONVERGENCE_MAX_TOKEN_SPREAD_PCT    }
 fn default_convergence_obi_adverse_block()  -> Decimal { config::CONVERGENCE_OBI_ADVERSE_BLOCK         }
+fn default_convergence_drift_coherence_deadband_pct() -> Decimal { config::CONVERGENCE_DRIFT_COHERENCE_DEADBAND_PCT }
+fn default_convergence_velocity_opposition_pct()      -> Decimal { config::CONVERGENCE_VELOCITY_OPPOSITION_PCT      }
 fn default_convergence_skip_band_low()      -> Decimal { config::CONVERGENCE_SKIP_BAND_LOW             }
 fn default_convergence_skip_band_high()     -> Decimal { config::CONVERGENCE_SKIP_BAND_HIGH            }
 
@@ -508,6 +510,14 @@ pub struct DynamicConfig {
     pub convergence_max_token_spread_pct: Decimal,
     #[serde(default = "default_convergence_obi_adverse_block")]
     pub convergence_obi_adverse_block:    Decimal,
+    /// Deadband below which a drift leg counts as neutral in the 10m-vs-60m
+    /// coherence check. Both legs must clear it before an opposition vetoes entry.
+    #[serde(default = "default_convergence_drift_coherence_deadband_pct")]
+    pub convergence_drift_coherence_deadband_pct: Decimal,
+    /// Deadband beyond which 5s oracle velocity running against the intended side
+    /// vetoes entry. Zero velocity never vetoes — this is opposition, not confirmation.
+    #[serde(default = "default_convergence_velocity_opposition_pct")]
+    pub convergence_velocity_opposition_pct: Decimal,
     #[serde(default = "default_convergence_skip_band_low")]
     pub convergence_skip_band_low:        Decimal,
     #[serde(default = "default_convergence_skip_band_high")]
@@ -664,6 +674,8 @@ impl Default for DynamicConfig {
             convergence_cvd_confirm_margin:   config::CONVERGENCE_CVD_CONFIRM_MARGIN,
             convergence_max_token_spread_pct: config::CONVERGENCE_MAX_TOKEN_SPREAD_PCT,
             convergence_obi_adverse_block:    config::CONVERGENCE_OBI_ADVERSE_BLOCK,
+            convergence_drift_coherence_deadband_pct: config::CONVERGENCE_DRIFT_COHERENCE_DEADBAND_PCT,
+            convergence_velocity_opposition_pct: config::CONVERGENCE_VELOCITY_OPPOSITION_PCT,
             convergence_skip_band_low:        config::CONVERGENCE_SKIP_BAND_LOW,
             convergence_skip_band_high:       config::CONVERGENCE_SKIP_BAND_HIGH,
         }

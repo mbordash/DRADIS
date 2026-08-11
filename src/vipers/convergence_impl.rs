@@ -226,7 +226,7 @@ impl Strategy for ConvergenceStrategyImpl {
         // opinion", not a conflict.
         let drift_10m = snap.oracle_drift_10m;
         let coherence_deadband = config::oracle_threshold(
-            config::CONVERGENCE_DRIFT_COHERENCE_DEADBAND_PCT, snap.oracle_price);
+            dc.convergence_drift_coherence_deadband_pct, snap.oracle_price);
         if drift_incoherent(drift_10m, drift_60m, coherence_deadband) {
             debug!(" Convergence blocked: drift incoherent (10m={:.0} vs 60m={:.0}, deadband=±{:.0}) — counter-trend bounce",
                 drift_10m, drift_60m, coherence_deadband);
@@ -244,7 +244,7 @@ impl Strategy for ConvergenceStrategyImpl {
         // blocked the only good trade of the day.
         let velocity = snap.velocity;
         let velocity_deadband = config::oracle_threshold(
-            config::CONVERGENCE_VELOCITY_OPPOSITION_PCT, snap.oracle_price);
+            dc.convergence_velocity_opposition_pct, snap.oracle_price);
         if velocity_opposes_entry(velocity, want_bull, velocity_deadband) {
             debug!(" Convergence blocked: velocity {:.2} opposes {} entry (deadband=±{:.2})",
                 velocity, if want_bull { "bull" } else { "bear" }, velocity_deadband);
@@ -550,15 +550,42 @@ impl Strategy for ConvergenceStrategyImpl {
                 let catastrophic_pct =
                     (-(dc.convergence_stop_loss_pct * config::CONVERGENCE_CATASTROPHIC_SL_MULT))
                         .max(config::CONVERGENCE_CATASTROPHIC_SL_PCT);
-                let cat_ref = self.entry_bid.lock().ok()
+                // A TRUE entry bid (recorded at signal time) makes the move below
+                // spread-neutral. Without one we fall back to avg_entry, which is an
+                // ask — that comparison carries the spread and must not drive the
+                // tighter dead-zone stop.
+                let recorded_entry_bid = self.entry_bid.lock().ok()
                     .and_then(|m| m.get(token_id).copied())
-                    .filter(|b| *b > dec!(0))
-                    .unwrap_or(avg_entry);
+                    .filter(|b| *b > dec!(0));
+                let cat_ref = recorded_entry_bid.unwrap_or(avg_entry);
                 let cat_move = (bid - cat_ref) / cat_ref;
                 if cat_move <= catastrophic_pct {
                     found = Some(make_exit(format!(
                         "ConvergenceCatastrophic: bid=${:.4} move={:.2}% (ref=${:.4}) pnl={:.2}%",
                         bid, cat_move * dec!(100), cat_ref, profit_margin * dec!(100))));
+                    break 'outer;
+                }
+
+                // ── Dead-zone stop (2026-08-11) ───────────────────────────────
+                // For the first CONVERGENCE_MIN_HOLD_SECS the normal stop cannot
+                // fire, so the catastrophic floor (1.5× the stop) is the ONLY
+                // guard — a nominal 10% stop is really a 15% stop for 60 seconds.
+                // Trade id 347 bled to −13.6% inside that window and stopped the
+                // instant it became eligible, losing ~4pts to the gap.
+                //
+                // Safe to run pre-MIN_HOLD *only* because it is measured BID-TO-BID
+                // against the entry bid. MIN_HOLD exists to avoid the instant paper
+                // loss from marking a fresh fill's ask against the bid; a bid-to-bid
+                // move has no spread component, so the artifact cannot occur.
+                // Requires a recorded entry bid — otherwise the normal post-MIN_HOLD
+                // stop remains the first line of defence, as before.
+                if recorded_entry_bid.is_some()
+                    && secs_held < config::CONVERGENCE_MIN_HOLD_SECS
+                    && cat_move <= -dc.convergence_stop_loss_pct
+                {
+                    found = Some(make_exit(format!(
+                        "ConvergenceDeadZoneSL: bid=${:.4} move={:.2}% bid-to-bid (ref=${:.4}, {}s held) pnl={:.2}%",
+                        bid, cat_move * dec!(100), cat_ref, secs_held, profit_margin * dec!(100))));
                     break 'outer;
                 }
 

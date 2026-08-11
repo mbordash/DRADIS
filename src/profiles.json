@@ -139,6 +139,8 @@
         "convergence_cvd_confirm_margin": "0.10",
         "convergence_max_token_spread_pct": "0.12",
         "convergence_obi_adverse_block": "0.45",
+        "convergence_drift_coherence_deadband_pct": "0.0004",
+        "convergence_velocity_opposition_pct": "0.00003",
         "convergence_skip_band_low": "0.43",
         "convergence_skip_band_high": "0.57"
       }
@@ -281,6 +283,8 @@
         "convergence_cvd_confirm_margin": "0.10",
         "convergence_max_token_spread_pct": "0.12",
         "convergence_obi_adverse_block": "0.50",
+        "convergence_drift_coherence_deadband_pct": "0.0005",
+        "convergence_velocity_opposition_pct": "0.00004",
         "convergence_skip_band_low": "0.45",
         "convergence_skip_band_high": "0.55"
       }
@@ -423,6 +427,8 @@
         "convergence_cvd_confirm_margin": "0.10",
         "convergence_max_token_spread_pct": "0.12",
         "convergence_obi_adverse_block": "0.55",
+        "convergence_drift_coherence_deadband_pct": "0.0007",
+        "convergence_velocity_opposition_pct": "0.00006",
         "convergence_skip_band_low": "0.50",
         "convergence_skip_band_high": "0.50"
       }

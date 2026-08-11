@@ -374,6 +374,13 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Lower edge of the ~0.50 coin-flip band where entries are skipped.").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "convergence_skip_band_high", "Skip Band High", "price", true,
             "Upper edge of the ~0.50 coin-flip band where entries are skipped.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "convergence_drift_coherence_deadband_pct", "Drift Coherence Deadband", "pct", true,
+            "Fraction of oracle price below which a 10m/60m drift leg counts as neutral. \
+             Entry is vetoed when BOTH legs clear this and point opposite ways (counter-trend bounce). \
+             Lower = stricter.").range(0.0, 0.01).step(0.0001));
+        v.push(F::new(g, e, "convergence_velocity_opposition_pct", "Velocity Opposition Deadband", "pct", true,
+            "Fraction of oracle price the 5s velocity must run AGAINST the intended side to veto entry. \
+             Zero velocity never vetoes. Lower = stricter.").range(0.0, 0.005).step(0.00001));
     }
 
     // ── FairValue ─────────────────────────────────────────────────────────────
