@@ -1030,7 +1030,13 @@ impl Squadron {
                                     if config::GHOST_MODE {
                                     if positions.lock().await.contains_key(&pos_key) { continue; }
                                     let pos_close_time = target_market_close_time;
-                                    let actual_entry_price = if params.post_only { params.price } else { (params.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE) };
+                                    // Simulate the fill at the TOUCH, not at the crossing limit.
+                                    // BUY_PRICE_OFFSET only lifts the limit so a marketable FAK
+                                    // sweeps the book; the executed price is the real best ask.
+                                    // Booking the offset limit overstated every simulated entry by
+                                    // a tick, so ghost P&L was pessimistic against live by ~1 tick
+                                    // per entry and the two could not be compared.
+                                    let actual_entry_price = params.price;
                                     positions.lock().await.insert(pos_key.clone(), Position { shares: params.shares, avg_entry: actual_entry_price, opened_at: Utc::now(), close_time: pos_close_time, market_name: params.market_name.clone(), pair_token_id: token_m.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: pair_params.as_ref().map(|p| p.token_id.clone()), entry_fee: Decimal::ZERO });
                                     token_ownership.lock().await.insert(token_m.clone(), sn.clone());
                                     let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" };
@@ -1040,11 +1046,8 @@ impl Squadron {
                                     if let Some(pool) = db::pool_for(&asset_lc) { let side_g = if params.token_id == target_yes_token { "YES" } else { "NO" }; db::record_open_position(&pool, &sn, &params.token_id.to_string(), &params.market_name, side_g, actual_entry_price, params.shares, true).await; }
                                     if let Some(pp) = pair_params {
                                         let pp_close_time = target_market_close_time;
-                                        let actual_paired_entry_price = if pp.post_only {
-                                            pp.price
-                                        } else {
-                                            (pp.price + config::BUY_PRICE_OFFSET).min(config::MAX_BUY_LIMIT_PRICE)
-                                        };
+                                        // Same as the primary leg: simulate at the touch.
+                                        let actual_paired_entry_price = pp.price;
                                         positions.lock().await.insert((sn.clone(), pp.token_id.clone()), Position { shares: pp.shares, avg_entry: actual_paired_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: Some(token_m.clone()), entry_fee: Decimal::ZERO });
                                         token_ownership.lock().await.insert(pp.token_id.clone(), sn.clone());
                                         let side_gp = if pp.token_id == target_yes_token { "YES" } else { "NO" };
@@ -1225,15 +1228,44 @@ impl Squadron {
                                             }
                                         }
                                     } else {
-                                        let leg_a_order_id = match place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &params.token_id, Side::Buy, params.shares, actual_entry_price, target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await {
+                                        // Book the price the venue actually traded at, not the limit.
+                                        //
+                                        // BUY_PRICE_OFFSET only LIFTS the limit so a marketable FAK
+                                        // reliably sweeps the book — the executed price is the real
+                                        // best ask. Booking the offset limit inflated `avg_entry` by
+                                        // a full tick on every taker entry, which then propagated
+                                        // into every TP/SL comparison (profit understated, so TPs
+                                        // fired late and SLs early) and into recorded P&L. It is
+                                        // also why Convergence trade 347 was recorded at $0.66 when
+                                        // its own $0.65 max-entry gate had passed: the gate saw the
+                                        // ask, the ledger saw the limit.
+                                        //
+                                        // Mirror of the exit-side fix above, and of the fix already
+                                        // living in `IntlClobVenue::place_order`.
+                                        let (leg_a_order_id, entry_fill_price) = match place_limit_order_filled(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &params.token_id, Side::Buy, params.shares, actual_entry_price, target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await {
                                             Err(e) => { warn!("⚠️ ENTRY order failed [{}]: {}", sn, e); positions.lock().await.remove(&pos_key); pending_orders.lock().await.remove(&pos_key); token_ownership.lock().await.remove(&token_m); if !e.to_string().contains("crosses book") { last_trade_time.insert(sn.clone(), Instant::now()); consecutive_failures += 1; } else { tokio::time::sleep(Duration::from_secs(config::CROSSES_BOOK_RETRY_PAUSE_SECS)).await; } continue; }
-                                            Ok(id) => id,
+                                            Ok((id, making, taking)) => {
+                                                // BUY orientation: making = USDC paid, taking = shares
+                                                // received. Ratio is unit-invariant. A post_only order
+                                                // rests and matches nothing now (making/taking = 0), so
+                                                // it falls back to the touch — which for post_only IS
+                                                // its limit, so that stays correct.
+                                                let px = if making > dec!(0) && taking > dec!(0) {
+                                                    let p = making / taking;
+                                                    if p > dec!(0) && p <= dec!(1) { Some(p) } else { None }
+                                                } else { None };
+                                                (id, px.unwrap_or(params.price))
+                                            }
                                         };
                                         let _ = leg_a_order_id;
+                                        // Correct the provisional booking made before placement.
+                                        if let Some(p) = positions.lock().await.get_mut(&pos_key) {
+                                            p.avg_entry = entry_fill_price;
+                                        }
                                         let cl_s = Arc::clone(&trading_client); let ps_s = Arc::clone(&positions); let pc_s = Arc::clone(&phantom_cooldowns); let to_s = Arc::clone(&token_ownership); let sn_s = sn.clone(); let tn_s = params.token_id.clone();
                                         let primary_wait_secs = if target_yes_token == hourly_yes_token { crate::helpers::balance::MAX_WAIT_SECS_HOURLY } else { crate::helpers::balance::MAX_WAIT_SECS_WINDOW };
                                         let db_sn_s = sn.clone(); let db_tid_s = params.token_id.to_string(); let db_mn_s = params.market_name.clone();
-                                        let db_side_s = if params.token_id == target_yes_token { "YES" } else { "NO" }; let db_ep_s = actual_entry_price; let db_sh_s = params.shares; let asset_s = asset_lc.clone(); let scope_s = scope.clone();
+                                        let db_side_s = if params.token_id == target_yes_token { "YES" } else { "NO" }; let db_ep_s = entry_fill_price; let db_sh_s = params.shares; let asset_s = asset_lc.clone(); let scope_s = scope.clone();
                                         let feat_snap_s = entry_snap.clone();
                                         // Write pending position immediately (Viper Launch)
                                         if let Some(pool) = db::pool_for(&asset_s) {
