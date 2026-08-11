@@ -22,6 +22,7 @@ import {
   getProfiles, applyProfile, ConfigProfile,
   getAdminToken, clearAdminToken, SetupApiError,
 } from '@/lib/setupApi';
+import { useConfirm } from '@/components/ConfirmDialog';
 
 // Which /api/setup/test kind exercises a given credential scope/group.
 const TEST_KINDS: Record<string, { kind: string; label: string; keys: string[] }> = {
@@ -251,6 +252,7 @@ function ProfilesPanel({ onAuthError }: { onAuthError: () => void }) {
   const [deployed, setDeployed] = useState<string[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
+  const [confirm, confirmDialog] = useConfirm();
 
   useEffect(() => {
     getProfiles()
@@ -268,13 +270,40 @@ function ProfilesPanel({ onAuthError }: { onAuthError: () => void }) {
     const p = profiles?.[name];
     const fieldCount = p ? Object.keys(p.values).length : 0;
     // Name the blast radius: squadron rows are allowed to diverge per market, and
-    // a full profile apply discards that divergence. Say so before doing it.
-    const target = deployed.length
-      ? `the global config AND these ${deployed.length} deployed squadron(s):\n\n  ${deployed.join('\n  ')}\n\nAny per-squadron tuning on them will be replaced.`
-      : `the global config. No squadrons are currently deployed, so this will seed the next one deployed.`;
-    if (!window.confirm(
-      `Apply the ${name} profile?\n\nThis replaces all ${fieldCount} runtime-tunable settings on ${target}\n\nApplies live (no restart) and is recorded in config history.`
-    )) return;
+    // a full profile apply discards that divergence. Show it, don't describe it.
+    const ok = await confirm({
+      title: `Apply the ${p?.label ?? name} profile?`,
+      tone: 'danger',
+      confirmLabel: `Apply ${name}`,
+      body: (
+        <>
+          <p>
+            Replaces all <span className="text-gray-200 font-mono">{fieldCount}</span> runtime-tunable
+            settings on the global config
+            {deployed.length > 0 && <> and the {deployed.length} deployed squadron(s) below</>}.
+          </p>
+          {deployed.length > 0 ? (
+            <>
+              <ul className="font-mono text-[11px] text-gray-300 bg-[#0e0e18] border border-[#1e1e32] rounded-lg px-3 py-2 space-y-0.5">
+                {deployed.map(s => <li key={s}>{s}</li>)}
+              </ul>
+              <p className="text-amber-400">
+                Any per-squadron tuning on these will be replaced.
+              </p>
+            </>
+          ) : (
+            <p className="text-gray-500">
+              No squadrons are currently deployed, so this seeds the next one deployed
+              but changes nothing that is trading right now.
+            </p>
+          )}
+          <p className="text-gray-500">
+            Applies live (no restart) and is recorded in config history.
+          </p>
+        </>
+      ),
+    });
+    if (!ok) return;
     setBusy(name);
     setNotice(null);
     try {
@@ -356,6 +385,7 @@ function ProfilesPanel({ onAuthError }: { onAuthError: () => void }) {
       ) : (
         <div className="text-xs text-gray-600 font-mono">Loading profiles…</div>
       )}
+      {confirmDialog}
     </div>
   );
 }
@@ -476,6 +506,7 @@ export default function SetupPage() {
   const [restarting, setRestarting] = useState(false);
   const [notice, setNotice] = useState<{ kind: 'ok' | 'err' | 'info'; text: string } | null>(null);
   const [showChangePw, setShowChangePw] = useState(false);
+  const [confirm, confirmDialog] = useConfirm();
 
   const loadStatus = useCallback(async () => {
     try {
@@ -541,7 +572,13 @@ export default function SetupPage() {
   };
 
   const restart = async () => {
-    if (!window.confirm('Restart the DRADIS engine now? Open positions keep managing after the ~30-60s respawn.')) return;
+    const ok = await confirm({
+      title: 'Restart the DRADIS engine?',
+      tone: 'danger',
+      confirmLabel: 'Restart',
+      body: <p>Open positions keep managing after the ~30-60s respawn.</p>,
+    });
+    if (!ok) return;
     setRestarting(true);
     setNotice({ kind: 'info', text: 'Engine restarting — back in ~30-60s…' });
     try {
@@ -707,7 +744,18 @@ export default function SetupPage() {
                 const file = e.target.files?.[0];
                 e.target.value = '';
                 if (!file) return;
-                if (!window.confirm('Import this bundle? Existing credentials and configs will be overwritten, then the engine needs a restart.')) return;
+                const ok = await confirm({
+                  title: 'Import this bundle?',
+                  tone: 'danger',
+                  confirmLabel: 'Import',
+                  body: (
+                    <>
+                      <p>Existing credentials and configs will be <span className="text-amber-400">overwritten</span>.</p>
+                      <p className="text-gray-500">The engine needs a restart afterwards for the changes to take effect.</p>
+                    </>
+                  ),
+                });
+                if (!ok) return;
                 try {
                   const text = await file.text();
                   const r = await importBundle(text);
@@ -764,6 +812,7 @@ export default function SetupPage() {
         Saved credentials persist on the data volume and override container env on boot.
         Changes take effect after an engine restart (Docker respawns the container automatically).
       </p>
+      {confirmDialog}
     </div>
   );
 }

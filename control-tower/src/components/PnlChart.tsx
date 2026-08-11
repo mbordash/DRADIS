@@ -118,8 +118,28 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const handleMouseMove = useCallback((state: any) => {
-    const idx = state?.activeTooltipIndex;
-    setHoveredIndex(state?.isTooltipActive && typeof idx === 'number' ? idx : null);
+    // recharts v3 hands back a STRING index, not a number: its
+    // `combineActiveTooltipIndex` combiner returns `String(clampedIndex)` on
+    // every success path, and the type is `number | TooltipIndex | undefined`
+    // where `TooltipIndex = string | null`.
+    //
+    // The previous fix here moved off the v2 `activePayload` (correct — v3
+    // dropped it) but kept a `typeof idx === 'number'` guard, which can never
+    // pass under v3. hoveredIndex stayed null forever and the header silently
+    // fell back to the latest point, so hovering never changed Total/Cash.
+    // Coerce instead of type-testing; recharts has already clamped the value to
+    // [0, data.length - 1] before we see it.
+    //
+    // `activeIndex` is documented as an exact duplicate kept for v2 back-compat.
+    const raw = state?.activeTooltipIndex ?? state?.activeIndex;
+    const idx =
+      typeof raw === 'number' ? raw
+      : typeof raw === 'string' && raw.trim() !== '' ? Number(raw)
+      : NaN;
+    // Upper bound is enforced where it is read (`chartDataWithMarkers[i] ?? null`),
+    // which keeps this callback free of data deps and stable across renders.
+    const valid = state?.isTooltipActive && Number.isInteger(idx) && idx >= 0;
+    setHoveredIndex(valid ? idx : null);
   }, []);
   const handleMouseLeave = useCallback(() => setHoveredIndex(null), []);
 
