@@ -248,12 +248,16 @@ const PROFILE_ACCENTS: Record<string, string> = {
 
 function ProfilesPanel({ onAuthError }: { onAuthError: () => void }) {
   const [profiles, setProfiles] = useState<Record<string, ConfigProfile> | null>(null);
+  const [deployed, setDeployed] = useState<string[]>([]);
   const [busy, setBusy] = useState<string | null>(null);
   const [notice, setNotice] = useState<{ kind: 'ok' | 'err'; text: string } | null>(null);
 
   useEffect(() => {
     getProfiles()
-      .then(r => setProfiles(r.profiles))
+      .then(r => {
+        setProfiles(r.profiles);
+        setDeployed(r.deployed_squadrons ?? []);
+      })
       .catch(err => {
         if (err instanceof SetupApiError && err.status === 401) onAuthError();
         else setNotice({ kind: 'err', text: err instanceof Error ? err.message : 'Failed to load profiles' });
@@ -261,12 +265,36 @@ function ProfilesPanel({ onAuthError }: { onAuthError: () => void }) {
   }, [onAuthError]);
 
   const apply = async (name: string) => {
-    if (!window.confirm(`Apply the ${name} profile? This overwrites the current global strategy config (audited in config history). Squadron-specific configs are not touched.`)) return;
+    const p = profiles?.[name];
+    const fieldCount = p ? Object.keys(p.values).length : 0;
+    // Name the blast radius: squadron rows are allowed to diverge per market, and
+    // a full profile apply discards that divergence. Say so before doing it.
+    const target = deployed.length
+      ? `the global config AND these ${deployed.length} deployed squadron(s):\n\n  ${deployed.join('\n  ')}\n\nAny per-squadron tuning on them will be replaced.`
+      : `the global config. No squadrons are currently deployed, so this will seed the next one deployed.`;
+    if (!window.confirm(
+      `Apply the ${name} profile?\n\nThis replaces all ${fieldCount} runtime-tunable settings on ${target}\n\nApplies live (no restart) and is recorded in config history.`
+    )) return;
     setBusy(name);
     setNotice(null);
     try {
       const r = await applyProfile(name);
-      setNotice({ kind: 'ok', text: `Applied '${r.profile}' — ${r.fields_applied} settings live now (no restart needed).` });
+      const where = r.squadrons_applied.length
+        ? ` across global + ${r.squadrons_applied.join(', ')}`
+        : ' on the global config (no squadrons deployed)';
+      if (r.squadron_errors.length) {
+        setNotice({
+          kind: 'err',
+          text: `Applied '${r.profile}'${where}, but ${r.squadron_errors.length} squadron(s) failed and are STILL TRADING their old values: ${
+            r.squadron_errors.map(e => `${e.squadron} (${e.error})`).join('; ')}`,
+        });
+      } else {
+        setNotice({
+          kind: 'ok',
+          text: `Applied '${r.profile}' — ${r.fields_applied} settings live now${where} (no restart needed).`,
+        });
+        setDeployed(r.squadrons_applied.length ? r.squadrons_applied : deployed);
+      }
     } catch (err) {
       if (err instanceof SetupApiError && err.status === 401) onAuthError();
       else setNotice({ kind: 'err', text: err instanceof Error ? err.message : 'Apply failed' });
@@ -280,9 +308,15 @@ function ProfilesPanel({ onAuthError }: { onAuthError: () => void }) {
       <div>
         <h3 className="text-sm font-mono text-gray-200">🎛️ Risk Profile</h3>
         <p className="text-xs text-gray-500 mt-0.5">
-          Seed the global strategy config from a curated preset. Applies live to the
-          running engine and is recorded in config history — individual settings can
-          still be tuned afterwards in the Config view.
+          Replace the strategy config from a curated preset — the global config and
+          every deployed squadron, so it reaches the running patrol loops. Applies
+          live and is recorded in config history; individual settings can still be
+          tuned afterwards in the Config view.
+        </p>
+        <p className="text-[11px] font-mono text-gray-600 mt-1.5">
+          {deployed.length
+            ? <>Will overwrite <span className="text-gray-400">{deployed.length}</span> deployed squadron(s): <span className="text-gray-400">{deployed.join(', ')}</span></>
+            : 'No squadrons currently deployed — will seed the global config only.'}
         </p>
       </div>
       {notice && (

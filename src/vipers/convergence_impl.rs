@@ -120,6 +120,25 @@ impl Default for ConvergenceStrategyImpl {
     fn default() -> Self { Self::new() }
 }
 
+/// Do the 10-minute and 60-minute oracle drift legs actively DISAGREE?
+///
+/// Both legs must clear `deadband` for the disagreement to count: a flat leg is
+/// "no opinion", not a conflict, and treating it as one would veto most entries
+/// during quiet tape. See `CONVERGENCE_DRIFT_COHERENCE_DEADBAND_PCT`.
+fn drift_incoherent(drift_10m: Decimal, drift_60m: Decimal, deadband: Decimal) -> bool {
+    drift_10m.abs() >= deadband
+        && drift_60m.abs() >= deadband
+        && (drift_10m.is_sign_positive() != drift_60m.is_sign_positive())
+}
+
+/// Is the 5-second oracle velocity actively running AGAINST the intended side?
+///
+/// A deadband test, not a confirmation test — `velocity == 0` (flat feed, or
+/// insufficient history) must PASS. See `CONVERGENCE_VELOCITY_OPPOSITION_PCT`.
+fn velocity_opposes_entry(velocity: Decimal, want_bull: bool, deadband: Decimal) -> bool {
+    if want_bull { velocity <= -deadband } else { velocity >= deadband }
+}
+
 #[async_trait]
 impl Strategy for ConvergenceStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
@@ -191,6 +210,45 @@ impl Strategy for ConvergenceStrategyImpl {
             debug!(" Convergence blocked: 60m drift exhausted ({:.0} vs ±{:.0}) — move already priced in",
                 drift_60m, exhaustion_thr);
             idle("60m drift exhausted (move priced in)");
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Drift coherence: 10m and 60m must not disagree (2026-08-11) ───────
+        // The exhaustion ceiling above only catches drift ALREADY RUN IN the entry
+        // direction. It cannot see the opposite failure: a short-term bounce
+        // against a strong hourly downtrend, which reads as fresh momentum to the
+        // pulse but is a counter-trend entry. Trade id 347 was exactly that —
+        // drift_10m +78.3 (bullish) against drift_60m −361.8 (strongly bearish),
+        // bought YES at $0.66, stopped −13.6% sixty seconds later. The winner in
+        // the same batch (id 344) had both legs bearish and agreeing.
+        //
+        // Only fires when BOTH legs clear the deadband: one flat leg is "no
+        // opinion", not a conflict.
+        let drift_10m = snap.oracle_drift_10m;
+        let coherence_deadband = config::oracle_threshold(
+            config::CONVERGENCE_DRIFT_COHERENCE_DEADBAND_PCT, snap.oracle_price);
+        if drift_incoherent(drift_10m, drift_60m, coherence_deadband) {
+            debug!(" Convergence blocked: drift incoherent (10m={:.0} vs 60m={:.0}, deadband=±{:.0}) — counter-trend bounce",
+                drift_10m, drift_60m, coherence_deadband);
+            idle("10m/60m drift disagree (counter-trend)");
+            return Ok(StrategySignal::NoSignal);
+        }
+
+        // ── Velocity opposition veto (2026-08-11) ─────────────────────────────
+        // Never pay up for a side the price is actively moving away from. Trade
+        // id 347 bought YES while the 5s oracle velocity was −4.01.
+        //
+        // A deadband, NOT a confirmation requirement: `velocity` is 0 when the
+        // feed is flat or history is short, and the batch winner (id 344) entered
+        // at velocity exactly 0.00 — demanding positive confirmation would have
+        // blocked the only good trade of the day.
+        let velocity = snap.velocity;
+        let velocity_deadband = config::oracle_threshold(
+            config::CONVERGENCE_VELOCITY_OPPOSITION_PCT, snap.oracle_price);
+        if velocity_opposes_entry(velocity, want_bull, velocity_deadband) {
+            debug!(" Convergence blocked: velocity {:.2} opposes {} entry (deadband=±{:.2})",
+                velocity, if want_bull { "bull" } else { "bear" }, velocity_deadband);
+            idle("oracle velocity opposes entry");
             return Ok(StrategySignal::NoSignal);
         }
 
@@ -591,5 +649,78 @@ impl Strategy for ConvergenceStrategyImpl {
         if let Ok(mut last) = self.last_exit_signal_at.lock() {
             *last = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Live values from the 2026-08-11 BTC session (logs/btc-dradis.db, trades
+    // 344 and 347). These two gates were added specifically to separate that
+    // pair, so they are pinned here: a future retune that lets trade 347 back
+    // through, or that starts rejecting trade 344, should fail loudly.
+    //
+    //   id 344 WIN  −$0.29 avoided: NO  @0.36, drift_10m −30.37, drift_60m −16.39, vel  0.00
+    //   id 347 LOSS −$0.745        : YES @0.66, drift_10m +78.33, drift_60m −361.81, vel −4.01
+    const ORACLE_344: Decimal = dec!(63949.61);
+    const ORACLE_347: Decimal = dec!(63816.00);
+
+    fn coherence_deadband(oracle: Decimal) -> Decimal {
+        config::oracle_threshold(config::CONVERGENCE_DRIFT_COHERENCE_DEADBAND_PCT, oracle)
+    }
+    fn velocity_deadband(oracle: Decimal) -> Decimal {
+        config::oracle_threshold(config::CONVERGENCE_VELOCITY_OPPOSITION_PCT, oracle)
+    }
+
+    #[test]
+    fn winner_344_passes_both_gates() {
+        // Bearish entry: both drift legs negative and agreeing.
+        assert!(!drift_incoherent(dec!(-30.37), dec!(-16.39), coherence_deadband(ORACLE_344)),
+            "trade 344 had coherent (both-bearish) drift and must not be blocked");
+        // Velocity was exactly 0.00 — the reason this is a deadband and not a
+        // "velocity must confirm" rule.
+        assert!(!velocity_opposes_entry(dec!(0), /* want_bull */ false, velocity_deadband(ORACLE_344)),
+            "zero velocity is 'no opinion' and must never veto");
+    }
+
+    #[test]
+    fn loser_347_blocked_by_drift_incoherence() {
+        // +78.33 over 10m against -361.81 over 60m: a bounce inside a downtrend.
+        assert!(drift_incoherent(dec!(78.33), dec!(-361.81), coherence_deadband(ORACLE_347)),
+            "trade 347's opposed drift legs must be blocked");
+    }
+
+    #[test]
+    fn loser_347_blocked_by_velocity_opposition() {
+        // Bought YES while the oracle was falling $4.01 per 5s window.
+        assert!(velocity_opposes_entry(dec!(-4.01), /* want_bull */ true, velocity_deadband(ORACLE_347)),
+            "trade 347 bought the bullish side into negative velocity and must be blocked");
+    }
+
+    #[test]
+    fn a_single_flat_leg_is_not_a_conflict() {
+        let db = coherence_deadband(ORACLE_347); // ~$31.9
+        // 60m flat (below deadband) + 10m strongly bullish → no opinion, not conflict.
+        assert!(!drift_incoherent(dec!(200), dec!(-5), db));
+        assert!(!drift_incoherent(dec!(-5), dec!(200), db));
+        // Both flat → also fine.
+        assert!(!drift_incoherent(dec!(3), dec!(-3), db));
+        // Both meaningful and opposed → blocked.
+        assert!(drift_incoherent(dec!(200), dec!(-200), db));
+    }
+
+    #[test]
+    fn velocity_gate_is_directional() {
+        let db = velocity_deadband(ORACLE_347); // ~$2.55
+        // Falling price vetoes a bull entry but confirms a bear one.
+        assert!(velocity_opposes_entry(dec!(-10), true,  db));
+        assert!(!velocity_opposes_entry(dec!(-10), false, db));
+        // Rising price vetoes a bear entry but confirms a bull one.
+        assert!(velocity_opposes_entry(dec!(10), false, db));
+        assert!(!velocity_opposes_entry(dec!(10), true,  db));
+        // Inside the deadband nothing is vetoed, either way.
+        assert!(!velocity_opposes_entry(dec!(1), true,  db));
+        assert!(!velocity_opposes_entry(dec!(-1), false, db));
     }
 }

@@ -81,6 +81,30 @@ pub fn register_squadron_config_handle(squadron_id: &str, handle: Arc<RwLock<Dyn
     }
 }
 
+/// Squadron IDs that currently hold a live config handle — i.e. the squadrons the
+/// CAG actually has deployed right now.  This is the correct scope for any
+/// fleet-wide config apply (see the Setup risk-profile picker).
+///
+/// Deliberately NOT derived from the `squadron_configs` table: that table also
+/// retains a row per historical market rotation (916 dead `<asset>-hourly-<ts>`
+/// rows as of 2026-08), and writing to those would revive long-dead config and
+/// make the config-history diff unreadable.  The registry only ever contains
+/// squadrons a patrol loop is reading from, so it is both the smallest and the
+/// only meaningful target set.
+pub fn registered_squadron_ids() -> Vec<String> {
+    match squadron_config_registry().lock() {
+        Ok(reg) => {
+            let mut ids: Vec<String> = reg.keys().cloned().collect();
+            ids.sort();
+            ids
+        }
+        Err(_) => {
+            warn!("⚠️  Squadron config registry poisoned — cannot enumerate deployed squadrons");
+            Vec::new()
+        }
+    }
+}
+
 // ── serde default helpers ────────────────────────────────────────────────────
 // Required when adding new fields to DynamicConfig: old DB rows that were
 // serialized before the field existed will have it missing.  Without a default,
@@ -864,6 +888,23 @@ impl DynamicConfig {
 
     /// Apply a partial JSON patch to a squadron's config and persist.
     pub async fn apply_squadron_patch(squadron_id: &str, patch_json: &str) -> Result<Arc<Self>> {
+        Self::apply_squadron_patch_as(squadron_id, patch_json, "operator").await
+    }
+
+    /// Like [`Self::apply_squadron_patch`] but with explicit attribution for the
+    /// `config_history` trail (e.g. `"profile_conservative"` for a risk-profile
+    /// apply).
+    ///
+    /// Squadron patches were previously unaudited: a squadron-scoped change —
+    /// which is the ONLY kind that reaches a running patrol loop — left no trace,
+    /// while the equivalent global change recorded a full snapshot.  That made a
+    /// live config change effectively unrevertable.  Recording the pre-patch row
+    /// here restores parity with `save_as`.
+    pub async fn apply_squadron_patch_as(
+        squadron_id: &str,
+        patch_json: &str,
+        actor: &str,
+    ) -> Result<Arc<Self>> {
         let current = Self::load_for_squadron(squadron_id).await;
         let mut value = serde_json::to_value(current.as_ref())?;
         let patch: serde_json::Value = serde_json::from_str(patch_json)?;
@@ -875,6 +916,25 @@ impl DynamicConfig {
         }
 
         let updated: DynamicConfig = serde_json::from_value(value)?;
+
+        // Record the diff BEFORE overwriting so the change stays revertable.
+        // Keyed per squadron so the history view can tell which squadron moved.
+        if let Some(pool) = db::pool() {
+            match serde_json::to_string(&updated) {
+                Ok(new_json) => {
+                    let old_json = db::squadron_config_get(pool, squadron_id).await;
+                    db::record_config_change(
+                        pool,
+                        actor,
+                        &format!("squadron:{squadron_id}"),
+                        old_json.as_deref(),
+                        &new_json,
+                    ).await;
+                }
+                Err(e) => warn!("⚠️  Squadron config serialize error [{}]: {}", squadron_id, e),
+            }
+        }
+
         updated.save_for_squadron(squadron_id).await;
 
         // Push the merged config into the running squadron's live handle so the
@@ -892,7 +952,7 @@ impl DynamicConfig {
             }
         }
 
-        info!("⚙️  Squadron config hot-patched: {}", squadron_id);
+        info!("⚙️  Squadron config hot-patched: {} (by {})", squadron_id, actor);
         Ok(Arc::new(updated))
     }
 }

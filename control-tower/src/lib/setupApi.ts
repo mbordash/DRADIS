@@ -208,11 +208,40 @@ export interface ConfigProfile {
   values: Record<string, unknown>;
 }
 
-export function getProfiles(): Promise<{ schema_version: number; profiles: Record<string, ConfigProfile> }> {
+/** How far a profile apply reaches. See `ProfileScope` in src/api/setup.rs. */
+export type ProfileScope = 'global_only' | 'global_and_deployed';
+
+export interface ApplyProfileResult {
+  ok: boolean;
+  profile: string;
+  scope: ProfileScope;
+  fields_applied: number;
+  squadrons_applied: string[];
+  squadron_errors: { squadron: string; error: string }[];
+}
+
+export function getProfiles(): Promise<{
+  schema_version: number;
+  profiles: Record<string, ConfigProfile>;
+  /** Squadrons a `global_and_deployed` apply would touch, right now. */
+  deployed_squadrons: string[];
+}> {
   return request('/api/setup/profiles');
 }
 
-/** Apply a named profile to the live global config (audited, no restart). */
-export function applyProfile(name: string): Promise<{ ok: boolean; profile: string; fields_applied: number }> {
-  return request('/api/setup/profiles/apply', { method: 'POST', body: JSON.stringify({ name }) });
+/**
+ * Apply a named profile (audited, no restart).
+ *
+ * Defaults to `global_and_deployed`: a deployed squadron reads its own
+ * `squadron_configs` row, so a global-only apply would leave every running
+ * patrol loop on its old values.
+ */
+export function applyProfile(
+  name: string,
+  scope: ProfileScope = 'global_and_deployed',
+): Promise<ApplyProfileResult> {
+  return request('/api/setup/profiles/apply', {
+    method: 'POST',
+    body: JSON.stringify({ name, scope }),
+  });
 }

@@ -96,8 +96,13 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
   const base = startingBalance ?? 0;
   const reversedData = [...data].reverse();
 
-  // Birdeye-style: track hovered point to show value in header area
-  const [hoveredPoint, setHoveredPoint] = useState<{ time: string; totalValue: number; cash: number } | null>(null);
+  // Birdeye-style: track hovered point to show value in header area.
+  //
+  // Stores the active *index*, not the datum: recharts v3 dropped `activePayload`
+  // from the chart mouse-handler state (only activeTooltipIndex / activeLabel /
+  // isTooltipActive survive), so the index is the only handle back to the row.
+  // It is resolved against `chartDataWithMarkers` below.
+  const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
   // Custom marker tooltip — bypasses Recharts hit-area limitations
   type MarkerTipState = {
     kind: 'trade';
@@ -113,12 +118,10 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
 
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const handleMouseMove = useCallback((state: any) => {
-    if (state?.activePayload?.length) {
-      const p = state.activePayload[0]?.payload;
-      if (p?.totalValue !== undefined) setHoveredPoint({ time: p.time, totalValue: p.totalValue, cash: p.cash });
-    }
+    const idx = state?.activeTooltipIndex;
+    setHoveredIndex(state?.isTooltipActive && typeof idx === 'number' ? idx : null);
   }, []);
-  const handleMouseLeave = useCallback(() => setHoveredPoint(null), []);
+  const handleMouseLeave = useCallback(() => setHoveredIndex(null), []);
 
   const chartData = reversedData.map((row) => {
     const sessionPnl = parseFloat(row.session_pnl);
@@ -214,6 +217,9 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
     _tradeMarker:    tradeMarkerMap.get(point.ts),
     _positionMarker: positionMarkerMap.get(point.ts),
   }));
+
+  // Header readout follows the cursor; falls back to the latest point when idle.
+  const hoveredPoint = hoveredIndex !== null ? chartDataWithMarkers[hoveredIndex] ?? null : null;
 
   // For legend display (count)
   const tradeEvents = tradesInRange;

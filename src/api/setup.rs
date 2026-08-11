@@ -845,21 +845,59 @@ fn profiles_value() -> serde_json::Value {
 }
 
 /// GET /api/setup/profiles — profile metadata + full value sets (for preview).
+///
+/// Also reports the squadrons a `global_and_deployed` apply would touch, so the
+/// UI can name them in the confirmation instead of making the operator guess.
 async fn list_profiles() -> Response {
-    Json(profiles_value()).into_response()
+    let mut v = profiles_value();
+    if let Some(obj) = v.as_object_mut() {
+        obj.insert(
+            "deployed_squadrons".to_string(),
+            json!(crate::helpers::dynamic_config::registered_squadron_ids()),
+        );
+    }
+    Json(v).into_response()
+}
+
+/// How far a profile apply reaches.
+///
+/// A deployed squadron reads its config from its OWN `squadron_configs` row
+/// (`DynamicConfig::load_or_init_for_squadron`), and nothing in the CAG
+/// subscribes to the global config broadcast. So a global-only apply is
+/// invisible to every running patrol loop — which is why this defaults to
+/// `GlobalAndDeployed`.
+#[derive(Deserialize, Default, PartialEq, Eq, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+enum ProfileScope {
+    /// Global config only. Seeds squadrons deployed LATER; changes nothing running now.
+    GlobalOnly,
+    /// Global config plus every currently-deployed squadron (default).
+    #[default]
+    GlobalAndDeployed,
 }
 
 #[derive(Deserialize)]
 struct ApplyProfileRequest {
     name: String,
+    #[serde(default)]
+    scope: ProfileScope,
 }
 
-/// POST /api/setup/profiles/apply {"name":"balanced"}
+/// POST /api/setup/profiles/apply {"name":"balanced","scope":"global_and_deployed"}
 ///
-/// Merges the profile's values over the CURRENT global config, persists, and
-/// broadcasts so live strategies pick it up within one tick. Attribution in
-/// config_history is `profile_<name>` so the change is auditable/revertable.
+/// Applies the profile as a COMPLETE replacement of the runtime-tunable field
+/// set (profiles.json carries every such field), persists, and broadcasts so
+/// live strategies pick it up within one tick. Attribution in config_history is
+/// `profile_<name>` so the change is auditable/revertable.
+///
+/// The global write always happens — it is what `init_for_squadron` seeds future
+/// squadrons from. When scope is `global_and_deployed` (the default) the same
+/// values are then pushed into each deployed squadron's own config and live
+/// handle, because that — not the global row — is what a running patrol loop
+/// reads each tick.
 async fn apply_profile(Json(req): Json<ApplyProfileRequest>) -> Response {
+    use crate::helpers::dynamic_config::{self as dyncfg, DynamicConfig};
+
     let profiles = profiles_value();
     let Some(profile) = profiles["profiles"].get(&req.name) else {
         return (StatusCode::BAD_REQUEST,
@@ -867,22 +905,55 @@ async fn apply_profile(Json(req): Json<ApplyProfileRequest>) -> Response {
     };
     let patch = profile["values"].to_string();
 
-    let Some(tx) = crate::helpers::dynamic_config::global_config_tx() else {
+    let Some(tx) = dyncfg::global_config_tx() else {
         return (StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"error": "config broadcast not ready — try again shortly"}))).into_response();
     };
     let current = tx.borrow().clone();
     let actor = format!("profile_{}", req.name);
-    match crate::helpers::dynamic_config::DynamicConfig::apply_patch_as(&current, &patch, &actor).await {
-        Ok(new_cfg) => {
-            let fields = profile["values"].as_object().map(|o| o.len()).unwrap_or(0);
-            let _ = tx.send(new_cfg);
-            info!("🎛️ Setup: applied '{}' profile ({} fields) to global config", req.name, fields);
-            Json(json!({"ok": true, "profile": req.name, "fields_applied": fields})).into_response()
-        }
-        Err(e) => (StatusCode::INTERNAL_SERVER_ERROR,
+    let fields = profile["values"].as_object().map(|o| o.len()).unwrap_or(0);
+
+    let new_cfg = match DynamicConfig::apply_patch_as(&current, &patch, &actor).await {
+        Ok(cfg) => cfg,
+        Err(e) => return (StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": format!("profile apply failed: {e}")}))).into_response(),
+    };
+    let _ = tx.send(new_cfg);
+    info!("🎛️ Setup: applied '{}' profile ({} fields) to global config", req.name, fields);
+
+    // Fan out to the squadrons that are actually trading.
+    let mut squadrons_applied: Vec<String> = Vec::new();
+    let mut squadron_errors: Vec<serde_json::Value> = Vec::new();
+    if req.scope == ProfileScope::GlobalAndDeployed {
+        for sid in dyncfg::registered_squadron_ids() {
+            match DynamicConfig::apply_squadron_patch_as(&sid, &patch, &actor).await {
+                Ok(_) => squadrons_applied.push(sid),
+                Err(e) => {
+                    warn!("⚠️ Setup: profile '{}' failed on squadron '{}': {}", req.name, sid, e);
+                    squadron_errors.push(json!({"squadron": sid, "error": e.to_string()}));
+                }
+            }
+        }
+        info!("🎛️ Setup: profile '{}' fanned out to {} deployed squadron(s){}",
+              req.name, squadrons_applied.len(),
+              if squadron_errors.is_empty() { String::new() }
+              else { format!(", {} failed", squadron_errors.len()) });
     }
+
+    // Partial failure is reported explicitly rather than swallowed: a squadron
+    // that kept its old values is still trading on them.
+    let status = if squadron_errors.is_empty() { StatusCode::OK } else { StatusCode::MULTI_STATUS };
+    (status, Json(json!({
+        "ok": squadron_errors.is_empty(),
+        "profile": req.name,
+        "scope": match req.scope {
+            ProfileScope::GlobalOnly => "global_only",
+            ProfileScope::GlobalAndDeployed => "global_and_deployed",
+        },
+        "fields_applied": fields,
+        "squadrons_applied": squadrons_applied,
+        "squadron_errors": squadron_errors,
+    }))).into_response()
 }
 
 // ─── AI autonomy (LLM config-patch policy) ───────────────────────────────────

@@ -1105,6 +1105,28 @@ pub const CONVERGENCE_MIN_ENTRY_PRICE: Decimal = dec!(0.35);
 pub const CONVERGENCE_MAX_TOKEN_SPREAD_PCT: Decimal = dec!(0.12);
 
 pub const CONVERGENCE_EXHAUSTION_DRIFT_60M_PCT: Decimal = dec!(0.0025);
+
+/// Drift-coherence deadband, as a fraction of oracle price (2026-08-11).
+///
+/// Gates the 10m-vs-60m drift AGREEMENT check: a drift leg whose magnitude is
+/// below this counts as neutral (no opinion) rather than as a direction, so the
+/// coherence test only fires on two genuinely opposed moves. A SMALLER deadband
+/// blocks more entries (aggressive profile).
+///
+/// Calibrated against the 2026-08-11 pair: the winner (id 344) ran drift_10m
+/// -30.4 / drift_60m -16.4 (same sign, coherent -> passes), while the -13.6%
+/// loser (id 347) ran drift_10m +78.3 against drift_60m -361.8.
+pub const CONVERGENCE_DRIFT_COHERENCE_DEADBAND_PCT: Decimal = dec!(0.0007);
+
+/// Velocity-opposition deadband, as a fraction of oracle price (2026-08-11).
+///
+/// Blocks entry when the 5s oracle velocity runs AGAINST the intended side by
+/// more than this. Deliberately a deadband and not a "velocity must confirm"
+/// rule: `velocity` is 0 when the feed is flat or history is short, and the
+/// 2026-08-11 winner (id 344) entered at velocity exactly 0.00 — requiring
+/// positive confirmation would have blocked it. Only ACTIVE opposition vetoes.
+/// The loser (id 347) bought YES at velocity -4.01. (aggressive profile.)
+pub const CONVERGENCE_VELOCITY_OPPOSITION_PCT: Decimal = dec!(0.00006);
 pub const CONVERGENCE_SKIP_BAND_LOW: Decimal = dec!(0.50);
 pub const CONVERGENCE_SKIP_BAND_HIGH: Decimal = dec!(0.50);
 pub const CONVERGENCE_OBI_ADVERSE_BLOCK: Decimal = dec!(0.55); // 2026-06-30: block entry into adverse order-book imbalance
