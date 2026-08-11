@@ -1,3 +1,19 @@
+// SPDX-License-Identifier: AGPL-3.0-only
+//
+// DRADIS Control Tower — operator dashboard for the DRADIS trading engine.
+// Copyright (C) 2026 Michael Bordash
+//
+// This file is part of DRADIS. DRADIS is free software: you can redistribute it
+// and/or modify it under the terms of the GNU Affero General Public License,
+// version 3, as published by the Free Software Foundation.
+//
+// DRADIS is distributed in the hope that it will be useful, but WITHOUT ANY
+// WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR
+// A PARTICULAR PURPOSE. See the GNU Affero General Public License for details.
+//
+// You should have received a copy of the GNU Affero General Public License along
+// with this program. If not, see <https://www.gnu.org/licenses/>.
+
 import type { DynamicConfig, ConfigFieldSchema, PnlSnapshotRow, TradeRow, OpenPositionRow, LlmRecommendationRow, LlmActionRow, ViperDef, StatusResponse, PortfolioValue, SquadronSummary, TelemetrySnapshot, TelemetrySample } from './types';
 
 // In development, NEXT_PUBLIC_API_URL=http://localhost:9000 (set in .env.local)

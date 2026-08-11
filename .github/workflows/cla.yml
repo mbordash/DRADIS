@@ -1,0 +1,70 @@
+name: CLA
+
+# Contributor License Agreement check.
+#
+# DRADIS is dual-licensed: AGPL-3.0 for open-source use, commercial licenses on
+# request. Offering a commercial license requires the right to relicense every
+# line in the tree — including contributions from other people. A CLA is what
+# grants that right.
+#
+# This is why a DCO (Developer Certificate of Origin) is NOT sufficient here: a
+# DCO only certifies that a contributor had the right to submit their work under
+# the project's existing licence. It grants no right to relicense it under
+# different terms, so a DCO-only project cannot sell commercial licences that
+# cover contributed code.
+#
+# Uses contributor-assistant/github-action, the maintained successor to the
+# original cla-assistant action. Signatures are stored in this repository on a
+# dedicated `cla-signatures` branch, so there is no third-party service holding
+# the record.
+
+on:
+  issue_comment:
+    types: [created]
+  pull_request_target:
+    types: [opened, synchronize, reopened]
+
+# `pull_request_target` runs with a token that can write to this repository, so
+# keep the grants to exactly what the action needs. Note that this event checks
+# out the BASE of the pull request, never the contributor's code — the action
+# only reads metadata and comments, so a fork cannot use it to run code here.
+permissions:
+  actions: write
+  contents: write
+  pull-requests: write
+  statuses: write
+
+jobs:
+  cla:
+    runs-on: ubuntu-latest
+    # Only act on the signature phrase, or on real pull requests. Without this
+    # guard every comment on every issue would spin up a runner.
+    if: >-
+      (github.event.comment.body == 'recheck' ||
+       github.event.comment.body == 'I have read the CLA Document and I hereby sign the CLA') ||
+      github.event_name == 'pull_request_target'
+    steps:
+      - name: Check or record CLA signature
+        uses: contributor-assistant/github-action@v2.6.1
+        env:
+          # Provided automatically; used to comment on the pull request.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # A classic PAT with `repo` scope, stored as a repository secret.
+          # Required because the default GITHUB_TOKEN cannot push the signature
+          # file to a branch in a way that persists across forked pull requests.
+          PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_SIGNATURES_TOKEN }}
+        with:
+          path-to-signatures: 'signatures/cla.json'
+          path-to-document: 'https://github.com/mbordash/DRADIS/blob/main/docs/CLA.md'
+          branch: 'cla-signatures'
+          allowlist: 'mbordash,dependabot[bot],renovate[bot]'
+          custom-notsigned-prcomment: >-
+            Thanks for the pull request — this is the last bit of paperwork.
+
+            DRADIS is dual-licensed (AGPL-3.0 plus commercial licenses), which means
+            the project needs your permission to license your contribution under both.
+            Please read the [Contributor License Agreement](https://github.com/mbordash/DRADIS/blob/main/docs/CLA.md),
+            then post a comment on this pull request with exactly:
+          custom-pr-sign-comment: 'I have read the CLA Document and I hereby sign the CLA'
+          custom-allsigned-prcomment: '✅ All contributors have signed the CLA.'
+          lock-pullrequest-aftermerge: false

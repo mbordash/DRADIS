@@ -11,7 +11,7 @@
 ![Ollama](https://img.shields.io/badge/Ollama-LLM%20Advisor-blueviolet?logo=ollama&logoColor=white)
 ![Docker](https://img.shields.io/badge/Docker-compose-2496ED?logo=docker&logoColor=white)
 [![OpenClaw](https://img.shields.io/badge/OpenClaw-AI%20Integration-CC0000?logoColor=white)](https://openclaw.ai)
-![License](https://img.shields.io/badge/License-GPLv3-blue)
+[![License](https://img.shields.io/badge/License-AGPL%20v3-blue)](LICENSE)
 
 **WARNING**: This is **ALPHA** software. You will probably lose money. Start in GHOST mode and tune before going live. Make sure to regularly pull updates as our own LLM advises on config and Viper strategy impls daily.
 
@@ -809,3 +809,39 @@ The safe pattern: bump the suffix in `GBOOST_MODEL_PATH` (e.g. `v14f` → `v15f`
 | Build/maintain cost  | Significant                                               | Zero — `GHOST_MODE = true` in `config.rs`  |
 
 Workflow: ghost overnight → `tools/session_parser.py` → tune `config.rs` → repeat until positive expectancy.
+
+---
+
+## License
+
+DRADIS is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
+The full text is in [LICENSE](LICENSE).
+
+You are free to use, study, modify, and redistribute this software under the terms
+of the AGPL. In return, the AGPL requires that anyone who receives the software —
+**including users who interact with a modified version over a network** — is offered
+the complete corresponding source code of that version under the same license.
+
+That network clause (AGPL §13) is the practical difference from the GPL. If you run
+a modified DRADIS as a hosted or SaaS product, you must make your modified source
+available to its users, even though you never distribute a binary.
+
+### Commercial licensing
+
+The AGPL is not suitable for every deployment. If you want to:
+
+- run DRADIS or a derivative as a **hosted / SaaS product** without publishing your changes,
+- **embed** it in a proprietary trading system or closed-source product, or
+- obtain it under terms **other than the AGPL** for any other reason,
+
+a separate commercial license is available. Contact **starbuck@dradis.live** with
+a short description of your intended use.
+
+Dual licensing is possible because the project's contributions are covered by a
+Contributor License Agreement — see [CONTRIBUTING.md](CONTRIBUTING.md).
+
+### Contributing
+
+Pull requests are welcome. Contributors are asked to sign the
+[Contributor License Agreement](docs/CLA.md) once; the CLA bot will prompt
+automatically on your first pull request.
