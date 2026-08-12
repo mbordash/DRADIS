@@ -2,8 +2,8 @@
 
 **Version 1.0**
 
-Thank you for your interest in DRADIS (the "Project"), maintained by Michael
-Bordash (the "Maintainer"). This agreement clarifies the intellectual property
+Thank you for your interest in DRADIS (the "Project"), maintained by Fraud Monitor, LLC
+(the "Maintainer"). This agreement clarifies the intellectual property
 rights granted with Contributions from any person or entity. It protects both
 you and the Maintainer; it does **not** change your right to use your own
 Contributions for any other purpose.
@@ -110,4 +110,4 @@ Your GitHub username, the date, and the pull request are recorded in
 `signatures/cla.json` on the `cla-signatures` branch. You only need to sign
 once; subsequent pull requests are checked against that record automatically.
 
-Questions about this agreement: **michaelbordash@gmail.com**
+Questions about this agreement: **starbuck@dradis.live**

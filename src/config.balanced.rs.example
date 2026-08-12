@@ -263,6 +263,43 @@ pub const MAKER_TOXIC_FLOW_EXIT_OBI: Decimal = dec!(-0.50);
 /// Balanced: 3-minute re-entry lockout.
 pub const MAKER_TOXIC_REENTRY_COOLDOWN_SECS: i64 = 180;
 
+// ── ToxicFill confirmation gates ────────────────────────────────────────────
+// Applied ONLY to a confirmed fill; an unfilled resting quote is still pulled
+// instantly. Without them the exit fires on the OBI dip caused by our own quote
+// being lifted, paying the spread to realize a loss price has not inflicted.
+
+/// Minimum seconds held before ToxicFill may fire.
+/// Balanced: 30s — covers the window dominated by our own vanished quote.
+pub const MAKER_TOXIC_MIN_HOLD_SECS: i64 = 30;
+
+/// Bid must be at least this fraction below avg entry for ToxicFill to fire.
+/// Balanced: 2% ≈ 1 tick at a $0.40 entry — the smallest non-flicker move.
+pub const MAKER_TOXIC_MIN_ADVERSE_PCT: Decimal = dec!(0.02);
+
+/// Consecutive OBI breaches required before ToxicFill fires.
+/// Balanced: 3 ticks — sub-second confirmation at the 50ms patrol tick.
+pub const MAKER_TOXIC_OBI_CONFIRM_TICKS: u32 = 3;
+
+// ── Resting maker exit ──────────────────────────────────────────────────────
+// Post a post-only GTC ASK against a filled position so it exits by being
+// lifted (spread capture) rather than crossing back to the bid. FAK-at-bid
+// still handles stops, ToxicFill and the near-expiry flatten.
+
+/// Master switch for the resting-ask maker exit.
+pub const MAKER_RESTING_EXIT_ENABLED: bool = true;
+
+/// Price floor for the resting ask, as a fraction over avg entry.
+/// Balanced: 4% — clears round-trip costs with room, below the bid-based TP.
+pub const MAKER_RESTING_EXIT_MIN_EDGE_PCT: Decimal = dec!(0.04);
+
+/// Ticks to undercut the best ask by when posting the resting exit.
+/// Balanced: 1 — one tick buys a materially higher fill probability.
+pub const MAKER_RESTING_EXIT_ASK_IMPROVEMENT_TICKS: i64 = 1;
+
+/// Minimum price change before an existing resting ask is repriced.
+/// Balanced: 2¢ — keeps queue priority through ordinary book flicker.
+pub const MAKER_RESTING_EXIT_REPRICE_THRESHOLD: Decimal = dec!(0.02);
+
 pub const MAKER_SLOW_TREND_THRESHOLD_BTC: Decimal = dec!(300.0); // legacy — not used in logic
 /// Slow trend threshold as fraction of oracle price.
 /// 0.003 = 0.30% of price. Balanced: at BTC=$100k → $300.
@@ -695,6 +732,13 @@ pub const FAIRVALUE_MIN_ABS_SIGMA: f64 = 0.35;
 pub const FAIRVALUE_MIN_ENTRY_PRICE: Decimal = dec!(0.10);
 pub const FAIRVALUE_MAX_ENTRY_PRICE: Decimal = dec!(0.985);
 pub const FAIRVALUE_MIN_SECS_TO_EXPIRY: i64 = 90;
+
+/// Prefer the HOURLY market over the Window/Daily maker venue for entries.
+/// The required edge scales with horizon and is capped at
+/// FAIRVALUE_EDGE_HORIZON_CAP, so on the daily venue the requirement pins at the
+/// cap (0.25) — a mispricing that does not occur on a liquid book. The hourly
+/// taper lands where real edges live. False restores daily-first ordering.
+pub const FAIRVALUE_PREFER_HOURLY: bool = true;
 pub const FAIRVALUE_VOL_SAMPLE_SECS: u64 = 15;
 pub const FAIRVALUE_VOL_WINDOW_SECS: u64 = 3600;
 pub const FAIRVALUE_MIN_VOL_SAMPLES: usize = 40;

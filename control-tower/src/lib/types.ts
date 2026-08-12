@@ -38,6 +38,7 @@ export interface DynamicConfig {
   fairvalue_base_edge:         string;
   fairvalue_min_edge:          string;
   fairvalue_min_entry_price:   string;
+  fairvalue_prefer_hourly:     boolean;
   fairvalue_max_entry_price:   string;
   fairvalue_target_profit_pct: string;
   fairvalue_stop_loss_pct:     string;
@@ -96,6 +97,14 @@ export interface DynamicConfig {
   maker_max_book_imbalance_ratio: string;
   maker_min_secs_to_expiry:      number;
   maker_toxic_flow_exit_obi:     string;
+  maker_toxic_reentry_cooldown_secs: number;
+  maker_toxic_min_hold_secs:     number;
+  maker_toxic_min_adverse_pct:   string;
+  maker_toxic_obi_confirm_ticks: number;
+  maker_resting_exit_enabled:    boolean;
+  maker_resting_exit_min_edge_pct: string;
+  maker_resting_exit_ask_improvement_ticks: number;
+  maker_resting_exit_reprice_threshold: string;
 
   // Basis Viper
   basis_max_exposure_usdc: string;

@@ -25,9 +25,18 @@
 /// Trade Velocity / Taker-Flow Filter (Phase 9):
 ///   - evaluate_entry tracks bid-depth drain over a 1.5s window to suppress new
 ///     maker bids when takers are actively sweeping one side of the book.
-///   - evaluate_exit fires an accelerated "ToxicFill" exit whenever an open
-///     position's book OBI falls below MAKER_TOXIC_FLOW_EXIT_OBI, meaning
-///     the ask side has grown 3× larger than the bid side — a book turn.
+///   - evaluate_exit reacts to an open position's book OBI falling below
+///     MAKER_TOXIC_FLOW_EXIT_OBI, meaning the ask side has grown much larger
+///     than the bid side — a book turn. The reaction is asymmetric by design:
+///       * an UNFILLED resting quote is pulled immediately (cancelling is free);
+///       * a CONFIRMED FILL additionally requires MAKER_TOXIC_MIN_HOLD_SECS,
+///         a real adverse price move of MAKER_TOXIC_MIN_ADVERSE_PCT, and
+///         MAKER_TOXIC_OBI_CONFIRM_TICKS consecutive breaches before exiting.
+///     Without those confirmations the exit fires on the OBI dip caused by our
+///     OWN quote being lifted and pays the spread to realize a loss the market
+///     has not inflicted — historically the strategy's single largest cost.
+///     Genuine collapses inside the confirmation window are still cut by the
+///     ungated catastrophic floor (MAKER_CATASTROPHIC_SL_MULT).
 
 use async_trait::async_trait;
 use anyhow::Result;
@@ -43,7 +52,7 @@ use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
 use crate::venues::core::TimeInForce;
-use crate::helpers::price::floor_to_tick_size;
+use crate::helpers::price::{ceil_to_tick_size, floor_to_tick_size};
 // Import OrderType
 
 /// Tracks bid-depth at the previous evaluation tick for drain-rate computation.
@@ -204,6 +213,76 @@ fn maker_toxic_log_permitted(token_id: &str) -> bool {
     }
 }
 
+/// Process-global consecutive-OBI-breach counter per token, backing the
+/// `MAKER_TOXIC_OBI_CONFIRM_TICKS` gate.  Global for the same rotation-survival
+/// reason as the trackers above.
+fn maker_toxic_obi_streaks() -> &'static std::sync::Mutex<HashMap<String, u32>> {
+    static REG: std::sync::OnceLock<std::sync::Mutex<HashMap<String, u32>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(HashMap::new()))
+}
+
+/// Record this tick's OBI verdict for `token_id` and return the resulting run
+/// length of CONSECUTIVE breaches.  A non-breaching tick resets the streak to 0,
+/// so a book that flickers back to healthy has to start the count over — the
+/// same "must qualify continuously" discipline the entry gates use
+/// (`maker_gate_streak_secs`).
+fn maker_toxic_obi_streak(token_id: &str, breached: bool) -> u32 {
+    let mut reg = match maker_toxic_obi_streaks().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if !breached {
+        reg.remove(token_id);
+        return 0;
+    }
+    let n = reg.entry(token_id.to_string()).or_insert(0);
+    *n = n.saturating_add(1);
+    *n
+}
+
+/// Drop any breach streak for `token_id` (position closed, or quote replaced).
+fn clear_maker_toxic_obi_streak(token_id: &str) {
+    let mut reg = match maker_toxic_obi_streaks().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.remove(token_id);
+}
+
+/// Price the resting post-only ASK for a filled maker position, or `None` when
+/// no valid ask can rest right now.
+///
+/// The price is the MORE PROFITABLE of two candidates:
+///   * `ask − improvement` — undercut the book to take queue priority, and
+///   * `entry × (1 + min_edge)` — the floor, so a spread that collapses after
+///     the fill can never drag the exit down to a scratch.
+///
+/// Rounding is UP (`ceil_to_tick_size`), the sell-side mirror of the bid path's
+/// floor-rounding: rounding a sell DOWN would both give away edge and risk
+/// crossing. Returns `None` when the result would sit at or below the best bid
+/// (a post-only sell there crosses the book and is rejected) or at/above $1.
+fn resting_exit_price(
+    bid: Decimal,
+    ask: Decimal,
+    avg_entry: Decimal,
+    min_edge_pct: Decimal,
+    ask_improvement_ticks: i64,
+) -> Option<Decimal> {
+    if avg_entry <= dec!(0) {
+        return None;
+    }
+    let tick = dec!(0.01);
+    let improvement = Decimal::from(ask_improvement_ticks.max(0)) * tick;
+    let floor_price = avg_entry * (dec!(1) + min_edge_pct);
+    let price = ceil_to_tick_size((ask - improvement).max(floor_price));
+
+    if price <= bid || price >= dec!(1.00) {
+        return None;
+    }
+    Some(price)
+}
+
 /// Returns true if `token_id` is still within its post-ToxicFill re-entry cooldown
 /// (i.e. fewer than `cooldown_secs` have elapsed since the last toxic exit).  A
 /// non-positive `cooldown_secs` disables the gate.  Expired entries are pruned on read.
@@ -307,6 +386,72 @@ impl MakerStrategyImpl {
             last_quote_log: Mutex::new(None),
             last_horizon_log: Mutex::new(None),
         }
+    }
+
+    /// Build the resting post-only ASK for a healthy, filled maker position, or
+    /// `None` when one should not rest right now.
+    ///
+    /// Price = the more profitable of (best_ask − improvement) and the floor
+    /// (entry × (1 + min_edge)), so a collapsing spread can never drag the exit
+    /// down to a scratch.  Returning a signal every tick is intentional and safe:
+    /// the consumer is idempotent (place / reprice past the deadband / no-op).
+    fn resting_exit_signal(
+        &self,
+        market: &crate::state::MarketConfig,
+        snapshot: &crate::state::MarketSnapshot,
+        position: &crate::state::Position,
+        token_id: &crate::venues::core::MarketId,
+        secs_to_expiry: i64,
+        dc: &crate::helpers::dynamic_config::DynamicConfig,
+    ) -> Option<StrategySignal> {
+        if !dc.maker_resting_exit_enabled {
+            return None;
+        }
+        // Only a CONFIRMED fill owns shares that can back a sell order.
+        position.fill_confirmed_at?;
+        if position.shares < config::MIN_ORDER_SHARES || position.avg_entry <= dec!(0) {
+            return None;
+        }
+        // Never leave shares committed to a resting ask as the market runs into
+        // resolution — inside this window the near-expiry guard wants a certain,
+        // immediate flatten, and an open sell order would lock the shares away
+        // from it.
+        if secs_to_expiry < dc.maker_min_secs_to_expiry {
+            return None;
+        }
+
+        let is_yes = *token_id == market.yes_token;
+        let (bid, ask) = if is_yes {
+            (snapshot.yes_bid, snapshot.yes_ask)
+        } else {
+            (snapshot.no_bid, snapshot.no_ask)
+        };
+
+        let price = resting_exit_price(
+            bid, ask, position.avg_entry,
+            dc.maker_resting_exit_min_edge_pct,
+            dc.maker_resting_exit_ask_improvement_ticks,
+        )?;
+
+        Some(StrategySignal::MakerRestingExit {
+            params: OrderParams {
+                token_id: token_id.clone(),
+                price,
+                shares: position.shares,
+                fee_bps: if is_yes { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
+                is_neg_risk: market.is_neg_risk,
+                market_name: market.market_name.clone(),
+                condition_id: market.condition_id.clone(),
+                order_type: TimeInForce::Gtc,
+                post_only: true,
+                ghost_mode: dc.ghost_mode,
+            },
+            reason: format!(
+                "MakerRestingExit: ask=${:.4} entry=${:.4} edge={:.2}%",
+                price, position.avg_entry,
+                (price - position.avg_entry) / position.avg_entry * dec!(100)
+            ),
+        })
     }
 
     /// Throttled gate-rejection logger.  `key` is a STABLE category (no live
@@ -802,6 +947,7 @@ impl Strategy for MakerStrategyImpl {
                 let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id.clone())) else {
                     // No quote/position on this token — drop any stale drift baseline.
                     clear_maker_quote_oracle_baseline(token_id.as_str());
+                    clear_maker_toxic_obi_streak(token_id.as_str());
                     continue;
                 };
 
@@ -842,37 +988,95 @@ impl Strategy for MakerStrategyImpl {
                     (bid_depth - ask_depth) / total_depth
                 } else { dec!(0) };
 
-                if obi < dc.maker_toxic_flow_exit_obi {
-                    arm_maker_toxic_cooldown(token_id.as_str());
-                    clear_maker_quote_oracle_baseline(token_id.as_str());
-                    if position.fill_confirmed_at.is_some() {
-                        if maker_toxic_log_permitted(token_id.as_str()) {
-                            tracing::info!(
-                                "⚡ Maker ToxicFill exit triggered: OBI={:.2} (threshold={:.2}) | bid=${:.4} | re-entry locked {}s",
-                                obi, dc.maker_toxic_flow_exit_obi, bid, dc.maker_toxic_reentry_cooldown_secs
-                            );
-                        }
-                        return Ok(StrategySignal::Exit {
-                            params: OrderParams {
-                                token_id: token_id.clone(),
-                                price: bid,
-                                shares: position.shares,
-                                fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
-                                is_neg_risk: market.is_neg_risk,
-                                market_name: market.market_name.clone(),
-                                condition_id: market.condition_id.clone(),
-                                order_type: TimeInForce::Fak,
-                                post_only: false,
-                                ghost_mode: dc.ghost_mode,
-                            },
-                            reason: format!("ToxicFill: OBI={:.2} (book turned adverse)", obi),
-                            exit_pair: false,
-                        });
-                    } else {
-                        // Unfilled resting quote sitting in a toxic book → pull it.
+                let breached = obi < dc.maker_toxic_flow_exit_obi;
+
+                // ── UNFILLED resting quote: pull instantly on any breach ──────
+                // Cancelling a quote that has not filled costs nothing and risks
+                // nothing, so this half of the mechanism stays as eager as it has
+                // always been. Only the FILLED path below is gated.
+                if position.fill_confirmed_at.is_none() {
+                    if breached {
+                        arm_maker_toxic_cooldown(token_id.as_str());
+                        clear_maker_quote_oracle_baseline(token_id.as_str());
+                        clear_maker_toxic_obi_streak(token_id.as_str());
                         pull_tokens.push(token_id.clone());
                     }
+                    continue;
                 }
+
+                // ── CONFIRMED FILL: require all three confirmations ───────────
+                // See MAKER_TOXIC_* in config.rs. Track the streak on EVERY tick
+                // (including non-breaching ones, which reset it) so the counter
+                // reflects consecutive breaches rather than cumulative ones.
+                let obi_streak = maker_toxic_obi_streak(token_id.as_str(), breached);
+                if !breached {
+                    continue;
+                }
+
+                let held_secs = position.fill_confirmed_at
+                    .map(|t| (Utc::now() - t).num_seconds())
+                    .unwrap_or(0);
+                let adverse_pct = if position.avg_entry > dec!(0) {
+                    (position.avg_entry - bid) / position.avg_entry
+                } else {
+                    dec!(0)
+                };
+                let confirm_ticks = dc.maker_toxic_obi_confirm_ticks.max(1);
+
+                let hold_ok   = held_secs >= dc.maker_toxic_min_hold_secs;
+                let price_ok  = adverse_pct >= dc.maker_toxic_min_adverse_pct;
+                let streak_ok = obi_streak >= confirm_ticks;
+
+                if !(hold_ok && price_ok && streak_ok) {
+                    // Held deliberately. The book looks hostile but at least one
+                    // confirmation is missing, so exiting here would pay the
+                    // spread to realize a loss the price has not yet inflicted.
+                    if maker_toxic_log_permitted(token_id.as_str()) {
+                        let blocker = if !hold_ok {
+                            format!("min_hold {}s/{}s", held_secs, dc.maker_toxic_min_hold_secs)
+                        } else if !price_ok {
+                            format!("adverse {:.2}% < {:.2}%",
+                                    adverse_pct * dec!(100), dc.maker_toxic_min_adverse_pct * dec!(100))
+                        } else {
+                            format!("obi_confirm {}/{} ticks", obi_streak, confirm_ticks)
+                        };
+                        tracing::info!(
+                            "🔒 Maker ToxicFill held: OBI={:.2} (threshold={:.2}) | bid=${:.4} entry=${:.4} | {}",
+                            obi, dc.maker_toxic_flow_exit_obi, bid, position.avg_entry, blocker
+                        );
+                    }
+                    continue;
+                }
+
+                arm_maker_toxic_cooldown(token_id.as_str());
+                clear_maker_quote_oracle_baseline(token_id.as_str());
+                clear_maker_toxic_obi_streak(token_id.as_str());
+                if maker_toxic_log_permitted(token_id.as_str()) {
+                    tracing::info!(
+                        "⚡ Maker ToxicFill exit triggered: OBI={:.2} (threshold={:.2}, confirmed {} ticks) | bid=${:.4} adverse={:.2}% held={}s | re-entry locked {}s",
+                        obi, dc.maker_toxic_flow_exit_obi, obi_streak, bid,
+                        adverse_pct * dec!(100), held_secs, dc.maker_toxic_reentry_cooldown_secs
+                    );
+                }
+                return Ok(StrategySignal::Exit {
+                    params: OrderParams {
+                        token_id: token_id.clone(),
+                        price: bid,
+                        shares: position.shares,
+                        fee_bps: if token_id == market.yes_token { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
+                        is_neg_risk: market.is_neg_risk,
+                        market_name: market.market_name.clone(),
+                        condition_id: market.condition_id.clone(),
+                        order_type: TimeInForce::Fak,
+                        post_only: false,
+                        ghost_mode: dc.ghost_mode,
+                    },
+                    reason: format!(
+                        "ToxicFill: OBI={:.2} adverse={:.2}% held={}s (book turned adverse)",
+                        obi, adverse_pct * dec!(100), held_secs
+                    ),
+                    exit_pair: false,
+                });
             }
             if !pull_tokens.is_empty() {
                 tracing::info!(
@@ -884,6 +1088,9 @@ impl Strategy for MakerStrategyImpl {
         }
 
         let pos_map = ctx.positions.lock().await;
+
+        // Deferred until after the loop so a hard exit on either leg wins.
+        let mut resting_exit: Option<StrategySignal> = None;
 
         for token_id in [market.yes_token.clone(), market.no_token.clone()] {
             let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id.clone())) else {
@@ -966,6 +1173,21 @@ impl Strategy for MakerStrategyImpl {
                     exit_pair: false,
                 });
             }
+
+            // ── Resting maker exit (spread capture) ───────────────────────────
+            // This token survived every hard-exit check, so the position is
+            // healthy and its natural way out is to be LIFTED at the ask rather
+            // than to cross back to the bid. Only RECORD the candidate here —
+            // returning it immediately would let a healthy YES leg preempt a
+            // stop-loss still pending on the NO leg, since the hard exits above
+            // are evaluated per token inside this same loop.
+            if resting_exit.is_none() {
+                resting_exit = self.resting_exit_signal(market, snapshot, position, &token_id, secs_to_expiry, dc);
+            }
+        }
+
+        if let Some(signal) = resting_exit {
+            return Ok(signal);
         }
 
         Ok(StrategySignal::NoSignal)
@@ -1013,5 +1235,132 @@ mod toxic_cooldown_tests {
         // and is pruned on read. Use cooldown_secs so small it is already expired.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert!(!maker_toxic_cooldown_active(tok, 1));
+    }
+}
+
+#[cfg(test)]
+mod resting_exit_price_tests {
+    use super::resting_exit_price;
+    use rust_decimal_macros::dec;
+
+    // Balanced-profile defaults.
+    const EDGE: rust_decimal::Decimal = dec!(0.04);
+    const IMPROVE: i64 = 1;
+
+    #[test]
+    fn undercuts_the_ask_by_one_tick_on_a_wide_book() {
+        // The 2026-08-12 loss #1 book: filled NO @ 0.41 with the ask at 0.46.
+        // Resting at 0.45 exits +9.8% by being LIFTED, where the old path
+        // crossed to the 0.39 bid for −7.3%.
+        let p = resting_exit_price(dec!(0.39), dec!(0.46), dec!(0.41), EDGE, IMPROVE);
+        assert_eq!(p, Some(dec!(0.45)));
+    }
+
+    #[test]
+    fn floor_wins_when_the_spread_collapses() {
+        // Ask crushed to 0.42: undercutting would rest at 0.41 — a scratch on a
+        // 0.41 entry. The floor holds the ask up at entry × 1.04 = 0.4264 → 0.43.
+        let p = resting_exit_price(dec!(0.40), dec!(0.42), dec!(0.41), EDGE, IMPROVE);
+        assert_eq!(p, Some(dec!(0.43)));
+    }
+
+    #[test]
+    fn rounds_the_floor_up_never_down() {
+        // entry 0.41 × 1.04 = 0.4264. Rounding DOWN to 0.42 would silently sell
+        // below the configured minimum edge.
+        let p = resting_exit_price(dec!(0.10), dec!(0.20), dec!(0.41), EDGE, IMPROVE);
+        assert_eq!(p, Some(dec!(0.43)));
+    }
+
+    #[test]
+    fn none_when_the_ask_would_cross_the_bid() {
+        // A post-only sell at or below the bid is rejected by the exchange, so
+        // there is nothing to place: bid 0.44 has already run past the 0.43 floor.
+        let p = resting_exit_price(dec!(0.44), dec!(0.45), dec!(0.41), EDGE, IMPROVE);
+        assert_eq!(p, None);
+    }
+
+    #[test]
+    fn none_at_or_above_one_dollar() {
+        let p = resting_exit_price(dec!(0.90), dec!(1.00), dec!(0.99), EDGE, IMPROVE);
+        assert_eq!(p, None);
+    }
+
+    #[test]
+    fn zero_improvement_joins_the_ask() {
+        let p = resting_exit_price(dec!(0.39), dec!(0.46), dec!(0.41), EDGE, 0);
+        assert_eq!(p, Some(dec!(0.46)));
+    }
+
+    #[test]
+    fn negative_improvement_is_clamped_to_zero() {
+        // A negative tick count must never push the ask UP past the book.
+        let p = resting_exit_price(dec!(0.39), dec!(0.46), dec!(0.41), EDGE, -3);
+        assert_eq!(p, Some(dec!(0.46)));
+    }
+
+    #[test]
+    fn none_on_a_zero_entry_price() {
+        let p = resting_exit_price(dec!(0.39), dec!(0.46), dec!(0), EDGE, IMPROVE);
+        assert_eq!(p, None);
+    }
+
+    #[test]
+    fn resting_price_always_beats_crossing_to_the_bid() {
+        // The invariant that justifies the whole feature: whenever an ask can
+        // rest, it exits strictly better than the FAK-at-bid path it replaces.
+        for (bid, ask, entry) in [
+            (dec!(0.39), dec!(0.46), dec!(0.41)),
+            (dec!(0.40), dec!(0.42), dec!(0.41)),
+            (dec!(0.30), dec!(0.38), dec!(0.32)),
+            (dec!(0.55), dec!(0.62), dec!(0.57)),
+        ] {
+            if let Some(p) = resting_exit_price(bid, ask, entry, EDGE, IMPROVE) {
+                assert!(p > bid, "resting ask {p} must beat the bid {bid}");
+                assert!(p >= entry, "resting ask {p} must not book a loss on entry {entry}");
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod toxic_obi_streak_tests {
+    use super::{clear_maker_toxic_obi_streak, maker_toxic_obi_streak};
+
+    #[test]
+    fn consecutive_breaches_accumulate() {
+        let tok = "test_tok_streak_accum";
+        assert_eq!(maker_toxic_obi_streak(tok, true), 1);
+        assert_eq!(maker_toxic_obi_streak(tok, true), 2);
+        assert_eq!(maker_toxic_obi_streak(tok, true), 3);
+        clear_maker_toxic_obi_streak(tok);
+    }
+
+    #[test]
+    fn a_healthy_tick_resets_the_streak() {
+        // This is the whole point of the gate: a book that flickers back to
+        // healthy has to earn the confirmation count again from zero, so the
+        // single-tick OBI dip caused by our own fill can never reach the
+        // threshold on its own.
+        let tok = "test_tok_streak_reset";
+        assert_eq!(maker_toxic_obi_streak(tok, true), 1);
+        assert_eq!(maker_toxic_obi_streak(tok, true), 2);
+        assert_eq!(maker_toxic_obi_streak(tok, false), 0);
+        assert_eq!(maker_toxic_obi_streak(tok, true), 1);
+        clear_maker_toxic_obi_streak(tok);
+    }
+
+    #[test]
+    fn clearing_drops_the_streak() {
+        let tok = "test_tok_streak_clear";
+        assert_eq!(maker_toxic_obi_streak(tok, true), 1);
+        clear_maker_toxic_obi_streak(tok);
+        assert_eq!(maker_toxic_obi_streak(tok, true), 1);
+        clear_maker_toxic_obi_streak(tok);
+    }
+
+    #[test]
+    fn unknown_token_starts_at_zero() {
+        assert_eq!(maker_toxic_obi_streak("test_tok_streak_unknown", false), 0);
     }
 }

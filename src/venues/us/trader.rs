@@ -1125,6 +1125,14 @@ async fn dispatch_signal(
             }
             acted
         }
+        // The resting maker exit (post-only ask against a filled position) is
+        // implemented only on the intl CLOB patrol loop, which owns the order
+        // record, reprice, cancel-before-stop and fill-detection machinery it
+        // requires. Ignoring it here is safe and lossless: the maker simply keeps
+        // its historical bid-based take-profit, which is what this venue did
+        // before the signal existed. `MakerStrategy` re-emits it every tick, so
+        // there is nothing to queue or replay if this venue later implements it.
+        StrategySignal::MakerRestingExit { .. } => false,
         StrategySignal::Exit { params, reason, exit_pair } => {
             info!("🚪 [{strategy_name}] exit ({reason}): {} @ {:.4}", params.token_id, params.price);
             // Snapshot the entry BEFORE the sell so the round-trip can be booked

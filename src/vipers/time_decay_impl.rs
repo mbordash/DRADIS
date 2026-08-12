@@ -66,6 +66,51 @@ use crate::venues::core::TimeInForce;
 
 const STRATEGY_NAME: &str = "TimeDecayStrategy";
 
+/// Throttle for the gate-rejection log line: `asset → (last reason, logged at)`.
+///
+/// Process-global rather than a field on the strategy for the same reason as the
+/// maker's trackers — patrol rebuilds every strategy object on each market
+/// rotation, which would reset per-instance state every hour and turn a throttled
+/// line into an hourly repeat.
+fn time_decay_gate_log_state()
+    -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>
+{
+    static REG: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (String, std::time::Instant)>>
+    > = std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// True when this gate rejection should be logged: the blocking reason CHANGED,
+/// or the interval elapsed since the last emit for the same reason.
+///
+/// TimeDecay previously reported gate reasons ONLY to the in-memory
+/// `viper_status` registry, which is a live snapshot with no history. That made
+/// its idleness unexplainable after the fact: the strategy is the only
+/// consistently profitable viper yet has entered 3 times ever, and nothing on
+/// disk said which of its five conjunctive gates was doing the blocking. Logging
+/// on change keeps the volume near zero on a steady book while still recording
+/// every transition — which is what makes a widening experiment measurable.
+fn time_decay_gate_log_permitted(asset: &str, reason: &str) -> bool {
+    let reg = time_decay_gate_log_state();
+    let mut reg = match reg.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match reg.get(asset) {
+        Some((prev, at))
+            if prev == reason
+                && at.elapsed().as_secs() < config::TIME_DECAY_GATE_LOG_INTERVAL_SECS =>
+        {
+            false
+        }
+        _ => {
+            reg.insert(asset.to_string(), (reason.to_string(), std::time::Instant::now()));
+            true
+        }
+    }
+}
+
 pub struct TimeDecayStrategyImpl;
 
 #[async_trait]
@@ -73,8 +118,15 @@ impl Strategy for TimeDecayStrategyImpl {
     async fn evaluate_entry(&self, ctx: &StrategyContext) -> Result<StrategySignal> {
         let dc = &ctx.dynamic_config; // hot-reloadable snapshot for this tick
 
-        // "Why no trades?" registry feed (GET /api/vipers/status).
-        let idle = |r: &str| crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), r);
+        // "Why no trades?" registry feed (GET /api/vipers/status) plus a throttled
+        // log line so the blocking gate is recoverable from history, not just from
+        // a live snapshot — see `time_decay_gate_log_permitted`.
+        let idle = |r: &str| {
+            crate::helpers::viper_status::report_reason(&ctx.crypto_filter, &self.name(), r);
+            if time_decay_gate_log_permitted(&ctx.crypto_filter, r) {
+                tracing::info!("🔒 TimeDecay gate: {}", r);
+            }
+        };
         if !dc.enable_time_decay {
             idle("disabled in config");
             return Ok(StrategySignal::NoSignal);
@@ -370,4 +422,40 @@ pub struct TimeDecayPosition { pub yes_token_id: MarketId, pub no_token_id: Mark
 impl TimeDecayPosition {
     pub fn time_to_expiry(&self) -> i64 { (self.expiry_time - Utc::now()).num_seconds() }
     pub fn is_expired(&self) -> bool { self.time_to_expiry() <= 0 }
+}
+
+#[cfg(test)]
+mod gate_log_throttle_tests {
+    use super::time_decay_gate_log_permitted;
+
+    #[test]
+    fn first_rejection_for_an_asset_logs() {
+        assert!(time_decay_gate_log_permitted("tdtest_first", "outside theta window"));
+    }
+
+    #[test]
+    fn same_reason_repeats_are_suppressed() {
+        let a = "tdtest_repeat";
+        assert!(time_decay_gate_log_permitted(a, "snapshot stale"));
+        assert!(!time_decay_gate_log_permitted(a, "snapshot stale"));
+        assert!(!time_decay_gate_log_permitted(a, "snapshot stale"));
+    }
+
+    #[test]
+    fn a_changed_reason_always_logs_immediately() {
+        // The transition is the whole signal — it is what says which gate took
+        // over as the binding constraint, so it must never be throttled away.
+        let a = "tdtest_change";
+        assert!(time_decay_gate_log_permitted(a, "outside theta window"));
+        assert!(!time_decay_gate_log_permitted(a, "outside theta window"));
+        assert!(time_decay_gate_log_permitted(a, "underlying moving too fast"));
+        assert!(!time_decay_gate_log_permitted(a, "underlying moving too fast"));
+        assert!(time_decay_gate_log_permitted(a, "outside theta window"));
+    }
+
+    #[test]
+    fn assets_throttle_independently() {
+        assert!(time_decay_gate_log_permitted("tdtest_btc", "exposure cap reached"));
+        assert!(time_decay_gate_log_permitted("tdtest_eth", "exposure cap reached"));
+    }
 }

@@ -69,6 +69,48 @@ const EXCHANGE_NEG_RISK: Address = address!("0xe2222d279d744050d28e0052001052000
 const MAX_CANCEL_RETRIES: u32 = 5;
 const BASE_CANCEL_RETRY_DELAY_MS: u64 = 200;
 
+/// How often a resting maker exit's on-chain balance is polled to detect that
+/// the ask was lifted. The patrol tick is 50ms; polling the chain at that rate
+/// would be absurd, and a few seconds of booking latency costs nothing because
+/// the fill price is already known (it is the resting limit, which cannot slip).
+const MAKER_RESTING_EXIT_POLL_SECS: u64 = 5;
+
+/// One live post-only GTC ask resting against a filled maker position.
+///
+/// The position stays in the position map while the ask rests — it is still
+/// owned, still marked, and still subject to every stop. This record only tracks
+/// the ORDER so the patrol can reprice it, cancel it before a FAK exit needs the
+/// shares, and book the exit at the exact resting price when it is lifted.
+#[derive(Debug, Clone)]
+struct MakerRestingExit {
+    /// Limit price of the resting ask — also the exact exit price when lifted,
+    /// since a resting limit order cannot slip.
+    price: Decimal,
+    /// Share count the position held when the ask was placed. A drop below this
+    /// on-chain means the ask (partially) filled.
+    shares: Decimal,
+    /// Entry price captured at placement, for P&L on fill.
+    avg_entry: Decimal,
+    market_name: String,
+    /// Last time the on-chain balance was polled for this token.
+    last_poll: Instant,
+    /// Consecutive polls that read a share count below `shares`.
+    ///
+    /// `onchain_balance_for_token` returns 0 on ANY failure (timeout, RPC error)
+    /// and the balance endpoint independently lags a real fill, so ONE short read
+    /// is not evidence of a lift. Requiring agreement across consecutive polls
+    /// gets that safety without blocking the 50ms patrol loop in a retry sleep.
+    short_reads: u32,
+    /// Largest balance seen across the current run of short reads — the exit is
+    /// sized from this rather than the latest reading, so a transient 0 cannot
+    /// inflate the booked quantity.
+    max_short_read: Decimal,
+}
+
+/// Consecutive short balance reads required before a resting ask is booked as
+/// lifted. Two polls, `MAKER_RESTING_EXIT_POLL_SECS` apart.
+const MAKER_RESTING_EXIT_FILL_CONFIRMATIONS: u32 = 2;
+
 impl Squadron {
     /// Run the squadron's full patrol lifecycle.
     ///
@@ -371,6 +413,10 @@ impl Squadron {
 
         let mut consecutive_failures: u32 = 0;
         let mut last_executor_summary = String::new();
+        // Live post-only asks resting against filled maker positions, keyed the
+        // same way as the position map: (strategy, token).
+        let mut maker_resting_exits: std::collections::HashMap<(String, MarketId), MakerRestingExit> =
+            std::collections::HashMap::new();
 
         info!("🚀 Orchestrator ready: {} strategies loaded", strategies.len());
         info!("📋 Strategy venue attachments:");
@@ -518,6 +564,10 @@ impl Squadron {
                     let maker_market_config_for_ctx = maker_market_config.clone();
 
                     let dyn_cfg = Arc::new(dynamic_config.read().unwrap().clone());
+                    // Snapshot the resting-exit knobs before `dyn_cfg` is moved
+                    // into the StrategyContext below.
+                    let resting_exit_reprice_threshold = dyn_cfg.maker_resting_exit_reprice_threshold;
+                    let resting_exit_enabled = dyn_cfg.maker_resting_exit_enabled;
 
                     // Hoist mutex-await calls OUT of the struct literal so that
                     // borrow() Ref guards (oracle_rx, velocity_rx, etc.) in the
@@ -620,6 +670,92 @@ impl Squadron {
                                 let tid = params.token_id;
                                 let tid_m = tid.clone(); // neutral key (slice 2a)
                                 let pos_key = (sn.clone(), tid_m.clone());
+
+                                // ── Free the shares before any FAK ────────────────
+                                // A resting post-only ask COMMITS the shares at the
+                                // exchange: leaving it on the book would make this sell
+                                // fail "not enough balance" and silently defeat the stop
+                                // it is trying to honour. Stops always outrank spread
+                                // capture, so the ask is pulled first.
+                                //
+                                // Whatever the ask managed to trade before the pull is
+                                // booked HERE, at the resting limit — a resting limit
+                                // cannot slip, so that price is exact. Leaving it to the
+                                // generic fallback would book it at the observed bid and
+                                // record a spread-capturing win as a loss.
+                                let resting_rec = if config::GHOST_MODE { None } else { maker_resting_exits.get(&pos_key).cloned() };
+                                if let Some(rest) = resting_rec {
+                                    let (_found, matched) =
+                                        cancel_resting_orders_for_token(&trading_client, &tid_m).await;
+                                    maker_resting_exits.remove(&pos_key);
+
+                                    // How much do we still hold? A single balance read of
+                                    // 0 proves nothing (the helper returns 0 on ANY
+                                    // failure and the endpoint lags fills), so confirm
+                                    // with settlement-lag retries, keeping the LARGEST
+                                    // reading — erring toward "still held" can only cost
+                                    // a retry, while erring the other way fabricates an
+                                    // exit and orphans real shares.
+                                    let mut held = onchain_balance_for_token(&trading_client, &tid_m).await;
+                                    if held < config::MIN_ORDER_SHARES {
+                                        for _ in 1..config::SETTLEMENT_LAG_RETRY_ATTEMPTS {
+                                            tokio::time::sleep(
+                                                Duration::from_secs(config::SETTLEMENT_LAG_RETRY_DELAY_SECS)
+                                            ).await;
+                                            let again = onchain_balance_for_token(&trading_client, &tid_m).await;
+                                            if again > held { held = again; }
+                                            if held >= config::MIN_ORDER_SHARES { break; }
+                                        }
+                                    }
+
+                                    let prior_shares = {
+                                        let map = positions.lock().await;
+                                        match map.get(&pos_key) { Some(p) => p.shares, None => continue }
+                                    };
+                                    // Trust the balance over `matched`: a fully-lifted ask
+                                    // has already left the book and reports no matched
+                                    // size at all.
+                                    let lifted = (prior_shares - held).max(matched).max(dec!(0));
+
+                                    if lifted >= config::MIN_ORDER_SHARES {
+                                        let avg_entry = {
+                                            let map = positions.lock().await;
+                                            map.get(&pos_key).map(|p| p.avg_entry).unwrap_or(rest.avg_entry)
+                                        };
+                                        let pnl = (rest.price - avg_entry) * lifted;
+                                        let side_label = if tid_m == target_yes_token { "YES" } else { "NO" }.to_string();
+                                        info!("✅ Maker resting exit filled [{}]: {:.4} shares lifted @ ${:.4} (entry ${:.4}) pnl=${:.4} — preempted \"{}\"",
+                                              sn, lifted, rest.price, avg_entry, pnl, reason);
+                                        *total_pnl.lock().await += pnl;
+                                        metrics::record_trade(
+                                            &scope, Decimal::ZERO, sn.clone(), params.market_name.clone(), side_label,
+                                            avg_entry, rest.price, lifted, pnl,
+                                            format!("Maker resting exit: lifted @ ${:.4} (spread captured, gain={:.2}%)",
+                                                    rest.price, (rest.price - avg_entry) / avg_entry * dec!(100)),
+                                        ).await;
+                                        last_trade_time.insert(sn.clone(), Instant::now());
+
+                                        if held < config::MIN_ORDER_SHARES {
+                                            // Nothing left — the stop has nothing to do.
+                                            positions.lock().await.remove(&pos_key);
+                                            token_ownership.lock().await.remove(&tid_m);
+                                            if let Some(pool) = db::pool_for(&asset_lc) {
+                                                db::close_open_position(&pool, &sn, tid_m.as_str()).await;
+                                            }
+                                            continue;
+                                        }
+                                        // Partial lift: the stop still wants the rest out.
+                                        if let Some(p) = positions.lock().await.get_mut(&pos_key) { p.shares = held; }
+                                    } else {
+                                        info!("🚫 EXIT [{}]: pulled resting ask to free shares for \"{}\"", sn, reason);
+                                        if held >= config::MIN_ORDER_SHARES {
+                                            if let Some(p) = positions.lock().await.get_mut(&pos_key) {
+                                                if held < p.shares { p.shares = held; }
+                                            }
+                                        }
+                                    }
+                                }
+
                                 let shares = { let map = positions.lock().await; match map.get(&pos_key) { Some(p) => p.shares, None => continue } };
                                 if shares < config::MIN_ORDER_SHARES || params.price <= dec!(0) {
                                     let mut map = positions.lock().await; if let Some(p) = map.remove(&pos_key) { let aep = (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); *total_pnl.lock().await += (aep - p.avg_entry) * p.shares; } continue;
@@ -1459,6 +1595,131 @@ impl Squadron {
                                     info!("🚫 Maker quote-pulled [{}]: {} — resting quote cancelled (toxic book / oracle drift)", sn, tok);
                                 }
                             }
+                            // ════════════════════ MAKER RESTING EXIT ════════════════════
+                            // Post-only GTC ask against a FILLED maker position so it
+                            // leaves by being lifted at the ask rather than crossing back
+                            // to the bid. Idempotent by contract — the strategy re-emits
+                            // this every tick, so the common path here is a no-op.
+                            StrategySignal::MakerRestingExit { params, reason } => {
+                                if !resting_exit_enabled { continue; }
+                                let tok = params.token_id.clone();
+                                let pk = (sn.clone(), tok.clone());
+
+                                // The position must still be live and confirmed —
+                                // a stop may have closed it earlier in this very tick.
+                                let (live_shares, avg_entry) = {
+                                    let map = positions.lock().await;
+                                    match map.get(&pk) {
+                                        Some(p) if p.fill_confirmed_at.is_some() => (p.shares, p.avg_entry),
+                                        _ => continue,
+                                    }
+                                };
+                                if live_shares < config::MIN_ORDER_SHARES { continue; }
+
+                                if config::GHOST_MODE || params.ghost_mode {
+                                    if !maker_resting_exits.contains_key(&pk) {
+                                        info!("👻 GHOST_MODE MakerRestingExit [{}]: {} | shares={:.2}, ask=${:.4} (simulated)",
+                                              sn, params.market_name, live_shares, params.price);
+                                        maker_resting_exits.insert(pk.clone(), MakerRestingExit {
+                                            price: params.price, shares: live_shares, avg_entry,
+                                            market_name: params.market_name.clone(), last_poll: Instant::now(),
+                                            short_reads: 0, max_short_read: dec!(0),
+                                        });
+                                    }
+                                    continue;
+                                }
+
+                                // Already resting near this price → leave it alone.
+                                // Cancel/replace surrenders queue priority, so chasing
+                                // every 1-tick flicker would defeat the point of resting.
+                                if let Some(existing) = maker_resting_exits.get(&pk) {
+                                    if (existing.price - params.price).abs() < resting_exit_reprice_threshold
+                                        && (existing.shares - live_shares).abs() < config::MIN_ORDER_SHARES
+                                    {
+                                        continue;
+                                    }
+                                    // Repricing: pull the stale ask so the shares are free
+                                    // to back the new one.
+                                    let stale_price = existing.price;
+                                    let (_found, matched) =
+                                        cancel_resting_orders_for_token(&trading_client, &tok).await;
+                                    // The record MUST go regardless of what the cancel
+                                    // found: after this point no ask of ours rests, and
+                                    // leaving the entry behind would make the next tick's
+                                    // deadband check believe one still does — silently
+                                    // stranding the position with no exit order at all.
+                                    maker_resting_exits.remove(&pk);
+
+                                    if matched >= config::MIN_ORDER_SHARES {
+                                        // Lifted while we were deciding. Book that slice
+                                        // here at the stale limit (a resting limit cannot
+                                        // slip) — the fill-detection sweep can no longer
+                                        // see it now that the record is gone.
+                                        let pnl = (stale_price - avg_entry) * matched;
+                                        let side_label = if tok == target_yes_token { "YES" } else { "NO" }.to_string();
+                                        info!("✅ Maker resting exit filled [{}]: {:.4} shares lifted @ ${:.4} (entry ${:.4}) pnl=${:.4} — caught while repricing",
+                                              sn, matched, stale_price, avg_entry, pnl);
+                                        *total_pnl.lock().await += pnl;
+                                        metrics::record_trade(
+                                            &scope, Decimal::ZERO, sn.clone(), params.market_name.clone(), side_label,
+                                            avg_entry, stale_price, matched, pnl,
+                                            format!("Maker resting exit: lifted @ ${:.4} (spread captured, gain={:.2}%)",
+                                                    stale_price, (stale_price - avg_entry) / avg_entry * dec!(100)),
+                                        ).await;
+                                        last_trade_time.insert(sn.clone(), Instant::now());
+
+                                        let remaining = live_shares - matched;
+                                        if remaining < config::MIN_ORDER_SHARES {
+                                            positions.lock().await.remove(&pk);
+                                            token_ownership.lock().await.remove(&tok);
+                                            if let Some(pool) = db::pool_for(&asset_lc) {
+                                                db::close_open_position(&pool, &sn, tok.as_str()).await;
+                                            }
+                                            continue;
+                                        }
+                                        // Re-post for the remainder on the next tick, once
+                                        // the strategy has priced it against a fresh book.
+                                        if let Some(p) = positions.lock().await.get_mut(&pk) { p.shares = remaining; }
+                                        continue;
+                                    }
+                                }
+
+                                let vc = if params.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
+                                match place_limit_order(
+                                    &trading_client, &nonce_manager, &signer,
+                                    safe_address, eoa_address, vc, &tok, Side::Sell,
+                                    live_shares, params.price, params.fee_bps,
+                                    params.order_type, params.post_only, 0, &shared_http,
+                                ).await {
+                                    Ok(_order_id) => {
+                                        maker_resting_exits.insert(pk.clone(), MakerRestingExit {
+                                            price: params.price, shares: live_shares, avg_entry,
+                                            market_name: params.market_name.clone(), last_poll: Instant::now(),
+                                            short_reads: 0, max_short_read: dec!(0),
+                                        });
+                                        info!("📤 Maker resting exit [{}]: {} | ASK {:.4} shares @ ${:.4} (entry ${:.4}) | {}",
+                                              sn, params.market_name, live_shares, params.price, avg_entry, reason);
+                                    }
+                                    Err(e) => {
+                                        let es = e.to_string();
+                                        if es.contains("crosses book") {
+                                            // The book moved under us between pricing and
+                                            // placement. Harmless: the strategy re-emits
+                                            // next tick against a fresh snapshot.
+                                            debug!("⏸️ Maker resting exit [{}]: ask ${:.4} crossed the book — retrying next tick", sn, params.price);
+                                        } else if es.contains("not enough balance") || es.contains("balance: 0") {
+                                            // Shares are still settling, or already gone.
+                                            // Either way do NOT count it as a venue failure;
+                                            // the next tick re-evaluates against real state.
+                                            debug!("⏸️ Maker resting exit [{}]: shares unavailable ({}) — retrying next tick",
+                                                   sn, es.chars().take(60).collect::<String>());
+                                        } else {
+                                            warn!("⚠️ Maker resting exit placement failed [{}] (\"{}\") — position held, retrying next tick",
+                                                  sn, es.chars().take(120).collect::<String>());
+                                        }
+                                    }
+                                }
+                            }
                             StrategySignal::NoSignal => {}
                         }
                     }
@@ -1467,10 +1728,150 @@ impl Squadron {
                     if signal_processing_result.is_err() {
                         warn!("⚠️ Signal processing timed out (45s) — select! loop unblocked, watchdog/heartbeat resume");
                     }
+
+                    // ── Resting maker exit: fill detection ───────────────────────
+                    // A resting ask is lifted silently — there is no order response
+                    // to read, so the fill shows up as a drop in the on-chain share
+                    // count. The exit price is NOT estimated here: a resting limit
+                    // order cannot slip, so `rec.price` IS the realized price. That
+                    // is exactly what the FAK exits cannot promise, and why the
+                    // ChainReconcile fallback (which books at "last mark") must
+                    // never be the thing that closes one of these.
+                    if !maker_resting_exits.is_empty() && !config::GHOST_MODE {
+                        let due: Vec<(String, MarketId)> = maker_resting_exits
+                            .iter()
+                            .filter(|(_, v)| v.last_poll.elapsed() >= Duration::from_secs(MAKER_RESTING_EXIT_POLL_SECS))
+                            .map(|(k, _)| k.clone())
+                            .collect();
+
+                        for pk in due {
+                            // Closed by a stop/FAK earlier — the ledger is already
+                            // written, so just drop the stale order record.
+                            if !positions.lock().await.contains_key(&pk) {
+                                maker_resting_exits.remove(&pk);
+                                continue;
+                            }
+
+                            // ── Confirm the drop before believing it ──────────────
+                            // A single short read is NOT evidence of a lift: the
+                            // helper returns 0 on ANY failure and the endpoint lags
+                            // real fills. Trusting one would fabricate an exit, credit
+                            // invented P&L, drop the position and leave real shares
+                            // floating unmanaged to settlement — the −$3.84 failure
+                            // mode already recorded twice in this file's history.
+                            //
+                            // So require CONSECUTIVE short polls to agree, and size the
+                            // exit from the LARGEST balance seen across that run. This
+                            // is deliberately not a retry-with-sleep: the sweep runs on
+                            // every 50ms tick and must never block the loop that
+                            // evaluates stops.
+                            let held_now = onchain_balance_for_token(&trading_client, &pk.1).await;
+                            let rec = match maker_resting_exits.get_mut(&pk) {
+                                Some(r) => {
+                                    r.last_poll = Instant::now();
+                                    if r.shares - held_now >= config::MIN_ORDER_SHARES {
+                                        r.short_reads += 1;
+                                        if r.short_reads == 1 || held_now > r.max_short_read {
+                                            r.max_short_read = held_now;
+                                        }
+                                    } else {
+                                        r.short_reads = 0;
+                                        r.max_short_read = dec!(0);
+                                    }
+                                    r.clone()
+                                }
+                                None => continue,
+                            };
+
+                            if rec.short_reads < MAKER_RESTING_EXIT_FILL_CONFIRMATIONS {
+                                continue; // still resting, or awaiting confirmation
+                            }
+
+                            let held = rec.max_short_read;
+                            let filled = rec.shares - held;
+                            if filled < config::MIN_ORDER_SHARES {
+                                continue;
+                            }
+
+                            let pnl = (rec.price - rec.avg_entry) * filled;
+                            let side_label = if maker_market_config.as_ref().is_some_and(|m| m.yes_token == pk.1)
+                                || pk.1 == hourly_yes_token { "YES" } else { "NO" }.to_string();
+                            let fully_closed = held < config::MIN_ORDER_SHARES;
+
+                            info!(
+                                "✅ Maker resting exit FILLED [{}]: {} | {:.4} shares lifted @ ${:.4} (entry ${:.4}) pnl=${:.4}{}",
+                                pk.0, rec.market_name, filled, rec.price, rec.avg_entry, pnl,
+                                if fully_closed { "" } else { " (partial — remainder still resting)" },
+                            );
+
+                            *total_pnl.lock().await += pnl;
+                            metrics::record_trade(
+                                &scope, Decimal::ZERO, pk.0.clone(), rec.market_name.clone(), side_label,
+                                rec.avg_entry, rec.price, filled, pnl,
+                                format!("Maker resting exit: lifted @ ${:.4} (spread captured, gain={:.2}%)",
+                                        rec.price, (rec.price - rec.avg_entry) / rec.avg_entry * dec!(100)),
+                            ).await;
+
+                            if fully_closed {
+                                positions.lock().await.remove(&pk);
+                                token_ownership.lock().await.remove(&pk.1);
+                                maker_resting_exits.remove(&pk);
+                                if let Some(pool) = db::pool_for(&asset_lc) {
+                                    db::close_open_position(&pool, &pk.0, pk.1.as_str()).await;
+                                }
+                                last_trade_time.insert(pk.0.clone(), Instant::now());
+                            } else {
+                                // Partial lift: the rest of the order is still on the
+                                // book. Re-sync both the position and the record to the
+                                // real on-chain size so the next poll measures against
+                                // the right baseline.
+                                if let Some(p) = positions.lock().await.get_mut(&pk) { p.shares = held; }
+                                if let Some(r) = maker_resting_exits.get_mut(&pk) { r.shares = held; }
+                            }
+                        }
+                    }
+
                     // Tick complete — back to waiting in the select!.
                     crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::Idle);
                 }
             }
+        }
+
+        // ── Tear-down: pull any resting maker asks ───────────────────────────
+        // These are the only orders this loop leaves on the book across a market
+        // rotation or stand-down. The in-memory record dies with `patrol()`, so an
+        // ask left resting would fill unmanaged and reach the ledger only via the
+        // ChainReconcile fallback — booked at "last mark" instead of its real
+        // resting price, which is precisely the ledger drift that path exists to
+        // paper over. Cancel them while we still know they are ours.
+        if !maker_resting_exits.is_empty() && !config::GHOST_MODE {
+            for (pk, rec) in maker_resting_exits.iter() {
+                let (_found, matched) =
+                    cancel_resting_orders_for_token(&trading_client, &pk.1).await;
+                if matched >= config::MIN_ORDER_SHARES {
+                    // Lifted during tear-down: book it here at the resting price
+                    // rather than leaving a silent cash move for the reconciler.
+                    let pnl = (rec.price - rec.avg_entry) * matched;
+                    *total_pnl.lock().await += pnl;
+                    let side_label = if maker_market_config.as_ref().is_some_and(|m| m.yes_token == pk.1)
+                        || pk.1 == hourly_yes_token { "YES" } else { "NO" }.to_string();
+                    info!("✅ Maker resting exit filled during stand-down [{}]: {:.4} shares @ ${:.4} pnl=${:.4}",
+                          pk.0, matched, rec.price, pnl);
+                    metrics::record_trade(
+                        &scope, Decimal::ZERO, pk.0.clone(), rec.market_name.clone(), side_label,
+                        rec.avg_entry, rec.price, matched, pnl,
+                        format!("Maker resting exit: lifted @ ${:.4} during stand-down", rec.price),
+                    ).await;
+                    positions.lock().await.remove(pk);
+                    token_ownership.lock().await.remove(&pk.1);
+                    if let Some(pool) = db::pool_for(&asset_lc) {
+                        db::close_open_position(&pool, &pk.0, pk.1.as_str()).await;
+                    }
+                } else {
+                    info!("🚫 Maker resting exit cancelled on stand-down [{}]: ask ${:.4} pulled from the book", pk.0, rec.price);
+                }
+            }
+            maker_resting_exits.clear();
         }
 
         // ── Tear-down: stop all peripheral tasks ─────────────────────────────

@@ -435,3 +435,67 @@ pub async fn fetch_simplified_crypto_candidates(http: &reqwest::Client, filter: 
     }
     out
 }
+
+/// Resolved settlement prices for a market, keyed by CLOB token id (decimal string).
+///
+/// Authoritative source for "did this side win?", used to label `gboost_vetoes`
+/// rows after settlement. The order book is deliberately NOT used for this: a
+/// resolved market's book is frequently empty, and a price endpoint that returns
+/// $0.00 for "no resting orders" is indistinguishable from $0.00 for "this side
+/// lost" — that ambiguity would silently mislabel winners as losers and poison
+/// the very calibration evidence the veto log exists to provide.
+///
+/// Returns `None` when the market is not yet closed, is missing resolution data,
+/// or the request fails; the caller retries on a later sweep. `Some(map)` is only
+/// produced for a `closed` market whose outcome prices parse cleanly.
+pub async fn fetch_resolved_outcome_prices(
+    http: &reqwest::Client,
+    condition_id: &str,
+) -> Option<std::collections::HashMap<String, rust_decimal::Decimal>> {
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    // `closed=true` is REQUIRED, not an optimisation: Gamma's default filter
+    // excludes closed markets, so without it this endpoint returns `[]` for every
+    // settled market — i.e. for exactly the set we need to score. (Verified
+    // 2026-08-12: the same condition_id returns [] bare and the resolved market
+    // with the flag. Note `condition_id=` singular is silently IGNORED and returns
+    // the unfiltered market list, which would resolve every token to the wrong
+    // market — use `condition_ids=`.)
+    let url = format!(
+        "https://gamma-api.polymarket.com/markets?condition_ids={}&closed=true",
+        condition_id
+    );
+    let resp = http.get(&url).send().await.ok()?;
+    let data: serde_json::Value = resp.json().await.ok()?;
+    let arr = data.as_array()
+        .or_else(|| data.get("data").and_then(|v| v.as_array()))?;
+    let m = arr.first()?;
+
+    // Only a CLOSED market has a final resolution. An open market can carry
+    // outcomePrices that merely reflect the current mark.
+    if !m.get("closed").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return None;
+    }
+
+    // Both fields arrive as JSON arrays that are sometimes string-encoded.
+    let as_vec = |v: &serde_json::Value| -> Option<Vec<serde_json::Value>> {
+        if let Some(a) = v.as_array() { return Some(a.clone()); }
+        v.as_str().and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok())
+    };
+    let token_ids = as_vec(m.get("clobTokenIds")?)?;
+    let prices    = as_vec(m.get("outcomePrices")?)?;
+    if token_ids.len() != prices.len() || token_ids.is_empty() {
+        return None;
+    }
+
+    let mut out = std::collections::HashMap::new();
+    for (t, p) in token_ids.iter().zip(prices.iter()) {
+        let tid = t.as_str().map(|s| s.to_string())
+            .or_else(|| t.as_u64().map(|n| n.to_string()))?;
+        let price = p.as_str().and_then(|s| Decimal::from_str(s).ok())
+            .or_else(|| p.as_f64().and_then(Decimal::from_f64_retain))?;
+        out.insert(tid, price);
+    }
+    Some(out)
+}

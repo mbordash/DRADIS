@@ -407,6 +407,34 @@ pub fn spawn_cleanup_task(
                         ).await;
                         crate::tasks::cleanup::sync_open_positions_with_chain(safe_address).await;
 
+                        // ── Score settled GBoost vetoes ──────────────────────
+                        // Attach real resolution outcomes to the shadow-log of
+                        // gate-rejected signals. Until this runs the table can
+                        // only say what the model BELIEVED, so there is no way to
+                        // tell whether a gate blocked a winner or saved a loss —
+                        // which is the entire question the entry stack turns on.
+                        // Capped per sweep so a long unlabelled backlog cannot
+                        // monopolise the 45s cleanup budget.
+                        if let Some(pool) = crate::helpers::db::pool_for(&asset) {
+                            let http = Arc::clone(&shared_http);
+                            let scored = crate::helpers::db::score_pending_gboost_vetoes(
+                                &pool,
+                                config::GBOOST_VETO_SCORING_BATCH,
+                                |token_id| {
+                                    let http = Arc::clone(&http);
+                                    let pool = pool.clone();
+                                    async move {
+                                        let cid = crate::helpers::db::condition_id_for_veto_token(&pool, &token_id).await?;
+                                        let prices = crate::helpers::market::fetch_resolved_outcome_prices(&http, &cid).await?;
+                                        prices.get(&token_id).copied()
+                                    }
+                                },
+                            ).await;
+                            if scored > 0 {
+                                info!("🏷️ Scored {} settled GBoost veto(es) with real outcomes", scored);
+                            }
+                        }
+
                         // Periodically clean up expired pending order locks
                         {
                             let mut pending = pending_orders.lock().await;

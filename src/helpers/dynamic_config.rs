@@ -147,6 +147,7 @@ fn default_fairvalue_enable()              -> bool    { config::ENABLE_FAIRVALUE
 fn default_fairvalue_trade_size()          -> Decimal { config::FAIRVALUE_TRADE_SIZE_USDC             }
 fn default_fairvalue_max_exposure()        -> Decimal { config::FAIRVALUE_MAX_EXPOSURE_USDC           }
 fn default_fairvalue_base_edge()           -> Decimal { config::FAIRVALUE_BASE_EDGE                   }
+fn default_fairvalue_prefer_hourly()       -> bool    { config::FAIRVALUE_PREFER_HOURLY               }
 fn default_fairvalue_min_edge()            -> Decimal { config::FAIRVALUE_MIN_EDGE                    }
 fn default_fairvalue_min_entry_price()     -> Decimal { config::FAIRVALUE_MIN_ENTRY_PRICE             }
 fn default_fairvalue_max_entry_price()     -> Decimal { config::FAIRVALUE_MAX_ENTRY_PRICE             }
@@ -192,6 +193,13 @@ fn default_maker_max_book_imbalance_ratio() -> Decimal { config::MAKER_MAX_BOOK_
 fn default_maker_min_secs_to_expiry()       -> i64     { config::MAKER_MIN_SECS_TO_EXPIRY              }
 fn default_maker_toxic_flow_exit_obi()      -> Decimal { config::MAKER_TOXIC_FLOW_EXIT_OBI             }
 fn default_maker_toxic_reentry_cooldown_secs() -> i64  { config::MAKER_TOXIC_REENTRY_COOLDOWN_SECS     }
+fn default_maker_toxic_min_hold_secs()      -> i64     { config::MAKER_TOXIC_MIN_HOLD_SECS            }
+fn default_maker_toxic_min_adverse_pct()    -> Decimal { config::MAKER_TOXIC_MIN_ADVERSE_PCT          }
+fn default_maker_toxic_obi_confirm_ticks()  -> u32     { config::MAKER_TOXIC_OBI_CONFIRM_TICKS        }
+fn default_maker_resting_exit_enabled()     -> bool    { config::MAKER_RESTING_EXIT_ENABLED           }
+fn default_maker_resting_exit_min_edge_pct() -> Decimal { config::MAKER_RESTING_EXIT_MIN_EDGE_PCT     }
+fn default_maker_resting_exit_ask_improvement_ticks() -> i64 { config::MAKER_RESTING_EXIT_ASK_IMPROVEMENT_TICKS }
+fn default_maker_resting_exit_reprice_threshold() -> Decimal { config::MAKER_RESTING_EXIT_REPRICE_THRESHOLD }
 
 fn default_momentum_max_entry_price()       -> Decimal { config::MAX_MOMENTUM_ENTRY_PRICE              }
 fn default_momentum_min_entry_price()       -> Decimal { config::MOMENTUM_MIN_ENTRY_PRICE              }
@@ -377,6 +385,28 @@ pub struct DynamicConfig {
     pub maker_toxic_flow_exit_obi:     Decimal,
     #[serde(default = "default_maker_toxic_reentry_cooldown_secs")]
     pub maker_toxic_reentry_cooldown_secs: i64,
+    /// Min seconds held (from fill confirmation) before ToxicFill may fire.
+    #[serde(default = "default_maker_toxic_min_hold_secs")]
+    pub maker_toxic_min_hold_secs:     i64,
+    /// Bid must be at least this fraction below avg entry for ToxicFill to fire.
+    #[serde(default = "default_maker_toxic_min_adverse_pct")]
+    pub maker_toxic_min_adverse_pct:   Decimal,
+    /// Consecutive OBI breaches required before ToxicFill fires.
+    #[serde(default = "default_maker_toxic_obi_confirm_ticks")]
+    pub maker_toxic_obi_confirm_ticks: u32,
+    /// Post a resting post-only ask against a filled maker position so it exits
+    /// by being lifted (spread capture) instead of crossing back to the bid.
+    #[serde(default = "default_maker_resting_exit_enabled")]
+    pub maker_resting_exit_enabled:    bool,
+    /// Price floor for the resting ask, as a fraction over avg entry.
+    #[serde(default = "default_maker_resting_exit_min_edge_pct")]
+    pub maker_resting_exit_min_edge_pct: Decimal,
+    /// Ticks to undercut the best ask by when posting the resting exit.
+    #[serde(default = "default_maker_resting_exit_ask_improvement_ticks")]
+    pub maker_resting_exit_ask_improvement_ticks: i64,
+    /// Minimum price change before an existing resting ask is repriced.
+    #[serde(default = "default_maker_resting_exit_reprice_threshold")]
+    pub maker_resting_exit_reprice_threshold: Decimal,
 
     // ── Basis Viper ───────────────────────────────────────────────────────────
     pub basis_max_exposure_usdc:  Decimal,
@@ -490,6 +520,10 @@ pub struct DynamicConfig {
     pub fairvalue_max_exposure_usdc:      Decimal,
     #[serde(default = "default_fairvalue_base_edge")]
     pub fairvalue_base_edge:              Decimal,
+    /// Prefer the hourly market over the Window/Daily venue for entries — the
+    /// daily horizon pins the required edge at its cap, making entries impossible.
+    #[serde(default = "default_fairvalue_prefer_hourly")]
+    pub fairvalue_prefer_hourly:          bool,
     #[serde(default = "default_fairvalue_min_edge")]
     pub fairvalue_min_edge:               Decimal,
     #[serde(default = "default_fairvalue_min_entry_price")]
@@ -615,6 +649,13 @@ impl Default for DynamicConfig {
             maker_min_secs_to_expiry:      config::MAKER_MIN_SECS_TO_EXPIRY,
             maker_toxic_flow_exit_obi:     config::MAKER_TOXIC_FLOW_EXIT_OBI,
             maker_toxic_reentry_cooldown_secs: config::MAKER_TOXIC_REENTRY_COOLDOWN_SECS,
+            maker_toxic_min_hold_secs:     config::MAKER_TOXIC_MIN_HOLD_SECS,
+            maker_toxic_min_adverse_pct:   config::MAKER_TOXIC_MIN_ADVERSE_PCT,
+            maker_toxic_obi_confirm_ticks: config::MAKER_TOXIC_OBI_CONFIRM_TICKS,
+            maker_resting_exit_enabled:    config::MAKER_RESTING_EXIT_ENABLED,
+            maker_resting_exit_min_edge_pct: config::MAKER_RESTING_EXIT_MIN_EDGE_PCT,
+            maker_resting_exit_ask_improvement_ticks: config::MAKER_RESTING_EXIT_ASK_IMPROVEMENT_TICKS,
+            maker_resting_exit_reprice_threshold: config::MAKER_RESTING_EXIT_REPRICE_THRESHOLD,
 
             basis_max_exposure_usdc:  config::BASIS_MAX_EXPOSURE_USDC,
             basis_stop_loss_pct:      config::BASIS_STOP_LOSS_PERCENT,
@@ -672,6 +713,7 @@ impl Default for DynamicConfig {
             fairvalue_trade_size_usdc:        config::FAIRVALUE_TRADE_SIZE_USDC,
             fairvalue_max_exposure_usdc:      config::FAIRVALUE_MAX_EXPOSURE_USDC,
             fairvalue_base_edge:              config::FAIRVALUE_BASE_EDGE,
+            fairvalue_prefer_hourly:          config::FAIRVALUE_PREFER_HOURLY,
             fairvalue_min_edge:               config::FAIRVALUE_MIN_EDGE,
             fairvalue_min_entry_price:        config::FAIRVALUE_MIN_ENTRY_PRICE,
             fairvalue_max_entry_price:        config::FAIRVALUE_MAX_ENTRY_PRICE,

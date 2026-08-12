@@ -372,6 +372,28 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_gboost_vetoes_ts ON gboost_vetoes(ts)")
         .execute(pool).await;
 
+    // Outcome labels (2026-08-12). The table above was always meant to be scored
+    // "offline by joining market/condition_id to the market's final resolution",
+    // but nothing ever wrote the resolution back — so 316 accumulated rows could
+    // state what the model BELIEVED and never what actually happened. Without a
+    // label the EV of a vetoed signal can only be computed from the model's own
+    // probability, which is the model marking its own homework and cannot say
+    // whether a gate blocked a winner or saved a loss.
+    //
+    // outcome:      1 = the vetoed SIDE would have won, 0 = it would have lost,
+    //               NULL = not yet resolved. Encoded from the strategy's point of
+    //               view (not "did YES win") so scoring needs no side arithmetic.
+    // settle_price: the winning-token price the label was derived from, kept for
+    //               auditability — a mislabelled row should be traceable.
+    let _ = sqlx::query("ALTER TABLE gboost_vetoes ADD COLUMN outcome INTEGER")
+        .execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE gboost_vetoes ADD COLUMN settle_price TEXT")
+        .execute(pool).await;
+    let _ = sqlx::query("ALTER TABLE gboost_vetoes ADD COLUMN scored_at TEXT")
+        .execute(pool).await;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_gboost_vetoes_unscored ON gboost_vetoes(outcome, ts)")
+        .execute(pool).await;
+
     // signals_json: per-viper gate/decision state captured at entry (JSON blob).
     // The generic columns above answer "what did the market look like?"; this column
     // answers "what did the STRATEGY see and decide?" — model probabilities, gate
@@ -1168,6 +1190,241 @@ pub async fn record_gboost_veto_db(
     .await {
         error!("❌ DB gboost_veto write failed: {}", e);
     }
+}
+
+/// A resolved binary token settles at $1.00 (won) or $0.00 (lost). Prices at or
+/// beyond these bounds are treated as final; anything between them means the
+/// market has not resolved yet (or the read was unreliable) and the row is left
+/// unlabelled for a later sweep. Deliberately strict — a wrong label is far worse
+/// than a late one, because it silently corrupts the gate-calibration evidence
+/// this table exists to provide.
+const VETO_SETTLE_WON_MIN:  Decimal = rust_decimal_macros::dec!(0.95);
+const VETO_SETTLE_LOST_MAX: Decimal = rust_decimal_macros::dec!(0.05);
+
+/// One row of the GBoost veto scoreboard: how a single gate performed on the
+/// signals it actually blocked.
+#[derive(Debug, Clone, Serialize)]
+pub struct GboostVetoScore {
+    /// Gate family, normalised from the free-text veto reason.
+    pub gate: String,
+    /// Vetoed signals attributable to this gate.
+    pub total: i64,
+    /// Of those, how many have a settled outcome yet.
+    pub scored: i64,
+    /// Scored signals whose side went on to win — i.e. entries this gate blocked
+    /// that would have paid $1.00.
+    pub would_have_won: i64,
+    /// Realised P&L per share had every scored signal been taken:
+    /// `mean(outcome − ask_price)`. Positive means the gate is, on this evidence,
+    /// costing money; negative means it is protecting the wallet. This is the
+    /// number the model's own probability could never supply.
+    pub avg_pnl_per_share: f64,
+    /// Distinct markets the scored signals came from — the REAL sample size.
+    ///
+    /// Signals inside one market are near-perfectly correlated: the model holds a
+    /// view for the whole session, so 40 signals on one daily market that closes
+    /// up are one observation, not 40. Reading `scored` as the sample size makes a
+    /// handful of trending days look like overwhelming evidence (first prod score,
+    /// 2026-08-12: 316 signals looked like a 73% win rate, but 3 of 12 markets
+    /// carried nearly all of it). Always judge significance on this column.
+    pub distinct_markets: i64,
+    /// Mean per-share edge computed per MARKET and then averaged, so one busy
+    /// market cannot outvote the rest. The conservative counterpart to
+    /// `avg_pnl_per_share`; when the two diverge sharply, the raw figure is being
+    /// driven by signal concentration rather than by a repeatable edge.
+    pub avg_pnl_per_market: f64,
+}
+
+/// SQL CASE mapping a free-text `veto_reason` onto a stable gate family.
+///
+/// Order matters: the `hourly …` reasons are the cross-market confirmation gate
+/// and must be matched BEFORE the generic OBI patterns, or they collapse into the
+/// primary book gate and the scoreboard silently attributes their blocks to the
+/// wrong knob. Defined once and interpolated into both queries below so the two
+/// can never drift apart.
+const VETO_GATE_CASE: &str = "CASE
+    WHEN veto_reason LIKE 'hourly%'              THEN 'hourly OBI cross-check'
+    WHEN veto_reason LIKE '%price out of range%' THEN 'price band'
+    WHEN veto_reason LIKE '%adverse OBI%'        THEN 'adverse OBI'
+    WHEN veto_reason LIKE '%OBI adverse%'        THEN 'adverse OBI'
+    WHEN veto_reason LIKE '%exhaust%'            THEN 'OBI exhaustion'
+    WHEN veto_reason LIKE '%counter-trend%'      THEN 'counter-trend'
+    WHEN veto_reason LIKE '%oracle too flat%'    THEN 'low volatility'
+    WHEN veto_reason LIKE '%too close to 0.5%'   THEN 'near coin-flip'
+    ELSE 'other' END";
+
+/// Score each GBoost gate against the settled outcomes of the signals it blocked.
+///
+/// Only rows with a resolved `outcome` participate; unscored rows are reported in
+/// `total − scored` so a thin sample is never mistaken for a confident verdict.
+pub async fn gboost_veto_scoreboard(pool: &SqlitePool) -> Vec<GboostVetoScore> {
+    let group_sql = format!(
+        "SELECT {case} AS gate,
+                COUNT(*) AS total,
+                SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) AS scored,
+                SUM(CASE WHEN outcome IS NOT NULL THEN outcome ELSE 0 END) AS wins
+           FROM gboost_vetoes
+          GROUP BY gate",
+        case = VETO_GATE_CASE
+    );
+    let rows: Vec<(String, i64, i64, Option<i64>)> = match sqlx::query_as(&group_sql)
+        .fetch_all(pool).await {
+        Ok(r) => r,
+        Err(e) => { error!("❌ DB gboost veto scoreboard failed: {}", e); return vec![]; }
+    };
+
+    // Average realised edge is computed separately so the ask price only enters
+    // for rows that actually have a label.
+    let avg_sql = format!(
+        "SELECT AVG(CAST(outcome AS REAL) - CAST(ask_price AS REAL))
+           FROM gboost_vetoes
+          WHERE outcome IS NOT NULL AND {case} = ?",
+        case = VETO_GATE_CASE
+    );
+    // Per-market aggregation first, then a mean over markets — one busy market
+    // must not outvote the rest. See `distinct_markets`.
+    let per_market_sql = format!(
+        "SELECT COUNT(*), AVG(m_avg) FROM (
+             SELECT AVG(CAST(outcome AS REAL) - CAST(ask_price AS REAL)) AS m_avg
+               FROM gboost_vetoes
+              WHERE outcome IS NOT NULL AND {case} = ?
+              GROUP BY market
+         )",
+        case = VETO_GATE_CASE
+    );
+
+    let mut out = Vec::with_capacity(rows.len());
+    for (gate, total, scored, wins) in rows {
+        let avg: Option<f64> = sqlx::query_as::<_, (Option<f64>,)>(&avg_sql)
+        .bind(&gate)
+        .fetch_optional(pool).await.ok().flatten().and_then(|(v,)| v);
+
+        let (markets, per_market): (i64, Option<f64>) =
+            sqlx::query_as::<_, (i64, Option<f64>)>(&per_market_sql)
+            .bind(&gate)
+            .fetch_optional(pool).await.ok().flatten().unwrap_or((0, None));
+
+        out.push(GboostVetoScore {
+            gate,
+            total,
+            scored,
+            would_have_won: wins.unwrap_or(0),
+            avg_pnl_per_share: avg.unwrap_or(0.0),
+            distinct_markets: markets,
+            avg_pnl_per_market: per_market.unwrap_or(0.0),
+        });
+    }
+    out.sort_by(|a, b| b.total.cmp(&a.total));
+    out
+}
+
+/// The `condition_id` recorded alongside a vetoed token — the key the Gamma
+/// resolution lookup needs. Kept next to the scorer so the caller's price-resolver
+/// closure stays a one-liner instead of threading condition ids through the query.
+pub async fn condition_id_for_veto_token(pool: &SqlitePool, token_id: &str) -> Option<String> {
+    sqlx::query_as::<_, (String,)>(
+        "SELECT condition_id FROM gboost_vetoes
+          WHERE token_id = ? AND condition_id <> ''
+          ORDER BY id DESC LIMIT 1"
+    )
+    .bind(token_id)
+    .fetch_optional(pool)
+    .await
+    .ok()
+    .flatten()
+    .map(|(c,)| c)
+}
+
+/// Attach resolution outcomes to `gboost_vetoes` rows whose market has settled.
+///
+/// `resolve_price(token_id) -> Option<Decimal>` fetches the token's CURRENT price;
+/// the caller supplies it so this module keeps no dependency on the venue SDK.
+/// Returns the number of rows newly labelled.
+///
+/// Only rows whose market should already have closed are attempted — close time
+/// is reconstructed as `ts + secs_to_expiry`, which is exactly what was recorded
+/// at veto time. A grace period is added on top so a market that resolves a
+/// little late is not read mid-settlement.
+///
+/// The label is written from the VETOED SIDE's point of view: `outcome = 1` means
+/// buying that side at the recorded ask would have paid $1.00, so scoring a gate
+/// is a plain average over `outcome` with no further arithmetic.
+pub async fn score_pending_gboost_vetoes<F, Fut>(
+    pool: &SqlitePool,
+    max_rows: i64,
+    resolve_price: F,
+) -> usize
+where
+    F: Fn(String) -> Fut,
+    Fut: std::future::Future<Output = Option<Decimal>>,
+{
+    /// Extra wait beyond the recorded close time before a price read is trusted.
+    const SETTLE_GRACE_SECS: i64 = 900;
+
+    let rows: Vec<(i64, String, String, String, i64)> = match sqlx::query_as(
+        "SELECT id, ts, token_id, side, secs_to_expiry
+           FROM gboost_vetoes
+          WHERE outcome IS NULL
+          ORDER BY ts ASC
+          LIMIT ?"
+    )
+    .bind(max_rows)
+    .fetch_all(pool)
+    .await {
+        Ok(r) => r,
+        Err(e) => { error!("❌ DB gboost_veto scoring fetch failed: {}", e); return 0; }
+    };
+    if rows.is_empty() { return 0; }
+
+    let now = Utc::now();
+    // One price read per distinct token, not per row: a single market typically
+    // accumulates many vetoes and they all share one resolution.
+    let mut price_cache: std::collections::HashMap<String, Option<Decimal>> =
+        std::collections::HashMap::new();
+    let mut scored = 0usize;
+
+    for (id, ts, token_id, side, secs_to_expiry) in rows {
+        let Ok(recorded_at) = DateTime::parse_from_rfc3339(&ts) else { continue };
+        let closes_at = recorded_at.with_timezone(&Utc)
+            + chrono::Duration::seconds(secs_to_expiry + SETTLE_GRACE_SECS);
+        if now < closes_at { continue; } // not settled yet — try again next sweep
+
+        let price = match price_cache.get(&token_id) {
+            Some(p) => *p,
+            None => {
+                let p = resolve_price(token_id.clone()).await;
+                price_cache.insert(token_id.clone(), p);
+                p
+            }
+        };
+        let Some(price) = price else { continue }; // lookup failed — retry later
+
+        // `price` is the price of the token the veto was ABOUT, so it already
+        // encodes the side: a vetoed NO signal reads the NO token.
+        let outcome = if price >= VETO_SETTLE_WON_MIN {
+            1
+        } else if price <= VETO_SETTLE_LOST_MAX {
+            0
+        } else {
+            continue; // ambiguous — leave unlabelled rather than guess
+        };
+
+        if let Err(e) = sqlx::query(
+            "UPDATE gboost_vetoes SET outcome = ?, settle_price = ?, scored_at = ?
+              WHERE id = ? AND outcome IS NULL"
+        )
+        .bind(outcome)
+        .bind(price.to_string())
+        .bind(now.to_rfc3339())
+        .bind(id)
+        .execute(pool)
+        .await {
+            error!("❌ DB gboost_veto scoring update failed (id={}, side={}): {}", id, side, e);
+        } else {
+            scored += 1;
+        }
+    }
+    scored
 }
 
 /// Look up the most recent entry price for a token_id.

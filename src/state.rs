@@ -362,6 +362,21 @@ pub enum StrategySignal {
     MakerCancel {
         tokens: Vec<MarketId>,
     },
+    /// Resting maker exit: post (or reprice) a post-only GTC **sell** for an
+    /// already-filled maker position, so the position leaves by being LIFTED at
+    /// the ask instead of by crossing back to the bid.
+    ///
+    /// This is the difference between market-making and paying the spread twice.
+    /// Every other exit path (`Exit`) sells at the bid with a FAK, which is
+    /// correct for a stop but throws away the entire spread on a normal
+    /// profit-taking exit. The consumer treats this as idempotent: it places the
+    /// ask if none rests, reprices if the book has moved beyond the reprice
+    /// threshold, and otherwise does nothing — so a strategy may safely re-emit
+    /// it on every tick.
+    MakerRestingExit {
+        params: OrderParams,
+        reason: String,
+    },
     /// Exit signal with metadata.
     Exit {
         params: OrderParams,

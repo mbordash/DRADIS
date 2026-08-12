@@ -290,11 +290,31 @@ impl Strategy for FairValueStrategyImpl {
         };
         let sigma_opt = self.update_and_read_sigma(&ctx.crypto_filter, spot);
 
-        // ── Venue: prefer the Window/Daily maker venue (lower fees, has strike) ──
-        let (market, snap) = if let (Some(mk_mkt), Some(mk_snap)) = (&ctx.maker_market, &ctx.maker_snapshot) {
-            (mk_mkt, mk_snap)
-        } else {
-            (&ctx.market, &ctx.snapshot)
+        // ── Venue selection ──────────────────────────────────────────────────
+        // The required edge is horizon-scaled: base × √(T/TAPER), capped at
+        // FAIRVALUE_EDGE_HORIZON_CAP. On the Window/Daily venue T is ~6-20 hours,
+        // which pins the requirement at the 0.25 cap — a 25% mispricing. Prod
+        // telemetry (2026-08-12, 478 evaluations over 16.5h): the best edge ever
+        // observed was 0.113 and the median was NEGATIVE, so daily-venue entries
+        // are not merely rare, they are arithmetically unreachable.
+        //
+        // The hourly venue's T taper resolves to roughly 0.03-0.10, which the
+        // observed edge distribution does reach. So prefer the hourly whenever it
+        // is structurally usable, and fall back to the daily only when it is not.
+        // `fairvalue_prefer_hourly` restores the old daily-first order if needed.
+        let hourly_viable = ctx.market.strike_price.is_some_and(|s| s > dec!(0))
+            && ctx.market.market_close_time
+                .is_some_and(|ct| (ct - Utc::now()).num_seconds() >= config::FAIRVALUE_MIN_SECS_TO_EXPIRY);
+
+        let (market, snap) = match (&ctx.maker_market, &ctx.maker_snapshot) {
+            (Some(mk_mkt), Some(mk_snap)) => {
+                if dc.fairvalue_prefer_hourly && hourly_viable {
+                    (&ctx.market, &ctx.snapshot)
+                } else {
+                    (mk_mkt, mk_snap)
+                }
+            }
+            _ => (&ctx.market, &ctx.snapshot),
         };
 
         // ── Structural requirements ──────────────────────────────────────────

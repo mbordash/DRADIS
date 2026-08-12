@@ -234,6 +234,27 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Don't quote with fewer than this many seconds left.").min(0.0).step(1.0).unit("s"));
         v.push(F::new(g, e, "maker_toxic_flow_exit_obi", "Toxic Flow Exit OBI", "decimal", true,
             "Exit a resting position when OBI turns adverse beyond this (negative).").range(-1.0, 0.0).step(0.05));
+        v.push(F::new(g, e, "maker_toxic_reentry_cooldown_secs", "Toxic Re-entry Lockout", "secs", true,
+            "After a ToxicFill exit, block re-quoting that same token for this long.").min(0.0).step(30.0).unit("s"));
+        // ToxicFill confirmation gates. These apply only once a quote has FILLED —
+        // an unfilled quote is still pulled the instant OBI breaches. Raising them
+        // makes the maker sit through more book noise to let the spread convert;
+        // lowering them returns toward the old exit-on-any-adverse-book behaviour.
+        v.push(F::new(g, e, "maker_toxic_min_hold_secs", "Toxic Min Hold", "secs", true,
+            "Minimum seconds a filled position is held before ToxicFill may fire. Covers the window where OBI is dominated by our own quote being lifted.").min(0.0).step(5.0).unit("s"));
+        v.push(F::new(g, e, "maker_toxic_min_adverse_pct", "Toxic Min Adverse Move", "pct", true,
+            "ToxicFill also requires the bid to be this far below entry (0.02 = 2%). A hostile-looking book that hasn't moved price is noise.").range(0.0, 0.5).step(0.005));
+        v.push(F::new(g, e, "maker_toxic_obi_confirm_ticks", "Toxic OBI Confirm Ticks", "decimal", true,
+            "Consecutive OBI breaches required before ToxicFill fires. A healthy tick resets the count.").range(1.0, 20.0).step(1.0));
+        // Resting maker exit — the spread-capture exit path.
+        v.push(F::new(g, e, "maker_resting_exit_enabled", "Resting Exit", "bool", true,
+            "Exit filled positions with a resting post-only ask (captures the spread) instead of only crossing back to the bid. Stops and the near-expiry flatten still cross."));
+        v.push(F::new(g, e, "maker_resting_exit_min_edge_pct", "Resting Exit Min Edge", "pct", true,
+            "Price floor for the resting ask, over avg entry (0.04 = 4%). Stops a collapsing spread from dragging the exit down to a scratch.").range(0.0, 0.5).step(0.005));
+        v.push(F::new(g, e, "maker_resting_exit_ask_improvement_ticks", "Resting Exit Ask Improvement", "decimal", true,
+            "Ticks to undercut the best ask by. 1 = take queue priority; 0 = join the ask and earn the extra tick.").range(0.0, 5.0).step(1.0));
+        v.push(F::new(g, e, "maker_resting_exit_reprice_threshold", "Resting Exit Reprice Deadband", "price", true,
+            "Minimum price move before the resting ask is cancelled and re-posted. Repricing surrenders queue priority, so keep this wider than normal book flicker.").range(0.0, 0.2).step(0.005));
     }
 
     // ── Basis ─────────────────────────────────────────────────────────────────
@@ -421,6 +442,8 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Highest token ask the strategy will pay (0.985 admits settlement snipes).").range(0.0, 1.0).step(0.005));
         v.push(F::new(g, e, "fairvalue_min_entry_price", "Min Entry", "price", true,
             "Lowest token ask the strategy will pay to enter.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "fairvalue_prefer_hourly", "Prefer Hourly Market", "bool", true,
+            "Trade the hourly market rather than the Window/Daily venue. The required edge scales with time to expiry and is capped, so on the daily venue it pins at the cap (25%) — an edge that does not occur on a liquid book. Off restores daily-first ordering."));
     }
 
     v

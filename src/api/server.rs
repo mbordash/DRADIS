@@ -585,6 +585,23 @@ async fn get_latency() -> Response {
     Json(crate::helpers::latency::snapshot()).into_response()
 }
 
+/// GET /api/gboost/veto-scores?asset=btc
+///
+/// Per-gate scoreboard for GBoost's entry stack, scored against SETTLED market
+/// outcomes rather than the model's own probability. Each row answers the only
+/// question that matters for gate calibration: of the signals this gate blocked,
+/// how many would actually have won, and what was the realised edge per share?
+///
+/// `total - scored` is the still-unresolved backlog — read `avg_pnl_per_share`
+/// only once `scored` is large enough to mean something.
+async fn get_gboost_veto_scores(Query(q): Query<AssetQuery>) -> Response {
+    let Some(pool) = db::pool_for_opt_retry(q.asset.as_deref()).await else {
+        error!("Database pool not available for GET /api/gboost/veto-scores");
+        return (StatusCode::SERVICE_UNAVAILABLE, "database not ready").into_response();
+    };
+    Json(db::gboost_veto_scoreboard(&pool).await).into_response()
+}
+
 /// GET /api/vipers/status?asset=btc
 ///
 /// Per-viper "why aren't we trading?" registry, keyed by (squadron asset,
@@ -2700,6 +2717,7 @@ pub async fn run_api_server(
         .route("/api/logs",                  get(get_logs))
         .route("/api/latency",               get(get_latency))
         .route("/api/vipers/status",         get(get_vipers_status))
+        .route("/api/gboost/veto-scores",    get(get_gboost_veto_scores))
         .route("/api/positions",             get(get_open_positions))
         .route("/api/positions/pending",     get(get_pending_positions))
         .route("/api/positions/confirmed",   get(get_confirmed_positions))
