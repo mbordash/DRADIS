@@ -331,6 +331,15 @@ pub const MAKER_MIN_MARKET_AGE_SECS: i64 = 600;
 /// Throttle interval (secs) for MakerStrategy gate-rejection diagnostics — a gate
 /// reason is logged when it changes or after this interval, without per-tick spam.
 pub const MAKER_GATE_LOG_INTERVAL_SECS: u64 = 30;
+
+/// Re-log interval for a TimeDecay gate rejection whose reason has NOT changed.
+/// A change of reason always logs immediately; this only paces the repeat.
+///
+/// 300s (vs the maker's 30s) because TimeDecay evaluates a much slower condition:
+/// its theta window is minutes wide and its blocking gate can legitimately hold
+/// for a whole market. Gives a recoverable on-disk history of which gate blocks
+/// it, which the in-memory viper_status registry alone cannot provide.
+pub const TIME_DECAY_GATE_LOG_INTERVAL_SECS: u64 = 300;
 pub const MOMENTUM_MIN_MARKET_AGE_SECS: i64 = 600;
 /// Must be strictly > MOMENTUM_EXPIRY_EXIT_SECS (1200s); 5 min breathing room.
 pub const MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY: i64 = 1500;
@@ -504,6 +513,17 @@ pub const GBOOST_BUDGET: f32 = 0.80; // raised from 0.65 — gives perpetual roo
 pub const GBOOST_NUM_THREADS: usize = 2;
 pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.78); // 2026-06-30: lowered (0.88 startup default produced zero trades in 13d)
 pub const GBOOST_PRED_LOG_INTERVAL_SECS: u64 = 120; // periodic P(UP) conviction diagnostic
+
+/// Max `gboost_vetoes` rows labelled with their settled outcome per cleanup sweep.
+///
+/// The veto shadow-log records every entry-eligible signal a gate rejected; the
+/// cleanup task attaches each one's real market resolution so the gate stack can
+/// be scored on outcomes instead of on the model's own probability. Bounded per
+/// sweep because each distinct market costs one Gamma request and the whole
+/// cleanup pass runs under a 45s timeout — a large backlog drains over several
+/// sweeps rather than starving orphan reconciliation, the safety-critical work
+/// in that task.
+pub const GBOOST_VETO_SCORING_BATCH: i64 = 200;
 pub const GBOOST_POST_EXIT_COOLDOWN_SECS: i64 = 300;
 /// Conservative: tightest OBI gate (2026-08-05: modest loosening from -0.25 with debounce protection).
 pub const GBOOST_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.40);
