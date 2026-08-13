@@ -98,7 +98,46 @@ pub fn market_id_from_u256(token: U256) -> MarketId {
 pub fn u256_from_market_id(market: &MarketId) -> Result<U256> {
     U256::from_str_radix(market.as_str(), 10)
         .with_context(|| format!("intl: invalid MarketId (not decimal U256): {market}"))
-}/// The international (self-custody) Polymarket CLOB venue.
+}
+
+/// Polymarket's taker fee for a matched order, in USDC.
+///
+///   fee = rate · p · (1 − p) · shares
+///
+/// Quadratic in price, so it peaks at 50¢ and collapses toward either tail —
+/// the same shape Kalshi uses (see `venues::kalshi::trader`), with the same 7¢
+/// coefficient. **Makers pay nothing**: call this only for an order that
+/// matched immediately, which the callers detect by a non-zero making/taking
+/// pair coming back from the exchange.
+///
+/// The venue's `fee-rate-bps` endpoint reports 1000 bps on these markets, but
+/// that is the *ceiling* an order authorizes, not the charged rate — signing
+/// against it and then booking 10% of notional would overstate the cost by
+/// nearly 2×. The rate here is the one actually charged, recovered from
+/// collateral movement and validated against every leg of the 2026-08-12 BTC
+/// session to within $0.0006 (see `fee_matches_observed_intl_fills`).
+///
+/// Prices outside `[0, 1]` cannot occur on a binary book; they clamp to zero
+/// fee rather than producing a negative charge.
+pub fn taker_fee(rate: Decimal, price: Decimal, shares: Decimal) -> Decimal {
+    if price <= Decimal::ZERO || price >= Decimal::ONE || shares <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    rate * price * (Decimal::ONE - price) * shares
+}
+
+/// The live taker-fee rate, falling back to the compile-time default before the
+/// config channel is published (venue bootstrap) or if it has gone away.
+///
+/// The patrol loop snapshots the same knob once per tick rather than calling
+/// this, so a rate edited in Control Tower reaches both paths.
+fn live_taker_fee_rate() -> Decimal {
+    crate::helpers::dynamic_config::global_config_tx()
+        .map(|tx| tx.borrow().intl_taker_fee_rate)
+        .unwrap_or(config::INTL_TAKER_FEE_RATE)
+}
+
+/// The international (self-custody) Polymarket CLOB venue.
 pub struct IntlClobVenue {
     /// Authenticated CLOB REST client used for all order/balance operations.
     clob: Arc<ClobClient<Authenticated<Normal>>>,
@@ -273,11 +312,27 @@ impl Execution for IntlClobVenue {
             intent.price
         };
 
+        // Fee on the same terms the price was derived: a non-zero making/taking
+        // pair means the order matched immediately, so we were the taker. A
+        // resting order reports zeros, pays nothing now, and is re-priced by the
+        // lifecycle when it does fill. The exchange charges this out of
+        // collateral and reports it nowhere, so leaving it at zero here made
+        // every lifecycle-adopted position carry a free entry (see `taker_fee`).
+        let matched_shares = if making_amount > dec!(0) && taking_amount > dec!(0) {
+            match intent.side {
+                Side::Sell => making_amount,
+                Side::Buy  => taking_amount,
+            }
+        } else {
+            Decimal::ZERO
+        };
+        let fee = taker_fee(live_taker_fee_rate(), fill_price, matched_shares);
+
         Ok(Fill {
             order_id: OrderId(order_id),
             market: intent.market,
             filled: intent.quantity,
-            price: fill_price, fee: Decimal::ZERO
+            price: fill_price, fee
         })
     }
 
@@ -397,5 +452,77 @@ impl Execution for IntlClobVenue {
             }
         }
         Ok(result)
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::taker_fee;
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+    use std::str::FromStr;
+
+    /// Ground truth for the fee model: every leg of the 2026-08-12 BTC session,
+    /// with the cash movement each one actually produced. The observed figures
+    /// are collateral deltas straight out of `pnl_snapshots` in
+    /// `logs/btc-dradis.db` — that session ran a single squadron (btc-hourly),
+    /// so no other order could contaminate them.
+    ///
+    /// This is what pins the rate at 7% against the 1000 bps the venue's
+    /// `fee-rate-bps` endpoint advertises. Booking the advertised ceiling would
+    /// overstate every fee by ~1.8×.
+    #[test]
+    fn fee_matches_observed_intl_fills() {
+        let rate = crate::config::INTL_TAKER_FEE_RATE;
+        // (shares, fill price, is_buy, observed collateral delta)
+        let legs = [
+            (dec!(19.20), dec!(0.15), true,  Decimal::from_str("3.051360").unwrap()),
+            (dec!(19.20), dec!(0.06), false, Decimal::from_str("1.076200").unwrap()),
+            (Decimal::from_str("15.833332").unwrap(), dec!(0.18), true,
+                Decimal::from_str("3.013579").unwrap()),
+            (Decimal::from_str("15.833332").unwrap(), dec!(0.18), false,
+                Decimal::from_str("2.685850").unwrap()),
+        ];
+        // A cent of tolerance: the venue rounds, and the recorded quote is the
+        // touch rather than the exact matched price on a swept book.
+        let tol = dec!(0.001);
+        for (shares, price, is_buy, observed) in legs {
+            let notional = shares * price;
+            let fee = taker_fee(rate, price, shares);
+            let cash = if is_buy { notional + fee } else { notional - fee };
+            let diff = (cash - observed).abs();
+            assert!(
+                diff < tol,
+                "leg {shares} @ {price} (buy={is_buy}): modeled cash {cash} vs observed {observed} (diff {diff})"
+            );
+        }
+    }
+
+    /// The winning round trip of that session, end to end: entry and exit fees
+    /// together must reproduce the +$0.7465 the wallet actually moved, not the
+    /// +$1.0920 that was booked when fees were ignored.
+    #[test]
+    fn round_trip_reproduces_observed_collateral_move() {
+        let rate = crate::config::INTL_TAKER_FEE_RATE;
+        let (shares, entry_px, exit_px) = (dec!(13.65), dec!(0.20), dec!(0.28));
+        let paid = shares * entry_px + taker_fee(rate, entry_px, shares);
+        let recv = shares * exit_px - taker_fee(rate, exit_px, shares);
+        let net = recv - paid;
+        let observed = Decimal::from_str("0.746500").unwrap();
+        assert!((net - observed).abs() < dec!(0.001), "net {net} vs observed {observed}");
+        // And it must be materially worse than the fee-free figure that was booked.
+        let gross = (exit_px - entry_px) * shares;
+        assert!(gross - net > dec!(0.34), "fees must account for the booking gap");
+    }
+
+    /// Makers pay nothing, and a degenerate price can never produce a charge.
+    #[test]
+    fn fee_is_zero_outside_a_live_binary_price() {
+        let rate = dec!(0.07);
+        assert_eq!(taker_fee(rate, dec!(0), dec!(10)), Decimal::ZERO);
+        assert_eq!(taker_fee(rate, dec!(1), dec!(10)), Decimal::ZERO);
+        assert_eq!(taker_fee(rate, dec!(0.5), dec!(0)), Decimal::ZERO);
+        // Peaks at the coin flip, collapses toward either tail.
+        assert!(taker_fee(rate, dec!(0.50), dec!(10)) > taker_fee(rate, dec!(0.10), dec!(10)));
+        assert!(taker_fee(rate, dec!(0.50), dec!(10)) > taker_fee(rate, dec!(0.90), dec!(10)));
     }
 }

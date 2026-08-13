@@ -104,6 +104,11 @@ pub const MOMENTUM_ENTRY_FAK_RETRIES: u32 = 3;
 pub const MAX_BUY_LIMIT_PRICE: Decimal = dec!(0.99);
 pub const SELL_PRICE_OFFSET: Decimal = dec!(0.01);
 pub const MIN_SELL_LIMIT_PRICE: Decimal = dec!(0.01);
+
+/// Polymarket taker fee rate: `fee = rate * p * (1 - p) * shares`, charged on
+/// both legs of a round trip. Makers pay nothing. Venue fact, identical across
+/// profiles — see src/config.rs for why it is 7% and not the advertised 1000 bps.
+pub const INTL_TAKER_FEE_RATE: Decimal = dec!(0.07);
 pub const EARLY_EXIT_COMBINED_BID_THRESHOLD: Decimal = dec!(0.995);
 
 
@@ -752,6 +757,11 @@ pub const FAIRVALUE_EDGE_TAPER_SECS: i64 = 1800;
 pub const FAIRVALUE_EDGE_HORIZON_CAP: Decimal = dec!(0.20);
 // Floor on sigma per sqrt-second — a quiet sampling hour must not collapse the model.
 pub const FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC: f64 = 3.5e-5;
+/// Horizon at or below which the sigma floor does not bind (ramps to full at 2x).
+/// Defaults to the vol window: trust the measurement as far out as we measured.
+pub const FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS: i64 = 3600;
+/// Absolute sigma backstop against degenerate input (frozen oracle / zero variance).
+pub const FAIRVALUE_ABSOLUTE_MIN_SIGMA_PER_SQRT_SEC: f64 = 1.0e-5;
 // Circuit breaker: stop entering a market after this many stop-loss exits on it.
 pub const FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET: u32 = 3;
 // Throttle for the entry-signal info log.
@@ -767,7 +777,7 @@ pub const FAIRVALUE_PIN_MIN_SIGMA: f64 = 1.25;
 /// to a -22% loss inside two minutes. The endgame pin guard could not see them.
 /// Calibrated on n=2; revisit once ~20 more round trips have accumulated.
 pub const FAIRVALUE_MIN_ABS_SIGMA: f64 = 0.25;
-pub const FAIRVALUE_MIN_ENTRY_PRICE: Decimal = dec!(0.10);
+pub const FAIRVALUE_MIN_ENTRY_PRICE: Decimal = dec!(0.20);
 pub const FAIRVALUE_MAX_ENTRY_PRICE: Decimal = dec!(0.985);
 pub const FAIRVALUE_MIN_SECS_TO_EXPIRY: i64 = 90;
 
@@ -786,7 +796,10 @@ pub const FAIRVALUE_SIGNAL_CONTINUITY_GAP_SECS: u64 = 20;
 pub const FAIRVALUE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.20);
 pub const FAIRVALUE_STOP_LOSS_PERCENT: Decimal = dec!(0.15);
 pub const FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 120;
-pub const FAIRVALUE_MODEL_REVERSAL_EXIT_PROB: f64 = 0.35;
+/// Fraction of the ENTRY fair value the model may lose before the reversal exit
+/// fires. Aggressive gives the thesis the most room. Entry-relative, not an
+/// absolute floor — see src/config.rs for why.
+pub const FAIRVALUE_MODEL_REVERSAL_DECAY_PCT: Decimal = dec!(0.45);
 pub const FAIRVALUE_SETTLE_HOLD_SECS: i64 = 600;
 pub const FAIRVALUE_SETTLE_HOLD_MIN_PROB: f64 = 0.85;
 pub const FAIRVALUE_BAIL_SECS: i64 = 120;

@@ -849,6 +849,14 @@ async fn run_migrations(pool: &SqlitePool) {
     // `pnl` is stored NET of this; subtracting it back recovers the gross figure.
     let _ = sqlx::query("ALTER TABLE trades ADD COLUMN fees TEXT")
         .execute(pool).await;
+    // `entry_fee`: dollars already paid to the venue to OPEN this position.
+    // Needed because a position can leave via settlement or off-strategy close
+    // rather than the strategy's exit path, and those bookings live here — with
+    // no access to the in-memory Position that carries the fee. Without it they
+    // booked gross P&L as if entry were free (2026-08-13 trade 356: +$0.7585
+    // recorded against +$0.7201 of actual collateral movement).
+    let _ = sqlx::query("ALTER TABLE open_positions ADD COLUMN entry_fee TEXT")
+        .execute(pool).await;
     for table in ["trades", "entries"] {
         for col in ["venue", "market_class", "underlying"] {
             let _ = sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {col} TEXT"))
@@ -1010,14 +1018,15 @@ pub async fn record_settlement_trade_idempotent(
     exit_price: Decimal,
     shares: Decimal,
     pnl: Decimal,
+    fees: Decimal,
     reason: &str,
     timestamp: Option<DateTime<Utc>>,
 ) -> bool {
     let ts = timestamp.unwrap_or_else(Utc::now).to_rfc3339();
     let sid = current_session_id();
     match sqlx::query(
-        "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+        "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id, fees)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          WHERE NOT EXISTS (
              SELECT 1 FROM trades
              WHERE strategy = ? AND market = ? AND side = ? AND reason = ?
@@ -1034,6 +1043,7 @@ pub async fn record_settlement_trade_idempotent(
     .bind(pnl.to_string())
     .bind(reason)
     .bind(sid)
+    .bind(fees.to_string())
     // WHERE NOT EXISTS fingerprint binds:
     .bind(strategy)
     .bind(market)
@@ -2104,6 +2114,23 @@ pub async fn record_static_config_snapshot(pool: &SqlitePool) {
 /// Insert a row into `open_positions` when a new position is entered.
 /// Called for every entry — both ghost mode and live — so the UI and LLM Advisor
 /// can see in-flight positions that have not yet appeared as completed trades.
+/// Stamp the venue fee already paid to open this position.
+///
+/// Separate from `record_open_position` because the fee is only known after the
+/// fill comes back, while the row is written earlier (and by fifteen call sites
+/// across three venues). Settlement and off-strategy bookings read it back to
+/// net the entry leg out of recorded P&L.
+pub async fn set_open_position_entry_fee(pool: &SqlitePool, token_id: &str, entry_fee: Decimal) {
+    if let Err(e) = sqlx::query("UPDATE open_positions SET entry_fee = ? WHERE token_id = ?")
+        .bind(entry_fee.to_string())
+        .bind(token_id)
+        .execute(pool)
+        .await
+    {
+        error!("❌ DB set_open_position_entry_fee failed for {}: {}", token_id, e);
+    }
+}
+
 pub async fn record_open_position(
     pool: &SqlitePool,
     strategy: &str,
@@ -2334,8 +2361,8 @@ pub async fn purge_stale_open_positions(
     // by its phantom mark-to-market (observed: +$14.85 of redeemed ETH arb legs).
     const STALE_PENDING_GRACE_SECS: i64 = 3600; // 60 min ≫ indexer lag, ≪ orphan lifetime
 
-    let rows: Vec<(i64, String, Option<String>, String, String, String, String, String, String, Option<String>)> = match sqlx::query_as(
-        "SELECT id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price FROM open_positions"
+    let rows: Vec<(i64, String, Option<String>, String, String, String, String, String, String, Option<String>, Option<String>)> = match sqlx::query_as(
+        "SELECT id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price, entry_fee FROM open_positions"
     )
     .fetch_all(pool)
     .await {
@@ -2345,7 +2372,14 @@ pub async fn purge_stale_open_positions(
 
     let now = Utc::now();
     let mut purged = 0usize;
-    for (id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price) in rows {
+    for (id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price, entry_fee) in rows {
+        // Dollars already paid to open this leg. Absent on rows written before
+        // the column existed, and on venues that do not report a fee — both
+        // degrade to the old gross-only behaviour rather than inventing a cost.
+        let entry_fee = entry_fee
+            .as_deref()
+            .and_then(|f| f.parse::<Decimal>().ok())
+            .unwrap_or(Decimal::ZERO);
         // Still held on-chain (size > 0, not redeemable) — keep.
         if live_token_ids.contains(&token_id) {
             continue;
@@ -2376,13 +2410,16 @@ pub async fn purge_stale_open_positions(
                         market, side, qty
                     );
                 } else {
-                    let pnl = (resolved_px - entry) * qty;
+                    // Settlement pays out with NO exit fee — verified against
+                    // collateral on 2026-08-13 (3.04 shares in the money paid
+                    // exactly $3.0400). So the round trip owes the entry leg only.
+                    let pnl = (resolved_px - entry) * qty - entry_fee;
                     let reason = format!(
                         "Settlement ({} — pending redemption)",
                         if won { "won" } else { "lost" }
                     );
                     let inserted = record_settlement_trade_idempotent(
-                        pool, &strategy, &market, &side, entry, resolved_px, qty, pnl, &reason, None,
+                        pool, &strategy, &market, &side, entry, resolved_px, qty, pnl, entry_fee, &reason, None,
                     ).await;
                     if inserted {
                         info!(
@@ -2439,7 +2476,11 @@ pub async fn purge_stale_open_positions(
                     } else {
                         // Position is a long outcome token: P&L = (exit − entry) × shares
                         // for either YES or NO side (both were bought at `entry`).
-                        let pnl = (exit_px - entry) * qty;
+                        // Net of the entry leg's fee. The exit leg is unknown on
+                        // this path by construction — the position left outside
+                        // the strategy's exit, so there is no fill to price — and
+                        // the reason string already marks the mark as estimated.
+                        let pnl = (exit_px - entry) * qty - entry_fee;
                         let reason = format!(
                             "ChainReconcile: closed off-strategy (est. @ ${:.4} last mark)",
                             exit_px
@@ -2447,7 +2488,7 @@ pub async fn purge_stale_open_positions(
                         // Reconciliation knows the book but not the market's class or
                         // underlying — leave those NULL rather than guessing.
                         let scope = TradeScope::new("", venue_for_pool(pool), None, None);
-                        record_trade_db(pool, &scope, Decimal::ZERO, &strategy, &market, &side, entry, exit_px, qty, pnl, &reason, None).await;
+                        record_trade_db(pool, &scope, entry_fee, &strategy, &market, &side, entry, exit_px, qty, pnl, &reason, None).await;
                         info!(
                             "🧾 Ledger reconcile: booked off-strategy exit — {} {} {} | {} sh entry=${:.4} exit=${:.4} → pnl=${:.4}",
                             strategy, market, side, qty, entry, exit_px, pnl
@@ -2508,8 +2549,9 @@ pub async fn update_position_from_chain(
     // existing entry_price.
     let result = if avg_price > rust_decimal::Decimal::ZERO {
         sqlx::query(
-            "UPDATE open_positions SET shares = ?, entry_price = ?, chain_adopted = 1, current_price = COALESCE(?, current_price) WHERE token_id = ?"
+            "UPDATE open_positions SET entry_fee = CAST(COALESCE(entry_fee,'0') AS REAL) * (CAST(? AS REAL) / NULLIF(CAST(shares AS REAL),0)), shares = ?, entry_price = ?, chain_adopted = 1, current_price = COALESCE(?, current_price) WHERE token_id = ?"
         )
+        .bind(shares.to_string())
         .bind(shares.to_string())
         .bind(avg_price.to_string())
         .bind(&cur_price_str)
@@ -2518,8 +2560,9 @@ pub async fn update_position_from_chain(
         .await
     } else {
         sqlx::query(
-            "UPDATE open_positions SET shares = ?, chain_adopted = 1, current_price = COALESCE(?, current_price) WHERE token_id = ?"
+            "UPDATE open_positions SET entry_fee = CAST(COALESCE(entry_fee,'0') AS REAL) * (CAST(? AS REAL) / NULLIF(CAST(shares AS REAL),0)), shares = ?, chain_adopted = 1, current_price = COALESCE(?, current_price) WHERE token_id = ?"
         )
+        .bind(shares.to_string())
         .bind(shares.to_string())
         .bind(&cur_price_str)
         .bind(token_id)
@@ -3471,6 +3514,67 @@ mod reconcile_tests {
         assert_eq!(pnl, dec_of("-0.9024"), "net P&L must match the real collateral move");
         assert_eq!(pnl + booked_fees, gross, "gross must be recoverable from pnl + fees");
         assert!(pnl < gross, "fees must make the loss larger, never smaller");
+    }
+
+    /// A position that leaves via settlement must still owe its entry fee.
+    ///
+    /// Reproduces 2026-08-13 trade 356: FairValue bought 3.04 shares at $0.75
+    /// and the market settled in the money. Collateral moved 65.573144 →
+    /// 63.253244 → 66.293244, i.e. −$2.3199 out (2.28 notional + $0.0399 taker
+    /// fee) and exactly +$3.0400 back — settlement pays $1.00/share and charges
+    /// nothing. True profit +$0.7201. It booked +$0.7585, because the
+    /// settlement path had no way to see the entry fee.
+    #[tokio::test]
+    async fn settlement_booking_is_net_of_the_entry_fee() {
+        let pool = mem_pool().await;
+        let shares = dec_of("3.04");
+        let entry = dec_of("0.75");
+        let entry_fee = dec_of("0.0399"); // 0.07 · p · (1−p) · shares
+        let gross = (Decimal::ONE - entry) * shares;
+
+        record_open_position(&pool, "FairValueStrategy", "tok-356",
+            "Bitcoin Up or Down - August 13, 2PM ET", "YES", entry, shares, false).await;
+        set_open_position_entry_fee(&pool, "tok-356", entry_fee).await;
+
+        let stored: Option<String> = sqlx::query_scalar(
+            "SELECT entry_fee FROM open_positions WHERE token_id = ?"
+        ).bind("tok-356").fetch_one(&pool).await.unwrap();
+        let stored: Decimal = stored.expect("entry_fee stored").parse().unwrap();
+        assert_eq!(stored, entry_fee);
+
+        // What the settlement path books once it can read the fee back.
+        let pnl = gross - stored;
+        assert_eq!(pnl, dec_of("0.7201"), "must match the real collateral move");
+        assert!(pnl < gross, "the entry leg was not free");
+        assert_eq!(gross - pnl, entry_fee, "gross must stay recoverable");
+    }
+
+    /// The stored entry fee is denominated in dollars for a specific fill size,
+    /// so a chain-sync share correction has to carry it along. Trade 356 filled
+    /// 3.04 of the 3.6363 shares requested; leaving the fee unscaled would
+    /// describe a fill that never happened.
+    #[tokio::test]
+    async fn entry_fee_follows_a_chain_sync_share_correction() {
+        let pool = mem_pool().await;
+        let requested = dec_of("3.6363636363636363636363636364");
+        let filled = dec_of("3.04");
+        let fee_at_request = dec_of("0.07") * dec_of("0.75") * dec_of("0.25") * requested;
+
+        record_open_position(&pool, "FairValueStrategy", "tok-sync", "mkt", "YES",
+            dec_of("0.75"), requested, false).await;
+        set_open_position_entry_fee(&pool, "tok-sync", fee_at_request).await;
+
+        update_position_from_chain(&pool, "tok-sync", filled, Decimal::ZERO, None).await;
+
+        let (shares, fee): (String, Option<String>) = sqlx::query_as(
+            "SELECT shares, entry_fee FROM open_positions WHERE token_id = ?"
+        ).bind("tok-sync").fetch_one(&pool).await.unwrap();
+        assert_eq!(shares.parse::<Decimal>().unwrap(), filled);
+
+        let fee: f64 = fee.expect("entry_fee retained").parse().unwrap();
+        let expected = 0.07 * 0.75 * 0.25 * 3.04;
+        assert!((fee - expected).abs() < 1e-6,
+            "fee should rescale to the filled size: got {fee}, expected {expected}");
     }
 
     fn dec_of(s: &str) -> Decimal { s.parse().unwrap() }

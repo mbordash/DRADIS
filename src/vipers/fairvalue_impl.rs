@@ -46,8 +46,16 @@
 ///    window with the model still ≥ SETTLE_HOLD_MIN_PROB, where holding to
 ///    settlement pays $1.00 with zero exit fee (strictly dominates a taker TP).
 /// 2. SL at FAIRVALUE_STOP_LOSS_PERCENT (min-hold gated, catastrophic bypass).
-/// 3. Model reversal: our side's fair probability < MODEL_REVERSAL_EXIT_PROB —
-///    the thesis is gone, exit without waiting for the SL.
+/// 3. Model reversal: our side's fair probability has decayed by
+///    `fairvalue_model_reversal_decay_pct` from where it stood at entry — the
+///    thesis is gone, exit without waiting for the SL. The trigger is
+///    **entry-relative**, not an absolute floor: this viper's whole job is to
+///    buy a side the model prices above its ask, and on a cheap tail that fair
+///    value is legitimately low (0.30 against a 0.18 ask). An absolute floor
+///    of 0.40 made every such entry exit-eligible the moment it filled, so the
+///    position was closed by the 60s min-hold rather than by any change of
+///    thesis (observed 2026-08-12: three round trips, all exited at exactly
+///    t+60s, the one "winner" saved only by TP firing at t+10s).
 /// 4. Endgame bail-out: final BAIL_SECS with fair probability < BAIL_PROB.
 
 use async_trait::async_trait;
@@ -98,6 +106,10 @@ struct FairValueGlobals {
     last_entry_log_at: StdMutex<Option<Instant>>,
     /// Stop-loss circuit breaker: SL exits per condition_id this process life.
     sl_counts: StdMutex<HashMap<String, u32>>,
+    /// Model fair probability of the bought side at the moment the entry signal
+    /// was emitted, keyed by token_id. The model-reversal exit measures decay
+    /// against this rather than against an absolute floor. Cleared on exit.
+    entry_fair: StdMutex<HashMap<String, f64>>,
 }
 
 impl FairValueGlobals {
@@ -109,6 +121,7 @@ impl FairValueGlobals {
             last_diag_log_at: StdMutex::new(None),
             last_entry_log_at: StdMutex::new(None),
             sl_counts:        StdMutex::new(HashMap::new()),
+            entry_fair:       StdMutex::new(HashMap::new()),
         }
     }
 }
@@ -153,8 +166,31 @@ impl FairValueStrategyImpl {
         Self
     }
 
-    /// Feed the vol sampler and return σ per √second, or None during warmup /
-    /// frozen oracle.
+    /// σ floor for a given forecast horizon.
+    ///
+    /// Zero-strength (absolute backstop only) at or below `horizon_secs`,
+    /// ramping linearly to the full floor at twice that. Rationale in
+    /// `config::FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS`: inside the measurement
+    /// window the realized-vol estimate is in-sample and should be trusted;
+    /// beyond it, forecast error compounds and the floor earns its keep.
+    fn sigma_floor(horizon_secs: i64, secs_left: i64) -> f64 {
+        let abs = config::FAIRVALUE_ABSOLUTE_MIN_SIGMA_PER_SQRT_SEC;
+        let full = config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC;
+        if horizon_secs <= 0 {
+            // Knob disabled — restore the unconditional floor.
+            return full;
+        }
+        let ramp = ((secs_left - horizon_secs) as f64 / horizon_secs as f64).clamp(0.0, 1.0);
+        abs + (full - abs) * ramp
+    }
+
+    /// Feed the vol sampler and return the **raw** σ per √second, or None
+    /// during warmup / frozen oracle.
+    ///
+    /// Unfloored on purpose: the sampler is fed before the venue (and therefore
+    /// the forecast horizon) is known, and the floor is horizon-dependent.
+    /// Callers apply [`sigma_floor`](Self::sigma_floor) once `secs_left` is in
+    /// hand.
     fn update_and_read_sigma(&self, asset: &str, oracle_price: f64) -> Option<f64> {
         let mut samples = match globals(asset).vol_samples.lock() {
             Ok(g) => g,
@@ -180,9 +216,6 @@ impl FairValueStrategyImpl {
         };
         let prices: Vec<f64> = samples.iter().map(|(_, p)| *p).collect();
         sigma_per_sqrt_sec(&prices, span_secs, config::FAIRVALUE_MIN_VOL_SAMPLES)
-            // σ floor: a quiet sampling hour must not make the model delusional
-            // about a multi-hour horizon (see FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC).
-            .map(|s| s.max(config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC))
     }
 
     /// Time-scaled edge requirement: linear taper MIN_EDGE→BASE_EDGE inside the
@@ -227,6 +260,51 @@ impl FairValueStrategyImpl {
             Err(p) => p.into_inner(),
         };
         reg.insert(token_id.to_string(), Instant::now());
+        // Every call site is an exit emission, so this is also where the
+        // position's entry-fair anchor stops being meaningful. Clearing here
+        // keeps the map from leaking across market rotations without needing a
+        // matching call on all four exit paths.
+        self.clear_entry_fair(asset, token_id);
+    }
+
+    /// Remember the model fair probability of the side we are buying, so the
+    /// model-reversal exit can measure decay from the entry thesis instead of
+    /// from a fixed floor. Re-firing entry signals overwrite the same key,
+    /// which is correct: the position's basis is the most recent fill.
+    fn record_entry_fair(&self, asset: &str, token_id: &str, fair: f64) {
+        let mut reg = match globals(asset).entry_fair.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        reg.insert(token_id.to_string(), fair);
+    }
+
+    /// Baseline the model-reversal exit measures decay against.
+    ///
+    /// Falls back to the position's entry price when no entry fair is on record
+    /// — a chain-adopted position, or one carried across a process restart.
+    /// That fallback is conservative and always available: entry required
+    /// `fair > ask`, so the recorded average entry price is a lower bound on
+    /// what the fair value was when the position was opened. Using it can only
+    /// make the exit *later* than the true thesis would, never instant.
+    fn reversal_baseline(&self, asset: &str, token_id: &str, avg_entry: Decimal) -> f64 {
+        let reg = match globals(asset).entry_fair.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        reg.get(token_id)
+            .copied()
+            .or_else(|| avg_entry.to_f64())
+            .unwrap_or(0.0)
+    }
+
+    /// Drop the entry-fair record once a position is closed.
+    fn clear_entry_fair(&self, asset: &str, token_id: &str) {
+        let mut reg = match globals(asset).entry_fair.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        reg.remove(token_id);
     }
 
     /// Recompute the model's current fair probability for a held token's side.
@@ -237,6 +315,7 @@ impl FairValueStrategyImpl {
         market: &MarketConfig,
         snapshot: &MarketSnapshot,
         token_is_yes: bool,
+        sigma_floor_horizon_secs: i64,
     ) -> Option<f64> {
         let strike = market.strike_price?.to_f64()?;
         let spot = snapshot.oracle_price.to_f64()?;
@@ -260,7 +339,7 @@ impl FairValueStrategyImpl {
         let prices: Vec<f64> = samples.iter().map(|(_, p)| *p).collect();
         drop(samples);
         let sigma = sigma_per_sqrt_sec(&prices, span_secs, config::FAIRVALUE_MIN_VOL_SAMPLES)?
-            .max(config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC);
+            .max(Self::sigma_floor(sigma_floor_horizon_secs, secs_left));
         let fair_yes = fair_yes_probability(spot, strike, sigma, secs_left as f64)?;
         Some(if token_is_yes { fair_yes } else { 1.0 - fair_yes })
     }
@@ -337,8 +416,11 @@ impl Strategy for FairValueStrategyImpl {
         }
 
         // ── Model inputs: self-sampled realized vol (sampled above) ──────────
+        // The floor is applied here, not in the sampler, because its strength
+        // depends on how far out we are forecasting.
         let sigma = match sigma_opt {
-            Some(s) => s, // warmup complete, oracle alive
+            // warmup complete, oracle alive
+            Some(s) => s.max(Self::sigma_floor(dc.fairvalue_sigma_floor_horizon_secs, secs_left)),
             None => {
                 // Warmup visibility: without this the viper is totally silent
                 // for the first FAIRVALUE_MIN_VOL_SAMPLES × SAMPLE_SECS.
@@ -526,6 +608,9 @@ impl Strategy for FairValueStrategyImpl {
 
         let side = if want_yes { "YES" } else { "NO" };
         let shares = (dc.fairvalue_trade_size_usdc / fee_headroom) / ask;
+        // Anchor the model-reversal exit to the thesis we are entering on.
+        let entry_fair = if want_yes { fair_yes } else { 1.0 - fair_yes };
+        self.record_entry_fair(&ctx.crypto_filter, token_id.as_str(), entry_fair);
         {
             // Throttled: a passed persistence gate re-fires every tick.
             let mut last = globals(&ctx.crypto_filter).last_entry_log_at.lock().unwrap();
@@ -599,7 +684,10 @@ impl Strategy for FairValueStrategyImpl {
                 .market_close_time
                 .map(|ct| (ct - Utc::now()).num_seconds())
                 .unwrap_or(i64::MAX);
-            let fair_side = self.fair_prob_for_side(&ctx.crypto_filter, market, snap, token_is_yes);
+            let fair_side = self.fair_prob_for_side(
+                &ctx.crypto_filter, market, snap, token_is_yes,
+                dc.fairvalue_sigma_floor_horizon_secs,
+            );
 
             let exit_params = |price: Decimal| OrderParams {
                 token_id: token_id.clone(),
@@ -631,16 +719,21 @@ impl Strategy for FairValueStrategyImpl {
             }
 
             // ── 2. Model-reversal exit — thesis gone, don't ride to the SL ───
+            // Entry-relative, not an absolute floor: a legitimate cheap-tail
+            // entry (fair 0.30 vs a 0.18 ask) must not be born exit-eligible.
+            let baseline = self.reversal_baseline(&ctx.crypto_filter, token_id.as_str(), avg_entry);
+            let decay_pct = dc.fairvalue_model_reversal_decay_pct.to_f64().unwrap_or(0.0);
+            let reversal_floor = baseline * (1.0 - decay_pct);
             if secs_held >= 60
                 && bid >= config::FAIRVALUE_MIN_EXIT_BID
-                && fair_side.map_or(false, |p| p < config::FAIRVALUE_MODEL_REVERSAL_EXIT_PROB)
+                && fair_side.map_or(false, |p| p < reversal_floor)
             {
                 self.arm_cooldown(&ctx.crypto_filter, token_id.as_str());
                 return Ok(StrategySignal::Exit {
                     params: exit_params(bid),
                     reason: format!(
-                        "FairValueReversal: fair={:.3} < {:.2}, bid=${:.4} ({:+.2}%)",
-                        fair_side.unwrap_or(0.0), config::FAIRVALUE_MODEL_REVERSAL_EXIT_PROB,
+                        "FairValueReversal: fair={:.3} < {:.3} (entry fair {:.3} −{:.0}%), bid=${:.4} ({:+.2}%)",
+                        fair_side.unwrap_or(0.0), reversal_floor, baseline, decay_pct * 100.0,
                         bid, profit_margin * dec!(100)
                     ),
                     exit_pair: false,
@@ -728,6 +821,126 @@ mod tests {
     /// `to_str_internal`. The FairValue diagnostic log formats both edges with
     /// `{:+.3}`, so a market with no ask on one leg crashed the process
     /// (observed 2026-08-10 on the Kalshi build).
+    /// The model-reversal exit must not be satisfied the instant a position
+    /// fills.
+    ///
+    /// This was the shape of the 2026-08-12 BTC session: the exit floor was an
+    /// absolute 0.40, but the entry gate takes cheap-tail positions whose fair
+    /// value is legitimately 0.30-0.34, so all three round trips were closed by
+    /// the 60s min-hold rather than by any change in the model. Anchoring the
+    /// floor to the entry thesis is what makes the two gates consistent.
+    #[test]
+    fn reversal_floor_is_below_every_admissible_entry_fair() {
+        let decay = config::FAIRVALUE_MODEL_REVERSAL_DECAY_PCT
+            .to_f64().expect("decay is a small decimal");
+        // The three entries actually taken that session, plus the extremes of
+        // the entry price band — an entry is only legal when fair > ask.
+        for entry_fair in [0.303_f64, 0.306, 0.340, 0.11, 0.99] {
+            let floor = entry_fair * (1.0 - decay);
+            assert!(
+                floor < entry_fair,
+                "entry fair {entry_fair} would be exit-eligible on arrival (floor {floor})"
+            );
+        }
+    }
+
+    /// The fallback baseline, used when no entry fair is on record (a
+    /// chain-adopted position, or one carried over a restart), must also never
+    /// be instantly triggered. Entry requires `fair > ask`, so the recorded
+    /// average entry price is a valid lower bound on the entry thesis.
+    #[test]
+    fn entry_price_fallback_baseline_is_never_instantly_triggered() {
+        let strat = FairValueStrategyImpl::new();
+        let decay = config::FAIRVALUE_MODEL_REVERSAL_DECAY_PCT
+            .to_f64().expect("decay is a small decimal");
+        // Nothing recorded for this token → falls back to avg_entry.
+        let baseline = strat.reversal_baseline("TEST-FALLBACK-ASSET", "no-such-token", dec!(0.18));
+        assert!((baseline - 0.18).abs() < 1e-9, "expected avg_entry fallback, got {baseline}");
+        // A position that entered at 0.18 had fair > 0.18, so the floor sits
+        // strictly under the thesis it was opened on.
+        assert!(baseline * (1.0 - decay) < 0.18);
+    }
+
+    /// A recorded entry fair takes precedence over the price fallback.
+    #[test]
+    fn recorded_entry_fair_anchors_the_reversal_floor() {
+        let strat = FairValueStrategyImpl::new();
+        strat.record_entry_fair("TEST-ANCHOR-ASSET", "tok-1", 0.34);
+        let baseline = strat.reversal_baseline("TEST-ANCHOR-ASSET", "tok-1", dec!(0.18));
+        assert!((baseline - 0.34).abs() < 1e-9, "expected recorded entry fair, got {baseline}");
+        // Arming the cooldown on exit clears it, so the next position on the
+        // same token starts from its own thesis rather than inheriting one.
+        strat.arm_cooldown("TEST-ANCHOR-ASSET", "tok-1");
+        let after = strat.reversal_baseline("TEST-ANCHOR-ASSET", "tok-1", dec!(0.18));
+        assert!((after - 0.18).abs() < 1e-9, "entry fair should be cleared on exit, got {after}");
+    }
+
+    /// The σ floor must not override an in-sample measurement.
+    ///
+    /// On 2026-08-13 σ sat pinned at exactly the floor (4.20e-5) for all 152
+    /// samples of a quiet overnight session while realized vol implied ~2.85e-5.
+    /// That inflated the fair value of cheap tails by 5-10¢ and manufactured all
+    /// three entries, which closed gross-flat and lost $0.97 to fees.
+    #[test]
+    fn sigma_floor_does_not_bind_inside_the_measurement_window() {
+        let h = config::FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS;
+        let abs = config::FAIRVALUE_ABSOLUTE_MIN_SIGMA_PER_SQRT_SEC;
+        let full = config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC;
+        // The three entries of that session, by seconds to expiry.
+        for secs_left in [932_i64, 1206, 2371] {
+            let f = FairValueStrategyImpl::sigma_floor(h, secs_left);
+            assert!(
+                (f - abs).abs() < 1e-12,
+                "T={secs_left}s is inside the vol window; floor should be the absolute backstop, got {f:e}"
+            );
+            // The measured σ of that night must survive unclamped.
+            assert!(2.85e-5_f64.max(f) < full, "realized σ must not be floored up to {full:e}");
+        }
+    }
+
+    /// Long horizons keep the protection the floor was written for: a 1-hour vol
+    /// window is a poor forecast for a settlement many hours out.
+    #[test]
+    fn sigma_floor_reaches_full_strength_beyond_twice_the_window() {
+        let h = config::FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS;
+        let full = config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC;
+        for secs_left in [2 * h, 6 * h, 20 * h] {
+            let f = FairValueStrategyImpl::sigma_floor(h, secs_left);
+            assert!((f - full).abs() < 1e-12, "T={secs_left}s should get the full floor, got {f:e}");
+        }
+        // Monotone ramp between the window and twice it — no discontinuity that
+        // would reprice a market as it crosses the threshold.
+        let mid = FairValueStrategyImpl::sigma_floor(h, h + h / 2);
+        assert!(mid > FairValueStrategyImpl::sigma_floor(h, h));
+        assert!(mid < full);
+    }
+
+    /// Setting the knob to zero restores the old unconditional floor, so the
+    /// change can be reverted live without a redeploy.
+    #[test]
+    fn zero_horizon_restores_the_unconditional_floor() {
+        let full = config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC;
+        for secs_left in [60_i64, 932, 100_000] {
+            assert_eq!(FairValueStrategyImpl::sigma_floor(0, secs_left), full);
+        }
+    }
+
+    /// Percentage stops need to span more than a tick to mean anything, and the
+    /// round-trip fee is `14·(1−p)%` of entry price — both argue against the
+    /// cheap tail. Trade 355 entered at 11¢, where a 12% stop is 1.3 ticks.
+    #[test]
+    fn min_entry_price_keeps_the_stop_clear_of_tick_noise() {
+        let min_entry = config::FAIRVALUE_MIN_ENTRY_PRICE.to_f64().unwrap();
+        let stop = config::FAIRVALUE_STOP_LOSS_PERCENT.to_f64().unwrap();
+        let tick = 0.01_f64;
+        let ticks = min_entry * stop / tick;
+        assert!(ticks >= 2.5, "stop is only {ticks:.1} ticks wide at the minimum entry price");
+        // And the round-trip toll must stay under the take-profit target.
+        let toll = 2.0 * config::CRYPTO_FEE_RATE.to_f64().unwrap() * (1.0 - min_entry);
+        let tp = config::FAIRVALUE_TARGET_PROFIT_PERCENT.to_f64().unwrap();
+        assert!(toll < tp, "round-trip toll {toll:.3} must leave something under a {tp:.2} TP");
+    }
+
     #[test]
     fn unavailable_edge_sentinel_is_formattable() {
         let s = format!("{:+.3}", NO_EDGE);

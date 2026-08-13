@@ -93,6 +93,12 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
     // ── Global ────────────────────────────────────────────────────────────────
     v.push(F::new("Global", None, "ghost_mode", "Ghost Mode", "bool", false,
         "Simulate all orders — no real CLOB calls (validation framework)."));
+    v.push(F::new("Global", None, "intl_taker_fee_rate", "Taker Fee Rate", "pct", true,
+        "Polymarket's taker fee coefficient: fee = rate × price × (1 − price) × shares, charged on BOTH \
+         legs of a round trip; makers pay nothing. Recorded P&L is net of it. 0.07 is the rate measured \
+         from actual collateral movement — the venue's fee-rate endpoint advertises 1000 bps, but that is \
+         the ceiling an order authorizes, not what is charged. Only change this if Polymarket's schedule \
+         changes; setting it wrong silently skews every recorded trade.").range(0.0, 0.5).step(0.005));
 
     // ── Arbitrage ───────────────────────────────────────────────────────────────
     {
@@ -436,6 +442,17 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(g, e, "fairvalue_base_edge", "Base Edge", "price", false,
             "Required (fair − ask − fee) edge mid-session; tapers to Min Edge inside the final 30 min.").range(0.0, 0.5).step(0.005));
         // Advanced
+        v.push(F::new(g, e, "fairvalue_model_reversal_decay_pct", "Reversal Decay", "pct", true,
+            "Exit once the model's probability for the held side has lost this fraction of its value AT ENTRY \
+             (0.35 = an entry at fair 0.30 exits below 0.195). Entry-relative on purpose: cheap-tail entries are \
+             taken at a fair value of 0.30-0.34, so an absolute floor closed them on the 60s min-hold rather than \
+             on any real change of thesis. Lower = cuts a decaying thesis sooner.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "fairvalue_sigma_floor_horizon_secs", "Vol Floor Horizon", "secs", true,
+            "Forecast horizon at or below which the realized-vol floor stops binding, ramping to full \
+             strength at twice this. The floor guards against trusting a 1-hour vol window for a settlement \
+             many hours out; inside the window the measurement is in-sample and the floor only overrides good \
+             data. Set to 0 to restore an unconditional floor. Raising this makes the model assume MORE \
+             volatility, which inflates the fair value of cheap tails.").min(0.0).step(300.0).unit("s"));
         v.push(F::new(g, e, "fairvalue_min_edge", "Min Edge", "price", true,
             "Edge floor at expiry — the settlement-snipe requirement.").range(0.0, 0.5).step(0.005));
         v.push(F::new(g, e, "fairvalue_max_entry_price", "Max Entry", "price", true,

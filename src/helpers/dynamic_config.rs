@@ -153,6 +153,9 @@ fn default_fairvalue_min_entry_price()     -> Decimal { config::FAIRVALUE_MIN_EN
 fn default_fairvalue_max_entry_price()     -> Decimal { config::FAIRVALUE_MAX_ENTRY_PRICE             }
 fn default_fairvalue_target_profit()       -> Decimal { config::FAIRVALUE_TARGET_PROFIT_PERCENT       }
 fn default_fairvalue_stop_loss()           -> Decimal { config::FAIRVALUE_STOP_LOSS_PERCENT           }
+fn default_fairvalue_reversal_decay()      -> Decimal { config::FAIRVALUE_MODEL_REVERSAL_DECAY_PCT    }
+fn default_fairvalue_sigma_floor_horizon() -> i64     { config::FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS    }
+fn default_intl_taker_fee_rate()           -> Decimal { config::INTL_TAKER_FEE_RATE                   }
 fn default_convergence_position_size()     -> Decimal { config::CONVERGENCE_POSITION_SIZE_USDC        }
 fn default_convergence_max_exposure()      -> Decimal { config::CONVERGENCE_MAX_EXPOSURE_USDC         }
 fn default_convergence_stop_loss()         -> Decimal { config::CONVERGENCE_STOP_LOSS_PERCENT         }
@@ -247,6 +250,10 @@ pub struct DynamicConfig {
     // ── Global ────────────────────────────────────────────────────────────────
     /// When true all orders are simulated — no real CLOB calls.
     pub ghost_mode: bool,
+    /// Polymarket taker fee rate used to book the real cost of a round trip:
+    /// `fee = rate · p · (1 − p) · shares`, charged on entry and exit alike.
+    #[serde(default = "default_intl_taker_fee_rate")]
+    pub intl_taker_fee_rate: Decimal,
 
     // ── Viper (strategy) enable flags ─────────────────────────────────────────
     pub enable_arbitrage:     bool,
@@ -534,6 +541,15 @@ pub struct DynamicConfig {
     pub fairvalue_target_profit_pct:      Decimal,
     #[serde(default = "default_fairvalue_stop_loss")]
     pub fairvalue_stop_loss_pct:          Decimal,
+    /// Fraction of the entry fair value the model may lose before the
+    /// model-reversal exit fires. Entry-relative, never an absolute floor.
+    #[serde(default = "default_fairvalue_reversal_decay")]
+    pub fairvalue_model_reversal_decay_pct: Decimal,
+    /// Forecast horizon at or below which the σ floor stops binding, ramping to
+    /// full strength at twice this. Trust an in-sample vol measurement; floor
+    /// only what it cannot see.
+    #[serde(default = "default_fairvalue_sigma_floor_horizon")]
+    pub fairvalue_sigma_floor_horizon_secs: i64,
 
     // ── Convergence Viper ─────────────────────────────────────────────────────
     #[serde(default = "default_convergence_enable")]
@@ -581,6 +597,7 @@ impl Default for DynamicConfig {
     fn default() -> Self {
         Self {
             ghost_mode: config::GHOST_MODE,
+            intl_taker_fee_rate: config::INTL_TAKER_FEE_RATE,
 
             enable_arbitrage:     config::ENABLE_ARBITRAGE_TRADING,
             enable_time_decay:    config::ENABLE_TIME_DECAY_TRADING,
@@ -719,6 +736,8 @@ impl Default for DynamicConfig {
             fairvalue_max_entry_price:        config::FAIRVALUE_MAX_ENTRY_PRICE,
             fairvalue_target_profit_pct:      config::FAIRVALUE_TARGET_PROFIT_PERCENT,
             fairvalue_stop_loss_pct:          config::FAIRVALUE_STOP_LOSS_PERCENT,
+            fairvalue_model_reversal_decay_pct: config::FAIRVALUE_MODEL_REVERSAL_DECAY_PCT,
+            fairvalue_sigma_floor_horizon_secs: config::FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS,
 
             enable_convergence:               config::ENABLE_CONVERGENCE_TRADING,
             convergence_position_size_usdc:   config::CONVERGENCE_POSITION_SIZE_USDC,

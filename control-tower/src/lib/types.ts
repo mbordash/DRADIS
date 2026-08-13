@@ -20,6 +20,7 @@
 export interface DynamicConfig {
   // Global
   ghost_mode: boolean;
+  intl_taker_fee_rate: string;
 
   // Viper enable flags
   enable_arbitrage:    boolean;
@@ -42,6 +43,8 @@ export interface DynamicConfig {
   fairvalue_max_entry_price:   string;
   fairvalue_target_profit_pct: string;
   fairvalue_stop_loss_pct:     string;
+  fairvalue_model_reversal_decay_pct: string;
+  fairvalue_sigma_floor_horizon_secs: number;
 
   // Arbitrage Viper
   arbitrage_position_size_usdc: string;

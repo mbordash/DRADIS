@@ -124,6 +124,14 @@ pub async fn sync_position_balance(
                 }
 
                 info!("⚖️ Position Synced [{}]: Token {} updated to actual: {}", strategy_name, token_id, actual_shares);
+                // The entry fee was booked against the shares we *asked* for, but
+                // the venue charges it on what actually filled — and a marketable
+                // FAK routinely over-fills (2026-08-13 trade 353: 16.04 requested,
+                // 16.94 filled). The fee is linear in shares, so it rescales by the
+                // same ratio; left unscaled it understated every round trip by ~5%.
+                if expected > dec!(0) && pos.entry_fee > dec!(0) {
+                    pos.entry_fee = pos.entry_fee * (actual_shares / expected);
+                }
                 pos.shares = actual_shares;
                 if pos.fill_confirmed_at.is_none() { pos.fill_confirmed_at = Some(Utc::now()); }
                 return Ok(true);

@@ -1207,6 +1207,8 @@ async fn record_settled_arb_trade(
                 Decimal::ONE,
                 pairs,
                 pnl,
+                // Arb enters on resting maker bids; makers pay no venue fee.
+                Decimal::ZERO,
                 "Settlement (YES+NO → $1.00)",
                 None,
             ).await;
@@ -1303,6 +1305,8 @@ async fn record_settled_arb_trade(
                 exit_price,
                 size,
                 pnl,
+                // Maker entry — no venue fee on the opening leg.
+                Decimal::ZERO,
                 &format!("Settlement (single-leg {})", side),
                 None,
             ).await;
@@ -1626,6 +1630,8 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address, squadron_ass
                             Decimal::ONE,
                             pairs,
                             pnl,
+                            // Maker entry — no venue fee on the opening leg.
+                            Decimal::ZERO,
                             "Settlement (auto-redeemed by Polymarket)",
                             None,
                         ).await;
