@@ -63,7 +63,7 @@ use anyhow::Result;
 use rust_decimal::Decimal;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::Instant;
@@ -110,6 +110,19 @@ struct FairValueGlobals {
     /// was emitted, keyed by token_id. The model-reversal exit measures decay
     /// against this rather than against an absolute floor. Cleared on exit.
     entry_fair: StdMutex<HashMap<String, f64>>,
+    /// Positions already counted toward `sl_counts`, keyed token_id →
+    /// `Position::opened_at`.
+    ///
+    /// A stop-loss exit is re-emitted on every patrol tick until it actually
+    /// fills, and an exit does not always fill first try. Counting on emission
+    /// therefore counted evaluation ticks rather than stop-outs: on 2026-08-13
+    /// a single catastrophic stop whose FAK missed at $0.33 drove the counter
+    /// from 1 to 101 in five seconds — the exact span of
+    /// `EXIT_RETRY_COOLDOWN_SECS`, during which dispatch was throttled while
+    /// `evaluate_exit` kept firing ~20×/s. `opened_at` distinguishes a genuine
+    /// second stop-out on a re-entered token from the same stop-out re-emitted,
+    /// so a re-entry still counts while a retry does not.
+    sl_counted: StdMutex<HashMap<String, DateTime<Utc>>>,
 }
 
 impl FairValueGlobals {
@@ -122,6 +135,7 @@ impl FairValueGlobals {
             last_entry_log_at: StdMutex::new(None),
             sl_counts:        StdMutex::new(HashMap::new()),
             entry_fair:       StdMutex::new(HashMap::new()),
+            sl_counted:       StdMutex::new(HashMap::new()),
         }
     }
 }
@@ -265,6 +279,42 @@ impl FairValueStrategyImpl {
         // keeps the map from leaking across market rotations without needing a
         // matching call on all four exit paths.
         self.clear_entry_fair(asset, token_id);
+    }
+
+    /// Count one stop-out toward the market's breaker, exactly once per
+    /// position however many times the exit is re-emitted before it fills.
+    ///
+    /// Returns the new count when this stop-out had not been counted yet, and
+    /// `None` when it is a re-emission of one already counted — which the
+    /// caller uses to suppress a duplicate breaker warning as well as the
+    /// duplicate increment.
+    fn count_stop_loss_once(
+        &self,
+        asset: &str,
+        token_id: &str,
+        opened_at: DateTime<Utc>,
+        condition_id: &str,
+    ) -> Option<u32> {
+        let g = globals(asset);
+        {
+            let mut seen = match g.sl_counted.lock() {
+                Ok(x) => x,
+                Err(p) => p.into_inner(),
+            };
+            // Same token AND same open instant → this is the same stop-out
+            // being retried, not a new one.
+            if seen.get(token_id) == Some(&opened_at) {
+                return None;
+            }
+            seen.insert(token_id.to_string(), opened_at);
+        }
+        let mut counts = match g.sl_counts.lock() {
+            Ok(x) => x,
+            Err(p) => p.into_inner(),
+        };
+        let n = counts.entry(condition_id.to_string()).or_insert(0);
+        *n += 1;
+        Some(*n)
     }
 
     /// Remember the model fair probability of the side we are buying, so the
@@ -773,14 +823,12 @@ impl Strategy for FairValueStrategyImpl {
                     continue;
                 }
                 self.arm_cooldown(&ctx.crypto_filter, token_id.as_str());
-                {
-                    let mut counts = match globals(&ctx.crypto_filter).sl_counts.lock() {
-                        Ok(g) => g,
-                        Err(p) => p.into_inner(),
-                    };
-                    let n = counts.entry(market.condition_id.clone()).or_insert(0);
-                    *n += 1;
-                    if *n >= config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET {
+                // Counted once per position, not once per emission — a retried
+                // exit is the same stop-out, not another one.
+                if let Some(n) = self.count_stop_loss_once(
+                    &ctx.crypto_filter, token_id.as_str(), position.opened_at, &market.condition_id,
+                ) {
+                    if n >= config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET {
                         tracing::warn!(
                             " FairValue circuit breaker: {} SL exits on \"{}\" — no further entries this market",
                             n, market.market_name
@@ -939,6 +987,70 @@ mod tests {
         let toll = 2.0 * config::CRYPTO_FEE_RATE.to_f64().unwrap() * (1.0 - min_entry);
         let tp = config::FAIRVALUE_TARGET_PROFIT_PERCENT.to_f64().unwrap();
         assert!(toll < tp, "round-trip toll {toll:.3} must leave something under a {tp:.2} TP");
+    }
+
+    /// A stop-out that is re-emitted while its exit retries must count once.
+    ///
+    /// Reproduces 2026-08-13 on the 4PM BTC market: the catastrophic stop's FAK
+    /// missed at $0.33 with no buyers, so the position correctly stayed in the
+    /// map. Dispatch was then throttled for `EXIT_RETRY_COOLDOWN_SECS` (5s)
+    /// while `evaluate_exit` kept firing at the 50ms patrol tick, driving
+    /// `sl_counts` from 1 to 101 and emitting 100 breaker WARNs in five seconds
+    /// — against a configured limit of 2.
+    #[test]
+    fn a_retried_stop_out_counts_once_not_once_per_tick() {
+        let strat = FairValueStrategyImpl::new();
+        let asset = "TEST-SL-RETRY";
+        let (token, condition) = ("tok-4pm", "cond-4pm");
+        let opened_at = Utc::now();
+
+        // First emission counts.
+        assert_eq!(
+            strat.count_stop_loss_once(asset, token, opened_at, condition),
+            Some(1),
+        );
+        // 100 re-emissions over the retry window must all be suppressed.
+        for _ in 0..100 {
+            assert_eq!(
+                strat.count_stop_loss_once(asset, token, opened_at, condition),
+                None,
+                "a retried exit is the same stop-out"
+            );
+        }
+        // The breaker must still be below its limit after one real stop-out.
+        assert!(1 < config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET);
+    }
+
+    /// A genuine second stop-out on the same token must still count — the
+    /// dedupe keys on the position's open instant, not the token alone, so
+    /// re-entering a market and stopping again trips the breaker as designed.
+    #[test]
+    fn a_re_entered_position_counts_again() {
+        let strat = FairValueStrategyImpl::new();
+        let asset = "TEST-SL-REENTRY";
+        let (token, condition) = ("tok-5pm", "cond-5pm");
+
+        let first = Utc::now();
+        let second = first + chrono::Duration::seconds(600); // re-entry later
+        assert_eq!(strat.count_stop_loss_once(asset, token, first, condition), Some(1));
+        assert_eq!(strat.count_stop_loss_once(asset, token, first, condition), None);
+        assert_eq!(
+            strat.count_stop_loss_once(asset, token, second, condition),
+            Some(2),
+            "a new position on the same token is a new stop-out"
+        );
+        assert!(2 >= config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET, "breaker trips on the second");
+    }
+
+    /// The breaker is per market: stop-outs on one condition_id must not bleed
+    /// into another's count.
+    #[test]
+    fn stop_loss_counts_are_scoped_per_market() {
+        let strat = FairValueStrategyImpl::new();
+        let asset = "TEST-SL-SCOPE";
+        let now = Utc::now();
+        assert_eq!(strat.count_stop_loss_once(asset, "tok-a", now, "cond-a"), Some(1));
+        assert_eq!(strat.count_stop_loss_once(asset, "tok-b", now, "cond-b"), Some(1));
     }
 
     #[test]
