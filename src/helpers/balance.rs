@@ -525,6 +525,10 @@ pub async fn arb_pair_fill_monitor(
     max_wait_secs: i64,
     http: Arc<reqwest::Client>,
     asset: String,
+    // Session P&L counter. Orphan flattens are real realised losses and must
+    // land here as well as in the `trades` table, or the dashboard's session
+    // figure drifts from the ledger.
+    total_pnl: Arc<Mutex<Decimal>>,
 ) {
     /// Hard-deadline grace added on top of the fill window. Only governs the
     /// neither-leg-filled case now: once both legs have had their full chance to
@@ -536,8 +540,15 @@ pub async fn arb_pair_fill_monitor(
     /// can move out of the rescue-profit ceiling within seconds of the first fill,
     /// turning a viable re-hedge into a forced flatten loss. Act quickly.
     const FIRST_LEG_CONFIRM_GRACE_SECS: u64 = 5;
-    /// Cadence at which the joint fill state is polled.
+    /// Cadence at which the joint fill state is polled while both legs are still
+    /// in play — nothing is at risk yet, so a slow poll is free.
     const POLL_INTERVAL_SECS: u64 = 5;
+    /// Cadence once exactly one leg has confirmed. From that instant a naked
+    /// directional leg exists and every second of poll granularity is added
+    /// straight onto the repair latency, so tighten right down: at the 5s
+    /// cadence the 5s asymmetric grace could overshoot to 10s before the repair
+    /// even started.
+    const ARBITER_ASYMMETRIC_POLL_SECS: u64 = 1;
     /// After the filled leg is flattened, the missing leg's cancelled GTC can still be
     /// taker-matched in a late race (observed 2026-07-03: NO flattened at 11:10:33, YES
     /// GTC filled 11:10:38 → invisible naked YES). Keep watching the missing leg for this
@@ -562,7 +573,14 @@ pub async fn arb_pair_fill_monitor(
     // Event-driven poll: exit with the asymmetric fill state to repair, or `return`
     // early on both-filled / deadline-reached-with-neither-filled.
     let (a_confirmed, a_shares, b_shares) = loop {
-        tokio::time::sleep(Duration::from_secs(POLL_INTERVAL_SECS)).await;
+        // Adaptive: slow while both legs are still candidates, fast the moment
+        // one has confirmed and the other has not.
+        let poll = if first_asymmetric_at.is_some() {
+            ARBITER_ASYMMETRIC_POLL_SECS
+        } else {
+            POLL_INTERVAL_SECS
+        };
+        tokio::time::sleep(Duration::from_secs(poll)).await;
 
         // Snapshot fill-confirmation state for both legs.
         let (a_conf, a_sh) = {
@@ -629,8 +647,15 @@ pub async fn arb_pair_fill_monitor(
     let _ = cancel_resting_orders(&client, missing_token).await;
 
     // Step 2: Short settlement grace — the cancel may have raced against a taker fill
-    //         that was mid-settlement on-chain.
-    tokio::time::sleep(Duration::from_secs(10)).await;
+    //         that was mid-settlement on-chain. Live knob (was a hardcoded 10s, the
+    //         single largest discretionary slice of the 26s entry→flatten latency
+    //         measured on 2026-08-15): every second here is a second of naked
+    //         directional exposure, and the post-flatten late-fill watcher bounds
+    //         the cost of cutting it too fine.
+    let settle_grace = crate::helpers::dynamic_config::global_config_tx()
+        .map(|tx| tx.borrow().arb_settle_grace_secs)
+        .unwrap_or(crate::config::ARB_SETTLE_GRACE_SECS);
+    tokio::time::sleep(Duration::from_secs(settle_grace)).await;
 
     // Step 3: Re-check the missing leg's on-chain balance (settle-lag race guard).
     let settled_shares = {
@@ -707,10 +732,10 @@ pub async fn arb_pair_fill_monitor(
 
     // Match the filled leg's confirmed share count AND entry price so we can compute a
     // breakeven ceiling — without this we'd cap at a fixed $0.99 and could lock in a loss.
-    let (filled_shares_recorded, filled_avg_entry) = positions.lock().await
+    let (filled_shares_recorded, filled_avg_entry, filled_entry_fee) = positions.lock().await
         .get(&(strategy_name.clone(), filled_market.clone()))
-        .map(|p| (p.shares, p.avg_entry))
-        .unwrap_or((dec!(0), dec!(0)));
+        .map(|p| (p.shares, p.avg_entry, p.entry_fee))
+        .unwrap_or((dec!(0), dec!(0), dec!(0)));
     // PARTIAL-FILL GUARD (2026-07-26 trade 296): fill-confirm stamps a leg "filled"
     // on ANY matched size, so the recorded count can be the full order size while
     // only a sliver settled on-chain (16.48 recorded vs 1.47 held). Sizing the
@@ -831,6 +856,18 @@ pub async fn arb_pair_fill_monitor(
     // claim that blocks re-entry, polluted P&L). Drop it now from the DB, the
     // in-memory map, and the ownership set. Idempotent: the sync task may have already
     // phantom-removed the in-memory entry, and deleting an absent DB row is a no-op.
+    // Read the missing leg's entry fee BEFORE the purge below deletes the row —
+    // `close_open_position` DELETEs and the `entries` ledger has no fee column,
+    // so this is the last moment it can be recovered. Only the late-fill branch
+    // consumes it, and only if that leg fills after all; zero is the right
+    // reading for the ordinary case of a maker GTC that never filled.
+    let missing_entry_fee = match crate::helpers::db::pool_for(&asset) {
+        Some(p) => crate::helpers::db::get_open_position_entry_fee(&p, &missing_token.to_string())
+            .await
+            .unwrap_or(dec!(0)),
+        None => dec!(0),
+    };
+
     positions.lock().await.remove(&(strategy_name.clone(), missing_market.clone()));
     token_ownership.lock().await.remove(&missing_market);
     if let Some(pool) = crate::helpers::db::pool_for(&asset) {
@@ -894,9 +931,30 @@ pub async fn arb_pair_fill_monitor(
             } else {
                 sell_price
             };
-            let realized = (exit_price - filled_avg_entry) * filled_shares;
-            warn!("✅ ARB ARBITER [{}]: Naked leg flattened (order_id={}) — exposure closed @ {:.4} (limit {:.4}), realized ${:.4}",
-                  strategy_name, order_id, exit_price, sell_price, realized);
+            // Net of BOTH legs' fees, mirroring the normal exit path in
+            // patrol_impl. This flatten is an FAK — always a taker fill, always
+            // charged — while the entry fee is whatever the venue took to open
+            // (zero for the resting GTC these strategies usually enter on).
+            // Prorated when a partial fill made us size the repair off-chain, so
+            // the fee follows the shares actually being closed.
+            let gross = (exit_price - filled_avg_entry) * filled_shares;
+            let entry_fee_share = if filled_shares_recorded > dec!(0) {
+                filled_entry_fee * (filled_shares / filled_shares_recorded)
+            } else {
+                dec!(0)
+            };
+            let fees = entry_fee_share
+                + crate::venues::intl::taker_fee(
+                    crate::venues::intl::live_taker_fee_rate(), exit_price, filled_shares,
+                );
+            let realized = gross - fees;
+            warn!("✅ ARB ARBITER [{}]: Naked leg flattened (order_id={}) — exposure closed @ {:.4} (limit {:.4}), realized ${:.4} (gross ${:.4} − fees ${:.4})",
+                  strategy_name, order_id, exit_price, sell_price, realized, gross, fees);
+            // Credit session P&L here too. This path recorded to `trades` but
+            // never touched the running counter, so the dashboard's session
+            // number silently diverged from the ledger by the full amount of
+            // every orphan flatten (12 of them, −$2.25, since July).
+            *total_pnl.lock().await += realized;
             // The leg is closed — drop it from tracking so it isn't counted as open.
             positions.lock().await.remove(&(strategy_name.clone(), filled_market.clone()));
             // The filled leg has been flattened — release its token claim so other
@@ -911,7 +969,7 @@ pub async fn arb_pair_fill_monitor(
             crate::helpers::metrics::record_trade(
                 &crate::state::TradeScope::crypto(
                     &asset, crate::venues::intl::INTL_VENUE, &asset),
-                Decimal::ZERO,
+                fees,
                 strategy_name.clone(),
                 market_name.clone(),
                 filled_side.to_string(),
@@ -981,9 +1039,17 @@ pub async fn arb_pair_fill_monitor(
                     } else {
                         late_sell
                     };
-                    let realized = (exit_price - late_entry) * late_shares;
-                    warn!("✅ ARB ARBITER [{}]: Late-fill naked leg flattened (order_id={}) — exposure closed @ {:.4} (limit {:.4}), realized ${:.4}",
-                          strategy_name, order_id, exit_price, late_sell, realized);
+                    // Same round-trip netting as the primary flatten above; the
+                    // entry fee was captured before this leg's row was purged.
+                    let gross = (exit_price - late_entry) * late_shares;
+                    let fees = missing_entry_fee
+                        + crate::venues::intl::taker_fee(
+                            crate::venues::intl::live_taker_fee_rate(), exit_price, late_shares,
+                        );
+                    let realized = gross - fees;
+                    warn!("✅ ARB ARBITER [{}]: Late-fill naked leg flattened (order_id={}) — exposure closed @ {:.4} (limit {:.4}), realized ${:.4} (gross ${:.4} − fees ${:.4})",
+                          strategy_name, order_id, exit_price, late_sell, realized, gross, fees);
+                    *total_pnl.lock().await += realized;
                     positions.lock().await.remove(&(strategy_name.clone(), missing_market.clone()));
                     token_ownership.lock().await.remove(&missing_market);
                     // (B) Book synchronously (awaited, not fire-and-forget) so a restart
@@ -991,7 +1057,7 @@ pub async fn arb_pair_fill_monitor(
                     crate::helpers::metrics::record_trade(
                         &crate::state::TradeScope::crypto(
                             &asset, crate::venues::intl::INTL_VENUE, &asset),
-                        Decimal::ZERO,
+                        fees,
                         strategy_name.clone(),
                         market_name.clone(),
                         missing_side.to_string(),

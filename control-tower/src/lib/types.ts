@@ -48,12 +48,14 @@ export interface DynamicConfig {
   fairvalue_post_exit_cooldown_secs:  number;
   fairvalue_max_stop_losses_per_market: number;
   fairvalue_edge_noise_multiple:      string;
+  fairvalue_stop_model_confirm_frac:  string;
 
   // Arbitrage Viper
   arbitrage_position_size_usdc: string;
   arbitrage_max_exposure_usdc:  string;
   arbitrage_profit_threshold:   string;
   arb_fak_rehedge_buffer:       string;
+  arb_settle_grace_secs:        number;
   arb_max_rescue_cost:          string;
 
   // TimeDecay Viper
@@ -196,6 +198,26 @@ export interface PnlSnapshotRow {
   session_pnl: string; // Decimal string
   collateral:  string; // Decimal string
   total_value?: string; // Decimal string (Phase 3f-7: cash + positions)
+}
+
+/**
+ * Lifetime aggregates over a shard's entire trade history, from
+ * `GET /api/trades/stats`.
+ *
+ * Summary cards must use this rather than reducing over `getTrades(n)`: that
+ * call is a bounded recent window (and the API clamps any limit to 500), so a
+ * client-side total silently truncates once history outgrows the window.
+ *
+ * `wins + losses` need not equal `count` — exactly-zero P&L trades are neither.
+ */
+export interface TradeStats {
+  count:        number;
+  wins:         number;
+  losses:       number;
+  realized_pnl: number;
+  fees:         number;
+  first_ts:     string | null;
+  last_ts:      string | null;
 }
 
 export interface TradeRow {

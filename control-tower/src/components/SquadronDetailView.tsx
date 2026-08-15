@@ -21,6 +21,7 @@ import useSWR from 'swr';
 import type { SquadronSummary, DynamicConfig, AssetRaptorHealth } from '@/lib/types';
 import {
   getTrades,
+  getTradeStats,
   getOpenPositions,
   getStatus,
   getSquadronConfig,
@@ -245,6 +246,16 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
     { refreshInterval: 15_000 }
   );
 
+  // Summary cards read lifetime aggregates, NOT a reduce over `trades` above:
+  // that call returns only the newest 60 rows (and the API clamps any limit to
+  // 500), so every "total" it fed was silently truncated once the shard passed
+  // 60 trades. `trades` still backs the list/table, which wants a recent window.
+  const { data: tradeStats, isLoading: statsLoading } = useSWR(
+    ['trade-stats', asset],
+    () => getTradeStats(asset),
+    { refreshInterval: 15_000 }
+  );
+
   const { data: openPositions, isLoading: positionsLoading } = useSWR(
     ['positions', asset],
     () => getOpenPositions(asset),
@@ -319,18 +330,23 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
 
       {/* ── Performance stats for this squadron/asset ─────────────────────── */}
       {(() => {
-        const pnls = (trades ?? [])
-          .map((t) => parseFloat(t.pnl))
-          .filter((v) => Number.isFinite(v));
-        const wins = pnls.filter((v) => v > 0).length;
-        const winRate = pnls.length > 0 ? (wins / pnls.length) * 100 : null;
-        const avgPnl = pnls.length > 0 ? pnls.reduce((a, b) => a + b, 0) / pnls.length : null;
+        const total   = tradeStats?.count ?? 0;
+        const wins    = tradeStats?.wins ?? 0;
+        // Win rate is measured over decided trades only. Exactly-flat trades are
+        // neither wins nor losses, and counting them as losses (which dividing by
+        // `count` would do) understates the rate.
+        const decided = wins + (tradeStats?.losses ?? 0);
+        const winRate = decided > 0 ? (wins / decided) * 100 : null;
+        const avgPnl  = total > 0 ? (tradeStats?.realized_pnl ?? 0) / total : null;
+        const since   = tradeStats?.first_ts
+          ? new Date(tradeStats.first_ts).toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+          : null;
         return (
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <div className="card px-4 py-3 flex flex-col gap-1">
           <span className="label-muted">Completed Trades</span>
-          <span className="stat-value">{tradesLoading ? '—' : String(trades?.length ?? 0)}</span>
-          <span className="text-xs text-gray-500">this session</span>
+          <span className="stat-value">{statsLoading ? '—' : String(total)}</span>
+          <span className="text-xs text-gray-500">{since ? `all time, since ${since}` : 'all time'}</span>
         </div>
         <div className="card px-4 py-3 flex flex-col gap-1">
           <span className="label-muted">Open Positions</span>
@@ -340,19 +356,19 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
         <div className="card px-4 py-3 flex flex-col gap-1">
           <span className="label-muted">Win Rate</span>
           <span className={`stat-value ${winRate === null ? 'text-gray-600' : winRate >= 50 ? 'text-emerald-300' : 'text-amber-300'}`}>
-            {tradesLoading || winRate === null ? '—' : `${winRate.toFixed(0)}%`}
+            {statsLoading || winRate === null ? '—' : `${winRate.toFixed(0)}%`}
           </span>
           <span className="text-xs text-gray-500">
-            {winRate === null ? 'no closed trades' : `${wins}/${pnls.length} profitable`}
+            {winRate === null ? 'no closed trades' : `${wins}/${decided} profitable`}
           </span>
         </div>
         <div className="card px-4 py-3 flex flex-col gap-1">
           <span className="label-muted">Avg Trade P&L</span>
           <span className={`stat-value ${avgPnl === null ? 'text-gray-600' : avgPnl >= 0 ? 'text-emerald-300' : 'text-rose-300'}`}>
-            {tradesLoading || avgPnl === null ? '—' : `${avgPnl >= 0 ? '+' : '−'}$${Math.abs(avgPnl).toFixed(2)}`}
+            {statsLoading || avgPnl === null ? '—' : `${avgPnl >= 0 ? '+' : '−'}$${Math.abs(avgPnl).toFixed(2)}`}
           </span>
           <span className="text-xs text-gray-500">
-            {avgPnl === null ? 'no closed trades' : 'per closed trade'}
+            {avgPnl === null ? 'no closed trades' : 'per closed trade, net of fees'}
           </span>
         </div>
       </div>

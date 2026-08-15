@@ -951,6 +951,25 @@ async fn get_trades(Query(q): Query<AssetQuery>) -> Response {
     }
 }
 
+/// GET /api/trades/stats?asset=btc
+///
+/// Lifetime aggregates over the shard's entire trade history — count, wins,
+/// losses, realized P&L, fees. Separate from `/api/trades` on purpose: that
+/// endpoint is a bounded recent window for the trade *list*, and summing it
+/// client-side silently truncated every "total" card on the dashboard.
+async fn get_trade_stats(Query(q): Query<AssetQuery>) -> Response {
+    match db::pool_for_opt_retry(q.asset.as_deref()).await {
+        Some(pool) => Json(db::get_trade_stats(&pool).await).into_response(),
+        None => {
+            error!("Database pool not available for GET /api/trades/stats");
+            Json(db::TradeStatsRow {
+                count: 0, wins: 0, losses: 0, realized_pnl: 0.0, fees: 0.0,
+                first_ts: None, last_ts: None,
+            }).into_response()
+        }
+    }
+}
+
 /// GET /api/positions?asset=btc
 ///
 /// Returns all currently open positions for this session (inserted on entry, removed on exit).
@@ -2753,6 +2772,7 @@ pub async fn run_api_server(
         .route("/api/config/schema",         get(get_config_schema))
         .route("/api/pnl/history",           get(get_pnl_history))
         .route("/api/trades",                get(get_trades))
+        .route("/api/trades/stats",          get(get_trade_stats))
         .route("/api/trades/export",         get(export_trades))
         .route("/api/logs",                  get(get_logs))
         .route("/api/latency",               get(get_latency))

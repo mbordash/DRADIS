@@ -1391,11 +1391,13 @@ impl Squadron {
                                                         primary_wait_secs.max(pair_wait_secs)
                                                     };
                                                     let arb_asset = asset_lc.clone();
+                                                    let arb_tp = Arc::clone(&total_pnl);
                                                     tokio::spawn(async move {
                                                         crate::helpers::balance::arb_pair_fill_monitor(
                                                             arb_cl, arb_nm, arb_sg, safe_address, eoa_address, vc, vc_p,
                                                             arb_ps, arb_pc, arb_to, arb_sn, &arb_tok_a, &arb_tok_b,
                                                             arb_base_a, arb_base_b, arb_side_a, arb_side_b, arb_wait, arb_http, arb_asset,
+                                                            arb_tp,
                                                         ).await;
                                                     });
                                                 }

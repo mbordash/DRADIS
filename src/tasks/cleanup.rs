@@ -43,8 +43,8 @@ use polymarket_client_sdk_v2::auth::Normal;
 use polymarket_client_sdk_v2::clob::types::request::OrdersRequest;
 use polymarket_client_sdk_v2::data::Client as DataClient;
 use polymarket_client_sdk_v2::data::types::request::PositionsRequest;
-use polymarket_client_sdk_v2::data::types::request::ClosedPositionsRequest;
-use polymarket_client_sdk_v2::data::types::ClosedPositionSortBy;
+use polymarket_client_sdk_v2::data::types::request::ActivityRequest;
+use polymarket_client_sdk_v2::data::types::ActivityType;
 
 use alloy::primitives::address as alloy_address;
 
@@ -1415,59 +1415,74 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address, squadron_ass
         }
     }
 
-    // ── Resolution evidence: closed-positions ────────────────────────────────
+    // ── Resolution evidence: on-chain REDEEM activity ────────────────────────
     // CRITICAL: a token vanishing from `active_tokens` does NOT mean the market
     // settled — it also vanishes when the leg was SOLD/FLATTENED (orphan cleanup,
     // early exit) or never filled at all. Booking a $1.00 "auto-settled" trade on
     // mere absence fabricates phantom profit on a still-open market (root cause of
     // the 2026-06-21 trade booked at 04:18 on a noon-close market).
     //
-    // The authoritative signal that a leg was REDEEMED (not sold) is the
-    // `/closed-positions` record: a redemption closes at/after the market's
-    // resolution (`end_date`), whereas an early sale closes strictly before it.
-    // We require both legs to show genuine redemption before booking a settlement.
-    let now = Utc::now();
-    let closed_positions = match tokio::time::timeout(
+    // This used to infer redemption from `/closed-positions`: a redemption closes
+    // at/after the market's `end_date`, an early sale strictly before it. That was
+    // wrong twice over, and both faults were found together on 2026-08-15.
+    //
+    // 1. It never ran. `ClosedPosition::end_date` is typed `DateTime<Utc>` in
+    //    polymarket_client_sdk_v2 0.7.0, but the API returns a date-only
+    //    "YYYY-MM-DD" string, so chrono rejected every response with "premature
+    //    end of input" — 72 failures in 74 cycles, i.e. 100% of calls that got
+    //    this far. The whole settlement path had been dead, silently.
+    //
+    // 2. Fixing the parse would have been WORSE than leaving it broken. A
+    //    date-only `end_date` resolves to midnight UTC, which for an hourly
+    //    crypto market precedes the actual resolution by up to a full day — so
+    //    "closed at/after end_date" is true for essentially every close,
+    //    including ordinary early sales. Both of that night's sales (a FairValue
+    //    stop-loss at 08:00Z and a TimeDecay orphan flatten at 05:35Z, against an
+    //    endDate of 2026-08-15 00:00Z) would have been booked a second time as
+    //    settlements — exactly the phantom-profit failure the paragraph above
+    //    warns about.
+    //
+    // `/activity` filtered to REDEEM is direct evidence rather than an inference:
+    // a REDEEM row exists if and only if the leg was actually redeemed on-chain.
+    // It carries integer timestamps (no chrono landmine), the type filter is
+    // applied server-side, and a leg sold early simply has no row.
+    let redeem_cutoff = (Utc::now() - chrono::Duration::days(14)).timestamp().max(0) as u64;
+    let redemptions = match tokio::time::timeout(
         std::time::Duration::from_secs(20),
-        data_client.closed_positions(
-            &ClosedPositionsRequest::builder()
+        data_client.activity(
+            &ActivityRequest::builder()
                 .user(safe_address)
-                .limit(50)
-                .expect("closed-positions limit 50 is within the 0-50 bound")
-                .sort_by(ClosedPositionSortBy::Timestamp)
+                .activity_types(vec![ActivityType::Redeem])
+                .limit(500)
+                .expect("activity limit 500 is within the 0-500 bound")
+                .start(redeem_cutoff)
                 .build(),
         ),
     ).await {
-        Ok(Ok(c)) => c,
+        Ok(Ok(a)) => a,
         Ok(Err(e)) => {
-            warn!("Orphan detection [{}]: closed_positions() error: {} — skipping settlement booking this cycle", squadron_asset, e);
+            warn!("Orphan detection [{}]: activity(REDEEM) error: {} — skipping settlement booking this cycle", squadron_asset, e);
             return;
         }
         Err(_) => {
-            warn!("Orphan detection [{}]: closed_positions() timed out (20s) — skipping settlement booking this cycle", squadron_asset);
+            warn!("Orphan detection [{}]: activity(REDEEM) timed out (20s) — skipping settlement booking this cycle", squadron_asset);
             return;
         }
     };
 
-    // Map token_id (decimal) → (market resolution date, close timestamp unix secs).
-    let closed_by_token: HashMap<String, (DateTime<Utc>, i64)> = closed_positions
+    // Token ids (decimal strings) with an on-chain redemption in the window.
+    // Defensive re-filter on activity_type: the server honours the filter today,
+    // but booking a phantom settlement is expensive enough to not rely on that.
+    let redeemed_tokens: HashSet<String> = redemptions
         .iter()
-        .map(|cp| (cp.asset.to_string(), (cp.end_date, cp.timestamp)))
+        .filter(|a| a.activity_type == ActivityType::Redeem)
+        .filter_map(|a| a.asset.as_ref().map(|t| t.to_string()))
         .collect();
 
-    // A leg was genuinely REDEEMED at settlement (not sold early / never filled)
-    // iff it closed at/after the market's resolution time. 60s grace absorbs minor
-    // indexer/clock skew between the redeem TX and the recorded end_date.
-    let redeemed_at_resolution = |token: &str| -> bool {
-        match closed_by_token.get(token) {
-            Some((end_date, close_ts)) => {
-                let market_resolved = *end_date <= now;
-                let closed_after_resolution = *close_ts >= end_date.timestamp() - 60;
-                market_resolved && closed_after_resolution
-            }
-            None => false,
-        }
-    };
+    debug!("Orphan detection [{}]: {} redeemed token(s) in the last 14d", squadron_asset, redeemed_tokens.len());
+
+    // A leg was genuinely REDEEMED at settlement (not sold early / never filled).
+    let redeemed_at_resolution = |token: &str| -> bool { redeemed_tokens.contains(token) };
 
     // Get database pool for this squadron's asset only
     let pool = match db::pool_for(squadron_asset) {
@@ -1669,3 +1684,68 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address, squadron_ass
 }
 
 
+
+#[cfg(test)]
+mod settlement_evidence_tests {
+    use super::*;
+    // Only the live probe still touches the broken endpoint.
+    use polymarket_client_sdk_v2::data::types::request::ClosedPositionsRequest;
+    use polymarket_client_sdk_v2::data::types::ClosedPositionSortBy;
+
+    /// Live-API probe, `#[ignore]`d so CI never depends on the network:
+    ///
+    /// ```bash
+    /// cargo test --release settlement_evidence -- --ignored --nocapture
+    /// ```
+    ///
+    /// Documents the upstream bug this module works around. `ClosedPosition`
+    /// declares `end_date: DateTime<Utc>` in polymarket_client_sdk_v2 0.7.0, but
+    /// `/closed-positions` returns a date-only `"YYYY-MM-DD"` string, so chrono
+    /// rejects it with "premature end of input" and the call fails 100% of the
+    /// time — 72 of 74 cycles in the 2026-08-15 production log.
+    ///
+    /// If this test ever starts reporting that `closed_positions` SUCCEEDED, the
+    /// SDK has been fixed and the `/activity` workaround below could in principle
+    /// be revisited — though note that `endDate` would still be too coarse to
+    /// serve as redemption evidence (see `redeemed_tokens_via_activity`).
+    #[tokio::test]
+    #[ignore = "hits the live Polymarket data API"]
+    async fn closed_positions_is_still_broken_and_activity_is_not() {
+        let user = std::env::var("DRADIS_PROBE_SAFE_ADDRESS")
+            .expect("set DRADIS_PROBE_SAFE_ADDRESS to a Polymarket proxy wallet to run this probe");
+        let user: Address = user.parse().expect("DRADIS_PROBE_SAFE_ADDRESS must be an 0x address");
+        let client = DataClient::default();
+
+        let closed = client
+            .closed_positions(
+                &ClosedPositionsRequest::builder()
+                    .user(user)
+                    .limit(50)
+                    .expect("limit within bounds")
+                    .sort_by(ClosedPositionSortBy::Timestamp)
+                    .build(),
+            )
+            .await;
+        match &closed {
+            Err(e) => println!("closed_positions FAILED (expected): {e}"),
+            Ok(v) => println!("closed_positions SUCCEEDED with {} rows — SDK may be fixed", v.len()),
+        }
+
+        let acts = client
+            .activity(
+                &ActivityRequest::builder()
+                    .user(user)
+                    .activity_types(vec![ActivityType::Redeem])
+                    .limit(100)
+                    .expect("limit within bounds")
+                    .build(),
+            )
+            .await
+            .expect("activity() must deserialize — it is the replacement evidence source");
+        println!("activity(REDEEM) returned {} rows", acts.len());
+        assert!(
+            acts.iter().all(|a| a.activity_type == ActivityType::Redeem),
+            "the type filter must be honoured server-side"
+        );
+    }
+}

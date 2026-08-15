@@ -330,6 +330,29 @@ impl FairValueStrategyImpl {
         config::CRYPTO_FEE_RATE * price * (dec!(1) - price)
     }
 
+    /// Does the model still justify holding a position that has hit its stop?
+    ///
+    /// Returns the live edge when the stop should be vetoed, `None` when it
+    /// should fire. Deliberately recomputes the *entry* test — same round-trip
+    /// fee treatment, same horizon-scaled requirement — so the two can never
+    /// drift apart: what it takes to open a position is what it takes to keep it.
+    ///
+    /// `confirm` scales the bar: 0 disables the veto entirely, 1.0 demands full
+    /// entry-grade edge, above 1.0 is stricter than entry.
+    fn stop_vetoed_by_model(
+        fair: Option<f64>,
+        ask: Decimal,
+        req_edge: Decimal,
+        confirm: Decimal,
+    ) -> Option<Decimal> {
+        if confirm <= dec!(0) || ask <= dec!(0) || ask >= dec!(1) {
+            return None;
+        }
+        let fair_dec = Decimal::from_f64_retain(fair?).map(|d| d.round_dp(10))?;
+        let live_edge = fair_dec - ask - Self::fee_frac(ask) - Self::fee_frac(fair_dec);
+        (live_edge >= req_edge * confirm).then_some(live_edge)
+    }
+
     fn cooldown_active(&self, asset: &str, token_id: &str, cooldown_secs: i64) -> bool {
         let mut reg = match globals(asset).exit_cooldowns.lock() {
             Ok(g) => g,
@@ -926,6 +949,34 @@ impl Strategy for FairValueStrategyImpl {
             if profit_margin <= -dc.fairvalue_stop_loss_pct
                 && (catastrophic || secs_held >= config::FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS)
             {
+                // ── Model-confirmation veto ──────────────────────────────────
+                // The stop is a price rule in a strategy whose entire thesis is
+                // "model > price". If the model STILL sees entry-grade edge at
+                // the live ask, the drawdown is the market moving toward us, not
+                // away — selling there realises a loss on a position we would
+                // buy again at that very price.
+                //
+                // Deliberately re-uses the entry test verbatim (same edge
+                // formula, same horizon-scaled requirement) so entry and exit
+                // cannot drift apart: whatever it takes to open is what it takes
+                // to keep holding. Catastrophic stops are never vetoed, so the
+                // veto only ever spans one to two stop widths.
+                let confirm = dc.fairvalue_stop_model_confirm_frac;
+                if !catastrophic {
+                    let ask = if token_is_yes { snap.yes_ask } else { snap.no_ask };
+                    let req = Self::required_edge(dc, secs_left);
+                    if let Some(live_edge) =
+                        Self::stop_vetoed_by_model(fair_side, ask, req, confirm)
+                    {
+                        tracing::info!(
+                            " FairValue stop vetoed [{}]: model still confirms — edge {:+.3} >= {:.3} ({:.2}x req {:.3}) | bid=${:.4} ({:.2}%) fair={:.3} ask=${:.4} held={}s",
+                            market.market_name, live_edge, req * confirm, confirm, req,
+                            bid, profit_margin * dec!(100), fair_side.unwrap_or(0.0), ask, secs_held,
+                        );
+                        continue;
+                    }
+                }
+
                 if bid < config::FAIRVALUE_MIN_EXIT_BID {
                     // Unfillable — an FAK into a vaporised bid just floods logs.
                     continue;
@@ -1122,6 +1173,80 @@ mod tests {
         assert_eq!(FairValueStrategyImpl::fair_noise_from(&short, min), None);
         let just_enough: Vec<f64> = (0..min).map(|i| 0.5 + i as f64 * 0.001).collect();
         assert!(FairValueStrategyImpl::fair_noise_from(&just_enough, min).is_some());
+    }
+
+    /// Trade 368 (2026-08-15), the trade that motivated the veto, replayed from
+    /// the recorded log line at the instant the stop fired:
+    ///
+    /// ```text
+    /// 04:00:28  fair(YES)=0.380 ... no_ask=$0.44 edge=+0.145 | req=0.140
+    /// ```
+    ///
+    /// Entered NO at $0.50, stopped out at $0.44 (−12%) after 206s with 3,800s
+    /// still to run — then settled at $1.00. The model read entry-grade edge at
+    /// the very moment the price rule was selling, which is exactly the state
+    /// the veto exists to catch.
+    #[test]
+    fn model_confirmation_vetoes_the_stop_that_sold_a_winner() {
+        let fair_no = 1.0 - 0.380;
+        let no_ask = dec!(0.44);
+        let req = dec!(0.140);
+
+        let edge = FairValueStrategyImpl::stop_vetoed_by_model(Some(fair_no), no_ask, req, dec!(1.0))
+            .expect("model still showed entry-grade edge — the stop must be vetoed");
+        // Matches the +0.145 the viper itself logged at 04:00:28.
+        assert_eq!(edge.round_dp(3), dec!(0.145));
+
+        // A conservative profile demands 1.5x entry-grade edge and would still
+        // have taken this stop — the knob genuinely spans both behaviours.
+        assert!(
+            FairValueStrategyImpl::stop_vetoed_by_model(Some(fair_no), no_ask, req, dec!(1.5))
+                .is_none()
+        );
+    }
+
+    /// Zero is the escape hatch: the veto disappears and the stop is price-only
+    /// again, revertible from Control Tower without a redeploy.
+    #[test]
+    fn zero_confirm_restores_the_price_only_stop() {
+        // An overwhelming edge that would certainly veto at any positive setting.
+        assert!(
+            FairValueStrategyImpl::stop_vetoed_by_model(Some(0.95), dec!(0.10), dec!(0.05), dec!(1.0))
+                .is_some()
+        );
+        assert!(
+            FairValueStrategyImpl::stop_vetoed_by_model(Some(0.95), dec!(0.10), dec!(0.05), dec!(0))
+                .is_none()
+        );
+    }
+
+    /// The veto must not fire on a thesis that has actually broken, nor on a
+    /// missing model reading or an unquoted book — those all fall through to the
+    /// stop, which is the safe direction.
+    #[test]
+    fn a_broken_thesis_still_stops_out() {
+        let req = dec!(0.10);
+        // Model has collapsed below the ask: no edge left, take the stop.
+        assert!(
+            FairValueStrategyImpl::stop_vetoed_by_model(Some(0.40), dec!(0.55), req, dec!(1.0))
+                .is_none()
+        );
+        // Edge exists but is thinner than entry would require.
+        assert!(
+            FairValueStrategyImpl::stop_vetoed_by_model(Some(0.60), dec!(0.55), req, dec!(1.0))
+                .is_none()
+        );
+        // No model reading at all (vol warmup) — never veto on absent evidence.
+        assert!(
+            FairValueStrategyImpl::stop_vetoed_by_model(None, dec!(0.44), req, dec!(1.0)).is_none()
+        );
+        // Vaporised / unquoted book.
+        for ask in [dec!(0), dec!(1)] {
+            assert!(
+                FairValueStrategyImpl::stop_vetoed_by_model(Some(0.95), ask, req, dec!(1.0))
+                    .is_none()
+            );
+        }
     }
 
     /// Setting the knob to zero restores the old unconditional floor, so the

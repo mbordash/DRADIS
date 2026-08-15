@@ -115,6 +115,13 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Breakeven cushion when FAK re-hedging a naked leg (taker fee + slippage).").range(0.0, 0.2).step(0.005));
         v.push(F::new(g, e, "arb_max_rescue_cost", "Max Rescue Cost", "price", false,
             "Block entry if a single-leg orphan can't be rescued below this cost.").range(1.0, 1.2).step(0.01));
+        v.push(F::new(g, e, "arb_settle_grace_secs", "Orphan Settle Grace", "secs", true,
+            "Seconds the orphan arbiter waits after cancelling the missing leg's GTC before re-reading its \
+             on-chain balance and committing to a repair. Guards against flattening a leg whose fill was still \
+             settling; every second is also a second of naked directional exposure. The post-flatten late-fill \
+             watcher catches a leg that fills after we commit, so cutting this short costs at most two spreads. \
+             Was hardcoded at 10s — the largest discretionary slice of the 26s entry→flatten latency measured \
+             on 2026-08-15.").range(0.0, 30.0).step(1.0).unit("s"));
         // Advanced
         v.push(F::new(g, e, "arbitrage_max_fill_gap", "Max Fill Gap", "price", true,
             "Skip if (ask − safe_bid) on either leg exceeds this — prevents one-sided fills.").range(0.0, 0.2).step(0.005));
@@ -462,6 +469,15 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              horizon. Guards the case where an 8¢ edge is read off a model that is itself swinging 18¢ per tick \
              — measured at 24% of hourly ticks on 2026-08-13/14. 0 disables the gate; higher = only trade when \
              the model has been steady.").range(0.0, 5.0).step(0.1));
+        v.push(F::new(g, e, "fairvalue_stop_model_confirm_frac", "Stop Model Confirm", "decimal", true,
+            "Multiple of the entry edge requirement the model must still show, at the live ask, for a losing \
+             position to veto its own stop loss. The stop is a price rule inside a model-vs-price strategy: if \
+             the model still sees entry-grade edge, the drawdown is the market coming toward us. Higher = \
+             stricter = the stop fires more readily; 0 restores a price-only stop. Catastrophic stops (2× the \
+             stop width) are never vetoed, so this can only extend a hold between one and two stop widths. \
+             On 2026-08-15 a NO entered at $0.50 stopped out at $0.44 — 1.4× the model's own 120s noise, with \
+             3,800s left — while the model read edge +0.145 vs req 0.140; it settled at $1.00.")
+            .range(0.0, 5.0).step(0.1));
         v.push(F::new(g, e, "fairvalue_post_exit_cooldown_secs", "Post-Exit Cooldown", "secs", true,
             "Seconds a token is locked out after any FairValue exit. Second entries into a market the viper had \
              just left went 0-for-4 for −$1.88 gross on 2026-08-13/14 while first entries were flat, and the \

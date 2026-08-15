@@ -2131,6 +2131,23 @@ pub async fn set_open_position_entry_fee(pool: &SqlitePool, token_id: &str, entr
     }
 }
 
+/// Read back the entry fee recorded for an open position, if any.
+///
+/// The orphan arbiter needs this before it purges the row: `close_open_position`
+/// DELETEs, and the `entries` ledger carries no fee column, so once the row is
+/// gone the fee paid to open that leg is unrecoverable and the round trip books
+/// gross. Returns `None` when the row is absent or the column was never set —
+/// callers treat that as zero, which is the correct reading for a maker fill.
+pub async fn get_open_position_entry_fee(pool: &SqlitePool, token_id: &str) -> Option<Decimal> {
+    let row: Option<(Option<String>,)> =
+        sqlx::query_as("SELECT entry_fee FROM open_positions WHERE token_id = ? LIMIT 1")
+            .bind(token_id)
+            .fetch_optional(pool)
+            .await
+            .unwrap_or(None);
+    row.and_then(|(f,)| f).and_then(|s| s.parse::<Decimal>().ok())
+}
+
 pub async fn record_open_position(
     pool: &SqlitePool,
     strategy: &str,
@@ -2781,6 +2798,65 @@ pub async fn recent_stop_loss_exists(
 }
 
 /// Return the most recent `limit` completed trades, newest first.
+/// Lifetime aggregates over the whole `trades` table for one shard.
+///
+/// The dashboard's summary cards want totals over all history, but the trade
+/// *list* they were computed from is a bounded recent window (`get_recent_trades`).
+/// Deriving a "total" from that window silently truncates it: on 2026-08-15 the
+/// squadron page summed 60 rows and the trade log 200, against 368 rows on the
+/// btc shard, and the API clamps any limit to 500 regardless — so no client-side
+/// number could have been made correct by raising it.
+///
+/// Aggregating in SQL keeps the card exact and O(1) in payload no matter how
+/// long the history grows. `wins + losses` deliberately need not equal `count`:
+/// exactly-zero P&L trades are neither, and collapsing them into one bucket or
+/// the other would skew the win rate.
+#[derive(Debug, Serialize)]
+pub struct TradeStatsRow {
+    pub count: i64,
+    pub wins: i64,
+    pub losses: i64,
+    /// Summed as f64: `pnl` is stored as a decimal string, and dollar amounts at
+    /// four decimal places stay far inside f64's ~15 significant digits even over
+    /// a very long history.
+    pub realized_pnl: f64,
+    pub fees: f64,
+    pub first_ts: Option<String>,
+    pub last_ts: Option<String>,
+}
+
+pub async fn get_trade_stats(pool: &SqlitePool) -> TradeStatsRow {
+    let empty = TradeStatsRow {
+        count: 0, wins: 0, losses: 0, realized_pnl: 0.0, fees: 0.0,
+        first_ts: None, last_ts: None,
+    };
+    match sqlx::query(
+        "SELECT COUNT(*),
+                COALESCE(SUM(CASE WHEN CAST(pnl AS REAL) > 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CASE WHEN CAST(pnl AS REAL) < 0 THEN 1 ELSE 0 END), 0),
+                COALESCE(SUM(CAST(pnl AS REAL)), 0.0),
+                COALESCE(SUM(CAST(COALESCE(fees, '0') AS REAL)), 0.0),
+                MIN(ts), MAX(ts)
+         FROM trades"
+    )
+    .fetch_one(pool)
+    .await {
+        Ok(r) => TradeStatsRow {
+            count:        r.try_get::<i64, _>(0).unwrap_or(0),
+            wins:         r.try_get::<i64, _>(1).unwrap_or(0),
+            losses:       r.try_get::<i64, _>(2).unwrap_or(0),
+            realized_pnl: r.try_get::<f64, _>(3).unwrap_or(0.0),
+            fees:         r.try_get::<f64, _>(4).unwrap_or(0.0),
+            first_ts:     r.try_get::<Option<String>, _>(5).ok().flatten(),
+            last_ts:      r.try_get::<Option<String>, _>(6).ok().flatten(),
+        },
+        Err(e) => {
+            error!("❌ DB get_trade_stats failed: {}", e);
+            empty
+        }
+    }
+}
+
 pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
     match sqlx::query(
         "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
@@ -3624,6 +3700,63 @@ mod reconcile_tests {
         // pnl = (0.40 - 0.33) * 11.44 = 0.8008
         let pnl: Decimal = rows[0].1.parse().unwrap();
         assert!((pnl - Decimal::new(8008, 4)).abs() < Decimal::new(1, 4), "pnl was: {}", pnl);
+    }
+
+    /// The dashboard's summary cards read `get_trade_stats`, not a reduce over
+    /// `get_recent_trades`. This pins the difference that motivated the split:
+    /// against the production btc shard on 2026-08-15, lifetime was 337 trades /
+    /// −$74.48 while the squadron page (newest 60) showed −$15.91 and the trade
+    /// log (newest 200) showed −$38.25.
+    #[tokio::test]
+    async fn trade_stats_cover_the_whole_history_not_just_the_recent_window() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::shard_only("test");
+        // Three −$10 losses in the distant past, then twelve +$1 wins. Explicit
+        // timestamps because the recent-window query orders by `ts`, and rows
+        // written in the same millisecond would order arbitrarily.
+        //
+        // The shape is the point: the newest 12 rows are all wins, so a card that
+        // sums that window reports a profit while the account is down $18.
+        let base = chrono::DateTime::parse_from_rfc3339("2026-08-01T00:00:00Z")
+            .unwrap().with_timezone(&Utc);
+        for i in 0..3 {
+            record_trade_db(&pool, &scope, Decimal::new(5, 2), "S", &format!("Loss{i}"), "YES",
+                Decimal::new(50, 2), Decimal::new(40, 2), Decimal::ONE,
+                Decimal::new(-10, 0), "SL", Some(base + chrono::Duration::minutes(i))).await;
+        }
+        for i in 0..12 {
+            record_trade_db(&pool, &scope, Decimal::new(5, 2), "S", &format!("Win{i}"), "YES",
+                Decimal::new(50, 2), Decimal::new(60, 2), Decimal::ONE,
+                Decimal::ONE, "TP", Some(base + chrono::Duration::hours(1) + chrono::Duration::minutes(i))).await;
+        }
+
+        let stats = get_trade_stats(&pool).await;
+        assert_eq!(stats.count, 15);
+        assert_eq!(stats.wins, 12);
+        assert_eq!(stats.losses, 3);
+        assert!((stats.realized_pnl - (-18.0)).abs() < 1e-9, "got {}", stats.realized_pnl);
+        assert!((stats.fees - 0.75).abs() < 1e-9, "got {}", stats.fees);
+
+        // The newest-N window the cards used to sum reports the opposite sign
+        // once N excludes the losses.
+        let window: f64 = get_recent_trades(&pool, 12).await.iter()
+            .filter_map(|t| t.pnl.parse::<f64>().ok()).sum();
+        assert!(window > 0.0, "the truncated window should look profitable: {window}");
+        assert!(stats.realized_pnl < 0.0, "while the true lifetime figure is a loss");
+    }
+
+    /// Exactly-flat trades are neither wins nor losses. Folding them into either
+    /// bucket would skew the win rate the squadron page displays.
+    #[tokio::test]
+    async fn flat_trades_are_excluded_from_both_win_and_loss_counts() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::shard_only("test");
+        for (market, pnl) in [("W", Decimal::ONE), ("L", Decimal::NEGATIVE_ONE), ("F", Decimal::ZERO)] {
+            record_trade_db(&pool, &scope, Decimal::ZERO, "S", market, "YES",
+                Decimal::new(50, 2), Decimal::new(50, 2), Decimal::ONE, pnl, "r", None).await;
+        }
+        let stats = get_trade_stats(&pool).await;
+        assert_eq!((stats.count, stats.wins, stats.losses), (3, 1, 1));
     }
 
     // A position already booked (settlement or normal close) with matching shares is

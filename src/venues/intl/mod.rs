@@ -131,7 +131,7 @@ pub fn taker_fee(rate: Decimal, price: Decimal, shares: Decimal) -> Decimal {
 ///
 /// The patrol loop snapshots the same knob once per tick rather than calling
 /// this, so a rate edited in Control Tower reaches both paths.
-fn live_taker_fee_rate() -> Decimal {
+pub fn live_taker_fee_rate() -> Decimal {
     crate::helpers::dynamic_config::global_config_tx()
         .map(|tx| tx.borrow().intl_taker_fee_rate)
         .unwrap_or(config::INTL_TAKER_FEE_RATE)

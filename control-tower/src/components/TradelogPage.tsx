@@ -18,8 +18,8 @@
 
 import { useState, useMemo } from 'react';
 import useSWR from 'swr';
-import type { TradeRow, OpenPositionRow } from '@/lib/types';
-import { getTrades, getOpenPositions, downloadTradelogCsv } from '@/lib/api';
+import type { TradeRow, OpenPositionRow, TradeStats } from '@/lib/types';
+import { getTrades, getTradeStats, getOpenPositions, downloadTradelogCsv } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -214,11 +214,21 @@ function FilterPill({
   );
 }
 
-function SummaryBar({ entries }: { entries: LogEntry[] }) {
+/**
+ * Top-of-page totals.
+ *
+ * `entries` is a bounded recent window (200 rows per asset, and the API clamps
+ * any limit to 500), so completed-mission counts and realized P&L come from
+ * `stats` — lifetime aggregates computed server-side in SQL — rather than a
+ * reduce over what happens to be loaded. Launches, in-flight, and unrealized
+ * P&L still come from `entries`: those describe currently-open positions, which
+ * are never truncated.
+ */
+function SummaryBar({ entries, stats }: { entries: LogEntry[]; stats: (TradeStats & { asset: string })[] }) {
   const launches   = entries.filter(e => e.status === 'launch').length;
   const inflight   = entries.filter(e => e.status === 'inflight').length;
-  const completed  = entries.filter(e => e.status === 'completed');
-  const realizedPnl   = completed.reduce((s, e) => s + (e.pnl ?? 0), 0);
+  const completedCount = stats.reduce((s, t) => s + t.count, 0);
+  const realizedPnl    = stats.reduce((s, t) => s + t.realized_pnl, 0);
   const unrealized = entries
     .filter(e => e.status !== 'completed' && e.pnl !== null)
     .reduce((s, e) => s + (e.pnl ?? 0), 0);
@@ -240,7 +250,7 @@ function SummaryBar({ entries }: { entries: LogEntry[] }) {
       </div>
       <div className="card px-4 py-3 flex flex-col gap-1">
         <span className="label-muted">🎯 Completed Missions</span>
-        <span className="stat-value text-gray-200">{completed.length}</span>
+        <span className="stat-value text-gray-200">{completedCount}</span>
         <span className={`text-xs ${realizedPnl >= 0 ? 'text-green-400' : 'text-red-400'}`}>
           {realizedPnl >= 0 ? '+' : ''}${realizedPnl.toFixed(4)} realized
         </span>
@@ -373,6 +383,14 @@ export default function TradelogPage({ availableAssets }: Props) {
     { refreshInterval: 15_000 },
   );
 
+  // Lifetime totals per asset for the summary cards. Kept separate from the
+  // trade list above, which stays a bounded window for display.
+  const { data: allStats = [] } = useSWR(
+    ['tradelog-stats', assets.join(',')],
+    async () => Promise.all(assets.map(a => getTradeStats(a).then(t => ({ asset: a, ...t })))),
+    { refreshInterval: 15_000 },
+  );
+
   const { data: allPositions = [], isLoading: positionsLoading } = useSWR(
     ['tradelog-positions', assets.join(',')],
     async () => {
@@ -468,7 +486,10 @@ export default function TradelogPage({ availableAssets }: Props) {
     <div className="space-y-5">
 
       {/* ── Summary stats ────────────────────────────────────────────────────── */}
-      <SummaryBar entries={filtered} />
+      <SummaryBar
+        entries={assetFilter === 'all' ? allEntries : allEntries.filter(e => e.shard === assetFilter)}
+        stats={assetFilter === 'all' ? allStats : allStats.filter(s => s.asset === assetFilter)}
+      />
 
       {/* ── Filters ──────────────────────────────────────────────────────────── */}
       <div className="card px-4 py-3 space-y-3">

@@ -133,6 +133,7 @@ fn default_deriv_cvd_confirm_margin()      -> Decimal { config::DERIV_CVD_CONFIR
 fn default_deriv_oi_unwind_block()         -> Decimal { config::DERIV_OI_UNWIND_BLOCK               }fn default_arb_max_obi_asymmetry()         -> Decimal { config::ARBITRAGE_MAX_OBI_ASYMMETRY         }
 fn default_arb_min_leg_conviction()        -> Decimal { config::ARBITRAGE_MIN_LEG_CONVICTION        }
 fn default_arb_fak_rehedge_buffer()        -> Decimal { config::ARB_FAK_REHEDGE_BUFFER              }
+fn default_arb_settle_grace_secs()         -> u64     { config::ARB_SETTLE_GRACE_SECS               }
 fn default_arb_max_rescue_cost()           -> Decimal { config::ARB_MAX_RESCUE_COST                 }
 fn default_trendcapture_enable()           -> bool    { config::ENABLE_TRENDCAPTURE_TRADING          }
 fn default_trendcapture_min_trade_size()   -> Decimal { config::TRENDCAPTURE_MIN_TRADE_SIZE_USDC     }
@@ -158,6 +159,7 @@ fn default_fairvalue_sigma_floor_horizon() -> i64     { config::FAIRVALUE_SIGMA_
 fn default_fairvalue_post_exit_cooldown()  -> i64     { config::FAIRVALUE_POST_EXIT_COOLDOWN_SECS     }
 fn default_fairvalue_max_stop_losses()     -> u32     { config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET  }
 fn default_fairvalue_edge_noise_multiple() -> Decimal { config::FAIRVALUE_EDGE_NOISE_MULTIPLE         }
+fn default_fairvalue_stop_model_confirm() -> Decimal { config::FAIRVALUE_STOP_MODEL_CONFIRM_FRAC      }
 fn default_intl_taker_fee_rate()           -> Decimal { config::INTL_TAKER_FEE_RATE                   }
 fn default_convergence_position_size()     -> Decimal { config::CONVERGENCE_POSITION_SIZE_USDC        }
 fn default_convergence_max_exposure()      -> Decimal { config::CONVERGENCE_MAX_EXPOSURE_USDC         }
@@ -306,6 +308,12 @@ pub struct DynamicConfig {
     /// carry a larger taker-fee/adverse-price cushion than deep BTC books.
     #[serde(default = "default_arb_fak_rehedge_buffer")]
     pub arb_fak_rehedge_buffer:       Decimal,
+    /// Seconds the orphan arbiter waits after cancelling the missing leg's GTC
+    /// before re-reading its balance and committing to a repair. Shorter = less
+    /// naked directional exposure; the post-flatten late-fill watcher bounds the
+    /// cost of cutting it too fine.
+    #[serde(default = "default_arb_settle_grace_secs")]
+    pub arb_settle_grace_secs:        u64,
     /// Upper bound on single-leg orphan RESCUE cost in the arb entry gate. Entry is
     /// blocked only when a single-leg fill would be materially unrecoverable
     /// (rescue ≥ this). Per-squadron so alts can demand a tighter bound than BTC.
@@ -564,6 +572,18 @@ pub struct DynamicConfig {
     /// 0 disables the gate.
     #[serde(default = "default_fairvalue_edge_noise_multiple")]
     pub fairvalue_edge_noise_multiple:    Decimal,
+    /// Multiple of the *entry* edge requirement the model must still show, at the
+    /// live ask, for a losing position to veto its own (non-catastrophic) stop
+    /// loss. Higher ⇒ stricter ⇒ the stop fires more readily. 0 disables the
+    /// veto and restores a price-only stop.
+    ///
+    /// The stop was noise-blind while the entry gate was not: on 2026-08-15 a NO
+    /// position entered at $0.50 with edge +0.178 (req 0.145) stopped out at
+    /// $0.44 — six cents, or 1.4× the model's own 120s noise — with 3,800s left
+    /// to run. At that moment the model still read edge +0.145 vs req 0.140, and
+    /// the contract settled at $1.00. Realised −$0.48 against +$2.46 available.
+    #[serde(default = "default_fairvalue_stop_model_confirm")]
+    pub fairvalue_stop_model_confirm_frac: Decimal,
 
     // ── Convergence Viper ─────────────────────────────────────────────────────
     #[serde(default = "default_convergence_enable")]
@@ -630,6 +650,7 @@ impl Default for DynamicConfig {
             arbitrage_max_obi_asymmetry:  config::ARBITRAGE_MAX_OBI_ASYMMETRY,
             arbitrage_min_leg_conviction: config::ARBITRAGE_MIN_LEG_CONVICTION,
             arb_fak_rehedge_buffer:       config::ARB_FAK_REHEDGE_BUFFER,
+            arb_settle_grace_secs:        config::ARB_SETTLE_GRACE_SECS,
             arb_max_rescue_cost:          config::ARB_MAX_RESCUE_COST,
 
             time_decay_position_size_usdc:  config::TIME_DECAY_POSITION_SIZE_USDC,
@@ -755,6 +776,7 @@ impl Default for DynamicConfig {
             fairvalue_post_exit_cooldown_secs: config::FAIRVALUE_POST_EXIT_COOLDOWN_SECS,
             fairvalue_max_stop_losses_per_market: config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET,
             fairvalue_edge_noise_multiple:    config::FAIRVALUE_EDGE_NOISE_MULTIPLE,
+            fairvalue_stop_model_confirm_frac: config::FAIRVALUE_STOP_MODEL_CONFIRM_FRAC,
 
             enable_convergence:               config::ENABLE_CONVERGENCE_TRADING,
             convergence_position_size_usdc:   config::CONVERGENCE_POSITION_SIZE_USDC,
@@ -1064,3 +1086,50 @@ impl DynamicConfig {
 }
 
 
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Config rows persist in SQLite across deploys, so every row written before
+    /// a field existed must still deserialize — `apply_patch` and the loader at
+    /// boot both go through `serde_json::from_*` against the full struct, and a
+    /// missing `#[serde(default)]` turns an old row into a hard startup failure
+    /// rather than a silent fallback.
+    ///
+    /// Built by serializing the current struct and *deleting* the new keys,
+    /// which is exactly what an older row looks like on disk. Only fields added
+    /// after the schema settled carry `#[serde(default)]` — the core ones are
+    /// required — so an empty object is not a valid stand-in for a legacy row.
+    #[test]
+    fn a_config_row_predating_the_newest_knobs_still_loads() {
+        let mut legacy = serde_json::to_value(DynamicConfig::default()).unwrap();
+        let obj = legacy.as_object_mut().unwrap();
+        for added in ["fairvalue_stop_model_confirm_frac", "arb_settle_grace_secs"] {
+            assert!(obj.remove(added).is_some(), "{added} must be a serialized field");
+        }
+        let cfg: DynamicConfig =
+            serde_json::from_value(legacy).expect("an old persisted row must still deserialize");
+
+        assert_eq!(
+            cfg.fairvalue_stop_model_confirm_frac,
+            config::FAIRVALUE_STOP_MODEL_CONFIRM_FRAC
+        );
+        assert_eq!(cfg.arb_settle_grace_secs, config::ARB_SETTLE_GRACE_SECS);
+    }
+
+    /// The orphan settle grace is a naked-exposure window, so it must stay well
+    /// inside the post-flatten late-fill watch that backstops it — if the grace
+    /// ever outgrew that watch, committing to a repair would no longer be
+    /// covered by the mechanism that makes a short grace safe.
+    #[test]
+    fn the_settle_grace_stays_inside_its_backstop() {
+        let grace = DynamicConfig::default().arb_settle_grace_secs;
+        assert!(grace > 0, "a zero grace would flatten on an unsettled balance read");
+        assert!(
+            grace < 20,
+            "grace {grace}s must stay under ARBITER_LATE_FILL_WATCH_SECS (20s), \
+             the watcher that bounds the cost of committing early"
+        );
+    }
+}

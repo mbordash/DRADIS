@@ -70,6 +70,25 @@ pub const ARBITRAGE_MAX_OBI_ASYMMETRY: Decimal = dec!(0.60);
 /// Conservative: stricter 0.85 (fewer entries, lowest orphan risk).
 pub const ARBITRAGE_MIN_LEG_CONVICTION: Decimal = dec!(0.95);
 pub const ARB_FAK_REHEDGE_BUFFER: Decimal = dec!(0.02);
+
+/// Seconds the orphan arbiter waits, after cancelling the missing leg's GTC,
+/// before re-reading its on-chain balance and committing to a repair.
+///
+/// Guards one specific race: the cancel may have arrived just after a taker fill
+/// that was still settling on-chain, and flattening on a stale zero balance
+/// would sell a leg we actually own. The grace lets Polygon settle (~2s/block)
+/// so Step 3's re-read sees the truth.
+///
+/// It is NOT the only protection, which is why it can be short: after the
+/// flatten, ARBITER_LATE_FILL_WATCH_SECS keeps watching the missing leg and
+/// flattens + books it if it fills late. The downside of guessing wrong is
+/// therefore bounded at two spreads, while the cost of waiting is unbounded
+/// naked directional exposure -- so shorter is the safer side of this trade.
+///
+/// Was hardcoded at 10s. On 2026-08-15 a TimeDecay leg took 26s from entry to
+/// flatten (10s fill-confirm, 5s asymmetric grace, 10s here, ~1s to trade) while
+/// YES collapsed 0.56 -> 0.38; the move was over before the repair began.
+pub const ARB_SETTLE_GRACE_SECS: u64 = 2;
 pub const ARB_FLATTEN_MIN_BID_BUFFER: Decimal = dec!(0.03);
 pub const ARB_FLATTEN_BID_HAIRCUT_PCT: Decimal = dec!(0.06);
 
@@ -786,6 +805,23 @@ pub const FAIRVALUE_EDGE_NOISE_MIN_SAMPLES: usize = 20;
 /// ticks moved further than the entire edge being claimed. An edge smaller than
 /// the model's own noise is not a measurement. 0 disables the gate.
 pub const FAIRVALUE_EDGE_NOISE_MULTIPLE: Decimal = dec!(1.5);
+
+/// Multiple of the *entry* edge requirement the model must still show, at the
+/// live ask, before a losing FairValue position vetoes its own non-catastrophic
+/// stop loss. Higher => stricter => the stop fires more readily. 0 disables the
+/// veto entirely and restores the old price-only stop.
+///
+/// The veto is bounded on both sides and cannot strand a position: the
+/// catastrophic branch (2x the stop) is never vetoed, and the model-reversal
+/// exit, the endgame bail, and settlement all remain in force. It can therefore
+/// only extend a hold across the band between one and two stop widths.
+///
+/// Sized from production on 2026-08-15: a NO entered at $0.50 (edge +0.178 vs
+/// req 0.145) stopped out at $0.44 after 206s -- six cents, 1.4x the model's own
+/// 120s noise, with 3,800s still to run. The model read edge +0.145 vs req 0.140
+/// at that instant and the contract settled at $1.00: -$0.48 realised against
+/// +$2.46 available.
+pub const FAIRVALUE_STOP_MODEL_CONFIRM_FRAC: Decimal = dec!(1.5);
 
 // Throttle for the entry-signal info log.
 pub const FAIRVALUE_ENTRY_LOG_THROTTLE_SECS: u64 = 30;

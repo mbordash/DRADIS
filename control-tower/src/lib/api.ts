@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License along
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import type { DynamicConfig, ConfigFieldSchema, PnlSnapshotRow, TradeRow, OpenPositionRow, LlmRecommendationRow, LlmActionRow, ViperDef, StatusResponse, PortfolioValue, SquadronSummary, TelemetrySnapshot, TelemetrySample } from './types';
+import type { DynamicConfig, ConfigFieldSchema, PnlSnapshotRow, TradeRow, TradeStats, OpenPositionRow, LlmRecommendationRow, LlmActionRow, ViperDef, StatusResponse, PortfolioValue, SquadronSummary, TelemetrySnapshot, TelemetrySample } from './types';
 
 // In development, NEXT_PUBLIC_API_URL=http://localhost:9000 (set in .env.local)
 // hits the DRADIS API directly.
@@ -94,6 +94,19 @@ export async function getTrades(limit = 60, asset?: string): Promise<TradeRow[]>
   const url = withAsset(`${BASE}/api/trades?limit=${limit}`, asset);
   const res = await fetch(url, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/trades → ${res.status}`);
+  return res.json();
+}
+
+/**
+ * Lifetime trade aggregates for a shard, computed server-side in SQL.
+ *
+ * Use this for any "total" the UI displays. `getTrades` is a bounded recent
+ * window for the list view; reducing over it truncates the totals silently.
+ */
+export async function getTradeStats(asset?: string): Promise<TradeStats> {
+  const url = withAsset(`${BASE}/api/trades/stats`, asset);
+  const res = await fetch(url, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/trades/stats → ${res.status}`);
   return res.json();
 }
 
