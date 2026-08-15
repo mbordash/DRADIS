@@ -155,6 +155,9 @@ fn default_fairvalue_target_profit()       -> Decimal { config::FAIRVALUE_TARGET
 fn default_fairvalue_stop_loss()           -> Decimal { config::FAIRVALUE_STOP_LOSS_PERCENT           }
 fn default_fairvalue_reversal_decay()      -> Decimal { config::FAIRVALUE_MODEL_REVERSAL_DECAY_PCT    }
 fn default_fairvalue_sigma_floor_horizon() -> i64     { config::FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS    }
+fn default_fairvalue_post_exit_cooldown()  -> i64     { config::FAIRVALUE_POST_EXIT_COOLDOWN_SECS     }
+fn default_fairvalue_max_stop_losses()     -> u32     { config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET  }
+fn default_fairvalue_edge_noise_multiple() -> Decimal { config::FAIRVALUE_EDGE_NOISE_MULTIPLE         }
 fn default_intl_taker_fee_rate()           -> Decimal { config::INTL_TAKER_FEE_RATE                   }
 fn default_convergence_position_size()     -> Decimal { config::CONVERGENCE_POSITION_SIZE_USDC        }
 fn default_convergence_max_exposure()      -> Decimal { config::CONVERGENCE_MAX_EXPOSURE_USDC         }
@@ -550,6 +553,17 @@ pub struct DynamicConfig {
     /// only what it cannot see.
     #[serde(default = "default_fairvalue_sigma_floor_horizon")]
     pub fairvalue_sigma_floor_horizon_secs: i64,
+    /// Seconds a token is locked out after any FairValue exit. Re-entries into a
+    /// market the viper has just left were 0-for-4 in prod (2026-08-13/14).
+    #[serde(default = "default_fairvalue_post_exit_cooldown")]
+    pub fairvalue_post_exit_cooldown_secs: i64,
+    /// Stop-outs allowed on one market before the breaker bars further entries.
+    #[serde(default = "default_fairvalue_max_stop_losses")]
+    pub fairvalue_max_stop_losses_per_market: u32,
+    /// Multiple of the model's own short-horizon noise the edge must clear.
+    /// 0 disables the gate.
+    #[serde(default = "default_fairvalue_edge_noise_multiple")]
+    pub fairvalue_edge_noise_multiple:    Decimal,
 
     // ── Convergence Viper ─────────────────────────────────────────────────────
     #[serde(default = "default_convergence_enable")]
@@ -738,6 +752,9 @@ impl Default for DynamicConfig {
             fairvalue_stop_loss_pct:          config::FAIRVALUE_STOP_LOSS_PERCENT,
             fairvalue_model_reversal_decay_pct: config::FAIRVALUE_MODEL_REVERSAL_DECAY_PCT,
             fairvalue_sigma_floor_horizon_secs: config::FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS,
+            fairvalue_post_exit_cooldown_secs: config::FAIRVALUE_POST_EXIT_COOLDOWN_SECS,
+            fairvalue_max_stop_losses_per_market: config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET,
+            fairvalue_edge_noise_multiple:    config::FAIRVALUE_EDGE_NOISE_MULTIPLE,
 
             enable_convergence:               config::ENABLE_CONVERGENCE_TRADING,
             convergence_position_size_usdc:   config::CONVERGENCE_POSITION_SIZE_USDC,

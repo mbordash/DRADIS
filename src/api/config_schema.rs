@@ -450,9 +450,26 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(g, e, "fairvalue_sigma_floor_horizon_secs", "Vol Floor Horizon", "secs", true,
             "Forecast horizon at or below which the realized-vol floor stops binding, ramping to full \
              strength at twice this. The floor guards against trusting a 1-hour vol window for a settlement \
-             many hours out; inside the window the measurement is in-sample and the floor only overrides good \
-             data. Set to 0 to restore an unconditional floor. Raising this makes the model assume MORE \
-             volatility, which inflates the fair value of cheap tails.").min(0.0).step(300.0).unit("s"));
+             many hours out. Set to 0 to restore an unconditional floor — recommended. RAISING this makes the \
+             model assume LESS volatility, which pushes fair value toward 0/1 and manufactures edge against the \
+             favorite. At 3600 the floor never bound on an hourly market at all (any secs_left ≤ 3600 collapses \
+             it to the absolute backstop): prod on 2026-08-13/14 ran hourly σ at 1.9-2.6e-5/√s = 13% annualized \
+             BTC vol, roughly half what the book implied, and FairValue lost $3.79 over 15 trades.")
+            .min(0.0).step(300.0).unit("s"));
+        v.push(F::new(g, e, "fairvalue_edge_noise_multiple", "Edge vs Noise", "decimal", true,
+            "Multiple of the model's own recent fair-value noise the edge must clear, on top of Base Edge. \
+             Noise is the std-dev of successive fair-value moves over the last 15 min, rescaled to a 2-minute \
+             horizon. Guards the case where an 8¢ edge is read off a model that is itself swinging 18¢ per tick \
+             — measured at 24% of hourly ticks on 2026-08-13/14. 0 disables the gate; higher = only trade when \
+             the model has been steady.").range(0.0, 5.0).step(0.1));
+        v.push(F::new(g, e, "fairvalue_post_exit_cooldown_secs", "Post-Exit Cooldown", "secs", true,
+            "Seconds a token is locked out after any FairValue exit. Second entries into a market the viper had \
+             just left went 0-for-4 for −$1.88 gross on 2026-08-13/14 while first entries were flat, and the \
+             300s setting let one of them back in 365s after the stop.").min(0.0).step(60.0).unit("s"));
+        v.push(F::new(g, e, "fairvalue_max_stop_losses_per_market", "Max Stops / Market", "int", true,
+            "Stop-outs allowed on one market before the breaker bars further entries there. Counts genuine \
+             stop-outs, not exit retries. At 2 the breaker only fires after both losses are booked.")
+            .min(1.0).step(1.0));
         v.push(F::new(g, e, "fairvalue_min_edge", "Min Edge", "price", true,
             "Edge floor at expiry — the settlement-snipe requirement.").range(0.0, 0.5).step(0.005));
         v.push(F::new(g, e, "fairvalue_max_entry_price", "Max Entry", "price", true,

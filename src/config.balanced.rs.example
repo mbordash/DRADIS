@@ -741,11 +741,28 @@ pub const FAIRVALUE_EDGE_HORIZON_CAP: Decimal = dec!(0.25);
 pub const FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC: f64 = 4.2e-5;
 /// Horizon at or below which the sigma floor does not bind (ramps to full at 2x).
 /// Defaults to the vol window: trust the measurement as far out as we measured.
-pub const FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS: i64 = 3600;
+pub const FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS: i64 = 0;
 /// Absolute sigma backstop against degenerate input (frozen oracle / zero variance).
 pub const FAIRVALUE_ABSOLUTE_MIN_SIGMA_PER_SQRT_SEC: f64 = 1.0e-5;
 // Circuit breaker: stop entering a market after this many stop-loss exits on it.
-pub const FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET: u32 = 2;
+pub const FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET: u32 = 1;
+/// Rolling window over which the model's own fair-value noise is measured.
+pub const FAIRVALUE_EDGE_NOISE_WINDOW_SECS: u64 = 900;
+/// Reference horizon the per-sample fair-value noise is rescaled to by √t,
+/// chosen to match the observed median hold (~2 minutes).
+pub const FAIRVALUE_EDGE_NOISE_HORIZON_SECS: u64 = 120;
+/// Samples required before the noise gate can bind. Below this the gate blocks
+/// rather than waves through — a freshly rotated market is when the model is
+/// least stable, so an unmeasured edge there is the one least worth taking.
+pub const FAIRVALUE_EDGE_NOISE_MIN_SAMPLES: usize = 20;
+/// Multiple of that noise the edge must clear before an entry is allowed.
+///
+/// Prod telemetry (2026-08-13/14, 48 hourly evaluations): |Δfair| over a ~2min
+/// tick had p75 = 0.078 and p90 = 0.179 against a base edge of 0.08 — 24% of
+/// ticks moved further than the entire edge being claimed. An edge smaller than
+/// the model's own noise is not a measurement. 0 disables the gate.
+pub const FAIRVALUE_EDGE_NOISE_MULTIPLE: Decimal = dec!(1.0);
+
 // Throttle for the entry-signal info log.
 pub const FAIRVALUE_ENTRY_LOG_THROTTLE_SECS: u64 = 30;
 pub const FAIRVALUE_PIN_GUARD_SECS: i64 = 600;
@@ -788,7 +805,7 @@ pub const FAIRVALUE_BAIL_SECS: i64 = 120;
 pub const FAIRVALUE_BAIL_PROB: f64 = 0.75;
 pub const FAIRVALUE_MIN_EXIT_BID: Decimal = dec!(0.05);
 pub const FAIRVALUE_MAX_SNAPSHOT_AGE_SECS: i64 = 900; // daily book is quiet; FAK orders can't fill vs phantom quotes
-pub const FAIRVALUE_POST_EXIT_COOLDOWN_SECS: i64 = 300;
+pub const FAIRVALUE_POST_EXIT_COOLDOWN_SECS: i64 = 900;
 
 // ============================================================================
 // TIME DECAY (THETA) STRATEGY PARAMETERS

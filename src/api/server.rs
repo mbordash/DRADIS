@@ -658,6 +658,29 @@ async fn export_trades(Query(q): Query<AssetQuery>) -> Response {
     ).into_response()
 }
 
+/// Snapshot closest in time to `target_time`, within `window_secs`.
+///
+/// Split out of [`get_pnl_history`] so the timestamp join can be regression
+/// tested without a database or an axum router. Note that callers pass
+/// newest-first slices, so any "first match" strategy here silently biases
+/// toward the future — see the comment at the call site.
+fn nearest_snapshot(
+    snaps: &[db::PnlSnapshotRow],
+    target_time: i64,
+    window_secs: i64,
+) -> Option<&db::PnlSnapshotRow> {
+    snaps
+        .iter()
+        .filter_map(|s| {
+            chrono::DateTime::parse_from_rfc3339(&s.ts)
+                .ok()
+                .map(|dt| ((dt.timestamp() - target_time).abs(), s))
+        })
+        .filter(|(delta, _)| *delta <= window_secs)
+        .min_by_key(|(delta, _)| *delta)
+        .map(|(_, s)| s)
+}
+
 /// GET /api/pnl/history?limit=200&asset=btc
 ///
 /// Returns up to `limit` P&L snapshots, newest first.
@@ -719,15 +742,29 @@ async fn get_pnl_history(Query(q): Query<AssetQuery>) -> Response {
     }
 
     // Use primary asset's timestamps as the base timeline
-    let primary_snaps = &all_snapshots[0].1;
+    let (primary_asset, primary_snaps) = &all_snapshots[0];
 
     // For each primary timestamp, aggregate positions_value from all assets
     let aggregated: Vec<db::PnlSnapshotRow> = primary_snaps.iter().map(|primary| {
         let ts = &primary.ts;
         let collateral = &primary.collateral;
 
-        // Find nearest snapshot from each asset within ±2 minutes of this timestamp
-        let window_secs = 120;
+        // Match each asset to this timestamp by NEAREST snapshot, not by the
+        // first one inside the window.
+        //
+        // `get_pnl_history` returns rows newest-first, so an `Iterator::find`
+        // over a ±120s window yielded the *newest* row in that window rather
+        // than the closest one. Every point then took its collateral from its
+        // own row but its positions_value from a row up to two minutes in the
+        // future, putting a phantom spike in front of every entry and a phantom
+        // dip in front of every exit. Observed 2026-08-14: the 19:36 buy marked
+        // the 19:34 and 19:35 points at $66.78 — pre-trade cash $64.06 plus a
+        // position that did not exist yet — against a true $64.06, then dropped
+        // the 19:41 point to $61.71 by pairing mid-trade cash with post-exit
+        // positions. The snapshots themselves were correct throughout
+        // (19:36:15 recorded 61.71 + 2.73 = 64.43); only this join was wrong.
+        // Nearest-match keeps cash and positions on the same clock.
+        let window_secs: i64 = 120;
         let primary_time = chrono::DateTime::parse_from_rfc3339(ts)
             .map(|dt| dt.timestamp())
             .unwrap_or(0);
@@ -736,12 +773,15 @@ async fn get_pnl_history(Query(q): Query<AssetQuery>) -> Response {
         let mut total_session_pnl = Decimal::ZERO;
 
         for (asset, snaps) in &all_snapshots {
-            // Find closest snapshot within window
-            if let Some(snap) = snaps.iter().find(|s| {
-                chrono::DateTime::parse_from_rfc3339(&s.ts)
-                    .map(|dt| (dt.timestamp() - primary_time).abs() <= window_secs)
-                    .unwrap_or(false)
-            }) {
+            // The primary asset contributes the very row that defines this
+            // point, so there is nothing to search for — and searching would
+            // reintroduce the skew whenever two snapshots share a timestamp.
+            let nearest = if asset == primary_asset {
+                Some(primary)
+            } else {
+                nearest_snapshot(snaps, primary_time, window_secs)
+            };
+            if let Some(snap) = nearest {
                 // Extract positions_value = total_value - collateral
                 if let (Some(tv_str), Ok(coll)) = (
                     snap.total_value.as_ref(),
@@ -2790,5 +2830,99 @@ pub async fn run_api_server(
 
     if let Err(e) = axum::serve(listener, app.into_make_service()).await {
         tracing::error!(" Control Tower API error: {}", e);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn snap(ts: &str, collateral: &str, total: &str) -> db::PnlSnapshotRow {
+        db::PnlSnapshotRow {
+            ts: ts.to_string(),
+            session_pnl: "0".to_string(),
+            collateral: collateral.to_string(),
+            total_value: Some(total.to_string()),
+        }
+    }
+
+    fn secs(ts: &str) -> i64 {
+        chrono::DateTime::parse_from_rfc3339(ts).unwrap().timestamp()
+    }
+
+    /// The exact production series that produced the phantom spike.
+    ///
+    /// On 2026-08-14 a FairValue buy filled at 19:36 and closed at 19:41 for
+    /// +$0.44. The portfolio chart showed $64.06 → $66.78 → $64.50. The
+    /// snapshots were correct all along; the join was picking each point's
+    /// positions_value out of the future.
+    fn production_series() -> Vec<db::PnlSnapshotRow> {
+        // Newest first, exactly as `get_pnl_history` returns them.
+        vec![
+            snap("2026-08-14T19:42:15+00:00", "64.50", "64.50"),
+            snap("2026-08-14T19:41:15+00:00", "61.71", "63.40"),
+            snap("2026-08-14T19:37:15+00:00", "61.71", "63.40"),
+            snap("2026-08-14T19:36:15+00:00", "61.71", "64.43"),
+            snap("2026-08-14T19:35:15+00:00", "64.06", "64.06"),
+            snap("2026-08-14T19:34:15+00:00", "64.06", "64.06"),
+        ]
+    }
+
+    /// A newest-first slice must not resolve to a later row just because it
+    /// came first. This is the whole bug: `find` over a ±120s window returned
+    /// the newest match, so 19:34 paired with 19:36 and inherited a position
+    /// that had not been bought yet.
+    #[test]
+    fn nearest_snapshot_does_not_drift_into_the_future() {
+        let snaps = production_series();
+        let hit = nearest_snapshot(&snaps, secs("2026-08-14T19:34:15+00:00"), 120).unwrap();
+        assert_eq!(hit.ts, "2026-08-14T19:34:15+00:00", "must match itself, not 19:36");
+
+        let hit = nearest_snapshot(&snaps, secs("2026-08-14T19:35:15+00:00"), 120).unwrap();
+        assert_eq!(hit.ts, "2026-08-14T19:35:15+00:00");
+    }
+
+    /// The same skew ran the other way on the exit: 19:41 (mid-trade cash) was
+    /// pairing with 19:42 (post-exit, no positions) and dropping the position
+    /// from the chart entirely.
+    #[test]
+    fn nearest_snapshot_does_not_drop_a_live_position_at_the_exit() {
+        let snaps = production_series();
+        let hit = nearest_snapshot(&snaps, secs("2026-08-14T19:41:15+00:00"), 120).unwrap();
+        assert_eq!(hit.ts, "2026-08-14T19:41:15+00:00");
+        assert_eq!(hit.total_value.as_deref(), Some("63.40"), "position must still be counted");
+    }
+
+    /// Reconstruct the plotted series the way the handler does for a
+    /// single-asset deployment and check it against the recorded truth.
+    #[test]
+    fn plotted_series_matches_the_recorded_snapshots() {
+        let snaps = production_series();
+        for primary in &snaps {
+            let t = secs(&primary.ts);
+            let collateral: f64 = primary.collateral.parse().unwrap();
+            // The primary asset contributes its own row; every other asset is
+            // matched by nearest. With one asset the two must agree.
+            let matched = nearest_snapshot(&snaps, t, 120).unwrap();
+            let pos = matched.total_value.as_ref().unwrap().parse::<f64>().unwrap()
+                - matched.collateral.parse::<f64>().unwrap();
+            let plotted = collateral + pos.max(0.0);
+            let truth: f64 = primary.total_value.as_ref().unwrap().parse().unwrap();
+            assert!(
+                (plotted - truth).abs() < 0.005,
+                "at {} plotted {plotted:.2} but the snapshot recorded {truth:.2}",
+                primary.ts
+            );
+        }
+    }
+
+    /// Beyond the window there is no match at all, rather than a far-away row.
+    #[test]
+    fn nearest_snapshot_respects_the_window() {
+        let snaps = production_series();
+        assert!(nearest_snapshot(&snaps, secs("2026-08-14T18:00:00+00:00"), 120).is_none());
+        // 19:37 is 240s from 19:41 — outside a 120s window, inside a 300s one.
+        assert!(nearest_snapshot(&snaps[2..3], secs("2026-08-14T19:41:15+00:00"), 120).is_none());
+        assert!(nearest_snapshot(&snaps[2..3], secs("2026-08-14T19:41:15+00:00"), 300).is_some());
     }
 }

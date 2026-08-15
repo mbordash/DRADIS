@@ -110,6 +110,16 @@ struct FairValueGlobals {
     /// was emitted, keyed by token_id. The model-reversal exit measures decay
     /// against this rather than against an absolute floor. Cleared on exit.
     entry_fair: StdMutex<HashMap<String, f64>>,
+    /// Per-market model fair-value history: condition_id → (sample time,
+    /// fair_yes), one sample per FAIRVALUE_VOL_SAMPLE_SECS, pruned past
+    /// FAIRVALUE_EDGE_NOISE_WINDOW_SECS. Feeds the edge-vs-noise gate.
+    ///
+    /// Keyed per market rather than held in a single slot because the viper
+    /// alternates between the hourly and Window/Daily venues from tick to tick,
+    /// and those price two different contracts: a single slot would read every
+    /// venue flip as a fair-value jump and report noise that is really just the
+    /// switch. Stale keys are pruned once their newest sample ages out.
+    fair_history: StdMutex<HashMap<String, VecDeque<(Instant, f64)>>>,
     /// Positions already counted toward `sl_counts`, keyed token_id →
     /// `Position::opened_at`.
     ///
@@ -135,6 +145,7 @@ impl FairValueGlobals {
             last_entry_log_at: StdMutex::new(None),
             sl_counts:        StdMutex::new(HashMap::new()),
             entry_fair:       StdMutex::new(HashMap::new()),
+            fair_history:     StdMutex::new(HashMap::new()),
             sl_counted:       StdMutex::new(HashMap::new()),
         }
     }
@@ -232,6 +243,71 @@ impl FairValueStrategyImpl {
         sigma_per_sqrt_sec(&prices, span_secs, config::FAIRVALUE_MIN_VOL_SAMPLES)
     }
 
+    /// Feed the per-market fair-value history and return the model's own
+    /// short-horizon noise: the standard deviation of successive Δfair, rescaled
+    /// from the sample cadence to `FAIRVALUE_EDGE_NOISE_HORIZON_SECS` by √t.
+    ///
+    /// This is the yardstick the claimed edge has to beat. Edge is a difference
+    /// between the model's fair value and the book; if the model's own output
+    /// wanders further than that difference over the horizon the position is
+    /// held, the difference carries no information and the entry is a coin flip
+    /// paying two taker fees. Measured in prod on 2026-08-13/14: 24% of ~2min
+    /// ticks moved the fair value more than the entire 0.08 base edge.
+    ///
+    /// `None` during warmup — deliberately blocking rather than permissive, see
+    /// `FAIRVALUE_EDGE_NOISE_MIN_SAMPLES`.
+    fn update_and_read_fair_noise(&self, asset: &str, condition_id: &str, fair_yes: f64) -> Option<f64> {
+        let mut hist = match globals(asset).fair_history.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let now = Instant::now();
+        let window = config::FAIRVALUE_EDGE_NOISE_WINDOW_SECS;
+
+        let samples = hist.entry(condition_id.to_string()).or_default();
+        let due = samples
+            .back()
+            .map_or(true, |(t, _)| now.duration_since(*t).as_secs() >= config::FAIRVALUE_VOL_SAMPLE_SECS);
+        if due {
+            samples.push_back((now, fair_yes));
+        }
+        while let Some((t, _)) = samples.front() {
+            if now.duration_since(*t).as_secs() > window {
+                samples.pop_front();
+            } else {
+                break;
+            }
+        }
+
+        let series: Vec<f64> = samples.iter().map(|(_, f)| *f).collect();
+
+        // Drop markets that have rotated out, so the map does not grow for the
+        // life of the process. Done here rather than on a timer because this is
+        // the only place the map is held.
+        hist.retain(|_, v| v.back().is_some_and(|(t, _)| now.duration_since(*t).as_secs() <= window));
+
+        Self::fair_noise_from(&series, config::FAIRVALUE_EDGE_NOISE_MIN_SAMPLES)
+    }
+
+    /// Statistics half of [`update_and_read_fair_noise`], split out because the
+    /// sampler half is cadence-gated on `Instant` and cannot be driven from a
+    /// test without sleeping through a real 15s window per sample.
+    fn fair_noise_from(series: &[f64], min_samples: usize) -> Option<f64> {
+        if series.len() < min_samples.max(3) {
+            return None;
+        }
+        let diffs: Vec<f64> = series.windows(2).map(|w| w[1] - w[0]).collect();
+        if diffs.len() < 2 {
+            return None;
+        }
+        let mean = diffs.iter().sum::<f64>() / diffs.len() as f64;
+        let var = diffs.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / diffs.len() as f64;
+        // √t rescale from one sample interval to the reference horizon.
+        let scale =
+            (config::FAIRVALUE_EDGE_NOISE_HORIZON_SECS as f64 / config::FAIRVALUE_VOL_SAMPLE_SECS as f64).sqrt();
+        Some(var.sqrt() * scale)
+    }
+
     /// Time-scaled edge requirement: linear taper MIN_EDGE→BASE_EDGE inside the
     /// taper horizon, then √(T/taper) growth beyond it (capped) — the further
     /// out settlement is, the less the 1-hour realized-vol window can be
@@ -254,13 +330,13 @@ impl FairValueStrategyImpl {
         config::CRYPTO_FEE_RATE * price * (dec!(1) - price)
     }
 
-    fn cooldown_active(&self, asset: &str, token_id: &str) -> bool {
+    fn cooldown_active(&self, asset: &str, token_id: &str, cooldown_secs: i64) -> bool {
         let mut reg = match globals(asset).exit_cooldowns.lock() {
             Ok(g) => g,
             Err(p) => p.into_inner(),
         };
         if let Some(t) = reg.get(token_id) {
-            if (t.elapsed().as_secs() as i64) < config::FAIRVALUE_POST_EXIT_COOLDOWN_SECS {
+            if (t.elapsed().as_secs() as i64) < cooldown_secs {
                 return true;
             }
             reg.remove(token_id);
@@ -496,6 +572,11 @@ impl Strategy for FairValueStrategyImpl {
         };
         let d_sigma = (spot / strike).ln() / (sigma * (secs_left as f64).sqrt());
 
+        // Fed before the guards below, for the same reason the vol sampler is:
+        // a gate that refuses entries must not also starve the measurement it
+        // will later be judged against.
+        let fair_noise = self.update_and_read_fair_noise(&ctx.crypto_filter, &market.condition_id, fair_yes);
+
         // ── Pin-risk guard (endgame coin-flip zone) ──────────────────────────
         // Two separate refusals, both guarding the same hazard — buying a coin
         // flip — but on different axes:
@@ -536,9 +617,11 @@ impl Strategy for FairValueStrategyImpl {
             if due {
                 *last = Some(Instant::now());
                 tracing::info!(
-                    " FairValue: fair(YES)={:.3} (d={:+.2}σ, σ/√s={:.2e}, T={}s) | yes_ask=${:.2} edge={:+.3} | no_ask=${:.2} edge={:+.3} | req={:.3}{}",
+                    " FairValue: fair(YES)={:.3} (d={:+.2}σ, σ/√s={:.2e}, T={}s) | yes_ask=${:.2} edge={:+.3} | no_ask=${:.2} edge={:+.3} | req={:.3} | noise{}={}{}",
                     fair_yes, d_sigma, sigma, secs_left,
                     snap.yes_ask, yes_edge, snap.no_ask, no_edge, req_edge,
+                    config::FAIRVALUE_EDGE_NOISE_HORIZON_SECS,
+                    fair_noise.map_or_else(|| "warmup".to_string(), |n| format!("{:.3}", n)),
                     match (endgame_pin, coin_flip) {
                         (true, _) => " [PIN-GUARD]",
                         (_, true) => " [COIN-FLIP]",
@@ -567,6 +650,31 @@ impl Strategy for FairValueStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── Edge vs the model's own noise ────────────────────────────────────
+        // `req_edge` scales with the forecast horizon but knows nothing about
+        // how steady the model has actually been on THIS market. Both matter:
+        // an 8¢ edge is meaningful when fair value has been drifting 2¢ per
+        // tick and meaningless when it has been swinging 18¢. On the 1AM ET
+        // market of 2026-08-14 fair(YES) travelled 0.118 → 0.808 in six minutes
+        // while the viper took two entries against a ~10¢ edge; both stopped
+        // out and the contract settled against the side it had bought.
+        if dc.fairvalue_edge_noise_multiple > dec!(0) {
+            match fair_noise {
+                Some(noise) => {
+                    let noise_dec = Decimal::from_f64_retain(noise).map(|d| d.round_dp(10)).unwrap_or(dec!(0));
+                    let required = dc.fairvalue_edge_noise_multiple * noise_dec;
+                    if edge < required {
+                        idle("edge below model noise");
+                        return Ok(StrategySignal::NoSignal);
+                    }
+                }
+                None => {
+                    idle("fair-value noise warmup");
+                    return Ok(StrategySignal::NoSignal);
+                }
+            }
+        }
+
         // ── Spread guard: never buy into a position that is born stopped out ──
         // Entry crosses the spread at the ask, but every exit rule below marks
         // against the bid, so a wide book prices the position under water the
@@ -586,7 +694,7 @@ impl Strategy for FairValueStrategyImpl {
             idle("spread too wide (entry would mark below the stop loss)");
             return Ok(StrategySignal::NoSignal);
         }
-        if self.cooldown_active(&ctx.crypto_filter, token_id.as_str()) {
+        if self.cooldown_active(&ctx.crypto_filter, token_id.as_str(), dc.fairvalue_post_exit_cooldown_secs) {
             idle("post-exit cooldown active");
             return Ok(StrategySignal::NoSignal);
         }
@@ -598,7 +706,7 @@ impl Strategy for FairValueStrategyImpl {
                 Err(p) => p.into_inner(),
             };
             if counts.get(&market.condition_id).copied().unwrap_or(0)
-                >= config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET
+                >= dc.fairvalue_max_stop_losses_per_market
             {
                 idle("stop-loss circuit breaker tripped");
                 return Ok(StrategySignal::NoSignal);
@@ -828,7 +936,7 @@ impl Strategy for FairValueStrategyImpl {
                 if let Some(n) = self.count_stop_loss_once(
                     &ctx.crypto_filter, token_id.as_str(), position.opened_at, &market.condition_id,
                 ) {
-                    if n >= config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET {
+                    if n >= dc.fairvalue_max_stop_losses_per_market {
                         tracing::warn!(
                             " FairValue circuit breaker: {} SL exits on \"{}\" — no further entries this market",
                             n, market.market_name
@@ -929,9 +1037,20 @@ mod tests {
     /// samples of a quiet overnight session while realized vol implied ~2.85e-5.
     /// That inflated the fair value of cheap tails by 5-10¢ and manufactured all
     /// three entries, which closed gross-flat and lost $0.97 to fees.
+    ///
+    /// SUPERSEDED as a default (2026-08-14), kept as a test of the ramp itself.
+    /// The taper rests on the premise that an in-sample realized-vol measurement
+    /// can be trusted; prod refuted it. Over 48 hourly evaluations on
+    /// 2026-08-13/14 the unfloored estimate ran 1.9-2.6e-5/√s — 0.70% daily,
+    /// ~13% annualized BTC — against a book implying 1.76× that, and the model's
+    /// resulting over-confident fair values manufactured 15 trades for −$3.79.
+    /// A horizon of 3600 also meant the floor never bound on an hourly market at
+    /// all, since any `secs_left ≤ 3600` clamps the ramp to zero. The shipped
+    /// default is now 0 in every profile; this test pins an explicit horizon so
+    /// it still covers the ramp for anyone who turns it back on.
     #[test]
     fn sigma_floor_does_not_bind_inside_the_measurement_window() {
-        let h = config::FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS;
+        let h = 3600_i64;
         let abs = config::FAIRVALUE_ABSOLUTE_MIN_SIGMA_PER_SQRT_SEC;
         let full = config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC;
         // The three entries of that session, by seconds to expiry.
@@ -950,7 +1069,7 @@ mod tests {
     /// window is a poor forecast for a settlement many hours out.
     #[test]
     fn sigma_floor_reaches_full_strength_beyond_twice_the_window() {
-        let h = config::FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS;
+        let h = 3600_i64;
         let full = config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC;
         for secs_left in [2 * h, 6 * h, 20 * h] {
             let f = FairValueStrategyImpl::sigma_floor(h, secs_left);
@@ -961,6 +1080,48 @@ mod tests {
         let mid = FairValueStrategyImpl::sigma_floor(h, h + h / 2);
         assert!(mid > FairValueStrategyImpl::sigma_floor(h, h));
         assert!(mid < full);
+    }
+
+    /// A steady model leaves the base edge in charge; a thrashing one does not.
+    ///
+    /// Both series below are real shapes from 2026-08-13/14. The quiet one is
+    /// the 12AM ET market that the viper held to a +20% take profit; the violent
+    /// one is the 1AM ET market where fair(YES) travelled 0.118 → 0.808 in six
+    /// minutes and both entries stopped out against a ~10¢ claimed edge.
+    #[test]
+    fn noise_gate_separates_a_steady_model_from_a_thrashing_one() {
+        let min = config::FAIRVALUE_EDGE_NOISE_MIN_SAMPLES;
+        let base = config::FAIRVALUE_BASE_EDGE.to_f64().unwrap();
+
+        // Drifting ~0.005 per 15s sample — the whole point of a fair-value model.
+        let quiet: Vec<f64> = (0..min + 5).map(|i| 0.85 + i as f64 * 0.005).collect();
+        let quiet_noise = FairValueStrategyImpl::fair_noise_from(&quiet, min).unwrap();
+        assert!(
+            quiet_noise < base,
+            "a steadily drifting model must not veto its own base edge (noise {quiet_noise:.3} vs edge {base:.3})"
+        );
+
+        // Alternating ±0.15 — the model has no idea, and any "edge" read off it
+        // is a coin flip paying two taker fees.
+        let violent: Vec<f64> = (0..min + 5).map(|i| if i % 2 == 0 { 0.15 } else { 0.65 }).collect();
+        let violent_noise = FairValueStrategyImpl::fair_noise_from(&violent, min).unwrap();
+        assert!(
+            violent_noise > base,
+            "a thrashing model must veto the base edge (noise {violent_noise:.3} vs edge {base:.3})"
+        );
+    }
+
+    /// The gate blocks rather than waves through while it has too little
+    /// history: a freshly rotated market is exactly when the model is least
+    /// stable, so an unmeasured edge there is the one least worth taking.
+    #[test]
+    fn noise_gate_is_closed_during_warmup() {
+        let min = config::FAIRVALUE_EDGE_NOISE_MIN_SAMPLES;
+        assert!(min >= 3, "a std-dev of successive diffs needs at least three samples");
+        let short: Vec<f64> = (0..min - 1).map(|i| 0.5 + i as f64 * 0.001).collect();
+        assert_eq!(FairValueStrategyImpl::fair_noise_from(&short, min), None);
+        let just_enough: Vec<f64> = (0..min).map(|i| 0.5 + i as f64 * 0.001).collect();
+        assert!(FairValueStrategyImpl::fair_noise_from(&just_enough, min).is_some());
     }
 
     /// Setting the knob to zero restores the old unconditional floor, so the
@@ -1017,8 +1178,13 @@ mod tests {
                 "a retried exit is the same stop-out"
             );
         }
-        // The breaker must still be below its limit after one real stop-out.
-        assert!(1 < config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET);
+        // The dedupe must have counted exactly one stop-out, whatever the
+        // profile's breaker limit happens to be.
+        assert_eq!(
+            strat.count_stop_loss_once(asset, token, opened_at + chrono::Duration::seconds(1), condition),
+            Some(2),
+            "only the first emission was deduped"
+        );
     }
 
     /// A genuine second stop-out on the same token must still count — the
@@ -1039,7 +1205,10 @@ mod tests {
             Some(2),
             "a new position on the same token is a new stop-out"
         );
-        assert!(2 >= config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET, "breaker trips on the second");
+        assert!(
+            2 >= crate::helpers::dynamic_config::DynamicConfig::default().fairvalue_max_stop_losses_per_market,
+            "breaker trips no later than the second stop-out"
+        );
     }
 
     /// The breaker is per market: stop-outs on one condition_id must not bleed
