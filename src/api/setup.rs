@@ -17,8 +17,18 @@
 //! Setup & credentials management API — the "prosumer" onboarding chapter.
 //!
 //! Lets the Control Tower configure venue credentials (intl wallet / US API keys),
-//! shared integrations (Alpaca, Telegram), and an admin password — without SSH
-//! access to the server or editing config files.
+//! Raptor signal-source keys (Alpaca, The Odds API), shared integrations
+//! (Telegram, LLM advisor), and an admin password — without SSH access to the
+//! server or editing config files.
+//!
+//! ## Panels
+//! `MANAGED_KEYS` tags every credential with the Setup panel that owns it.
+//! Venue keys are blocking (no key ⇒ no trading); Raptor keys are additive
+//! (no key ⇒ that Raptor idles on a neutral snapshot), which is why they are a
+//! separate panel rather than more rows in the venue card — first boot must not
+//! present them as though they gate trading. `RAPTOR_SOURCES` drives that panel
+//! and is the extension point for contributed Raptors: registering one there
+//! surfaces its key in the Control Tower with no front-end change.
 //!
 //! ## Storage model
 //! Secrets are persisted to `$DRADIS_DATA_DIR/secrets.env` (default `./data/`),
@@ -75,24 +85,98 @@ const SESSION_TTL_SECS: i64 = 24 * 3600;
 #[allow(dead_code)]
 const INTERNAL_KEYS: &[&str] = &["DRADIS_ADMIN_HASH", "DRADIS_SESSION_KEY"];
 
-/// UI-manageable credential whitelist: (env key, label, venue scope).
+/// UI-manageable credential whitelist: (env key, label, venue scope, panel).
+///
 /// Scope: "intl" | "us" | "shared" — the UI shows only the scopes relevant to
 /// the running build (see `GET /api/setup/status`).
-const MANAGED_KEYS: &[(&str, &str, &str)] = &[
-    ("POLYMARKET_PRIVATE_KEY",   "Polymarket wallet private key", "intl"),
-    ("POLYGON_RPC_URL",          "Polygon RPC endpoint",          "intl"),
-    ("POLYMARKET_US_KEY_ID",     "Polymarket US API key ID",      "us"),
-    ("POLYMARKET_US_SECRET_KEY", "Polymarket US secret key",      "us"),
-    ("ALPACA_API_KEY_ID",        "Alpaca API key ID",             "shared"),
-    ("ALPACA_API_SECRET_KEY",    "Alpaca API secret key",         "shared"),
-    ("TELEGRAM_BOT_TOKEN",       "Telegram bot token",            "shared"),
-    ("TELEGRAM_CHAT_ID",         "Telegram chat ID",              "shared"),
-    ("LLM_PROVIDER",             "LLM provider (ollama | openai | anthropic)", "shared"),
-    ("OLLAMA_URL",               "Ollama URL (local or remote)",  "shared"),
-    ("OLLAMA_MODEL",             "Ollama model",                  "shared"),
-    ("LLM_API_BASE",             "Hosted LLM API base URL",       "shared"),
-    ("LLM_API_KEY",              "Hosted LLM API key",            "shared"),
-    ("LLM_MODEL",                "Hosted LLM model",              "shared"),
+///
+/// Panel: which Setup-view section the key belongs to — "venue" (core trading
+/// credentials, blocking: no key means no trading), "raptor" (signal-source
+/// credentials, additive: no key means that Raptor idles and publishes a
+/// neutral snapshot) or "integration" (notifications, LLM advisor). The split
+/// matters because the two kinds fail differently, so first boot must not ask
+/// for Raptor keys as though they were required to trade.
+const MANAGED_KEYS: &[(&str, &str, &str, &str)] = &[
+    ("POLYMARKET_PRIVATE_KEY",   "Polymarket wallet private key", "intl",   "venue"),
+    ("POLYGON_RPC_URL",          "Polygon RPC endpoint",          "intl",   "venue"),
+    ("POLYMARKET_US_KEY_ID",     "Polymarket US API key ID",      "us",     "venue"),
+    ("POLYMARKET_US_SECRET_KEY", "Polymarket US secret key",      "us",     "venue"),
+    ("ALPACA_API_KEY_ID",        "Alpaca API key ID",             "shared", "raptor"),
+    ("ALPACA_API_SECRET_KEY",    "Alpaca API secret key",         "shared", "raptor"),
+    ("ODDS_API_KEY",             "The Odds API key",              "shared", "raptor"),
+    ("TELEGRAM_BOT_TOKEN",       "Telegram bot token",            "shared", "integration"),
+    ("TELEGRAM_CHAT_ID",         "Telegram chat ID",              "shared", "integration"),
+    ("LLM_PROVIDER",             "LLM provider (ollama | openai | anthropic)", "shared", "integration"),
+    ("OLLAMA_URL",               "Ollama URL (local or remote)",  "shared", "integration"),
+    ("OLLAMA_MODEL",             "Ollama model",                  "shared", "integration"),
+    ("LLM_API_BASE",             "Hosted LLM API base URL",       "shared", "integration"),
+    ("LLM_API_KEY",              "Hosted LLM API key",            "shared", "integration"),
+    ("LLM_MODEL",                "Hosted LLM model",              "shared", "integration"),
+];
+
+/// Raptor signal sources rendered as cards in the Setup view's Raptor panel.
+///
+/// This table is the extension point for new Raptors: adding one here (plus any
+/// credential rows in `MANAGED_KEYS` with panel `"raptor"`) makes it appear in
+/// the Control Tower with no front-end change. A contributor adding a Raptor
+/// therefore never has to touch the React code to make their key configurable.
+///
+/// `tier` describes how much the *signal* matters, not whether it is currently
+/// satisfied:
+///   - "required"    — DRADIS depends on this feed to trade at all.
+///   - "recommended" — materially improves signal quality where it applies.
+///   - "optional"    — observe-only or narrow; safe to leave unconfigured.
+///
+/// Raptors backed by public endpoints carry no keys at all; they still appear
+/// so the panel is a complete inventory of the recon layer, with an empty
+/// `keys` list signalling "nothing to configure".
+struct RaptorSource {
+    /// Stable identifier, also the React key for the card.
+    id: &'static str,
+    /// Display name, e.g. "Tide Raptor".
+    name: &'static str,
+    /// Upstream data source, shown under the name.
+    source: &'static str,
+    /// What the Raptor contributes, in one line.
+    blurb: &'static str,
+    tier: &'static str,
+    /// Env keys this Raptor reads; empty ⇒ no credentials required.
+    keys: &'static [&'static str],
+    /// `POST /api/setup/test` kind that validates `keys`, when one exists.
+    test_kind: Option<&'static str>,
+}
+
+const RAPTOR_SOURCES: &[RaptorSource] = &[
+    RaptorSource {
+        id: "price", name: "Price Raptor", source: "Binance spot (public)",
+        blurb: "Oracle price, velocity, acceleration and drift — the core signal every Viper reads.",
+        tier: "required", keys: &[], test_kind: None,
+    },
+    RaptorSource {
+        id: "funding", name: "Funding Raptor", source: "Binance perpetuals (public)",
+        blurb: "Perp funding rates; the Basis Viper uses them to confirm retail skew.",
+        tier: "required", keys: &[], test_kind: None,
+    },
+    RaptorSource {
+        id: "derivatives", name: "Derivatives Raptor", source: "Binance derivatives (public)",
+        blurb: "Open interest and CVD ratio, fused as features by GBoost and Convergence.",
+        tier: "required", keys: &[], test_kind: None,
+    },
+    RaptorSource {
+        id: "tide", name: "Tide Raptor", source: "Alpaca IEX",
+        blurb: "ETF premium \"institutional pulse\" (BTC only, US market hours). Shares one IEX connection with Horizon.",
+        tier: "recommended", keys: &["ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY"], test_kind: Some("alpaca"),
+    },
+    RaptorSource {
+        id: "horizon", name: "Horizon Raptor", source: "Alpaca IEX (shared connection)",
+        blurb: "TradFi macro velocity from SPY/QQQ/UVXY plus a VIX proxy (BTC only). Uses the same Alpaca keys as Tide.",
+        tier: "recommended", keys: &["ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY"], test_kind: Some("alpaca"),
+    },
+    RaptorSource {
+        id: "sports", name: "Sports Raptor", source: "The Odds API",
+        blurb: "Head-to-head line movement and consensus probability. Observe-only — published to telemetry, not consumed by Viper sizing.",
+        tier: "optional", keys: &["ODDS_API_KEY"], test_kind: Some("odds"),
+    },
 ];
 
 // ─── Secrets file I/O ────────────────────────────────────────────────────────
@@ -341,7 +425,7 @@ async fn acknowledge_alpha() -> Response {
 /// secret values; only whether each is set plus a last-4 hint for recognition.
 async fn get_credentials() -> Response {
     let secrets = read_secrets();
-    let items: Vec<serde_json::Value> = MANAGED_KEYS.iter().map(|(key, label, scope)| {
+    let items: Vec<serde_json::Value> = MANAGED_KEYS.iter().map(|(key, label, scope, panel)| {
         // Prefer the managed file; fall back to process env (container .env).
         let val = secrets.get(*key).cloned()
             .filter(|v| !v.is_empty())
@@ -354,9 +438,23 @@ async fn get_credentials() -> Response {
             }
             None => (false, String::new(), "unset"),
         };
-        json!({ "key": key, "label": label, "scope": scope, "set": set, "hint": hint, "source": source })
+        json!({ "key": key, "label": label, "scope": scope, "panel": panel,
+                "set": set, "hint": hint, "source": source })
     }).collect();
     Json(json!({ "credentials": items })).into_response()
+}
+
+/// GET /api/setup/raptors — the Raptor signal inventory backing the Setup
+/// view's Raptor panel. Pairs with `GET /api/setup/credentials` for per-key
+/// state; this endpoint carries only static card metadata, never secrets.
+async fn get_raptor_sources() -> Response {
+    let items: Vec<serde_json::Value> = RAPTOR_SOURCES.iter().map(|r| {
+        json!({
+            "id": r.id, "name": r.name, "source": r.source, "blurb": r.blurb,
+            "tier": r.tier, "keys": r.keys, "test_kind": r.test_kind,
+        })
+    }).collect();
+    Json(json!({ "raptors": items })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -370,7 +468,7 @@ struct PutCredentials {
 /// test endpoints and freshly-spawned tasks see new values immediately).
 async fn put_credentials(Json(body): Json<PutCredentials>) -> Response {
     for key in body.credentials.keys() {
-        if !MANAGED_KEYS.iter().any(|(k, _, _)| k == key) {
+        if !MANAGED_KEYS.iter().any(|(k, _, _, _)| k == key) {
             return (StatusCode::BAD_REQUEST,
                     Json(json!({"error": format!("'{}' is not a managed credential", key)}))).into_response();
         }
@@ -477,6 +575,7 @@ async fn test_connection(Json(body): Json<TestRequest>) -> Response {
         "polygon_rpc" => test_polygon_rpc(&body).await,
         "telegram" => test_telegram(&body).await,
         "alpaca" => test_alpaca(&body).await,
+        "odds" => test_odds(&body).await,
         "llm" => test_llm(&body).await,
         #[cfg(feature = "us_retail")]
         "us_keys" => test_us_keys(&body).await,
@@ -578,6 +677,43 @@ async fn test_alpaca(body: &TestRequest) -> Result<serde_json::Value, String> {
         return Err(format!("Alpaca rejected the keys (HTTP {})", resp.status()));
     }
     Ok(json!({"feed": "IEX", "probe": "SPY latest trade"}))
+}
+
+/// Validate a The Odds API key via `GET /v4/sports`.
+///
+/// That endpoint is deliberately chosen because it does not draw down the
+/// request quota, so testing a key never costs the operator part of the free
+/// tier the Sports Raptor is budgeted against. The remaining-quota headers are
+/// surfaced so the panel can show the budget alongside the result.
+async fn test_odds(body: &TestRequest) -> Result<serde_json::Value, String> {
+    let key = test_cred(body, "ODDS_API_KEY").ok_or("ODDS_API_KEY not provided or stored")?;
+    let client = reqwest::Client::new();
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.get("https://api.the-odds-api.com/v4/sports")
+            .query(&[("apiKey", key.trim())])
+            .send(),
+    ).await.map_err(|_| "The Odds API request timed out (10s)".to_string())?
+        .map_err(|e| format!("The Odds API request failed: {}", e))?;
+    let status = resp.status();
+    let header = |r: &reqwest::Response, n: &str| -> Option<String> {
+        r.headers().get(n).and_then(|v| v.to_str().ok()).map(|s| s.to_string())
+    };
+    let remaining = header(&resp, "x-requests-remaining");
+    let used = header(&resp, "x-requests-used");
+    if !status.is_success() {
+        // 401 = bad key, 429 = quota exhausted. Surface a snippet either way.
+        let snippet: String = resp.text().await.unwrap_or_default().chars().take(200).collect();
+        return Err(format!("The Odds API rejected the key (HTTP {}): {}", status, snippet));
+    }
+    let sports: serde_json::Value = resp.json().await
+        .map_err(|e| format!("The Odds API returned non-JSON: {}", e))?;
+    let count = sports.as_array().map(|a| a.len()).unwrap_or(0);
+    Ok(json!({
+        "sports": count,
+        "requests_remaining": remaining.unwrap_or_else(|| "?".into()),
+        "requests_used": used.unwrap_or_else(|| "?".into()),
+    }))
 }
 
 /// Validate the LLM Advisor provider settings with a cheap live probe:
@@ -784,7 +920,7 @@ async fn import_bundle(Json(bundle): Json<ImportBundle>) -> Response {
     let mut map = read_secrets();
     let mut imported_secrets = 0usize;
     for (k, v) in &bundle.secrets {
-        let allowed = MANAGED_KEYS.iter().any(|(mk, _, _)| mk == k)
+        let allowed = MANAGED_KEYS.iter().any(|(mk, _, _, _)| mk == k)
             || k == "DRADIS_ADMIN_HASH"
             || k.starts_with("LLM_");   // autonomy knobs persisted by put_autonomy
         if !allowed || v.is_empty() { continue; }
@@ -1045,6 +1181,7 @@ async fn put_autonomy(Json(body): Json<PutAutonomy>) -> Response {
 pub fn admin_routes() -> Router {
     Router::new()
         .route("/api/setup/credentials", get(get_credentials).put(put_credentials))
+        .route("/api/setup/raptors",     get(get_raptor_sources))
         .route("/api/setup/admin",       post(set_admin))
         .route("/api/setup/test",        post(test_connection))
         .route("/api/setup/restart",     post(restart))
@@ -1152,7 +1289,52 @@ mod tests {
     #[test]
     fn managed_key_whitelist_rejects_internal() {
         for k in INTERNAL_KEYS {
-            assert!(!MANAGED_KEYS.iter().any(|(mk, _, _)| mk == k));
+            assert!(!MANAGED_KEYS.iter().any(|(mk, _, _, _)| mk == k));
+        }
+    }
+
+    /// Every key a Raptor advertises must be a managed credential filed under
+    /// the "raptor" panel. Without this, adding a Raptor whose key is missing
+    /// from `MANAGED_KEYS` renders an input that `put_credentials` then rejects
+    /// as un-managed — a dead field the operator cannot diagnose.
+    #[test]
+    fn raptor_sources_reference_managed_raptor_keys() {
+        for r in RAPTOR_SOURCES {
+            for k in r.keys {
+                let entry = MANAGED_KEYS.iter().find(|(mk, _, _, _)| mk == k);
+                let (_, _, _, panel) = entry.unwrap_or_else(|| {
+                    panic!("Raptor '{}' references unmanaged key '{}' — add it to MANAGED_KEYS", r.id, k)
+                });
+                assert_eq!(
+                    *panel, "raptor",
+                    "key '{}' is used by Raptor '{}' but filed under the '{}' panel",
+                    k, r.id, panel,
+                );
+            }
+        }
+    }
+
+    /// Tiers drive the UI badges, so an unrecognised value would render blank.
+    #[test]
+    fn raptor_tiers_are_known_values() {
+        for r in RAPTOR_SOURCES {
+            assert!(
+                matches!(r.tier, "required" | "recommended" | "optional"),
+                "Raptor '{}' has unknown tier '{}'", r.id, r.tier,
+            );
+        }
+    }
+
+    /// Conversely, every "raptor"-panel credential must be claimed by at least
+    /// one Raptor — otherwise it appears in no card and is unreachable in the UI.
+    #[test]
+    fn every_raptor_panel_key_belongs_to_a_raptor() {
+        for (key, _, _, _) in MANAGED_KEYS.iter().filter(|(_, _, _, p)| *p == "raptor") {
+            assert!(
+                RAPTOR_SOURCES.iter().any(|r| r.keys.contains(key)),
+                "credential '{}' is on the raptor panel but no Raptor in RAPTOR_SOURCES claims it",
+                key,
+            );
         }
     }
 }

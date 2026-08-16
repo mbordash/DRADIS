@@ -40,9 +40,31 @@ export interface CredentialInfo {
   key: string;
   label: string;
   scope: 'intl' | 'us' | 'shared';
+  /** Which Setup panel owns this key: core venue, Raptor signal, or integration. */
+  panel: 'venue' | 'raptor' | 'integration';
   set: boolean;
   hint: string;            // "…last4" when set
   source: 'managed' | 'env' | 'unset';
+}
+
+/** How much a Raptor's signal matters — drives the badge on its card. */
+export type RaptorTier = 'required' | 'recommended' | 'optional';
+
+/**
+ * A Raptor signal source, as advertised by `GET /api/setup/raptors`. The card
+ * layout is server-driven so adding a Raptor needs no front-end change: it is
+ * enough to add it to `RAPTOR_SOURCES` in `src/api/setup.rs`.
+ */
+export interface RaptorSource {
+  id: string;
+  name: string;
+  source: string;
+  blurb: string;
+  tier: RaptorTier;
+  /** Env keys this Raptor reads; empty ⇒ nothing to configure. */
+  keys: string[];
+  /** `POST /api/setup/test` kind validating `keys`, when one exists. */
+  test_kind: string | null;
 }
 
 export interface TestResult {
@@ -133,6 +155,10 @@ export async function setAdminPassword(password: string): Promise<void> {
 
 export function getCredentials(): Promise<{ credentials: CredentialInfo[] }> {
   return request('/api/setup/credentials');
+}
+
+export function getRaptorSources(): Promise<{ raptors: RaptorSource[] }> {
+  return request('/api/setup/raptors');
 }
 
 export function putCredentials(

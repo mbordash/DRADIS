@@ -31,6 +31,7 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
   SetupStatus, CredentialInfo, TestResult, AutonomyStatus,
+  RaptorSource, RaptorTier, getRaptorSources,
   getSetupStatus, getCredentials, putCredentials, testConnection,
   login, setAdminPassword, restartEngine,
   getAutonomy, putAutonomy,
@@ -46,6 +47,7 @@ const TEST_KINDS: Record<string, { kind: string; label: string; keys: string[] }
   polygon_rpc: { kind: 'polygon_rpc', label: 'Test RPC', keys: ['POLYGON_RPC_URL'] },
   us_keys:     { kind: 'us_keys',     label: 'Test API keys', keys: ['POLYMARKET_US_KEY_ID', 'POLYMARKET_US_SECRET_KEY'] },
   alpaca:      { kind: 'alpaca',      label: 'Test Alpaca', keys: ['ALPACA_API_KEY_ID', 'ALPACA_API_SECRET_KEY'] },
+  odds:        { kind: 'odds',        label: 'Test key',    keys: ['ODDS_API_KEY'] },
   telegram:    { kind: 'telegram',    label: 'Test Telegram', keys: ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'] },
   llm:         { kind: 'llm',         label: 'Test LLM', keys: ['LLM_PROVIDER', 'OLLAMA_URL', 'OLLAMA_MODEL', 'LLM_API_BASE', 'LLM_API_KEY', 'LLM_MODEL'] },
 };
@@ -63,8 +65,10 @@ function groupsForVenue(venue: 'intl' | 'us') {
       { title: 'Polymarket US API Keys', blurb: 'Custodial venue key ID + secret from your Polymarket US account.', keys: ['POLYMARKET_US_KEY_ID', 'POLYMARKET_US_SECRET_KEY'], test: 'us_keys' },
     );
   }
+  // Raptor signal keys (Alpaca, The Odds API, …) deliberately do NOT appear
+  // here — they live in the Raptor Signal Sources panel below, which is driven
+  // by GET /api/setup/raptors so a new Raptor needs no change to this file.
   groups.push(
-    { title: 'Alpaca Market Data', blurb: 'Used by the Tide raptor for US equities session data (optional).', keys: ['ALPACA_API_KEY_ID', 'ALPACA_API_SECRET_KEY'], test: 'alpaca' },
     { title: 'Telegram Alerts', blurb: 'Bot token + chat ID for trade notifications (optional).', keys: ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'], test: 'telegram' },
     { title: 'LLM Advisor', blurb: 'Provider: ollama (local/remote, no key — set Ollama URL + model) or a hosted API: openai-compatible / anthropic (set API base, key, model). Applies on restart.', keys: ['LLM_PROVIDER', 'OLLAMA_URL', 'OLLAMA_MODEL', 'LLM_API_BASE', 'LLM_API_KEY', 'LLM_MODEL'], test: 'llm' },
   );
@@ -236,6 +240,178 @@ function CredentialGroup({
             ? `✓ Connection OK (${result.ms}ms)${result.details ? ' — ' + Object.entries(result.details).map(([k, v]) => `${k}: ${v}`).join(', ') : ''}`
             : `✗ ${result.error}`}
         </div>
+      )}
+    </div>
+  );
+}
+
+// ── Raptor signal sources panel ───────────────────────────────────────────────
+
+// Tier badges describe how much the SIGNAL matters, not whether it is currently
+// configured — a "required" Raptor on a public feed needs no key at all.
+const TIER_BADGE: Record<RaptorTier, string> = {
+  required:    'bg-rose-500/10 border-rose-500/30 text-rose-300',
+  recommended: 'bg-amber-500/10 border-amber-500/30 text-amber-300',
+  optional:    'bg-sky-500/10 border-sky-500/30 text-sky-300',
+};
+
+function RaptorCard({
+  raptor, creds, drafts, onDraft,
+}: {
+  raptor: RaptorSource;
+  creds: CredentialInfo[];
+  drafts: Record<string, string>;
+  onDraft: (key: string, value: string) => void;
+}) {
+  const [testing, setTesting] = useState(false);
+  const [result, setResult] = useState<TestResult | null>(null);
+
+  const fields = raptor.keys
+    .map(k => creds.find(c => c.key === k))
+    .filter((c): c is CredentialInfo => !!c);
+  // A Raptor is live when every key it needs is set. Keyless Raptors are always
+  // live, which is exactly why they render without inputs.
+  const configured = fields.length === 0 || fields.every(f => f.set);
+
+  const runTest = async () => {
+    if (!raptor.test_kind) return;
+    setTesting(true);
+    setResult(null);
+    try {
+      // Send unsaved drafts so a key can be validated before it is persisted.
+      const candidate: Record<string, string> = {};
+      for (const k of raptor.keys) {
+        if (drafts[k]) candidate[k] = drafts[k];
+      }
+      setResult(await testConnection(raptor.test_kind, candidate));
+    } catch (err) {
+      setResult({ ok: false, ms: 0, error: err instanceof Error ? err.message : 'test failed' });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  return (
+    <div className="bg-[#13131f] border border-[#1e1e32] rounded-xl p-5 space-y-3">
+      <div className="flex items-start justify-between gap-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2 flex-wrap">
+            <h3 className="text-sm font-mono text-gray-200">{raptor.name}</h3>
+            <span className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${TIER_BADGE[raptor.tier]}`}>
+              {raptor.tier}
+            </span>
+            <span className={`text-[10px] font-mono ${configured ? 'text-emerald-400' : 'text-gray-600'}`}>
+              {configured ? '● live' : '○ idle'}
+            </span>
+          </div>
+          <p className="text-[11px] font-mono text-gray-600 mt-0.5">{raptor.source}</p>
+          <p className="text-xs text-gray-500 mt-1">{raptor.blurb}</p>
+        </div>
+        {raptor.test_kind && (
+          <button onClick={runTest} disabled={testing} className={btnCls('ghost') + ' shrink-0'}>
+            {testing ? 'Testing…' : 'Test key'}
+          </button>
+        )}
+      </div>
+
+      {fields.length === 0 ? (
+        <p className="text-[11px] font-mono text-gray-600 border-t border-[#1e1e32] pt-3">
+          No credentials required — public endpoint, always on.
+        </p>
+      ) : (
+        <div className="space-y-2">
+          {fields.map(c => (
+            <div key={c.key}>
+              <div className="flex items-center justify-between mb-1">
+                <label className="text-xs font-mono text-gray-400">{c.label}</label>
+                <span className={`text-[10px] font-mono ${c.set ? 'text-emerald-400' : 'text-gray-600'}`}>
+                  {c.set ? `set ${c.hint} · ${c.source}` : 'not set'}
+                </span>
+              </div>
+              <input
+                type="password"
+                className={inputCls}
+                placeholder={c.set ? '•••••••• (leave blank to keep current)' : 'Enter value'}
+                value={drafts[c.key] ?? ''}
+                onChange={e => onDraft(c.key, e.target.value)}
+                autoComplete="off"
+                spellCheck={false}
+              />
+            </div>
+          ))}
+        </div>
+      )}
+
+      {result && (
+        <div className={`text-xs font-mono rounded-lg px-3 py-2 border ${
+          result.ok
+            ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
+            : 'bg-rose-500/10 border-rose-500/30 text-rose-300'
+        }`}>
+          {result.ok
+            ? `✓ Connection OK (${result.ms}ms)${result.details ? ' — ' + Object.entries(result.details).map(([k, v]) => `${k}: ${v}`).join(', ') : ''}`
+            : `✗ ${result.error}`}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Raptor signal sources — the recon layer's credentials, kept separate from the
+ * venue credentials above because they fail differently: a missing venue key
+ * means DRADIS cannot trade, whereas a missing Raptor key only means that one
+ * Raptor idles and publishes a neutral snapshot.
+ *
+ * The card list comes from GET /api/setup/raptors, so contributors adding a
+ * Raptor register it in `RAPTOR_SOURCES` (src/api/setup.rs) and it appears here
+ * with no change to this file.
+ */
+function RaptorPanel({
+  creds, drafts, onDraft, onAuthError,
+}: {
+  creds: CredentialInfo[];
+  drafts: Record<string, string>;
+  onDraft: (key: string, value: string) => void;
+  onAuthError: () => void;
+}) {
+  const [raptors, setRaptors] = useState<RaptorSource[] | null>(null);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    getRaptorSources()
+      .then(r => setRaptors(r.raptors))
+      .catch(err => {
+        if (err instanceof SetupApiError && err.status === 401) onAuthError();
+        else setError(err instanceof Error ? err.message : 'Failed to load Raptor sources');
+      });
+  }, [onAuthError]);
+
+  return (
+    <div className="space-y-3">
+      <div>
+        <h3 className="text-sm font-mono text-gray-200">📡 Raptor Signal Sources</h3>
+        <p className="text-xs text-gray-500 mt-0.5">
+          Optional recon feeds. A Raptor without its key idles and publishes a neutral
+          snapshot — it never blocks trading. Badges rate the <span className="text-gray-400">signal</span>,
+          not whether it is configured. Saved keys apply on engine restart.
+        </p>
+      </div>
+
+      {error && (
+        <div className="text-xs font-mono rounded-xl px-4 py-3 border bg-rose-500/10 border-rose-500/30 text-rose-300">
+          {error}
+        </div>
+      )}
+
+      {raptors ? (
+        <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+          {raptors.map(r => (
+            <RaptorCard key={r.id} raptor={r} creds={creds} drafts={drafts} onDraft={onDraft} />
+          ))}
+        </div>
+      ) : !error && (
+        <div className="text-center text-gray-500 font-mono text-sm py-6">Loading Raptor sources…</div>
       )}
     </div>
   );
@@ -714,6 +890,15 @@ export default function SetupPage() {
         </div>
       ) : (
         <div className="text-center text-gray-500 font-mono text-sm py-8">Loading credentials…</div>
+      )}
+
+      {creds && (
+        <RaptorPanel
+          creds={creds}
+          drafts={drafts}
+          onDraft={(k, v) => setDrafts(d => ({ ...d, [k]: v }))}
+          onAuthError={() => { clearAdminToken(); setAuthed(false); }}
+        />
       )}
 
       <ProfilesPanel onAuthError={() => { clearAdminToken(); setAuthed(false); }} />
