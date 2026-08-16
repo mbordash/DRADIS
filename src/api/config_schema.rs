@@ -496,6 +496,47 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Trade the hourly market rather than the Window/Daily venue. The required edge scales with time to expiry and is capped, so on the daily venue it pins at the cap (25%) — an edge that does not occur on a liquid book. Off restores daily-first ordering."));
     }
 
+    // ── Raptor polling ────────────────────────────────────────────────────────
+    // Cadence for the two credentialed Raptors. The defaults are sized for each
+    // provider's FREE tier; an operator on a paid plan raises the rate here
+    // instead of recompiling.
+    //
+    // The minimums are deliberate and are about the provider, not about DRADIS:
+    // these values set an outbound request rate against a third-party API, and
+    // the LLM autonomy tiers can move config, so an unclamped field risks
+    // getting the operator's key rate-limited or banned. Live Tennis allows
+    // 30 req/min, hence a 5s floor with headroom; The Odds API is billed per
+    // request on every tier, so its floor is higher.
+    {
+        let g = "Raptor Polling"; let e: Option<&'static str> = None;
+        v.push(F::new(g, e, "sports_poll_secs", "Sports Poll Interval", "secs", false,
+            "Seconds between Sports Raptor (The Odds API) polls. The 300s default suits the free tier's ~500 requests/month; lower it only on a paid plan.")
+            .range(10.0, 86_400.0).step(10.0).unit("s"));
+        v.push(F::new(g, e, "sports_low_budget_warn", "Sports Budget Warning", "secs", true,
+            "Warn when The Odds API reports this many requests remaining. Raise it on a large plan so the warning still gives useful notice.")
+            .min(0.0).step(10.0));
+        v.push(F::new(g, e, "tennis_poll_secs", "Tennis Poll Interval", "secs", false,
+            "Seconds between Tennis Raptor (Live Tennis API) polls. The 900s default keeps an all-day run inside the free tier's 100 requests/day; ~60s gives near point-level tracking but needs a paid plan.")
+            .range(5.0, 86_400.0).step(5.0).unit("s"));
+        v.push(F::new(g, e, "tennis_low_budget_warn", "Tennis Budget Warning", "secs", true,
+            "Warn when the Live Tennis API reports this many requests remaining in the current window.")
+            .min(0.0).step(5.0));
+
+        // Free-text provider identifiers. These have no min/max because the
+        // valid set belongs to the upstream API, not to DRADIS — the value is
+        // passed through to the provider verbatim. A wrong one does not error
+        // loudly: an unknown sport key yields empty polls, and an unknown tour
+        // filter returns an empty match list that reads as a healthy quiet
+        // period. The descriptions carry that warning, since it is the only
+        // guard rail these fields have.
+        v.push(F::new(g, e, "sports_odds_sport", "Sports Key", "string", true,
+            "The Odds API sport key, passed to the provider verbatim. 'upcoming' = next games across all in-season sports; or a specific key such as 'americanfootball_nfl'. ⚠️ Not validated — a wrong key returns no events and the raptor simply reads as offline. Valid keys: the-odds-api.com/sports-odds-data/sports-apis.html"));
+        v.push(F::new(g, e, "sports_odds_regions", "Sports Regions", "string", true,
+            "Comma-separated bookmaker regions for the odds query: us, us2, uk, eu, au. ⚠️ Not validated — an unrecognised region returns no bookmakers."));
+        v.push(F::new(g, e, "tennis_tour", "Tennis Tour", "string", true,
+            "Live Tennis API tour filter: atp, wta, challenger, itf, juniors — or blank for all tours. ⚠️ Not validated, and this one fails SILENTLY: a misspelt tour returns an empty match list, which is indistinguishable from tennis being off-season or between sessions. Leave blank if unsure."));
+    }
+
     v
 }
 

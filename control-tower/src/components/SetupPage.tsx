@@ -40,6 +40,9 @@ import {
   getAdminToken, clearAdminToken, SetupApiError,
 } from '@/lib/setupApi';
 import { useConfirm } from '@/components/ConfirmDialog';
+import useSWR from 'swr';
+import { getConfig, patchConfig, getConfigSchema } from '@/lib/api';
+import type { DynamicConfig, ConfigFieldSchema } from '@/lib/types';
 
 // Which /api/setup/test kind exercises a given credential scope/group.
 const TEST_KINDS: Record<string, { kind: string; label: string; keys: string[] }> = {
@@ -255,13 +258,168 @@ const TIER_BADGE: Record<RaptorTier, string> = {
   optional:    'bg-sky-500/10 border-sky-500/30 text-sky-300',
 };
 
+const PERIOD_SECS: Record<'day' | 'month', number> = { day: 86_400, month: 2_592_000 };
+
+/**
+ * Poll cadence control. Separate from the credential inputs because it saves to
+ * a different place: keys go to the secrets file and need a restart, whereas the
+ * cadence is a live DynamicConfig knob that the raptor loops pick up on their
+ * next cycle.
+ *
+ * The projected request count is the point of the control. An operator raising
+ * the rate is spending a third-party allowance, and the consequence should be
+ * visible before saving rather than discovered as a 429 hours later.
+ */
+function PollCadence({ raptor, schema }: { raptor: RaptorSource; schema: ConfigFieldSchema[] }) {
+  const field = raptor.poll_field!;
+  const { data: config, mutate } = useSWR('dynamic-config', getConfig, { revalidateOnFocus: false });
+  const spec = schema.find(f => f.key === field);
+  const [draft, setDraft] = useState<string>('');
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const saved = config ? Number((config as unknown as Record<string, unknown>)[field] ?? 0) : null;
+  const shown = draft !== '' ? Number(draft) : saved;
+  const min = spec?.min ?? 1;
+  const max = spec?.max ?? 86_400;
+
+  // Projected spend at the *displayed* value, so the warning tracks what you
+  // are about to save rather than what is already saved.
+  const projection = (() => {
+    if (!raptor.free_quota || !shown || shown <= 0) return null;
+    const { requests, period } = raptor.free_quota;
+    const used = Math.round(PERIOD_SECS[period] / shown);
+    return { used, requests, period, over: used > requests };
+  })();
+
+  const save = async () => {
+    const n = Number(draft);
+    if (!Number.isFinite(n)) return;
+    const clamped = Math.min(max, Math.max(min, n));
+    setSaving(true);
+    setErr(null);
+    try {
+      await patchConfig({ [field]: clamped } as unknown as Partial<DynamicConfig>);
+      await mutate();
+      setDraft('');
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'save failed');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const dirty = draft !== '' && Number(draft) !== saved;
+
+  return (
+    <div className="border-t border-[#1e1e32] pt-3 space-y-1.5">
+      <div className="flex items-center justify-between gap-2">
+        <label className="text-xs font-mono text-gray-400">Poll interval</label>
+        <div className="flex items-center gap-1.5">
+          <input
+            type="number"
+            min={min}
+            max={max}
+            step={spec?.step ?? 1}
+            className={inputCls + ' w-24 text-right py-1'}
+            value={draft !== '' ? draft : (saved ?? '')}
+            onChange={e => setDraft(e.target.value)}
+            disabled={!config}
+          />
+          <span className="text-[11px] font-mono text-gray-600">s</span>
+          <button onClick={save} disabled={!dirty || saving} className={btnCls('primary')}>
+            {saving ? '…' : 'Save'}
+          </button>
+        </div>
+      </div>
+
+      {projection && (
+        <p className={`text-[10px] font-mono ${projection.over ? 'text-amber-400' : 'text-gray-600'}`}>
+          ≈ {projection.used.toLocaleString()} requests/{projection.period}
+          {projection.over
+            ? ` — over the free tier's ${projection.requests.toLocaleString()}/${projection.period}; needs a paid plan`
+            : ` — within the free tier's ${projection.requests.toLocaleString()}/${projection.period}`}
+        </p>
+      )}
+      <p className="text-[10px] font-mono text-gray-700">
+        Applies on the raptor&apos;s next cycle — no restart, unlike the key above.
+      </p>
+      {err && <p className="text-[10px] font-mono text-rose-400">{err}</p>}
+    </div>
+  );
+}
+
+
+/**
+ * Free-text feed selector (sport key, region list, tour filter). Kept visually
+ * distinct from the credential inputs because it is neither secret nor
+ * validated: the value is handed to the provider verbatim, and DRADIS has no
+ * way to tell a valid identifier from a typo. The schema description carries
+ * the specific warning, which is the only guard rail these fields have.
+ */
+function FeedSelector({ fieldKey, schema }: { fieldKey: string; schema: ConfigFieldSchema[] }) {
+  const { data: config, mutate } = useSWR('dynamic-config', getConfig, { revalidateOnFocus: false });
+  const spec = schema.find(f => f.key === fieldKey);
+  const [draft, setDraft] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const saved = config ? String((config as unknown as Record<string, unknown>)[fieldKey] ?? '') : null;
+  // null draft = untouched; '' is a MEANINGFUL value here (blank tour = all tours).
+  const shown = draft ?? saved ?? '';
+  const dirty = draft !== null && draft !== saved;
+
+  const save = async () => {
+    if (draft === null) return;
+    setSaving(true);
+    setErr(null);
+    try {
+      await patchConfig({ [fieldKey]: draft.trim() } as unknown as Partial<DynamicConfig>);
+      await mutate();
+      setDraft(null);
+    } catch (e) {
+      setErr(e instanceof Error ? e.message : 'save failed');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between gap-2">
+        <label className="text-xs font-mono text-gray-400">{spec?.label ?? fieldKey}</label>
+        <div className="flex items-center gap-1.5">
+          <input
+            type="text"
+            className={inputCls + ' w-44 py-1'}
+            value={shown}
+            placeholder="(blank = no filter)"
+            onChange={e => setDraft(e.target.value)}
+            disabled={!config}
+            autoComplete="off"
+            spellCheck={false}
+          />
+          <button onClick={save} disabled={!dirty || saving} className={btnCls('primary')}>
+            {saving ? '…' : 'Save'}
+          </button>
+        </div>
+      </div>
+      {spec?.description && (
+        <p className="text-[10px] font-mono text-gray-600 leading-snug">{spec.description}</p>
+      )}
+      {err && <p className="text-[10px] font-mono text-rose-400">{err}</p>}
+    </div>
+  );
+}
+
 function RaptorCard({
-  raptor, creds, drafts, onDraft,
+  raptor, creds, drafts, onDraft, schema,
 }: {
   raptor: RaptorSource;
   creds: CredentialInfo[];
   drafts: Record<string, string>;
   onDraft: (key: string, value: string) => void;
+  schema: ConfigFieldSchema[];
 }) {
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState<TestResult | null>(null);
@@ -354,6 +512,16 @@ function RaptorCard({
         </div>
       )}
 
+      {raptor.selector_fields.length > 0 && (
+        <div className="border-t border-[#1e1e32] pt-3 space-y-3">
+          {raptor.selector_fields.map(f => (
+            <FeedSelector key={f} fieldKey={f} schema={schema} />
+          ))}
+        </div>
+      )}
+
+      {raptor.poll_field && <PollCadence raptor={raptor} schema={schema} />}
+
       {result && (
         <div className={`text-xs font-mono rounded-lg px-3 py-2 border ${
           result.ok
@@ -389,6 +557,8 @@ function RaptorPanel({
 }) {
   const [raptors, setRaptors] = useState<RaptorSource[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  // Shared SWR key, so N cards dedupe to one schema request.
+  const { data: schema = [] } = useSWR('config-schema', getConfigSchema, { revalidateOnFocus: false });
 
   useEffect(() => {
     getRaptorSources()
@@ -419,7 +589,7 @@ function RaptorPanel({
       {raptors ? (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
           {raptors.map(r => (
-            <RaptorCard key={r.id} raptor={r} creds={creds} drafts={drafts} onDraft={onDraft} />
+            <RaptorCard key={r.id} raptor={r} creds={creds} drafts={drafts} onDraft={onDraft} schema={schema} />
           ))}
         </div>
       ) : !error && (

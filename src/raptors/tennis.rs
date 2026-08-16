@@ -116,6 +116,7 @@ pub async fn run_tennis_raptor(
     http: Arc<reqwest::Client>,
     tennis_tx: watch::Sender<TennisSnapshot>,
     raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
+    mut config_rx: watch::Receiver<Arc<crate::helpers::dynamic_config::DynamicConfig>>,
 ) {
     let api_key = std::env::var(config::TENNIS_API_KEY_ENV).ok().filter(|k| !k.is_empty());
     let Some(api_key) = api_key else {
@@ -133,15 +134,21 @@ pub async fn run_tennis_raptor(
         return;
     };
 
-    let url = live_matches_url(config::TENNIS_TOUR);
-
     // Track the previously tracked match id so the raptor stays on the SAME
     // match while it remains live and rotates cleanly when it finishes.
     let mut tracked: Option<i64> = None;
     let mut consecutive_failures: u32 = 0;
 
     loop {
-        match try_fetch_live_state(&http, &url, &api_key, tracked).await {
+        // Re-read each cycle so a budget-warning change applies without a restart.
+        // Tour filter is live config, so the URL is rebuilt each cycle — a tour
+        // change must not wait for a restart.
+        let (low_budget_warn, tour) = {
+            let c = config_rx.borrow();
+            (c.tennis_low_budget_warn, c.tennis_tour.clone())
+        };
+        let url = live_matches_url(&tour);
+        match try_fetch_live_state(&http, &url, &api_key, tracked, low_budget_warn).await {
             Ok(sample) => {
                 consecutive_failures = 0;
                 tracked = (sample.match_id != 0).then_some(sample.match_id);
@@ -210,7 +217,21 @@ pub async fn run_tennis_raptor(
                 }
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(config::TENNIS_POLL_SECS)).await;
+        // Sleep the CURRENT configured interval, but wake early if the operator
+        // changes it. Without the select the raptor would serve out the rest of
+        // an old sleep first — dropping 900s to 60s would appear to do nothing
+        // for a quarter of an hour, and on a slower feed for far longer, which
+        // reads as a broken setting rather than a pending one.
+        let poll_secs = config_rx.borrow().tennis_poll_secs.max(1);
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(poll_secs)) => {}
+            _ = config_rx.changed() => {
+                let next = config_rx.borrow().tennis_poll_secs.max(1);
+                if next != poll_secs {
+                    info!("🎾 Tennis Raptor poll interval {poll_secs}s → {next}s (applies now)");
+                }
+            }
+        }
     }
 }
 
@@ -265,6 +286,7 @@ async fn try_fetch_live_state(
     url: &str,
     api_key: &str,
     tracked: Option<i64>,
+    low_budget_warn: i64,
 ) -> Result<TennisSample, String> {
     let resp = tokio::time::timeout(
         std::time::Duration::from_secs(8),
@@ -285,9 +307,10 @@ async fn try_fetch_live_state(
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.trim().parse::<i64>().ok());
     match remaining {
-        Some(r) if r <= config::TENNIS_LOW_BUDGET_WARN => warn!(
+        Some(r) if r <= low_budget_warn => warn!(
             "⚠️ Tennis Raptor: Live Tennis API budget low — {r} requests remaining in the current window. \
-             Consider raising TENNIS_POLL_SECS (free tier: 30 req/min, 100 req/day)."
+             Raise the Tennis poll interval in Setup → Raptor Signal Sources \
+             (free tier: 30 req/min, 100 req/day)."
         ),
         Some(r) => debug!("🎾 Tennis Raptor budget: {r} requests remaining in the current window"),
         None => {}

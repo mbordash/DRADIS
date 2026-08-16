@@ -398,6 +398,7 @@ async fn run() -> Result<()> {
             watch::channel(dradis::raptors::sports::SportsSnapshot::default());
         tokio::spawn(dradis::raptors::sports::run_sports_raptor(
             Arc::clone(&shared_http), us_sports_tx, Arc::clone(&raptor_health_tx),
+            config_rx.clone(),
         ));
 
         // ── Tennis Raptor (venue-neutral, observe-only) ───────────────────────
@@ -410,6 +411,7 @@ async fn run() -> Result<()> {
             watch::channel(dradis::raptors::tennis::TennisSnapshot::default());
         tokio::spawn(dradis::raptors::tennis::run_tennis_raptor(
             Arc::clone(&shared_http), us_tennis_tx, Arc::clone(&raptor_health_tx),
+            config_rx.clone(),
         ));
 
         // ── Connect the custodial US retail venue + run the arb loop (Step 3c) ──
@@ -692,9 +694,10 @@ async fn run() -> Result<()> {
     {
         let http = Arc::clone(&shared_http);
         let health = Arc::clone(&raptor_health_tx);
+        let cfg = config_rx.clone();
         spawn_supervised("sports-raptor", move || {
             dradis::raptors::sports::run_sports_raptor(
-                Arc::clone(&http), sports_tx.clone(), Arc::clone(&health),
+                Arc::clone(&http), sports_tx.clone(), Arc::clone(&health), cfg.clone(),
             )
         });
     }
@@ -710,9 +713,10 @@ async fn run() -> Result<()> {
     {
         let http = Arc::clone(&shared_http);
         let health = Arc::clone(&raptor_health_tx);
+        let cfg = config_rx.clone();
         spawn_supervised("tennis-raptor", move || {
             dradis::raptors::tennis::run_tennis_raptor(
-                Arc::clone(&http), tennis_tx.clone(), Arc::clone(&health),
+                Arc::clone(&http), tennis_tx.clone(), Arc::clone(&health), cfg.clone(),
             )
         });
     }

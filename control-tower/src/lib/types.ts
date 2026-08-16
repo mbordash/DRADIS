@@ -176,6 +176,19 @@ export interface DynamicConfig {
   convergence_obi_adverse_block:    string;
   convergence_skip_band_low:        string;
   convergence_skip_band_high:       string;
+
+  // Raptor polling — live cadence + budget thresholds for the two credentialed,
+  // budget-metered Raptors. Numbers, not Decimal strings.
+  sports_poll_secs:                 number;
+  sports_low_budget_warn:           number;
+  tennis_poll_secs:                 number;
+  tennis_low_budget_warn:           number;
+
+  // Raptor feed selectors — free-text provider identifiers, passed through to
+  // the upstream API verbatim and NOT validated by DRADIS.
+  sports_odds_sport:                string;
+  sports_odds_regions:              string;
+  tennis_tour:                      string;
 }
 
 /** One editable config field, from GET /api/config/schema (Rust source of truth). */
@@ -184,7 +197,7 @@ export interface ConfigFieldSchema {
   group:       string;          // viper name or "Global"
   enable_key:  string | null;   // owning viper enable flag (null for global)
   label:       string;
-  type:        'usd' | 'price' | 'pct' | 'decimal' | 'secs' | 'int' | 'bool';
+  type:        'usd' | 'price' | 'pct' | 'decimal' | 'secs' | 'int' | 'bool' | 'string';
   unit:        string | null;
   min:         number | null;
   max:         number | null;
@@ -459,7 +472,10 @@ export interface SquadronSummary {
 
 // ── Field descriptor for ViperCard ───────────────────────────────────────────
 
-export type FieldType = 'usd' | 'pct' | 'price' | 'decimal' | 'secs';
+// 'string' covers free-text provider identifiers (sport keys, tour filters).
+// toDisplay/fromDisplay already fall through for non-numeric input, so these
+// pass across the wire unchanged.
+export type FieldType = 'usd' | 'pct' | 'price' | 'decimal' | 'secs' | 'string';
 
 export interface FieldDef {
   key:   keyof DynamicConfig;

@@ -87,6 +87,7 @@ pub async fn run_sports_raptor(
     http: Arc<reqwest::Client>,
     sports_tx: watch::Sender<SportsSnapshot>,
     raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
+    mut config_rx: watch::Receiver<Arc<crate::helpers::dynamic_config::DynamicConfig>>,
 ) {
     let api_key = std::env::var(config::SPORTS_ODDS_KEY_ENV).ok().filter(|k| !k.is_empty());
     let Some(api_key) = api_key else {
@@ -104,9 +105,12 @@ pub async fn run_sports_raptor(
         return;
     };
 
-    let url = format!(
-        "https://api.the-odds-api.com/v4/sports/{}/odds?regions={}&markets=h2h&oddsFormat=decimal&apiKey={}",
-        config::SPORTS_ODDS_SPORT, config::SPORTS_ODDS_REGIONS, api_key,
+    // The sport/region selectors are live config, so the URL is rebuilt each
+    // cycle rather than once here — changing the sport must not require a
+    // restart, and a stale URL would keep polling the previous feed.
+    let odds_url = |sport: &str, regions: &str| format!(
+        "https://api.the-odds-api.com/v4/sports/{sport}/odds?regions={regions}\
+&markets=h2h&oddsFormat=decimal&apiKey={api_key}",
     );
 
     // Track the last consensus per event id so `line_drift` measures movement on
@@ -115,7 +119,13 @@ pub async fn run_sports_raptor(
     let mut consecutive_failures: u32 = 0;
 
     loop {
-        match try_fetch_nearest_event(&http, &url).await {
+        // Re-read each cycle so a budget-warning change applies without a restart.
+        let (low_budget_warn, sport, regions) = {
+            let c = config_rx.borrow();
+            (c.sports_low_budget_warn, c.sports_odds_sport.clone(), c.sports_odds_regions.clone())
+        };
+        let url = odds_url(&sport, &regions);
+        match try_fetch_nearest_event(&http, &url, low_budget_warn).await {
             Ok(sample) => {
                 consecutive_failures = 0;
                 let line_drift = match &prev_event {
@@ -164,7 +174,19 @@ pub async fn run_sports_raptor(
                 }
             }
         }
-        tokio::time::sleep(std::time::Duration::from_secs(config::SPORTS_POLL_SECS)).await;
+        // Sleep the CURRENT configured interval, waking early if it changes —
+        // otherwise a new value waits out the remainder of the old sleep, which
+        // on this feed's multi-minute cadence reads as a setting that did nothing.
+        let poll_secs = config_rx.borrow().sports_poll_secs.max(1);
+        tokio::select! {
+            _ = tokio::time::sleep(std::time::Duration::from_secs(poll_secs)) => {}
+            _ = config_rx.changed() => {
+                let next = config_rx.borrow().sports_poll_secs.max(1);
+                if next != poll_secs {
+                    info!("🏈 Sports Raptor poll interval {poll_secs}s → {next}s (applies now)");
+                }
+            }
+        }
     }
 }
 
@@ -190,7 +212,7 @@ struct EventSample {
 ///
 /// Returns `Err(reason)` on any failure so the caller can log *why* the poll
 /// produced no signal (bad key, quota exhausted, error payload, no events, …).
-async fn try_fetch_nearest_event(http: &reqwest::Client, url: &str) -> Result<EventSample, String> {
+async fn try_fetch_nearest_event(http: &reqwest::Client, url: &str, low_budget_warn: i64) -> Result<EventSample, String> {
     let resp = tokio::time::timeout(
         std::time::Duration::from_secs(8),
         http.get(url).send(),
@@ -216,8 +238,8 @@ async fn try_fetch_nearest_event(http: &reqwest::Client, url: &str) -> Result<Ev
         .and_then(|s| s.trim().parse::<f64>().ok())
         .map(|f| f as i64);
     match remaining {
-        Some(r) if r <= config::SPORTS_ODDS_LOW_BUDGET_WARN => warn!(
-            "⚠️ Sports Raptor: The Odds API budget low — {r} requests remaining (used {}). Consider raising SPORTS_POLL_SECS.",
+        Some(r) if r <= low_budget_warn => warn!(
+            "⚠️ Sports Raptor: The Odds API budget low — {r} requests remaining (used {}). Raise the Sports poll interval in Setup → Raptor Signal Sources.",
             used.map(|u| u.to_string()).unwrap_or_else(|| "?".into()),
         ),
         Some(r) => debug!(
@@ -243,7 +265,7 @@ async fn try_fetch_nearest_event(http: &reqwest::Client, url: &str) -> Result<Ev
             format!("expected a JSON array of events, got: {snippet}")
         })?;
     if events.is_empty() {
-        return Err(format!("no upcoming events returned for sport '{}'", config::SPORTS_ODDS_SPORT));
+        return Err("no upcoming events returned for the configured sport".to_string());
     }
 
     // Pick the nearest-commencing event that actually has priced h2h odds. The

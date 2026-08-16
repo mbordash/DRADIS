@@ -68,6 +68,16 @@ export interface RaptorSource {
   /** Where to generate the key, when it comes from a third party. Null for
    *  Raptors on public endpoints, which need no account. */
   signup_url: string | null;
+  /** DynamicConfig field holding this Raptor's poll cadence, when tunable.
+   *  Server-driven so a contributed Raptor gets a cadence control for free. */
+  poll_field: string | null;
+  /** Free-tier allowance, used to show whether a chosen cadence fits the free
+   *  plan or needs a paid one. */
+  free_quota: { requests: number; period: 'day' | 'month' } | null;
+  /** Free-text config keys selecting what this Raptor watches (sport, region,
+   *  tour). Rendered as text inputs; the schema description carries the
+   *  "not validated" warning. */
+  selector_fields: string[];
 }
 
 export interface TestResult {

@@ -190,6 +190,13 @@ fn default_convergence_drift_coherence_deadband_pct() -> Decimal { config::CONVE
 fn default_convergence_velocity_opposition_pct()      -> Decimal { config::CONVERGENCE_VELOCITY_OPPOSITION_PCT      }
 fn default_convergence_skip_band_low()      -> Decimal { config::CONVERGENCE_SKIP_BAND_LOW             }
 fn default_convergence_skip_band_high()     -> Decimal { config::CONVERGENCE_SKIP_BAND_HIGH            }
+fn default_sports_poll_secs()               -> u64     { config::SPORTS_POLL_SECS                      }
+fn default_sports_low_budget_warn()         -> i64     { config::SPORTS_ODDS_LOW_BUDGET_WARN           }
+fn default_tennis_poll_secs()               -> u64     { config::TENNIS_POLL_SECS                      }
+fn default_tennis_low_budget_warn()         -> i64     { config::TENNIS_LOW_BUDGET_WARN                }
+fn default_sports_odds_sport()              -> String  { config::SPORTS_ODDS_SPORT.to_string()         }
+fn default_sports_odds_regions()            -> String  { config::SPORTS_ODDS_REGIONS.to_string()       }
+fn default_tennis_tour()                    -> String  { config::TENNIS_TOUR.to_string()               }
 
 fn default_maker_min_spread()               -> Decimal { config::MAKER_MIN_SPREAD                      }
 fn default_maker_bid_buffer()               -> Decimal { config::MAKER_BID_BUFFER                      }
@@ -622,6 +629,53 @@ pub struct DynamicConfig {
     pub convergence_skip_band_low:        Decimal,
     #[serde(default = "default_convergence_skip_band_high")]
     pub convergence_skip_band_high:       Decimal,
+
+    // ── Raptor polling ────────────────────────────────────────────────────────
+    // Cadence for the two credentialed, budget-metered Raptors. These are live
+    // knobs rather than constants because the right value depends on the API
+    // plan the operator bought, which the build cannot know: the compile-time
+    // defaults are sized for each provider's FREE tier, and a paid plan wants a
+    // much faster poll. Changing either takes effect on the next cycle — the
+    // raptor loops select on this channel, so they do not sit out the remainder
+    // of an old, long sleep before adopting a new value.
+    //
+    // The floors in `config_schema.rs` matter: these drive outbound request
+    // rates against third-party rate limits, and the LLM autonomy tiers can move
+    // config, so an unclamped value risks a provider ban rather than a bad fill.
+    /// Seconds between Sports Raptor (The Odds API) polls.
+    #[serde(default = "default_sports_poll_secs")]
+    pub sports_poll_secs:                 u64,
+    /// Warn when The Odds API reports this many requests left in the quota.
+    /// Sized for the tier you are on — the free tier's ~500/month makes 50 a
+    /// useful warning, while a paid plan would warn constantly at that value.
+    #[serde(default = "default_sports_low_budget_warn")]
+    pub sports_low_budget_warn:           i64,
+    /// Seconds between Tennis Raptor (Live Tennis API) polls.
+    #[serde(default = "default_tennis_poll_secs")]
+    pub tennis_poll_secs:                 u64,
+    /// Warn when the Live Tennis API reports this many requests left in the
+    /// current window.
+    #[serde(default = "default_tennis_low_budget_warn")]
+    pub tennis_low_budget_warn:           i64,
+
+    // ── Raptor feed selectors ─────────────────────────────────────────────────
+    // Free-text provider identifiers. Unlike every numeric knob above these
+    // cannot be range-clamped — the set of valid values is defined by the
+    // upstream API, not by DRADIS — so a wrong value is accepted here and
+    // rejected (or silently ignored) by the provider. The Setup UI warns about
+    // that; getting the identifier right is the operator's responsibility.
+    /// The Odds API sport key, e.g. `upcoming` (next games across all in-season
+    /// sports) or a specific key like `americanfootball_nfl`.
+    #[serde(default = "default_sports_odds_sport")]
+    pub sports_odds_sport:                String,
+    /// Comma-separated bookmaker regions for the odds query: `us`, `us2`, `uk`,
+    /// `eu`, `au`.
+    #[serde(default = "default_sports_odds_regions")]
+    pub sports_odds_regions:              String,
+    /// Live Tennis API tour filter: `atp`, `wta`, `challenger`, `itf`,
+    /// `juniors`, or empty for all tours.
+    #[serde(default = "default_tennis_tour")]
+    pub tennis_tour:                      String,
 }
 
 impl Default for DynamicConfig {
@@ -794,6 +848,14 @@ impl Default for DynamicConfig {
             convergence_velocity_opposition_pct: config::CONVERGENCE_VELOCITY_OPPOSITION_PCT,
             convergence_skip_band_low:        config::CONVERGENCE_SKIP_BAND_LOW,
             convergence_skip_band_high:       config::CONVERGENCE_SKIP_BAND_HIGH,
+
+            sports_poll_secs:                 config::SPORTS_POLL_SECS,
+            sports_low_budget_warn:           config::SPORTS_ODDS_LOW_BUDGET_WARN,
+            tennis_poll_secs:                 config::TENNIS_POLL_SECS,
+            tennis_low_budget_warn:           config::TENNIS_LOW_BUDGET_WARN,
+            sports_odds_sport:                config::SPORTS_ODDS_SPORT.to_string(),
+            sports_odds_regions:              config::SPORTS_ODDS_REGIONS.to_string(),
+            tennis_tour:                      config::TENNIS_TOUR.to_string(),
         }
     }
 }

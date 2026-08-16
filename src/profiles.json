@@ -158,7 +158,14 @@
         "convergence_drift_coherence_deadband_pct": "0.0004",
         "convergence_velocity_opposition_pct": "0.00003",
         "convergence_skip_band_low": "0.43",
-        "convergence_skip_band_high": "0.57"
+        "convergence_skip_band_high": "0.57",
+        "sports_poll_secs": 300,
+        "sports_low_budget_warn": 50,
+        "tennis_poll_secs": 900,
+        "tennis_low_budget_warn": 20,
+        "sports_odds_sport": "upcoming",
+        "sports_odds_regions": "us",
+        "tennis_tour": ""
       }
     },
     "balanced": {
@@ -318,7 +325,14 @@
         "convergence_drift_coherence_deadband_pct": "0.0005",
         "convergence_velocity_opposition_pct": "0.00004",
         "convergence_skip_band_low": "0.45",
-        "convergence_skip_band_high": "0.55"
+        "convergence_skip_band_high": "0.55",
+        "sports_poll_secs": 300,
+        "sports_low_budget_warn": 50,
+        "tennis_poll_secs": 900,
+        "tennis_low_budget_warn": 20,
+        "sports_odds_sport": "upcoming",
+        "sports_odds_regions": "us",
+        "tennis_tour": ""
       }
     },
     "aggressive": {
@@ -478,7 +492,14 @@
         "convergence_drift_coherence_deadband_pct": "0.0007",
         "convergence_velocity_opposition_pct": "0.00006",
         "convergence_skip_band_low": "0.50",
-        "convergence_skip_band_high": "0.50"
+        "convergence_skip_band_high": "0.50",
+        "sports_poll_secs": 300,
+        "sports_low_budget_warn": 50,
+        "tennis_poll_secs": 900,
+        "tennis_low_budget_warn": 20,
+        "sports_odds_sport": "upcoming",
+        "sports_odds_regions": "us",
+        "tennis_tour": ""
       }
     }
   }

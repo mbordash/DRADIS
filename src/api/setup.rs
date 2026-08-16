@@ -150,6 +150,22 @@ struct RaptorSource {
     /// so the UI only offers a link where there is actually something to sign
     /// up for, rather than sending people to a vendor page pointlessly.
     signup_url: Option<&'static str>,
+    /// `DynamicConfig` field holding this Raptor's poll cadence, when it has
+    /// one. Naming the field here rather than in the front end is what lets the
+    /// Setup card render a cadence control for a contributed Raptor without any
+    /// React change — the same reason `keys` lives here.
+    poll_field: Option<&'static str>,
+    /// Free-tier request allowance as `(requests, period)`, where period is
+    /// "day" or "month". The card multiplies the chosen cadence out against
+    /// this so an operator can see *before* saving whether a faster poll needs
+    /// a paid plan — the question that makes cadence worth exposing at all.
+    free_quota: Option<(i64, &'static str)>,
+    /// Free-text `DynamicConfig` keys selecting WHAT this Raptor watches — the
+    /// sport, region or tour handed to the provider. Rendered as text inputs
+    /// carrying the schema's own description, which is where the "not
+    /// validated" warning lives: these values pass through to the upstream API
+    /// verbatim and DRADIS cannot check them.
+    selector_fields: &'static [&'static str],
 }
 
 const RAPTOR_SOURCES: &[RaptorSource] = &[
@@ -157,40 +173,49 @@ const RAPTOR_SOURCES: &[RaptorSource] = &[
         id: "price", name: "Price Raptor", source: "Binance spot (public)",
         blurb: "Oracle price, velocity, acceleration and drift — the core signal every Viper reads.",
         tier: "required", keys: &[], test_kind: None, signup_url: None,
+        poll_field: None, free_quota: None, selector_fields: &[],
     },
     RaptorSource {
         id: "funding", name: "Funding Raptor", source: "Binance perpetuals (public)",
         blurb: "Perp funding rates; the Basis Viper uses them to confirm retail skew.",
         tier: "required", keys: &[], test_kind: None, signup_url: None,
+        poll_field: None, free_quota: None, selector_fields: &[],
     },
     RaptorSource {
         id: "derivatives", name: "Derivatives Raptor", source: "Binance derivatives (public)",
         blurb: "Open interest and CVD ratio, fused as features by GBoost and Convergence.",
         tier: "required", keys: &[], test_kind: None, signup_url: None,
+        poll_field: None, free_quota: None, selector_fields: &[],
     },
     RaptorSource {
         id: "tide", name: "Tide Raptor", source: "Alpaca IEX",
         blurb: "ETF premium \"institutional pulse\" (BTC only, US market hours). Shares one IEX connection with Horizon. Alpaca's free tier is sufficient — the feed is real-time IEX, not delayed.",
         tier: "recommended", keys: &["ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY"],
         test_kind: Some("alpaca"), signup_url: Some("https://alpaca.markets"),
+        poll_field: None, free_quota: None, selector_fields: &[],
     },
     RaptorSource {
         id: "horizon", name: "Horizon Raptor", source: "Alpaca IEX (shared connection)",
         blurb: "TradFi macro velocity from SPY/QQQ/UVXY plus a VIX proxy (BTC only). Uses the same Alpaca keys as Tide — configure them once.",
         tier: "recommended", keys: &["ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY"],
         test_kind: Some("alpaca"), signup_url: Some("https://alpaca.markets"),
+        poll_field: None, free_quota: None, selector_fields: &[],
     },
     RaptorSource {
         id: "sports", name: "Sports Raptor", source: "The Odds API",
         blurb: "Head-to-head line movement and consensus probability. Observe-only — published to telemetry, not consumed by Viper sizing. Free tier is ~500 requests/month.",
         tier: "optional", keys: &["ODDS_API_KEY"],
         test_kind: Some("odds"), signup_url: Some("https://the-odds-api.com"),
+        poll_field: Some("sports_poll_secs"), free_quota: Some((500, "month")),
+        selector_fields: &["sports_odds_sport", "sports_odds_regions"],
     },
     RaptorSource {
         id: "tennis", name: "Tennis Raptor", source: "Live Tennis API",
         blurb: "Live match event state — sets, games, serving side and a derived break-point flag. Observe-only. Free tier is 30 req/min and 100 req/day; the 900s default poll stays inside the day cap.",
         tier: "optional", keys: &["LIVETENNIS_API_KEY"],
         test_kind: Some("livetennis"), signup_url: Some("https://livetennisapi.com"),
+        poll_field: Some("tennis_poll_secs"), free_quota: Some((100, "day")),
+        selector_fields: &["tennis_tour"],
     },
 ];
 
@@ -467,7 +492,9 @@ async fn get_raptor_sources() -> Response {
         json!({
             "id": r.id, "name": r.name, "source": r.source, "blurb": r.blurb,
             "tier": r.tier, "keys": r.keys, "test_kind": r.test_kind,
-            "signup_url": r.signup_url,
+            "signup_url": r.signup_url, "poll_field": r.poll_field,
+            "free_quota": r.free_quota.map(|(n, p)| json!({"requests": n, "period": p})),
+            "selector_fields": r.selector_fields,
         })
     }).collect();
     Json(json!({ "raptors": items })).into_response()
@@ -1396,6 +1423,41 @@ mod tests {
                     "Raptor '{}' signup_url must be https, got '{}'", r.id, url,
                 );
             }
+        }
+    }
+
+    /// A Raptor's `poll_field` must name a real, schema-registered config key.
+    /// Without this a typo renders a cadence input that PATCHes a field the
+    /// engine never reads — the control appears to work and changes nothing.
+    #[test]
+    fn raptor_poll_fields_are_registered_config_keys() {
+        let schema = crate::api::config_schema::config_schema();
+        for r in RAPTOR_SOURCES {
+            for field in r.poll_field.iter().copied().chain(r.selector_fields.iter().copied()) {
+                assert!(
+                    schema.iter().any(|f| f.key == field),
+                    "Raptor '{}' names config field '{}', which is not in config_schema()",
+                    r.id, field,
+                );
+            }
+        }
+    }
+
+    /// A cadence control without a quota is a number with no consequence shown.
+    /// If a Raptor is tunable it must also state the allowance the operator is
+    /// spending, and the period must be one the UI knows how to multiply out.
+    #[test]
+    fn tunable_raptors_declare_a_quota() {
+        for r in RAPTOR_SOURCES {
+            if r.poll_field.is_none() { continue; }
+            let (n, period) = r.free_quota.unwrap_or_else(|| {
+                panic!("Raptor '{}' is poll-tunable but declares no free_quota", r.id)
+            });
+            assert!(n > 0, "Raptor '{}' has a non-positive quota {}", r.id, n);
+            assert!(
+                matches!(period, "day" | "month"),
+                "Raptor '{}' quota period '{}' is not one the UI can convert", r.id, period,
+            );
         }
     }
 
