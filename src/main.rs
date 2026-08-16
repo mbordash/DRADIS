@@ -400,6 +400,18 @@ async fn run() -> Result<()> {
             Arc::clone(&shared_http), us_sports_tx, Arc::clone(&raptor_health_tx),
         ));
 
+        // ── Tennis Raptor (venue-neutral, observe-only) ───────────────────────
+        // Spawned beside the Sports Raptor so its live event-state telemetry
+        // ("tennis" health key) is available on the US build too. Degrades to
+        // Default without LIVETENNIS_API_KEY. Its receiver is threaded into the
+        // US trader's SquadronRaptors like the Sports feed, so the channel stays
+        // live for the first consumer.
+        let (us_tennis_tx, us_tennis_rx) =
+            watch::channel(dradis::raptors::tennis::TennisSnapshot::default());
+        tokio::spawn(dradis::raptors::tennis::run_tennis_raptor(
+            Arc::clone(&shared_http), us_tennis_tx, Arc::clone(&raptor_health_tx),
+        ));
+
         // ── Connect the custodial US retail venue + run the arb loop (Step 3c) ──
         // Best-effort connect: a failure (missing creds, gateway down) is logged
         // but does not crash the process — the Control Tower API stays up so the
@@ -449,6 +461,7 @@ async fn run() -> Result<()> {
                     Arc::clone(&markets_tx),
                     Arc::clone(&process_heartbeat_secs),
                     us_sports_rx,
+                    us_tennis_rx,
                     cancel,
                 ).await;
             }
@@ -686,6 +699,24 @@ async fn run() -> Result<()> {
         });
     }
 
+    // ── Tennis Raptor (venue-neutral, observe-only) ───────────────────────────
+    // A single shared instance beside the Sports Raptor — live tennis event
+    // state (score, server, break point) is not a per-crypto-asset signal.
+    // Publishes telemetry under the "tennis" key and degrades to Default when
+    // LIVETENNIS_API_KEY is unset. Not consumed by Viper sizing (telemetry
+    // observation phase, same status as the Tide and Sports Raptors).
+    let (tennis_tx, tennis_rx) =
+        watch::channel(dradis::raptors::tennis::TennisSnapshot::default());
+    {
+        let http = Arc::clone(&shared_http);
+        let health = Arc::clone(&raptor_health_tx);
+        spawn_supervised("tennis-raptor", move || {
+            dradis::raptors::tennis::run_tennis_raptor(
+                Arc::clone(&http), tennis_tx.clone(), Arc::clone(&health),
+            )
+        });
+    }
+
     for asset in assets.iter() {
         // ── Per-asset raptor signal feeds ─────────────────────────────────────
         let (oracle_tx, oracle_rx)     = watch::channel(dec!(0));
@@ -766,7 +797,10 @@ async fn run() -> Result<()> {
             (None, None)
         };
 
-        let raptor_signals = SquadronRaptors::full(oracle_rx, velocity_rx, drift_rx, funding_rx, deriv_rx, tide_rx, horizon_rx, Some(sports_rx.clone()));
+        let mut raptor_signals = SquadronRaptors::full(oracle_rx, velocity_rx, drift_rx, funding_rx, deriv_rx, tide_rx, horizon_rx, Some(sports_rx.clone()));
+        // Attach the venue-neutral Tennis Raptor feed (observe-only) the same
+        // way the US general wing attaches its sports feed.
+        raptor_signals.tennis = Some(tennis_rx.clone());
 
         // ── Per-asset session state ────────────────────────────────────────────
         // startup_balance is the real wallet balance at process start — used as

@@ -362,22 +362,26 @@ where
             yes_fee_bps:       hourly_yes_fee_rate,
             no_fee_bps:        hourly_no_fee_rate,
         };
+        let mut squadron_raptors = SquadronRaptors::full(
+            raptor_signals.oracle.clone(),
+            raptor_signals.velocity.clone(),
+            raptor_signals.drift.clone(),
+            raptor_signals.funding.clone().expect("funding raptor always present"),
+            raptor_signals.derivatives.clone().expect("derivatives raptor always present"),
+            raptor_signals.tide.clone(),
+            raptor_signals.horizon.clone(),
+            raptor_signals.sports.clone(),
+        );
+        // The observe-only Tennis Raptor feed rides along when deployed
+        // (attached post-construction so `full()`'s signature stays stable).
+        squadron_raptors.tennis = raptor_signals.tennis.clone();
         let mut squadron = Squadron::new(
             patrol_ctx.crypto_filter.parse::<CryptoAsset>().unwrap_or(CryptoAsset::Btc),
             SquadronConfig::full_wing(
                 format!("Full Wing — {}", patrol_ctx.crypto_filter.to_uppercase())
             ),
             hourly_market_config_for_squadron,
-            SquadronRaptors::full(
-                raptor_signals.oracle.clone(),
-                raptor_signals.velocity.clone(),
-                raptor_signals.drift.clone(),
-                raptor_signals.funding.clone().expect("funding raptor always present"),
-                raptor_signals.derivatives.clone().expect("derivatives raptor always present"),
-                raptor_signals.tide.clone(),
-                raptor_signals.horizon.clone(),
-                raptor_signals.sports.clone(),
-            ),
+            squadron_raptors,
         );
 
         // Load squadron-scoped config, preserving operator edits made via the

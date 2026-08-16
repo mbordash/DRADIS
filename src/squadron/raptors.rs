@@ -32,6 +32,7 @@ use tokio::sync::watch;
 use crate::raptors::derivatives::DerivativesSnapshot;
 use crate::raptors::tide::TideSnapshot;
 use crate::raptors::sports::SportsSnapshot;
+use crate::raptors::tennis::TennisSnapshot;
 use crate::raptors::horizon::HorizonSnapshot;
 
 /// All Raptor signal receivers available to a squadron.
@@ -72,6 +73,14 @@ pub struct SquadronRaptors {
     /// pipelines — not yet consumed by Viper sizing (telemetry observation phase).
     /// `None` when the Sports Raptor is not deployed for this squadron.
     pub sports: Option<watch::Receiver<SportsSnapshot>>,
+
+    /// Live tennis event-state snapshot from the Tennis Raptor (Live Tennis
+    /// API). A *macro / observe-only* signal shared by all pipelines — not yet
+    /// consumed by Viper sizing (telemetry observation phase). `None` when the
+    /// Tennis Raptor is not deployed for this squadron. Attached after
+    /// construction (`raptors.tennis = Some(rx)`), the same way the US general
+    /// wing attaches its sports feed, so the constructor signatures stay stable.
+    pub tennis: Option<watch::Receiver<TennisSnapshot>>,
     // ── Future Raptors ────────────────────────────────────────────────────────
     // pub politics: Option<watch::Receiver<PoliticsSignal>>,
 }
@@ -99,6 +108,7 @@ impl SquadronRaptors {
             tide,
             horizon,
             sports,
+            tennis: None,
         }
     }
 
@@ -109,7 +119,7 @@ impl SquadronRaptors {
         velocity: watch::Receiver<(Decimal, Decimal, Decimal)>,
         drift:    watch::Receiver<(Decimal, Decimal, Decimal)>,
     ) -> Self {
-        Self { oracle, velocity, drift, funding: None, derivatives: None, tide: None, horizon: None, sports: None }
+        Self { oracle, velocity, drift, funding: None, derivatives: None, tide: None, horizon: None, sports: None, tennis: None }
     }
 
     /// Compose a sports-only bundle for Admiral Adama sports market squadrons.
@@ -127,6 +137,7 @@ impl SquadronRaptors {
             tide: None,
             horizon: None,
             sports: Some(sports),
+            tennis: None,
         }
     }
 
@@ -145,6 +156,7 @@ impl SquadronRaptors {
             tide: None,
             horizon: None,
             sports: None,
+            tennis: None,
         }
     }
 }
