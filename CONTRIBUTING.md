@@ -40,6 +40,20 @@ A change that compiles under the default `intl_clob` feature can still break the
 `us_retail` or `kalshi` builds — the venue feature gates are mutually exclusive,
 so please check all three.
 
+## Commit messages
+
+Please do **not** include AI co-author trailers — `Co-Authored-By: Claude ...`,
+`Co-Authored-By: Copilot ...` or similar — in commit messages.
+
+This is not a position on using AI assistance; use whatever tools you like. It is
+about what the trailer does on GitHub: those addresses resolve to real GitHub
+accounts, so a commit carrying one renders with the assistant as a linked
+contributor avatar beside the humans who wrote the code. DRADIS credits people.
+
+If you use an assistant that adds the trailer automatically, strip it before
+pushing — `git commit --amend` on the last commit, or an interactive rebase for
+older ones.
+
 ## Config files
 
 `src/config.rs` is gitignored and holds live tuning. If you add a constant there,
