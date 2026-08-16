@@ -104,6 +104,7 @@ const MANAGED_KEYS: &[(&str, &str, &str, &str)] = &[
     ("ALPACA_API_KEY_ID",        "Alpaca API key ID",             "shared", "raptor"),
     ("ALPACA_API_SECRET_KEY",    "Alpaca API secret key",         "shared", "raptor"),
     ("ODDS_API_KEY",             "The Odds API key",              "shared", "raptor"),
+    ("LIVETENNIS_API_KEY",       "Live Tennis API key",           "shared", "raptor"),
     ("TELEGRAM_BOT_TOKEN",       "Telegram bot token",            "shared", "integration"),
     ("TELEGRAM_CHAT_ID",         "Telegram chat ID",              "shared", "integration"),
     ("LLM_PROVIDER",             "LLM provider (ollama | openai | anthropic)", "shared", "integration"),
@@ -144,38 +145,52 @@ struct RaptorSource {
     keys: &'static [&'static str],
     /// `POST /api/setup/test` kind that validates `keys`, when one exists.
     test_kind: Option<&'static str>,
+    /// Where the operator generates the key, when it comes from a third party.
+    /// `None` for Raptors on public endpoints, which need no account at all —
+    /// so the UI only offers a link where there is actually something to sign
+    /// up for, rather than sending people to a vendor page pointlessly.
+    signup_url: Option<&'static str>,
 }
 
 const RAPTOR_SOURCES: &[RaptorSource] = &[
     RaptorSource {
         id: "price", name: "Price Raptor", source: "Binance spot (public)",
         blurb: "Oracle price, velocity, acceleration and drift — the core signal every Viper reads.",
-        tier: "required", keys: &[], test_kind: None,
+        tier: "required", keys: &[], test_kind: None, signup_url: None,
     },
     RaptorSource {
         id: "funding", name: "Funding Raptor", source: "Binance perpetuals (public)",
         blurb: "Perp funding rates; the Basis Viper uses them to confirm retail skew.",
-        tier: "required", keys: &[], test_kind: None,
+        tier: "required", keys: &[], test_kind: None, signup_url: None,
     },
     RaptorSource {
         id: "derivatives", name: "Derivatives Raptor", source: "Binance derivatives (public)",
         blurb: "Open interest and CVD ratio, fused as features by GBoost and Convergence.",
-        tier: "required", keys: &[], test_kind: None,
+        tier: "required", keys: &[], test_kind: None, signup_url: None,
     },
     RaptorSource {
         id: "tide", name: "Tide Raptor", source: "Alpaca IEX",
-        blurb: "ETF premium \"institutional pulse\" (BTC only, US market hours). Shares one IEX connection with Horizon.",
-        tier: "recommended", keys: &["ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY"], test_kind: Some("alpaca"),
+        blurb: "ETF premium \"institutional pulse\" (BTC only, US market hours). Shares one IEX connection with Horizon. Alpaca's free tier is sufficient — the feed is real-time IEX, not delayed.",
+        tier: "recommended", keys: &["ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY"],
+        test_kind: Some("alpaca"), signup_url: Some("https://alpaca.markets"),
     },
     RaptorSource {
         id: "horizon", name: "Horizon Raptor", source: "Alpaca IEX (shared connection)",
-        blurb: "TradFi macro velocity from SPY/QQQ/UVXY plus a VIX proxy (BTC only). Uses the same Alpaca keys as Tide.",
-        tier: "recommended", keys: &["ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY"], test_kind: Some("alpaca"),
+        blurb: "TradFi macro velocity from SPY/QQQ/UVXY plus a VIX proxy (BTC only). Uses the same Alpaca keys as Tide — configure them once.",
+        tier: "recommended", keys: &["ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY"],
+        test_kind: Some("alpaca"), signup_url: Some("https://alpaca.markets"),
     },
     RaptorSource {
         id: "sports", name: "Sports Raptor", source: "The Odds API",
-        blurb: "Head-to-head line movement and consensus probability. Observe-only — published to telemetry, not consumed by Viper sizing.",
-        tier: "optional", keys: &["ODDS_API_KEY"], test_kind: Some("odds"),
+        blurb: "Head-to-head line movement and consensus probability. Observe-only — published to telemetry, not consumed by Viper sizing. Free tier is ~500 requests/month.",
+        tier: "optional", keys: &["ODDS_API_KEY"],
+        test_kind: Some("odds"), signup_url: Some("https://the-odds-api.com"),
+    },
+    RaptorSource {
+        id: "tennis", name: "Tennis Raptor", source: "Live Tennis API",
+        blurb: "Live match event state — sets, games, serving side and a derived break-point flag. Observe-only. Free tier is 30 req/min and 100 req/day; the 900s default poll stays inside the day cap.",
+        tier: "optional", keys: &["LIVETENNIS_API_KEY"],
+        test_kind: Some("livetennis"), signup_url: Some("https://livetennisapi.com"),
     },
 ];
 
@@ -452,6 +467,7 @@ async fn get_raptor_sources() -> Response {
         json!({
             "id": r.id, "name": r.name, "source": r.source, "blurb": r.blurb,
             "tier": r.tier, "keys": r.keys, "test_kind": r.test_kind,
+            "signup_url": r.signup_url,
         })
     }).collect();
     Json(json!({ "raptors": items })).into_response()
@@ -576,6 +592,7 @@ async fn test_connection(Json(body): Json<TestRequest>) -> Response {
         "telegram" => test_telegram(&body).await,
         "alpaca" => test_alpaca(&body).await,
         "odds" => test_odds(&body).await,
+        "livetennis" => test_livetennis(&body).await,
         "llm" => test_llm(&body).await,
         #[cfg(feature = "us_retail")]
         "us_keys" => test_us_keys(&body).await,
@@ -688,11 +705,13 @@ async fn test_alpaca(body: &TestRequest) -> Result<serde_json::Value, String> {
 async fn test_odds(body: &TestRequest) -> Result<serde_json::Value, String> {
     let key = test_cred(body, "ODDS_API_KEY").ok_or("ODDS_API_KEY not provided or stored")?;
     let client = reqwest::Client::new();
+    // Interpolate rather than `.query()`: RequestBuilder::query needs a reqwest
+    // feature the us_retail / kalshi dependency sets do not enable, and the
+    // Sports Raptor builds its own URL the same way.
+    let url = format!("https://api.the-odds-api.com/v4/sports?apiKey={}", key.trim());
     let resp = tokio::time::timeout(
         std::time::Duration::from_secs(10),
-        client.get("https://api.the-odds-api.com/v4/sports")
-            .query(&[("apiKey", key.trim())])
-            .send(),
+        client.get(&url).send(),
     ).await.map_err(|_| "The Odds API request timed out (10s)".to_string())?
         .map_err(|e| format!("The Odds API request failed: {}", e))?;
     let status = resp.status();
@@ -714,6 +733,48 @@ async fn test_odds(body: &TestRequest) -> Result<serde_json::Value, String> {
         "requests_remaining": remaining.unwrap_or_else(|| "?".into()),
         "requests_used": used.unwrap_or_else(|| "?".into()),
     }))
+}
+
+/// Validate a Live Tennis API key via `GET /usage`.
+///
+/// `/usage` is the API's own quota endpoint and is quota-exempt, so pressing
+/// "Test key" never spends part of the 100 requests/day the free tier gives the
+/// Tennis Raptor. The key travels in an `Authorization: Bearer` header, matching
+/// how the Raptor itself authenticates.
+async fn test_livetennis(body: &TestRequest) -> Result<serde_json::Value, String> {
+    let key = test_cred(body, "LIVETENNIS_API_KEY").ok_or("LIVETENNIS_API_KEY not provided or stored")?;
+    let client = reqwest::Client::new();
+    let resp = tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        client.get("https://api.livetennisapi.com/api/public/v1/usage")
+            .bearer_auth(key.trim())
+            .send(),
+    ).await.map_err(|_| "Live Tennis API request timed out (10s)".to_string())?
+        .map_err(|e| format!("Live Tennis API request failed: {}", e))?;
+    let status = resp.status();
+    let text = resp.text().await.unwrap_or_default();
+    if !status.is_success() {
+        // 401 = bad key, 403 = upgrade_required, 429 = rate limited.
+        let snippet: String = text.chars().take(200).collect();
+        return Err(format!("Live Tennis API rejected the key (HTTP {}): {}", status, snippet));
+    }
+    // Observed /usage shape (verified against a live free-tier key):
+    //   {"tier":"free","limits":{"per_day":100,"per_minute":30},
+    //    "today":{"calls":0,"errors":0,"remaining_day":100}}
+    // Every field is read defensively so an upstream reshape degrades to a bare
+    // "auth ok" rather than failing a key that is actually valid.
+    let parsed: serde_json::Value = serde_json::from_str(&text).unwrap_or(json!({}));
+    let mut details = json!({"auth": "ok"});
+    if let Some(tier) = parsed.get("tier").and_then(|v| v.as_str()) {
+        details["tier"] = json!(tier);
+    }
+    if let Some(remaining) = parsed.pointer("/today/remaining_day").and_then(|v| v.as_i64()) {
+        details["requests_remaining_today"] = json!(remaining);
+    }
+    if let Some(per_day) = parsed.pointer("/limits/per_day").and_then(|v| v.as_i64()) {
+        details["daily_limit"] = json!(per_day);
+    }
+    Ok(details)
 }
 
 /// Validate the LLM Advisor provider settings with a cheap live probe:
@@ -1309,6 +1370,30 @@ mod tests {
                     *panel, "raptor",
                     "key '{}' is used by Raptor '{}' but filed under the '{}' panel",
                     k, r.id, panel,
+                );
+            }
+        }
+    }
+
+    /// A Raptor that needs a third-party key must tell the operator where to
+    /// get one — otherwise the card shows an input with no way to fill it.
+    /// Conversely a keyless Raptor must NOT link out, since there is nothing
+    /// to sign up for.
+    #[test]
+    fn raptors_needing_keys_link_to_key_generation() {
+        for r in RAPTOR_SOURCES {
+            if r.keys.is_empty() {
+                assert!(
+                    r.signup_url.is_none(),
+                    "Raptor '{}' needs no keys but offers a signup link", r.id,
+                );
+            } else {
+                let url = r.signup_url.unwrap_or_else(|| {
+                    panic!("Raptor '{}' requires {:?} but has no signup_url", r.id, r.keys)
+                });
+                assert!(
+                    url.starts_with("https://"),
+                    "Raptor '{}' signup_url must be https, got '{}'", r.id, url,
                 );
             }
         }

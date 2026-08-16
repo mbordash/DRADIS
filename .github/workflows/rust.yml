@@ -1,5 +1,20 @@
 name: Rust
 
+# DRADIS builds as ONE venue at a time — `intl_clob` (default), `us_retail` and
+# `kalshi` are mutually exclusive Cargo features. Only `src/venues/mod.rs` uses
+# `#[cfg]` guards, but each venue pulls in its own module tree, so a change under
+# `src/venues/us/` or `src/venues/kalshi/` is invisible to a default-feature
+# build.
+#
+# This job therefore runs the matrix rather than a single build. Checking only
+# the default feature set is what let a pull request touching 40 lines of
+# `src/venues/us/trader.rs` pass every check without that file ever being
+# compiled — green CI that had not read the change.
+#
+# `fail-fast: false` so one venue breaking still reports the other two: when a
+# shared signature changes, knowing whether it broke one venue or all three is
+# most of the diagnosis.
+
 on:
   push:
     branches: [ "main" ]
@@ -14,8 +29,19 @@ permissions:
 
 jobs:
   build:
-
+    name: build (${{ matrix.venue }})
     runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - venue: intl_clob
+            flags: ""
+          - venue: us_retail
+            flags: "--no-default-features --features us_retail"
+          - venue: kalshi
+            flags: "--no-default-features --features kalshi"
 
     steps:
     - uses: actions/checkout@v4
@@ -23,6 +49,8 @@ jobs:
     - name: Install Rust stable
       uses: dtolnay/rust-toolchain@stable
 
+    # Keyed per venue: the three feature sets produce different artifacts, so a
+    # shared key would have them evicting each other on every run.
     - name: Cache cargo registry
       uses: actions/cache@v4
       with:
@@ -30,15 +58,18 @@ jobs:
           ~/.cargo/registry
           ~/.cargo/git
           target
-        key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+        key: ${{ runner.os }}-cargo-${{ matrix.venue }}-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: |
-          ${{ runner.os }}-cargo-
+          ${{ runner.os }}-cargo-${{ matrix.venue }}-
 
+    # src/config.rs is gitignored — each checkout holds a different profile — so
+    # CI compiles against the balanced template. A `pub const` added to a local
+    # config but missing from the templates fails here and nowhere else.
     - name: Prepare CI config
       run: cp src/config.balanced.rs.example src/config.rs
 
     - name: Check
-      run: cargo check --verbose
+      run: cargo check --verbose ${{ matrix.flags }}
 
     - name: Run tests
-      run: cargo test --verbose
+      run: cargo test --verbose ${{ matrix.flags }}

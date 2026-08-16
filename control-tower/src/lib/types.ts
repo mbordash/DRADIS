@@ -382,6 +382,25 @@ export interface TelemetrySample {
   sports_commence?:      string;  // ISO-8601 UTC kickoff of the tracked event
   sports_books?:         string;  // comma-separated bookmaker titles
 
+  // ── Tennis Raptor — live event state (Live Tennis API, observe-only) ──
+  // `tennis_connected` is false on a failed poll OR a stale score, so a stale
+  // feed reads exactly like a missing one.
+  tennis_connected:     boolean;
+  tennis_num_live:      number;  // live matches in the sample (0 = nothing on court)
+  tennis_sets_p1:       number;  // sets won, tracked match
+  tennis_sets_p2:       number;
+  tennis_games_p1:      number;  // games won in the CURRENT set
+  tennis_games_p2:      number;
+  tennis_server:        number;  // serving side (1/2; 0 = unknown)
+  tennis_break_point:   boolean; // receiver holds break point (never in a tiebreak)
+  tennis_is_tiebreak:   boolean;
+  tennis_feed_age_secs: number;  // age of the score timestamp (-1 = unknown)
+  tennis_match?:        string;  // tracked match label ("C. Alcaraz vs J. Sinner")
+  tennis_tournament?:   string;  // tournament name
+  tennis_tour?:         string;  // "atp" / "wta" / …
+  tennis_points?:       string;  // in-game points ("30–40", "AD–40")
+  tennis_score_at?:     string;  // ISO-8601 UTC of the last score change
+
   // ── Horizon Raptor — TradFi velocity / VIX proxy (Alpaca IEX, observe-only) ──
   horizon_connected:  boolean;
   horizon_market_open: boolean;

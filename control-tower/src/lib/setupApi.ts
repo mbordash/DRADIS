@@ -65,6 +65,9 @@ export interface RaptorSource {
   keys: string[];
   /** `POST /api/setup/test` kind validating `keys`, when one exists. */
   test_kind: string | null;
+  /** Where to generate the key, when it comes from a third party. Null for
+   *  Raptors on public endpoints, which need no account. */
+  signup_url: string | null;
 }
 
 export interface TestResult {
