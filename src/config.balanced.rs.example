@@ -469,6 +469,36 @@ pub const SPORTS_ODDS_REGIONS: &str = "us";
 pub const SPORTS_POLL_SECS: u64 = 300;
 pub const SPORTS_ODDS_LOW_BUDGET_WARN: i64 = 50;
 
+// ── Tennis Raptor (Live Tennis API live event-state feed) ────────────────────
+//
+/// Env var carrying the Live Tennis API (livetennisapi.com) key. Absent ⇒ the
+/// Tennis Raptor runs idle/observe-only: it seeds a neutral snapshot, reports
+/// `tennis_connected = false`, and publishes no event-state signal.
+pub const TENNIS_API_KEY_ENV: &str = "LIVETENNIS_API_KEY";
+
+/// Optional tour filter for the live-match poll: `atp`, `wta`, `challenger`,
+/// `itf` or `juniors`. Empty ⇒ all tours (the raptor then tracks the live match
+/// with the freshest score). Narrow this to the tour whose markets you trade.
+pub const TENNIS_TOUR: &str = "";
+
+/// Seconds between Tennis Raptor polls. Honest budget note — the free tier
+/// allows 30 req/min and 100 req/day: the 900s default fits ALL-DAY polling
+/// inside the free cap (≤96 req/day); ~60s gives near point-level tracking but
+/// burns the free day cap in ~100 minutes (fine for develop-and-test or a few
+/// tracked matches; sustained all-day fast polling needs a paid tier). The top
+/// tier's push WebSocket is NOT used by this raptor — v1 is REST-only, a WS
+/// lane would arrive later as a separate config-gated option.
+pub const TENNIS_POLL_SECS: u64 = 900;
+
+/// Max age (seconds) of the tracked match's score timestamp before the feed is
+/// reported stale (`tennis_connected = false`, so consumers widen/pull rather
+/// than hold). Tennis pauses legitimately — changeovers ~90s, set breaks
+/// ~120s+ — so this sits well above those to avoid flapping.
+pub const TENNIS_SCORE_STALENESS_SECS: u64 = 600;
+
+/// Warn when the API's X-RateLimit remaining-request count drops to this.
+pub const TENNIS_LOW_BUDGET_WARN: i64 = 20;
+
 
 // ============================================================================
 // BASIS STRATEGY MAKER ORDER PARAMETERS

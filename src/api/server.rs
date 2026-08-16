@@ -175,6 +175,43 @@ pub struct AssetRaptorHealth {
     /// Comma-separated bookmaker titles in the consensus (e.g. "DraftKings, FanDuel").
     #[serde(default)]
     pub sports_books:          String,
+
+    // ── Live Tennis Raptor signal snapshot (Live Tennis API event state) ─────
+    /// Tennis Raptor's last poll succeeded AND the tracked score is fresh
+    /// (observe-only). False on failure OR staleness — a stale feed must read
+    /// as disconnected so a consumer widens/pulls, never holds on it.
+    pub tennis_connected:     bool,
+    /// Live matches in the sample (0 = no data / nothing on court — neutral).
+    pub tennis_num_live:      Decimal,
+    /// Sets won by player 1 / player 2 in the tracked match.
+    pub tennis_sets_p1:       Decimal,
+    pub tennis_sets_p2:       Decimal,
+    /// Games won in the tracked match's current set.
+    pub tennis_games_p1:      Decimal,
+    pub tennis_games_p2:      Decimal,
+    /// Serving side of the tracked match (1/2; 0 = unknown).
+    pub tennis_server:        Decimal,
+    /// Receiver holds a break point (never true in a tiebreak).
+    pub tennis_break_point:   bool,
+    /// The tracked match's current game is a tiebreak.
+    pub tennis_is_tiebreak:   bool,
+    /// Age (seconds) of the tracked score's API timestamp (-1 = unknown).
+    pub tennis_feed_age_secs: Decimal,
+    /// Tracked match label, e.g. "C. Alcaraz vs J. Sinner".
+    #[serde(default)]
+    pub tennis_match:         String,
+    /// Tournament name from the feed, e.g. "Cincinnati Open".
+    #[serde(default)]
+    pub tennis_tournament:    String,
+    /// Tour of the tracked match ("atp"/"wta"/…); empty when unstated.
+    #[serde(default)]
+    pub tennis_tour:          String,
+    /// In-game points as tennis strings, e.g. "30–40" or "AD–40".
+    #[serde(default)]
+    pub tennis_points:        String,
+    /// ISO-8601 UTC timestamp of the tracked score (last score change).
+    #[serde(default)]
+    pub tennis_score_at:      String,
 }
 
 // ─── Telemetry ring buffer ────────────────────────────────────────────────────
@@ -229,6 +266,28 @@ pub struct TelemetrySample {
     #[serde(default)]
     pub sports_books:          String,
 
+    // ── Tennis Raptor (live event state) ──
+    pub tennis_connected:     bool,
+    pub tennis_num_live:      Decimal,
+    pub tennis_sets_p1:       Decimal,
+    pub tennis_sets_p2:       Decimal,
+    pub tennis_games_p1:      Decimal,
+    pub tennis_games_p2:      Decimal,
+    pub tennis_server:        Decimal,
+    pub tennis_break_point:   bool,
+    pub tennis_is_tiebreak:   bool,
+    pub tennis_feed_age_secs: Decimal,
+    #[serde(default)]
+    pub tennis_match:         String,
+    #[serde(default)]
+    pub tennis_tournament:    String,
+    #[serde(default)]
+    pub tennis_tour:          String,
+    #[serde(default)]
+    pub tennis_points:        String,
+    #[serde(default)]
+    pub tennis_score_at:      String,
+
     // ── Horizon Raptor (TradFi velocity / VIX proxy) ──
     pub horizon_connected:   bool,
     pub horizon_market_open: bool,
@@ -255,6 +314,14 @@ const SPORTS_HISTORY_CAP: usize = 1440;
 /// series keeps advancing in time and the most-recent point stays reasonably fresh.
 /// 1440 points × 30 min ≈ 30 days of retained, readable movement.
 const SPORTS_TELEMETRY_HEARTBEAT_SECS: i64 = 1800;
+/// The Tennis Raptor is another slow poller (`config::TENNIS_POLL_SECS`, 900s
+/// default), so it gets the same change-or-heartbeat de-duplication as the
+/// Sports feed, with the same heartbeat: nothing can change between polls, so
+/// a heartbeat shorter than the poll interval would only re-store identical
+/// points and shrink the retained window. 1440 points × ≥30 min spans the same
+/// ~30 days of readable movement as the Sports feed.
+const TENNIS_HISTORY_CAP: usize = 1440;
+const TENNIS_TELEMETRY_HEARTBEAT_SECS: i64 = 1800;
 
 /// Background task — every `TELEMETRY_SAMPLE_SECS`, snapshot the current Raptor
 /// signal values into the per-asset ring buffer. Spawned once by
@@ -300,6 +367,32 @@ async fn run_telemetry_sampler(
                 }
             }
 
+            // Same treatment for the slow Tennis feed: keep a point only when the
+            // event state actually changes, or once per heartbeat.
+            if asset == "tennis" {
+                let changed = match buf.back() {
+                    Some(last) => {
+                        last.tennis_sets_p1      != h.tennis_sets_p1
+                            || last.tennis_sets_p2       != h.tennis_sets_p2
+                            || last.tennis_games_p1      != h.tennis_games_p1
+                            || last.tennis_games_p2      != h.tennis_games_p2
+                            || last.tennis_points        != h.tennis_points
+                            || last.tennis_server        != h.tennis_server
+                            || last.tennis_break_point   != h.tennis_break_point
+                            || last.tennis_num_live      != h.tennis_num_live
+                            || last.tennis_match         != h.tennis_match
+                            || last.tennis_connected     != h.tennis_connected
+                    }
+                    None => true,
+                };
+                let heartbeat_due = buf.back()
+                    .map(|last| now - last.t >= TENNIS_TELEMETRY_HEARTBEAT_SECS * 1000)
+                    .unwrap_or(true);
+                if !changed && !heartbeat_due {
+                    continue;
+                }
+            }
+
             buf.push_back(TelemetrySample {
                 t: now,
                 oracle_price: h.oracle_price,
@@ -332,6 +425,21 @@ async fn run_telemetry_sampler(
                 sports_sport:          h.sports_sport.clone(),
                 sports_commence:       h.sports_commence.clone(),
                 sports_books:          h.sports_books.clone(),
+                tennis_connected:     h.tennis_connected,
+                tennis_num_live:      h.tennis_num_live,
+                tennis_sets_p1:       h.tennis_sets_p1,
+                tennis_sets_p2:       h.tennis_sets_p2,
+                tennis_games_p1:      h.tennis_games_p1,
+                tennis_games_p2:      h.tennis_games_p2,
+                tennis_server:        h.tennis_server,
+                tennis_break_point:   h.tennis_break_point,
+                tennis_is_tiebreak:   h.tennis_is_tiebreak,
+                tennis_feed_age_secs: h.tennis_feed_age_secs,
+                tennis_match:         h.tennis_match.clone(),
+                tennis_tournament:    h.tennis_tournament.clone(),
+                tennis_tour:          h.tennis_tour.clone(),
+                tennis_points:        h.tennis_points.clone(),
+                tennis_score_at:      h.tennis_score_at.clone(),
                 horizon_connected:   h.horizon_connected,
                 horizon_market_open: h.tradfi_velocity != Decimal::ZERO || h.vix_proxy != Decimal::ZERO,
                 tradfi_velocity:     h.tradfi_velocity,
@@ -340,7 +448,11 @@ async fn run_telemetry_sampler(
                 vix_velocity:        h.vix_velocity,
             });
             let len = buf.len();
-            let cap = if asset == "sports" { SPORTS_HISTORY_CAP } else { TELEMETRY_HISTORY_CAP };
+            let cap = match asset.as_str() {
+                "sports" => SPORTS_HISTORY_CAP,
+                "tennis" => TENNIS_HISTORY_CAP,
+                _ => TELEMETRY_HISTORY_CAP,
+            };
             if len > cap {
                 buf.drain(0..len - cap);
             }
