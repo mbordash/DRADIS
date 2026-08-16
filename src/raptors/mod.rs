@@ -31,15 +31,16 @@
 /// │ Tide Raptor     │ Binance oracle + IEX │ ETF "Institutional Pulse" + coherence    │
 ///
 /// │ Sports Raptor   │ The Odds API (h2h)   │ line drift, consensus prob, book spread  │
+/// │ Tennis Raptor   │ Live Tennis API      │ live score, server, break-point state    │
 ///
 /// Future Raptors (not yet implemented)
 /// ─────────────────────────────────────
 /// │ Politics Raptor │ Polling aggregators  │ approval drift, event probability shifts │
 /// │ Horizon Raptor  │ Alpaca IEX WS        │ TradFi velocity (SPY/QQQ), VIX proxy     │
 ///
-/// The Sports and Horizon Raptors are venue-neutral (shared by all pipelines) and,
-/// like the Tide Raptor, run observe-only: they publish telemetry but no Viper
-/// consumes them for sizing yet.
+/// The Sports, Tennis and Horizon Raptors are venue-neutral (shared by all
+/// pipelines) and, like the Tide Raptor, run observe-only: they publish telemetry
+/// but no Viper consumes them for sizing yet.
 ///
 /// When multiple Raptors are active the GBoost and Basis strategies fuse their
 /// signals as features — no single Raptor has veto power alone.
@@ -48,4 +49,5 @@ pub mod funding;
 pub mod derivatives;
 pub mod tide;
 pub mod sports;
+pub mod tennis;
 pub mod horizon;
