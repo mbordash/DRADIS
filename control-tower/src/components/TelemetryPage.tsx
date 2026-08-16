@@ -16,7 +16,7 @@
 // You should have received a copy of the GNU Affero General Public License along
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import { useEffect, useMemo, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import useSWR from 'swr';
 import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer,
@@ -149,12 +149,52 @@ function toSportsRow(s: TelemetrySample): SportsRow {
   };
 }
 
+// The Tennis Raptor is the other slow, venue-neutral poller (900s default), so
+// it gets the same sparse multi-day row treatment as the Sports feed.
+interface TennisRow {
+  t: number;
+  time: string;
+  gamesP1: number;    // games won in the CURRENT set
+  gamesP2: number;
+  setsP1: number;     // sets won in the match
+  setsP2: number;
+  feedAge: number;    // seconds since the score last moved (-1 → 0, unknown)
+}
+
+function toTennisRow(s: TelemetrySample): TennisRow {
+  const age = num(s.tennis_feed_age_secs);
+  return {
+    t: Number(s.t),
+    time: fmtDayClock(Number(s.t)),
+    gamesP1: num(s.tennis_games_p1),
+    gamesP2: num(s.tennis_games_p2),
+    setsP1: num(s.tennis_sets_p1),
+    setsP2: num(s.tennis_sets_p2),
+    // -1 means "no timestamp on the score", not "zero seconds old". Plot it as
+    // 0 so the unknown case cannot masquerade as a fresher-than-real feed.
+    feedAge: age < 0 ? 0 : age,
+  };
+}
+
+// Player series colors. Amber/sky rather than the emerald/sky used elsewhere:
+// the two sides of a match are the one place on this page where two series must
+// stay tellable apart under colour-vision deficiency, and emerald↔sky separates
+// by only ΔE 3.0 under tritanopia, versus 27.5 for this pair.
+const P1_COLOR = '#f59e0b';
+const P2_COLOR = '#38bdf8';
+
+// Mirrors config::TENNIS_SCORE_STALENESS_SECS. Drawn as a reference line so the
+// chart shows *why* the raptor flips to disconnected, rather than the pill just
+// going dark with no visible cause.
+const TENNIS_STALENESS_SECS = 600;
+
 // ── Signal-graph card ─────────────────────────────────────────────────────────
 
 interface SeriesDef<R> { key: keyof R; label: string; color: string }
 
 function SignalChart<R extends { time: string }>({
   title, subtitle, data, series, fmtY, zeroLine = false, refY, refLabel,
+  lineType = 'monotone',
 }: {
   title: string;
   subtitle: string;
@@ -165,6 +205,13 @@ function SignalChart<R extends { time: string }>({
   /** Optional horizontal baseline (e.g. 1.0 for a balanced CVD ratio). */
   refY?: number;
   refLabel?: string;
+  /**
+   * Interpolation between samples. Continuous measures curve ('monotone');
+   * counts that only ever change by whole steps — games, sets — must use
+   * 'stepAfter', or the curve draws values the score never held (3.5 games)
+   * and implies the change happened gradually between polls.
+   */
+  lineType?: 'monotone' | 'stepAfter';
 }) {
   const latest = data[data.length - 1];
   return (
@@ -229,7 +276,7 @@ function SignalChart<R extends { time: string }>({
               {series.map(s => (
                 <Line
                   key={String(s.key)}
-                  type="monotone"
+                  type={lineType}
                   dataKey={s.key as string}
                   name={s.label}
                   stroke={s.color}
@@ -662,6 +709,27 @@ export default function TelemetryPage({ availableAssets, venue }: { availableAss
     [sportsSamples],
   );
 
+  // The Tennis Raptor publishes under its own fixed "tennis" health key, on the
+  // same slow cadence as Sports, so it is fetched as a sibling series here.
+  const { data: tennisSamples } = useSWR(
+    ['telemetry-history', 'tennis', 288],
+    () => getTelemetryHistory('tennis', 288),
+    { refreshInterval: live ? POLL_MS : 0, revalidateOnFocus: false, keepPreviousData: true },
+  );
+  const tennisLast = tennisSamples && tennisSamples.length > 0
+    ? tennisSamples[tennisSamples.length - 1]
+    : undefined;
+  const tennisRows = useMemo<TennisRow[]>(
+    () => (tennisSamples ?? []).map(toTennisRow),
+    [tennisSamples],
+  );
+  // The feed labels the tracked match "A vs B"; split it so the chart legends
+  // carry the actual players rather than an anonymous "p1"/"p2".
+  const [tennisP1, tennisP2] = useMemo(() => {
+    const parts = (tennisLast?.tennis_match ?? '').split(' vs ');
+    return [parts[0]?.trim() || 'player 1', parts[1]?.trim() || 'player 2'];
+  }, [tennisLast?.tennis_match]);
+
   const rows = useMemo<Row[]>(() => (samples ?? []).map(toRow), [samples]);
 
   // When pausing, seed the scrub range to the full loaded window; clear on resume.
@@ -957,6 +1025,138 @@ export default function TelemetryPage({ availableAssets, venue }: { availableAss
           implied probability of the reference outcome; <span className="text-gray-500">drift</span> is its
           move since the prior poll; <span className="text-gray-500">dispersion</span> is how much the
           books disagree — a proxy for soft, potentially mispriced lines.
+        </p>
+
+        {/* ── Tennis Raptor — live event state ────────────────────────────── */}
+        <div className="card px-5 py-4 border border-sky-500/20 bg-[#0d0d1a]">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+            <div>
+              <p className="label-muted text-xs">🎾 Tennis Raptor — Live Event State</p>
+              <p className="text-[11px] text-gray-500 mt-0.5">
+                Venue-neutral observe-only feed (Live Tennis API). One tracked live match —
+                sets, games, serving side and a derived break-point flag.
+              </p>
+            </div>
+            <div className="flex items-center gap-3 text-[10px] font-mono shrink-0">
+              <ConnPill label="Tennis Raptor" live={!!tennisLast?.tennis_connected} />
+              <span className="text-gray-500">
+                live <span className="text-gray-300">{num(tennisLast?.tennis_num_live).toFixed(0)}</span>
+              </span>
+            </div>
+          </div>
+
+          {/* Live scoreboard for the tracked match */}
+          {tennisLast?.tennis_connected && tennisLast?.tennis_match ? (
+            <div className="mb-4 rounded-lg border border-[#1e1e32] bg-[#0a0a14] px-4 py-3">
+              <div className="flex flex-wrap items-baseline gap-x-2 gap-y-1">
+                {tennisLast.tennis_tour && (
+                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/25 uppercase">
+                    {tennisLast.tennis_tour}
+                  </span>
+                )}
+                <span className="text-sm text-gray-200 font-medium">{tennisLast.tennis_match}</span>
+                {tennisLast.tennis_tournament && (
+                  <span className="text-[11px] font-mono text-gray-500">
+                    · {tennisLast.tennis_tournament}
+                  </span>
+                )}
+                {tennisLast.tennis_is_tiebreak && (
+                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-violet-500/15 text-violet-300 border border-violet-500/25">
+                    TIEBREAK
+                  </span>
+                )}
+                {tennisLast.tennis_break_point && (
+                  <span className="text-[10px] font-mono px-1.5 py-0.5 rounded bg-rose-500/15 text-rose-300 border border-rose-500/25">
+                    BREAK POINT
+                  </span>
+                )}
+              </div>
+
+              {/* Score grid — one row per player, colour-keyed to the charts.
+                  The serving side carries a ● marker, so "who is serving" is
+                  never conveyed by colour alone. */}
+              <div className="mt-2.5 grid grid-cols-[1fr_auto_auto_auto] gap-x-4 gap-y-1 text-[11px] font-mono max-w-md">
+                <span className="text-gray-600" />
+                <span className="text-gray-600 text-right">sets</span>
+                <span className="text-gray-600 text-right">games</span>
+                <span className="text-gray-600 text-right">pts</span>
+
+                {([
+                  [tennisP1, P1_COLOR, 1, num(tennisLast.tennis_sets_p1), num(tennisLast.tennis_games_p1), 0],
+                  [tennisP2, P2_COLOR, 2, num(tennisLast.tennis_sets_p2), num(tennisLast.tennis_games_p2), 1],
+                ] as const).map(([name, color, side, sets, games, ptIdx]) => (
+                  <Fragment key={side}>
+                    <span className="flex items-center gap-1.5 text-gray-300 truncate">
+                      <span className="w-2 h-2 rounded-sm shrink-0" style={{ background: color }} />
+                      {name}
+                      {num(tennisLast.tennis_server) === side && (
+                        <span className="text-emerald-400" title="serving">●</span>
+                      )}
+                    </span>
+                    <span className="text-gray-200 text-right">{sets.toFixed(0)}</span>
+                    <span className="text-gray-200 text-right">{games.toFixed(0)}</span>
+                    <span className="text-gray-200 text-right">
+                      {(tennisLast.tennis_points ?? '').split('–')[ptIdx] || '–'}
+                    </span>
+                  </Fragment>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="mb-4 rounded-lg border border-[#1e1e32] bg-[#0a0a14] px-4 py-3 text-[11px] font-mono text-gray-600">
+              {num(tennisLast?.tennis_num_live) > 0
+                ? 'Live matches on court, but no score has been published yet.'
+                : 'Nothing on court — tennis has quiet hours daily, which is a healthy state, not a fault. Set LIVETENNIS_API_KEY in Setup if the pill stays offline.'}
+            </div>
+          )}
+
+          <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
+            <SignalChart<TennisRow>
+              title="Games — Current Set"
+              subtitle="Games won in the set in progress"
+              data={tennisRows}
+              lineType="stepAfter"
+              series={[
+                { key: 'gamesP1', label: tennisP1, color: P1_COLOR },
+                { key: 'gamesP2', label: tennisP2, color: P2_COLOR },
+              ]}
+              fmtY={v => v.toFixed(0)}
+            />
+            <SignalChart<TennisRow>
+              title="Sets Won"
+              subtitle="Match score in sets"
+              data={tennisRows}
+              lineType="stepAfter"
+              series={[
+                { key: 'setsP1', label: tennisP1, color: P1_COLOR },
+                { key: 'setsP2', label: tennisP2, color: P2_COLOR },
+              ]}
+              fmtY={v => v.toFixed(0)}
+            />
+            <div className="lg:col-span-2">
+              <SignalChart<TennisRow>
+                title="Feed Age"
+                subtitle="Seconds since the tracked score last moved"
+                data={tennisRows}
+                refY={TENNIS_STALENESS_SECS}
+                refLabel={`stale > ${TENNIS_STALENESS_SECS}s`}
+                series={[{ key: 'feedAge', label: 'feed age', color: '#9ca3af' }]}
+                fmtY={v => `${v.toFixed(0)}s`}
+              />
+            </div>
+          </div>
+        </div>
+
+        <p className="text-[10px] font-mono text-gray-600">
+          The Tennis Raptor observes only — no Viper trades on it yet, and the tracked match is
+          chosen for signal liveness (sticky on the previous match, else the freshest score), not
+          because it maps to a listed market. It polls every ~15 min to stay inside the free tier
+          (100 requests/day), so <span className="text-gray-500">games</span> and{' '}
+          <span className="text-gray-500">sets</span> step rather than curve — the score only ever
+          moves in whole units, and between polls it genuinely has no value.{' '}
+          <span className="text-gray-500">Feed age</span> above the dashed line means the score has
+          gone stale, and the raptor then reports disconnected so a consumer widens or pulls rather
+          than holding on a frozen number.
         </p>
       </div>
       )}

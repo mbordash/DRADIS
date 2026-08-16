@@ -320,6 +320,18 @@ function RaptorCard({
         </p>
       ) : (
         <div className="space-y-2">
+          {/* Where to generate the key. Shown above the inputs because an
+              operator who lacks a key needs the link before the field. */}
+          {raptor.signup_url && (
+            <a
+              href={raptor.signup_url}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 text-[11px] font-mono text-indigo-400 hover:text-indigo-300 hover:underline"
+            >
+              Get a key at {raptor.signup_url.replace(/^https:\/\//, '')} ↗
+            </a>
+          )}
           {fields.map(c => (
             <div key={c.key}>
               <div className="flex items-center justify-between mb-1">
