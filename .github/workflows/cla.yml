@@ -13,10 +13,21 @@ name: CLA
 # different terms, so a DCO-only project cannot sell commercial licences that
 # cover contributed code.
 #
-# Uses contributor-assistant/github-action, the maintained successor to the
-# original cla-assistant action. Signatures are stored in this repository on a
-# dedicated `cla-signatures` branch, so there is no third-party service holding
-# the record.
+# Uses contributor-assistant/github-action, the successor to the original
+# cla-assistant action. Signatures are stored in this repository on a dedicated
+# `cla-signatures` branch, so there is no third-party service holding the record.
+# That upstream action was archived on 2026-03-23 and is now read-only, so the
+# `v2.6.1` pin below is effectively permanent — no upstream fixes are coming.
+#
+# The `cla-signatures` branch must already exist. The action never creates it: it
+# passes the branch straight to the GitHub contents API as a ref, so a missing
+# branch fails every run with `Branch cla-signatures not found` for every
+# contributor. It was bootstrapped as an orphan commit with an empty tree; the
+# action creates `signatures/cla.json` itself on the first signature. If the
+# branch is ever deleted, recreate it before expecting the check to pass:
+#
+#   git branch cla-signatures $(git commit-tree $(git mktree </dev/null) -m init)
+#   git push origin cla-signatures
 
 on:
   issue_comment:
@@ -47,12 +58,16 @@ jobs:
       - name: Check or record CLA signature
         uses: contributor-assistant/github-action@v2.6.1
         env:
-          # Provided automatically; used to comment on the pull request.
+          # Provided automatically. Used both to comment on the pull request and
+          # to write the signature file — the `contents: write` grant above is
+          # what authorizes that write.
+          #
+          # No PERSONAL_ACCESS_TOKEN is set here on purpose. The action only
+          # reaches for one when signatures live in a different repo or org
+          # (`remote-repository-name` / `remote-organization-name`); with
+          # same-repo storage it always uses GITHUB_TOKEN, so a PAT would be
+          # inert. Set one only if the signature store ever moves out of here.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          # A classic PAT with `repo` scope, stored as a repository secret.
-          # Required because the default GITHUB_TOKEN cannot push the signature
-          # file to a branch in a way that persists across forked pull requests.
-          PERSONAL_ACCESS_TOKEN: ${{ secrets.CLA_SIGNATURES_TOKEN }}
         with:
           path-to-signatures: 'signatures/cla.json'
           path-to-document: 'https://github.com/mbordash/DRADIS/blob/main/docs/CLA.md'
