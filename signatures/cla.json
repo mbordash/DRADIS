@@ -1,3 +1,12 @@
 {
-   "signedContributors": []
+  "signedContributors": [
+    {
+      "name": "bensynapse",
+      "id": 118375461,
+      "comment_id": 5307711305,
+      "created_at": "2026-08-16T13:38:40Z",
+      "repoId": 1189043067,
+      "pullRequestNo": 7
+    }
+  ]
 }
