@@ -316,11 +316,12 @@ const SPORTS_HISTORY_CAP: usize = 1440;
 const SPORTS_TELEMETRY_HEARTBEAT_SECS: i64 = 1800;
 /// The Tennis Raptor is another slow poller (`config::TENNIS_POLL_SECS`, 900s
 /// default), so it gets the same change-or-heartbeat de-duplication as the
-/// Sports feed — but with a shorter heartbeat: a live tennis score moves every
-/// few points, and when it *doesn't* move the advancing heartbeat is what makes
-/// the staleness visible on the chart.
+/// Sports feed, with the same heartbeat: nothing can change between polls, so
+/// a heartbeat shorter than the poll interval would only re-store identical
+/// points and shrink the retained window. 1440 points × ≥30 min spans the same
+/// ~30 days of readable movement as the Sports feed.
 const TENNIS_HISTORY_CAP: usize = 1440;
-const TENNIS_TELEMETRY_HEARTBEAT_SECS: i64 = 300;
+const TENNIS_TELEMETRY_HEARTBEAT_SECS: i64 = 1800;
 
 /// Background task — every `TELEMETRY_SAMPLE_SECS`, snapshot the current Raptor
 /// signal values into the per-asset ring buffer. Spawned once by

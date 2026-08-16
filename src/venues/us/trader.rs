@@ -68,6 +68,7 @@ use crate::squadron::{CryptoAsset, Squadron, SquadronConfig, SquadronRaptors, Sq
 use crate::raptors::derivatives::DerivativesSnapshot;
 use crate::raptors::horizon::HorizonSnapshot;
 use crate::raptors::sports::SportsSnapshot;
+use crate::raptors::tennis::TennisSnapshot;
 use crate::raptors::tide::TideSnapshot;
 use crate::state::{
     TradeScope,
@@ -357,6 +358,7 @@ enum MarketOutcome {
 /// its own schedule) rather than the hourly-crypto cadence. The shared
 /// [`MarketConfig::phase`] classifier and the squadron RTB/stand-down state
 /// machine are reused so close semantics are identical across venues.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_us_trader(
     venue: Arc<UsRetailVenue>,
     cag: Cag,
@@ -364,6 +366,7 @@ pub async fn run_us_trader(
     markets_tx: Arc<watch::Sender<HashMap<String, String>>>,
     process_heartbeat_secs: Arc<AtomicU64>,
     sports_rx: watch::Receiver<SportsSnapshot>,
+    tennis_rx: watch::Receiver<TennisSnapshot>,
     cancel: CancellationToken,
 ) {
     let filter = std::env::var(ENV_MARKET_FILTER).ok().filter(|s| !s.is_empty());
@@ -376,11 +379,11 @@ pub async fn run_us_trader(
     tokio::join!(
         run_wing(
             Wing::General, &venue, &cag, &raptor_health_tx, &markets_tx,
-            &process_heartbeat_secs, &sports_rx, &filter, &cancel,
+            &process_heartbeat_secs, &sports_rx, &tennis_rx, &filter, &cancel,
         ),
         run_wing(
             Wing::Crypto, &venue, &cag, &raptor_health_tx, &markets_tx,
-            &process_heartbeat_secs, &sports_rx, &filter, &cancel,
+            &process_heartbeat_secs, &sports_rx, &tennis_rx, &filter, &cancel,
         ),
     );
 }
@@ -396,6 +399,7 @@ async fn run_wing(
     markets_tx: &Arc<watch::Sender<HashMap<String, String>>>,
     process_heartbeat_secs: &Arc<AtomicU64>,
     sports_rx: &watch::Receiver<SportsSnapshot>,
+    tennis_rx: &watch::Receiver<TennisSnapshot>,
     filter: &Option<String>,
     cancel: &CancellationToken,
 ) {
@@ -450,6 +454,7 @@ async fn run_wing(
             markets_tx,
             process_heartbeat_secs,
             sports_rx,
+            tennis_rx,
             &market_cancel,
             wing,
             pair,
@@ -580,6 +585,7 @@ async fn trade_one_market(
     markets_tx: &Arc<watch::Sender<HashMap<String, String>>>,
     process_heartbeat_secs: &AtomicU64,
     sports_rx: &watch::Receiver<SportsSnapshot>,
+    tennis_rx: &watch::Receiver<TennisSnapshot>,
     cancel: &CancellationToken,
     wing: Wing,
     pair: super::markets::UsMarketPair,
@@ -619,7 +625,7 @@ async fn trade_one_market(
     // The US venue runs a standalone arb loop (no intl-style patrol), but the
     // dashboard reads squadrons from the CAG registry — so without this the UI
     // shows zero squadrons even though the venue is live.
-    let squadron = register_us_squadron(cag, &pair, sports_rx.clone(), wing, raptors.as_ref(), strike_price);
+    let squadron = register_us_squadron(cag, &pair, sports_rx.clone(), tennis_rx.clone(), wing, raptors.as_ref(), strike_price);
     let squadron_id = squadron.id.clone();
 
     // Seed the squadron's Viper config so the detail view's strategy cards render.
@@ -1370,21 +1376,28 @@ fn register_us_squadron(
     cag: &Cag,
     pair: &super::markets::UsMarketPair,
     sports_rx: watch::Receiver<SportsSnapshot>,
+    tennis_rx: watch::Receiver<TennisSnapshot>,
     wing: Wing,
     crypto_raptors: Option<&CryptoRaptors>,
     strike_price: Option<Decimal>,
 ) -> Squadron {
     let raptors = match crypto_raptors {
-        Some(r) => SquadronRaptors::full(
-            r.oracle.clone(),
-            r.velocity.clone(),
-            r.drift.clone(),
-            r.funding.clone(),
-            r.derivatives.clone(),
-            r.tide.clone(),
-            r.horizon.clone(),
-            Some(sports_rx),
-        ),
+        Some(r) => {
+            let mut r2 = SquadronRaptors::full(
+                r.oracle.clone(),
+                r.velocity.clone(),
+                r.drift.clone(),
+                r.funding.clone(),
+                r.derivatives.clone(),
+                r.tide.clone(),
+                r.horizon.clone(),
+                Some(sports_rx),
+            );
+            // The venue-neutral Tennis Raptor rides along observe-only, same
+            // post-construction attach as the general wing below.
+            r2.tennis = Some(tennis_rx);
+            r2
+        }
         None => {
             // Placeholder signal channels (the general wing reads prices from
             // the WS feed). Receivers stay valid after the senders drop.
@@ -1395,6 +1408,7 @@ fn register_us_squadron(
             // attach it so its observe-only line-movement signal is available.
             let mut r = SquadronRaptors::price_only(oracle_rx, velocity_rx, drift_rx);
             r.sports = Some(sports_rx);
+            r.tennis = Some(tennis_rx);
             r
         }
     };

@@ -403,9 +403,10 @@ async fn run() -> Result<()> {
         // ── Tennis Raptor (venue-neutral, observe-only) ───────────────────────
         // Spawned beside the Sports Raptor so its live event-state telemetry
         // ("tennis" health key) is available on the US build too. Degrades to
-        // Default without LIVETENNIS_API_KEY. Observe-only: telemetry now,
-        // squadron wiring when a consumer earns it.
-        let (us_tennis_tx, _us_tennis_rx) =
+        // Default without LIVETENNIS_API_KEY. Its receiver is threaded into the
+        // US trader's SquadronRaptors like the Sports feed, so the channel stays
+        // live for the first consumer.
+        let (us_tennis_tx, us_tennis_rx) =
             watch::channel(dradis::raptors::tennis::TennisSnapshot::default());
         tokio::spawn(dradis::raptors::tennis::run_tennis_raptor(
             Arc::clone(&shared_http), us_tennis_tx, Arc::clone(&raptor_health_tx),
@@ -460,6 +461,7 @@ async fn run() -> Result<()> {
                     Arc::clone(&markets_tx),
                     Arc::clone(&process_heartbeat_secs),
                     us_sports_rx,
+                    us_tennis_rx,
                     cancel,
                 ).await;
             }

@@ -23,6 +23,12 @@
 /// receiver holds a break point. Both venues list tennis match markets; this is
 /// the event-specific state a 300s generic line sample cannot carry.
 ///
+/// The tracked match is chosen for signal liveness, not market linkage: sticky
+/// on the previously tracked id while it stays live, otherwise whichever live
+/// match has the freshest score. It is NOT yet tied to a specific venue
+/// market — matching the tracked match to a listed tennis market is
+/// deliberately left to the first consumer.
+///
 /// ── Source ──────────────────────────────────────────────────────────────────
 /// The Live Tennis API (livetennisapi.com) REST surface, keyed on env
 /// `LIVETENNIS_API_KEY` (`config::TENNIS_API_KEY_ENV`). Each poll fetches
