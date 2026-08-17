@@ -878,6 +878,22 @@ pub const FAIRVALUE_ENTRY_PERSISTENCE_SECS: u64 = 30;
 pub const FAIRVALUE_SIGNAL_CONTINUITY_GAP_SECS: u64 = 20;
 pub const FAIRVALUE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.20);
 pub const FAIRVALUE_STOP_LOSS_PERCENT: Decimal = dec!(0.15);
+
+/// FairValue entry veto on order-book imbalance for the side being bought.
+/// OBI = (bid_depth − ask_depth) / total_depth on that token: −1.0 is an
+/// all-offer book with no bid support.
+///
+/// FairValue's thesis is that the model prices a token better than the market,
+/// which says nothing about whether the position can be EXITED. Buying a side
+/// with no bids means crossing a wide spread in and having nothing to hit on the
+/// way out, so a stop realises far more than its nominal width.
+///
+/// 2026-08-16 1PM BTC market: entered YES at $0.50 with YES OBI = −0.999, and
+/// the catastrophic stop filled at −30% against a nominal 12% stop. Adverse-book
+/// entries carried −3.04 of FairValue's −5.71 cumulative P&L over 25 trades.
+/// −0.60 matches MOMENTUM_OBI_ADVERSE_BLOCK and the documented OBI circuit
+/// breaker.
+pub const FAIRVALUE_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.60);
 pub const FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 120;
 /// Fraction of the ENTRY fair value the model may lose before the reversal exit
 /// fires. Aggressive gives the thesis the most room. Entry-relative, not an

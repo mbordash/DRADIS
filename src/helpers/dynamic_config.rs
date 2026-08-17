@@ -190,6 +190,7 @@ fn default_convergence_drift_coherence_deadband_pct() -> Decimal { config::CONVE
 fn default_convergence_velocity_opposition_pct()      -> Decimal { config::CONVERGENCE_VELOCITY_OPPOSITION_PCT      }
 fn default_convergence_skip_band_low()      -> Decimal { config::CONVERGENCE_SKIP_BAND_LOW             }
 fn default_convergence_skip_band_high()     -> Decimal { config::CONVERGENCE_SKIP_BAND_HIGH            }
+fn default_fairvalue_obi_adverse_block()    -> Decimal { config::FAIRVALUE_OBI_ADVERSE_BLOCK           }
 fn default_sports_poll_secs()               -> u64     { config::SPORTS_POLL_SECS                      }
 fn default_sports_low_budget_warn()         -> i64     { config::SPORTS_ODDS_LOW_BUDGET_WARN           }
 fn default_tennis_poll_secs()               -> u64     { config::TENNIS_POLL_SECS                      }
@@ -642,6 +643,13 @@ pub struct DynamicConfig {
     // The floors in `config_schema.rs` matter: these drive outbound request
     // rates against third-party rate limits, and the LLM autonomy tiers can move
     // config, so an unclamped value risks a provider ban rather than a bad fill.
+    /// Entry veto on order-book imbalance for the side FairValue is buying.
+    /// OBI = (bid_depth − ask_depth)/total on that token; below this, the book
+    /// is too offer-heavy to exit without giving back far more than the stop.
+    /// See FAIRVALUE_OBI_ADVERSE_BLOCK for the incident that motivated it.
+    #[serde(default = "default_fairvalue_obi_adverse_block")]
+    pub fairvalue_obi_adverse_block:      Decimal,
+
     /// Seconds between Sports Raptor (The Odds API) polls.
     #[serde(default = "default_sports_poll_secs")]
     pub sports_poll_secs:                 u64,
@@ -849,6 +857,7 @@ impl Default for DynamicConfig {
             convergence_skip_band_low:        config::CONVERGENCE_SKIP_BAND_LOW,
             convergence_skip_band_high:       config::CONVERGENCE_SKIP_BAND_HIGH,
 
+            fairvalue_obi_adverse_block:      config::FAIRVALUE_OBI_ADVERSE_BLOCK,
             sports_poll_secs:                 config::SPORTS_POLL_SECS,
             sports_low_budget_warn:           config::SPORTS_ODDS_LOW_BUDGET_WARN,
             tennis_poll_secs:                 config::TENNIS_POLL_SECS,

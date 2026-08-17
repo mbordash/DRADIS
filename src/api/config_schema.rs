@@ -444,6 +444,8 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Hard cap on total FairValue capital at risk.").min(0.0).step(0.5).unit("USDC"));
         v.push(F::new(g, e, "fairvalue_stop_loss_pct", "Stop Loss", "pct", false,
             "Entry-relative stop loss (0.12 = 12%). Catastrophic bypass at 2× this.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "fairvalue_obi_adverse_block", "OBI Adverse Block", "decimal", true,
+            "Reject entries when the book on the side being bought is this offer-heavy. OBI = (bid_depth − ask_depth)/total; −1.0 is an all-offer book with no bid support, which cannot be exited without giving back far more than the stop width.").range(-1.0, 0.0).step(0.05));
         v.push(F::new(g, e, "fairvalue_target_profit_pct", "Take Profit", "pct", false,
             "Entry-relative take profit (0.20 = 20%). Skipped in favor of fee-free settlement when the model is ≥0.90 near expiry.").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "fairvalue_base_edge", "Base Edge", "price", false,

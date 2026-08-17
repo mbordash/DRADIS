@@ -787,6 +787,47 @@ impl Strategy for FairValueStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── Order-book imbalance veto ────────────────────────────────────────
+        // FairValue's thesis is that the model prices the token better than the
+        // market does. That is a claim about VALUE and says nothing about
+        // whether the position can be exited: buying a side whose depth is
+        // nearly all offers means crossing a wide spread on the way in and
+        // having nothing to hit on the way out, so a stop realises far more
+        // than its nominal width.
+        //
+        // This is the last gate before emitting an entry, deliberately — it is
+        // a liquidity check on the side actually being bought, not part of the
+        // edge calculation, so it stays independent of the model.
+        //
+        // 2026-08-16 1PM BTC market: entered YES at $0.50 with YES OBI = −0.999
+        // and the catastrophic stop filled at −30% against a nominal 12% stop.
+        // Across 25 trades, entries into an adverse book carried −3.04 of
+        // FairValue's −5.71 cumulative P&L.
+        let (bid_depth, ask_depth) = if want_yes {
+            (ctx.snapshot.yes_bid_depth, ctx.snapshot.yes_ask_depth)
+        } else {
+            (ctx.snapshot.no_bid_depth, ctx.snapshot.no_ask_depth)
+        };
+        let total_depth = bid_depth + ask_depth;
+        // No depth at all reads as maximally adverse rather than neutral: an
+        // empty book is the case this gate most needs to reject, and a 0/0
+        // ratio would otherwise sail through as 0.0.
+        let side_obi = if total_depth > dec!(0) {
+            (bid_depth - ask_depth) / total_depth
+        } else {
+            dec!(-1)
+        };
+        if side_obi < dc.fairvalue_obi_adverse_block {
+            tracing::info!(
+                " FairValue OBI veto [{}]: {} OBI={:.3} < block {:.3} — book is offer-heavy, \
+                 an exit would give back more than the stop width",
+                market.market_name, if want_yes { "YES" } else { "NO" },
+                side_obi, dc.fairvalue_obi_adverse_block,
+            );
+            idle("OBI adverse — no bid support on the entry side");
+            return Ok(StrategySignal::NoSignal);
+        }
+
         let side = if want_yes { "YES" } else { "NO" };
         let shares = (dc.fairvalue_trade_size_usdc / fee_headroom) / ask;
         // Anchor the model-reversal exit to the thesis we are entering on.
@@ -1257,6 +1298,39 @@ mod tests {
         for secs_left in [60_i64, 932, 100_000] {
             assert_eq!(FairValueStrategyImpl::sigma_floor(0, secs_left), full);
         }
+    }
+
+    /// Side-adjusted OBI, matching the gate in `evaluate_entry`: an empty book
+    /// must read as maximally adverse rather than neutral.
+    fn side_obi(bid_depth: Decimal, ask_depth: Decimal) -> Decimal {
+        let total = bid_depth + ask_depth;
+        if total > dec!(0) { (bid_depth - ask_depth) / total } else { dec!(-1) }
+    }
+
+    /// The 2026-08-16 1PM BTC loss: bought YES at $0.50 into a book that was
+    /// essentially all offers (OBI −0.999), then the catastrophic stop filled at
+    /// −30% against a nominal 12% stop, because there was nothing to sell into.
+    /// The block must reject exactly that entry.
+    #[test]
+    fn obi_block_rejects_the_all_offer_book_that_caused_the_2026_08_16_loss() {
+        let block = config::FAIRVALUE_OBI_ADVERSE_BLOCK;
+
+        // Reconstructed from entry_signals: obi_yes = -0.9991 on the YES side.
+        let observed = dec!(-0.9991);
+        assert!(observed < block, "the incident's book must be rejected: {observed} !< {block}");
+
+        // A book with no depth on either side is the worst case, not a neutral one.
+        assert_eq!(side_obi(dec!(0), dec!(0)), dec!(-1));
+        assert!(side_obi(dec!(0), dec!(0)) < block);
+
+        // A balanced book passes; a mildly offer-heavy one still passes, so the
+        // gate does not quietly become a "only trade bid-heavy books" filter.
+        assert!(side_obi(dec!(100), dec!(100)) >= block, "balanced book must pass");
+        assert!(side_obi(dec!(40), dec!(60)) >= block, "mildly offer-heavy book must pass");
+
+        // The threshold itself must stay in the meaningful range: OBI is bounded
+        // to [-1, 1], so a block outside it is either inert or blocks everything.
+        assert!(block > dec!(-1) && block < dec!(0), "block {block} must be a real veto");
     }
 
     /// Percentage stops need to span more than a tick to mean anything, and the
