@@ -567,16 +567,16 @@ export default function TradelogPage({ availableAssets }: Props) {
           </div>
         ) : (
           <div className="overflow-x-auto">
-            <table className="w-full text-xs font-mono">
+            <table className="w-full text-xs font-mono border-separate border-spacing-0 [&_td]:border-b [&_td]:border-[#1e1e32] [&_th]:border-b [&_th]:border-[#1e1e32]">
               <thead>
-                <tr className="border-b border-[#1e1e32]">
+                <tr>
                   {/* Time is pinned left so a horizontally scrolled row stays
                       identifiable; Actions is pinned right because RTB closes a
                       live position and must never be scrolled out of reach. */}
                   <th className="sticky left-0 z-20 bg-[#13131f] px-3 py-2 text-left text-gray-500 font-normal whitespace-nowrap">
                     Time
                   </th>
-                  {['Venue', 'Status', 'Strategy', 'Market', 'Entry → Exit', 'Shares', 'P&L', 'Reason / Mode'].map(h => (
+                  {['Venue', 'Status', 'Strategy', 'Market', 'Size @ Entry → Exit', 'P&L', 'Reason / Mode'].map(h => (
                     <th key={h} className="px-3 py-2 text-left text-gray-500 font-normal whitespace-nowrap">
                       {h}
                     </th>
@@ -597,7 +597,7 @@ export default function TradelogPage({ availableAssets }: Props) {
                     <tr
                       key={e.key}
                       className={[
-                        'group border-b border-[#1e1e32] hover:bg-[#1a1a2e] transition-colors',
+                        'group hover:bg-[#1a1a2e] transition-colors',
                         e.status === 'launch'   ? 'opacity-70' : '',
                       ].join(' ')}
                     >
@@ -646,6 +646,13 @@ export default function TradelogPage({ availableAssets }: Props) {
                         <span className={`mr-1.5 text-[10px] font-bold ${isLong ? 'text-green-400' : 'text-red-400'}`}>
                           {e.side}
                         </span>
+                        {/* Size rides with the price it was filled at — one
+                            execution, one cell. Kept muted so the price journey
+                            stays the thing the eye lands on. */}
+                        <span className="text-gray-500" title={`${e.shares} shares`}>
+                          {e.shares.toFixed(2)}
+                        </span>
+                        <span className="mx-1 text-gray-600">@</span>
                         <span className="text-gray-300">{e.entry.toFixed(4)}</span>
                         <span className="mx-1 text-gray-600">→</span>
                         {e.curOrExit !== null ? (() => {
@@ -662,11 +669,6 @@ export default function TradelogPage({ availableAssets }: Props) {
                             </span>
                           );
                         })() : <span className="text-gray-600">—</span>}
-                      </td>
-
-                      {/* Shares */}
-                      <td className="px-3 py-2 text-gray-400">
-                        {e.shares.toFixed(2)}
                       </td>
 
                       {/* P&L, with fees folded in beneath it. The two belong
