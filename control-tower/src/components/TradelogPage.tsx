@@ -570,12 +570,20 @@ export default function TradelogPage({ availableAssets }: Props) {
             <table className="w-full text-xs font-mono">
               <thead>
                 <tr className="border-b border-[#1e1e32]">
-                  {['Time', 'Venue', 'Subject', 'Status', 'Strategy', 'Market', 'Side', 'Entry', 'Cur / Exit', 'Shares', 'P&L', 'Fees', 'Reason / Mode'].map(h => (
+                  {/* Time is pinned left so a horizontally scrolled row stays
+                      identifiable; Actions is pinned right because RTB closes a
+                      live position and must never be scrolled out of reach. */}
+                  <th className="sticky left-0 z-20 bg-[#13131f] px-3 py-2 text-left text-gray-500 font-normal whitespace-nowrap">
+                    Time
+                  </th>
+                  {['Venue', 'Status', 'Strategy', 'Market', 'Entry → Exit', 'Shares', 'P&L', 'Reason / Mode'].map(h => (
                     <th key={h} className="px-3 py-2 text-left text-gray-500 font-normal whitespace-nowrap">
                       {h}
                     </th>
                   ))}
-                  <th className="px-3 py-2 text-left text-gray-500 font-normal">Actions</th>
+                  <th className="sticky right-0 z-20 bg-[#13131f] border-l border-[#1e1e32] px-3 py-2 text-left text-gray-500 font-normal whitespace-nowrap">
+                    Actions
+                  </th>
                 </tr>
               </thead>
               <tbody>
@@ -589,12 +597,12 @@ export default function TradelogPage({ availableAssets }: Props) {
                     <tr
                       key={e.key}
                       className={[
-                        'border-b border-[#1e1e32] hover:bg-[#1a1a2e] transition-colors',
+                        'group border-b border-[#1e1e32] hover:bg-[#1a1a2e] transition-colors',
                         e.status === 'launch'   ? 'opacity-70' : '',
                       ].join(' ')}
                     >
-                      {/* Time */}
-                      <td className="px-3 py-2 text-gray-400 whitespace-nowrap">
+                      {/* Time — pinned left */}
+                      <td className="sticky left-0 z-10 bg-[#13131f] group-hover:bg-[#1a1a2e] transition-colors px-3 py-2 text-gray-400 whitespace-nowrap">
                         {e.chainAdopted
                           ? <span className="text-amber-500/80 cursor-help" title="Re-adopted from on-chain wallet">⛓ adopted</span>
                           : fmtTime(e.ts)
@@ -608,13 +616,6 @@ export default function TradelogPage({ availableAssets }: Props) {
                         </span>
                       </td>
 
-                      {/* Subject: underlying, or market class when there is none */}
-                      <td className="px-3 py-2 whitespace-nowrap">
-                        <span className={`inline-block px-1.5 py-0.5 text-[10px] font-bold rounded border ${assetCls}`}>
-                          {subjectBadge(e)}
-                        </span>
-                      </td>
-
                       {/* Status */}
                       <td className={`px-3 py-2 whitespace-nowrap ${sm.color}`}>
                         {sm.icon} {sm.label}
@@ -625,23 +626,28 @@ export default function TradelogPage({ availableAssets }: Props) {
                         {shortStrategy(e.strategy)}
                       </td>
 
-                      {/* Market */}
-                      <td className="px-3 py-2 text-gray-400 max-w-[160px]">
-                        <TipCell full={e.market} maxChars={28} />
+                      {/* Market, prefixed with the asset. The Subject column was
+                          folded in here rather than dropped: it duplicates the
+                          asset filter pills only while a filter is applied, and
+                          on "All" it is the sole thing identifying the row. */}
+                      <td className="px-3 py-2 text-gray-400 max-w-[190px]">
+                        <span
+                          className={`mr-1.5 inline-block px-1 py-0.5 text-[9px] font-bold rounded border align-middle ${assetCls}`}
+                          title="Subject"
+                        >
+                          {subjectBadge(e)}
+                        </span>
+                        <TipCell full={e.market} maxChars={24} />
                       </td>
 
-                      {/* Side */}
-                      <td className={`px-3 py-2 font-semibold ${isLong ? 'text-green-400' : 'text-red-400'}`}>
-                        {e.side}
-                      </td>
-
-                      {/* Entry */}
-                      <td className="px-3 py-2 text-gray-300">
-                        {e.entry.toFixed(4)}
-                      </td>
-
-                      {/* Current / Exit */}
-                      <td className="px-3 py-2">
+                      {/* Entry → Exit. Side rides along as a LABEL plus colour,
+                          never colour alone, so it survives a mono display. */}
+                      <td className="px-3 py-2 whitespace-nowrap">
+                        <span className={`mr-1.5 text-[10px] font-bold ${isLong ? 'text-green-400' : 'text-red-400'}`}>
+                          {e.side}
+                        </span>
+                        <span className="text-gray-300">{e.entry.toFixed(4)}</span>
+                        <span className="mx-1 text-gray-600">→</span>
                         {e.curOrExit !== null ? (() => {
                           const delta = e.curOrExit - e.entry;
                           const color = delta > 0 ? 'text-green-400' : delta < 0 ? 'text-red-400' : 'text-gray-300';
@@ -663,30 +669,28 @@ export default function TradelogPage({ availableAssets }: Props) {
                         {e.shares.toFixed(2)}
                       </td>
 
-                      {/* P&L */}
+                      {/* P&L, with fees folded in beneath it. The two belong
+                          together: the headline figure is already NET of the
+                          fee, so showing them apart invites double-counting. */}
                       <td className="px-3 py-2 font-semibold whitespace-nowrap">
-                        {isOpen && e.curOrExit === null
-                          ? <span className="text-gray-600">—</span>
-                          : fmtPnl(e.pnl)
-                        }
-                        {isOpen && e.pnl !== null && (
-                          <span className="ml-1 text-[10px] text-gray-600">(unrlzd)</span>
-                        )}
-                      </td>
-
-                      {/* Fees — P&L above is already net of these. */}
-                      <td className="px-3 py-2 text-gray-500 whitespace-nowrap">
-                        {e.fees != null && e.fees > 0 ? (
-                          <span
-                            className="cursor-help"
-                            title={`Venue fees for the round trip. P&L is net of this; gross was ${(
+                        <div>
+                          {isOpen && e.curOrExit === null
+                            ? <span className="text-gray-600">—</span>
+                            : fmtPnl(e.pnl)
+                          }
+                          {isOpen && e.pnl !== null && (
+                            <span className="ml-1 text-[10px] font-normal text-gray-600">(unrlzd)</span>
+                          )}
+                        </div>
+                        {e.fees != null && e.fees > 0 && (
+                          <div
+                            className="text-[10px] font-normal text-gray-600 cursor-help"
+                            title={`P&L is net of venue fees. Gross was ${(
                               (e.pnl ?? 0) + e.fees
                             ).toFixed(4)}.`}
                           >
-                            −${e.fees.toFixed(4)}
-                          </span>
-                        ) : (
-                          <span className="text-gray-700">—</span>
+                            net · ${e.fees.toFixed(4)} fees
+                          </div>
                         )}
                       </td>
 
@@ -701,8 +705,8 @@ export default function TradelogPage({ availableAssets }: Props) {
                         )}
                       </td>
 
-                      {/* Actions */}
-                      <td className="px-3 py-2">
+                      {/* Actions — pinned right */}
+                      <td className="sticky right-0 z-10 bg-[#13131f] group-hover:bg-[#1a1a2e] transition-colors border-l border-[#1e1e32] px-3 py-2">
                         {e.status === 'inflight' && e.rawPosition && !DEMO_MODE && (
                           <button
                             onClick={() => setRtbEntry(e)}

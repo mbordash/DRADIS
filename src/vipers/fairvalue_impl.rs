@@ -104,6 +104,11 @@ struct FairValueGlobals {
     last_diag_log_at: StdMutex<Option<Instant>>,
     /// Throttle for the entry-signal info log (signal can re-fire every tick).
     last_entry_log_at: StdMutex<Option<Instant>>,
+    /// Throttle for the OBI veto log. A one-sided book persists for minutes and
+    /// the gate re-evaluates on the 50ms patrol tick, so an unthrottled line
+    /// emits thousands of identical entries and buries everything else — the
+    /// same failure the entry log above already guards against.
+    last_obi_veto_log_at: StdMutex<Option<Instant>>,
     /// Stop-loss circuit breaker: SL exits per condition_id this process life.
     sl_counts: StdMutex<HashMap<String, u32>>,
     /// Model fair probability of the bought side at the moment the entry signal
@@ -143,6 +148,7 @@ impl FairValueGlobals {
             exit_cooldowns:   StdMutex::new(HashMap::new()),
             last_diag_log_at: StdMutex::new(None),
             last_entry_log_at: StdMutex::new(None),
+            last_obi_veto_log_at: StdMutex::new(None),
             sl_counts:        StdMutex::new(HashMap::new()),
             entry_fair:       StdMutex::new(HashMap::new()),
             fair_history:     StdMutex::new(HashMap::new()),
@@ -818,12 +824,24 @@ impl Strategy for FairValueStrategyImpl {
             dec!(-1)
         };
         if side_obi < dc.fairvalue_obi_adverse_block {
-            tracing::info!(
-                " FairValue OBI veto [{}]: {} OBI={:.3} < block {:.3} — book is offer-heavy, \
-                 an exit would give back more than the stop width",
-                market.market_name, if want_yes { "YES" } else { "NO" },
-                side_obi, dc.fairvalue_obi_adverse_block,
-            );
+            // Throttled: an offer-heavy book persists for minutes while this
+            // gate re-evaluates every 50ms tick. The idle() reason below is
+            // unthrottled, so the Control Tower still shows the live cause.
+            {
+                let mut last = globals(&ctx.crypto_filter).last_obi_veto_log_at.lock().unwrap();
+                let due = last.map_or(true, |t| {
+                    t.elapsed().as_secs() >= config::FAIRVALUE_ENTRY_LOG_THROTTLE_SECS
+                });
+                if due {
+                    *last = Some(Instant::now());
+                    tracing::info!(
+                        " FairValue OBI veto [{}]: {} OBI={:.3} < block {:.3} — book is offer-heavy, \
+                         an exit would give back more than the stop width",
+                        market.market_name, if want_yes { "YES" } else { "NO" },
+                        side_obi, dc.fairvalue_obi_adverse_block,
+                    );
+                }
+            }
             idle("OBI adverse — no bid support on the entry side");
             return Ok(StrategySignal::NoSignal);
         }
