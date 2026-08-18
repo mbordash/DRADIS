@@ -766,6 +766,34 @@ openclaw skills install dradis-tactical-command
 DRADIS_API_KEY=replace-with-a-strong-random-secret
 ```
 
+### MCP Server (Claude Desktop, Claude Code, any MCP client)
+
+Query your running deployment conversationally from any client that speaks the
+[Model Context Protocol](https://modelcontextprotocol.io) — 12 read-only tools
+covering positions, trades, P&L, raptor telemetry and the AI advisor audit trail.
+
+```bash
+cd integrations/mcp && npm install
+```
+
+| You ask                                      | Tool used            |
+|----------------------------------------------|----------------------|
+| *"Why isn't FairValue taking trades?"*       | `get_viper_status`   |
+| *"What's my drawdown this session?"*         | `get_pnl_history`    |
+| *"Which raptor feeds are offline?"*          | `get_raptor_telemetry` |
+| *"Show me every FairValue loss and its exit reason"* | `list_trades` |
+| *"Are there pending AI config proposals?"*   | `get_llm_actions`    |
+
+**It runs on your machine, not on the trading box.** The server speaks MCP over
+stdio to your client and HTTPS to your DRADIS API, so no new port is opened on
+the host holding your wallet keys and your API key never leaves your laptop.
+
+**Read-only by construction.** The server has no code path that issues a
+non-GET request, and pairing it with `DRADIS_READ_ONLY=true` makes the engine
+reject mutating methods in middleware as well. Configuration changes and order
+placement are deliberately not exposed — see `integrations/mcp/README.md` for
+setup and `ROADMAP.md` for why write-capable tools are gated behind future work.
+
 ---
 
 ## FAQ

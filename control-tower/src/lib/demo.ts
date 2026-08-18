@@ -28,3 +28,6 @@ export const DEMO_MODE = process.env.NEXT_PUBLIC_DEMO_MODE === 'true';
 
 /** Public repo URL surfaced in the demo banner. */
 export const REPO_URL = 'https://github.com/mbordash/DRADIS';
+
+export const HOME_URL = 'https://dradis.live';
+

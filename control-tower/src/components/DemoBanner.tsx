@@ -16,7 +16,7 @@
 // You should have received a copy of the GNU Affero General Public License along
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import { DEMO_MODE, REPO_URL } from '@/lib/demo';
+import { DEMO_MODE, REPO_URL, HOME_URL } from '@/lib/demo';
 
 /**
  * Persistent read-only demo banner.
@@ -44,7 +44,7 @@ export default function DemoBanner() {
           streams in real time, but no controls are active.
         </span>
         <a
-          href={REPO_URL}
+          href={HOME_URL}
           target="_blank"
           rel="noopener noreferrer"
           className="ml-1 inline-flex items-center gap-1 rounded border border-cyan-500/40 bg-cyan-500/10 px-2 py-0.5 font-semibold text-cyan-200 transition-colors hover:bg-cyan-500/20"

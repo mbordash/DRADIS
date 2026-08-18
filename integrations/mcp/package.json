@@ -1,0 +1,13 @@
+{
+  "name": "dradis-mcp",
+  "version": "0.1.0",
+  "description": "Read-only MCP server for a DRADIS deployment — query positions, trades, P&L, telemetry and raptor signals from any MCP client.",
+  "type": "module",
+  "bin": { "dradis-mcp": "./server.js" },
+  "files": ["server.js", "README.md"],
+  "engines": { "node": ">=20" },
+  "license": "AGPL-3.0-only",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.30.0"
+  }
+}

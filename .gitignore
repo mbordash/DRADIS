@@ -89,3 +89,11 @@ tools/dedupe-duplicate-settlements.sh
 # Private keys
 *.pem
 data/
+
+# Sonar study artifacts (tools/sonar_backtest.py) — bulky API caches, not source
+tools/.sonar_cache/
+tools/__pycache__/
+
+# MCP integration (integrations/mcp) — installed locally by the operator
+integrations/mcp/node_modules/
+integrations/mcp/package-lock.json
