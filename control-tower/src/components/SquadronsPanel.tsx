@@ -19,7 +19,7 @@
 import { useState } from 'react';
 import useSWR from 'swr';
 import type { SquadronSummary, SquadronState } from '@/lib/types';
-import { getOpenPositions } from '@/lib/api';
+import { getOpenPositions, getVipersForClass } from '@/lib/api';
 import DeploySquadronModal from './DeploySquadronModal';
 
 // ── State badge ───────────────────────────────────────────────────────────────
@@ -73,6 +73,53 @@ function timeAgo(iso: string): string {
 
 // ── Squadron row ──────────────────────────────────────────────────────────────
 
+/**
+ * Viper coverage for a squadron's market class.
+ *
+ * Only crypto markets get the full nine strategies; sports, politics and the
+ * `unknown` fallback are mapped to arbitrage + maker only (see the
+ * market_class_viper seeding in helpers/db.rs). That is a market-class limit
+ * rather than a venue one — it applies identically on Polymarket and Kalshi —
+ * and it is invisible today: a customer on a sports market sees seven strategies
+ * sit idle with no explanation. This surfaces it on the card.
+ *
+ * The denominator is read from the crypto class rather than hardcoded to 9, so
+ * adding a tenth viper updates this automatically.
+ */
+function ViperCoverage({ marketClass }: { marketClass: string }) {
+  const { data: mine } = useSWR(
+    ['vipers-for-class', marketClass],
+    () => getVipersForClass(marketClass as never),
+    { revalidateOnFocus: false },
+  );
+  const { data: full } = useSWR(
+    ['vipers-for-class', 'crypto'],
+    () => getVipersForClass('crypto' as never),
+    { revalidateOnFocus: false },
+  );
+  if (!mine || !full || full.length === 0) return null;
+
+  const partial = mine.length < full.length;
+  return (
+    <span
+      className={`text-[10px] font-mono rounded px-2 py-0.5 border ${
+        partial
+          ? 'bg-amber-500/10 text-amber-300 border-amber-500/25'
+          : 'bg-emerald-500/10 text-emerald-300 border-emerald-500/20'
+      }`}
+      title={
+        partial
+          ? `${mine.length} of ${full.length} strategies apply to ${marketClass} markets: ` +
+            `${mine.map(v => v.display).join(', ')}. The rest need a per-market price ` +
+            `signal that only crypto markets provide.`
+          : `All ${full.length} strategies apply to ${marketClass} markets.`
+      }
+    >
+      {mine.length}/{full.length} vipers
+    </span>
+  );
+}
+
 function SquadronRow({
   sq,
   onClick,
@@ -113,6 +160,7 @@ function SquadronRow({
             {sq.market_class}
           </span>
         )}
+        {sq.market_class && <ViperCoverage marketClass={sq.market_class} />}
         {missionCount !== undefined && missionCount > 0 && (
           <span className="text-[10px] font-mono bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 rounded px-2 py-0.5" title={`${missionCount} active mission${missionCount === 1 ? '' : 's'}`}>
             ✈️ {missionCount}
