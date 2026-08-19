@@ -89,6 +89,10 @@ export interface DynamicConfig {
   momentum_take_profit_ceiling:  string;
   momentum_catastrophic_sl_pct:  string;
   momentum_min_secs_to_expiry_for_entry: number;
+  momentum_obi_exhaust_max_adverse_pct:  string;
+  momentum_obi_exhaust_min_hold_secs:    number;
+  momentum_obi_exhaust_persist_secs:     number;
+  momentum_tp_fee_margin_mult:           string;
 
   // Maker Viper
   maker_max_entry_price:   string;

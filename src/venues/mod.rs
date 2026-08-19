@@ -21,6 +21,43 @@
 
 pub mod core;
 
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+
+/// Round-trip taker cost, expressed as a fraction of the entry notional.
+///
+/// Both quadratic-fee venues (Polymarket intl, Kalshi) charge `rate × p × (1 − p)`
+/// per share on **each** leg of a round trip. Approximating the exit price by the
+/// entry price — which is where it sits at the moment a profit target is being
+/// set — the round trip costs `2 × rate × p × (1 − p)` per share against an entry
+/// notional of `p` per share, i.e. **`2 × rate × (1 − p)`** of notional.
+///
+/// The price dependence is the point: at `p = $0.20` the round trip eats 11.2% of
+/// notional, at `p = $0.80` only 2.8%. Any strategy holding a *flat* percentage
+/// take-profit target is therefore below break-even across part of its permitted
+/// entry range, and silently so — the trade closes "at target" and still loses
+/// money. Callers should floor their target against this.
+///
+/// US Retail charges no taker fee (`yes_fee_bps: 0` throughout), so this is zero
+/// there and the floor becomes inert rather than wrong.
+pub fn round_trip_fee_pct(entry_price: Decimal) -> Decimal {
+    if entry_price <= Decimal::ZERO || entry_price >= Decimal::ONE { return Decimal::ZERO; }
+    dec!(2) * taker_fee_rate() * (Decimal::ONE - entry_price)
+}
+
+/// The venue's quadratic taker-fee coefficient.
+#[cfg(feature = "intl_clob")]
+fn taker_fee_rate() -> Decimal { crate::venues::intl::live_taker_fee_rate() }
+
+/// Kalshi quotes the same quadratic schedule as a per-contract ceiling of 1.75¢ at
+/// P=0.5 (`KALSHI_FEE_BPS`), which is exactly `rate/4` — so the coefficient is 0.07.
+#[cfg(feature = "kalshi")]
+fn taker_fee_rate() -> Decimal { dec!(0.07) }
+
+/// US Retail takes no taker fee.
+#[cfg(feature = "us_retail")]
+fn taker_fee_rate() -> Decimal { Decimal::ZERO }
+
 /// Venue-neutral order lifecycle engine (Option C). Compiled for every venue;
 /// US drives it today, intl migrates onto it next.
 pub mod lifecycle;

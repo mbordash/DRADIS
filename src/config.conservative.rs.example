@@ -171,6 +171,16 @@ pub const MOMENTUM_EXPIRY_EXIT_SECS: i64 = 1200;
 pub const MOMENTUM_EXPIRY_MIN_PROFIT_TO_HOLD: Decimal = dec!(0.03);
 pub const MOMENTUM_TAKE_PROFIT_CEILING: Decimal = dec!(0.90);
 
+/// Multiple of the round-trip taker fee that the Momentum take-profit target must
+/// clear. Venue fees are entry-price dependent — on Polymarket intl the round trip
+/// costs 2 x rate x (1 - entry) of notional, so a $0.20 entry burns 11.2% while a
+/// $0.80 entry burns only 2.8%. A flat percentage target is therefore below break-even
+/// across part of the permitted entry range (at TP=6% every entry under $0.571 is a
+/// guaranteed net loss). The effective target is raised to this multiple of the
+/// computed fee whenever the configured target would not clear it.
+/// Conservative: 1.50 — take-profit must beat fees by half again.
+pub const MOMENTUM_TP_FEE_MARGIN_MULT: Decimal = dec!(1.50);
+
 /// Tighter strike buffers — only trade when well away from the strike.
 /// 0.001 = 0.10% of price. Conservative: 0.001 at BTC=$100k → $100.
 pub const STRIKE_BUFFER_PCT: Decimal = dec!(0.001);
@@ -179,7 +189,7 @@ pub const STRIKE_BUFFER_PCT: Decimal = dec!(0.001);
 pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.50);
 pub const MAX_MOMENTUM_CROSSING_ENTRY_PRICE: Decimal = dec!(0.52);
 pub const MOMENTUM_MIN_ENTRY_PRICE: Decimal = dec!(0.20); // Conservative: 20-80% probability range only
-pub const MOMENTUM_CATASTROPHIC_SL_PCT: Decimal = dec!(0.06); // Conservative: tight 6% catastrophic SL
+pub const MOMENTUM_CATASTROPHIC_SL_PCT: Decimal = dec!(0.15); // Conservative: 1.5x the 10% stop-loss — a true last-resort floor
 
 pub const MOMENTUM_WINDOW_SECS: u64 = 5;
 pub const MOMENTUM_SHORT_WINDOW_SECS: u64 = 1;
@@ -207,7 +217,27 @@ pub const MOMENTUM_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.20);
 /// Conservative: 0.70 — tightest gate; mirrors GBOOST_OBI_EXHAUSTION_BLOCK conservative setting.
 pub const MOMENTUM_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.70);
 
-pub const MOMENTUM_OBI_EXHAUST_MAX_ADVERSE_PCT: Decimal = dec!(-0.08);
+/// Deepest drawdown at which the in-position OBI-exhaustion exit may still fire.
+/// Past this the position is already wrecked and the (catastrophic) stop-loss owns it,
+/// so the early-reversal exit stands down. Conservative: -0.15 = 1.5x the 10% stop-loss.
+pub const MOMENTUM_OBI_EXHAUST_MAX_ADVERSE_PCT: Decimal = dec!(-0.15);
+
+/// Minimum seconds a Momentum position must be held before the in-position
+/// OBI-exhaustion exit may fire. Without this the exit triggers on the first tick
+/// after fill confirmation, when the position is underwater by the bid/ask spread
+/// alone (2026-08-19 10:55 ET: entered $0.43, exited $0.40 five seconds later on a
+/// -6.97% "loss" that was pure spread; the token went on to $0.95).
+/// Mirrors MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL — OBI exhaustion is a reversal signal.
+pub const MOMENTUM_OBI_EXHAUST_MIN_HOLD_SECS: i64 = 60;
+
+/// How long the book must read exhausted, continuously, before the OBI exit fires.
+/// Single-sample OBI on the hourly book is noise: the 2026-08-19 10:00-11:15 ET
+/// heartbeats swing +0.95 -> -0.80 -> +0.93 -> -0.93 minute to minute, crossing the
+/// 0.70 threshold constantly. Expressed in seconds rather than ticks deliberately —
+/// the patrol loop runs at 75ms, so any tick count small enough to look reasonable
+/// (3, 5, 10) is a quarter-second and filters nothing. Any non-exhausted reading
+/// resets the clock. Conservative: 20s — slowest, most confirmation.
+pub const MOMENTUM_OBI_EXHAUST_PERSIST_SECS: i64 = 20;
 
 /// Maximum OBI swing allowed at Momentum entry.
 /// Conservative: 0.65 — strictest gate; blocks any significant book-side oscillation.

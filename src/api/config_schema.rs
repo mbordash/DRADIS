@@ -211,6 +211,14 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Distance from neutral CVD ratio 1.0 that blocks the contradicted direction (0.15 ⇒ ≤0.85 blocks bulls, ≥1.15 blocks bears).").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "momentum_deriv_oi_unwind_block", "Deriv OI Unwind Block", "decimal", true,
             "OI delta at/below which hard de-leveraging blocks BOTH directions (−0.05 = −5% per poll).").range(-1.0, 0.0).step(0.01));
+        v.push(F::new(g, e, "momentum_obi_exhaust_min_hold_secs", "OBI Exhaust Min Hold", "secs", true,
+            "Minimum hold before the in-position OBI-exhaustion exit may fire. A fresh fill is underwater by the bid/ask spread alone, so exiting on tick one books the spread as a loss — this is the floor that prevents it.").min(0.0).step(5.0).unit("s"));
+        v.push(F::new(g, e, "momentum_obi_exhaust_persist_secs", "OBI Exhaust Persistence", "secs", true,
+            "How long the book must read exhausted, continuously, before the OBI exit fires. Single-sample OBI on the hourly book swings across the threshold constantly, so a momentary spike must not arm the exit; any normal reading resets the clock. Seconds rather than ticks because the patrol loop runs at 75ms.").range(0.0, 120.0).step(1.0).unit("s"));
+        v.push(F::new(g, e, "momentum_obi_exhaust_max_adverse_pct", "OBI Exhaust Max Adverse", "pct", true,
+            "Deepest drawdown at which the OBI-exhaustion exit may still fire (negative). Past this the position is already wrecked and the stop-loss owns it. Keep it beyond the stop loss or the early exit can never fire.").range(-1.0, 0.0).step(0.01));
+        v.push(F::new(g, e, "momentum_tp_fee_margin_mult", "TP Fee Margin", "decimal", true,
+            "Multiple of the round-trip taker fee the take-profit must clear. Venue fees scale with entry price (2 × rate × (1 − entry) of notional), so a flat percentage target sits below break-even on cheap entries; the effective target is lifted to this multiple of the fee whenever it would not clear.").range(1.0, 3.0).step(0.05));
     }
 
     // ── Maker ─────────────────────────────────────────────────────────────────

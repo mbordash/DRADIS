@@ -226,6 +226,10 @@ fn default_momentum_obi_exhaustion_block()  -> Decimal { config::MOMENTUM_OBI_EX
 fn default_momentum_take_profit_ceiling()   -> Decimal { config::MOMENTUM_TAKE_PROFIT_CEILING          }
 fn default_momentum_catastrophic_sl_pct()   -> Decimal { config::MOMENTUM_CATASTROPHIC_SL_PCT          }
 fn default_momentum_min_secs_to_expiry_for_entry() -> i64 { config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY }
+fn default_momentum_obi_exhaust_max_adverse_pct() -> Decimal { config::MOMENTUM_OBI_EXHAUST_MAX_ADVERSE_PCT }
+fn default_momentum_obi_exhaust_min_hold_secs()   -> i64     { config::MOMENTUM_OBI_EXHAUST_MIN_HOLD_SECS   }
+fn default_momentum_obi_exhaust_persist_secs()    -> i64     { config::MOMENTUM_OBI_EXHAUST_PERSIST_SECS    }
+fn default_momentum_tp_fee_margin_mult()          -> Decimal { config::MOMENTUM_TP_FEE_MARGIN_MULT          }
 
 fn default_time_decay_max_fast_velocity_pct()      -> Decimal { config::TIME_DECAY_MAX_FAST_VELOCITY_PCT      }
 fn default_time_decay_max_slow_drift_pct()         -> Decimal { config::TIME_DECAY_MAX_SLOW_DRIFT_PCT         }
@@ -384,6 +388,21 @@ pub struct DynamicConfig {
     pub momentum_catastrophic_sl_pct:  Decimal,
     #[serde(default = "default_momentum_min_secs_to_expiry_for_entry")]
     pub momentum_min_secs_to_expiry_for_entry: i64,
+    /// Deepest drawdown at which the in-position OBI-exhaustion exit may still fire.
+    /// Beyond it the (catastrophic) stop-loss owns the position instead.
+    #[serde(default = "default_momentum_obi_exhaust_max_adverse_pct")]
+    pub momentum_obi_exhaust_max_adverse_pct: Decimal,
+    /// Minimum hold before the OBI-exhaustion exit is allowed to fire. Guards against
+    /// exiting on tick one, when the position is underwater by the spread alone.
+    #[serde(default = "default_momentum_obi_exhaust_min_hold_secs")]
+    pub momentum_obi_exhaust_min_hold_secs: i64,
+    /// How long the book must read exhausted, continuously, before the OBI exit
+    /// fires. Seconds rather than ticks: the patrol loop runs at 75ms.
+    #[serde(default = "default_momentum_obi_exhaust_persist_secs")]
+    pub momentum_obi_exhaust_persist_secs: i64,
+    /// Multiple of the round-trip taker fee the take-profit target must clear.
+    #[serde(default = "default_momentum_tp_fee_margin_mult")]
+    pub momentum_tp_fee_margin_mult: Decimal,
 
     // ── Maker Viper ───────────────────────────────────────────────────────────
     pub maker_max_entry_price:    Decimal,
@@ -747,6 +766,10 @@ impl Default for DynamicConfig {
             momentum_take_profit_ceiling:  config::MOMENTUM_TAKE_PROFIT_CEILING,
             momentum_catastrophic_sl_pct:  config::MOMENTUM_CATASTROPHIC_SL_PCT,
             momentum_min_secs_to_expiry_for_entry: config::MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY,
+            momentum_obi_exhaust_max_adverse_pct: config::MOMENTUM_OBI_EXHAUST_MAX_ADVERSE_PCT,
+            momentum_obi_exhaust_min_hold_secs:   config::MOMENTUM_OBI_EXHAUST_MIN_HOLD_SECS,
+            momentum_obi_exhaust_persist_secs:    config::MOMENTUM_OBI_EXHAUST_PERSIST_SECS,
+            momentum_tp_fee_margin_mult:          config::MOMENTUM_TP_FEE_MARGIN_MULT,
 
             maker_max_entry_price:    config::MAKER_MAX_ENTRY_PRICE,
             maker_min_entry_price:    config::MAKER_MIN_ENTRY_PRICE,

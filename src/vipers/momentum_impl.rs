@@ -25,13 +25,14 @@ use anyhow::Result;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use tracing::debug;
+use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
 use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
-use crate::venues::core::TimeInForce;
+use crate::venues::core::{MarketId, TimeInForce};
 
 /// Stateful Momentum strategy implementation.
 ///
@@ -39,9 +40,18 @@ use crate::venues::core::TimeInForce;
 /// the OBI-swing gate can detect sudden book-flip events between consecutive evaluations.
 /// Uses `std::sync::Mutex` (non-async) because the values are read/written atomically
 /// without any await points between lock acquisition and release.
+///
+/// `obi_exhaust_since` records, per held token, when the book *began* its current
+/// unbroken run of reading exhausted. It is cleared the instant the book reads
+/// normal again, so only a flip that persists for
+/// `momentum_obi_exhaust_persist_secs` can arm the OBI exit — a single spike
+/// cannot. Wall-clock rather than a tick count: the patrol loop runs at 75ms, so
+/// any tick threshold small enough to look reasonable filters nothing. See the
+/// exhaustion block in `evaluate_exit` for why this matters.
 pub struct MomentumStrategyImpl {
     prev_yes_obi: Mutex<Decimal>,
     prev_no_obi:  Mutex<Decimal>,
+    obi_exhaust_since: Mutex<HashMap<MarketId, chrono::DateTime<chrono::Utc>>>,
 }
 
 impl MomentumStrategyImpl {
@@ -49,6 +59,7 @@ impl MomentumStrategyImpl {
         Self {
             prev_yes_obi: Mutex::new(dec!(0)),
             prev_no_obi:  Mutex::new(dec!(0)),
+            obi_exhaust_since: Mutex::new(HashMap::new()),
         }
     }
 }
@@ -459,6 +470,18 @@ impl Strategy for MomentumStrategyImpl {
         let dc = &ctx.dynamic_config;
         let pos_map = ctx.positions.lock().await;
 
+        // Drop OBI-exhaustion clocks for tokens we no longer hold, so a closed
+        // position cannot leave a primed timer behind for the next entry on the
+        // same token. Cheap: the map only ever holds tokens Momentum is long.
+        {
+            let mut clocks = self.obi_exhaust_since.lock().unwrap();
+            if !clocks.is_empty() {
+                clocks.retain(|tok, _| {
+                    pos_map.contains_key(&("MomentumStrategy".to_string(), tok.clone()))
+                });
+            }
+        }
+
         for ((strategy_name, token_id), position) in pos_map.iter() {
             if strategy_name != "MomentumStrategy" { continue; }
             // Slice 2b: position keys are neutral MarketId throughout (no U256).
@@ -469,15 +492,19 @@ impl Strategy for MomentumStrategyImpl {
             // Skipping maker-market tokens caused reconciled positions to never hit
             // stop-loss evaluation, producing uncontrolled losses (e.g. -$5.38 on a
             // BasisStrategy position wrongly re-attributed to MomentumStrategy).
-            let bid = if tok == ctx.market.yes_token {
-                ctx.snapshot.yes_bid
+            // `ask` is carried alongside `bid` so exits that ask "has this position
+            // actually moved against us?" can mark against mid rather than bid. A
+            // position marked at bid the instant it fills is underwater by the full
+            // spread with no price having moved at all.
+            let (bid, ask) = if tok == ctx.market.yes_token {
+                (ctx.snapshot.yes_bid, ctx.snapshot.yes_ask)
             } else if tok == ctx.market.no_token {
-                ctx.snapshot.no_bid
+                (ctx.snapshot.no_bid, ctx.snapshot.no_ask)
             } else if let (Some(mk), Some(mk_snap)) = (&ctx.maker_market, &ctx.maker_snapshot) {
                 if tok == mk.yes_token {
-                    mk_snap.yes_bid
+                    (mk_snap.yes_bid, mk_snap.yes_ask)
                 } else if tok == mk.no_token {
-                    mk_snap.no_bid
+                    (mk_snap.no_bid, mk_snap.no_ask)
                 } else {
                     continue
                 }
@@ -486,6 +513,16 @@ impl Strategy for MomentumStrategyImpl {
             };
 
             let secs_held = (chrono::Utc::now() - position.opened_at).num_seconds();
+
+            // A "catastrophic" stop that is TIGHTER than the normal stop is not an
+            // emergency floor, it is a stricter stop that fires first — and it fires
+            // during the fill-confirmation window, when the position is underwater by
+            // the spread alone. Balanced shipped 0.06 catastrophic against a 0.11 stop,
+            // so a 7%-spread entry cleared the "catastrophic" bar on tick one of every
+            // trade. The templates now ladder it above the stop; this floor makes the
+            // invariant hold for any value an operator can dial in from Control Tower.
+            let catastrophic_sl_pct = dc.momentum_catastrophic_sl_pct.max(dc.momentum_stop_loss_pct);
+
             if position.fill_confirmed_at.is_none() {
                 let profit_margin_check = (bid - position.avg_entry) / position.avg_entry;
                 if secs_held < config::MOMENTUM_FILL_CONFIRM_MIN_HOLD_SECS {
@@ -495,7 +532,7 @@ impl Strategy for MomentumStrategyImpl {
                     // the Polymarket indexer to register the balance.
                     // Root cause: 2026-05-13 Trade #3 lost -14% during a 30s lock with
                     // no exit allowed; a catastrophic SL at 8% would have exited at ~5s.
-                    if profit_margin_check > -dc.momentum_catastrophic_sl_pct {
+                    if profit_margin_check > -catastrophic_sl_pct {
                         continue; // Not catastrophic yet — wait for fill confirmation
                     }
                     // Fall through: loss > catastrophic threshold → allow exit below
@@ -557,7 +594,25 @@ impl Strategy for MomentumStrategyImpl {
                 }
             }
 
-            let target = if avg_entry >= dec!(0.70) { dec!(0.05) } else { dc.momentum_target_profit_pct };
+            // Take-profit target, floored so it actually clears the round trip.
+            //
+            // Venue fees are entry-price dependent: `2 × rate × (1 − entry)` of
+            // notional (see `venues::round_trip_fee_pct`). A flat percentage target
+            // is therefore below break-even over part of the permitted entry range —
+            // with the balanced 10% target every entry under $0.286 books a "profit"
+            // that is a net loss, and the conservative 6% target does so under $0.571,
+            // i.e. across almost its whole $0.20–$0.50 entry band. Raising the target
+            // to a margin above the fee makes MomentumTP mean what it says; it also
+            // simply never binds on venues that charge no taker fee.
+            let fee_floor = crate::venues::round_trip_fee_pct(avg_entry)
+                * dc.momentum_tp_fee_margin_mult;
+            let base_target = if avg_entry >= dec!(0.70) { dec!(0.05) } else { dc.momentum_target_profit_pct };
+            let target = base_target.max(fee_floor);
+            if target > base_target {
+                debug!("Momentum TP floor: target {:.2}% → {:.2}% (round-trip fee {:.2}% at entry ${:.4})",
+                       base_target * dec!(100), target * dec!(100),
+                       crate::venues::round_trip_fee_pct(avg_entry) * dec!(100), avg_entry);
+            }
             let stop_loss = -dc.momentum_stop_loss_pct;
             let reversal_threshold = -(threshold * config::MOMENTUM_REVERSAL_RATIO);
 
@@ -600,19 +655,39 @@ impl Strategy for MomentumStrategyImpl {
             // OBI exhaustion in-position exit
             //
             // When the book flips to exhaustion AFTER we enter (OBI > exhaustion_block
-            // for a YES position, or < −exhaustion_block for a NO position) it means
-            // all buyers have accumulated and a selling reversal is imminent.  If we
-            // are at or below breakeven, exit immediately rather than wait for the
-            // full stop-loss to hit.
+            // for a YES position, or for the NO book on a NO position) it can mean all
+            // buyers have accumulated and a selling reversal is imminent. If we are at
+            // or below breakeven, exit rather than wait for the full stop-loss.
             //
             // Root cause of 2026-06-01 13:39 loss: entry at $0.49 avg, 14 s later
             // OBI_Y=0.85 (above exhaustion=0.70) at bid=$0.48 (−4%), but no exit
             // path existed for this scenario.  The SL eventually fired at −8%
             // ($0.06 worse than the OBI-detected reversal signal).
             //
-            // Gate: only fires after fill_confirmed_at to avoid false exits during
-            // the 30s indexer-settle window.
-            if position.fill_confirmed_at.is_some() && profit_margin <= dec!(0) {
+            // Three guards, all added after 2026-08-19 10:55 ET, where this branch
+            // took its first-ever fire and produced the day's only loss: it bought YES
+            // @ $0.43 and sold @ $0.40 **five seconds later**, calling −6.97% a loss
+            // when the entire move was the bid/ask spread. BTC then ran $65,767 →
+            // $66,632 and that token went to $0.95; FairValue bought the same token at
+            // the same $0.43 seventy-one seconds later and booked +20.9%. The read was
+            // right and the exit threw it away.
+            //
+            //   1. Min hold. Every other exit here has one — SL waits 120 s, Reversal
+            //      45 s — but this branch fired on the first tick after fill
+            //      confirmation. OBI exhaustion IS a reversal signal, so it now waits
+            //      the same as Reversal.
+            //   2. Mark at mid, not bid. `profit_margin <= 0` measured at bid is true
+            //      by construction for a fresh taker fill: buy at ask, mark at bid, and
+            //      the position is "down" by the spread before any price has moved.
+            //      Marking at mid asks whether the *market* moved against us.
+            //   3. Persistence. Single-sample OBI on this book is noise — the
+            //      2026-08-19 10:00–11:15 ET heartbeats read +0.95, −0.80, +0.93,
+            //      −0.93, −0.88 on consecutive minutes, crossing ±0.70 constantly. The
+            //      book must now read exhausted continuously for
+            //      `momentum_obi_exhaust_persist_secs`, and any normal reading resets
+            //      the clock. Measured in wall-clock, not ticks: the patrol loop runs
+            //      at 75ms, so a "3 tick" filter would be a quarter-second.
+            if position.fill_confirmed_at.is_some() {
                 let yes_total_depth = ctx.snapshot.yes_bid_depth + ctx.snapshot.yes_ask_depth;
                 let no_total_depth  = ctx.snapshot.no_bid_depth  + ctx.snapshot.no_ask_depth;
                 let yes_obi = if yes_total_depth > dec!(0) {
@@ -622,11 +697,38 @@ impl Strategy for MomentumStrategyImpl {
                     (ctx.snapshot.no_bid_depth - ctx.snapshot.no_ask_depth) / no_total_depth
                 } else { dec!(-1.0) };
 
-                let obi_exhausted_in_pos =
+                let obi_exhausted_now =
                     (is_yes  && yes_obi > dc.momentum_obi_exhaustion_block) ||
                         (!is_yes && no_obi  > dc.momentum_obi_exhaustion_block);
 
-                if obi_exhausted_in_pos {
+                // Guard 3: start or clear this token's exhaustion clock. Done on every
+                // tick regardless of the other guards, so the elapsed time reflects the
+                // book rather than how long we happened to be eligible to act on it.
+                let now = chrono::Utc::now();
+                let exhausted_for_secs = {
+                    let mut m = self.obi_exhaust_since.lock().unwrap();
+                    if obi_exhausted_now {
+                        let since = *m.entry(tok.clone()).or_insert(now);
+                        (now - since).num_seconds()
+                    } else {
+                        m.remove(&tok);
+                        -1
+                    }
+                };
+
+                // Guard 2: mark against mid so the spread is not read as an adverse move.
+                // Falls back to bid if the book is crossed or the ask is missing.
+                let mark = if ask > bid { (bid + ask) / dec!(2) } else { bid };
+                let mid_margin = (mark - avg_entry) / avg_entry;
+
+                // Guard 1: the same hold floor the Reversal exit uses.
+                let held_long_enough = secs_held >= dc.momentum_obi_exhaust_min_hold_secs;
+
+                if obi_exhausted_now
+                    && held_long_enough
+                    && exhausted_for_secs >= dc.momentum_obi_exhaust_persist_secs
+                    && mid_margin <= dec!(0)
+                {
                     // ── Max adverse move guard for OBI exhaustion exit ─────────────────────
                     // OBIExhaust is intended as an *early* reversal detector (exit before
                     // hitting the normal stop-loss). Without this guard, a late OBI spike
@@ -634,22 +736,24 @@ impl Strategy for MomentumStrategyImpl {
                     // still trigger an exit — turning the mechanism into a "we're already
                     // wrecked" exit rather than a protective early one.
                     //
-                    // We allow the OBI exit only if the position is not too far underwater.
-                    // Using 1.6× the configured stop-loss gives a small buffer past normal
-                    // SL while still protecting against deep late-signal losses.
-                    let max_adverse_for_obi_exit = config::MOMENTUM_OBI_EXHAUST_MAX_ADVERSE_PCT;
-
-                    if profit_margin >= max_adverse_for_obi_exit {
+                    // Below this floor the position belongs to the stop-loss instead. The
+                    // bound is now a Control Tower knob laddered above the stop loss; it
+                    // shipped hardcoded at −8% against an 11% stop, which left the early
+                    // exit live only in a band the spread alone could put a fresh fill into.
+                    if mid_margin >= dc.momentum_obi_exhaust_max_adverse_pct {
                         let obi_val = if is_yes { yes_obi } else { no_obi };
                         let reason = format!(
-                            "MomentumOBIExhaust: bid=${:.4}, obi={:.3}, profit={:.2}%",
-                            bid, obi_val, profit_margin * dec!(100)
+                            "MomentumOBIExhaust: bid=${:.4}, obi={:.3}, exhausted={}s, held={}s, mid_profit={:.2}%",
+                            bid, obi_val, exhausted_for_secs, secs_held, mid_margin * dec!(100)
                         );
                         return Ok(StrategySignal::Exit { params: exit_params!(), reason, exit_pair: false });
                     }
                     // If we reach here: OBI is exhausted but we're already deep underwater.
                     // Let the normal stop-loss (or catastrophic SL) handle it instead.
                 }
+            } else {
+                // Not yet fill-confirmed — keep no stale clock for this token.
+                self.obi_exhaust_since.lock().unwrap().remove(&tok);
             }
         }
         Ok(StrategySignal::NoSignal)
@@ -679,4 +783,103 @@ pub fn kelly_momentum_size(
     let fraction = (strength - rust_decimal::Decimal::ONE)
         / (config::MOMENTUM_KELLY_MAX_MULTIPLIER - rust_decimal::Decimal::ONE);
     min_size + fraction * (max_size - min_size)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::helpers::dynamic_config::DynamicConfig;
+
+    /// The take-profit target must clear the round trip it has to pay for.
+    ///
+    /// Venue fees are entry-price dependent — `2 × rate × (1 − entry)` of notional —
+    /// so a flat percentage target is below break-even on cheap entries. With the
+    /// balanced 10% target every entry under $0.286 books a "profit" that is really a
+    /// net loss; the conservative 6% target does so under $0.571, i.e. across almost
+    /// the whole of its own $0.20–$0.50 permitted entry band. The floor in
+    /// `evaluate_exit` exists to stop MomentumTP meaning "we lost money on plan".
+    #[test]
+    fn take_profit_target_clears_round_trip_fees_across_entry_range() {
+        let dc = DynamicConfig::default();
+        // Walk the permitted entry band in 1¢ steps.
+        let mut price = dc.momentum_min_entry_price;
+        while price <= dc.momentum_max_entry_price {
+            let fee = crate::venues::round_trip_fee_pct(price);
+            let base = if price >= dec!(0.70) { dec!(0.05) } else { dc.momentum_target_profit_pct };
+            let effective = base.max(fee * dc.momentum_tp_fee_margin_mult);
+            assert!(
+                effective > fee,
+                "entry ${price}: effective TP {effective} does not clear round-trip fee {fee}",
+            );
+            price += dec!(0.01);
+        }
+    }
+
+    /// A "catastrophic" stop tighter than the normal stop is not an emergency floor,
+    /// it is a stricter stop that fires first — and it fires inside the
+    /// fill-confirmation window, where a fresh taker fill is underwater by the spread
+    /// alone. All three profiles shipped inverted (balanced: 0.06 catastrophic against
+    /// a 0.11 stop), so a 7%-spread entry cleared the "catastrophic" bar on tick one.
+    #[test]
+    fn catastrophic_stop_is_never_tighter_than_the_normal_stop() {
+        let dc = DynamicConfig::default();
+        assert!(
+            dc.momentum_catastrophic_sl_pct >= dc.momentum_stop_loss_pct,
+            "catastrophic SL {} is tighter than stop loss {}",
+            dc.momentum_catastrophic_sl_pct, dc.momentum_stop_loss_pct,
+        );
+    }
+
+    /// The OBI-exhaustion exit is an *early* reversal detector: it only earns its keep
+    /// if it can fire before the stop-loss would. Its max-adverse bound must therefore
+    /// sit beyond the stop, or the branch is dead code. It shipped at −8% against an
+    /// 11% stop, leaving it live only in a band the spread alone could put a fresh
+    /// fill into — which is exactly how it fired 5s into the 2026-08-19 10:55 ET trade.
+    #[test]
+    fn obi_exhaust_window_extends_past_the_stop_loss() {
+        let dc = DynamicConfig::default();
+        assert!(
+            dc.momentum_obi_exhaust_max_adverse_pct < -dc.momentum_stop_loss_pct,
+            "OBI exhaust floor {} does not reach past stop loss {}",
+            dc.momentum_obi_exhaust_max_adverse_pct, dc.momentum_stop_loss_pct,
+        );
+    }
+
+    /// Every other Momentum exit waits before it may fire; this one did not, and
+    /// closed a correct position five seconds after entry on a loss that was entirely
+    /// bid/ask spread. OBI exhaustion is a reversal signal, so it must wait at least
+    /// as long as the fill-confirmation window it was previously escaping.
+    #[test]
+    fn obi_exhaust_waits_for_fill_settle_before_firing() {
+        let dc = DynamicConfig::default();
+        assert!(
+            dc.momentum_obi_exhaust_min_hold_secs >= config::MOMENTUM_FILL_CONFIRM_MIN_HOLD_SECS,
+            "OBI exhaust min hold {}s is inside the {}s fill-confirmation window",
+            dc.momentum_obi_exhaust_min_hold_secs, config::MOMENTUM_FILL_CONFIRM_MIN_HOLD_SECS,
+        );
+        assert!(
+            dc.momentum_obi_exhaust_persist_secs > 0,
+            "a single OBI sample must not arm the exit",
+        );
+        // Persistence has to fit inside the hold floor, or it can never be the
+        // binding constraint and the noise filter is decorative.
+        assert!(
+            dc.momentum_obi_exhaust_persist_secs < dc.momentum_obi_exhaust_min_hold_secs,
+            "persistence window {}s does not fit inside the {}s hold floor",
+            dc.momentum_obi_exhaust_persist_secs, dc.momentum_obi_exhaust_min_hold_secs,
+        );
+    }
+
+    /// Round-trip fee is steeply price-dependent — the whole reason a flat target
+    /// fails. Pins the shape so a venue-fee refactor cannot quietly flatten it.
+    #[test]
+    fn round_trip_fee_falls_as_entry_price_rises() {
+        let cheap = crate::venues::round_trip_fee_pct(dec!(0.20));
+        let mid   = crate::venues::round_trip_fee_pct(dec!(0.43));
+        let rich  = crate::venues::round_trip_fee_pct(dec!(0.80));
+        assert!(cheap > mid && mid > rich, "fee curve is not decreasing: {cheap} / {mid} / {rich}");
+        // Degenerate prices carry no fee rather than a negative one.
+        assert_eq!(crate::venues::round_trip_fee_pct(dec!(0)), Decimal::ZERO);
+        assert_eq!(crate::venues::round_trip_fee_pct(dec!(1)), Decimal::ZERO);
+    }
 }
