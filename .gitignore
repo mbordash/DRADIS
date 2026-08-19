@@ -97,3 +97,7 @@ tools/__pycache__/
 # MCP integration (integrations/mcp) — installed locally by the operator
 integrations/mcp/node_modules/
 integrations/mcp/package-lock.json
+tools/sonar_addresses.json
+tools/sonar_backtest.py
+tools/check-config-drift.sh
+tools/check-profile-ladder.py

@@ -792,7 +792,7 @@ the host holding your wallet keys and your API key never leaves your laptop.
 non-GET request, and pairing it with `DRADIS_READ_ONLY=true` makes the engine
 reject mutating methods in middleware as well. Configuration changes and order
 placement are deliberately not exposed — see `integrations/mcp/README.md` for
-setup and `ROADMAP.md` for why write-capable tools are gated behind future work.
+setup for why write-capable tools are gated behind future work.
 
 ---
 

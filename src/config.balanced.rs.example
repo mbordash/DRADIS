@@ -57,14 +57,14 @@ pub const ARB_QUOTE_PERSISTENCE_SECS: u64 = 3;
 
 /// Maximum allowable gap between our safe bid and the current ask on each arb leg.
 /// Adjusted from 0.05 to 0.03 to be more strict about liquidity.
-pub const ARBITRAGE_MAX_FILL_GAP: Decimal = dec!(0.03);
+pub const ARBITRAGE_MAX_FILL_GAP: Decimal = dec!(0.05);
 
 /// Maximum price allowed for either arb leg (YES bid OR NO bid).
 /// Balanced: 0.60 — requires both legs in the genuine-uncertainty band [0.40, 0.60].
 /// Root cause of the 2026-05-19 "10 YES / 40 NO" imbalance (YES=72¢, NO=27¢).
 pub const ARBITRAGE_MAX_LEG_PRICE: Decimal = dec!(0.60);
 /// Increased from 0.02 to 0.03 to give more buffer for FAK re-hedges.
-pub const ARB_FAK_REHEDGE_BUFFER: Decimal = dec!(0.03);
+pub const ARB_FAK_REHEDGE_BUFFER: Decimal = dec!(0.02);
 
 /// Seconds the orphan arbiter waits, after cancelling the missing leg's GTC,
 /// before re-reading its on-chain balance and committing to a repair.
@@ -105,7 +105,7 @@ pub const TOKEN_SOVEREIGNTY_DUST_NOTIONAL_USDC: Decimal = dec!(3.0);
 /// Guarantees profit_margin ≈ 33% on first tick → immediate TakeProfit exit at current market price.
 /// All profiles use the same value — reconciled positions should always exit promptly regardless of style.
 pub const RECONCILE_ADOPTED_ENTRY_DISCOUNT: Decimal = dec!(0.25);
-pub const MIN_LIQUIDITY_FILL_RATIO: Decimal = dec!(0.85);
+pub const MIN_LIQUIDITY_FILL_RATIO: Decimal = dec!(0.80);
 pub const BUY_PRICE_OFFSET: Decimal = dec!(0.01);
 
 // ── Fleet-wide risk controls (2026-06-29) ────────────────────────────────────
@@ -115,9 +115,9 @@ pub const ENABLE_KELLY_SIZING: bool = false;
 pub const ENTRY_MIN_SECS_TO_RESOLUTION: i64 = 900;
 /// Require exit-side bid depth ≥ position × this ratio (else stop gaps through).
 pub const ENTRY_MIN_EXIT_BID_DEPTH_RATIO: Decimal = dec!(1.0);
-pub const MOMENTUM_BUY_PRICE_OFFSET: Decimal = dec!(0.02);
+pub const MOMENTUM_BUY_PRICE_OFFSET: Decimal = dec!(0.03);
 pub const MOMENTUM_ENTRY_FAK_RETRIES: u32 = 2;
-pub const MAX_BUY_LIMIT_PRICE: Decimal = dec!(0.97);
+pub const MAX_BUY_LIMIT_PRICE: Decimal = dec!(0.99);
 pub const SELL_PRICE_OFFSET: Decimal = dec!(0.01);
 pub const MIN_SELL_LIMIT_PRICE: Decimal = dec!(0.01);
 
@@ -142,15 +142,15 @@ pub fn oracle_threshold(pct: Decimal, oracle_price: Decimal) -> Decimal {
 pub const ENABLE_MOMENTUM_TRADING: bool = true;
 
 pub const MOMENTUM_KELLY_MAX_MULTIPLIER: Decimal = dec!(3.0);
-pub const MOMENTUM_MIN_TRADE_SIZE_USDC: Decimal = dec!(4.0);
-pub const MOMENTUM_MAX_TRADE_SIZE_USDC: Decimal = dec!(15.0);
+pub const MOMENTUM_MIN_TRADE_SIZE_USDC: Decimal = dec!(5.0);
+pub const MOMENTUM_MAX_TRADE_SIZE_USDC: Decimal = dec!(25.0);
 
 pub const MOMENTUM_CONFIRMATION_TICKS: u32 = 3;
 
 pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.10);
-pub const MOMENTUM_STOP_LOSS_PERCENT: Decimal = dec!(0.15);
-pub const MOMENTUM_REVERSAL_RATIO: Decimal = dec!(0.85);
-pub const MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL: i64 = 35;
+pub const MOMENTUM_STOP_LOSS_PERCENT: Decimal = dec!(0.11);
+pub const MOMENTUM_REVERSAL_RATIO: Decimal = dec!(0.75);
+pub const MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL: i64 = 45;
 pub const MOMENTUM_FILL_CONFIRM_MIN_HOLD_SECS: i64 = 30;
 pub const MOMENTUM_MIN_HOLD_BEFORE_SL_SECS: i64 = 120;
 pub const LATE_MARKET_SIZE_THRESHOLD_SECS: i64 = 1800;
@@ -160,19 +160,19 @@ pub const MOMENTUM_TAKE_PROFIT_CEILING: Decimal = dec!(0.90);
 
 /// Strike buffer as fraction of oracle price.
 /// 0.0005 = 0.05% of price. Balanced: at BTC=$100k → $50.
-pub const STRIKE_BUFFER_PCT: Decimal = dec!(0.0005);
+pub const STRIKE_BUFFER_PCT: Decimal = dec!(0.0001);
 
-pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.85);
-pub const MAX_MOMENTUM_CROSSING_ENTRY_PRICE: Decimal = dec!(0.70);
-pub const MOMENTUM_MIN_ENTRY_PRICE: Decimal = dec!(0.18); // Balanced: 18-82% probability range
-pub const MOMENTUM_CATASTROPHIC_SL_PCT: Decimal = dec!(0.08); // Balanced: 8% catastrophic floor
+pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.60);
+pub const MAX_MOMENTUM_CROSSING_ENTRY_PRICE: Decimal = dec!(0.62);
+pub const MOMENTUM_MIN_ENTRY_PRICE: Decimal = dec!(0.20); // Balanced: 18-82% probability range
+pub const MOMENTUM_CATASTROPHIC_SL_PCT: Decimal = dec!(0.06); // Balanced: 8% catastrophic floor
 
 pub const MOMENTUM_WINDOW_SECS: u64 = 5;
 pub const MOMENTUM_SHORT_WINDOW_SECS: u64 = 1;
 pub const DRIFT_60M_MIN_WINDOW_SECS: u64 = 600;
-pub const MOMENTUM_SHORT_WINDOW_FRACTION: Decimal = dec!(0.60);
-pub const MOMENTUM_ACCELERATION_BYPASS_MULTIPLIER: Decimal = dec!(3.0);
-pub const MOMENTUM_DECAY_EXIT_FRACTION: Decimal = dec!(0.25);
+pub const MOMENTUM_SHORT_WINDOW_FRACTION: Decimal = dec!(0.65);
+pub const MOMENTUM_ACCELERATION_BYPASS_MULTIPLIER: Decimal = dec!(2.5);
+pub const MOMENTUM_DECAY_EXIT_FRACTION: Decimal = dec!(0.20);
 
 /// Velocity threshold as fraction of oracle price/5s.
 /// 0.001 = 0.10% of price. Balanced: at BTC=$100k → $100/5s.
@@ -186,7 +186,7 @@ pub const MOMENTUM_WINDOW_BEARISH_BLOCK: Decimal = dec!(0.30);
 pub const MOMENTUM_WINDOW_BULLISH_BLOCK: Decimal = dec!(0.70);
 
 /// OBI adverse veto: skip entries when the book is moderately stacked against the trade.
-pub const MOMENTUM_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.60);
+pub const MOMENTUM_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.30);
 
 /// OBI exhaustion veto: block entries when the bid side dominates entirely (all buyers, no sellers).
 /// Balanced: 0.70 — tightened to avoid buying exhausted rallies.
@@ -205,11 +205,11 @@ pub const MOMENTUM_OBI_SWING_BLOCK: Decimal = dec!(0.80);
 /// 10m drift block as fraction of oracle price.
 /// 0.0005 = 0.05% of price. Balanced: at BTC=$100k → $50.
 /// Set to dec!(9999) to disable.
-pub const MOMENTUM_DRIFT_10M_BLOCK_PCT: Decimal = dec!(0.0005);
+pub const MOMENTUM_DRIFT_10M_BLOCK_PCT: Decimal = dec!(0.00075);
 
 /// Maximum combined ask sum (YES_ask + NO_ask) allowed for a Momentum entry.
 /// Balanced: 3-cent combined spread cap — allows some widening but blocks clearly broken books.
-pub const MOMENTUM_MAX_ENTRY_ASK_SUM: Decimal = dec!(1.030);
+pub const MOMENTUM_MAX_ENTRY_ASK_SUM: Decimal = dec!(1.025);
 
 /// Maximum age (seconds) of the live orderbook snapshot at Momentum entry.
 /// Stale snapshots silently retain last-known OBI/depth values — unreliable veto data.
@@ -241,45 +241,45 @@ pub const MAKER_HORIZON_VIX_VEL_MAX: Decimal = dec!(0.10);
 pub const MAKER_HORIZON_TRADFI_VETO: Decimal = dec!(0.15);
 /// Directional TradFi vetoes require at least this QQQ-vs-BTC macro coherence.
 pub const MAKER_HORIZON_COHERENCE_MIN: Decimal = dec!(0.5);
-pub const MAKER_BID_BUFFER: Decimal = dec!(0.03);
+pub const MAKER_BID_BUFFER: Decimal = dec!(0.025);
 pub const MAKER_MIN_SPREAD: Decimal = dec!(0.04);
-pub const MAKER_BID_IMPROVEMENT: Decimal = dec!(0.01);
-pub const MAKER_BID_IMPROVEMENT_RATIO: Decimal = dec!(0.28);
-pub const MAKER_MIN_BID_IMPROVEMENT: Decimal = dec!(0.01);
-pub const MAKER_MAX_BID_IMPROVEMENT: Decimal = dec!(0.03);
+pub const MAKER_BID_IMPROVEMENT: Decimal = dec!(-0.01);
+pub const MAKER_BID_IMPROVEMENT_RATIO: Decimal = dec!(0.00);
+pub const MAKER_MIN_BID_IMPROVEMENT: Decimal = dec!(-0.02);
+pub const MAKER_MAX_BID_IMPROVEMENT: Decimal = dec!(0.00);
 pub const MAKER_CROSS_BUFFER: Decimal = dec!(0.02);
-pub const CROSSES_BOOK_COOLDOWN_SECS: i64 = 45;
+pub const CROSSES_BOOK_COOLDOWN_SECS: i64 = 30;
 /// Balanced: 5s pause lets the WS snapshot refresh without stalling entries long.
 pub const CROSSES_BOOK_RETRY_PAUSE_SECS: u64 = 5;
 
-pub const MAKER_MIN_SECS_TO_EXPIRY: i64 = 2100;
+pub const MAKER_MIN_SECS_TO_EXPIRY: i64 = 1800;
 /// Standard 1-day horizon for maker venue discovery.
 pub const MAKER_MAX_SECS_TO_EXPIRY: i64 = 86400;
 
-pub const MAKER_MAX_ENTRY_PRICE: Decimal = dec!(0.52);
+pub const MAKER_MAX_ENTRY_PRICE: Decimal = dec!(0.48);
 pub const MAKER_MAX_COMPLEMENTARY_PRICE: Decimal = dec!(0.65);
 pub const MAKER_MIN_ENTRY_PRICE: Decimal = dec!(0.10);
 
-pub const MAKER_TARGET_PROFIT_PERCENT: Decimal = dec!(0.08);
-pub const MAKER_STOP_LOSS_PERCENT: Decimal = dec!(0.07);
+pub const MAKER_TARGET_PROFIT_PERCENT: Decimal = dec!(0.07);
+pub const MAKER_STOP_LOSS_PERCENT: Decimal = dec!(0.15);
 pub const MAKER_LATE_MARKET_STOP_TIGHTEN_SECS: i64 = 2700;
-pub const MAKER_LATE_MARKET_STOP_LOSS_PERCENT: Decimal = dec!(0.05);
-pub const MAKER_MIN_HOLD_SECS_BEFORE_STOP: i64 = 720;
+pub const MAKER_LATE_MARKET_STOP_LOSS_PERCENT: Decimal = dec!(0.08);
+pub const MAKER_MIN_HOLD_SECS_BEFORE_STOP: i64 = 300;
 pub const MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = MAKER_MIN_HOLD_SECS_BEFORE_STOP;
 /// Catastrophic floor at (live SL × mult), ungated by min-hold (2026-07-14).
 pub const MAKER_CATASTROPHIC_SL_MULT: Decimal = dec!(1.5);
-pub const MAKER_STOP_LOSS_COOLDOWN_SECS: i64 = 720;
-pub const MAKER_MAX_COMBINED_BID: Decimal = dec!(0.89);
+pub const MAKER_STOP_LOSS_COOLDOWN_SECS: i64 = 600;
+pub const MAKER_MAX_COMBINED_BID: Decimal = dec!(0.85);
 pub const MAKER_MAX_BOOK_IMBALANCE_RATIO: Decimal = dec!(3.0);
 
 /// Taker-flow / bid-depth drain gate.
 /// Balanced: suppress entry when 40%+ of bid depth drains in 1.5s;
 /// exit on a moderately adverse book turn (OBI < -0.50).
-pub const MAKER_TAKER_FLOW_WINDOW_MS: u64 = 1500;
+pub const MAKER_TAKER_FLOW_WINDOW_MS: u64 = 2500;
 /// Minimum elapsed ms between depth snapshots before the drain check runs.
 /// Prevents price-level rotation (normal tick moves) from false-triggering suppression.
 pub const MAKER_TAKER_FLOW_MIN_ELAPSED_MS: u64 = 500;
-pub const MAKER_TAKER_FLOW_DRAIN_THRESHOLD: Decimal = dec!(0.40);
+pub const MAKER_TAKER_FLOW_DRAIN_THRESHOLD: Decimal = dec!(0.75);
 pub const MAKER_TOXIC_FLOW_EXIT_OBI: Decimal = dec!(-0.50);
 /// After a ToxicFill exit, block re-entry on that same token for this long.
 /// Prevents the maker from immediately re-quoting into a collapsing book and
@@ -324,13 +324,12 @@ pub const MAKER_RESTING_EXIT_ASK_IMPROVEMENT_TICKS: i64 = 1;
 /// Balanced: 2¢ — keeps queue priority through ordinary book flicker.
 pub const MAKER_RESTING_EXIT_REPRICE_THRESHOLD: Decimal = dec!(0.02);
 
-pub const MAKER_SLOW_TREND_THRESHOLD_BTC: Decimal = dec!(300.0); // legacy — not used in logic
 /// Slow trend threshold as fraction of oracle price.
 /// 0.003 = 0.30% of price. Balanced: at BTC=$100k → $300.
 pub const MAKER_SLOW_TREND_THRESHOLD_PCT: Decimal = dec!(0.003);
 pub const MAKER_INVENTORY_SKEW_MAX: Decimal = dec!(0.03);
 
-pub const MAKER_MIN_MARKET_AGE_SECS: i64 = 420;
+pub const MAKER_MIN_MARKET_AGE_SECS: i64 = 300;
 /// Throttle interval (secs) for MakerStrategy gate-rejection diagnostics — a gate
 /// reason is logged when it changes or after this interval, without per-tick spam.
 pub const MAKER_GATE_LOG_INTERVAL_SECS: u64 = 30;
@@ -343,14 +342,14 @@ pub const MAKER_GATE_LOG_INTERVAL_SECS: u64 = 30;
 /// for a whole market. Gives a recoverable on-disk history of which gate blocks
 /// it, which the in-memory viper_status registry alone cannot provide.
 pub const TIME_DECAY_GATE_LOG_INTERVAL_SECS: u64 = 300;
-pub const MOMENTUM_MIN_MARKET_AGE_SECS: i64 = 420;
+pub const MOMENTUM_MIN_MARKET_AGE_SECS: i64 = 300;
 /// Must be strictly > MOMENTUM_EXPIRY_EXIT_SECS (900s); 300s breathing room.
 pub const MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY: i64 = 1200;
 
 /// Minimum seconds since market switch before MomentumStrategy is allowed to enter.
 /// Balanced: 60s — standard warmup for orderbook depth to stabilise.
 /// Root cause fix for 2026-05-27 20:11 loss (−$0.73): entry fired 6s after switch.
-pub const MOMENTUM_MARKET_WARMUP_SECS: i64 = 60;
+pub const MOMENTUM_MARKET_WARMUP_SECS: i64 = 90;
 
 
 // ============================================================================
@@ -371,31 +370,30 @@ pub const TIDE_CONN_LIMIT_BACKOFF_MIN_SECS: u64 = 15;
 pub const TIDE_CONN_LIMIT_BACKOFF_MAX_SECS: u64 = 60;
 /// Basis velocity ceiling as fraction of oracle price/5s.
 /// 0.00025 = 0.025% of price. Balanced: at BTC=$100k → $25.
-pub const BASIS_MAX_VELOCITY_PCT: Decimal = dec!(0.00025);
+pub const BASIS_MAX_VELOCITY_PCT: Decimal = dec!(0.0003);
 
-pub const BASIS_BTC_ORACLE_STRIKE_BUFFER: Decimal = dec!(175.0); // legacy — not used in logic
 /// Strike buffer as fraction of oracle price.
 /// 0.00175 = 0.175% of price. Balanced: at BTC=$100k → $175.
-pub const BASIS_ORACLE_STRIKE_BUFFER_PCT: Decimal = dec!(0.00175);
+pub const BASIS_ORACLE_STRIKE_BUFFER_PCT: Decimal = dec!(0.0015);
 
 pub const BASIS_MAX_ENTRY_PRICE: Decimal = dec!(0.55);
-pub const BASIS_TARGET_PROFIT_PERCENT: Decimal = dec!(0.08);
-pub const BASIS_STOP_LOSS_PERCENT: Decimal = dec!(0.06);
-pub const BASIS_CATASTROPHIC_SL_PCT: Decimal = dec!(0.10); // bypasses min-hold guard on deep drawdown
-pub const BASIS_SKEW_COLLAPSE_THRESHOLD: Decimal = dec!(0.035);
-pub const BASIS_MIN_SECS_TO_EXPIRY: i64 = 1500;
+pub const BASIS_TARGET_PROFIT_PERCENT: Decimal = dec!(0.10);
+pub const BASIS_STOP_LOSS_PERCENT: Decimal = dec!(0.03);
+pub const BASIS_CATASTROPHIC_SL_PCT: Decimal = dec!(0.06); // bypasses min-hold guard on deep drawdown
+pub const BASIS_SKEW_COLLAPSE_THRESHOLD: Decimal = dec!(0.03);
+pub const BASIS_MIN_SECS_TO_EXPIRY: i64 = 3600;
 pub const BASIS_MAX_SPREAD_PCT: Decimal = dec!(0.06);
 pub const BASIS_LOSS_LOCKOUT_COUNT: i64 = 2;
 pub const BASIS_LOSS_LOCKOUT_SECS: i64 = 3600;
 pub const BASIS_EXTREME_SKEW_BYPASS: bool = false;
 /// Minimum best-bid required to fire a basis forced-exit near expiry.
 pub const BASIS_EXPIRY_MIN_EXIT_BID: Decimal = dec!(0.15);
-pub const BASIS_MIN_TRADE_SIZE_USDC: Decimal = dec!(4.0);
-pub const BASIS_MAX_TRADE_SIZE_USDC: Decimal = dec!(12.0);
+pub const BASIS_MIN_TRADE_SIZE_USDC: Decimal = dec!(5.0);
+pub const BASIS_MAX_TRADE_SIZE_USDC: Decimal = dec!(8.0);
 pub const BASIS_MAX_SNAPSHOT_AGE_SECS: i64 = 15;
 pub const BASIS_KELLY_MAX_MULTIPLIER: Decimal = dec!(3.0);
 pub const BASIS_MAX_TAKER_FEE_BPS: u32 = 1500; // Updated from 200
-pub const BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 30;
+pub const BASIS_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 120;
 pub const BASIS_FUNDING_POLL_SECS: u64 = 60;
 
 /// Polling interval (seconds) for the Derivatives Raptor (open interest + taker
@@ -466,7 +464,7 @@ pub const SPORTS_ODDS_REGIONS: &str = "us";
 
 /// Seconds between Sports Raptor polls. The Odds API free tier is quota-limited
 /// (~500 requests/month), so poll conservatively — line movement is a slow signal.
-pub const SPORTS_POLL_SECS: u64 = 300;
+pub const SPORTS_POLL_SECS: u64 = 7200;
 pub const SPORTS_ODDS_LOW_BUDGET_WARN: i64 = 50;
 
 // ── Tennis Raptor (Live Tennis API live event-state feed) ────────────────────
@@ -527,16 +525,15 @@ pub const ENABLE_GBOOST_TRADING: bool = true;
 pub const GBOOST_MIN_ENTRY_PRICE: Decimal = dec!(0.40); // Raised from 0.35 — prevents sub-3-tick SL knockouts
 pub const GBOOST_MAX_YES_ENTRY_PRICE: Decimal = dec!(0.55);
 pub const GBOOST_MAX_NO_ENTRY_PRICE: Decimal = dec!(0.45);
-pub const GBOOST_HISTORY_BUFFER_SIZE: usize = 1000;
-pub const GBOOST_LOOKAHEAD_TICKS: usize = 200; // legacy — superseded 2026-07-14 by GBOOST_LABEL_HORIZON_SECS
+pub const GBOOST_HISTORY_BUFFER_SIZE: usize = 2200;
 pub const GBOOST_HISTORY_MIN_SPACING_MS: i64 = 500; // time-decimated snapshot buffer
 pub const GBOOST_LABEL_HORIZON_SECS: i64 = 180; // oracle-based label: BTC higher after 180s
 pub const GBOOST_LABEL_MIN_ORACLE_MOVE_FRAC: f64 = 0.0002; // skip flat samples (<2bp move)
-pub const GBOOST_MIN_TRAINING_SAMPLES: usize = 320;
+pub const GBOOST_MIN_TRAINING_SAMPLES: usize = 600;
 /// FIFO cap on the process-global lookahead label pool — labels accumulate across
 /// retrain cycles and market rotations so flat regimes can still bootstrap the model.
 pub const GBOOST_LABEL_POOL_CAP: usize = 6000;
-pub const GBOOST_RETRAIN_EVERY_N: usize = 200;
+pub const GBOOST_RETRAIN_EVERY_N: usize = 600;
 /// Hard minimum wall-clock interval (seconds) between successful GBoost retrains.
 /// Prevents a fast tick rate from storming booster.fit() and starving the runtime.
 pub const GBOOST_MIN_RETRAIN_INTERVAL_SECS: u64 = 300;
@@ -555,7 +552,7 @@ pub const GBOOST_PRED_LOG_INTERVAL_SECS: u64 = 120; // periodic P(UP) conviction
 /// sweeps rather than starving orphan reconciliation, the safety-critical work
 /// in that task.
 pub const GBOOST_VETO_SCORING_BATCH: i64 = 200;
-pub const GBOOST_POST_EXIT_COOLDOWN_SECS: i64 = 300;
+pub const GBOOST_POST_EXIT_COOLDOWN_SECS: i64 = 600;
 /// Balanced: matches config.rs (2026-08-05: -0.25 vetoed 19/38 eligible signals; persistence debounce added).
 pub const GBOOST_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.60);
 /// Entry-signal persistence debounce (2026-08-05): same side must stay eligible this long.
@@ -574,21 +571,21 @@ pub const GBOOST_SIGNAL_REV_MIN_PROFIT: f64 = 0.04;
 /// Balanced: 1.04 = up to 4-cent spread on the daily book; blocks degenerate books.
 pub const GBOOST_MAX_TARGET_ASK_SUM: Decimal = dec!(1.04);
 /// Hourly OBI adverse block for daily entries — blocks contra-trend entries.
-pub const GBOOST_HOURLY_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.65);
+pub const GBOOST_HOURLY_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.40);
 /// OBI momentum-exhaustion gate: block entries when |obi| exceeds threshold.
 /// Balanced: 0.80 — blocks ≥80% depth imbalance; confirmed 2026-05-08.
 pub const GBOOST_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.80);
 /// Minimum historical volatility regime required for a GBoost entry.
 /// Balanced: 0.002 — default value; blocks entries when the oracle is completely flat.
 pub const GBOOST_MIN_HIST_VOL: f64 = 0.0010; // Recalibrated from 0.020 (2026-07-10): normal BTC 60m realized-vol is ~0.0025-0.0035; old floor blocked ALL entries. Blocks frozen oracle (~0.0), admits live BTC.
-pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.40);
+pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.50);
 pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(4.0);
 pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300;
 pub const GBOOST_TARGET_PROFIT_PERCENT: Decimal = dec!(0.12);
 pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.075); // balanced: 7.5% — raised from 0.055; model still bootstrapping
-pub const GBOOST_MIN_HOLD_SECS: i64 = 180;
-pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 10;
-pub const GBOOST_MIN_USABLE_TREES: usize = 30;
+pub const GBOOST_MIN_HOLD_SECS: i64 = 300;
+pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 45;
+pub const GBOOST_MIN_USABLE_TREES: usize = 20;
 pub const GBOOST_MODEL_FILENAME: &str = "gboost_model_v30g_o180.json";
 pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v30g_o180.json";
 /// Max fraction of identical labels before skipping a retrain cycle (avoids degenerate storms).
@@ -604,7 +601,7 @@ pub const GBOOST_MAX_SNAPSHOT_AGE_SECS: i64 = 10;
 
 /// Minimum hourly YES bid / maximum hourly YES ask allowed at GBoost entry.
 /// Guards against entering a daily position when the hourly market is near-resolved.
-pub const GBOOST_MIN_HOURLY_YES_BID: Decimal = dec!(0.05);
+pub const GBOOST_MIN_HOURLY_YES_BID: Decimal = dec!(0.25);
 pub const GBOOST_MAX_HOURLY_YES_ASK: Decimal = dec!(0.95);
 
 /// When trading the DAILY market, block DAILY NO entries if hourly YES bid > threshold
@@ -630,7 +627,7 @@ pub const GBOOST_HIGH_VOL_REGIME_THRESHOLD: f64 = 0.65;
 pub const GBOOST_HIGH_VOL_SIZE_SCALE: f64 = 0.50;
 
 /// Balanced: 15-minute SL cooldown — longer than aggressive, shorter than conservative.
-pub const GBOOST_SL_POST_EXIT_COOLDOWN_SECS: i64 = 900;
+pub const GBOOST_SL_POST_EXIT_COOLDOWN_SECS: i64 = 1200;
 
 /// Minimum expected net profit (USDC) after round-trip fees required to place a GBoost entry.
 /// Balanced: $0.15 — standard threshold; filters marginal minimum-size signals near fee break-even.
@@ -675,9 +672,9 @@ pub const ENABLE_TRENDCAPTURE_TRADING: bool = true;
 pub const TRENDCAPTURE_MIN_TRADE_SIZE_USDC: Decimal = dec!(5.0);
 pub const TRENDCAPTURE_MAX_TRADE_SIZE_USDC: Decimal = dec!(15.0);
 pub const TRENDCAPTURE_MAX_EXPOSURE_USDC: Decimal = dec!(15.0);
-pub const TRENDCAPTURE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.20);
-pub const TRENDCAPTURE_STOP_LOSS_PERCENT: Decimal = dec!(0.12);
-pub const TRENDCAPTURE_MAX_ENTRY_PRICE: Decimal = dec!(0.65);
+pub const TRENDCAPTURE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.05);
+pub const TRENDCAPTURE_STOP_LOSS_PERCENT: Decimal = dec!(0.05);
+pub const TRENDCAPTURE_MAX_ENTRY_PRICE: Decimal = dec!(0.55);
 /// At high-consensus prices (ask >= threshold) use $0.02 offset instead of $0.01
 /// to avoid crossing resting sells in thin book conditions.
 pub const TRENDCAPTURE_HIGH_CONSENSUS_ENTRY_THRESHOLD: Decimal = dec!(0.62);
@@ -686,7 +683,7 @@ pub const TRENDCAPTURE_HIGH_CONSENSUS_ENTRY_OFFSET: Decimal = dec!(0.02);
 // 10m drift entry thresholds — tightened to require stronger trends.
 // TrendCapture thresholds — PCT-based, oracle-relative.
 /// 10m drift: 0.002 = 0.20% of price. Balanced: at BTC=$100k → $200.
-pub const TRENDCAPTURE_DRIFT_10M_PCT: Decimal = dec!(0.002);
+pub const TRENDCAPTURE_DRIFT_10M_PCT: Decimal = dec!(0.004);
 /// 60m confirmation: 0.003 = 0.30% of price. Balanced: at BTC=$100k → $300.
 pub const TRENDCAPTURE_DRIFT_60M_PCT: Decimal = dec!(0.003);
 
@@ -706,7 +703,7 @@ pub const TRENDCAPTURE_STRIKE_GAP_PCT: Decimal = dec!(0.004);
 
 // Reversal thresholds — balanced: moderate counter-drift required to exit.
 /// Reversal drift: 0.00075 = 0.075% of price. Balanced: at BTC=$100k → $75.
-pub const TRENDCAPTURE_REVERSAL_DRIFT_PCT: Decimal = dec!(0.00075);
+pub const TRENDCAPTURE_REVERSAL_DRIFT_PCT: Decimal = dec!(0.0015);
 
 pub const TRENDCAPTURE_MAX_SNAPSHOT_AGE_SECS: i64 = 15;
 pub const TRENDCAPTURE_MIN_SECS_TO_EXPIRY: i64 = 1800;  // 30 min minimum
@@ -714,14 +711,14 @@ pub const TRENDCAPTURE_MAX_SECS_TO_EXPIRY: i64 = 14400;
 pub const TRENDCAPTURE_MARKET_WARMUP_SECS: i64 = 120;
 pub const TRENDCAPTURE_MAX_ENTRY_ASK_SUM: Decimal = dec!(1.04);
 pub const TRENDCAPTURE_MAX_TOKEN_SPREAD_PCT: Decimal = dec!(0.12);
-pub const TRENDCAPTURE_MIN_ENTRY_PRICE: Decimal = dec!(0.30);
+pub const TRENDCAPTURE_MIN_ENTRY_PRICE: Decimal = dec!(0.45);
 pub const TRENDCAPTURE_POST_EXIT_COOLDOWN_SECS: i64 = 1800;
 /// Late-market entry/exit tightening — applied in the last N seconds before close.
 /// Balanced: 2h window, $0.40 floor, standard 3-minute exit re-fire suppress.
 pub const TRENDCAPTURE_LATE_MARKET_SECS: i64 = 7200;
-pub const TRENDCAPTURE_LATE_MARKET_MIN_ENTRY_PRICE: Decimal = dec!(0.40);
+pub const TRENDCAPTURE_LATE_MARKET_MIN_ENTRY_PRICE: Decimal = dec!(0.48);
 pub const TRENDCAPTURE_LATE_MARKET_SL_SECS: i64 = 3600;
-pub const TRENDCAPTURE_LATE_MARKET_STOP_LOSS_PERCENT: Decimal = dec!(0.08);
+pub const TRENDCAPTURE_LATE_MARKET_STOP_LOSS_PERCENT: Decimal = dec!(0.05);
 /// Consecutive-loss protection: after N SL exits on the same market, extend cooldown.
 pub const TRENDCAPTURE_CONSECUTIVE_LOSS_COOLDOWN_SECS: i64 = 3600;
 pub const TRENDCAPTURE_CONSECUTIVE_LOSS_THRESHOLD: u32 = 2;
@@ -755,7 +752,7 @@ pub const TRENDREVERSAL_MIN_EDGE_FROM_FAIR: Decimal = dec!(0.05); // block coin-
 pub const TRENDCAPTURE_OBI_EXHAUSTION_BLOCK: Decimal = dec!(0.75);
 
 pub const TRENDCAPTURE_KELLY_MAX_MULTIPLIER: Decimal = dec!(3.0);
-pub const TRENDCAPTURE_CATASTROPHIC_SL_PCT: Decimal = dec!(0.08);
+pub const TRENDCAPTURE_CATASTROPHIC_SL_PCT: Decimal = dec!(0.06);
 pub const TRENDCAPTURE_EXPIRY_EXIT_SECS: i64 = 900;
 pub const TRENDCAPTURE_EXPIRY_MIN_PROFIT_TO_HOLD: Decimal = dec!(0.02);
 pub const TRENDCAPTURE_TAKE_PROFIT_CEILING: Decimal = dec!(0.90);
@@ -895,17 +892,17 @@ pub const FAIRVALUE_POST_EXIT_COOLDOWN_SECS: i64 = 900;
 
 pub const ENABLE_TIME_DECAY_TRADING: bool = true;
 
-pub const MIN_TIME_DECAY_NET_PROFIT: Decimal = dec!(0.003);
-pub const MAX_TIME_DECAY_COMBINED_ASK: Decimal = dec!(1.006);
-pub const TIME_DECAY_CONVERGENCE_WINDOW_SECS: i64 = 1050;
+pub const MIN_TIME_DECAY_NET_PROFIT: Decimal = dec!(0.002);
+pub const MAX_TIME_DECAY_COMBINED_ASK: Decimal = dec!(1.008);
+pub const TIME_DECAY_CONVERGENCE_WINDOW_SECS: i64 = 1200;
 pub const TIME_DECAY_CONVERGENCE_EXIT_BID: Decimal = dec!(0.998);
-pub const TIME_DECAY_MIN_SECS_TO_EXPIRY: i64 = 240;
-pub const TIME_DECAY_MAX_SECS_TO_EXPIRY: i64 = 1350;
-pub const TIME_DECAY_POSITION_SIZE_USDC: Decimal = dec!(12);
-pub const TIME_DECAY_TARGET_PROFIT_PERCENT: Decimal = dec!(0.015);
-pub const TIME_DECAY_MAX_TOTAL_EXPOSURE_USDC: Decimal = dec!(36);
-pub const TIME_DECAY_MAX_POSITIONS: usize = 3;
-pub const TIME_DECAY_STOP_LOSS_PERCENT: Decimal = dec!(0.025);
+pub const TIME_DECAY_MIN_SECS_TO_EXPIRY: i64 = 900;
+pub const TIME_DECAY_MAX_SECS_TO_EXPIRY: i64 = 1800;
+pub const TIME_DECAY_POSITION_SIZE_USDC: Decimal = dec!(15);
+pub const TIME_DECAY_TARGET_PROFIT_PERCENT: Decimal = dec!(0.012);
+pub const TIME_DECAY_MAX_TOTAL_EXPOSURE_USDC: Decimal = dec!(50);
+pub const TIME_DECAY_MAX_POSITIONS: usize = 5;
+pub const TIME_DECAY_STOP_LOSS_PERCENT: Decimal = dec!(0.05);
 pub const TIME_DECAY_MIN_HOLD_SECS: i64 = 120;
 pub const TIME_DECAY_STOP_LOSS_COOLDOWN_SECS: u64 = 600;
 
@@ -916,7 +913,7 @@ pub const TIME_DECAY_MAX_FAST_VELOCITY_PCT: Decimal = dec!(0.00015);
 /// Slow drift gate as fraction of oracle price/hour.
 /// 0.002 = 0.20% of price. Balanced: at BTC=$100k → $200/hour.
 pub const TIME_DECAY_MAX_SLOW_DRIFT_PCT: Decimal = dec!(0.002);
-pub const TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER: Decimal = dec!(0.50);
+pub const TIME_DECAY_IV_STOP_TIGHTEN_MULTIPLIER: Decimal = dec!(0.5);
 
 /// Price bounds: only enter when genuine market uncertainty exists.
 pub const TIME_DECAY_MAX_ENTRY_PRICE: Decimal = dec!(0.46);
@@ -933,7 +930,7 @@ pub const TIME_DECAY_MAX_SNAPSHOT_AGE_SECS: i64 = 10;
 // ============================================================================
 
 pub const MAX_CONSECUTIVE_FAILURES: u32 = 3;
-pub const FAILURE_COOLDOWN_SECS: i64 = 90;
+pub const FAILURE_COOLDOWN_SECS: i64 = 60;
 
 
 // ============================================================================
@@ -950,8 +947,8 @@ pub const CRYPTO_FEE_RATE: Decimal = dec!(0.072);
 // POSITION DURATION AND TIMING (Seconds)
 // ============================================================================
 
-pub const TRADE_COOLDOWN_SECS: i64 = 10;
-pub const PARTIAL_FILL_COOLDOWN_SECS: i64 = 45;
+pub const TRADE_COOLDOWN_SECS: i64 = 60;
+pub const PARTIAL_FILL_COOLDOWN_SECS: i64 = 30;
 pub const STOP_LOSS_COOLDOWN_SECS: u64 = 180;
 /// Cooldown period (in seconds) before retrying a failed exit order.
 /// This prevents log floods and API hammering when FAK exits fail due to thin books.
@@ -982,8 +979,8 @@ pub const FLASH_EXIT_EXTRA_OFFSET: Decimal = dec!(0.02);
 
 pub const MIN_SECONDS_TO_EXPIRY_FOR_ENTRY: i64 = 300;
 pub const MAX_SECONDS_TO_EXPIRY_FOR_ENTRY: i64 = 14400;
-pub const FINAL_EXPIRY_WINDOW_SECS: i64 = 720;
-pub const MARKET_EXPIRY_SAFETY_BUFFER_SECS: i64 = 240;
+pub const FINAL_EXPIRY_WINDOW_SECS: i64 = 600;
+pub const MARKET_EXPIRY_SAFETY_BUFFER_SECS: i64 = 180;
 
 
 // ============================================================================
@@ -1030,20 +1027,20 @@ pub fn tcp_keepalive() -> StdDuration {
 // ============================================================================
 
 pub const MIN_MARKET_VOLUME: f64 = 0.0;
-pub const MAX_EXPOSURE_PER_TOKEN_USDC: Decimal = dec!(18);
+pub const MAX_EXPOSURE_PER_TOKEN_USDC: Decimal = dec!(10);
 /// Soft vol24h floor for hourly market selection.
 pub const MIN_HOURLY_MARKET_VOL24H: f64 = 500.0;
 
-pub const MOMENTUM_MAX_EXPOSURE_USDC: Decimal = dec!(15);
-pub const MAKER_MAX_EXPOSURE_USDC: Decimal = dec!(12);
+pub const MOMENTUM_MAX_EXPOSURE_USDC: Decimal = dec!(10);
+pub const MAKER_MAX_EXPOSURE_USDC: Decimal = dec!(8);
 /// USDC notional per resting maker quote. Drives order size and net-exposure
 /// projection; kept ≤ half of MAKER_MAX_EXPOSURE_USDC so the maker has room to
 /// quote both sides without tripping the exposure cap.
-pub const MAKER_QUOTE_SIZE_USDC: Decimal = dec!(6);
-pub const ARBITRAGE_MAX_EXPOSURE_USDC: Decimal = dec!(35);
-pub const ARBITRAGE_POSITION_SIZE_USDC: Decimal = dec!(10.0);
-pub const TIME_DECAY_MAX_EXPOSURE_USDC: Decimal = dec!(36);
-pub const BASIS_MAX_EXPOSURE_USDC: Decimal = dec!(15);
+pub const MAKER_QUOTE_SIZE_USDC: Decimal = dec!(8);
+pub const ARBITRAGE_MAX_EXPOSURE_USDC: Decimal = dec!(30);
+pub const ARBITRAGE_POSITION_SIZE_USDC: Decimal = dec!(15.0);
+pub const TIME_DECAY_MAX_EXPOSURE_USDC: Decimal = dec!(24);
+pub const BASIS_MAX_EXPOSURE_USDC: Decimal = dec!(15.0);
 
 pub fn max_session_drawdown(collateral: Decimal) -> Decimal {
     (collateral * dec!(0.01)).max(dec!(4.00))
@@ -1063,7 +1060,7 @@ pub const LLM_INFERENCE_TIMEOUT_SECS: u64 = 480;
 
 /// How often (seconds) the advisor wakes up to analyse trades and send recommendations.
 /// Balanced: every 30 minutes — once per typical hourly market cycle.
-pub const LLM_ADVISOR_INTERVAL_SECS: u64 = 1800;
+pub const LLM_ADVISOR_INTERVAL_SECS: u64 = 3600;
 
 /// Number of most-recent completed trades to include in each LLM analysis.
 pub const LLM_ADVISOR_TRADES_LOOKBACK: i64 = 20;
@@ -1242,7 +1239,7 @@ pub const CONVERGENCE_MIN_ENTRY_PRICE: Decimal = dec!(0.35);
 
 /// Max per-token bid-ask spread (fraction of ask). A hollow bid guarantees an
 /// instant stop-out, so skip when the spread is wider than this.
-pub const CONVERGENCE_MAX_TOKEN_SPREAD_PCT: Decimal = dec!(0.12);
+pub const CONVERGENCE_MAX_TOKEN_SPREAD_PCT: Decimal = dec!(0.04);
 
 pub const CONVERGENCE_EXHAUSTION_DRIFT_60M_PCT: Decimal = dec!(0.0015);
 

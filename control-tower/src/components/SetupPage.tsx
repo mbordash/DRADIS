@@ -721,6 +721,18 @@ function ProfilesPanel({ onAuthError }: { onAuthError: () => void }) {
             ? <>Will overwrite <span className="text-gray-400">{deployed.length}</span> deployed squadron(s): <span className="text-gray-400">{deployed.join(', ')}</span></>
             : 'No squadrons currently deployed — will seed the global config only.'}
         </p>
+        {/* Honesty caveat. A profile has ~420 constants but only the ~160 backed
+            by DynamicConfig can change at runtime; the rest are compiled in. The
+            picker would otherwise imply a complete switch and deliver a partial
+            one. Pre-built images bake the conservative profile, so the residue
+            always errs safe. See ROADMAP "Profile switching is only 38% complete". */}
+        <p className="mt-2 rounded-lg border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-[11px] leading-relaxed text-amber-200/80">
+          Applies the live risk parameters — sizes, stops, targets, entry limits and
+          strategy toggles. Some structural values are fixed when the engine is
+          built and do not change with the profile, so this shifts most of the risk
+          posture rather than all of it. Pre-built images ship the conservative
+          baseline, so anything not covered stays on the cautious side.
+        </p>
       </div>
       {notice && (
         <div className={`text-xs font-mono rounded-lg px-3 py-2 ${notice.kind === 'ok' ? 'bg-emerald-950/50 text-emerald-300' : 'bg-red-950/50 text-red-300'}`}>
