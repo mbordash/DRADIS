@@ -24,6 +24,7 @@ import {
 } from 'recharts';
 import { getTelemetryHistory, getTelemetryAssets } from '@/lib/api';
 import type { TelemetrySample } from '@/lib/types';
+import type { VenueId } from '@/lib/setupApi';
 
 const POLL_MS = 2000;            // server samples at 2s — match it while live
 const SAMPLES_PER_MIN = 30;      // 60s / 2s
@@ -658,9 +659,13 @@ function ClassNav({
   );
 }
 
-export default function TelemetryPage({ availableAssets, venue }: { availableAssets: string[]; venue?: 'intl' | 'us' }) {
+export default function TelemetryPage({ availableAssets, venue }: { availableAssets: string[]; venue?: VenueId }) {
   // US builds run a crypto wing (Polymarket US lists crypto markets), so the
   // Crypto tab stays visible — but Sports remains the default landing tab.
+  //
+  // Deliberately `=== 'us'` and not "any non-intl venue": Kalshi's default
+  // series (KALSHI_SERIES) are crypto contracts, so a Kalshi instance should
+  // land on Crypto like an intl one does.
   const isUs = venue === 'us';
   const classes = TELEMETRY_CLASSES;
   // Use raptor-specific asset list (crypto underlyings only) rather than the

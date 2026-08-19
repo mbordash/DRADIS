@@ -30,6 +30,15 @@
 
 import { useState } from 'react';
 import { acknowledgeAlpha } from '@/lib/setupApi';
+import type { VenueId } from '@/lib/setupApi';
+
+/** Display name per venue — used in the header, the jurisdiction heading, and
+ *  the confirmation checkbox, so a Kalshi build never labels itself "US". */
+const VENUE_NAME: Record<VenueId, string> = {
+  intl:   'International',
+  us:     'US',
+  kalshi: 'Kalshi',
+};
 
 const REPO_URL = 'https://github.com/mbordash/DRADIS';
 
@@ -38,7 +47,7 @@ export default function AlphaGate({
   appVersion,
   onAcknowledged,
 }: {
-  venue: 'intl' | 'us';
+  venue: VenueId;
   appVersion?: string;
   onAcknowledged: () => void;
 }) {
@@ -68,7 +77,7 @@ export default function AlphaGate({
         <div className="w-full max-w-2xl bg-[#13131f] border border-amber-500/40 rounded-2xl p-6 sm:p-8 space-y-5 shadow-2xl">
           <div className="flex items-center gap-3">
             <h2 className="text-lg font-mono text-gray-100">
-              DRADIS {venue === 'intl' ? 'International' : 'US'}
+              DRADIS {VENUE_NAME[venue]}
               {appVersion ? ` v${appVersion}` : ''} — read before proceeding
             </h2>
           </div>
@@ -95,12 +104,13 @@ export default function AlphaGate({
 
           {/* ── Jurisdiction ─────────────────────────────────────────────── */}
           <div className="bg-amber-950/40 border border-amber-500/30 rounded-xl p-4 space-y-2">
-            <h3 className="text-sm font-mono text-amber-300">🌍 Jurisdiction — {venue === 'intl' ? 'International build' : 'US build'}</h3>
+            <h3 className="text-sm font-mono text-amber-300">🌍 Jurisdiction — {VENUE_NAME[venue]} venue</h3>
             {venue === 'intl' ? (
               <p className="text-xs text-amber-200/90">
                 This build trades on Polymarket&apos;s <strong>international CLOB</strong>, which is{' '}
                 <strong>not available to US persons</strong>. If you are a US person, do not use this
-                build — deploy the separate <strong>DRADIS US</strong> build instead. By continuing you
+                venue — switch this instance to <strong>Polymarket US</strong> or <strong>Kalshi</strong>{' '}
+                in Setup instead. By continuing you
                 confirm you are legally permitted to trade on this venue in your jurisdiction and that
                 you bear <strong>sole legal responsibility</strong> for that determination; the DRADIS
                 project accepts none.
@@ -138,7 +148,7 @@ export default function AlphaGate({
               <span>
                 {venue === 'intl'
                   ? 'I confirm I am legally permitted to trade on the international venue this build connects to, and I bear sole legal responsibility for that determination.'
-                  : 'I confirm I am eligible to trade on the US venues this build connects to under the laws that apply to me.'}
+                  : `I confirm I am eligible to trade on ${VENUE_NAME[venue]}, a US-regulated venue, under the laws that apply to me.`}
               </span>
             </label>
           </div>

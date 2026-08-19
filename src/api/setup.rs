@@ -62,7 +62,7 @@ use axum::{
     http::StatusCode,
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
     Json, Router,
 };
 use hmac::{Hmac, Mac};
@@ -87,8 +87,10 @@ const INTERNAL_KEYS: &[&str] = &["DRADIS_ADMIN_HASH", "DRADIS_SESSION_KEY"];
 
 /// UI-manageable credential whitelist: (env key, label, venue scope, panel).
 ///
-/// Scope: "intl" | "us" | "shared" — the UI shows only the scopes relevant to
-/// the running build (see `GET /api/setup/status`).
+/// Scope: "intl" | "us" | "kalshi" | "shared" — the UI shows only the scopes
+/// relevant to the running build (see `GET /api/setup/status`). A venue-scoped
+/// key MUST match the string `build_venue()` returns for that venue, or the
+/// card silently never renders.
 ///
 /// Panel: which Setup-view section the key belongs to — "venue" (core trading
 /// credentials, blocking: no key means no trading), "raptor" (signal-source
@@ -101,6 +103,8 @@ const MANAGED_KEYS: &[(&str, &str, &str, &str)] = &[
     ("POLYGON_RPC_URL",          "Polygon RPC endpoint",          "intl",   "venue"),
     ("POLYMARKET_US_KEY_ID",     "Polymarket US API key ID",      "us",     "venue"),
     ("POLYMARKET_US_SECRET_KEY", "Polymarket US secret key",      "us",     "venue"),
+    ("KALSHI_API_KEY_ID",        "Kalshi API key ID",             "kalshi", "venue"),
+    ("KALSHI_PRIVATE_KEY",       "Kalshi RSA private key (PEM)",  "kalshi", "venue"),
     ("ALPACA_API_KEY_ID",        "Alpaca API key ID",             "shared", "raptor"),
     ("ALPACA_API_SECRET_KEY",    "Alpaca API secret key",         "shared", "raptor"),
     ("ODDS_API_KEY",             "The Odds API key",              "shared", "raptor"),
@@ -225,6 +229,39 @@ const RAPTOR_SOURCES: &[RaptorSource] = &[
 pub fn secrets_path() -> PathBuf {
     let dir = std::env::var("DRADIS_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
     PathBuf::from(dir).join("secrets.env")
+}
+
+/// Path of the venue selection file: `$DRADIS_DATA_DIR/venue`.
+///
+/// The AMI image carries one binary per venue and `deploy/entrypoint.sh` execs
+/// the one named here, so this file — not an env var — is what a venue switch
+/// has to change. It lives in the data volume precisely so it survives the
+/// container restart that applies the switch.
+pub fn venue_path() -> PathBuf {
+    let dir = std::env::var("DRADIS_DATA_DIR").unwrap_or_else(|_| "./data".to_string());
+    PathBuf::from(dir).join("venue")
+}
+
+/// Directory holding the per-venue binaries in a multi-venue image.
+fn bin_dir() -> PathBuf {
+    PathBuf::from(std::env::var("DRADIS_BIN_DIR").unwrap_or_else(|_| "/app/bin".to_string()))
+}
+
+/// Venues this image can actually run, discovered from the baked binaries.
+///
+/// Empty means single-venue: a dev build, or the production image built with
+/// the default `DRADIS_VENUES`. The UI hides the venue switcher in that case
+/// rather than offering a choice that cannot be honoured.
+fn available_venues() -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(bin_dir()) else { return Vec::new() };
+    let mut v: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter_map(|n| n.strip_prefix("dradis-").map(str::to_string))
+        .filter(|n| matches!(n.as_str(), "intl" | "us" | "kalshi"))
+        .collect();
+    v.sort();
+    v
 }
 
 /// Parse the secrets file into an ordered map. Missing file → empty map.
@@ -395,11 +432,18 @@ async fn require_admin(req: Request, next: Next) -> Response {
 // ─── Handlers ────────────────────────────────────────────────────────────────
 
 /// Which venue is compiled into this binary.
+///
+/// `src/venues/mod.rs` enforces that exactly one venue feature is enabled, so
+/// exactly one arm survives the preprocessor. Do NOT collapse this back to
+/// `intl` / `not(intl)`: a Kalshi build then reports itself as "us", which
+/// makes the Setup view demand Polymarket US keys that the binary never reads.
 fn build_venue() -> &'static str {
     #[cfg(feature = "intl_clob")]
     { "intl" }
-    #[cfg(not(feature = "intl_clob"))]
+    #[cfg(feature = "us_retail")]
     { "us" }
+    #[cfg(feature = "kalshi")]
+    { "kalshi" }
 }
 
 /// DB key for the one-time alpha/jurisdiction acknowledgment record.
@@ -423,11 +467,21 @@ async fn get_status() -> Response {
     };
     let venue = build_venue();
     let venue_configured = match venue {
-        "intl" => env_set("POLYMARKET_PRIVATE_KEY") && env_set("POLYGON_RPC_URL"),
-        _      => env_set("POLYMARKET_US_KEY_ID") && env_set("POLYMARKET_US_SECRET_KEY"),
+        "intl"   => env_set("POLYMARKET_PRIVATE_KEY") && env_set("POLYGON_RPC_URL"),
+        "us"     => env_set("POLYMARKET_US_KEY_ID") && env_set("POLYMARKET_US_SECRET_KEY"),
+        // KALSHI_PRIVATE_KEY_PATH is a headless-only alternative (a PEM file
+        // mounted into the container); it is deliberately not UI-manageable,
+        // but an operator using it is still fully configured.
+        "kalshi" => env_set("KALSHI_API_KEY_ID")
+            && (env_set("KALSHI_PRIVATE_KEY") || env_set("KALSHI_PRIVATE_KEY_PATH")),
+        _        => false,
     };
+    let venues_available = available_venues();
     Json(json!({
         "venue": venue,
+        // Only populated on a multi-venue image (the Marketplace AMI). One
+        // entry or none means there is nothing to switch between.
+        "venues_available": venues_available,
         "admin_set": admin_hash().is_some(),
         "auth_disabled": setup_auth_disabled(),
         "venue_configured": venue_configured,
@@ -597,7 +651,7 @@ async fn login(Json(body): Json<Login>) -> Response {
 
 #[derive(Deserialize)]
 struct TestRequest {
-    /// "intl_wallet" | "polygon_rpc" | "us_keys" | "telegram" | "alpaca"
+    /// "intl_wallet" | "polygon_rpc" | "us_keys" | "kalshi_keys" | "telegram" | "alpaca"
     kind: String,
     /// Candidate credentials to test (falls back to stored/env values if omitted).
     #[serde(default)]
@@ -623,6 +677,8 @@ async fn test_connection(Json(body): Json<TestRequest>) -> Response {
         "llm" => test_llm(&body).await,
         #[cfg(feature = "us_retail")]
         "us_keys" => test_us_keys(&body).await,
+        #[cfg(feature = "kalshi")]
+        "kalshi_keys" => test_kalshi_keys(&body).await,
         other => Err(format!("unknown or unsupported test kind '{}' for this build", other)),
     };
     let ms = started.elapsed().as_millis() as u64;
@@ -895,6 +951,83 @@ async fn test_us_keys(body: &TestRequest) -> Result<serde_json::Value, String> {
     crate::venues::us::auth::UsAuth::from_env()
         .map_err(|e| format!("US auth failed: {}", e))?;
     Ok(json!({"auth": "constructed"}))
+}
+
+/// Validate Kalshi venue keys by building the RSA-PSS signer from the candidate
+/// values and signing a probe request.
+///
+/// This is deliberately local-only. Kalshi has no unauthenticated identity
+/// endpoint, and the failure this needs to catch is a malformed PEM or a key
+/// the operator pasted with literal `\n` escapes — both of which surface at
+/// construction. Catching them here means the operator learns before the
+/// restart, rather than from a container that comes back up unable to trade.
+#[cfg(feature = "kalshi")]
+async fn test_kalshi_keys(body: &TestRequest) -> Result<serde_json::Value, String> {
+    let key_id = test_cred(body, "KALSHI_API_KEY_ID")
+        .ok_or("KALSHI_API_KEY_ID not provided or stored")?;
+    // Mirror `KalshiAuth::from_env`: a PEM pasted into a single-line form field
+    // arrives with escaped newlines, which the RSA parser rejects outright.
+    let pem = test_cred(body, "KALSHI_PRIVATE_KEY")
+        .map(|p| p.replace("\\n", "\n"))
+        .ok_or("KALSHI_PRIVATE_KEY not provided or stored")?;
+    let auth = crate::venues::kalshi::auth::KalshiAuth::new(key_id.trim().to_string(), &pem)
+        .map_err(|e| format!("Kalshi auth failed: {}", e))?;
+    // Proves the signing key is usable, not merely parseable.
+    let headers = auth.signed_headers("GET", "/trade-api/v2/portfolio/balance");
+    Ok(json!({"auth": "constructed", "signed_headers": headers.len()}))
+}
+
+#[derive(Deserialize)]
+struct VenueRequest {
+    venue: String,
+}
+
+/// PUT /api/setup/venue — select which venue binary the container runs next.
+///
+/// Writes the selection and returns; it does NOT restart. The venue only
+/// changes when the process is replaced, so the UI pairs this with
+/// `POST /api/setup/restart` and tells the operator what is about to happen.
+/// Splitting the two keeps the destructive step explicit.
+async fn put_venue(Json(body): Json<VenueRequest>) -> Response {
+    let requested = body.venue.trim().to_lowercase();
+    let available = available_venues();
+
+    if available.len() < 2 {
+        return (StatusCode::CONFLICT, Json(json!({
+            "error": "this image carries a single venue — switching requires the multi-venue AMI",
+            "venues_available": available,
+        }))).into_response();
+    }
+    if !available.contains(&requested) {
+        return (StatusCode::BAD_REQUEST, Json(json!({
+            "error": format!("venue '{}' is not in this image", requested),
+            "venues_available": available,
+        }))).into_response();
+    }
+    if requested == build_venue() {
+        return Json(json!({"ok": true, "venue": requested, "restart_required": false})).into_response();
+    }
+
+    let path = venue_path();
+    if let Some(parent) = path.parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            return (StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"error": format!("creating {}: {}", parent.display(), e)}))).into_response();
+        }
+    }
+    if let Err(e) = std::fs::write(&path, format!("{}\n", requested)) {
+        return (StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": format!("writing {}: {}", path.display(), e)}))).into_response();
+    }
+
+    warn!("🔀 Setup: venue switched {} → {} — takes effect on restart",
+          build_venue(), requested);
+    Json(json!({
+        "ok": true,
+        "venue": requested,
+        "previous": build_venue(),
+        "restart_required": true,
+    })).into_response()
 }
 
 /// POST /api/setup/restart — gracefully exit the process so the container
@@ -1272,6 +1405,7 @@ pub fn admin_routes() -> Router {
         .route("/api/setup/raptors",     get(get_raptor_sources))
         .route("/api/setup/admin",       post(set_admin))
         .route("/api/setup/test",        post(test_connection))
+        .route("/api/setup/venue",       put(put_venue))
         .route("/api/setup/restart",     post(restart))
         .route("/api/setup/export",      get(export_bundle))
         .route("/api/setup/import",      post(import_bundle))
@@ -1379,6 +1513,30 @@ mod tests {
         for k in INTERNAL_KEYS {
             assert!(!MANAGED_KEYS.iter().any(|(mk, _, _, _)| mk == k));
         }
+    }
+
+    /// Every venue-scoped credential must be filed under a scope string that
+    /// `build_venue()` can actually return, and the venue this binary was built
+    /// for must own at least one credential row.
+    ///
+    /// This is the regression guard for the defect that blocked the first
+    /// multi-venue AMI: `build_venue()` reported "us" on a Kalshi build and
+    /// `MANAGED_KEYS` had no Kalshi rows at all, so a Kalshi instance booted
+    /// showing Polymarket US fields and offered no way to enter its own keys.
+    #[test]
+    fn every_venue_scope_is_reachable_and_the_running_venue_is_configurable() {
+        const KNOWN: &[&str] = &["intl", "us", "kalshi", "shared"];
+        for (key, _, scope, _) in MANAGED_KEYS {
+            assert!(
+                KNOWN.contains(scope),
+                "credential '{key}' has scope '{scope}', which no build reports",
+            );
+        }
+        let venue = build_venue();
+        assert!(
+            MANAGED_KEYS.iter().any(|(_, _, scope, panel)| *scope == venue && *panel == "venue"),
+            "venue '{venue}' has no credential rows — its Setup card renders empty",
+        );
     }
 
     /// Every key a Raptor advertises must be a managed credential filed under

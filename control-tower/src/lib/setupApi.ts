@@ -27,8 +27,17 @@ const TOKEN_KEY = 'dradis_admin_token';
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
+/** Venue compiled into the running engine binary — mirrors `build_venue()`. */
+export type VenueId = 'intl' | 'us' | 'kalshi';
+
 export interface SetupStatus {
-  venue: 'intl' | 'us';
+  venue: VenueId;
+  /**
+   * Venues baked into this image. Length < 2 means there is nothing to switch
+   * between (dev build, or the single-venue production image) and the venue
+   * selector is hidden.
+   */
+  venues_available?: VenueId[];
   admin_set: boolean;
   auth_disabled: boolean;
   venue_configured: boolean;
@@ -39,7 +48,7 @@ export interface SetupStatus {
 export interface CredentialInfo {
   key: string;
   label: string;
-  scope: 'intl' | 'us' | 'shared';
+  scope: VenueId | 'shared';
   /** Which Setup panel owns this key: core venue, Raptor signal, or integration. */
   panel: 'venue' | 'raptor' | 'integration';
   set: boolean;
@@ -231,6 +240,21 @@ export function putAutonomy(body: {
 
 export function restartEngine(): Promise<{ ok: boolean; message: string }> {
   return request('/api/setup/restart', { method: 'POST' });
+}
+
+/**
+ * Select which venue binary the engine runs next.
+ *
+ * Only meaningful on the multi-venue AMI (see `SetupStatus.venues_available`).
+ * The change is written but NOT applied — follow with `restartEngine()`.
+ */
+export function putVenue(venue: VenueId): Promise<{
+  ok: boolean;
+  venue: VenueId;
+  previous?: VenueId;
+  restart_required: boolean;
+}> {
+  return request('/api/setup/venue', { method: 'PUT', body: JSON.stringify({ venue }) });
 }
 
 // ── Config bundle export / import (AMI upgrade path) ─────────────────────────

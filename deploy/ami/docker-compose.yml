@@ -8,6 +8,11 @@
 # The engine API (9000) binds to localhost only — the Control Tower proxy on
 # port 80 is the sole public surface. Operator credentials are entered through
 # the Setup view and persist in /opt/dradis/data/secrets.env.
+#
+# Venue selection is NOT set here. The image carries one binary per venue and
+# /app/entrypoint.sh reads /opt/dradis/data/venue (seeded on first boot, changed
+# from the Setup view). Setting DRADIS_VENUE in .env would be ignored while that
+# file exists — see deploy/entrypoint.sh for the full resolution order.
 
 services:
   dradis:

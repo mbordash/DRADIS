@@ -11,14 +11,36 @@ RUN apk add --no-cache \
 RUN rustup target add x86_64-unknown-linux-musl
 WORKDIR /app
 
-# ── Dependency caching layer ────────────────────────────────────────────────
-# DRADIS_FEATURES selects the venue build. Default (empty) = intl_clob.
-# US retail: --build-arg DRADIS_FEATURES="--no-default-features --features us_retail"
-ARG DRADIS_FEATURES=""
+# ── Venue selection ─────────────────────────────────────────────────────────
+# The three venues are mutually exclusive Cargo features, so each is a separate
+# binary. DRADIS_VENUES is a space-separated list of the ones to bake:
+#
+#   (unset)            → intl only. Production (deploy-live.sh) and local dev.
+#   "intl us kalshi"   → all three. The AWS Marketplace AMI, which is one
+#                        product covering every venue; deploy/ami/provision.sh
+#                        passes this and the customer picks in the Setup view.
+#
+# Keeping the default single-venue matters: each extra venue is a full Rust
+# release build, and cargo rebuilds dependencies whenever the feature set
+# changes, so a three-venue image costs roughly three times the build time.
+ARG DRADIS_VENUES="intl"
 COPY Cargo.toml Cargo.lock ./
 
-RUN mkdir -p src && echo "fn main() {}" > src/main.rs && \
-    cargo build --release --target x86_64-unknown-linux-musl $DRADIS_FEATURES && \
+# ── Dependency caching layer ────────────────────────────────────────────────
+# Primes the dependency graph for the FIRST venue in the list. Later venues
+# enable different optional dependencies (alloy / polymarket-us / rsa), so
+# cargo rebuilds for those regardless — the win is real only for the common
+# single-venue case, which is exactly the one that gets rebuilt often.
+RUN set -eux; \
+    first=$(set -- $DRADIS_VENUES; echo "$1"); \
+    case "$first" in \
+        intl)   flags="" ;; \
+        us)     flags="--no-default-features --features us_retail" ;; \
+        kalshi) flags="--no-default-features --features kalshi" ;; \
+        *) echo "unknown venue '$first' in DRADIS_VENUES (want: intl us kalshi)"; exit 1 ;; \
+    esac; \
+    mkdir -p src && echo "fn main() {}" > src/main.rs; \
+    cargo build --release --target x86_64-unknown-linux-musl $flags; \
     rm -rf src \
            target/x86_64-unknown-linux-musl/release/.fingerprint/dradis-* \
            target/x86_64-unknown-linux-musl/release/deps/dradis-* \
@@ -43,10 +65,21 @@ COPY src ./src
 # never touches Setup, or who picks Conservative, is never running something
 # racier than they asked for.
 RUN cp src/config.conservative.rs.example src/config.rs
-RUN touch src/main.rs && \
-    cargo build --release --target x86_64-unknown-linux-musl $DRADIS_FEATURES && \
-    strip target/x86_64-unknown-linux-musl/release/dradis && \
-    cp target/x86_64-unknown-linux-musl/release/dradis /dradis-bin && \
+RUN set -eux; \
+    mkdir -p /out/bin; \
+    for v in $DRADIS_VENUES; do \
+        case "$v" in \
+            intl)   flags="" ;; \
+            us)     flags="--no-default-features --features us_retail" ;; \
+            kalshi) flags="--no-default-features --features kalshi" ;; \
+            *) echo "unknown venue '$v' in DRADIS_VENUES (want: intl us kalshi)"; exit 1 ;; \
+        esac; \
+        echo "── building venue: $v ──"; \
+        touch src/main.rs; \
+        cargo build --release --target x86_64-unknown-linux-musl $flags; \
+        strip target/x86_64-unknown-linux-musl/release/dradis; \
+        cp target/x86_64-unknown-linux-musl/release/dradis "/out/bin/dradis-$v"; \
+    done; \
     rm -rf target /usr/local/cargo/registry /usr/local/cargo/git
 
 FROM alpine:latest
@@ -55,7 +88,10 @@ ENV TZ=America/New_York
 WORKDIR /app
 # Control Tower REST API (axum)
 EXPOSE 9000
-COPY --from=builder /dradis-bin ./dradis
+# One binary per baked venue; entrypoint.sh selects at container start.
+COPY --from=builder /out/bin ./bin
+COPY deploy/entrypoint.sh ./entrypoint.sh
+RUN chmod +x ./entrypoint.sh
 # Liveness check: /api/health must respond within 10s.
 # Docker will mark the container unhealthy after 3 consecutive failures
 # (~90 s of silence) so an operator / restart policy can act on it.
@@ -63,5 +99,5 @@ COPY --from=builder /dradis-bin ./dradis
 # in /etc/hosts, causing "can't connect" failures even when the API is running.
 HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
     CMD wget -qO- http://127.0.0.1:9000/api/health || exit 1
-ENTRYPOINT ["./dradis"]
+ENTRYPOINT ["/app/entrypoint.sh"]
 

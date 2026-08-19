@@ -30,10 +30,10 @@
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
 import {
-  SetupStatus, CredentialInfo, TestResult, AutonomyStatus,
+  SetupStatus, VenueId, CredentialInfo, TestResult, AutonomyStatus,
   RaptorSource, RaptorTier, getRaptorSources,
   getSetupStatus, getCredentials, putCredentials, testConnection,
-  login, setAdminPassword, restartEngine,
+  login, setAdminPassword, restartEngine, putVenue,
   getAutonomy, putAutonomy,
   exportBundle, importBundle,
   getProfiles, applyProfile, ConfigProfile,
@@ -49,19 +49,32 @@ const TEST_KINDS: Record<string, { kind: string; label: string; keys: string[] }
   intl_wallet: { kind: 'intl_wallet', label: 'Test wallet + CLOB auth', keys: ['POLYMARKET_PRIVATE_KEY'] },
   polygon_rpc: { kind: 'polygon_rpc', label: 'Test RPC', keys: ['POLYGON_RPC_URL'] },
   us_keys:     { kind: 'us_keys',     label: 'Test API keys', keys: ['POLYMARKET_US_KEY_ID', 'POLYMARKET_US_SECRET_KEY'] },
+  kalshi_keys: { kind: 'kalshi_keys', label: 'Test API keys', keys: ['KALSHI_API_KEY_ID', 'KALSHI_PRIVATE_KEY'] },
   alpaca:      { kind: 'alpaca',      label: 'Test Alpaca', keys: ['ALPACA_API_KEY_ID', 'ALPACA_API_SECRET_KEY'] },
   odds:        { kind: 'odds',        label: 'Test key',    keys: ['ODDS_API_KEY'] },
   telegram:    { kind: 'telegram',    label: 'Test Telegram', keys: ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'] },
   llm:         { kind: 'llm',         label: 'Test LLM', keys: ['LLM_PROVIDER', 'OLLAMA_URL', 'OLLAMA_MODEL', 'LLM_API_BASE', 'LLM_API_KEY', 'LLM_MODEL'] },
 };
 
+// Per-venue display strings, so the venue never has to be re-derived inline.
+// `missing` is the phrase used in the "cannot trade" banner.
+const VENUE_META: Record<VenueId, { label: string; missing: string }> = {
+  intl:   { label: 'Polymarket CLOB (intl, self-custody)', missing: 'Polymarket wallet' },
+  us:     { label: 'Polymarket US (custodial)',            missing: 'Polymarket US API keys' },
+  kalshi: { label: 'Kalshi (CFTC-regulated, custodial)',   missing: 'Kalshi API credentials' },
+};
+
 // Group layout: section title → credential keys + test kind.
-function groupsForVenue(venue: 'intl' | 'us') {
+function groupsForVenue(venue: VenueId) {
   const groups: { title: string; blurb: string; keys: string[]; test?: keyof typeof TEST_KINDS }[] = [];
   if (venue === 'intl') {
     groups.push(
       { title: 'Polymarket Wallet', blurb: 'Self-custody EOA key — Safe address and CLOB auth are derived from it.', keys: ['POLYMARKET_PRIVATE_KEY'], test: 'intl_wallet' },
       { title: 'Polygon RPC', blurb: 'JSON-RPC endpoint for on-chain settlement + balance checks.', keys: ['POLYGON_RPC_URL'], test: 'polygon_rpc' },
+    );
+  } else if (venue === 'kalshi') {
+    groups.push(
+      { title: 'Kalshi API Credentials', blurb: 'API key ID plus the RSA private key you downloaded when creating it. Paste the full PEM including the BEGIN/END lines.', keys: ['KALSHI_API_KEY_ID', 'KALSHI_PRIVATE_KEY'], test: 'kalshi_keys' },
     );
   } else {
     groups.push(
@@ -89,6 +102,106 @@ const btnCls = (variant: 'primary' | 'ghost' | 'danger' = 'ghost') =>
     variant === 'danger'  && 'bg-rose-500/10 border-rose-500/30 text-rose-300 hover:bg-rose-500/20',
     variant === 'ghost'   && 'bg-[#13131f] border-[#1e1e32] text-gray-400 hover:border-gray-600 hover:text-gray-200',
   ].filter(Boolean).join(' ');
+
+// ── Venue selector (multi-venue AMI only) ────────────────────────────────────
+
+/**
+ * Switch which venue the engine trades.
+ *
+ * The three venues are mutually exclusive Cargo features, so each is a separate
+ * binary and switching means restarting into a different one. That makes this
+ * the one Setup control that is NOT a live DynamicConfig knob — the card says
+ * so explicitly rather than letting a save appear to take effect immediately.
+ *
+ * Renders only when the running image actually carries more than one venue
+ * (the AWS Marketplace AMI). A single-venue build has nothing to offer.
+ */
+function VenueCard({
+  status, onSwitched,
+}: {
+  status: SetupStatus;
+  onSwitched: (msg: string) => void;
+}) {
+  const [busy, setBusy] = useState(false);
+  const [pending, setPending] = useState<VenueId | null>(null);
+  const available = status.venues_available ?? [];
+
+  if (available.length < 2) return null;
+
+  const apply = async (venue: VenueId) => {
+    setBusy(true);
+    try {
+      await putVenue(venue);
+      await restartEngine();
+      onSwitched(
+        `Venue switched to ${VENUE_META[venue].label}. The engine is restarting — ` +
+        `it will come back in 30-60s, then enter its ${VENUE_META[venue].missing}.`,
+      );
+      setPending(null);
+    } catch (e) {
+      onSwitched(e instanceof Error ? e.message : 'Venue switch failed.');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="bg-[#13131f] border border-[#1e1e32] rounded-xl p-4 space-y-3">
+      <div>
+        <h3 className="text-sm font-mono text-gray-200">🎯 Trading Venue</h3>
+        <p className="text-xs text-gray-500 mt-0.5">
+          This image can trade any of the venues below. Switching restarts the engine
+          and loads that venue&apos;s credentials — positions and history stay in the
+          database but are scoped per venue.
+        </p>
+      </div>
+
+      <div className="grid grid-cols-1 sm:grid-cols-3 gap-2">
+        {available.map(v => {
+          const active = v === status.venue;
+          return (
+            <button
+              key={v}
+              disabled={busy || active}
+              onClick={() => setPending(v)}
+              className={[
+                'text-left text-xs font-mono rounded-lg border px-3 py-2 transition-colors',
+                'disabled:cursor-default',
+                active
+                  ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-300'
+                  : 'bg-[#0e0e18] border-[#1e1e32] text-gray-400 hover:border-gray-600 hover:text-gray-200',
+              ].join(' ')}
+            >
+              <div>{VENUE_META[v].label}</div>
+              {active && <div className="text-[10px] text-emerald-400/70 mt-0.5">running</div>}
+            </button>
+          );
+        })}
+      </div>
+
+      {pending && (
+        <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg px-3 py-2.5 space-y-2">
+          <p className="text-xs font-mono text-amber-300">
+            Switch to {VENUE_META[pending].label}?
+          </p>
+          <p className="text-[11px] text-amber-200/80">
+            The engine restarts immediately. Any resting orders on{' '}
+            {VENUE_META[status.venue].label} are left in place on that venue and will
+            no longer be managed — cancel them first if you do not want them working.
+          </p>
+          <div className="flex gap-2">
+            <button disabled={busy} onClick={() => apply(pending)} className={btnCls('primary')}>
+              {busy ? 'Switching…' : 'Switch and restart'}
+            </button>
+            <button disabled={busy} onClick={() => setPending(null)} className={btnCls('ghost')}>
+              Cancel
+            </button>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
 
 // ── Login / first-boot password card ─────────────────────────────────────────
 
@@ -1019,7 +1132,7 @@ export default function SetupPage() {
       {!status.venue_configured && (
         <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl px-4 py-3 text-xs font-mono text-amber-300">
           ⚠️ Venue credentials not configured — DRADIS cannot trade until the{' '}
-          {status.venue === 'intl' ? 'Polymarket wallet' : 'Polymarket US API keys'} are set.
+          {VENUE_META[status.venue].missing} are set.
         </div>
       )}
 
@@ -1027,7 +1140,7 @@ export default function SetupPage() {
         <div>
           <h2 className="text-sm font-mono text-gray-200">⚙️ Setup — Credentials</h2>
           <p className="text-xs text-gray-500 mt-0.5">
-            Venue: <span className="text-gray-300">{status.venue === 'intl' ? 'Polymarket CLOB (intl, self-custody)' : 'Polymarket US (custodial)'}</span>
+            Venue: <span className="text-gray-300">{VENUE_META[status.venue].label}</span>
             {' '}· stored in <span className="text-gray-300">data/secrets.env</span> · values are write-only
           </p>
         </div>
@@ -1065,6 +1178,11 @@ export default function SetupPage() {
           {notice.text}
         </div>
       )}
+
+      <VenueCard
+        status={status}
+        onSwitched={text => { setNotice({ kind: 'ok', text }); loadStatus(); }}
+      />
 
       {creds ? (
         <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">

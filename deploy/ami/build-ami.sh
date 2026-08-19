@@ -2,9 +2,12 @@
 # =============================================================================
 # build-ami.sh — builds a DRADIS AWS Marketplace AMI from the current repo.
 #
-# Two product variants (run once per listing):
-#   ./deploy/ami/build-ami.sh --venue intl    → "DRADIS International" AMI
-#   ./deploy/ami/build-ami.sh --venue us      → "DRADIS US" AMI
+# ONE AMI for ONE Marketplace listing. The image carries a binary for every
+# venue (Polymarket International, Polymarket US, Kalshi) and the customer
+# picks theirs in the Setup view; see deploy/entrypoint.sh for the dispatch.
+#
+#   ./deploy/ami/build-ami.sh                      → all three venues
+#   ./deploy/ami/build-ami.sh --venues "intl us"   → shorter test build
 #
 # What it does (everything is created fresh and torn down afterwards):
 #   1. Resolves the latest Canonical Ubuntu 24.04 LTS base AMI via public SSM
@@ -20,23 +23,25 @@
 # Requirements: aws CLI v2 with credentials, git, ssh, a default VPC in REGION.
 #
 # Options:
-#   --venue intl|us        (required) which product variant to bake
+#   --venues "LIST"        default: "intl us kalshi" (space-separated)
 #   --region REGION        default: eu-west-1
-#   --instance-type TYPE   default: c5.2xlarge (8 vCPU — Rust release build)
+#   --instance-type TYPE   default: c5.4xlarge (16 vCPU — three Rust builds)
 #   --version LABEL        default: git describe (AMI name suffix)
 #   --keep-instance        don't terminate the builder on failure (debugging)
 # =============================================================================
 set -euo pipefail
 
 REGION="eu-west-1"
-INSTANCE_TYPE="c5.2xlarge"
-VENUE=""
+# Three sequential Rust release builds: 16 vCPU keeps the wall clock sane, and
+# the instance is torn down at the end so the extra cost is minutes, not hours.
+INSTANCE_TYPE="c5.4xlarge"
+VENUES="intl us kalshi"
 VERSION=""
 KEEP_INSTANCE=false
 
 while [ $# -gt 0 ]; do
     case "$1" in
-        --venue)         VENUE="$2"; shift 2 ;;
+        --venues)        VENUES="$2"; shift 2 ;;
         --region)        REGION="$2"; shift 2 ;;
         --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;
         --version)       VERSION="$2"; shift 2 ;;
@@ -45,10 +50,14 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-case "$VENUE" in
-    intl|us) ;;
-    *) echo "usage: build-ami.sh --venue intl|us [--region R] [--instance-type T] [--version V]"; exit 1 ;;
-esac
+for v in $VENUES; do
+    case "$v" in
+        intl|us|kalshi) ;;
+        *) echo "unknown venue '$v'"
+           echo "usage: build-ami.sh [--venues \"intl us kalshi\"] [--region R] [--instance-type T] [--version V]"
+           exit 1 ;;
+    esac
+done
 
 REPO_ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 cd "$REPO_ROOT"
@@ -61,8 +70,8 @@ fi
 
 [ -n "$VERSION" ] || VERSION="$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)"
 STAMP="$(date -u +%Y%m%d-%H%M)"
-AMI_NAME="dradis-${VENUE}-${VERSION}-${STAMP}"
-TAG="dradis-ami-builder-${VENUE}-${STAMP}"
+AMI_NAME="dradis-${VERSION}-${STAMP}"
+TAG="dradis-ami-builder-${STAMP}"
 
 AWS() { aws --region "$REGION" "$@"; }
 
@@ -115,7 +124,7 @@ INSTANCE_ID=$(AWS ec2 run-instances \
     --instance-type "$INSTANCE_TYPE" \
     --key-name "$KEY_NAME" \
     --security-group-ids "$SG_ID" \
-    --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":30,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
+    --block-device-mappings '[{"DeviceName":"/dev/sda1","Ebs":{"VolumeSize":60,"VolumeType":"gp3","DeleteOnTermination":true}}]' \
     --tag-specifications "ResourceType=instance,Tags=[{Key=Name,Value=$TAG}]" \
     --query 'Instances[0].InstanceId' --output text)
 echo "Builder instance: $INSTANCE_ID"
@@ -138,7 +147,7 @@ git archive --format=tar.gz HEAD \
     | "${SSH[@]}" "mkdir -p /tmp/dradis-src && tar xz -C /tmp/dradis-src"
 
 echo "Provisioning (Docker + image builds — this takes a while)…"
-"${SSH[@]}" "sudo bash /tmp/dradis-src/deploy/ami/provision.sh $VENUE"
+"${SSH[@]}" "sudo bash /tmp/dradis-src/deploy/ami/provision.sh '$VENUES'"
 
 # ── 5. Marketplace hygiene sweep (last SSH command — it locks us out) ────────
 echo "Scrubbing instance for Marketplace…"
@@ -161,12 +170,12 @@ AWS ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
 
 AMI_ID=$(AWS ec2 create-image --instance-id "$INSTANCE_ID" \
     --name "$AMI_NAME" \
-    --description "DRADIS $([ "$VENUE" = intl ] && echo International || echo US) — self-hosted, non-custodial automated prediction-market trading engine (provided AS IS)" \
+    --description "DRADIS — self-hosted, non-custodial automated prediction-market trading engine for Polymarket International, Polymarket US and Kalshi (provided AS IS)" \
     --query 'ImageId' --output text)
 echo "AMI: $AMI_ID — waiting for 'available'…"
 AWS ec2 wait image-available --image-ids "$AMI_ID"
 AWS ec2 create-tags --resources "$AMI_ID" \
-    --tags "Key=Name,Value=$AMI_NAME" "Key=dradis:venue,Value=$VENUE" \
+    --tags "Key=Name,Value=$AMI_NAME" "Key=dradis:venues,Value=${VENUES// /,}" \
            "Key=dradis:version,Value=$VERSION"
 
 BUILD_OK=true
@@ -174,7 +183,7 @@ echo ""
 echo "═══════════════════════════════════════════════════════════════════"
 echo "✅ $AMI_NAME"
 echo "   AMI ID:  $AMI_ID   (region $REGION)"
-echo "   Venue:   $VENUE"
+echo "   Venues:  $VENUES"
 echo ""
 echo "Test it:   launch the AMI, open http://<public-ip>/ and log in with"
 echo "           user 'admin' / password = the new instance's ID."
