@@ -870,15 +870,33 @@ mod tests {
         );
     }
 
-    /// Round-trip fee is steeply price-dependent — the whole reason a flat target
-    /// fails. Pins the shape so a venue-fee refactor cannot quietly flatten it.
+    /// Round-trip fee is steeply price-dependent — the whole reason a flat
+    /// take-profit target fails. Pins the shape so a venue-fee refactor cannot
+    /// quietly flatten it.
+    ///
+    /// The assertion is conditional on the venue actually charging a taker fee,
+    /// because US Retail charges none: there `round_trip_fee_pct` is zero at every
+    /// price and the fee floor is *correctly* inert. Asserting a decreasing curve
+    /// unconditionally fails the `us_retail` build for a venue that is behaving
+    /// exactly as intended, so each branch pins the property that venue should hold.
     #[test]
     fn round_trip_fee_falls_as_entry_price_rises() {
         let cheap = crate::venues::round_trip_fee_pct(dec!(0.20));
         let mid   = crate::venues::round_trip_fee_pct(dec!(0.43));
         let rich  = crate::venues::round_trip_fee_pct(dec!(0.80));
-        assert!(cheap > mid && mid > rich, "fee curve is not decreasing: {cheap} / {mid} / {rich}");
-        // Degenerate prices carry no fee rather than a negative one.
+
+        if mid > Decimal::ZERO {
+            // Quadratic-fee venue (Polymarket intl, Kalshi): cheap entries cost more.
+            assert!(cheap > mid && mid > rich, "fee curve is not decreasing: {cheap} / {mid} / {rich}");
+        } else {
+            // Zero-fee venue: flat at zero everywhere, never negative.
+            assert!(
+                cheap == Decimal::ZERO && rich == Decimal::ZERO,
+                "zero-fee venue reported a non-zero fee: {cheap} / {mid} / {rich}",
+            );
+        }
+
+        // Degenerate prices carry no fee rather than a negative one, on every venue.
         assert_eq!(crate::venues::round_trip_fee_pct(dec!(0)), Decimal::ZERO);
         assert_eq!(crate::venues::round_trip_fee_pct(dec!(1)), Decimal::ZERO);
     }
