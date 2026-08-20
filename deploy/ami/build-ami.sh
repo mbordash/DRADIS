@@ -129,12 +129,18 @@ AWS ec2 authorize-security-group-ingress --group-id "$SG_ID" \
 
 INSTANCE_ID=""
 cleanup() {
-    set +e
+    # +u as well as +e: a cleanup trap must never be the thing that fails.
+    # It previously died on an unbound variable and leaked a running builder.
+    set +e +u
     if [ -n "$INSTANCE_ID" ]; then
         if [ "$KEEP_INSTANCE" = true ] && [ "${BUILD_OK:-false}" != true ]; then
             echo "⚠️  --keep-instance: builder $INSTANCE_ID left running for debugging."
         else
-            echo "Terminating builder $INSTANCE_ID…"
+            # Braces are load-bearing: bash in a UTF-8 locale folds the
+            # following ellipsis into the identifier, looks up a variable that
+            # does not exist, and under `set -u` aborts the trap before the
+            # instance is terminated.
+            echo "Terminating builder ${INSTANCE_ID}…"
             AWS ec2 terminate-instances --instance-ids "$INSTANCE_ID" >/dev/null
             AWS ec2 wait instance-terminated --instance-ids "$INSTANCE_ID"
         fi
@@ -161,8 +167,11 @@ HOST=$(AWS ec2 describe-instances --instance-ids "$INSTANCE_ID" \
     --query 'Reservations[0].Instances[0].PublicIpAddress' --output text)
 echo "Builder IP: $HOST — waiting for SSH…"
 
+# ServerAlive* keeps a NAT or wifi blip from silently dropping a connection
+# that is waiting on a long, quiet remote command.
 SSH=(ssh -i "$KEY_FILE" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
-     -o ConnectTimeout=10 "ubuntu@$HOST")
+     -o ConnectTimeout=10 -o ServerAliveInterval=30 -o ServerAliveCountMax=10 \
+     "ubuntu@$HOST")
 for i in $(seq 1 30); do
     "${SSH[@]}" true 2>/dev/null && break
     [ "$i" = 30 ] && { echo "SSH never came up"; exit 1; }
@@ -174,8 +183,41 @@ echo "Uploading source (git archive HEAD)…"
 git archive --format=tar.gz HEAD \
     | "${SSH[@]}" "mkdir -p /tmp/dradis-src && tar xz -C /tmp/dradis-src"
 
+# A three-venue build runs for the better part of an hour with long silent
+# stretches. Holding one SSH session open for all of it is fragile — any NAT
+# timeout or wifi drop kills the connection and takes the build with it, which
+# is exactly what happened on the first real run. Start it detached instead,
+# then follow the log over short-lived connections that can each fail and be
+# retried without losing the build.
 echo "Provisioning (Docker + image builds — this takes a while)…"
-"${SSH[@]}" "sudo bash /tmp/dradis-src/deploy/ami/provision.sh '$VENUES'"
+"${SSH[@]}" "cat > /tmp/run-provision.sh" <<RUNNER
+#!/bin/bash
+sudo bash /tmp/dradis-src/deploy/ami/provision.sh '$VENUES' > /tmp/provision.log 2>&1
+echo \$? > /tmp/provision.rc
+RUNNER
+"${SSH[@]}" "chmod +x /tmp/run-provision.sh && \
+    setsid nohup /tmp/run-provision.sh </dev/null >/dev/null 2>&1 & sleep 2"
+
+SENT=0            # lines of provision.log already mirrored locally
+PROV_RC=""
+while [ -z "$PROV_RC" ]; do
+    if CHUNK=$("${SSH[@]}" "tail -n +$((SENT+1)) /tmp/provision.log 2>/dev/null" 2>/dev/null); then
+        if [ -n "$CHUNK" ]; then
+            printf '%s\n' "$CHUNK"
+            SENT=$((SENT + $(printf '%s\n' "$CHUNK" | wc -l)))
+        fi
+        PROV_RC=$("${SSH[@]}" "cat /tmp/provision.rc 2>/dev/null" 2>/dev/null || true)
+    else
+        echo "   … lost contact with the builder — retrying (the build keeps running)"
+    fi
+    [ -z "$PROV_RC" ] && sleep 20
+done
+
+if [ "$PROV_RC" != 0 ]; then
+    echo "❌ Provisioning failed on the builder (exit $PROV_RC)."
+    echo "   Re-run with --keep-instance to keep the box and read /tmp/provision.log on it."
+    exit 1
+fi
 
 # ── 5. Marketplace hygiene sweep (last SSH command — it locks us out) ────────
 echo "Scrubbing instance for Marketplace…"
