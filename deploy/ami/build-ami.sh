@@ -71,6 +71,42 @@ if [ -n "$(git status --porcelain)" ]; then
     [ "${ans:-n}" = "y" ] || exit 1
 fi
 
+# ── Preflight: the git archive must carry everything the images COPY ─────────
+# The AMI is built from `git archive HEAD` — tracked files only. A file that is
+# present locally but ignored is therefore invisible to the build even though
+# `docker build .` works fine here, and the failure only surfaces on the remote
+# builder, twenty minutes and one instance later. Three separate files were
+# missing this way on the first real run (Cargo.lock, control-tower/Dockerfile,
+# control-tower/package-lock.json), so check it locally instead.
+REQUIRED_IN_ARCHIVE=(
+    Dockerfile
+    Cargo.toml
+    Cargo.lock
+    src/main.rs
+    deploy/entrypoint.sh
+    control-tower/Dockerfile
+    control-tower/package.json
+    control-tower/package-lock.json
+    deploy/ami/provision.sh
+    deploy/ami/docker-compose.yml
+    deploy/ami/dradis-firstboot.sh
+    deploy/ami/dradis.service
+)
+ARCHIVE_LIST=$(git archive HEAD | tar -t)
+MISSING=""
+for f in "${REQUIRED_IN_ARCHIVE[@]}"; do
+    printf '%s\n' "$ARCHIVE_LIST" | grep -qxF "$f" || MISSING="$MISSING $f"
+done
+if [ -n "$MISSING" ]; then
+    echo "❌ Missing from \`git archive HEAD\` — the remote build would fail on these:"
+    for f in $MISSING; do echo "     - $f"; done
+    echo
+    echo "   They may exist locally but be untracked or ignored. Diagnose with:"
+    echo "     git check-ignore -v <path>     # names the rule, including ~/.gitignore_global"
+    echo "     git ls-files --error-unmatch <path>"
+    exit 1
+fi
+
 [ -n "$VERSION" ] || VERSION="$(git describe --tags --always 2>/dev/null || git rev-parse --short HEAD)"
 STAMP="$(date -u +%Y%m%d-%H%M)"
 AMI_NAME="dradis-${VERSION}-${STAMP}"

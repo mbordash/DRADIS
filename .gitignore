@@ -1,7 +1,13 @@
 # Rust
 /target
 **/*.rs.bk
-Cargo.lock
+# Cargo.lock is deliberately TRACKED. DRADIS is an application, not a library,
+# and Cargo's own guidance is to commit the lockfile for binaries so builds are
+# reproducible. It is also load-bearing for the AMI: deploy/ami/build-ami.sh
+# ships `git archive HEAD`, so an untracked lockfile is simply absent from the
+# build context and the Dockerfile's `COPY Cargo.toml Cargo.lock ./` fails.
+# Without it, the image sold to a customer could resolve different crate
+# versions than the ones tested here.
 
 # Environment / Secrets (CRITICAL - Never commit!)
 .env
@@ -28,7 +34,10 @@ CLAUDE.md
 
 # Docker
 Dockerfile.*
-control-tower/Dockerfile
+# control-tower/Dockerfile is deliberately TRACKED: deploy/ami/provision.sh
+# builds the Control Tower image from it on the AMI builder, and the build
+# context there is `git archive HEAD`, so an ignored Dockerfile is simply not
+# present and `docker build control-tower/` fails.
 .dockerignore
 **/.docker
 
@@ -41,7 +50,9 @@ logs/
 # Control Tower (Next.js)
 control-tower/.next/
 control-tower/node_modules/
-control-tower/package-lock.json
+# control-tower/package-lock.json is tracked for the same reasons as Cargo.lock,
+# and additionally because the Control Tower Dockerfile runs `npm ci`, which
+# refuses to run at all without a lockfile.
 control-tower/.env.local
 control-tower/.env*.local
 
