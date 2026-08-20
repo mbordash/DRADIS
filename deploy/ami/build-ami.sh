@@ -177,6 +177,9 @@ AWS ec2 authorize-security-group-ingress --group-id "$SG_ID" \
     --protocol tcp --port 22 --cidr "$MY_IP" >/dev/null
 
 INSTANCE_ID=""
+# Set before the trap is installed so cleanup() can distinguish "no image yet"
+# from "image created, a later step failed".
+AMI_ID=""
 cleanup() {
     # +u as well as +e: a cleanup trap must never be the thing that fails.
     # It previously died on an unbound variable and leaked a running builder.
@@ -188,13 +191,29 @@ cleanup() {
             # the instance away here means rebuilding all of it, so keep it —
             # stopped, it costs only its EBS volume.
             echo ""
-            echo "⚠️  Provisioning succeeded; only the snapshot failed."
-            echo "    Builder ${INSTANCE_ID} is left STOPPED so you need not rebuild."
-            echo ""
-            echo "    Retry just the snapshot:"
-            echo "      aws ${PROFILE:+--profile ${PROFILE} }--region ${REGION} ec2 create-image \\"
-            echo "          --instance-id ${INSTANCE_ID} --name '${AMI_NAME}' \\"
-            echo "          --description '${AMI_DESCRIPTION}'"
+            if [ -n "${AMI_ID:-}" ]; then
+                # create-image already succeeded — the image EXISTS. Telling the
+                # operator to re-snapshot here would silently create a second,
+                # duplicate AMI (this is exactly what a create-tags failure looked
+                # like on 2026-08-20).
+                echo "⚠️  The AMI was created successfully; a later step failed."
+                echo "    AMI: ${AMI_ID}  — do NOT re-run the build, it already exists."
+                echo ""
+                echo "    Finish it by hand (note '+' not ',' in the venues value —"
+                echo "    a comma is the CLI's shorthand delimiter):"
+                echo "      aws ${PROFILE:+--profile ${PROFILE} }--region ${REGION} ec2 create-tags --resources ${AMI_ID} \\"
+                echo "          --tags Key=Name,Value=${AMI_NAME} \\"
+                echo "                 \"Key=dradis:venues,Value=${VENUES// /+}\" \\"
+                echo "                 Key=dradis:version,Value=${VERSION}"
+            else
+                echo "⚠️  Provisioning succeeded; only the snapshot failed."
+                echo "    Builder ${INSTANCE_ID} is left STOPPED so you need not rebuild."
+                echo ""
+                echo "    Retry just the snapshot:"
+                echo "      aws ${PROFILE:+--profile ${PROFILE} }--region ${REGION} ec2 create-image \\"
+                echo "          --instance-id ${INSTANCE_ID} --name '${AMI_NAME}' \\"
+                echo "          --description '${AMI_DESCRIPTION}'"
+            fi
             echo ""
             echo "    When you are done, clean up:"
             echo "      aws ${PROFILE:+--profile ${PROFILE} }--region ${REGION} ec2 terminate-instances --instance-ids ${INSTANCE_ID}"
@@ -317,8 +336,12 @@ AMI_ID=$(AWS ec2 create-image --instance-id "$INSTANCE_ID" \
     --query 'ImageId' --output text)
 echo "AMI: $AMI_ID — waiting for 'available'…"
 AWS ec2 wait image-available --image-ids "$AMI_ID"
+# `+` and NOT `,` as the separator. In the CLI's shorthand syntax the comma is
+# what delimits Key= from Value=, so "Value=intl,us,kalshi" is parsed as three
+# shorthand tokens and the value arrives as a LIST — which create-tags rejects
+# with a ParamValidation error, AFTER the image has already been created.
 AWS ec2 create-tags --resources "$AMI_ID" \
-    --tags "Key=Name,Value=$AMI_NAME" "Key=dradis:venues,Value=${VENUES// /,}" \
+    --tags "Key=Name,Value=$AMI_NAME" "Key=dradis:venues,Value=${VENUES// /+}" \
            "Key=dradis:version,Value=$VERSION"
 
 BUILD_OK=true
