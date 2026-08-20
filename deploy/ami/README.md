@@ -88,6 +88,12 @@ with no `endpoint_url`, and select it with `--profile` or `AWS_PROFILE`.
 Marketplace ingests and scans AMIs from **us-east-1**, so build there
 (`--region us-east-1`) even though the script defaults to eu-west-1.
 
+`iam-policy.json` in this directory is the least-privilege policy the build
+needs — EC2 builder lifecycle, image creation, the Marketplace image-sharing
+attribute, and read access to Canonical's public SSM parameter for the Ubuntu
+base AMI. The write statements are conditioned on `aws:RequestedRegion`, so add
+a region there before building outside us-east-1 / eu-west-1.
+
 Defaults reflect the three-venue build: `c5.4xlarge` (16 vCPU) on a 60 GB
 volume, because each venue is a full Rust release build and cargo rebuilds the
 dependency graph whenever the feature set changes. Expect roughly three times
