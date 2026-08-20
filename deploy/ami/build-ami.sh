@@ -268,6 +268,58 @@ for i in $(seq 1 30); do
     sleep 10
 done
 
+# Re-authorise our current public IP on the builder's security group.
+#
+# The group is opened to ONE address, captured once at build start. A dynamic
+# lease, a VPN reconnect or a mobile handoff changes that address mid-build, and
+# every subsequent SSH then hangs until it times out — packets are dropped, so
+# it presents as "Operation timed out" rather than a refusal, which makes it
+# look like a dead instance. Idempotent: a duplicate rule is not an error worth
+# stopping for.
+reauthorize_ip() {
+    local ip
+    ip="$(curl -sf https://checkip.amazonaws.com || true)"
+    [ -n "$ip" ] || return 0
+    ip="${ip}/32"
+    [ "$ip" = "$MY_IP" ] && return 0
+    echo "   public IP changed ($MY_IP -> $ip) — reopening SSH for it"
+    AWS ec2 authorize-security-group-ingress --group-id "$SG_ID" \
+        --protocol tcp --port 22 --cidr "$ip" >/dev/null 2>&1 || true
+    MY_IP="$ip"
+}
+
+# Run a remote command, retrying through transient network failures.
+#
+# Everything after the source upload is expensive to redo, so a single dropped
+# connection must not end the build (2026-08-20: it did, immediately after the
+# upload, and cost the whole run).
+ssh_try() {
+    local attempt=1
+    # </dev/null so ssh cannot swallow this script's own stdin — the dirty-tree
+    # prompt and the log-follow loop both read from it.
+    until "${SSH[@]}" "$@" < /dev/null; do
+        [ "$attempt" -ge 5 ] && { echo "   ssh failed 5 times — giving up"; return 1; }
+        echo "   ssh failed (attempt $attempt) — retrying in 10s"
+        reauthorize_ip
+        sleep 10
+        attempt=$((attempt + 1))
+    done
+}
+
+# As ssh_try, but feeds the remote command from a local file. A heredoc cannot
+# be retried — its stdin is consumed by the first attempt.
+ssh_try_file() {
+    local src="$1"; shift
+    local attempt=1
+    until "${SSH[@]}" "$@" < "$src"; do
+        [ "$attempt" -ge 5 ] && { echo "   ssh failed 5 times — giving up"; return 1; }
+        echo "   ssh failed (attempt $attempt) — retrying in 10s"
+        reauthorize_ip
+        sleep 10
+        attempt=$((attempt + 1))
+    done
+}
+
 # ── 4. Upload clean source + provision ───────────────────────────────────────
 echo "Uploading source (git archive HEAD)…"
 git archive --format=tar.gz HEAD \
@@ -280,13 +332,16 @@ git archive --format=tar.gz HEAD \
 # then follow the log over short-lived connections that can each fail and be
 # retried without losing the build.
 echo "Provisioning (Docker + image builds — this takes a while)…"
-"${SSH[@]}" "cat > /tmp/run-provision.sh" <<RUNNER
+RUNNER_LOCAL="$(mktemp)"
+cat > "$RUNNER_LOCAL" <<RUNNER
 #!/bin/bash
 sudo bash /tmp/dradis-src/deploy/ami/provision.sh '$VENUES' > /tmp/provision.log 2>&1
 echo \$? > /tmp/provision.rc
 RUNNER
-"${SSH[@]}" "chmod +x /tmp/run-provision.sh && \
-    setsid nohup /tmp/run-provision.sh </dev/null >/dev/null 2>&1 & sleep 2"
+ssh_try_file "$RUNNER_LOCAL" "cat > /tmp/run-provision.sh" || exit 1
+rm -f "$RUNNER_LOCAL"
+ssh_try "chmod +x /tmp/run-provision.sh && \
+    setsid nohup /tmp/run-provision.sh </dev/null >/dev/null 2>&1 & sleep 2" || exit 1
 
 SENT=0            # lines of provision.log already mirrored locally
 PROV_RC=""
@@ -299,6 +354,7 @@ while [ -z "$PROV_RC" ]; do
         PROV_RC=$("${SSH[@]}" "cat /tmp/provision.rc 2>/dev/null" 2>/dev/null || true)
     else
         echo "   … lost contact with the builder — retrying (the build keeps running)"
+        reauthorize_ip
     fi
     [ -z "$PROV_RC" ] && sleep 20
 done
@@ -311,7 +367,10 @@ fi
 
 # ── 5. Marketplace hygiene sweep (last SSH command — it locks us out) ────────
 echo "Scrubbing instance for Marketplace…"
-"${SSH[@]}" 'sudo bash -s' <<'SCRUB'
+# Split deliberately. Everything here is idempotent, so it can be retried
+# through a dropped connection like every other post-upload step.
+SCRUB_LOCAL="$(mktemp)"
+cat > "$SCRUB_LOCAL" <<'SCRUB'
 set -e
 sudo cloud-init clean --logs
 sudo rm -f /etc/ssh/ssh_host_*                 # regenerated on customer boot
@@ -320,8 +379,32 @@ sudo truncate -s 0 /etc/machine-id
 sudo rm -rf /tmp/* /var/tmp/* || true
 sudo find /var/log -type f -exec truncate -s 0 {} \;
 rm -f ~/.bash_history ~/.lesshst ~/.viminfo
-sudo rm -f /home/ubuntu/.ssh/authorized_keys   # must be last — kills SSH access
 SCRUB
+ssh_try_file "$SCRUB_LOCAL" 'sudo bash -s' || exit 1
+rm -f "$SCRUB_LOCAL"
+
+# The operator key goes last, alone, and is CONFIRMED.
+#
+# Removing it is what makes the image redistributable — an AMI carrying an
+# authorized_keys entry hands every customer the same login and fails
+# Marketplace scanning. It is also what ends our own access, so this step cannot
+# simply be retried: a second attempt fails whether the removal worked or not.
+# Instead the removal reports back in the same breath, and if that report is
+# lost we distinguish the two cases by whether SSH still works at all.
+KEY_GONE=false
+if OUT=$("${SSH[@]}" 'sudo rm -f /home/ubuntu/.ssh/authorized_keys; sudo test ! -f /home/ubuntu/.ssh/authorized_keys && echo REMOVED' 2>/dev/null); then
+    [ "$OUT" = "REMOVED" ] && KEY_GONE=true
+fi
+if [ "$KEY_GONE" != true ]; then
+    # No confirmation came back. If we can still log in, the key is still there.
+    if "${SSH[@]}" true 2>/dev/null; then
+        echo "❌ Operator key is still present on the builder and could not be removed."
+        echo "   Refusing to snapshot: the AMI would ship with a usable login."
+        exit 1
+    fi
+    echo "   operator key removal unconfirmed, but SSH is closed — treating as removed"
+fi
+echo "   ✓ operator key removed (SSH access closed)"
 
 # ── 6. Snapshot into an AMI ──────────────────────────────────────────────────
 echo "Stopping builder and creating AMI…"
