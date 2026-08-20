@@ -23,6 +23,7 @@
 # Requirements: aws CLI v2 with credentials, git, ssh, a default VPC in REGION.
 #
 # Options:
+#   --profile NAME         AWS CLI profile (or set AWS_PROFILE)
 #   --venues "LIST"        default: "intl us kalshi" (space-separated)
 #   --region REGION        default: eu-west-1
 #   --instance-type TYPE   default: c5.4xlarge (16 vCPU — three Rust builds)
@@ -36,12 +37,14 @@ REGION="eu-west-1"
 # the instance is torn down at the end so the extra cost is minutes, not hours.
 INSTANCE_TYPE="c5.4xlarge"
 VENUES="intl us kalshi"
+PROFILE=""
 VERSION=""
 KEEP_INSTANCE=false
 
 while [ $# -gt 0 ]; do
     case "$1" in
         --venues)        VENUES="$2"; shift 2 ;;
+        --profile)       PROFILE="$2"; shift 2 ;;
         --region)        REGION="$2"; shift 2 ;;
         --instance-type) INSTANCE_TYPE="$2"; shift 2 ;;
         --version)       VERSION="$2"; shift 2 ;;
@@ -73,9 +76,34 @@ STAMP="$(date -u +%Y%m%d-%H%M)"
 AMI_NAME="dradis-${VERSION}-${STAMP}"
 TAG="dradis-ami-builder-${STAMP}"
 
-AWS() { aws --region "$REGION" "$@"; }
+# Built as an array so an empty PROFILE cannot inject an empty argument, and
+# so the array is never empty (bash 3.2 + `set -u` errors on "${arr[@]}" when
+# the array has no elements).
+AWS_BASE=(--region "$REGION")
+[ -n "$PROFILE" ] && AWS_BASE=(--profile "$PROFILE" "${AWS_BASE[@]}")
+AWS() { aws "${AWS_BASE[@]}" "$@"; }
 
 echo "═══ DRADIS AMI build: $AMI_NAME ($REGION, $INSTANCE_TYPE) ═══"
+
+# ── 0. Preflight: the credentials must actually reach AWS ────────────────────
+# A profile configured for an S3-compatible third party (Tigris, R2, MinIO, …)
+# carries an `endpoint_url`, and botocore applies that to EVERY service — so an
+# SSM or EC2 call is POSTed to object storage and comes back as a bare HTTP
+# error with an empty body, naming nothing. Catch it here, before we create a
+# key pair and pay for a builder instance.
+if ! IDENTITY=$(AWS sts get-caller-identity --query Arn --output text 2>&1); then
+    echo "❌ AWS credentials are not usable${PROFILE:+ for profile '$PROFILE'}:"
+    echo "   ${IDENTITY:-(no response body)}"
+    echo
+    echo "   An HTTP status rather than an AWS error usually means a non-AWS"
+    echo "   endpoint override is intercepting every service:"
+    echo "     grep -n endpoint_url ~/.aws/config ~/.aws/credentials"
+    echo
+    echo "   Put real AWS keys in their own profile (no endpoint_url), then:"
+    echo "     $0 --profile <name> --region $REGION"
+    exit 1
+fi
+echo "Identity: $IDENTITY"
 
 # ── 1. Base AMI (Canonical Ubuntu 24.04 LTS, x86_64, gp3) ────────────────────
 BASE_AMI=$(AWS ssm get-parameter \

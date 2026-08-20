@@ -77,6 +77,17 @@ acknowledgment → venue → credentials → restart engine.
 region. The builder instance exists only for the duration of the build and is
 terminated automatically.
 
+The build runs `sts get-caller-identity` first and refuses to start if the
+credentials do not reach AWS. The failure worth knowing about: a profile
+configured for an S3-compatible third party (Tigris, Cloudflare R2, MinIO)
+carries an `endpoint_url`, and botocore applies that to **every** service — so
+EC2 and SSM calls get POSTed to object storage and return a bare HTTP status
+with an empty body, naming nothing. Keep AWS keys in a profile of their own
+with no `endpoint_url`, and select it with `--profile` or `AWS_PROFILE`.
+
+Marketplace ingests and scans AMIs from **us-east-1**, so build there
+(`--region us-east-1`) even though the script defaults to eu-west-1.
+
 Defaults reflect the three-venue build: `c5.4xlarge` (16 vCPU) on a 60 GB
 volume, because each venue is a full Rust release build and cargo rebuilds the
 dependency graph whenever the feature set changes. Expect roughly three times
