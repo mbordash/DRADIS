@@ -213,6 +213,7 @@ fn default_maker_toxic_min_hold_secs()      -> i64     { config::MAKER_TOXIC_MIN
 fn default_maker_toxic_min_adverse_pct()    -> Decimal { config::MAKER_TOXIC_MIN_ADVERSE_PCT          }
 fn default_maker_toxic_obi_confirm_ticks()  -> u32     { config::MAKER_TOXIC_OBI_CONFIRM_TICKS        }
 fn default_maker_resting_exit_enabled()     -> bool    { config::MAKER_RESTING_EXIT_ENABLED           }
+fn default_exit_reconcile_max_deviation()   -> Decimal { config::EXIT_RECONCILE_MAX_DEVIATION        }
 fn default_maker_resting_exit_min_edge_pct() -> Decimal { config::MAKER_RESTING_EXIT_MIN_EDGE_PCT     }
 fn default_maker_resting_exit_ask_improvement_ticks() -> i64 { config::MAKER_RESTING_EXIT_ASK_IMPROVEMENT_TICKS }
 fn default_maker_resting_exit_reprice_threshold() -> Decimal { config::MAKER_RESTING_EXIT_REPRICE_THRESHOLD }
@@ -443,6 +444,11 @@ pub struct DynamicConfig {
     /// by being lifted (spread capture) instead of crossing back to the bid.
     #[serde(default = "default_maker_resting_exit_enabled")]
     pub maker_resting_exit_enabled:    bool,
+
+    /// Contamination filter for pricing an exit the exchange refused to confirm.
+    /// See `config::EXIT_RECONCILE_MAX_DEVIATION`.
+    #[serde(default = "default_exit_reconcile_max_deviation")]
+    pub exit_reconcile_max_deviation:  Decimal,
     /// Price floor for the resting ask, as a fraction over avg entry.
     #[serde(default = "default_maker_resting_exit_min_edge_pct")]
     pub maker_resting_exit_min_edge_pct: Decimal,
@@ -790,6 +796,7 @@ impl Default for DynamicConfig {
             maker_toxic_min_adverse_pct:   config::MAKER_TOXIC_MIN_ADVERSE_PCT,
             maker_toxic_obi_confirm_ticks: config::MAKER_TOXIC_OBI_CONFIRM_TICKS,
             maker_resting_exit_enabled:    config::MAKER_RESTING_EXIT_ENABLED,
+            exit_reconcile_max_deviation:  config::EXIT_RECONCILE_MAX_DEVIATION,
             maker_resting_exit_min_edge_pct: config::MAKER_RESTING_EXIT_MIN_EDGE_PCT,
             maker_resting_exit_ask_improvement_ticks: config::MAKER_RESTING_EXIT_ASK_IMPROVEMENT_TICKS,
             maker_resting_exit_reprice_threshold: config::MAKER_RESTING_EXIT_REPRICE_THRESHOLD,

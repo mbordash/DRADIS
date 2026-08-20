@@ -175,7 +175,95 @@ pub fn spawn_settlement_task<P>(
 /// (positions in other/resolved markets were mis-priced). Valuing each token by
 /// its own `current_price` keeps this snapshot consistent with `/api/portfolio`
 /// and the chain-sync snapshot — a single source of truth.
-async fn calculate_positions_value(pool: &sqlx::SqlitePool) -> Decimal {
+/// On-chain share balance for one token, distinguishing "holds nothing" from
+/// "could not ask".
+///
+/// `helpers::balance::onchain_balance_for_token` collapses both into `0`, which
+/// is right for its callers (erring toward "still held" costs only a retry) but
+/// wrong here: a transient API error would silently value a real position at
+/// zero and make the portfolio drop by its full size for a minute.
+async fn onchain_shares(
+    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    token_id: &str,
+) -> Option<Decimal> {
+    let token_u = crate::venues::intl::u256_from_market_id(
+        &crate::venues::core::MarketId::new(token_id)).ok()?;
+    let mut req = BalanceAllowanceRequest::default();
+    req.asset_type = AssetType::Conditional;
+    req.token_id = Some(token_u);
+    match tokio::time::timeout(Duration::from_secs(5), client.balance_allowance(req)).await {
+        Ok(Ok(resp)) => Decimal::from_str(&resp.balance.to_string())
+            .ok()
+            .map(|b| b / dec!(1_000_000)),
+        _ => None,
+    }
+}
+
+/// May a chain reading of ZERO be written back over the stored share count?
+///
+/// The balance endpoint lags a fresh fill by up to ~15s and has read 0 for
+/// positions that genuinely existed (trades 294, 300, 308, 310). Persisting that
+/// zero would erase a real position from the row every consumer reads, so a
+/// downward correction to nothing is only trusted once the row is older than the
+/// settlement grace. Non-zero readings are always trusted: they cannot erase
+/// anything, and they are how a partial fill or partial exit gets recorded.
+fn persist_chain_correction(chain_shares: Decimal, row_ts: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+    if chain_shares > dec!(0) { return true; }
+    match chrono::DateTime::parse_from_rfc3339(row_ts) {
+        Ok(opened) => (now - opened.with_timezone(&chrono::Utc)).num_seconds()
+            >= crate::config::FRESH_FILL_SETTLEMENT_GRACE_SECS,
+        // Unparseable timestamp: refuse to zero the row rather than guess.
+        Err(_) => false,
+    }
+}
+
+/// How many shares should a portfolio valuation credit this row?
+///
+/// `None` means "do not value this row at all".
+///
+/// The chain is authoritative when it answers. Two production symptoms came
+/// from trusting the DB row instead (2026-08-20 02:44-02:47):
+///
+///   * UNDER-count — a fill had settled and taken $7.92 of cash, but the row was
+///     still `pending`, so the portfolio showed the cash gone and the shares
+///     absent, dipping ~$8 for a minute.
+///   * OVER-count — the shares were disposed of and the cash had come back, but
+///     the row stayed open until the exit was booked two minutes later, so the
+///     portfolio counted $8 of stock that no longer existed AND the cash it had
+///     been sold for.
+///
+/// When the chain cannot be reached we fall back to the old DB-only rule rather
+/// than guess, because a failed read must not erase a real position.
+fn shares_to_value(
+    chain_shares: Option<Decimal>,
+    db_shares: Decimal,
+    status: &str,
+    chain_adopted: bool,
+) -> Option<Decimal> {
+    match chain_shares {
+        Some(on_chain) => Some(on_chain.max(dec!(0))),
+        // Unconfirmed phantom: an order we placed that the chain never
+        // confirmed. Valuing it invents profit that does not exist.
+        None if status == "pending" && !chain_adopted => None,
+        None => Some(db_shares),
+    }
+}
+
+/// Reconcile open positions against on-chain holdings, persist any correction,
+/// and return the portfolio's mark-to-market position value.
+///
+/// The write-back is the point. Valuing correctly here would fix only this
+/// snapshot, while `/api/portfolio` — which the dashboard polls continuously —
+/// re-derives its own valuation straight from the same stale rows. Correcting
+/// the row instead fixes every consumer at once, and keeps the claim those two
+/// call sites make about being "one source of truth" actually true.
+///
+/// Only a SUCCESSFUL chain read is ever persisted: a failed request must not be
+/// written back as zero shares.
+async fn calculate_positions_value(
+    pool: &sqlx::SqlitePool,
+    client: &Arc<ClobClient<Authenticated<Normal>>>,
+) -> Decimal {
     // Fetch all open positions
     let positions = db::get_open_positions(pool).await;
     if positions.is_empty() {
@@ -202,9 +290,6 @@ async fn calculate_positions_value(pool: &sqlx::SqlitePool) -> Decimal {
         // exist on-chain (observed 2026-06-19: a never-filled TrendCapture June-20 NO
         // leg added a phantom +$2.83 / "open profitable trade"). A genuine fill flips
         // to chain_adopted=1 on the next chain-sync and starts counting then.
-        if pos.status == "pending" && !pos.chain_adopted {
-            continue;
-        }
         match deduped_by_token.get(&pos.token_id) {
             None => {
                 deduped_by_token.insert(pos.token_id.clone(), pos);
@@ -224,10 +309,37 @@ async fn calculate_positions_value(pool: &sqlx::SqlitePool) -> Decimal {
     let mut total_value = dec!(0);
     for (_, pos) in deduped_by_token {
         // Parse shares
-        let shares = match pos.shares.parse::<Decimal>() {
+        let db_shares = match pos.shares.parse::<Decimal>() {
             Ok(s) => s,
             Err(_) => continue,
         };
+
+        // Ask the chain what we actually hold. Typically 1-3 open positions, so
+        // this is a handful of calls a minute against a task that already makes
+        // one; each is individually timed out and a failure falls back to the
+        // DB row rather than erasing the position.
+        let chain = onchain_shares(client, &pos.token_id).await;
+        if let Some(c) = chain {
+            let c = c.max(dec!(0));
+            // 5% tolerance absorbs rounding on fractional share sizes; anything
+            // larger is real drift and gets written back so the API, the banner
+            // and the next snapshot all agree.
+            let drifted = (c - db_shares).abs() > (db_shares.abs() * dec!(0.05)).max(dec!(0.0001));
+            if drifted && persist_chain_correction(c, &pos.ts, chrono::Utc::now()) {
+                warn!("⚠️ Position drift [{}]: DB says {:.4} shares, chain says {:.4} — correcting the row",
+                      pos.token_id, db_shares, c);
+                let entry = pos.entry_price.parse::<Decimal>().unwrap_or(dec!(0));
+                db::update_position_from_chain(pool, &pos.token_id, c, entry, None).await;
+            } else if drifted {
+                debug!("Position drift [{}] within settlement grace ({:.4} vs {:.4}) — not persisting yet",
+                       pos.token_id, db_shares, c);
+            }
+        }
+        let shares = match shares_to_value(chain, db_shares, &pos.status, pos.chain_adopted) {
+            Some(s) => s,
+            None => continue,
+        };
+        if shares <= dec!(0) { continue; }
 
         // Value this position by its OWN live current_price (per-token, set by
         // the chain-sync task from the Polymarket Data API). Fall back to the
@@ -310,7 +422,7 @@ pub fn spawn_status_task(
                                 let pnl_snap = *total_pnl.lock().await;
 
                                 // Calculate total portfolio value: cash + mark-to-market positions
-                                let positions_value = calculate_positions_value(&pool).await;
+                                let positions_value = calculate_positions_value(&pool, &trading_client).await;
                            let total_value = bal + positions_value;
 
                                 if tokio::time::timeout(
@@ -852,4 +964,110 @@ pub fn spawn_lifecycle_task(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod portfolio_valuation_tests {
+    use super::*;
+
+    /// The OVER-count half of the 2026-08-20 02:45-02:47 divergence: the shares
+    /// had been disposed of and the cash was already back in collateral, but the
+    /// open_positions row survived until the exit was booked two minutes later.
+    /// The portfolio then counted $8 of stock that no longer existed AND the
+    /// cash it had been sold for, reporting 75.005 against a real 67.005.
+    #[test]
+    fn a_position_the_chain_no_longer_holds_is_worth_nothing() {
+        assert_eq!(
+            shares_to_value(Some(dec!(0)), dec!(18), "confirmed", true),
+            Some(dec!(0)),
+        );
+    }
+
+    /// The UNDER-count half: the fill had settled and taken $7.92 of cash, but
+    /// the row was still `pending` and got skipped, so the portfolio showed the
+    /// cash gone and the shares absent — 58.905 against a real 66.825.
+    #[test]
+    fn a_settled_fill_counts_even_while_the_row_says_pending() {
+        assert_eq!(
+            shares_to_value(Some(dec!(18)), dec!(18), "pending", false),
+            Some(dec!(18)),
+            "the chain says we hold them; the row's status is just lag",
+        );
+    }
+
+    /// A failed chain read must never erase a real position — that would drop
+    /// the portfolio by the position's full size for a minute.
+    #[test]
+    fn an_unreachable_chain_falls_back_to_the_database() {
+        assert_eq!(
+            shares_to_value(None, dec!(18), "confirmed", true),
+            Some(dec!(18)),
+        );
+    }
+
+    /// …but with no chain answer, the old phantom guard still applies: a row
+    /// that is pending AND never chain-adopted is an order that may never have
+    /// filled, and valuing it invents profit.
+    #[test]
+    fn an_unconfirmed_phantom_is_still_skipped_when_the_chain_is_unreachable() {
+        assert_eq!(shares_to_value(None, dec!(18), "pending", false), None);
+        // Chain-adopted rescues it: chain-sync stamped it to real holdings.
+        assert_eq!(shares_to_value(None, dec!(18), "pending", true), Some(dec!(18)));
+    }
+
+    /// The chain is authoritative even when it disagrees with the row, in either
+    /// direction — a partial fill or a partial exit both land here.
+    #[test]
+    fn the_chain_wins_over_a_stale_share_count() {
+        assert_eq!(shares_to_value(Some(dec!(9)), dec!(18), "confirmed", true), Some(dec!(9)));
+        assert_eq!(shares_to_value(Some(dec!(25)), dec!(18), "confirmed", true), Some(dec!(25)));
+    }
+
+    /// A negative balance is not physically meaningful; clamp rather than
+    /// subtract from the portfolio.
+    #[test]
+    fn a_negative_chain_balance_clamps_to_zero() {
+        assert_eq!(shares_to_value(Some(dec!(-5)), dec!(18), "confirmed", true), Some(dec!(0)));
+    }
+
+    // ── Write-back safety ──────────────────────────────────────────────────
+
+    fn at(secs_ago: i64) -> (String, chrono::DateTime<chrono::Utc>) {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-08-20T02:47:26Z")
+            .unwrap().with_timezone(&chrono::Utc);
+        ((now - chrono::Duration::seconds(secs_ago)).to_rfc3339(), now)
+    }
+
+    /// The balance endpoint has read 0 for positions that genuinely existed
+    /// (trades 294, 300, 308 and 310 all turned on exactly this). Writing that
+    /// zero back would erase a real position from the row every consumer reads.
+    #[test]
+    fn a_zero_reading_on_a_fresh_fill_is_not_persisted() {
+        let (ts, now) = at(10);
+        assert!(!persist_chain_correction(dec!(0), &ts, now));
+    }
+
+    /// Past the settlement grace a zero is believable — this is the case that
+    /// clears the phantom position which inflated total_value to 75.005.
+    #[test]
+    fn a_zero_reading_past_the_settlement_grace_is_persisted() {
+        let (ts, now) = at(crate::config::FRESH_FILL_SETTLEMENT_GRACE_SECS + 30);
+        assert!(persist_chain_correction(dec!(0), &ts, now));
+    }
+
+    /// A non-zero reading cannot erase anything, so it is always trusted — that
+    /// is how a partial fill or partial exit reaches the row promptly.
+    #[test]
+    fn a_non_zero_reading_is_always_persisted() {
+        let (fresh, now) = at(1);
+        assert!(persist_chain_correction(dec!(9), &fresh, now));
+    }
+
+    /// An unparseable timestamp must not license zeroing the row.
+    #[test]
+    fn an_unparseable_timestamp_blocks_a_zeroing_write() {
+        let now = chrono::Utc::now();
+        assert!(!persist_chain_correction(dec!(0), "not-a-timestamp", now));
+        assert!(persist_chain_correction(dec!(9), "not-a-timestamp", now));
+    }
 }

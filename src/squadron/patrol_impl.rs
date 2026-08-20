@@ -75,6 +75,63 @@ const BASE_CANCEL_RETRY_DELAY_MS: u64 = 200;
 /// the fill price is already known (it is the resting limit, which cannot slip).
 const MAKER_RESTING_EXIT_POLL_SECS: u64 = 5;
 
+/// Recover the exit price of a position the exchange says is already gone, from
+/// the collateral that came back for it.
+///
+/// Returns `None` when the figure cannot be trusted, and the caller must then
+/// book the trade with zero P&L rather than invent one. Never falls back to the
+/// order book: this path is only reachable from a stop firing on an adverse
+/// book, so a book-derived price sits below entry by construction and would
+/// record every such exit as a loss regardless of what actually happened.
+///
+/// `baseline` is collateral as it read just after the entry fill confirmed, so
+/// `now - baseline` is the disposal proceeds — provided nothing else moved
+/// collateral in between. `max_dev` is the contamination filter: another
+/// position opening or closing shifts collateral by dollars and implies a price
+/// nowhere near entry.
+fn reconcile_unverified_exit(
+    baseline: Option<Decimal>,
+    now_collateral: Decimal,
+    shares: Decimal,
+    avg_entry: Decimal,
+    max_dev: Decimal,
+) -> Option<Decimal> {
+    let base = baseline?;
+    if shares <= dec!(0) { return None; }
+    let proceeds = now_collateral - base;
+    if proceeds <= dec!(0) { return None; }
+    let px = proceeds / shares;
+    if px > dec!(0) && px <= dec!(1) && (px - avg_entry).abs() <= max_dev {
+        Some(px)
+    } else {
+        None
+    }
+}
+
+/// Maker quote epochs: `(strategy, token) -> (epoch, last touched)`.
+type QuoteEpochs = std::collections::HashMap<(String, MarketId), (u64, Instant)>;
+
+/// Retire whatever quote currently owns `key` and return the new epoch.
+///
+/// Called both when a quote is PLACED (claiming an epoch for its own fill
+/// watcher) and when one is PULLED (so the pulled quote's watcher can no longer
+/// claim a later fill).
+fn bump_quote_epoch(map: &mut QuoteEpochs, key: &(String, MarketId)) -> u64 {
+    let e = map.entry(key.clone()).or_insert((0, Instant::now()));
+    e.0 += 1;
+    e.1 = Instant::now();
+    e.0
+}
+
+/// Is `epoch` still the live quote for `key`?
+///
+/// A fill watcher spawned for a quote must ask this before recording an entry.
+/// Answering `false` means the quote it was watching was pulled or replaced, and
+/// the shares it can see belong to a later quote.
+fn quote_epoch_is_current(map: &QuoteEpochs, key: &(String, MarketId), epoch: u64) -> bool {
+    map.get(key).map(|(e, _)| *e) == Some(epoch)
+}
+
 /// One live post-only GTC ask resting against a filled maker position.
 ///
 /// The position stays in the position map while the ask rests — it is still
@@ -418,6 +475,45 @@ impl Squadron {
         let mut maker_resting_exits: std::collections::HashMap<(String, MarketId), MakerRestingExit> =
             std::collections::HashMap::new();
 
+        // Collateral as it read on the first tick AFTER a position's fill was
+        // confirmed, keyed like the position map.
+        //
+        // This is the only way to price an exit the exchange refuses to confirm.
+        // When a sell is rejected with "position already gone", the shares were
+        // disposed of by something we did not observe, and the observed bid is a
+        // terrible proxy for what they fetched: that branch is only reachable
+        // from a stop firing on an adverse book, so the bid is always BELOW
+        // entry and the estimate can only ever manufacture a loss. Production
+        // trade 377 (2026-08-20) booked -$0.18 that way while collateral rose
+        // $0.18 — a $0.36 error, and all four such trades to date show the same
+        // one-tick-down signature.
+        //
+        // Deliberately not persisted: after a restart the baseline is unknown,
+        // and the exit is then booked as unreconciled rather than guessed.
+        let mut fill_collateral: std::collections::HashMap<(String, MarketId), Decimal> =
+            std::collections::HashMap::new();
+
+        // Monotonic epoch per (strategy, token), bumped every time a maker quote
+        // is placed AND every time one is pulled.
+        //
+        // Each quote placement spawns its own fill-verification task, but pulling
+        // the quote does not stop that task: it keeps waiting on the balance
+        // endpoint, and when a LATER quote on the same token fills it sees the
+        // shares appear and books an entry for its own — cancelled, never filled
+        // — price and size. Production 2026-08-20 recorded rows 494 and 495 that
+        // way, 30ms apart on one token: 18.18 @ $0.44 (the quote that really
+        // filled) and 17.78 @ $0.45 (a quote pulled 47s earlier). The same
+        // signature appears in 12+ groups across the trade history.
+        //
+        // A task captures the epoch at spawn and records only if it still
+        // matches, so a pulled quote's task can no longer claim someone else's
+        // fill. Shared because the tasks outlive the tick that spawned them.
+        // Value is (epoch, last touched). The timestamp exists only so the map
+        // can be pruned: DRADIS runs for weeks and tokens rotate hourly, so an
+        // unbounded key-per-token map is a slow leak.
+        let quote_epochs: Arc<tokio::sync::Mutex<QuoteEpochs>> =
+            Arc::new(tokio::sync::Mutex::new(QuoteEpochs::new()));
+
         info!("🚀 Orchestrator ready: {} strategies loaded", strategies.len());
         info!("📋 Strategy venue attachments:");
         let mut strategy_markets_map: std::collections::HashMap<String, String> = std::collections::HashMap::new();
@@ -569,6 +665,8 @@ impl Squadron {
                     let resting_exit_reprice_threshold = dyn_cfg.maker_resting_exit_reprice_threshold;
                     let resting_exit_enabled = dyn_cfg.maker_resting_exit_enabled;
                     let intl_taker_fee_rate = dyn_cfg.intl_taker_fee_rate;
+                    // Hoisted like the two above: dyn_cfg is moved into `ctx` below.
+                    let exit_reconcile_max_dev = dyn_cfg.exit_reconcile_max_deviation;
 
                     // Hoist mutex-await calls OUT of the struct literal so that
                     // borrow() Ref guards (oracle_rx, velocity_rx, etc.) in the
@@ -578,6 +676,29 @@ impl Squadron {
                     let ctx_session_pnl          = *total_pnl.lock().await;
                     let ctx_starting_collateral  = *starting_collateral_store.lock().await;
                     let ctx_available_collateral = *live_collateral.lock().await;
+
+                    // Baseline for exit reconciliation: record collateral the
+                    // first time we see a position whose fill is confirmed, and
+                    // drop entries for positions that are gone so the map cannot
+                    // grow without bound.
+                    {
+                        let map = positions.lock().await;
+                        for (k, p) in map.iter() {
+                            if p.fill_confirmed_at.is_some() {
+                                fill_collateral.entry(k.clone()).or_insert(ctx_available_collateral);
+                            }
+                        }
+                        fill_collateral.retain(|k, _| map.contains_key(k));
+                    }
+                    // Drop epochs no in-flight fill watcher could still consult.
+                    // A watcher waits at most MAX_WAIT_SECS_WINDOW, so double that
+                    // is comfortably past the last moment one can read this.
+                    {
+                        let cutoff = Duration::from_secs(
+                            crate::helpers::balance::MAX_WAIT_SECS_WINDOW as u64 * 2);
+                        let mut m = quote_epochs.lock().await;
+                        m.retain(|_, (_, touched)| touched.elapsed() < cutoff);
+                    }
 
                     let ctx = StrategyContext {
                         market: hourly_market_config_for_ctx.clone(),
@@ -870,20 +991,53 @@ impl Squadron {
                                             // and no open_positions cleanup, so the ledger diverged and
                                             // ChainReconcile later invented a second exit at the current mark.
                                             let removed = { let mut map = positions.lock().await; map.remove(&pos_key) };
+                                            let fill_baseline = fill_collateral.remove(&pos_key);
                                             if let Some(p) = removed {
                                                 if p.fill_confirmed_at.is_some() {
-                                                    let aep3 = params.price; // est: no fill occurred; observed bid is the best estimate
-                                                    let pnl3 = (aep3 - p.avg_entry) * p.shares;
-                                                    warn!(
-                                                        "⚠️ EXIT rejected by exchange [{}] (\"{}\"): position already gone — booking est. exit @ ${:.4} pnl=${:.4}",
-                                                        sn, es.chars().take(80).collect::<String>(), aep3, pnl3
+                                                    // Price the exit from the MONEY, not from the book.
+                                                    //
+                                                    // The shares are gone, so whatever took them paid us
+                                                    // something; collateral has already moved by exactly that
+                                                    // amount. `params.price` — the current bid — is not that
+                                                    // number and is structurally biased: this branch is only
+                                                    // reachable from a stop firing on an adverse book, so the
+                                                    // bid always sits below entry and the "estimate" can only
+                                                    // ever book a loss. Trade 377 booked -$0.18 on a +$0.18
+                                                    // move that way.
+                                                    let now_collateral = *live_collateral.lock().await;
+                                                    let implied = reconcile_unverified_exit(
+                                                        fill_baseline, now_collateral, p.shares,
+                                                        p.avg_entry, exit_reconcile_max_dev,
                                                     );
-                                                    *total_pnl.lock().await += pnl3;
                                                     let sid3 = side_of(&tid).to_string();
+                                                    let (aep3, pnl3, tag) = match implied {
+                                                        Some(px) => {
+                                                            let pnl = (px - p.avg_entry) * p.shares;
+                                                            warn!(
+                                                                "⚠️ EXIT rejected by exchange [{}] (\"{}\"): position already gone — reconciled from collateral @ ${:.4} pnl=${:.4}",
+                                                                sn, es.chars().take(80).collect::<String>(), px, pnl
+                                                            );
+                                                            (px, pnl, format!("{} (ExitReconciled: price derived from collateral delta)", reason))
+                                                        }
+                                                        None => {
+                                                            // Not confidently knowable. Book the trade so the
+                                                            // count stays honest, but do NOT invent a P&L: a
+                                                            // fabricated loss corrupts session P&L and every
+                                                            // statistic derived from it. Log what a human needs
+                                                            // to reconcile by hand.
+                                                            warn!(
+                                                                "⚠️ EXIT rejected by exchange [{}] (\"{}\"): position already gone and the exit price is NOT verifiable                                                                  — booking pnl=$0.00. entry=${:.4} shares={:.4} bid_at_exit=${:.4} collateral_now=${:.4} baseline={}                                                                  — reconcile against the venue's fill history",
+                                                                sn, es.chars().take(80).collect::<String>(),
+                                                                p.avg_entry, p.shares, params.price, now_collateral,
+                                                                fill_baseline.map(|b| format!("${:.4}", b)).unwrap_or_else(|| "unknown".into()),
+                                                            );
+                                                            (p.avg_entry, dec!(0), format!("{} (ExitUnreconciled: shares gone, exit price unverifiable — pnl booked as 0)", reason))
+                                                        }
+                                                    };
+                                                    *total_pnl.lock().await += pnl3;
                                                     metrics::record_trade(
                                                         &scope, Decimal::ZERO, sn.clone(), params.market_name.clone(), sid3,
-                                                        p.avg_entry, aep3, p.shares, pnl3,
-                                                        format!("{} (ExitUnverified: est. price — sell rejected, shares gone)", reason),
+                                                        p.avg_entry, aep3, p.shares, pnl3, tag,
                                                     ).await;
                                                     if let Some(pool) = db::pool_for(&asset_lc) { db::close_open_position(&pool, &sn, &tid_m.to_string()).await; }
                                                 } else {
@@ -1559,8 +1713,24 @@ impl Squadron {
                                             if let Some(pool) = db::pool_for(&asset_em) {
                                                 db::record_open_position_with_status(&pool, &sn, &tid_em, &mn_em, &side_em, ep_em, sh_em, false, "pending").await;
                                             }
+                                            // Claim this quote's epoch. Anything that pulls or
+                                            // replaces the quote bumps it, which is how the task
+                                            // below learns its quote is no longer the live one.
+                                            let epoch_map = Arc::clone(&quote_epochs);
+                                            let my_epoch = bump_quote_epoch(&mut *epoch_map.lock().await, &pk);
+                                            let epoch_key = pk.clone();
                                             tokio::spawn(async move {
                                                 if let Ok(true) = sync_position_balance(&cl_m, &ps_m, &sn_m, &p.token_id, Some(&pc_m), dec!(0), crate::helpers::balance::MAX_WAIT_SECS_WINDOW, &to_m, true).await {
+                                                    // Shares exist — but are they THIS quote's? If the
+                                                    // epoch moved, this quote was pulled or replaced and
+                                                    // the fill belongs to whatever came after it.
+                                                    let still_live = quote_epoch_is_current(
+                                                        &*epoch_map.lock().await, &epoch_key, my_epoch);
+                                                    if !still_live {
+                                                        info!("↩️ Maker fill-watch [{}] {}: quote @ ${:.4} x{:.2} was pulled or replaced (epoch {} superseded) — not recording an entry for it",
+                                                              sn_m, tid_em, ep_em, sh_em, my_epoch);
+                                                        return;
+                                                    }
                                                     // Update to confirmed (Mission In-Flight) + record entry
                                                     if let Some(pool) = db::pool_for(&asset_em) {
                                                         db::confirm_position_status(&pool, &sn_m, &tid_em).await;
@@ -1589,6 +1759,11 @@ impl Squadron {
                                         matches!(pos.get(&pk), Some(p) if p.fill_confirmed_at.is_none())
                                     };
                                     if !is_unfilled { continue; }
+                                    // Retire this quote's epoch before doing anything else. Its
+                                    // fill-verification task is still waiting on the balance
+                                    // endpoint, and without this it would adopt the NEXT quote's
+                                    // fill as its own and write a second entry row.
+                                    bump_quote_epoch(&mut *quote_epochs.lock().await, &pk);
                                     let matched = if config::GHOST_MODE {
                                         info!("👻 GHOST_MODE MakerCancel [{}]: {} (simulated quote-pull)", sn, tok);
                                         dec!(0)
@@ -1950,5 +2125,152 @@ impl Squadron {
         // firing and the lifecycle task exiting.
         ctx.session.venue.clear_active_tokens().await;
         peripheral_cancel.cancel();
+    }
+}
+
+#[cfg(test)]
+mod trade_accounting_tests {
+    use super::*;
+
+    /// The production case this was written for.
+    ///
+    /// Trade 377 (2026-08-20, MakerStrategy): 18 shares entered at $0.44, the
+    /// sell was rejected with "position already gone", and collateral moved
+    /// 58.90502 -> 67.00502. The old code priced the exit at the observed bid
+    /// ($0.43) and booked -$0.18 on a position that had in fact made +$0.18 —
+    /// a $0.36 error that also corrupted session P&L.
+    #[test]
+    fn recovers_the_real_exit_price_of_production_trade_377() {
+        let px = reconcile_unverified_exit(
+            Some(dec!(58.90502)), dec!(67.00502), dec!(18), dec!(0.44), dec!(0.10),
+        ).expect("collateral delta is clean and should price the exit");
+        assert_eq!(px, dec!(0.45));
+        let pnl = (px - dec!(0.44)) * dec!(18);
+        assert_eq!(pnl, dec!(0.18), "must book the gain that actually occurred");
+    }
+
+    /// No baseline (e.g. the process restarted since the fill) is not an excuse
+    /// to guess — the caller books zero.
+    #[test]
+    fn refuses_to_price_without_a_baseline() {
+        assert_eq!(
+            reconcile_unverified_exit(None, dec!(67.0), dec!(18), dec!(0.44), dec!(0.10)),
+            None,
+        );
+    }
+
+    /// A second position closing in between inflates the delta far past
+    /// anything a single fill could explain, so the figure must be rejected.
+    #[test]
+    fn rejects_a_baseline_contaminated_by_another_position() {
+        // +$25.10 for 18 shares implies $1.39/share — impossible for a binary.
+        assert_eq!(
+            reconcile_unverified_exit(Some(dec!(58.90502)), dec!(84.0), dec!(18), dec!(0.44), dec!(0.10)),
+            None,
+        );
+        // A subtler one: still a valid price, but 20c from entry.
+        assert_eq!(
+            reconcile_unverified_exit(Some(dec!(58.90502)), dec!(70.42502), dec!(18), dec!(0.44), dec!(0.10)),
+            None,
+            "0.64/share is inside (0,1] but outside the trust band",
+        );
+    }
+
+    /// Collateral that did not rise proves nothing came back, so there is no
+    /// price to derive.
+    #[test]
+    fn rejects_a_non_positive_delta() {
+        assert_eq!(
+            reconcile_unverified_exit(Some(dec!(58.90502)), dec!(58.90502), dec!(18), dec!(0.44), dec!(0.10)),
+            None,
+        );
+        assert_eq!(
+            reconcile_unverified_exit(Some(dec!(58.90502)), dec!(50.0), dec!(18), dec!(0.44), dec!(0.10)),
+            None,
+        );
+    }
+
+    /// The band is operator-tunable; a wider one accepts a move a tighter one
+    /// rejects. Guards against the knob being silently ignored.
+    #[test]
+    fn the_trust_band_is_honoured() {
+        let args = (Some(dec!(58.90502)), dec!(70.42502), dec!(18), dec!(0.44));
+        assert_eq!(reconcile_unverified_exit(args.0, args.1, args.2, args.3, dec!(0.10)), None);
+        assert_eq!(
+            reconcile_unverified_exit(args.0, args.1, args.2, args.3, dec!(0.25)),
+            Some(dec!(0.64)),
+        );
+    }
+
+    /// Zero shares must not panic on the division.
+    #[test]
+    fn rejects_a_zero_share_position() {
+        assert_eq!(
+            reconcile_unverified_exit(Some(dec!(58.0)), dec!(67.0), dec!(0), dec!(0.44), dec!(0.10)),
+            None,
+        );
+    }
+
+    // ── Maker quote epochs ─────────────────────────────────────────────────
+
+    fn key() -> (String, MarketId) {
+        ("MakerStrategy".to_string(), MarketId::new("98160110645972743141257069093476801874133411306802274299633963514874310415390"))
+    }
+
+    /// The production sequence behind duplicate entry rows 494 and 495
+    /// (2026-08-20): a quote was placed, pulled 47s later, and replaced. The
+    /// pulled quote's fill watcher was never stopped, so when the REPLACEMENT
+    /// filled, both watchers saw the shares and both wrote an entry — one of
+    /// them for a quote that never filled at all.
+    #[test]
+    fn a_pulled_quote_cannot_claim_the_replacement_quotes_fill() {
+        let mut epochs = QuoteEpochs::new();
+        let k = key();
+
+        // 22:43:33 — quote YES 17.77 @ $0.45; its watcher captures this epoch.
+        let watcher_a = bump_quote_epoch(&mut epochs, &k);
+        // 22:44:13 — MakerCancel pulls it.
+        bump_quote_epoch(&mut epochs, &k);
+        // 22:44:13 — quote YES 18.18 @ $0.44 replaces it.
+        let watcher_b = bump_quote_epoch(&mut epochs, &k);
+
+        // 22:45:00 — the $0.44 quote fills. Both watchers wake and see 18 shares.
+        assert!(!quote_epoch_is_current(&epochs, &k, watcher_a),
+                "the pulled $0.45 quote must NOT record an entry");
+        assert!(quote_epoch_is_current(&epochs, &k, watcher_b),
+                "the $0.44 quote that actually filled must record exactly one");
+    }
+
+    /// The ordinary path must still record: a quote placed, left alone, filled.
+    #[test]
+    fn an_unpulled_quote_records_its_own_fill() {
+        let mut epochs = QuoteEpochs::new();
+        let k = key();
+        let watcher = bump_quote_epoch(&mut epochs, &k);
+        assert!(quote_epoch_is_current(&epochs, &k, watcher));
+    }
+
+    /// Epochs are per (strategy, token): the maker quotes YES and NO at once,
+    /// and pulling one side must not silence the other side's watcher.
+    #[test]
+    fn epochs_do_not_leak_across_tokens() {
+        let mut epochs = QuoteEpochs::new();
+        let yes = key();
+        let no = ("MakerStrategy".to_string(), MarketId::new("85421064502935751366375640444050801090202872554536397578825264135513707159160"));
+
+        let watch_yes = bump_quote_epoch(&mut epochs, &yes);
+        let watch_no  = bump_quote_epoch(&mut epochs, &no);
+        bump_quote_epoch(&mut epochs, &yes); // pull YES only
+
+        assert!(!quote_epoch_is_current(&epochs, &yes, watch_yes));
+        assert!(quote_epoch_is_current(&epochs, &no, watch_no), "NO side must be untouched");
+    }
+
+    /// An unknown key is not "current" — a watcher whose epoch was pruned must
+    /// stand down rather than record against a map that no longer knows it.
+    #[test]
+    fn a_pruned_epoch_is_not_current() {
+        let epochs = QuoteEpochs::new();
+        assert!(!quote_epoch_is_current(&epochs, &key(), 1));
     }
 }

@@ -1676,8 +1676,19 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
             // Skip UNCONFIRMED phantoms: still `status='pending'` AND not chain-adopted
             // means the order was placed but never confirmed on-chain (never filled or
             // rejected). Valuing it inflates the portfolio with non-existent profit until
-            // the 60-min purge grace elapses. Mirrors calculate_positions_value() so the
-            // banner and snapshots stay one source of truth.
+            // the 60-min purge grace elapses.
+            //
+            // This endpoint deliberately does NOT read the chain itself: the dashboard
+            // polls it continuously, and a balance call per open position per poll would
+            // hammer the venue. It relies instead on the 60s status task, which reconciles
+            // every open position against on-chain holdings and writes the correction back
+            // to this very row (`calculate_positions_value` in patrol_tasks.rs). That is
+            // what keeps the banner and the snapshots one source of truth — and it is why
+            // the row's `shares` and `chain_adopted` can be trusted here.
+            //
+            // The consequence worth knowing: this endpoint can be up to one status-task
+            // cycle behind the chain. It cannot DIVERGE from the snapshot any more, but it
+            // can lag it.
             if pos.status == "pending" && !pos.chain_adopted {
                 continue;
             }

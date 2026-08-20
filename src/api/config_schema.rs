@@ -517,6 +517,15 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
     // getting the operator's key rate-limited or banned. Live Tennis allows
     // 30 req/min, hence a 5s floor with headroom; The Odds API is billed per
     // request on every tier, so its floor is higher.
+    // Exit accounting — venue-neutral, applies to every viper, so it is not
+    // filed under a strategy card.
+    {
+        let g = "Exit Accounting"; let e: Option<&'static str> = None;
+        v.push(F::new(g, e, "exit_reconcile_max_deviation", "Exit Reconcile Band", "decimal", true,
+            "When the exchange rejects a sell because the shares are already gone, the exit price is recovered from the collateral that came back. Trust that price only if it lands within this distance of the entry price — a wider gap means another position moved collateral in between and the figure is contaminated, in which case the trade is booked with zero P&L rather than a guess. Never estimated from the order book: that path is only reached on an adverse book, so a book-derived estimate can only ever record a loss.")
+            .range(0.0, 0.50).step(0.01));
+    }
+
     {
         let g = "Raptor Polling"; let e: Option<&'static str> = None;
         v.push(F::new(g, e, "sports_poll_secs", "Sports Poll Interval", "secs", false,
