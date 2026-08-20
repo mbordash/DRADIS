@@ -44,6 +44,22 @@ pub const ENABLE_X: bool = false;
 // ============================================================================
 
 pub const GHOST_MODE: bool = false;
+
+/// Should a BRAND-NEW install start in simulation?
+///
+/// Distinct from `GHOST_MODE`, and the distinction matters. `GHOST_MODE` is a
+/// build-level switch compiled into the binary; setting it true would put a
+/// running deployment into permanent simulation regardless of what its operator
+/// chose. This one seeds only the DEFAULT of the runtime `ghost_mode` knob, so
+/// it applies exactly once — to an install with no persisted config yet — and an
+/// existing deployment keeps whatever is in its database.
+///
+/// True because the alternative is a customer's first experience of the product
+/// being an unexpected real trade: the profile baked into the Marketplace AMI
+/// enables five strategies, so saving credentials and restarting is enough to
+/// start placing live orders. They can turn it off from the Control Tower the
+/// moment they mean to.
+pub const GHOST_MODE_DEFAULT: bool = true;
 pub const ENABLE_ARBITRAGE_TRADING: bool = true;
 
 /// Min net profit after fees to trigger arbitrage.

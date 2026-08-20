@@ -89,6 +89,22 @@ pub fn global_config_tx() -> Option<&'static Arc<tokio::sync::watch::Sender<Arc<
     GLOBAL_CONFIG_TX.get()
 }
 
+/// Is the engine forbidden from touching the exchange right now?
+///
+/// Combines the BUILD-level `config::GHOST_MODE` with the operator's runtime
+/// switch. For code inside the patrol tick, prefer the `ghosting` value hoisted
+/// there — it reads the same tick's config snapshot. This exists for the paths
+/// that run OUTSIDE a tick (background tasks, shutdown) and have no snapshot to
+/// read from.
+///
+/// Fails safe: if the global handle is not up yet, only the compile-time switch
+/// applies, which is the same answer the code gave before the runtime switch was
+/// honoured at all.
+pub fn ghosting_now() -> bool {
+    if crate::config::GHOST_MODE { return true; }
+    global_config_tx().map(|tx| tx.borrow().ghost_mode).unwrap_or(false)
+}
+
 /// Register (or replace) the live config handle a running squadron's patrol loop
 /// reads each tick.  Called once per squadron deploy / market rotation.
 pub fn register_squadron_config_handle(squadron_id: &str, handle: Arc<RwLock<DynamicConfig>>) {
@@ -214,6 +230,7 @@ fn default_maker_toxic_min_adverse_pct()    -> Decimal { config::MAKER_TOXIC_MIN
 fn default_maker_toxic_obi_confirm_ticks()  -> u32     { config::MAKER_TOXIC_OBI_CONFIRM_TICKS        }
 fn default_maker_resting_exit_enabled()     -> bool    { config::MAKER_RESTING_EXIT_ENABLED           }
 fn default_exit_reconcile_max_deviation()   -> Decimal { config::EXIT_RECONCILE_MAX_DEVIATION        }
+fn default_ghost_mode()                     -> bool    { config::GHOST_MODE_DEFAULT                 }
 fn default_maker_resting_exit_min_edge_pct() -> Decimal { config::MAKER_RESTING_EXIT_MIN_EDGE_PCT     }
 fn default_maker_resting_exit_ask_improvement_ticks() -> i64 { config::MAKER_RESTING_EXIT_ASK_IMPROVEMENT_TICKS }
 fn default_maker_resting_exit_reprice_threshold() -> Decimal { config::MAKER_RESTING_EXIT_REPRICE_THRESHOLD }
@@ -267,6 +284,11 @@ fn default_trendreversal_mode()                -> bool    { config::TRENDREVERSA
 pub struct DynamicConfig {
     // ── Global ────────────────────────────────────────────────────────────────
     /// When true all orders are simulated — no real CLOB calls.
+    ///
+    /// Defaulted like every other field (repo convention), and the default is
+    /// deliberately the SAFE direction: a persisted config that somehow lacks
+    /// this key comes back simulating rather than trading.
+    #[serde(default = "default_ghost_mode")]
     pub ghost_mode: bool,
     /// Polymarket taker fee rate used to book the real cost of a round trip:
     /// `fee = rate · p · (1 − p) · shares`, charged on entry and exit alike.
@@ -717,7 +739,8 @@ impl Default for DynamicConfig {
     /// the SQLite row is only authoritative once the user has changed something.
     fn default() -> Self {
         Self {
-            ghost_mode: config::GHOST_MODE,
+            // GHOST_MODE_DEFAULT, not GHOST_MODE: this seeds a fresh install only.
+            ghost_mode: config::GHOST_MODE_DEFAULT,
             intl_taker_fee_rate: config::INTL_TAKER_FEE_RATE,
 
             enable_arbitrage:     config::ENABLE_ARBITRAGE_TRADING,

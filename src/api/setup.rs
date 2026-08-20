@@ -1445,8 +1445,24 @@ mod tests {
             let values = profile["values"].as_object().expect("values object");
             let keys: std::collections::BTreeSet<&str> =
                 values.keys().map(|k| k.as_str()).collect();
-            let missing: Vec<_> = schema_keys.difference(&keys).collect();
+            // `ghost_mode` is deliberately absent: a profile expresses risk
+            // appetite, not whether real money moves. Leaving it in meant a new
+            // operator taking the Setup view's own advice — "start with
+            // conservative" — silently disarmed simulation, because
+            // `apply_profile` patches every field a profile declares. Asserted
+            // as an exact set so a genuine omission still fails here.
+            const NOT_IN_PROFILES: &[&str] = &["ghost_mode"];
+            let missing: Vec<_> = schema_keys
+                .difference(&keys)
+                .filter(|k| !NOT_IN_PROFILES.contains(k))
+                .collect();
             let unknown: Vec<_> = keys.difference(&schema_keys).collect();
+            for excluded in NOT_IN_PROFILES {
+                assert!(
+                    !keys.contains(excluded),
+                    "profile '{name}' declares '{excluded}', which must never be part of a profile",
+                );
+            }
             assert!(missing.is_empty(), "profile '{name}' missing fields: {missing:?}");
             assert!(unknown.is_empty(), "profile '{name}' has unknown fields: {unknown:?}");
             // Full deserialization proves every value has the right type.

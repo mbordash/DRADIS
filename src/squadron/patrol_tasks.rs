@@ -566,8 +566,11 @@ pub fn spawn_cleanup_task(
                     // Priority 1 — RE-HEDGE: buy the MISSING leg at its current ask (FAK).
                     // Priority 2 — BID-BASED EXIT: sell the orphan at (current_bid − offset).
                     //
-                    // GHOST_MODE guard: neither path places live orders in ghost mode.
-                    if !config::GHOST_MODE {
+                    // Ghost guard: neither path places live orders when ghosting.
+                    // Reads the live switch as well as the build constant — this is a
+                    // background task with no tick snapshot to consult, and both of
+                    // these branches place real orders.
+                    if !crate::helpers::dynamic_config::ghosting_now() {
                         for orphan in orphan_exits {
                             // Slice 2b: OrphanExit and market tokens are all neutral MarketId.
                             let vc = if orphan.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };

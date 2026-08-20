@@ -73,8 +73,19 @@ def const_values(path: Path) -> dict[str, object]:
     return out
 
 
+# Fields a profile must NOT carry.
+#
+# A profile expresses risk appetite. `ghost_mode` expresses whether real money
+# moves at all, which is a different kind of decision and not one that should
+# change as a side effect of picking a risk level. Leaving it in meant a new
+# operator following the Setup view's own advice — "start with conservative" —
+# silently disarmed simulation on their first run, because `apply_profile`
+# patches every field a profile declares.
+NON_PROFILE_FIELDS = {"ghost_mode"}
+
+
 def main() -> None:
-    mapping = field_const_map()
+    mapping = {f: c for f, c in field_const_map().items() if f not in NON_PROFILE_FIELDS}
     result = {"schema_version": 1, "profiles": {}}
     missing_report: list[str] = []
 

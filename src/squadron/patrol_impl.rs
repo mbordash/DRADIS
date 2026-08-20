@@ -668,6 +668,22 @@ impl Squadron {
                     // Hoisted like the two above: dyn_cfg is moved into `ctx` below.
                     let exit_reconcile_max_dev = dyn_cfg.exit_reconcile_max_deviation;
 
+                    // Is this tick allowed to touch the exchange at all?
+                    //
+                    // `config::GHOST_MODE` is a BUILD-level switch; `ghost_mode` in
+                    // DynamicConfig is the operator's runtime one, toggled from the
+                    // Control Tower. Until 2026-08-20 the intl order paths read only the
+                    // constant, so the runtime switch was inert on this venue — the UI
+                    // said simulation while real orders went out. (Kalshi and Polymarket
+                    // US always honoured it; see `params.ghost_mode` in their traders.)
+                    //
+                    // Deliberately ONE value for the whole tick rather than a check per
+                    // call site: eleven separate conditions is precisely the shape of
+                    // change where one gets missed, and `params` is not in scope at
+                    // several of them. The tick value is also fresher than the one
+                    // captured on a signal when it was emitted.
+                    let ghosting = config::GHOST_MODE || dyn_cfg.ghost_mode;
+
                     // Hoist mutex-await calls OUT of the struct literal so that
                     // borrow() Ref guards (oracle_rx, velocity_rx, etc.) in the
                     // snapshot fields are NOT alive at any .await point.
@@ -829,7 +845,7 @@ impl Squadron {
                                 // cannot slip, so that price is exact. Leaving it to the
                                 // generic fallback would book it at the observed bid and
                                 // record a spread-capturing win as a loss.
-                                let resting_rec = if config::GHOST_MODE { None } else { maker_resting_exits.get(&pos_key).cloned() };
+                                let resting_rec = if ghosting { None } else { maker_resting_exits.get(&pos_key).cloned() };
                                 if let Some(rest) = resting_rec {
                                     let (_found, matched) =
                                         cancel_resting_orders_for_token(&trading_client, &tid_m).await;
@@ -922,7 +938,7 @@ impl Squadron {
                                 // Same class of bug as intl trade 56 (2026-06-21), already
                                 // fixed inside `IntlClobVenue::place_order`.
                                 let mut exit_fill_price: Option<Decimal> = None;
-                                if !config::GHOST_MODE {
+                                if !ghosting {
                                     if let Err(e) = place_limit_order_filled(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &tid, Side::Sell, shares, (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await
                                         .map(|(_oid, making, taking)| {
                                             // SELL orientation: making = shares given, taking = USDC received.
@@ -1120,7 +1136,7 @@ impl Squadron {
                                             // Release token claim — position is fully closed.
                                             token_ownership.lock().await.remove(&tid_m);
 
-                                        if rs_m > dec!(0) && !config::GHOST_MODE {
+                                        if rs_m > dec!(0) && !ghosting {
                                             let ps = Arc::clone(&positions); let cl = Arc::clone(&trading_client); let tp = Arc::clone(&total_pnl); let m_name = params.market_name.clone();
                                             let sn_async = sn.clone();
                                             let tid_async = tid_m.clone(); // neutral key moved into the spawn
@@ -1231,7 +1247,7 @@ impl Squadron {
                                             let other_bid = if other_tid == target_yes_token { exit_snap.yes_bid } else { exit_snap.no_bid };
                                             let other_fee_bps = if other_tid == target_yes_token { target_yes_fee_bps as u16 } else { target_no_fee_bps as u16 };
                                             let other_vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
-                                                if !config::GHOST_MODE { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, &other_tid, Side::Sell, s, (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), other_fee_bps, crate::venues::core::TimeInForce::Fak, false, 0, &shared_http).await; }
+                                                if !ghosting { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, &other_tid, Side::Sell, s, (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), other_fee_bps, crate::venues::core::TimeInForce::Fak, false, 0, &shared_http).await; }
                                                     let mut map = positions.lock().await; if let Some(p) = map.remove(&pk) { let actual_other_exit = (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnl = (actual_other_exit - p.avg_entry) * p.shares; paired_pnl = pnl; *total_pnl.lock().await += pnl;
                                                 // Release paired token claim.
                                                 token_ownership.lock().await.remove(&other_tid_m);
@@ -1386,7 +1402,7 @@ impl Squadron {
                                     if let Some(expiry) = pending.get(&pos_key) { if expiry > &Instant::now() { continue; } }
                                 }
 
-                                    if config::GHOST_MODE {
+                                    if ghosting {
                                     if positions.lock().await.contains_key(&pos_key) { continue; }
                                     let pos_close_time = target_market_close_time;
                                     // Simulate the fill at the TOUCH, not at the crossing limit.
@@ -1670,7 +1686,7 @@ impl Squadron {
                                     let p_token_m = p.token_id.clone(); // neutral key (slice 2a)
                                     let pk = (sn.clone(), p_token_m.clone());
                                     { let pending = pending_orders.lock().await; if let Some(expiry) = pending.get(&pk) { if expiry > &Instant::now() { continue; } } }
-                                    if config::GHOST_MODE {
+                                    if ghosting {
                                         if positions.lock().await.contains_key(&pk) { continue; }
                                         positions.lock().await.insert(pk.clone(), Position { shares: p.shares, avg_entry: p.price, opened_at: Utc::now(), close_time: None, market_name: p.market_name.clone(), pair_token_id: p_token_m.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None, entry_fee: Decimal::ZERO });
                                         info!("👻 GHOST_MODE MakerQuote [{}]: {} | shares={:.2}, bid=${:.4} (simulated)", sn, p.market_name, p.shares, p.price);
@@ -1764,7 +1780,7 @@ impl Squadron {
                                     // endpoint, and without this it would adopt the NEXT quote's
                                     // fill as its own and write a second entry row.
                                     bump_quote_epoch(&mut *quote_epochs.lock().await, &pk);
-                                    let matched = if config::GHOST_MODE {
+                                    let matched = if ghosting {
                                         info!("👻 GHOST_MODE MakerCancel [{}]: {} (simulated quote-pull)", sn, tok);
                                         dec!(0)
                                     } else {
@@ -1861,7 +1877,7 @@ impl Squadron {
                                 };
                                 if live_shares < config::MIN_ORDER_SHARES { continue; }
 
-                                if config::GHOST_MODE || params.ghost_mode {
+                                if ghosting || params.ghost_mode {
                                     if !maker_resting_exits.contains_key(&pk) {
                                         info!("👻 GHOST_MODE MakerRestingExit [{}]: {} | shares={:.2}, ask=${:.4} (simulated)",
                                               sn, params.market_name, live_shares, params.price);
@@ -1982,7 +1998,7 @@ impl Squadron {
                     // is exactly what the FAK exits cannot promise, and why the
                     // ChainReconcile fallback (which books at "last mark") must
                     // never be the thing that closes one of these.
-                    if !maker_resting_exits.is_empty() && !config::GHOST_MODE {
+                    if !maker_resting_exits.is_empty() && !ghosting {
                         let due: Vec<(String, MarketId)> = maker_resting_exits
                             .iter()
                             .filter(|(_, v)| v.last_poll.elapsed() >= Duration::from_secs(MAKER_RESTING_EXIT_POLL_SECS))
@@ -2089,7 +2105,9 @@ impl Squadron {
         // ChainReconcile fallback — booked at "last mark" instead of its real
         // resting price, which is precisely the ledger drift that path exists to
         // paper over. Cancel them while we still know they are ours.
-        if !maker_resting_exits.is_empty() && !config::GHOST_MODE {
+        // Outside the tick, so there is no `ghosting` in scope — read the live
+        // config directly rather than the build constant alone.
+        if !maker_resting_exits.is_empty() && !crate::helpers::dynamic_config::ghosting_now() {
             for (pk, rec) in maker_resting_exits.iter() {
                 let (_found, matched) =
                     cancel_resting_orders_for_token(&trading_client, &pk.1).await;
@@ -2272,5 +2290,52 @@ mod trade_accounting_tests {
     fn a_pruned_epoch_is_not_current() {
         let epochs = QuoteEpochs::new();
         assert!(!quote_epoch_is_current(&epochs, &key(), 1));
+    }
+
+    // ── Ghost mode ─────────────────────────────────────────────────────────
+
+    /// No order path may consult the BUILD constant on its own.
+    ///
+    /// `config::GHOST_MODE` is compile-time; the operator's switch lives in
+    /// DynamicConfig. Until 2026-08-20 eleven sites in this file read only the
+    /// constant, so toggling Ghost Mode in the Control Tower did nothing on the
+    /// intl venue — entries and exits went to the exchange for real while the UI
+    /// reported simulation. Both are now folded once per tick into `ghosting`.
+    ///
+    /// This asserts the idiom rather than the behaviour, because the failure mode
+    /// is someone adding a NEW order path with the old habit. Behaviour tests
+    /// cannot catch a site that does not exist yet.
+    #[test]
+    fn no_order_path_reads_the_build_ghost_switch_directly() {
+        let src = include_str!("patrol_impl.rs");
+        // Assembled at compile time so this line does not match itself.
+        let needle = concat!("config::", "GHOST_MODE");
+        let offenders: Vec<(usize, &str)> = src
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains(needle))
+            .filter(|(_, l)| {
+                let t = l.trim_start();
+                // The single hoist is the one legitimate read; comments describe it.
+                !t.starts_with("//") && !t.starts_with("let ghosting =")
+            })
+            .map(|(i, l)| (i + 1, l.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these read the build-level ghost switch instead of the per-tick `ghosting`: {offenders:#?}",
+        );
+    }
+
+    /// `ghosting` must be true if EITHER switch is set — a build compiled for
+    /// simulation cannot be un-ghosted by the runtime knob, and a live build must
+    /// still obey the operator.
+    #[test]
+    fn either_switch_is_enough_to_ghost() {
+        let combine = |build: bool, runtime: bool| build || runtime;
+        assert!(!combine(false, false), "live build, switch off — trades for real");
+        assert!(combine(false, true),  "operator turned it on — must simulate");
+        assert!(combine(true, false),  "ghost build — must simulate regardless");
+        assert!(combine(true, true));
     }
 }

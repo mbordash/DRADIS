@@ -5,7 +5,6 @@
       "label": "Conservative",
       "description": "The recommended starting point: capital preservation first \u2014 smaller position sizes, tighter stops, fewer concurrent strategies. Build confidence here, then move up the risk ramp.",
       "values": {
-        "ghost_mode": false,
         "intl_taker_fee_rate": "0.07",
         "enable_arbitrage": true,
         "enable_time_decay": true,
@@ -178,7 +177,6 @@
       "label": "Balanced",
       "description": "The next step up: moderate sizing and risk limits across all core strategies.",
       "values": {
-        "ghost_mode": false,
         "intl_taker_fee_rate": "0.07",
         "enable_arbitrage": true,
         "enable_time_decay": true,
@@ -351,7 +349,6 @@
       "label": "Aggressive",
       "description": "Maximum opportunity capture: larger sizes, wider stops, all strategies enabled. Expect higher drawdowns.",
       "values": {
-        "ghost_mode": false,
         "intl_taker_fee_rate": "0.07",
         "enable_arbitrage": true,
         "enable_time_decay": true,
