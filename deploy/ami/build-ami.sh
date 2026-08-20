@@ -112,6 +112,19 @@ STAMP="$(date -u +%Y%m%d-%H%M)"
 AMI_NAME="dradis-${VERSION}-${STAMP}"
 TAG="dradis-ami-builder-${STAMP}"
 
+# EC2 CreateImage rejects any non-ASCII byte in Description or Name — and it
+# rejects it at the very END of the build, after provisioning has succeeded and
+# the instance has been stopped. An em dash cost one complete build, so the
+# string lives here and is checked before anything is launched.
+AMI_DESCRIPTION="DRADIS - self-hosted, non-custodial automated prediction-market trading engine for Polymarket International, Polymarket US and Kalshi (provided AS IS)"
+if printf '%s%s' "$AMI_DESCRIPTION" "$AMI_NAME" | LC_ALL=C grep -q '[^ -~]'; then
+    echo "❌ AMI name or description contains non-ASCII characters, which EC2"
+    echo "   CreateImage rejects. Offending text:"
+    printf '%s\n' "$AMI_DESCRIPTION" "$AMI_NAME" | LC_ALL=C grep -n '[^ -~]'
+    exit 1
+fi
+
+
 # Built as an array so an empty PROFILE cannot inject an empty argument, and
 # so the array is never empty (bash 3.2 + `set -u` errors on "${arr[@]}" when
 # the array has no elements).
@@ -169,7 +182,29 @@ cleanup() {
     # It previously died on an unbound variable and leaked a running builder.
     set +e +u
     if [ -n "$INSTANCE_ID" ]; then
-        if [ "$KEEP_INSTANCE" = true ] && [ "${BUILD_OK:-false}" != true ]; then
+        if [ "${SNAPSHOT_READY:-false}" = true ] && [ "${BUILD_OK:-false}" != true ]; then
+            # Everything expensive already succeeded: Docker, three Rust release
+            # builds, the Marketplace scrub. Only the snapshot failed. Throwing
+            # the instance away here means rebuilding all of it, so keep it —
+            # stopped, it costs only its EBS volume.
+            echo ""
+            echo "⚠️  Provisioning succeeded; only the snapshot failed."
+            echo "    Builder ${INSTANCE_ID} is left STOPPED so you need not rebuild."
+            echo ""
+            echo "    Retry just the snapshot:"
+            echo "      aws ${PROFILE:+--profile ${PROFILE} }--region ${REGION} ec2 create-image \\"
+            echo "          --instance-id ${INSTANCE_ID} --name '${AMI_NAME}' \\"
+            echo "          --description '${AMI_DESCRIPTION}'"
+            echo ""
+            echo "    When you are done, clean up:"
+            echo "      aws ${PROFILE:+--profile ${PROFILE} }--region ${REGION} ec2 terminate-instances --instance-ids ${INSTANCE_ID}"
+            echo "      aws ${PROFILE:+--profile ${PROFILE} }--region ${REGION} ec2 delete-key-pair --key-name ${KEY_NAME}"
+            echo "      aws ${PROFILE:+--profile ${PROFILE} }--region ${REGION} ec2 delete-security-group --group-id ${SG_ID}"
+            echo ""
+            # Leave the key pair and security group in place too: deleting the
+            # SG would fail anyway while the instance still references it.
+            return
+        elif [ "$KEEP_INSTANCE" = true ] && [ "${BUILD_OK:-false}" != true ]; then
             echo "⚠️  --keep-instance: builder $INSTANCE_ID left running for debugging."
         else
             # Braces are load-bearing: bash in a UTF-8 locale folds the
@@ -273,10 +308,12 @@ SCRUB
 echo "Stopping builder and creating AMI…"
 AWS ec2 stop-instances --instance-ids "$INSTANCE_ID" >/dev/null
 AWS ec2 wait instance-stopped --instance-ids "$INSTANCE_ID"
+# From here on, a failure must not destroy the builder — see cleanup().
+SNAPSHOT_READY=true
 
 AMI_ID=$(AWS ec2 create-image --instance-id "$INSTANCE_ID" \
     --name "$AMI_NAME" \
-    --description "DRADIS — self-hosted, non-custodial automated prediction-market trading engine for Polymarket International, Polymarket US and Kalshi (provided AS IS)" \
+    --description "$AMI_DESCRIPTION" \
     --query 'ImageId' --output text)
 echo "AMI: $AMI_ID — waiting for 'available'…"
 AWS ec2 wait image-available --image-ids "$AMI_ID"
