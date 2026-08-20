@@ -1029,20 +1029,26 @@ pub const STOP_LOSS_COOLDOWN_SECS: u64 = 180;
 /// This prevents log floods and API hammering when FAK exits fail due to thin books.
 pub const EXIT_RETRY_COOLDOWN_SECS: u64 = 5;
 
-/// Maximum distance (in price units) between the entry price and the exit price
-/// implied by the collateral delta, for that implied price to be trusted.
+/// How far the exit price implied by collateral movement may sit from the bid
+/// observed at exit, before the reconciliation is distrusted.
 ///
-/// When the exchange rejects a sell with "position already gone", the exit price
-/// is recovered by dividing the collateral that came back by the shares that
-/// left. That arithmetic is only valid if nothing ELSE moved collateral in the
-/// meantime — another viper entering or exiting shifts it by dollars and implies
-/// a price nowhere near entry. This band is the contamination filter: outside it
-/// the trade is booked as `ExitUnreconciled` with pnl = 0 rather than guessed.
+/// When the exchange rejects a sell with "position already gone", the P&L is
+/// taken from the collateral delta across the round trip and the exit price is
+/// derived from it. Two things can make that number wrong: another position
+/// moving collateral in between, or a baseline captured on the wrong side of the
+/// entry. Both throw the derived price away from the bid, so this band catches
+/// them and the trade is booked as `ExitUnreconciled` with pnl = 0 instead.
+///
+/// Measured against the BID, not the entry price. Measuring from entry was a
+/// real bug (production trade 378, 2026-08-20): FairValue took a legitimate
+/// 20.27 percent profit, which sat 0.15 from its entry and was discarded as an
+/// outlier while the bid it actually traded against was 0.026 away.
 ///
 /// Wider = more exits priced automatically, with more risk of trusting a
-/// contaminated baseline. Narrower = more exits booked as 0 and left for manual
-/// reconciliation. The old behaviour (estimate from the observed bid) is not an
-/// option at any setting: it could only ever manufacture a loss.
+/// contaminated baseline. Narrower = more booked as 0 and left for manual
+/// reconciliation. Estimating from the order book is not an option at any
+/// setting: that path is only reached on a rejected sell, where the book is
+/// evidence of nothing.
 pub const EXIT_RECONCILE_MAX_DEVIATION: Decimal = dec!(0.06);
 
 /// Balance re-check attempts when a maker quote-pull finds the resting order GONE but the

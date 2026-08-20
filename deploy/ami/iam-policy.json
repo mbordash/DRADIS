@@ -5,7 +5,7 @@
       "Sid": "ReadOnlyLookups",
       "Effect": "Allow",
       "Action": [
-        "ec2:DescribeVpcs",
+        "ec2:DescribeVpcs"
         "ec2:DescribeSubnets",
         "ec2:DescribeInstances",
         "ec2:DescribeInstanceStatus",

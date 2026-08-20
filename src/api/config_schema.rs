@@ -522,7 +522,7 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
     {
         let g = "Exit Accounting"; let e: Option<&'static str> = None;
         v.push(F::new(g, e, "exit_reconcile_max_deviation", "Exit Reconcile Band", "decimal", true,
-            "When the exchange rejects a sell because the shares are already gone, the exit price is recovered from the collateral that came back. Trust that price only if it lands within this distance of the entry price — a wider gap means another position moved collateral in between and the figure is contaminated, in which case the trade is booked with zero P&L rather than a guess. Never estimated from the order book: that path is only reached on an adverse book, so a book-derived estimate can only ever record a loss.")
+            "When the exchange rejects a sell because the shares are already gone, the profit or loss is taken from how much your collateral actually moved across the round trip. Trust it only if the exit price that implies lands within this distance of the bid showing at the time — a wider gap means something else moved collateral and the figure cannot be relied on, so the trade is booked with zero P&L rather than a guess. Raise it if genuine exits are being left unreconciled; lower it to be stricter.")
             .range(0.0, 0.50).step(0.01));
     }
 

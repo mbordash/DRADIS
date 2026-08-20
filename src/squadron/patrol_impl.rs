@@ -75,37 +75,48 @@ const BASE_CANCEL_RETRY_DELAY_MS: u64 = 200;
 /// the fill price is already known (it is the resting limit, which cannot slip).
 const MAKER_RESTING_EXIT_POLL_SECS: u64 = 5;
 
-/// Recover the exit price of a position the exchange says is already gone, from
-/// the collateral that came back for it.
+/// Book an exit the exchange says already happened, from the money.
 ///
-/// Returns `None` when the figure cannot be trusted, and the caller must then
-/// book the trade with zero P&L rather than invent one. Never falls back to the
-/// order book: this path is only reachable from a stop firing on an adverse
-/// book, so a book-derived price sits below entry by construction and would
-/// record every such exit as a loss regardless of what actually happened.
+/// Returns `(exit_price, pnl)`, or `None` when the figure cannot be trusted —
+/// in which case the caller books zero rather than inventing a number. Never
+/// falls back to the order book: this path is only reachable from a stop or a
+/// take-profit whose sell was rejected, and a book-derived price is a guess.
 ///
-/// `baseline` is collateral as it read just after the entry fill confirmed, so
-/// `now - baseline` is the disposal proceeds — provided nothing else moved
-/// collateral in between. `max_dev` is the contamination filter: another
-/// position opening or closing shifts collateral by dollars and implies a price
-/// nowhere near entry.
+/// `baseline` is collateral as it read BEFORE the entry was placed, so
+/// `now - baseline` is the round trip's net P&L directly — no division, and no
+/// assumption about what the shares fetched. That is deliberate. The first
+/// version of this reconstructed a per-share exit price from a supposedly
+/// post-fill baseline, but `live_collateral` refreshes only once a minute, so
+/// the "post-fill" reading was routinely taken before the buy had even settled
+/// (production trade 378, 2026-08-20: baseline $67.0050 against an entry placed
+/// 17s later). Dividing that by the share count produced a meaningless price.
+///
+/// Two guards, and between them they also disambiguate a baseline that landed on
+/// the wrong side of the entry: a post-buy baseline makes `pnl` the gross
+/// proceeds instead of the net, which pushes the derived price far outside a
+/// binary's range and is rejected here.
+///
+///   * the derived price must be a possible binary price, and
+///   * it must sit within `max_dev` of the bid observed at exit — the only
+///     contemporaneous evidence of what the shares were worth. Measuring against
+///     the ENTRY price instead was the other half of the trade-378 bug: FairValue
+///     routinely takes 20%+ profits, so a correct reconciliation looked like a
+///     wild outlier and got thrown away.
 fn reconcile_unverified_exit(
     baseline: Option<Decimal>,
     now_collateral: Decimal,
     shares: Decimal,
     avg_entry: Decimal,
+    observed_bid: Decimal,
     max_dev: Decimal,
-) -> Option<Decimal> {
+) -> Option<(Decimal, Decimal)> {
     let base = baseline?;
     if shares <= dec!(0) { return None; }
-    let proceeds = now_collateral - base;
-    if proceeds <= dec!(0) { return None; }
-    let px = proceeds / shares;
-    if px > dec!(0) && px <= dec!(1) && (px - avg_entry).abs() <= max_dev {
-        Some(px)
-    } else {
-        None
-    }
+    let pnl = now_collateral - base;
+    let exit_price = avg_entry + pnl / shares;
+    if exit_price <= dec!(0) || exit_price > dec!(1) { return None; }
+    if (exit_price - observed_bid).abs() > max_dev { return None; }
+    Some((exit_price, pnl))
 }
 
 /// Maker quote epochs: `(strategy, token) -> (epoch, last touched)`.
@@ -475,8 +486,8 @@ impl Squadron {
         let mut maker_resting_exits: std::collections::HashMap<(String, MarketId), MakerRestingExit> =
             std::collections::HashMap::new();
 
-        // Collateral as it read on the first tick AFTER a position's fill was
-        // confirmed, keyed like the position map.
+        // Collateral as it read BEFORE a position was entered, keyed like the
+        // position map.
         //
         // This is the only way to price an exit the exchange refuses to confirm.
         // When a sell is rejected with "position already gone", the shares were
@@ -490,7 +501,7 @@ impl Squadron {
         //
         // Deliberately not persisted: after a restart the baseline is unknown,
         // and the exit is then booked as unreconciled rather than guessed.
-        let mut fill_collateral: std::collections::HashMap<(String, MarketId), Decimal> =
+        let mut pre_entry_collateral: std::collections::HashMap<(String, MarketId), Decimal> =
             std::collections::HashMap::new();
 
         // Monotonic epoch per (strategy, token), bumped every time a maker quote
@@ -693,18 +704,20 @@ impl Squadron {
                     let ctx_starting_collateral  = *starting_collateral_store.lock().await;
                     let ctx_available_collateral = *live_collateral.lock().await;
 
-                    // Baseline for exit reconciliation: record collateral the
-                    // first time we see a position whose fill is confirmed, and
-                    // drop entries for positions that are gone so the map cannot
-                    // grow without bound.
+                    // Baseline for exit reconciliation: collateral as it stood
+                    // BEFORE this position was entered.
+                    //
+                    // Recorded on first sight of the position — including while it
+                    // is still an unconfirmed resting order — because a fill that
+                    // settles inside the status task's 60s refresh window would
+                    // otherwise be baselined against its own post-buy collateral.
+                    // Positions that vanish are dropped so the map cannot grow.
                     {
                         let map = positions.lock().await;
-                        for (k, p) in map.iter() {
-                            if p.fill_confirmed_at.is_some() {
-                                fill_collateral.entry(k.clone()).or_insert(ctx_available_collateral);
-                            }
+                        for k in map.keys() {
+                            pre_entry_collateral.entry(k.clone()).or_insert(ctx_available_collateral);
                         }
-                        fill_collateral.retain(|k, _| map.contains_key(k));
+                        pre_entry_collateral.retain(|k, _| map.contains_key(k));
                     }
                     // Drop epochs no in-flight fill watcher could still consult.
                     // A watcher waits at most MAX_WAIT_SECS_WINDOW, so double that
@@ -1007,7 +1020,7 @@ impl Squadron {
                                             // and no open_positions cleanup, so the ledger diverged and
                                             // ChainReconcile later invented a second exit at the current mark.
                                             let removed = { let mut map = positions.lock().await; map.remove(&pos_key) };
-                                            let fill_baseline = fill_collateral.remove(&pos_key);
+                                            let fill_baseline = pre_entry_collateral.remove(&pos_key);
                                             if let Some(p) = removed {
                                                 if p.fill_confirmed_at.is_some() {
                                                     // Price the exit from the MONEY, not from the book.
@@ -1023,17 +1036,16 @@ impl Squadron {
                                                     let now_collateral = *live_collateral.lock().await;
                                                     let implied = reconcile_unverified_exit(
                                                         fill_baseline, now_collateral, p.shares,
-                                                        p.avg_entry, exit_reconcile_max_dev,
+                                                        p.avg_entry, params.price, exit_reconcile_max_dev,
                                                     );
                                                     let sid3 = side_of(&tid).to_string();
                                                     let (aep3, pnl3, tag) = match implied {
-                                                        Some(px) => {
-                                                            let pnl = (px - p.avg_entry) * p.shares;
+                                                        Some((px, pnl)) => {
                                                             warn!(
-                                                                "⚠️ EXIT rejected by exchange [{}] (\"{}\"): position already gone — reconciled from collateral @ ${:.4} pnl=${:.4}",
-                                                                sn, es.chars().take(80).collect::<String>(), px, pnl
+                                                                "⚠️ EXIT rejected by exchange [{}] (\"{}\"): position already gone — reconciled from collateral: pnl=${:.4} (implies exit @ ${:.4} against bid ${:.4})",
+                                                                sn, es.chars().take(80).collect::<String>(), pnl, px, params.price
                                                             );
-                                                            (px, pnl, format!("{} (ExitReconciled: price derived from collateral delta)", reason))
+                                                            (px, pnl, format!("{} (ExitReconciled: pnl taken from collateral movement)", reason))
                                                         }
                                                         None => {
                                                             // Not confidently knowable. Book the trade so the
@@ -2150,81 +2162,103 @@ impl Squadron {
 mod trade_accounting_tests {
     use super::*;
 
-    /// The production case this was written for.
+    /// Production trade 378 (2026-08-20, FairValue): the case that forced this
+    /// redesign.
     ///
-    /// Trade 377 (2026-08-20, MakerStrategy): 18 shares entered at $0.44, the
-    /// sell was rejected with "position already gone", and collateral moved
-    /// 58.90502 -> 67.00502. The old code priced the exit at the observed bid
-    /// ($0.43) and booked -$0.18 on a position that had in fact made +$0.18 —
-    /// a $0.36 error that also corrupted session P&L.
+    /// 4.054053 shares entered at $0.74, take-profit at a $0.89 bid, sell
+    /// rejected. Collateral moved 67.00502 -> 67.718402 — a real +$0.71 that the
+    /// first implementation booked as $0.00, because it divided a pre-buy
+    /// baseline by the share count and got a nonsense price of $0.176.
     #[test]
-    fn recovers_the_real_exit_price_of_production_trade_377() {
-        let px = reconcile_unverified_exit(
-            Some(dec!(58.90502)), dec!(67.00502), dec!(18), dec!(0.44), dec!(0.10),
-        ).expect("collateral delta is clean and should price the exit");
-        assert_eq!(px, dec!(0.45));
-        let pnl = (px - dec!(0.44)) * dec!(18);
-        assert_eq!(pnl, dec!(0.18), "must book the gain that actually occurred");
+    fn books_the_real_gain_of_production_trade_378() {
+        let (px, pnl) = reconcile_unverified_exit(
+            Some(dec!(67.00502)), dec!(67.718402), dec!(4.054053),
+            dec!(0.74), dec!(0.89), dec!(0.10),
+        ).expect("a settled pre-entry baseline should reconcile");
+        assert_eq!(pnl, dec!(0.713382));
+        // Derived, not measured: entry + pnl/shares. The book showed an ask of
+        // $0.91 twenty seconds later, so ~$0.916 is the right neighbourhood.
+        assert!(px > dec!(0.91) && px < dec!(0.92), "derived exit was {px}");
     }
 
-    /// No baseline (e.g. the process restarted since the fill) is not an excuse
-    /// to guess — the caller books zero.
+    /// Production trade 377 (2026-08-20, Maker) must still reconcile: 18 shares
+    /// at $0.44 against a $0.43 bid, collateral 58.90502 -> 67.00502 where
+    /// 58.90502 is the PRE-ENTRY reading.
+    #[test]
+    fn still_books_the_maker_case_that_started_this() {
+        let (px, pnl) = reconcile_unverified_exit(
+            Some(dec!(66.82502)), dec!(67.00502), dec!(18),
+            dec!(0.44), dec!(0.43), dec!(0.10),
+        ).expect("clean baseline should reconcile");
+        assert_eq!(pnl, dec!(0.18), "the gain that actually occurred");
+        assert_eq!(px, dec!(0.45));
+    }
+
+    /// The band measures against the BID, not the entry. FairValue routinely
+    /// takes 20%+ profits; measuring from entry made a correct reconciliation
+    /// look like a wild outlier and threw it away.
+    #[test]
+    fn a_large_but_genuine_profit_is_not_mistaken_for_contamination() {
+        // +$0.71 on a $0.74 entry is a 24% move — far outside a 0.10 band drawn
+        // around the entry, but right on top of the observed bid.
+        assert!(reconcile_unverified_exit(
+            Some(dec!(67.00502)), dec!(67.718402), dec!(4.054053),
+            dec!(0.74), dec!(0.89), dec!(0.10),
+        ).is_some());
+    }
+
+    /// A baseline taken AFTER the buy makes `pnl` the gross proceeds rather than
+    /// the net, which inflates the derived price past a binary's ceiling. That
+    /// is how a mis-timed baseline is caught rather than silently booked.
+    #[test]
+    fn rejects_a_baseline_taken_on_the_wrong_side_of_the_entry() {
+        // Post-buy baseline: 67.00502 - 3.00 = 64.00502.
+        assert_eq!(
+            reconcile_unverified_exit(
+                Some(dec!(64.00502)), dec!(67.718402), dec!(4.054053),
+                dec!(0.74), dec!(0.89), dec!(0.10),
+            ),
+            None,
+        );
+    }
+
+    /// No baseline — the process restarted since the entry — is not an excuse to
+    /// guess. The caller books zero.
     #[test]
     fn refuses_to_price_without_a_baseline() {
         assert_eq!(
-            reconcile_unverified_exit(None, dec!(67.0), dec!(18), dec!(0.44), dec!(0.10)),
+            reconcile_unverified_exit(None, dec!(67.0), dec!(18), dec!(0.44), dec!(0.43), dec!(0.10)),
             None,
         );
     }
 
-    /// A second position closing in between inflates the delta far past
-    /// anything a single fill could explain, so the figure must be rejected.
+    /// Another position closing in between moves collateral by dollars, which
+    /// throws the derived price nowhere near the bid.
     #[test]
     fn rejects_a_baseline_contaminated_by_another_position() {
-        // +$25.10 for 18 shares implies $1.39/share — impossible for a binary.
         assert_eq!(
-            reconcile_unverified_exit(Some(dec!(58.90502)), dec!(84.0), dec!(18), dec!(0.44), dec!(0.10)),
-            None,
-        );
-        // A subtler one: still a valid price, but 20c from entry.
-        assert_eq!(
-            reconcile_unverified_exit(Some(dec!(58.90502)), dec!(70.42502), dec!(18), dec!(0.44), dec!(0.10)),
-            None,
-            "0.64/share is inside (0,1] but outside the trust band",
-        );
-    }
-
-    /// Collateral that did not rise proves nothing came back, so there is no
-    /// price to derive.
-    #[test]
-    fn rejects_a_non_positive_delta() {
-        assert_eq!(
-            reconcile_unverified_exit(Some(dec!(58.90502)), dec!(58.90502), dec!(18), dec!(0.44), dec!(0.10)),
-            None,
-        );
-        assert_eq!(
-            reconcile_unverified_exit(Some(dec!(58.90502)), dec!(50.0), dec!(18), dec!(0.44), dec!(0.10)),
+            reconcile_unverified_exit(
+                Some(dec!(66.82502)), dec!(92.0), dec!(18), dec!(0.44), dec!(0.43), dec!(0.10)),
             None,
         );
     }
 
-    /// The band is operator-tunable; a wider one accepts a move a tighter one
-    /// rejects. Guards against the knob being silently ignored.
+    /// A loss reconciles exactly like a gain — the sign is never assumed.
     #[test]
-    fn the_trust_band_is_honoured() {
-        let args = (Some(dec!(58.90502)), dec!(70.42502), dec!(18), dec!(0.44));
-        assert_eq!(reconcile_unverified_exit(args.0, args.1, args.2, args.3, dec!(0.10)), None);
-        assert_eq!(
-            reconcile_unverified_exit(args.0, args.1, args.2, args.3, dec!(0.25)),
-            Some(dec!(0.64)),
-        );
+    fn a_genuine_loss_is_booked_as_a_loss() {
+        let (px, pnl) = reconcile_unverified_exit(
+            Some(dec!(66.82502)), dec!(66.64502), dec!(18),
+            dec!(0.44), dec!(0.43), dec!(0.10),
+        ).expect("a loss is still a reconcilable outcome");
+        assert_eq!(pnl, dec!(-0.18));
+        assert_eq!(px, dec!(0.43));
     }
 
     /// Zero shares must not panic on the division.
     #[test]
     fn rejects_a_zero_share_position() {
         assert_eq!(
-            reconcile_unverified_exit(Some(dec!(58.0)), dec!(67.0), dec!(0), dec!(0.44), dec!(0.10)),
+            reconcile_unverified_exit(Some(dec!(58.0)), dec!(67.0), dec!(0), dec!(0.44), dec!(0.43), dec!(0.10)),
             None,
         );
     }
