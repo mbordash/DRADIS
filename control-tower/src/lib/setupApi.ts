@@ -30,6 +30,12 @@ const TOKEN_KEY = 'dradis_admin_token';
 /** Venue compiled into the running engine binary — mirrors `build_venue()`. */
 export type VenueId = 'intl' | 'us' | 'kalshi';
 
+/**
+ * How this instance was distributed. Drives whether the risk gate shows
+ * commercial support contacts or the community "no individual support" wording.
+ */
+export type Edition = 'community' | 'marketplace';
+
 export interface SetupStatus {
   venue: VenueId;
   /**
@@ -38,6 +44,8 @@ export interface SetupStatus {
    * selector is hidden.
    */
   venues_available?: VenueId[];
+  /** 'marketplace' on the paid AMI; absent or 'community' everywhere else. */
+  edition?: Edition;
   admin_set: boolean;
   auth_disabled: boolean;
   venue_configured: boolean;

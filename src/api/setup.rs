@@ -446,6 +446,28 @@ fn build_venue() -> &'static str {
     { "kalshi" }
 }
 
+/// How this instance was distributed.
+///
+/// `"marketplace"` on the AWS Marketplace AMI, `"community"` everywhere else
+/// (source builds, the demo, private deployments). Set via `DRADIS_EDITION` in
+/// the AMI's compose file rather than compiled in, so one binary serves both.
+///
+/// It exists for one reason: a paid customer must be pointed at real support.
+/// The community wording — "individual support is not included, ask an AI
+/// assistant, file a GitHub issue" — is honest for a free self-hosted build and
+/// unacceptable on a product someone paid for. AWS requires a seller to state
+/// how buyers get help, so shipping the community text in a Marketplace image
+/// risks the listing being rejected.
+fn edition() -> &'static str {
+    static EDITION: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    EDITION.get_or_init(|| {
+        match std::env::var("DRADIS_EDITION").unwrap_or_default().trim().to_ascii_lowercase().as_str() {
+            "marketplace" => "marketplace".to_string(),
+            _ => "community".to_string(),
+        }
+    })
+}
+
 /// DB key for the one-time alpha/jurisdiction acknowledgment record.
 const ALPHA_ACK_KEY: &str = "alpha_jurisdiction_ack";
 
@@ -482,6 +504,7 @@ async fn get_status() -> Response {
         // Only populated on a multi-venue image (the Marketplace AMI). One
         // entry or none means there is nothing to switch between.
         "venues_available": venues_available,
+        "edition": edition(),
         "admin_set": admin_hash().is_some(),
         "auth_disabled": setup_auth_disabled(),
         "venue_configured": venue_configured,

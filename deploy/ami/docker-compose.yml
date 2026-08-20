@@ -24,6 +24,11 @@ services:
       - API_PORT=9000
       - DRADIS_DATA_DIR=/app/data
       - ASSETS=btc
+      # Marks this as the paid Marketplace image. The Control Tower uses it to
+      # show commercial support contacts instead of the community "no individual
+      # support, file a GitHub issue" wording, which AWS would not accept on a
+      # product a customer paid for.
+      - DRADIS_EDITION=marketplace
     volumes:
       - ./data:/app/data
     ports:
@@ -38,9 +43,27 @@ services:
     environment:
       - DRADIS_API_URL=http://dradis:9000
       - NEXT_PUBLIC_DEPLOYMENT_ENV=production
-    ports:
-      - "80:3002"
+    # No host port. The only way in is through the TLS terminator below, so the
+    # Control Tower cannot be reached in plaintext even by accident.
+    expose:
+      - "3002"
     depends_on: [dradis]
+    networks: [dradis-net]
+
+  # TLS terminator. See nginx.conf for why this exists rather than serving the
+  # Control Tower directly: Basic Auth over plaintext puts the login and every
+  # credential entered in Setup on the wire in readable form.
+  proxy:
+    image: nginx:alpine
+    container_name: dradis-proxy
+    restart: always
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./data/tls:/etc/dradis/tls:ro
+    depends_on: [control-tower]
     networks: [dradis-net]
 
 networks:

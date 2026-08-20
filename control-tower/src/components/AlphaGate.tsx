@@ -30,7 +30,7 @@
 
 import { useState } from 'react';
 import { acknowledgeAlpha } from '@/lib/setupApi';
-import type { VenueId } from '@/lib/setupApi';
+import type { VenueId, Edition } from '@/lib/setupApi';
 
 /** Display name per venue — used in the header, the jurisdiction heading, and
  *  the confirmation checkbox, so a Kalshi build never labels itself "US". */
@@ -45,10 +45,12 @@ const REPO_URL = 'https://github.com/mbordash/DRADIS';
 export default function AlphaGate({
   venue,
   appVersion,
+  edition,
   onAcknowledged,
 }: {
   venue: VenueId;
   appVersion?: string;
+  edition?: Edition;
   onAcknowledged: () => void;
 }) {
   const [riskOk, setRiskOk] = useState(false);
@@ -56,15 +58,36 @@ export default function AlphaGate({
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
+  // The engine serves its API before the SQLite pool finishes opening, so on a
+  // freshly launched instance this call can land in that gap and come back
+  // "DB not ready". That is a startup race, not a failure, and showing it as an
+  // error makes a customer's very first interaction with the product look broken.
+  // Retry quietly for a few seconds before surfacing anything.
   const accept = async () => {
     setBusy(true);
     setError(null);
-    try {
-      await acknowledgeAlpha();
-      onAcknowledged();
-    } catch (e) {
-      setError(e instanceof Error ? e.message : 'Failed to record acknowledgment — is the engine reachable?');
-      setBusy(false);
+    const DELAYS_MS = [400, 800, 1500, 2500, 4000];
+    for (let attempt = 0; ; attempt++) {
+      try {
+        await acknowledgeAlpha();
+        onAcknowledged();
+        return;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : '';
+        const stillStarting = /not ready|503|unavailable/i.test(msg);
+        if (stillStarting && attempt < DELAYS_MS.length) {
+          setError('Engine is still starting — retrying…');
+          await new Promise(r => setTimeout(r, DELAYS_MS[attempt]));
+          continue;
+        }
+        setError(
+          stillStarting
+            ? 'The engine has not finished starting. Wait a moment and try again.'
+            : msg || 'Failed to record acknowledgment — is the engine reachable?',
+        );
+        setBusy(false);
+        return;
+      }
     }
   };
 
@@ -125,17 +148,37 @@ export default function AlphaGate({
           </div>
 
           {/* ── Support policy ───────────────────────────────────────────── */}
-          <div className="bg-[#0e0e18] border border-[#1e1e32] rounded-xl p-4 space-y-2">
-            <h3 className="text-sm font-mono text-gray-300">🧪 Community-supported software</h3>
-            <ul className="text-xs text-gray-400 space-y-1 list-disc pl-4">
-              <li>Individual support is not included. For setup help, ask an AI assistant (ChatGPT, Gemini, Claude) — paste in the README and your question; they are very good at this.</li>
-              <li>Report bugs via{' '}
-                <a href={`${REPO_URL}/issues`} target="_blank" rel="noreferrer" className="text-sky-400 hover:underline">GitHub Issues</a>{' '}
-                and request enhancements via{' '}
-                <a href={`${REPO_URL}/discussions`} target="_blank" rel="noreferrer" className="text-sky-400 hover:underline">GitHub Discussions</a>.
-              </li>
-            </ul>
-          </div>
+          {/* A paid customer must be told how to get help, and by whom. The
+              community wording below is honest for a free self-hosted build and
+              would be unacceptable — quite possibly rejected — on a Marketplace
+              product someone paid for. */}
+          {edition === 'marketplace' ? (
+            <div className="bg-[#0e0e18] border border-[#1e1e32] rounded-xl p-4 space-y-2">
+              <h3 className="text-sm font-mono text-gray-300">🛟 Support</h3>
+              <ul className="text-xs text-gray-400 space-y-1 list-disc pl-4">
+                <li>Get help at{' '}
+                  <a href="https://dradis.live/support" target="_blank" rel="noreferrer" className="text-sky-400 hover:underline">dradis.live/support</a>{' '}
+                  — the form collects what is needed to diagnose a deployment.
+                </li>
+                <li>Or email{' '}
+                  <a href="mailto:starbuck@dradis.live" className="text-sky-400 hover:underline">starbuck@dradis.live</a>.
+                </li>
+                <li><strong className="text-gray-300">Support will never ask for your wallet private key, seed phrase or API secrets.</strong> Anyone who does is not us.</li>
+              </ul>
+            </div>
+          ) : (
+            <div className="bg-[#0e0e18] border border-[#1e1e32] rounded-xl p-4 space-y-2">
+              <h3 className="text-sm font-mono text-gray-300">🧪 Community-supported software</h3>
+              <ul className="text-xs text-gray-400 space-y-1 list-disc pl-4">
+                <li>Individual support is not included. For setup help, ask an AI assistant (ChatGPT, Gemini, Claude) — paste in the README and your question; they are very good at this.</li>
+                <li>Report bugs via{' '}
+                  <a href={`${REPO_URL}/issues`} target="_blank" rel="noreferrer" className="text-sky-400 hover:underline">GitHub Issues</a>{' '}
+                  and request enhancements via{' '}
+                  <a href={`${REPO_URL}/discussions`} target="_blank" rel="noreferrer" className="text-sky-400 hover:underline">GitHub Discussions</a>.
+                </li>
+              </ul>
+            </div>
+          )}
 
           {/* ── Acknowledgment ───────────────────────────────────────────── */}
           <div className="space-y-2.5">

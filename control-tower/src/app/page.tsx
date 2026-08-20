@@ -415,6 +415,7 @@ export default function DashboardPage() {
     <AlphaGate
       venue={setupStatus.venue}
       appVersion={setupStatus.app_version}
+      edition={setupStatus.edition}
       onAcknowledged={() => mutateSetupStatus()}
     />
   ) : null;

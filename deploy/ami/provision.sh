@@ -52,6 +52,10 @@ echo "     wall clock of a single-venue image."
 cd "$SRC_DIR"
 docker build -t dradis-engine:latest --build-arg DRADIS_VENUES="$VENUES" .
 docker build -t dradis-control-tower:latest control-tower/
+# Baked in rather than pulled on the customer's first boot: a fresh instance
+# should come up without needing egress to Docker Hub, and without a pull delay
+# on the very first thing a buyer does.
+docker pull nginx:alpine
 
 # Fail the build here rather than shipping an AMI that is missing a venue the
 # Setup view will happily offer.
@@ -61,10 +65,14 @@ for v in $VENUES; do
         || { echo "❌ engine image is missing /app/bin/dradis-$v"; exit 1; }
 done
 echo "     ✓ verified binaries present for: $VENUES"
+# The stack will not serve at all without this — nginx is the only listener.
+docker image inspect nginx:alpine >/dev/null 2>&1 \
+    || { echo "❌ nginx:alpine was not baked into the image"; exit 1; }
 
 echo "── [3/4] Installing /opt/dradis runtime ────────────────────────────────"
 mkdir -p /opt/dradis/data
 install -m 0644 deploy/ami/docker-compose.yml    /opt/dradis/docker-compose.yml
+install -m 0644 deploy/ami/nginx.conf           /opt/dradis/nginx.conf
 install -m 0755 deploy/ami/dradis-firstboot.sh   /opt/dradis/dradis-firstboot.sh
 install -m 0644 deploy/ami/dradis.service        /etc/systemd/system/dradis.service
 # Record the build variant on the image for support / listing verification.

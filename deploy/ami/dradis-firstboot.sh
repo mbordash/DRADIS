@@ -13,6 +13,8 @@
 #
 #   2. Mint per-instance credentials (/opt/dradis/.env) — once.
 #
+#   3. Mint a per-instance TLS certificate (/opt/dradis/data/tls) — once.
+#
 # AWS Marketplace rules prohibit baked-in default passwords, so credentials
 # are derived per instance:
 #   CT_PASSWORD     = the EC2 instance ID (fetched via IMDSv2) — the standard
@@ -63,7 +65,31 @@ if [ ! -s "$VENUE_FILE" ]; then
     echo "dradis-firstboot: venue set to '$VENUE' (change it in Setup → Venue)"
 fi
 
-# ── 2. Per-instance credentials ─────────────────────────────────────────────
+# ── 2. Per-instance TLS certificate ─────────────────────────────────────────
+# Self-signed, generated here rather than baked into the image: a certificate
+# shipped inside an AMI would have its private key in every customer's hands,
+# which is worse than no certificate at all. Browsers will warn — that is
+# inherent to self-signing, and the documented path to a trusted certificate is
+# an Application Load Balancer with ACM in front of this.
+#
+# Lives in the data volume so it survives container restarts and instance
+# stop/start, and so the operator can replace it with a real certificate by
+# dropping cert.pem and key.pem in the same place.
+TLS_DIR="$DATA_DIR/tls"
+if [ ! -s "$TLS_DIR/cert.pem" ] || [ ! -s "$TLS_DIR/key.pem" ]; then
+    mkdir -p "$TLS_DIR"
+    # 10 years: nobody is rotating a self-signed appliance certificate, and an
+    # expiry that lapses mid-deployment turns a warning into a hard failure.
+    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \
+        -keyout "$TLS_DIR/key.pem" -out "$TLS_DIR/cert.pem" \
+        -subj "/CN=DRADIS Control Tower" \
+        -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" >/dev/null 2>&1
+    chmod 600 "$TLS_DIR/key.pem"
+    chmod 644 "$TLS_DIR/cert.pem"
+    echo "dradis-firstboot: generated a self-signed TLS certificate"
+fi
+
+# ── 3. Per-instance credentials ─────────────────────────────────────────────
 [ -f "$ENV_FILE" ] && exit 0
 
 INSTANCE_ID=$(imds meta-data/instance-id || true)

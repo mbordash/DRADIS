@@ -89,6 +89,7 @@ REQUIRED_IN_ARCHIVE=(
     control-tower/package-lock.json
     deploy/ami/provision.sh
     deploy/ami/docker-compose.yml
+    deploy/ami/nginx.conf
     deploy/ami/dradis-firstboot.sh
     deploy/ami/dradis.service
 )
