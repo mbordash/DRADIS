@@ -82,7 +82,7 @@ export default function AlphaGate({
         }
         setError(
           stillStarting
-            ? 'The engine has not finished starting. Wait a moment and try again.'
+            ? 'The engine is reachable but its database has not opened. If this persists past a minute it is not a slow start — check the engine log for "SQLite init failed".'
             : msg || 'Failed to record acknowledgment — is the engine reachable?',
         );
         setBusy(false);

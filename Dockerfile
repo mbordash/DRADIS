@@ -92,6 +92,13 @@ EXPOSE 9000
 COPY --from=builder /out/bin ./bin
 COPY deploy/entrypoint.sh ./entrypoint.sh
 RUN chmod +x ./entrypoint.sh
+# The engine opens its SQLite shards at logs/<asset>-dradis.db, relative to this
+# WORKDIR. SQLite creates the FILE but never the directory, so without this the
+# open fails, DB_POOL is never set, and every database-backed endpoint answers
+# "DB not ready" forever — which is exactly how the Marketplace AMI behaved
+# until 2026-08-20. deploy-live.sh happened to hide it by bind-mounting a logs
+# directory over the same path.
+RUN mkdir -p /app/logs /app/data
 # Liveness check: /api/health must respond within 10s.
 # Docker will mark the container unhealthy after 3 consecutive failures
 # (~90 s of silence) so an operator / restart policy can act on it.

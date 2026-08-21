@@ -31,6 +31,10 @@ services:
       - DRADIS_EDITION=marketplace
     volumes:
       - ./data:/app/data
+      # Trades, positions and P&L history live in SQLite under logs/. Without
+      # this mount they would sit inside the container and vanish on the next
+      # `docker compose down` — taking the customer's entire record with them.
+      - ./logs:/app/logs
     ports:
       - "127.0.0.1:9000:9000"
     networks: [dradis-net]

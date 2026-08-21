@@ -33,6 +33,9 @@ VENUE_FILE="$DATA_DIR/venue"
 DEFAULT_VENUE="intl"
 
 mkdir -p "$DATA_DIR"
+# Bind-mount target for the SQLite shards. Docker would create it as root-owned
+# anyway, but creating it here keeps ownership and intent explicit.
+mkdir -p /opt/dradis/logs
 
 # IMDSv2 token, reused for instance ID and user data (absent off-EC2).
 TOKEN=$(curl -sf -X PUT "http://169.254.169.254/latest/api/token" \
