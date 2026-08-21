@@ -136,6 +136,15 @@ const MANAGED_KEYS: &[(&str, &str, &str, &str)] = &[
 /// so the panel is a complete inventory of the recon layer, with an empty
 /// `keys` list signalling "nothing to configure".
 struct RaptorSource {
+    /// Where the feed is unavailable, and what happens instead.
+    ///
+    /// Binance geo-blocks US IPs with HTTP 451, which matters more than it
+    /// sounds: a Kalshi or Polymarket US customer is a US person by definition
+    /// and will deploy in a US region, so for two of the three venues the block
+    /// is the default case rather than an edge case. The affected raptors fail
+    /// over to OKX automatically — this note exists so an operator seeing
+    /// "Binance" on the card does not assume the feed is dead.
+    region_note: Option<&'static str>,
     /// Stable identifier, also the React key for the card.
     id: &'static str,
     /// Display name, e.g. "Tide Raptor".
@@ -178,18 +187,21 @@ const RAPTOR_SOURCES: &[RaptorSource] = &[
         blurb: "Oracle price, velocity, acceleration and drift — the core signal every Viper reads.",
         tier: "required", keys: &[], test_kind: None, signup_url: None,
         poll_field: None, free_quota: None, selector_fields: &[],
+        region_note: Some("Binance is geo-blocked from US IPs (HTTP 451). This feed rotates automatically to Binance's open data mirror, which is unrestricted — no action needed."),
     },
     RaptorSource {
-        id: "funding", name: "Funding Raptor", source: "Binance perpetuals (public)",
+        id: "funding", name: "Funding Raptor", source: "Binance perpetuals, OKX fallback (public)",
         blurb: "Perp funding rates; the Basis Viper uses them to confirm retail skew.",
         tier: "required", keys: &[], test_kind: None, signup_url: None,
         poll_field: None, free_quota: None, selector_fields: &[],
+        region_note: Some("Binance is geo-blocked from US IPs (HTTP 451). This feed fails over to OKX automatically, which serves the same signal and is reachable from the US — no action needed."),
     },
     RaptorSource {
-        id: "derivatives", name: "Derivatives Raptor", source: "Binance derivatives (public)",
+        id: "derivatives", name: "Derivatives Raptor", source: "Binance derivatives, OKX fallback (public)",
         blurb: "Open interest and CVD ratio, fused as features by GBoost and Convergence.",
         tier: "required", keys: &[], test_kind: None, signup_url: None,
         poll_field: None, free_quota: None, selector_fields: &[],
+        region_note: Some("Binance is geo-blocked from US IPs (HTTP 451). This feed fails over to OKX automatically, which serves the same signal and is reachable from the US — no action needed."),
     },
     RaptorSource {
         id: "tide", name: "Tide Raptor", source: "Alpaca IEX",
@@ -197,6 +209,7 @@ const RAPTOR_SOURCES: &[RaptorSource] = &[
         tier: "recommended", keys: &["ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY"],
         test_kind: Some("alpaca"), signup_url: Some("https://alpaca.markets"),
         poll_field: None, free_quota: None, selector_fields: &[],
+        region_note: None,
     },
     RaptorSource {
         id: "horizon", name: "Horizon Raptor", source: "Alpaca IEX (shared connection)",
@@ -204,6 +217,7 @@ const RAPTOR_SOURCES: &[RaptorSource] = &[
         tier: "recommended", keys: &["ALPACA_API_KEY_ID", "ALPACA_API_SECRET_KEY"],
         test_kind: Some("alpaca"), signup_url: Some("https://alpaca.markets"),
         poll_field: None, free_quota: None, selector_fields: &[],
+        region_note: None,
     },
     RaptorSource {
         id: "sports", name: "Sports Raptor", source: "The Odds API",
@@ -212,6 +226,7 @@ const RAPTOR_SOURCES: &[RaptorSource] = &[
         test_kind: Some("odds"), signup_url: Some("https://the-odds-api.com"),
         poll_field: Some("sports_poll_secs"), free_quota: Some((500, "month")),
         selector_fields: &["sports_odds_sport", "sports_odds_regions"],
+        region_note: None,
     },
     RaptorSource {
         id: "tennis", name: "Tennis Raptor", source: "Live Tennis API",
@@ -220,6 +235,7 @@ const RAPTOR_SOURCES: &[RaptorSource] = &[
         test_kind: Some("livetennis"), signup_url: Some("https://livetennisapi.com"),
         poll_field: Some("tennis_poll_secs"), free_quota: Some((100, "day")),
         selector_fields: &["tennis_tour"],
+        region_note: None,
     },
 ];
 
@@ -569,6 +585,7 @@ async fn get_raptor_sources() -> Response {
         json!({
             "id": r.id, "name": r.name, "source": r.source, "blurb": r.blurb,
             "tier": r.tier, "keys": r.keys, "test_kind": r.test_kind,
+            "region_note": r.region_note,
             "signup_url": r.signup_url, "poll_field": r.poll_field,
             "free_quota": r.free_quota.map(|(n, p)| json!({"requests": n, "period": p})),
             "selector_fields": r.selector_fields,
@@ -1659,6 +1676,26 @@ mod tests {
     }
 
     /// Tiers drive the UI badges, so an unrecognised value would render blank.
+    /// A raptor whose feed is unavailable in some region must say so on its
+    /// card. Binance's 451 block is invisible from the developer's own
+    /// deployment in eu-west-1 and universal for a US customer, which is the
+    /// worst combination — the person who would notice never sees it.
+    #[test]
+    fn geo_restricted_raptors_explain_themselves() {
+        for r in RAPTOR_SOURCES {
+            if r.source.contains("Binance") {
+                let note = r.region_note.unwrap_or_else(|| panic!(
+                    "Raptor '{}' reads Binance, which geo-blocks US IPs — it needs a region_note \
+                     saying what happens instead", r.id));
+                assert!(
+                    note.contains("451"),
+                    "Raptor '{}' region_note should name the HTTP 451 block so an operator can \
+                     match it to what they see in the log", r.id,
+                );
+            }
+        }
+    }
+
     #[test]
     fn raptor_tiers_are_known_values() {
         for r in RAPTOR_SOURCES {

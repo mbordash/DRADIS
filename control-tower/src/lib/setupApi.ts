@@ -85,6 +85,9 @@ export interface RaptorSource {
   /** Where to generate the key, when it comes from a third party. Null for
    *  Raptors on public endpoints, which need no account. */
   signup_url: string | null;
+  /** Where this feed is unavailable and what happens instead. Null when the
+   *  source is reachable everywhere. */
+  region_note: string | null;
   /** DynamicConfig field holding this Raptor's poll cadence, when tunable.
    *  Server-driven so a contributed Raptor gets a cadence control for free. */
   poll_field: string | null;

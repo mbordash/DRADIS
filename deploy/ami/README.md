@@ -71,6 +71,23 @@ Port 80 (Control Tower) is the only public surface; the engine API stays on
 localhost. The operator then completes the Setup view → AlphaGate
 acknowledgment → venue → credentials → restart engine.
 
+## Instance sizing for the listing
+
+The engine and Control Tower run comfortably on the smallest type validated in
+QA. One caveat belongs in the listing's usage instructions rather than being
+discovered later:
+
+> **Optional LLM advisor.** DRADIS can use a hosted model (Anthropic, OpenAI) on
+> any instance size — that path costs only an API key. Running your **own** model
+> via Ollama is different: it is not bundled, and a useful model needs several
+> gigabytes of RAM and realistically a GPU. Choose a GPU instance type
+> (`g5.xlarge` or larger) if you intend to self-host the model, or point DRADIS
+> at an Ollama server you already run. On the recommended instance type a local
+> model would compete with the trading engine for memory.
+
+The Setup view says the same thing at the point of choice, but a buyer picking an
+instance type has not reached Setup yet — which is exactly when they need it.
+
 ## Requirements
 
 `aws` CLI v2 with credentials, `git`, `ssh`, a default VPC in the target

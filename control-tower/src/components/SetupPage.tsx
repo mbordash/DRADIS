@@ -56,6 +56,111 @@ const TEST_KINDS: Record<string, { kind: string; label: string; keys: string[] }
   llm:         { kind: 'llm',         label: 'Test LLM', keys: ['LLM_PROVIDER', 'OLLAMA_URL', 'OLLAMA_MODEL', 'LLM_API_BASE', 'LLM_API_KEY', 'LLM_MODEL'] },
 };
 
+// ── Contextual help ──────────────────────────────────────────────────────────
+//
+// A prosumer who has never held a self-custody wallet cannot be expected to know
+// what "EOA private key" means, and sending them to a search engine to find out
+// is how people end up pasting a seed phrase into the wrong box. Each venue
+// credential group gets step-by-step instructions written for someone who has
+// the account but has never used its developer surface.
+type HelpDoc = {
+  title: string;
+  intro: string;
+  steps: string[];
+  /** Consequences that are not obvious and are expensive to learn by doing. */
+  warnings?: string[];
+  link?: { label: string; href: string };
+};
+
+const HELP: Record<string, HelpDoc> = {
+  POLYMARKET_PRIVATE_KEY: {
+    title: 'Finding your Polymarket wallet key',
+    intro:
+      'Polymarket International is self-custody: your funds sit in a wallet you control, and DRADIS signs orders with its key. Nothing is held by Polymarket or by us.',
+    steps: [
+      'Open polymarket.com and sign in to the account holding your funds.',
+      'Open the account menu (top right) and choose Settings.',
+      'Find "Export Private Key" and confirm the prompt.',
+      'Copy the value beginning 0x — that is the key, not your seed phrase.',
+      'Paste it into the field here and press Test wallet + CLOB auth before saving.',
+    ],
+    warnings: [
+      'A private key is not a seed phrase. If what you have is twelve or twenty-four words, that is the wrong value — DRADIS cannot use it and it controls far more than one wallet.',
+      'Anyone holding this key can move the funds in that wallet. Use a wallet funded only with what you intend to trade.',
+      'DRADIS stores it on your own instance and never transmits it. Support will never ask you for it.',
+    ],
+    link: { label: 'Polymarket settings', href: 'https://polymarket.com/settings' },
+  },
+
+  POLYGON_RPC_URL: {
+    title: 'Getting a Polygon RPC endpoint',
+    intro:
+      'Settlement happens on Polygon, so DRADIS needs a node to read balances and submit transactions. The free public endpoints are rate-limited to the point of failing settlements, so use your own — the free tier of any provider is ample.',
+    steps: [
+      'Create a free account at alchemy.com (quickest) or infura.io.',
+      'Create a new app and choose the Polygon PoS network, Mainnet.',
+      'Copy the HTTPS URL it gives you — it ends in a key unique to you.',
+      'Paste it here and press Test RPC.',
+    ],
+    warnings: [
+      'It must be Polygon, not Ethereum. An Ethereum mainnet URL connects successfully and then fails every settlement.',
+      'Helius is Solana-only and will not work here, despite appearing in many RPC lists.',
+    ],
+    link: { label: 'Alchemy', href: 'https://www.alchemy.com/' },
+  },
+
+  POLYMARKET_US_KEY_ID: {
+    title: 'Creating Polymarket US API keys',
+    intro:
+      'Polymarket US is custodial and CFTC-regulated: funds stay in your exchange account and DRADIS authenticates with an API key rather than a wallet.',
+    steps: [
+      'Sign in to your Polymarket US account.',
+      'Open the developer or API section of account settings.',
+      'Create a new API key with trading permission.',
+      'Copy both values: the Key ID (a UUID) and the Secret Key.',
+      'Paste both here and press Test API keys before saving.',
+    ],
+    warnings: [
+      'The secret is shown once, at creation. If you lose it, revoke the key and make another — it cannot be retrieved.',
+      'Grant trading permission only. DRADIS never needs withdrawal rights, and no software should have them.',
+    ],
+  },
+
+  KALSHI_API_KEY_ID: {
+    title: 'Creating Kalshi API credentials',
+    intro:
+      'Kalshi signs every request with an RSA key you generate. You get a Key ID and a private key file, and DRADIS needs both.',
+    steps: [
+      'Sign in to Kalshi and open Account → API Keys.',
+      'Create a new API key. Your browser downloads a .pem file — that is the private key.',
+      'Copy the Key ID (a UUID) into the first field.',
+      'Open the .pem file in a text editor and paste its entire contents into the second field, including the BEGIN and END lines.',
+      'Press Test API keys — it parses the key and signs a probe, so a malformed paste fails here rather than after a restart.',
+    ],
+    warnings: [
+      'Paste the PEM with its real line breaks. A single-line paste with literal \\n characters is the most common failure, and the test above exists to catch it.',
+      'The .pem downloads once and cannot be re-downloaded. Keep a copy somewhere safe.',
+      'Start with demo.kalshi.co if you want to paper trade first — demo and production credentials are separate accounts.',
+    ],
+    link: { label: 'Kalshi API keys', href: 'https://kalshi.com/account/api' },
+  },
+
+  LLM_PROVIDER: {
+    title: 'Setting up the LLM advisor',
+    intro:
+      'Entirely optional. The advisor reads your session and comments on it; it never places orders on its own unless you raise its autonomy tier deliberately. Leaving it off costs you nothing else.',
+    steps: [
+      'For a hosted model: set provider to openai or anthropic, then fill in the API base, key and model.',
+      'For a local model: set provider to ollama and point the Ollama URL at your own machine or another server.',
+      'Press Test LLM to confirm the credentials before restarting.',
+    ],
+    warnings: [
+      'Ollama is not bundled. A useful model needs several gigabytes of RAM and realistically a GPU, so self-hosting means either a GPU instance (g5.xlarge or larger) or an Ollama server you already run. On the recommended instance type it would compete with the trading engine for memory.',
+      'A hosted model bills per call. The advisor runs on a schedule, so watch the first day of usage before leaving it unattended.',
+    ],
+  },
+};
+
 // Per-venue display strings, so the venue never has to be re-derived inline.
 // `missing` is the phrase used in the "cannot trade" banner.
 const VENUE_META: Record<VenueId, { label: string; missing: string }> = {
@@ -276,11 +381,168 @@ function PasswordCard({
 
 // ── Credential group card ─────────────────────────────────────────────────────
 
+// ── LLM presets ──────────────────────────────────────────────────────────────
+//
+// "LLM_PROVIDER: ollama | openai | anthropic" reads like a config file and made
+// an optional-but-valuable feature look like a chore. A preset fills in
+// everything except the secret, so the operator's remaining job is to paste one
+// key. Both hosted providers default their own API base server-side, so a preset
+// only has to set the provider and a model.
+type LlmPreset = {
+  id: string;
+  label: string;
+  blurb: string;
+  /** Drafts to apply. The operator still supplies whatever is left blank. */
+  values: Record<string, string>;
+  /** Field the operator must fill in after applying — focused for them. */
+  needs?: string;
+  note?: string;
+};
+
+const LLM_PRESETS: LlmPreset[] = [
+  {
+    id: 'anthropic',
+    label: 'Use Claude',
+    blurb: 'Hosted by Anthropic. Billed per call.',
+    values: { LLM_PROVIDER: 'anthropic', LLM_MODEL: 'claude-sonnet-5' },
+    needs: 'LLM_API_KEY',
+    note: 'Create a key at console.anthropic.com, then paste it below and press Test LLM.',
+  },
+  {
+    id: 'openai',
+    label: 'Use OpenAI',
+    blurb: 'Hosted by OpenAI. Billed per call.',
+    values: { LLM_PROVIDER: 'openai', LLM_MODEL: 'gpt-4o' },
+    needs: 'LLM_API_KEY',
+    note: 'Create a key at platform.openai.com, then paste it below and press Test LLM.',
+  },
+  {
+    id: 'ollama',
+    label: 'Run my own',
+    blurb: 'A model on hardware you control. No per-call cost.',
+    values: { LLM_PROVIDER: 'ollama', OLLAMA_MODEL: 'llama3.1' },
+    needs: 'OLLAMA_URL',
+    note:
+      'Ollama is not bundled — a useful model needs several gigabytes of RAM and, realistically, a GPU. ' +
+      'Point this at a machine sized for it, or relaunch DRADIS on a larger GPU instance. On the ' +
+      'recommended instance type it would compete with the trading engine for memory.',
+  },
+  {
+    id: 'off',
+    label: 'Leave it off',
+    blurb: 'The advisor is optional and nothing else depends on it.',
+    values: { LLM_PROVIDER: '' },
+  },
+];
+
+/** Preset chooser, shown above the LLM Advisor fields. */
+function LlmPresets({ onApply }: { onApply: (values: Record<string, string>) => void }) {
+  const [chosen, setChosen] = useState<string | null>(null);
+  const active = LLM_PRESETS.find(p => p.id === chosen);
+
+  return (
+    <div className="space-y-2 border-b border-[#1e1e32] pb-3">
+      <p className="text-[11px] font-mono text-gray-500">Start from a preset</p>
+      <div className="flex flex-wrap gap-2">
+        {LLM_PRESETS.map(p => (
+          <button
+            key={p.id}
+            onClick={() => { setChosen(p.id); onApply(p.values); }}
+            className={[
+              'text-xs font-mono px-3 py-1.5 rounded-lg border transition-colors',
+              chosen === p.id
+                ? 'bg-indigo-500/20 border-indigo-500/40 text-indigo-300'
+                : 'bg-[#0e0e18] border-[#1e1e32] text-gray-400 hover:border-gray-600 hover:text-gray-200',
+            ].join(' ')}
+            title={p.blurb}
+          >
+            {p.label}
+          </button>
+        ))}
+      </div>
+      {active?.note && (
+        <p className="text-[11px] text-amber-200/80 bg-amber-500/5 border border-amber-500/20 rounded-lg px-2.5 py-2 leading-relaxed">
+          {active.id === 'ollama' ? '🖥️ ' : '🔑 '}{active.note}
+        </p>
+      )}
+    </div>
+  );
+}
+
+/** Step-by-step help for one credential group. Dismissed on Escape or backdrop. */
+function HelpModal({ doc, onClose }: { doc: HelpDoc; onClose: () => void }) {
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onClose(); };
+    window.addEventListener('keydown', onKey);
+    return () => window.removeEventListener('keydown', onKey);
+  }, [onClose]);
+
+  return (
+    <div
+      className="fixed inset-0 z-[120] overflow-y-auto bg-black/70 backdrop-blur-sm"
+      onClick={onClose}
+      role="presentation"
+    >
+      <div className="min-h-full flex items-start justify-center p-4 py-12">
+        <div
+          className="w-full max-w-lg bg-[#13131f] border border-[#2a2a44] rounded-2xl p-6 space-y-4 shadow-2xl"
+          onClick={e => e.stopPropagation()}
+          role="dialog"
+          aria-modal="true"
+          aria-label={doc.title}
+        >
+          <div className="flex items-start justify-between gap-4">
+            <h3 className="text-base font-mono text-gray-100">{doc.title}</h3>
+            <button onClick={onClose} className={btnCls('ghost') + ' shrink-0'} autoFocus>
+              Close
+            </button>
+          </div>
+
+          <p className="text-xs text-gray-400 leading-relaxed">{doc.intro}</p>
+
+          <ol className="space-y-2 text-xs text-gray-300">
+            {doc.steps.map((step, i) => (
+              <li key={i} className="flex gap-3">
+                <span className="shrink-0 w-5 h-5 rounded-full bg-indigo-500/20 border border-indigo-500/40 text-indigo-300 text-[10px] font-mono flex items-center justify-center mt-px">
+                  {i + 1}
+                </span>
+                <span className="leading-relaxed">{step}</span>
+              </li>
+            ))}
+          </ol>
+
+          {doc.warnings && doc.warnings.length > 0 && (
+            <div className="bg-amber-500/5 border border-amber-500/25 rounded-xl p-3 space-y-1.5">
+              {doc.warnings.map((w, i) => (
+                <p key={i} className="text-[11px] text-amber-200/85 leading-relaxed">⚠️ {w}</p>
+              ))}
+            </div>
+          )}
+
+          {doc.link && (
+            <a
+              href={doc.link.href}
+              target="_blank"
+              rel="noopener noreferrer"
+              className="inline-flex items-center gap-1 text-xs font-mono text-indigo-400 hover:text-indigo-300 hover:underline"
+            >
+              {doc.link.label} ↗
+            </a>
+          )}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function CredentialGroup({
-  title, blurb, creds, drafts, onDraft, testKind, onTested,
+  title, blurb, creds, drafts, onDraft, testKind, onTested, help, presets,
 }: {
   title: string;
   blurb: string;
+  help?: HelpDoc;
+  /** Show the LLM preset chooser above the fields. */
+  presets?: boolean;
   creds: CredentialInfo[];
   drafts: Record<string, string>;
   onDraft: (key: string, value: string) => void;
@@ -289,6 +551,7 @@ function CredentialGroup({
 }) {
   const [testing, setTesting] = useState(false);
   const [result, setResult] = useState<TestResult | null>(null);
+  const [showHelp, setShowHelp] = useState(false);
 
   const runTest = async () => {
     if (!testKind) return;
@@ -314,7 +577,17 @@ function CredentialGroup({
     <div className="bg-[#13131f] border border-[#1e1e32] rounded-xl p-5 space-y-3">
       <div className="flex items-start justify-between gap-3">
         <div>
-          <h3 className="text-sm font-mono text-gray-200">{title}</h3>
+          <h3 className="text-sm font-mono text-gray-200">
+            {title}
+            {help && (
+              <button
+                onClick={() => setShowHelp(true)}
+                className="ml-2 align-middle text-[11px] font-mono text-indigo-400 hover:text-indigo-300 hover:underline"
+              >
+                How do I get this?
+              </button>
+            )}
+          </h3>
           <p className="text-xs text-gray-500 mt-0.5">{blurb}</p>
         </div>
         {testKind && (
@@ -323,6 +596,10 @@ function CredentialGroup({
           </button>
         )}
       </div>
+
+      {showHelp && help && <HelpModal doc={help} onClose={() => setShowHelp(false)} />}
+
+      {presets && <LlmPresets onApply={vals => { for (const [k, v] of Object.entries(vals)) onDraft(k, v); }} />}
 
       <div className="space-y-2">
         {creds.map(c => (
@@ -584,6 +861,15 @@ function RaptorCard({
           </button>
         )}
       </div>
+
+      {/* Regional availability. Shown for every Raptor that has one, credentials
+          or not — an operator watching a US deployment log fill with HTTP 451
+          needs to know that is expected and already handled. */}
+      {raptor.region_note && (
+        <p className="text-[11px] text-amber-300/80 bg-amber-500/5 border border-amber-500/20 rounded-lg px-2.5 py-2 leading-relaxed">
+          🌍 {raptor.region_note}
+        </p>
+      )}
 
       {fields.length === 0 ? (
         <p className="text-[11px] font-mono text-gray-600 border-t border-[#1e1e32] pt-3">
@@ -1197,6 +1483,8 @@ export default function SetupPage() {
               drafts={drafts}
               onDraft={(k, v) => setDrafts(d => ({ ...d, [k]: v }))}
               testKind={g.test}
+              help={g.keys.map(k => HELP[k]).find(Boolean)}
+              presets={g.keys.includes('LLM_PROVIDER')}
             />
           ))}
         </div>
@@ -1287,30 +1575,53 @@ export default function SetupPage() {
       </div>
 
       {/* ── Support policy ─────────────────────────────────────────────────── */}
-      <div className="bg-[#13131f] border border-[#1e1e32] rounded-xl p-4 space-y-2">
-        <h3 className="text-sm font-mono text-gray-200">🧪 Support</h3>
-        <p className="text-xs text-gray-500">
-          DRADIS is community-supported — <span className="text-gray-400">individual support is not
-          included</span>. For setup help, ask an AI assistant (ChatGPT, Gemini, Claude): paste the README
-          and your question — they are very good at this.
-        </p>
-        <div className="flex flex-wrap items-center gap-2 pt-1">
-          <a
-            href="https://github.com/mbordash/DRADIS/issues"
-            target="_blank" rel="noreferrer"
-            className={btnCls('ghost')}
-          >
-            🐛 Report a bug (GitHub Issues)
-          </a>
-          <a
-            href="https://github.com/mbordash/DRADIS/discussions"
-            target="_blank" rel="noreferrer"
-            className={btnCls('ghost')}
-          >
-            💡 Request a feature (Discussions)
-          </a>
+      {/* Mirrors the risk gate: a customer who paid for this must be pointed at
+          real support, and the community wording would be wrong — quite possibly
+          rejected — on a Marketplace product. Both surfaces read the same
+          `edition` so they can never disagree with each other. */}
+      {status.edition === 'marketplace' ? (
+        <div className="bg-[#13131f] border border-[#1e1e32] rounded-xl p-4 space-y-2">
+          <h3 className="text-sm font-mono text-gray-200">🛟 Support</h3>
+          <p className="text-xs text-gray-500">
+            Include your instance ID and what you were doing — the form collects what is needed to
+            diagnose a deployment. <span className="text-gray-400">Support will never ask for your
+            wallet private key, seed phrase or API secrets.</span>
+          </p>
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <a href="https://dradis.live/support" target="_blank" rel="noreferrer" className={btnCls('primary')}>
+              🛟 Contact support
+            </a>
+            <a href="mailto:starbuck@dradis.live" className={btnCls('ghost')}>
+              ✉️ starbuck@dradis.live
+            </a>
+          </div>
         </div>
-      </div>
+      ) : (
+        <div className="bg-[#13131f] border border-[#1e1e32] rounded-xl p-4 space-y-2">
+          <h3 className="text-sm font-mono text-gray-200">🧪 Support</h3>
+          <p className="text-xs text-gray-500">
+            DRADIS is community-supported — <span className="text-gray-400">individual support is not
+            included</span>. For setup help, ask an AI assistant (ChatGPT, Gemini, Claude): paste the README
+            and your question — they are very good at this.
+          </p>
+          <div className="flex flex-wrap items-center gap-2 pt-1">
+            <a
+              href="https://github.com/mbordash/DRADIS/issues"
+              target="_blank" rel="noreferrer"
+              className={btnCls('ghost')}
+            >
+              🐛 Report a bug (GitHub Issues)
+            </a>
+            <a
+              href="https://github.com/mbordash/DRADIS/discussions"
+              target="_blank" rel="noreferrer"
+              className={btnCls('ghost')}
+            >
+              💡 Request a feature (Discussions)
+            </a>
+          </div>
+        </div>
+      )}
 
       <div className="flex items-center justify-end gap-2 border-t border-[#1e1e32] pt-4">
         <button onClick={save} disabled={!dirty || saving} className={btnCls('primary')}>
