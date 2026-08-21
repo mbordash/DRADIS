@@ -849,11 +849,22 @@ async fn build_snapshot(
                 let (ya, yad) = b.best_yes_ask().unwrap_or((dec!(0), dec!(0)));
                 let (nb, nbd) = b.best_no_bid().unwrap_or((dec!(0), dec!(0)));
                 let (na, nad) = b.best_no_ask().unwrap_or((dec!(0), dec!(0)));
-                ((yb, ybd, ya, yad, now), (nb, nbd, na, nad, now))
+                // Cumulative depth alongside the touch. Nothing reads these yet;
+                // they exist so order-book imbalance can be compared as a
+                // whole-book ratio against the top-of-book one vipers gate on.
+                let (ybd_all, yad_all) = (b.yes_bid_depth_total(), b.yes_ask_depth_total());
+                let (nbd_all, nad_all) = (b.no_bid_depth_total(),  b.no_ask_depth_total());
+                (
+                    (yb, ybd, ya, yad, now, ybd_all, yad_all),
+                    (nb, nbd, na, nad, now, nbd_all, nad_all),
+                )
             }
             _ => {
                 let now = Utc::now();
-                ((dec!(0), dec!(0), dec!(0), dec!(0), now), (dec!(0), dec!(0), dec!(0), dec!(0), now))
+                (
+                    (dec!(0), dec!(0), dec!(0), dec!(0), now, dec!(0), dec!(0)),
+                    (dec!(0), dec!(0), dec!(0), dec!(0), now, dec!(0), dec!(0)),
+                )
             }
         }
     };

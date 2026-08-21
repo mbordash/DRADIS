@@ -76,6 +76,30 @@ impl Book {
         self.best_yes_bid().map(|(p, q)| (Decimal::ONE - p, q))
     }
 
+    /// Total size resting across every YES bid level.
+    pub fn yes_bid_depth_total(&self) -> Decimal {
+        self.yes_bids.values().copied().sum()
+    }
+
+    /// Total size across every NO bid level.
+    pub fn no_bid_depth_total(&self) -> Decimal {
+        self.no_bids.values().copied().sum()
+    }
+
+    /// Depth available to BUY YES, i.e. the whole NO bid side.
+    ///
+    /// Kalshi publishes bids only; an ask on one outcome is the mirror of a bid
+    /// on the other, exactly as `best_yes_ask` derives its price from the best NO
+    /// bid. The same mirroring applies to size, so YES ask depth IS NO bid depth.
+    pub fn yes_ask_depth_total(&self) -> Decimal {
+        self.no_bid_depth_total()
+    }
+
+    /// Depth available to BUY NO, i.e. the whole YES bid side.
+    pub fn no_ask_depth_total(&self) -> Decimal {
+        self.yes_bid_depth_total()
+    }
+
     fn apply_delta(&mut self, side: &str, price: Decimal, delta: Decimal) {
         let levels = if side == "yes" { &mut self.yes_bids } else { &mut self.no_bids };
         let q = levels.entry(price).or_insert(Decimal::ZERO);

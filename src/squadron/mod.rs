@@ -358,7 +358,7 @@ impl Squadron {
         let cancel = CancellationToken::new();
         self.ws_cancel = cancel.clone();
 
-        let default_feed: PriceState = (dec!(0), dec!(0), dec!(1), dec!(0), Utc::now());
+        let default_feed: PriceState = (dec!(0), dec!(0), dec!(1), dec!(0), Utc::now(), dec!(0), dec!(0));
 
         // ── Hourly market feeds ───────────────────────────────────────────────
         let (yes_tx, yes_rx) = watch::channel(default_feed);
@@ -462,8 +462,19 @@ fn spawn_ws_task(
                                     .min_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
                                     .map(|l| (l.price, l.size))
                                     .unwrap_or((dec!(1), dec!(0)));
+                                // Aggregate depth across EVERY published level, alongside
+                                // the touch sizes above. The venue sends the whole book
+                                // (`Vec<OrderBookLevel>`); until now everything but the
+                                // best level was discarded, which is why order-book
+                                // imbalance was really a top-of-book ratio. Published for
+                                // comparison only — no consumer's behaviour changes yet.
+                                let bid_depth_total: rust_decimal::Decimal = book.bids.iter().map(|l| l.size).sum();
+                                let ask_depth_total: rust_decimal::Decimal = book.asks.iter().map(|l| l.size).sum();
                                 // Stamp the WS update time at receipt, NOT at tick time.
-                                let _ = tx.send((bid, bid_depth, ask, ask_depth, Utc::now()));
+                                let _ = tx.send((
+                                    bid, bid_depth, ask, ask_depth, Utc::now(),
+                                    bid_depth_total, ask_depth_total,
+                                ));
                             }
                             Some(Err(_)) | None => {
                                 warn!(

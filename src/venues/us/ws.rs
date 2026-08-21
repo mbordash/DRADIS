@@ -117,7 +117,13 @@ fn book_to_price(ev: &OrderBookEvent) -> Option<PriceState> {
     if best_bid.is_none() && best_ask.is_none() {
         return None;
     }
-    Some((bid, bid_depth, ask, ask_depth, Utc::now()))
+    // Aggregate depth across every level the venue publishes, beside the touch
+    // sizes above. Nothing consumes these yet — they exist so order-book
+    // imbalance can be compared as a whole-book ratio against the top-of-book
+    // one every viper currently gates on.
+    let bid_depth_total: Decimal = ev.bids.iter().filter_map(parse).map(|(_, sz)| sz).sum();
+    let ask_depth_total: Decimal = ev.asks.iter().filter_map(parse).map(|(_, sz)| sz).sum();
+    Some((bid, bid_depth, ask, ask_depth, Utc::now(), bid_depth_total, ask_depth_total))
 }
 
 /// True if an epoch-millis frame timestamp lags wall-clock beyond the staleness
@@ -467,11 +473,16 @@ mod tests {
     #[test]
     fn book_reduces_to_best_bid_ask() {
         let e = ev(&[["0.54", "12000"], ["0.53", "45000"]], &[["0.57", "19500"], ["0.56", "8000"]], 1, 0);
-        let (bid, bid_d, ask, ask_d, _) = book_to_price(&e).unwrap();
+        let (bid, bid_d, ask, ask_d, _, bid_all, ask_all) = book_to_price(&e).unwrap();
         assert_eq!(bid.to_string(), "0.54");
         assert_eq!(bid_d.to_string(), "12000");
         assert_eq!(ask.to_string(), "0.56");
         assert_eq!(ask_d.to_string(), "8000");
+        // Cumulative depth spans every level, not just the touch — this book has
+        // nearly five times the size behind the best bid than at it, which is the
+        // gap that makes a top-of-book imbalance a different measure entirely.
+        assert_eq!(bid_all.to_string(), "57000", "12000 + 45000");
+        assert_eq!(ask_all.to_string(), "27500", "19500 + 8000");
     }
 
     #[test]

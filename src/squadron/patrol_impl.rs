@@ -652,13 +652,13 @@ impl Squadron {
                     crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::SignalEval);
 
                     // Get hourly market snapshot
-                    let (hourly_yb, hourly_ybd, hourly_ya, hourly_yad, hourly_yes_ws_ts) = *yes_price_rx.borrow();
-                    let (hourly_nb, hourly_nbd, hourly_na, hourly_nad, hourly_no_ws_ts) = *no_price_rx.borrow();
+                    let (hourly_yb, hourly_ybd, hourly_ya, hourly_yad, hourly_yes_ws_ts, _hourly_ybd_all, _hourly_yad_all) = *yes_price_rx.borrow();
+                    let (hourly_nb, hourly_nbd, hourly_na, hourly_nad, hourly_no_ws_ts, _hourly_nbd_all, _hourly_nad_all) = *no_price_rx.borrow();
                     let hourly_snap_ts = hourly_yes_ws_ts.min(hourly_no_ws_ts);
 
                     // Get maker market snapshot if available
-                    let (maker_yb, maker_ybd, maker_ya, maker_yad, maker_yes_ws_ts) = maker_yes_price_rx.as_ref().map_or((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now()), |rx| *rx.borrow());
-                    let (maker_nb, maker_nbd, maker_na, maker_nad, maker_no_ws_ts) = maker_no_price_rx.as_ref().map_or((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now()), |rx| *rx.borrow());
+                    let (maker_yb, maker_ybd, maker_ya, maker_yad, maker_yes_ws_ts, _maker_ybd_all, _maker_yad_all) = maker_yes_price_rx.as_ref().map_or((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now(), dec!(0), dec!(0)), |rx| *rx.borrow());
+                    let (maker_nb, maker_nbd, maker_na, maker_nad, maker_no_ws_ts, _maker_nbd_all, _maker_nad_all) = maker_no_price_rx.as_ref().map_or((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now(), dec!(0), dec!(0)), |rx| *rx.borrow());
                     let maker_snap_ts = maker_yes_ws_ts.min(maker_no_ws_ts);
 
                     // Only proceed if at least one market has valid prices

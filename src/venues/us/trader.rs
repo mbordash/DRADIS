@@ -695,7 +695,7 @@ async fn trade_one_market(
     // ── Stream both legs' order books (tied to the per-market cancel token) ───
     let ws_url = venue.markets_ws_url();
     let ws_auth = venue.ws_auth();
-    let default_feed: PriceState = (dec!(0), dec!(0), dec!(1), dec!(0), Utc::now());
+    let default_feed: PriceState = (dec!(0), dec!(0), dec!(1), dec!(0), Utc::now(), dec!(0), dec!(0));
     let (long_tx, long_rx) = watch::channel(default_feed);
     let (short_tx, short_rx) = watch::channel(default_feed);
     ws::spawn_market_feed(ws_url.clone(), pair.long.as_str().to_string(), ws_auth.clone(), long_tx, cancel.clone());

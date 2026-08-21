@@ -393,16 +393,25 @@ pub fn spawn_status_task(
                         AtomicOrdering::Relaxed,
                     );
 
-                    let (yb, ybd, ya, yad, _) = *yes_price_rx.borrow();
-                    let (nb, nbd, na, nad, _) = *no_price_rx.borrow();
+                    let (yb, ybd, ya, yad, _, ybd_all, yad_all) = *yes_price_rx.borrow();
+                    let (nb, nbd, na, nad, _, nbd_all, nad_all) = *no_price_rx.borrow();
                     // Compute OBI for heartbeat visibility so thresholds can be tuned empirically.
                     let yes_obi = if ybd + yad > dec!(0) { (ybd - yad) / (ybd + yad) } else { dec!(0) };
                     let no_obi  = if nbd + nad > dec!(0) { (nbd - nad) / (nbd + nad) } else { dec!(0) };
+                    // The same ratio over EVERY published level, logged beside the
+                    // top-of-book figure the vipers actually gate on. Nothing reads
+                    // these yet: they exist so the two series can be compared on live
+                    // books before any threshold is re-derived. The top-of-book
+                    // version is one resting order per side, which is why it swings
+                    // between +0.9 and -0.3 on an unremarkable book.
+                    let yes_obi_all = if ybd_all + yad_all > dec!(0) { (ybd_all - yad_all) / (ybd_all + yad_all) } else { dec!(0) };
+                    let no_obi_all  = if nbd_all + nad_all > dec!(0) { (nbd_all - nad_all) / (nbd_all + nad_all) } else { dec!(0) };
                     info!(
                         " Heartbeat | Ask Sum ${:.4} (Y ask ${:.2} / N ask ${:.2}) | \
                          Bid Sum ${:.4} (Y bid ${:.2} / N bid ${:.2}) | \
-                         Binance: ${:.2} | OBI Y={:.2} N={:.2}",
+                         Binance: ${:.2} | OBI Y={:.2} N={:.2} | OBIall Y={:.2} N={:.2} (depth Y {:.0}/{:.0} N {:.0}/{:.0})",
                         ya + na, ya, na, yb + nb, yb, nb, *oracle_rx.borrow(), yes_obi, no_obi,
+                        yes_obi_all, no_obi_all, ybd_all, yad_all, nbd_all, nad_all,
                     );
 
                     // Refresh live pUSD balance so strategies can self-gate on insufficient funds.
@@ -604,13 +613,13 @@ pub fn spawn_cleanup_task(
                                 } else {
                                     maker_yes_price_rx.as_ref()
                                         .and_then(|rx| {
-                                            let (_, _, ya, _, _) = *rx.borrow();
+                                            let (_, _, ya, _, _, _, _) = *rx.borrow();
                                             if maker_market_config.as_ref().map_or(false, |mkc| mkc.yes_token == paired_id) {
                                                 Some(ya)
                                             } else { None }
                                         })
                                         .or_else(|| maker_no_price_rx.as_ref().and_then(|rx| {
-                                            let (_, _, na, _, _) = *rx.borrow();
+                                            let (_, _, na, _, _, _, _) = *rx.borrow();
                                             if maker_market_config.as_ref().map_or(false, |mkc| mkc.no_token == paired_id) {
                                                 Some(na)
                                             } else { None }
@@ -765,13 +774,13 @@ pub fn spawn_cleanup_task(
                                 } else {
                                     maker_yes_price_rx.as_ref()
                                         .and_then(|rx| {
-                                            let (yb, _, _, _, _) = *rx.borrow();
+                                            let (yb, _, _, _, _, _, _) = *rx.borrow();
                                             if maker_market_config.as_ref().map_or(false, |mkc| mkc.yes_token == orphan.token_id) {
                                                 Some(yb)
                                             } else { None }
                                         })
                                         .or_else(|| maker_no_price_rx.as_ref().and_then(|rx| {
-                                            let (nb, _, _, _, _) = *rx.borrow();
+                                            let (nb, _, _, _, _, _, _) = *rx.borrow();
                                             if maker_market_config.as_ref().map_or(false, |mkc| mkc.no_token == orphan.token_id) {
                                                 Some(nb)
                                             } else { None }

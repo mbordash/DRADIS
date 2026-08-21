@@ -149,7 +149,7 @@ where
     // We seed it with zeroed sentinels here; the real receivers are installed by
     // `squadron.subscribe_markets()` inside 'market_loop before patrol() starts.
     let (_sentinel_tx, sentinel_rx) = watch::channel::<PriceState>(
-        (dec!(0), dec!(0), dec!(1), dec!(0), Utc::now()));
+        (dec!(0), dec!(0), dec!(1), dec!(0), Utc::now(), dec!(0), dec!(0)));
 
     // ── Bootstrap: poll Gamma API until we have a valid initial market ────────
     let mut bootstrap_attempts = 0u32;

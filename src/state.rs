@@ -112,7 +112,64 @@ pub type ArbMarketLockouts = Arc<Mutex<HashSet<MarketId>>>;
 ///
 /// Previously a `type` alias private to `main.rs`.  Promoted here in Phase 3f-2
 /// so `Squadron::subscribe_markets()` and the tick loop share a single definition.
-pub type PriceState = (Decimal, Decimal, Decimal, Decimal, DateTime<Utc>);
+/// One venue's top-of-book plus aggregate depth, as published on a watch channel.
+///
+/// `(best_bid, bid_size_at_touch, best_ask, ask_size_at_touch, ws_timestamp,
+///   cumulative_bid_depth, cumulative_ask_depth)`
+///
+/// The first five are the historical layout and are read positionally in a dozen
+/// places; the depths were appended rather than folded into a struct so those
+/// indices stay valid. Prefer the `price_state` accessors below over indexing.
+///
+/// The distinction between the touch sizes and the cumulative depths matters.
+/// Elements 1 and 3 are the size resting at the single best level; 5 and 6 sum
+/// every level the venue publishes. Order-book imbalance has always been
+/// computed from the former, which makes it a TOP-OF-BOOK ratio — one resting
+/// order on each side deciding whether flow is toxic. On 2026-08-21 that read
+/// 0.88, -0.33, -0.08, 0.90 and 0.11 across four minutes on an unremarkable
+/// book. The cumulative figures exist so the same measure can be computed over
+/// the whole book and the two compared on live data before any threshold moves.
+pub type PriceState = (
+    Decimal,        // 0 best bid
+    Decimal,        // 1 size at best bid
+    Decimal,        // 2 best ask
+    Decimal,        // 3 size at best ask
+    DateTime<Utc>,  // 4 websocket receipt time
+    Decimal,        // 5 cumulative bid depth, all levels
+    Decimal,        // 6 cumulative ask depth, all levels
+);
+
+/// Named accessors for [`PriceState`], so new code never indexes a 7-tuple.
+pub mod price_state {
+    use super::{Decimal, PriceState};
+
+    pub fn best_bid(p: &PriceState) -> Decimal { p.0 }
+    pub fn best_ask(p: &PriceState) -> Decimal { p.2 }
+    /// Size resting at the best bid only.
+    pub fn bid_touch_size(p: &PriceState) -> Decimal { p.1 }
+    /// Size resting at the best ask only.
+    pub fn ask_touch_size(p: &PriceState) -> Decimal { p.3 }
+    /// Size across every published bid level.
+    pub fn bid_depth_total(p: &PriceState) -> Decimal { p.5 }
+    /// Size across every published ask level.
+    pub fn ask_depth_total(p: &PriceState) -> Decimal { p.6 }
+
+    /// Imbalance in `[-1, 1]`; positive means more resting size on the bid.
+    ///
+    /// `total = false` reproduces the historical top-of-book ratio exactly.
+    /// `total = true` uses the whole book. Both return `-1` on an empty book,
+    /// which every caller treats as maximally adverse — note that this makes
+    /// "no data" and "toxic flow" indistinguishable downstream.
+    pub fn imbalance(p: &PriceState, total: bool) -> Decimal {
+        let (b, a) = if total {
+            (bid_depth_total(p), ask_depth_total(p))
+        } else {
+            (bid_touch_size(p), ask_touch_size(p))
+        };
+        let sum = b + a;
+        if sum > Decimal::ZERO { (b - a) / sum } else { Decimal::NEGATIVE_ONE }
+    }
+}
 
 /// Represents a single position held in the trading system.
 /// Shared across strategies and the main orchestrator.
@@ -421,3 +478,63 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod price_state_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    fn ps(bid_touch: Decimal, ask_touch: Decimal, bid_all: Decimal, ask_all: Decimal) -> PriceState {
+        (dec!(0.50), bid_touch, dec!(0.51), ask_touch, Utc::now(), bid_all, ask_all)
+    }
+
+    /// The historical top-of-book ratio must be reproduced exactly, or every
+    /// existing threshold silently changes meaning.
+    #[test]
+    fn touch_imbalance_matches_the_historical_formula() {
+        let p = ps(dec!(30), dec!(70), dec!(500), dec!(500));
+        let expected = (dec!(30) - dec!(70)) / (dec!(30) + dec!(70));
+        assert_eq!(price_state::imbalance(&p, false), expected);
+    }
+
+    /// The whole-book view can disagree sharply with the touch — that disagreement
+    /// is the entire reason for collecting it.
+    #[test]
+    fn a_single_resting_order_can_invert_the_signal() {
+        // One large offer at the touch reads as heavy selling; across the book the
+        // two sides are balanced.
+        let p = ps(dec!(10), dec!(200), dec!(1000), dec!(1000));
+        assert!(price_state::imbalance(&p, false) < dec!(-0.9), "touch says toxic");
+        assert_eq!(price_state::imbalance(&p, true), dec!(0), "book says balanced");
+    }
+
+    /// An empty book returns -1 on both measures. Callers read that as maximally
+    /// adverse, which is the safe direction — but it means "no data" and "toxic
+    /// flow" are indistinguishable, and that is worth knowing.
+    #[test]
+    fn an_empty_book_reads_as_maximally_adverse_on_both() {
+        let p = ps(dec!(0), dec!(0), dec!(0), dec!(0));
+        assert_eq!(price_state::imbalance(&p, false), dec!(-1));
+        assert_eq!(price_state::imbalance(&p, true), dec!(-1));
+    }
+
+    /// Cumulative depth is never less than the touch it contains.
+    #[test]
+    fn cumulative_depth_contains_the_touch() {
+        let p = ps(dec!(30), dec!(70), dec!(500), dec!(400));
+        assert!(price_state::bid_depth_total(&p) >= price_state::bid_touch_size(&p));
+        assert!(price_state::ask_depth_total(&p) >= price_state::ask_touch_size(&p));
+    }
+
+    /// Accessors must not drift from the tuple layout.
+    #[test]
+    fn accessors_map_to_the_documented_positions() {
+        let p = ps(dec!(1), dec!(2), dec!(3), dec!(4));
+        assert_eq!(price_state::best_bid(&p), dec!(0.50));
+        assert_eq!(price_state::best_ask(&p), dec!(0.51));
+        assert_eq!(price_state::bid_touch_size(&p), dec!(1));
+        assert_eq!(price_state::ask_touch_size(&p), dec!(2));
+        assert_eq!(price_state::bid_depth_total(&p), dec!(3));
+        assert_eq!(price_state::ask_depth_total(&p), dec!(4));
+    }
+}
