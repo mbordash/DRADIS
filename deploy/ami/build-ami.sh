@@ -368,13 +368,13 @@ fi
 
 # ── 5. Marketplace hygiene sweep (last SSH command — it locks us out) ────────
 echo "Scrubbing instance for Marketplace…"
-# Split deliberately. Everything here is idempotent, so it can be retried
-# through a dropped connection like every other post-upload step.
+# Split deliberately: everything here is idempotent, so it can be retried
+# through a dropped connection like every other post-upload step. The two
+# removals that end our own access are NOT here — see below for why.
 SCRUB_LOCAL="$(mktemp)"
 cat > "$SCRUB_LOCAL" <<'SCRUB'
 set -e
 sudo cloud-init clean --logs
-sudo rm -f /etc/ssh/ssh_host_*                 # regenerated on customer boot
 sudo rm -f /root/.ssh/authorized_keys
 sudo truncate -s 0 /etc/machine-id
 sudo rm -rf /tmp/* /var/tmp/* || true
@@ -384,28 +384,48 @@ SCRUB
 ssh_try_file "$SCRUB_LOCAL" 'sudo bash -s' || exit 1
 rm -f "$SCRUB_LOCAL"
 
-# The operator key goes last, alone, and is CONFIRMED.
+# ── The two removals that end our own access — ONE session, confirmed ────────
 #
-# Removing it is what makes the image redistributable — an AMI carrying an
-# authorized_keys entry hands every customer the same login and fails
-# Marketplace scanning. It is also what ends our own access, so this step cannot
-# simply be retried: a second attempt fails whether the removal worked or not.
-# Instead the removal reports back in the same breath, and if that report is
-# lost we distinguish the two cases by whether SSH still works at all.
+# Host keys and the operator's authorized_keys are removed together, in a single
+# connection, in this order, and the confirmation is echoed back over that same
+# connection before it closes.
+#
+# Splitting them was a real bug (fixed 2026-08-21). The bulk scrub above used to
+# delete /etc/ssh/ssh_host_* and the authorized_keys removal ran over a SECOND
+# connection — which could no longer complete a handshake. The removal never
+# happened, the confirmation never arrived, and the fallback concluded "SSH is
+# closed, so the key must be gone". Four AMIs shipped with the builder's public
+# key in /home/ubuntu/.ssh/authorized_keys, which is precisely what Marketplace
+# scanning rejects.
+#
+# The lesson is in the fallback, not the ordering: once host keys are gone,
+# "cannot connect" says nothing about authorized_keys. So there is no fallback
+# now. Either the confirmation comes back or the build stops.
+echo "Removing operator access…"
+# Reports COUNTS, not a boolean. `test ! -f` answers true when the file merely
+# cannot be seen — unreadable parent, permission error — so a check built on it
+# reports success for a failure it never observed. Counting what is actually
+# there makes a wrong answer visible in the build log instead of silent.
 KEY_GONE=false
-if OUT=$("${SSH[@]}" 'sudo rm -f /home/ubuntu/.ssh/authorized_keys; sudo test ! -f /home/ubuntu/.ssh/authorized_keys && echo REMOVED' 2>/dev/null); then
-    [ "$OUT" = "REMOVED" ] && KEY_GONE=true
+if OUT=$("${SSH[@]}" '
+    sudo rm -f /etc/ssh/ssh_host_*
+    sudo rm -f /home/ubuntu/.ssh/authorized_keys
+    printf "AUTHKEYS=%s HOSTKEYS=%s\n" \
+      "$(sudo ls -1 /home/ubuntu/.ssh/authorized_keys 2>/dev/null | wc -l | tr -d " ")" \
+      "$(sudo ls -1 /etc/ssh/ssh_host_* 2>/dev/null | wc -l | tr -d " ")"
+' 2>&1); then
+    case "$OUT" in *"AUTHKEYS=0 HOSTKEYS=0"*) KEY_GONE=true ;; esac
 fi
 if [ "$KEY_GONE" != true ]; then
-    # No confirmation came back. If we can still log in, the key is still there.
-    if "${SSH[@]}" true 2>/dev/null; then
-        echo "❌ Operator key is still present on the builder and could not be removed."
-        echo "   Refusing to snapshot: the AMI would ship with a usable login."
-        exit 1
-    fi
-    echo "   operator key removal unconfirmed, but SSH is closed — treating as removed"
+    echo "❌ Could not confirm the operator key was removed."
+    echo "   Remote said: ${OUT:-(nothing)}"
+    echo ""
+    echo "   Refusing to snapshot. An AMI carrying /home/ubuntu/.ssh/authorized_keys"
+    echo "   hands every customer the same login and fails Marketplace scanning."
+    echo "   Re-run with --keep-instance to inspect the builder."
+    exit 1
 fi
-echo "   ✓ operator key removed (SSH access closed)"
+echo "   ✓ operator key and host keys removed ($OUT)"
 
 # ── 6. Snapshot into an AMI ──────────────────────────────────────────────────
 echo "Stopping builder and creating AMI…"
