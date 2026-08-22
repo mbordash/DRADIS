@@ -660,15 +660,37 @@ function CredentialGroup({
                 {c.set ? `set ${c.hint} · ${c.source}` : 'not set'}
               </span>
             </div>
-            <input
-              type={/URL|CHAT_ID|PROVIDER|MODEL|BASE/.test(c.key) ? 'text' : 'password'}
-              className={inputCls}
-              placeholder={c.set ? '•••••••• (leave blank to keep current)' : 'Enter value'}
-              value={drafts[c.key] ?? ''}
-              onChange={e => onDraft(c.key, e.target.value)}
-              autoComplete="off"
-              spellCheck={false}
-            />
+            {c.multiline ? (
+              // A PEM has to keep its line breaks, and a single-line <input>
+              // cannot hold one — the browser strips the newlines on paste, so
+              // the key arrives mangled and only fails much later, at signing.
+              <>
+                <textarea
+                  className={`${inputCls} h-32 resize-y font-mono text-[11px] leading-snug`}
+                  placeholder={c.set
+                    ? '•••••••• (leave blank to keep current)'
+                    : '-----BEGIN RSA PRIVATE KEY-----\n…\n-----END RSA PRIVATE KEY-----'}
+                  value={drafts[c.key] ?? ''}
+                  onChange={e => onDraft(c.key, e.target.value)}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+                <p className="text-[10px] text-gray-600 mt-1 leading-relaxed">
+                  Paste the whole key including the BEGIN and END lines. Line breaks are
+                  restored automatically if your clipboard drops them.
+                </p>
+              </>
+            ) : (
+              <input
+                type={/URL|CHAT_ID|PROVIDER|MODEL|BASE/.test(c.key) ? 'text' : 'password'}
+                className={inputCls}
+                placeholder={c.set ? '•••••••• (leave blank to keep current)' : 'Enter value'}
+                value={drafts[c.key] ?? ''}
+                onChange={e => onDraft(c.key, e.target.value)}
+                autoComplete="off"
+                spellCheck={false}
+              />
+            )}
           </div>
         ))}
       </div>
@@ -947,15 +969,26 @@ function RaptorCard({
                   {c.set ? `set ${c.hint} · ${c.source}` : 'not set'}
                 </span>
               </div>
-              <input
-                type="password"
-                className={inputCls}
-                placeholder={c.set ? '•••••••• (leave blank to keep current)' : 'Enter value'}
-                value={drafts[c.key] ?? ''}
-                onChange={e => onDraft(c.key, e.target.value)}
-                autoComplete="off"
-                spellCheck={false}
-              />
+              {c.multiline ? (
+                <textarea
+                  className={`${inputCls} h-32 resize-y font-mono text-[11px] leading-snug`}
+                  placeholder={c.set ? '•••••••• (leave blank to keep current)' : 'Paste the whole key'}
+                  value={drafts[c.key] ?? ''}
+                  onChange={e => onDraft(c.key, e.target.value)}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              ) : (
+                <input
+                  type="password"
+                  className={inputCls}
+                  placeholder={c.set ? '•••••••• (leave blank to keep current)' : 'Enter value'}
+                  value={drafts[c.key] ?? ''}
+                  onChange={e => onDraft(c.key, e.target.value)}
+                  autoComplete="off"
+                  spellCheck={false}
+                />
+              )}
             </div>
           ))}
         </div>

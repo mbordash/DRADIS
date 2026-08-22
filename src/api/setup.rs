@@ -576,6 +576,54 @@ fn edition() -> &'static str {
     })
 }
 
+/// Credentials whose value is a PEM block, and therefore inherently multi-line.
+///
+/// The Setup UI renders these as a textarea; every other credential is a
+/// single-line password field. A single-line `<input>` cannot hold newlines at
+/// all — the browser drops them on paste — so a PEM entered there arrived
+/// mangled no matter how faithfully the server stored it.
+const PEM_KEYS: &[&str] = &["KALSHI_PRIVATE_KEY"];
+
+fn is_pem_key(key: &str) -> bool { PEM_KEYS.contains(&key) }
+
+/// Rebuild a canonical PEM from a paste whose line structure did not survive.
+///
+/// Returns the input unchanged when it does not look like a PEM, so this is safe
+/// to apply to any value. Recovers the common damage: newlines collapsed to
+/// spaces, newlines removed entirely, or CRLF endings — all of which produce a
+/// key that looks present in the UI and fails at signing time.
+fn normalize_pem(value: &str) -> String {
+    let v = value.trim();
+    let (Some(b_start), Some(e_start)) = (v.find("-----BEGIN"), v.rfind("-----END")) else {
+        return value.to_string();
+    };
+    if e_start < b_start { return value.to_string(); }
+    let Some(hdr_end) = v[b_start..].find("-----\n").map(|i| b_start + i + 5)
+        .or_else(|| v[b_start + 10..].find("-----").map(|i| b_start + 10 + i + 5)) else {
+        return value.to_string();
+    };
+    let Some(ftr_end) = v[e_start + 8..].find("-----").map(|i| e_start + 8 + i + 5) else {
+        return value.to_string();
+    };
+    let header = v[b_start..hdr_end].trim();
+    let footer = v[e_start..ftr_end].trim();
+    // Everything between the markers, with all whitespace removed, is the body.
+    let body: String = v[hdr_end..e_start].chars().filter(|c| !c.is_whitespace()).collect();
+    if body.is_empty() { return value.to_string(); }
+
+    let mut out = String::with_capacity(body.len() + body.len() / 64 + header.len() + footer.len() + 4);
+    out.push_str(header);
+    out.push('\n');
+    // PEM bodies wrap at 64 characters (RFC 7468).
+    let bytes = body.as_bytes();
+    for chunk in bytes.chunks(64) {
+        out.push_str(std::str::from_utf8(chunk).unwrap_or_default());
+        out.push('\n');
+    }
+    out.push_str(footer);
+    out
+}
+
 /// DB key for the one-time alpha/jurisdiction acknowledgment record.
 const ALPHA_ACK_KEY: &str = "alpha_jurisdiction_ack";
 
@@ -691,6 +739,7 @@ async fn get_credentials() -> Response {
             None => (false, String::new(), "unset"),
         };
         json!({ "key": key, "label": label, "scope": scope, "panel": panel,
+                "multiline": is_pem_key(key),
                 "set": set, "hint": hint, "source": source })
     }).collect();
     Json(json!({ "credentials": items })).into_response()
@@ -739,6 +788,10 @@ async fn put_credentials(Json(body): Json<PutCredentials>) -> Response {
                 changed.push(format!("{} (removed)", key));
             }
         } else {
+            // Repair line structure first: a browser that stripped the newlines
+            // yields a single-line blob that is otherwise a perfectly good key.
+            let repaired = if is_pem_key(key) { normalize_pem(value) } else { value.to_string() };
+            let value = repaired.as_str();
             // A PEM pasted with its tail cut off is the single most likely
             // credential mistake, and it used to fail silently at signing time
             // hours later. Reject it here, while the operator is looking.
@@ -1891,6 +1944,66 @@ mod tests {
         assert!(!is_env_key("MIIEowIBAAKCAQEA"), "mixed-case base64 is not a key name");
         assert!(!is_env_key("7x9abc"));
         assert!(!is_env_key(""));
+    }
+
+    /// The QA failure this exists for: the Setup field was a single-line
+    /// `<input>`, so the browser stripped every newline out of a pasted PEM
+    /// before it reached the server. The key looked set, and signing failed.
+    #[test]
+    fn a_pem_whose_newlines_were_stripped_is_rebuilt() {
+        let canonical = "-----BEGIN RSA PRIVATE KEY-----\n\
+                         MIIEowIBAAKCAQEA7x+mQmFzZTY0TGluZVdpdGhTaXh0eUZvdXJDaGFyc0hlcmVY\n\
+                         QmFzZTY0TGluZQ==\n\
+                         -----END RSA PRIVATE KEY-----";
+
+        // Same key, damaged the ways a paste actually gets damaged.
+        let one_line = canonical.replace('\n', "");
+        let spaces   = canonical.replace('\n', " ");
+        let crlf     = canonical.replace('\n', "\r\n");
+
+        for (name, damaged) in [("stripped", one_line), ("spaces", spaces), ("crlf", crlf)] {
+            let fixed = normalize_pem(&damaged);
+            assert_eq!(fixed, canonical, "{name} was not repaired");
+        }
+    }
+
+    /// Repair must be idempotent — a good key stays byte-identical.
+    #[test]
+    fn a_canonical_pem_is_left_alone() {
+        let canonical = "-----BEGIN PRIVATE KEY-----\nQmFzZTY0TGluZQ==\n-----END PRIVATE KEY-----";
+        assert_eq!(normalize_pem(canonical), canonical);
+        assert_eq!(normalize_pem(&normalize_pem(canonical)), canonical);
+    }
+
+    /// Anything that is not a PEM passes through untouched, so this is safe to
+    /// apply without knowing what a credential contains.
+    #[test]
+    fn a_non_pem_value_is_untouched() {
+        for v in ["sk-ant-api03-abc123", "", "   ", "-----BEGIN but no end marker"] {
+            assert_eq!(normalize_pem(v), v, "mangled a non-PEM value: {v:?}");
+        }
+    }
+
+    /// The body must survive the round trip exactly — a dropped or added
+    /// character yields a key that parses and then produces invalid signatures.
+    #[test]
+    fn the_key_body_is_preserved_exactly() {
+        let body = "QmFzZTY0TGluZQ==QmFzZTY0TGluZQ==QmFzZTY0TGluZQ==QmFzZTY0TGluZQ==EXTRA";
+        let fixed = normalize_pem(&format!("-----BEGIN X-----{body}-----END X-----"));
+        let recovered: String = fixed
+            .lines()
+            .filter(|l| !l.starts_with("-----"))
+            .collect();
+        assert_eq!(recovered, body);
+        // And it must actually wrap, not sit on one line.
+        assert!(fixed.lines().count() > 3, "body was not wrapped: {fixed}");
+    }
+
+    #[test]
+    fn only_pem_credentials_are_flagged_multiline() {
+        assert!(is_pem_key("KALSHI_PRIVATE_KEY"));
+        assert!(!is_pem_key("POLYMARKET_PRIVATE_KEY"), "hex wallet key is single-line");
+        assert!(!is_pem_key("LLM_API_KEY"));
     }
 
     /// The jurisdiction acknowledgment must never be recorded against a venue

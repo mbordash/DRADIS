@@ -73,6 +73,9 @@ export interface CredentialInfo {
   set: boolean;
   hint: string;            // "…last4" when set
   source: 'managed' | 'env' | 'unset';
+  /** True for PEM-style values, which need a textarea: a single-line input
+   *  silently strips the newlines a PEM cannot do without. */
+  multiline?: boolean;
 }
 
 /** How much a Raptor's signal matters — drives the badge on its card. */
