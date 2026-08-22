@@ -57,6 +57,10 @@ export interface SetupStatus {
   auth_disabled: boolean;
   venue_configured: boolean;
   alpha_ack: boolean;
+  /** Provider the operator explicitly chose, or "" if none. Never a secret. */
+  llm_provider?: string;
+  /** True when the LLM Advisor has everything it needs to run. */
+  llm_configured?: boolean;
   app_version: string;
 }
 

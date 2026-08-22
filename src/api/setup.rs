@@ -607,6 +607,28 @@ async fn get_status() -> Response {
         _        => false,
     };
     let venues_available = available_venues();
+
+    // Whether the LLM Advisor could run at all. The AI Actions view otherwise
+    // shows an empty table that looks identical whether the advisor is working
+    // and has proposed nothing, or was never configured and never will.
+    // Provider name and a boolean only — no key material.
+    //
+    // Deliberately NOT falling back to `config::LLM_PROVIDER`: that compile-time
+    // default is "ollama", so a fresh instance with nothing configured would
+    // otherwise report a working advisor. Empty means "the operator has not
+    // chosen", which is exactly what the AI Actions view needs to say.
+    let llm_provider = secrets.get("LLM_PROVIDER").cloned()
+        .filter(|v| !v.is_empty())
+        .or_else(|| std::env::var("LLM_PROVIDER").ok().filter(|v| !v.is_empty()))
+        .unwrap_or_default();
+    let llm_configured = match llm_provider.trim().to_lowercase().as_str() {
+        // Ollama needs no key, only a reachable host — and only the Test button
+        // can establish that. An explicit choice is as far as this can go.
+        "ollama" => true,
+        "openai" | "anthropic" => env_set("LLM_API_KEY"),
+        _ => false,
+    };
+
     Json(json!({
         "venue": venue,
         // Only populated on a multi-venue image (the Marketplace AMI). One
@@ -620,6 +642,8 @@ async fn get_status() -> Response {
         "auth_disabled": setup_auth_disabled(),
         "venue_configured": venue_configured,
         "alpha_ack": alpha_acknowledged().await,
+        "llm_provider": llm_provider,
+        "llm_configured": llm_configured,
         "app_version": env!("CARGO_PKG_VERSION"),
         "restart_pending": false,
     })).into_response()
@@ -1040,8 +1064,11 @@ async fn test_llm(body: &TestRequest) -> Result<serde_json::Value, String> {
         }
         "openai" => {
             let key = test_cred(body, "LLM_API_KEY").ok_or("LLM_API_KEY not provided or stored")?;
-            let base = test_cred(body, "LLM_API_BASE")
-                .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+            let base = crate::helpers::llm_advisor::normalize_llm_base(
+                &test_cred(body, "LLM_API_BASE")
+                    .unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
+                "openai",
+            );
             let resp = tokio::time::timeout(
                 timeout,
                 client.get(format!("{}/models", base.trim_end_matches('/')))
@@ -1057,8 +1084,11 @@ async fn test_llm(body: &TestRequest) -> Result<serde_json::Value, String> {
         "anthropic" => {
             let key = test_cred(body, "LLM_API_KEY").ok_or("LLM_API_KEY not provided or stored")?;
             let model = test_cred(body, "LLM_MODEL").ok_or("LLM_MODEL not provided or stored")?;
-            let base = test_cred(body, "LLM_API_BASE")
-                .unwrap_or_else(|| "https://api.anthropic.com".to_string());
+            let base = crate::helpers::llm_advisor::normalize_llm_base(
+                &test_cred(body, "LLM_API_BASE")
+                    .unwrap_or_else(|| "https://api.anthropic.com".to_string()),
+                "anthropic",
+            );
             let resp = tokio::time::timeout(
                 timeout,
                 client.post(format!("{}/v1/messages", base.trim_end_matches('/')))

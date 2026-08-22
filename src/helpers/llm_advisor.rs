@@ -169,6 +169,37 @@ struct LlmReply {
     truncated_by_length: bool,
 }
 
+/// Normalise an LLM API base URL.
+///
+/// Operators paste the endpoint from the provider's documentation — the
+/// Anthropic docs say `https://api.anthropic.com/v1/messages` — but this code
+/// appends the path itself, producing `.../v1/messages/v1/messages` and a
+/// bewildering 404 that names neither the model nor the URL. Strip the path
+/// back off rather than requiring the operator to know which half we want.
+///
+/// Deliberately provider-specific and suffix-only: OpenAI-compatible gateways
+/// are routinely hosted under a prefix, so nothing is ever appended and no
+/// path is removed that the caller does not re-add.
+pub fn normalize_llm_base(base: &str, provider: &str) -> String {
+    let mut b = base.trim().trim_end_matches('/');
+    match provider.trim().to_lowercase().as_str() {
+        "anthropic" => {
+            // Caller appends "/v1/messages".
+            for suffix in ["/v1/messages", "/messages"] {
+                if let Some(rest) = b.strip_suffix(suffix) { b = rest.trim_end_matches('/'); break; }
+            }
+            b = b.strip_suffix("/v1").unwrap_or(b).trim_end_matches('/');
+        }
+        _ => {
+            // Caller appends "/models"; the base keeps its "/v1".
+            for suffix in ["/chat/completions", "/completions", "/responses", "/models"] {
+                if let Some(rest) = b.strip_suffix(suffix) { b = rest.trim_end_matches('/'); break; }
+            }
+        }
+    }
+    b.to_string()
+}
+
 impl LlmProvider {
     /// Resolve provider + connection settings from the environment.
     ///
@@ -192,14 +223,20 @@ impl LlmProvider {
                     .unwrap_or_else(|_| config::LLM_OLLAMA_MODEL.to_string()),
             }),
             "openai" | "openai-compatible" => Ok(Self::OpenAiCompatible {
-                base_url: std::env::var("LLM_API_BASE")
-                    .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
+                base_url: normalize_llm_base(
+                    &std::env::var("LLM_API_BASE")
+                        .unwrap_or_else(|_| "https://api.openai.com/v1".to_string()),
+                    "openai",
+                ),
                 api_key: require_api_key(&provider)?,
                 model: require_model(&provider)?,
             }),
             "anthropic" => Ok(Self::Anthropic {
-                base_url: std::env::var("LLM_API_BASE")
-                    .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),
+                base_url: normalize_llm_base(
+                    &std::env::var("LLM_API_BASE")
+                        .unwrap_or_else(|_| "https://api.anthropic.com".to_string()),
+                    "anthropic",
+                ),
                 api_key: require_api_key(&provider)?,
                 model: require_model(&provider)?,
             }),
@@ -1313,3 +1350,59 @@ pub async fn run_llm_advisor_loop(
     }
 }
 
+#[cfg(test)]
+mod base_url_tests {
+    use super::normalize_llm_base;
+
+    /// The exact failure from QA: the Anthropic docs publish the *endpoint*, so
+    /// that is what gets pasted, and the caller then appended its own path —
+    /// yielding `/v1/messages/v1/messages` and a 404 that explained nothing.
+    #[test]
+    fn the_documented_anthropic_endpoint_is_accepted() {
+        for input in [
+            "https://api.anthropic.com/v1/messages",
+            "https://api.anthropic.com/v1/messages/",
+            "https://api.anthropic.com/v1",
+            "https://api.anthropic.com/",
+            "https://api.anthropic.com",
+            "  https://api.anthropic.com/v1/messages  ",
+        ] {
+            assert_eq!(
+                normalize_llm_base(input, "anthropic"),
+                "https://api.anthropic.com",
+                "input {input:?}",
+            );
+        }
+    }
+
+    /// OpenAI's base keeps its `/v1` — the caller appends only `/models`.
+    #[test]
+    fn openai_keeps_its_v1_prefix() {
+        for input in [
+            "https://api.openai.com/v1",
+            "https://api.openai.com/v1/",
+            "https://api.openai.com/v1/chat/completions",
+            "https://api.openai.com/v1/models",
+        ] {
+            assert_eq!(
+                normalize_llm_base(input, "openai"),
+                "https://api.openai.com/v1",
+                "input {input:?}",
+            );
+        }
+    }
+
+    /// Self-hosted gateways sit behind arbitrary prefixes. Nothing may be
+    /// appended and no prefix removed, or a working proxy config breaks.
+    #[test]
+    fn a_self_hosted_gateway_prefix_is_left_alone() {
+        assert_eq!(
+            normalize_llm_base("https://gw.internal/llm/openai/v1", "openai"),
+            "https://gw.internal/llm/openai/v1",
+        );
+        assert_eq!(
+            normalize_llm_base("https://gw.internal/llm/anthropic", "anthropic"),
+            "https://gw.internal/llm/anthropic",
+        );
+    }
+}

@@ -29,6 +29,7 @@ import { useState } from 'react';
 import useSWR from 'swr';
 import type { LlmActionRow } from '@/lib/types';
 import { getLlmActions, approveLlmAction, rejectLlmAction } from '@/lib/api';
+import { getSetupStatus } from '@/lib/setupApi';
 
 const STATUS_STYLE: Record<string, string> = {
   proposed: 'bg-amber-500/10 text-amber-400 border-amber-500/20',
@@ -52,7 +53,16 @@ function fmtTs(iso: string): string {
 
 const unquote = (s: string) => s.replaceAll('"', '');
 
+/** Provider ids are config values; these are what an operator calls them. */
+const LLM_LABEL: Record<string, string> = {
+  anthropic: 'Claude',
+  openai:    'OpenAI',
+  ollama:    'Ollama',
+};
+
 export default function AiActionsPage() {
+  // Public endpoint — no admin session needed just to say whether an advisor exists.
+  const { data: setup } = useSWR('setupStatus', getSetupStatus, { refreshInterval: 60_000 });
   const { data: actions, isLoading, mutate } =
     useSWR('llmActionsFull', () => getLlmActions(250), { refreshInterval: 30_000 });
   const [filter, setFilter] = useState<string>('all');
@@ -127,11 +137,30 @@ export default function AiActionsPage() {
         ) : rows.length === 0 ? (
           <div className="flex flex-col items-center justify-center gap-2 py-10 text-center">
             <span className="text-3xl">🤖</span>
-            <p className="text-sm text-gray-500">
-              {filter === 'all'
-                ? 'No AI actions yet — the LLM Advisor records every config proposal here.'
-                : `No '${filter}' actions.`}
-            </p>
+            {filter !== 'all' ? (
+              <p className="text-sm text-gray-500">No &apos;{filter}&apos; actions.</p>
+            ) : setup && !setup.llm_configured ? (
+              // An empty table looks the same whether the advisor is running and
+              // has proposed nothing, or was never set up. Say which.
+              <>
+                <p className="text-sm text-gray-400">No LLM Advisor is configured.</p>
+                <p className="text-xs text-gray-600 max-w-md leading-relaxed">
+                  Nothing will ever appear here until one is. The advisor is optional —
+                  it reviews live trading and proposes config changes for your approval.
+                  Choose a provider under{' '}
+                  <span className="text-gray-400 font-mono">Setup → LLM Advisor</span>.
+                </p>
+              </>
+            ) : (
+              <>
+                <p className="text-sm text-gray-500">No AI actions yet.</p>
+                <p className="text-xs text-gray-600">
+                  {setup?.llm_provider
+                    ? `The advisor (${LLM_LABEL[setup.llm_provider.toLowerCase()] ?? setup.llm_provider}) records every config proposal here.`
+                    : 'The LLM Advisor records every config proposal here.'}
+                </p>
+              </>
+            )}
           </div>
         ) : (
           <table className="w-full text-xs font-mono">

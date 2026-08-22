@@ -414,7 +414,14 @@ const LLM_PRESETS: LlmPreset[] = [
     id: 'anthropic',
     label: 'Use Claude',
     blurb: 'Hosted by Anthropic. Billed per call.',
-    values: { LLM_PROVIDER: 'anthropic', LLM_MODEL: 'claude-sonnet-5' },
+    values: {
+      LLM_PROVIDER: 'anthropic',
+      LLM_MODEL: 'claude-sonnet-5',
+      // Prefilled rather than left blank so the endpoint in use is visible, and
+      // so an operator on a proxy or gateway has something to edit instead of a
+      // box whose default they have to guess. Matches the server-side fallback.
+      LLM_API_BASE: 'https://api.anthropic.com',
+    },
     needs: 'LLM_API_KEY',
     note: 'Create a key at console.anthropic.com, then paste it below and press Test LLM.',
   },
@@ -422,7 +429,11 @@ const LLM_PRESETS: LlmPreset[] = [
     id: 'openai',
     label: 'Use OpenAI',
     blurb: 'Hosted by OpenAI. Billed per call.',
-    values: { LLM_PROVIDER: 'openai', LLM_MODEL: 'gpt-4o' },
+    values: {
+      LLM_PROVIDER: 'openai',
+      LLM_MODEL: 'gpt-4o',
+      LLM_API_BASE: 'https://api.openai.com/v1',
+    },
     needs: 'LLM_API_KEY',
     note: 'Create a key at platform.openai.com, then paste it below and press Test LLM.',
   },
@@ -433,9 +444,9 @@ const LLM_PRESETS: LlmPreset[] = [
     values: { LLM_PROVIDER: 'ollama', OLLAMA_MODEL: 'llama3.1' },
     needs: 'OLLAMA_URL',
     note:
-      'Ollama is not bundled — a useful model needs several gigabytes of RAM and, realistically, a GPU. ' +
-      'Point this at a machine sized for it, or relaunch DRADIS on a larger GPU instance. On the ' +
-      'recommended instance type it would compete with the trading engine for memory.',
+      'Point this at any machine running Ollama. A small model runs comfortably alongside the ' +
+      'engine on a t3.large or bigger — no GPU required — but it does want a few gigabytes of RAM, ' +
+      'so it is worth sizing up from the smallest instance types.',
   },
   {
     id: 'off',
@@ -457,13 +468,19 @@ const LLM_PRESETS: LlmPreset[] = [
 function llmFieldsFor(provider: string): string[] {
   switch (provider.trim().toLowerCase()) {
     case 'ollama':
-      return ['LLM_PROVIDER', 'OLLAMA_URL', 'OLLAMA_MODEL'];
+      return ['OLLAMA_URL', 'OLLAMA_MODEL'];
     case 'openai':
     case 'anthropic':
-      return ['LLM_PROVIDER', 'LLM_API_BASE', 'LLM_API_KEY', 'LLM_MODEL'];
+      return ['LLM_API_BASE', 'LLM_API_KEY', 'LLM_MODEL'];
+    case '':
+      // Nothing chosen yet — show no fields at all. The presets above are the
+      // whole decision at this point; a "LLM provider (ollama | openai |
+      // anthropic)" box next to them asks the same question twice, in the
+      // config-file phrasing the presets exist to replace.
+      return [];
     default:
-      // Nothing chosen yet — show only the provider itself, so the card starts
-      // as one decision rather than six blanks.
+      // A provider we have no preset for — set in .env, or a typo. Show the raw
+      // field so it is visible and correctable rather than silently in effect.
       return ['LLM_PROVIDER'];
   }
 }
