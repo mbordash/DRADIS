@@ -2114,6 +2114,86 @@ struct AvailableMarketsResponse {
     markets: Vec<AvailableMarket>,
 }
 
+/// Default max-time-to-close for a market class, in seconds.
+///
+/// The sensible value depends on the VENUE as much as the class, because the
+/// venues structure the same category completely differently.
+///
+/// Polymarket sports are game-day markets, so 24h is right there. Kalshi sports
+/// are season futures — measured 2026-08-22, its 5,715 open sports markets had a
+/// median 6,896 hours to close and NOT ONE closed within seven days ("Will
+/// Philadelphia win the 2027 Pro Basketball Final" closes in 25,748h). Applying
+/// the Polymarket default to Kalshi filtered the entire category to nothing,
+/// which reads as "no markets available" rather than as a filter doing its job.
+///
+/// Shared by the browse list and Quick deploy: when Quick had its own hardcoded
+/// 7-day window, it found nothing for classes the browse list happily showed.
+fn default_expiry_secs(market_type: &str) -> i64 {
+    #[cfg(all(not(feature = "intl_clob"), feature = "kalshi"))]
+    match market_type.to_lowercase().as_str() {
+        "sports" => 63_072_000,   // 2y — championship futures
+        "politics" => 63_072_000, // 2y — election cycles run long
+        "crypto" => 2_592_000,    // 30d
+        _ => 604_800,
+    }
+    #[cfg(not(all(not(feature = "intl_clob"), feature = "kalshi")))]
+    match market_type.to_lowercase().as_str() {
+        "sports" => 86_400,     // 24h — game-day markets
+        "crypto" => 2_592_000,  // 30d — price targets have longer horizons
+        "politics" => 7_776_000,// 90d — longer horizons
+        _ => 604_800,           // 7d fallback
+    }
+}
+
+#[cfg(test)]
+mod discovery_window_tests {
+    use super::default_expiry_secs;
+
+    /// Quick deploy used a hardcoded 7-day window while the browse list used
+    /// this function. On Kalshi that combination reported "No politics markets
+    /// available for deployment" for a category the browse list could list,
+    /// because no Kalshi politics or sports market closes within a week.
+    #[test]
+    fn every_class_admits_more_than_a_week_where_the_venue_needs_it() {
+        const WEEK: i64 = 7 * 24 * 3600;
+        for class in ["politics", "sports", "crypto"] {
+            let secs = default_expiry_secs(class);
+            assert!(secs > 0, "{class} has no window");
+            #[cfg(all(not(feature = "intl_clob"), feature = "kalshi"))]
+            assert!(
+                secs > WEEK,
+                "{class}: Kalshi structures this as a long-dated future; {secs}s hides the whole category",
+            );
+            #[cfg(not(all(not(feature = "intl_clob"), feature = "kalshi")))]
+            let _ = WEEK;
+        }
+    }
+
+    /// Case must not decide whether a category is visible.
+    #[test]
+    fn the_window_is_case_insensitive() {
+        for class in ["politics", "sports", "crypto"] {
+            assert_eq!(
+                default_expiry_secs(class),
+                default_expiry_secs(&class.to_uppercase()),
+                "{class} changed window with case",
+            );
+        }
+    }
+
+    /// An unknown class must still be usable rather than resolving to zero.
+    #[test]
+    fn an_unknown_class_falls_back_to_a_week() {
+        assert_eq!(default_expiry_secs("weather"), 604_800);
+    }
+}
+
+/// Liquidity floor for market discovery. Quick deploy sorts by liquidity and
+/// takes the best, so it uses the same floor as the browse list rather than a
+/// stricter one — otherwise Quick refuses to deploy a market the operator can
+/// see listed, with an error that says none exist.
+const DISCOVERY_MIN_LIQUIDITY: f64 = 500.0;
+
 /// GET /api/markets/available?market_type=crypto&expiry_window=4h&min_liquidity=1000
 ///
 /// Returns available markets for squadron deployment, filtered by type.
@@ -2122,7 +2202,7 @@ async fn get_available_markets(Query(q): Query<AvailableMarketsQuery>) -> Respon
     debug!("Received GET /api/markets/available for type {}", q.market_type);
     
     let market_type = q.market_type.to_lowercase();
-    let min_liquidity = q.min_liquidity.unwrap_or(500.0);
+    let min_liquidity = q.min_liquidity.unwrap_or(DISCOVERY_MIN_LIQUIDITY);
     
     // Parse expiry window to seconds. The sensible default depends on the VENUE
     // as much as the class, because the venues structure the same category
@@ -2135,20 +2215,7 @@ async fn get_available_markets(Query(q): Query<AvailableMarketsQuery>) -> Respon
     // 25,748h). Applying the Polymarket default to Kalshi filtered the entire
     // category to nothing, which read as "no markets available" rather than as
     // a filter doing its job.
-    #[cfg(all(not(feature = "intl_clob"), feature = "kalshi"))]
-    let default_expiry = match q.market_type.to_lowercase().as_str() {
-        "sports" => 63_072_000,   // 2y — championship futures
-        "politics" => 63_072_000, // 2y — election cycles run long
-        "crypto" => 2_592_000,    // 30d
-        _ => 604_800,
-    };
-    #[cfg(not(all(not(feature = "intl_clob"), feature = "kalshi")))]
-    let default_expiry = match q.market_type.to_lowercase().as_str() {
-        "sports" => 86400,     // 24h for sports (game-day markets)
-        "crypto" => 2592000,   // 30d for crypto (price targets have longer horizons)
-        "politics" => 7776000, // 90d for politics (longer horizons)
-        _ => 604800,           // 7d fallback
-    };
+    let default_expiry = default_expiry_secs(&q.market_type);
     
     let max_expiry_secs: i64 = match q.expiry_window.as_deref() {
         Some("1h") => 3600,
@@ -2777,7 +2844,12 @@ async fn deploy_squadron(
             .build()
             .unwrap_or_default();
         
-        let markets = fetch_markets_by_type(&http, &req.market_type, 7 * 24 * 3600, 10000.0).await;
+        let markets = fetch_markets_by_type(
+            &http,
+            &req.market_type,
+            default_expiry_secs(&req.market_type),
+            DISCOVERY_MIN_LIQUIDITY,
+        ).await;
         
         if markets.is_empty() {
             return Json(DeploySquadronResponse {

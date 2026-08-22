@@ -300,15 +300,23 @@ async fn run() -> Result<()> {
     // can be used to name the DB file.  ASSETS=btc,eth,sol overrides CRYPTO_FILTER.
     // The DB global singleton covers the PRIMARY asset only; secondary assets run
     // CSV-only metrics.  Per-asset DB pools are a Phase 3f-7 concern.
-    #[cfg(feature = "kalshi")]
-    let default_asset = "kalshi";
-    #[cfg(not(feature = "kalshi"))]
     // The venue that owns the per-asset shards created below. Only the intl
     // CLOB shards by underlying; US and Kalshi register their own shards later.
     #[cfg(feature = "intl_clob")]
     const INTL_VENUE_NAME: &str = dradis::venues::intl::INTL_VENUE;
     #[cfg(not(feature = "intl_clob"))]
     const INTL_VENUE_NAME: &str = "";
+
+    // These two attributes must stay adjacent to their own `let`. When the
+    // INTL_VENUE_NAME const was inserted between them, `#[cfg(not(kalshi))]`
+    // bound to the const instead, leaving `let default_asset = "btc"`
+    // unconditional — so a Kalshi build shadowed "kalshi" with "btc", created a
+    // stray logs/btc-dradis.db shard it never traded, handed the primary
+    // db::pool() slot to that empty shard, and showed "Active Assets: 2" for a
+    // single-venue instance. rustc flagged it only as an unused variable.
+    #[cfg(feature = "kalshi")]
+    let default_asset = "kalshi";
+    #[cfg(not(feature = "kalshi"))]
     let default_asset = "btc";
     let crypto_filter = env::var("CRYPTO_FILTER").unwrap_or_else(|_| default_asset.to_string()).to_lowercase();
     let assets: Vec<String> = env::var("ASSETS")
