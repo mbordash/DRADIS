@@ -221,6 +221,12 @@ fn raptor_stack_for(
     }
 
     info!("🦖 Spawning crypto Raptor stack for '{underlying}' (US crypto wing)");
+    // Route any lookup keyed by the underlying to this wing's shard. Nothing in
+    // the US trader writes under a bare underlying today — every path goes
+    // through Wing::asset() — but pool_for() returns None on a miss rather than
+    // falling back, so an alias turns a future mistake into a redirect instead
+    // of a silent dropped write. Mirrors what the Kalshi trader does.
+    crate::helpers::db::alias_pool(underlying, US_CRYPTO_ASSET);
     let http = Arc::new(reqwest::Client::new());
 
     let (oracle_tx, oracle_rx) = watch::channel(dec!(0));
@@ -944,15 +950,18 @@ fn strategy_name_to_kind(name: &str) -> &'static str {
 
 /// Build a venue-neutral [`MarketSnapshot`] from the two US leg feeds, enriched
 /// with live Raptor intelligence when the wing has a stack attached.
-/// `PriceState` layout: `(best_bid, bid_depth, best_ask, ask_depth, ts)`.
+/// `PriceState` layout: `(best_bid, bid_touch, best_ask, ask_touch, ts,
+/// bid_depth_total, ask_depth_total)` — see `state::price_state`.
 fn build_snapshot(
     long_rx: &watch::Receiver<PriceState>,
     short_rx: &watch::Receiver<PriceState>,
     raptors: Option<&CryptoRaptors>,
     market: &MarketConfig,
 ) -> MarketSnapshot {
-    let (yb, ybd, ya, yad) = { let b = long_rx.borrow();  (b.0, b.1, b.2, b.3) };
-    let (nb, nbd, na, nad) = { let b = short_rx.borrow(); (b.0, b.1, b.2, b.3) };
+    let yes_state = *long_rx.borrow();
+    let no_state  = *short_rx.borrow();
+    let (yb, ybd, ya, yad) = (yes_state.0, yes_state.1, yes_state.2, yes_state.3);
+    let (nb, nbd, na, nad) = (no_state.0,  no_state.1,  no_state.2,  no_state.3);
     let now = Utc::now();
     let mut snap = MarketSnapshot {
         yes_bid: yb, yes_bid_depth: ybd, yes_ask: ya, yes_ask_depth: yad,
@@ -998,6 +1007,9 @@ fn build_snapshot(
             snap.vix_velocity = h.vix_velocity;
         }
     }
+    crate::state::price_state::log_heartbeat(
+        &market.market_name, &yes_state, &no_state, snap.oracle_price,
+    );
     snap
 }
 

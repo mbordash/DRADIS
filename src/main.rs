@@ -307,16 +307,24 @@ async fn run() -> Result<()> {
     #[cfg(not(feature = "intl_clob"))]
     const INTL_VENUE_NAME: &str = "";
 
-    // These two attributes must stay adjacent to their own `let`. When the
+    // Each attribute must stay adjacent to its own `let`. When the
     // INTL_VENUE_NAME const was inserted between them, `#[cfg(not(kalshi))]`
     // bound to the const instead, leaving `let default_asset = "btc"`
-    // unconditional — so a Kalshi build shadowed "kalshi" with "btc", created a
-    // stray logs/btc-dradis.db shard it never traded, handed the primary
-    // db::pool() slot to that empty shard, and showed "Active Assets: 2" for a
-    // single-venue instance. rustc flagged it only as an unused variable.
+    // unconditional — so non-intl builds shadowed their own name with "btc",
+    // created a stray logs/btc-dradis.db shard they never traded, handed the
+    // primary db::pool() slot to that empty shard, and inflated "Active Assets".
+    // rustc flagged it only as an unused variable.
+    //
+    // The primary slot matters beyond the count: it is what db::pool() returns,
+    // so API handlers and the LLM advisor were reading an empty database while
+    // trades were written to the venue's own shards. US was worst hit — it
+    // registers two shards of its own, so it showed three assets and read none
+    // of them.
     #[cfg(feature = "kalshi")]
     let default_asset = "kalshi";
-    #[cfg(not(feature = "kalshi"))]
+    #[cfg(feature = "us_retail")]
+    let default_asset = "us";
+    #[cfg(feature = "intl_clob")]
     let default_asset = "btc";
     let crypto_filter = env::var("CRYPTO_FILTER").unwrap_or_else(|_| default_asset.to_string()).to_lowercase();
     let assets: Vec<String> = env::var("ASSETS")

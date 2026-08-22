@@ -169,6 +169,55 @@ pub mod price_state {
         let sum = b + a;
         if sum > Decimal::ZERO { (b - a) / sum } else { Decimal::NEGATIVE_ONE }
     }
+
+    /// Emit the periodic book + signal line for one market, at most once per
+    /// [`HEARTBEAT_SECS`] per `label`.
+    ///
+    /// The intl CLOB gets this from `spawn_status_task`, which is spawned only
+    /// from its own patrol loop. Kalshi and US retail drive their own loops and
+    /// never reached it, so those instances printed no heartbeat at all: no ask
+    /// sum, no mark, and none of the whole-book depth the order-book-imbalance
+    /// retune is meant to be gathering. Both already had every figure to hand.
+    ///
+    /// Throttled per label rather than globally because a venue runs several
+    /// markets at once — Kalshi a primary and a maker market, US a general and a
+    /// crypto wing — and one global gate would let whichever ticked first
+    /// silence the others.
+    pub fn log_heartbeat(label: &str, yes: &PriceState, no: &PriceState, oracle: Decimal) {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        use std::time::{Duration, Instant};
+
+        /// Interval between heartbeat lines for a given market.
+        const HEARTBEAT_SECS: u64 = 30;
+
+        static LAST: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+        let reg = LAST.get_or_init(|| Mutex::new(HashMap::new()));
+        {
+            let mut reg = match reg.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let now = Instant::now();
+            match reg.get(label) {
+                Some(prev) if now.duration_since(*prev) < Duration::from_secs(HEARTBEAT_SECS) => return,
+                _ => { reg.insert(label.to_string(), now); }
+            }
+        }
+
+        tracing::info!(
+            " Heartbeat [{}] | Ask Sum ${:.4} (Y ${:.2} / N ${:.2}) | Bid Sum ${:.4} (Y ${:.2} / N ${:.2}) | \
+             Mark: ${:.2} | OBI Y={:.2} N={:.2} | OBIall Y={:.2} N={:.2} (depth Y {:.0}/{:.0} N {:.0}/{:.0})",
+            label,
+            best_ask(yes) + best_ask(no), best_ask(yes), best_ask(no),
+            best_bid(yes) + best_bid(no), best_bid(yes), best_bid(no),
+            oracle,
+            imbalance(yes, false), imbalance(no, false),
+            imbalance(yes, true),  imbalance(no, true),
+            bid_depth_total(yes), ask_depth_total(yes),
+            bid_depth_total(no),  ask_depth_total(no),
+        );
+    }
 }
 
 /// Represents a single position held in the trading system.
