@@ -828,6 +828,45 @@ fn strategy_name_to_kind(name: &str) -> &'static str {
     }
 }
 
+/// Periodic book + signal line, mirroring the intl CLOB patrol heartbeat.
+///
+/// `spawn_status_task` — which emits that heartbeat, and with it the OBI and
+/// cumulative-depth figures — is spawned only from the intl patrol loop. This
+/// venue drives its own loop and never reached it, so a Kalshi instance printed
+/// no heartbeat at all: no ask sum, no mark, and none of the whole-book depth
+/// the order-book-imbalance retune is supposed to be gathering. The data was
+/// already computed here for every tick; it was simply never logged.
+///
+/// Throttled rather than per-tick: this loop ticks far faster than anyone reads.
+fn heartbeat(snap: &MarketSnapshot, yes: &PriceState, no: &PriceState, ticker: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::{SystemTime, UNIX_EPOCH};
+    /// Seconds between heartbeat lines.
+    const EVERY_SECS: u64 = 30;
+    static LAST: AtomicU64 = AtomicU64::new(0);
+
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let last = LAST.load(Ordering::Relaxed);
+    if now < last.saturating_add(EVERY_SECS) { return; }
+    // Losing the race just means another tick logged first.
+    if LAST.compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed).is_err() { return; }
+
+    let obi = |bid: rust_decimal::Decimal, ask: rust_decimal::Decimal| {
+        if bid + ask > dec!(0) { (bid - ask) / (bid + ask) } else { dec!(0) }
+    };
+    info!(
+        " Heartbeat [{}] | Ask Sum ${:.4} (Y ${:.2} / N ${:.2}) | Bid Sum ${:.4} (Y ${:.2} / N ${:.2}) | \
+         Binance: ${:.2} | OBI Y={:.2} N={:.2} | OBIall Y={:.2} N={:.2} (depth Y {:.0}/{:.0} N {:.0}/{:.0})",
+        ticker,
+        snap.yes_ask + snap.no_ask, snap.yes_ask, snap.no_ask,
+        snap.yes_bid + snap.no_bid, snap.yes_bid, snap.no_bid,
+        snap.oracle_price,
+        obi(yes.1, yes.3), obi(no.1, no.3),
+        obi(yes.5, yes.6), obi(no.5, no.6),
+        yes.5, yes.6, no.5, no.6,
+    );
+}
+
 /// Build a venue-neutral [`MarketSnapshot`] from the live Kalshi book +
 /// Raptor intelligence.
 ///
@@ -887,6 +926,7 @@ async fn build_snapshot(
         timestamp: now,
     };
     snap.oracle_price = *raptors.oracle.borrow();
+    heartbeat(&snap, &yes_state, &no_state, ticker);
     let (vel, vel_1s, accel) = *raptors.velocity.borrow();
     snap.velocity = vel;
     snap.velocity_1s = vel_1s;

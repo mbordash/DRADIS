@@ -104,7 +104,13 @@ impl StrategyRegistry {
     /// Every strategy is always instantiated so the DynamicConfig hot-patch can
     /// enable or disable any of them during a running session via the Control Tower UI.
     pub fn create_all_strategies() -> Vec<Box<dyn Strategy>> {
-        Self::log_active_thresholds();
+        // Once per process, despite its name promising as much. Venues that
+        // rediscover their primary market on a timer rebuild the squadron each
+        // cycle — the Kalshi trader does so every two minutes — and this banner
+        // is 24 lines. In an 8-minute QA capture it was 40% of the log, burying
+        // the gate decisions an operator is actually reading for.
+        static BANNER: std::sync::Once = std::sync::Once::new();
+        BANNER.call_once(Self::log_active_thresholds);
         vec![
             Box::new(MomentumStrategyImpl::new())          as Box<dyn Strategy>,
             Box::new(ArbitrageStrategyImpl::default())                as Box<dyn Strategy>,
