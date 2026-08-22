@@ -30,6 +30,7 @@ import SetupPage       from '@/components/SetupPage';
 import AiActionsPage   from '@/components/AiActionsPage';
 import ConsolePage     from '@/components/ConsolePage';
 import AlphaGate       from '@/components/AlphaGate';
+import VenueGate       from '@/components/VenueGate';
 import ErrorBoundary   from '@/components/ErrorBoundary';
 import Footer          from '@/components/Footer';
 import { ViperHealthStrip } from '@/components/ViperHealthStrip';
@@ -410,8 +411,28 @@ export default function DashboardPage() {
   const { data: setupStatus, mutate: mutateSetupStatus } =
     useSWR(!DEMO_MODE ? 'setupStatus' : null, getSetupStatus, { refreshInterval: 60_000 });
 
-  // Blocking first-run overlay until the alpha/jurisdiction acknowledgment is recorded.
-  const alphaGate = setupStatus && !setupStatus.alpha_ack ? (
+  // ── First-run overlays, in order ──────────────────────────────────────────
+  //
+  // Venue BEFORE jurisdiction, and the order is load-bearing. The risk gate
+  // records an acknowledgment stamped with the running venue, and that record is
+  // write-once. Shown first, it made a US buyer accept International terms — for
+  // a venue the same screen tells them they may not use — and filed that
+  // permanently before they ever reached the venue switcher.
+  const needsVenue =
+    !!setupStatus &&
+    !setupStatus.venue_selected &&
+    (setupStatus.venues_available?.length ?? 0) > 1;
+
+  const venueGate = needsVenue ? (
+    <VenueGate
+      available={setupStatus!.venues_available!}
+      onChosen={() => mutateSetupStatus()}
+    />
+  ) : null;
+
+  // Only once a venue is settled — either chosen here, or the sole one this
+  // image carries — does the jurisdiction gate have a venue worth naming.
+  const alphaGate = setupStatus && !needsVenue && !setupStatus.alpha_ack ? (
     <AlphaGate
       venue={setupStatus.venue}
       appVersion={setupStatus.app_version}
@@ -457,6 +478,7 @@ export default function DashboardPage() {
   if (focusedSquadron) {
     return (
       <div className="min-h-screen bg-[#0a0a12]">
+        {venueGate}
         {alphaGate}
         <header className="sticky top-0 z-10 border-b border-[#1e1e32] bg-[#0a0a12]/90 backdrop-blur-sm px-6 py-3">
           <div className="max-w-7xl mx-auto relative flex items-center justify-between gap-4">
@@ -514,7 +536,8 @@ export default function DashboardPage() {
 
   return (
     <div className="min-h-screen bg-[#0a0a12]">
-      {alphaGate}
+      {venueGate}
+        {alphaGate}
       {/* ── Header ─────────────────────────────────────────────────────────── */}
       <header className="sticky top-0 z-10 border-b border-[#1e1e32] bg-[#0a0a12]/90 backdrop-blur-sm px-6 py-3">
         <div className="max-w-7xl mx-auto relative flex items-center justify-between gap-4">

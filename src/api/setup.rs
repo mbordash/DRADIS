@@ -258,6 +258,29 @@ pub fn venue_path() -> PathBuf {
     PathBuf::from(dir).join("venue")
 }
 
+/// Has the operator explicitly chosen a venue, or is the engine merely running
+/// on its fallback?
+///
+/// The distinction matters because the risk gate stamps its jurisdiction
+/// acknowledgment with the running venue and that record is write-once. Booting
+/// a US buyer into a seeded International default made them file a permanent
+/// acknowledgment against a venue the same screen told them they may not use.
+/// The venue file is now written only on a real choice, so its absence is the
+/// signal to ask first.
+fn venue_selected() -> bool {
+    venue_selected_at(&venue_path())
+}
+
+/// Path-taking half of [`venue_selected`], so it can be tested without touching
+/// `DRADIS_DATA_DIR`. That variable is process-global and the test harness runs
+/// threads in parallel: a test that sets it — or worse, removes the directory it
+/// points at — breaks whatever else is reading it at that moment.
+fn venue_selected_at(path: &std::path::Path) -> bool {
+    std::fs::read_to_string(path)
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+}
+
 /// Directory holding the per-venue binaries in a multi-venue image.
 fn bin_dir() -> PathBuf {
     PathBuf::from(std::env::var("DRADIS_BIN_DIR").unwrap_or_else(|_| "/app/bin".to_string()))
@@ -520,6 +543,9 @@ async fn get_status() -> Response {
         // Only populated on a multi-venue image (the Marketplace AMI). One
         // entry or none means there is nothing to switch between.
         "venues_available": venues_available,
+        // False on a fresh multi-venue instance: the Control Tower must ask
+        // before showing a jurisdiction gate for a venue nobody picked.
+        "venue_selected": venue_selected(),
         "edition": edition(),
         "admin_set": admin_hash().is_some(),
         "auth_disabled": setup_auth_disabled(),
@@ -1676,6 +1702,39 @@ mod tests {
     }
 
     /// Tiers drive the UI badges, so an unrecognised value would render blank.
+    /// The jurisdiction acknowledgment must never be recorded against a venue
+    /// nobody chose.
+    ///
+    /// `acknowledge_alpha` stamps the record with `build_venue()` and is
+    /// write-once — "the first acknowledgment is the record of legal
+    /// significance". While first boot seeded a default of Polymarket
+    /// International, a US buyer was shown a gate saying the International CLOB
+    /// is not available to US persons, had to accept it to proceed, and filed a
+    /// permanent acknowledgment against a venue they may not legally trade.
+    ///
+    /// The fix is an ordering one and lives partly in the Control Tower, so this
+    /// asserts the contract the UI depends on: a status payload carries the flag
+    /// that lets the front end know whether a choice has actually been made.
+    #[test]
+    fn status_reports_whether_a_venue_was_actually_chosen() {
+        // Deliberately path-based rather than env-based: DRADIS_DATA_DIR is
+        // process-global and these tests run in parallel.
+        let dir = std::env::temp_dir()
+            .join(format!("dradis-venue-sel-{}-{:?}", std::process::id(), std::thread::current().id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("venue");
+
+        assert!(!venue_selected_at(&f), "no file means no choice has been made");
+
+        std::fs::write(&f, "   \n").unwrap();
+        assert!(!venue_selected_at(&f), "a blank file is not a choice either");
+
+        std::fs::write(&f, "kalshi\n").unwrap();
+        assert!(venue_selected_at(&f), "a written venue is a choice");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A raptor whose feed is unavailable in some region must say so on its
     /// card. Binance's 451 block is invisible from the developer's own
     /// deployment in eu-west-1 and universal for a US customer, which is the

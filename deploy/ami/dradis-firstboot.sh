@@ -50,6 +50,18 @@ imds() {
 # Customers who want a non-default venue without opening the UI can pass it in
 # EC2 user data as a `dradis_venue=<intl|us|kalshi>` line. Everyone else gets
 # the default and switches in the Setup view.
+# The file is written ONLY when the operator has actually chosen. Its ABSENCE is
+# meaningful: it tells the Control Tower to ask before anything else happens.
+#
+# Seeding a default here was wrong. The risk gate records a jurisdiction
+# acknowledgment stamped with the running venue, and that record is write-once —
+# "the first acknowledgment is the record of legal significance". A US buyer who
+# booted into the seeded International default was shown a gate telling them
+# Polymarket International is not available to US persons, had to accept it to
+# proceed, and thereby filed a permanent, uncorrectable acknowledgment against a
+# venue they may not legally trade. The engine still RUNS on intl until a choice
+# is made (see deploy/entrypoint.sh) so the API is reachable; it simply must not
+# be presented as a decision the customer made.
 if [ ! -s "$VENUE_FILE" ]; then
     VENUE=""
     USER_DATA=$(imds user-data || true)
@@ -59,13 +71,17 @@ if [ ! -s "$VENUE_FILE" ]; then
                 | head -n1)
     fi
     case "$VENUE" in
-        intl|us|kalshi) ;;
-        "") VENUE="$DEFAULT_VENUE" ;;
-        *)  echo "dradis-firstboot: ignoring unknown dradis_venue='$VENUE'" >&2
-            VENUE="$DEFAULT_VENUE" ;;
+        intl|us|kalshi)
+            printf '%s\n' "$VENUE" > "$VENUE_FILE"
+            echo "dradis-firstboot: venue set to '$VENUE' from user data"
+            ;;
+        "")
+            echo "dradis-firstboot: no venue chosen yet — the Control Tower will ask"
+            ;;
+        *)
+            echo "dradis-firstboot: ignoring unknown dradis_venue='$VENUE' — the Control Tower will ask" >&2
+            ;;
     esac
-    printf '%s\n' "$VENUE" > "$VENUE_FILE"
-    echo "dradis-firstboot: venue set to '$VENUE' (change it in Setup → Venue)"
 fi
 
 # ── 2. Per-instance TLS certificate ─────────────────────────────────────────

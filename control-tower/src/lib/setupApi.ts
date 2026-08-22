@@ -44,6 +44,13 @@ export interface SetupStatus {
    * selector is hidden.
    */
   venues_available?: VenueId[];
+  /**
+   * Has the operator actually chosen a venue? False on a fresh multi-venue
+   * instance, where the engine is running on its fallback and no choice has
+   * been made. The risk gate must not be shown until this is true — its
+   * acknowledgment is write-once and stamped with the running venue.
+   */
+  venue_selected?: boolean;
   /** 'marketplace' on the paid AMI; absent or 'community' everywhere else. */
   edition?: Edition;
   admin_set: boolean;
