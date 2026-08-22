@@ -47,11 +47,17 @@ export default function AlphaGate({
   appVersion,
   edition,
   onAcknowledged,
+  onBack,
 }: {
   venue: VenueId;
   appVersion?: string;
   edition?: Edition;
   onAcknowledged: () => void;
+  /** Return to the venue chooser. Supplied only on a multi-venue image, where
+   *  there is something to go back to. Accepting here writes a permanent,
+   *  write-once record stamped with this venue, so an operator who arrives and
+   *  sees the wrong one must be able to leave without signing it. */
+  onBack?: () => void;
 }) {
   const [riskOk, setRiskOk] = useState(false);
   const [jurisdictionOk, setJurisdictionOk] = useState(false);
@@ -207,6 +213,16 @@ export default function AlphaGate({
           >
             {busy ? 'Recording…' : 'I acknowledge — continue to DRADIS'}
           </button>
+
+          {onBack && !busy && (
+            <button
+              onClick={onBack}
+              className="w-full text-[11px] font-mono text-gray-500 hover:text-gray-300 underline underline-offset-2"
+            >
+              ← Not {VENUE_NAME[venue]}? Choose a different trading venue
+            </button>
+          )}
+
           <p className="text-[10px] text-gray-600 font-mono text-center">
             Your acknowledgment is recorded with a timestamp on this instance.
           </p>

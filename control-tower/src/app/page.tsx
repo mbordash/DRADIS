@@ -418,15 +418,22 @@ export default function DashboardPage() {
   // write-once. Shown first, it made a US buyer accept International terms — for
   // a venue the same screen tells them they may not use — and filed that
   // permanently before they ever reached the venue switcher.
+  const multiVenue = (setupStatus?.venues_available?.length ?? 0) > 1;
+
+  // Set when the operator backs out of the acknowledgment to pick again. The
+  // venue file on disk stays as it is — reopening the chooser is a UI decision,
+  // and the choice is only rewritten if they actually confirm a different one.
+  const [reselectVenue, setReselectVenue] = useState(false);
+
   const needsVenue =
     !!setupStatus &&
-    !setupStatus.venue_selected &&
-    (setupStatus.venues_available?.length ?? 0) > 1;
+    multiVenue &&
+    (!setupStatus.venue_selected || reselectVenue);
 
   const venueGate = needsVenue ? (
     <VenueGate
       available={setupStatus!.venues_available!}
-      onChosen={() => mutateSetupStatus()}
+      onChosen={() => { setReselectVenue(false); mutateSetupStatus(); }}
     />
   ) : null;
 
@@ -438,6 +445,7 @@ export default function DashboardPage() {
       appVersion={setupStatus.app_version}
       edition={setupStatus.edition}
       onAcknowledged={() => mutateSetupStatus()}
+      onBack={multiVenue ? () => setReselectVenue(true) : undefined}
     />
   ) : null;
 

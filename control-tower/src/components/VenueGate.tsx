@@ -88,18 +88,27 @@ export default function VenueGate({
         setNote('Restarting the engine — this takes 30-60 seconds.');
         await restartEngine();
       }
-      // Poll until the engine confirms the choice. `onChosen()` alone was not
-      // enough: it refetches once, and during a restart that request fails, so
-      // the gate stayed mounted showing "Applying…" with nothing to indicate
-      // whether it was working, wedged, or finished.
+      // Wait for the engine to be RUNNING the chosen venue — not merely for the
+      // choice to be recorded.
+      //
+      // `venue_selected` flips true the instant PUT writes the file, which is
+      // before the restart has even begun. Polling on it dismissed this gate
+      // while the old binary was still serving, so the jurisdiction gate behind
+      // it rendered with the previous venue: choose Kalshi, get "DRADIS
+      // International — read before proceeding". Acknowledging there would have
+      // filed the write-once record against intl, which is the precise failure
+      // this whole gate exists to prevent.
+      //
+      // `st.venue` comes from build_venue() — the binary actually running — so it
+      // only reports the new venue once the swap is complete.
       const deadline = Date.now() + 120_000;
       for (;;) {
         try {
           const st = await getSetupStatus();
-          if (st.venue_selected) { onChosen(); return; }
+          if (st.venue === pending) { onChosen(); return; }
         } catch { /* engine still down mid-restart — keep waiting */ }
         if (Date.now() > deadline) {
-          setError('The engine did not confirm the venue within two minutes. It may still be starting — reload the page in a moment.');
+          setError(`The engine did not come back as ${VENUES.find(v => v.id === pending)?.name ?? pending} within two minutes. It may still be starting — reload the page in a moment.`);
           setBusy(false);
           return;
         }
