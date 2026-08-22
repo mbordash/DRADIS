@@ -304,17 +304,86 @@ fn available_venues() -> Vec<String> {
 }
 
 /// Parse the secrets file into an ordered map. Missing file → empty map.
-fn read_secrets() -> BTreeMap<String, String> {
-    let mut map = BTreeMap::new();
-    if let Ok(content) = std::fs::read_to_string(secrets_path()) {
-        for line in content.lines() {
-            let line = line.trim();
-            if line.is_empty() || line.starts_with('#') { continue; }
-            if let Some((k, v)) = line.split_once('=') {
-                map.insert(k.trim().to_string(), v.trim().to_string());
-            }
+/// Does `k` look like an environment variable name? Used to tell a real
+/// `KEY=value` line from a stray line of base64 that happens to contain `=`
+/// padding — every managed key is SCREAMING_SNAKE_CASE, base64 is mixed case.
+fn is_env_key(k: &str) -> bool {
+    !k.is_empty()
+        && k.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && !k.starts_with(|c: char| c.is_ascii_digit())
+}
+
+/// Undo the escaping applied by `write_secrets`.
+fn unescape_secret(v: &str) -> String {
+    if !v.contains('\\') { return v.to_string(); }
+    let mut out = String::with_capacity(v.len());
+    let mut it = v.chars();
+    while let Some(c) = it.next() {
+        if c != '\\' { out.push(c); continue; }
+        match it.next() {
+            Some('n')  => out.push('\n'),
+            Some('r')  => out.push('\r'),
+            Some('\\') => out.push('\\'),
+            // Not an escape we produce — leave it exactly as written so a
+            // literal backslash in a password survives untouched.
+            Some(other) => { out.push('\\'); out.push(other); }
+            None => out.push('\\'),
         }
     }
+    out
+}
+
+/// Escape a value down to a single line so `KEY=value` stays parseable.
+///
+/// Without this, a pasted PEM private key — which is inherently multi-line —
+/// was written verbatim across several lines. The reader took only the first,
+/// so the key came back as the literal string `-----BEGIN RSA PRIVATE KEY-----`,
+/// signing failed, and the venue silently never initialised.
+fn escape_secret(v: &str) -> String {
+    v.replace('\\', "\\\\").replace('\n', "\\n").replace('\r', "\\r")
+}
+
+fn read_secrets() -> BTreeMap<String, String> {
+    match std::fs::read_to_string(secrets_path()) {
+        Ok(content) => parse_secrets(&content),
+        Err(_) => BTreeMap::new(),
+    }
+}
+
+/// Split out from `read_secrets` so it can be tested directly: the path comes
+/// from `DRADIS_DATA_DIR`, which is process-global, and a test that mutates it
+/// corrupts every other test running in parallel.
+fn parse_secrets(content: &str) -> BTreeMap<String, String> {
+    let mut map = BTreeMap::new();
+
+    // `pending` holds a PEM being reassembled. Files written before escaping
+    // existed contain raw multi-line keys; rather than force the operator to
+    // re-enter a credential they already saved, glue those lines back together.
+    let mut pending: Option<(String, String)> = None;
+
+    for raw in content.lines() {
+        if let Some((_, val)) = pending.as_mut() {
+            val.push('\n');
+            val.push_str(raw.trim_end());
+            if raw.trim_start().starts_with("-----END") {
+                let (k, v) = pending.take().expect("checked above");
+                map.insert(k, v);
+            }
+            continue;
+        }
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') { continue; }
+        let Some((k, v)) = line.split_once('=') else { continue };
+        let (key, val) = (k.trim(), v.trim());
+        if !is_env_key(key) { continue; }
+        if val.starts_with("-----BEGIN") && !val.contains("-----END") {
+            pending = Some((key.to_string(), val.to_string()));
+            continue;
+        }
+        map.insert(key.to_string(), unescape_secret(val));
+    }
+    // An unterminated PEM is still better than the BEGIN line alone.
+    if let Some((k, v)) = pending { map.insert(k, v); }
     map
 }
 
@@ -334,7 +403,7 @@ fn write_secrets(map: &BTreeMap<String, String>) -> std::io::Result<()> {
         writeln!(f, "# DRADIS managed secrets — written by the Control Tower setup UI.")?;
         writeln!(f, "# Do not edit while DRADIS is running; changes apply on restart.")?;
         for (k, v) in map {
-            writeln!(f, "{}={}", k, v)?;
+            writeln!(f, "{}={}", k, escape_secret(v))?;
         }
         f.sync_all()?;
     }
@@ -646,6 +715,15 @@ async fn put_credentials(Json(body): Json<PutCredentials>) -> Response {
                 changed.push(format!("{} (removed)", key));
             }
         } else {
+            // A PEM pasted with its tail cut off is the single most likely
+            // credential mistake, and it used to fail silently at signing time
+            // hours later. Reject it here, while the operator is looking.
+            if value.contains("-----BEGIN") && !value.contains("-----END") {
+                return (StatusCode::BAD_REQUEST, Json(json!({
+                    "error": format!("{} looks like a truncated PEM — it has a BEGIN line but no END line. \
+                                      Paste the whole key, including the -----END ...----- line.", key)
+                }))).into_response();
+            }
             map.insert(key.clone(), value.to_string());
             std::env::set_var(key, value);
             changed.push(key.clone());
@@ -1716,6 +1794,75 @@ mod tests {
     }
 
     /// Tiers drive the UI badges, so an unrecognised value would render blank.
+    /// A pasted PEM is multi-line, but the secrets file is one KEY=value per
+    /// line. Escaping on write and unescaping on read must round-trip it
+    /// exactly, or Kalshi request signing fails with a key that looks present.
+    #[test]
+    fn a_multiline_pem_survives_the_secrets_round_trip() {
+        let pem = "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEA7x+m\nQmFzZTY0TGluZQ==\n-----END RSA PRIVATE KEY-----";
+        let mut map = BTreeMap::new();
+        map.insert("KALSHI_PRIVATE_KEY".to_string(), pem.to_string());
+        map.insert("KALSHI_API_KEY_ID".to_string(), "abc-123".to_string());
+
+        // Reproduce exactly what write_secrets emits.
+        let mut file = String::from("# header\n");
+        for (k, v) in &map {
+            file.push_str(&format!("{}={}\n", k, escape_secret(v)));
+        }
+        // The whole point: every credential occupies exactly one line.
+        assert_eq!(file.lines().count(), 3, "escaped secrets must be single-line:\n{file}");
+
+        let back = parse_secrets(&file);
+        assert_eq!(back.get("KALSHI_PRIVATE_KEY").map(String::as_str), Some(pem));
+        assert_eq!(back.get("KALSHI_API_KEY_ID").map(String::as_str), Some("abc-123"));
+    }
+
+    /// Instances configured before escaping existed have a raw multi-line PEM
+    /// on disk. Reading must glue it back together rather than returning the
+    /// BEGIN line alone — otherwise the operator has to re-enter a credential
+    /// they already saved, with no indication that anything is wrong.
+    #[test]
+    fn a_legacy_multiline_pem_is_recovered_not_truncated() {
+        let file = "# DRADIS managed secrets\n\
+                    KALSHI_API_KEY_ID=abc-123\n\
+                    KALSHI_PRIVATE_KEY=-----BEGIN RSA PRIVATE KEY-----\n\
+                    MIIEowIBAAKCAQEA7x+m\n\
+                    QmFzZTY0TGluZQ==\n\
+                    -----END RSA PRIVATE KEY-----\n\
+                    POLYGON_RPC_URL=https://example.invalid\n";
+        let back = parse_secrets(file);
+
+        let pem = back.get("KALSHI_PRIVATE_KEY").expect("PEM must be recovered");
+        assert!(pem.starts_with("-----BEGIN RSA PRIVATE KEY-----"));
+        assert!(pem.ends_with("-----END RSA PRIVATE KEY-----"), "PEM was truncated: {pem:?}");
+        assert!(pem.contains("MIIEowIBAAKCAQEA7x+m"), "PEM body lost: {pem:?}");
+
+        // Keys on either side of the PEM must still be readable.
+        assert_eq!(back.get("KALSHI_API_KEY_ID").map(String::as_str), Some("abc-123"));
+        assert_eq!(back.get("POLYGON_RPC_URL").map(String::as_str), Some("https://example.invalid"));
+
+        // And the base64 line ending in `==` must not have become a key.
+        assert!(!back.contains_key("QmFzZTY0TGluZQ"), "base64 padding was parsed as a key: {back:?}");
+    }
+
+    /// Escaping must not corrupt an ordinary secret that contains a backslash.
+    #[test]
+    fn a_backslash_in_a_password_is_preserved() {
+        for original in ["p\\ssw0rd", "back\\\\slash", "trailing\\", "line1\nline2"] {
+            let round = unescape_secret(&escape_secret(original));
+            assert_eq!(round, original, "round trip lost data for {original:?}");
+        }
+    }
+
+    #[test]
+    fn base64_lines_are_not_mistaken_for_keys() {
+        assert!(is_env_key("KALSHI_PRIVATE_KEY"));
+        assert!(is_env_key("RUST_LOG"));
+        assert!(!is_env_key("MIIEowIBAAKCAQEA"), "mixed-case base64 is not a key name");
+        assert!(!is_env_key("7x9abc"));
+        assert!(!is_env_key(""));
+    }
+
     /// The jurisdiction acknowledgment must never be recorded against a venue
     /// nobody chose.
     ///
