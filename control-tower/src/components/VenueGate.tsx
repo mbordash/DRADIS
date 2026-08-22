@@ -21,7 +21,7 @@
 
 import { useState } from 'react';
 import type { VenueId } from '@/lib/setupApi';
-import { putVenue, restartEngine } from '@/lib/setupApi';
+import { putVenue, restartEngine, getSetupStatus } from '@/lib/setupApi';
 
 const VENUES: {
   id: VenueId;
@@ -72,14 +72,40 @@ export default function VenueGate({
   const options = VENUES.filter(v => available.includes(v.id));
   const chosen = options.find(v => v.id === pending);
 
+  const [note, setNote] = useState<string | null>(null);
+
   const confirm = async () => {
     if (!pending) return;
     setBusy(true);
     setError(null);
     try {
-      await putVenue(pending);
-      await restartEngine();
-      onChosen();
+      // Only restart when the engine is not already running this venue. A fresh
+      // instance runs the intl fallback, so choosing Polymarket International
+      // needs no restart at all — bouncing it anyway meant a pointless minute of
+      // downtime on the very first thing a customer does.
+      const res = await putVenue(pending);
+      if (res.restart_required) {
+        setNote('Restarting the engine — this takes 30-60 seconds.');
+        await restartEngine();
+      }
+      // Poll until the engine confirms the choice. `onChosen()` alone was not
+      // enough: it refetches once, and during a restart that request fails, so
+      // the gate stayed mounted showing "Applying…" with nothing to indicate
+      // whether it was working, wedged, or finished.
+      const deadline = Date.now() + 120_000;
+      for (;;) {
+        try {
+          const st = await getSetupStatus();
+          if (st.venue_selected) { onChosen(); return; }
+        } catch { /* engine still down mid-restart — keep waiting */ }
+        if (Date.now() > deadline) {
+          setError('The engine did not confirm the venue within two minutes. It may still be starting — reload the page in a moment.');
+          setBusy(false);
+          return;
+        }
+        setNote('Waiting for the engine to come back…');
+        await new Promise(r => setTimeout(r, 3000));
+      }
     } catch (e) {
       setError(e instanceof Error ? e.message : 'Could not set the venue — is the engine reachable?');
       setBusy(false);
@@ -138,6 +164,12 @@ export default function VenueGate({
             Eligibility is yours to determine. DRADIS does not verify your jurisdiction, and
             you are solely responsible for confirming you may trade on the venue you select.
           </p>
+
+          {note && !error && (
+            <div className="bg-indigo-500/10 border border-indigo-500/30 rounded-xl px-4 py-3 text-xs font-mono text-indigo-300">
+              {note}
+            </div>
+          )}
 
           {error && (
             <div className="bg-rose-500/10 border border-rose-500/30 rounded-xl px-4 py-3 text-xs font-mono text-rose-300">

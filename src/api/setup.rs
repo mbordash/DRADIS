@@ -1070,9 +1070,18 @@ async fn put_venue(Json(body): Json<VenueRequest>) -> Response {
             "venues_available": available,
         }))).into_response();
     }
-    if requested == build_venue() {
-        return Json(json!({"ok": true, "venue": requested, "restart_required": false})).into_response();
-    }
+    // NOTE: no early return when `requested == build_venue()`.
+    //
+    // It used to short-circuit here as a no-op, which was right while the venue
+    // file always existed. It is wrong now that the file's ABSENCE is what tells
+    // the Control Tower to ask: a fresh instance runs `intl` as its fallback, so
+    // an operator choosing Polymarket International matched the running venue,
+    // got `ok: true`, and had nothing written — leaving `venue_selected` false
+    // and the first-run chooser spinning on "Applying…" forever.
+    //
+    // The file records a CHOICE, not the running state. Always write it; only
+    // the restart is conditional.
+    let restart_required = requested != build_venue();
 
     let path = venue_path();
     if let Some(parent) = path.parent() {
@@ -1086,13 +1095,18 @@ async fn put_venue(Json(body): Json<VenueRequest>) -> Response {
             Json(json!({"error": format!("writing {}: {}", path.display(), e)}))).into_response();
     }
 
-    warn!("🔀 Setup: venue switched {} → {} — takes effect on restart",
-          build_venue(), requested);
+    if restart_required {
+        warn!("🔀 Setup: venue switched {} → {} — takes effect on restart",
+              build_venue(), requested);
+    } else {
+        info!("✅ Setup: venue confirmed as {} — already running it, no restart needed",
+              requested);
+    }
     Json(json!({
         "ok": true,
         "venue": requested,
         "previous": build_venue(),
-        "restart_required": true,
+        "restart_required": restart_required,
     })).into_response()
 }
 
@@ -1715,6 +1729,42 @@ mod tests {
     /// The fix is an ordering one and lives partly in the Control Tower, so this
     /// asserts the contract the UI depends on: a status payload carries the flag
     /// that lets the front end know whether a choice has actually been made.
+    /// Choosing the venue the engine already runs must still RECORD the choice.
+    ///
+    /// `put_venue` used to short-circuit on `requested == build_venue()` and
+    /// return `ok: true` without writing anything. Harmless while the venue file
+    /// always existed; broken once its absence became the signal to ask. A fresh
+    /// instance runs the intl fallback, so an operator picking Polymarket
+    /// International got a success response, no file written, `venue_selected`
+    /// stuck at false, and a first-run chooser that span forever.
+    ///
+    /// Asserted at source level because the failure is control flow — a unit test
+    /// of the write path cannot catch a `return` that skips it.
+    #[test]
+    fn put_venue_records_the_choice_even_when_it_matches_the_running_venue() {
+        let src = include_str!("setup.rs");
+        let body = src.split("async fn put_venue(").nth(1).expect("put_venue must exist");
+        let write_at = body.find("std::fs::write(&path").expect("put_venue must write the venue file");
+        let head = &body[..write_at];
+
+        // Early returns are fine — a single-venue image, an unavailable venue, a
+        // failed mkdir. What is NOT fine is returning SUCCESS without writing:
+        // that is exactly the shape of the bug, an `ok: true` the caller believes
+        // while nothing was recorded.
+        let lines: Vec<&str> = head.lines().collect();
+        for (i, line) in lines.iter().enumerate() {
+            if !line.trim().starts_with("return ") { continue; }
+            let stmt: String = lines[i..lines.len().min(i + 6)].join(" ");
+            assert!(
+                !stmt.contains("\"ok\": true"),
+                "put_venue returns success before writing the venue file:\n  {}\n\
+                 Choosing the already-running venue must still be recorded — its absence \
+                 is what tells the Control Tower to keep asking.",
+                line.trim(),
+            );
+        }
+    }
+
     #[test]
     fn status_reports_whether_a_venue_was_actually_chosen() {
         // Deliberately path-based rather than env-based: DRADIS_DATA_DIR is
