@@ -29,6 +29,13 @@ services:
       # support, file a GitHub issue" wording, which AWS would not accept on a
       # product a customer paid for.
       - DRADIS_EDITION=marketplace
+      # Without this the engine logs at ERROR only: tracing's EnvFilter falls
+      # back to ERROR when RUST_LOG is unset, so the Control Tower's Console view
+      # stayed permanently empty ("No log lines yet — the buffer fills as the
+      # engine runs") and `docker logs dradis` showed almost nothing. A customer
+      # diagnosing their own instance had nothing to look at, and neither did
+      # support. .env.example has always recommended this; the AMI never set it.
+      - RUST_LOG=info,dradis=info
     volumes:
       - ./data:/app/data
       # Trades, positions and P&L history live in SQLite under logs/. Without

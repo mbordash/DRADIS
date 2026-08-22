@@ -191,7 +191,7 @@ function groupsForVenue(venue: VenueId) {
   // by GET /api/setup/raptors so a new Raptor needs no change to this file.
   groups.push(
     { title: 'Telegram Alerts', blurb: 'Bot token + chat ID for trade notifications (optional).', keys: ['TELEGRAM_BOT_TOKEN', 'TELEGRAM_CHAT_ID'], test: 'telegram' },
-    { title: 'LLM Advisor', blurb: 'Provider: ollama (local/remote, no key — set Ollama URL + model) or a hosted API: openai-compatible / anthropic (set API base, key, model). Applies on restart.', keys: ['LLM_PROVIDER', 'OLLAMA_URL', 'OLLAMA_MODEL', 'LLM_API_BASE', 'LLM_API_KEY', 'LLM_MODEL'], test: 'llm' },
+    { title: 'LLM Advisor', blurb: 'Optional. Pick a preset below — the fields shown adapt to it. Applies on restart.', keys: ['LLM_PROVIDER', 'OLLAMA_URL', 'OLLAMA_MODEL', 'LLM_API_BASE', 'LLM_API_KEY', 'LLM_MODEL'], test: 'llm' },
   );
   return groups;
 }
@@ -229,12 +229,15 @@ function VenueCard({
 }) {
   const [busy, setBusy] = useState(false);
   const [pending, setPending] = useState<VenueId | null>(null);
+  /** Venue currently being switched to — drives the highlight and the lock. */
+  const [switching, setSwitching] = useState<VenueId | null>(null);
   const available = status.venues_available ?? [];
 
   if (available.length < 2) return null;
 
   const apply = async (venue: VenueId) => {
     setBusy(true);
+    setSwitching(venue);
     try {
       await putVenue(venue);
       await restartEngine();
@@ -247,11 +250,12 @@ function VenueCard({
       onSwitched(e instanceof Error ? e.message : 'Venue switch failed.');
     } finally {
       setBusy(false);
+      setSwitching(null);
     }
   };
 
   return (
-    <div className="bg-[#13131f] border border-[#1e1e32] rounded-xl p-4 space-y-3">
+    <div className={`bg-[#13131f] border border-[#1e1e32] rounded-xl p-4 space-y-3 ${busy ? 'opacity-70 pointer-events-none' : ''}`}>
       <div>
         <h3 className="text-sm font-mono text-gray-200">🎯 Trading Venue</h3>
         <p className="text-xs text-gray-500 mt-0.5">
@@ -272,13 +276,19 @@ function VenueCard({
               className={[
                 'text-left text-xs font-mono rounded-lg border px-3 py-2 transition-colors',
                 'disabled:cursor-default',
-                active
-                  ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-300'
-                  : 'bg-[#0e0e18] border-[#1e1e32] text-gray-400 hover:border-gray-600 hover:text-gray-200',
+                // While a switch is applying, highlight the venue being switched
+                // TO. Leaving the old one lit made a successful switch look like
+                // nothing had happened until the engine finished restarting.
+                switching === v
+                  ? 'bg-indigo-500/15 border-indigo-500/50 text-indigo-200'
+                  : active && !switching
+                    ? 'bg-emerald-500/10 border-emerald-500/40 text-emerald-300'
+                    : 'bg-[#0e0e18] border-[#1e1e32] text-gray-400 hover:border-gray-600 hover:text-gray-200',
               ].join(' ')}
             >
               <div>{VENUE_META[v].label}</div>
-              {active && <div className="text-[10px] text-emerald-400/70 mt-0.5">running</div>}
+              {switching === v && <div className="text-[10px] text-indigo-300/80 mt-0.5">starting…</div>}
+              {active && !switching && <div className="text-[10px] text-emerald-400/70 mt-0.5">running</div>}
             </button>
           );
         })}
@@ -434,6 +444,29 @@ const LLM_PRESETS: LlmPreset[] = [
     values: { LLM_PROVIDER: '' },
   },
 ];
+
+/**
+ * Which LLM fields are meaningful for a given provider.
+ *
+ * The card used to render all six regardless, so choosing Claude still showed
+ * "Ollama URL" and "Ollama model" — fields that do nothing for a hosted key and
+ * read as either a mistake or a second thing to fill in. Hiding them is not
+ * cosmetic: an operator who dutifully fills in every visible box has misread the
+ * product.
+ */
+function llmFieldsFor(provider: string): string[] {
+  switch (provider.trim().toLowerCase()) {
+    case 'ollama':
+      return ['LLM_PROVIDER', 'OLLAMA_URL', 'OLLAMA_MODEL'];
+    case 'openai':
+    case 'anthropic':
+      return ['LLM_PROVIDER', 'LLM_API_BASE', 'LLM_API_KEY', 'LLM_MODEL'];
+    default:
+      // Nothing chosen yet — show only the provider itself, so the card starts
+      // as one decision rather than six blanks.
+      return ['LLM_PROVIDER'];
+  }
+}
 
 /** Preset chooser, shown above the LLM Advisor fields. */
 function LlmPresets({ onApply }: { onApply: (values: Record<string, string>) => void }) {
@@ -1477,7 +1510,12 @@ export default function SetupPage() {
               key={g.title}
               title={g.title}
               blurb={g.blurb}
-              creds={g.keys
+              creds={(g.keys.includes('LLM_PROVIDER')
+                        // Only the fields this provider actually uses.
+                        ? llmFieldsFor(drafts['LLM_PROVIDER']
+                            ?? creds.find(c => c.key === 'LLM_PROVIDER')?.hint
+                            ?? '')
+                        : g.keys)
                 .map(k => creds.find(c => c.key === k))
                 .filter((c): c is CredentialInfo => !!c)}
               drafts={drafts}
@@ -1623,13 +1661,24 @@ export default function SetupPage() {
         </div>
       )}
 
+      {/* Sticky rather than parked at the bottom of a long page. The Setup view
+          scrolls well past a screen once the Raptor panel is expanded, so an
+          operator editing a field near the top had to scroll to the end to save,
+          then scroll back. Sticky keeps the action next to the work. */}
+      <div className="sticky bottom-0 -mx-1 px-1 pb-1 pt-3 bg-gradient-to-t from-[#0a0a12] via-[#0a0a12] to-transparent">
       <div className="flex items-center justify-end gap-2 border-t border-[#1e1e32] pt-4">
+        {dirty && (
+          <span className="mr-auto text-[11px] font-mono text-amber-300/80">
+            Unsaved changes
+          </span>
+        )}
         <button onClick={save} disabled={!dirty || saving} className={btnCls('primary')}>
           {saving ? 'Saving…' : 'Save changes'}
         </button>
         <button onClick={restart} disabled={restarting} className={btnCls('danger')}>
           {restarting ? 'Restarting…' : '🔄 Restart engine to apply'}
         </button>
+      </div>
       </div>
 
       <p className="text-[11px] text-gray-600 font-mono">

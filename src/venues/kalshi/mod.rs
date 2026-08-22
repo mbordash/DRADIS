@@ -232,6 +232,48 @@ impl KalshiVenue {
     }
 
     /// One market by ticker.
+    /// Every open market under the given Kalshi categories, paged.
+    ///
+    /// Kalshi organises discovery by series ticker, and there are thousands of
+    /// them — 2,226 under Politics, 3,491 under Sports — so fetching markets
+    /// series by series is not viable. `/events?with_nested_markets=true`
+    /// carries the category on each event and nests its markets, so one sweep
+    /// covers everything and the filtering happens here.
+    ///
+    /// Categories are matched case-insensitively. Returns `(category, market)`
+    /// so the caller can label what it found.
+    pub async fn open_markets_for_categories(
+        &self,
+        categories: &[&str],
+    ) -> anyhow::Result<Vec<(String, types::KalshiMarket)>> {
+        let wanted: Vec<String> = categories.iter().map(|c| c.to_ascii_lowercase()).collect();
+        let mut out = Vec::new();
+        let mut cursor = String::new();
+        // Bounded: the open-event set is a few hundred pages at most, and an
+        // unbounded loop here would hang market discovery on a bad cursor.
+        for _page in 0..12 {
+            let path = if cursor.is_empty() {
+                "/events?status=open&with_nested_markets=true&limit=200".to_string()
+            } else {
+                format!("/events?status=open&with_nested_markets=true&limit=200&cursor={cursor}")
+            };
+            let resp: types::EventsResponse = self.get_json(&path).await?;
+            for ev in resp.events {
+                if !wanted.iter().any(|w| ev.category.eq_ignore_ascii_case(w)) {
+                    continue;
+                }
+                for m in ev.markets {
+                    out.push((ev.category.clone(), m));
+                }
+            }
+            cursor = resp.cursor;
+            if cursor.is_empty() {
+                break;
+            }
+        }
+        Ok(out)
+    }
+
     pub async fn market(&self, ticker: &str) -> anyhow::Result<types::KalshiMarket> {
         let resp: types::MarketResponse = self.get_json(&format!("/markets/{ticker}")).await?;
         Ok(resp.market)

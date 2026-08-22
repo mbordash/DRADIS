@@ -178,9 +178,21 @@ export default function VenueGate({
           )}
 
           <div className="flex items-center justify-between gap-3 border-t border-[#1e1e32] pt-4">
-            <span className="text-[11px] font-mono text-gray-600">
-              {chosen ? `Selected: ${chosen.name}` : 'Select a venue to continue'}
-            </span>
+            <div className="flex items-center gap-3">
+              <span className="text-[11px] font-mono text-gray-600">
+                {chosen ? `Selected: ${chosen.name}` : 'Select a venue to continue'}
+              </span>
+              {/* Until Continue is pressed nothing has been written, so undoing a
+                  misclick should not mean reloading the page. */}
+              {chosen && !busy && (
+                <button
+                  onClick={() => { setPending(null); setNote(null); setError(null); }}
+                  className="text-[11px] font-mono text-gray-500 hover:text-gray-300 underline underline-offset-2"
+                >
+                  Change
+                </button>
+              )}
+            </div>
             <button
               onClick={confirm}
               disabled={!pending || busy}

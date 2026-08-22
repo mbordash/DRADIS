@@ -34,6 +34,34 @@ pub fn fp(s: &str) -> Option<Decimal> {
 
 // ─── Markets (GET /markets, /markets/{ticker}) ───────────────────────────────
 
+/// One page of `/events?with_nested_markets=true`.
+///
+/// Kalshi's discovery is series-based, and there are thousands of series — 2,226
+/// under Politics alone — so enumerating them individually is not viable. The
+/// events endpoint carries a `category` and nests each event's open markets, so
+/// one paginated sweep yields every tradeable market grouped by category.
+#[derive(Debug, Clone, Deserialize)]
+pub struct EventsResponse {
+    #[serde(default)]
+    pub events: Vec<KalshiEvent>,
+    #[serde(default)]
+    pub cursor: String,
+}
+
+/// An event and the markets under it.
+#[derive(Debug, Clone, Deserialize)]
+pub struct KalshiEvent {
+    #[serde(default)]
+    pub event_ticker: String,
+    /// Kalshi's own taxonomy: "Elections", "Politics", "Sports", "Economics", …
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub markets: Vec<KalshiMarket>,
+}
+
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct MarketsResponse {
     #[serde(default)]

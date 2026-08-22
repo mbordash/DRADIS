@@ -2008,8 +2008,12 @@ async fn get_deployment_region() -> Response {
     #[cfg(feature = "intl_clob")]
     let (region, types) = ("intl", vec!["politics", "sports", "crypto"]);
 
+    // Kalshi carries far more politics and sports than crypto — 4,626 and 815
+    // open markets respectively against a handful of crypto series. Listing only
+    // crypto hid the venue's entire brand from its own customers, and DRADIS has
+    // supported two vipers on those classes all along.
     #[cfg(all(not(feature = "intl_clob"), feature = "kalshi"))]
-    let (region, types) = ("kalshi", vec!["crypto"]);
+    let (region, types) = ("kalshi", vec!["politics", "sports", "crypto"]);
 
     #[cfg(all(not(feature = "intl_clob"), not(feature = "kalshi")))]
     let (region, types) = ("us", vec!["politics", "sports"]);
@@ -2120,7 +2124,25 @@ async fn get_available_markets(Query(q): Query<AvailableMarketsQuery>) -> Respon
     let market_type = q.market_type.to_lowercase();
     let min_liquidity = q.min_liquidity.unwrap_or(500.0);
     
-    // Parse expiry window to seconds (default varies by market type)
+    // Parse expiry window to seconds. The sensible default depends on the VENUE
+    // as much as the class, because the venues structure the same category
+    // completely differently.
+    //
+    // Polymarket sports are game-day markets, so 24h is right there. Kalshi
+    // sports are season futures — measured 2026-08-22, its 5,715 open sports
+    // markets had a median 6,896 hours to close and NOT ONE closed within seven
+    // days ("Will Philadelphia win the 2027 Pro Basketball Final" closes in
+    // 25,748h). Applying the Polymarket default to Kalshi filtered the entire
+    // category to nothing, which read as "no markets available" rather than as
+    // a filter doing its job.
+    #[cfg(all(not(feature = "intl_clob"), feature = "kalshi"))]
+    let default_expiry = match q.market_type.to_lowercase().as_str() {
+        "sports" => 63_072_000,   // 2y — championship futures
+        "politics" => 63_072_000, // 2y — election cycles run long
+        "crypto" => 2_592_000,    // 30d
+        _ => 604_800,
+    };
+    #[cfg(not(all(not(feature = "intl_clob"), feature = "kalshi")))]
     let default_expiry = match q.market_type.to_lowercase().as_str() {
         "sports" => 86400,     // 24h for sports (game-day markets)
         "crypto" => 2592000,   // 30d for crypto (price targets have longer horizons)
@@ -2135,6 +2157,10 @@ async fn get_available_markets(Query(q): Query<AvailableMarketsQuery>) -> Respon
         Some("7d") => 604800,
         Some("30d") => 2592000,
         Some("90d") => 7776000,
+        // Kalshi season futures and election cycles sit years out; without this
+        // the longest selectable window still hides them.
+        Some("1y") => 31_536_000,
+        Some("2y") => 63_072_000,
         _ => default_expiry,
     };
     
@@ -2521,9 +2547,6 @@ async fn fetch_markets_by_type(
     min_liquidity: f64,
 ) -> Vec<AvailableMarket> {
     use crate::venues::kalshi::KalshiVenue;
-    if market_type != "crypto" {
-        return Vec::new(); // Kalshi wing hunts crypto series only (for now)
-    }
     static KALSHI_VENUE: tokio::sync::OnceCell<Option<std::sync::Arc<KalshiVenue>>> =
         tokio::sync::OnceCell::const_new();
     let venue = KALSHI_VENUE.get_or_init(|| async {
@@ -2539,6 +2562,55 @@ async fn fetch_markets_by_type(
 
     let now = chrono::Utc::now();
     let mut out: Vec<AvailableMarket> = Vec::new();
+
+    // Politics and sports come from Kalshi's own category taxonomy rather than
+    // from series tickers: there are thousands of series (2,226 under Politics
+    // alone), so `/events?with_nested_markets=true` is the only viable sweep.
+    if market_type == "politics" || market_type == "sports" {
+        let cats_raw = if market_type == "politics" {
+            crate::config::KALSHI_POLITICS_CATEGORIES
+        } else {
+            crate::config::KALSHI_SPORTS_CATEGORIES
+        };
+        let cats: Vec<&str> = cats_raw.split(',').map(str::trim).filter(|c| !c.is_empty()).collect();
+        match venue.open_markets_for_categories(&cats).await {
+            Ok(found) => {
+                for (_cat, m) in found {
+                    let close = m.close_time_utc();
+                    let volume = crate::venues::kalshi::types::fp(&m.volume_fp)
+                        .and_then(|d| f64::try_from(d).ok())
+                        .unwrap_or(0.0);
+                    if volume < min_liquidity { continue; }
+                    if let Some(ct) = close {
+                        let secs_left = (ct - now).num_seconds();
+                        if secs_left < 300 || secs_left > max_expiry_secs { continue; }
+                    }
+                    let question = if m.yes_sub_title.is_empty() {
+                        m.title.clone()
+                    } else {
+                        format!("{} — {}", m.title, m.yes_sub_title)
+                    };
+                    out.push(AvailableMarket {
+                        condition_id: m.ticker.clone(),
+                        question,
+                        market_class: market_type.to_string(),
+                        end_date: close.map(|ct| ct.to_rfc3339()),
+                        liquidity: volume,
+                        tokens: AvailableMarketTokens {
+                            yes_id: crate::venues::kalshi::leg_id(&m.ticker, true),
+                            no_id: crate::venues::kalshi::leg_id(&m.ticker, false),
+                        },
+                    });
+                }
+            }
+            Err(e) => warn!("Kalshi {market_type} discovery failed: {e:#}"),
+        }
+        out.sort_by(|a, b| b.liquidity.partial_cmp(&a.liquidity).unwrap_or(std::cmp::Ordering::Equal));
+        out.truncate(50);
+        info!("📊 fetch_markets_by_type: found {} Kalshi markets for type '{}'", out.len(), market_type);
+        return out;
+    }
+
     for series in ["KXBTC15M", "KXBTCD", "KXETH15M", "KXETHD"] {
         let markets = match venue.markets_for_series(series).await {
             Ok(m) => m,
@@ -2638,14 +2710,19 @@ async fn deploy_squadron(
     info!("📥 POST /api/squadrons/deploy: mode={}, type={}", req.mode, req.market_type);
     
     // Validate market type against deployment region.
-    // Kalshi is crypto-only; US is politics/sports (its crypto wing is
-    // auto-managed by the trader loop, not deployable from the builder).
+    // US is politics/sports (its crypto wing is auto-managed by the trader loop,
+    // not deployable from the builder). Kalshi accepts all three: politics and
+    // sports are the bulk of that venue, and the two venue-agnostic vipers
+    // (Arbitrage, Maker) have always been mapped to those classes.
     #[cfg(all(not(feature = "intl_clob"), feature = "kalshi"))]
-    if req.market_type != "crypto" {
+    if !matches!(req.market_type.as_str(), "crypto" | "politics" | "sports") {
         return Json(DeploySquadronResponse {
             success: false,
             squadron_id: None,
-            error: Some("Only crypto markets are available in the Kalshi deployment".to_string()),
+            error: Some(format!(
+                "Unknown market type '{}' — Kalshi supports crypto, politics and sports",
+                req.market_type
+            )),
         }).into_response();
     }
     #[cfg(all(not(feature = "intl_clob"), not(feature = "kalshi")))]

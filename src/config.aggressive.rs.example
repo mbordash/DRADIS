@@ -1017,6 +1017,17 @@ pub const STOP_LOSS_COOLDOWN_SECS: u64 = 180;
 /// This prevents log floods and API hammering when FAK exits fail due to thin books.
 pub const EXIT_RETRY_COOLDOWN_SECS: u64 = 5;
 
+/// Kalshi categories that back DRADIS's `politics` market class.
+///
+/// Kalshi splits what DRADIS calls politics across two of its own categories,
+/// and the larger one is "Elections" — omitting it hides roughly 4,000 open
+/// markets. Verified against the live API 2026-08-22: Elections 3,982 open
+/// markets, Politics 644, Sports 815.
+pub const KALSHI_POLITICS_CATEGORIES: &str = "Elections,Politics";
+
+/// Kalshi categories that back DRADIS's `sports` market class.
+pub const KALSHI_SPORTS_CATEGORIES: &str = "Sports";
+
 /// How far the exit price implied by collateral movement may sit from the bid
 /// observed at exit, before the reconciliation is distrusted.
 ///
