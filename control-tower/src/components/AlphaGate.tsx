@@ -117,7 +117,21 @@ export default function AlphaGate({
             <ul className="text-xs text-red-200/90 space-y-1 list-disc pl-4">
               <li>DRADIS is <strong>trading automation software provided AS IS</strong>. It places live orders with real funds and can <strong>lose some or all of the capital</strong> you give it access to.</li>
               <li>Automated trading involves substantial risk of loss: software bugs, security issues, network latency, API rate limits, venue outages, slippage, or misconfiguration can produce unintended trades and <strong>total loss of deployed capital</strong>. Start in GHOST mode and with money you can afford to lose entirely.</li>
-              <li>Provided under the GPLv3 <strong>without warranty of any kind</strong>. Nothing here is financial advice.</li>
+              {/* The licence an operator holds depends on how they obtained
+                  DRADIS. A Marketplace subscription carries commercial terms —
+                  telling those customers they hold an AGPL grant is simply
+                  wrong, and it was naming GPLv3 rather than AGPLv3 besides. */}
+              {edition === 'marketplace' ? (
+                <li>
+                  Licensed under the commercial terms of your AWS Marketplace subscription,{' '}
+                  <strong>without warranty of any kind</strong>. Nothing here is financial advice.
+                </li>
+              ) : (
+                <li>
+                  Provided under the <strong>AGPLv3</strong>, without warranty of any kind.
+                  Nothing here is financial advice.
+                </li>
+              )}
             </ul>
           </div>
 
