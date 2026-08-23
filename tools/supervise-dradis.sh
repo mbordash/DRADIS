@@ -44,6 +44,24 @@ fi
 echo "🛡️  Supervisor started (venue=$VENUE instance=$INSTANCE port=$API_PORT bin=$BIN pid=$$)" >> "$LOG"
 
 while true; do
+    # Re-read .env before every launch.
+    #
+    # start-local.sh sources .env once with `set -a`, so the engine inherits
+    # those values — and dotenv does NOT override an existing environment
+    # variable. An edit to .env therefore had no effect on restart: the stale
+    # exported value won, silently. Observed 2026-08-23 with
+    # ENABLE_LLM_ADVISOR, where flipping it to true and restarting the engine
+    # left the advisor switched off with nothing in the log to say why.
+    #
+    # Sourcing here means a restart picks up the file, which is what an operator
+    # editing .env and restarting expects.
+    if [ -f .env ]; then
+        set -a
+        # shellcheck disable=SC1091
+        . ./.env
+        set +a
+    fi
+
     case "$VENUE" in
         us)     ASSETS=${ASSETS:-us}     API_PORT=$API_PORT RUST_LOG=${RUST_LOG:-info,dradis=info} "./$BIN" >> "$LOG" 2>&1 ;;
         kalshi) ASSETS=${ASSETS:-kalshi} API_PORT=$API_PORT RUST_LOG=${RUST_LOG:-info,dradis=info} "./$BIN" >> "$LOG" 2>&1 ;;

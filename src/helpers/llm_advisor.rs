@@ -950,8 +950,12 @@ async fn call_anthropic(
 pub async fn run_llm_advisor_loop(
     tg_token: String,
     tg_chat_id: String,
-    session_pnl: Arc<Mutex<rust_decimal::Decimal>>,
-    starting_collateral: Arc<Mutex<rust_decimal::Decimal>>,
+    // Live session handles, when the venue keeps a SessionState. Only the intl
+    // CLOB does; Kalshi and Polymarket US track P&L inside their own trade loops
+    // and publish it to `pnl_history` instead, so they pass None and the loop
+    // reads the latest snapshot from the database each cycle.
+    session_pnl: Option<Arc<Mutex<rust_decimal::Decimal>>>,
+    starting_collateral: Option<Arc<Mutex<rust_decimal::Decimal>>>,
     mut config_rx: tokio::sync::watch::Receiver<Arc<DynamicConfig>>,
     config_tx: Arc<tokio::sync::watch::Sender<Arc<DynamicConfig>>>,
 ) {
@@ -1136,8 +1140,28 @@ pub async fn run_llm_advisor_loop(
                 None
             };
 
-        let current_pnl = *session_pnl.lock().await;
-        let collateral = *starting_collateral.lock().await;
+        // Session P&L and collateral, from the live handles where they exist and
+        // from the newest `pnl_history` row otherwise. Both venues without a
+        // SessionState already record that snapshot every dashboard sync, so
+        // this is the same number their Control Tower shows — not a stand-in.
+        let (current_pnl, collateral) = match (&session_pnl, &starting_collateral) {
+            (Some(p), Some(c)) => (*p.lock().await, *c.lock().await),
+            _ => {
+                let latest = db::get_pnl_history(&primary_pool, 1).await;
+                match latest.first() {
+                    Some(row) => (
+                        row.session_pnl.parse().unwrap_or(rust_decimal::Decimal::ZERO),
+                        row.collateral.parse().unwrap_or(rust_decimal::Decimal::ZERO),
+                    ),
+                    // No snapshot yet — the venue has not completed a dashboard
+                    // sync. Skip rather than reason about a portfolio of zero.
+                    None => {
+                        info!("🤖 LLM Advisor: no P&L snapshot yet — skipping this cycle");
+                        continue;
+                    }
+                }
+            }
+        };
         // Kept only to drain the watch channel; the CONFIG the advisor reasons
         // about is now loaded per squadron below. The global record is not read.
         let _ = config_rx.borrow_and_update();

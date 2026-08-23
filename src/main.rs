@@ -413,6 +413,36 @@ async fn run() -> Result<()> {
     // can hand it to the Control Tower API server.
     let cag = Cag::new();
 
+    // ── LLM Advisor — every venue ────────────────────────────────────────────
+    //
+    // Spawned here rather than inside a venue block. It used to live in the
+    // intl-only section, tied to that venue's SessionState, so Kalshi and
+    // Polymarket US never started it at all: enabling ENABLE_LLM_ADVISOR there
+    // changed nothing and the log stayed silent about why. That is the third
+    // shared subsystem found inside a venue gate today, after the deployment
+    // queue processor and the status heartbeat.
+    //
+    // The intl session handles are attached below where that venue sets them up;
+    // the other venues pass None and the loop reads session P&L from the
+    // `pnl_history` snapshot each of their traders already records.
+    {
+        let advisor_cfg_rx = config_rx.clone();
+        let advisor_cfg_tx = Arc::clone(&config_tx);
+        tokio::spawn(async move {
+            // Give the venue a moment to initialise its shard and write a first
+            // dashboard snapshot; the loop skips cycles until one exists anyway.
+            tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+            dradis::helpers::llm_advisor::run_llm_advisor_loop(
+                env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
+                env::var("TELEGRAM_CHAT_ID").unwrap_or_default(),
+                None,
+                None,
+                advisor_cfg_rx,
+                advisor_cfg_tx,
+            ).await;
+        });
+    }
+
     // ── US retail: Control-Tower-only mode ───────────────────────────────────
     // The custodial US venue's trading bootstrap (auth, market discovery,
     // execution) is implemented in Step 3b.  For now we bring up the API server
@@ -914,20 +944,6 @@ async fn run() -> Result<()> {
         loop_tasks.push(handle);
     }
 
-    // ── Spawn global LLM Advisor (reads all asset DBs, writes to primary) ────
-    // Spawned once after all assets are initialised so it can iterate over
-    // db::available_assets().  Uses the first asset's SessionState as the P&L
-    // reference for combined portfolio analysis.
-    if let Some(ref session) = primary_session {
-        tokio::spawn(dradis::helpers::llm_advisor::run_llm_advisor_loop(
-            env::var("TELEGRAM_BOT_TOKEN").unwrap_or_default(),
-            env::var("TELEGRAM_CHAT_ID").unwrap_or_default(),
-            session.total_pnl.clone(),
-            session.starting_collateral.clone(),
-            config_rx.clone(),
-            Arc::clone(&config_tx),
-        ));
-    }
 
     // ── Admiral Adama infrastructure for user-deployed squadrons ─────────────
     // Bundles ALL trading handles needed to spawn real squadrons. The processor
