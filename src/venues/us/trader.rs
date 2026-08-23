@@ -442,7 +442,7 @@ async fn run_wing(
         }
 
         // ── Select a tradeable market (retry until one matches or cancelled) ──
-        let pair = match select_market(venue, filter, cancel, process_heartbeat_secs, wing).await {
+        let selection = match select_market(venue, filter, cancel, process_heartbeat_secs, wing).await {
             Some(p) => p,
             None => return, // cancelled during discovery
         };
@@ -463,7 +463,7 @@ async fn run_wing(
             tennis_rx,
             &market_cancel,
             wing,
-            pair,
+            selection,
         ).await;
         trading_active.store(false, AtomicOrdering::Relaxed);
 
@@ -491,13 +491,37 @@ async fn run_wing(
 /// Discover markets and pick one to trade, skipping any already closed or closing
 /// within [`MIN_TIME_TO_CLOSE_SECS`]. Retries until a market matches or `cancel`
 /// fires. Returns `None` only on cancellation.
+/// Longest time-to-close still treated as a short-cadence ("hourly") market.
+/// Venue structure rather than a tuning parameter, which is why it is a constant
+/// here and not a Control Tower knob — it describes how Polymarket US lists
+/// crypto markets, not a preference about them. Mirrors the Kalshi trader's
+/// MAX_CLOSE_SHORT_SECS so the two venues classify the same way.
+const MAX_CLOSE_SHORT_SECS: i64 = 7_200; // 2h
+/// Longest time-to-close considered for the secondary maker market.
+const MAX_CLOSE_MAKER_SECS: i64 = 129_600; // 36h
+
+/// The pair of markets a wing trades at once.
+///
+/// US previously selected a single market and then aliased `maker_market` to it,
+/// so Maker and FairValue — both of which declare `venue() == "Window/Daily"` —
+/// were quoting on an hourly market they were never designed for: an hour rather
+/// than a day for a resting quote to fill, and every rotation eating the
+/// inventory. Kalshi and the intl CLOB both split these; US now does too.
+struct UsMarketSelection {
+    primary: super::markets::UsMarketPair,
+    /// Longer-dated market on the same underlying for passive quotes. None for
+    /// the general wing, whose event markets have no hourly/daily pair, and for
+    /// any underlying that happens to list only one cadence.
+    maker: Option<super::markets::UsMarketPair>,
+}
+
 async fn select_market(
     venue: &Arc<UsRetailVenue>,
     filter: &Option<String>,
     cancel: &CancellationToken,
     process_heartbeat_secs: &AtomicU64,
     wing: Wing,
-) -> Option<super::markets::UsMarketPair> {
+) -> Option<UsMarketSelection> {
     loop {
         if cancel.is_cancelled() {
             return None;
@@ -551,22 +575,66 @@ async fn select_market(
                         "US trader: {total_pairs} pair(s) found but all closed or closing within {MIN_TIME_TO_CLOSE_SECS}s — retrying"
                     );
                 } else {
-                    let selected = match filter {
-                        Some(f) => {
-                            let fl = f.to_lowercase();
-                            tradeable.into_iter().find(|m| {
-                                m.slug.to_lowercase().contains(&fl)
-                                    || m.question.to_lowercase().contains(&fl)
-                            })
-                        }
-                        None => tradeable.into_iter().next(),
+                    // Split by cadence the way Kalshi does: short-dated leads,
+                    // longer-dated backs it for passive quotes.
+                    let now = Utc::now();
+                    let secs_to_close = |m: &super::markets::UsMarketPair| {
+                        m.close_time.map(|c| (c - now).num_seconds())
                     };
+                    let (short, long): (Vec<_>, Vec<_>) = tradeable.into_iter()
+                        .partition(|m| secs_to_close(m).is_some_and(|s| s <= MAX_CLOSE_SHORT_SECS));
+
+                    let apply_filter = |candidates: Vec<super::markets::UsMarketPair>| {
+                        match filter {
+                            Some(f) => {
+                                let fl = f.to_lowercase();
+                                candidates.into_iter().find(|m| {
+                                    m.slug.to_lowercase().contains(&fl)
+                                        || m.question.to_lowercase().contains(&fl)
+                                })
+                            }
+                            None => candidates.into_iter().next(),
+                        }
+                    };
+
+                    // Prefer a short-dated primary, but fall back to the longer
+                    // set rather than idling — that is what this did before the
+                    // split, and an always-open market has no close time at all.
+                    let selected = apply_filter(short).or_else(|| apply_filter(long.clone()));
+
                     if let Some(m) = selected {
+                        // Only the crypto wing has an hourly/daily pair to match
+                        // on; general-wing event markets do not, and pairing two
+                        // unrelated events would be worse than none.
+                        let maker = if wing == Wing::Crypto {
+                            let underlying = detect_underlying(&m);
+                            long.into_iter().find(|c| {
+                                c.slug != m.slug
+                                    && detect_underlying(c) == underlying
+                                    && secs_to_close(c).is_some_and(|s| s <= MAX_CLOSE_MAKER_SECS)
+                                    && secs_to_close(c) > secs_to_close(&m)
+                            })
+                        } else {
+                            None
+                        };
+
                         info!(
-                            "🎯 US arb target: \"{}\" [YES={} / NO={}] close={:?}",
+                            "🎯 US primary: \"{}\" [YES={} / NO={}] close={:?}",
                             m.question, m.long, m.short, m.close_time
                         );
-                        return Some(m);
+                        match &maker {
+                            Some(mk) => info!(
+                                "🎯 US maker:   \"{}\" close={:?}",
+                                mk.question, mk.close_time,
+                            ),
+                            // Worth saying out loud: Maker and FairValue fall back
+                            // to the primary, which is not what they are tuned for.
+                            None if wing == Wing::Crypto => info!(
+                                "🎯 US maker:   none found for this underlying — passive quotes will use the primary"
+                            ),
+                            None => {}
+                        }
+                        return Some(UsMarketSelection { primary: m, maker });
                     }
                     warn!("US trader: no active market matched filter {filter:?} — retrying");
                 }
@@ -594,9 +662,11 @@ async fn trade_one_market(
     tennis_rx: &watch::Receiver<TennisSnapshot>,
     cancel: &CancellationToken,
     wing: Wing,
-    pair: super::markets::UsMarketPair,
+    selection: UsMarketSelection,
 ) -> MarketOutcome {
     let asset = wing.asset();
+    let pair = selection.primary;
+    let maker_pair = selection.maker;
 
     // ── Crypto wing: Raptor intelligence + strike price ──────────────────────
     // Spawn (or reuse) the live Raptor stack for the market's underlying and
@@ -683,6 +753,20 @@ async fn trade_one_market(
         yes_fee_bps: 0,
         no_fee_bps: 0,
     };
+    // Secondary market the Window/Daily vipers quote on. Its own close time
+    // matters: it is typically hours later than the primary's, which is the
+    // whole reason a resting quote has a chance of filling there.
+    let maker_cfg = maker_pair.as_ref().map(|mk| MarketConfig {
+        yes_token: mk.long.clone(),
+        no_token: mk.short.clone(),
+        market_name: mk.question.clone(),
+        market_close_time: mk.close_time,
+        strike_price,
+        is_neg_risk: false,
+        condition_id: String::new(),
+        yes_fee_bps: 0,
+        no_fee_bps: 0,
+    });
     let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
     // Shared, venue-neutral order lifecycle engine (Option C). Drives fill-confirm,
     // stale-cancel, and naked-leg flatten off the `Execution` trait surface.
@@ -705,7 +789,17 @@ async fn trade_one_market(
     let (long_tx, long_rx) = watch::channel(default_feed);
     let (short_tx, short_rx) = watch::channel(default_feed);
     ws::spawn_market_feed(ws_url.clone(), pair.long.as_str().to_string(), ws_auth.clone(), long_tx, cancel.clone());
-    ws::spawn_market_feed(ws_url, pair.short.as_str().to_string(), ws_auth, short_tx, cancel.clone());
+    ws::spawn_market_feed(ws_url.clone(), pair.short.as_str().to_string(), ws_auth.clone(), short_tx, cancel.clone());
+
+    // The secondary market needs its own book: Maker and FairValue quote on it,
+    // and a snapshot built from the primary's feed would price the wrong market.
+    let maker_feeds = maker_pair.as_ref().map(|mk| {
+        let (mlong_tx, mlong_rx) = watch::channel(default_feed);
+        let (mshort_tx, mshort_rx) = watch::channel(default_feed);
+        ws::spawn_market_feed(ws_url.clone(), mk.long.as_str().to_string(), ws_auth.clone(), mlong_tx, cancel.clone());
+        ws::spawn_market_feed(ws_url.clone(), mk.short.as_str().to_string(), ws_auth.clone(), mshort_tx, cancel.clone());
+        (mlong_rx, mshort_rx)
+    });
 
     // ── Dashboard + strategy-context state ───────────────────────────────────
     let pool = db::pool_for(asset);
@@ -833,7 +927,19 @@ async fn trade_one_market(
         match market_cfg.phase(Utc::now(), MARKET_RTB_WINDOW_SECS) {
             MarketPhase::Closed => {
                 info!("🏁 US market \"{}\" reached close — standing down to rotate", market_cfg.market_name);
+                // cancel_all cancels RESTING ORDERS; it does not sell inventory.
+                // Now that this wing trades a secondary market whose close is
+                // hours later than the primary's, tearing down here would leave
+                // any position on it unmanaged — no stop, no take-profit — until
+                // it expired. That is the shape of the -$3.09 loss on Kalshi
+                // (2026-08-10); giving US the same market pair would have given
+                // it the same bug.
                 lifecycle.cancel_all(venue.as_ref()).await;
+                flatten_before_stand_down(
+                    venue, &pool, &scope, &positions, &lifecycle,
+                    &market_cfg, maker_cfg.as_ref(), maker_feeds.as_ref(),
+                    raptors.as_ref(), starting, dyn_cfg.ghost_mode,
+                ).await;
                 cag.update_state(&squadron_id, SquadronState::StoodDown);
                 publish_us_raptor_health(raptor_health_tx, asset, false);
                 return MarketOutcome::Closed;
@@ -867,6 +973,22 @@ async fn trade_one_market(
         // (arbitrage/maker) don't read them.
         let snapshot = build_snapshot(&long_rx, &short_rx, raptors.as_ref(), &market_cfg);
 
+        // Maker snapshot from the secondary market's own feed. Falls back to the
+        // primary when there is no secondary, or when its book has not arrived
+        // yet — the same fallback Kalshi uses, so a viper always has something
+        // priced rather than a zeroed book that reads as maximally adverse.
+        let (mk_market, mk_snapshot) = match (&maker_cfg, &maker_feeds) {
+            (Some(mcfg), Some((ml, ms))) => {
+                let snap = build_snapshot(ml, ms, raptors.as_ref(), mcfg);
+                if snap.yes_ask.is_zero() && snap.no_ask.is_zero() {
+                    (Some(market_cfg.clone()), Some(snapshot.clone()))
+                } else {
+                    (Some(mcfg.clone()), Some(snap))
+                }
+            }
+            _ => (Some(market_cfg.clone()), Some(snapshot.clone())),
+        };
+
         let ctx = StrategyContext {
             market: market_cfg.clone(),
             snapshot: snapshot.clone(),
@@ -880,8 +1002,8 @@ async fn trade_one_market(
             // to run without a maker market (intl orphan-loss guard), so feed
             // it the same market/snapshot rather than None, which left it
             // permanently idle ("no daily/window venue available", 2026-08-08).
-            maker_market: Some(market_cfg.clone()),
-            maker_snapshot: Some(snapshot),
+            maker_market: mk_market,
+            maker_snapshot: mk_snapshot,
             available_collateral,
             dynamic_config: dyn_cfg.clone(),
             arb_market_lockouts: None,
@@ -954,6 +1076,127 @@ fn strategy_name_to_kind(name: &str) -> &'static str {
         "TrendReversalStrategy" => "trendcapture",
         "TrendCaptureStrategy" => "trendcapture", // legacy alias (pre-rename positions)
         _ => "",
+    }
+}
+
+#[cfg(test)]
+mod market_pairing_tests {
+    use super::{MAX_CLOSE_SHORT_SECS, MAX_CLOSE_MAKER_SECS};
+
+    /// The two cadences must not overlap or the same market could be picked as
+    /// both primary and maker, which is the self-reference this change exists to
+    /// remove.
+    #[test]
+    fn the_cadence_bands_are_ordered_and_disjoint() {
+        assert!(MAX_CLOSE_SHORT_SECS < MAX_CLOSE_MAKER_SECS);
+    }
+
+    /// A short-cadence market is roughly an hour out and a maker market roughly a
+    /// day: the point of the split is that a resting quote gets meaningfully more
+    /// time to fill on the second than the first.
+    #[test]
+    fn a_maker_market_lives_far_longer_than_a_primary() {
+        assert!(MAX_CLOSE_SHORT_SECS >= 3_600, "an hourly market must fit inside the short band");
+        assert!(
+            MAX_CLOSE_MAKER_SECS >= MAX_CLOSE_SHORT_SECS * 12,
+            "the maker band must be worth splitting out",
+        );
+    }
+
+    /// Matches the Kalshi trader's bands, so the two venues classify the same
+    /// market shape the same way — the consistency this change is for.
+    #[test]
+    fn the_bands_match_kalshi() {
+        assert_eq!(MAX_CLOSE_SHORT_SECS, 7_200);
+        assert_eq!(MAX_CLOSE_MAKER_SECS, 129_600);
+    }
+}
+
+/// Sell any inventory still tradeable before the wing stands down.
+///
+/// The primary has closed and anything held on it can only settle, which is what
+/// a binary is meant to do. Inventory on the SECONDARY market is the problem:
+/// its close is typically hours later, this wing was its only manager, and
+/// walking away leaves it with no stop and no take-profit until expiry.
+///
+/// Exits are synthesised at the live bid for the leg actually held — the same
+/// FAK-at-the-bid path a stop takes. A leg whose book has emptied is left to
+/// settle and logged, since selling into an empty book is worse than holding to
+/// resolution.
+#[allow(clippy::too_many_arguments)]
+async fn flatten_before_stand_down(
+    venue: &Arc<UsRetailVenue>,
+    pool: &Option<sqlx::SqlitePool>,
+    scope: &TradeScope,
+    positions: &Arc<Mutex<PositionMap>>,
+    lifecycle: &Arc<OrderLifecycle>,
+    primary_cfg: &MarketConfig,
+    maker_cfg: Option<&MarketConfig>,
+    maker_feeds: Option<&(watch::Receiver<PriceState>, watch::Receiver<PriceState>)>,
+    raptors: Option<&CryptoRaptors>,
+    starting: Decimal,
+    ghost: bool,
+) {
+    let held: Vec<(String, MarketId, Decimal)> = {
+        let map = positions.lock().await;
+        map.iter()
+            .filter(|(_, p)| p.shares > dec!(0))
+            .map(|((strategy, token), p)| (strategy.clone(), token.clone(), p.shares))
+            .collect()
+    };
+    if held.is_empty() {
+        return;
+    }
+
+    let (Some(mcfg), Some((mlong, mshort))) = (maker_cfg, maker_feeds) else {
+        warn!(
+            "🏁 Standing down holding {} position(s) with no open secondary market — leaving them to settle",
+            held.len(),
+        );
+        return;
+    };
+    let snap = build_snapshot(mlong, mshort, raptors, mcfg);
+
+    for (strategy, token, shares) in held {
+        let bid = if token == mcfg.yes_token {
+            snap.yes_bid
+        } else if token == mcfg.no_token {
+            snap.no_bid
+        } else {
+            info!(
+                "🏁 [{strategy}] {shares} shares on \"{}\" are on the closed primary — leaving to settle",
+                primary_cfg.market_name,
+            );
+            continue;
+        };
+        if bid <= dec!(0) {
+            warn!(
+                "🏁 [{strategy}] {shares} shares on \"{}\" have no bid — leaving to settle rather than dumping into an empty book",
+                mcfg.market_name,
+            );
+            continue;
+        }
+        warn!(
+            "🏁 [{strategy}] flattening {shares} shares on \"{}\" at ${bid:.2} before stand-down",
+            mcfg.market_name,
+        );
+        let signal = StrategySignal::Exit {
+            params: OrderParams {
+                token_id: token.clone(),
+                price: bid,
+                shares,
+                fee_bps: 0,
+                is_neg_risk: false,
+                market_name: mcfg.market_name.clone(),
+                condition_id: String::new(),
+                order_type: crate::venues::core::TimeInForce::Fak,
+                post_only: false,
+                ghost_mode: ghost,
+            },
+            reason: "SquadronStandDown".to_string(),
+            exit_pair: false,
+        };
+        dispatch_signal(venue.as_ref(), pool, positions, lifecycle, scope, &strategy, &signal, starting).await;
     }
 }
 
