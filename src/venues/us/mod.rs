@@ -305,12 +305,34 @@ impl UsRetailVenue {
     /// filter on `/v1/markets`, so a second fetch would return random sports
     /// markets (2026-08-08: 200 raw, "World Series Champion", zero crypto).
     pub async fn discover_crypto_markets_via_search(&self) -> Result<Vec<markets::UsMarketPair>> {
-        const QUERIES: &[&str] = &["bitcoin", "ethereum", "solana", "xrp", "crypto"];
+        self.discover_via_search(&["bitcoin", "ethereum", "solana", "xrp", "crypto"], "crypto").await
+    }
+
+    /// Politics markets, via the same search path and for the same reason.
+    ///
+    /// `/v1/markets` is sports-dominated — a live fetch returned 60 pairs with
+    /// not one in the politics domain, while `/v1/search?query=politics` returns
+    /// 133 open markets with real books. The politics wing found nothing at all
+    /// until it stopped relying on the default listing.
+    pub async fn discover_politics_markets_via_search(&self) -> Result<Vec<markets::UsMarketPair>> {
+        self.discover_via_search(
+            &["politics", "election", "senate", "president", "congress"],
+            "politics",
+        ).await
+    }
+
+    /// Shared search-based discovery. `label` only names the wing in logs.
+    async fn discover_via_search(
+        &self,
+        queries: &[&str],
+        label: &str,
+    ) -> Result<Vec<markets::UsMarketPair>> {
+
         let mut event_count = 0usize;
         let mut all_markets: Vec<types::UsMarket> = Vec::new();
         let mut seen_slugs: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        for q in QUERIES {
+        for q in queries {
             // /v1/search is public and lives on the gateway host (no auth —
             // it 404s on the authenticated api host).
             let url = format!("{GATEWAY_BASE_URL}/v1/search?query={q}&status=active&limit=100");
@@ -361,13 +383,13 @@ impl UsRetailVenue {
                 }
                 event_count += 1;
             }
-            info!("US crypto search '{q}': {hits} events, {added} new markets");
+            info!("US {label} search '{q}': {hits} events, {added} new markets");
         }
 
         let raw_total = all_markets.len();
         let pairs = markets::pair_markets(all_markets);
         info!(
-            "US crypto search discovery: {event_count} active event(s) → {raw_total} raw markets → {} tradeable pairs",
+            "US {label} search discovery: {event_count} active event(s) → {raw_total} raw markets → {} tradeable pairs",
             pairs.len()
         );
         Ok(pairs)

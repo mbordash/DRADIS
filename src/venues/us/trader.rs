@@ -186,7 +186,12 @@ impl Wing {
         venue: &UsRetailVenue,
     ) -> anyhow::Result<Vec<super::markets::UsMarketPair>> {
         match self {
-            Wing::Sports | Wing::Politics => venue.discover_binary_markets().await,
+            // Politics needs the search path for the same reason crypto does:
+            // /v1/markets is sports-dominated and returned 60 pairs with not one
+            // politics market, while /v1/search?query=politics returns 133 open
+            // ones with real books.
+            Wing::Politics => venue.discover_politics_markets_via_search().await,
+            Wing::Sports => venue.discover_binary_markets().await,
             Wing::Crypto => venue.discover_crypto_markets_via_search().await,
         }
     }
