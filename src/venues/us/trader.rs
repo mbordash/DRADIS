@@ -107,8 +107,15 @@ const MARKET_RESCAN_SECS: u64 = 300; // 5 minutes
 /// Rotate to a new market only when it has at least this much more volume than
 /// the current one. Prevents thrashing between near-equal markets.
 const ROTATION_VOLUME_THRESHOLD: f64 = 10_000.0;
-/// SQLite shard key for the US general wing (storage identity, not an asset).
-pub const US_ASSET: &str = "us";
+/// Shard and squadron identity for the sports wing.
+///
+/// Renamed from a bare "us" so all three wings read consistently in the
+/// Control Tower — the panel tags squadrons by asset, and "US" beside
+/// "US-CRYPTO" and "US-POLITICS" looked like a different kind of thing rather
+/// than a sibling. Done before launch deliberately: the squadron id derives
+/// from this, and the id is the persistence key for operator config, so
+/// changing it later would need a migration rather than a rename.
+pub const US_ASSET: &str = "us-sports";
 /// Runtime venue identity persisted on every trade and entry row. Both US
 /// wings share one venue; they differ by shard and market class.
 pub const US_VENUE: &str = "polymarket-us";
@@ -117,10 +124,6 @@ pub const US_VENUE: &str = "polymarket-us";
 pub const US_CRYPTO_ASSET: &str = "us-crypto";
 
 /// Shard for the politics wing.
-///
-/// The sports wing keeps `US_ASSET` ("us") so its existing squadron config and
-/// trade history survive the split — the squadron id is the persistence key, and
-/// renaming it would orphan every operator edit.
 pub const US_POLITICS_ASSET: &str = "us-politics";
 
 /// Which market domain a US trading wing hunts. The venue runs one wing per
@@ -1938,6 +1941,11 @@ fn register_us_squadron(
         Wing::Politics => "US Politics Arb",
         Wing::Crypto => "US Crypto Squadron",
     };
+    // Anything still addressing the sports wing by its former bare "us" — a
+    // saved dashboard link, a stale client — resolves to the renamed shard
+    // rather than 500ing on a missing pool.
+    db::alias_pool("us", US_ASSET);
+
     let squadron = Squadron::new_with_category(
         CryptoAsset::Custom(wing.asset().to_uppercase()),
         SquadronConfig::arb_wing(name),

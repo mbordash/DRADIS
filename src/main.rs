@@ -484,7 +484,7 @@ async fn run() -> Result<()> {
                 // the "us" asset selector (positions, portfolio P&L).
                 if let Err(e) = dradis::helpers::db::init_shard(
                     dradis::venues::us::trader::US_ASSET,
-                    "logs/us-dradis.db",
+                    "logs/us-sports-dradis.db",
                     dradis::venues::us::trader::US_VENUE,
                 ).await {
                     tracing::warn!("⚠️ US DB pool init failed (dashboard disabled): {e}");
