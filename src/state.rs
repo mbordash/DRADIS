@@ -295,6 +295,29 @@ pub struct MarketSnapshot {
     pub no_ask: Decimal,
     /// NO token ask-side depth (shares available at best ask)
     pub no_ask_depth: Decimal,
+
+    // ── Whole-book depth ────────────────────────────────────────────────────
+    //
+    // The four fields above are the TOUCH — size resting at the best price only.
+    // On a thin book that is one or two contracts, which makes any ratio built
+    // from them extremely noisy: measured on Kalshi, top-of-book imbalance
+    // disagreed in sign with the whole-book ratio 41% of the time, and the
+    // Maker's taker-sweep detector read "99% of bid depth drained" when a single
+    // contract was lifted.
+    //
+    // These carry the sum across every published level so a strategy can choose.
+    // Nothing reads them yet — they are plumbed first, deliberately without
+    // behavioural change, so the two series can be compared on live books before
+    // any threshold moves.
+    /// Total size across every published YES bid level.
+    pub yes_bid_depth_total: Decimal,
+    /// Total size across every published YES ask level.
+    pub yes_ask_depth_total: Decimal,
+    /// Total size across every published NO bid level.
+    pub no_bid_depth_total: Decimal,
+    /// Total size across every published NO ask level.
+    pub no_ask_depth_total: Decimal,
+
     /// Current oracle price from Binance
     pub oracle_price: Decimal,
     /// Price velocity over the primary window (MOMENTUM_WINDOW_SECS = 5s)

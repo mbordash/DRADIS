@@ -79,6 +79,14 @@ impl MarketDataBroadcaster {
             no_bid_depth,
             no_ask,
             no_ask_depth,
+            // This constructor is used where only touch data is available; the
+            // whole-book totals fall back to the touch rather than to zero, so a
+            // ratio built from them degrades to the touch ratio instead of
+            // reading as an empty book.
+            yes_bid_depth_total: yes_bid_depth,
+            yes_ask_depth_total: yes_ask_depth,
+            no_bid_depth_total: no_bid_depth,
+            no_ask_depth_total: no_ask_depth,
             oracle_price,
             velocity,
             velocity_1s,

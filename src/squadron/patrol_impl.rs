@@ -652,13 +652,13 @@ impl Squadron {
                     crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::SignalEval);
 
                     // Get hourly market snapshot
-                    let (hourly_yb, hourly_ybd, hourly_ya, hourly_yad, hourly_yes_ws_ts, _hourly_ybd_all, _hourly_yad_all) = *yes_price_rx.borrow();
-                    let (hourly_nb, hourly_nbd, hourly_na, hourly_nad, hourly_no_ws_ts, _hourly_nbd_all, _hourly_nad_all) = *no_price_rx.borrow();
+                    let (hourly_yb, hourly_ybd, hourly_ya, hourly_yad, hourly_yes_ws_ts, hourly_ybd_all, hourly_yad_all) = *yes_price_rx.borrow();
+                    let (hourly_nb, hourly_nbd, hourly_na, hourly_nad, hourly_no_ws_ts, hourly_nbd_all, hourly_nad_all) = *no_price_rx.borrow();
                     let hourly_snap_ts = hourly_yes_ws_ts.min(hourly_no_ws_ts);
 
                     // Get maker market snapshot if available
-                    let (maker_yb, maker_ybd, maker_ya, maker_yad, maker_yes_ws_ts, _maker_ybd_all, _maker_yad_all) = maker_yes_price_rx.as_ref().map_or((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now(), dec!(0), dec!(0)), |rx| *rx.borrow());
-                    let (maker_nb, maker_nbd, maker_na, maker_nad, maker_no_ws_ts, _maker_nbd_all, _maker_nad_all) = maker_no_price_rx.as_ref().map_or((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now(), dec!(0), dec!(0)), |rx| *rx.borrow());
+                    let (maker_yb, maker_ybd, maker_ya, maker_yad, maker_yes_ws_ts, maker_ybd_all, maker_yad_all) = maker_yes_price_rx.as_ref().map_or((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now(), dec!(0), dec!(0)), |rx| *rx.borrow());
+                    let (maker_nb, maker_nbd, maker_na, maker_nad, maker_no_ws_ts, maker_nbd_all, maker_nad_all) = maker_no_price_rx.as_ref().map_or((dec!(0), dec!(0), dec!(1), dec!(0), Utc::now(), dec!(0), dec!(0)), |rx| *rx.borrow());
                     let maker_snap_ts = maker_yes_ws_ts.min(maker_no_ws_ts);
 
                     // Only proceed if at least one market has valid prices
@@ -734,6 +734,8 @@ impl Squadron {
                         snapshot: MarketSnapshot {
                             yes_bid: hourly_yb, yes_bid_depth: hourly_ybd, yes_ask: hourly_ya, yes_ask_depth: hourly_yad,
                             no_bid: hourly_nb, no_bid_depth: hourly_nbd, no_ask: hourly_na, no_ask_depth: hourly_nad,
+                            yes_bid_depth_total: hourly_ybd_all, yes_ask_depth_total: hourly_yad_all,
+                            no_bid_depth_total: hourly_nbd_all, no_ask_depth_total: hourly_nad_all,
                             oracle_price: *oracle_rx.borrow(),
                             velocity: velocity_rx.borrow().0,
                             velocity_1s: velocity_rx.borrow().1,
@@ -765,6 +767,8 @@ impl Squadron {
                         maker_snapshot: maker_market_config.as_ref().map(|mk| MarketSnapshot {
                             yes_bid: maker_yb, yes_bid_depth: maker_ybd, yes_ask: maker_ya, yes_ask_depth: maker_yad,
                             no_bid: maker_nb, no_bid_depth: maker_nbd, no_ask: maker_na, no_ask_depth: maker_nad,
+                            yes_bid_depth_total: maker_ybd_all, yes_ask_depth_total: maker_yad_all,
+                            no_bid_depth_total: maker_nbd_all, no_ask_depth_total: maker_nad_all,
                             oracle_price: *oracle_rx.borrow(), velocity: velocity_rx.borrow().0, velocity_1s: velocity_rx.borrow().1, acceleration: velocity_rx.borrow().2,
                             funding_rate: *funding_rx.borrow(), oracle_drift_60m: drift_rx.borrow().0, oracle_drift_10m: drift_rx.borrow().1,
                             hist_vol: drift_rx.borrow().2,

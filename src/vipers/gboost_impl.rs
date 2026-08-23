@@ -2148,6 +2148,10 @@ mod tests {
             yes_ask: dec!(0.52), yes_ask_depth: dec!(150),
             no_bid:  dec!(0.48), no_bid_depth:  dec!(180),
             no_ask:  dec!(0.50), no_ask_depth:  dec!(160),
+            // Deeper than the touch, as a real book is — a fixture where the two
+            // are equal would hide any bug that confuses them.
+            yes_bid_depth_total: dec!(1200), yes_ask_depth_total: dec!(900),
+            no_bid_depth_total:  dec!(1100), no_ask_depth_total:  dec!(950),
             oracle_price: dec!(95000),
             velocity: dec!(50), velocity_1s: dec!(10), acceleration: dec!(5),
             funding_rate: dec!(0.0001), oracle_drift_60m: dec!(100),

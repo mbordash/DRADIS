@@ -966,6 +966,8 @@ fn build_snapshot(
     let mut snap = MarketSnapshot {
         yes_bid: yb, yes_bid_depth: ybd, yes_ask: ya, yes_ask_depth: yad,
         no_bid:  nb, no_bid_depth:  nbd, no_ask:  na, no_ask_depth:  nad,
+        yes_bid_depth_total: yes_state.5, yes_ask_depth_total: yes_state.6,
+        no_bid_depth_total:  no_state.5,  no_ask_depth_total:  no_state.6,
         oracle_price: dec!(0), velocity: dec!(0), velocity_1s: dec!(0), acceleration: dec!(0),
         funding_rate: dec!(0), oracle_drift_60m: dec!(0), oracle_drift_10m: dec!(0),
         hist_vol: dec!(0),
