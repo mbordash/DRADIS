@@ -87,10 +87,9 @@ const SUBSCRIPTION_MARKET_DATA: &str = "SUBSCRIPTION_TYPE_MARKET_DATA";
 
 /// Order lifecycle / fills on the private stream.
 ///
-/// `SUBSCRIPTION_TYPE_ORDER`, not the `..._ORDER_UPDATE` this originally
-/// guessed — corrected against the documented set now enumerated in the
-/// polymarket_us SDK (MARKET_DATA, MARKET_DATA_LITE, TRADE, ORDER, POSITION,
-/// ACCOUNT_BALANCE).
+/// `SUBSCRIPTION_TYPE_ORDER` — confirmed against the venue's documentation, not
+/// the `..._ORDER_UPDATE` this originally guessed. The documented set is
+/// MARKET_DATA, MARKET_DATA_LITE, TRADE, ORDER, POSITION and ACCOUNT_BALANCE.
 const SUBSCRIPTION_ORDER: &str = "SUBSCRIPTION_TYPE_ORDER";
 
 /// Private order/fill stream. Same envelope, no market slugs — the private feed
