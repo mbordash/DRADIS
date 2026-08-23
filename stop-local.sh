@@ -3,7 +3,11 @@
 
 API_PORT=${API_PORT:-9000}
 
-# Kill via PID file if present
+# Tell the supervisor this exit is deliberate BEFORE killing anything, or it
+# will dutifully respawn the engine we are trying to stop.
+touch .dradis-local.stop
+
+# Kill via PID file if present (the supervisor loop, since start-local.sh 2026-08)
 if [ -f ".dradis-local.pid" ]; then
     PID=$(cat .dradis-local.pid)
     if kill -0 "$PID" 2>/dev/null; then
@@ -27,4 +31,5 @@ fi
 # Kill any lingering release binary by name
 pkill -f "target/release/dradis" 2>/dev/null && echo "🧹 Killed lingering dradis binary"
 
+rm -f .dradis-local.stop
 echo "✅ Done"

@@ -2924,14 +2924,14 @@ async fn deploy_squadron(
         req.raptors.clone()
     } else {
         // Auto-select default raptors for this market class
-        default_raptors_for_class(&req.market_type)
+        default_raptors_for_class(&req.market_type).await
     };
     
     let vipers = if req.mode == "manual" && !req.vipers.is_empty() {
         req.vipers.clone()
     } else {
         // Auto-select default vipers for this market class
-        default_vipers_for_class(&req.market_type)
+        default_vipers_for_class(&req.market_type).await
     };
     
     // Queue the deployment request for the CAG to process
@@ -2964,23 +2964,30 @@ async fn deploy_squadron(
     }).into_response()
 }
 
-/// Return default raptors for a market class.
-fn default_raptors_for_class(market_class: &str) -> Vec<String> {
-    match market_class {
-        "crypto" => vec!["momentum".to_string(), "reversal".to_string()],
-        "sports" => vec!["market_maker".to_string()],
-        "politics" => vec!["momentum".to_string(), "market_maker".to_string()],
-        _ => vec!["market_maker".to_string()],
+/// The raptors a market class actually links to, from the taxonomy.
+///
+/// This used to return a hardcoded list naming things that do not exist —
+/// "market_maker" and "reversal" are not raptor kinds — so a deploy request was
+/// recorded, and reported back to the operator, advertising a stack the engine
+/// would never run. The engine reads `market_class_raptor`; so does this now,
+/// and the two cannot drift.
+async fn default_raptors_for_class(market_class: &str) -> Vec<String> {
+    match crate::helpers::db::pool() {
+        Some(p) => crate::helpers::db::raptors_for_class(p, market_class).await,
+        None => Vec::new(),
     }
 }
 
-/// Return default vipers for a market class.
-fn default_vipers_for_class(market_class: &str) -> Vec<String> {
-    match market_class {
-        "crypto" => vec!["trailing_stop".to_string(), "time_decay".to_string()],
-        "sports" => vec!["trailing_stop".to_string()],
-        "politics" => vec!["trailing_stop".to_string(), "time_decay".to_string()],
-        _ => vec!["trailing_stop".to_string()],
+/// The vipers a market class actually links to, from the taxonomy.
+///
+/// Same defect as the raptors above: "trailing_stop" is not a viper kind. A
+/// politics deployment reported `["trailing_stop", "time_decay"]` while the
+/// engine ran Arbitrage and Maker — the operator was shown neither what they
+/// were getting nor anything that exists.
+async fn default_vipers_for_class(market_class: &str) -> Vec<String> {
+    match crate::helpers::db::pool() {
+        Some(p) => crate::helpers::db::vipers_for_class(p, market_class).await,
+        None => Vec::new(),
     }
 }
 

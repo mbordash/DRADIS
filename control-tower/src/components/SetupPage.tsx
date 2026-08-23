@@ -682,7 +682,7 @@ function CredentialGroup({
               </>
             ) : (
               <input
-                type={/URL|CHAT_ID|PROVIDER|MODEL|BASE/.test(c.key) ? 'text' : 'password'}
+                type={/URL|CHAT_ID|PROVIDER|MODEL|BASE|DEMO/.test(c.key) ? 'text' : 'password'}
                 className={inputCls}
                 placeholder={c.set ? '•••••••• (leave blank to keep current)' : 'Enter value'}
                 value={drafts[c.key] ?? ''}

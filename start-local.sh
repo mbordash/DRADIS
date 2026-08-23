@@ -114,29 +114,41 @@ fi
 echo "⚙️  Building DRADIS (release, VENUE=$VENUE)..."
 cargo build --release ${CARGO_FEATURE_ARGS[@]+"${CARGO_FEATURE_ARGS[@]}"} 2>&1 | tail -3
 
-if [ "$VENUE" = "us" ]; then
-    echo "🦀 Starting DRADIS (US Retail, API on :$API_PORT)..."
-    RUST_LOG=${RUST_LOG:-info,dradis=info} \
-    API_PORT=$API_PORT \
-    ASSETS=${ASSETS:-us} \
-        ./target/release/dradis >> logs/dradis-local.log 2>&1 &
-elif [ "$VENUE" = "kalshi" ]; then
-    echo "🦀 Starting DRADIS (Kalshi, API on :$API_PORT)..."
-    RUST_LOG=${RUST_LOG:-info,dradis=info} \
-    API_PORT=$API_PORT \
-    ASSETS=${ASSETS:-kalshi} \
-        ./target/release/dradis >> logs/dradis-local.log 2>&1 &
-else
-    echo "🦀 Starting DRADIS (GHOST_MODE, API on :$API_PORT)..."
-    RUST_LOG=${RUST_LOG:-info,dradis=info} \
-    API_PORT=$API_PORT \
-    CRYPTO_FILTER=$CRYPTO \
-        ./target/release/dradis >> logs/dradis-local.log 2>&1 &
-fi
+# Supervise the engine, the way the container does.
+#
+# "Restart engine" in the Control Tower works by exiting the process and letting
+# something bring it back: docker-compose has `restart: always`, and the
+# watchdog thread relies on the same contract when it calls process::exit(1) on
+# a stall. Locally there was nothing, so the first restart from the UI left the
+# dashboard up and the engine gone — the API simply stopped answering, with no
+# indication of why.
+#
+# `.dradis-local.stop` is how stop-local.sh tells the supervisor that the exit
+# was intentional; without it a deliberate shutdown would respawn immediately.
+rm -f .dradis-local.stop
+supervise_engine() {
+    while true; do
+        case "$VENUE" in
+            us)     ASSETS=${ASSETS:-us}     API_PORT=$API_PORT RUST_LOG=${RUST_LOG:-info,dradis=info} ./target/release/dradis >> logs/dradis-local.log 2>&1 ;;
+            kalshi) ASSETS=${ASSETS:-kalshi} API_PORT=$API_PORT RUST_LOG=${RUST_LOG:-info,dradis=info} ./target/release/dradis >> logs/dradis-local.log 2>&1 ;;
+            *)      CRYPTO_FILTER=$CRYPTO    API_PORT=$API_PORT RUST_LOG=${RUST_LOG:-info,dradis=info} ./target/release/dradis >> logs/dradis-local.log 2>&1 ;;
+        esac
+        code=$?
+        if [ -f .dradis-local.stop ]; then
+            echo "🛑 Engine stopped (exit $code) — supervisor exiting" >> logs/dradis-local.log
+            return
+        fi
+        echo "♻️  Engine exited ($code) — respawning in 2s" | tee -a logs/dradis-local.log
+        sleep 2
+    done
+}
+
+echo "🦀 Starting DRADIS ($VENUE, API on :$API_PORT, supervised)..."
+supervise_engine &
 
 DRADIS_PID=$!
 echo $DRADIS_PID > .dradis-local.pid
-echo "   PID $DRADIS_PID → logs/dradis-local.log"
+echo "   supervisor PID $DRADIS_PID → logs/dradis-local.log"
 
 # Wait for the API to come up
 echo -n "   Waiting for API on :$API_PORT"

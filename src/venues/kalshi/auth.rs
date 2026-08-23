@@ -32,6 +32,7 @@
 //! Spec: https://docs.kalshi.com/getting_started/api_keys
 
 use anyhow::{Context, Result};
+use tracing::warn;
 use rsa::pkcs1::DecodeRsaPrivateKey;
 use rsa::pkcs8::DecodePrivateKey;
 use rsa::pss::SigningKey;
@@ -80,13 +81,35 @@ impl KalshiAuth {
     pub fn from_env() -> Result<Self> {
         let key_id = std::env::var("KALSHI_API_KEY_ID")
             .context("KALSHI_API_KEY_ID not set")?;
-        let pem = if let Ok(path) = std::env::var("KALSHI_PRIVATE_KEY_PATH") {
-            std::fs::read_to_string(&path)
-                .with_context(|| format!("reading KALSHI_PRIVATE_KEY_PATH={path}"))?
-        } else {
-            std::env::var("KALSHI_PRIVATE_KEY")
-                .context("set KALSHI_PRIVATE_KEY_PATH or KALSHI_PRIVATE_KEY")?
-                .replace("\\n", "\n")
+        // An inline key wins over a key file.
+        //
+        // The path used to take precedence, which meant a stale
+        // KALSHI_PRIVATE_KEY_PATH left in .env silently outranked the key the
+        // operator had just entered in the Control Tower. The UI reported the
+        // credential as set, the venue reported itself connected, and every
+        // signed request was made with a different key — a failure with no
+        // visible cause anywhere in the product.
+        //
+        // Inline is the UI-managed value (data/secrets.env overrides process env
+        // at startup), so preferring it makes the most recently set credential
+        // the effective one. Headless deployments that only ever set the path
+        // are unaffected, because they never set the inline key.
+        let inline = std::env::var("KALSHI_PRIVATE_KEY").ok().filter(|v| !v.trim().is_empty());
+        let path = std::env::var("KALSHI_PRIVATE_KEY_PATH").ok().filter(|v| !v.trim().is_empty());
+        let pem = match (inline, path) {
+            (Some(key), Some(p)) => {
+                warn!(
+                    "🔑 Both KALSHI_PRIVATE_KEY and KALSHI_PRIVATE_KEY_PATH are set — \
+                     using the managed inline key and ignoring {p}"
+                );
+                key.replace("\\n", "\n")
+            }
+            (Some(key), None) => key.replace("\\n", "\n"),
+            (None, Some(p)) => std::fs::read_to_string(&p)
+                .with_context(|| format!("reading KALSHI_PRIVATE_KEY_PATH={p}"))?,
+            (None, None) => {
+                anyhow::bail!("set KALSHI_PRIVATE_KEY (Control Tower → Setup) or KALSHI_PRIVATE_KEY_PATH")
+            }
         };
         Self::new(key_id, &pem)
     }

@@ -105,6 +105,12 @@ const MANAGED_KEYS: &[(&str, &str, &str, &str)] = &[
     ("POLYMARKET_US_SECRET_KEY", "Polymarket US secret key",      "us",     "venue"),
     ("KALSHI_API_KEY_ID",        "Kalshi API key ID",             "kalshi", "venue"),
     ("KALSHI_PRIVATE_KEY",       "Kalshi RSA private key (PEM)",  "kalshi", "venue"),
+    // Not a secret, but it decides which Kalshi you are talking to, and getting
+    // it wrong presents as an authentication failure rather than as a wrong
+    // environment: a production key sent to the demo API returns
+    // "authentication_error / NOT_FOUND". Managed so it is visible and
+    // changeable from Setup instead of living only in .env.
+    ("KALSHI_DEMO",              "Kalshi demo environment (1 = demo)", "kalshi", "venue"),
     ("ALPACA_API_KEY_ID",        "Alpaca API key ID",             "shared", "raptor"),
     ("ALPACA_API_SECRET_KEY",    "Alpaca API secret key",         "shared", "raptor"),
     ("ODDS_API_KEY",             "The Odds API key",              "shared", "raptor"),
