@@ -27,9 +27,11 @@ import {
   getSquadronConfig,
   getVipersStatus,
   patchSquadronConfig,
+  getConfigSchema,
   VIPER_DEFS,
 } from '@/lib/api';
 import ViperCard, { fmtAgo, STALE_EVAL_SECS } from '@/components/ViperCard';
+import { AdvancedRow } from '@/components/AdvancedConfigModal';
 import OpenPositionsCard from '@/components/OpenPositionsCard';
 import { DEMO_MODE } from '@/lib/demo';
 
@@ -213,6 +215,62 @@ function SquadronInfoCard({ squadron }: { squadron: SquadronSummary }) {
 interface Props {
   squadron: SquadronSummary;
   onBack: () => void;
+}
+
+/**
+ * Config groups that belong to the squadron rather than to any single viper.
+ *
+ * The schema is rendered by matching `group` against a viper's name, so a group
+ * named for something other than a viper had no home and simply never appeared —
+ * "Order Book" and "Exit Accounting" were registered in the Rust schema and
+ * unreachable in the UI. Listed explicitly rather than inferred as "not a viper
+ * name", because a squadron only carries the vipers of its market class: a
+ * politics squadron has no Momentum card, and inferring would then treat
+ * Momentum's own fields as squadron-wide.
+ */
+const SQUADRON_GROUPS = ['Order Book', 'Exit Accounting'];
+
+function SquadronSettingsCard({
+  config,
+  onPatch,
+}: {
+  config: DynamicConfig;
+  onPatch: (patch: Partial<DynamicConfig>) => Promise<void>;
+}) {
+  const { data: schema } = useSWR('configSchema', getConfigSchema);
+  const fields = (schema ?? []).filter(f => SQUADRON_GROUPS.includes(f.group));
+  if (fields.length === 0) return null;
+
+  return (
+    <div className="card p-4 space-y-3">
+      <div>
+        <h3 className="text-sm font-mono text-gray-200">Squadron settings</h3>
+        <p className="text-[11px] text-gray-500 mt-1 leading-relaxed">
+          Apply to every viper in this squadron. Changing them here affects only this
+          squadron, so a setting can be tried on one market class and compared against
+          the others.
+        </p>
+      </div>
+      {SQUADRON_GROUPS.map(group => {
+        const inGroup = fields.filter(f => f.group === group);
+        if (inGroup.length === 0) return null;
+        return (
+          <div key={group} className="space-y-2">
+            <p className="text-[10px] font-mono uppercase tracking-wide text-gray-600">{group}</p>
+            {inGroup.map(f => (
+              <AdvancedRow
+                key={f.key}
+                field={f}
+                config={config}
+                onPatch={onPatch}
+                disabled={DEMO_MODE}
+              />
+            ))}
+          </div>
+        );
+      })}
+    </div>
+  );
 }
 
 export default function SquadronDetailView({ squadron, onBack }: Props) {
@@ -418,6 +476,15 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
         ) : (
           <div className="card p-6 flex items-center justify-center h-32 text-gray-600 text-sm">
             Loading config…
+          </div>
+        )}
+
+        {/* Settings that apply across the squadron rather than to one viper.
+            Rendered here because these read the SQUADRON's config — the same
+            values the vipers above read — so a change lands where it is seen. */}
+        {config && (
+          <div className="mt-3">
+            <SquadronSettingsCard config={config} onPatch={handlePatch} />
           </div>
         )}
 

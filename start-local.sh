@@ -127,6 +127,16 @@ cargo build --release ${CARGO_FEATURE_ARGS[@]+"${CARGO_FEATURE_ARGS[@]}"} 2>&1 |
 # was intentional; without it a deliberate shutdown would respawn immediately.
 rm -f .dradis-local.stop
 supervise_engine() {
+    # Survive the parent's stdout going away.
+    #
+    # This script is often launched through a pipe (`./start-local.sh | tail`).
+    # When that reader exits, anything the supervisor writes to inherited stdout
+    # takes SIGPIPE and kills it silently — which is exactly what happened on
+    # 2026-08-23: the engine was killed for a restart, no respawn line appeared,
+    # and the supervisor subshell was simply gone. Ignoring PIPE and HUP, and
+    # writing only to the log file rather than to stdout, keeps it alive whether
+    # or not anyone is still reading the terminal.
+    trap '' PIPE HUP
     while true; do
         case "$VENUE" in
             us)     ASSETS=${ASSETS:-us}     API_PORT=$API_PORT RUST_LOG=${RUST_LOG:-info,dradis=info} ./target/release/dradis >> logs/dradis-local.log 2>&1 ;;
@@ -138,13 +148,14 @@ supervise_engine() {
             echo "🛑 Engine stopped (exit $code) — supervisor exiting" >> logs/dradis-local.log
             return
         fi
-        echo "♻️  Engine exited ($code) — respawning in 2s" | tee -a logs/dradis-local.log
+        echo "♻️  Engine exited ($code) — respawning in 2s" >> logs/dradis-local.log
         sleep 2
     done
 }
 
 echo "🦀 Starting DRADIS ($VENUE, API on :$API_PORT, supervised)..."
-supervise_engine &
+# stdout/stderr to the log for the same reason as the trap above.
+supervise_engine >> logs/dradis-local.log 2>&1 &
 
 DRADIS_PID=$!
 echo $DRADIS_PID > .dradis-local.pid

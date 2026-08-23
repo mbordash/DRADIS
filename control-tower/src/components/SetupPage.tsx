@@ -42,6 +42,7 @@ import {
 import { useConfirm } from '@/components/ConfirmDialog';
 import useSWR from 'swr';
 import { getConfig, patchConfig, getConfigSchema } from '@/lib/api';
+import { AdvancedRow } from '@/components/AdvancedConfigModal';
 import type { DynamicConfig, ConfigFieldSchema } from '@/lib/types';
 
 // Which /api/setup/test kind exercises a given credential scope/group.
@@ -1258,6 +1259,44 @@ function ProfilesPanel({ onAuthError }: { onAuthError: () => void }) {
   );
 }
 
+/**
+ * Config groups that are global rather than per-squadron.
+ *
+ * The Advanced editor matches a field's `group` against a viper name, so groups
+ * named for anything else were registered in the Rust schema and rendered
+ * nowhere. These read the global config — the deploy endpoint reads the process
+ * config, not a squadron's — so they belong here rather than on a squadron page.
+ */
+const GLOBAL_CONFIG_GROUPS = ['Deployment'];
+
+function GlobalConfigPanel() {
+  const { data: schema } = useSWR('configSchema', getConfigSchema);
+  const { data: config, mutate } = useSWR('dynamic-config', getConfig, { revalidateOnFocus: false });
+
+  const patch = useCallback(async (p: Partial<DynamicConfig>) => {
+    await patchConfig(p);
+    await mutate();
+  }, [mutate]);
+
+  const fields = (schema ?? []).filter(f => GLOBAL_CONFIG_GROUPS.includes(f.group));
+  if (!config || fields.length === 0) return null;
+
+  return (
+    <div className="card p-4 space-y-3">
+      <div>
+        <h3 className="text-sm font-mono text-gray-200">Deployment</h3>
+        <p className="text-[11px] text-gray-500 mt-1 leading-relaxed">
+          Applies when you deploy a squadron. Unlike the per-viper settings on a
+          squadron page, these are instance-wide.
+        </p>
+      </div>
+      {fields.map(f => (
+        <AdvancedRow key={f.key} field={f} config={config} onPatch={patch} disabled={false} />
+      ))}
+    </div>
+  );
+}
+
 function AutonomyPanel({ onAuthError }: { onAuthError: () => void }) {
   const [state, setState] = useState<AutonomyStatus | null>(null);
   const [busy, setBusy] = useState(false);
@@ -1590,6 +1629,8 @@ export default function SetupPage() {
       )}
 
       <ProfilesPanel onAuthError={() => { clearAdminToken(); setAuthed(false); }} />
+
+      <GlobalConfigPanel />
 
       <AutonomyPanel onAuthError={() => { clearAdminToken(); setAuthed(false); }} />
 

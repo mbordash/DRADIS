@@ -34,7 +34,7 @@ import { DEMO_MODE } from '@/lib/demo';
 // per-field description clarifies the encoding. Schema is fetched via SWR with a
 // shared key, so multiple open cards/modals dedupe to one request.
 
-interface RowProps {
+export interface RowProps {
   field:    ConfigFieldSchema;
   config:   DynamicConfig;
   onPatch:  (patch: Partial<DynamicConfig>) => Promise<void>;
@@ -48,7 +48,10 @@ function clamp(n: number, min: number | null, max: number | null): number {
   return n;
 }
 
-function AdvancedRow({ field, config, onPatch, disabled }: RowProps) {
+/// Exported so config groups that belong to no viper — the order-book source,
+/// exit accounting — can be rendered with the same clamping, units and patch
+/// path rather than a second, divergent editor.
+export function AdvancedRow({ field, config, onPatch, disabled }: RowProps) {
   const stored = String((config as unknown as Record<string, unknown>)[field.key] ?? '');
   const [draft,  setDraft]  = useState(stored);
   const [saving, setSaving] = useState(false);
