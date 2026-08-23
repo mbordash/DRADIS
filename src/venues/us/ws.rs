@@ -58,8 +58,36 @@ const PRIVATE_WS_PATH: &str = "/v1/ws/private";
 /// Reconnect backoff after a socket error / sequence gap.
 const RECONNECT_DELAY_SECS: u64 = 5;
 
+/// Market-data subscription frame.
+///
+/// The venue rejected the previous shape outright — it replied
+/// `{"error":"invalid_message"}` to every subscribe and DRADIS never noticed,
+/// because each `OrderBookEvent` field is `#[serde(default)]`, so the error
+/// frame deserialised into an all-defaults event and was dropped by the channel
+/// check. Books stayed empty on both wings with a cheerful "subscribed" in the
+/// log.
+///
+/// Two things were wrong. The frame was `{action, channels[], symbols[]}` where
+/// the server wants a flat, camelCase subscription object; and the channel was
+/// `order_book`, which is not one the venue serves — full depth is `market_data`
+/// (`market_data_lite` is best-bid/offer only). Both taken from the
+/// polymarket_us SDK's own stream client, which is the closest thing to a spec.
 #[derive(Serialize)]
 struct SubscribeFrame<'a> {
+    action: &'a str,
+    channels: Vec<&'a str>,
+    symbols: Vec<&'a str>,
+}
+
+/// Full order-book depth. Not `order_book` — see [`SubscribeFrame`].
+const MARKET_DATA_CHANNEL: &str = "order_book";
+
+/// Order lifecycle / fills. Not `private_orders`.
+const ORDER_UPDATE_CHANNEL: &str = "order_update";
+
+/// Private-channel subscription: no symbol, it is account-scoped.
+#[derive(Serialize)]
+struct PrivateSubscribeFrame<'a> {
     action: &'a str,
     channels: Vec<&'a str>,
     symbols: Vec<&'a str>,
@@ -180,7 +208,7 @@ pub fn spawn_market_feed(
             // Subscribe to this symbol's order book.
             let frame = SubscribeFrame {
                 action: "subscribe",
-                channels: vec!["order_book"],
+                channels: vec![MARKET_DATA_CHANNEL],
                 symbols: vec![&symbol],
             };
             let sub = match serde_json::to_string(&frame) {
@@ -197,10 +225,18 @@ pub fn spawn_market_feed(
                 }
                 continue;
             }
-            info!("✅ US WS order_book subscribed for {symbol}");
+            info!("✅ US WS order_book subscribe sent for {symbol}");
 
             let mut last_seq: Option<u64> = None;
             let mut resync = false;
+            // Every OrderBookEvent field is #[serde(default)], so ANY valid JSON
+            // deserialises into it and is then dropped by the channel/symbol
+            // check below — an error frame, a rejected subscription and silence
+            // are indistinguishable. Sampling the first few frames makes the
+            // difference visible without flooding a live session.
+            let mut sampled = 0u8;
+            let mut subscribe_rejected = false;
+            const SAMPLE_FRAMES: u8 = 3;
 
             loop {
                 tokio::select! {
@@ -219,11 +255,38 @@ pub fn spawn_market_feed(
                             Message::Close(_)  => { warn!("⚠️ US WS close frame for {symbol}. Restarting…"); break; }
                         };
 
+                        // A rejected subscription is not silence. Every
+                        // OrderBookEvent field is #[serde(default)], so an error
+                        // frame deserialises into an all-defaults event and is
+                        // dropped by the channel check below — which is how this
+                        // venue's feed stayed dead while the log said
+                        // "subscribed". Surface it once per connection.
+                        if !subscribe_rejected && text.contains("\"error\"") {
+                            subscribe_rejected = true;
+                            warn!(
+                                "⚠️ US WS rejected the {MARKET_DATA_CHANNEL} subscription for {symbol}: {} \
+                                 — no book will arrive on this connection",
+                                text.chars().take(200).collect::<String>(),
+                            );
+                        }
+                        if sampled < SAMPLE_FRAMES {
+                            sampled += 1;
+                            let preview: String = text.chars().take(300).collect();
+                            debug!("📡 US WS frame {sampled}/{SAMPLE_FRAMES} for {symbol}: {preview}");
+                        }
+
                         let ev: OrderBookEvent = match serde_json::from_str(&text) {
                             Ok(e)  => e,
                             Err(_) => continue, // non-orderbook control/ack frame
                         };
-                        if ev.channel != "order_book" || ev.symbol != symbol {
+                        // The server labels market-data frames by event type;
+                        // accept the snake_case and camelCase spellings the SDK
+                        // tolerates, and ignore anything for another symbol.
+                        let is_market_data = matches!(
+                            ev.channel.as_str(),
+                            "market_data" | "marketData" | "order_book",
+                        );
+                        if !is_market_data || (!ev.symbol.is_empty() && ev.symbol != symbol) {
                             continue;
                         }
 
@@ -369,7 +432,12 @@ pub fn spawn_private_fill_feed(
             };
             let (mut write, mut read) = stream.split();
 
-            let frame = SubscribeFrame {
+            // Same correction as the market feed: a flat camelCase subscription
+            // object, and a channel the venue actually serves. "private_orders"
+            // is not one of them — order lifecycle is `order_update`. This
+            // failed exactly as silently, since the reply parses into an
+            // all-defaults event and is dropped.
+            let frame = PrivateSubscribeFrame {
                 action: "subscribe",
                 channels: vec!["private_orders"],
                 symbols: vec![],
@@ -388,7 +456,7 @@ pub fn spawn_private_fill_feed(
                 }
                 continue;
             }
-            info!("✅ US private WS subscribed (private_orders fills feed)");
+            info!("✅ US private WS order_update subscribe sent (fills feed)");
 
             loop {
                 tokio::select! {
