@@ -1,0 +1,66 @@
+{
+  "markets": [
+    {
+      "id": "454191",
+      "question": "Top WR Fantasy Football Week 1 (PPR)",
+      "slug": "ftsc-nfl-wrmostfp-w1-2026-09-14-jakomey",
+      "endDate": "2026-09-28T23:00:00Z",
+      "category": "sports",
+      "description": "This market will settle to Yes if Jakobi Meyers records the most fantasy points among all wide receivers (WR) in Week 1 of the 2026 Pro Football regular season. Fantasy points will be calculated using ESPN's Fantasy Football League Points Per Reception (PPR) scoring system and reflect each player's total for Week 1 of the 2026 Pro Football regular season. If two or more players tie, each tied player's market will settle at $1.00 divided by the number of tied players. If the listed player does not play for any reason, the market will settle to No. Outcome sourced from ESPN.",
+      "active": true,
+      "closed": false,
+      "status": "MARKET_STATUS_OPEN",
+      "outcomes": "[\"Yes\",\"No\"]",
+      "marketSides": [
+        {
+          "id": "907894",
+          "identifier": "ftsc-nfl-wrmostfp-w1-2026-09-14-jakomey",
+          "description": "Yes",
+          "long": true,
+          "price": "0.0100",
+          "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT"
+        },
+        {
+          "id": "907895",
+          "identifier": "ftsc-nfl-wrmostfp-w1-2026-09-14-jakomey",
+          "description": "No",
+          "long": false,
+          "price": "0.0300",
+          "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT"
+        }
+      ],
+      "marketType": "futures"
+    },
+    {
+      "id": "454206",
+      "question": "Top WR Fantasy Football Week 1 (PPR)",
+      "slug": "ftsc-nfl-wrmostfp-w1-2026-09-14-chrgod",
+      "endDate": "2026-09-28T23:00:00Z",
+      "category": "sports",
+      "description": "This market will settle to Yes if Chris Godwin Jr. records the most fantasy points among all wide receivers (WR) in Week 1 of the 2026 Pro Football regular season. Fantasy points will be calculated using ESPN's Fantasy Football League Points Per Reception (PPR) scoring system and reflect each player's total for Week 1 of the 2026 Pro Football regular season. If two or more players tie, each tied player's market will settle at $1.00 divided by the number of tied players. If the listed player does not play for any reason, the market will settle to No. Outcome sourced from ESPN.",
+      "active": true,
+      "closed": false,
+      "status": "MARKET_STATUS_OPEN",
+      "outcomes": "[\"Yes\",\"No\"]",
+      "marketSides": [
+        {
+          "id": "907924",
+          "identifier": "ftsc-nfl-wrmostfp-w1-2026-09-14-chrgod",
+          "description": "Yes",
+          "long": true,
+          "price": "0.0100",
+          "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT"
+        },
+        {
+          "id": "907925",
+          "identifier": "ftsc-nfl-wrmostfp-w1-2026-09-14-chrgod",
+          "description": "No",
+          "long": false,
+          "price": "0.0200",
+          "marketSideType": "MARKET_SIDE_TYPE_INSTRUMENT"
+        }
+      ],
+      "marketType": "futures"
+    }
+  ]
+}

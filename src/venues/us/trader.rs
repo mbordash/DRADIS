@@ -786,19 +786,34 @@ async fn trade_one_market(
     let ws_url = venue.markets_ws_url();
     let ws_auth = venue.ws_auth();
     let default_feed: PriceState = (dec!(0), dec!(0), dec!(1), dec!(0), Utc::now(), dec!(0), dec!(0));
+    // ONE subscription per market, not one per leg.
+    //
+    // Both legs share the venue's identifier, so subscribing with each of them
+    // opened two streams for the same book and then treated them as two
+    // independent sides — the NO side mirrored the YES side instead of being its
+    // complement. The book is quoted in LONG terms; SHORT is derived, exactly as
+    // Kalshi derives its asks from the complementary bid.
     let (long_tx, long_rx) = watch::channel(default_feed);
-    let (short_tx, short_rx) = watch::channel(default_feed);
-    ws::spawn_market_feed(ws_url.clone(), pair.long.as_str().to_string(), ws_auth.clone(), long_tx, cancel.clone());
-    ws::spawn_market_feed(ws_url.clone(), pair.short.as_str().to_string(), ws_auth.clone(), short_tx, cancel.clone());
+    ws::spawn_market_feed(
+        ws_url.clone(),
+        super::markets::bare_symbol(pair.long.as_str()).to_string(),
+        ws_auth.clone(),
+        long_tx,
+        cancel.clone(),
+    );
 
     // The secondary market needs its own book: Maker and FairValue quote on it,
     // and a snapshot built from the primary's feed would price the wrong market.
     let maker_feeds = maker_pair.as_ref().map(|mk| {
         let (mlong_tx, mlong_rx) = watch::channel(default_feed);
-        let (mshort_tx, mshort_rx) = watch::channel(default_feed);
-        ws::spawn_market_feed(ws_url.clone(), mk.long.as_str().to_string(), ws_auth.clone(), mlong_tx, cancel.clone());
-        ws::spawn_market_feed(ws_url.clone(), mk.short.as_str().to_string(), ws_auth.clone(), mshort_tx, cancel.clone());
-        (mlong_rx, mshort_rx)
+        ws::spawn_market_feed(
+            ws_url.clone(),
+            super::markets::bare_symbol(mk.long.as_str()).to_string(),
+            ws_auth.clone(),
+            mlong_tx,
+            cancel.clone(),
+        );
+        mlong_rx
     });
 
     // ── Dashboard + strategy-context state ───────────────────────────────────
@@ -971,15 +986,15 @@ async fn trade_one_market(
         // funding, derivatives, macro) so the full viper suite can gate; the
         // general wing's raptor fields stay zero — its order-book vipers
         // (arbitrage/maker) don't read them.
-        let snapshot = build_snapshot(&long_rx, &short_rx, raptors.as_ref(), &market_cfg);
+        let snapshot = build_snapshot(&long_rx, raptors.as_ref(), &market_cfg);
 
         // Maker snapshot from the secondary market's own feed. Falls back to the
         // primary when there is no secondary, or when its book has not arrived
         // yet — the same fallback Kalshi uses, so a viper always has something
         // priced rather than a zeroed book that reads as maximally adverse.
         let (mk_market, mk_snapshot) = match (&maker_cfg, &maker_feeds) {
-            (Some(mcfg), Some((ml, ms))) => {
-                let snap = build_snapshot(ml, ms, raptors.as_ref(), mcfg);
+            (Some(mcfg), Some(ml)) => {
+                let snap = build_snapshot(ml, raptors.as_ref(), mcfg);
                 if snap.yes_ask.is_zero() && snap.no_ask.is_zero() {
                     (Some(market_cfg.clone()), Some(snapshot.clone()))
                 } else {
@@ -1080,6 +1095,59 @@ fn strategy_name_to_kind(name: &str) -> &'static str {
 }
 
 #[cfg(test)]
+mod complement_tests {
+    use super::complement;
+    use rust_decimal_macros::dec;
+    use chrono::Utc;
+
+    fn state(bid: rust_decimal::Decimal, bid_sz: rust_decimal::Decimal,
+             ask: rust_decimal::Decimal, ask_sz: rust_decimal::Decimal) -> crate::state::PriceState {
+        (bid, bid_sz, ask, ask_sz, Utc::now(), bid_sz * dec!(3), ask_sz * dec!(3))
+    }
+
+    /// Polymarket US publishes ONE book per market, quoted in LONG terms, and
+    /// puts the side in an order field. Subscribing with both legs opened two
+    /// streams for the same book and treated them as independent sides, so the
+    /// NO side mirrored the YES side instead of being its complement — YES+NO
+    /// summed to 2× the long price rather than to a dollar.
+    #[test]
+    fn the_short_side_is_the_dollar_complement_of_the_long_side() {
+        let long = state(dec!(0.40), dec!(10), dec!(0.45), dec!(7));
+        let short = complement(long);
+
+        assert_eq!(short.0, dec!(0.55), "short bid = 1 - long ask");
+        assert_eq!(short.2, dec!(0.60), "short ask = 1 - long bid");
+        // Sizes follow the level they came from.
+        assert_eq!(short.1, dec!(7),  "short bid size is the long ask's size");
+        assert_eq!(short.3, dec!(10), "short ask size is the long bid's size");
+
+        // The pair prices a dollar, which is the whole point of a binary.
+        assert_eq!(long.0 + short.2, dec!(1));
+        assert_eq!(long.2 + short.0, dec!(1));
+    }
+
+    /// An untouched feed is bid 0 / ask 1 with no depth. Complementing that
+    /// naively yields bid 0 / ask 1 again — but only because it is passed
+    /// through: inventing a two-sided book at even money out of "no data" would
+    /// read as a live market to every viper.
+    #[test]
+    fn an_empty_book_stays_empty() {
+        let untouched = state(dec!(0), dec!(0), dec!(1), dec!(0));
+        let short = complement(untouched);
+        assert_eq!(short.1, dec!(0), "invented bid depth from an empty book");
+        assert_eq!(short.3, dec!(0), "invented ask depth from an empty book");
+    }
+
+    /// Complementing twice returns the original, so the identity is sound.
+    #[test]
+    fn complementing_twice_is_the_identity() {
+        let long = state(dec!(0.31), dec!(4), dec!(0.34), dec!(9));
+        let back = complement(complement(long));
+        assert_eq!((back.0, back.1, back.2, back.3), (long.0, long.1, long.2, long.3));
+    }
+}
+
+#[cfg(test)]
 mod market_pairing_tests {
     use super::{MAX_CLOSE_SHORT_SECS, MAX_CLOSE_MAKER_SECS};
 
@@ -1132,7 +1200,7 @@ async fn flatten_before_stand_down(
     lifecycle: &Arc<OrderLifecycle>,
     primary_cfg: &MarketConfig,
     maker_cfg: Option<&MarketConfig>,
-    maker_feeds: Option<&(watch::Receiver<PriceState>, watch::Receiver<PriceState>)>,
+    maker_feeds: Option<&watch::Receiver<PriceState>>,
     raptors: Option<&CryptoRaptors>,
     starting: Decimal,
     ghost: bool,
@@ -1148,14 +1216,14 @@ async fn flatten_before_stand_down(
         return;
     }
 
-    let (Some(mcfg), Some((mlong, mshort))) = (maker_cfg, maker_feeds) else {
+    let (Some(mcfg), Some(mlong)) = (maker_cfg, maker_feeds) else {
         warn!(
             "🏁 Standing down holding {} position(s) with no open secondary market — leaving them to settle",
             held.len(),
         );
         return;
     };
-    let snap = build_snapshot(mlong, mshort, raptors, mcfg);
+    let snap = build_snapshot(mlong, raptors, mcfg);
 
     for (strategy, token, shares) in held {
         let bid = if token == mcfg.yes_token {
@@ -1204,14 +1272,40 @@ async fn flatten_before_stand_down(
 /// with live Raptor intelligence when the wing has a stack attached.
 /// `PriceState` layout: `(best_bid, bid_touch, best_ask, ask_touch, ts,
 /// bid_depth_total, ask_depth_total)` — see `state::price_state`.
+/// The SHORT side of a Polymarket US book, derived from the LONG side.
+///
+/// The venue publishes one book per market, quoted in LONG terms. A binary's
+/// complement is `1 - price` with the sides swapped: the best SHORT bid is what
+/// is left of a dollar after the best LONG ask, and its size is that ask's size.
+/// Same identity Kalshi uses to derive asks from complementary bids.
+///
+/// An untouched feed (bid 0 / ask 1, no depth) complements to bid 0 / ask 1
+/// again, so "no data" stays "no data" rather than becoming a fake two-sided
+/// book at even money.
+fn complement(p: PriceState) -> PriceState {
+    let (bid, bid_sz, ask, ask_sz, ts, bid_tot, ask_tot) = p;
+    let has_book = bid_sz > dec!(0) || ask_sz > dec!(0);
+    if !has_book {
+        return p;
+    }
+    (
+        dec!(1) - ask,   // short bid  = 1 - long ask
+        ask_sz,
+        dec!(1) - bid,   // short ask  = 1 - long bid
+        bid_sz,
+        ts,
+        ask_tot,
+        bid_tot,
+    )
+}
+
 fn build_snapshot(
     long_rx: &watch::Receiver<PriceState>,
-    short_rx: &watch::Receiver<PriceState>,
     raptors: Option<&CryptoRaptors>,
     market: &MarketConfig,
 ) -> MarketSnapshot {
     let yes_state = *long_rx.borrow();
-    let no_state  = *short_rx.borrow();
+    let no_state  = complement(yes_state);
     let (yb, ybd, ya, yad) = (yes_state.0, yes_state.1, yes_state.2, yes_state.3);
     let (nb, nbd, na, nad) = (no_state.0,  no_state.1,  no_state.2,  no_state.3);
     let now = Utc::now();

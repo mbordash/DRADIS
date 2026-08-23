@@ -26,6 +26,30 @@ use crate::venues::core::MarketId;
 
 use super::types::{self, outcome as oc};
 
+/// Suffixes distinguishing the two legs of a Polymarket US market.
+///
+/// The venue gives both sides one identifier and a `long: bool`. DRADIS keys
+/// positions, books and orders by `MarketId`, so the leg has to live in the id.
+/// `#` is used rather than `-` because a real symbol is dash-delimited and ends
+/// in a team abbreviation (`-fcb`, `-lac`) — a dash suffix could not be told
+/// apart from the venue's own naming.
+pub const LEG_LONG: &str = "#long";
+pub const LEG_SHORT: &str = "#short";
+
+/// Strip the leg suffix, yielding the symbol the venue actually knows.
+pub fn bare_symbol(symbol: &str) -> &str {
+    symbol.split('#').next().unwrap_or(symbol)
+}
+
+/// Which leg a suffixed symbol refers to. `None` when unsuffixed.
+pub fn leg_is_long(symbol: &str) -> Option<bool> {
+    match symbol.split_once('#') {
+        Some((_, "long")) => Some(true),
+        Some((_, "short")) => Some(false),
+        _ => None,
+    }
+}
+
 use chrono::{DateTime, Utc};
 
 /// A tradeable binary market reduced to its two neutral leg ids.
@@ -106,10 +130,21 @@ pub fn pair_markets(markets: Vec<types::UsMarket>) -> Vec<UsMarketPair> {
                 .and_then(|v| v.as_bool())
                 .unwrap_or(false);
 
+            // Both sides carry the SAME identifier — Polymarket US addresses a
+            // market with one symbol and puts the side in a boolean, where
+            // Polymarket International has two ERC-1155 token ids. Without a
+            // suffix the two legs collapse into one MarketId: the order builder
+            // then cannot tell which side to trade (it infers the side from the
+            // symbol) and the book feed subscribes twice to the same stream
+            // while treating it as two independent sides.
+            //
+            // Suffixing mirrors Kalshi, which has the same one-ticker-two-sides
+            // model. The bare identifier is recovered by `bare_symbol` wherever
+            // the value goes on the wire.
             if is_long {
-                long_sym.get_or_insert(identifier);
+                long_sym.get_or_insert(format!("{identifier}{LEG_LONG}"));
             } else {
-                short_sym.get_or_insert(identifier);
+                short_sym.get_or_insert(format!("{identifier}{LEG_SHORT}"));
             }
         }
 
@@ -160,6 +195,59 @@ pub fn pair_markets(markets: Vec<types::UsMarket>) -> Vec<UsMarketPair> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A real `/v1/markets` response, captured from gateway.polymarket.us on
+    /// 2026-08-23 and trimmed to the fields this parser reads.
+    ///
+    /// The hand-written fixtures below assert a `-yes` / `-no` symbol convention
+    /// the venue does not use: live symbols carry `marketSides` with ONE shared
+    /// identifier and a `long` boolean, and end in a team abbreviation. Those
+    /// tests passed for months while ordering could not work at all, which is
+    /// why the real shape is now pinned here.
+    const REAL_MARKETS_JSON: &str = include_str!("testdata/markets_response.json");
+
+    #[test]
+    fn the_live_response_yields_two_distinguishable_legs() {
+        #[derive(serde::Deserialize)]
+        struct Resp { markets: Vec<UsMarket> }
+        let resp: Resp = serde_json::from_str(REAL_MARKETS_JSON)
+            .expect("captured gateway response must still parse");
+        let pairs = pair_markets(resp.markets);
+        let p = pairs.first().expect("the captured market must produce a pair");
+
+        // The venue gives both sides the same identifier; DRADIS must not.
+        assert_ne!(p.long, p.short, "legs collapsed into one MarketId");
+        assert_eq!(bare_symbol(p.long.as_str()), bare_symbol(p.short.as_str()),
+            "both legs must still address the same venue symbol");
+        assert_eq!(leg_is_long(p.long.as_str()), Some(true));
+        assert_eq!(leg_is_long(p.short.as_str()), Some(false));
+    }
+
+    /// The wire form must be the identifier the venue knows — suffixes are ours.
+    #[test]
+    fn the_bare_symbol_is_what_the_venue_published() {
+        #[derive(serde::Deserialize)]
+        struct Resp { markets: Vec<UsMarket> }
+        let resp: Resp = serde_json::from_str(REAL_MARKETS_JSON).expect("parse");
+        let published: Vec<String> = resp.markets.iter()
+            .flat_map(|m| m.market_sides.iter())
+            .filter_map(|s| s.get("identifier").and_then(|v| v.as_str()).map(str::to_string))
+            .collect();
+        let pairs = pair_markets(resp.markets);
+        let p = pairs.first().expect("pair");
+        assert!(published.iter().any(|id| id == bare_symbol(p.long.as_str())),
+            "bare symbol is not one the venue published");
+    }
+
+    /// A leg suffix must never be mistaken for part of the symbol.
+    #[test]
+    fn stripping_is_idempotent_and_safe_on_unsuffixed_symbols() {
+        assert_eq!(bare_symbol("aec-nfl-lac-ten-2025-11-02#long"), "aec-nfl-lac-ten-2025-11-02");
+        assert_eq!(bare_symbol("aec-nfl-lac-ten-2025-11-02"), "aec-nfl-lac-ten-2025-11-02");
+        assert_eq!(bare_symbol(bare_symbol("x#short")), "x");
+        assert_eq!(leg_is_long("no-suffix-here"), None);
+    }
+
     use crate::venues::us::types::UsMarket;
     use serde_json::json;
 

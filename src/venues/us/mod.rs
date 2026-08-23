@@ -387,6 +387,18 @@ impl UsRetailVenue {
     /// lookup is needed. Recognises the `yes/long/up` and `no/short/down`
     /// conventions Polymarket US uses across sports and crypto markets.
     fn outcome_side_from_symbol(symbol: &str) -> Result<polymarket_us::types::OrderSide> {
+        // The leg suffix is authoritative. Live symbols end in a TEAM
+        // abbreviation — `atc-lal-elc-fcb-2026-08-23-fcb`, `aec-nfl-lac-ten-…`
+        // — so the dash convention below could never recover the side from a
+        // real market and bailed on every order. It is kept only for symbols
+        // that genuinely encode the side that way.
+        if let Some(is_long) = markets::leg_is_long(symbol) {
+            return Ok(if is_long {
+                polymarket_us::types::OrderSide::Long
+            } else {
+                polymarket_us::types::OrderSide::Short
+            });
+        }
         let last = symbol.rsplit('-').next().unwrap_or("").to_ascii_lowercase();
         match last.as_str() {
             "yes" | "long" | "up" => Ok(polymarket_us::types::OrderSide::Long),
@@ -426,8 +438,10 @@ impl UsRetailVenue {
 
     /// Build the JSON order body for one neutral intent (pure — no network).
     fn build_order(intent: &OrderIntent) -> Result<types::PlaceOrderRequest> {
-        let symbol = intent.market.as_str().to_string();
-        let outcome_side = Self::outcome_side_from_symbol(&symbol)?;
+        // Side comes from the leg suffix; the wire gets the bare symbol, which is
+        // the only form the venue recognises.
+        let outcome_side = Self::outcome_side_from_symbol(intent.market.as_str())?;
+        let symbol = markets::bare_symbol(intent.market.as_str()).to_string();
         let quantity = Self::map_quantity(intent.quantity)?;
         let expires_at = if matches!(intent.tif, TimeInForce::Gtd) && intent.expiration_secs > 0 {
             Some((chrono::Utc::now().timestamp() as u64).saturating_add(intent.expiration_secs))
@@ -642,6 +656,52 @@ mod tests {
             sdk::OrderSide::Short
         );
         assert!(UsRetailVenue::outcome_side_from_symbol("mystery-symbol-xyz").is_err());
+    }
+
+    /// The case the dash convention above could never handle.
+    ///
+    /// Live Polymarket US symbols end in a TEAM abbreviation — `…-2026-08-23-fcb`
+    /// for FC Barcelona, `aec-nfl-lac-ten-…` — because the venue puts the side in
+    /// a `long` boolean on `marketSides`, not in the symbol. Every real order
+    /// therefore failed with "cannot infer outcome side", while the tests above
+    /// passed on symbols no market actually has.
+    #[test]
+    fn a_real_team_suffixed_symbol_resolves_by_its_leg() {
+        use polymarket_us::types::OrderSide;
+        let base = "atc-lal-elc-fcb-2026-08-23-fcb";
+
+        // Unsuffixed: genuinely ambiguous, and must say so rather than guess.
+        assert!(UsRetailVenue::outcome_side_from_symbol(base).is_err());
+
+        assert_eq!(
+            UsRetailVenue::outcome_side_from_symbol(&format!("{base}#long")).unwrap(),
+            OrderSide::Long,
+        );
+        assert_eq!(
+            UsRetailVenue::outcome_side_from_symbol(&format!("{base}#short")).unwrap(),
+            OrderSide::Short,
+        );
+    }
+
+    /// The suffix is DRADIS's own bookkeeping; the venue must never see it.
+    #[test]
+    fn the_order_sends_the_bare_symbol_with_the_side_in_its_own_field() {
+        use crate::venues::core::{MarketId, OrderIntent, Side, TimeInForce};
+        let base = "atc-lal-elc-fcb-2026-08-23-fcb";
+        let intent = OrderIntent {
+            market: MarketId::new(format!("{base}#short")),
+            side: Side::Buy,
+            quantity: rust_decimal_macros::dec!(5),
+            price: rust_decimal_macros::dec!(0.42),
+            tif: TimeInForce::Fak,
+            post_only: false,
+            expiration_secs: 0,
+            fee_bps: 0,
+            is_neg_risk: false,
+        };
+        let req = UsRetailVenue::build_order(&intent).expect("order must build");
+        assert_eq!(req.symbol, base, "leg suffix leaked onto the wire");
+        assert_eq!(req.outcome_side, polymarket_us::types::OrderSide::Short);
     }
 
     #[test]
