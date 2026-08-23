@@ -1830,11 +1830,13 @@ fn register_us_squadron(
         Wing::General => "US Retail Arb",
         Wing::Crypto => "US Crypto Squadron",
     };
-    let squadron = Squadron::new(
+    let squadron = Squadron::new_with_category(
         CryptoAsset::Custom(wing.asset().to_uppercase()),
         SquadronConfig::arb_wing(name),
         market,
         raptors,
+        // "sports", "crypto", … straight from the venue.
+        Some(pair.category.clone()).filter(|c| !c.is_empty()),
     );
     cag.register(&squadron);
     squadron

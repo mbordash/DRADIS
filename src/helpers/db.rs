@@ -4070,6 +4070,48 @@ mod deployment_requeue_tests {
 }
 
 #[cfg(test)]
+mod venue_category_tests {
+    use super::*;
+
+    async fn seeded() -> SqlitePool {
+        let pool = SqlitePoolOptions::new().max_connections(1)
+            .connect("sqlite::memory:").await.expect("sqlite");
+        init_schema(&pool).await.expect("schema");
+        seed_market_taxonomy(&pool).await.expect("taxonomy");
+        pool
+    }
+
+    /// A live Polymarket US football market. Its symbol is `atc-lal-…` — La
+    /// Liga — which matches none of the symbol-token rules (nfl, nba, mlb, nhl,
+    /// ncaa, ufc, soccer, tennis). Without the venue's own category it
+    /// classified as `unknown`, so it lost the Sports Raptor and displayed as
+    /// "US Retail Squadron" rather than "US Sports Squadron".
+    #[tokio::test]
+    async fn the_venue_category_rescues_an_unrecognised_sports_symbol() {
+        let pool = seeded().await;
+        let symbols = ["atc-lal-elc-fcb-2026-08-23-fcb#long", "atc-lal-elc-fcb-2026-08-23-fcb#short"];
+        let title = "Will FC Barcelona win against Elche CF in the La Liga match scheduled for Aug 23, 2026?";
+
+        // What the squadron asset gave us before: "US" matches no rule.
+        assert_eq!(classify_market(&pool, "US", &symbols, title).await, "unknown");
+
+        // What the venue itself reports.
+        assert_eq!(classify_market(&pool, "sports", &symbols, title).await, "sports");
+    }
+
+    /// Sports markets carry a raptor that `unknown` does not, so this was a
+    /// capability loss and not only a naming one.
+    #[tokio::test]
+    async fn sports_links_a_raptor_that_unknown_does_not() {
+        let pool = seeded().await;
+        let sports = raptors_for_class(&pool, "sports").await;
+        let unknown = raptors_for_class(&pool, "unknown").await;
+        assert!(sports.iter().any(|r| r == "sports"), "sports lost its raptor: {sports:?}");
+        assert!(unknown.is_empty(), "unknown unexpectedly links raptors: {unknown:?}");
+    }
+}
+
+#[cfg(test)]
 mod deployed_class_tests {
     use super::*;
 

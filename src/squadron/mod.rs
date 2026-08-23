@@ -225,6 +225,19 @@ pub struct Squadron {
     pub state:   SquadronState,
     pub deployed_at: DateTime<Utc>,
 
+    /// Market class as the VENUE itself reports it, when it says.
+    ///
+    /// Classification otherwise derives its category from `asset`, which is a
+    /// storage identity rather than a domain: Polymarket US wings are "us" and
+    /// "us-crypto", neither of which matches a category rule. Its sports
+    /// markets then fell through to the symbol-token rules, which cover
+    /// nfl/nba/mlb and friends but not `atc-lal-…` for La Liga — so a live
+    /// football market classified as `unknown`, lost the Sports Raptor, and
+    /// displayed as "US Retail Squadron" instead of "US Sports Squadron".
+    ///
+    /// The venue's own `category` field says "sports" outright. Prefer it.
+    pub venue_category: Option<String>,
+
     /// Cancellation token used to stop WS reconnect loops on market rotation.
     ///
     /// A fresh token is created on each `subscribe_markets()` call; the
@@ -240,6 +253,17 @@ impl Squadron {
         config:  SquadronConfig,
         market:  MarketConfig,
         raptors: SquadronRaptors,
+    ) -> Self {
+        Self::new_with_category(asset, config, market, raptors, None)
+    }
+
+    /// Like [`Self::new`] but carrying the venue's own market category.
+    pub fn new_with_category(
+        asset:   CryptoAsset,
+        config:  SquadronConfig,
+        market:  MarketConfig,
+        raptors: SquadronRaptors,
+        venue_category: Option<String>,
     ) -> Self {
         let deployed_at = Utc::now();
         // Stable identity: `{asset}-{cadence}` — deliberately WITHOUT a timestamp.
@@ -264,6 +288,7 @@ impl Squadron {
             raptors,
             state: SquadronState::Deployed,
             deployed_at,
+            venue_category,
             ws_cancel: CancellationToken::new(),
         }
     }
@@ -298,9 +323,15 @@ impl Squadron {
         // category test requires an exact match rather than merely a non-empty
         // string. So this strengthens a declared class without altering any
         // venue that does not declare one.
-        let category = match &self.asset {
-            CryptoAsset::Btc | CryptoAsset::Eth | CryptoAsset::Sol => "crypto",
-            CryptoAsset::Custom(name) => name.as_str(),
+        // The venue's own category wins when it gives one — it is a domain
+        // statement, where `asset` is a storage identity that happens to match
+        // a rule for crypto and nothing else.
+        let category = match self.venue_category.as_deref().filter(|c| !c.is_empty()) {
+            Some(c) => c,
+            None => match &self.asset {
+                CryptoAsset::Btc | CryptoAsset::Eth | CryptoAsset::Sol => "crypto",
+                CryptoAsset::Custom(name) => name.as_str(),
+            },
         };
         let symbols = [self.market.yes_token.as_str(), self.market.no_token.as_str()];
         let class = crate::helpers::db::classify_market(
