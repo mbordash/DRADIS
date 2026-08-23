@@ -23,7 +23,15 @@ services:
     environment:
       - API_PORT=9000
       - DRADIS_DATA_DIR=/app/data
-      - ASSETS=btc
+      # ASSETS is deliberately NOT set. This image carries all three venues and
+      # the venue is chosen at runtime, so a hardcoded asset list is wrong for
+      # two of the three: it forced a logs/btc-dradis.db shard onto Kalshi and US
+      # instances that never trade a "btc" shard, showed it in the asset selector,
+      # and — because the first shard created claims the primary db::pool() slot —
+      # pointed the API and LLM advisor at a database that never sees a trade.
+      # Left unset, the engine derives the right default per venue. An intl
+      # operator running several underlyings can still set ASSETS=btc,eth,sol in
+      # .env, which is the case this was meant to serve.
       # Marks this as the paid Marketplace image. The Control Tower uses it to
       # show commercial support contacts instead of the community "no individual
       # support, file a GitHub issue" wording, which AWS would not accept on a

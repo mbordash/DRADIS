@@ -2114,6 +2114,14 @@ struct AvailableMarketsResponse {
     markets: Vec<AvailableMarket>,
 }
 
+/// Does this build run the deployment-queue consumer?
+///
+/// `run_adama_processor` is spawned from the `#[cfg(feature = "intl_clob")]`
+/// block in main.rs because it is generic over the on-chain wallet Provider.
+/// Named rather than inlined so the coupling is greppable from both ends: if the
+/// processor is ever made venue-neutral, this is the constant to change.
+const DEPLOY_QUEUE_HAS_CONSUMER: bool = cfg!(feature = "intl_clob");
+
 /// Default max-time-to-close for a market class, in seconds.
 ///
 /// The sensible value depends on the VENUE as much as the class, because the
@@ -2775,6 +2783,38 @@ async fn deploy_squadron(
     Json(req): Json<DeploySquadronRequest>,
 ) -> Response {
     info!("📥 POST /api/squadrons/deploy: mode={}, type={}", req.mode, req.market_type);
+
+    // Refuse rather than queue a request nothing will ever pick up.
+    //
+    // A deploy request is written to the deployment_queue table and consumed by
+    // run_adama_processor, which is generic over the on-chain wallet Provider
+    // and therefore spawned only on the intl CLOB build. On Kalshi and US the
+    // row was written, the API answered "queued", and the squadron never
+    // appeared — no error anywhere, in the log or the UI. That is the worst
+    // possible failure: the operator is told it worked.
+    //
+    // These venues run their own market selection, so nothing is lost today by
+    // saying so plainly. Operator-chosen squadrons here need a venue-side queue
+    // consumer, which is real work: the Kalshi loop trades one market at a time
+    // and derives its Raptor stack from a crypto underlying that a politics or
+    // sports market does not have.
+    if !DEPLOY_QUEUE_HAS_CONSUMER {
+        warn!(
+            "📋 Deployment refused ({} / {}): no queue processor on this venue build",
+            req.mode, req.market_type,
+        );
+        return Json(DeploySquadronResponse {
+            success: false,
+            squadron_id: None,
+            error: Some(
+                "This venue selects and manages its own markets automatically — \
+                 operator-deployed squadrons are not available on this build yet. \
+                 The squadron it is trading appears on the Main view; use the viper \
+                 controls on its squadron page to tune it."
+                    .to_string(),
+            ),
+        }).into_response();
+    }
     
     // Validate market type against deployment region.
     // US is politics/sports (its crypto wing is auto-managed by the trader loop,
