@@ -164,6 +164,54 @@ fn pair_from_market(m: &KalshiMarket) -> Option<KalshiPair> {
     })
 }
 
+/// Build a pair for a market with no crypto underlying — a politics or sports
+/// market the operator deployed by hand.
+///
+/// `pair_from_market` returns None for these, because it derives the underlying
+/// from the ticker prefix and there is none to find. That is correct for the
+/// rotation loop, which only ever trades the configured crypto series, but it
+/// also meant an operator-deployed market could not be represented at all.
+fn pair_from_market_untethered(m: &KalshiMarket) -> KalshiPair {
+    let question = if m.yes_sub_title.is_empty() {
+        m.title.clone()
+    } else {
+        format!("{} — {}", m.title, m.yes_sub_title)
+    };
+    KalshiPair {
+        long: MarketId::new(leg_id(&m.ticker, true)),
+        short: MarketId::new(leg_id(&m.ticker, false)),
+        close_time: m.close_time_utc(),
+        volume: super::types::fp(&m.volume_fp)
+            .and_then(|d| f64::try_from(d).ok())
+            .unwrap_or(0.0),
+        strike: m.strike().and_then(|s| Decimal::try_from(s).ok()),
+        ticker: m.ticker.clone(),
+        cadence: Cadence::from_ticker(&m.ticker),
+        question,
+        // Empty is the marker for "no crypto underlying". Every crypto-specific
+        // path in the trade loop checks this rather than the market class, so a
+        // future non-crypto class needs no further plumbing.
+        underlying: "",
+    }
+}
+
+impl KalshiPair {
+    /// Does this market track a crypto underlying? False for politics, sports,
+    /// and anything else deployed by hand.
+    fn is_crypto(&self) -> bool { !self.underlying.is_empty() }
+}
+
+/// Why this market is being traded, and therefore how the loop treats it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum MarketMandate {
+    /// Chosen by the venue's own volume rotation. May be rotated away from when
+    /// a hotter market appears.
+    Rotating,
+    /// Deployed by the operator. Traded until it closes or is stood down —
+    /// rotating away from a market someone deliberately chose would be wrong.
+    Pinned,
+}
+
 /// Crypto underlying from a Kalshi series/market ticker prefix.
 fn detect_underlying(ticker: &str) -> Option<&'static str> {
     let t = ticker.to_ascii_uppercase();
@@ -202,6 +250,28 @@ struct CryptoRaptors {
     derivatives: watch::Receiver<DerivativesSnapshot>,
     tide: Option<watch::Receiver<TideSnapshot>>,
     horizon: Option<watch::Receiver<HorizonSnapshot>>,
+}
+
+impl CryptoRaptors {
+    /// A stack that publishes nothing, for markets with no crypto underlying.
+    ///
+    /// Spawning the real stack for a politics market would open a Binance feed
+    /// for a symbol that does not exist. The vipers that read these channels
+    /// (Momentum, GBoost, Basis, FairValue) are not in the viper set for those
+    /// classes anyway — the class-to-viper mapping in the database decides that
+    /// — so a neutral snapshot is what the remaining vipers should see.
+    ///
+    /// The senders are dropped immediately; a `watch::Receiver` keeps serving
+    /// its last value after the sender goes, which is exactly the behaviour
+    /// wanted here.
+    fn neutral() -> Self {
+        let (_, oracle) = watch::channel(dec!(0));
+        let (_, velocity) = watch::channel((dec!(0), dec!(0), dec!(0)));
+        let (_, drift) = watch::channel((dec!(0), dec!(0), dec!(0)));
+        let (_, funding) = watch::channel(dec!(0));
+        let (_, derivatives) = watch::channel(DerivativesSnapshot::default());
+        Self { oracle, velocity, drift, funding, derivatives, tide: None, horizon: None }
+    }
 }
 
 static CRYPTO_RAPTOR_STACKS: OnceLock<std::sync::Mutex<HashMap<String, CryptoRaptors>>> =
@@ -324,6 +394,7 @@ fn raptor_stack_for(
 
 // ─── Rotation loop ────────────────────────────────────────────────────────────
 
+#[derive(Debug)]
 enum MarketOutcome {
     Closed,
     BetterMarketFound,
@@ -348,6 +419,18 @@ pub async fn run_kalshi_trader(
     // Venue-lifetime private fill feed (event-precise fill confirmation).
     venue.start_fill_feed(cancel.clone());
 
+    // Drain the deployment queue alongside the rotation loop. Operator-deployed
+    // markets run concurrently with the venue's own selection — they are a
+    // different market class on a different cadence, not a replacement for it.
+    tokio::spawn(run_deployment_processor(
+        Arc::clone(&venue),
+        cag.clone(),
+        Arc::clone(&raptor_health_tx),
+        Arc::clone(&markets_tx),
+        Arc::clone(&process_heartbeat_secs),
+        cancel.clone(),
+    ));
+
     loop {
         if cancel.is_cancelled() {
             return;
@@ -368,6 +451,8 @@ pub async fn run_kalshi_trader(
             &series,
             &market_cancel,
             selection,
+            MarketMandate::Rotating,
+            None,
         ).await;
         market_cancel.cancel();
 
@@ -423,6 +508,102 @@ async fn discover_pairs(venue: &KalshiVenue, series: &[String]) -> Vec<KalshiPai
 }
 
 /// Selected primary market and optional daily maker venue.
+/// How often the deployment queue is polled. Operational plumbing rather than a
+/// trading parameter, so it stays a compile-time constant alongside the loop's
+/// other cadences rather than becoming a Control Tower knob.
+const DEPLOY_POLL_SECS: u64 = 5;
+
+/// Trade the markets an operator deployed from the Control Tower.
+///
+/// The deploy endpoint writes a row to `deployment_queue`. On the intl CLOB that
+/// queue is drained by `run_adama_processor`, which is generic over the on-chain
+/// wallet Provider and so cannot run here — which is why, until this existed, a
+/// Kalshi deploy was accepted, written, and then silently ignored forever.
+///
+/// Each deployment gets its own task running the same trade loop the rotation
+/// path uses, pinned to the chosen market: no volume rotation, and a neutral
+/// Raptor stack when the market has no crypto underlying. The class-to-viper
+/// mapping in the database decides which vipers actually run, so a politics
+/// market picks up the politics set rather than inheriting crypto's.
+pub async fn run_deployment_processor(
+    venue: Arc<KalshiVenue>,
+    cag: Cag,
+    raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
+    markets_tx: Arc<watch::Sender<HashMap<String, String>>>,
+    process_heartbeat_secs: Arc<AtomicU64>,
+    cancel: CancellationToken,
+) {
+    let mut ticker = tokio::time::interval(Duration::from_secs(DEPLOY_POLL_SECS));
+    info!("📋 Kalshi deployment processor started — operator-deployed squadrons enabled");
+
+    loop {
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!("📋 Kalshi deployment processor stopping");
+                return;
+            }
+            _ = ticker.tick() => {}
+        }
+
+        for dep in db::fetch_pending_deployments().await {
+            // Claim it first. fetch_pending_deployments only returns rows still
+            // marked 'pending', so this is what stops the next tick — two
+            // seconds away — from starting the same market a second time.
+            if let Err(e) = db::update_deployment_status(&dep.id, "processing", None, None).await {
+                warn!("📋 Could not claim deployment {}: {e}", dep.id);
+                continue;
+            }
+
+            let market = match venue.market(&dep.market_id).await {
+                Ok(m) => m,
+                Err(e) => {
+                    let msg = format!("could not load market {}: {e}", dep.market_id);
+                    warn!("📋 Deployment {} failed — {msg}", dep.id);
+                    let _ = db::update_deployment_status(&dep.id, "failed", None, Some(&msg)).await;
+                    continue;
+                }
+            };
+
+            let pair = pair_from_market_untethered(&market);
+            info!(
+                "📋 Deploying {} squadron on \"{}\" [{}] close={:?}",
+                dep.market_type, pair.question, pair.ticker, pair.close_time,
+            );
+            if let Err(e) = db::update_deployment_status(&dep.id, "active", None, None).await {
+                warn!("📋 Could not mark deployment {} active: {e}", dep.id);
+            }
+
+            let (venue_t, cag_t) = (Arc::clone(&venue), cag.clone());
+            let health_t = Arc::clone(&raptor_health_tx);
+            let markets_t = Arc::clone(&markets_tx);
+            let hb_t = Arc::clone(&process_heartbeat_secs);
+            // A child token so standing the venue down stops deployed markets too.
+            let cancel_t = cancel.child_token();
+            let dep_id = dep.id.clone();
+            let class = dep.market_type.clone();
+
+            tokio::spawn(async move {
+                let outcome = trade_one_market(
+                    &venue_t,
+                    &cag_t,
+                    &health_t,
+                    &markets_t,
+                    &hb_t,
+                    // Rotation series are irrelevant to a pinned market; the
+                    // rescan branch returns early before ever reading them.
+                    &[],
+                    &cancel_t,
+                    MarketSelection { primary: pair, maker: None },
+                    MarketMandate::Pinned,
+                    Some(&class),
+                ).await;
+                info!("📋 Deployed {class} squadron finished: {outcome:?}");
+                let _ = db::update_deployment_status(&dep_id, "completed", None, None).await;
+            });
+        }
+    }
+}
+
 struct MarketSelection {
     primary: KalshiPair,
     /// Daily market for passive maker/FairValue orders (longer-lived, lower fee).
@@ -512,26 +693,38 @@ async fn trade_one_market(
     series: &[String],
     cancel: &CancellationToken,
     selection: MarketSelection,
+    mandate: MarketMandate,
+    // `deployed_as` is the class label for an operator-deployed market
+    // ("politics", "sports"), used to name its squadron. None for the rotation
+    // loop, which names the squadron after the crypto underlying.
+    deployed_as: Option<&str>,
 ) -> MarketOutcome {
     let asset = KALSHI_ASSET;
     let pair = selection.primary;
     let maker_pair = selection.maker;
 
     // ── Raptor intelligence for the market's underlying ─────────────────────
-    let raptors = raptor_stack_for(pair.underlying, raptor_health_tx);
-    info!(
-        "🧠 Kalshi: underlying={} strike={:?} for \"{}\"",
-        pair.underlying, pair.strike, pair.question
-    );
+    let raptors = if pair.is_crypto() {
+        info!(
+            "🧠 Kalshi: underlying={} strike={:?} for \"{}\"",
+            pair.underlying, pair.strike, pair.question
+        );
+        raptor_stack_for(pair.underlying, raptor_health_tx)
+    } else {
+        info!("🧠 Kalshi: no crypto underlying for \"{}\" — neutral signals", pair.question);
+        CryptoRaptors::neutral()
+    };
 
     // ── Register the squadron so the Control Tower lists it ─────────────────
-    let squadron = register_kalshi_squadron(cag, &pair, &raptors);
+    let squadron = register_kalshi_squadron(cag, &pair, &raptors, deployed_as);
     let squadron_id = squadron.id.clone();
     // The squadron registers under the crypto underlying (so the taxonomy
     // classifies it as crypto), but this venue's DB scope is KALSHI_ASSET.
     // Alias the two so the Control Tower's `?asset=btc` queries reach this
     // venue's database instead of erroring out with an empty tradelog.
-    db::alias_pool(pair.underlying, asset);
+    if pair.is_crypto() {
+        db::alias_pool(pair.underlying, asset);
+    }
     seed_squadron_config(&squadron_id).await;
     let market_class = squadron.classify_and_link().await;
     // Filing dimensions for every row this market writes. `asset` above is
@@ -541,7 +734,9 @@ async fn trade_one_market(
         asset,
         KALSHI_VENUE,
         Some(market_class.clone()),
-        Some(pair.underlying.to_string()),
+        // A politics market has no underlying; recording "" would file every
+        // such trade under a blank dimension rather than none.
+        pair.is_crypto().then(|| pair.underlying.to_string()),
     );
 
     let viper_kinds = match db::pool() {
@@ -588,7 +783,9 @@ async fn trade_one_market(
     let _fill_listener = lifecycle.spawn_fill_listener(Arc::clone(venue), Arc::clone(&positions));
     let market_started_at = Utc::now();
 
-    publish_raptor_health(raptor_health_tx, pair.underlying, true);
+    if pair.is_crypto() {
+        publish_raptor_health(raptor_health_tx, pair.underlying, true);
+    }
     // Map each viper to its preferred venue: "Hourly" vipers → primary (15M),
     // "Window/Daily" vipers → maker (daily), mirroring the intl/US patrol logic.
     let maker_name = maker_pair.as_ref().map(|mp| mp.question.as_str()).unwrap_or(&pair.question);
@@ -650,7 +847,7 @@ async fn trade_one_market(
                 info!("Kalshi trader: cancelled — standing down");
                 lifecycle.cancel_all(venue.as_ref()).await;
                 cag.update_state(&squadron_id, SquadronState::StoodDown);
-                publish_raptor_health(raptor_health_tx, pair.underlying, false);
+                if pair.is_crypto() { publish_raptor_health(raptor_health_tx, pair.underlying, false); }
                 return MarketOutcome::Cancelled;
             }
             _ = dash_tick.tick() => {
@@ -663,6 +860,12 @@ async fn trade_one_market(
                 continue;
             }
             _ = rescan_tick.tick() => {
+                // A market the operator deployed is never rotated away from —
+                // they chose it, and swapping it for whatever is hottest in the
+                // crypto series would be both surprising and off-class.
+                if mandate == MarketMandate::Pinned {
+                    continue;
+                }
                 // Only rotate when flat.
                 if !positions.lock().await.is_empty() {
                     continue;
@@ -678,7 +881,7 @@ async fn trade_one_market(
                         lifecycle.cancel_all(venue.as_ref()).await;
                         cag.update_state(&squadron_id, SquadronState::StoodDown);
                         cag.remove(&squadron_id);
-                        publish_raptor_health(raptor_health_tx, pair.underlying, false);
+                        if pair.is_crypto() { publish_raptor_health(raptor_health_tx, pair.underlying, false); }
                         return MarketOutcome::BetterMarketFound;
                     }
                 }
@@ -718,7 +921,7 @@ async fn trade_one_market(
                 lifecycle.cancel_all(venue.as_ref()).await;
                 cag.update_state(&squadron_id, SquadronState::StoodDown);
                 cag.remove(&squadron_id);
-                publish_raptor_health(raptor_health_tx, pair.underlying, false);
+                if pair.is_crypto() { publish_raptor_health(raptor_health_tx, pair.underlying, false); }
                 return MarketOutcome::Closed;
             }
             MarketPhase::WindingDown => {
@@ -1321,7 +1524,21 @@ async fn wait_or_cancel(cancel: &CancellationToken, secs: u64) -> bool {
 }
 
 /// Assemble and register the Kalshi squadron with the full Raptor stack.
-fn register_kalshi_squadron(cag: &Cag, pair: &KalshiPair, r: &CryptoRaptors) -> Squadron {
+/// "politics" -> "Politics". Squadron names are shown in the UI.
+fn title_case(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
+fn register_kalshi_squadron(
+    cag: &Cag,
+    pair: &KalshiPair,
+    r: &CryptoRaptors,
+    deployed_as: Option<&str>,
+) -> Squadron {
     let raptors = SquadronRaptors::full(
         r.oracle.clone(),
         r.velocity.clone(),
@@ -1349,14 +1566,25 @@ fn register_kalshi_squadron(cag: &Cag, pair: &KalshiPair, r: &CryptoRaptors) -> 
 
     // Use the actual crypto underlying (Btc/Eth/Sol) so the squadron
     // self-classifies as "crypto" and links to the full raptor/viper set.
-    let crypto_asset = match pair.underlying {
-        "eth" => CryptoAsset::Eth,
-        "sol" => CryptoAsset::Sol,
-        _     => CryptoAsset::Btc,
+    //
+    // An operator-deployed market has no underlying, so it takes a Custom asset
+    // named for its class. classify_and_link() passes an empty category for
+    // Custom, which is what makes the taxonomy fall through to its market-name
+    // rules — so a politics market classifies as politics and picks up that
+    // class's vipers rather than inheriting crypto's.
+    let crypto_asset = match (deployed_as, pair.underlying) {
+        (Some(class), _) => CryptoAsset::Custom(class.to_string()),
+        (None, "eth") => CryptoAsset::Eth,
+        (None, "sol") => CryptoAsset::Sol,
+        (None, _)     => CryptoAsset::Btc,
+    };
+    let squadron_name = match deployed_as {
+        Some(class) => format!("Kalshi {} Squadron", title_case(class)),
+        None => "Kalshi Crypto Squadron".to_string(),
     };
     let squadron = Squadron::new(
         crypto_asset,
-        SquadronConfig::arb_wing("Kalshi Crypto Squadron"),
+        SquadronConfig::arb_wing(squadron_name),
         market,
         raptors,
     );
@@ -1451,5 +1679,61 @@ mod tests {
         let s = configured_series();
         assert!(s.contains(&"KXBTC15M".to_string()));
         assert!(s.contains(&"KXETHD".to_string()));
+    }
+}
+
+
+#[cfg(test)]
+mod deployed_market_tests {
+    use super::*;
+    use crate::venues::kalshi::types::KalshiMarket;
+
+    fn market(ticker: &str, title: &str) -> KalshiMarket {
+        KalshiMarket { ticker: ticker.to_string(), title: title.to_string(), ..Default::default() }
+    }
+
+    /// pair_from_market derives the underlying from the ticker prefix and
+    /// returns None when there is none. That is right for the rotation loop,
+    /// which only trades the configured crypto series — but it also meant an
+    /// operator-deployed politics or sports market could not be represented at
+    /// all, which is why deploying one produced nothing.
+    #[test]
+    fn a_politics_market_has_no_pair_until_it_is_untethered() {
+        let m = market("KXCITRINI-28JUL01", "Who will win the Citrini Prize?");
+        assert!(pair_from_market(&m).is_none(), "test premise broken");
+
+        let pair = pair_from_market_untethered(&m);
+        assert!(!pair.is_crypto());
+        assert_eq!(pair.ticker, "KXCITRINI-28JUL01");
+        assert_eq!(pair.question, "Who will win the Citrini Prize?");
+        assert_eq!(pair.long.as_str(), leg_id("KXCITRINI-28JUL01", true));
+        assert_eq!(pair.short.as_str(), leg_id("KXCITRINI-28JUL01", false));
+    }
+
+    /// The crypto path must be untouched: a BTC market still reports its
+    /// underlying, so it keeps its real Raptor stack and its crypto viper set.
+    #[test]
+    fn a_crypto_market_still_reports_its_underlying() {
+        let m = market("KXBTCD-26AUG2218-T77099.99", "Bitcoin price on Aug 22");
+        let pair = pair_from_market(&m).expect("crypto market must still pair");
+        assert!(pair.is_crypto());
+        assert_eq!(pair.underlying, "btc");
+
+        // And the untethered constructor is only for markets that need it — it
+        // deliberately drops the underlying even on a crypto ticker, so it must
+        // never be reached from the rotation path.
+        assert!(!pair_from_market_untethered(&m).is_crypto());
+    }
+
+    /// The question is built the same way on both paths, so a deployed squadron
+    /// is labelled in the UI exactly as the rotation loop would label it.
+    #[test]
+    fn the_subtitle_is_appended_to_the_title() {
+        let mut m = market("KXNBA-26", "Who wins the 2027 Final?");
+        m.yes_sub_title = "Philadelphia".to_string();
+        assert_eq!(
+            pair_from_market_untethered(&m).question,
+            "Who wins the 2027 Final? — Philadelphia",
+        );
     }
 }

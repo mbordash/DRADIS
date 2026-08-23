@@ -2114,13 +2114,17 @@ struct AvailableMarketsResponse {
     markets: Vec<AvailableMarket>,
 }
 
-/// Does this build run the deployment-queue consumer?
+/// Does this build run a deployment-queue consumer?
 ///
-/// `run_adama_processor` is spawned from the `#[cfg(feature = "intl_clob")]`
-/// block in main.rs because it is generic over the on-chain wallet Provider.
-/// Named rather than inlined so the coupling is greppable from both ends: if the
-/// processor is ever made venue-neutral, this is the constant to change.
-const DEPLOY_QUEUE_HAS_CONSUMER: bool = cfg!(feature = "intl_clob");
+/// The intl CLOB drains the queue with `run_adama_processor`, which is generic
+/// over the on-chain wallet Provider. Kalshi has its own consumer,
+/// `kalshi::trader::run_deployment_processor`, spawned beside its rotation loop.
+///
+/// US retail has neither, so a deploy there is still refused rather than written
+/// and abandoned. Named rather than inlined so the coupling is greppable from
+/// both ends when that changes.
+const DEPLOY_QUEUE_HAS_CONSUMER: bool =
+    cfg!(feature = "intl_clob") || cfg!(feature = "kalshi");
 
 /// Default max-time-to-close for a market class, in seconds.
 ///

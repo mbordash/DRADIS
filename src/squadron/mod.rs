@@ -290,11 +290,17 @@ impl Squadron {
         let Some(pool) = crate::helpers::db::pool() else {
             return "unknown".to_string();
         };
-        // Crypto assets self-identify; venue-specific assets (e.g. US retail)
-        // leave the category empty so the symbol-token rules drive the match.
+        // Crypto assets self-identify. A Custom asset offers its own name as the
+        // category: an operator who deploys a market as "politics" has declared
+        // the class, and the category rule matches it exactly at the highest
+        // priority. Names that match no category rule — "us", "us-crypto" —
+        // simply fall through to the symbol-token and slug rules, because the
+        // category test requires an exact match rather than merely a non-empty
+        // string. So this strengthens a declared class without altering any
+        // venue that does not declare one.
         let category = match &self.asset {
             CryptoAsset::Btc | CryptoAsset::Eth | CryptoAsset::Sol => "crypto",
-            CryptoAsset::Custom(_) => "",
+            CryptoAsset::Custom(name) => name.as_str(),
         };
         let symbols = [self.market.yes_token.as_str(), self.market.no_token.as_str()];
         let class = crate::helpers::db::classify_market(

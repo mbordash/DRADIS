@@ -3877,6 +3877,78 @@ mod reconcile_tests {
 }
 
 #[cfg(test)]
+mod deployed_class_tests {
+    use super::*;
+
+    async fn seeded_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        init_schema(&pool).await.expect("schema");
+        seed_market_taxonomy(&pool).await.expect("taxonomy");
+        pool
+    }
+
+    /// A Kalshi politics ticker carries nothing the symbol or slug rules
+    /// recognise — "KXCITRINI-28JUL01" is not "election" or "senate". Without
+    /// the operator's declared class such a market classified as "unknown",
+    /// which is how a squadron someone deliberately deployed as politics ends up
+    /// filed as something else.
+    #[tokio::test]
+    async fn a_declared_class_wins_over_an_unrecognisable_ticker() {
+        let pool = seeded_pool().await;
+        let symbols = ["KXCITRINI-28JUL01#yes", "KXCITRINI-28JUL01#no"];
+        let title = "Who will win the Citrini Prize?";
+
+        // Undeclared: nothing in the ticker or the title matches a rule.
+        let derived = classify_market(&pool, "", &symbols, title).await;
+        assert_ne!(derived, "politics", "test premise broken — this title is recognisable");
+
+        // Declared: the category rule matches exactly, at the highest priority.
+        let declared = classify_market(&pool, "politics", &symbols, title).await;
+        assert_eq!(declared, "politics");
+    }
+
+    /// Declaring a class must not let an arbitrary asset name invent one. US
+    /// wings pass "us" / "us-crypto" as their Custom asset name and must keep
+    /// falling through to the symbol and slug rules exactly as before.
+    #[tokio::test]
+    async fn an_unrecognised_category_still_falls_through() {
+        let pool = seeded_pool().await;
+        let sports = ["aec-nfl-lac-ten-2026#yes", "aec-nfl-lac-ten-2026#no"];
+
+        // "us" matches no category rule, so the nfl symbol token decides.
+        assert_eq!(classify_market(&pool, "us", &sports, "Chargers at Titans").await, "sports");
+        assert_eq!(
+            classify_market(&pool, "us", &sports, "Chargers at Titans").await,
+            classify_market(&pool, "", &sports, "Chargers at Titans").await,
+            "declaring an unrecognised category changed the outcome",
+        );
+    }
+
+    /// The classes an operator can deploy on Kalshi must have vipers, or the
+    /// squadron registers and then does nothing — which looks identical to the
+    /// deployment having been dropped.
+    #[tokio::test]
+    async fn every_deployable_class_has_runnable_vipers() {
+        let pool = seeded_pool().await;
+        for class in ["politics", "sports", "crypto", "unknown"] {
+            let vipers = vipers_for_class(&pool, class).await;
+            assert!(!vipers.is_empty(), "class '{class}' has no vipers");
+            // Arbitrage and Maker are the venue-agnostic pair every class gets.
+            for expected in ["arbitrage", "maker"] {
+                assert!(
+                    vipers.iter().any(|v| v == expected),
+                    "class '{class}' is missing '{expected}' (has {vipers:?})",
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod pool_alias_tests {
     use super::*;
 
