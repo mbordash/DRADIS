@@ -87,10 +87,11 @@ const SUBSCRIPTION_MARKET_DATA: &str = "SUBSCRIPTION_TYPE_MARKET_DATA";
 
 /// Order lifecycle / fills on the private stream.
 ///
-/// UNVERIFIED against the live endpoint, unlike the market-data type above. If
-/// the venue rejects it the connection now warns loudly rather than going quiet,
-/// so a wrong value here is visible rather than silently costing fill events.
-const SUBSCRIPTION_ORDER_UPDATE: &str = "SUBSCRIPTION_TYPE_ORDER_UPDATE";
+/// `SUBSCRIPTION_TYPE_ORDER`, not the `..._ORDER_UPDATE` this originally
+/// guessed — corrected against the documented set now enumerated in the
+/// polymarket_us SDK (MARKET_DATA, MARKET_DATA_LITE, TRADE, ORDER, POSITION,
+/// ACCOUNT_BALANCE).
+const SUBSCRIPTION_ORDER: &str = "SUBSCRIPTION_TYPE_ORDER";
 
 /// Private order/fill stream. Same envelope, no market slugs — the private feed
 /// is account-scoped.
@@ -459,7 +460,7 @@ pub fn spawn_private_fill_feed(
             let frame = PrivateSubscribeFrame {
                 subscribe: PrivateSubscribeBody {
                     request_id: "dradis-fills".to_string(),
-                    subscription_type: SUBSCRIPTION_ORDER_UPDATE,
+                    subscription_type: SUBSCRIPTION_ORDER,
                 },
             };
             let sub = match serde_json::to_string(&frame) {

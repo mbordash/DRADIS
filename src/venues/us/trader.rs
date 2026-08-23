@@ -780,7 +780,7 @@ async fn trade_one_market(
     // Publish Raptor telemetry + active market so the squadron detail panels
     // populate (both feed `/api/status`).
     publish_us_raptor_health(raptor_health_tx, asset, true);
-    publish_us_strategy_market(markets_tx, &viper_kinds, &pair.question);
+    publish_us_strategy_market(markets_tx, &squadron_id, &viper_kinds, &pair.question);
 
     // ── Stream both legs' order books (tied to the per-market cancel token) ───
     let ws_url = venue.markets_ws_url();
@@ -1888,14 +1888,25 @@ fn publish_us_raptor_health(
 /// Publish the active market under **every** resolved viper kind into the
 /// `/api/status` strategy→market map, so each viper card in the squadron detail
 /// (Arbitrage, Maker, …) shows the market it's running on — not just Arbitrage.
+/// Publish "which market is each viper working" for the Control Tower.
+///
+/// Keyed by SQUADRON and viper kind, not by viper kind alone. Both US wings run
+/// the same venue-agnostic vipers, so a bare kind meant the crypto wing
+/// overwrote the general wing's entry and the squadron page showed one market in
+/// its header while the viper strip named the other. Kalshi has the same shape
+/// with three squadrons.
+///
+/// The squadron id is used rather than the asset because Kalshi's squadron asset
+/// is "KALSHI" for every one of its squadrons, which would collide again.
 fn publish_us_strategy_market(
     tx: &watch::Sender<HashMap<String, String>>,
+    squadron_id: &str,
     viper_kinds: &[String],
     market_name: &str,
 ) {
     tx.send_modify(|map| {
         for kind in viper_kinds {
-            map.insert(kind.clone(), market_name.to_string());
+            map.insert(crate::state::strategy_market_key(squadron_id, kind), market_name.to_string());
         }
     });
 }

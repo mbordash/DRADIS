@@ -141,6 +141,47 @@ pub type PriceState = (
 
 /// Named accessors for [`PriceState`], so new code never indexes a 7-tuple.
 #[cfg(test)]
+mod strategy_market_key_tests {
+    use super::strategy_market_key;
+
+    /// The collision: both US wings and all three Kalshi squadrons run the same
+    /// venue-agnostic viper kinds. Keyed by kind alone, whichever squadron
+    /// published last won, so a squadron page named one market in its header and
+    /// a different one on its viper cards.
+    #[test]
+    fn the_same_viper_on_two_squadrons_gets_two_keys() {
+        assert_ne!(
+            strategy_market_key("us-open", "maker"),
+            strategy_market_key("us-crypto-open", "maker"),
+        );
+        assert_ne!(
+            strategy_market_key("politics-open", "arbitrage"),
+            strategy_market_key("sports-open", "arbitrage"),
+        );
+    }
+
+    /// Squadron id rather than asset: every Kalshi squadron reports asset
+    /// "KALSHI", so keying on that would collide exactly as before.
+    #[test]
+    fn different_vipers_on_one_squadron_stay_distinct() {
+        assert_ne!(
+            strategy_market_key("btc-open", "maker"),
+            strategy_market_key("btc-open", "arbitrage"),
+        );
+    }
+
+    /// The key must be reproducible from the same inputs, since the writer is
+    /// the engine and the reader is the browser.
+    #[test]
+    fn the_key_is_stable_and_contains_both_parts() {
+        let k = strategy_market_key("us-crypto-open", "fairvalue");
+        assert_eq!(k, strategy_market_key("us-crypto-open", "fairvalue"));
+        assert!(k.contains("us-crypto-open"));
+        assert!(k.contains("fairvalue"));
+    }
+}
+
+#[cfg(test)]
 mod signal_exposure_tests {
     use super::{StrategySignal, OrderParams, MarketId};
     use crate::venues::core::TimeInForce;
@@ -429,6 +470,17 @@ impl MarketSnapshot {
         let total = bid + ask;
         if total > Decimal::ZERO { (bid - ask) / total } else { -Decimal::ONE }
     }
+}
+
+/// Key for the Control Tower's "which market is this viper working" map.
+///
+/// Scoped by squadron because every venue now runs more than one at a time —
+/// two US wings, three Kalshi squadrons — and they share the venue-agnostic
+/// viper kinds. Keyed by kind alone, the last squadron to publish overwrote the
+/// rest, so a squadron page showed one market in its header and a different one
+/// on its viper cards.
+pub fn strategy_market_key(squadron_id: &str, viper_kind: &str) -> String {
+    format!("{squadron_id}:{viper_kind}")
 }
 
 /// Current market data snapshot.

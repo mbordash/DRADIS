@@ -463,7 +463,11 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
                   viper={v}
                   config={config}
                   onPatch={handlePatch}
-                  market={status?.strategy_markets[v.statusKey]}
+                  // Scoped by squadron: both US wings and all three Kalshi
+                  // squadrons share the venue-agnostic viper kinds, so a bare
+                  // kind returned whichever squadron published last — the header
+                  // named one market and the viper cards another.
+                  market={status?.strategy_markets[`${squadron.id}:${v.statusKey}`]}
                   status={statusByStrategy.get(v.strategyName)}
                 />
               ))}

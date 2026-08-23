@@ -810,7 +810,7 @@ async fn trade_one_market(
                 .replace("timedecay", "time_decay")
                 .replace("trendreversal", "trendcapture");
             let market = if s.venue() == "Window/Daily" { maker_name } else { &pair.question };
-            map.insert(key, market.to_string());
+            map.insert(crate::state::strategy_market_key(&squadron_id, &key), market.to_string());
         }
     });
     if let Some(ref mp) = maker_pair {
