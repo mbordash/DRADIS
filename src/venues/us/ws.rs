@@ -60,55 +60,92 @@ const RECONNECT_DELAY_SECS: u64 = 5;
 
 /// Market-data subscription frame.
 ///
-/// The venue rejected the previous shape outright — it replied
-/// `{"error":"invalid_message"}` to every subscribe and DRADIS never noticed,
-/// because each `OrderBookEvent` field is `#[serde(default)]`, so the error
-/// frame deserialised into an all-defaults event and was dropped by the channel
-/// check. Books stayed empty on both wings with a cheerful "subscribed" in the
-/// log.
+/// Verified against the live endpoint 2026-08-23. The previous frame —
+/// `{action, channels[], symbols[]}` — was rejected with
+/// `{"error":"invalid_message"}`, as were four other shapes including `{}` and
+/// deliberately malformed non-JSON. An identical error for valid and invalid
+/// JSON alike meant the server never parsed any of them as a subscribe.
 ///
-/// Two things were wrong. The frame was `{action, channels[], symbols[]}` where
-/// the server wants a flat, camelCase subscription object; and the channel was
-/// `order_book`, which is not one the venue serves — full depth is `market_data`
-/// (`market_data_lite` is best-bid/offer only). Both taken from the
-/// polymarket_us SDK's own stream client, which is the closest thing to a spec.
+/// The real shape wraps everything in a `subscribe` object and, critically,
+/// addresses markets by **slug** rather than by instrument symbol.
 #[derive(Serialize)]
-struct SubscribeFrame<'a> {
-    action: &'a str,
-    channels: Vec<&'a str>,
-    symbols: Vec<&'a str>,
+struct SubscribeFrame {
+    subscribe: SubscribeBody,
 }
 
-/// Full order-book depth. Not `order_book` — see [`SubscribeFrame`].
-const MARKET_DATA_CHANNEL: &str = "order_book";
-
-/// Order lifecycle / fills. Not `private_orders`.
-const ORDER_UPDATE_CHANNEL: &str = "order_update";
-
-/// Private-channel subscription: no symbol, it is account-scoped.
 #[derive(Serialize)]
-struct PrivateSubscribeFrame<'a> {
-    action: &'a str,
-    channels: Vec<&'a str>,
-    symbols: Vec<&'a str>,
+#[serde(rename_all = "camelCase")]
+struct SubscribeBody {
+    request_id: String,
+    subscription_type: &'static str,
+    market_slugs: Vec<String>,
 }
 
-/// One `order_book` event (spec §4.1). `bids`/`asks` are `[price, size]` string
-/// pairs; `timestamp` is epoch-millis.
+/// Full order book plus stats. `SUBSCRIPTION_TYPE_MARKET_DATA_LITE` is
+/// best-bid/offer only, which is not enough for the depth-based gates.
+const SUBSCRIPTION_MARKET_DATA: &str = "SUBSCRIPTION_TYPE_MARKET_DATA";
+
+/// Order lifecycle / fills on the private stream.
+///
+/// UNVERIFIED against the live endpoint, unlike the market-data type above. If
+/// the venue rejects it the connection now warns loudly rather than going quiet,
+/// so a wrong value here is visible rather than silently costing fill events.
+const SUBSCRIPTION_ORDER_UPDATE: &str = "SUBSCRIPTION_TYPE_ORDER_UPDATE";
+
+/// Private order/fill stream. Same envelope, no market slugs — the private feed
+/// is account-scoped.
+#[derive(Serialize)]
+struct PrivateSubscribeFrame {
+    subscribe: PrivateSubscribeBody,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+struct PrivateSubscribeBody {
+    request_id: String,
+    subscription_type: &'static str,
+}
+
+/// A price level. The venue nests the price in an object with its currency and
+/// sends both price and quantity as decimal strings.
 #[derive(Debug, Clone, Deserialize)]
-struct OrderBookEvent {
+struct Level {
     #[serde(default)]
-    channel: String,
+    px: Px,
     #[serde(default)]
-    symbol: String,
+    qty: String,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+struct Px {
     #[serde(default)]
-    sequence_number: u64,
+    value: String,
+}
+
+/// One market-data frame.
+///
+/// Note `offers`, not `asks`, and no sequence number — the previous parser
+/// expected `bids`/`asks` as flat `[price, size]` pairs and enforced a
+/// sequence-gap resync that has nothing to reference here.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarketDataFrame {
     #[serde(default)]
-    bids: Vec<[String; 2]>,
+    market_data: Option<MarketData>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct MarketData {
     #[serde(default)]
-    asks: Vec<[String; 2]>,
+    market_slug: String,
     #[serde(default)]
-    timestamp: i64,
+    bids: Vec<Level>,
+    #[serde(default)]
+    offers: Vec<Level>,
+    /// e.g. `MARKET_STATE_OPEN`.
+    #[serde(default)]
+    state: String,
 }
 
 /// Derive `wss://…` market-data URL from the venue's `https://…` REST base.
@@ -122,21 +159,19 @@ pub fn ws_url_from_base(base_url: &str) -> String {
 }
 
 /// Best bid/ask reducer: highest bid price, lowest ask price, with their depths.
-fn book_to_price(ev: &OrderBookEvent) -> Option<PriceState> {
-    let parse = |lvl: &[String; 2]| -> Option<(Decimal, Decimal)> {
-        Some((Decimal::from_str(&lvl[0]).ok()?, Decimal::from_str(&lvl[1]).ok()?))
+fn book_to_price(md: &MarketData) -> Option<PriceState> {
+    let parse = |lvl: &Level| -> Option<(Decimal, Decimal)> {
+        Some((
+            Decimal::from_str(&lvl.px.value).ok()?,
+            Decimal::from_str(&lvl.qty).ok()?,
+        ))
     };
 
-    let best_bid = ev
-        .bids
-        .iter()
-        .filter_map(parse)
-        .max_by(|a, b| a.0.cmp(&b.0));
-    let best_ask = ev
-        .asks
-        .iter()
-        .filter_map(parse)
-        .min_by(|a, b| a.0.cmp(&b.0));
+    // The venue sends bids descending and offers ascending, but max/min is
+    // taken explicitly rather than trusting position: a book that arrives
+    // out of order would otherwise quote the wrong touch.
+    let best_bid = md.bids.iter().filter_map(parse).max_by(|a, b| a.0.cmp(&b.0));
+    let best_ask = md.offers.iter().filter_map(parse).min_by(|a, b| a.0.cmp(&b.0));
 
     // A usable book needs at least one side; missing sides default to the
     // "no liquidity" sentinels the intl feed uses (bid 0 / ask 1).
@@ -146,11 +181,10 @@ fn book_to_price(ev: &OrderBookEvent) -> Option<PriceState> {
         return None;
     }
     // Aggregate depth across every level the venue publishes, beside the touch
-    // sizes above. Nothing consumes these yet — they exist so order-book
-    // imbalance can be compared as a whole-book ratio against the top-of-book
-    // one every viper currently gates on.
-    let bid_depth_total: Decimal = ev.bids.iter().filter_map(parse).map(|(_, sz)| sz).sum();
-    let ask_depth_total: Decimal = ev.asks.iter().filter_map(parse).map(|(_, sz)| sz).sum();
+    // sizes above, so order-book imbalance can be measured as a whole-book
+    // ratio rather than from a single resting order.
+    let bid_depth_total: Decimal = md.bids.iter().filter_map(parse).map(|(_, sz)| sz).sum();
+    let ask_depth_total: Decimal = md.offers.iter().filter_map(parse).map(|(_, sz)| sz).sum();
     Some((bid, bid_depth, ask, ask_depth, Utc::now(), bid_depth_total, ask_depth_total))
 }
 
@@ -205,11 +239,14 @@ pub fn spawn_market_feed(
             };
             let (mut write, mut read) = stream.split();
 
-            // Subscribe to this symbol's order book.
+            // Subscribe by market SLUG — the venue does not accept instrument
+            // symbols here.
             let frame = SubscribeFrame {
-                action: "subscribe",
-                channels: vec![MARKET_DATA_CHANNEL],
-                symbols: vec![&symbol],
+                subscribe: SubscribeBody {
+                    request_id: format!("dradis-{symbol}"),
+                    subscription_type: SUBSCRIPTION_MARKET_DATA,
+                    market_slugs: vec![symbol.clone()],
+                },
             };
             let sub = match serde_json::to_string(&frame) {
                 Ok(s) => s,
@@ -225,15 +262,13 @@ pub fn spawn_market_feed(
                 }
                 continue;
             }
-            info!("✅ US WS order_book subscribe sent for {symbol}");
+            info!("✅ US WS market-data subscribe sent for {symbol}");
 
-            let mut last_seq: Option<u64> = None;
-            let mut resync = false;
-            // Every OrderBookEvent field is #[serde(default)], so ANY valid JSON
-            // deserialises into it and is then dropped by the channel/symbol
-            // check below — an error frame, a rejected subscription and silence
-            // are indistinguishable. Sampling the first few frames makes the
-            // difference visible without flooding a live session.
+            let resync = false;
+            // A rejected subscription used to be indistinguishable from silence,
+            // because every field was #[serde(default)] and an error frame
+            // deserialised into an all-defaults event. Sampling the first few
+            // frames keeps a protocol change visible without flooding a session.
             let mut sampled = 0u8;
             let mut subscribe_rejected = false;
             const SAMPLE_FRAMES: u8 = 3;
@@ -264,7 +299,7 @@ pub fn spawn_market_feed(
                         if !subscribe_rejected && text.contains("\"error\"") {
                             subscribe_rejected = true;
                             warn!(
-                                "⚠️ US WS rejected the {MARKET_DATA_CHANNEL} subscription for {symbol}: {} \
+                                "⚠️ US WS rejected the market-data subscription for {symbol}: {} \
                                  — no book will arrive on this connection",
                                 text.chars().take(200).collect::<String>(),
                             );
@@ -275,39 +310,23 @@ pub fn spawn_market_feed(
                             debug!("📡 US WS frame {sampled}/{SAMPLE_FRAMES} for {symbol}: {preview}");
                         }
 
-                        let ev: OrderBookEvent = match serde_json::from_str(&text) {
-                            Ok(e)  => e,
-                            Err(_) => continue, // non-orderbook control/ack frame
+                        let frame: MarketDataFrame = match serde_json::from_str(&text) {
+                            Ok(f)  => f,
+                            Err(_) => continue, // control / ack / error frame
                         };
-                        // The server labels market-data frames by event type;
-                        // accept the snake_case and camelCase spellings the SDK
-                        // tolerates, and ignore anything for another symbol.
-                        let is_market_data = matches!(
-                            ev.channel.as_str(),
-                            "market_data" | "marketData" | "order_book",
-                        );
-                        if !is_market_data || (!ev.symbol.is_empty() && ev.symbol != symbol) {
+                        let Some(md) = frame.market_data else { continue };
+                        if !md.market_slug.is_empty() && md.market_slug != symbol {
+                            continue;
+                        }
+                        // The venue publishes a market's state alongside its
+                        // book; quoting a settled or halted market would price
+                        // something that cannot be traded.
+                        if !md.state.is_empty() && md.state != "MARKET_STATE_OPEN" {
+                            debug!("US WS {symbol} state={} — not quoting", md.state);
                             continue;
                         }
 
-                        // Sequence-gap guard: a skipped number means we lost frames;
-                        // the local book is unreliable, so resync via reconnect.
-                        if let Some(prev) = last_seq {
-                            if ev.sequence_number != prev + 1 {
-                                warn!("⚠️ US WS sequence gap for {symbol}: {prev} → {} — resyncing", ev.sequence_number);
-                                resync = true;
-                                break;
-                            }
-                        }
-                        last_seq = Some(ev.sequence_number);
-
-                        // Staleness guard.
-                        if is_stale(ev.timestamp, Utc::now().timestamp_millis()) {
-                            debug!("US WS dropped stale frame for {symbol} (ts={})", ev.timestamp);
-                            continue;
-                        }
-
-                        if let Some(price) = book_to_price(&ev) {
+                        if let Some(price) = book_to_price(&md) {
                             let _ = tx.send(price);
                         }
                     }
@@ -438,9 +457,10 @@ pub fn spawn_private_fill_feed(
             // failed exactly as silently, since the reply parses into an
             // all-defaults event and is dropped.
             let frame = PrivateSubscribeFrame {
-                action: "subscribe",
-                channels: vec!["private_orders"],
-                symbols: vec![],
+                subscribe: PrivateSubscribeBody {
+                    request_id: "dradis-fills".to_string(),
+                    subscription_type: SUBSCRIPTION_ORDER_UPDATE,
+                },
             };
             let sub = match serde_json::to_string(&frame) {
                 Ok(s) => s,
@@ -515,15 +535,67 @@ fn authed_request(ws_url: &str, auth: &UsAuth, path: &str) -> anyhow::Result<Cli
 mod tests {
     use super::*;
 
-    fn ev(bids: &[[&str; 2]], asks: &[[&str; 2]], seq: u64, ts: i64) -> OrderBookEvent {
-        OrderBookEvent {
-            channel: "order_book".to_string(),
-            symbol: "sym".to_string(),
-            sequence_number: seq,
-            bids: bids.iter().map(|b| [b[0].to_string(), b[1].to_string()]).collect(),
-            asks: asks.iter().map(|a| [a[0].to_string(), a[1].to_string()]).collect(),
-            timestamp: ts,
+    /// Build a `MarketData` in the venue's real shape: prices nested under
+    /// `px.value`, quantities as strings, and the offer side named `offers`.
+    fn ev(bids: &[[&str; 2]], offers: &[[&str; 2]]) -> MarketData {
+        let lvl = |l: &[&str; 2]| Level {
+            px: Px { value: l[0].to_string() },
+            qty: l[1].to_string(),
+        };
+        MarketData {
+            market_slug: "sym".to_string(),
+            bids: bids.iter().map(lvl).collect(),
+            offers: offers.iter().map(lvl).collect(),
+            state: "MARKET_STATE_OPEN".to_string(),
         }
+    }
+
+    /// A real market-data frame, captured from the live endpoint on 2026-08-23.
+    ///
+    /// Pinned verbatim because every earlier assumption about this payload was
+    /// wrong: the code expected `bids`/`asks` as flat `[price, size]` pairs with
+    /// a sequence number, where the venue sends `bids`/`offers` with the price
+    /// nested under `px.value` and no sequence at all.
+    const REAL_FRAME: &str = r#"{"requestId":"p","subscriptionType":"SUBSCRIPTION_TYPE_MARKET_DATA","marketData":{"marketSlug":"atc-lal-elc-fcb-2026-08-23-fcb","bids":[{"px":{"value":"0.7300","currency":"USD"},"qty":"109118.7800"},{"px":{"value":"0.7200","currency":"USD"},"qty":"43767.5000"}],"offers":[{"px":{"value":"0.7400","currency":"USD"},"qty":"13529.6900"},{"px":{"value":"0.7500","currency":"USD"},"qty":"5000.0000"}],"state":"MARKET_STATE_OPEN","transactTime":"2026-08-23T18:15:38.339877873Z"}}"#;
+
+    #[test]
+    fn the_live_frame_parses_into_a_usable_book() {
+        let frame: MarketDataFrame = serde_json::from_str(REAL_FRAME)
+            .expect("captured live frame must parse");
+        let md = frame.market_data.expect("frame carries marketData");
+        assert_eq!(md.market_slug, "atc-lal-elc-fcb-2026-08-23-fcb");
+        assert_eq!(md.state, "MARKET_STATE_OPEN");
+
+        let (bid, bid_d, ask, ask_d, _, bid_all, ask_all) =
+            book_to_price(&md).expect("a two-sided book must reduce");
+        assert_eq!(bid.to_string(), "0.7300");
+        assert_eq!(bid_d.to_string(), "109118.7800");
+        assert_eq!(ask.to_string(), "0.7400");
+        assert_eq!(ask_d.to_string(), "13529.6900");
+        // Whole-book depth spans every published level.
+        assert_eq!(bid_all.to_string(), "152886.2800");
+        assert_eq!(ask_all.to_string(), "18529.6900");
+    }
+
+    /// The subscribe frame is addressed by SLUG and wrapped in a `subscribe`
+    /// object. A flat frame, or one addressed by instrument symbol, is rejected
+    /// with `{"error":"invalid_message"}` — which is how this venue's feed
+    /// stayed dead.
+    #[test]
+    fn the_subscribe_frame_matches_the_accepted_shape() {
+        let frame = SubscribeFrame {
+            subscribe: SubscribeBody {
+                request_id: "dradis-x".to_string(),
+                subscription_type: SUBSCRIPTION_MARKET_DATA,
+                market_slugs: vec!["some-slug".to_string()],
+            },
+        };
+        let json: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&frame).unwrap()).unwrap();
+        let sub = json.get("subscribe").expect("must be wrapped in `subscribe`");
+        assert_eq!(sub["requestId"], "dradis-x");
+        assert_eq!(sub["subscriptionType"], "SUBSCRIPTION_TYPE_MARKET_DATA");
+        assert_eq!(sub["marketSlugs"][0], "some-slug");
     }
 
     #[test]
@@ -540,7 +612,7 @@ mod tests {
 
     #[test]
     fn book_reduces_to_best_bid_ask() {
-        let e = ev(&[["0.54", "12000"], ["0.53", "45000"]], &[["0.57", "19500"], ["0.56", "8000"]], 1, 0);
+        let e = ev(&[["0.54", "12000"], ["0.53", "45000"]], &[["0.57", "19500"], ["0.56", "8000"]]);
         let (bid, bid_d, ask, ask_d, _, bid_all, ask_all) = book_to_price(&e).unwrap();
         assert_eq!(bid.to_string(), "0.54");
         assert_eq!(bid_d.to_string(), "12000");
@@ -555,14 +627,14 @@ mod tests {
 
     #[test]
     fn empty_book_yields_none() {
-        assert!(book_to_price(&ev(&[], &[], 1, 0)).is_none());
+        assert!(book_to_price(&ev(&[], &[])).is_none());
     }
 
     #[test]
     fn one_sided_book_uses_sentinel_for_missing_side() {
-        let bid_only = book_to_price(&ev(&[["0.40", "10"]], &[], 1, 0)).unwrap();
+        let bid_only = book_to_price(&ev(&[["0.40", "10"]], &[])).unwrap();
         assert_eq!(bid_only.2.to_string(), "1"); // ask sentinel
-        let ask_only = book_to_price(&ev(&[], &[["0.60", "10"]], 1, 0)).unwrap();
+        let ask_only = book_to_price(&ev(&[], &[["0.60", "10"]])).unwrap();
         assert_eq!(ask_only.0.to_string(), "0"); // bid sentinel
     }
 
