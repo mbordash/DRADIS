@@ -413,6 +413,44 @@ async fn run() -> Result<()> {
     // can hand it to the Control Tower API server.
     let cag = Cag::new();
 
+    // ── Venue-neutral observe-only raptors ───────────────────────────────────
+    //
+    // Sports and Tennis carry no venue-specific state — they read a public odds
+    // feed — so they are spawned once here and their receivers handed to
+    // whichever venue runs. They were previously spawned inside the intl block
+    // and again inside the US block, and not at all for Kalshi: its sports
+    // squadron showed the Sports Raptor as linked, because the taxonomy maps the
+    // `sports` class to it, while nothing ever fed the channel.
+    //
+    // Both degrade to a default snapshot without their API key, so spawning them
+    // unconditionally costs nothing when unconfigured.
+    // Supervised, matching how the intl block used to run them: a raptor that
+    // exits or panics is respawned rather than leaving the channel silent.
+    let (sports_tx, sports_rx) =
+        watch::channel(dradis::raptors::sports::SportsSnapshot::default());
+    {
+        let http = Arc::clone(&shared_http);
+        let health = Arc::clone(&raptor_health_tx);
+        let cfg = config_rx.clone();
+        spawn_supervised("sports-raptor", move || {
+            dradis::raptors::sports::run_sports_raptor(
+                Arc::clone(&http), sports_tx.clone(), Arc::clone(&health), cfg.clone(),
+            )
+        });
+    }
+    let (tennis_tx, tennis_rx) =
+        watch::channel(dradis::raptors::tennis::TennisSnapshot::default());
+    {
+        let http = Arc::clone(&shared_http);
+        let health = Arc::clone(&raptor_health_tx);
+        let cfg = config_rx.clone();
+        spawn_supervised("tennis-raptor", move || {
+            dradis::raptors::tennis::run_tennis_raptor(
+                Arc::clone(&http), tennis_tx.clone(), Arc::clone(&health), cfg.clone(),
+            )
+        });
+    }
+
     // ── LLM Advisor — every venue ────────────────────────────────────────────
     //
     // Spawned here rather than inside a venue block. It used to live in the
@@ -461,30 +499,10 @@ async fn run() -> Result<()> {
             cag.clone(),
         ));
 
-        // ── Sports Raptor (venue-neutral, observe-only) ───────────────────────
-        // Same shared instance the intl pipeline runs — spawned here for the US
-        // build so its line-movement telemetry ("sports" health key) is available
-        // to US squadrons too. Degrades to Default without ODDS_API_KEY. Its
-        // receiver is threaded into the US trader's SquadronRaptors.
-        let (us_sports_tx, us_sports_rx) =
-            watch::channel(dradis::raptors::sports::SportsSnapshot::default());
-        tokio::spawn(dradis::raptors::sports::run_sports_raptor(
-            Arc::clone(&shared_http), us_sports_tx, Arc::clone(&raptor_health_tx),
-            config_rx.clone(),
-        ));
-
-        // ── Tennis Raptor (venue-neutral, observe-only) ───────────────────────
-        // Spawned beside the Sports Raptor so its live event-state telemetry
-        // ("tennis" health key) is available on the US build too. Degrades to
-        // Default without LIVETENNIS_API_KEY. Its receiver is threaded into the
-        // US trader's SquadronRaptors like the Sports feed, so the channel stays
-        // live for the first consumer.
-        let (us_tennis_tx, us_tennis_rx) =
-            watch::channel(dradis::raptors::tennis::TennisSnapshot::default());
-        tokio::spawn(dradis::raptors::tennis::run_tennis_raptor(
-            Arc::clone(&shared_http), us_tennis_tx, Arc::clone(&raptor_health_tx),
-            config_rx.clone(),
-        ));
+        // Sports and Tennis are spawned once above and shared across venues;
+        // this block used to start its own pair, which meant two Odds API
+        // consumers on one key whenever more than one venue could run.
+        let (us_sports_rx, us_tennis_rx) = (sports_rx.clone(), tennis_rx.clone());
 
         // ── Connect the custodial US retail venue + run the arb loop (Step 3c) ──
         // Best-effort connect: a failure (missing creds, gateway down) is logged
@@ -588,6 +606,8 @@ async fn run() -> Result<()> {
                     Arc::clone(&raptor_health_tx),
                     Arc::clone(&markets_tx),
                     Arc::clone(&process_heartbeat_secs),
+                    sports_rx.clone(),
+                    tennis_rx.clone(),
                     cancel,
                 ).await;
             }
@@ -768,37 +788,9 @@ async fn run() -> Result<()> {
     // squadron's `SquadronRaptors`. Publishes telemetry under the "sports" key
     // and degrades to Default when ODDS_API_KEY is unset. Not consumed by Viper
     // sizing yet (telemetry observation phase, same status as the Tide Raptor).
-    let (sports_tx, sports_rx) =
-        watch::channel(dradis::raptors::sports::SportsSnapshot::default());
-    {
-        let http = Arc::clone(&shared_http);
-        let health = Arc::clone(&raptor_health_tx);
-        let cfg = config_rx.clone();
-        spawn_supervised("sports-raptor", move || {
-            dradis::raptors::sports::run_sports_raptor(
-                Arc::clone(&http), sports_tx.clone(), Arc::clone(&health), cfg.clone(),
-            )
-        });
-    }
-
-    // ── Tennis Raptor (venue-neutral, observe-only) ───────────────────────────
-    // A single shared instance beside the Sports Raptor — live tennis event
-    // state (score, server, break point) is not a per-crypto-asset signal.
-    // Publishes telemetry under the "tennis" key and degrades to Default when
-    // LIVETENNIS_API_KEY is unset. Not consumed by Viper sizing (telemetry
-    // observation phase, same status as the Tide and Sports Raptors).
-    let (tennis_tx, tennis_rx) =
-        watch::channel(dradis::raptors::tennis::TennisSnapshot::default());
-    {
-        let http = Arc::clone(&shared_http);
-        let health = Arc::clone(&raptor_health_tx);
-        let cfg = config_rx.clone();
-        spawn_supervised("tennis-raptor", move || {
-            dradis::raptors::tennis::run_tennis_raptor(
-                Arc::clone(&http), tennis_tx.clone(), Arc::clone(&health), cfg.clone(),
-            )
-        });
-    }
+    // Sports and Tennis are spawned once before the venue blocks and shared;
+    // this section used to start its own pair, which is why the two feeds were
+    // duplicated across venues while Kalshi had none.
 
     for asset in assets.iter() {
         // ── Per-asset raptor signal feeds ─────────────────────────────────────
