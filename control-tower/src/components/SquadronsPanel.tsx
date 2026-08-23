@@ -115,7 +115,7 @@ function ViperCoverage({ marketClass }: { marketClass: string }) {
           : `All ${full.length} strategies apply to ${marketClass} markets.`
       }
     >
-      {mine.length}/{full.length} vipers
+      {mine.length}/{full.length} apply
     </span>
   );
 }

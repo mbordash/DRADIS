@@ -714,6 +714,10 @@ async fn trade_one_market(
     let maker_pair = selection.maker;
 
     // ── Raptor intelligence for the market's underlying ─────────────────────
+    // Identity for logs and the viper-status registry: the crypto underlying
+    // where there is one, the market class otherwise.
+    let status_scope = if pair.is_crypto() { pair.underlying } else { deployed_as.unwrap_or("deployed") };
+
     let raptors = if pair.is_crypto() {
         info!(
             "🧠 Kalshi: underlying={} strike={:?} for \"{}\"",
@@ -978,7 +982,15 @@ async fn trade_one_market(
             positions: positions.clone(),
             session_pnl,
             starting_collateral: starting,
-            crypto_filter: pair.underlying.to_uppercase(),
+            // Doubles as the viper-status registry key, which is
+            // (this string, strategy name). A market with no crypto underlying
+            // left it empty, so every non-crypto squadron shared one set of
+            // slots: deploying politics and sports produced two rows between
+            // them instead of two each, with whichever evaluated last
+            // overwriting the other, and the CAG rollup counting two squadrons
+            // where there were three. Fall back to the market class, which the
+            // deploy endpoint already enforces as one squadron apiece.
+            crypto_filter: status_scope.to_uppercase(),
             market_started_at,
             maker_market: mk_market,
             maker_snapshot: mk_snapshot,

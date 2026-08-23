@@ -253,6 +253,33 @@ function PortfolioValueBanner({
 
 type AppView = 'main' | 'telemetry' | 'tradelog' | 'ai' | 'console' | 'setup';
 
+/**
+ * The app's location, encoded in the URL hash.
+ *
+ * Navigation was state-only, so the browser had no record of it: Back from a
+ * squadron detail left DRADIS entirely rather than returning to the CAG, which
+ * is a good way to lose your place mid-investigation. The hash keeps view and
+ * focused squadron, so Back and Forward walk the trail, a reload lands where you
+ * were, and a squadron page can be linked to directly.
+ *
+ * Hash rather than real paths because the Control Tower is served as a static
+ * export with no server-side routing.
+ */
+function encodeRoute(view: AppView, squadronId: string | null): string {
+  return squadronId ? `#${view}/squadron/${encodeURIComponent(squadronId)}` : `#${view}`;
+}
+
+function decodeRoute(hash: string): { view: AppView; squadronId: string | null } {
+  const [view, kind, id] = hash.replace(/^#/, '').split('/');
+  // An unknown view means a hand-edited or stale URL; fall back rather than
+  // rendering nothing.
+  const known = VIEW_DEFS.some(v => v.id === view);
+  return {
+    view: known ? (view as AppView) : 'main',
+    squadronId: kind === 'squadron' && id ? decodeURIComponent(id) : null,
+  };
+}
+
 const VIEW_DEFS: { id: AppView; label: string; icon: string }[] = [
   { id: 'main',      label: 'Main',       icon: '🗺️' },
   { id: 'telemetry', label: 'Telemetry',  icon: '📡' },
@@ -337,6 +364,29 @@ export default function DashboardPage() {
 
   // ── Squadron drill-down state ────────────────────────────────────────────────
   const [focusedSquadronId, setFocusedSquadronId] = useState<string | null>(null);
+
+  /** Move to a view (optionally a squadron) and record it in browser history. */
+  const navigate = useCallback((view: AppView, squadronId: string | null = null) => {
+    setActiveView(view);
+    setFocusedSquadronId(squadronId);
+    const next = encodeRoute(view, squadronId);
+    if (typeof window !== 'undefined' && window.location.hash !== next) {
+      window.history.pushState({ view, squadronId }, '', next);
+    }
+  }, []);
+
+  // Adopt the URL on first paint, and follow Back/Forward thereafter. Deliberately
+  // does not push: this reacts to history rather than adding to it.
+  useEffect(() => {
+    const apply = () => {
+      const { view, squadronId } = decodeRoute(window.location.hash);
+      setActiveView(view);
+      setFocusedSquadronId(squadronId);
+    };
+    apply();
+    window.addEventListener('popstate', apply);
+    return () => window.removeEventListener('popstate', apply);
+  }, []);
 
   // ── Asset selector — populated from GET /api/assets on first load ───────────
   const { data: availableAssets = [] } = useSWR('assets', getAssets, {
@@ -473,12 +523,12 @@ export default function DashboardPage() {
 
   // ── Squadron navigation ────────────────────────────────────────────────────
   const handleSquadronClick = useCallback((sq: SquadronSummary) => {
-    setFocusedSquadronId(sq.id);
-  }, []);
+    navigate('main', sq.id);
+  }, [navigate]);
 
   const handleBackToCag = useCallback(() => {
-    setFocusedSquadronId(null);
-  }, []);
+    navigate('main', null);
+  }, [navigate]);
 
   const focusedSquadron = squadrons?.find((s) => s.id === focusedSquadronId);
 
@@ -496,7 +546,7 @@ export default function DashboardPage() {
                 <span className="font-mono font-bold text-lg tracking-wide text-indigo-400">DRADIS</span>
                 <span className="text-gray-600 text-lg">|</span>
               </div>
-              <NavMenu active={activeView} onChange={(v) => { setActiveView(v); setFocusedSquadronId(null); }} />
+              <NavMenu active={activeView} onChange={(v) => navigate(v)} />
             </div>
 
             {/* Center — BSG motto */}
@@ -555,7 +605,7 @@ export default function DashboardPage() {
               <span className="font-mono font-bold text-lg tracking-wide text-indigo-400">DRADIS</span>
               <span className="text-gray-600 text-lg">|</span>
             </div>
-            <NavMenu active={activeView} onChange={setActiveView} />
+            <NavMenu active={activeView} onChange={(v) => navigate(v)} />
           </div>
 
           {/* Center — BSG motto */}
@@ -594,7 +644,7 @@ export default function DashboardPage() {
       {setupStatus && !setupStatus.venue_configured && activeView !== 'setup' && (
         <div className="max-w-7xl mx-auto px-4 sm:px-6 pt-4">
           <button
-            onClick={() => setActiveView('setup')}
+            onClick={() => navigate('setup')}
             className="w-full text-left bg-amber-500/10 border border-amber-500/30 rounded-xl px-4 py-3 text-xs font-mono text-amber-300 hover:bg-amber-500/20 transition-colors"
           >
             ⚠️ ENGINE IDLE — venue credentials not configured. DRADIS is running but cannot
@@ -721,7 +771,7 @@ export default function DashboardPage() {
           isLoading={llmLoading}
           advisorEnabled={true}
           pendingCount={pendingLlmCount}
-          onGoToActions={() => setActiveView('ai')}
+          onGoToActions={() => navigate('ai')}
         />
 
         {/* ── CAG Squadron Registry ─────────────────────────────────────── */}

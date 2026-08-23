@@ -41,7 +41,11 @@ export function ViperHealthStrip() {
     (r) => r.last_eval_secs_ago <= STALE_EVAL_SECS && r.last_outcome !== 'error' && r.last_outcome !== 'timeout',
   );
   const troubled = active.length - alive.length;
-  const squadrons = new Set(data.map((r) => r.asset)).size;
+  // Distinct scopes, not distinct assets: every Kalshi squadron shares one DB
+  // shard, so counting the shard name would report one squadron for all of them.
+  // A row whose scope is empty predates the fix that gave non-crypto squadrons
+  // their own key; count it rather than folding it into another squadron.
+  const squadrons = new Set(data.map((r) => r.asset || '(unscoped)')).size;
   // Up to 3 distinct holding reasons for a quick "why quiet?" glance.
   const reasons = [...new Set(alive.map((r) => r.last_reason).filter(Boolean))].slice(0, 3);
 
