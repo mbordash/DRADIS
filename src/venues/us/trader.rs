@@ -116,6 +116,13 @@ pub const US_VENUE: &str = "polymarket-us";
 /// viper-status scope so the sports and crypto squadrons never collide.
 pub const US_CRYPTO_ASSET: &str = "us-crypto";
 
+/// Shard for the politics wing.
+///
+/// The sports wing keeps `US_ASSET` ("us") so its existing squadron config and
+/// trade history survive the split — the squadron id is the persistence key, and
+/// renaming it would orphan every operator edit.
+pub const US_POLITICS_ASSET: &str = "us-politics";
+
 /// Which market domain a US trading wing hunts. The venue runs one wing per
 /// domain concurrently: the general wing keeps the original behaviour (sports /
 /// politics / anything non-crypto → order-book vipers), while the crypto wing
@@ -123,20 +130,48 @@ pub const US_CRYPTO_ASSET: &str = "us-crypto";
 /// stack so all nine vipers can fly.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Wing {
-    General,
+    /// Sports — the bulk of what Polymarket US lists (over a thousand NFL
+    /// markets alone).
+    Sports,
+    /// Politics. Split out from the sports wing so the two run CONCURRENTLY:
+    /// a single "everything non-crypto" wing trades one market at a time, so
+    /// whichever ranked first won and the other category never got a look.
+    /// Kalshi runs three concurrent squadrons; this brings the venues level.
+    Politics,
+    /// Crypto — the only class with a per-market price signal, and so the only
+    /// one that can fly all nine vipers.
     Crypto,
 }
 
 impl Wing {
     fn asset(self) -> &'static str {
         match self {
-            Wing::General => US_ASSET,
+            Wing::Sports => US_ASSET,
+            Wing::Politics => US_POLITICS_ASSET,
             Wing::Crypto => US_CRYPTO_ASSET,
         }
     }
+    /// Does this wing trade `pair`?
+    ///
+    /// Each wing takes only its own domain so the three run side by side without
+    /// competing for the same market. The venue reports a `category` on every
+    /// market, which is authoritative; `pair_is_crypto` remains the fallback for
+    /// anything it does not label.
+    async fn claims(self, pair: &super::markets::UsMarketPair) -> bool {
+        let category = pair.category.to_ascii_lowercase();
+        match self {
+            Wing::Crypto => pair_is_crypto(pair).await,
+            Wing::Politics => category == "politics",
+            // Sports keeps everything else that is not crypto, so a market the
+            // venue labels unusually still gets traded rather than dropped.
+            Wing::Sports => category != "politics" && !pair_is_crypto(pair).await,
+        }
+    }
+
     fn label(self) -> &'static str {
         match self {
-            Wing::General => "general",
+            Wing::Sports => "sports",
+            Wing::Politics => "politics",
             Wing::Crypto => "crypto",
         }
     }
@@ -151,7 +186,7 @@ impl Wing {
         venue: &UsRetailVenue,
     ) -> anyhow::Result<Vec<super::markets::UsMarketPair>> {
         match self {
-            Wing::General => venue.discover_binary_markets().await,
+            Wing::Sports | Wing::Politics => venue.discover_binary_markets().await,
             Wing::Crypto => venue.discover_crypto_markets_via_search().await,
         }
     }
@@ -378,13 +413,21 @@ pub async fn run_us_trader(
     let filter = std::env::var(ENV_MARKET_FILTER).ok().filter(|s| !s.is_empty());
     info!("🇺🇸 US trader starting — market filter={filter:?}");
 
-    // Two concurrent wings over the same venue connection: the general wing
-    // (sports/politics — original behaviour, asset "us") and the crypto wing
-    // (crypto-class markets + full Raptor stack → all nine vipers, asset
-    // "us-crypto"). Each has its own squadron, DB pool, and rotation loop.
+    // Three concurrent wings over the same venue connection — sports, politics
+    // and crypto — each with its own squadron, DB shard and rotation loop.
+    //
+    // Sports and politics were previously one "everything non-crypto" wing that
+    // traded a single market at a time, so whichever category ranked first won
+    // and the other never got a look: Polymarket US lists over a thousand NFL
+    // markets, which meant its 133 politics markets were effectively invisible.
+    // Kalshi runs three concurrent squadrons; this brings the venues level.
     tokio::join!(
         run_wing(
-            Wing::General, &venue, &cag, &raptor_health_tx, &markets_tx,
+            Wing::Sports, &venue, &cag, &raptor_health_tx, &markets_tx,
+            &process_heartbeat_secs, &sports_rx, &tennis_rx, &filter, &cancel,
+        ),
+        run_wing(
+            Wing::Politics, &venue, &cag, &raptor_health_tx, &markets_tx,
             &process_heartbeat_secs, &sports_rx, &tennis_rx, &filter, &cancel,
         ),
         run_wing(
@@ -558,7 +601,7 @@ async fn select_market(
                 let before_class = tradeable.len();
                 let mut classed = Vec::with_capacity(tradeable.len());
                 for m in tradeable.drain(..) {
-                    if pair_is_crypto(&m).await == (wing == Wing::Crypto) {
+                    if wing.claims(&m).await {
                         classed.push(m);
                     }
                 }
@@ -1144,6 +1187,65 @@ mod complement_tests {
         let long = state(dec!(0.31), dec!(4), dec!(0.34), dec!(9));
         let back = complement(complement(long));
         assert_eq!((back.0, back.1, back.2, back.3), (long.0, long.1, long.2, long.3));
+    }
+}
+
+#[cfg(test)]
+mod wing_claim_tests {
+    use super::*;
+
+    fn pair(category: &str, slug: &str) -> super::super::markets::UsMarketPair {
+        super::super::markets::UsMarketPair {
+            slug: slug.to_string(),
+            question: "q".into(),
+            category: category.to_string(),
+            description: String::new(),
+            long: MarketId::new(format!("{slug}#long")),
+            short: MarketId::new(format!("{slug}#short")),
+            close_time: None,
+            volume: 0.0,
+        }
+    }
+
+    /// Sports and politics were one "everything non-crypto" wing that traded a
+    /// single market at a time. Polymarket US lists over a thousand NFL markets
+    /// against 133 politics ones, so politics never won the ranking and was
+    /// effectively invisible. The wings must not both claim the same market, or
+    /// they would compete for it instead of running side by side.
+    #[tokio::test]
+    async fn each_market_is_claimed_by_exactly_one_wing() {
+        for (category, slug) in [
+            ("politics", "vmc-ussep-mov-sc-rep-2026-08-25-gragte30"),
+            ("sports",   "atc-lal-elc-fcb-2026-08-23-fcb"),
+        ] {
+            let p = pair(category, slug);
+            let claims: Vec<&str> = [
+                (Wing::Sports.claims(&p).await, "sports"),
+                (Wing::Politics.claims(&p).await, "politics"),
+            ].into_iter().filter_map(|(c, n)| c.then_some(n)).collect();
+            assert_eq!(claims.len(), 1, "{category} claimed by {claims:?}");
+            assert_eq!(claims[0], category);
+        }
+    }
+
+    /// A market the venue labels unusually must still be traded rather than
+    /// dropped — the sports wing keeps everything non-crypto that politics does
+    /// not claim.
+    #[tokio::test]
+    async fn an_unlabelled_market_still_finds_a_wing() {
+        let p = pair("", "aec-xyz-2026");
+        assert!(Wing::Sports.claims(&p).await, "an unlabelled market fell through every wing");
+        assert!(!Wing::Politics.claims(&p).await);
+    }
+
+    /// Each wing needs its own shard, or two squadrons share one database.
+    #[test]
+    fn the_wings_have_distinct_shards() {
+        let assets = [Wing::Sports.asset(), Wing::Politics.asset(), Wing::Crypto.asset()];
+        let mut uniq = assets.to_vec();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 3, "wings share a shard: {assets:?}");
     }
 }
 
@@ -1827,7 +1929,8 @@ fn register_us_squadron(
     };
 
     let name = match wing {
-        Wing::General => "US Retail Arb",
+        Wing::Sports => "US Sports Arb",
+        Wing::Politics => "US Politics Arb",
         Wing::Crypto => "US Crypto Squadron",
     };
     let squadron = Squadron::new_with_category(
