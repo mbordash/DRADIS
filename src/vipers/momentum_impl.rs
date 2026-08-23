@@ -240,14 +240,9 @@ impl Strategy for MomentumStrategyImpl {
 
         // ── OBI adverse-direction veto ────────────────────────────────────────
         // Default to -1.0 (maximally adverse) when depth data is missing.
-        let yes_total_depth = ctx.snapshot.yes_bid_depth + ctx.snapshot.yes_ask_depth;
-        let no_total_depth  = ctx.snapshot.no_bid_depth  + ctx.snapshot.no_ask_depth;
-        let yes_obi = if yes_total_depth > dec!(0) {
-            (ctx.snapshot.yes_bid_depth - ctx.snapshot.yes_ask_depth) / yes_total_depth
-        } else { dec!(-1.0) };
-        let no_obi = if no_total_depth > dec!(0) {
-            (ctx.snapshot.no_bid_depth - ctx.snapshot.no_ask_depth) / no_total_depth
-        } else { dec!(-1.0) };
+        let whole_book = dc.obi_use_whole_book;
+        let yes_obi = ctx.snapshot.yes_obi(whole_book);
+        let no_obi  = ctx.snapshot.no_obi(whole_book);
         let obi_blocks_bull = yes_obi < dc.momentum_obi_adverse_block;
         let obi_blocks_bear = no_obi  < dc.momentum_obi_adverse_block;
         if obi_blocks_bull {
@@ -291,14 +286,12 @@ impl Strategy for MomentumStrategyImpl {
         // and the previous OBI snapshot exceeds MOMENTUM_OBI_SWING_BLOCK.  This
         // detects in-progress sweep events where the book is repricing too fast
         // for a safe directional entry.
-        let yes_total_depth_check = ctx.snapshot.yes_bid_depth + ctx.snapshot.yes_ask_depth;
-        let no_total_depth_check  = ctx.snapshot.no_bid_depth  + ctx.snapshot.no_ask_depth;
-        let cur_yes_obi = if yes_total_depth_check > dec!(0) {
-            (ctx.snapshot.yes_bid_depth - ctx.snapshot.yes_ask_depth) / yes_total_depth_check
-        } else { dec!(-1.0) };
-        let cur_no_obi = if no_total_depth_check > dec!(0) {
-            (ctx.snapshot.no_bid_depth - ctx.snapshot.no_ask_depth) / no_total_depth_check
-        } else { dec!(-1.0) };
+        // Same source as the veto above, so the two never disagree about what the
+        // book looks like. Toggling `obi_use_whole_book` mid-session makes the
+        // first comparison after the flip span two different measures and can
+        // read as one large swing; it self-corrects on the next tick.
+        let cur_yes_obi = ctx.snapshot.yes_obi(whole_book);
+        let cur_no_obi  = ctx.snapshot.no_obi(whole_book);
 
         // Read previous OBI and update atomically (non-async Mutex, no await held)
         let (prev_yes_obi_val, prev_no_obi_val) = {

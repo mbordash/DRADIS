@@ -527,6 +527,13 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
     }
 
     {
+        let g = "Order Book"; let e: Option<&'static str> = None;
+        v.push(F::new(g, e, "obi_use_whole_book", "Use Whole-Book Depth", "bool", false,
+            "Measure order-book imbalance across every price level instead of only the best bid and ask. The best price alone is often one or two contracts, so a ratio built from it swings wildly on trades that move nothing real: measured on Kalshi, the two readings disagreed about which way the book leaned 41% of the time, and roughly three in four crypto entry vetoes fired on a top-of-book reading the rest of the book contradicted. Turning this on makes the gates steadier but noticeably less likely to veto, so treat it as loosening a safety check — try it on one squadron and compare before applying it everywhere. The GBoost model is not affected; it keeps using best-price depth, which is what it was trained on.")
+            );
+    }
+
+    {
         let g = "Deployment"; let e: Option<&'static str> = None;
         v.push(F::new(g, e, "deploy_max_days_to_close", "Max Days To Resolution", "secs", false,
             "Furthest-out market a Quick deploy will choose, in days. Browsing is not affected — the market list still shows everything, and you can always deploy a longer-dated market by picking it by hand. This only bounds the automatic choice. It matters because Kalshi structures politics and sports as multi-year futures, and the strategies available to those classes do not suit that horizon: Arbitrage locks your collateral until the market resolves, so a 2028 market ties it up for years to earn a few percent, and Maker rests quotes expecting them to fill and mean-revert within a session. Raise it if you want Quick deploy to consider longer-dated markets.")

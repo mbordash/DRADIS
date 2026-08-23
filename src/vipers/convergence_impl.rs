@@ -287,9 +287,13 @@ impl Strategy for ConvergenceStrategyImpl {
         // −20.9% catastrophic); no winner on either side had adverse OBI ≥ 0.5.
         //   NO  (want_bear): adverse if YES has buy pressure  → obi_yes > +block
         //   YES (want_bull): adverse if YES has sell pressure → obi_yes < −block
-        let yes_depth = snap.yes_bid_depth + snap.yes_ask_depth;
+        // Inputs follow `obi_use_whole_book`. The empty-book fallback stays 0
+        // (neutral) rather than the shared accessor's -1: this gate is about an
+        // adverse book in a known direction, and no data is not evidence of one.
+        let (yes_bid_d, yes_ask_d) = snap.yes_depths(dc.obi_use_whole_book);
+        let yes_depth = yes_bid_d + yes_ask_d;
         let obi_yes = if yes_depth > dec!(0) {
-            (snap.yes_bid_depth - snap.yes_ask_depth) / yes_depth
+            (yes_bid_d - yes_ask_d) / yes_depth
         } else {
             dec!(0)
         };

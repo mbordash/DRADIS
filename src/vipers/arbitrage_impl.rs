@@ -267,8 +267,14 @@ impl Strategy for ArbitrageStrategyImpl {
         // Fallback gate: if BOTH legs have zero depth (snapshot unavailable),
         //   fall back to a bid-price cap (arbitrage_max_leg_price = 0.60)
         //   as a secondary backstop (ask ceiling above already guards this case).
-        let yes_total_depth = snapshot.yes_bid_depth + snapshot.yes_ask_depth;
-        let no_total_depth  = snapshot.no_bid_depth  + snapshot.no_ask_depth;
+        // Inputs follow `obi_use_whole_book`; the empty-book fallback below stays
+        // +1 ("unfillable") rather than the -1 the shared accessor returns, since
+        // here an empty complement book means no seller to fill our bid, not
+        // toxic flow.
+        let (yes_bid_d, yes_ask_d) = snapshot.yes_depths(dc.obi_use_whole_book);
+        let (no_bid_d,  no_ask_d)  = snapshot.no_depths(dc.obi_use_whole_book);
+        let yes_total_depth = yes_bid_d + yes_ask_d;
+        let no_total_depth  = no_bid_d  + no_ask_d;
 
         let depth_available = yes_total_depth > dec!(0) || no_total_depth > dec!(0);
 
@@ -288,9 +294,9 @@ impl Strategy for ArbitrageStrategyImpl {
             let complement_total_depth = if yes_is_dominant { no_total_depth } else { yes_total_depth };
             let complement_obi = if complement_total_depth > dec!(0) {
                 if yes_is_dominant {
-                    (snapshot.no_bid_depth - snapshot.no_ask_depth) / no_total_depth
+                    (no_bid_d - no_ask_d) / no_total_depth
                 } else {
-                    (snapshot.yes_bid_depth - snapshot.yes_ask_depth) / yes_total_depth
+                    (yes_bid_d - yes_ask_d) / yes_total_depth
                 }
             } else {
                 // Complement book empty — no sellers to fill our bid → unfillable.

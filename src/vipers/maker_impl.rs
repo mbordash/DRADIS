@@ -544,10 +544,15 @@ impl Strategy for MakerStrategyImpl {
         let no_ask  = snapshot.no_ask;
 
         // ── Orderbook imbalance gate ──────────────────────────────────────────
-        let yes_book_ok = snapshot.yes_bid_depth > dec!(0)
-            && (snapshot.yes_ask_depth / snapshot.yes_bid_depth) <= dc.maker_max_book_imbalance_ratio;
-        let no_book_ok  = snapshot.no_bid_depth > dec!(0)
-            && (snapshot.no_ask_depth  / snapshot.no_bid_depth)  <= dc.maker_max_book_imbalance_ratio;
+        // An ask/bid ratio rather than an imbalance, but built from the same
+        // depths and just as sensitive to a one-contract touch, so it follows the
+        // same source switch.
+        let (yes_gate_bid, yes_gate_ask) = snapshot.yes_depths(dc.obi_use_whole_book);
+        let (no_gate_bid,  no_gate_ask)  = snapshot.no_depths(dc.obi_use_whole_book);
+        let yes_book_ok = yes_gate_bid > dec!(0)
+            && (yes_gate_ask / yes_gate_bid) <= dc.maker_max_book_imbalance_ratio;
+        let no_book_ok  = no_gate_bid > dec!(0)
+            && (no_gate_ask  / no_gate_bid)  <= dc.maker_max_book_imbalance_ratio;
 
         if !yes_book_ok && !no_book_ok {
             maker_gate_streak_secs(market.yes_token.as_str(), false);

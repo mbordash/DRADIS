@@ -369,6 +369,27 @@ pub const MAKER_TOXIC_REENTRY_COOLDOWN_SECS: i64 = 300;
 // deliberately by picking it by hand.
 pub const DEPLOY_MAX_DAYS_TO_CLOSE: u32 = 30;
 
+// ── Order-book imbalance source (2026-08-23) ────────────────────────────────
+//
+// Whether the OBI entry gates read whole-book depth instead of the touch.
+//
+// The touch is the size resting at the best price only. On a thin book that is
+// one or two contracts, so a ratio built from it swings wildly on trades that
+// move nothing. Measured over 1,720 leg-samples on Kalshi, the two disagreed in
+// SIGN 41% of the time, and 188 of 247 crypto entry vetoes fired on a touch the
+// rest of the book contradicted — the extreme case reading +0.97 at the touch
+// against -0.01 across a book holding 683,574 vs 702,306 contracts.
+//
+// Defaults to false — the touch — because that measurement is from Kalshi and
+// the gate is venue-neutral. Switching cut simulated crypto vetoes by 57%, which
+// is a large loosening of a risk control to apply to a venue on the strength of
+// another venue's book structure. Turn it on per squadron, compare, then decide.
+//
+// Deliberately does NOT affect the GBoost feature vector: that model is trained
+// on touch-derived features, and changing their meaning underneath it at runtime
+// would leave it predicting from a distribution it never saw.
+pub const OBI_USE_WHOLE_BOOK: bool = false;
+
 // ── ToxicFill confirmation gates ────────────────────────────────────────────
 // Applied ONLY to a confirmed fill; an unfilled resting quote is still pulled
 // instantly. Without them the exit fires on the OBI dip caused by our own quote

@@ -810,9 +810,9 @@ impl Strategy for FairValueStrategyImpl {
         // Across 25 trades, entries into an adverse book carried −3.04 of
         // FairValue's −5.71 cumulative P&L.
         let (bid_depth, ask_depth) = if want_yes {
-            (ctx.snapshot.yes_bid_depth, ctx.snapshot.yes_ask_depth)
+            ctx.snapshot.yes_depths(dc.obi_use_whole_book)
         } else {
-            (ctx.snapshot.no_bid_depth, ctx.snapshot.no_ask_depth)
+            ctx.snapshot.no_depths(dc.obi_use_whole_book)
         };
         let total_depth = bid_depth + ask_depth;
         // No depth at all reads as maximally adverse rather than neutral: an

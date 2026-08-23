@@ -216,6 +216,7 @@ fn default_sports_odds_regions()            -> String  { config::SPORTS_ODDS_REG
 fn default_tennis_tour()                    -> String  { config::TENNIS_TOUR.to_string()               }
 
 fn default_deploy_max_days_to_close()       -> u32     { config::DEPLOY_MAX_DAYS_TO_CLOSE             }
+fn default_obi_use_whole_book()             -> bool    { config::OBI_USE_WHOLE_BOOK                   }
 fn default_maker_min_spread()               -> Decimal { config::MAKER_MIN_SPREAD                      }
 fn default_maker_bid_buffer()               -> Decimal { config::MAKER_BID_BUFFER                      }
 fn default_maker_cross_buffer()             -> Decimal { config::MAKER_CROSS_BUFFER                    }
@@ -440,6 +441,10 @@ pub struct DynamicConfig {
     /// Discovery still lists markets far beyond this — see the constant's note.
     #[serde(default = "default_deploy_max_days_to_close")]
     pub deploy_max_days_to_close:      u32,
+    /// Read whole-book depth rather than the touch in the OBI entry gates.
+    /// Does not affect the GBoost feature vector — see the constant's note.
+    #[serde(default = "default_obi_use_whole_book")]
+    pub obi_use_whole_book:            bool,
     #[serde(default = "default_maker_min_spread")]
     pub maker_min_spread:              Decimal,
     #[serde(default = "default_maker_bid_buffer")]
@@ -812,6 +817,7 @@ impl Default for DynamicConfig {
             maker_max_exposure_usdc:  config::MAKER_MAX_EXPOSURE_USDC,
             maker_quote_size_usdc:    config::MAKER_QUOTE_SIZE_USDC,
             deploy_max_days_to_close:      config::DEPLOY_MAX_DAYS_TO_CLOSE,
+            obi_use_whole_book:            config::OBI_USE_WHOLE_BOOK,
             maker_min_spread:              config::MAKER_MIN_SPREAD,
             maker_bid_buffer:              config::MAKER_BID_BUFFER,
             maker_cross_buffer:            config::MAKER_CROSS_BUFFER,

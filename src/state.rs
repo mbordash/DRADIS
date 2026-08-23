@@ -140,6 +140,75 @@ pub type PriceState = (
 );
 
 /// Named accessors for [`PriceState`], so new code never indexes a 7-tuple.
+#[cfg(test)]
+mod snapshot_obi_tests {
+    use super::MarketSnapshot;
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+
+    /// Only the YES depths vary; everything else is inert. The NO side mirrors
+    /// the YES side so a test that reads the wrong one fails loudly.
+    fn snap(yb: Decimal, ya: Decimal, ybt: Decimal, yat: Decimal) -> MarketSnapshot {
+        MarketSnapshot {
+            yes_bid: dec!(0.50), yes_bid_depth: yb, yes_ask: dec!(0.52), yes_ask_depth: ya,
+            no_bid:  dec!(0.48), no_bid_depth:  ya, no_ask:  dec!(0.50), no_ask_depth:  yb,
+            yes_bid_depth_total: ybt, yes_ask_depth_total: yat,
+            no_bid_depth_total:  yat, no_ask_depth_total:  ybt,
+            oracle_price: Decimal::ZERO, velocity: Decimal::ZERO,
+            velocity_1s: Decimal::ZERO, acceleration: Decimal::ZERO,
+            funding_rate: Decimal::ZERO, institutional_pulse: Decimal::ZERO,
+            tide_coherence: Decimal::ZERO, tradfi_velocity: Decimal::ZERO,
+            macro_coherence: Decimal::ZERO, vix_proxy: Decimal::ZERO,
+            vix_velocity: Decimal::ZERO, oi_delta_pct: Decimal::ZERO,
+            cvd_ratio: Decimal::ZERO, oracle_drift_60m: Decimal::ZERO,
+            oracle_drift_10m: Decimal::ZERO, hist_vol: Decimal::ZERO,
+            secs_to_expiry: 0, timestamp: chrono::Utc::now(),
+        }
+    }
+
+    /// The measured failure: one contract at the touch against a balanced book.
+    /// Top-of-book reads maximally bid-heavy; the book reads flat. A -0.60 veto
+    /// keyed on the touch fires on nothing real.
+    #[test]
+    fn a_single_resting_contract_moves_the_touch_but_not_the_book() {
+        let s = snap(dec!(1), dec!(71), dec!(683574), dec!(702306));
+        let touch = s.yes_obi(false);
+        let book  = s.yes_obi(true);
+        assert!(touch < dec!(-0.9), "touch should read extreme, got {touch}");
+        assert!(book.abs() < dec!(0.05), "book should read flat, got {book}");
+    }
+
+    /// Selecting a source must not change the formula: with an equal book the
+    /// two agree exactly, so any divergence is the data and never the maths.
+    #[test]
+    fn the_two_sources_agree_when_the_book_is_the_touch() {
+        let s = snap(dec!(30), dec!(70), dec!(30), dec!(70));
+        assert_eq!(s.yes_obi(false), s.yes_obi(true));
+        assert_eq!(s.yes_obi(false), dec!(-0.4));
+    }
+
+    /// No depth is treated as maximally adverse, in either source. This
+    /// conflates "no data" with "toxic flow" deliberately — see yes_obi.
+    #[test]
+    fn an_empty_book_reads_maximally_adverse() {
+        let s = snap(dec!(0), dec!(0), dec!(0), dec!(0));
+        assert_eq!(s.yes_obi(false), dec!(-1));
+        assert_eq!(s.yes_obi(true),  dec!(-1));
+    }
+
+    /// The result stays inside [-1, 1] whichever source is chosen.
+    #[test]
+    fn imbalance_stays_bounded() {
+        for (b, a) in [(dec!(1), dec!(0)), (dec!(0), dec!(1)), (dec!(999999), dec!(1))] {
+            let s = snap(b, a, b, a);
+            for whole in [false, true] {
+                let v = s.yes_obi(whole);
+                assert!(v >= dec!(-1) && v <= dec!(1), "out of range: {v}");
+            }
+        }
+    }
+}
+
 pub mod price_state {
     use super::{Decimal, PriceState};
 
@@ -274,6 +343,54 @@ pub type PositionKey = (String, MarketId);
 /// can both hold YES simultaneously without colliding.
 /// Typically wrapped in Arc<Mutex<>> for concurrent access.
 pub type PositionMap = HashMap<PositionKey, Position>;
+
+impl MarketSnapshot {
+    /// Depth pair to gate on for the YES side: `(bid, ask)`.
+    ///
+    /// `whole_book` selects the whole-book totals over the touch. See
+    /// `DynamicConfig::obi_use_whole_book` for why this is a choice rather than
+    /// a fixed answer.
+    pub fn yes_depths(&self, whole_book: bool) -> (Decimal, Decimal) {
+        if whole_book {
+            (self.yes_bid_depth_total, self.yes_ask_depth_total)
+        } else {
+            (self.yes_bid_depth, self.yes_ask_depth)
+        }
+    }
+
+    /// Depth pair to gate on for the NO side: `(bid, ask)`.
+    pub fn no_depths(&self, whole_book: bool) -> (Decimal, Decimal) {
+        if whole_book {
+            (self.no_bid_depth_total, self.no_ask_depth_total)
+        } else {
+            (self.no_bid_depth, self.no_ask_depth)
+        }
+    }
+
+    /// Order-book imbalance for the YES side, in `[-1, 1]`; positive means more
+    /// size resting on the bid.
+    ///
+    /// Returns -1 when there is no depth at all, which every caller treats as
+    /// maximally adverse and therefore blocks entry. That conflation of "no
+    /// data" with "toxic flow" is deliberate and long-standing: ghost-OBI trades
+    /// in the 2026-05-07 session took losses on ticks whose depth was missing
+    /// while the heartbeat showed -0.76 to -0.96.
+    pub fn yes_obi(&self, whole_book: bool) -> Decimal {
+        let (bid, ask) = self.yes_depths(whole_book);
+        Self::obi(bid, ask)
+    }
+
+    /// Order-book imbalance for the NO side. See [`yes_obi`](Self::yes_obi).
+    pub fn no_obi(&self, whole_book: bool) -> Decimal {
+        let (bid, ask) = self.no_depths(whole_book);
+        Self::obi(bid, ask)
+    }
+
+    fn obi(bid: Decimal, ask: Decimal) -> Decimal {
+        let total = bid + ask;
+        if total > Decimal::ZERO { (bid - ask) / total } else { -Decimal::ONE }
+    }
+}
 
 /// Current market data snapshot.
 /// Used for broadcasting to strategies.

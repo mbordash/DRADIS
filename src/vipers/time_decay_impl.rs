@@ -182,22 +182,14 @@ impl Strategy for TimeDecayStrategyImpl {
         // ── OBI gate ─────────────────────────────────────────────────────────
         let yes_bid = snap.yes_bid;
         let no_bid  = snap.no_bid;
-        let yes_total_depth = snap.yes_bid_depth + snap.yes_ask_depth;
-        let yes_obi = if yes_total_depth > dec!(0) {
-            (snap.yes_bid_depth - snap.yes_ask_depth) / yes_total_depth
-        } else {
-            // No depth data → treat as maximally adverse → block entry.
-            // "Ghost OBI" trades (zero depth at evaluation but adverse heartbeat OBI)
-            // were responsible for losses in the 2026-05-07 afternoon session where
-            // the live tick snapshot had missing depth but the heartbeat showed -0.76 to -0.96.
-            dec!(-1.0)
-        };
-        let no_total_depth = snap.no_bid_depth + snap.no_ask_depth;
-        let no_obi = if no_total_depth > dec!(0) {
-            (snap.no_bid_depth - snap.no_ask_depth) / no_total_depth
-        } else {
-            dec!(-1.0) // no depth data → treat as maximally adverse → block entry
-        };
+        // Source selected by `obi_use_whole_book`; -1 when there is no depth at
+        // all, which blocks entry. "Ghost OBI" trades (zero depth at evaluation
+        // but adverse heartbeat OBI) caused losses in the 2026-05-07 afternoon
+        // session, where the tick snapshot had missing depth while the heartbeat
+        // showed -0.76 to -0.96.
+        let whole_book = dc.obi_use_whole_book;
+        let yes_obi = snap.yes_obi(whole_book);
+        let no_obi  = snap.no_obi(whole_book);
         // Use the stricter of the dynamic config value or the compile-time constant.
         // This prevents a stale DB value (written before the constant was tightened)
         // from silently bypassing the gate.  The config constant is the hard floor.
