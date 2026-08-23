@@ -205,13 +205,22 @@ pub mod price_state {
             }
         }
 
+        // A market with no underlying has no mark, and printing "$0.00" for it
+        // reads as a dead price feed rather than as "not applicable" — which is
+        // exactly the wrong impression on a politics or sports squadron whose
+        // Raptor stack is neutral by design.
+        let mark = if oracle > Decimal::ZERO {
+            format!("${oracle:.2}")
+        } else {
+            "n/a".to_string()
+        };
         tracing::info!(
             " Heartbeat [{}] | Ask Sum ${:.4} (Y ${:.2} / N ${:.2}) | Bid Sum ${:.4} (Y ${:.2} / N ${:.2}) | \
-             Mark: ${:.2} | OBI Y={:.2} N={:.2} | OBIall Y={:.2} N={:.2} (depth Y {:.0}/{:.0} N {:.0}/{:.0})",
+             Mark: {} | OBI Y={:.2} N={:.2} | OBIall Y={:.2} N={:.2} (depth Y {:.0}/{:.0} N {:.0}/{:.0})",
             label,
             best_ask(yes) + best_ask(no), best_ask(yes), best_ask(no),
             best_bid(yes) + best_bid(no), best_bid(yes), best_bid(no),
-            oracle,
+            mark,
             imbalance(yes, false), imbalance(no, false),
             imbalance(yes, true),  imbalance(no, true),
             bid_depth_total(yes), ask_depth_total(yes),
