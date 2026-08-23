@@ -121,6 +121,11 @@ const MANAGED_KEYS: &[(&str, &str, &str, &str)] = &[
     ("OLLAMA_URL",               "Ollama URL (local or remote)",  "shared", "integration"),
     ("OLLAMA_MODEL",             "Ollama model",                  "shared", "integration"),
     ("LLM_API_BASE",             "Hosted LLM API base URL",       "shared", "integration"),
+    // Not a credential, but it decides whether the advisor runs at all. Left
+    // out of the UI, an operator could configure a provider, press Test, see
+    // "Connection OK", and then wait indefinitely for recommendations that were
+    // never going to come — which is exactly what happened on 2026-08-23.
+    ("ENABLE_LLM_ADVISOR",       "Run the LLM Advisor (true/false)", "shared", "integration"),
     ("LLM_API_KEY",              "Hosted LLM API key",            "shared", "integration"),
     ("LLM_MODEL",                "Hosted LLM model",              "shared", "integration"),
 ];
@@ -675,13 +680,24 @@ async fn get_status() -> Response {
         .filter(|v| !v.is_empty())
         .or_else(|| std::env::var("LLM_PROVIDER").ok().filter(|v| !v.is_empty()))
         .unwrap_or_default();
-    let llm_configured = match llm_provider.trim().to_lowercase().as_str() {
+    let llm_provider_ready = match llm_provider.trim().to_lowercase().as_str() {
         // Ollama needs no key, only a reachable host — and only the Test button
         // can establish that. An explicit choice is as far as this can go.
         "ollama" => true,
         "openai" | "anthropic" => env_set("LLM_API_KEY"),
         _ => false,
     };
+    // A working provider is not a running advisor. The loop is gated on
+    // ENABLE_LLM_ADVISOR, and reporting "configured" while that is false told
+    // the operator the opposite of the truth.
+    let llm_enabled = match read_secrets().get("ENABLE_LLM_ADVISOR")
+        .cloned()
+        .or_else(|| std::env::var("ENABLE_LLM_ADVISOR").ok())
+    {
+        Some(v) => matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"),
+        None => crate::config::ENABLE_LLM_ADVISOR,
+    };
+    let llm_configured = llm_provider_ready && llm_enabled;
 
     Json(json!({
         "venue": venue,
@@ -698,6 +714,9 @@ async fn get_status() -> Response {
         "alpha_ack": alpha_acknowledged().await,
         "llm_provider": llm_provider,
         "llm_configured": llm_configured,
+        // Distinguishes "no provider chosen" from "provider fine, advisor off".
+        "llm_provider_ready": llm_provider_ready,
+        "llm_enabled": llm_enabled,
         "app_version": env!("CARGO_PKG_VERSION"),
         "restart_pending": false,
     })).into_response()

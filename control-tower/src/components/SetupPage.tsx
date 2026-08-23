@@ -469,10 +469,10 @@ const LLM_PRESETS: LlmPreset[] = [
 function llmFieldsFor(provider: string): string[] {
   switch (provider.trim().toLowerCase()) {
     case 'ollama':
-      return ['OLLAMA_URL', 'OLLAMA_MODEL'];
+      return ['ENABLE_LLM_ADVISOR', 'OLLAMA_URL', 'OLLAMA_MODEL'];
     case 'openai':
     case 'anthropic':
-      return ['LLM_API_BASE', 'LLM_API_KEY', 'LLM_MODEL'];
+      return ['ENABLE_LLM_ADVISOR', 'LLM_API_BASE', 'LLM_API_KEY', 'LLM_MODEL'];
     case '':
       // Nothing chosen yet — show no fields at all. The presets above are the
       // whole decision at this point; a "LLM provider (ollama | openai |
@@ -683,7 +683,7 @@ function CredentialGroup({
               </>
             ) : (
               <input
-                type={/URL|CHAT_ID|PROVIDER|MODEL|BASE|DEMO/.test(c.key) ? 'text' : 'password'}
+                type={/URL|CHAT_ID|PROVIDER|MODEL|BASE|DEMO|ENABLE_/.test(c.key) ? 'text' : 'password'}
                 className={inputCls}
                 placeholder={c.set ? '•••••••• (leave blank to keep current)' : 'Enter value'}
                 value={drafts[c.key] ?? ''}

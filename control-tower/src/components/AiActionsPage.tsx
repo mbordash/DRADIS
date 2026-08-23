@@ -129,6 +129,20 @@ export default function AiActionsPage() {
             <span className="text-3xl">🤖</span>
             {filter !== 'all' ? (
               <p className="text-sm text-gray-500">No &apos;{filter}&apos; actions.</p>
+            ) : setup && setup.llm_provider_ready && !setup.llm_enabled ? (
+              // The most confusing state: credentials test green, and nothing
+              // ever appears. Say which half is missing.
+              <>
+                <p className="text-sm text-amber-300">The LLM Advisor is configured but switched off.</p>
+                <p className="text-xs text-gray-600 max-w-md leading-relaxed">
+                  Your provider and key are working — the advisor itself is not running, so no
+                  recommendations will be produced. Set{' '}
+                  <span className="text-gray-400 font-mono">Run the LLM Advisor</span> to{' '}
+                  <span className="text-gray-400 font-mono">true</span> under{' '}
+                  <span className="text-gray-400 font-mono">Setup → LLM Advisor</span>, then restart
+                  the engine.
+                </p>
+              </>
             ) : setup && !setup.llm_configured ? (
               // An empty table looks the same whether the advisor is running and
               // has proposed nothing, or was never set up. Say which.

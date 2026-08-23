@@ -59,8 +59,12 @@ export interface SetupStatus {
   alpha_ack: boolean;
   /** Provider the operator explicitly chose, or "" if none. Never a secret. */
   llm_provider?: string;
-  /** True when the LLM Advisor has everything it needs to run. */
+  /** True when the LLM Advisor has everything it needs AND is switched on. */
   llm_configured?: boolean;
+  /** Provider + credentials are valid, regardless of whether the advisor runs. */
+  llm_provider_ready?: boolean;
+  /** ENABLE_LLM_ADVISOR — the advisor loop is gated on this. */
+  llm_enabled?: boolean;
   app_version: string;
 }
 
