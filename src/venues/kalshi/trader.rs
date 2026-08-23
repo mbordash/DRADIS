@@ -1271,26 +1271,35 @@ fn order_params_to_intent(p: &OrderParams, side: Side) -> OrderIntent {
     }
 }
 
+/// Record the position guard from what the venue actually filled.
+///
+/// Takes the `Fill` rather than the `OrderParams` on purpose. Booking the
+/// REQUESTED size at the LIMIT price meant a partial fill left the bot believing
+/// it held more than it did, at a cost basis it never paid — every downstream
+/// exposure check, stop distance and P&L then worked from that number. Exits
+/// were already protected (`record_round_trip` clamps to the guard, so it cannot
+/// book shares we never owned), which is exactly why this stayed invisible: the
+/// error was confined to the entry side, where nothing contradicted it.
 async fn record_guard(
     positions: &Arc<Mutex<PositionMap>>,
     strategy_name: &str,
     params: &OrderParams,
     paired: Option<&MarketId>,
-    entry_fee: Decimal,
+    fill: &Fill,
 ) {
     let mut map = positions.lock().await;
     map.insert(
         (strategy_name.to_string(), params.token_id.clone()),
         Position {
-            shares: params.shares,
-            avg_entry: params.price,
+            shares: fill.filled,
+            avg_entry: fill.price,
             opened_at: Utc::now(),
             close_time: None,
             market_name: params.market_name.clone(),
             pair_token_id: params.token_id.clone(),
             fill_confirmed_at: None,
             paired_leg_token_id: paired.cloned(),
-            entry_fee,
+            entry_fee: fill.fee,
         },
     );
 }
@@ -1309,10 +1318,18 @@ async fn dispatch_signal(
         StrategySignal::Entry { params, pair_params: Some(pp) } => {
             if params.ghost_mode {
                 info!("👻 [{strategy_name}] ghost entry pair: {} + {}", params.token_id, pp.token_id);
-                record_guard(positions, strategy_name, params, Some(&pp.token_id), Decimal::ZERO).await;
-                record_guard(positions, strategy_name, pp, Some(&params.token_id), Decimal::ZERO).await;
-                record_entry(pool, scope, strategy_name, params).await;
-                record_entry(pool, scope, strategy_name, pp).await;
+                let ghost_of = |p: &OrderParams| Fill {
+                    order_id: OrderId(String::new()),
+                    market: p.token_id.clone(),
+                    filled: p.shares,
+                    price: p.price,
+                    fee: Decimal::ZERO,
+                };
+                let (ga, gb) = (ghost_of(params), ghost_of(pp));
+                record_guard(positions, strategy_name, params, Some(&pp.token_id), &ga).await;
+                record_guard(positions, strategy_name, pp, Some(&params.token_id), &gb).await;
+                record_entry(pool, scope, strategy_name, params, &ga).await;
+                record_entry(pool, scope, strategy_name, pp, &gb).await;
                 return true;
             }
             let legs = [
@@ -1323,12 +1340,12 @@ async fn dispatch_signal(
                 Ok([a, b]) => {
                     info!("✅ [{strategy_name}] entry pair: {} @ {:.4} | {} @ {:.4}",
                         a.order_id, a.price, b.order_id, b.price);
-                    record_guard(positions, strategy_name, params, Some(&pp.token_id), a.fee).await;
-                    record_guard(positions, strategy_name, pp, Some(&params.token_id), b.fee).await;
+                    record_guard(positions, strategy_name, params, Some(&pp.token_id), &a).await;
+                    record_guard(positions, strategy_name, pp, Some(&params.token_id), &b).await;
                     lifecycle.track(&a, strategy_name, params.order_type, Some(pp.token_id.clone())).await;
                     lifecycle.track(&b, strategy_name, pp.order_type, Some(params.token_id.clone())).await;
-                    record_entry(pool, scope, strategy_name, params).await;
-                    record_entry(pool, scope, strategy_name, pp).await;
+                    record_entry(pool, scope, strategy_name, params, &a).await;
+                    record_entry(pool, scope, strategy_name, pp, &b).await;
                     if let Some(p) = pool { sync_dashboard(venue, p, positions, starting).await; }
                     true
                 }
@@ -1465,18 +1482,20 @@ async fn dispatch_single(
     if params.ghost_mode {
         info!("👻 [{strategy_name}] ghost {side:?}: {} @ {:.4} × {:.2}",
             params.token_id, params.price, params.shares);
-        if matches!(side, Side::Buy) {
-            record_guard(positions, strategy_name, params, None, Decimal::ZERO).await;
-            record_entry(pool, scope, strategy_name, params).await;
-        }
-        // Ghost orders never touch the venue, so there is no fee to book.
-        return Some(Fill {
+        // Ghost orders never touch the venue, so there is no fee to book — and
+        // nothing partially fills, so the requested size IS the fill.
+        let ghost = Fill {
             order_id: OrderId(String::new()),
             market: params.token_id.clone(),
             filled: params.shares,
             price: params.price,
             fee: Decimal::ZERO,
-        });
+        };
+        if matches!(side, Side::Buy) {
+            record_guard(positions, strategy_name, params, None, &ghost).await;
+            record_entry(pool, scope, strategy_name, params, &ghost).await;
+        }
+        return Some(ghost);
     }
     match venue.place_order(order_params_to_intent(params, side)).await {
         Ok(f) => {
@@ -1489,16 +1508,16 @@ async fn dispatch_single(
                 return None;
             }
             if f.filled < params.shares.round_dp(2) {
-                warn!("⚠️ [{strategy_name}] {side:?} {} partial fill {:.2} of {:.2} — booking full size; \
+                warn!("⚠️ [{strategy_name}] {side:?} {} partial fill {:.2} of {:.2} — booking what filled; \
                        lifecycle reconciliation owns the remainder",
                     params.token_id, f.filled, params.shares);
             }
             info!("✅ [{strategy_name}] {side:?} {} @ {:.4} × {:.2} (order {})",
                 params.token_id, f.price, f.filled, f.order_id);
             if matches!(side, Side::Buy) {
-                record_guard(positions, strategy_name, params, None, f.fee).await;
+                record_guard(positions, strategy_name, params, None, &f).await;
                 lifecycle.track(&f, strategy_name, params.order_type, None).await;
-                record_entry(pool, scope, strategy_name, params).await;
+                record_entry(pool, scope, strategy_name, params, &f).await;
             }
             if let Some(p) = pool { sync_dashboard(venue, p, positions, starting).await; }
             Some(f)
@@ -1517,6 +1536,7 @@ async fn record_entry(
     scope: &TradeScope,
     strategy_name: &str,
     params: &OrderParams,
+    fill: &Fill,
 ) {
     let side = side_label(params.token_id.as_str());
     metrics::record_entry(
@@ -1525,8 +1545,8 @@ async fn record_entry(
         params.token_id.to_string(),
         params.market_name.clone(),
         side.to_string(),
-        params.price,
-        params.shares,
+        fill.price,
+        fill.filled,
     ).await;
     if let Some(p) = pool {
         // Live entries land as `pending` — the fill is not venue-confirmed yet, and
@@ -1536,7 +1556,7 @@ async fn record_entry(
         let status = if params.ghost_mode { "confirmed" } else { "pending" };
         db::record_open_position_with_status(
             p, strategy_name, params.token_id.as_str(), &params.market_name,
-            side, params.price, params.shares, params.ghost_mode, status,
+            side, fill.price, fill.filled, params.ghost_mode, status,
         ).await;
     }
 }
@@ -1821,6 +1841,86 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod fill_accounting_tests {
+    use super::*;
+
+    fn params(shares: Decimal, limit: Decimal) -> OrderParams {
+        OrderParams {
+            token_id: MarketId::new("KX-1#yes"),
+            price: limit,
+            shares,
+            fee_bps: 0,
+            is_neg_risk: false,
+            market_name: "m".into(),
+            condition_id: String::new(),
+            order_type: crate::venues::core::TimeInForce::Fak,
+            post_only: false,
+            ghost_mode: false,
+        }
+    }
+
+    fn fill(filled: Decimal, price: Decimal, fee: Decimal) -> Fill {
+        Fill {
+            order_id: OrderId("o1".into()),
+            market: MarketId::new("KX-1#yes"),
+            filled,
+            price,
+            fee,
+        }
+    }
+
+    /// The bug: a partial fill booked the REQUESTED size at the LIMIT price, so
+    /// the bot believed it held more than it did at a basis it never paid. Every
+    /// downstream exposure check and stop distance then worked from that number.
+    #[tokio::test]
+    async fn a_partial_fill_books_only_what_filled() {
+        let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let p = params(dec!(100), dec!(0.55));
+        // Asked for 100 at a 0.55 limit; got 30 at 0.52.
+        record_guard(&positions, "MakerStrategy", &p, None, &fill(dec!(30), dec!(0.52), dec!(0.1))).await;
+
+        let map = positions.lock().await;
+        let pos = map.get(&("MakerStrategy".to_string(), p.token_id.clone())).expect("guard recorded");
+        assert_eq!(pos.shares, dec!(30), "booked the requested size, not the fill");
+        assert_eq!(pos.avg_entry, dec!(0.52), "booked the limit price, not the fill price");
+        assert_eq!(pos.entry_fee, dec!(0.1));
+    }
+
+    /// A full fill must be unchanged — this fix must not move the common case.
+    #[tokio::test]
+    async fn a_full_fill_is_booked_exactly() {
+        let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let p = params(dec!(50), dec!(0.40));
+        record_guard(&positions, "ArbitrageStrategy", &p, None, &fill(dec!(50), dec!(0.40), dec!(0))).await;
+
+        let map = positions.lock().await;
+        let pos = map.get(&("ArbitrageStrategy".to_string(), p.token_id.clone())).expect("guard recorded");
+        assert_eq!(pos.shares, dec!(50));
+        assert_eq!(pos.avg_entry, dec!(0.40));
+    }
+
+    /// The paired leg carries its own fill: legs of an atomic pair can fill
+    /// differently, and booking both from one leg's fill would misstate the hedge.
+    #[tokio::test]
+    async fn each_leg_of_a_pair_books_its_own_fill() {
+        let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
+        let yes = params(dec!(20), dec!(0.45));
+        let mut no = params(dec!(20), dec!(0.52));
+        no.token_id = MarketId::new("KX-1#no");
+
+        record_guard(&positions, "ArbitrageStrategy", &yes, Some(&no.token_id), &fill(dec!(20), dec!(0.45), dec!(0))).await;
+        record_guard(&positions, "ArbitrageStrategy", &no, Some(&yes.token_id), &fill(dec!(12), dec!(0.50), dec!(0))).await;
+
+        let map = positions.lock().await;
+        let a = map.get(&("ArbitrageStrategy".to_string(), yes.token_id.clone())).unwrap();
+        let b = map.get(&("ArbitrageStrategy".to_string(), no.token_id.clone())).unwrap();
+        assert_eq!(a.shares, dec!(20));
+        assert_eq!(b.shares, dec!(12), "the short leg's own partial fill was lost");
+        assert_eq!(b.avg_entry, dec!(0.50));
+    }
+}
 
 #[cfg(test)]
 mod deployed_market_tests {

@@ -75,7 +75,7 @@ use crate::state::{
     MarketConfig, MarketPhase, MarketSnapshot, OrderParams, Position, PositionMap, PriceState,
     StrategySignal,
 };
-use crate::venues::core::{Execution, MarketId, OrderIntent, Side};
+use crate::venues::core::{Execution, MarketId, OrderIntent, Side, Fill, OrderId};
 use crate::venues::lifecycle::{LifecycleConfig, OrderLifecycle};
 
 use super::{ws, UsRetailVenue};
@@ -1285,24 +1285,32 @@ fn order_params_to_intent(p: &OrderParams, side: Side) -> OrderIntent {
 
 /// Insert a per-strategy position guard so the viper won't re-enter the same
 /// token next tick. `paired` links the hedge partner for paired strategies.
+/// Record the position guard from what the venue actually filled.
+///
+/// Takes the `Fill` rather than the `OrderParams`: booking the REQUESTED size at
+/// the LIMIT price left the bot believing it held more than it did, at a cost
+/// basis it never paid, and every downstream exposure check and stop distance
+/// then worked from that number. Exits were already clamped to the guard, which
+/// is why the error stayed confined to the entry side and went unnoticed.
 async fn record_guard(
     positions: &Arc<Mutex<PositionMap>>,
     strategy_name: &str,
     params: &OrderParams,
     paired: Option<&MarketId>,
+    fill: &Fill,
 ) {
     let mut map = positions.lock().await;
     map.insert(
         (strategy_name.to_string(), params.token_id.clone()),
         Position {
-            shares: params.shares,
-            avg_entry: params.price,
+            shares: fill.filled,
+            avg_entry: fill.price,
             opened_at: Utc::now(),
             close_time: None,
             market_name: params.market_name.clone(),
             pair_token_id: params.token_id.clone(),
             fill_confirmed_at: None,
-            paired_leg_token_id: paired.cloned(), entry_fee: Decimal::ZERO,
+            paired_leg_token_id: paired.cloned(), entry_fee: fill.fee,
         },
     );
 }
@@ -1338,10 +1346,18 @@ async fn dispatch_signal(
         StrategySignal::Entry { params, pair_params: Some(pp) } => {
             if params.ghost_mode {
                 info!("👻 [{strategy_name}] ghost entry pair: {} + {}", params.token_id, pp.token_id);
-                record_guard(positions, strategy_name, params, Some(&pp.token_id)).await;
-                record_guard(positions, strategy_name, pp, Some(&params.token_id)).await;
-                record_entry(pool, scope, strategy_name, params).await;
-                record_entry(pool, scope, strategy_name, pp).await;
+                let ghost_of = |p: &OrderParams| Fill {
+                    order_id: OrderId(String::new()),
+                    market: p.token_id.clone(),
+                    filled: p.shares,
+                    price: p.price,
+                    fee: Decimal::ZERO,
+                };
+                let (ga, gb) = (ghost_of(params), ghost_of(pp));
+                record_guard(positions, strategy_name, params, Some(&pp.token_id), &ga).await;
+                record_guard(positions, strategy_name, pp, Some(&params.token_id), &gb).await;
+                record_entry(pool, scope, strategy_name, params, &ga).await;
+                record_entry(pool, scope, strategy_name, pp, &gb).await;
                 return true;
             }
             let legs = [
@@ -1352,14 +1368,14 @@ async fn dispatch_signal(
                 Ok([a, b]) => {
                     info!("✅ [{strategy_name}] entry pair: {} @ {:.4} | {} @ {:.4}",
                         a.order_id, a.price, b.order_id, b.price);
-                    record_guard(positions, strategy_name, params, Some(&pp.token_id)).await;
-                    record_guard(positions, strategy_name, pp, Some(&params.token_id)).await;
+                    record_guard(positions, strategy_name, params, Some(&pp.token_id), &a).await;
+                    record_guard(positions, strategy_name, pp, Some(&params.token_id), &b).await;
                     // Track both resting legs so the reconciler manages their
                     // lifecycle (fill-confirm / stale-cancel / naked-leg hedge).
                     lifecycle.track(&a, strategy_name, params.order_type, Some(pp.token_id.clone())).await;
                     lifecycle.track(&b, strategy_name, pp.order_type, Some(params.token_id.clone())).await;
-                    record_entry(pool, scope, strategy_name, params).await;
-                    record_entry(pool, scope, strategy_name, pp).await;
+                    record_entry(pool, scope, strategy_name, params, &a).await;
+                    record_entry(pool, scope, strategy_name, pp, &b).await;
                     if let Some(p) = pool { sync_dashboard(venue, p, Some(positions), starting).await; }
                     true
                 }
@@ -1453,20 +1469,40 @@ async fn dispatch_single(
     if params.ghost_mode {
         info!("👻 [{strategy_name}] ghost {side:?}: {} @ {:.4} × {:.2}",
             params.token_id, params.price, params.shares);
+        let ghost = Fill {
+            order_id: OrderId(String::new()),
+            market: params.token_id.clone(),
+            filled: params.shares,
+            price: params.price,
+            fee: Decimal::ZERO,
+        };
         if matches!(side, Side::Buy) {
-            record_guard(positions, strategy_name, params, None).await;
-            record_entry(pool, scope, strategy_name, params).await;
+            record_guard(positions, strategy_name, params, None, &ghost).await;
+            record_entry(pool, scope, strategy_name, params, &ghost).await;
         }
         return true;
     }
     match venue.place_order(order_params_to_intent(params, side)).await {
         Ok(f) => {
-            info!("✅ [{strategy_name}] {side:?} {} @ {:.4} (order {})",
-                params.token_id, f.price, f.order_id);
+            // A 2xx is not a fill. Kalshi grew this guard on 2026-08-10 after
+            // booking `fill_count: 0` as done — phantom positions on entry,
+            // abandoned live ones on exit — but US never got it.
+            if f.filled <= Decimal::ZERO {
+                warn!("⚠️ [{strategy_name}] {side:?} {} @ {:.4} filled 0 of {:.2} — no state change (order {})",
+                    params.token_id, params.price, params.shares, f.order_id);
+                return false;
+            }
+            if f.filled < params.shares.round_dp(2) {
+                warn!("⚠️ [{strategy_name}] {side:?} {} partial fill {:.2} of {:.2} — booking what filled; \
+                       lifecycle reconciliation owns the remainder",
+                    params.token_id, f.filled, params.shares);
+            }
+            info!("✅ [{strategy_name}] {side:?} {} @ {:.4} × {:.2} (order {})",
+                params.token_id, f.price, f.filled, f.order_id);
             if matches!(side, Side::Buy) {
-                record_guard(positions, strategy_name, params, None).await;
+                record_guard(positions, strategy_name, params, None, &f).await;
                 lifecycle.track(&f, strategy_name, params.order_type, None).await;
-                record_entry(pool, scope, strategy_name, params).await;
+                record_entry(pool, scope, strategy_name, params, &f).await;
             }
             if let Some(p) = pool { sync_dashboard(venue, p, Some(positions), starting).await; }
             true
@@ -1485,6 +1521,7 @@ async fn record_entry(
     scope: &TradeScope,
     strategy_name: &str,
     params: &OrderParams,
+    fill: &Fill,
 ) {
     let side = side_label(params.token_id.as_str());
     metrics::record_entry(
@@ -1493,8 +1530,8 @@ async fn record_entry(
         params.token_id.to_string(),
         params.market_name.clone(),
         side.to_string(),
-        params.price,
-        params.shares,
+        fill.price,
+        fill.filled,
     ).await;
     if let Some(p) = pool {
         // Live entries land as `pending` — the fill is not venue-confirmed yet, and
@@ -1504,7 +1541,7 @@ async fn record_entry(
         let status = if params.ghost_mode { "confirmed" } else { "pending" };
         db::record_open_position_with_status(
             p, strategy_name, params.token_id.as_str(), &params.market_name,
-            side, params.price, params.shares, params.ghost_mode, status,
+            side, fill.price, fill.filled, params.ghost_mode, status,
         ).await;
     }
 }
