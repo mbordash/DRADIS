@@ -736,9 +736,15 @@ async fn trade_one_market(
     // classifies it as crypto), but this venue's DB scope is KALSHI_ASSET.
     // Alias the two so the Control Tower's `?asset=btc` queries reach this
     // venue's database instead of erroring out with an empty tradelog.
-    if pair.is_crypto() {
-        db::alias_pool(pair.underlying, asset);
-    }
+    // Route lookups by this squadron's public identity to the venue's shard.
+    //
+    // Every Kalshi squadron writes to one shard, but the Control Tower queries
+    // positions by the SQUADRON's asset — "btc"/"eth" for the rotation loop,
+    // "politics"/"sports" for a deployed one. Without an alias those resolve to
+    // no pool and the endpoint 500s. The non-crypto case was missed originally,
+    // and the crypto one only registers when a market is already selected, which
+    // leaves a window across restarts and underlying rotations.
+    db::alias_pool(status_scope, asset);
     seed_squadron_config(&squadron_id).await;
     let market_class = squadron.classify_and_link().await;
     // Filing dimensions for every row this market writes. `asset` above is

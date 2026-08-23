@@ -1095,7 +1095,7 @@ async fn get_open_positions(Query(q): Query<AssetQuery>) -> Response {
             Json(positions).into_response()
         },
         None => {
-            error!("Database pool not available for GET /api/positions");
+            error!("Database pool not available for GET /api/positions (asset={:?})", q.asset);
             Json(Vec::<db::OpenPositionRow>::new()).into_response()
         },
     }
