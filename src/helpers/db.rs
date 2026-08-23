@@ -704,17 +704,7 @@ async fn seed_market_taxonomy(pool: &SqlitePool) -> Result<()> {
         .execute(pool).await?;
 
     // viper_kind — venue_agnostic = 1 for pure order-book strategies.
-    for (id, display, agnostic) in [
-        ("arbitrage",    "Arbitrage",    1),
-        ("maker",        "Maker",        1),
-        ("momentum",     "Momentum",     0),
-        ("gboost",       "GBoost",       0),
-        ("basis",        "Basis",        0),
-        ("time_decay",   "TimeDecay",    0),
-        ("trendcapture", "TrendReversal", 0),
-        ("convergence",  "Convergence",  0),
-        ("fairvalue",    "FairValue",    0),
-    ] {
+    for (id, display, agnostic) in VIPER_KINDS {
         sqlx::query("INSERT OR IGNORE INTO viper_kind (id, display, venue_agnostic) VALUES (?, ?, ?)")
             .bind(id).bind(display).bind(agnostic).execute(pool).await?;
     }
@@ -1770,6 +1760,25 @@ pub async fn requeue_interrupted_deployments() -> u64 {
         }
     }
 }
+
+/// Every viper kind, as seeded into `viper_kind`.
+///
+/// Public because adding a viper means touching more than this table: the deploy
+/// budget router in `cag::adama` needs a matching arm, and a kind seeded without
+/// one has its operator-chosen budget silently dropped in favour of the
+/// compile-time default while the deploy UI reports success. FairValue shipped
+/// exactly that way. A test in `cag::adama` pins the two lists together.
+pub const VIPER_KINDS: &[(&str, &str, i32)] = &[
+    ("arbitrage",    "Arbitrage",     1),
+    ("maker",        "Maker",         1),
+    ("momentum",     "Momentum",      0),
+    ("gboost",       "GBoost",        0),
+    ("basis",        "Basis",         0),
+    ("time_decay",   "TimeDecay",     0),
+    ("trendcapture", "TrendReversal", 0),
+    ("convergence",  "Convergence",   0),
+    ("fairvalue",    "FairValue",     0),
+];
 
 /// Fetch pending deployment requests from the queue.
 pub async fn fetch_pending_deployments() -> Vec<PendingDeployment> {

@@ -932,7 +932,21 @@ async fn trade_one_market(
         match market_cfg.phase(Utc::now(), MARKET_RTB_WINDOW_SECS) {
             MarketPhase::Closed => {
                 info!("🏁 Kalshi market \"{}\" reached close — standing down to rotate", market_cfg.market_name);
+                // cancel_all cancels RESTING ORDERS; it does not sell inventory.
+                // A squadron trades two markets at once — the hot primary that
+                // rotates every 15-30 minutes, and a longer-lived daily maker
+                // market that FairValue actively prefers — and its lifetime is
+                // tied to the PRIMARY's close. Tearing down here therefore
+                // abandoned any position sitting on the daily, which then ran
+                // unmanaged (no stop, no take-profit) until it expired. That is
+                // how -$3.09 was lost on 2026-08-10, recorded in neither
+                // `trades` nor `entries`.
                 lifecycle.cancel_all(venue.as_ref()).await;
+                flatten_before_stand_down(
+                    venue, &hub, &pool, &scope, &positions, &lifecycle,
+                    &market_cfg, maker_cfg.as_ref(), maker_pair.as_ref(), &raptors, starting,
+                    dyn_cfg.ghost_mode,
+                ).await;
                 cag.update_state(&squadron_id, SquadronState::StoodDown);
                 cag.remove(&squadron_id);
                 if pair.is_crypto() { publish_raptor_health(raptor_health_tx, pair.underlying, false); }
@@ -947,7 +961,11 @@ async fn trade_one_market(
                     );
                     cag.update_state(&squadron_id, SquadronState::Rtb);
                 }
-                continue;
+                // Deliberately NOT `continue`. This arm used to skip the tick
+                // entirely, which stopped exits as well as entries — so for the
+                // whole run-up to a close, a position could not be stopped out
+                // or taken off. Fall through and let evaluation run; entries are
+                // suppressed at dispatch by `opens_exposure`.
             }
             MarketPhase::Open => {}
         }
@@ -1010,6 +1028,11 @@ async fn trade_one_market(
 
         let mut acted = false;
         for (strategy_name, signal) in signals {
+            // Inside the RTB window we manage what we hold but take on nothing
+            // new: cancels and exits still flow, entries and quotes do not.
+            if winding_down && signal.opens_exposure() {
+                continue;
+            }
             if dispatch_signal(venue.as_ref(), &pool, &scope, &positions, &lifecycle, &strategy_name, &signal, starting).await {
                 acted = true;
             }
@@ -1021,6 +1044,98 @@ async fn trade_one_market(
 }
 
 // ─── Strategy plumbing ────────────────────────────────────────────────────────
+
+/// Sell any inventory that is still tradeable before the squadron stands down.
+///
+/// The primary market has closed, so anything held on it can only settle — that
+/// is fine and expected, a binary pays out at resolution. What is not fine is
+/// inventory on the SECONDARY daily market, which typically has up to an hour
+/// left: the squadron was its only manager, and walking away leaves it with no
+/// stop and no take-profit until it expires.
+///
+/// Exits are synthesised at the live bid for the leg actually held, so this is
+/// the same FAK-at-the-bid path a stop would take, not a market order into
+/// nothing. A leg whose book has gone empty is left to settle and logged, since
+/// selling into an empty book is worse than holding to resolution.
+#[allow(clippy::too_many_arguments)]
+async fn flatten_before_stand_down(
+    venue: &Arc<KalshiVenue>,
+    hub: &ws::BookHub,
+    pool: &Option<sqlx::SqlitePool>,
+    scope: &TradeScope,
+    positions: &Arc<Mutex<PositionMap>>,
+    lifecycle: &Arc<OrderLifecycle>,
+    primary_cfg: &MarketConfig,
+    maker_cfg: Option<&MarketConfig>,
+    maker_pair: Option<&KalshiPair>,
+    raptors: &CryptoRaptors,
+    starting: Decimal,
+    ghost: bool,
+) {
+    let held: Vec<(String, MarketId, Decimal)> = {
+        let map = positions.lock().await;
+        map.iter()
+            .filter(|(_, p)| p.shares > dec!(0))
+            .map(|((strategy, token), p)| (strategy.clone(), token.clone(), p.shares))
+            .collect()
+    };
+    if held.is_empty() {
+        return;
+    }
+
+    // Only the maker market can still be traded; the primary is closed.
+    let (Some(mcfg), Some(mpair)) = (maker_cfg, maker_pair) else {
+        warn!(
+            "🏁 Standing down holding {} position(s) with no open secondary market — leaving them to settle",
+            held.len(),
+        );
+        return;
+    };
+    let snap = build_snapshot(hub, &mpair.ticker, raptors, mcfg).await;
+
+    for (strategy, token, shares) in held {
+        let bid = if token == mcfg.yes_token {
+            snap.yes_bid
+        } else if token == mcfg.no_token {
+            snap.no_bid
+        } else {
+            info!(
+                "🏁 [{strategy}] {} shares on \"{}\" are on the closed primary — leaving to settle",
+                shares, primary_cfg.market_name,
+            );
+            continue;
+        };
+        if bid <= dec!(0) {
+            warn!(
+                "🏁 [{strategy}] {shares} shares on \"{}\" have no bid — leaving to settle rather than dumping into an empty book",
+                mcfg.market_name,
+            );
+            continue;
+        }
+        warn!(
+            "🏁 [{strategy}] flattening {shares} shares on \"{}\" at ${bid:.2} before stand-down",
+            mcfg.market_name,
+        );
+        let signal = StrategySignal::Exit {
+            params: OrderParams {
+                token_id: token.clone(),
+                price: bid,
+                shares,
+                fee_bps: KALSHI_FEE_BPS as u16,
+                is_neg_risk: false,
+                market_name: mcfg.market_name.clone(),
+                condition_id: String::new(),
+                order_type: crate::venues::core::TimeInForce::Fak,
+                post_only: false,
+                ghost_mode: ghost,
+            },
+            reason: "SquadronStandDown".to_string(),
+            // Each leg is flattened on its own; pairing here would double-exit.
+            exit_pair: false,
+        };
+        dispatch_signal(venue.as_ref(), pool, scope, positions, lifecycle, &strategy, &signal, starting).await;
+    }
+}
 
 fn touch_heartbeat(hb: &AtomicU64) {
     let now = std::time::SystemTime::now()

@@ -265,6 +265,11 @@ fn apply_viper_budgets(
             "gboost"       => &mut cfg.gboost_max_exposure_usdc,
             "trendcapture" => &mut cfg.trendcapture_max_exposure_usdc,
             "convergence"  => &mut cfg.convergence_max_exposure_usdc,
+            // Every id seeded into `viper_kind` needs an arm here or the
+            // operator's chosen budget is dropped and the squadron flies on the
+            // compile-time default — while the deploy UI reports success.
+            // `viper_kinds_all_have_a_budget_slot` pins the two lists together.
+            "fairvalue"    => &mut cfg.fairvalue_max_exposure_usdc,
             other => {
                 warn!("Unknown viper kind '{}' in deploy budgets — skipped", other);
                 continue;
@@ -430,5 +435,41 @@ where
                 }
             }
         }
+    }
+}
+
+
+
+#[cfg(test)]
+mod budget_coverage_tests {
+    /// Viper kinds `apply_viper_budgets` can route a deploy budget to. Kept
+    /// beside the match above so the two are edited together.
+    const BUDGETED_KINDS: &[&str] = &[
+        "arbitrage", "time_decay", "momentum", "maker", "basis",
+        "gboost", "trendcapture", "convergence", "fairvalue",
+    ];
+
+    /// A viper seeded into `viper_kind` with no arm in the budget match has its
+    /// deploy budget silently dropped: the squadron flies on the compile-time
+    /// exposure rather than the operator's, and the deploy UI still reports
+    /// success. FairValue shipped that way — seeded, with a
+    /// `fairvalue_max_exposure_usdc` field, and no route to reach it.
+    #[test]
+    fn every_seeded_viper_kind_has_a_budget_slot() {
+        let missing: Vec<&str> = crate::helpers::db::VIPER_KINDS
+            .iter()
+            .map(|(id, _, _)| *id)
+            .filter(|id| !BUDGETED_KINDS.contains(id))
+            .collect();
+        assert!(missing.is_empty(), "viper kinds with no deploy-budget slot: {missing:?}");
+    }
+
+    /// And the reverse: a budget arm for a kind nobody seeds is dead code that
+    /// reads as coverage.
+    #[test]
+    fn no_budget_slot_points_at_a_kind_that_does_not_exist() {
+        let seeded: Vec<&str> = crate::helpers::db::VIPER_KINDS.iter().map(|(id, _, _)| *id).collect();
+        let orphans: Vec<&&str> = BUDGETED_KINDS.iter().filter(|k| !seeded.contains(k)).collect();
+        assert!(orphans.is_empty(), "budget slots for unseeded kinds: {orphans:?}");
     }
 }

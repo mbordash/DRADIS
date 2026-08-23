@@ -847,7 +847,11 @@ async fn trade_one_market(
                     );
                     cag.update_state(&squadron_id, SquadronState::Rtb);
                 }
-                continue; // stop opening new positions; let existing ones resolve
+                // Deliberately NOT `continue`. This skipped the whole tick, so
+                // the RTB window stopped exits as well as entries: for its full
+                // duration a position could not be stopped out or taken off, and
+                // simply ran into the close. Fall through; entries are suppressed
+                // at dispatch by `opens_exposure`.
             }
             MarketPhase::Open => {}
         }
@@ -895,6 +899,11 @@ async fn trade_one_market(
 
         let mut acted = false;
         for (strategy_name, signal) in signals {
+            // Inside the RTB window we manage what we hold but take on nothing
+            // new: cancels and exits still flow, entries and quotes do not.
+            if winding_down && signal.opens_exposure() {
+                continue;
+            }
             if dispatch_signal(venue.as_ref(), &pool, &positions, &lifecycle, &scope, &strategy_name, &signal, starting).await {
                 acted = true;
             }

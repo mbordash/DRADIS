@@ -141,6 +141,45 @@ pub type PriceState = (
 
 /// Named accessors for [`PriceState`], so new code never indexes a 7-tuple.
 #[cfg(test)]
+mod signal_exposure_tests {
+    use super::{StrategySignal, OrderParams, MarketId};
+    use crate::venues::core::TimeInForce;
+    use rust_decimal_macros::dec;
+
+    fn params() -> OrderParams {
+        OrderParams {
+            token_id: MarketId::new("t"), price: dec!(0.5), shares: dec!(1),
+            fee_bps: 0, is_neg_risk: false, market_name: "m".into(),
+            condition_id: String::new(), order_type: TimeInForce::Fak,
+            post_only: false, ghost_mode: true,
+        }
+    }
+
+    /// Inside the RTB window and after a primary market closes, the loop keeps
+    /// managing what it holds but takes on nothing new. Getting this backwards
+    /// in either direction is costly: block exits and a position runs to expiry
+    /// with no stop — which is how -$3.09 was lost on 2026-08-10 — while
+    /// allowing entries buys into a market that is about to stop trading.
+    #[test]
+    fn only_entries_and_quotes_open_exposure() {
+        assert!(StrategySignal::Entry { params: params(), pair_params: None }.opens_exposure());
+        assert!(StrategySignal::MakerQuote { yes: Some(params()), no: None }.opens_exposure());
+
+        for reducing in [
+            StrategySignal::Exit { params: params(), reason: "stop".into(), exit_pair: false },
+            StrategySignal::MakerCancel { tokens: vec![MarketId::new("t")] },
+            StrategySignal::MakerRestingExit { params: params(), reason: "tp".into() },
+            StrategySignal::NoSignal,
+        ] {
+            assert!(
+                !reducing.opens_exposure(),
+                "{reducing:?} must still flow while winding down",
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod snapshot_obi_tests {
     use super::MarketSnapshot;
     use rust_decimal::Decimal;
@@ -641,6 +680,19 @@ pub enum StrategySignal {
     },
     /// No action at this time
     NoSignal,
+}
+
+impl StrategySignal {
+    /// Would acting on this open or increase exposure?
+    ///
+    /// Lets a loop keep managing what it already holds while refusing new risk —
+    /// during the run-up to a market close, and after a primary market has
+    /// closed while inventory remains on a secondary that has not. Cancels and
+    /// exits reduce exposure and must keep flowing in both cases; a position
+    /// nobody is allowed to sell is a position nobody is managing.
+    pub fn opens_exposure(&self) -> bool {
+        matches!(self, Self::Entry { .. } | Self::MakerQuote { .. })
+    }
 }
 
 #[cfg(test)]
