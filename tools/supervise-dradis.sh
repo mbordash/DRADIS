@@ -34,6 +34,13 @@ BIN="target/release/dradis-${INSTANCE}"
 trap '' PIPE HUP
 
 rm -f "$STOP"
+# Re-check on every supervisor start, not just at launch: the binary can be
+# replaced under a long-running supervisor by a later build.
+BUILT=$("./$BIN" --build-venue 2>/dev/null || echo unknown)
+if [ "$BUILT" != "$VENUE" ]; then
+    echo "❌ $BIN is a '$BUILT' build but this supervisor is for '$VENUE' — refusing to start" >> "$LOG"
+    exit 1
+fi
 echo "🛡️  Supervisor started (venue=$VENUE instance=$INSTANCE port=$API_PORT bin=$BIN pid=$$)" >> "$LOG"
 
 while true; do

@@ -139,11 +139,34 @@ fi
 # ── Start DRADIS API + trading engine ─────────────────────────────────────────
 echo "⚙️  Building DRADIS (release, VENUE=$VENUE)..."
 cargo build --release ${CARGO_FEATURE_ARGS[@]+"${CARGO_FEATURE_ARGS[@]}"} 2>&1 | tail -3
-# Copy the build aside immediately. Building another venue overwrites
-# target/release/dradis, and a running instance would then be restarted by its
-# supervisor onto the WRONG venue's binary — silently, since the path is the same.
-cp target/release/dradis "$BIN"
-echo "   binary → $BIN"
+# Verify the freshly-built binary is actually THIS venue before copying it aside.
+#
+# All three venue builds write target/release/dradis, so anything that builds
+# another venue in between — a `cargo test` matrix, a parallel window — leaves
+# the wrong binary at that path. Copying it then hands the instance a different
+# venue entirely, and the supervisor keeps restarting it that way. This happened
+# on 2026-08-23: a Kalshi build was copied to the Polymarket US instance and ran
+# there, visible only because a Kalshi squadron id appeared in the US log.
+#
+# `--build-venue` prints the compiled venue without starting anything.
+BUILT_VENUE=$(./target/release/dradis --build-venue 2>/dev/null || echo "unknown")
+if [ "$BUILT_VENUE" != "$VENUE" ]; then
+    echo "❌  target/release/dradis is a '$BUILT_VENUE' build, expected '$VENUE'."
+    echo "    Something rebuilt it for another venue after the build above."
+    echo "    Re-run this script; nothing was copied or started."
+    exit 1
+fi
+# Install atomically: copy to a temp path on the same filesystem, then rename.
+#
+# `cp` writes through the SAME inode, so overwriting a binary that is currently
+# executing invalidates its code signature — macOS then SIGKILLs both the running
+# process and any new one launched from that path (observed 2026-08-23: exit 137
+# on a plain `--build-venue`). `mv` is a rename: the new file gets a fresh inode
+# and the running process keeps the one it mapped, undisturbed until its
+# supervisor restarts it.
+cp target/release/dradis "$BIN.tmp"
+mv -f "$BIN.tmp" "$BIN"
+echo "   binary → $BIN ($BUILT_VENUE)"
 
 # Supervise the engine, the way the container does.
 #

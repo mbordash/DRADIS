@@ -171,7 +171,33 @@ where
 // allow `TOKIO_WORKER_THREADS` to override upward for multi-asset boxes.  Blocking
 // work already lives on the dedicated `spawn_blocking` pool, so matching workers
 // to cores is the correct tokio configuration and removes the oversubscription.
+/// Which venue this binary was compiled for.
+///
+/// Mirrors `api::setup::build_venue`; kept here so `--build-venue` answers
+/// without starting a runtime, connecting to anything, or touching the DB.
+const COMPILED_VENUE: &str = {
+    #[cfg(feature = "intl_clob")]
+    { "intl" }
+    #[cfg(feature = "us_retail")]
+    { "us" }
+    #[cfg(feature = "kalshi")]
+    { "kalshi" }
+};
+
 fn main() -> Result<()> {
+    // `--build-venue` prints the compiled venue and exits.
+    //
+    // All three venue builds write the same target/release/dradis, so a binary
+    // copied aside for one instance can silently be another venue's — a Kalshi
+    // build was once copied to the Polymarket US instance and ran there, visible
+    // only because a Kalshi squadron id turned up in the US log. start-local.sh
+    // checks this before copying, which turns a silent wrong-venue run into a
+    // refusal to start.
+    if std::env::args().any(|a| a == "--build-venue") {
+        println!("{COMPILED_VENUE}");
+        return Ok(());
+    }
+
     let host_cores = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(2);
