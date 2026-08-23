@@ -181,7 +181,11 @@ pub async fn enforce_batch(
     batch: &ProposalBatch,
     ids: &[i64],
     configured_tier: i64,
-    config_tx: &watch::Sender<Arc<DynamicConfig>>,
+    // The squadron this batch was reasoned about. Applies go to ITS config, not
+    // the global record: patrol loops read a per-squadron handle, so a change
+    // written globally never reaches a strategy. Auto-apply was structurally
+    // inert for exactly that reason.
+    squadron_id: &str,
     current_pnl: f64,
     knobs: &PolicyKnobs,
 ) -> EnforceOutcome {
@@ -231,15 +235,15 @@ pub async fn enforce_batch(
     let patch = Value::Object(
         to_apply.iter().map(|(_, c)| (c.key.clone(), c.to.clone())).collect(),
     );
-    let current = config_tx.borrow().clone();
-    match DynamicConfig::apply_patch_as(&current, &patch.to_string(), "llm_advisor").await {
-        Ok(new_cfg) => {
-            let _ = config_tx.send(new_cfg);
+    // apply_squadron_patch_as persists, records the diff for revert, and pushes
+    // into the running squadron's live handle so the next patrol tick sees it.
+    match DynamicConfig::apply_squadron_patch_as(squadron_id, &patch.to_string(), "llm_advisor").await {
+        Ok(_) => {
             for (id, c) in &to_apply {
                 let inverse = json!({ c.key.clone(): c.from.clone() }).to_string();
-                let detail = format!("auto-applied at tier {tier}: {}", c.reason);
+                let detail = format!("auto-applied at tier {tier} on {squadron_id}: {}", c.reason);
                 db::mark_llm_action_applied(pool, *id, &detail, &inverse, current_pnl).await;
-                info!("🤖 LLM autonomy applied {}: {} → {}", c.key, c.from, c.to);
+                info!("🤖 LLM autonomy applied [{squadron_id}] {}: {} → {}", c.key, c.from, c.to);
                 out.applied.push(c.key.clone());
             }
         }
@@ -263,7 +267,9 @@ pub async fn enforce_batch(
 /// demote autonomy to tier 1, and return an alert string for Telegram.
 pub async fn circuit_breaker_check(
     pool: &SqlitePool,
-    config_tx: &watch::Sender<Arc<DynamicConfig>>,
+    // Retained for signature stability with callers; reverts now go through
+    // apply_squadron_patch_as, since the global record reaches no strategy.
+    _config_tx: &watch::Sender<Arc<DynamicConfig>>,
     current_pnl: f64,
     knobs: &PolicyKnobs,
 ) -> Option<String> {
@@ -282,27 +288,47 @@ pub async fn circuit_breaker_check(
         return None;
     }
 
-    // Merge inverse patches newest→oldest so the OLDEST original value wins
-    // when the same key was patched more than once.
-    let mut revert = serde_json::Map::new();
+    // Merge inverse patches per SQUADRON, newest→oldest so the OLDEST original
+    // value wins when the same key was patched more than once. Grouping matters
+    // now that two squadrons can be tuned differently: a single merged patch
+    // would revert one squadron's change onto another's config.
+    //
+    // Rows with no squadron_id predate the squadron-scoped advisor. They were
+    // applied to the global record that no patrol loop reads, so there is
+    // nothing live to revert — they are marked reverted for the audit trail and
+    // otherwise skipped.
+    let mut by_squadron: std::collections::BTreeMap<String, serde_json::Map<String, Value>> =
+        std::collections::BTreeMap::new();
     for a in &applied { // already newest first
+        let Some(sq) = a.squadron_id.as_deref().filter(|s| !s.is_empty()) else { continue };
         if let Some(inv) = a.inverse_patch.as_deref() {
             if let Ok(Value::Object(m)) = serde_json::from_str::<Value>(inv) {
+                let entry = by_squadron.entry(sq.to_string()).or_default();
                 for (k, v) in m {
-                    revert.insert(k, v); // later (older) inserts overwrite
+                    entry.insert(k, v); // later (older) inserts overwrite
                 }
             }
         }
     }
-    if revert.is_empty() {
+    if by_squadron.is_empty() {
         return None;
     }
 
-    let patch = Value::Object(revert).to_string();
-    let current = config_tx.borrow().clone();
-    match DynamicConfig::apply_patch_as(&current, &patch, "llm_breaker").await {
-        Ok(new_cfg) => {
-            let _ = config_tx.send(new_cfg);
+    let mut reverted_squadrons: Vec<String> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    for (sq, patch_map) in by_squadron {
+        let patch = Value::Object(patch_map).to_string();
+        match DynamicConfig::apply_squadron_patch_as(&sq, &patch, "llm_breaker").await {
+            Ok(_) => reverted_squadrons.push(sq),
+            Err(e) => {
+                warn!("❌ Circuit breaker revert failed for {sq}: {e}");
+                failures.push(sq);
+            }
+        }
+    }
+
+    if !reverted_squadrons.is_empty() {
+        {
             let fields: Vec<String> = applied.iter().map(|a| a.field.clone()).collect();
             for a in &applied {
                 db::update_llm_action_status(
@@ -314,16 +340,24 @@ pub async fn circuit_breaker_check(
                     None,
                 ).await;
             }
+            // Demotion is deliberately GLOBAL even though the revert is scoped.
+            // Session P&L is a portfolio number: it cannot tell us which
+            // squadron caused the drawdown, so demoting only the one whose
+            // change happened to be newest would be arbitrary. Conservative
+            // beats precise when the signal is ambiguous.
             BREAKER_DEMOTED.store(true, Ordering::Relaxed);
             let alert = format!(
-                "🧯 LLM autonomy CIRCUIT BREAKER tripped — reverted {} change(s) ({}) after a ${:.2}+ P&L drawdown. Autonomy demoted to tier 1 (recommend-only) until operator reset.",
-                applied.len(), fields.join(", "), knobs.breaker_drawdown_usdc,
+                "🧯 LLM autonomy CIRCUIT BREAKER tripped — reverted {} change(s) ({}) across {} after a ${:.2}+ P&L drawdown. Autonomy demoted to tier 1 (recommend-only) everywhere until operator reset.",
+                applied.len(), fields.join(", "), reverted_squadrons.join(", "), knobs.breaker_drawdown_usdc,
             );
             warn!("{alert}");
-            Some(alert)
+            return Some(alert);
         }
-        Err(e) => {
-            warn!("❌ Circuit breaker revert failed: {e}");
+    }
+    {
+        let e = failures.join(", ");
+        {
+            warn!("❌ Circuit breaker revert failed for every squadron: {e}");
             // Demote anyway — the config may be in a bad state, stop the AI.
             BREAKER_DEMOTED.store(true, Ordering::Relaxed);
             Some(format!(

@@ -121,16 +121,6 @@ export default function AiActionsPage() {
         </div>
       )}
 
-      {/* Scope caveat — approvals and auto-applies write the global config,
-          which no squadron reads. Until the advisor is re-scoped per squadron
-          (see ROADMAP), an "applied" row does not mean a live strategy changed. */}
-      <div className="mb-3 text-[11px] font-mono rounded-lg px-3 py-2 bg-amber-500/5 border border-amber-500/20 text-amber-300/80">
-        <span className="font-semibold">Scope:</span> approvals apply to the{' '}
-        <span className="text-amber-200">global</span> config, which strategies do not read —
-        squadrons run their own config. An <span className="text-amber-200">applied</span> row here
-        does not change live trading. Edit a squadron&apos;s vipers from its squadron page.
-      </div>
-
       <div className="card p-0 overflow-x-auto">
         {isLoading ? (
           <div className="flex items-center justify-center h-24 text-gray-600 text-sm">Loading AI actions…</div>
@@ -167,6 +157,7 @@ export default function AiActionsPage() {
             <thead>
               <tr className="text-left text-gray-600 border-b border-[#1e1e32]">
                 <th className="px-3 py-2 font-normal">When</th>
+                <th className="px-3 py-2 font-normal">Squadron</th>
                 <th className="px-3 py-2 font-normal">Field</th>
                 <th className="px-3 py-2 font-normal">Change</th>
                 <th className="px-3 py-2 font-normal">Δ</th>
@@ -186,6 +177,16 @@ export default function AiActionsPage() {
                       {fmtTs(a.ts)}
                       {a.ghost_mode && (
                         <span className="ml-1 text-[9px] bg-gray-800 text-gray-500 border border-gray-700 rounded px-1">GHOST</span>
+                      )}
+                    </td>
+                    <td className="px-3 py-2 text-gray-400 whitespace-nowrap">
+                      {a.squadron_id ?? (
+                        // Written before the advisor was squadron-scoped: applied
+                        // to a config no strategy reads, so it never moved
+                        // anything live and cannot be approved now.
+                        <span className="text-gray-600" title="Pre-dates squadron-scoped advice — targets a config no strategy reads">
+                          —
+                        </span>
                       )}
                     </td>
                     <td className="px-3 py-2 text-gray-300">{a.field}</td>

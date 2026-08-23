@@ -293,6 +293,9 @@ export interface LlmRecommendationRow {
 
 /** One row of the llm_actions audit trail — a proposed AI config change. */
 export interface LlmActionRow {
+  /** Squadron this proposal targets. Null for rows written before the advisor
+   *  became squadron-scoped — those were applied to a config no strategy reads. */
+  squadron_id?: string | null;
   id:             number;
   batch_id:       string;
   session_id:     string;

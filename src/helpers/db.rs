@@ -517,6 +517,7 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
             inverse_patch TEXT,
             pnl_at_apply  REAL,
             outcome_score REAL,
+            squadron_id   TEXT,
             outcome_detail TEXT
         )"
     ).execute(pool).await?;
@@ -662,6 +663,20 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
     // recorded a P&L baseline at apply time.
     let _ = sqlx::query(
         "ALTER TABLE llm_actions ADD COLUMN pnl_at_apply REAL"
+    ).execute(pool).await;
+    // Which squadron a proposal targets.
+    //
+    // The advisor ran one global pass and applied to the global DynamicConfig,
+    // which no patrol loop reads — squadrons read a per-squadron handle. Without
+    // this column an action cannot say which squadron it moved, so the audit
+    // trail, the inverse patch and the circuit breaker's revert would all target
+    // the wrong config once more than one squadron is in play.
+    //
+    // Existing rows keep NULL: they were written against the global record and
+    // never reached a strategy, so attributing them to a squadron would be a
+    // lie. Readers treat NULL as "global, never applied".
+    let _ = sqlx::query(
+        "ALTER TABLE llm_actions ADD COLUMN squadron_id TEXT"
     ).execute(pool).await;
 
     seed_market_taxonomy(pool).await?;
@@ -1566,6 +1581,21 @@ pub async fn config_set(pool: &SqlitePool, key: &str, value: &str) {
 }
 
 // ─── Squadron config helpers ─────────────────────────────────────────────────
+
+/// Squadrons that have a config row, with the market class each was classified
+/// as — the set the LLM advisor runs a pass over.
+///
+/// Reads the DB rather than the CAG registry so the advisor needs no handle on
+/// the running fleet, and so a squadron that has rotated markets but kept its
+/// config is still advised.
+pub async fn list_squadron_configs(pool: &SqlitePool) -> Vec<(String, String)> {
+    sqlx::query("SELECT squadron_id, market_class FROM squadron_configs ORDER BY squadron_id")
+        .fetch_all(pool).await.ok()
+        .map(|rows| rows.into_iter().filter_map(|r| {
+            Some((r.try_get::<String, _>(0).ok()?, r.try_get::<String, _>(1).unwrap_or_else(|_| "unknown".into())))
+        }).collect())
+        .unwrap_or_default()
+}
 
 /// Load a squadron's config from the `squadron_configs` table.
 /// Returns None if the squadron has no stored config yet.
@@ -3224,6 +3254,10 @@ pub struct LlmActionRow {
     pub status: String,
     pub status_detail: Option<String>,
     pub status_ts: Option<String>,
+    /// Squadron this action targets. `None` for rows written before the
+    /// advisor became squadron-scoped: those were applied to the global config,
+    /// which no patrol loop reads, so they never moved a live parameter.
+    pub squadron_id: Option<String>,
     /// JSON merge-patch restoring the pre-apply value (set when applied).
     pub inverse_patch: Option<String>,
     /// Session P&L (USDC) at apply time — circuit-breaker drawdown baseline.
@@ -3243,6 +3277,10 @@ pub async fn record_llm_action_batch(
     ghost_mode: bool,
     ttl_secs: i64,
     batch: &crate::helpers::llm_patch::ProposalBatch,
+    // `squadron_id` is the squadron this batch was reasoned about and will be
+    // applied to. The advisor runs one pass per squadron, so every row belongs
+    // to exactly one.
+    squadron_id: &str,
 ) -> Vec<i64> {
     let ts = Utc::now();
     let expires_at = (ts + chrono::Duration::seconds(ttl_secs)).to_rfc3339();
@@ -3254,8 +3292,9 @@ pub async fn record_llm_action_batch(
         match sqlx::query(
             "INSERT INTO llm_actions
                (batch_id, session_id, ts, expires_at, model, tier, ghost_mode,
-                field, from_value, to_value, clamped, delta_pct, reason, status)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed')"
+                field, from_value, to_value, clamped, delta_pct, reason, status,
+                squadron_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'proposed', ?)"
         )
         .bind(batch_id).bind(sid).bind(&ts).bind(&expires_at).bind(model)
         .bind(tier).bind(ghost_mode)
@@ -3265,6 +3304,7 @@ pub async fn record_llm_action_batch(
         .bind(c.clamped)
         .bind(c.delta_pct)
         .bind(&c.reason)
+        .bind(squadron_id)
         .execute(pool)
         .await {
             Ok(r) => ids.push(r.last_insert_rowid()),
@@ -3276,8 +3316,9 @@ pub async fn record_llm_action_batch(
         if let Err(e) = sqlx::query(
             "INSERT INTO llm_actions
                (batch_id, session_id, ts, expires_at, model, tier, ghost_mode,
-                field, from_value, to_value, reason, status, status_detail, status_ts)
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, '', 'rejected', ?, ?)"
+                field, from_value, to_value, reason, status, status_detail, status_ts,
+                squadron_id)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, '', ?, '', 'rejected', ?, ?, ?)"
         )
         .bind(batch_id).bind(sid).bind(&ts).bind(&expires_at).bind(model)
         .bind(tier).bind(ghost_mode)
@@ -3285,6 +3326,7 @@ pub async fn record_llm_action_batch(
         .bind(r.to.to_string())
         .bind(&r.why)
         .bind(&ts)
+        .bind(squadron_id)
         .execute(pool)
         .await {
             error!("❌ DB llm_actions reject-insert failed for {}: {}", r.field, e);
@@ -3298,6 +3340,7 @@ fn llm_action_from_row(r: &sqlx::sqlite::SqliteRow) -> Option<LlmActionRow> {
     Some(LlmActionRow {
         id:            r.try_get("id").ok()?,
         batch_id:      r.try_get("batch_id").ok()?,
+        squadron_id:   r.try_get("squadron_id").ok().flatten(),
         session_id:    r.try_get("session_id").ok()?,
         ts:            r.try_get("ts").ok()?,
         expires_at:    r.try_get("expires_at").ok()?,
@@ -3910,6 +3953,63 @@ mod reconcile_tests {
 }
 
 #[cfg(test)]
+mod llm_squadron_scope_tests {
+    use super::*;
+
+    /// Every proposal must record which squadron it was reasoned about. Without
+    /// it the audit trail, the inverse patch and the circuit breaker's revert
+    /// all target the wrong config the moment two squadrons are tuned
+    /// differently — and the advisor's applies were landing on a global record
+    /// no patrol loop reads.
+    #[tokio::test]
+    async fn a_recorded_action_remembers_its_squadron() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        init_schema(&pool).await.expect("schema");
+
+        sqlx::query(
+            "INSERT INTO llm_actions
+               (batch_id, session_id, ts, expires_at, model, tier, ghost_mode,
+                field, from_value, to_value, clamped, reason, status, squadron_id)
+             VALUES ('b','s',datetime('now'),datetime('now'),'m',2,1,
+                     'maker_min_spread','0.04','0.05',0,'why','proposed','politics-open')"
+        ).execute(&pool).await.expect("insert");
+
+        let rows = fetch_llm_actions(&pool, 10).await;
+        let row = rows.first().expect("row read back");
+        assert_eq!(row.squadron_id.as_deref(), Some("politics-open"));
+    }
+
+    /// Rows written before the advisor became squadron-scoped keep NULL. They
+    /// were applied to the global config and never reached a strategy, so
+    /// attributing them to a squadron would be a fabrication — readers must be
+    /// able to tell the two apart.
+    #[tokio::test]
+    async fn a_legacy_action_has_no_squadron() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        init_schema(&pool).await.expect("schema");
+
+        sqlx::query(
+            "INSERT INTO llm_actions
+               (batch_id, session_id, ts, expires_at, model, tier, ghost_mode,
+                field, from_value, to_value, clamped, reason, status)
+             VALUES ('b','s',datetime('now'),datetime('now'),'m',1,1,
+                     'maker_min_spread','0.04','0.05',0,'why','proposed')"
+        ).execute(&pool).await.expect("insert");
+
+        let rows = fetch_llm_actions(&pool, 10).await;
+        assert_eq!(rows.first().expect("row").squadron_id, None);
+    }
+}
+
+#[cfg(test)]
 mod deployment_requeue_tests {
     use super::*;
 
@@ -4109,7 +4209,7 @@ mod llm_actions_tests {
     #[tokio::test]
     async fn batch_persists_proposed_and_rejected() {
         let pool = mem_pool().await;
-        let ids = record_llm_action_batch(&pool, "b1", "test-model", 1, true, 1800, &sample_batch()).await;
+        let ids = record_llm_action_batch(&pool, "b1", "test-model", 1, true, 1800, &sample_batch(), "btc-open").await;
         assert_eq!(ids.len(), 1);
 
         let all = fetch_llm_actions(&pool, 10).await;
@@ -4127,7 +4227,7 @@ mod llm_actions_tests {
     #[tokio::test]
     async fn status_lifecycle_and_inverse_patch() {
         let pool = mem_pool().await;
-        let ids = record_llm_action_batch(&pool, "b2", "m", 2, false, 1800, &sample_batch()).await;
+        let ids = record_llm_action_batch(&pool, "b2", "m", 2, false, 1800, &sample_batch(), "btc-open").await;
         let id = ids[0];
 
         assert!(update_llm_action_status(&pool, id, "approved", None, None).await);
@@ -4150,8 +4250,8 @@ mod llm_actions_tests {
     async fn ttl_expiry_sweeps_only_stale_proposed() {
         let pool = mem_pool().await;
         // Already expired (negative TTL) + still fresh.
-        record_llm_action_batch(&pool, "b3", "m", 1, true, -5, &sample_batch()).await;
-        let fresh = record_llm_action_batch(&pool, "b4", "m", 1, true, 1800, &sample_batch()).await;
+        record_llm_action_batch(&pool, "b3", "m", 1, true, -5, &sample_batch(), "btc-open").await;
+        let fresh = record_llm_action_batch(&pool, "b4", "m", 1, true, 1800, &sample_batch(), "btc-open").await;
 
         assert_eq!(expire_stale_llm_actions(&pool).await, 1);
         let pending = fetch_pending_llm_actions(&pool).await;
@@ -4166,7 +4266,7 @@ mod llm_actions_tests {
     #[tokio::test]
     async fn outcome_recorded() {
         let pool = mem_pool().await;
-        let ids = record_llm_action_batch(&pool, "b5", "m", 3, false, 1800, &sample_batch()).await;
+        let ids = record_llm_action_batch(&pool, "b5", "m", 3, false, 1800, &sample_batch(), "btc-open").await;
         assert!(set_llm_action_outcome(&pool, ids[0], -0.42, "strategy PnL -$0.42 over 4h window").await);
         let row = fetch_llm_actions(&pool, 10).await.into_iter().find(|a| a.id == ids[0]).unwrap();
         assert_eq!(row.outcome_score, Some(-0.42));
@@ -4175,7 +4275,7 @@ mod llm_actions_tests {
     #[tokio::test]
     async fn outcome_scoring_and_fewshot_queries() {
         let pool = mem_pool().await;
-        let ids = record_llm_action_batch(&pool, "b6", "m", 2, false, 1800, &sample_batch()).await;
+        let ids = record_llm_action_batch(&pool, "b6", "m", 2, false, 1800, &sample_batch(), "btc-open").await;
         let id = ids[0];
 
         // Applied with a P&L baseline → shows up as due once past the horizon.

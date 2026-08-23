@@ -1486,8 +1486,23 @@ async fn approve_llm_action(
         ).into_response();
     }
 
-    // Re-validate against the live config (apply-time revalidation).
-    let current = s.config_rx.borrow().clone();
+    // Approve against the SQUADRON the proposal was reasoned about.
+    //
+    // This used to revalidate against, and apply to, the global config — which no
+    // patrol loop reads. The endpoint returned 200 and the row was stamped
+    // `applied` while no live parameter moved: the operator was told their
+    // approval had taken effect when it had not.
+    //
+    // A row with no squadron_id predates the squadron-scoped advisor. It cannot
+    // be applied anywhere meaningful, so say so rather than repeating the lie.
+    let Some(squadron_id) = row.squadron_id.clone().filter(|v| !v.is_empty()) else {
+        let detail = "this proposal predates squadron-scoped advice and targets a config no strategy reads - reject it and let the advisor re-propose".to_string();
+        db::update_llm_action_status(&pool, id, "rejected", Some(&detail), None).await;
+        return (StatusCode::CONFLICT, detail).into_response();
+    };
+
+    // Re-validate against the squadron's live config (apply-time revalidation).
+    let current = DynamicConfig::load_for_squadron(&squadron_id).await;
     let to: serde_json::Value = serde_json::from_str(&row.to_value)
         .unwrap_or(serde_json::Value::String(row.to_value.clone()));
     let raw = RawProposal { field: row.field.clone(), to, reason: row.reason.clone() };
@@ -1502,9 +1517,10 @@ async fn approve_llm_action(
     };
 
     let patch = serde_json::json!({ change.key.clone(): change.to.clone() }).to_string();
-    match DynamicConfig::apply_patch_as(&current, &patch, "llm_approved").await {
-        Ok(new_cfg) => {
-            let _ = s.config_tx.send(new_cfg);
+    // apply_squadron_patch_as persists, records the diff for revert, and pushes
+    // into the running squadron's live handle so the next patrol tick sees it.
+    match DynamicConfig::apply_squadron_patch_as(&squadron_id, &patch, "llm_approved").await {
+        Ok(_) => {
             let inverse = serde_json::json!({ change.key.clone(): change.from.clone() }).to_string();
             let pnl = db::get_pnl_history(&pool, 1).await.first()
                 .and_then(|p| p.session_pnl.parse::<f64>().ok())
@@ -1514,7 +1530,7 @@ async fn approve_llm_action(
                 if change.clamped { " (re-clamped to schema bounds)" } else { "" },
             );
             db::mark_llm_action_applied(&pool, id, &detail, &inverse, pnl).await;
-            info!("✅ LLM action {id} approved & applied: {} → {}", change.key, change.to);
+            info!("✅ LLM action {id} approved & applied to {squadron_id}: {} -> {}", change.key, change.to);
             match db::fetch_llm_action_by_id(&pool, id).await {
                 Some(updated) => Json(updated).into_response(),
                 None => StatusCode::OK.into_response(),

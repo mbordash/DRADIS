@@ -509,6 +509,10 @@ fn build_user_prompt(
     session_id: &str,
     dyn_cfg: &DynamicConfig,
     fewshot: &[db::LlmActionRow],
+    // Viper kinds linked to this squadron's market class — the only ones worth
+    // offering the model, since a proposal into a viper the squadron does not
+    // fly can never take effect.
+    allowed_vipers: &[String],
 ) -> String {
     let mut lines = Vec::new();
 
@@ -723,6 +727,16 @@ fn build_user_prompt(
                 .unwrap_or(true);
             if !enabled && f.key != enable_key {
                 continue;
+            }
+            // And skip vipers this squadron's market class does not fly at all.
+            // A politics squadron runs Arbitrage and Maker; offering it Momentum
+            // or GBoost invites proposals that could never take effect and burns
+            // the change budget on them. `enable_maker` → `maker` is exact,
+            // which is why the enable key is used rather than the display group.
+            if let Some(kind) = enable_key.strip_prefix("enable_") {
+                if !allowed_vipers.iter().any(|v| v == kind) {
+                    continue;
+                }
             }
         }
         let current = cfg_json
@@ -983,10 +997,13 @@ pub async fn run_llm_advisor_loop(
         .filter(|t| (1..=3).contains(t))
         .unwrap_or(1);
     if configured_tier > 1 {
+        // Auto-apply now lands on the squadron's own config and reaches the
+        // patrol loop on its next tick, so this is a live-money warning rather
+        // than the "this does nothing" notice it replaced.
         warn!(
-            "🤖 LLM autonomy tier {} is configured, but auto-applied changes write the GLOBAL \
-             config, which no squadron reads — live strategy parameters will NOT change. Treat \
-             tiers 2–3 as recommend-only until the advisor is re-scoped per squadron (see ROADMAP).",
+            "🤖 LLM autonomy tier {} is configured — accepted proposals will be applied to \
+             squadron configs automatically and take effect on the next patrol tick. The circuit \
+             breaker reverts them and demotes to tier 1 on a P&L drawdown.",
             configured_tier,
         );
     }
@@ -1121,7 +1138,9 @@ pub async fn run_llm_advisor_loop(
 
         let current_pnl = *session_pnl.lock().await;
         let collateral = *starting_collateral.lock().await;
-        let dyn_cfg = config_rx.borrow_and_update().clone();
+        // Kept only to drain the watch channel; the CONFIG the advisor reasons
+        // about is now loaded per squadron below. The global record is not read.
+        let _ = config_rx.borrow_and_update();
 
         // ── Autonomy circuit breaker (S3) ────────────────────────────────────
         // Every cycle, check whether session P&L has drawn down past the
@@ -1182,6 +1201,34 @@ pub async fn run_llm_advisor_loop(
             continue;
         }
 
+        // ── One advisory pass PER SQUADRON ───────────────────────────────────
+        //
+        // The advisor used to run a single pass against the global DynamicConfig
+        // and apply back to it. No patrol loop reads that record — squadrons read
+        // a per-squadron handle — so tiers 2 and 3 were structurally inert, and
+        // worse, each cycle's prompt read back the global record the previous
+        // cycle had mutated. The model saw its own past changes as current state
+        // while nothing had actually moved, so its reasoning drifted further from
+        // reality every cycle.
+        //
+        // Portfolio context (trades, P&L, open positions) stays fleet-wide — that
+        // is genuinely global. The CONFIG half of the prompt, and every apply,
+        // is now the squadron's own.
+        let squadrons = db::list_squadron_configs(&primary_pool).await;
+        if squadrons.is_empty() {
+            info!("🤖 LLM Advisor: no squadrons configured yet — nothing to advise on this cycle");
+            continue;
+        }
+        info!(
+            "🤖 LLM Advisor: {} squadron(s) to advise: {}",
+            squadrons.len(),
+            squadrons.iter().map(|(id, c)| format!("{id} ({c})")).collect::<Vec<_>>().join(", "),
+        );
+
+        for (squadron_id, market_class) in squadrons {
+        let dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
+        let allowed_vipers = db::vipers_for_class(&primary_pool, &market_class).await;
+
         // ── Build prompt & call LLM (with retries) ───────────────────────────
         // all_open_positions already collected above from all asset pools
         let user_prompt = build_user_prompt(
@@ -1193,6 +1240,7 @@ pub async fn run_llm_advisor_loop(
             &session_id,
             &dyn_cfg,
             &fewshot,
+            &allowed_vipers,
         );
 
         info!(
@@ -1281,10 +1329,11 @@ pub async fn run_llm_advisor_loop(
                                 dyn_cfg.ghost_mode,
                                 LLM_PROPOSAL_TTL_SECS,
                                 &batch,
+                                &squadron_id,
                             ).await;
                             info!(
-                                "🤖 LLM Advisor: {} recorded {} proposed / {} rejected change(s) (tier {})",
-                                batch_id, ids.len(), batch.rejected.len(), autonomy_tier(),
+                                "🤖 LLM Advisor: [{}] {} recorded {} proposed / {} rejected change(s) (tier {})",
+                                squadron_id, batch_id, ids.len(), batch.rejected.len(), autonomy_tier(),
                             );
 
                             // ── Policy engine (S3): tier enforcement ─────────
@@ -1295,7 +1344,7 @@ pub async fn run_llm_advisor_loop(
                                 &batch,
                                 &ids,
                                 autonomy_tier(),
-                                &config_tx,
+                                &squadron_id,
                                 current_pnl.to_f64().unwrap_or(0.0),
                                 &knobs,
                             ).await;
@@ -1324,6 +1373,9 @@ pub async fn run_llm_advisor_loop(
                 ).await;
 
                 // Telegram has a 4096-char limit per message; truncate with notice if needed.
+                // Name the squadron: with a pass per squadron, an unlabelled
+                // Telegram report cannot be told apart from the others.
+                let prose = format!("[{squadron_id} · {market_class}]\n{prose}");
                 let message = if prose.len() > 4000 {
                     format!("{}\n\n[truncated — full response in logs]", &prose[..3980])
                 } else {
@@ -1342,11 +1394,13 @@ pub async fn run_llm_advisor_loop(
             }
             None => {
                 error!(
-                    "🤖 LLM Advisor: {} call failed after {} retries ({}@{}): {}",
-                    provider.name(), MAX_RETRIES, provider.model(), provider.display_url(), last_err
+                    "🤖 LLM Advisor: [{}] {} call failed after {} retries ({}@{}): {}",
+                    squadron_id, provider.name(), MAX_RETRIES, provider.model(),
+                    provider.display_url(), last_err
                 );
             }
         }
+        } // end per-squadron pass
     }
 }
 
