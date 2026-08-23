@@ -7,7 +7,7 @@ API_PORT=${API_PORT:-9000}
 # will dutifully respawn the engine we are trying to stop.
 touch .dradis-local.stop
 
-# Kill via PID file if present (the supervisor loop, since start-local.sh 2026-08)
+# Kill via PID file if present (tools/supervise-dradis.sh)
 if [ -f ".dradis-local.pid" ]; then
     PID=$(cat .dradis-local.pid)
     if kill -0 "$PID" 2>/dev/null; then
@@ -29,6 +29,7 @@ if [ -n "$STALE" ]; then
 fi
 
 # Kill any lingering release binary by name
+pkill -f "supervise-dradis.sh" 2>/dev/null && echo "🧹 Stopped supervisor"
 pkill -f "target/release/dradis" 2>/dev/null && echo "🧹 Killed lingering dradis binary"
 
 rm -f .dradis-local.stop

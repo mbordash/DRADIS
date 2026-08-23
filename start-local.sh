@@ -117,45 +117,12 @@ cargo build --release ${CARGO_FEATURE_ARGS[@]+"${CARGO_FEATURE_ARGS[@]}"} 2>&1 |
 # Supervise the engine, the way the container does.
 #
 # "Restart engine" in the Control Tower works by exiting the process and letting
-# something bring it back: docker-compose has `restart: always`, and the
-# watchdog thread relies on the same contract when it calls process::exit(1) on
-# a stall. Locally there was nothing, so the first restart from the UI left the
-# dashboard up and the engine gone — the API simply stopped answering, with no
-# indication of why.
-#
-# `.dradis-local.stop` is how stop-local.sh tells the supervisor that the exit
-# was intentional; without it a deliberate shutdown would respawn immediately.
-rm -f .dradis-local.stop
-supervise_engine() {
-    # Survive the parent's stdout going away.
-    #
-    # This script is often launched through a pipe (`./start-local.sh | tail`).
-    # When that reader exits, anything the supervisor writes to inherited stdout
-    # takes SIGPIPE and kills it silently — which is exactly what happened on
-    # 2026-08-23: the engine was killed for a restart, no respawn line appeared,
-    # and the supervisor subshell was simply gone. Ignoring PIPE and HUP, and
-    # writing only to the log file rather than to stdout, keeps it alive whether
-    # or not anyone is still reading the terminal.
-    trap '' PIPE HUP
-    while true; do
-        case "$VENUE" in
-            us)     ASSETS=${ASSETS:-us}     API_PORT=$API_PORT RUST_LOG=${RUST_LOG:-info,dradis=info} ./target/release/dradis >> logs/dradis-local.log 2>&1 ;;
-            kalshi) ASSETS=${ASSETS:-kalshi} API_PORT=$API_PORT RUST_LOG=${RUST_LOG:-info,dradis=info} ./target/release/dradis >> logs/dradis-local.log 2>&1 ;;
-            *)      CRYPTO_FILTER=$CRYPTO    API_PORT=$API_PORT RUST_LOG=${RUST_LOG:-info,dradis=info} ./target/release/dradis >> logs/dradis-local.log 2>&1 ;;
-        esac
-        code=$?
-        if [ -f .dradis-local.stop ]; then
-            echo "🛑 Engine stopped (exit $code) — supervisor exiting" >> logs/dradis-local.log
-            return
-        fi
-        echo "♻️  Engine exited ($code) — respawning in 2s" >> logs/dradis-local.log
-        sleep 2
-    done
-}
-
+# something bring it back: docker-compose has `restart: always`, and the stall
+# watchdog's process::exit(1) relies on the same contract. The supervisor lives in
+# its own script — see tools/supervise-dradis.sh for why a shell function here
+# could not do the job.
 echo "🦀 Starting DRADIS ($VENUE, API on :$API_PORT, supervised)..."
-# stdout/stderr to the log for the same reason as the trap above.
-supervise_engine >> logs/dradis-local.log 2>&1 &
+nohup ./tools/supervise-dradis.sh "$VENUE" "$API_PORT" "$CRYPTO" >> logs/dradis-local.log 2>&1 &
 
 DRADIS_PID=$!
 echo $DRADIS_PID > .dradis-local.pid
