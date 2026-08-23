@@ -536,6 +536,16 @@ pub async fn run_deployment_processor(
     let mut ticker = tokio::time::interval(Duration::from_secs(DEPLOY_POLL_SECS));
     info!("📋 Kalshi deployment processor started — operator-deployed squadrons enabled");
 
+    // Nothing can be mid-flight at startup, so any row still marked active or
+    // processing belongs to a previous process. Return it to the queue rather
+    // than stranding it: the Control Tower restarts the engine for ordinary
+    // config changes, and an operator should not silently lose every squadron
+    // they deployed each time they adjust a setting.
+    match db::requeue_interrupted_deployments().await {
+        0 => {}
+        n => info!("📋 Requeued {n} deployment(s) interrupted by the last restart"),
+    }
+
     loop {
         tokio::select! {
             _ = cancel.cancelled() => {

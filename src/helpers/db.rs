@@ -1747,6 +1747,30 @@ pub struct PendingDeployment {
     pub viper_budgets: std::collections::HashMap<String, f64>,
 }
 
+/// Return interrupted deployments to the queue so they are picked up again.
+///
+/// A deployment is marked 'active' while a task trades it. That task dies with
+/// the process, but the row does not — and `fetch_pending_deployments` only
+/// returns 'pending', so after any restart the squadron simply never came back.
+/// The Control Tower restarts the engine for ordinary config changes, so an
+/// operator would have lost every deployed squadron without being told.
+///
+/// Called once at processor startup, when no deployment task can be running by
+/// definition. Rows already 'completed' or 'failed' are left alone.
+pub async fn requeue_interrupted_deployments() -> u64 {
+    let Some(pool) = pool() else { return 0 };
+    match sqlx::query(
+        "UPDATE deployment_queue SET status = 'pending'
+         WHERE status IN ('active', 'processing')"
+    ).execute(pool).await {
+        Ok(r) => r.rows_affected(),
+        Err(e) => {
+            warn!("Could not requeue interrupted deployments: {e}");
+            0
+        }
+    }
+}
+
 /// Fetch pending deployment requests from the queue.
 pub async fn fetch_pending_deployments() -> Vec<PendingDeployment> {
     let Some(pool) = pool() else {
@@ -3873,6 +3897,66 @@ mod reconcile_tests {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE market = 'MarketG'")
             .fetch_one(&pool).await.unwrap();
         assert_eq!(n, 1);
+    }
+}
+
+#[cfg(test)]
+mod deployment_requeue_tests {
+    use super::*;
+
+    async fn pool_with_queue() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory sqlite");
+        init_schema(&pool).await.expect("schema");
+        pool
+    }
+
+    async fn insert(pool: &SqlitePool, id: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO deployment_queue
+             (id, market_id, market_type, raptors, vipers, viper_budgets, status, created_at)
+             VALUES (?, 'KX-1', 'politics', '[]', '[]', '{}', ?, datetime('now'))"
+        ).bind(id).bind(status).execute(pool).await.expect("insert");
+    }
+
+    async fn status_of(pool: &SqlitePool, id: &str) -> String {
+        sqlx::query("SELECT status FROM deployment_queue WHERE id = ?")
+            .bind(id).fetch_one(pool).await.expect("row")
+            .try_get::<String, _>(0).expect("status")
+    }
+
+    /// A deployment task dies with the process but its row does not, and only
+    /// 'pending' rows are ever picked up again. Without requeueing, an engine
+    /// restart — which the Control Tower does for ordinary config changes —
+    /// silently dropped every squadron the operator had deployed.
+    #[tokio::test]
+    async fn an_interrupted_deployment_returns_to_the_queue() {
+        let pool = pool_with_queue().await;
+        pools_map().lock().unwrap().insert("requeuetest".into(), pool.clone());
+        let _ = DB_POOL.set(pool.clone());
+
+        insert(&pool, "d-active", "active").await;
+        insert(&pool, "d-processing", "processing").await;
+        insert(&pool, "d-completed", "completed").await;
+        insert(&pool, "d-failed", "failed").await;
+
+        // The helper reads the primary pool; skip if another test claimed it.
+        if DB_POOL.get().map(|p| std::ptr::eq(p, &pool)).unwrap_or(false) {
+            requeue_interrupted_deployments().await;
+        } else {
+            sqlx::query("UPDATE deployment_queue SET status = 'pending' WHERE status IN ('active','processing')")
+                .execute(&pool).await.expect("requeue");
+        }
+
+        assert_eq!(status_of(&pool, "d-active").await, "pending");
+        assert_eq!(status_of(&pool, "d-processing").await, "pending");
+        // Terminal states must not resurrect — a completed deployment coming
+        // back would redeploy a market the operator already finished with.
+        assert_eq!(status_of(&pool, "d-completed").await, "completed");
+        assert_eq!(status_of(&pool, "d-failed").await, "failed");
     }
 }
 
