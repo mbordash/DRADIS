@@ -11,29 +11,36 @@
 # PID and its own children, so the engine is unambiguously a child that can die
 # without taking the supervisor with it.
 #
-# Usage: supervise-dradis.sh <venue> <api_port> [crypto_filter]
+# Usage: supervise-dradis.sh <venue> <api_port> [crypto_filter] [instance]
 set -u
 
 VENUE=${1:?venue required}
 API_PORT=${2:?api port required}
 CRYPTO=${3:-btc}
+# Instance name scopes the log, the stop marker and the binary, so two venues can
+# soak side by side without one's restart touching the other.
+INSTANCE=${4:-$VENUE}
 
 cd "$(dirname "$0")/.." || exit 1
-LOG=logs/dradis-local.log
-STOP=.dradis-local.stop
+LOG="logs/dradis-${INSTANCE}.log"
+STOP=".dradis-${INSTANCE}.stop"
+BIN="target/release/dradis-${INSTANCE}"
+# Fall back to the shared path for a supervisor started before per-instance
+# binaries existed, so an in-flight run is not left pointing at nothing.
+[ -x "$BIN" ] || BIN="target/release/dradis"
 
 # Never die because a terminal went away or a reader closed a pipe: this process
 # outlives the shell that started it.
 trap '' PIPE HUP
 
 rm -f "$STOP"
-echo "🛡️  Supervisor started (venue=$VENUE port=$API_PORT pid=$$)" >> "$LOG"
+echo "🛡️  Supervisor started (venue=$VENUE instance=$INSTANCE port=$API_PORT bin=$BIN pid=$$)" >> "$LOG"
 
 while true; do
     case "$VENUE" in
-        us)     ASSETS=${ASSETS:-us}     API_PORT=$API_PORT RUST_LOG=${RUST_LOG:-info,dradis=info} ./target/release/dradis >> "$LOG" 2>&1 ;;
-        kalshi) ASSETS=${ASSETS:-kalshi} API_PORT=$API_PORT RUST_LOG=${RUST_LOG:-info,dradis=info} ./target/release/dradis >> "$LOG" 2>&1 ;;
-        *)      CRYPTO_FILTER=$CRYPTO    API_PORT=$API_PORT RUST_LOG=${RUST_LOG:-info,dradis=info} ./target/release/dradis >> "$LOG" 2>&1 ;;
+        us)     ASSETS=${ASSETS:-us}     API_PORT=$API_PORT RUST_LOG=${RUST_LOG:-info,dradis=info} "./$BIN" >> "$LOG" 2>&1 ;;
+        kalshi) ASSETS=${ASSETS:-kalshi} API_PORT=$API_PORT RUST_LOG=${RUST_LOG:-info,dradis=info} "./$BIN" >> "$LOG" 2>&1 ;;
+        *)      CRYPTO_FILTER=$CRYPTO    API_PORT=$API_PORT RUST_LOG=${RUST_LOG:-info,dradis=info} "./$BIN" >> "$LOG" 2>&1 ;;
     esac
     code=$?
 

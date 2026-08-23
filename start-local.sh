@@ -25,8 +25,32 @@ set -euo pipefail
 
 VENUE=${VENUE:-intl}
 CRYPTO=${1:-btc}
-API_PORT=${API_PORT:-9000}
-UI_PORT=${UI_PORT:-3002}
+
+# Every venue runs as its own INSTANCE so two can soak side by side.
+#
+# Ports were already per-run, but four things were not and would have collided:
+# all three venue builds write the same target/release/dradis, and the log, pid
+# file and Control Tower port were fixed names. Interleaving two venues into one
+# log is the worst of those — correlating the wrong log with the right database
+# has cost a whole investigation before.
+#
+# Defaults keep a single-venue run byte-identical to before: Kalshi on 9000/3002
+# with logs/dradis-local.log.
+INSTANCE=${INSTANCE:-$VENUE}
+case "$VENUE" in
+    us|us_retail) DEFAULT_API=9001; DEFAULT_UI=3003 ;;
+    kalshi)       DEFAULT_API=9000; DEFAULT_UI=3002 ;;
+    *)            DEFAULT_API=9002; DEFAULT_UI=3004 ;;
+esac
+API_PORT=${API_PORT:-$DEFAULT_API}
+UI_PORT=${UI_PORT:-$DEFAULT_UI}
+
+# Per-instance paths. The binary is copied aside because a second `cargo build`
+# with different features would otherwise overwrite the running venue's binary.
+LOG_FILE="logs/dradis-${INSTANCE}.log"
+PID_FILE=".dradis-${INSTANCE}.pid"
+STOP_FILE=".dradis-${INSTANCE}.stop"
+BIN="target/release/dradis-${INSTANCE}"
 
 # Map the selected venue to its cargo feature flags + runtime asset.
 case "$VENUE" in
@@ -83,14 +107,14 @@ mkdir -p logs
 # the dradis binary keeps running). A stale binary holding :$API_PORT would
 # silently serve the dashboard from the OLD build while the new one fails to
 # bind — observed 2026-08-08 with three concurrent dradis processes.
-if [ -f ".dradis-local.pid" ]; then
-    OLD_PID=$(cat .dradis-local.pid)
+if [ -f "$PID_FILE" ]; then
+    OLD_PID=$(cat "$PID_FILE")
     if kill -0 "$OLD_PID" 2>/dev/null; then
         echo "🧹 Stopping previous DRADIS (PID $OLD_PID)..."
         kill "$OLD_PID" 2>/dev/null || true
         sleep 1
     fi
-    rm -f .dradis-local.pid
+    rm -f "$PID_FILE"
 fi
 STALE=$(lsof -ti :"$API_PORT" 2>/dev/null || true)
 if [ -n "$STALE" ]; then
@@ -101,18 +125,25 @@ if [ -n "$STALE" ]; then
     STALE=$(lsof -ti :"$API_PORT" 2>/dev/null || true)
     [ -n "$STALE" ] && kill -9 $STALE 2>/dev/null || true
 fi
-# Any other lingering local dradis binaries (port may differ or never bound)
-pkill -f "target/release/dradis" 2>/dev/null && echo "🧹 Killed lingering dradis binary" || true
+# Lingering binaries for THIS instance only. A blanket pkill on
+# "target/release/dradis" would kill the other venue soaking alongside it, which
+# is precisely what per-instance binaries exist to prevent.
+pkill -f "$BIN" 2>/dev/null && echo "🧹 Killed lingering $INSTANCE binary" || true
 
 # Rotate previous log so each session starts clean
-if [ -f "logs/dradis-local.log" ]; then
-    mv "logs/dradis-local.log" "logs/dradis-local.log.prev"
-    echo "📋 Previous log archived → logs/dradis-local.log.prev"
+if [ -f "$LOG_FILE" ]; then
+    mv "$LOG_FILE" "${LOG_FILE}.prev"
+    echo "📋 Previous log archived → ${LOG_FILE}.prev"
 fi
 
 # ── Start DRADIS API + trading engine ─────────────────────────────────────────
 echo "⚙️  Building DRADIS (release, VENUE=$VENUE)..."
 cargo build --release ${CARGO_FEATURE_ARGS[@]+"${CARGO_FEATURE_ARGS[@]}"} 2>&1 | tail -3
+# Copy the build aside immediately. Building another venue overwrites
+# target/release/dradis, and a running instance would then be restarted by its
+# supervisor onto the WRONG venue's binary — silently, since the path is the same.
+cp target/release/dradis "$BIN"
+echo "   binary → $BIN"
 
 # Supervise the engine, the way the container does.
 #
@@ -122,11 +153,11 @@ cargo build --release ${CARGO_FEATURE_ARGS[@]+"${CARGO_FEATURE_ARGS[@]}"} 2>&1 |
 # its own script — see tools/supervise-dradis.sh for why a shell function here
 # could not do the job.
 echo "🦀 Starting DRADIS ($VENUE, API on :$API_PORT, supervised)..."
-nohup ./tools/supervise-dradis.sh "$VENUE" "$API_PORT" "$CRYPTO" >> logs/dradis-local.log 2>&1 &
+nohup ./tools/supervise-dradis.sh "$VENUE" "$API_PORT" "$CRYPTO" "$INSTANCE" >> "$LOG_FILE" 2>&1 &
 
 DRADIS_PID=$!
-echo $DRADIS_PID > .dradis-local.pid
-echo "   supervisor PID $DRADIS_PID → logs/dradis-local.log"
+echo $DRADIS_PID > "$PID_FILE"
+echo "   supervisor PID $DRADIS_PID → $LOG_FILE"
 
 # Wait for the API to come up
 echo -n "   Waiting for API on :$API_PORT"
@@ -160,7 +191,11 @@ echo ""
 # (sourced above with `set -a`) — keep DRADIS_API_KEY in .env so the engine and the
 # proxy use the SAME value. (Next also auto-loads control-tower/.env.local, but .env
 # is the single source of truth that the Rust engine reads too.)
+# NEXT_DIST_DIR keeps two instances' build artifacts apart; without it a second
+# dev server overwrites the first's .next and the running one starts answering
+# 500 with MODULE_NOT_FOUND.
 NEXT_PUBLIC_API_URL='' \
 DRADIS_API_URL=http://127.0.0.1:$API_PORT \
+NEXT_DIST_DIR=".next-$INSTANCE" \
     npm --prefix control-tower run dev -- -p $UI_PORT
 

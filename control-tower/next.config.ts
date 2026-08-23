@@ -1,6 +1,15 @@
 import type { NextConfig } from 'next';
 
 const nextConfig: NextConfig = {
+  // Build output directory, overridable per instance.
+  //
+  // Two `next dev` servers on this same project directory would otherwise share
+  // .next and overwrite each other's artifacts — the running one starts serving
+  // files that no longer exist and answers 500 with MODULE_NOT_FOUND. Soaking
+  // two venues side by side needs a Control Tower each, so each gets its own
+  // build directory. Unset (the default, Docker, CI) keeps plain `.next`.
+  distDir: process.env.NEXT_DIST_DIR || '.next',
+
   // Standalone output: produces a self-contained server.js for Docker.
   // Note: outputFileTracingRoot is intentionally omitted — setting it to '../'
   // works locally but resolves to '/' inside Docker (/app/../ = /), causing
