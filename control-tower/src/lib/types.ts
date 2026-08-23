@@ -101,6 +101,7 @@ export interface DynamicConfig {
   maker_target_profit_pct: string;
   maker_max_exposure_usdc: string;
   maker_quote_size_usdc: string;
+  deploy_max_days_to_close:      number;
   maker_min_spread:              string;
   maker_bid_buffer:              string;
   maker_cross_buffer:            string;

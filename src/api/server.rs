@@ -2158,6 +2158,55 @@ fn default_expiry_secs(market_type: &str) -> i64 {
 }
 
 #[cfg(test)]
+mod deploy_horizon_tests {
+    use super::default_expiry_secs;
+
+    /// Quick deploy bounds its choice by min(discovery window, horizon). The two
+    /// answer different questions: discovery reaches years out because Kalshi
+    /// structures politics and sports as multi-year futures, while selection has
+    /// to hand the vipers something they can actually trade.
+    fn selectable_secs(class: &str, horizon_days: i64) -> i64 {
+        default_expiry_secs(class).min(horizon_days * 86_400)
+    }
+
+    /// The concrete case from QA: Quick deploy chose KXCITRINI-28JUL01, closing
+    /// in July 2028, for a squadron whose only vipers are Arbitrage and Maker.
+    #[test]
+    fn a_multi_year_market_is_out_of_reach_at_the_default_horizon() {
+        let two_years = 730 * 86_400;
+        for class in ["politics", "sports"] {
+            let limit = selectable_secs(class, crate::config::DEPLOY_MAX_DAYS_TO_CLOSE as i64);
+            assert!(
+                limit < two_years,
+                "{class}: a 2028 market is still selectable ({limit}s)",
+            );
+        }
+    }
+
+    /// The horizon must bound selection, never widen it beyond what discovery
+    /// would return — otherwise raising the knob silently changes the class
+    /// filter as well.
+    #[test]
+    fn the_horizon_can_only_narrow_the_window() {
+        for class in ["politics", "sports", "crypto", "weather"] {
+            for days in [1_i64, 30, 90, 100_000] {
+                assert!(
+                    selectable_secs(class, days) <= default_expiry_secs(class),
+                    "{class} at {days}d exceeded the discovery window",
+                );
+            }
+        }
+    }
+
+    /// A tight horizon must still leave something selectable for crypto, which
+    /// is where the venue's own rotation operates on 15-minute and daily markets.
+    #[test]
+    fn a_tight_horizon_still_admits_short_dated_crypto() {
+        assert!(selectable_secs("crypto", 1) >= 86_400, "a one-day horizon excluded daily crypto");
+    }
+}
+
+#[cfg(test)]
 mod discovery_window_tests {
     use super::default_expiry_secs;
 
@@ -2888,10 +2937,19 @@ async fn deploy_squadron(
             .build()
             .unwrap_or_default();
         
+        // Quick deploy picks a market to trade, so it is bounded by the
+        // deployment horizon rather than by the discovery window. Those are
+        // different questions: discovery reaches years out because that is how
+        // Kalshi structures politics and sports, but Arbitrage locks collateral
+        // until resolution and Maker quotes on a session scale, so pointing
+        // either at a 2028 market is a poor use of both. The browse list is
+        // unaffected — a longer-dated market can still be deployed by hand.
+        let horizon_days = _s.config_rx.borrow().deploy_max_days_to_close as i64;
+        let max_secs = default_expiry_secs(&req.market_type).min(horizon_days * 86_400);
         let markets = fetch_markets_by_type(
             &http,
             &req.market_type,
-            default_expiry_secs(&req.market_type),
+            max_secs,
             DISCOVERY_MIN_LIQUIDITY,
         ).await;
         

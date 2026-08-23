@@ -215,6 +215,7 @@ fn default_sports_odds_sport()              -> String  { config::SPORTS_ODDS_SPO
 fn default_sports_odds_regions()            -> String  { config::SPORTS_ODDS_REGIONS.to_string()       }
 fn default_tennis_tour()                    -> String  { config::TENNIS_TOUR.to_string()               }
 
+fn default_deploy_max_days_to_close()       -> u32     { config::DEPLOY_MAX_DAYS_TO_CLOSE             }
 fn default_maker_min_spread()               -> Decimal { config::MAKER_MIN_SPREAD                      }
 fn default_maker_bid_buffer()               -> Decimal { config::MAKER_BID_BUFFER                      }
 fn default_maker_cross_buffer()             -> Decimal { config::MAKER_CROSS_BUFFER                    }
@@ -435,6 +436,10 @@ pub struct DynamicConfig {
     pub maker_max_exposure_usdc:  Decimal,
     #[serde(default = "default_maker_quote_size_usdc")]
     pub maker_quote_size_usdc:    Decimal,
+    /// Longest time-to-resolution, in days, that a Quick deploy may auto-select.
+    /// Discovery still lists markets far beyond this — see the constant's note.
+    #[serde(default = "default_deploy_max_days_to_close")]
+    pub deploy_max_days_to_close:      u32,
     #[serde(default = "default_maker_min_spread")]
     pub maker_min_spread:              Decimal,
     #[serde(default = "default_maker_bid_buffer")]
@@ -806,6 +811,7 @@ impl Default for DynamicConfig {
             maker_target_profit_pct:  config::MAKER_TARGET_PROFIT_PERCENT,
             maker_max_exposure_usdc:  config::MAKER_MAX_EXPOSURE_USDC,
             maker_quote_size_usdc:    config::MAKER_QUOTE_SIZE_USDC,
+            deploy_max_days_to_close:      config::DEPLOY_MAX_DAYS_TO_CLOSE,
             maker_min_spread:              config::MAKER_MIN_SPREAD,
             maker_bid_buffer:              config::MAKER_BID_BUFFER,
             maker_cross_buffer:            config::MAKER_CROSS_BUFFER,

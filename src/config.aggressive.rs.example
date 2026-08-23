@@ -344,6 +344,24 @@ pub const MAKER_TOXIC_FLOW_EXIT_OBI: Decimal = dec!(-0.65);
 /// Aggressive: shorter 2-minute re-entry lockout (recovers spread capture sooner).
 pub const MAKER_TOXIC_REENTRY_COOLDOWN_SECS: i64 = 120;
 
+// ── Operator-deployed squadron horizon (2026-08-23) ─────────────────────────
+//
+// Longest time-to-resolution a Quick deploy will auto-select, in days.
+//
+// Market DISCOVERY deliberately looks much further out — Kalshi structures
+// politics and sports as multi-year futures, and a browse list that hides them
+// shows an empty category. Auto-SELECTION is a different question: the vipers
+// available to those classes are Arbitrage and Maker, and neither works on a
+// multi-year horizon. Arbitrage locks collateral until resolution, so a two-year
+// market ties up the whole book for a few percent; Maker rests quotes expecting
+// fills and reversion on a session scale. A market resolving in 2028 is a
+// perfectly good market and a bad thing to point these strategies at.
+//
+// Raising this widens what Quick deploy may choose; it does not change what the
+// browse list shows, so an operator can always deploy a longer-dated market
+// deliberately by picking it by hand.
+pub const DEPLOY_MAX_DAYS_TO_CLOSE: u32 = 180;
+
 // ── ToxicFill confirmation gates ────────────────────────────────────────────
 // Applied ONLY to a confirmed fill; an unfilled resting quote is still pulled
 // instantly. Without them the exit fires on the OBI dip caused by our own quote

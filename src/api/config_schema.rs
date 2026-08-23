@@ -527,6 +527,13 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
     }
 
     {
+        let g = "Deployment"; let e: Option<&'static str> = None;
+        v.push(F::new(g, e, "deploy_max_days_to_close", "Max Days To Resolution", "secs", false,
+            "Furthest-out market a Quick deploy will choose, in days. Browsing is not affected — the market list still shows everything, and you can always deploy a longer-dated market by picking it by hand. This only bounds the automatic choice. It matters because Kalshi structures politics and sports as multi-year futures, and the strategies available to those classes do not suit that horizon: Arbitrage locks your collateral until the market resolves, so a 2028 market ties it up for years to earn a few percent, and Maker rests quotes expecting them to fill and mean-revert within a session. Raise it if you want Quick deploy to consider longer-dated markets.")
+            .range(1.0, 3650.0).step(1.0).unit("d"));
+    }
+
+    {
         let g = "Raptor Polling"; let e: Option<&'static str> = None;
         v.push(F::new(g, e, "sports_poll_secs", "Sports Poll Interval", "secs", false,
             "Seconds between Sports Raptor (The Odds API) polls. The 300s default suits the free tier's ~500 requests/month; lower it only on a paid plan.")
