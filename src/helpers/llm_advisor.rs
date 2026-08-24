@@ -63,7 +63,7 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tokio::time::{interval, Duration};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::config;
 use crate::helpers::{db, dynamic_config::DynamicConfig, notifications};
@@ -359,7 +359,45 @@ struct AnthropicRequest {
     system: String,
     messages: Vec<ChatMessage>,
     max_tokens: u32,
-    temperature: f32,
+    /// Omitted entirely for models that no longer accept sampling parameters.
+    /// Anthropic rejects the whole request with HTTP 400 rather than ignoring
+    /// the field, so this cannot be sent hopefully.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    temperature: Option<f32>,
+}
+
+/// Does this Anthropic model still accept `temperature`?
+///
+/// Anthropic removed the sampling parameters from its newer model families:
+/// Sonnet 5, Opus 5, Opus 4.7/4.8 and Fable 5 answer a request carrying
+/// `temperature` with `400 invalid_request_error: "temperature is deprecated for
+/// this model"`, which took the advisor offline entirely rather than degrading.
+/// Models at 4.6 and below still accept it.
+///
+/// Deliberately an ALLOW-list of families known to accept the parameter, not a
+/// deny-list of families known to reject it. The two fail in opposite
+/// directions: an unrecognised model under an allow-list simply runs with the
+/// provider's default sampling, while under a deny-list it repeats exactly the
+/// outage above. Anthropic is dropping these parameters as it goes, so the
+/// unrecognised model of the future is far more likely to reject than accept.
+///
+/// The cost of omitting it is that the advisor runs at the model's default
+/// sampling rather than the deliberately low `LLM_TEMPERATURE`, so its wording
+/// varies more between cycles. Its proposals are parsed structurally and every
+/// one is validated against the config schema before it can be applied, so this
+/// costs some consistency of prose and nothing in safety.
+fn anthropic_accepts_temperature(model: &str) -> bool {
+    const SAMPLING_FAMILIES: [&str; 7] = [
+        "claude-opus-4-6",
+        "claude-sonnet-4-6",
+        "claude-opus-4-5",
+        "claude-sonnet-4-5",
+        "claude-haiku-4-5",
+        "claude-3-",   // 3.x: haiku, sonnet, opus
+        "claude-2",
+    ];
+    let m = model.trim().to_ascii_lowercase();
+    SAMPLING_FAMILIES.iter().any(|f| m.starts_with(f))
 }
 
 #[derive(Deserialize)]
@@ -897,12 +935,16 @@ async fn call_anthropic(
 ) -> anyhow::Result<LlmReply> {
     let url = format!("{}/v1/messages", base_url.trim_end_matches('/'));
 
+    let temperature = anthropic_accepts_temperature(model).then_some(LLM_TEMPERATURE);
+    if temperature.is_none() {
+        debug!("🤖 LLM Advisor: {model} does not accept `temperature` — using the model's default sampling");
+    }
     let request = AnthropicRequest {
         model: model.to_string(),
         system: system_prompt(),
         messages: vec![ChatMessage { role: "user".to_string(), content: user_prompt.to_string() }],
         max_tokens: LLM_MAX_OUTPUT_TOKENS,
-        temperature: LLM_TEMPERATURE,
+        temperature,
     };
 
     let resp = client
@@ -1482,5 +1524,58 @@ mod base_url_tests {
             normalize_llm_base("https://gw.internal/llm/anthropic", "anthropic"),
             "https://gw.internal/llm/anthropic",
         );
+    }
+}
+
+#[cfg(test)]
+mod anthropic_sampling_tests {
+    use super::anthropic_accepts_temperature;
+
+    /// The model that broke the advisor. Anthropic answers a request carrying
+    /// `temperature` with a 400 rather than ignoring the field, so this must be
+    /// omitted, not merely tolerated.
+    #[test]
+    fn sonnet_5_does_not_accept_temperature() {
+        assert!(!anthropic_accepts_temperature("claude-sonnet-5"));
+    }
+
+    /// The rest of the families that removed sampling parameters.
+    #[test]
+    fn the_newer_families_do_not_accept_temperature() {
+        for m in ["claude-opus-5", "claude-opus-4-8", "claude-opus-4-7", "claude-fable-5"] {
+            assert!(!anthropic_accepts_temperature(m), "{m} should not be sent temperature");
+        }
+    }
+
+    /// Models that still accept it keep getting the deliberately low value, so
+    /// an operator on an older model does not silently lose response
+    /// consistency to this fix.
+    #[test]
+    fn older_families_still_accept_temperature() {
+        for m in [
+            "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5",
+            "claude-sonnet-4-5", "claude-3-5-sonnet-20241022",
+        ] {
+            assert!(anthropic_accepts_temperature(m), "{m} should still be sent temperature");
+        }
+    }
+
+    /// An unrecognised model omits the parameter rather than sending it. This
+    /// is the whole point of an allow-list: the unknown model of the future is
+    /// far likelier to reject sampling than to accept it, and omitting costs
+    /// only default sampling where sending costs the entire advisor.
+    #[test]
+    fn an_unknown_model_omits_temperature() {
+        assert!(!anthropic_accepts_temperature("claude-something-7"));
+        assert!(!anthropic_accepts_temperature(""));
+    }
+
+    /// Operators type the model into a config field, so surrounding whitespace
+    /// and casing must not decide whether the request is well-formed.
+    #[test]
+    fn matching_ignores_case_and_whitespace() {
+        assert!(anthropic_accepts_temperature("  claude-haiku-4-5  "));
+        assert!(anthropic_accepts_temperature("Claude-Haiku-4-5"));
+        assert!(!anthropic_accepts_temperature("  claude-sonnet-5  "));
     }
 }
