@@ -2723,11 +2723,18 @@ async fn fetch_sports_markets_by_tags(
 
 /// Fetch markets for the US retail venue via `UsRetailVenue::discover_binary_markets`.
 ///
-/// The venue handle is connected once (env credentials) and cached for the API
-/// process lifetime. Crypto is rejected upstream (`deploy_squadron` blocks it and
-/// the region endpoint hides it), so every discovered binary market is offered
-/// under the requested class. Markets missing a close time degrade to
-/// "always open" (venue convention) and pass the expiry filter.
+/// The venue handle is connected on first use and cached, but only on SUCCESS —
+/// a failed connect is retried on the next request rather than remembered.
+///
+/// `OnceCell<Option<_>>` cached the failure too, so one transient error disabled
+/// market discovery for the rest of the process: the operator saw an empty
+/// market list from then on, with the cause a single warning that had scrolled
+/// away minutes earlier. Restarts are the common trigger — several in quick
+/// succession trip the venue's rate limiter (Cloudflare 1015) on the auth probe,
+/// and by the time the limit clears the empty cache is what the browser sees.
+///
+/// Markets missing a close time degrade to "always open" (venue convention) and
+/// pass the expiry filter.
 #[cfg(all(not(feature = "intl_clob"), feature = "us_retail"))]
 async fn fetch_markets_by_type(
     http: &reqwest::Client,
@@ -2736,24 +2743,29 @@ async fn fetch_markets_by_type(
     min_liquidity: f64,
 ) -> Vec<AvailableMarket> {
     use crate::venues::us::UsRetailVenue;
-    static US_VENUE: tokio::sync::OnceCell<Option<std::sync::Arc<UsRetailVenue>>> =
-        tokio::sync::OnceCell::const_new();
+    static US_VENUE: tokio::sync::Mutex<Option<std::sync::Arc<UsRetailVenue>>> =
+        tokio::sync::Mutex::const_new(None);
 
-    let venue = US_VENUE.get_or_init(|| {
-        let http = std::sync::Arc::new(http.clone());
-        async move {
-            match UsRetailVenue::connect(http).await {
-                Ok(v) => Some(std::sync::Arc::new(v)),
-                Err(e) => {
-                    warn!("US venue connect failed for market discovery: {e:#}");
-                    None
+    let venue = {
+        let mut slot = US_VENUE.lock().await;
+        match slot.as_ref() {
+            Some(v) => std::sync::Arc::clone(v),
+            None => {
+                let http = std::sync::Arc::new(http.clone());
+                match UsRetailVenue::connect(http).await {
+                    Ok(v) => {
+                        let v = std::sync::Arc::new(v);
+                        *slot = Some(std::sync::Arc::clone(&v));
+                        v
+                    }
+                    Err(e) => {
+                        // Left uncached so the next request tries again.
+                        warn!("US venue connect failed for market discovery: {e:#}");
+                        return Vec::new();
+                    }
                 }
             }
         }
-    }).await;
-
-    let Some(venue) = venue else {
-        return Vec::new();
     };
 
     // Every class discovers differently on this venue — `/v1/markets` is
@@ -2828,18 +2840,28 @@ async fn fetch_markets_by_type(
     min_liquidity: f64,
 ) -> Vec<AvailableMarket> {
     use crate::venues::kalshi::KalshiVenue;
-    static KALSHI_VENUE: tokio::sync::OnceCell<Option<std::sync::Arc<KalshiVenue>>> =
-        tokio::sync::OnceCell::const_new();
-    let venue = KALSHI_VENUE.get_or_init(|| async {
-        match KalshiVenue::from_env() {
-            Ok(v) => Some(std::sync::Arc::new(v)),
-            Err(e) => {
-                warn!("Kalshi venue init failed for market discovery: {e:#}");
-                None
-            }
+    // Cached on success only — a failed init is retried next request rather
+    // than remembered. See the note on the US venue handle: caching the failure
+    // disabled market discovery for the whole process from one transient error.
+    static KALSHI_VENUE: tokio::sync::Mutex<Option<std::sync::Arc<KalshiVenue>>> =
+        tokio::sync::Mutex::const_new(None);
+    let venue = {
+        let mut slot = KALSHI_VENUE.lock().await;
+        match slot.as_ref() {
+            Some(v) => std::sync::Arc::clone(v),
+            None => match KalshiVenue::from_env() {
+                Ok(v) => {
+                    let v = std::sync::Arc::new(v);
+                    *slot = Some(std::sync::Arc::clone(&v));
+                    v
+                }
+                Err(e) => {
+                    warn!("Kalshi venue init failed for market discovery: {e:#}");
+                    return Vec::new();
+                }
+            },
         }
-    }).await;
-    let Some(venue) = venue else { return Vec::new() };
+    };
 
     let now = chrono::Utc::now();
     let mut out: Vec<AvailableMarket> = Vec::new();
