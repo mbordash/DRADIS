@@ -43,7 +43,7 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 
 use crate::orchestrator::{Strategy, StrategyContext};
-use crate::state::{StrategySignal, StrategyStatus, OrderParams};
+use crate::state::{StrategySignal, StrategyStatus, OrderParams, PositionKey};
 use crate::vipers::is_drawdown_limit_hit;
 use crate::venues::core::TimeInForce;
 use tracing::{debug, info};
@@ -408,8 +408,8 @@ impl Strategy for ArbitrageStrategyImpl {
             // line with spurious  on every tick.
             // This guards against both re-adopted on-chain positions and live GTC
             // orders waiting for confirmation (fill_confirmed_at == None).
-            if pos_map.contains_key(&(STRATEGY_NAME.to_string(), market.yes_token.clone()))
-                || pos_map.contains_key(&(STRATEGY_NAME.to_string(), market.no_token.clone()))
+            if pos_map.contains_key(&PositionKey::new(&ctx.squadron_id, STRATEGY_NAME, market.yes_token.clone()))
+                || pos_map.contains_key(&PositionKey::new(&ctx.squadron_id, STRATEGY_NAME, market.no_token.clone()))
             {
                 debug!(" Arb skipped — already hold YES or NO leg for this market");
                 idle("position already open on this market");
@@ -417,7 +417,7 @@ impl Strategy for ArbitrageStrategyImpl {
             }
 
             pos_map.iter()
-                .filter(|((s, _), _)| s == STRATEGY_NAME)
+                .filter(|(k, _)| (k.strategy == STRATEGY_NAME) && k.squadron == ctx.squadron_id)
                 .map(|(_, p)| p.shares * p.avg_entry)
                 .sum::<Decimal>()
         };
@@ -520,8 +520,8 @@ impl Strategy for ArbitrageStrategyImpl {
         let snapshot = ctx.maker_snapshot.as_ref().unwrap_or(&ctx.snapshot);
         let pos_map = ctx.positions.lock().await;
 
-        let yes_key = (STRATEGY_NAME.to_string(), market.yes_token.clone());
-        let no_key  = (STRATEGY_NAME.to_string(), market.no_token.clone());
+        let yes_key = PositionKey::new(&ctx.squadron_id, STRATEGY_NAME, market.yes_token.clone());
+        let no_key  = PositionKey::new(&ctx.squadron_id, STRATEGY_NAME, market.no_token.clone());
 
         if let (Some(yp), Some(_np)) = (pos_map.get(&yes_key), pos_map.get(&no_key)) {
             let yes_bid = snapshot.yes_bid;

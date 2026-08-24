@@ -243,7 +243,7 @@ impl Strategy for BasisStrategyImpl {
         let current_exposure = {
             let pos_map = ctx.positions.lock().await;
             pos_map.iter()
-                .filter(|((s, _), _)| s == "BasisStrategy")
+                .filter(|(k, _)| k.strategy == "BasisStrategy" && k.squadron == ctx.squadron_id)
                 .map(|(_, p)| p.shares * p.avg_entry)
                 .sum::<Decimal>()
         };
@@ -403,8 +403,9 @@ impl Strategy for BasisStrategyImpl {
 
         let positions: MutexGuard<PositionMap> = ctx.positions.lock().await;
 
-        for ((strategy_name, token_id), position) in positions.iter() {
-            if strategy_name != "BasisStrategy" { continue; }
+        for (key, position) in positions.iter() {
+            let (strategy_name, token_id) = (&key.strategy, &key.market);
+            if strategy_name != "BasisStrategy" || key.squadron != ctx.squadron_id { continue; }
 
             // Match current venue for the held token
             let (target_market, snap) = if let Some(mk) = &ctx.maker_market {

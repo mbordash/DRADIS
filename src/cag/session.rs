@@ -74,7 +74,7 @@ pub struct SessionState {
     /// Key: `(strategy_name, token_id)` → expiry `Instant`.
     /// An entry present with `expiry > Instant::now()` blocks a new order
     /// placement for that (strategy, token) pair.
-    pub pending_orders: Arc<Mutex<HashMap<(String, MarketId), Instant>>>,
+    pub pending_orders: Arc<Mutex<HashMap<crate::state::PositionKey, Instant>>>,
 
     /// Accumulated session P&L (realised on confirmed exits).
     pub total_pnl: Arc<Mutex<Decimal>>,

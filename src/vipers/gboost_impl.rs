@@ -116,6 +116,7 @@ use crate::venues::core::MarketId; // venue-neutral key for pending_entries / co
 use crate::config;
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{MarketSnapshot, OrderParams, StrategySignal, StrategyStatus};
+use crate::state::PositionKey;
 use crate::vipers::is_drawdown_limit_hit;
 use crate::helpers::price::floor_to_tick_size;
 use crate::venues::core::TimeInForce;
@@ -1667,8 +1668,8 @@ impl Strategy for GboostStrategyImpl {
         let (has_yes, has_no) = {
             let map = ctx.positions.lock().await;
             (
-                map.contains_key(&("GboostStrategy".to_string(), target_market.yes_token.clone())),
-                map.contains_key(&("GboostStrategy".to_string(), target_market.no_token.clone())),
+                map.contains_key(&PositionKey::new(&ctx.squadron_id, "GboostStrategy", target_market.yes_token.clone())),
+                map.contains_key(&PositionKey::new(&ctx.squadron_id, "GboostStrategy", target_market.no_token.clone())),
             )
         };
 
@@ -1986,7 +1987,7 @@ impl Strategy for GboostStrategyImpl {
         let pos_map = ctx.positions.lock().await;
 
         // ── YES position ──────────────────────────────────────────────────────
-        if let Some(pos) = pos_map.get(&("GboostStrategy".to_string(), target_market.yes_token.clone())) {
+        if let Some(pos) = pos_map.get(&PositionKey::new(&ctx.squadron_id, "GboostStrategy", target_market.yes_token.clone())) {
             if pos.fill_confirmed_at.is_some() {
                 let bid = target_snapshot.yes_bid;
                 let profit_pct = if pos.avg_entry > dec!(0) {
@@ -2055,7 +2056,7 @@ impl Strategy for GboostStrategyImpl {
         }
 
         // ── NO position ───────────────────────────────────────────────────────
-        if let Some(pos) = pos_map.get(&("GboostStrategy".to_string(), target_market.no_token.clone())) {
+        if let Some(pos) = pos_map.get(&PositionKey::new(&ctx.squadron_id, "GboostStrategy", target_market.no_token.clone())) {
             if pos.fill_confirmed_at.is_some() {
                 let bid = target_snapshot.no_bid;
                 let profit_pct = if pos.avg_entry > dec!(0) {
@@ -2168,6 +2169,7 @@ mod tests {
 
     fn make_ctx() -> StrategyContext {
         StrategyContext {
+            squadron_id: "test-squadron".to_string(),
             market: MarketConfig {
                 yes_token: MarketId::new("1"), no_token: MarketId::new("2"),
                 market_name: "Test".to_string(),
@@ -2263,7 +2265,7 @@ mod tests {
         {
             let mut map = ctx.positions.lock().await;
             map.insert(
-                ("GboostStrategy".to_string(), ctx.market.yes_token.clone()),
+                PositionKey::new(&ctx.squadron_id, "GboostStrategy", ctx.market.yes_token.clone()),
                 Position {
                     shares: dec!(10),
                     avg_entry: dec!(0.52),
@@ -2296,7 +2298,7 @@ mod tests {
         {
             let mut map = ctx.positions.lock().await;
             map.insert(
-                ("GboostStrategy".to_string(), ctx.market.yes_token.clone()),
+                PositionKey::new(&ctx.squadron_id, "GboostStrategy", ctx.market.yes_token.clone()),
                 Position {
                     shares: dec!(10),
                     avg_entry: dec!(0.40),

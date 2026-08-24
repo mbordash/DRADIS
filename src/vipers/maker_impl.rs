@@ -49,6 +49,7 @@ use tokio::sync::Mutex;
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
+use crate::state::PositionKey;
 use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
 use crate::venues::core::TimeInForce;
@@ -707,9 +708,9 @@ impl Strategy for MakerStrategyImpl {
         // ── Inventory and Net Exposure Check ─────────────────────────────────
         let (yes_inv_value, no_inv_value) = {
             let pos_map = ctx.positions.lock().await;
-            let yv = pos_map.get(&("MakerStrategy".to_string(), market.yes_token.clone()))
+            let yv = pos_map.get(&PositionKey::new(&ctx.squadron_id, "MakerStrategy", market.yes_token.clone()))
                 .map(|p| p.shares * p.avg_entry).unwrap_or(dec!(0));
-            let nv = pos_map.get(&("MakerStrategy".to_string(), market.no_token.clone()))
+            let nv = pos_map.get(&PositionKey::new(&ctx.squadron_id, "MakerStrategy", market.no_token.clone()))
                 .map(|p| p.shares * p.avg_entry).unwrap_or(dec!(0));
             (yv, nv)
         };
@@ -979,7 +980,7 @@ impl Strategy for MakerStrategyImpl {
         if secs_to_expiry < dc.maker_min_secs_to_expiry {
             let pos_map = ctx.positions.lock().await;
             for token_id in [market.yes_token.clone(), market.no_token.clone()] {
-                if let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id.clone())) {
+                if let Some(position) = pos_map.get(&PositionKey::new(&ctx.squadron_id, "MakerStrategy", token_id.clone())) {
                     let bid = if token_id == market.yes_token { snapshot.yes_bid } else { snapshot.no_bid };
                     let profit_pct = (bid - position.avg_entry) / position.avg_entry;
                     if profit_pct < profit_threshold {
@@ -1025,7 +1026,7 @@ impl Strategy for MakerStrategyImpl {
             let pos_map = ctx.positions.lock().await;
             let mut pull_tokens = Vec::new();
             for token_id in [market.yes_token.clone(), market.no_token.clone()] {
-                let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id.clone())) else {
+                let Some(position) = pos_map.get(&PositionKey::new(&ctx.squadron_id, "MakerStrategy", token_id.clone())) else {
                     // No quote/position on this token — drop any stale drift baseline.
                     clear_maker_quote_oracle_baseline(token_id.as_str());
                     clear_maker_toxic_obi_streak(token_id.as_str());
@@ -1174,7 +1175,7 @@ impl Strategy for MakerStrategyImpl {
         let mut resting_exit: Option<StrategySignal> = None;
 
         for token_id in [market.yes_token.clone(), market.no_token.clone()] {
-            let Some(position) = pos_map.get(&("MakerStrategy".to_string(), token_id.clone())) else {
+            let Some(position) = pos_map.get(&PositionKey::new(&ctx.squadron_id, "MakerStrategy", token_id.clone())) else {
                 continue;
             };
 

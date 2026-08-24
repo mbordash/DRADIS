@@ -608,6 +608,8 @@ export interface DeploySquadronRequest {
   vipers?: string[];
   /** Per-viper capital budgets: viper kind id → max-exposure USDC. */
   viper_budgets?: Record<string, number>;
+  /** Operator-chosen name; distinguishes two squadrons of the same class. */
+  name?: string;
 }
 
 /** Response from POST /api/squadrons/deploy. */

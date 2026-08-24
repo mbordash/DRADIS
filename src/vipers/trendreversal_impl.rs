@@ -230,7 +230,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 // Match this strategy's own positions. Accept the legacy
                 // "TrendCaptureStrategy" tag too so any position opened under the old
                 // name (pre-rename) is still exposure-counted across a deploy.
-                .filter(|((s, _), _)| s == "TrendReversalStrategy" || s == "TrendCaptureStrategy")
+                .filter(|(k, _)| (k.strategy == "TrendReversalStrategy" || k.strategy == "TrendCaptureStrategy") && k.squadron == ctx.squadron_id)
                 .map(|(_, p)| p.shares * p.avg_entry)
                 .sum::<Decimal>()
         };
@@ -747,7 +747,9 @@ impl Strategy for TrendReversalStrategyImpl {
             let pos_map = ctx.positions.lock().await;
             let mut found: Option<PendingExit> = None;
 
-            'outer: for ((strategy_name, token_id), position) in pos_map.iter() {
+            'outer: for (key, position) in pos_map.iter() {
+                if key.squadron != ctx.squadron_id { continue; }
+                let (strategy_name, token_id) = (&key.strategy, &key.market);
                 // Accept legacy "TrendCaptureStrategy" too so a position opened under
                 // the old name is still exited after the rename.
                 if strategy_name != "TrendReversalStrategy" && strategy_name != "TrendCaptureStrategy" { continue; }

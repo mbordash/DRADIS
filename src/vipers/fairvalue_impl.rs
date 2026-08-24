@@ -69,7 +69,7 @@ use std::sync::{Mutex as StdMutex, OnceLock};
 use std::time::Instant;
 
 use crate::orchestrator::{Strategy, StrategyContext};
-use crate::state::{StrategySignal, StrategyStatus, OrderParams, MarketConfig, MarketSnapshot};
+use crate::state::{StrategySignal, StrategyStatus, OrderParams, MarketConfig, MarketSnapshot, PositionKey};
 use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
 use crate::helpers::volatility::{fair_yes_probability, sigma_per_sqrt_sec};
@@ -746,14 +746,14 @@ impl Strategy for FairValueStrategyImpl {
         // ── Exposure cap ──────────────────────────────────────────────────────
         {
             let pos_map = ctx.positions.lock().await;
-            if pos_map.contains_key(&("FairValueStrategy".to_string(), market.yes_token.clone()))
-                || pos_map.contains_key(&("FairValueStrategy".to_string(), market.no_token.clone()))
+            if pos_map.contains_key(&PositionKey::new(&ctx.squadron_id, "FairValueStrategy", market.yes_token.clone()))
+                || pos_map.contains_key(&PositionKey::new(&ctx.squadron_id, "FairValueStrategy", market.no_token.clone()))
             {
                 idle("position already open (no pyramiding)");
                 return Ok(StrategySignal::NoSignal);
             }
             let current_exposure: Decimal = pos_map.iter()
-                .filter(|((s, _), _)| s == "FairValueStrategy")
+                .filter(|(k, _)| (k.strategy == "FairValueStrategy") && k.squadron == ctx.squadron_id)
                 .map(|(_, p)| p.shares * p.avg_entry)
                 .sum();
             if current_exposure + dc.fairvalue_trade_size_usdc > dc.fairvalue_max_exposure_usdc {
@@ -896,7 +896,9 @@ impl Strategy for FairValueStrategyImpl {
         let dc = &ctx.dynamic_config;
         let positions = ctx.positions.lock().await;
 
-        for ((strategy_name, token_id), position) in positions.iter() {
+        for (key, position) in positions.iter() {
+            if key.squadron != ctx.squadron_id { continue; }
+            let (strategy_name, token_id) = (&key.strategy, &key.market);
             if strategy_name != "FairValueStrategy" {
                 continue;
             }

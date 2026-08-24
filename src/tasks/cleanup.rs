@@ -50,7 +50,7 @@ use alloy::primitives::address as alloy_address;
 
 use crate::helpers::{db, send_notification, PhantomCooldowns};
 use crate::helpers::balance::OrphanTombstones;
-use crate::state::{Position, PositionMap};
+use crate::state::{Position, PositionKey, PositionMap};
 use crate::venues::core::MarketId;
 use crate::venues::intl::u256_from_market_id;
 use crate::vipers::time_decay_impl::TimeDecayPosition;
@@ -326,7 +326,7 @@ pub async fn cleanup_expired_positions(
 
         if is_expired || is_expiring_soon {
             let before = pos_map.len();
-            pos_map.retain(|(_, token), _| token != &yes_market && token != &no_market);
+            pos_map.retain(|k, _| k.market != yes_market && k.market != no_market);
             let removed = before - pos_map.len();
 
             if removed > 0 {
@@ -415,9 +415,10 @@ pub async fn reconcile_orphaned_positions(
     //     re-hedging on top of an already-tracked opposite leg.
     // Fees are ~0 on the V2 CLOB, so the only real cost is the ~1-3¢ bid/ask
     // spread — making a fast cheap re-hedge strongly preferred over flatten.
-    let mut legs_by_market: std::collections::HashMap<String, Vec<((String, MarketId), Position)>> =
+    let mut legs_by_market: std::collections::HashMap<String, Vec<(PositionKey, Position)>> =
         std::collections::HashMap::new();
-    for ((strategy_name, token_id), position) in pos_map.iter() {
+    for (key, position) in pos_map.iter() {
+        let (strategy_name, token_id) = (&key.strategy, &key.market);
         if strategy_name != "ArbitrageStrategy" && strategy_name != "TimeDecayStrategy" {
             continue;
         }
@@ -425,13 +426,13 @@ pub async fn reconcile_orphaned_positions(
         legs_by_market
             .entry(position.market_name.clone())
             .or_default()
-            .push(((strategy_name.clone(), token_id.clone()), position.clone()));
+            .push((key.clone(), position.clone()));
     }
 
     // Fully-naked single legs → full orphan handling (re-hedge if cheap, else flatten).
-    let mut orphans_to_exit: Vec<((String, MarketId), Position)> = Vec::new();
+    let mut orphans_to_exit: Vec<(PositionKey, Position)> = Vec::new();
     // Imbalanced pairs → flatten ONLY the naked excess of the heavier leg.
-    let mut imbalanced_to_trim: Vec<((String, MarketId), Position, Decimal)> = Vec::new();
+    let mut imbalanced_to_trim: Vec<(PositionKey, Position, Decimal)> = Vec::new();
 
     for (_market, legs) in legs_by_market {
         match legs.len() {
@@ -448,7 +449,7 @@ pub async fn reconcile_orphaned_positions(
                 // Only a genuine YES+NO pair (two DISTINCT tokens) can be a hedge.
                 // Two keys on the SAME token (e.g. arb + time-decay) are the same
                 // side — skip to avoid mis-flattening a non-hedge.
-                if k0.1 == k1.1 { continue; }
+                if k0.market == k1.market { continue; }
                 let excess = (p0.shares - p1.shares).abs();
                 if excess >= crate::config::MIN_ORDER_SHARES {
                     let (heavy_key, heavy_pos) =
@@ -463,7 +464,8 @@ pub async fn reconcile_orphaned_positions(
         }
     }
 
-    for ((strategy_name, token_id), position) in orphans_to_exit {
+    for (key, position) in orphans_to_exit {
+        let (strategy_name, token_id) = (key.strategy.clone(), key.market.clone());
         warn!(" ORPHANED PAIR DETECTED [{}]: {} shares at ${:.4} ({}s old) — cancelling GTC + removing",
               strategy_name, position.shares, position.avg_entry,
               (now - position.opened_at).num_seconds());
@@ -495,7 +497,7 @@ pub async fn reconcile_orphaned_positions(
             Err(_) => warn!("⚠️ Orphan cleanup: orders() timed out (10s) for token {} — skipping cancel", token_id),
         }
 
-        pos_map.remove(&(strategy_name.clone(), token_id.clone()));
+        pos_map.remove(&key);
 
         // Tombstone this token so reconcile_orphaned_positions (balance.rs) never
         // re-adopts it within the same session.  Without this, phantom_cooldowns are
@@ -550,7 +552,8 @@ pub async fn reconcile_orphaned_positions(
     // None) because buying more of the opposite leg on top of an already-tracked
     // row risks duplicate bookkeeping; flattening the excess is the conservative
     // path and caps the loss at the spread (~1-3¢/share, fees ~0 on V2).
-    for ((strategy_name, token_id), position, excess) in imbalanced_to_trim {
+    for (key, position, excess) in imbalanced_to_trim {
+        let (strategy_name, token_id) = (key.strategy.clone(), key.market.clone());
         // Re-processing guard: skip if we acted on this token within the cooldown
         // window (chain-sync needs time to reflect the sell on-chain).
         let cooldown_key = format!("{}:{}", strategy_name, token_id);
@@ -567,7 +570,7 @@ pub async fn reconcile_orphaned_positions(
         // Optimistically reduce the tracked shares to the hedged remainder so the
         // next cycle won't re-detect the same excess. Chain-sync self-heals this
         // if the FAK sell fails (it re-reads actual on-chain holdings).
-        if let Some(p) = pos_map.get_mut(&(strategy_name.clone(), token_id.clone())) {
+        if let Some(p) = pos_map.get_mut(&key) {
             p.shares = (p.shares - excess).max(Decimal::ZERO);
         }
         phantom_cooldowns.lock().await.insert(cooldown_key, tokio::time::Instant::now());

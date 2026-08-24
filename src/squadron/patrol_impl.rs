@@ -120,14 +120,14 @@ fn reconcile_unverified_exit(
 }
 
 /// Maker quote epochs: `(strategy, token) -> (epoch, last touched)`.
-type QuoteEpochs = std::collections::HashMap<(String, MarketId), (u64, Instant)>;
+type QuoteEpochs = std::collections::HashMap<PositionKey, (u64, Instant)>;
 
 /// Retire whatever quote currently owns `key` and return the new epoch.
 ///
 /// Called both when a quote is PLACED (claiming an epoch for its own fill
 /// watcher) and when one is PULLED (so the pulled quote's watcher can no longer
 /// claim a later fill).
-fn bump_quote_epoch(map: &mut QuoteEpochs, key: &(String, MarketId)) -> u64 {
+fn bump_quote_epoch(map: &mut QuoteEpochs, key: &PositionKey) -> u64 {
     let e = map.entry(key.clone()).or_insert((0, Instant::now()));
     e.0 += 1;
     e.1 = Instant::now();
@@ -139,7 +139,7 @@ fn bump_quote_epoch(map: &mut QuoteEpochs, key: &(String, MarketId)) -> u64 {
 /// A fill watcher spawned for a quote must ask this before recording an entry.
 /// Answering `false` means the quote it was watching was pulled or replaced, and
 /// the shares it can see belong to a later quote.
-fn quote_epoch_is_current(map: &QuoteEpochs, key: &(String, MarketId), epoch: u64) -> bool {
+fn quote_epoch_is_current(map: &QuoteEpochs, key: &PositionKey, epoch: u64) -> bool {
     map.get(key).map(|(e, _)| *e) == Some(epoch)
 }
 
@@ -337,6 +337,7 @@ impl Squadron {
         );
 
         spawn_cleanup_task(
+            self.id.clone(),
             Arc::clone(&positions),
             Arc::clone(&trading_client),
             Arc::clone(&nonce_manager),
@@ -375,11 +376,16 @@ impl Squadron {
             peripheral_cancel.clone(),
         );
 
+        // Squadron identity, cloned once for the whole patrol. Every PositionKey
+        // built below carries it, so this squadron addresses its own positions
+        // and not those of another squadron holding the same token.
+        let squadron_id = self.id.clone();
+
         // ── Slice 3: shared OrderLifecycle (intl migration) ──────────────────
         // One engine drives fill-confirm, stale-cancel, and naked-leg flatten
         // over the Execution trait surface. Runs alongside the existing bespoke
         // arb_pair_fill_monitor / sync_position_balance paths (additive for now).
-        let lifecycle = std::sync::Arc::new(OrderLifecycle::new(LifecycleConfig::intl()));
+        let lifecycle = std::sync::Arc::new(OrderLifecycle::new(LifecycleConfig::intl(), self.id.clone()));
         spawn_lifecycle_task(
             std::sync::Arc::clone(&lifecycle),
             std::sync::Arc::clone(&ctx.session.venue),
@@ -421,7 +427,7 @@ impl Squadron {
 
         if hourly_yes_token != market_id_from_u256(U256::ZERO) {
             reconcile_orphaned_positions(
-                &trading_client, &positions,
+                &squadron_id, &trading_client, &positions,
                 &[(hourly_yes_token.clone(), "YES"), (hourly_no_token.clone(), "NO")],
                 &hourly_market_name, hourly_market_close_time, &hourly_token_bids, &adoption_order,
                 Some(&orphan_tombstones),
@@ -429,7 +435,7 @@ impl Squadron {
         }
         if let Some(ref mk_config) = maker_market_config {
             reconcile_orphaned_positions(
-                &trading_client, &positions,
+                &squadron_id, &trading_client, &positions,
                 &[(mk_config.yes_token.clone(), "YES(maker)"), (mk_config.no_token.clone(), "NO(maker)")],
                 &mk_config.market_name, mk_config.market_close_time, &maker_token_bids, &adoption_order,
                 Some(&orphan_tombstones),
@@ -458,7 +464,9 @@ impl Squadron {
             let map = positions.lock().await;
             let mut ownership = token_ownership.lock().await;
             ownership.clear();
-            for ((sn, tid), _pos) in map.iter() {
+            for (k, _pos) in map.iter() {
+                if k.squadron != squadron_id { continue; }
+                let (sn, tid) = (&k.strategy, &k.market);
                 let current_priority = StrategyRegistry::get_strategy_priority(sn).unwrap_or(usize::MAX);
                 let entry = ownership.entry(tid.clone()).or_insert_with(|| sn.clone());
                 let existing_priority = StrategyRegistry::get_strategy_priority(entry).unwrap_or(usize::MAX);
@@ -483,7 +491,7 @@ impl Squadron {
         let mut last_executor_summary = String::new();
         // Live post-only asks resting against filled maker positions, keyed the
         // same way as the position map: (strategy, token).
-        let mut maker_resting_exits: std::collections::HashMap<(String, MarketId), MakerRestingExit> =
+        let mut maker_resting_exits: std::collections::HashMap<PositionKey, MakerRestingExit> =
             std::collections::HashMap::new();
 
         // Collateral as it read BEFORE a position was entered, keyed like the
@@ -501,7 +509,7 @@ impl Squadron {
         //
         // Deliberately not persisted: after a restart the baseline is unknown,
         // and the exit is then booked as unreconciled rather than guessed.
-        let mut pre_entry_collateral: std::collections::HashMap<(String, MarketId), Decimal> =
+        let mut pre_entry_collateral: std::collections::HashMap<PositionKey, Decimal> =
             std::collections::HashMap::new();
 
         // Monotonic epoch per (strategy, token), bumped every time a maker quote
@@ -664,6 +672,7 @@ impl Squadron {
                     // Only proceed if at least one market has valid prices
                     if (hourly_ya == dec!(1) && hourly_na == dec!(1)) && (maker_ya == dec!(1) && maker_na == dec!(1)) { continue; }
 
+                    // Part of every PositionKey the vipers build this tick.
                     let hourly_market_config_for_ctx = MarketConfig {
                         yes_token: hourly_yes_token.clone(), no_token: hourly_no_token.clone(), market_name: hourly_market_name.clone(), market_close_time: hourly_market_close_time, strike_price: hourly_strike_price, is_neg_risk: hourly_is_neg_risk, condition_id: hourly_condition_id.clone(), yes_fee_bps: hourly_yes_fee_rate, no_fee_bps: hourly_no_fee_rate,
                     };
@@ -730,6 +739,7 @@ impl Squadron {
                     }
 
                     let ctx = StrategyContext {
+                        squadron_id: squadron_id.clone(),
                         market: hourly_market_config_for_ctx.clone(),
                         snapshot: MarketSnapshot {
                             yes_bid: hourly_yb, yes_bid_depth: hourly_ybd, yes_ask: hourly_ya, yes_ask_depth: hourly_yad,
@@ -803,6 +813,7 @@ impl Squadron {
                     for (strategy_name, signal) in resolved_signals {
 
                         let sn = strategy_name.clone();
+                        let sq_key = squadron_id.clone();
                         let (target_yes_token, target_no_token, target_market_close_time, target_is_neg_risk, target_yes_fee_bps, target_no_fee_bps) = {
                             let strategy_venue = strategies.iter().find(|s| s.name() == sn).map(|s| s.venue()).unwrap_or("Hourly");
                             if strategy_venue == "Window/Daily" && maker_market_config.is_some() {
@@ -848,7 +859,7 @@ impl Squadron {
                                 last_exit_attempt_time.insert(sn.clone(), Instant::now());
                                 let tid = params.token_id;
                                 let tid_m = tid.clone(); // neutral key (slice 2a)
-                                let pos_key = (sn.clone(), tid_m.clone());
+                                let pos_key = PositionKey::new(sq_key.clone(), sn.clone(), tid_m.clone());
 
                                 // ── Free the shares before any FAK ────────────────
                                 // A resting post-only ask COMMITS the shares at the
@@ -1155,6 +1166,7 @@ impl Squadron {
                                         if rs_m > dec!(0) && !ghosting {
                                             let ps = Arc::clone(&positions); let cl = Arc::clone(&trading_client); let tp = Arc::clone(&total_pnl); let m_name = params.market_name.clone();
                                             let sn_async = sn.clone();
+                                            let sq_key = squadron_id.clone();
                                             let tid_async = tid_m.clone(); // neutral key moved into the spawn
                                             // Capture all vars needed for deferred DB recording.
                                             let sid_m = side_of(&tid).to_string();
@@ -1197,7 +1209,7 @@ impl Squadron {
                                                         // reconciles it, instead of leaking it out of the position map.
                                                         warn!("⚠️ FAK verify [{}]: all balance reads failed — fill unknown; re-inserting {:.4} shares for retry (no PnL booked)", sn_async, rs_m);
                                                         let mut map = ps.lock().await;
-                                                        map.entry((sn_async.clone(), tid_async.clone())).or_insert_with(|| Position { shares: rs_m, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name.clone(), pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None, entry_fee: Decimal::ZERO });
+                                                        map.entry(PositionKey::new(sq_key.clone(), sn_async.clone(), tid_async.clone())).or_insert_with(|| Position { shares: rs_m, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name.clone(), pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None, entry_fee: Decimal::ZERO });
                                                         return;
                                                     }
                                                 };
@@ -1205,7 +1217,7 @@ impl Squadron {
                                                 let other_strats_shares = {
                                                     let map = ps.lock().await;
                                                     map.iter()
-                                                        .filter(|((s, t), _)| *t == tid_async && s != &sn_async)
+                                                        .filter(|(k, _)| k.market == tid_async && k.strategy != sn_async && k.squadron == sq_key)
                                                         .map(|(_, p)| p.shares)
                                                         .fold(dec!(0), |a, b| a + b)
                                                 };
@@ -1216,16 +1228,16 @@ impl Squadron {
                                                     if fill < config::MIN_ORDER_SHARES {
                                                         warn!("⚠️ PARTIAL EXIT [{}]: FAK filled 0/{:.4} shares (our_rem={:.4}, other_strats={:.4}) — re-inserting for retry.", sn_async, rs_m, our_rem, other_strats_shares);
                                                         let mut map = ps.lock().await;
-                                                        if !map.contains_key(&(sn_async.clone(), tid_async.clone())) {
-                                                            map.insert((sn_async.clone(), tid_async.clone()), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None, entry_fee: Decimal::ZERO });
+                                                        if !map.contains_key(&PositionKey::new(sq_key.clone(), sn_async.clone(), tid_async.clone())) {
+                                                            map.insert(PositionKey::new(sq_key.clone(), sn_async.clone(), tid_async.clone()), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None, entry_fee: Decimal::ZERO });
                                                         }
                                                         // 0 fills — no PnL credit, no DB write; position re-inserted for retry.
                                                     } else {
                                                         warn!("⚠️ PARTIAL EXIT [{}]: sold {:.4}/{:.4} (our_rem={:.4}, other_strats={:.4}) — re-inserting.", sn_async, fill, rs_m, our_rem, other_strats_shares);
                                                         {
                                                             let mut map = ps.lock().await;
-                                                            if !map.contains_key(&(sn_async.clone(), tid_async.clone())) {
-                                                                map.insert((sn_async.clone(), tid_async.clone()), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name.clone(), pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None, entry_fee: Decimal::ZERO });
+                                                            if !map.contains_key(&PositionKey::new(sq_key.clone(), sn_async.clone(), tid_async.clone())) {
+                                                                map.insert(PositionKey::new(sq_key.clone(), sn_async.clone(), tid_async.clone()), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name.clone(), pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None, entry_fee: Decimal::ZERO });
                                                             }
                                                         }
                                                         // Partial fill — credit and record ONLY the filled portion, together.
@@ -1253,7 +1265,7 @@ impl Squadron {
                                     if exit_pair {
                                         let other_tid = if tid == target_yes_token { target_no_token.clone() } else { target_yes_token.clone() };
                                         let other_tid_m = other_tid.clone(); // neutral key (slice 2a)
-                                        let pk = (sn.clone(), other_tid_m.clone()); let ps = { let map = positions.lock().await; map.get(&pk).map(|p| p.shares) };
+                                        let pk = PositionKey::new(sq_key.clone(), sn.clone(), other_tid_m.clone()); let ps = { let map = positions.lock().await; map.get(&pk).map(|p| p.shares) };
                                         if let Some(s) = ps {
                                             let exit_snap = if target_yes_token == ctx.market.yes_token {
                                                 &ctx.snapshot
@@ -1344,7 +1356,7 @@ impl Squadron {
                                 if pair_params.is_none() {
                                     let pm = positions.lock().await;
                                     let other_token = if params.token_id == target_yes_token { target_no_token.clone() } else { target_yes_token.clone() };
-                                    if pm.contains_key(&(sn.clone(), other_token.clone())) { debug!("⏳ ENTRY blocked — already hold opposite leg in same market [{}] — must exit first", sn); continue; }
+                                    if pm.contains_key(&PositionKey::new(sq_key.clone(), sn.clone(), other_token.clone())) { debug!("⏳ ENTRY blocked — already hold opposite leg in same market [{}] — must exit first", sn); continue; }
                                 }
 
                                 // ── Token sovereignty check ───────────────────────────────────────
@@ -1397,7 +1409,9 @@ impl Squadron {
                                 // tick loop, but belt-and-suspenders).
                                 {
                                     let pm = positions.lock().await;
-                                    let blocked = pm.iter().any(|((other_sn, tid), _p)| {
+                                    let blocked = pm.iter().any(|(k, _p)| {
+                                        if k.squadron != sq_key { return false; }
+                                        let (other_sn, tid) = (&k.strategy, &k.market);
                                         *tid == token_m && other_sn != &sn
                                     });
                                     if blocked {
@@ -1411,7 +1425,7 @@ impl Squadron {
                                     }
                                 }
 
-                                let pos_key = (sn.clone(), token_m.clone());
+                                let pos_key = PositionKey::new(sq_key.clone(), sn.clone(), token_m.clone());
 
                                 {
                                     let pending = pending_orders.lock().await;
@@ -1434,17 +1448,17 @@ impl Squadron {
                                     info!("👻 GHOST_MODE ENTRY {} [{}]: {} | ${:.4} x {:.1} (simulated)", side_g, sn, params.market_name, params.price, params.shares);
                                     { let side_g = side_of(&params.token_id); let sn_g = sn.clone(); let tid_g = params.token_id.to_string(); let mn_g = params.market_name.clone(); let side_gs = side_g.to_string(); let ep_g = actual_entry_price; let sh_g = params.shares; let asset_g = asset_lc.clone(); let scope_g = scope.clone(); tokio::spawn(async move { metrics::record_entry(&scope_g, sn_g, tid_g, mn_g, side_gs, ep_g, sh_g).await; }); }
                                     { let side_g = side_of(&params.token_id); let sn_g = sn.clone(); let tid_g = params.token_id.to_string(); let mn_g = params.market_name.clone(); let side_gs = side_g.to_string(); let ep_g = actual_entry_price; let sh_g = params.shares; let asset_g = asset_lc.clone(); let snap_g = entry_snap.clone(); tokio::spawn(async move { metrics::record_entry_signal(&asset_g, sn_g, tid_g, mn_g, side_gs, ep_g, sh_g, &snap_g).await; }); }
-                                    if let Some(pool) = db::pool_for(&asset_lc) { let side_g = side_of(&params.token_id); db::record_open_position(&pool, &sn, &params.token_id.to_string(), &params.market_name, side_g, actual_entry_price, params.shares, true).await; }
+                                    if let Some(pool) = db::pool_for(&asset_lc) { let side_g = side_of(&params.token_id); db::record_open_position(&pool, &squadron_id, &sn, &params.token_id.to_string(), &params.market_name, side_g, actual_entry_price, params.shares, true).await; }
                                     if let Some(pp) = pair_params {
                                         let pp_close_time = target_market_close_time;
                                         // Same as the primary leg: simulate at the touch.
                                         let actual_paired_entry_price = pp.price;
-                                        positions.lock().await.insert((sn.clone(), pp.token_id.clone()), Position { shares: pp.shares, avg_entry: actual_paired_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: Some(token_m.clone()), entry_fee: Decimal::ZERO });
+                                        positions.lock().await.insert(PositionKey::new(sq_key.clone(), sn.clone(), pp.token_id.clone()), Position { shares: pp.shares, avg_entry: actual_paired_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp.token_id.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: Some(token_m.clone()), entry_fee: Decimal::ZERO });
                                         token_ownership.lock().await.insert(pp.token_id.clone(), sn.clone());
                                         let side_gp = side_of(&pp.token_id);
                                         info!("👻 GHOST_MODE ENTRY {} (paired) [{}]: {} | ${:.4} x {:.1} (simulated)", side_gp, sn, pp.market_name, pp.price, pp.shares);
                                         { let side_gp = side_of(&pp.token_id); let sn_gp = sn.clone(); let tid_gp = pp.token_id.to_string(); let mn_gp = pp.market_name.clone(); let side_gps = side_gp.to_string(); let ep_gp = actual_paired_entry_price; let sh_gp = pp.shares; let asset_gp = asset_lc.clone(); let scope_gp = scope.clone(); tokio::spawn(async move { metrics::record_entry(&scope_gp, sn_gp, tid_gp, mn_gp, side_gps, ep_gp, sh_gp).await; }); }
-                                        if let Some(pool) = db::pool_for(&asset_lc) { let side_gp = side_of(&pp.token_id); db::record_open_position(&pool, &sn, &pp.token_id.to_string(), &pp.market_name, side_gp, actual_paired_entry_price, pp.shares, true).await; }
+                                        if let Some(pool) = db::pool_for(&asset_lc) { let side_gp = side_of(&pp.token_id); db::record_open_position(&pool, &squadron_id, &sn, &pp.token_id.to_string(), &pp.market_name, side_gp, actual_paired_entry_price, pp.shares, true).await; }
                                     }
                                     last_trade_time.insert(sn.clone(), Instant::now());
                                 } else {
@@ -1525,10 +1539,11 @@ impl Squadron {
                                                 let db_side_a = side_of(&params.token_id); let db_ep_a = actual_entry_price; let db_sh_a = params.shares; let asset_a = asset_lc.clone(); let scope_a = scope.clone();
                                                 // Write pending position immediately (Viper Launch)
                                                 if let Some(pool) = db::pool_for(&asset_a) {
-                                                    db::record_open_position_with_status(&pool, &sn, &db_tid_a, &db_mn_a, db_side_a, db_ep_a, db_sh_a, false, "pending").await;
+                                                    db::record_open_position_with_status(&pool, &squadron_id, &sn, &db_tid_a, &db_mn_a, db_side_a, db_ep_a, db_sh_a, false, "pending").await;
                                                 }
+                                                let sq_bal = squadron_id.clone();
                                                 tokio::spawn(async move {
-                                                    if let Ok(true) = sync_position_balance(&cl_s, &ps_s, &sn_s, &tn_s, Some(&pc_s), primary_baseline, primary_wait_secs, &to_s, false).await {
+                                                    if let Ok(true) = sync_position_balance(&sq_bal, &cl_s, &ps_s, &sn_s, &tn_s, Some(&pc_s), primary_baseline, primary_wait_secs, &to_s, false).await {
                                                         // Update to confirmed (Mission In-Flight) + record entry
                                                         if let Some(pool) = db::pool_for(&asset_a) {
                                                             db::confirm_position_status(&pool, &db_sn_a, &db_tid_a).await;
@@ -1538,7 +1553,7 @@ impl Squadron {
                                                 });
 
                                         let pp_close_time = target_market_close_time;
-                                        positions.lock().await.insert((sn.clone(), pp_token_m.clone()), Position { shares: pp.shares, avg_entry: actual_pair_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp_token_m.clone(), fill_confirmed_at: None, paired_leg_token_id: Some(token_m.clone()), entry_fee: Decimal::ZERO });
+                                        positions.lock().await.insert(PositionKey::new(sq_key.clone(), sn.clone(), pp_token_m.clone()), Position { shares: pp.shares, avg_entry: actual_pair_entry_price, opened_at: Utc::now(), close_time: pp_close_time, market_name: pp.market_name.clone(), pair_token_id: pp_token_m.clone(), fill_confirmed_at: None, paired_leg_token_id: Some(token_m.clone()), entry_fee: Decimal::ZERO });
                                         // Claim paired token in registry.
                                         token_ownership.lock().await.insert(pp_token_m.clone(), sn.clone());
 
@@ -1548,10 +1563,11 @@ impl Squadron {
                                                 let db_side_b = side_of(&pp.token_id); let db_ep_b = actual_pair_entry_price; let db_sh_b = pp.shares; let asset_b = asset_lc.clone(); let scope_b = scope.clone();
                                                 // Write pending position immediately (Viper Launch)
                                                 if let Some(pool) = db::pool_for(&asset_b) {
-                                                    db::record_open_position_with_status(&pool, &sn, &db_tid_b, &db_mn_b, db_side_b, db_ep_b, db_sh_b, false, "pending").await;
+                                                    db::record_open_position_with_status(&pool, &squadron_id, &sn, &db_tid_b, &db_mn_b, db_side_b, db_ep_b, db_sh_b, false, "pending").await;
                                                 }
+                                                let sq_bal = squadron_id.clone();
                                                 tokio::spawn(async move {
-                                                    if let Ok(true) = sync_position_balance(&cl_p, &ps_p, &sn_p, &tn_p, Some(&pc_p), pair_baseline, pair_wait_secs, &to_p, false).await {
+                                                    if let Ok(true) = sync_position_balance(&sq_bal, &cl_p, &ps_p, &sn_p, &tn_p, Some(&pc_p), pair_baseline, pair_wait_secs, &to_p, false).await {
                                                         // Update to confirmed (Mission In-Flight) + record entry
                                                         if let Some(pool) = db::pool_for(&asset_b) {
                                                             db::confirm_position_status(&pool, &db_sn_b, &db_tid_b).await;
@@ -1578,8 +1594,10 @@ impl Squadron {
                                                     };
                                                     let arb_asset = asset_lc.clone();
                                                     let arb_tp = Arc::clone(&total_pnl);
+                                                    let sq_bal = squadron_id.clone();
                                                     tokio::spawn(async move {
                                                         crate::helpers::balance::arb_pair_fill_monitor(
+                                                            &sq_bal,
                                                             arb_cl, arb_nm, arb_sg, safe_address, eoa_address, vc, vc_p,
                                                             arb_ps, arb_pc, arb_to, arb_sn, &arb_tok_a, &arb_tok_b,
                                                             arb_base_a, arb_base_b, arb_side_a, arb_side_b, arb_wait, arb_http, arb_asset,
@@ -1671,7 +1689,7 @@ impl Squadron {
                                         let feat_snap_s = entry_snap.clone();
                                         // Write pending position immediately (Viper Launch)
                                         if let Some(pool) = db::pool_for(&asset_s) {
-                                            db::record_open_position_with_status(&pool, &sn, &db_tid_s, &db_mn_s, db_side_s, db_ep_s, db_sh_s, false, "pending").await;
+                                            db::record_open_position_with_status(&pool, &squadron_id, &sn, &db_tid_s, &db_mn_s, db_side_s, db_ep_s, db_sh_s, false, "pending").await;
                                             // Stamp what opening this leg cost. If the position
                                             // later leaves via settlement or an off-strategy
                                             // close, that booking happens in db.rs with no view
@@ -1679,8 +1697,9 @@ impl Squadron {
                                             // source for the entry fee.
                                             db::set_open_position_entry_fee(&pool, &db_tid_s, entry_fee_paid).await;
                                         }
+                                        let sq_bal = squadron_id.clone();
                                         tokio::spawn(async move {
-                                            if let Ok(true) = sync_position_balance(&cl_s, &ps_s, &sn_s, &tn_s, Some(&pc_s), primary_baseline, primary_wait_secs, &to_s, false).await {
+                                            if let Ok(true) = sync_position_balance(&sq_bal, &cl_s, &ps_s, &sn_s, &tn_s, Some(&pc_s), primary_baseline, primary_wait_secs, &to_s, false).await {
                                                 // Update to confirmed (Mission In-Flight) + record entry
                                                 if let Some(pool) = db::pool_for(&asset_s) {
                                                     db::confirm_position_status(&pool, &db_sn_s, &db_tid_s).await;
@@ -1700,7 +1719,7 @@ impl Squadron {
                                 let mut placed = false;
                                 for p in [yes, no].into_iter().flatten() {
                                     let p_token_m = p.token_id.clone(); // neutral key (slice 2a)
-                                    let pk = (sn.clone(), p_token_m.clone());
+                                    let pk = PositionKey::new(sq_key.clone(), sn.clone(), p_token_m.clone());
                                     { let pending = pending_orders.lock().await; if let Some(expiry) = pending.get(&pk) { if expiry > &Instant::now() { continue; } } }
                                     if ghosting {
                                         if positions.lock().await.contains_key(&pk) { continue; }
@@ -1713,7 +1732,7 @@ impl Squadron {
                                             positions.lock().await.insert(pk.clone(), Position { shares: p.shares, avg_entry: p.price, opened_at: Utc::now(), close_time: None, market_name: p.market_name.clone(), pair_token_id: p_token_m.clone(), fill_confirmed_at: None, paired_leg_token_id: None, entry_fee: Decimal::ZERO });
                                             token_ownership.lock().await.insert(p_token_m.clone(), sn.clone());
                                             { pending_orders.lock().await.insert(pk.clone(), Instant::now() + Duration::from_secs(3)); }
-                                            let _ = tokio::time::timeout(Duration::from_secs(10), crate::helpers::balance::quick_confirm_fill(&trading_client, &sn, &p.token_id, &positions, &p.condition_id, p.order_type.clone())).await;
+                                            let _ = tokio::time::timeout(Duration::from_secs(10), crate::helpers::balance::quick_confirm_fill(&squadron_id, &trading_client, &sn, &p.token_id, &positions, &p.condition_id, p.order_type.clone())).await;
                                             let vc = if p.is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
                                             if let Err(e) = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &p.token_id, Side::Buy, p.shares, p.price, target_yes_fee_bps as u16, p.order_type, true, 0, &shared_http).await {
                                                 positions.lock().await.remove(&pk);
@@ -1743,7 +1762,7 @@ impl Squadron {
                                             let feat_snap_m = ctx.maker_snapshot.clone().unwrap_or_else(|| ctx.snapshot.clone());
                                             // Write pending position immediately (Viper Launch)
                                             if let Some(pool) = db::pool_for(&asset_em) {
-                                                db::record_open_position_with_status(&pool, &sn, &tid_em, &mn_em, &side_em, ep_em, sh_em, false, "pending").await;
+                                                db::record_open_position_with_status(&pool, &squadron_id, &sn, &tid_em, &mn_em, &side_em, ep_em, sh_em, false, "pending").await;
                                             }
                                             // Claim this quote's epoch. Anything that pulls or
                                             // replaces the quote bumps it, which is how the task
@@ -1751,8 +1770,9 @@ impl Squadron {
                                             let epoch_map = Arc::clone(&quote_epochs);
                                             let my_epoch = bump_quote_epoch(&mut *epoch_map.lock().await, &pk);
                                             let epoch_key = pk.clone();
+                                            let sq_bal = squadron_id.clone();
                                             tokio::spawn(async move {
-                                                if let Ok(true) = sync_position_balance(&cl_m, &ps_m, &sn_m, &p.token_id, Some(&pc_m), dec!(0), crate::helpers::balance::MAX_WAIT_SECS_WINDOW, &to_m, true).await {
+                                                if let Ok(true) = sync_position_balance(&sq_bal, &cl_m, &ps_m, &sn_m, &p.token_id, Some(&pc_m), dec!(0), crate::helpers::balance::MAX_WAIT_SECS_WINDOW, &to_m, true).await {
                                                     // Shares exist — but are they THIS quote's? If the
                                                     // epoch moved, this quote was pulled or replaced and
                                                     // the fill belongs to whatever came after it.
@@ -1784,7 +1804,7 @@ impl Squadron {
                             // can't pick them off (the noon-ET adverse-selection losses).
                             StrategySignal::MakerCancel { tokens } => {
                                 for tok in tokens {
-                                    let pk = (sn.clone(), tok.clone());
+                                    let pk = PositionKey::new(sq_key.clone(), sn.clone(), tok.clone());
                                     // Never touch a CONFIRMED fill — only pull unfilled resting quotes.
                                     let is_unfilled = {
                                         let pos = positions.lock().await;
@@ -1880,7 +1900,7 @@ impl Squadron {
                             StrategySignal::MakerRestingExit { params, reason } => {
                                 if !resting_exit_enabled { continue; }
                                 let tok = params.token_id.clone();
-                                let pk = (sn.clone(), tok.clone());
+                                let pk = PositionKey::new(sq_key.clone(), sn.clone(), tok.clone());
 
                                 // The position must still be live and confirmed —
                                 // a stop may have closed it earlier in this very tick.
@@ -2015,7 +2035,7 @@ impl Squadron {
                     // ChainReconcile fallback (which books at "last mark") must
                     // never be the thing that closes one of these.
                     if !maker_resting_exits.is_empty() && !ghosting {
-                        let due: Vec<(String, MarketId)> = maker_resting_exits
+                        let due: Vec<PositionKey> = maker_resting_exits
                             .iter()
                             .filter(|(_, v)| v.last_poll.elapsed() >= Duration::from_secs(MAKER_RESTING_EXIT_POLL_SECS))
                             .map(|(k, _)| k.clone())
@@ -2042,7 +2062,7 @@ impl Squadron {
                             // is deliberately not a retry-with-sleep: the sweep runs on
                             // every 50ms tick and must never block the loop that
                             // evaluates stops.
-                            let held_now = onchain_balance_for_token(&trading_client, &pk.1).await;
+                            let held_now = onchain_balance_for_token(&trading_client, &pk.market).await;
                             let rec = match maker_resting_exits.get_mut(&pk) {
                                 Some(r) => {
                                     r.last_poll = Instant::now();
@@ -2071,19 +2091,19 @@ impl Squadron {
                             }
 
                             let pnl = (rec.price - rec.avg_entry) * filled;
-                            let side_label = if maker_market_config.as_ref().is_some_and(|m| m.yes_token == pk.1)
-                                || pk.1 == hourly_yes_token { "YES" } else { "NO" }.to_string();
+                            let side_label = if maker_market_config.as_ref().is_some_and(|m| m.yes_token == pk.market)
+                                || pk.market == hourly_yes_token { "YES" } else { "NO" }.to_string();
                             let fully_closed = held < config::MIN_ORDER_SHARES;
 
                             info!(
                                 "✅ Maker resting exit FILLED [{}]: {} | {:.4} shares lifted @ ${:.4} (entry ${:.4}) pnl=${:.4}{}",
-                                pk.0, rec.market_name, filled, rec.price, rec.avg_entry, pnl,
+                                pk.strategy, rec.market_name, filled, rec.price, rec.avg_entry, pnl,
                                 if fully_closed { "" } else { " (partial — remainder still resting)" },
                             );
 
                             *total_pnl.lock().await += pnl;
                             metrics::record_trade(
-                                &scope, Decimal::ZERO, pk.0.clone(), rec.market_name.clone(), side_label,
+                                &scope, Decimal::ZERO, pk.strategy.clone(), rec.market_name.clone(), side_label,
                                 rec.avg_entry, rec.price, filled, pnl,
                                 format!("Maker resting exit: lifted @ ${:.4} (spread captured, gain={:.2}%)",
                                         rec.price, (rec.price - rec.avg_entry) / rec.avg_entry * dec!(100)),
@@ -2091,12 +2111,12 @@ impl Squadron {
 
                             if fully_closed {
                                 positions.lock().await.remove(&pk);
-                                token_ownership.lock().await.remove(&pk.1);
+                                token_ownership.lock().await.remove(&pk.market);
                                 maker_resting_exits.remove(&pk);
                                 if let Some(pool) = db::pool_for(&asset_lc) {
-                                    db::close_open_position(&pool, &pk.0, pk.1.as_str()).await;
+                                    db::close_open_position(&pool, &pk.strategy, pk.market.as_str()).await;
                                 }
-                                last_trade_time.insert(pk.0.clone(), Instant::now());
+                                last_trade_time.insert(pk.strategy.clone(), Instant::now());
                             } else {
                                 // Partial lift: the rest of the order is still on the
                                 // book. Re-sync both the position and the record to the
@@ -2126,28 +2146,28 @@ impl Squadron {
         if !maker_resting_exits.is_empty() && !crate::helpers::dynamic_config::ghosting_now() {
             for (pk, rec) in maker_resting_exits.iter() {
                 let (_found, matched) =
-                    cancel_resting_orders_for_token(&trading_client, &pk.1).await;
+                    cancel_resting_orders_for_token(&trading_client, &pk.market).await;
                 if matched >= config::MIN_ORDER_SHARES {
                     // Lifted during tear-down: book it here at the resting price
                     // rather than leaving a silent cash move for the reconciler.
                     let pnl = (rec.price - rec.avg_entry) * matched;
                     *total_pnl.lock().await += pnl;
-                    let side_label = if maker_market_config.as_ref().is_some_and(|m| m.yes_token == pk.1)
-                        || pk.1 == hourly_yes_token { "YES" } else { "NO" }.to_string();
+                    let side_label = if maker_market_config.as_ref().is_some_and(|m| m.yes_token == pk.market)
+                        || pk.market == hourly_yes_token { "YES" } else { "NO" }.to_string();
                     info!("✅ Maker resting exit filled during stand-down [{}]: {:.4} shares @ ${:.4} pnl=${:.4}",
-                          pk.0, matched, rec.price, pnl);
+                          pk.strategy, matched, rec.price, pnl);
                     metrics::record_trade(
-                        &scope, Decimal::ZERO, pk.0.clone(), rec.market_name.clone(), side_label,
+                        &scope, Decimal::ZERO, pk.strategy.clone(), rec.market_name.clone(), side_label,
                         rec.avg_entry, rec.price, matched, pnl,
                         format!("Maker resting exit: lifted @ ${:.4} during stand-down", rec.price),
                     ).await;
                     positions.lock().await.remove(pk);
-                    token_ownership.lock().await.remove(&pk.1);
+                    token_ownership.lock().await.remove(&pk.market);
                     if let Some(pool) = db::pool_for(&asset_lc) {
-                        db::close_open_position(&pool, &pk.0, pk.1.as_str()).await;
+                        db::close_open_position(&pool, &pk.strategy, pk.market.as_str()).await;
                     }
                 } else {
-                    info!("🚫 Maker resting exit cancelled on stand-down [{}]: ask ${:.4} pulled from the book", pk.0, rec.price);
+                    info!("🚫 Maker resting exit cancelled on stand-down [{}]: ask ${:.4} pulled from the book", pk.strategy, rec.price);
                 }
             }
             maker_resting_exits.clear();
@@ -2269,8 +2289,12 @@ mod trade_accounting_tests {
 
     // ── Maker quote epochs ─────────────────────────────────────────────────
 
-    fn key() -> (String, MarketId) {
-        ("MakerStrategy".to_string(), MarketId::new("98160110645972743141257069093476801874133411306802274299633963514874310415390"))
+    fn key() -> PositionKey {
+        PositionKey::new(
+            "btc-hourly",
+            "MakerStrategy",
+            MarketId::new("98160110645972743141257069093476801874133411306802274299633963514874310415390"),
+        )
     }
 
     /// The production sequence behind duplicate entry rows 494 and 495
@@ -2312,7 +2336,7 @@ mod trade_accounting_tests {
     fn epochs_do_not_leak_across_tokens() {
         let mut epochs = QuoteEpochs::new();
         let yes = key();
-        let no = ("MakerStrategy".to_string(), MarketId::new("85421064502935751366375640444050801090202872554536397578825264135513707159160"));
+        let no = PositionKey::new("btc-hourly", "MakerStrategy", MarketId::new("85421064502935751366375640444050801090202872554536397578825264135513707159160"));
 
         let watch_yes = bump_quote_epoch(&mut epochs, &yes);
         let watch_no  = bump_quote_epoch(&mut epochs, &no);

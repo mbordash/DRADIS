@@ -1400,7 +1400,17 @@ async fn manual_exit(
     // ── Step 8: Remove from in-memory positions map ────────────────────────────
     {
         let mut pos_map = session.positions.lock().await;
-        pos_map.remove(&(req.strategy.clone(), crate::venues::intl::market_id_from_u256(token_id)));
+        // The operator names a strategy and a token, not a squadron, so remove
+        // every squadron's entry for that pair. On this venue there is one
+        // squadron per asset, which makes it exactly the previous behaviour;
+        // once several squadrons can hold the same token, a manual RTB from
+        // this endpoint should carry the squadron so it targets just one.
+        let market = crate::venues::intl::market_id_from_u256(token_id);
+        let before = pos_map.len();
+        pos_map.retain(|k, _| !(k.strategy == req.strategy && k.market == market));
+        if before - pos_map.len() > 1 {
+            warn!("RTB: removed {} squadrons' entries for {}/{}", before - pos_map.len(), req.strategy, market);
+        }
     }
 
     info!("✅ RTB: Manual exit complete — order_id={}", order_id);
@@ -2913,6 +2923,16 @@ struct DeploySquadronRequest {
     /// Applied to the squadron's `DynamicConfig` `*_max_exposure_usdc` fields at spawn.
     #[serde(default)]
     viper_budgets: std::collections::HashMap<String, f64>,
+    /// Operator-chosen name, used to tell two squadrons of the same class apart
+    /// in the Control Tower and to give each its own config and positions.
+    ///
+    /// Squadron ids are deliberately stable across restarts and market
+    /// rotations — they are the persistence key for a squadron's config, and a
+    /// generated id would orphan an operator's tuning on every restart. A name
+    /// is stable in the same way while still being unique, which a derived
+    /// `{asset}-{cadence}` id is not.
+    #[serde(default)]
+    name: Option<String>,
 }
 
 /// Response for POST /api/squadrons/deploy.
@@ -3004,25 +3024,45 @@ async fn deploy_squadron(
             // "crypto" deploy also matches boot-time BTC/ETH squadrons.
             enrich_taxonomy(sq).await;
         }
+        // One squadron per MARKET, not per class. Two squadrons of a class are
+        // now safe — positions, config and budgets are all keyed by squadron —
+        // so the only thing left to prevent is two squadrons quoting the same
+        // book against each other, which is self-competition rather than
+        // diversification. A named second squadron on a different market is
+        // exactly the case this used to refuse.
+        let target_market = req.market_id.clone().unwrap_or_default();
         let dup_active = summaries.iter().any(|sq| {
-            (sq.asset.eq_ignore_ascii_case(&req.market_type)
-                || sq.market_class.eq_ignore_ascii_case(&req.market_type))
+            !target_market.is_empty()
+                && sq.market_name == target_market
                 && sq.state != "STOOD_DOWN"
         });
-        let dup_queued = crate::helpers::db::fetch_pending_deployments().await
-            .iter()
-            .any(|d| d.market_type.eq_ignore_ascii_case(&req.market_type));
+        let dup_queued = !target_market.is_empty()
+            && crate::helpers::db::fetch_pending_deployments().await
+                .iter()
+                .any(|d| d.market_id == target_market);
         if dup_active || dup_queued {
             return Json(DeploySquadronResponse {
                 success: false,
                 squadron_id: None,
                 error: Some(format!(
-                    "A {} squadron is already {} — stand it down before deploying another. \
-                     (One squadron per market class; run a second DRADIS instance for side-by-side experiments.)",
-                    req.market_type,
-                    if dup_active { "active" } else { "queued for deployment" },
+                    "A squadron is already {} on that market — two squadrons quoting the same book \
+                     compete with each other rather than diversifying. Pick a different market, or \
+                     stand the existing squadron down first.",
+                    if dup_active { "active" } else { "queued" },
                 )),
             }).into_response();
+        }
+
+        // A name is what tells two squadrons of one class apart, so a second one
+        // must carry a distinct one rather than silently colliding.
+        if let Some(name) = req.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+            if summaries.iter().any(|sq| sq.name.eq_ignore_ascii_case(name) && sq.state != "STOOD_DOWN") {
+                return Json(DeploySquadronResponse {
+                    success: false,
+                    squadron_id: None,
+                    error: Some(format!("A squadron named \"{name}\" is already running — choose another name.")),
+                }).into_response();
+            }
         }
     }
 
@@ -3092,6 +3132,7 @@ async fn deploy_squadron(
     // Queue the deployment request for the CAG to process
     // NOTE: Full Admiral Adama extension will spawn actual squadron tasks.
     // For now, we record the intent and return success.
+    let squadron_name = req.name.as_deref().map(str::trim).unwrap_or("");
     let deployment_id = format!("deploy-{}-{}", req.market_type, chrono::Utc::now().timestamp());
     
     info!(
@@ -3103,7 +3144,7 @@ async fn deploy_squadron(
     );
     
     // Store deployment request in the database for CAG to pick up
-    if let Err(e) = crate::helpers::db::queue_deployment(&deployment_id, &market_id, &req.market_type, &raptors, &vipers, &req.viper_budgets).await {
+    if let Err(e) = crate::helpers::db::queue_deployment(&deployment_id, &market_id, &req.market_type, squadron_name, &raptors, &vipers, &req.viper_budgets).await {
         error!("Failed to queue deployment: {}", e);
         return Json(DeploySquadronResponse {
             success: false,

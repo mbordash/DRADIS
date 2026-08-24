@@ -473,6 +473,25 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
     // current_price: live mark-to-market price from Polymarket Data API, updated on every
     // chain-sync cycle.  NULL until first chain sync.  Used by calculate_positions_value()
     // and /api/portfolio to price positions at current market value instead of entry price.
+    // squadron_id: which squadron owns the position. Added so two squadrons of
+    // the same class can trade the same market without addressing each other's
+    // rows — the in-memory PositionKey carries it for the same reason.
+    //
+    // Existing rows default to '' rather than being guessed at. A blank squadron
+    // reads as "written before squadrons were distinguished", which the dedupe
+    // below treats as matching any squadron, so an upgrade cannot resurrect a
+    // position that is already open.
+    let _ = sqlx::query(
+        "ALTER TABLE open_positions ADD COLUMN squadron_id TEXT NOT NULL DEFAULT ''"
+    ).execute(pool).await;
+
+    // Operator-chosen squadron name, so a second squadron of a class can be
+    // told apart from the first. Blank for every deployment made before naming
+    // existed, which keeps their squadron ids exactly as they were.
+    let _ = sqlx::query(
+        "ALTER TABLE deployment_queue ADD COLUMN name TEXT NOT NULL DEFAULT ''"
+    ).execute(pool).await;
+
     let _ = sqlx::query(
         "ALTER TABLE open_positions ADD COLUMN current_price TEXT"
     ).execute(pool).await;
@@ -1723,6 +1742,8 @@ pub async fn queue_deployment(
     deployment_id: &str,
     market_id: &str,
     market_type: &str,
+    // Operator-chosen name; "" when they did not supply one.
+    name: &str,
     raptors: &[String],
     vipers: &[String],
     viper_budgets: &std::collections::HashMap<String, f64>,
@@ -1740,8 +1761,8 @@ pub async fn queue_deployment(
     };
     
     sqlx::query(
-        "INSERT INTO deployment_queue (id, market_id, market_type, raptors, vipers, viper_budgets, status)
-         VALUES (?, ?, ?, ?, ?, ?, 'pending')"
+        "INSERT INTO deployment_queue (id, market_id, market_type, raptors, vipers, viper_budgets, status, name)
+         VALUES (?, ?, ?, ?, ?, ?, 'pending', ?)"
     )
     .bind(deployment_id)
     .bind(market_id)
@@ -1749,6 +1770,7 @@ pub async fn queue_deployment(
     .bind(&raptors_json)
     .bind(&vipers_json)
     .bind(&budgets_json)
+    .bind(name)
     .execute(pool).await?;
     
     info!(deployment_id, market_id, market_type, "📋 Deployment request queued");
@@ -1765,6 +1787,8 @@ pub struct PendingDeployment {
     pub vipers: Vec<String>,
     /// Per-viper capital budgets (viper kind → max-exposure USDC) set at deploy time.
     pub viper_budgets: std::collections::HashMap<String, f64>,
+    /// Operator-chosen name; empty when they did not supply one.
+    pub name: String,
 }
 
 /// Return interrupted deployments to the queue so they are picked up again.
@@ -1835,7 +1859,7 @@ pub async fn fetch_pending_deployments() -> Vec<PendingDeployment> {
     };
     
     sqlx::query(
-        "SELECT id, market_id, market_type, raptors, vipers, viper_budgets FROM deployment_queue
+        "SELECT id, market_id, market_type, raptors, vipers, viper_budgets, name FROM deployment_queue
          WHERE status = 'pending' ORDER BY created_at ASC LIMIT 10"
     )
     .fetch_all(pool).await.ok()
@@ -1851,7 +1875,8 @@ pub async fn fetch_pending_deployments() -> Vec<PendingDeployment> {
         let viper_budgets = budgets_json
             .and_then(|j| serde_json::from_str(&j).ok())
             .unwrap_or_default();
-        Some(PendingDeployment { id, market_id, market_type, raptors, vipers, viper_budgets })
+        let name = r.try_get::<String, _>(6).unwrap_or_default();
+        Some(PendingDeployment { id, market_id, market_type, raptors, vipers, viper_budgets, name })
     }).collect())
     .unwrap_or_default()
 }
@@ -2231,6 +2256,8 @@ pub async fn get_open_position_entry_fee(pool: &SqlitePool, token_id: &str) -> O
 
 pub async fn record_open_position(
     pool: &SqlitePool,
+    // Squadron that owns the position; '' for callers that predate squadrons.
+    squadron_id: &str,
     strategy: &str,
     token_id: &str,
     market: &str,
@@ -2239,7 +2266,7 @@ pub async fn record_open_position(
     shares: Decimal,
     ghost_mode: bool,
 ) {
-    record_open_position_with_status(pool, strategy, token_id, market, side, entry_price, shares, ghost_mode, "confirmed").await;
+    record_open_position_with_status(pool, squadron_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, "confirmed").await;
 }
 
 /// Record an open position with explicit status.
@@ -2247,6 +2274,8 @@ pub async fn record_open_position(
 ///         "confirmed" = Mission In-Flight (on-chain confirmed)
 pub async fn record_open_position_with_status(
     pool: &SqlitePool,
+    // Squadron that owns the position; '' for callers that predate squadrons.
+    squadron_id: &str,
     strategy: &str,
     token_id: &str,
     market: &str,
@@ -2266,9 +2295,13 @@ pub async fn record_open_position_with_status(
     // we skip the insert — chain-sync will keep the shares count accurate via UPDATE.
     match sqlx::query(
         "INSERT INTO open_positions
-         (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, status)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
-         WHERE NOT EXISTS (SELECT 1 FROM open_positions WHERE token_id = ? AND strategy = ?)"
+         (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, status, squadron_id)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+         WHERE NOT EXISTS (
+             SELECT 1 FROM open_positions
+             WHERE token_id = ? AND strategy = ?
+               AND (squadron_id = ? OR squadron_id = '')
+         )"
     )
     .bind(&ts)
     .bind(sid)
@@ -2280,8 +2313,10 @@ pub async fn record_open_position_with_status(
     .bind(shares.to_string())
     .bind(ghost_mode as i32)
     .bind(status)
+    .bind(squadron_id)
     .bind(token_id)
     .bind(strategy)
+    .bind(squadron_id)
     .execute(pool)
     .await {
         Ok(_)  => {}
@@ -3702,7 +3737,7 @@ mod reconcile_tests {
         let entry_fee = dec_of("0.0399"); // 0.07 · p · (1−p) · shares
         let gross = (Decimal::ONE - entry) * shares;
 
-        record_open_position(&pool, "FairValueStrategy", "tok-356",
+        record_open_position(&pool, "test-squadron", "FairValueStrategy", "tok-356",
             "Bitcoin Up or Down - August 13, 2PM ET", "YES", entry, shares, false).await;
         set_open_position_entry_fee(&pool, "tok-356", entry_fee).await;
 
@@ -3730,7 +3765,7 @@ mod reconcile_tests {
         let filled = dec_of("3.04");
         let fee_at_request = dec_of("0.07") * dec_of("0.75") * dec_of("0.25") * requested;
 
-        record_open_position(&pool, "FairValueStrategy", "tok-sync", "mkt", "YES",
+        record_open_position(&pool, "test-squadron", "FairValueStrategy", "tok-sync", "mkt", "YES",
             dec_of("0.75"), requested, false).await;
         set_open_position_entry_fee(&pool, "tok-sync", fee_at_request).await;
 
@@ -4443,5 +4478,111 @@ mod auto_deploy_dedupe_tests {
         let pool = queue_pool().await;
         row(&pool, "d1", "Politics", "pending").await;
         assert_eq!(deployment_classes_in_flight(&pool).await, vec!["politics"]);
+    }
+}
+
+#[cfg(test)]
+mod squadron_column_migration_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    /// A database written before positions carried a squadron must gain the
+    /// column and keep its rows. Losing them would strand real open positions:
+    /// the engine would stop tracking a holding that still exists on-chain.
+    #[tokio::test]
+    async fn legacy_open_positions_survive_the_squadron_column() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        // Pre-migration shape: no squadron_id.
+        sqlx::query(
+            "CREATE TABLE open_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, session_id TEXT NOT NULL,
+                strategy TEXT NOT NULL, token_id TEXT NOT NULL, market TEXT NOT NULL,
+                side TEXT NOT NULL, entry_price TEXT NOT NULL, shares TEXT NOT NULL,
+                ghost_mode INTEGER NOT NULL DEFAULT 0, chain_adopted INTEGER NOT NULL DEFAULT 0)"
+        ).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO open_positions (ts, session_id, strategy, token_id, market, side, entry_price, shares)
+             VALUES ('2026-08-23T00:00:00Z','s1','MakerStrategy','tok-1','BTC','YES','0.42','10')"
+        ).execute(&pool).await.unwrap();
+
+        init_schema(&pool).await.unwrap();
+        run_migrations(&pool).await;
+
+        let (squadron, shares): (String, String) = sqlx::query_as(
+            "SELECT squadron_id, shares FROM open_positions WHERE token_id = 'tok-1'"
+        ).fetch_one(&pool).await.unwrap();
+
+        assert_eq!(shares, "10", "the legacy position was lost in migration");
+        assert_eq!(squadron, "", "a legacy row must not be assigned to a guessed squadron");
+    }
+
+    /// A blank squadron means "written before squadrons were distinguished", so
+    /// the insert guard treats it as matching. Otherwise the first write after
+    /// an upgrade would add a SECOND row for a position already open, and the
+    /// engine would double-count a holding it has not actually doubled.
+    #[tokio::test]
+    async fn a_legacy_row_still_blocks_a_duplicate_insert() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        init_schema(&pool).await.unwrap();
+        run_migrations(&pool).await;
+        sqlx::query(
+            "INSERT INTO open_positions (ts, session_id, strategy, token_id, market, side, entry_price, shares, squadron_id)
+             VALUES ('2026-08-23T00:00:00Z','s1','MakerStrategy','tok-1','BTC','YES','0.42','10','')"
+        ).execute(&pool).await.unwrap();
+
+        record_open_position(&pool, "btc-open", "MakerStrategy", "tok-1", "BTC", "YES", dec!(0.42), dec!(10), false).await;
+
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE token_id = 'tok-1'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1, "a legacy row was duplicated instead of matched");
+    }
+
+    /// Two squadrons holding the same token each get their own row — the
+    /// persistence half of what PositionKey does in memory.
+    #[tokio::test]
+    async fn two_squadrons_each_get_a_row_for_the_same_token() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        init_schema(&pool).await.unwrap();
+        run_migrations(&pool).await;
+
+        record_open_position(&pool, "btc-open", "MakerStrategy", "tok-1", "BTC", "YES", dec!(0.42), dec!(10), false).await;
+        record_open_position(&pool, "btc-15m",  "MakerStrategy", "tok-1", "BTC", "YES", dec!(0.44), dec!(25), false).await;
+
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE token_id = 'tok-1'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 2, "the second squadron's position was suppressed as a duplicate");
+    }
+
+    /// The same squadron topping up must NOT create a second row — the
+    /// behaviour the original dedupe existed for, which the squadron column
+    /// must not weaken.
+    #[tokio::test]
+    async fn one_squadron_topping_up_does_not_duplicate() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        init_schema(&pool).await.unwrap();
+        run_migrations(&pool).await;
+
+        record_open_position(&pool, "btc-open", "MakerStrategy", "tok-1", "BTC", "YES", dec!(0.42), dec!(10), false).await;
+        record_open_position(&pool, "btc-open", "MakerStrategy", "tok-1", "BTC", "YES", dec!(0.43), dec!(15), false).await;
+
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE token_id = 'tok-1'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1);
     }
 }

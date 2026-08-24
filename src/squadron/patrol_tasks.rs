@@ -460,6 +460,9 @@ pub fn spawn_status_task(
 /// 45 s cleanup timeout so order latency doesn't count against the cap.
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_cleanup_task(
+    // Squadron these positions belong to; recorded with each row so a restart
+    // restores them to the squadron that opened them.
+    squadron_id:          String,
     positions:            Arc<Mutex<crate::state::PositionMap>>,
     trading_client:       Arc<ClobClient<Authenticated<Normal>>>,
     nonce_manager:        Arc<AtomicU64>,
@@ -470,7 +473,7 @@ pub fn spawn_cleanup_task(
     phantom_cooldowns:    PhantomCooldowns,
     orphan_tombstones:    OrphanTombstones,
     time_decay_positions: Arc<Mutex<std::collections::HashMap<crate::venues::core::MarketId, crate::vipers::time_decay_impl::TimeDecayPosition>>>,
-    pending_orders:       Arc<Mutex<std::collections::HashMap<(String, crate::venues::core::MarketId), Instant>>>,
+    pending_orders:       Arc<Mutex<std::collections::HashMap<crate::state::PositionKey, Instant>>>,
     yes_price_rx:         watch::Receiver<PriceState>,
     no_price_rx:          watch::Receiver<PriceState>,
     maker_yes_price_rx:   Option<watch::Receiver<PriceState>>,
@@ -678,6 +681,7 @@ pub fn spawn_cleanup_task(
                                                                 || maker_market_config.as_ref().map_or(false, |mkc| mkc.yes_token == paired_id)
                                                             { "YES" } else { "NO" };
 
+                                                            let rh_squadron = squadron_id.clone();
                                                             let rh_tid = paired_id.to_string();
                                                             let rh_mkt = rh_market.clone();
                                                             let rh_sd  = rh_side.to_string();
@@ -694,7 +698,7 @@ pub fn spawn_cleanup_task(
                                                             // Write pending position immediately (Viper Launch)
                                                             if let Some(pool) = db::pool_for(&rh_asset) {
                                                                 db::record_open_position_with_status(
-                                                                    &pool, "ArbitrageStrategy",
+                                                                    &pool, &rh_squadron, "ArbitrageStrategy",
                                                                     &rh_tid, &rh_mkt, &rh_sd,
                                                                     rh_ep, rh_sh, false, "pending",
                                                                 ).await;

@@ -246,6 +246,28 @@ pub struct Squadron {
     ws_cancel: CancellationToken,
 }
 
+/// Reduce an operator-chosen name to something safe to embed in an id.
+///
+/// The id ends up in log lines, API paths and a database key, so it is kept to
+/// lowercase alphanumerics and single dashes rather than trusting free text.
+fn slugify(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    let mut last_dash = true; // leading dashes are dropped
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() {
+            out.push(ch.to_ascii_lowercase());
+            last_dash = false;
+        } else if !last_dash {
+            out.push('-');
+            last_dash = true;
+        }
+    }
+    while out.ends_with('-') { out.pop(); }
+    out.truncate(32);
+    while out.ends_with('-') { out.pop(); }
+    out
+}
+
 impl Squadron {
     /// Construct a new squadron descriptor at deployment time.
     pub fn new(
@@ -265,6 +287,25 @@ impl Squadron {
         raptors: SquadronRaptors,
         venue_category: Option<String>,
     ) -> Self {
+        Self::new_named(asset, config, market, raptors, venue_category, None)
+    }
+
+    /// Like [`Self::new_with_category`] but with an operator-chosen name that
+    /// distinguishes this squadron from others of the same class.
+    ///
+    /// The name is folded into the id rather than replacing the asset, so
+    /// classification, DB-pool aliasing and taxonomy lookups keep seeing the
+    /// class they always did. What changes is the identity: the id is the
+    /// persistence key for operator config and part of every `PositionKey`, so
+    /// naming a squadron is what gives it its own config, budgets and positions.
+    pub fn new_named(
+        asset:   CryptoAsset,
+        config:  SquadronConfig,
+        market:  MarketConfig,
+        raptors: SquadronRaptors,
+        venue_category: Option<String>,
+        name: Option<&str>,
+    ) -> Self {
         let deployed_at = Utc::now();
         // Stable identity: `{asset}-{cadence}` — deliberately WITHOUT a timestamp.
         //
@@ -275,11 +316,15 @@ impl Squadron {
         // operator edits (e.g. a disabled viper re-enabling itself on restart).
         // `deployed_at` is retained as its own field for sorting/display, so we
         // lose no information by keeping the id stable across deployments.
-        let id = format!(
-            "{}-{}",
-            asset.slug(),
-            if market.market_close_time.is_some() { "hourly" } else { "open" },
-        );
+        let cadence = if market.market_close_time.is_some() { "hourly" } else { "open" };
+        // A named squadron takes `{asset}-{cadence}-{name}`, so a second one of
+        // the same class no longer collides with the first. Unnamed squadrons
+        // keep exactly the id they had, which matters: that id is the key their
+        // persisted config is already stored under.
+        let id = match name.map(slugify).filter(|s| !s.is_empty()) {
+            Some(slug) => format!("{}-{}-{}", asset.slug(), cadence, slug),
+            None => format!("{}-{}", asset.slug(), cadence),
+        };
         Self {
             id,
             asset,
@@ -532,4 +577,47 @@ fn spawn_ws_task(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod squadron_naming_tests {
+    use super::slugify;
+
+    /// An unnamed squadron must keep the id it already had. That id is the key
+    /// its persisted operator config is stored under, so changing its shape
+    /// would orphan every existing squadron's tuning on upgrade.
+    #[test]
+    fn an_empty_name_slugs_to_nothing() {
+        assert_eq!(slugify(""), "");
+        assert_eq!(slugify("   "), "");
+        assert_eq!(slugify("!!!"), "");
+    }
+
+    /// The id reaches log lines, an API path and a database key, so free text
+    /// is reduced to something safe rather than trusted.
+    #[test]
+    fn names_are_reduced_to_safe_slugs() {
+        assert_eq!(slugify("Fast Scalper"), "fast-scalper");
+        assert_eq!(slugify("15m  BTC"), "15m-btc");
+        assert_eq!(slugify("  leading/trailing  "), "leading-trailing");
+        assert_eq!(slugify("../../etc/passwd"), "etc-passwd");
+    }
+
+    /// Two different names must not collapse to one slug, or two squadrons
+    /// would silently share a config row and a position namespace again.
+    #[test]
+    fn distinct_names_stay_distinct() {
+        assert_ne!(slugify("scalper one"), slugify("scalper two"));
+    }
+
+    /// Long names are truncated, and truncation must not leave a trailing dash
+    /// that makes the id look malformed.
+    #[test]
+    fn long_names_truncate_cleanly() {
+        let s = slugify(&"a".repeat(80));
+        assert_eq!(s.len(), 32);
+        assert!(!s.ends_with('-'));
+        let s2 = slugify(&format!("{} x", "b".repeat(31)));
+        assert!(!s2.ends_with('-'), "truncation left a trailing dash: {s2:?}");
+    }
 }

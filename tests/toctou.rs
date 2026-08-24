@@ -14,7 +14,7 @@ use chrono::Utc;
 use rust_decimal_macros::dec;
 use tokio::sync::Mutex;
 
-use dradis::state::{Position, PositionMap};
+use dradis::state::{Position, PositionMap, PositionKey};
 use dradis::venues::core::MarketId;
 
 // ── Helpers ──────────────────────────────────────────────────────────────
@@ -38,8 +38,8 @@ fn make_position(token_id: &str) -> Position {
 const TOKEN: &str = "42";
 const STRATEGY: &str = "TestStrategy";
 
-fn key(token_id: &str) -> (String, MarketId) {
-    (STRATEGY.to_string(), MarketId::new(token_id))
+fn key(token_id: &str) -> PositionKey {
+    PositionKey::new("test-squadron", STRATEGY, MarketId::new(token_id))
 }
 
 async fn entry_fixed(

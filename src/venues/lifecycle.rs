@@ -47,7 +47,7 @@ use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{info, warn};
 
-use crate::state::PositionMap;
+use crate::state::{PositionKey, PositionMap};
 use crate::venues::core::{
     Execution, Fill, MarketId, OrderId, OrderIntent, Side, TimeInForce,
 };
@@ -137,12 +137,18 @@ struct TrackedLeg {
 /// Shared, venue-neutral order lifecycle engine.
 pub struct OrderLifecycle {
     cfg: LifecycleConfig,
+    /// Squadron whose positions this engine reconciles. See `new`.
+    squadron_id: String,
     tracked: Mutex<Vec<TrackedLeg>>,
 }
 
 impl OrderLifecycle {
-    pub fn new(cfg: LifecycleConfig) -> Self {
-        Self { cfg, tracked: Mutex::new(Vec::new()) }
+    /// `squadron_id` identifies the squadron this engine reconciles for. It is
+    /// part of every `PositionKey` the engine touches, so that confirming or
+    /// clearing a guard reaches the position belonging to THIS squadron rather
+    /// than another squadron's position on the same token.
+    pub fn new(cfg: LifecycleConfig, squadron_id: impl Into<String>) -> Self {
+        Self { cfg, squadron_id: squadron_id.into(), tracked: Mutex::new(Vec::new()) }
     }
 
     /// Register a freshly placed order so the reconciler manages its lifecycle.
@@ -207,7 +213,7 @@ impl OrderLifecycle {
         for ord in snapshot {
             let filled = held.get(ord.market.as_str()).copied().unwrap_or(Decimal::ZERO) > Decimal::ZERO;
             if filled {
-                confirm_guard(positions, &ord.strategy, &ord.market).await;
+                confirm_guard(positions, &self.squadron_id, &ord.strategy, &ord.market).await;
                 continue; // resting done — drop from tracking
             }
             if ord.placed_at.elapsed().as_secs() >= self.cfg.stale_order_secs {
@@ -215,7 +221,7 @@ impl OrderLifecycle {
                     Ok(_)  => info!(" [{}] cancelled stale resting order {} ({})", ord.strategy, ord.id, ord.market),
                     Err(e) => warn!("[{}] stale cancel failed for {} ({}): {e}", ord.strategy, ord.id, ord.market),
                 }
-                clear_guard(positions, &ord.strategy, &ord.market).await;
+                clear_guard(positions, &self.squadron_id, &ord.strategy, &ord.market).await;
                 continue;
             }
             keep.push(ord);
@@ -233,7 +239,9 @@ impl OrderLifecycle {
         let orphans: Vec<(String, MarketId, Decimal, String, Decimal, MarketId)> = {
             let map = positions.lock().await;
             map.iter()
-                .filter_map(|((s, t), p)| {
+                .filter_map(|(k, p)| {
+                    if k.squadron != self.squadron_id { return None; }
+                    let (s, t) = (&k.strategy, &k.market);
                     let partner = p.paired_leg_token_id.as_ref()?;
                     let i_held          = held.get(t.as_str()).copied().unwrap_or_default() > Decimal::ZERO;
                     let partner_held    = held.get(partner.as_str()).copied().unwrap_or_default() > Decimal::ZERO;
@@ -281,7 +289,7 @@ impl OrderLifecycle {
                             // strategy can't double-enter; already venue-held,
                             // so mark it fill-confirmed.
                             positions.lock().await.insert(
-                                (strategy.clone(), partner.clone()),
+                                PositionKey::new(&self.squadron_id, strategy.clone(), partner.clone()),
                                 crate::state::Position {
                                     shares: f.filled,
                                     avg_entry: entry,
@@ -342,7 +350,7 @@ impl OrderLifecycle {
                 Err(e) => warn!("[{strategy}] flatten of {token} failed: {e} — will retry next reconcile"),
             }
             // Clear the guard so we don't re-flatten before the sell settles.
-            clear_guard(positions, &strategy, &token).await;
+            clear_guard(positions, &self.squadron_id, &strategy, &token).await;
         }
         flattened
     }
@@ -395,8 +403,8 @@ impl OrderLifecycle {
     async fn confirm_on_fill(&self, positions: &Arc<Mutex<PositionMap>>, market: &MarketId) {
         {
             let mut map = positions.lock().await;
-            for ((_, t), p) in map.iter_mut() {
-                if t == market && p.fill_confirmed_at.is_none() {
+            for (k, p) in map.iter_mut() {
+                if k.squadron == self.squadron_id && &k.market == market && p.fill_confirmed_at.is_none() {
                     p.fill_confirmed_at = Some(Utc::now());
                 }
             }
@@ -406,8 +414,8 @@ impl OrderLifecycle {
 }
 
 /// Mark a strategy's position guard fill-confirmed (idempotent).
-async fn confirm_guard(positions: &Arc<Mutex<PositionMap>>, strategy: &str, token: &MarketId) {
-    if let Some(p) = positions.lock().await.get_mut(&(strategy.to_string(), token.clone())) {
+async fn confirm_guard(positions: &Arc<Mutex<PositionMap>>, squadron: &str, strategy: &str, token: &MarketId) {
+    if let Some(p) = positions.lock().await.get_mut(&PositionKey::new(squadron, strategy, token.clone())) {
         if p.fill_confirmed_at.is_none() {
             p.fill_confirmed_at = Some(Utc::now());
             info!("✅ [{strategy}] fill confirmed: {token}");
@@ -416,8 +424,8 @@ async fn confirm_guard(positions: &Arc<Mutex<PositionMap>>, strategy: &str, toke
 }
 
 /// Drop a strategy's position guard for a token (so the viper may re-enter).
-async fn clear_guard(positions: &Arc<Mutex<PositionMap>>, strategy: &str, token: &MarketId) {
-    positions.lock().await.remove(&(strategy.to_string(), token.clone()));
+async fn clear_guard(positions: &Arc<Mutex<PositionMap>>, squadron: &str, strategy: &str, token: &MarketId) {
+    positions.lock().await.remove(&PositionKey::new(squadron, strategy, token.clone()));
 }
 
 /// Naked-leg re-hedge economics (mirrors intl's ARB ARBITER, `balance.rs`).

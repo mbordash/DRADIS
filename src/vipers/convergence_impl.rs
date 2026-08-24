@@ -403,8 +403,9 @@ impl Strategy for ConvergenceStrategyImpl {
         {
             let pos_map = ctx.positions.lock().await;
             let mut exposure = Decimal::ZERO;
-            for ((sname, tok), pos) in pos_map.iter() {
-                if sname != STRATEGY_NAME { continue; }
+            for (key, pos) in pos_map.iter() {
+                let (sname, tok) = (&key.strategy, &key.market);
+                if sname != STRATEGY_NAME || key.squadron != ctx.squadron_id { continue; }
                 exposure += pos.shares * pos.avg_entry;
                 // Don't stack a second position on either leg of this market.
                 if tok == &market.yes_token || tok == &market.no_token {
@@ -522,7 +523,9 @@ impl Strategy for ConvergenceStrategyImpl {
             let pos_map = ctx.positions.lock().await;
             let mut found: Option<PendingExit> = None;
 
-            'outer: for ((sname, token_id), position) in pos_map.iter() {
+            'outer: for (key, position) in pos_map.iter() {
+                if key.squadron != ctx.squadron_id { continue; }
+                let (sname, token_id) = (&key.strategy, &key.market);
                 if sname != STRATEGY_NAME { continue; }
 
                 let is_yes = token_id == &market.yes_token;

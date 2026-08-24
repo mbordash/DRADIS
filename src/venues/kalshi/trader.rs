@@ -61,8 +61,7 @@ use crate::raptors::tide::TideSnapshot;
 use crate::squadron::{CryptoAsset, Squadron, SquadronConfig, SquadronRaptors, SquadronState};
 use crate::state::{
     MarketConfig, MarketPhase, MarketSnapshot, OrderParams, Position, PositionMap, PriceState,
-    StrategySignal, TradeScope,
-};
+    StrategySignal, TradeScope, PositionKey};
 use crate::venues::core::{Execution, Fill, MarketId, OrderId, OrderIntent, Side};
 use crate::venues::lifecycle::{LifecycleConfig, OrderLifecycle};
 
@@ -463,6 +462,7 @@ pub async fn run_kalshi_trader(
             selection,
             MarketMandate::Rotating,
             None,
+            None,
             &sports_rx,
             &tennis_rx,
         ).await;
@@ -616,6 +616,7 @@ pub async fn run_deployment_processor(
             let cancel_t = cancel.child_token();
             let dep_id = dep.id.clone();
             let class = dep.market_type.clone();
+            let dep_name = Some(dep.name.clone()).filter(|n| !n.is_empty());
 
             tokio::spawn(async move {
                 let outcome = trade_one_market(
@@ -631,6 +632,7 @@ pub async fn run_deployment_processor(
                     MarketSelection { primary: pair, maker: None },
                     MarketMandate::Pinned,
                     Some(&class),
+                    dep_name.as_deref(),
                     &sports_t,
                     &tennis_t,
                 ).await;
@@ -712,7 +714,7 @@ async fn seed_auto_deployments(venue: &Arc<KalshiVenue>, cag: &Cag) {
         let vipers  = db::vipers_for_class(pool, class).await;
 
         let id = format!("autodeploy-{class}-{}", Utc::now().timestamp());
-        match db::queue_deployment(&id, &market_id, class, &raptors, &vipers, &Default::default()).await {
+        match db::queue_deployment(&id, &market_id, class, "", &raptors, &vipers, &Default::default()).await {
             Ok(()) => info!("📋 Auto-deploying {class} squadron on [{market_id}]"),
             Err(e) => warn!("📋 Auto-deploy of {class} failed to queue: {e}"),
         }
@@ -860,6 +862,9 @@ async fn trade_one_market(
     // ("politics", "sports"), used to name its squadron. None for the rotation
     // loop, which names the squadron after the crypto underlying.
     deployed_as: Option<&str>,
+    // Operator-chosen name; folded into the squadron id so a second squadron of
+    // this class gets its own config, budgets and positions.
+    squadron_name: Option<&str>,
     sports_rx: &watch::Receiver<SportsSnapshot>,
     tennis_rx: &watch::Receiver<TennisSnapshot>,
 ) -> MarketOutcome {
@@ -884,7 +889,7 @@ async fn trade_one_market(
     };
 
     // ── Register the squadron so the Control Tower lists it ─────────────────
-    let squadron = register_kalshi_squadron(cag, &pair, &raptors, deployed_as, sports_rx, tennis_rx, cancel);
+    let squadron = register_kalshi_squadron(cag, &pair, &raptors, deployed_as, squadron_name, sports_rx, tennis_rx, cancel);
     let squadron_id = squadron.id.clone();
     // The squadron registers under the crypto underlying (so the taxonomy
     // classifies it as crypto), but this venue's DB scope is KALSHI_ASSET.
@@ -953,7 +958,7 @@ async fn trade_one_market(
         no_fee_bps: KALSHI_FEE_BPS as u32,
     });
     let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
-    let lifecycle = Arc::new(OrderLifecycle::new(LifecycleConfig::us()));
+    let lifecycle = Arc::new(OrderLifecycle::new(LifecycleConfig::us(), squadron_id.clone()));
     let _fill_listener = lifecycle.spawn_fill_listener(Arc::clone(venue), Arc::clone(&positions));
     let market_started_at = Utc::now();
 
@@ -998,7 +1003,7 @@ async fn trade_one_market(
     let mut session_pnl = Decimal::ZERO;
     let mut dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
     if let Some(p) = &pool {
-        let (coll, total) = sync_dashboard(venue.as_ref(), p, &positions, starting).await;
+        let (coll, total) = sync_dashboard(&squadron_id, venue.as_ref(), p, &positions, starting).await;
         available_collateral = coll;
         session_pnl = total - starting;
     }
@@ -1026,7 +1031,7 @@ async fn trade_one_market(
             }
             _ = dash_tick.tick() => {
                 if let Some(p) = &pool {
-                    let (coll, total) = sync_dashboard(venue.as_ref(), p, &positions, starting).await;
+                    let (coll, total) = sync_dashboard(&squadron_id, venue.as_ref(), p, &positions, starting).await;
                     available_collateral = coll;
                     session_pnl = total - starting;
                 }
@@ -1103,7 +1108,7 @@ async fn trade_one_market(
                 // `trades` nor `entries`.
                 lifecycle.cancel_all(venue.as_ref()).await;
                 flatten_before_stand_down(
-                    venue, &hub, &pool, &scope, &positions, &lifecycle,
+                    &squadron_id, venue, &hub, &pool, &scope, &positions, &lifecycle,
                     &market_cfg, maker_cfg.as_ref(), maker_pair.as_ref(), &raptors, starting,
                     dyn_cfg.ghost_mode,
                 ).await;
@@ -1157,6 +1162,7 @@ async fn trade_one_market(
             positions: positions.clone(),
             session_pnl,
             starting_collateral: starting,
+            squadron_id: squadron_id.clone(),
             // Doubles as the viper-status registry key, which is
             // (this string, strategy name). A market with no crypto underlying
             // left it empty, so every non-crypto squadron shared one set of
@@ -1190,7 +1196,7 @@ async fn trade_one_market(
             if winding_down && signal.opens_exposure() {
                 continue;
             }
-            if dispatch_signal(venue.as_ref(), &pool, &scope, &positions, &lifecycle, &strategy_name, &signal, starting).await {
+            if dispatch_signal(&squadron_id, venue.as_ref(), &pool, &scope, &positions, &lifecycle, &strategy_name, &signal, starting).await {
                 acted = true;
             }
         }
@@ -1216,6 +1222,9 @@ async fn trade_one_market(
 /// selling into an empty book is worse than holding to resolution.
 #[allow(clippy::too_many_arguments)]
 async fn flatten_before_stand_down(
+    // Squadron whose positions these keys address, so two squadrons
+    // holding the same token stay independent.
+    squadron_id: &str,
     venue: &Arc<KalshiVenue>,
     hub: &ws::BookHub,
     pool: &Option<sqlx::SqlitePool>,
@@ -1233,7 +1242,8 @@ async fn flatten_before_stand_down(
         let map = positions.lock().await;
         map.iter()
             .filter(|(_, p)| p.shares > dec!(0))
-            .map(|((strategy, token), p)| (strategy.clone(), token.clone(), p.shares))
+            .filter(|(k, _)| k.squadron == squadron_id)
+            .map(|(k, p)| (k.strategy.clone(), k.market.clone(), p.shares))
             .collect()
     };
     if held.is_empty() {
@@ -1296,7 +1306,7 @@ async fn flatten_before_stand_down(
             // Each leg is flattened on its own; pairing here would double-exit.
             exit_pair: false,
         };
-        dispatch_signal(venue.as_ref(), pool, scope, positions, lifecycle, &strategy, &signal, starting).await;
+        dispatch_signal(squadron_id, venue.as_ref(), pool, scope, positions, lifecycle, &strategy, &signal, starting).await;
     }
 }
 
@@ -1460,6 +1470,9 @@ fn order_params_to_intent(p: &OrderParams, side: Side) -> OrderIntent {
 /// book shares we never owned), which is exactly why this stayed invisible: the
 /// error was confined to the entry side, where nothing contradicted it.
 async fn record_guard(
+    // Squadron whose positions these keys address, so two squadrons
+    // holding the same token stay independent.
+    squadron_id: &str,
     positions: &Arc<Mutex<PositionMap>>,
     strategy_name: &str,
     params: &OrderParams,
@@ -1468,7 +1481,7 @@ async fn record_guard(
 ) {
     let mut map = positions.lock().await;
     map.insert(
-        (strategy_name.to_string(), params.token_id.clone()),
+        PositionKey::new(squadron_id, strategy_name, params.token_id.clone()),
         Position {
             shares: fill.filled,
             avg_entry: fill.price,
@@ -1484,6 +1497,9 @@ async fn record_guard(
 }
 
 async fn dispatch_signal(
+    // Squadron whose positions these keys address, so two squadrons
+    // holding the same token stay independent.
+    squadron_id: &str,
     venue: &KalshiVenue,
     pool: &Option<sqlx::SqlitePool>,
     scope: &TradeScope,
@@ -1505,10 +1521,10 @@ async fn dispatch_signal(
                     fee: Decimal::ZERO,
                 };
                 let (ga, gb) = (ghost_of(params), ghost_of(pp));
-                record_guard(positions, strategy_name, params, Some(&pp.token_id), &ga).await;
-                record_guard(positions, strategy_name, pp, Some(&params.token_id), &gb).await;
-                record_entry(pool, scope, strategy_name, params, &ga).await;
-                record_entry(pool, scope, strategy_name, pp, &gb).await;
+                record_guard(squadron_id, positions, strategy_name, params, Some(&pp.token_id), &ga).await;
+                record_guard(squadron_id, positions, strategy_name, pp, Some(&params.token_id), &gb).await;
+                record_entry(squadron_id, pool, scope, strategy_name, params, &ga).await;
+                record_entry(squadron_id, pool, scope, strategy_name, pp, &gb).await;
                 return true;
             }
             let legs = [
@@ -1519,27 +1535,27 @@ async fn dispatch_signal(
                 Ok([a, b]) => {
                     info!("✅ [{strategy_name}] entry pair: {} @ {:.4} | {} @ {:.4}",
                         a.order_id, a.price, b.order_id, b.price);
-                    record_guard(positions, strategy_name, params, Some(&pp.token_id), &a).await;
-                    record_guard(positions, strategy_name, pp, Some(&params.token_id), &b).await;
+                    record_guard(squadron_id, positions, strategy_name, params, Some(&pp.token_id), &a).await;
+                    record_guard(squadron_id, positions, strategy_name, pp, Some(&params.token_id), &b).await;
                     lifecycle.track(&a, strategy_name, params.order_type, Some(pp.token_id.clone())).await;
                     lifecycle.track(&b, strategy_name, pp.order_type, Some(params.token_id.clone())).await;
-                    record_entry(pool, scope, strategy_name, params, &a).await;
-                    record_entry(pool, scope, strategy_name, pp, &b).await;
-                    if let Some(p) = pool { sync_dashboard(venue, p, positions, starting).await; }
+                    record_entry(squadron_id, pool, scope, strategy_name, params, &a).await;
+                    record_entry(squadron_id, pool, scope, strategy_name, pp, &b).await;
+                    if let Some(p) = pool { sync_dashboard(squadron_id, venue, p, positions, starting).await; }
                     true
                 }
                 Err(e) => { warn!("[{strategy_name}] atomic entry failed: {e}"); false }
             }
         }
         StrategySignal::Entry { params, pair_params: None } => {
-            dispatch_single(venue, pool, scope, positions, lifecycle, strategy_name, params, Side::Buy, starting)
+            dispatch_single(squadron_id, venue, pool, scope, positions, lifecycle, strategy_name, params, Side::Buy, starting)
                 .await
                 .is_some()
         }
         StrategySignal::MakerQuote { yes, no } => {
             let mut acted = false;
             for q in [yes.as_ref(), no.as_ref()].into_iter().flatten() {
-                if dispatch_single(venue, pool, scope, positions, lifecycle, strategy_name, q, Side::Buy, starting)
+                if dispatch_single(squadron_id, venue, pool, scope, positions, lifecycle, strategy_name, q, Side::Buy, starting)
                     .await
                     .is_some()
                 {
@@ -1560,7 +1576,7 @@ async fn dispatch_signal(
                         acted = true;
                     }
                 }
-                positions.lock().await.remove(&(strategy_name.to_string(), tok.clone()));
+                positions.lock().await.remove(&PositionKey::new(squadron_id, strategy_name, tok.clone()));
             }
             acted
         }
@@ -1586,9 +1602,9 @@ async fn dispatch_signal(
             let entered = positions
                 .lock()
                 .await
-                .get(&(strategy_name.to_string(), params.token_id.clone()))
+                .get(&PositionKey::new(squadron_id, strategy_name, params.token_id.clone()))
                 .map(|p| (p.avg_entry, p.shares, p.entry_fee));
-            let exit_fill = dispatch_single(venue, pool, scope, positions, lifecycle, strategy_name, params, Side::Sell, starting).await;
+            let exit_fill = dispatch_single(squadron_id, venue, pool, scope, positions, lifecycle, strategy_name, params, Side::Sell, starting).await;
             let Some(exit_fill) = exit_fill else {
                 // Nothing traded — we still own it. Dropping the position here is
                 // what abandoned a live stop-loss to expire worthless on
@@ -1603,14 +1619,14 @@ async fn dispatch_signal(
             record_round_trip(pool, scope, strategy_name, params, entered, exit_fill.fee, reason).await;
             clear_exit_retry_backoff(strategy_name, params.token_id.as_str());
             let mut map = positions.lock().await;
-            map.remove(&(strategy_name.to_string(), params.token_id.clone()));
+            map.remove(&PositionKey::new(squadron_id, strategy_name, params.token_id.clone()));
             if *exit_pair {
                 let paired: Vec<_> = map.iter()
-                    .filter(|((s, _), p)| s == strategy_name
+                    .filter(|(k, p)| k.strategy == strategy_name && k.squadron == squadron_id
                         && p.paired_leg_token_id.as_ref() == Some(&params.token_id))
-                    .map(|((s, t), _)| (s.clone(), t.clone()))
+                    .map(|(k, _)| (k.strategy.clone(), k.market.clone()))
                     .collect();
-                for k in paired { map.remove(&k); }
+                for k in paired { map.remove(&PositionKey::new(squadron_id, k.0, k.1)); }
             }
             true
         }
@@ -1648,6 +1664,8 @@ fn clear_exit_retry_backoff(strategy_name: &str, token_id: &str) {
 }
 
 async fn dispatch_single(
+    // Squadron whose positions these guards belong to.
+    squadron_id: &str,
     venue: &KalshiVenue,
     pool: &Option<sqlx::SqlitePool>,
     scope: &TradeScope,
@@ -1671,8 +1689,8 @@ async fn dispatch_single(
             fee: Decimal::ZERO,
         };
         if matches!(side, Side::Buy) {
-            record_guard(positions, strategy_name, params, None, &ghost).await;
-            record_entry(pool, scope, strategy_name, params, &ghost).await;
+            record_guard(squadron_id, positions, strategy_name, params, None, &ghost).await;
+            record_entry(squadron_id, pool, scope, strategy_name, params, &ghost).await;
         }
         return Some(ghost);
     }
@@ -1694,11 +1712,11 @@ async fn dispatch_single(
             info!("✅ [{strategy_name}] {side:?} {} @ {:.4} × {:.2} (order {})",
                 params.token_id, f.price, f.filled, f.order_id);
             if matches!(side, Side::Buy) {
-                record_guard(positions, strategy_name, params, None, &f).await;
+                record_guard(squadron_id, positions, strategy_name, params, None, &f).await;
                 lifecycle.track(&f, strategy_name, params.order_type, None).await;
-                record_entry(pool, scope, strategy_name, params, &f).await;
+                record_entry(squadron_id, pool, scope, strategy_name, params, &f).await;
             }
-            if let Some(p) = pool { sync_dashboard(venue, p, positions, starting).await; }
+            if let Some(p) = pool { sync_dashboard(squadron_id, venue, p, positions, starting).await; }
             Some(f)
         }
         Err(e) => { warn!("[{strategy_name}] {side:?} order failed: {e}"); None }
@@ -1711,6 +1729,8 @@ async fn dispatch_single(
 /// [`sync_dashboard`]'s venue sweep, which knows the ticker but not which viper
 /// owns it — every live position was mislabelled as ArbitrageStrategy.
 async fn record_entry(
+    // Squadron credited with the position in the database.
+    squadron_id: &str,
     pool: &Option<sqlx::SqlitePool>,
     scope: &TradeScope,
     strategy_name: &str,
@@ -1734,7 +1754,7 @@ async fn record_entry(
         // promotes it. Ghost entries have no venue truth to wait for.
         let status = if params.ghost_mode { "confirmed" } else { "pending" };
         db::record_open_position_with_status(
-            p, strategy_name, params.token_id.as_str(), &params.market_name,
+            p, squadron_id, strategy_name, params.token_id.as_str(), &params.market_name,
             side, fill.price, fill.filled, params.ghost_mode, status,
         ).await;
     }
@@ -1798,6 +1818,8 @@ async fn record_round_trip(
 }
 
 async fn sync_dashboard(
+    // Squadron whose guards are summarised for the dashboard.
+    squadron_id: &str,
     venue: &KalshiVenue,
     pool: &sqlx::SqlitePool,
     guards: &Arc<Mutex<PositionMap>>,
@@ -1816,7 +1838,8 @@ async fn sync_dashboard(
     let owners: HashMap<String, (String, String)> = {
         let map = guards.lock().await;
         map.iter()
-            .map(|((s, t), p)| (t.as_str().to_string(), (s.clone(), p.market_name.clone())))
+            .filter(|(k, _)| k.squadron == squadron_id)
+            .map(|(k, p)| (k.market.as_str().to_string(), (k.strategy.clone(), p.market_name.clone())))
             .collect()
     };
 
@@ -1830,13 +1853,13 @@ async fn sync_dashboard(
             // holding is what promotes it out of `pending`.
             Some((strategy, market_name)) => {
                 db::record_open_position(
-                    pool, strategy, sym, market_name, side_label(sym), p.avg_price, p.shares, false,
+                    pool, squadron_id, strategy, sym, market_name, side_label(sym), p.avg_price, p.shares, false,
                 ).await;
                 db::confirm_position_status(pool, strategy, sym).await;
             }
             None => {
                 db::record_open_position(
-                    pool, "ChainAdopted", sym, sym, side_label(sym), p.avg_price, p.shares, false,
+                    pool, squadron_id, "ChainAdopted", sym, sym, side_label(sym), p.avg_price, p.shares, false,
                 ).await;
             }
         }
@@ -1876,6 +1899,7 @@ fn register_kalshi_squadron(
     pair: &KalshiPair,
     r: &CryptoRaptors,
     deployed_as: Option<&str>,
+    squadron_name: Option<&str>,
     sports_rx: &watch::Receiver<SportsSnapshot>,
     tennis_rx: &watch::Receiver<TennisSnapshot>,
     // The token the trade loop selects on, so a stand-down actually stops it.
@@ -1927,15 +1951,19 @@ fn register_kalshi_squadron(
         (None, "sol") => CryptoAsset::Sol,
         (None, _)     => CryptoAsset::Btc,
     };
-    let squadron_name = match deployed_as {
-        Some(class) => format!("Kalshi {} Squadron", title_case(class)),
-        None => "Kalshi Crypto Squadron".to_string(),
+    // What the operator sees. Their own name wins when they gave one.
+    let display_name = match (squadron_name, deployed_as) {
+        (Some(n), _) if !n.trim().is_empty() => n.trim().to_string(),
+        (_, Some(class)) => format!("Kalshi {} Squadron", title_case(class)),
+        (_, None) => "Kalshi Crypto Squadron".to_string(),
     };
-    let squadron = Squadron::new(
+    let squadron = Squadron::new_named(
         crypto_asset,
-        SquadronConfig::arb_wing(squadron_name),
+        SquadronConfig::arb_wing(display_name),
         market,
         raptors,
+        None,
+        squadron_name,
     );
     cag.register_with_cancel(&squadron, cancel.clone());
     squadron
@@ -2069,10 +2097,10 @@ mod fill_accounting_tests {
         let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
         let p = params(dec!(100), dec!(0.55));
         // Asked for 100 at a 0.55 limit; got 30 at 0.52.
-        record_guard(&positions, "MakerStrategy", &p, None, &fill(dec!(30), dec!(0.52), dec!(0.1))).await;
+        record_guard("test-squadron", &positions, "MakerStrategy", &p, None, &fill(dec!(30), dec!(0.52), dec!(0.1))).await;
 
         let map = positions.lock().await;
-        let pos = map.get(&("MakerStrategy".to_string(), p.token_id.clone())).expect("guard recorded");
+        let pos = map.get(&PositionKey::new("test-squadron", "MakerStrategy", p.token_id.clone())).expect("guard recorded");
         assert_eq!(pos.shares, dec!(30), "booked the requested size, not the fill");
         assert_eq!(pos.avg_entry, dec!(0.52), "booked the limit price, not the fill price");
         assert_eq!(pos.entry_fee, dec!(0.1));
@@ -2083,10 +2111,10 @@ mod fill_accounting_tests {
     async fn a_full_fill_is_booked_exactly() {
         let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
         let p = params(dec!(50), dec!(0.40));
-        record_guard(&positions, "ArbitrageStrategy", &p, None, &fill(dec!(50), dec!(0.40), dec!(0))).await;
+        record_guard("test-squadron", &positions, "ArbitrageStrategy", &p, None, &fill(dec!(50), dec!(0.40), dec!(0))).await;
 
         let map = positions.lock().await;
-        let pos = map.get(&("ArbitrageStrategy".to_string(), p.token_id.clone())).expect("guard recorded");
+        let pos = map.get(&PositionKey::new("test-squadron", "ArbitrageStrategy", p.token_id.clone())).expect("guard recorded");
         assert_eq!(pos.shares, dec!(50));
         assert_eq!(pos.avg_entry, dec!(0.40));
     }
@@ -2100,12 +2128,12 @@ mod fill_accounting_tests {
         let mut no = params(dec!(20), dec!(0.52));
         no.token_id = MarketId::new("KX-1#no");
 
-        record_guard(&positions, "ArbitrageStrategy", &yes, Some(&no.token_id), &fill(dec!(20), dec!(0.45), dec!(0))).await;
-        record_guard(&positions, "ArbitrageStrategy", &no, Some(&yes.token_id), &fill(dec!(12), dec!(0.50), dec!(0))).await;
+        record_guard("test-squadron", &positions, "ArbitrageStrategy", &yes, Some(&no.token_id), &fill(dec!(20), dec!(0.45), dec!(0))).await;
+        record_guard("test-squadron", &positions, "ArbitrageStrategy", &no, Some(&yes.token_id), &fill(dec!(12), dec!(0.50), dec!(0))).await;
 
         let map = positions.lock().await;
-        let a = map.get(&("ArbitrageStrategy".to_string(), yes.token_id.clone())).unwrap();
-        let b = map.get(&("ArbitrageStrategy".to_string(), no.token_id.clone())).unwrap();
+        let a = map.get(&PositionKey::new("test-squadron", "ArbitrageStrategy", yes.token_id.clone())).unwrap();
+        let b = map.get(&PositionKey::new("test-squadron", "ArbitrageStrategy", no.token_id.clone())).unwrap();
         assert_eq!(a.shares, dec!(20));
         assert_eq!(b.shares, dec!(12), "the short leg's own partial fill was lost");
         assert_eq!(b.avg_entry, dec!(0.50));

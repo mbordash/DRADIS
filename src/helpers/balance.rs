@@ -41,7 +41,7 @@ use crate::helpers::orders::place_limit_order_filled;
 use crate::venues::core::MarketId;
 use crate::venues::intl::{market_id_from_u256, u256_from_market_id};
 
-pub use crate::state::{Position, PositionMap};
+pub use crate::state::{Position, PositionKey, PositionMap};
 
 /// Shared map of (strategy:token_id) → Instant for phantom removal cooldowns.
 /// Canonical definition lives in `crate::state` (venue-neutral); re-exported here
@@ -75,6 +75,10 @@ pub fn parse_balance_from_error(err_msg: &str) -> Option<Decimal> {
 }
 
 pub async fn sync_position_balance(
+    // Squadron that owns the positions being reconciled. Part of every
+    // PositionKey built below, so two squadrons trading the same token each
+    // reconcile their own position rather than one another's.
+    squadron_id: &str,
     client: &Arc<ClobClient<Authenticated<Normal>>>,
     positions: &Arc<Mutex<PositionMap>>,
     strategy_name: &str,
@@ -88,7 +92,7 @@ pub async fn sync_position_balance(
     // Slice 2b: resolve the on-chain U256 once; the rest of the body is unchanged.
     let token_id = u256_from_market_id(token_id)?;
     let market = market_id_from_u256(token_id);
-    let key = (strategy_name.to_string(), market.clone());
+    let key = PositionKey::new(squadron_id, strategy_name, market.clone());
     let check_interval_ms: u64 = 3000;
 
         tokio::time::sleep(Duration::from_secs(5)).await;
@@ -296,6 +300,10 @@ pub async fn cancel_resting_orders_for_token(
 /// through the full orphan-detection cycle.  Tombstoned tokens are skipped permanently so
 /// the reconcile → re-adopt → orphan-detect loop cannot repeat across market switches.
 pub async fn reconcile_orphaned_positions(
+    // Squadron that owns the positions being reconciled. Part of every
+    // PositionKey built below, so two squadrons trading the same token each
+    // reconcile their own position rather than one another's.
+    squadron_id: &str,
     client: &Arc<ClobClient<Authenticated<Normal>>>,
     positions: &Arc<Mutex<PositionMap>>,
     tokens: &[(MarketId, &str)],
@@ -350,7 +358,7 @@ pub async fn reconcile_orphaned_positions(
 
         {
             let map = positions.lock().await;
-            if map.iter().any(|((_, tid), _)| *tid == market) { continue; }
+            if map.iter().any(|(k, _)| k.market == market && k.squadron == squadron_id) { continue; }
         }
 
         let current_bid = token_bids.iter().find(|(tid, _)| tid == token_id)
@@ -403,13 +411,13 @@ pub async fn reconcile_orphaned_positions(
             }
             candidates.extend(adoption_order.iter().cloned());
             let map = positions.lock().await;
-            candidates.into_iter().find(|s| !map.contains_key(&(s.clone(), market.clone())))
+            candidates.into_iter().find(|s| !map.contains_key(&PositionKey::new(squadron_id, s.clone(), market.clone())))
         };
 
         if let Some(strategy_name) = adopted_strategy {
             let mut pos_map = positions.lock().await;
 
-            pos_map.insert((strategy_name.to_string(), market.clone()), Position {
+            pos_map.insert(PositionKey::new(squadron_id, strategy_name.clone(), market.clone()), Position {
                 shares: actual_shares,
                 avg_entry,
                 opened_at: Utc::now() - chrono::Duration::seconds(crate::config::MIN_HOLD_SECS_BEFORE_STOP_LOSS),
@@ -458,15 +466,15 @@ pub async fn reconcile_orphaned_positions(
 
         // Find which strategy adopted each token (may be None if balance was 0)
         let strat_a = pos_map.iter()
-            .find(|((_, tid), _)| *tid == market_a)
-            .map(|((s, _), _)| s.clone());
+            .find(|(k, _)| k.market == market_a && k.squadron == squadron_id)
+            .map(|(k, _)| k.strategy.clone());
         let strat_b = pos_map.iter()
-            .find(|((_, tid), _)| *tid == market_b)
-            .map(|((s, _), _)| s.clone());
+            .find(|(k, _)| k.market == market_b && k.squadron == squadron_id)
+            .map(|(k, _)| k.strategy.clone());
 
         if let Some(sa) = strat_a {
             if is_paired_strategy(&sa) {
-                if let Some(p) = pos_map.get_mut(&(sa, market_a.clone())) {
+                if let Some(p) = pos_map.get_mut(&PositionKey::new(squadron_id, sa.clone(), market_a.clone())) {
                     p.paired_leg_token_id = Some(market_b.clone());
                 }
             } else {
@@ -475,7 +483,7 @@ pub async fn reconcile_orphaned_positions(
         }
         if let Some(sb) = strat_b {
             if is_paired_strategy(&sb) {
-                if let Some(p) = pos_map.get_mut(&(sb, market_b.clone())) {
+                if let Some(p) = pos_map.get_mut(&PositionKey::new(squadron_id, sb.clone(), market_b.clone())) {
                     p.paired_leg_token_id = Some(market_a.clone());
                 }
             } else {
@@ -505,6 +513,10 @@ pub async fn reconcile_orphaned_positions(
 /// `max_wait_secs + ARBITER_GRACE_SECS` is retained only as a hard deadline for the
 /// neither-filled case, where the individual `sync_position_balance` tasks own cleanup.
 pub async fn arb_pair_fill_monitor(
+    // Squadron that owns the positions being reconciled. Part of every
+    // PositionKey built below, so two squadrons trading the same token each
+    // reconcile their own position rather than one another's.
+    squadron_id: &str,
     client: Arc<ClobClient<Authenticated<Normal>>>,
     nonce_manager: Arc<AtomicU64>,
     signer: LocalSigner<alloy::signers::k256::ecdsa::SigningKey>,
@@ -560,8 +572,8 @@ pub async fn arb_pair_fill_monitor(
     let leg_a_token = u256_from_market_id(leg_a_token).unwrap_or_default();
     let leg_b_token = u256_from_market_id(leg_b_token).unwrap_or_default();
 
-    let key_a = (strategy_name.clone(), market_id_from_u256(leg_a_token));
-    let key_b = (strategy_name.clone(), market_id_from_u256(leg_b_token));
+    let key_a = PositionKey::new(squadron_id, strategy_name.clone(), market_id_from_u256(leg_a_token));
+    let key_b = PositionKey::new(squadron_id, strategy_name.clone(), market_id_from_u256(leg_b_token));
 
     // Hard deadline for the neither-filled case; also a backstop upper bound for the
     // asymmetric case so we never wait past the original window.
@@ -678,14 +690,14 @@ pub async fn arb_pair_fill_monitor(
         // The missing leg actually filled during the cancel settle-lag window — recover it.
         warn!("✅ ARB ARBITER [{}]: Missing leg {} RECOVERED post-cancel settle ({} shares)",
               strategy_name, missing_token, settled_shares);
-        let key_m = (strategy_name.clone(), missing_market.clone());
+        let key_m = PositionKey::new(squadron_id, strategy_name.clone(), missing_market.clone());
         let mut map = positions.lock().await;
         if let Some(pos) = map.get_mut(&key_m) {
             pos.shares = settled_shares;
             if pos.fill_confirmed_at.is_none() { pos.fill_confirmed_at = Some(Utc::now()); }
         } else {
             // Sync task already phantom-removed it; re-insert with data from the filled leg.
-            let reference = map.get(&(strategy_name.clone(), filled_market.clone())).cloned();
+            let reference = map.get(&PositionKey::new(squadron_id, strategy_name.clone(), filled_market.clone())).cloned();
             if let Some(ref_pos) = reference {
                 map.insert(key_m, Position {
                     shares: settled_shares,
@@ -733,7 +745,7 @@ pub async fn arb_pair_fill_monitor(
     // Match the filled leg's confirmed share count AND entry price so we can compute a
     // breakeven ceiling — without this we'd cap at a fixed $0.99 and could lock in a loss.
     let (filled_shares_recorded, filled_avg_entry, filled_entry_fee) = positions.lock().await
-        .get(&(strategy_name.clone(), filled_market.clone()))
+        .get(&PositionKey::new(squadron_id, strategy_name.clone(), filled_market.clone()))
         .map(|p| (p.shares, p.avg_entry, p.entry_fee))
         .unwrap_or((dec!(0), dec!(0), dec!(0)));
     // PARTIAL-FILL GUARD (2026-07-26 trade 296): fill-confirm stamps a leg "filled"
@@ -794,10 +806,10 @@ pub async fn arb_pair_fill_monitor(
                 // Re-insert the missing leg into the positions map (the sync task already
                 // phantom-removed it; we restore it with the FAK fill data).
                 let reference = positions.lock().await
-                    .get(&(strategy_name.clone(), filled_market.clone()))
+                    .get(&PositionKey::new(squadron_id, strategy_name.clone(), filled_market.clone()))
                     .cloned();
                 if let Some(ref_pos) = reference {
-                    let key_m = (strategy_name.clone(), missing_market.clone());
+                    let key_m = PositionKey::new(squadron_id, strategy_name.clone(), missing_market.clone());
                     let mut map = positions.lock().await;
                     if !map.contains_key(&key_m) {
                         map.insert(key_m.clone(), Position {
@@ -819,8 +831,7 @@ pub async fn arb_pair_fill_monitor(
 
                     // Write the re-hedged fill to the DB.
                     if let Some(pool) = crate::helpers::db::pool_for(&asset) {
-                        crate::helpers::db::record_open_position(
-                            &pool,
+                        crate::helpers::db::record_open_position(&pool, squadron_id,
                             &strategy_name,
                             &missing_token.to_string(),
                             &ref_pos.market_name,
@@ -868,7 +879,7 @@ pub async fn arb_pair_fill_monitor(
         None => dec!(0),
     };
 
-    positions.lock().await.remove(&(strategy_name.clone(), missing_market.clone()));
+    positions.lock().await.remove(&PositionKey::new(squadron_id, strategy_name.clone(), missing_market.clone()));
     token_ownership.lock().await.remove(&missing_market);
     if let Some(pool) = crate::helpers::db::pool_for(&asset) {
         crate::helpers::db::close_open_position(&pool, &strategy_name, &missing_token.to_string()).await;
@@ -879,7 +890,7 @@ pub async fn arb_pair_fill_monitor(
     // at the live bid. Worst case is the spread (~1–3¢/share) instead of a full leg
     // resolving to $0. This is the hard guarantee: exposure is always closed now.
     let market_name = positions.lock().await
-        .get(&(strategy_name.clone(), filled_market.clone()))
+        .get(&PositionKey::new(squadron_id, strategy_name.clone(), filled_market.clone()))
         .map(|p| p.market_name.clone())
         .unwrap_or_default();
 
@@ -956,7 +967,7 @@ pub async fn arb_pair_fill_monitor(
             // every orphan flatten (12 of them, −$2.25, since July).
             *total_pnl.lock().await += realized;
             // The leg is closed — drop it from tracking so it isn't counted as open.
-            positions.lock().await.remove(&(strategy_name.clone(), filled_market.clone()));
+            positions.lock().await.remove(&PositionKey::new(squadron_id, strategy_name.clone(), filled_market.clone()));
             // The filled leg has been flattened — release its token claim so other
             // strategies aren't blocked on a position we no longer hold.
             token_ownership.lock().await.remove(&filled_market);
@@ -1050,7 +1061,7 @@ pub async fn arb_pair_fill_monitor(
                     warn!("✅ ARB ARBITER [{}]: Late-fill naked leg flattened (order_id={}) — exposure closed @ {:.4} (limit {:.4}), realized ${:.4} (gross ${:.4} − fees ${:.4})",
                           strategy_name, order_id, exit_price, late_sell, realized, gross, fees);
                     *total_pnl.lock().await += realized;
-                    positions.lock().await.remove(&(strategy_name.clone(), missing_market.clone()));
+                    positions.lock().await.remove(&PositionKey::new(squadron_id, strategy_name.clone(), missing_market.clone()));
                     token_ownership.lock().await.remove(&missing_market);
                     // (B) Book synchronously (awaited, not fire-and-forget) so a restart
                     // mid-cleanup cannot drop the record — the July-3 invisibility mode.
@@ -1088,7 +1099,7 @@ pub async fn arb_pair_fill_monitor(
     // `sync_position_balance` to age it out at `max_wait_secs`. This stops the redundant
     // Position-Sync retry loop on the next poll and frees the token immediately so
     // higher-priority strategies aren't rejected by TOKEN SOVEREIGNTY for ~minutes.
-    positions.lock().await.remove(&(strategy_name.clone(), missing_market.clone()));
+    positions.lock().await.remove(&PositionKey::new(squadron_id, strategy_name.clone(), missing_market.clone()));
     token_ownership.lock().await.remove(&missing_market);
 
     // Block re-entry on BOTH legs until the operator/cleanup confirms the state is clean.
@@ -1098,6 +1109,10 @@ pub async fn arb_pair_fill_monitor(
 }
 
 pub async fn quick_confirm_fill(
+    // Squadron that owns the positions being reconciled. Part of every
+    // PositionKey built below, so two squadrons trading the same token each
+    // reconcile their own position rather than one another's.
+    squadron_id: &str,
     client: &Arc<ClobClient<Authenticated<Normal>>>,
     strategy_name: &str,
     token_id: &MarketId,
@@ -1117,7 +1132,7 @@ pub async fn quick_confirm_fill(
     let req2 = OrdersRequest::builder().asset_id(token_id).build();
     if !(match client.orders(&req2, None).await { Ok(p) => p.data.is_empty(), Err(_) => true }) {
         let mut pos_map = positions.lock().await;
-        if let Some(pos) = pos_map.get_mut(&(strategy_name.to_string(), market_id_from_u256(token_id))) {
+        if let Some(pos) = pos_map.get_mut(&PositionKey::new(squadron_id, strategy_name, market_id_from_u256(token_id))) {
             pos.fill_confirmed_at = Some(Utc::now());
             info!("✅ QUICK CONFIRM FILL [{}]: Token {} filled instantly", strategy_name, token_id);
             return Ok(true);

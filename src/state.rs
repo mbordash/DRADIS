@@ -416,11 +416,40 @@ pub struct Position {
 /// Slice 2a: the token component is the venue-neutral [`MarketId`] (decimal-`U256`
 /// string for intl) rather than a raw `U256`, so the canonical position key is
 /// venue-agnostic.
-pub type PositionKey = (String, MarketId);
+/// Identity of a position: which squadron, which viper, which token.
+///
+/// The squadron component is what allows two squadrons of the same class to
+/// trade the same market. Without it the key was `(strategy, token)`, so a
+/// second crypto squadron running Maker on the market the first was already
+/// quoting would address the *same* entry — each one reading the other's size
+/// as its own, and whichever exited first taking the whole position with it.
+/// That is why deploying one was refused outright rather than merely discouraged.
+///
+/// A struct rather than a tuple deliberately: the first two fields are both
+/// `String`, and a transposed `(strategy, squadron)` would compile, run, and
+/// simply never find a position — a viper that cannot see its own fill re-enters
+/// instead of exiting.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct PositionKey {
+    /// Squadron that owns this position (`btc-open`, `politics-open`, …).
+    pub squadron: String,
+    /// Viper that opened it (`MakerStrategy`, `ArbitrageStrategy`, …).
+    pub strategy: String,
+    /// The YES or NO token held.
+    pub market: MarketId,
+}
+
+impl PositionKey {
+    pub fn new(squadron: impl Into<String>, strategy: impl Into<String>, market: MarketId) -> Self {
+        Self { squadron: squadron.into(), strategy: strategy.into(), market }
+    }
+}
 
 /// Shared positions state accessible by all strategies.
-/// Keyed by (strategy_name, token_id) so that MomentumStrategy and MakerStrategy
-/// can both hold YES simultaneously without colliding.
+///
+/// Keyed by (squadron, strategy, token) so that MomentumStrategy and
+/// MakerStrategy can both hold YES simultaneously without colliding, and so can
+/// two squadrons running the same viper on the same market.
 /// Typically wrapped in Arc<Mutex<>> for concurrent access.
 pub type PositionMap = HashMap<PositionKey, Position>;
 
@@ -914,5 +943,98 @@ mod ask_presence_tests {
         let s = snapshot(dec!(0.01), Decimal::ONE);
         assert!(!(s.yes_has_ask() && s.no_has_ask()),
             "a leg with no seller must not present as a tradeable pair");
+    }
+}
+
+#[cfg(test)]
+mod position_key_tests {
+    use super::{PositionKey, PositionMap, Position};
+    use crate::venues::core::MarketId;
+    use chrono::Utc;
+    use rust_decimal_macros::dec;
+
+    fn position(shares: rust_decimal::Decimal) -> Position {
+        Position {
+            shares,
+            avg_entry: dec!(0.50),
+            opened_at: Utc::now(),
+            close_time: None,
+            market_name: "BTC above $77,000".to_string(),
+            pair_token_id: MarketId::new("pair"),
+            fill_confirmed_at: None,
+            paired_leg_token_id: None,
+            entry_fee: dec!(0),
+        }
+    }
+
+    /// The reason this change exists. Two crypto squadrons quoting the same
+    /// market with the same viper each keep their own position; before the
+    /// squadron was part of the key the second insert overwrote the first, so
+    /// one squadron read the other's size as its own and whichever exited first
+    /// took the whole thing.
+    #[test]
+    fn two_squadrons_hold_the_same_market_independently() {
+        let market = MarketId::new("tok-yes");
+        let mut map: PositionMap = PositionMap::new();
+        map.insert(PositionKey::new("btc-open", "MakerStrategy", market.clone()), position(dec!(10)));
+        map.insert(PositionKey::new("btc-15m", "MakerStrategy", market.clone()), position(dec!(25)));
+
+        assert_eq!(map.len(), 2, "one squadron's position displaced the other's");
+        assert_eq!(map[&PositionKey::new("btc-open", "MakerStrategy", market.clone())].shares, dec!(10));
+        assert_eq!(map[&PositionKey::new("btc-15m", "MakerStrategy", market)].shares, dec!(25));
+    }
+
+    /// The property that already held and must survive: two vipers in ONE
+    /// squadron can hold opposing sides of the same market on separate budgets.
+    #[test]
+    fn two_vipers_in_one_squadron_still_hold_the_same_market() {
+        let market = MarketId::new("tok-yes");
+        let mut map: PositionMap = PositionMap::new();
+        map.insert(PositionKey::new("btc-open", "MakerStrategy", market.clone()), position(dec!(10)));
+        map.insert(PositionKey::new("btc-open", "ArbitrageStrategy", market.clone()), position(dec!(7)));
+        assert_eq!(map.len(), 2);
+    }
+
+    /// One squadron exiting must not remove another's position on that token —
+    /// the failure that made a second squadron unsafe rather than merely untidy.
+    #[test]
+    fn exiting_one_squadron_leaves_the_other_holding() {
+        let market = MarketId::new("tok-yes");
+        let mut map: PositionMap = PositionMap::new();
+        map.insert(PositionKey::new("btc-open", "MakerStrategy", market.clone()), position(dec!(10)));
+        map.insert(PositionKey::new("btc-15m", "MakerStrategy", market.clone()), position(dec!(25)));
+
+        map.remove(&PositionKey::new("btc-open", "MakerStrategy", market.clone()));
+
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[&PositionKey::new("btc-15m", "MakerStrategy", market)].shares, dec!(25));
+    }
+
+    /// Squadron and strategy are both plain strings and adjacent in the
+    /// constructor, so a transposed call would compile. It must not silently
+    /// resolve to the same entry — a viper that cannot find its own position
+    /// re-enters instead of exiting.
+    #[test]
+    fn transposing_squadron_and_strategy_is_a_different_key() {
+        let market = MarketId::new("tok-yes");
+        let right = PositionKey::new("btc-open", "MakerStrategy", market.clone());
+        let wrong = PositionKey::new("MakerStrategy", "btc-open", market);
+        assert_ne!(right, wrong);
+    }
+
+    /// Exposure is summed per squadron, which is what gives each its own budget
+    /// rather than one shared pool across every squadron running that viper.
+    #[test]
+    fn exposure_sums_per_squadron() {
+        let mut map: PositionMap = PositionMap::new();
+        map.insert(PositionKey::new("btc-open", "MakerStrategy", MarketId::new("a")), position(dec!(10)));
+        map.insert(PositionKey::new("btc-open", "MakerStrategy", MarketId::new("b")), position(dec!(20)));
+        map.insert(PositionKey::new("btc-15m", "MakerStrategy", MarketId::new("c")), position(dec!(99)));
+
+        let mine: rust_decimal::Decimal = map.iter()
+            .filter(|(k, _)| k.strategy == "MakerStrategy" && k.squadron == "btc-open")
+            .map(|(_, p)| p.shares)
+            .sum();
+        assert_eq!(mine, dec!(30), "another squadron's size leaked into this budget");
     }
 }

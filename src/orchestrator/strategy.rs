@@ -42,6 +42,13 @@ pub struct StrategyContext {
     pub starting_collateral: Decimal,
     /// Crypto identifier (e.g., "BTC", "ETH", "SOL") for threshold lookups
     pub crypto_filter: String,
+    /// Squadron this evaluation belongs to (`btc-open`, `politics-open`, …).
+    ///
+    /// Part of every `PositionKey` a viper builds, which is what keeps two
+    /// squadrons trading the same market from addressing each other's
+    /// positions. Distinct from `crypto_filter`: that is the underlying used for
+    /// threshold lookups and is shared by every squadron on the same asset.
+    pub squadron_id: String,
     /// Timestamp when the bot started trading the current market.
     /// Used by strategies to enforce a minimum market maturation period before entry.
     pub market_started_at: DateTime<Utc>,

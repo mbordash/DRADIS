@@ -58,7 +58,7 @@ use rust_decimal_macros::dec;
 use chrono::{DateTime, Utc};
 
 use crate::orchestrator::{Strategy, StrategyContext};
-use crate::state::{StrategySignal, StrategyStatus, OrderParams};
+use crate::state::{StrategySignal, StrategyStatus, OrderParams, PositionKey};
 use crate::venues::core::MarketId;
 use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
@@ -231,7 +231,7 @@ impl Strategy for TimeDecayStrategyImpl {
             let current_exposure = {
                 let pos_map = ctx.positions.lock().await;
                 pos_map.iter()
-                    .filter(|((s, _), _)| s == STRATEGY_NAME)
+                    .filter(|(k, _)| (k.strategy == STRATEGY_NAME) && k.squadron == ctx.squadron_id)
                     .map(|(_, p)| p.shares * p.avg_entry)
                     .sum::<Decimal>()
             };
@@ -291,8 +291,8 @@ impl Strategy for TimeDecayStrategyImpl {
 
         let (market, snap) = (&ctx.market, &ctx.snapshot);
 
-        let yes_key = ("TimeDecayStrategy".to_string(), market.yes_token.clone());
-        let no_key  = ("TimeDecayStrategy".to_string(), market.no_token.clone());
+        let yes_key = PositionKey::new(&ctx.squadron_id, "TimeDecayStrategy", market.yes_token.clone());
+        let no_key  = PositionKey::new(&ctx.squadron_id, "TimeDecayStrategy", market.no_token.clone());
 
         if let (Some(yp), Some(np)) = (pos_map.get(&yes_key), pos_map.get(&no_key)) {
             let yes_bid = snap.yes_bid;

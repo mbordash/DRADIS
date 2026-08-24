@@ -330,6 +330,12 @@ export default function DeploySquadronModal({ isOpen, onClose, onDeployed }: Dep
   const [selectedVipers, setSelectedVipers] = useState<Set<string>>(new Set());
   const [viperBudgets, setViperBudgets] = useState<Record<string, string>>({});
   
+  // Operator-chosen name. Optional: without one the squadron is named after its
+  // class, which is fine until a second squadron of that class exists — then the
+  // name is what tells them apart on screen and what gives each its own config
+  // and budgets.
+  const [name, setName] = useState('');
+
   // Deployment state
   const [deploying, setDeploying] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -437,6 +443,7 @@ export default function DeploySquadronModal({ isOpen, onClose, onDeployed }: Dep
         raptors: mode === 'manual' ? Array.from(selectedRaptors) : undefined,
         vipers: mode === 'manual' ? Array.from(selectedVipers) : undefined,
         viper_budgets: Object.keys(budgets).length > 0 ? budgets : undefined,
+        name: name.trim() || undefined,
       });
       
       if (response.success && response.squadron_id) {
@@ -587,6 +594,28 @@ export default function DeploySquadronModal({ isOpen, onClose, onDeployed }: Dep
               <span className="text-xs font-mono text-red-400">{error}</span>
             </div>
           )}
+        </div>
+
+        {/* Name — optional, but the only thing that tells two squadrons of one
+            class apart once a second exists. */}
+        <div className="px-5 pb-4">
+          <label className="block text-[11px] font-mono text-gray-400 mb-1.5">
+            Squadron name <span className="text-gray-600">(optional)</span>
+          </label>
+          <input
+            type="text"
+            value={name}
+            onChange={e => setName(e.target.value)}
+            placeholder="e.g. 15m Scalper"
+            maxLength={48}
+            className="w-full bg-[#0a0a14] border border-[#1e1e32] rounded px-3 py-2
+                       text-xs font-mono text-gray-200 placeholder:text-gray-700
+                       focus:outline-none focus:border-green-500/40"
+          />
+          <p className="text-[10px] text-gray-600 mt-1.5 leading-relaxed">
+            Names a second squadron of this class so it gets its own strategy
+            settings, budgets and positions. Leave blank for the default name.
+          </p>
         </div>
 
         {/* Footer */}

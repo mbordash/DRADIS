@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use crate::orchestrator::{Strategy, StrategyContext};
-use crate::state::{StrategySignal, StrategyStatus, OrderParams};
+use crate::state::{StrategySignal, StrategyStatus, OrderParams, PositionKey};
 use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
 use crate::venues::core::{MarketId, TimeInForce};
@@ -138,7 +138,7 @@ impl Strategy for MomentumStrategyImpl {
         let current_exposure = {
             let pos_map = ctx.positions.lock().await;
             pos_map.iter()
-                .filter(|((s, _), _)| s == "MomentumStrategy")
+                .filter(|(k, _)| k.strategy == "MomentumStrategy" && k.squadron == ctx.squadron_id)
                 .map(|(_, p)| p.shares * p.avg_entry)
                 .sum::<Decimal>()
         };
@@ -470,12 +470,14 @@ impl Strategy for MomentumStrategyImpl {
             let mut clocks = self.obi_exhaust_since.lock().unwrap();
             if !clocks.is_empty() {
                 clocks.retain(|tok, _| {
-                    pos_map.contains_key(&("MomentumStrategy".to_string(), tok.clone()))
+                    pos_map.contains_key(&PositionKey::new(&ctx.squadron_id, "MomentumStrategy", tok.clone()))
                 });
             }
         }
 
-        for ((strategy_name, token_id), position) in pos_map.iter() {
+        for (key, position) in pos_map.iter() {
+            if key.squadron != ctx.squadron_id { continue; }
+            let (strategy_name, token_id) = (&key.strategy, &key.market);
             if strategy_name != "MomentumStrategy" { continue; }
             // Slice 2b: position keys are neutral MarketId throughout (no U256).
             let tok = token_id.clone();

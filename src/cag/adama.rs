@@ -96,6 +96,8 @@ where
         market_id: &str,
         market_type: &str,
         market_question: &str,
+        // Operator-chosen name; "" when they did not supply one.
+        squadron_name: &str,
         yes_token: &str,
         no_token: &str,
         _raptors: &[String],
@@ -129,7 +131,11 @@ where
         // Create Squadron
         let asset = CryptoAsset::Custom(market_type.to_uppercase());
         let squadron_config = SquadronConfig::full_wing(
-            format!("{} Squadron — {}", market_type.to_uppercase(), &market_question[..market_question.len().min(40)])
+            if squadron_name.is_empty() {
+                format!("{} Squadron — {}", market_type.to_uppercase(), &market_question[..market_question.len().min(40)])
+            } else {
+                squadron_name.to_string()
+            }
         );
         let squadron_raptors = self.build_raptors_for_type(market_type);
 
@@ -348,7 +354,7 @@ where
         
         for dep in pending {
             let crate::helpers::db::PendingDeployment {
-                id: deployment_id, market_id, market_type, raptors, vipers, viper_budgets,
+                id: deployment_id, market_id, market_type, raptors, vipers, viper_budgets, name,
             } = dep;
             // Mark as processing
             if let Err(e) = crate::helpers::db::update_deployment_status(
@@ -388,6 +394,7 @@ where
                 &market_id,
                 &market_type,
                 &market_info.question,
+                &name,
                 &market_info.yes_token,
                 &market_info.no_token,
                 &raptors,

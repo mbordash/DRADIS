@@ -73,8 +73,7 @@ use crate::raptors::tide::TideSnapshot;
 use crate::state::{
     TradeScope,
     MarketConfig, MarketPhase, MarketSnapshot, OrderParams, Position, PositionMap, PriceState,
-    StrategySignal,
-};
+    StrategySignal, PositionKey};
 use crate::venues::core::{Execution, MarketId, OrderIntent, Side, Fill, OrderId};
 use crate::venues::lifecycle::{LifecycleConfig, OrderLifecycle};
 
@@ -487,6 +486,7 @@ async fn run_wing(
     let trading_active = Arc::new(AtomicBool::new(false));
     if let Some(snap_pool) = db::pool_for(wing.asset()) {
         let venue_bg = Arc::clone(venue);
+        let sq_bg = wing.asset().to_string();
         let active_bg = Arc::clone(&trading_active);
         let cancel_bg = cancel.clone();
         tokio::spawn(async move {
@@ -499,7 +499,7 @@ async fn run_wing(
                     _ = tick.tick() => {}
                 }
                 if active_bg.load(AtomicOrdering::Relaxed) { continue; }
-                sync_dashboard(venue_bg.as_ref(), &snap_pool, None, starting).await;
+                sync_dashboard(&sq_bg, venue_bg.as_ref(), &snap_pool, None, starting).await;
             }
         });
     }
@@ -857,7 +857,7 @@ async fn trade_one_market(
     let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
     // Shared, venue-neutral order lifecycle engine (Option C). Drives fill-confirm,
     // stale-cancel, and naked-leg flatten off the `Execution` trait surface.
-    let lifecycle = Arc::new(OrderLifecycle::new(LifecycleConfig::us()));
+    let lifecycle = Arc::new(OrderLifecycle::new(LifecycleConfig::us(), squadron_id.clone()));
     // Upgrade fill confirmation to event-precise via the venue's private
     // account feed (`/v1/ws/private` → `subscribe_fills`); reconcile polling
     // remains the cancel/flatten path and the fallback backstop.
@@ -910,7 +910,7 @@ async fn trade_one_market(
     let mut session_pnl = Decimal::ZERO;
     let mut dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
     if let Some(p) = &pool {
-        let (coll, total) = sync_dashboard(venue.as_ref(), p, Some(&positions), starting).await;
+        let (coll, total) = sync_dashboard(&squadron_id, venue.as_ref(), p, Some(&positions), starting).await;
         available_collateral = coll;
         session_pnl = total - starting;
     }
@@ -939,7 +939,7 @@ async fn trade_one_market(
             }
             _ = dash_tick.tick() => {
                 if let Some(p) = &pool {
-                    let (coll, total) = sync_dashboard(venue.as_ref(), p, Some(&positions), starting).await;
+                    let (coll, total) = sync_dashboard(&squadron_id, venue.as_ref(), p, Some(&positions), starting).await;
                     available_collateral = coll;
                     session_pnl = total - starting;
                 }
@@ -1038,7 +1038,7 @@ async fn trade_one_market(
                 // it the same bug.
                 lifecycle.cancel_all(venue.as_ref()).await;
                 flatten_before_stand_down(
-                    venue, &pool, &scope, &positions, &lifecycle,
+                    &squadron_id, venue, &pool, &scope, &positions, &lifecycle,
                     &market_cfg, maker_cfg.as_ref(), maker_feeds.as_ref(),
                     raptors.as_ref(), starting, dyn_cfg.ghost_mode,
                 ).await;
@@ -1097,6 +1097,7 @@ async fn trade_one_market(
             positions: positions.clone(),
             session_pnl,
             starting_collateral: starting,
+            squadron_id: squadron_id.clone(),
             crypto_filter: asset.to_uppercase(),
             market_started_at,
             // The US venue has no hourly/daily split — the single discovered
@@ -1128,7 +1129,7 @@ async fn trade_one_market(
             if winding_down && signal.opens_exposure() {
                 continue;
             }
-            if dispatch_signal(venue.as_ref(), &pool, &positions, &lifecycle, &scope, &strategy_name, &signal, starting).await {
+            if dispatch_signal(&squadron_id, venue.as_ref(), &pool, &positions, &lifecycle, &scope, &strategy_name, &signal, starting).await {
                 acted = true;
             }
         }
@@ -1339,6 +1340,9 @@ mod market_pairing_tests {
 /// resolution.
 #[allow(clippy::too_many_arguments)]
 async fn flatten_before_stand_down(
+    // Squadron whose positions these keys address, so two squadrons
+    // holding the same token stay independent.
+    squadron_id: &str,
     venue: &Arc<UsRetailVenue>,
     pool: &Option<sqlx::SqlitePool>,
     scope: &TradeScope,
@@ -1355,7 +1359,8 @@ async fn flatten_before_stand_down(
         let map = positions.lock().await;
         map.iter()
             .filter(|(_, p)| p.shares > dec!(0))
-            .map(|((strategy, token), p)| (strategy.clone(), token.clone(), p.shares))
+            .filter(|(k, _)| k.squadron == squadron_id)
+            .map(|(k, p)| (k.strategy.clone(), k.market.clone(), p.shares))
             .collect()
     };
     if held.is_empty() {
@@ -1410,7 +1415,7 @@ async fn flatten_before_stand_down(
             reason: "SquadronStandDown".to_string(),
             exit_pair: false,
         };
-        dispatch_signal(venue.as_ref(), pool, positions, lifecycle, scope, &strategy, &signal, starting).await;
+        dispatch_signal(squadron_id, venue.as_ref(), pool, positions, lifecycle, scope, &strategy, &signal, starting).await;
     }
 }
 
@@ -1533,6 +1538,9 @@ fn order_params_to_intent(p: &OrderParams, side: Side) -> OrderIntent {
 /// then worked from that number. Exits were already clamped to the guard, which
 /// is why the error stayed confined to the entry side and went unnoticed.
 async fn record_guard(
+    // Squadron whose positions these keys address, so two squadrons
+    // holding the same token stay independent.
+    squadron_id: &str,
     positions: &Arc<Mutex<PositionMap>>,
     strategy_name: &str,
     params: &OrderParams,
@@ -1541,7 +1549,7 @@ async fn record_guard(
 ) {
     let mut map = positions.lock().await;
     map.insert(
-        (strategy_name.to_string(), params.token_id.clone()),
+        PositionKey::new(squadron_id, strategy_name, params.token_id.clone()),
         Position {
             shares: fill.filled,
             avg_entry: fill.price,
@@ -1573,6 +1581,9 @@ async fn record_guard(
 /// naked leg. `Exit { exit_pair }` sells the leg the signal carries and clears
 /// the pair's guards.
 async fn dispatch_signal(
+    // Squadron whose positions these keys address, so two squadrons
+    // holding the same token stay independent.
+    squadron_id: &str,
     venue: &UsRetailVenue,
     pool: &Option<sqlx::SqlitePool>,
     positions: &Arc<Mutex<PositionMap>>,
@@ -1594,10 +1605,10 @@ async fn dispatch_signal(
                     fee: Decimal::ZERO,
                 };
                 let (ga, gb) = (ghost_of(params), ghost_of(pp));
-                record_guard(positions, strategy_name, params, Some(&pp.token_id), &ga).await;
-                record_guard(positions, strategy_name, pp, Some(&params.token_id), &gb).await;
-                record_entry(pool, scope, strategy_name, params, &ga).await;
-                record_entry(pool, scope, strategy_name, pp, &gb).await;
+                record_guard(squadron_id, positions, strategy_name, params, Some(&pp.token_id), &ga).await;
+                record_guard(squadron_id, positions, strategy_name, pp, Some(&params.token_id), &gb).await;
+                record_entry(squadron_id, pool, scope, strategy_name, params, &ga).await;
+                record_entry(squadron_id, pool, scope, strategy_name, pp, &gb).await;
                 return true;
             }
             let legs = [
@@ -1608,27 +1619,27 @@ async fn dispatch_signal(
                 Ok([a, b]) => {
                     info!("✅ [{strategy_name}] entry pair: {} @ {:.4} | {} @ {:.4}",
                         a.order_id, a.price, b.order_id, b.price);
-                    record_guard(positions, strategy_name, params, Some(&pp.token_id), &a).await;
-                    record_guard(positions, strategy_name, pp, Some(&params.token_id), &b).await;
+                    record_guard(squadron_id, positions, strategy_name, params, Some(&pp.token_id), &a).await;
+                    record_guard(squadron_id, positions, strategy_name, pp, Some(&params.token_id), &b).await;
                     // Track both resting legs so the reconciler manages their
                     // lifecycle (fill-confirm / stale-cancel / naked-leg hedge).
                     lifecycle.track(&a, strategy_name, params.order_type, Some(pp.token_id.clone())).await;
                     lifecycle.track(&b, strategy_name, pp.order_type, Some(params.token_id.clone())).await;
-                    record_entry(pool, scope, strategy_name, params, &a).await;
-                    record_entry(pool, scope, strategy_name, pp, &b).await;
-                    if let Some(p) = pool { sync_dashboard(venue, p, Some(positions), starting).await; }
+                    record_entry(squadron_id, pool, scope, strategy_name, params, &a).await;
+                    record_entry(squadron_id, pool, scope, strategy_name, pp, &b).await;
+                    if let Some(p) = pool { sync_dashboard(squadron_id, venue, p, Some(positions), starting).await; }
                     true
                 }
                 Err(e) => { warn!("[{strategy_name}] atomic entry failed: {e}"); false }
             }
         }
         StrategySignal::Entry { params, pair_params: None } => {
-            dispatch_single(venue, pool, positions, lifecycle, scope, strategy_name, params, Side::Buy, starting).await
+            dispatch_single(squadron_id, venue, pool, positions, lifecycle, scope, strategy_name, params, Side::Buy, starting).await
         }
         StrategySignal::MakerQuote { yes, no } => {
             let mut acted = false;
             for q in [yes.as_ref(), no.as_ref()].into_iter().flatten() {
-                if dispatch_single(venue, pool, positions, lifecycle, scope, strategy_name, q, Side::Buy, starting).await {
+                if dispatch_single(squadron_id, venue, pool, positions, lifecycle, scope, strategy_name, q, Side::Buy, starting).await {
                     acted = true;
                 }
             }
@@ -1649,7 +1660,7 @@ async fn dispatch_signal(
                         acted = true;
                     }
                 }
-                positions.lock().await.remove(&(strategy_name.to_string(), tok.clone()));
+                positions.lock().await.remove(&PositionKey::new(squadron_id, strategy_name, tok.clone()));
             }
             acted
         }
@@ -1669,23 +1680,23 @@ async fn dispatch_signal(
             let entered = positions
                 .lock()
                 .await
-                .get(&(strategy_name.to_string(), params.token_id.clone()))
+                .get(&PositionKey::new(squadron_id, strategy_name, params.token_id.clone()))
                 .map(|p| (p.avg_entry, p.shares));
-            let acted = dispatch_single(venue, pool, positions, lifecycle, scope, strategy_name, params, Side::Sell, starting).await;
+            let acted = dispatch_single(squadron_id, venue, pool, positions, lifecycle, scope, strategy_name, params, Side::Sell, starting).await;
             if acted {
                 record_round_trip(pool, scope, strategy_name, params, entered, reason).await;
             }
             // Clear this strategy's guard for the leg (and the paired leg, if any)
             // so it can re-enter later.
             let mut map = positions.lock().await;
-            map.remove(&(strategy_name.to_string(), params.token_id.clone()));
+            map.remove(&PositionKey::new(squadron_id, strategy_name, params.token_id.clone()));
             if *exit_pair {
                 let paired: Vec<_> = map.iter()
-                    .filter(|((s, _), p)| s == strategy_name
+                    .filter(|(k, p)| k.strategy == strategy_name && k.squadron == squadron_id
                         && p.paired_leg_token_id.as_ref() == Some(&params.token_id))
-                    .map(|((s, t), _)| (s.clone(), t.clone()))
+                    .map(|(k, _)| (k.strategy.clone(), k.market.clone()))
                     .collect();
-                for k in paired { map.remove(&k); }
+                for k in paired { map.remove(&PositionKey::new(squadron_id, k.0, k.1)); }
             }
             acted
         }
@@ -1696,6 +1707,8 @@ async fn dispatch_signal(
 /// Place a single venue order from viper params, recording a buy-side guard and
 /// tracking the order for lifecycle reconciliation if it rests.
 async fn dispatch_single(
+    // Squadron whose positions these guards belong to.
+    squadron_id: &str,
     venue: &UsRetailVenue,
     pool: &Option<sqlx::SqlitePool>,
     positions: &Arc<Mutex<PositionMap>>,
@@ -1717,8 +1730,8 @@ async fn dispatch_single(
             fee: Decimal::ZERO,
         };
         if matches!(side, Side::Buy) {
-            record_guard(positions, strategy_name, params, None, &ghost).await;
-            record_entry(pool, scope, strategy_name, params, &ghost).await;
+            record_guard(squadron_id, positions, strategy_name, params, None, &ghost).await;
+            record_entry(squadron_id, pool, scope, strategy_name, params, &ghost).await;
         }
         return true;
     }
@@ -1740,11 +1753,11 @@ async fn dispatch_single(
             info!("✅ [{strategy_name}] {side:?} {} @ {:.4} × {:.2} (order {})",
                 params.token_id, f.price, f.filled, f.order_id);
             if matches!(side, Side::Buy) {
-                record_guard(positions, strategy_name, params, None, &f).await;
+                record_guard(squadron_id, positions, strategy_name, params, None, &f).await;
                 lifecycle.track(&f, strategy_name, params.order_type, None).await;
-                record_entry(pool, scope, strategy_name, params, &f).await;
+                record_entry(squadron_id, pool, scope, strategy_name, params, &f).await;
             }
-            if let Some(p) = pool { sync_dashboard(venue, p, Some(positions), starting).await; }
+            if let Some(p) = pool { sync_dashboard(squadron_id, venue, p, Some(positions), starting).await; }
             true
         }
         Err(e) => { warn!("[{strategy_name}] {side:?} order failed: {e}"); false }
@@ -1757,6 +1770,8 @@ async fn dispatch_single(
 /// [`sync_dashboard`]'s venue sweep, which knows the instrument but not which
 /// viper owns it — every live position was mislabelled as ArbitrageStrategy.
 async fn record_entry(
+    // Squadron credited with the position in the database.
+    squadron_id: &str,
     pool: &Option<sqlx::SqlitePool>,
     scope: &TradeScope,
     strategy_name: &str,
@@ -1780,7 +1795,7 @@ async fn record_entry(
         // promotes it. Ghost entries have no venue truth to wait for.
         let status = if params.ghost_mode { "confirmed" } else { "pending" };
         db::record_open_position_with_status(
-            p, strategy_name, params.token_id.as_str(), &params.market_name,
+            p, squadron_id, strategy_name, params.token_id.as_str(), &params.market_name,
             side, fill.price, fill.filled, params.ghost_mode, status,
         ).await;
     }
@@ -1838,6 +1853,8 @@ async fn record_round_trip(
 /// `guards` is the trade loop's live position map when one is running; the idle
 /// heartbeat passes `None` (no viper owns anything while the loop is parked).
 async fn sync_dashboard(
+    // Squadron whose guards are summarised for the dashboard.
+    squadron_id: &str,
     venue: &UsRetailVenue,
     pool: &sqlx::SqlitePool,
     guards: Option<&Arc<Mutex<PositionMap>>>,
@@ -1857,7 +1874,8 @@ async fn sync_dashboard(
     // than being blamed on a viper that never traded them.
     let owners: HashMap<String, (String, String)> = match guards {
         Some(g) => g.lock().await.iter()
-            .map(|((s, t), p)| (t.as_str().to_string(), (s.clone(), p.market_name.clone())))
+            .filter(|(k, _)| k.squadron == squadron_id)
+            .map(|(k, p)| (k.market.as_str().to_string(), (k.strategy.clone(), p.market_name.clone())))
             .collect(),
         None => HashMap::new(),
     };
@@ -1872,13 +1890,13 @@ async fn sync_dashboard(
             // holding is what promotes it out of `pending`.
             Some((strategy, market_name)) => {
                 db::record_open_position(
-                    pool, strategy, sym, market_name, side_label(sym), p.avg_price, p.shares, false,
+                    pool, squadron_id, strategy, sym, market_name, side_label(sym), p.avg_price, p.shares, false,
                 ).await;
                 db::confirm_position_status(pool, strategy, sym).await;
             }
             None => {
                 db::record_open_position(
-                    pool, "ChainAdopted", sym, sym, side_label(sym), p.avg_price, p.shares, false,
+                    pool, squadron_id, "ChainAdopted", sym, sym, side_label(sym), p.avg_price, p.shares, false,
                 ).await;
             }
         }
