@@ -316,7 +316,8 @@ function ViperBudgets({ vipers, budgets, onChange }: ViperBudgetsProps) {
 interface DeploySquadronModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onDeployed?: (squadronId: string) => void;
+  /** Fired on a successful queue-up, with the deployment id and its class. */
+  onDeployed?: (deploymentId: string, marketType: string) => void;
 }
 
 export default function DeploySquadronModal({ isOpen, onClose, onDeployed }: DeploySquadronModalProps) {
@@ -455,7 +456,7 @@ export default function DeploySquadronModal({ isOpen, onClose, onDeployed }: Dep
         // with nothing to say their click had landed, which reads as a dead
         // button even when the deployment succeeded.
         setConfirmed(`Queued. ${selectedType} squadron starting — it appears in the CAG registry shortly.`);
-        onDeployed?.(response.squadron_id);
+        onDeployed?.(response.squadron_id, selectedType);
         setTimeout(onClose, 1800);
       } else {
         setError(response.error || 'Deployment failed');

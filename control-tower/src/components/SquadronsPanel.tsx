@@ -16,7 +16,7 @@
 // You should have received a copy of the GNU Affero General Public License along
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import useSWR from 'swr';
 import type { SquadronSummary, SquadronState, DeploymentStatus } from '@/lib/types';
 import { getOpenPositions, getVipersForClass, getDeployments } from '@/lib/api';
@@ -265,10 +265,21 @@ interface Props {
 
 export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, onDeploySuccess }: Props) {
   const [deployModalOpen, setDeployModalOpen] = useState(false);
+  // A deploy this panel just made, held until the engine's own queue confirms
+  // it. Optimistic on purpose: the API answered success, so the row is true the
+  // moment it is shown, and it is retired by real state rather than by a timer.
+  const [justDeployed, setJustDeployed] = useState<{ id: string; marketType: string } | null>(null);
   
   // STAGED is active (pending deployment), not inactive
-  const active   = squadrons.filter(s => s.state === 'PATROLLING' || s.state === 'DEPLOYED' || s.state === 'STAGED');
-  const inactive = squadrons.filter(s => s.state === 'RTB' || s.state === 'STOOD_DOWN');
+  // RTB belongs with the ACTIVE squadrons. "Return to base" is an operating
+  // phase, not an ending: the squadron is alive and managing its open positions
+  // to close, it has only stopped opening new ones. It is entered 60s before
+  // every market close, so grouping it with STOOD_DOWN made a healthy crypto
+  // squadron drop into a collapsed drawer labelled "stood-down" every fifteen
+  // minutes and reappear afterwards — routine rotation shown as a death.
+  const active   = squadrons.filter(s =>
+    s.state === 'PATROLLING' || s.state === 'DEPLOYED' || s.state === 'STAGED' || s.state === 'RTB');
+  const inactive = squadrons.filter(s => s.state === 'STOOD_DOWN');
 
   // Get unique assets from squadrons
   const assets = [...new Set(squadrons.map(s => s.asset.toLowerCase()))];
@@ -312,7 +323,29 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, 
     const at = Date.parse(d.created_at);
     return Number.isNaN(at) || Date.now() - at < FAILURE_VISIBLE_MS;
   });
-  const queueRows = [...inFlight, ...failed];
+  // Retire the optimistic row once the engine's queue accounts for it — either
+  // it is now one of the in-flight rows (which carry the real market id), or it
+  // has left pending/processing entirely, meaning the squadron exists.
+  const optimisticSettled = justDeployed !== null && (
+    inFlight.some(d => d.id === justDeployed.id) ||
+    (deployments ?? []).some(d => d.id === justDeployed.id && d.status !== 'pending' && d.status !== 'processing')
+  );
+  useEffect(() => {
+    if (optimisticSettled) setJustDeployed(null);
+  }, [optimisticSettled]);
+
+  const optimisticRow: DeploymentStatus[] = justDeployed && !optimisticSettled
+    ? [{
+        id: justDeployed.id,
+        market_id: 'selecting market…',
+        market_type: justDeployed.marketType as DeploymentStatus['market_type'],
+        raptors: [], vipers: [],
+        status: 'pending',
+        created_at: new Date().toISOString(),
+      }]
+    : [];
+
+  const queueRows = [...optimisticRow, ...inFlight.filter(d => d.id !== justDeployed?.id), ...failed];
 
   // Build mission count map: asset -> count
   const missionCounts: Record<string, number> = {};
@@ -381,7 +414,7 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, 
             <details className="group">
               <summary className="flex items-center gap-2 px-4 py-2 text-[10px] font-mono text-gray-600 cursor-pointer hover:text-gray-400 transition-colors border-t border-[#1e1e32] list-none">
                 <span className="group-open:rotate-90 transition-transform inline-block">▶</span>
-                {inactive.length} stood-down / RTB
+                {inactive.length} stood-down
               </summary>
               {inactive.map(sq => (
                 <SquadronRow
@@ -401,7 +434,13 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, 
     <DeploySquadronModal
       isOpen={deployModalOpen}
       onClose={() => setDeployModalOpen(false)}
-      onDeployed={(squadronId) => {
+      onDeployed={(deploymentId, marketType) => {
+        // Show the row immediately rather than waiting to discover it by poll.
+        // The queued → active window is only a few seconds and both this panel
+        // and the engine poll on their own schedules, so a purely poll-driven
+        // row can be missed entirely — which leaves the operator watching an
+        // unchanged table, the exact complaint this was meant to answer.
+        setJustDeployed({ id: deploymentId, marketType });
         setDeployModalOpen(false);
         onDeploySuccess?.();
       }}
