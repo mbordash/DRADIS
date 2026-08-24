@@ -25,14 +25,22 @@
 # Options:
 #   --profile NAME         AWS CLI profile (or set AWS_PROFILE)
 #   --venues "LIST"        default: "intl us kalshi" (space-separated)
-#   --region REGION        default: eu-west-1
+#   --region REGION        default: us-east-1 (where Marketplace sources AMIs)
 #   --instance-type TYPE   default: c5.4xlarge (16 vCPU — three Rust builds)
 #   --version LABEL        default: git describe (AMI name suffix)
 #   --keep-instance        don't terminate the builder on failure (debugging)
 # =============================================================================
 set -euo pipefail
 
-REGION="eu-west-1"
+# AWS Marketplace sources an AMI from us-east-1, so an image registered anywhere
+# else cannot be listed — this default is a correctness requirement, not a
+# preference. eu-west-1 hosts only the public demo box, which is deployed by
+# hand via deploy-demo.sh and is not this script's business.
+#
+# Note that every AWS call below passes --region "$REGION" explicitly, so
+# AWS_DEFAULT_REGION in the environment has NO effect. Overriding the region
+# means passing --region; exporting the variable silently does nothing.
+REGION="us-east-1"
 # Three sequential Rust release builds: 16 vCPU keeps the wall clock sane, and
 # the instance is torn down at the end so the extra cost is minutes, not hours.
 INSTANCE_TYPE="c5.4xlarge"
