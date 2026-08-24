@@ -1843,6 +1843,22 @@ pub const VIPER_KINDS: &[(&str, &str, i32)] = &[
 /// with the CAG, and during that window the class appears in neither the
 /// pending queue nor the squadron list. Deduping on pending alone would seed a
 /// second squadron for a class that is already starting one.
+/// Market ids that already have a deployment the engine has not finished with.
+///
+/// The squadron registry records a market's *question*, never its id, so a
+/// "is this market already deployed" check cannot be answered from the registry
+/// — comparing a question against a ticker silently never matches. The queue is
+/// the only place the id is recorded, so the check belongs here.
+pub async fn deployment_markets_in_flight(pool: &SqlitePool) -> Vec<String> {
+    sqlx::query(
+        "SELECT DISTINCT market_id FROM deployment_queue
+         WHERE status IN ('pending', 'processing', 'active')"
+    )
+    .fetch_all(pool).await.ok()
+    .map(|rows| rows.into_iter().filter_map(|r| r.try_get::<String, _>(0).ok()).collect())
+    .unwrap_or_default()
+}
+
 pub async fn deployment_classes_in_flight(pool: &SqlitePool) -> Vec<String> {
     sqlx::query(
         "SELECT DISTINCT LOWER(market_type) FROM deployment_queue
@@ -4469,6 +4485,37 @@ mod auto_deploy_dedupe_tests {
         row(&pool, "d2", "politics", "pending").await;
         row(&pool, "d3", "politics", "active").await;
         assert_eq!(deployment_classes_in_flight(&pool).await, vec!["politics"]);
+    }
+
+    /// A market with a live deployment must be reported, so a second squadron
+    /// cannot be put on the same book to compete with the first.
+    #[tokio::test]
+    async fn a_live_deployment_holds_its_market() {
+        let pool = queue_pool().await;
+        row(&pool, "d1", "politics", "active").await;
+        assert_eq!(deployment_markets_in_flight(&pool).await, vec!["MKT"]);
+    }
+
+    /// Once a deployment finishes the market is free again — otherwise standing
+    /// a squadron down would permanently bar its market from being redeployed.
+    #[tokio::test]
+    async fn a_finished_deployment_releases_its_market() {
+        let pool = queue_pool().await;
+        row(&pool, "d1", "politics", "completed").await;
+        row(&pool, "d2", "sports", "failed").await;
+        assert!(deployment_markets_in_flight(&pool).await.is_empty());
+    }
+
+    /// The registry records a market's question and never its id, so this query
+    /// is the only thing that can answer "is this market already deployed".
+    /// Comparing a question against a ticker silently never matches.
+    #[tokio::test]
+    async fn markets_are_reported_by_id_not_question() {
+        let pool = queue_pool().await;
+        row(&pool, "d1", "politics", "active").await;
+        let found = deployment_markets_in_flight(&pool).await;
+        assert!(found.iter().any(|m| m == "MKT"));
+        assert!(!found.iter().any(|m| m.contains(' ')), "ids, not questions");
     }
 
     /// Compared case-insensitively against squadron assets and market types,

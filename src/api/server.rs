@@ -1912,10 +1912,16 @@ async fn stand_down_squadron(
 ) -> Response {
     info!("📥 POST /api/squadrons/{}/stand-down", id);
 
-    let Some(summary) = s.cag.get_squadron(&id) else {
+    let Some(mut summary) = s.cag.get_squadron(&id) else {
         warn!("stand-down: squadron '{}' not found", id);
         return (StatusCode::NOT_FOUND, format!("squadron '{}' not found", id)).into_response();
     };
+    // A registry copy carries an EMPTY market_class — it is resolved from the
+    // taxonomy at request time, which is why every other handler that reads the
+    // field calls this first. Without it the match below fell through to `None`,
+    // no auto-deploy switch was turned off, and the seeder replaced the squadron
+    // roughly ten seconds after the operator stood it down.
+    enrich_taxonomy(&mut summary).await;
 
     // Turn the switch off BEFORE cancelling, so the seeder cannot win the race
     // between the squadron leaving the registry and the config being written.
@@ -3024,35 +3030,6 @@ async fn deploy_squadron(
             // "crypto" deploy also matches boot-time BTC/ETH squadrons.
             enrich_taxonomy(sq).await;
         }
-        // One squadron per MARKET, not per class. Two squadrons of a class are
-        // now safe — positions, config and budgets are all keyed by squadron —
-        // so the only thing left to prevent is two squadrons quoting the same
-        // book against each other, which is self-competition rather than
-        // diversification. A named second squadron on a different market is
-        // exactly the case this used to refuse.
-        let target_market = req.market_id.clone().unwrap_or_default();
-        let dup_active = summaries.iter().any(|sq| {
-            !target_market.is_empty()
-                && sq.market_name == target_market
-                && sq.state != "STOOD_DOWN"
-        });
-        let dup_queued = !target_market.is_empty()
-            && crate::helpers::db::fetch_pending_deployments().await
-                .iter()
-                .any(|d| d.market_id == target_market);
-        if dup_active || dup_queued {
-            return Json(DeploySquadronResponse {
-                success: false,
-                squadron_id: None,
-                error: Some(format!(
-                    "A squadron is already {} on that market — two squadrons quoting the same book \
-                     compete with each other rather than diversifying. Pick a different market, or \
-                     stand the existing squadron down first.",
-                    if dup_active { "active" } else { "queued" },
-                )),
-            }).into_response();
-        }
-
         // A name is what tells two squadrons of one class apart, so a second one
         // must carry a distinct one rather than silently colliding.
         if let Some(name) = req.name.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
@@ -3113,7 +3090,37 @@ async fn deploy_squadron(
             }
         }
     };
-    
+
+    // ── One squadron per MARKET ──────────────────────────────────────────────
+    // Two squadrons of a class are now safe — positions, config and budgets are
+    // all keyed by squadron — so the only thing left to prevent is two squadrons
+    // quoting the same book against each other, which is self-competition rather
+    // than diversification.
+    //
+    // Checked HERE, after the market is resolved, rather than up with the class
+    // checks: in quick mode `req.market_id` is None until the selection above
+    // runs, so a check placed earlier saw an empty string and passed every time.
+    // The registry cannot answer this either — a squadron records its market's
+    // question, never its id — so the queue is the source of truth.
+    if let Some(pool) = crate::helpers::db::pool() {
+        if crate::helpers::db::deployment_markets_in_flight(pool).await
+            .iter()
+            .any(|m| m == &market_id)
+        {
+            warn!("📋 Deployment refused: a squadron is already on market {market_id}");
+            return Json(DeploySquadronResponse {
+                success: false,
+                squadron_id: None,
+                error: Some(
+                    "A squadron is already running on that market — two squadrons quoting the \
+                     same book compete with each other rather than diversifying. Pick a different \
+                     market, or stand the existing squadron down first."
+                        .to_string(),
+                ),
+            }).into_response();
+        }
+    }
+
     // Validate raptors and vipers (if manual mode)
     let raptors = if req.mode == "manual" && !req.raptors.is_empty() {
         req.raptors.clone()

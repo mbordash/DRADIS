@@ -460,10 +460,18 @@ export default function DeploySquadronModal({ isOpen, onClose, onDeployed }: Dep
   }, [mode, selectedType, selectedMarket, selectedRaptors, selectedVipers, onClose, onDeployed]);
 
   // Can deploy?
-  const canDeploy = selectedType && (
-    mode === 'quick' || 
-    (mode === 'manual' && selectedMarket && selectedVipers.size > 0)
-  );
+  // Why Deploy is unavailable, or null when it is available.
+  //
+  // A disabled button with no explanation is indistinguishable from a broken
+  // one — the operator clicks it, nothing happens, and there is nothing on
+  // screen or in the log to say why. Naming the missing piece costs a line.
+  const blockedReason: string | null =
+    !selectedType                                   ? 'Pick a market type first.'
+    : mode === 'quick'                              ? null
+    : !selectedMarket                               ? 'Pick a market from the list.'
+    : selectedVipers.size === 0                     ? 'Select at least one viper.'
+    : null;
+  const canDeploy = blockedReason === null;
 
   if (!isOpen) return null;
 
@@ -594,32 +602,37 @@ export default function DeploySquadronModal({ isOpen, onClose, onDeployed }: Dep
               <span className="text-xs font-mono text-red-400">{error}</span>
             </div>
           )}
-        </div>
 
-        {/* Name — optional, but the only thing that tells two squadrons of one
-            class apart once a second exists. */}
-        <div className="px-5 pb-4">
-          <label className="block text-[11px] font-mono text-gray-400 mb-1.5">
-            Squadron name <span className="text-gray-600">(optional)</span>
-          </label>
-          <input
-            type="text"
-            value={name}
-            onChange={e => setName(e.target.value)}
-            placeholder="e.g. 15m Scalper"
-            maxLength={48}
-            className="w-full bg-[#0a0a14] border border-[#1e1e32] rounded px-3 py-2
-                       text-xs font-mono text-gray-200 placeholder:text-gray-700
-                       focus:outline-none focus:border-green-500/40"
-          />
-          <p className="text-[10px] text-gray-600 mt-1.5 leading-relaxed">
-            Names a second squadron of this class so it gets its own strategy
-            settings, budgets and positions. Leave blank for the default name.
-          </p>
+          {/* Name — optional, but the only thing that tells two squadrons of one
+              class apart once a second exists. Inside the scroll container: when it
+              sat below it the modal grew past the viewport and pushed the Deploy
+              button off-screen, which reads as a dead button. */}
+          <div>
+            <label className="block text-[11px] font-mono text-gray-400 mb-1.5">
+              Squadron name <span className="text-gray-600">(optional)</span>
+            </label>
+            <input
+              type="text"
+              value={name}
+              onChange={e => setName(e.target.value)}
+              placeholder="e.g. 15m Scalper"
+              maxLength={48}
+              className="w-full bg-[#0a0a14] border border-[#1e1e32] rounded px-3 py-2
+                         text-xs font-mono text-gray-200 placeholder:text-gray-700
+                         focus:outline-none focus:border-green-500/40"
+            />
+            <p className="text-[10px] text-gray-600 mt-1.5 leading-relaxed">
+              Names a second squadron of this class so it gets its own strategy
+              settings, budgets and positions. Leave blank for the default name.
+            </p>
+          </div>
         </div>
 
         {/* Footer */}
         <div className="flex items-center justify-end gap-3 px-5 py-4 border-t border-[#1e1e32] bg-[#0a0a14]">
+          {blockedReason && (
+            <span className="mr-auto text-[10px] font-mono text-amber-400/80">{blockedReason}</span>
+          )}
           <button
             onClick={onClose}
             className="px-4 py-2 text-xs font-mono text-gray-400 hover:text-gray-300 transition-colors"
