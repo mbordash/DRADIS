@@ -290,17 +290,28 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, 
     { refreshInterval: 3_000 }
   );
 
-  // A queued row is only worth showing until its squadron exists — after that
-  // the real row carries the state, and showing both would double-count.
-  const liveClasses = new Set(squadrons
-    .filter(s => s.state !== 'STOOD_DOWN')
-    .map(s => s.asset.toLowerCase()));
+  // A queued row is worth showing until its squadron exists — after that the
+  // real row carries the state and showing both would double-count.
+  //
+  // Keyed on the deployment's OWN status, not on whether the class is live.
+  // Suppressing by class was correct while only one squadron per class could
+  // exist: a live class meant the deployment had landed. Now that a class can
+  // hold several squadrons, it suppressed the feedback exactly when it was most
+  // wanted — deploying a second sports squadron beside a running one showed
+  // nothing at all. A row's status goes pending → processing → active, and
+  // 'active' is precisely the moment the squadron appears in the list.
   const inFlight = (deployments ?? []).filter(d =>
-    (d.status === 'pending' || d.status === 'processing') && !liveClasses.has(d.market_type.toLowerCase()));
-  // Failures are shown until the class is running again, so a failed deploy
-  // cannot vanish unseen between two poll ticks.
-  const failed = (deployments ?? []).filter(d =>
-    d.status === 'failed' && !liveClasses.has(d.market_type.toLowerCase()));
+    d.status === 'pending' || d.status === 'processing');
+
+  // Failures have no later status to retire them, so they are bounded by age
+  // instead — long enough that one cannot slip by between two poll ticks,
+  // short enough that last week's failures do not accumulate on screen.
+  const FAILURE_VISIBLE_MS = 10 * 60 * 1000;
+  const failed = (deployments ?? []).filter(d => {
+    if (d.status !== 'failed') return false;
+    const at = Date.parse(d.created_at);
+    return Number.isNaN(at) || Date.now() - at < FAILURE_VISIBLE_MS;
+  });
   const queueRows = [...inFlight, ...failed];
 
   // Build mission count map: asset -> count
