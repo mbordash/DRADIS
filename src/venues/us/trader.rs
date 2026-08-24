@@ -788,7 +788,7 @@ async fn trade_one_market(
     // The US venue runs a standalone arb loop (no intl-style patrol), but the
     // dashboard reads squadrons from the CAG registry — so without this the UI
     // shows zero squadrons even though the venue is live.
-    let squadron = register_us_squadron(cag, &pair, sports_rx.clone(), tennis_rx.clone(), wing, raptors.as_ref(), strike_price);
+    let squadron = register_us_squadron(cag, &pair, sports_rx.clone(), tennis_rx.clone(), wing, raptors.as_ref(), strike_price, cancel);
     let squadron_id = squadron.id.clone();
 
     // Seed the squadron's Viper config so the detail view's strategy cards render.
@@ -1923,6 +1923,8 @@ fn register_us_squadron(
     wing: Wing,
     crypto_raptors: Option<&CryptoRaptors>,
     strike_price: Option<Decimal>,
+    // The token this wing's trade loop selects on, so a stand-down stops it.
+    cancel: &CancellationToken,
 ) -> Squadron {
     let raptors = match crypto_raptors {
         Some(r) => {
@@ -1990,7 +1992,7 @@ fn register_us_squadron(
         // "sports", "crypto", … straight from the venue.
         Some(pair.category.clone()).filter(|c| !c.is_empty()),
     );
-    cag.register(&squadron);
+    cag.register_with_cancel(&squadron, cancel.clone());
     squadron
 }
 

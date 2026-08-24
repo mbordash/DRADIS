@@ -343,7 +343,23 @@ export async function deploySquadron(request: DeploySquadronRequest): Promise<De
   return res.json();
 }
 
-import type { DeploymentStatus } from './types';
+import type { DeploymentStatus, StandDownResult } from './types';
+
+/// Stop one squadron without stopping the engine.
+///
+/// The deploy endpoint's one-per-class error has always told operators to
+/// "stand it down before deploying another", but nothing exposed the CAG's
+/// stand-down until this route existed. If the squadron belongs to a class
+/// DRADIS auto-deploys, the backend also switches that off — otherwise the
+/// seeder would start a replacement within seconds.
+export async function standDownSquadron(squadronId: string): Promise<StandDownResult> {
+  const res = await fetch(`${BASE}/api/squadrons/${encodeURIComponent(squadronId)}/stand-down`, {
+    method: 'POST',
+    cache: 'no-store',
+  });
+  if (!res.ok) throw new Error(await res.text() || `stand-down → ${res.status}`);
+  return res.json();
+}
 
 /** Get all deployment requests with their status. */
 export async function getDeployments(): Promise<DeploymentStatus[]> {

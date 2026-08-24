@@ -1871,6 +1871,87 @@ async fn get_squadron_by_id(
     }
 }
 
+/// Response for POST /api/squadrons/{id}/stand-down.
+#[derive(Serialize)]
+struct StandDownResponse {
+    success: bool,
+    squadron_id: String,
+    /// Set when the class's auto-deploy switch was turned off as part of this.
+    auto_deploy_disabled: Option<String>,
+    message: String,
+}
+
+/// POST /api/squadrons/{id}/stand-down
+///
+/// Stop a squadron. The engine keeps running; this squadron's trade loop exits,
+/// its resting orders are cancelled, and any position it holds is flattened or
+/// left to settle by the venue's normal stand-down path.
+///
+/// There was no way to do this at all before — `Cag::stand_down` existed but no
+/// route reached it, so the deploy endpoint's own error message ("stand it down
+/// before deploying another") named a control the product did not have.
+///
+/// If the squadron belongs to a class DRADIS auto-deploys, the corresponding
+/// switch is turned off in the same operation. Otherwise the seeder would notice
+/// the class was empty and start a replacement within seconds, and the operator
+/// would be left fighting a loop they cannot see. Turning the switch back on is
+/// how they resume it.
+async fn stand_down_squadron(
+    State(s): State<ApiState>,
+    Path(id): Path<String>,
+) -> Response {
+    info!("📥 POST /api/squadrons/{}/stand-down", id);
+
+    let Some(summary) = s.cag.get_squadron(&id) else {
+        warn!("stand-down: squadron '{}' not found", id);
+        return (StatusCode::NOT_FOUND, format!("squadron '{}' not found", id)).into_response();
+    };
+
+    // Turn the switch off BEFORE cancelling, so the seeder cannot win the race
+    // between the squadron leaving the registry and the config being written.
+    let class = summary.market_class.to_lowercase();
+    let mut disabled = None;
+    let patch = match class.as_str() {
+        "politics" => Some(("auto_deploy_politics", serde_json::json!(false))),
+        "sports"   => Some(("auto_deploy_sports",   serde_json::json!(false))),
+        _ => None,
+    };
+    if let Some((field, value)) = patch {
+        let current = s.config_rx.borrow().clone();
+        let still_on = match field {
+            "auto_deploy_politics" => current.auto_deploy_politics,
+            _ => current.auto_deploy_sports,
+        };
+        if still_on {
+            let body = serde_json::json!({ field: value }).to_string();
+            match DynamicConfig::apply_patch_as(&current, &body, "operator (stand-down)").await {
+                Ok(updated) => {
+                    let _ = s.config_tx.send(updated);
+                    disabled = Some(field.to_string());
+                    info!("🛬 stand-down: {field} switched off so the squadron is not re-seeded");
+                }
+                Err(e) => warn!("🛬 stand-down: could not switch off {field}: {e}"),
+            }
+        }
+    }
+
+    if !s.cag.stand_down(&id) {
+        return (StatusCode::NOT_FOUND, format!("squadron '{}' not found", id)).into_response();
+    }
+    s.cag.update_state(&id, crate::squadron::SquadronState::StoodDown);
+
+    let message = match &disabled {
+        Some(f) => format!("Squadron {id} standing down. {f} switched off so it is not redeployed automatically."),
+        None => format!("Squadron {id} standing down."),
+    };
+    Json(StandDownResponse {
+        success: true,
+        squadron_id: id,
+        auto_deploy_disabled: disabled,
+        message,
+    }).into_response()
+}
+
 /// Populate a squadron summary's market taxonomy (`market_class` + the
 /// `raptors`/`vipers` meaningful for it) from the DB at request time.
 ///
@@ -3193,6 +3274,7 @@ pub async fn run_api_server(
         .route("/api/squadrons/{id}",        get(get_squadron_by_id))
         .route("/api/squadrons/{id}/config", get(get_squadron_config).patch(patch_squadron_config))
         .route("/api/squadrons/deploy",      axum::routing::post(deploy_squadron))
+        .route("/api/squadrons/{id}/stand-down", axum::routing::post(stand_down_squadron))
         // ── Squadron Deployment & Taxonomy (Admiral Adama extension) ───────
         .route("/api/deployment/region",     get(get_deployment_region))
         .route("/api/deployments",           get(get_deployments))

@@ -617,6 +617,15 @@ export interface DeploySquadronResponse {
   error?: string;
 }
 
+/** Response from POST /api/squadrons/{id}/stand-down. */
+export interface StandDownResult {
+  success: boolean;
+  squadron_id: string;
+  /** Set when the class's auto-deploy switch was turned off as part of this. */
+  auto_deploy_disabled?: string;
+  message: string;
+}
+
 /** Deployment status from GET /api/deployments. */
 export interface DeploymentStatus {
   id: string;

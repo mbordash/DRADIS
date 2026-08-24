@@ -285,9 +285,19 @@ impl Cag {
     /// `SquadronId` can be used with `update_state()`, `update_maker_market()`,
     /// and `remove()` to keep the registry in sync across market rotations.
     pub fn register(&self, squadron: &Squadron) -> SquadronId {
+        self.register_with_cancel(squadron, CancellationToken::new())
+    }
+
+    /// Register a squadron along with the token that actually stops it.
+    ///
+    /// `register` fabricates a token instead, which nothing selects on — so
+    /// `stand_down` cancelled it, logged that the signal was sent, returned
+    /// true, and the squadron carried on trading. Any caller that owns a real
+    /// cancellation path should use this one, so the registry's token and the
+    /// trade loop's token are the same object.
+    pub fn register_with_cancel(&self, squadron: &Squadron, cancel_token: CancellationToken) -> SquadronId {
         let id      = squadron.id.clone();
         let summary = SquadronSummary::from_squadron(squadron);
-        let cancel_token = CancellationToken::new(); // reserved for Admiral Adama extension
 
         self.inner.registry.insert(id.clone(), CagEntry {
             summary,

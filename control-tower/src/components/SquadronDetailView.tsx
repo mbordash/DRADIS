@@ -16,7 +16,7 @@
 // You should have received a copy of the GNU Affero General Public License along
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import { useCallback } from 'react';
+import { useCallback, useState } from 'react';
 import useSWR from 'swr';
 import type { SquadronSummary, DynamicConfig, AssetRaptorHealth } from '@/lib/types';
 import {
@@ -28,11 +28,13 @@ import {
   getVipersStatus,
   patchSquadronConfig,
   getConfigSchema,
+  standDownSquadron,
   VIPER_DEFS,
 } from '@/lib/api';
 import ViperCard, { fmtAgo, STALE_EVAL_SECS } from '@/components/ViperCard';
 import { AdvancedRow } from '@/components/AdvancedConfigModal';
 import OpenPositionsCard from '@/components/OpenPositionsCard';
+import { useConfirm } from '@/components/ConfirmDialog';
 import { DEMO_MODE } from '@/lib/demo';
 
 // ── Raptor health panel ───────────────────────────────────────────────────────
@@ -289,6 +291,49 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
       ? VIPER_DEFS.filter((v) => squadron.vipers!.includes(v.statusKey))
       : VIPER_DEFS;
 
+  // ── Stand down ─────────────────────────────────────────────────────────────
+  // Stops this squadron without stopping the engine. Confirmed first, because it
+  // can flatten open positions and there is no undo — the operator redeploys.
+  const [confirm, confirmDialog] = useConfirm();
+  const [standingDown, setStandingDown] = useState(false);
+  const [standDownError, setStandDownError] = useState<string | null>(null);
+
+  const handleStandDown = useCallback(async () => {
+    const autoDeployed = marketClass === 'politics' || marketClass === 'sports';
+    const ok = await confirm({
+      title: `Stand down ${squadron.name}?`,
+      body: (
+        <div className="space-y-2">
+          <p>
+            This squadron stops trading {squadron.market_name || 'its market'}. Resting
+            orders are cancelled and any open position is flattened or left to settle.
+          </p>
+          {autoDeployed && (
+            <p className="text-amber-300">
+              Auto-deploy for {marketClass} will be switched off, so DRADIS does not
+              immediately start a replacement. Turn it back on in Setup → Deployment.
+            </p>
+          )}
+          <p className="text-gray-400">The engine and other squadrons keep running.</p>
+        </div>
+      ),
+      confirmLabel: 'Stand down',
+      tone: 'danger',
+    });
+    if (!ok) return;
+
+    setStandingDown(true);
+    setStandDownError(null);
+    try {
+      await standDownSquadron(squadron.id);
+      onBack();
+    } catch (err) {
+      setStandDownError(err instanceof Error ? err.message : 'Stand-down failed');
+    } finally {
+      setStandingDown(false);
+    }
+  }, [confirm, squadron.id, squadron.name, squadron.market_name, marketClass, onBack]);
+
   // ── Data fetching ──────────────────────────────────────────────────────────
   // Load squadron-specific config instead of global config
   const { data: config, mutate: refreshConfig } = useSWR(
@@ -364,16 +409,34 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
 
       {/* ── Header banner ─────────────────────────────────────────────────── */}
       <div className="card px-5 py-4 border border-indigo-500/20 bg-[#0d0d1a]">
-        <div className="flex items-center gap-3">
-          <span className="text-2xl">✈️</span>
-          <div>
-            <h1 className="text-xl font-mono font-bold text-white">{squadron.name}</h1>
-            <p className="text-xs font-mono text-gray-500 mt-0.5">
-              {squadron.asset} Squadron · {squadron.state}
-            </p>
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex items-center gap-3">
+            <span className="text-2xl">✈️</span>
+            <div>
+              <h1 className="text-xl font-mono font-bold text-white">{squadron.name}</h1>
+              <p className="text-xs font-mono text-gray-500 mt-0.5">
+                {squadron.asset} Squadron · {squadron.state}
+              </p>
+            </div>
           </div>
+          {squadron.state !== 'STOOD_DOWN' && (
+            <button
+              onClick={handleStandDown}
+              disabled={standingDown}
+              className="shrink-0 text-[11px] font-mono border rounded px-3 py-1.5 transition-colors
+                         border-red-500/30 text-red-300 bg-red-500/10 hover:bg-red-500/20
+                         disabled:opacity-50 disabled:cursor-not-allowed"
+              title="Stop this squadron"
+            >
+              {standingDown ? 'Standing down…' : '🛬 Stand Down'}
+            </button>
+          )}
         </div>
+        {standDownError && (
+          <p className="text-[11px] font-mono text-red-400 mt-2">{standDownError}</p>
+        )}
       </div>
+      {confirmDialog}
 
       {/* ── Squadron + Raptor info ────────────────────────────────────────── */}
       <div className="grid grid-cols-1 md:grid-cols-2 gap-4">

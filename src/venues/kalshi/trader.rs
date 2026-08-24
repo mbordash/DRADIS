@@ -884,7 +884,7 @@ async fn trade_one_market(
     };
 
     // ── Register the squadron so the Control Tower lists it ─────────────────
-    let squadron = register_kalshi_squadron(cag, &pair, &raptors, deployed_as, sports_rx, tennis_rx);
+    let squadron = register_kalshi_squadron(cag, &pair, &raptors, deployed_as, sports_rx, tennis_rx, cancel);
     let squadron_id = squadron.id.clone();
     // The squadron registers under the crypto underlying (so the taxonomy
     // classifies it as crypto), but this venue's DB scope is KALSHI_ASSET.
@@ -1878,6 +1878,8 @@ fn register_kalshi_squadron(
     deployed_as: Option<&str>,
     sports_rx: &watch::Receiver<SportsSnapshot>,
     tennis_rx: &watch::Receiver<TennisSnapshot>,
+    // The token the trade loop selects on, so a stand-down actually stops it.
+    cancel: &CancellationToken,
 ) -> Squadron {
     let raptors = SquadronRaptors::full(
         r.oracle.clone(),
@@ -1935,7 +1937,7 @@ fn register_kalshi_squadron(
         market,
         raptors,
     );
-    cag.register(&squadron);
+    cag.register_with_cancel(&squadron, cancel.clone());
     squadron
 }
 

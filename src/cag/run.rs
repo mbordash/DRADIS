@@ -402,7 +402,12 @@ where
         info!("🛫  Squadron [{}] → state={}", squadron.id, squadron.state);
 
         // Register with CAG so GET /api/squadrons shows this deployment.
-        let _squadron_id = patrol_ctx.cag.register(&squadron);
+        // Registered with the loop's own cancellation token. On this venue a
+        // squadron IS the asset's current market, so a squadron stand-down and
+        // an asset stand-down are the same act — and this is the token the loop
+        // above actually checks.
+        let _squadron_id = patrol_ctx.cag
+            .register_with_cancel(&squadron, cancel.clone());
 
         // Classify this market and link it to its eligible raptors/vipers via
         // the shared DB taxonomy (crypto → price+funding + full viper suite).
