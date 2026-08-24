@@ -2245,6 +2245,72 @@ struct AvailableMarketsResponse {
 /// instead of writing a row nothing will ever collect.
 const DEPLOY_QUEUE_HAS_CONSUMER: bool = true;
 
+
+/// A lazily-connected venue handle for market discovery.
+///
+/// Caches a SUCCESSFUL connection for the process lifetime and a FAILED one for
+/// [`Self::RETRY_AFTER`]. Both halves matter and pull in opposite directions:
+///
+/// * Caching the failure permanently — which `OnceCell<Option<_>>` does — let a
+///   single transient error disable market discovery for the whole process. The
+///   operator saw an empty market list from then on, with the cause a lone
+///   warning that had scrolled away.
+/// * Not caching it at all makes every browse re-attempt the connect. Against a
+///   venue that rate-limits (Cloudflare 1015, which several restarts in quick
+///   succession will trigger), that keeps the limiter tripped and turns a brief
+///   outage into a standing one.
+///
+/// So: retry, but not on every keystroke.
+// The intl CLOB discovers through the Gamma API rather than a venue handle, so
+// this is unused on that build.
+#[cfg_attr(feature = "intl_clob", allow(dead_code))]
+struct VenueSlot<V> {
+    connected: Option<std::sync::Arc<V>>,
+    last_failure: Option<std::time::Instant>,
+}
+
+#[cfg_attr(feature = "intl_clob", allow(dead_code))]
+impl<V> VenueSlot<V> {
+    /// How long to wait before re-attempting after a failed connect.
+    const RETRY_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+    const fn new() -> Self {
+        Self { connected: None, last_failure: None }
+    }
+
+    /// The cached handle, connecting if there is none and the cooldown has passed.
+    async fn get_or_connect<F, Fut, E>(&mut self, connect: F) -> Option<std::sync::Arc<V>>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<V, E>>,
+        E: std::fmt::Display,
+    {
+        if let Some(v) = self.connected.as_ref() {
+            return Some(std::sync::Arc::clone(v));
+        }
+        if let Some(at) = self.last_failure {
+            if at.elapsed() < Self::RETRY_AFTER {
+                debug!("venue connect on cooldown, {}s remaining",
+                       (Self::RETRY_AFTER - at.elapsed()).as_secs());
+                return None;
+            }
+        }
+        match connect().await {
+            Ok(v) => {
+                let v = std::sync::Arc::new(v);
+                self.connected = Some(std::sync::Arc::clone(&v));
+                self.last_failure = None;
+                Some(v)
+            }
+            Err(e) => {
+                warn!("Venue connect failed for market discovery: {e}");
+                self.last_failure = Some(std::time::Instant::now());
+                None
+            }
+        }
+    }
+}
+
 /// Default max-time-to-close for a market class, in seconds.
 ///
 /// The sensible value depends on the VENUE as much as the class, because the
@@ -2743,28 +2809,17 @@ async fn fetch_markets_by_type(
     min_liquidity: f64,
 ) -> Vec<AvailableMarket> {
     use crate::venues::us::UsRetailVenue;
-    static US_VENUE: tokio::sync::Mutex<Option<std::sync::Arc<UsRetailVenue>>> =
-        tokio::sync::Mutex::const_new(None);
+    static US_VENUE: tokio::sync::Mutex<VenueSlot<UsRetailVenue>> =
+        tokio::sync::Mutex::const_new(VenueSlot::new());
 
     let venue = {
         let mut slot = US_VENUE.lock().await;
-        match slot.as_ref() {
-            Some(v) => std::sync::Arc::clone(v),
-            None => {
-                let http = std::sync::Arc::new(http.clone());
-                match UsRetailVenue::connect(http).await {
-                    Ok(v) => {
-                        let v = std::sync::Arc::new(v);
-                        *slot = Some(std::sync::Arc::clone(&v));
-                        v
-                    }
-                    Err(e) => {
-                        // Left uncached so the next request tries again.
-                        warn!("US venue connect failed for market discovery: {e:#}");
-                        return Vec::new();
-                    }
-                }
-            }
+        match slot.get_or_connect(|| {
+            let http = std::sync::Arc::new(http.clone());
+            async move { UsRetailVenue::connect(http).await }
+        }).await {
+            Some(v) => v,
+            None => return Vec::new(),
         }
     };
 
@@ -2843,23 +2898,13 @@ async fn fetch_markets_by_type(
     // Cached on success only — a failed init is retried next request rather
     // than remembered. See the note on the US venue handle: caching the failure
     // disabled market discovery for the whole process from one transient error.
-    static KALSHI_VENUE: tokio::sync::Mutex<Option<std::sync::Arc<KalshiVenue>>> =
-        tokio::sync::Mutex::const_new(None);
+    static KALSHI_VENUE: tokio::sync::Mutex<VenueSlot<KalshiVenue>> =
+        tokio::sync::Mutex::const_new(VenueSlot::new());
     let venue = {
         let mut slot = KALSHI_VENUE.lock().await;
-        match slot.as_ref() {
-            Some(v) => std::sync::Arc::clone(v),
-            None => match KalshiVenue::from_env() {
-                Ok(v) => {
-                    let v = std::sync::Arc::new(v);
-                    *slot = Some(std::sync::Arc::clone(&v));
-                    v
-                }
-                Err(e) => {
-                    warn!("Kalshi venue init failed for market discovery: {e:#}");
-                    return Vec::new();
-                }
-            },
+        match slot.get_or_connect(|| async { KalshiVenue::from_env() }).await {
+            Some(v) => v,
+            None => return Vec::new(),
         }
     };
 
