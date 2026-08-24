@@ -1025,14 +1025,19 @@ async fn trade_one_market(
             _ = cancel.cancelled() => {
                 info!("Kalshi trader: cancelled — standing down");
                 lifecycle.cancel_all(venue.as_ref()).await;
+                // Marked STOOD_DOWN but deliberately LEFT in the registry, so
+                // the operator keeps a record of what they stood down — the
+                // Control Tower lists these under "stood-down / RTB". The other
+                // exit paths remove the entry because the squadron is being
+                // replaced by the next rotation; an operator stand-down is not
+                // replaced by anything, and removing it made the squadron
+                // vanish with no trace of the act.
+                //
+                // A redeploy under the same id revives this row rather than
+                // adding one. That is only ambiguous for an UNNAMED redeploy:
+                // a named squadron takes `{asset}-{cadence}-{slug}` and appears
+                // as its own entry alongside this one.
                 cag.update_state(&squadron_id, SquadronState::StoodDown);
-                // Leave the registry, like every other exit path and like the
-                // intl venue. Without this an operator stand-down left the row
-                // in place forever, and a redeploy re-registered the same id —
-                // so the list showed one row flipping STOOD_DOWN → PATROLLING,
-                // which reads as "it came back on its own and my deploy did
-                // nothing" rather than as two deliberate acts.
-                cag.remove(&squadron_id);
                 if pair.is_crypto() { publish_raptor_health(raptor_health_tx, pair.underlying, false); }
                 return MarketOutcome::Cancelled;
             }

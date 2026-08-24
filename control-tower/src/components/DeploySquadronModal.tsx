@@ -465,7 +465,14 @@ export default function DeploySquadronModal({ isOpen, onClose, onDeployed }: Dep
     } finally {
       setDeploying(false);
     }
-  }, [mode, selectedType, selectedMarket, selectedRaptors, selectedVipers, onClose, onDeployed]);
+    // Every value the callback READS must be listed, or useCallback memoises a
+    // closure over the render in which it was created and keeps reading that
+    // render's values forever. `name` and `viperBudgets` were missing: a typed
+    // squadron name and per-viper capital budgets were captured as their initial
+    // empty state and silently dropped from the request — the deploy succeeded,
+    // so nothing surfaced the loss.
+  }, [mode, selectedType, selectedMarket, selectedRaptors, selectedVipers,
+      name, viperBudgets, onClose, onDeployed]);
 
   // Can deploy?
   // Why Deploy is unavailable, or null when it is available.

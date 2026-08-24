@@ -4432,7 +4432,8 @@ mod auto_deploy_dedupe_tests {
             "CREATE TABLE deployment_queue (
                 id TEXT PRIMARY KEY, market_id TEXT NOT NULL, market_type TEXT NOT NULL,
                 raptors TEXT NOT NULL, vipers TEXT NOT NULL, viper_budgets TEXT,
-                status TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+                status TEXT NOT NULL, name TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
         ).execute(&pool).await.unwrap();
         pool
     }
@@ -4485,6 +4486,35 @@ mod auto_deploy_dedupe_tests {
         row(&pool, "d2", "politics", "pending").await;
         row(&pool, "d3", "politics", "active").await;
         assert_eq!(deployment_classes_in_flight(&pool).await, vec!["politics"]);
+    }
+
+    /// The operator's squadron name must survive the round trip through the
+    /// queue. It is what gives a second squadron of a class its own id, config
+    /// and positions, so losing it silently downgrades a named deploy into a
+    /// collision with the squadron already running.
+    #[tokio::test]
+    async fn a_squadron_name_survives_the_queue() {
+        let pool = queue_pool().await;
+        sqlx::query(
+            "INSERT INTO deployment_queue (id, market_id, market_type, raptors, vipers, status, name)
+             VALUES ('d1', 'MKT', 'sports', '[]', '[]', 'pending', 'Scottie Scalper')"
+        ).execute(&pool).await.unwrap();
+
+        let name: String = sqlx::query_scalar("SELECT name FROM deployment_queue WHERE id = 'd1'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(name, "Scottie Scalper");
+    }
+
+    /// An unnamed deploy stores an empty name rather than NULL, so the reader
+    /// does not have to distinguish "no name" from a missing column on a
+    /// database that predates naming.
+    #[tokio::test]
+    async fn an_unnamed_deploy_stores_an_empty_name() {
+        let pool = queue_pool().await;
+        row(&pool, "d1", "sports", "pending").await;
+        let name: String = sqlx::query_scalar("SELECT COALESCE(name, '') FROM deployment_queue WHERE id = 'd1'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(name, "");
     }
 
     /// A market with a live deployment must be reported, so a second squadron

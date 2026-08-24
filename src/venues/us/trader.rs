@@ -933,11 +933,9 @@ async fn trade_one_market(
             _ = cancel.cancelled() => {
                 info!("US trader: cancelled — standing down");
                 lifecycle.cancel_all(venue.as_ref()).await;
+                // Left in the registry so the operator keeps a record of the
+                // stand-down; see the matching note in the Kalshi trader.
                 cag.update_state(&squadron_id, SquadronState::StoodDown);
-                // Leave the registry on an operator stand-down, matching the other
-                // venues. A lingering row that a redeploy revives is indistinguishable
-                // from a squadron that came back by itself.
-                cag.remove(&squadron_id);
                 publish_us_raptor_health(raptor_health_tx, asset, false);
                 return MarketOutcome::Cancelled;
             }
