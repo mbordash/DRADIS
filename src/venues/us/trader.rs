@@ -79,6 +79,9 @@ use crate::venues::lifecycle::{LifecycleConfig, OrderLifecycle};
 
 use super::{ws, UsRetailVenue};
 
+/// How long to wait between attempts to read the session's starting collateral.
+const COLLATERAL_RETRY_SECS: u64 = 15;
+
 /// Optional substring filter (matched against slug / question) to pick a market.
 const ENV_MARKET_FILTER: &str = "POLYMARKET_US_MARKET_FILTER";
 
@@ -644,7 +647,8 @@ async fn run_wing(
         let active_bg = Arc::clone(&trading_active);
         let cancel_bg = cancel.clone();
         tokio::spawn(async move {
-            let starting = venue_bg.collateral().await.unwrap_or(Decimal::ZERO);
+            let Some(starting) = crate::venues::core::starting_collateral(
+                venue_bg.as_ref(), &cancel_bg, COLLATERAL_RETRY_SECS).await else { return };
             let mut tick = tokio::time::interval(Duration::from_secs(60));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
@@ -1059,7 +1063,12 @@ async fn trade_one_market(
 
     // ── Dashboard + strategy-context state ───────────────────────────────────
     let pool = db::pool_for(asset);
-    let starting = venue.collateral().await.unwrap_or(Decimal::ZERO);
+    // Held until the venue answers. A zero baseline reports the whole balance
+    // as session profit for the life of the process — see `starting_collateral`.
+    let Some(starting) = crate::venues::core::starting_collateral(
+        venue.as_ref(), cancel, COLLATERAL_RETRY_SECS).await else {
+        return MarketOutcome::Cancelled;
+    };
     let mut available_collateral = starting;
     let mut session_pnl = Decimal::ZERO;
     let mut dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;

@@ -67,6 +67,9 @@ use crate::venues::lifecycle::{LifecycleConfig, OrderLifecycle};
 
 use super::{leg_id, types::KalshiMarket, ws, KalshiVenue};
 
+/// How long to wait between attempts to read the session's starting collateral.
+const COLLATERAL_RETRY_SECS: u64 = 15;
+
 /// Comma-separated series tickers to hunt (override with `KALSHI_SERIES`).
 const ENV_SERIES: &str = "KALSHI_SERIES";
 const DEFAULT_SERIES: &str = "KXBTC15M,KXBTCD,KXETH15M,KXETHD";
@@ -864,7 +867,11 @@ async fn trade_one_market(
 
     // ── Dashboard + strategy-context state ──────────────────────────────────
     let pool = db::pool_for(asset);
-    let starting = venue.collateral().await.unwrap_or(Decimal::ZERO);
+    // Held until the venue answers — see `starting_collateral`.
+    let Some(starting) = crate::venues::core::starting_collateral(
+        venue.as_ref(), cancel, COLLATERAL_RETRY_SECS).await else {
+        return MarketOutcome::Cancelled;
+    };
     let mut available_collateral = starting;
     let mut session_pnl = Decimal::ZERO;
     let mut dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;

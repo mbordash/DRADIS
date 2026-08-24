@@ -261,3 +261,58 @@ pub trait Execution: Send + Sync {
     }
 }
 
+
+/// Read the session's starting collateral, retrying until the venue answers.
+///
+/// A wing that cannot read its balance cannot compute session P&L or its
+/// drawdown limit, so treating a failed read as "starting from zero" is the one
+/// answer that is certainly wrong. It was also the previous behaviour
+/// (`collateral().await.unwrap_or(Decimal::ZERO)`), and it poisons the whole
+/// session rather than one tick: `session_pnl = total - starting` then reports
+/// the entire balance as profit, for the lifetime of the process.
+///
+/// That is not hypothetical. Several engine restarts in quick succession trip
+/// the Polymarket US rate limiter on this exact probe; every snapshot afterwards
+/// recorded a $120 balance as $120 of session profit, which the portfolio chart
+/// summed across three wings and the LLM advisor read as a winning session.
+///
+/// Retries with a fixed delay rather than failing: the venue being briefly
+/// unreachable at startup is ordinary, and waiting is strictly better than
+/// trading against a baseline known to be false. Returns `None` only if
+/// cancelled, in which case the caller is shutting down anyway.
+pub async fn starting_collateral<V: Execution + ?Sized>(
+    venue: &V,
+    cancel: &tokio_util::sync::CancellationToken,
+    retry_secs: u64,
+) -> Option<Decimal> {
+    let mut attempt: u32 = 0;
+    loop {
+        if cancel.is_cancelled() {
+            return None;
+        }
+        match venue.collateral().await {
+            Ok(c) => {
+                if attempt > 0 {
+                    tracing::info!("💰 Starting collateral resolved after {attempt} retries: ${c:.2}");
+                }
+                return Some(c);
+            }
+            Err(e) => {
+                attempt += 1;
+                // Warn once, then stay quiet — a venue outage should not fill
+                // the log with one line per retry for as long as it lasts.
+                if attempt == 1 {
+                    tracing::warn!(
+                        "💰 Starting collateral unavailable ({e}) — retrying every {retry_secs}s. \
+                         Trading is held until the baseline is known; a wrong baseline would \
+                         misreport session P&L and the drawdown limit for the whole session."
+                    );
+                }
+                tokio::select! {
+                    _ = cancel.cancelled() => return None,
+                    _ = tokio::time::sleep(std::time::Duration::from_secs(retry_secs)) => {}
+                }
+            }
+        }
+    }
+}

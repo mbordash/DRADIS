@@ -48,7 +48,7 @@ use tokio::sync::watch;
 use tokio::time::Duration;
 
 #[cfg(feature = "intl_clob")]
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use dradis::config;
 #[cfg(feature = "intl_clob")]
@@ -708,18 +708,33 @@ async fn run() -> Result<()> {
     info!(" Order nonce ready (Maker/Safe): {}", initial_nonce);
 
     let mut startup_balance = dec!(0);
+    let mut balance_ever_read = false;
     for i in 1..=3 {
         info!(" Initializing portfolio balance (Attempt {}/3)...", i);
         let mut req = BalanceAllowanceRequest::default();
         req.asset_type = AssetType::Collateral;
         match trading_client.balance_allowance(req).await {
             Ok(resp) => {
+                balance_ever_read = true;
                 startup_balance = Decimal::from_str(&resp.balance.to_string()).unwrap_or(dec!(1)) / dec!(1_000_000);
                 if startup_balance > dec!(0) { break; }
             },
             Err(e) => warn!("⚠️ Balance fetch failed: {:?}", e),
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    // Zero is ambiguous here in a way it is not elsewhere: it means either an
+    // empty wallet or a balance that could not be read at all. Only the second
+    // is a problem, and it is a bad one — session P&L is `total - starting`, so
+    // a false zero baseline reports the entire balance as profit for the life of
+    // the session, and the drawdown limit degrades to its $4 floor. Say which
+    // one happened rather than printing "$0.00" for both.
+    if !balance_ever_read {
+        error!(
+            "❌ Could not read the wallet balance after 3 attempts. Session P&L and the \
+             drawdown limit are computed against this figure, so both will be wrong until \
+             the next restart. Check venue connectivity before trusting any reported P&L."
+        );
     }
     info!(" Starting portfolio value: ${:.2}", startup_balance);
 
