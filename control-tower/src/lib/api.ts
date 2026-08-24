@@ -361,6 +361,25 @@ export async function standDownSquadron(squadronId: string): Promise<StandDownRe
   return res.json();
 }
 
+/// Acknowledge a failed deployment so it stops being listed.
+///
+/// The row is marked terminal, not deleted — the failure and its reason stay in
+/// the queue for anyone looking later.
+export async function dismissDeployment(deploymentId: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/deployments/${encodeURIComponent(deploymentId)}/dismiss`, {
+    method: 'POST', cache: 'no-store',
+  });
+  if (!res.ok) throw new Error(await res.text() || `dismiss → ${res.status}`);
+}
+
+/// Put a failed deployment back in the queue for the engine to collect again.
+export async function retryDeployment(deploymentId: string): Promise<void> {
+  const res = await fetch(`${BASE}/api/deployments/${encodeURIComponent(deploymentId)}/retry`, {
+    method: 'POST', cache: 'no-store',
+  });
+  if (!res.ok) throw new Error(await res.text() || `retry → ${res.status}`);
+}
+
 /** Get all deployment requests with their status. */
 export async function getDeployments(): Promise<DeploymentStatus[]> {
   const res = await fetch(`${BASE}/api/deployments`, { cache: 'no-store' });

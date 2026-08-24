@@ -638,7 +638,7 @@ export interface DeploymentStatus {
   /// Written by the engine: queued → claimed → trading → finished, or failed.
   /// 'deployed' was never one of them — the engine writes 'active' when the
   /// squadron starts and 'completed' when its market closes.
-  status: 'pending' | 'processing' | 'active' | 'completed' | 'failed';
+  status: 'pending' | 'processing' | 'active' | 'completed' | 'failed' | 'dismissed';
   squadron_id?: string;
   error?: string;
   created_at: string;

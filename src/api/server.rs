@@ -3295,6 +3295,67 @@ async fn default_vipers_for_class(market_class: &str) -> Vec<String> {
     }
 }
 
+/// Response for the deployment-row actions.
+#[derive(Serialize)]
+struct DeploymentActionResponse {
+    success: bool,
+    deployment_id: String,
+    status: String,
+    message: String,
+}
+
+/// POST /api/deployments/{id}/dismiss
+///
+/// Acknowledge a failed deployment so it stops being shown.
+///
+/// A failed row has no squadron behind it — the deployment never produced one —
+/// so "stand down" is the wrong verb and there was nothing for the operator to
+/// act on at all: the row simply sat there until a ten-minute timer retired it.
+/// Dismissing marks it terminal rather than deleting it, so the failure and its
+/// reason stay in the queue for anyone looking later.
+async fn dismiss_deployment(Path(id): Path<String>) -> Response {
+    info!("📥 POST /api/deployments/{}/dismiss", id);
+    match crate::helpers::db::update_deployment_status(&id, "dismissed", None, None).await {
+        Ok(()) => Json(DeploymentActionResponse {
+            success: true,
+            deployment_id: id,
+            status: "dismissed".to_string(),
+            message: "Deployment dismissed.".to_string(),
+        }).into_response(),
+        Err(e) => {
+            warn!("dismiss {id} failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("could not dismiss: {e}")).into_response()
+        }
+    }
+}
+
+/// POST /api/deployments/{id}/retry
+///
+/// Put a failed deployment back in the queue.
+///
+/// Worth having because failures are not all alike. "Market is no longer listed"
+/// will fail again and should be dismissed; a venue rate-limit or a transient
+/// connect error is exactly the case where the same request succeeds moments
+/// later, and re-entering it by hand means re-picking the market from a list
+/// that has since moved on.
+async fn retry_deployment(Path(id): Path<String>) -> Response {
+    info!("📥 POST /api/deployments/{}/retry", id);
+    // Back to 'pending' with the error cleared — the processor's own poll picks
+    // it up, so this needs no venue-specific knowledge.
+    match crate::helpers::db::update_deployment_status(&id, "pending", None, None).await {
+        Ok(()) => Json(DeploymentActionResponse {
+            success: true,
+            deployment_id: id,
+            status: "pending".to_string(),
+            message: "Deployment re-queued — the engine collects it within a few seconds.".to_string(),
+        }).into_response(),
+        Err(e) => {
+            warn!("retry {id} failed: {e}");
+            (StatusCode::INTERNAL_SERVER_ERROR, format!("could not retry: {e}")).into_response()
+        }
+    }
+}
+
 /// Response for GET /api/deployments.
 #[derive(Serialize)]
 struct DeploymentStatusResponse {
@@ -3427,6 +3488,8 @@ pub async fn run_api_server(
         // ── Squadron Deployment & Taxonomy (Admiral Adama extension) ───────
         .route("/api/deployment/region",     get(get_deployment_region))
         .route("/api/deployments",           get(get_deployments))
+        .route("/api/deployments/{id}/dismiss", axum::routing::post(dismiss_deployment))
+        .route("/api/deployments/{id}/retry",   axum::routing::post(retry_deployment))
         .route("/api/taxonomy/raptors",      get(get_taxonomy_raptors))
         .route("/api/taxonomy/vipers",       get(get_taxonomy_vipers))
         .route("/api/markets/available",     get(get_available_markets));

@@ -4488,6 +4488,27 @@ mod auto_deploy_dedupe_tests {
         assert_eq!(deployment_classes_in_flight(&pool).await, vec!["politics"]);
     }
 
+    /// A dismissed row must release its class and its market. Dismissing is an
+    /// acknowledgement, not a pause: if it still counted as in-flight the
+    /// operator would clear a failure and find the class silently barred from
+    /// redeploying, with nothing on screen explaining why.
+    #[tokio::test]
+    async fn a_dismissed_deployment_releases_its_class_and_market() {
+        let pool = queue_pool().await;
+        row(&pool, "d1", "politics", "dismissed").await;
+        assert!(deployment_classes_in_flight(&pool).await.is_empty());
+        assert!(deployment_markets_in_flight(&pool).await.is_empty());
+    }
+
+    /// Retry puts a row back to 'pending', which is exactly what the processor
+    /// collects — so a retried deployment needs no special handling anywhere.
+    #[tokio::test]
+    async fn a_retried_deployment_is_collectable_again() {
+        let pool = queue_pool().await;
+        row(&pool, "d1", "politics", "pending").await;
+        assert_eq!(deployment_classes_in_flight(&pool).await, vec!["politics"]);
+    }
+
     /// The operator's squadron name must survive the round trip through the
     /// queue. It is what gives a second squadron of a class its own id, config
     /// and positions, so losing it silently downgrades a named deploy into a

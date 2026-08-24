@@ -16,10 +16,10 @@
 // You should have received a copy of the GNU Affero General Public License along
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import useSWR from 'swr';
 import type { SquadronSummary, SquadronState, DeploymentStatus } from '@/lib/types';
-import { getOpenPositions, getVipersForClass, getDeployments } from '@/lib/api';
+import { getOpenPositions, getVipersForClass, getDeployments, retryDeployment, dismissDeployment } from '@/lib/api';
 import DeploySquadronModal from './DeploySquadronModal';
 
 // ── State badge ───────────────────────────────────────────────────────────────
@@ -210,7 +210,12 @@ const DEPLOY_STATUS_STYLES: Record<string, { label: string; bg: string; text: st
   failed:     { label: 'FAILED',   bg: 'bg-red-500/10',   text: 'text-red-300',   dot: 'bg-red-500',   pulse: false },
 };
 
-function PendingDeploymentRow({ dep }: { dep: DeploymentStatus }) {
+function PendingDeploymentRow({ dep, onRetry, onDismiss, busy }: {
+  dep: DeploymentStatus;
+  onRetry: (id: string) => void;
+  onDismiss: (id: string) => void;
+  busy: boolean;
+}) {
   const style = DEPLOY_STATUS_STYLES[dep.status] ?? DEPLOY_STATUS_STYLES.pending;
   return (
     <div className="flex items-center justify-between px-4 py-3 border-b border-[#1e1e32] last:border-b-0">
@@ -234,7 +239,34 @@ function PendingDeploymentRow({ dep }: { dep: DeploymentStatus }) {
           )}
         </div>
       </div>
-      {dep.status !== 'failed' && (
+      {dep.status === 'failed' ? (
+        // A failed deployment has no squadron behind it, so there is nothing to
+        // stand down — only a record to act on. Retry is worth offering because
+        // failures differ in kind: "market no longer listed" will fail again and
+        // wants dismissing, while a venue rate-limit or a transient connect
+        // error is exactly the case that succeeds on a second attempt.
+        <div className="flex items-center gap-2 shrink-0">
+          <button
+            onClick={() => onRetry(dep.id)}
+            disabled={busy}
+            className="text-[10px] font-mono border border-amber-500/30 text-amber-300 bg-amber-500/10
+                       rounded px-2 py-1 hover:bg-amber-500/20 transition-colors disabled:opacity-50"
+            title="Queue this deployment again"
+          >
+            Retry
+          </button>
+          <button
+            onClick={() => onDismiss(dep.id)}
+            disabled={busy}
+            className="text-[10px] font-mono border border-[#1e1e32] text-gray-400
+                       rounded px-2 py-1 hover:text-gray-200 hover:border-gray-600
+                       transition-colors disabled:opacity-50"
+            title="Acknowledge and hide this failure"
+          >
+            Dismiss
+          </button>
+        </div>
+      ) : (
         <span className="text-[10px] font-mono text-gray-600 shrink-0">
           waiting for the engine
         </span>
@@ -305,7 +337,7 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, 
   // because this is exactly the window the operator is staring at: the engine's
   // own queue poll is 5s, so anything slower would make the UI look stuck for
   // reasons that have nothing to do with the engine.
-  const { data: deployments } = useSWR<DeploymentStatus[]>(
+  const { data: deployments, mutate: mutateDeployments } = useSWR<DeploymentStatus[]>(
     'deployment-queue',
     getDeployments,
     { refreshInterval: 3_000 }
@@ -357,6 +389,27 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, 
 
   const queueRows = [...optimisticRow, ...inFlight.filter(d => d.id !== justDeployed?.id), ...failed];
 
+  // Row actions. `actingOn` disables just the row being acted on, so a slow
+  // request cannot be double-submitted while leaving the others usable.
+  const [actingOn, setActingOn] = useState<string | null>(null);
+  const act = useCallback(async (id: string, fn: (id: string) => Promise<void>) => {
+    setActingOn(id);
+    try {
+      await fn(id);
+      // Refresh at once rather than waiting for the next poll — the row is
+      // gone from the operator's point of view the moment they click.
+      await mutateDeployments();
+    } catch {
+      // The row stays put and the next poll re-reads real state; nothing is
+      // lost by a failed dismiss, and inventing an error banner for it would
+      // be more noise than the action deserves.
+    } finally {
+      setActingOn(null);
+    }
+  }, [mutateDeployments]);
+  const handleRetry   = useCallback((id: string) => { void act(id, retryDeployment); }, [act]);
+  const handleDismiss = useCallback((id: string) => { void act(id, dismissDeployment); }, [act]);
+
   // Build mission count map: asset -> count
   const missionCounts: Record<string, number> = {};
   if (allPositions) {
@@ -400,7 +453,13 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, 
           {queueRows.length > 0 && (
             <div>
               {queueRows.map(dep => (
-                <PendingDeploymentRow key={dep.id} dep={dep} />
+                <PendingDeploymentRow
+                  key={dep.id}
+                  dep={dep}
+                  onRetry={handleRetry}
+                  onDismiss={handleDismiss}
+                  busy={actingOn === dep.id}
+                />
               ))}
             </div>
           )}
