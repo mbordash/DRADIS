@@ -216,6 +216,8 @@ fn default_sports_odds_regions()            -> String  { config::SPORTS_ODDS_REG
 fn default_tennis_tour()                    -> String  { config::TENNIS_TOUR.to_string()               }
 
 fn default_deploy_max_days_to_close()       -> u32     { config::DEPLOY_MAX_DAYS_TO_CLOSE             }
+fn default_auto_deploy_politics()           -> bool    { config::AUTO_DEPLOY_POLITICS                 }
+fn default_auto_deploy_sports()             -> bool    { config::AUTO_DEPLOY_SPORTS                   }
 fn default_obi_use_whole_book()             -> bool    { config::OBI_USE_WHOLE_BOOK                   }
 fn default_maker_min_spread()               -> Decimal { config::MAKER_MIN_SPREAD                      }
 fn default_maker_bid_buffer()               -> Decimal { config::MAKER_BID_BUFFER                      }
@@ -225,6 +227,8 @@ fn default_maker_max_combined_bid()         -> Decimal { config::MAKER_MAX_COMBI
 fn default_maker_max_complementary_price()  -> Decimal { config::MAKER_MAX_COMPLEMENTARY_PRICE         }
 fn default_maker_max_book_imbalance_ratio() -> Decimal { config::MAKER_MAX_BOOK_IMBALANCE_RATIO        }
 fn default_maker_min_secs_to_expiry()       -> i64     { config::MAKER_MIN_SECS_TO_EXPIRY              }
+fn default_maker_min_market_age_secs()      -> i64     { config::MAKER_MIN_MARKET_AGE_SECS             }
+fn default_maker_maturation_max_fraction()  -> Decimal { config::MAKER_MATURATION_MAX_FRACTION         }
 fn default_maker_toxic_flow_exit_obi()      -> Decimal { config::MAKER_TOXIC_FLOW_EXIT_OBI             }
 fn default_maker_toxic_reentry_cooldown_secs() -> i64  { config::MAKER_TOXIC_REENTRY_COOLDOWN_SECS     }
 fn default_maker_toxic_min_hold_secs()      -> i64     { config::MAKER_TOXIC_MIN_HOLD_SECS            }
@@ -441,6 +445,12 @@ pub struct DynamicConfig {
     /// Discovery still lists markets far beyond this — see the constant's note.
     #[serde(default = "default_deploy_max_days_to_close")]
     pub deploy_max_days_to_close:      u32,
+    /// Keep a politics squadron running without waiting for an operator deploy.
+    #[serde(default = "default_auto_deploy_politics")]
+    pub auto_deploy_politics:          bool,
+    /// Keep a sports squadron running without waiting for an operator deploy.
+    #[serde(default = "default_auto_deploy_sports")]
+    pub auto_deploy_sports:            bool,
     /// Read whole-book depth rather than the touch in the OBI entry gates.
     /// Does not affect the GBoost feature vector — see the constant's note.
     #[serde(default = "default_obi_use_whole_book")]
@@ -459,6 +469,12 @@ pub struct DynamicConfig {
     pub maker_max_book_imbalance_ratio: Decimal,
     #[serde(default = "default_maker_min_secs_to_expiry")]
     pub maker_min_secs_to_expiry:      i64,
+    /// Seconds a maker market must be observed before quoting into it.
+    #[serde(default = "default_maker_min_market_age_secs")]
+    pub maker_min_market_age_secs:     i64,
+    /// Ceiling on the maturation wait as a fraction of the market's own life.
+    #[serde(default = "default_maker_maturation_max_fraction")]
+    pub maker_maturation_max_fraction: Decimal,
     #[serde(default = "default_maker_toxic_flow_exit_obi")]
     pub maker_toxic_flow_exit_obi:     Decimal,
     #[serde(default = "default_maker_toxic_reentry_cooldown_secs")]
@@ -817,6 +833,8 @@ impl Default for DynamicConfig {
             maker_max_exposure_usdc:  config::MAKER_MAX_EXPOSURE_USDC,
             maker_quote_size_usdc:    config::MAKER_QUOTE_SIZE_USDC,
             deploy_max_days_to_close:      config::DEPLOY_MAX_DAYS_TO_CLOSE,
+            auto_deploy_politics:          config::AUTO_DEPLOY_POLITICS,
+            auto_deploy_sports:            config::AUTO_DEPLOY_SPORTS,
             obi_use_whole_book:            config::OBI_USE_WHOLE_BOOK,
             maker_min_spread:              config::MAKER_MIN_SPREAD,
             maker_bid_buffer:              config::MAKER_BID_BUFFER,
@@ -825,6 +843,8 @@ impl Default for DynamicConfig {
             maker_max_complementary_price: config::MAKER_MAX_COMPLEMENTARY_PRICE,
             maker_max_book_imbalance_ratio: config::MAKER_MAX_BOOK_IMBALANCE_RATIO,
             maker_min_secs_to_expiry:      config::MAKER_MIN_SECS_TO_EXPIRY,
+            maker_min_market_age_secs:     config::MAKER_MIN_MARKET_AGE_SECS,
+            maker_maturation_max_fraction: config::MAKER_MATURATION_MAX_FRACTION,
             maker_toxic_flow_exit_obi:     config::MAKER_TOXIC_FLOW_EXIT_OBI,
             maker_toxic_reentry_cooldown_secs: config::MAKER_TOXIC_REENTRY_COOLDOWN_SECS,
             maker_toxic_min_hold_secs:     config::MAKER_TOXIC_MIN_HOLD_SECS,

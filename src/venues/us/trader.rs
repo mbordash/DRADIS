@@ -52,7 +52,7 @@ use rust_decimal_macros::dec;
 use tokio::sync::{watch, Mutex};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::api::server::AssetRaptorHealth;
 use crate::cag::Cag;
@@ -447,6 +447,23 @@ pub async fn run_us_trader(
 
 /// Run one wing's market rotation loop until `cancel` fires: select a market
 /// in the wing's domain, trade it until it closes, re-discover the next one.
+
+/// How long a switched-off wing waits before re-reading its switch.
+const AUTO_DEPLOY_RECHECK_SECS: u64 = 30;
+
+/// Is this wing allowed to go looking for a market?
+///
+/// Crypto is always allowed: it is the venue's own rotation, the equivalent of
+/// Kalshi's crypto loop, and is not one of the classes the switches govern.
+async fn wing_auto_deploy_enabled(wing: Wing) -> bool {
+    let cfg = DynamicConfig::load_or_default().await;
+    match wing {
+        Wing::Politics => cfg.auto_deploy_politics,
+        Wing::Sports => cfg.auto_deploy_sports,
+        Wing::Crypto => true,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_wing(
     wing: Wing,
@@ -490,6 +507,25 @@ async fn run_wing(
     loop {
         if cancel.is_cancelled() {
             return;
+        }
+
+        // ── Auto-deploy switch ───────────────────────────────────────────────
+        // The same two switches that decide whether Kalshi seeds a politics or
+        // sports squadron decide whether this wing hunts for a market. Without
+        // this the operator would have a control on one venue and not the other,
+        // which is the asymmetry the switches exist to remove.
+        //
+        // Checked here rather than at spawn so a switch takes effect without a
+        // restart: a wing turned off idles between its markets instead of dying,
+        // and picks up again when it is turned back on. Positions already open
+        // are unaffected — this gates the hunt for the NEXT market, and an
+        // in-flight one runs to its close.
+        if !wing_auto_deploy_enabled(wing).await {
+            debug!("{} wing idle — auto-deploy switched off", wing.label());
+            if wait_or_cancel(cancel, AUTO_DEPLOY_RECHECK_SECS).await {
+                return;
+            }
+            continue;
         }
 
         // ── Select a tradeable market (retry until one matches or cancelled) ──

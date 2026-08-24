@@ -253,6 +253,16 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Skip when bid/ask depth ratio exceeds this (toxic imbalance).").range(1.0, 10.0).step(0.5));
         v.push(F::new(g, e, "maker_min_secs_to_expiry", "Min Secs to Expiry", "secs", true,
             "Don't quote with fewer than this many seconds left.").min(0.0).step(1.0).unit("s"));
+        v.push(F::new(g, e, "maker_min_market_age_secs", "Market Maturation", "secs", true,
+            "Observe a market for this long before quoting into it, so the book has settled. \
+             Capped by Maturation Cap below, which keeps the wait sane on short-lived markets.")
+            .min(0.0).step(30.0).unit("s"));
+        v.push(F::new(g, e, "maker_maturation_max_fraction", "Maturation Cap", "decimal", true,
+            "Ceiling on the maturation wait as a fraction of the market's own lifetime. \
+             At 0.25 a 15-minute market matures in under 4 minutes while a daily market still \
+             serves the full wait above. Set to 0 to always use the full wait — on short markets \
+             that can consume the whole tradeable window.")
+            .range(0.0, 1.0).step(0.05));
         v.push(F::new(g, e, "maker_toxic_flow_exit_obi", "Toxic Flow Exit OBI", "decimal", true,
             "Exit a resting position when OBI turns adverse beyond this (negative).").range(-1.0, 0.0).step(0.05));
         v.push(F::new(g, e, "maker_toxic_reentry_cooldown_secs", "Toxic Re-entry Lockout", "secs", true,
@@ -538,6 +548,20 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(g, e, "deploy_max_days_to_close", "Max Days To Resolution", "secs", false,
             "Furthest-out market a Quick deploy will choose, in days. Browsing is not affected — the market list still shows everything, and you can always deploy a longer-dated market by picking it by hand. This only bounds the automatic choice. It matters because Kalshi structures politics and sports as multi-year futures, and the strategies available to those classes do not suit that horizon: Arbitrage locks your collateral until the market resolves, so a 2028 market ties it up for years to earn a few percent, and Maker rests quotes expecting them to fill and mean-revert within a session. Raise it if you want Quick deploy to consider longer-dated markets.")
             .range(1.0, 3650.0).step(1.0).unit("d"));
+        v.push(F::new(g, e, "auto_deploy_politics", "Auto-Deploy Politics", "bool", false,
+            "Keep a politics squadron running without waiting for you to deploy one. DRADIS picks \
+             the highest-volume politics market inside the resolution horizon above, and replaces \
+             it with a fresh one when that market closes. The squadron behaves exactly like one you \
+             deployed by hand — same one-per-class rule, same entry in the deployment list. Turn \
+             this off to decide for yourself when capital goes to work on the class; a squadron \
+             already trading is left alone and runs to its market's close.")
+            );
+        v.push(F::new(g, e, "auto_deploy_sports", "Auto-Deploy Sports", "bool", false,
+            "Keep a sports squadron running without waiting for you to deploy one — see Auto-Deploy \
+             Politics for how the selection and replacement work. This does not need an Odds API \
+             key: the class trades Arbitrage and Maker off the venue's own book, and the Sports \
+             Raptor is an additive signal that idles harmlessly when no key is set.")
+            );
     }
 
     {
@@ -597,6 +621,39 @@ mod tests {
         for f in &schema {
             if let (Some(min), Some(max)) = (f.min, f.max) {
                 assert!(min <= max, "{}: min {} > max {}", f.key, min, max);
+            }
+        }
+    }
+
+    /// Knobs that exist only in Rust are invisible to the operator, which is the
+    /// failure this registry exists to prevent: the engine reads them, the
+    /// Control Tower cannot show or change them, and the only way to move one is
+    /// a recompile. Pinning the newest additions here means adding a
+    /// `DynamicConfig` field without registering it fails the build rather than
+    /// shipping a knob nobody can reach.
+    #[test]
+    fn operator_facing_knobs_are_registered() {
+        let keys: Vec<&str> = config_schema().iter().map(|f| f.key).collect();
+        for key in [
+            "maker_min_market_age_secs",
+            "maker_maturation_max_fraction",
+            "auto_deploy_politics",
+            "auto_deploy_sports",
+        ] {
+            assert!(keys.contains(&key), "`{key}` is not exposed in the Control Tower");
+        }
+    }
+
+    /// The two auto-deploy switches decide whether DRADIS commits capital to a
+    /// market class on its own, so they belong on the Basic panel where an
+    /// operator will see them, not behind the Advanced modal.
+    #[test]
+    fn auto_deploy_switches_are_not_hidden_behind_advanced() {
+        for f in config_schema() {
+            if f.key.starts_with("auto_deploy_") {
+                assert_eq!(f.value_type, "bool", "{} should render as a switch", f.key);
+                assert!(!f.advanced, "{} must not be hidden in the Advanced modal", f.key);
+                assert_eq!(f.group, "Deployment", "{} must render in a group the UI shows", f.key);
             }
         }
     }

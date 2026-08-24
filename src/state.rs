@@ -425,6 +425,26 @@ pub type PositionKey = (String, MarketId);
 pub type PositionMap = HashMap<PositionKey, Position>;
 
 impl MarketSnapshot {
+    /// Is there a real seller on the YES leg?
+    ///
+    /// A binary outcome settles at $1.00, so nobody offers at or above that —
+    /// an ask of $1.00 is the venue layer saying "no offer", not a price. Both
+    /// Kalshi and Polymarket US fill an absent ask in this way deliberately: it
+    /// is the least attractive value expressible, so a leg with no seller looks
+    /// unappealing to every gate rather than irresistible.
+    ///
+    /// Strategies that reason about the ask — spread width, arbitrage cost,
+    /// rehedge price — must ask this first. The alternative is computing a
+    /// spread or a combined cost against a price that does not exist.
+    pub fn yes_has_ask(&self) -> bool {
+        self.yes_ask < Decimal::ONE
+    }
+
+    /// Is there a real seller on the NO leg? See [`Self::yes_has_ask`].
+    pub fn no_has_ask(&self) -> bool {
+        self.no_ask < Decimal::ONE
+    }
+
     /// Depth pair to gate on for the YES side: `(bid, ask)`.
     ///
     /// `whole_book` selects the whole-book totals over the touch. See
@@ -838,5 +858,61 @@ mod price_state_tests {
         assert_eq!(price_state::ask_touch_size(&p), dec!(2));
         assert_eq!(price_state::bid_depth_total(&p), dec!(3));
         assert_eq!(price_state::ask_depth_total(&p), dec!(4));
+    }
+}
+
+#[cfg(test)]
+mod ask_presence_tests {
+    use super::MarketSnapshot;
+    use chrono::Utc;
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+
+    /// A book with an ordinary two-sided market on both legs.
+    fn snapshot(yes_ask: Decimal, no_ask: Decimal) -> MarketSnapshot {
+        MarketSnapshot {
+            yes_bid: dec!(0.40), yes_bid_depth: dec!(100),
+            yes_ask, yes_ask_depth: dec!(100),
+            no_bid: dec!(0.55), no_bid_depth: dec!(100),
+            no_ask, no_ask_depth: dec!(100),
+            yes_bid_depth_total: dec!(100), yes_ask_depth_total: dec!(100),
+            no_bid_depth_total: dec!(100), no_ask_depth_total: dec!(100),
+            oracle_price: dec!(0), velocity: dec!(0), velocity_1s: dec!(0),
+            acceleration: dec!(0), funding_rate: dec!(0),
+            oracle_drift_60m: dec!(0), oracle_drift_10m: dec!(0), hist_vol: dec!(0),
+            institutional_pulse: dec!(0), tide_coherence: dec!(0),
+            tradfi_velocity: dec!(0), macro_coherence: dec!(0),
+            vix_proxy: dec!(0), vix_velocity: dec!(0),
+            oi_delta_pct: dec!(0), cvd_ratio: dec!(0),
+            secs_to_expiry: 3600,
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn a_real_offer_counts_as_an_ask() {
+        let s = snapshot(dec!(0.45), dec!(0.60));
+        assert!(s.yes_has_ask());
+        assert!(s.no_has_ask());
+    }
+
+    /// The venue layer fills an absent ask in at the settlement value, so $1.00
+    /// means "nobody is selling", not "someone is selling at a dollar".
+    #[test]
+    fn the_payout_price_means_no_offer() {
+        let s = snapshot(dec!(0.01), Decimal::ONE);
+        assert!(s.yes_has_ask());
+        assert!(!s.no_has_ask(), "$1.00 is the no-offer sentinel, not a price");
+    }
+
+    /// The exact shape seen on Kalshi's KXLAKECONF politics market: YES offered
+    /// at a penny, no NO sellers at all. Read naively the two asks sum to $0.01
+    /// for a $1.00 payout, which is why this must be recognised as an absent
+    /// leg rather than priced.
+    #[test]
+    fn decided_market_with_one_empty_leg() {
+        let s = snapshot(dec!(0.01), Decimal::ONE);
+        assert!(!(s.yes_has_ask() && s.no_has_ask()),
+            "a leg with no seller must not present as a tradeable pair");
     }
 }

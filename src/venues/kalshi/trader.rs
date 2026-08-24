@@ -42,7 +42,7 @@ use rust_decimal_macros::dec;
 use tokio::sync::{watch, Mutex};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::api::server::AssetRaptorHealth;
 use crate::cag::Cag;
@@ -525,6 +525,11 @@ async fn discover_pairs(venue: &KalshiVenue, series: &[String]) -> Vec<KalshiPai
 /// other cadences rather than becoming a Control Tower knob.
 const DEPLOY_POLL_SECS: u64 = 5;
 
+/// Market classes DRADIS keeps a squadron running for on its own, subject to
+/// the `auto_deploy_*` switches. Crypto is absent because the venue's rotation
+/// loop already owns it.
+const AUTO_DEPLOY_CLASSES: [&str; 2] = ["politics", "sports"];
+
 /// Trade the markets an operator deployed from the Control Tower.
 ///
 /// The deploy endpoint writes a row to `deployment_queue`. On the intl CLOB that
@@ -568,6 +573,11 @@ pub async fn run_deployment_processor(
             }
             _ = ticker.tick() => {}
         }
+
+        // Seed the classes DRADIS is configured to keep running. Ordered after
+        // the requeue above so a squadron restored from the last process is
+        // already visible and is not duplicated.
+        seed_auto_deployments(&venue, &cag).await;
 
         for dep in db::fetch_pending_deployments().await {
             // Claim it first. fetch_pending_deployments only returns rows still
@@ -629,6 +639,131 @@ pub async fn run_deployment_processor(
             });
         }
     }
+}
+
+/// Keep a squadron running for every market class DRADIS is configured to
+/// deploy on its own.
+///
+/// Kalshi ran only its crypto rotation loop at boot while Polymarket US started
+/// all three of its wings, so the same customer saw one squadron on one venue
+/// and three on the other for reasons nothing on screen explained.
+///
+/// The seed goes through the ordinary deployment queue rather than spawning a
+/// second lifecycle beside it: the resulting squadron is indistinguishable from
+/// one an operator deployed, shows up in the Control Tower deployment list with
+/// the same status transitions, and is stood down the same way. It also means
+/// this function does not need to know how to trade — only how to choose.
+///
+/// Idempotent by construction: it seeds a class only when that class has no
+/// live squadron and no row already waiting in the queue, so it is safe to call
+/// on every tick. When a seeded market closes, its squadron ends and the next
+/// tick picks a fresh market — that, rather than an internal rotation, is what
+/// keeps the class populated.
+async fn seed_auto_deployments(venue: &Arc<KalshiVenue>, cag: &Cag) {
+    let Some(pool) = db::pool() else {
+        warn!("📋 Auto-deploy: DB unavailable, skipping this pass");
+        return;
+    };
+    let live: Vec<String> = cag
+        .list_squadrons()
+        .into_iter()
+        .filter(|sq| sq.state != "STOOD_DOWN")
+        .map(|sq| sq.asset.to_ascii_lowercase())
+        .collect();
+    // Every class with a deployment still in flight — including one being
+    // claimed right now, which is briefly in neither the pending queue nor the
+    // squadron list.
+    let queued = db::deployment_classes_in_flight(pool).await;
+
+    // Read the operator's switches fresh each pass so turning one off takes
+    // effect without a restart. Cheap enough at this cadence, and only reached
+    // when a class actually needs seeding.
+    let mut cfg: Option<Arc<DynamicConfig>> = None;
+
+    for class in AUTO_DEPLOY_CLASSES {
+        if live.iter().any(|a| a == class) || queued.iter().any(|q| q == class) {
+            continue;
+        }
+        let cfg = match &cfg {
+            Some(c) => Arc::clone(c),
+            None => {
+                let c = DynamicConfig::load_or_default().await;
+                cfg = Some(Arc::clone(&c));
+                c
+            }
+        };
+        let enabled = match class {
+            "politics" => cfg.auto_deploy_politics,
+            "sports" => cfg.auto_deploy_sports,
+            _ => false,
+        };
+        if !enabled {
+            continue;
+        }
+
+        let Some(market_id) = select_auto_deploy_market(venue, class, cfg.deploy_max_days_to_close).await else {
+            // Nothing suitable open right now (out-of-season sports, a quiet
+            // politics calendar). Not an error — the next tick tries again.
+            debug!("📋 Auto-deploy: no {class} market available yet");
+            continue;
+        };
+
+        let raptors = db::raptors_for_class(pool, class).await;
+        let vipers  = db::vipers_for_class(pool, class).await;
+
+        let id = format!("autodeploy-{class}-{}", Utc::now().timestamp());
+        match db::queue_deployment(&id, &market_id, class, &raptors, &vipers, &Default::default()).await {
+            Ok(()) => info!("📋 Auto-deploying {class} squadron on [{market_id}]"),
+            Err(e) => warn!("📋 Auto-deploy of {class} failed to queue: {e}"),
+        }
+    }
+}
+
+/// Highest-volume open market in `class`, within the operator's deploy horizon.
+///
+/// Mirrors the Control Tower's quick-deploy selection: same categories, same
+/// sort, same horizon. Discovery reaches years out because that is how Kalshi
+/// structures politics and sports, but Arbitrage locks collateral until the
+/// market resolves, so a 2028 market is a poor use of it.
+async fn select_auto_deploy_market(
+    venue: &Arc<KalshiVenue>,
+    class: &str,
+    max_days_to_close: u32,
+) -> Option<String> {
+    let cats_raw = if class == "politics" {
+        crate::config::KALSHI_POLITICS_CATEGORIES
+    } else {
+        crate::config::KALSHI_SPORTS_CATEGORIES
+    };
+    let cats: Vec<&str> = cats_raw.split(',').map(str::trim).filter(|c| !c.is_empty()).collect();
+    let found = match venue.open_markets_for_categories(&cats).await {
+        Ok(f) => f,
+        Err(e) => {
+            warn!("📋 Auto-deploy {class} discovery failed: {e:#}");
+            return None;
+        }
+    };
+
+    let now = Utc::now();
+    let max_secs = max_days_to_close as i64 * 86_400;
+    let mut best: Option<(f64, String)> = None;
+    for (_cat, m) in found {
+        if let Some(ct) = m.close_time_utc() {
+            let secs_left = (ct - now).num_seconds();
+            if secs_left < MIN_TIME_TO_CLOSE_SECS || secs_left > max_secs {
+                continue;
+            }
+        } else {
+            continue;
+        }
+        let volume = crate::venues::kalshi::types::fp(&m.volume_fp)
+            .and_then(|d| f64::try_from(d).ok())
+            .unwrap_or(0.0);
+        if best.as_ref().is_none_or(|(v, _)| volume > *v) {
+            best = Some((volume, m.ticker.clone()));
+        }
+    }
+    best.map(|(_, ticker)| ticker)
 }
 
 struct MarketSelection {
@@ -999,21 +1134,18 @@ async fn trade_one_market(
             continue;
         }
 
-        let snapshot = build_snapshot(&hub, &pair.ticker, &raptors, &market_cfg).await;
-        // Don't act on an empty book (feed still connecting).
-        if snapshot.yes_ask.is_zero() && snapshot.no_ask.is_zero() {
+        // No book yet (feed still connecting) — nothing to evaluate this tick.
+        let Some(snapshot) = build_snapshot(&hub, &pair.ticker, &raptors, &market_cfg).await else {
             continue;
-        }
+        };
 
         // Build maker snapshot from the daily market (if available).
         let (mk_market, mk_snapshot) = match (&maker_cfg, &maker_pair) {
             (Some(mcfg), Some(mp)) => {
-                let ms = build_snapshot(&hub, &mp.ticker, &raptors, mcfg).await;
-                if ms.yes_ask.is_zero() && ms.no_ask.is_zero() {
+                match build_snapshot(&hub, &mp.ticker, &raptors, mcfg).await {
+                    Some(ms) => (Some(mcfg.clone()), Some(ms)),
                     // Maker book not ready — fall back to primary.
-                    (Some(market_cfg.clone()), Some(snapshot.clone()))
-                } else {
-                    (Some(mcfg.clone()), Some(ms))
+                    None => (Some(market_cfg.clone()), Some(snapshot.clone())),
                 }
             }
             _ => (Some(market_cfg.clone()), Some(snapshot.clone())),
@@ -1116,7 +1248,13 @@ async fn flatten_before_stand_down(
         );
         return;
     };
-    let snap = build_snapshot(hub, &mpair.ticker, raptors, mcfg).await;
+    let Some(snap) = build_snapshot(hub, &mpair.ticker, raptors, mcfg).await else {
+        warn!(
+            "🏁 Standing down holding {} position(s) but the secondary book has not arrived — leaving them to settle",
+            held.len(),
+        );
+        return;
+    };
 
     for (strategy, token, shares) in held {
         let bid = if token == mcfg.yes_token {
@@ -1199,21 +1337,42 @@ fn strategy_name_to_kind(name: &str) -> &'static str {
 /// Kalshi's book is bids-only per side; asks derive from the complement:
 /// `yes_ask = 1 − best_no_bid`, `no_ask = 1 − best_yes_bid` (depth carries
 /// over from the complementary bid level).
+///
+/// Returns `None` until the book is ready. Readiness used to be inferred by the
+/// callers from "both asks are zero", which only worked because a missing ask
+/// was itself defaulted to zero — the two bugs concealed each other. A ready
+/// book with no sellers on either leg is real, tradeable data and must reach the
+/// vipers; a book that has not arrived yet must not.
 async fn build_snapshot(
     hub: &ws::BookHub,
     ticker: &str,
     raptors: &CryptoRaptors,
     market: &MarketConfig,
-) -> MarketSnapshot {
+) -> Option<MarketSnapshot> {
     let (yes_state, no_state): (PriceState, PriceState) = {
         let books = hub.read().await;
         match books.get(ticker) {
             Some(b) if b.ready => {
                 let now = Utc::now();
+                // An absent level has to be filled in with the price that is
+                // LEAST attractive to us, never the most. A missing bid is $0.00
+                // (nobody is buying) and a missing ask is $1.00 (nobody is
+                // selling below the full payout) — both are conservative, and
+                // both make the leg unattractive rather than irresistible.
+                //
+                // Asks were previously defaulted to $0.00, which is the most
+                // aggressive ask expressible. On a decided market with no NO
+                // sellers that rendered as "Ask Sum $0.0100" — YES at a penny
+                // plus NO at nothing, which reads as a guaranteed dollar for a
+                // cent. Arbitrage did decline it, but only because the
+                // locked/inverted-spread guard rejects `no_bid >= no_ask`
+                // first; had it not, the safe-bid calculation would have
+                // produced a bid of −$0.01. Polymarket US has always defaulted
+                // asks to ONE (`venues/us/ws.rs`); this brings Kalshi in line.
                 let (yb, ybd) = b.best_yes_bid().unwrap_or((dec!(0), dec!(0)));
-                let (ya, yad) = b.best_yes_ask().unwrap_or((dec!(0), dec!(0)));
+                let (ya, yad) = b.best_yes_ask().unwrap_or((dec!(1), dec!(0)));
                 let (nb, nbd) = b.best_no_bid().unwrap_or((dec!(0), dec!(0)));
-                let (na, nad) = b.best_no_ask().unwrap_or((dec!(0), dec!(0)));
+                let (na, nad) = b.best_no_ask().unwrap_or((dec!(1), dec!(0)));
                 // Cumulative depth alongside the touch. Nothing reads these yet;
                 // they exist so order-book imbalance can be compared as a
                 // whole-book ratio against the top-of-book one vipers gate on.
@@ -1224,13 +1383,8 @@ async fn build_snapshot(
                     (nb, nbd, na, nad, now, nbd_all, nad_all),
                 )
             }
-            _ => {
-                let now = Utc::now();
-                (
-                    (dec!(0), dec!(0), dec!(0), dec!(0), now, dec!(0), dec!(0)),
-                    (dec!(0), dec!(0), dec!(0), dec!(0), now, dec!(0), dec!(0)),
-                )
-            }
+            // Feed still connecting — no book to describe.
+            _ => return None,
         }
     };
 
@@ -1279,7 +1433,7 @@ async fn build_snapshot(
         snap.vix_proxy = h.vix_proxy;
         snap.vix_velocity = h.vix_velocity;
     }
-    snap
+    Some(snap)
 }
 
 fn order_params_to_intent(p: &OrderParams, side: Side) -> OrderIntent {

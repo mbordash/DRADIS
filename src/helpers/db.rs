@@ -1811,6 +1811,24 @@ pub const VIPER_KINDS: &[(&str, &str, i32)] = &[
 ];
 
 /// Fetch pending deployment requests from the queue.
+/// Market classes that already have a deployment the engine has not finished with.
+///
+/// Covers every non-terminal status, not just `pending`. The auto-deploy seeder
+/// needs this rather than `fetch_pending_deployments`: a row is 'processing'
+/// from the moment the processor claims it until its squadron is registered
+/// with the CAG, and during that window the class appears in neither the
+/// pending queue nor the squadron list. Deduping on pending alone would seed a
+/// second squadron for a class that is already starting one.
+pub async fn deployment_classes_in_flight(pool: &SqlitePool) -> Vec<String> {
+    sqlx::query(
+        "SELECT DISTINCT LOWER(market_type) FROM deployment_queue
+         WHERE status IN ('pending', 'processing', 'active')"
+    )
+    .fetch_all(pool).await.ok()
+    .map(|rows| rows.into_iter().filter_map(|r| r.try_get::<String, _>(0).ok()).collect())
+    .unwrap_or_default()
+}
+
 pub async fn fetch_pending_deployments() -> Vec<PendingDeployment> {
     let Some(pool) = pool() else {
         return Vec::new();
@@ -4346,5 +4364,84 @@ mod llm_actions_tests {
         // Rate-limit counter sees the applied batch.
         let hour_ago = (Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
         assert_eq!(count_llm_batches_applied_since(&pool, &hour_ago).await, 1);
+    }
+}
+
+#[cfg(test)]
+mod auto_deploy_dedupe_tests {
+    use super::*;
+
+    async fn queue_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE deployment_queue (
+                id TEXT PRIMARY KEY, market_id TEXT NOT NULL, market_type TEXT NOT NULL,
+                raptors TEXT NOT NULL, vipers TEXT NOT NULL, viper_budgets TEXT,
+                status TEXT NOT NULL, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP)"
+        ).execute(&pool).await.unwrap();
+        pool
+    }
+
+    async fn row(pool: &SqlitePool, id: &str, class: &str, status: &str) {
+        sqlx::query(
+            "INSERT INTO deployment_queue (id, market_id, market_type, raptors, vipers, status)
+             VALUES (?, 'MKT', ?, '[]', '[]', ?)"
+        ).bind(id).bind(class).bind(status).execute(pool).await.unwrap();
+    }
+
+    /// The race this query exists for. Between the processor claiming a row and
+    /// registering its squadron the class is in neither the pending queue nor
+    /// the CAG, so deduping on 'pending' alone would seed a second squadron for
+    /// a class that is already starting one.
+    #[tokio::test]
+    async fn a_claimed_deployment_still_counts_as_in_flight() {
+        let pool = queue_pool().await;
+        row(&pool, "d1", "politics", "processing").await;
+        assert_eq!(deployment_classes_in_flight(&pool).await, vec!["politics"]);
+    }
+
+    #[tokio::test]
+    async fn pending_and_active_both_count() {
+        let pool = queue_pool().await;
+        row(&pool, "d1", "politics", "pending").await;
+        row(&pool, "d2", "sports", "active").await;
+        let mut got = deployment_classes_in_flight(&pool).await;
+        got.sort();
+        assert_eq!(got, vec!["politics", "sports"]);
+    }
+
+    /// Terminal rows must NOT hold a class open, or the seeder would never
+    /// replace a squadron whose market closed — which is the mechanism that
+    /// keeps a class populated over time.
+    #[tokio::test]
+    async fn finished_and_failed_deployments_release_the_class() {
+        let pool = queue_pool().await;
+        row(&pool, "d1", "politics", "completed").await;
+        row(&pool, "d2", "sports", "failed").await;
+        assert!(deployment_classes_in_flight(&pool).await.is_empty());
+    }
+
+    /// A class is reported once however many rows it has accumulated, so the
+    /// caller can compare against it directly.
+    #[tokio::test]
+    async fn a_class_is_reported_once_regardless_of_history() {
+        let pool = queue_pool().await;
+        row(&pool, "d1", "politics", "completed").await;
+        row(&pool, "d2", "politics", "pending").await;
+        row(&pool, "d3", "politics", "active").await;
+        assert_eq!(deployment_classes_in_flight(&pool).await, vec!["politics"]);
+    }
+
+    /// Compared case-insensitively against squadron assets and market types,
+    /// which reach the queue in whatever case the caller used.
+    #[tokio::test]
+    async fn classes_come_back_lowercased() {
+        let pool = queue_pool().await;
+        row(&pool, "d1", "Politics", "pending").await;
+        assert_eq!(deployment_classes_in_flight(&pool).await, vec!["politics"]);
     }
 }

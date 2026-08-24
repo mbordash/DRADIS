@@ -40,7 +40,7 @@
 
 use async_trait::async_trait;
 use anyhow::Result;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::time::Instant;
@@ -68,6 +68,7 @@ struct DepthSample {
 /// string with the live values.  Keeping the throttle key stable prevents the
 /// 50 ms tick loop from defeating the throttle via fluctuating price numbers.
 fn side_reject_reason(
+    has_ask: bool,
     book_ok: bool,
     taker_block: bool,
     toxic_cooldown: bool,
@@ -78,6 +79,12 @@ fn side_reject_reason(
     velocity_block: bool,
     dc: &crate::helpers::dynamic_config::DynamicConfig,
 ) -> Option<(&'static str, String)> {
+    // Checked before the spread, because without an ask there is no spread to
+    // report — the venue fills an absent ask in at the $1.00 payout, which would
+    // otherwise be subtracted from the bid and printed as a plausible number.
+    if !has_ask {
+        return Some(("no_ask", "no seller on this leg".to_string()));
+    }
     if !book_ok {
         return Some(("book_imbalance", "book_imbalance".to_string()));
     }
@@ -168,6 +175,54 @@ fn market_age_secs(market_ident: &str) -> i64 {
     };
     let first_seen = reg.entry(market_ident.to_string()).or_insert_with(Instant::now);
     first_seen.elapsed().as_secs() as i64
+}
+
+/// The maturation wait actually required for this market, in seconds.
+///
+/// `configured` is the absolute wait an operator set. It is a sensible number for
+/// a market that lives for a day and a disqualifying one for a market that lives
+/// for a quarter of an hour, so it is capped at `fraction` of the market's own
+/// lifetime. Lifetime is `age + seconds_to_close`: the two move in opposite
+/// directions at the same rate, so the estimate is stable across the market's
+/// life rather than drifting as it ages.
+///
+/// A market with no close time cannot be scaled against anything and keeps the
+/// absolute wait. So does one whose close time has already passed — the expiry
+/// gate immediately below is what should reject that, not this one silently
+/// admitting it with a zero wait.
+fn effective_min_market_age(
+    age_secs: i64,
+    close_time: Option<DateTime<Utc>>,
+    configured: i64,
+    fraction: Decimal,
+) -> i64 {
+    let Some(close) = close_time else { return configured };
+    maturation_wait(age_secs, (close - Utc::now()).num_seconds(), configured, fraction)
+}
+
+/// The arithmetic behind `effective_min_market_age`, with the clock read out.
+///
+/// Kept separate so it can be tested exactly: reading `Utc::now()` inside the
+/// calculation makes the result depend on how long the test itself took, which
+/// lands on a truncation boundary often enough to fail intermittently.
+fn maturation_wait(
+    age_secs: i64,
+    secs_to_close: i64,
+    configured: i64,
+    fraction: Decimal,
+) -> i64 {
+    if secs_to_close <= 0 || fraction <= Decimal::ZERO {
+        return configured;
+    }
+    let life = age_secs.saturating_add(secs_to_close);
+    if life <= 0 {
+        return configured;
+    }
+    let scaled: i64 = (Decimal::from(life) * fraction)
+        .trunc()
+        .try_into()
+        .unwrap_or(configured);
+    configured.min(scaled)
 }
 
 /// Process-global post-ToxicFill re-entry cooldown: token_id → the instant the
@@ -509,12 +564,29 @@ impl Strategy for MakerStrategyImpl {
         // hourly rotation and would wrongly re-arm the maturation blackout on a
         // day-old daily maker market each hour.
         let secs_since_market_start = market_age_secs(&market.market_name);
-        if secs_since_market_start < config::MAKER_MIN_MARKET_AGE_SECS {
+        // The absolute wait is scaled down for short-lived markets. A flat 600s
+        // is right for a daily market and unusable on a 15-minute one: measured
+        // on Kalshi's KXBTC15M, the gate cleared at 21:12:00 on a market that
+        // stopped accepting entries at 21:14:00 (60s RTB cutoff before a 21:15
+        // close), leaving two minutes of a thirteen-minute market. The Maker
+        // viper was, in practice, switched off there.
+        //
+        // Market life is measured as observed age + seconds to close, which is
+        // stable as the market ages (age grows exactly as fast as the remainder
+        // shrinks). Markets with no close time keep the absolute wait — nothing
+        // to scale against.
+        let min_age = effective_min_market_age(
+            secs_since_market_start,
+            market.market_close_time,
+            dc.maker_min_market_age_secs,
+            dc.maker_maturation_max_fraction,
+        );
+        if secs_since_market_start < min_age {
             maker_gate_streak_secs(market.yes_token.as_str(), false);
             maker_gate_streak_secs(market.no_token.as_str(), false);
             self.log_gate(&ctx.crypto_filter, "market_age", &format!(
                 "market_age {}s < min {}s",
-                secs_since_market_start, config::MAKER_MIN_MARKET_AGE_SECS
+                secs_since_market_start, min_age
             )).await;
             return Ok(StrategySignal::NoSignal);
         }
@@ -717,7 +789,8 @@ impl Strategy for MakerStrategyImpl {
         let horizon_vetoes_yes = config::MAKER_HORIZON_GATE_ENFORCE && horizon_blocks_yes;
         let horizon_vetoes_no  = config::MAKER_HORIZON_GATE_ENFORCE && horizon_blocks_no;
 
-        let yes_gates_pass = yes_book_ok
+        let yes_gates_pass = snapshot.yes_has_ask()
+            && yes_book_ok
             && !taker_flow_blocks_yes
             && !yes_toxic_cooldown
             && !horizon_vetoes_yes
@@ -728,7 +801,8 @@ impl Strategy for MakerStrategyImpl {
             && no_bid <= dc.maker_max_complementary_price
             && !velocity_bias_strong_negative;
 
-        let no_gates_pass = no_book_ok
+        let no_gates_pass = snapshot.no_has_ask()
+            && no_book_ok
             && !taker_flow_blocks_no
             && !no_toxic_cooldown
             && !horizon_vetoes_no
@@ -753,14 +827,16 @@ impl Strategy for MakerStrategyImpl {
             let (yes_key, yes_detail) = match yes_streak {
                 Some(s) => ("gate_dwell", format!("gate_dwell {}s/{}s", s, config::MAKER_GATE_DWELL_SECS)),
                 None => side_reject_reason(
-                    yes_book_ok, taker_flow_blocks_yes, yes_toxic_cooldown, yes_spread, yes_bid_price,
+                    snapshot.yes_has_ask(), yes_book_ok, taker_flow_blocks_yes, yes_toxic_cooldown,
+                    yes_spread, yes_bid_price,
                     snapshot.yes_ask, no_bid, velocity_bias_strong_negative, dc,
                 ).unwrap_or(("unknown", "unknown".to_string())),
             };
             let (no_key, no_detail) = match no_streak {
                 Some(s) => ("gate_dwell", format!("gate_dwell {}s/{}s", s, config::MAKER_GATE_DWELL_SECS)),
                 None => side_reject_reason(
-                    no_book_ok, taker_flow_blocks_no, no_toxic_cooldown, no_spread, no_bid_price,
+                    snapshot.no_has_ask(), no_book_ok, taker_flow_blocks_no, no_toxic_cooldown,
+                    no_spread, no_bid_price,
                     snapshot.no_ask, yes_bid, velocity_bias_strong_positive, dc,
                 ).unwrap_or(("unknown", "unknown".to_string())),
             };
@@ -1367,5 +1443,71 @@ mod toxic_obi_streak_tests {
     #[test]
     fn unknown_token_starts_at_zero() {
         assert_eq!(maker_toxic_obi_streak("test_tok_streak_unknown", false), 0);
+    }
+}
+
+#[cfg(test)]
+mod maturation_gate_tests {
+    use super::{effective_min_market_age, maturation_wait};
+    use rust_decimal_macros::dec;
+
+    /// The case that motivated the scaling. A Kalshi KXBTC15M market runs about
+    /// thirteen minutes and stops accepting entries 60s before close, so a flat
+    /// 600s wait left roughly two minutes of tradeable life.
+    #[test]
+    fn fifteen_minute_market_matures_well_inside_its_life() {
+        let wait = maturation_wait(0, 780, 600, dec!(0.25));
+        assert_eq!(wait, 195, "a 13-minute market should not wait 10 minutes");
+        assert!(wait < 780 - 60, "maturation must clear before the RTB cutoff");
+    }
+
+    /// A daily market is long enough that the fraction never binds, so the
+    /// operator's absolute wait is served in full — the scaling must not quietly
+    /// shorten maturation where it was already correct.
+    #[test]
+    fn daily_market_keeps_the_full_absolute_wait() {
+        assert_eq!(maturation_wait(0, 86_400, 600, dec!(0.25)), 600);
+    }
+
+    /// Lifetime is age + remaining, so it stays put as the market ages. Without
+    /// this the required wait would shrink every tick and the gate would admit a
+    /// market it had just rejected.
+    #[test]
+    fn required_wait_is_stable_as_the_market_ages() {
+        let at_open  = maturation_wait(0,   780, 600, dec!(0.25));
+        let mid_life = maturation_wait(300, 480, 600, dec!(0.25));
+        let late     = maturation_wait(700,  80, 600, dec!(0.25));
+        assert_eq!(at_open, mid_life);
+        assert_eq!(at_open, late);
+    }
+
+    /// A market already past its close is the expiry gate's business, not this
+    /// one's, so it keeps the absolute wait rather than collapsing to zero.
+    #[test]
+    fn expired_market_keeps_the_absolute_wait() {
+        assert_eq!(maturation_wait(0, -60, 600, dec!(0.25)), 600);
+        assert_eq!(maturation_wait(0, 0, 600, dec!(0.25)), 600);
+    }
+
+    /// A zero or negative fraction disables scaling rather than admitting every
+    /// market instantly — an operator clearing the field must not silently turn
+    /// the maturation gate off.
+    #[test]
+    fn zero_or_negative_fraction_disables_scaling() {
+        assert_eq!(maturation_wait(0, 780, 600, dec!(0)), 600);
+        assert_eq!(maturation_wait(0, 780, 600, dec!(-1)), 600);
+    }
+
+    /// Scaling never lengthens the wait: the fraction is a ceiling on the
+    /// operator's number, never a floor.
+    #[test]
+    fn scaling_is_a_ceiling_never_a_floor() {
+        assert_eq!(maturation_wait(0, 86_400, 60, dec!(0.25)), 60);
+    }
+
+    /// No close time means nothing to scale against.
+    #[test]
+    fn market_without_close_time_keeps_the_absolute_wait() {
+        assert_eq!(effective_min_market_age(0, None, 600, dec!(0.25)), 600);
     }
 }

@@ -105,6 +105,24 @@ impl Strategy for ArbitrageStrategyImpl {
         let yes_ask = snapshot.yes_ask;
         let no_ask  = snapshot.no_ask;
 
+        // ── Both legs must have a seller ─────────────────────────────────────
+        // A maker arb rests a bid on each leg and, if only one fills, rehedges
+        // the other by taking its ask. A leg with no ask at all has no rehedge
+        // price, so the trade cannot be underwritten no matter how the bids
+        // look. This is the honest expression of a condition the strategy has
+        // always rejected only by accident: an absent ask used to be filled in
+        // as $0.00 on Kalshi, which the locked-spread guard below caught as
+        // `no_bid >= no_ask`. Both facts have since been fixed, and neither was
+        // ever a statement about rehedgeability.
+        if !snapshot.yes_has_ask() || !snapshot.no_has_ask() {
+            debug!(
+                " Arb skipped — no seller on {} leg (nothing to rehedge against)",
+                if snapshot.yes_has_ask() { "NO" } else { "YES" },
+            );
+            idle("no seller on one leg");
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Locked / inverted-spread guard ───────────────────────────────────
         // If YES or NO bid ≥ ask, the WS snapshot is stale or the market is at
         // an inflection.  We must NOT place a post-only bid at or above the ask

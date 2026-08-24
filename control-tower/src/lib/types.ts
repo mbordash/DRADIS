@@ -102,6 +102,8 @@ export interface DynamicConfig {
   maker_max_exposure_usdc: string;
   maker_quote_size_usdc: string;
   deploy_max_days_to_close:      number;
+  auto_deploy_politics:          boolean;
+  auto_deploy_sports:            boolean;
   obi_use_whole_book:            boolean;
   maker_min_spread:              string;
   maker_bid_buffer:              string;
@@ -110,6 +112,8 @@ export interface DynamicConfig {
   maker_max_complementary_price: string;
   maker_max_book_imbalance_ratio: string;
   maker_min_secs_to_expiry:      number;
+  maker_min_market_age_secs:     number;
+  maker_maturation_max_fraction: string;
   maker_toxic_flow_exit_obi:     string;
   maker_toxic_reentry_cooldown_secs: number;
   maker_toxic_min_hold_secs:     number;
@@ -620,7 +624,10 @@ export interface DeploymentStatus {
   market_type: MarketType;
   raptors: string[];
   vipers: string[];
-  status: 'pending' | 'processing' | 'deployed' | 'failed';
+  /// Written by the engine: queued → claimed → trading → finished, or failed.
+  /// 'deployed' was never one of them — the engine writes 'active' when the
+  /// squadron starts and 'completed' when its market closes.
+  status: 'pending' | 'processing' | 'active' | 'completed' | 'failed';
   squadron_id?: string;
   error?: string;
   created_at: string;

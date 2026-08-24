@@ -18,8 +18,8 @@
 
 import { useState } from 'react';
 import useSWR from 'swr';
-import type { SquadronSummary, SquadronState } from '@/lib/types';
-import { getOpenPositions, getVipersForClass } from '@/lib/api';
+import type { SquadronSummary, SquadronState, DeploymentStatus } from '@/lib/types';
+import { getOpenPositions, getVipersForClass, getDeployments } from '@/lib/api';
 import DeploySquadronModal from './DeploySquadronModal';
 
 // ── State badge ───────────────────────────────────────────────────────────────
@@ -181,6 +181,58 @@ function SquadronRow({
   );
 }
 
+// ── In-flight deployment row ──────────────────────────────────────────────────
+//
+// A deploy is queued, not executed. `POST /api/squadrons/deploy` returns as soon
+// as the row is written; the engine picks it up on its own poll and only then
+// does a squadron exist to list. In between, the modal has already closed and
+// the squadron list looks exactly as it did before — which reads as "nothing
+// happened" rather than "starting". Worse, a deployment that FAILS leaves that
+// state permanently: the error is recorded in the queue and was never surfaced,
+// so a failure and a slow success were indistinguishable.
+//
+// These rows come straight from the queue, so they say what is actually true
+// rather than assuming the deploy will succeed.
+
+const DEPLOY_STATUS_STYLES: Record<string, { label: string; bg: string; text: string; dot: string; pulse: boolean }> = {
+  pending:    { label: 'QUEUED',   bg: 'bg-amber-500/10', text: 'text-amber-300', dot: 'bg-amber-400', pulse: true  },
+  processing: { label: 'STARTING', bg: 'bg-blue-500/10',  text: 'text-blue-300',  dot: 'bg-blue-400',  pulse: true  },
+  failed:     { label: 'FAILED',   bg: 'bg-red-500/10',   text: 'text-red-300',   dot: 'bg-red-500',   pulse: false },
+};
+
+function PendingDeploymentRow({ dep }: { dep: DeploymentStatus }) {
+  const style = DEPLOY_STATUS_STYLES[dep.status] ?? DEPLOY_STATUS_STYLES.pending;
+  return (
+    <div className="flex items-center justify-between px-4 py-3 border-b border-[#1e1e32] last:border-b-0">
+      <div className="flex items-center gap-3 min-w-0">
+        <span className={`inline-flex items-center gap-1.5 text-[10px] font-mono ${style.bg} ${style.text} rounded-full px-2 py-0.5 shrink-0`}>
+          <span className={`w-1.5 h-1.5 rounded-full ${style.dot} ${style.pulse ? 'animate-pulse' : ''}`} />
+          {style.label}
+        </span>
+        <div className="min-w-0">
+          <div className="text-xs font-mono text-gray-300 truncate">
+            {dep.market_type} squadron
+          </div>
+          {dep.status === 'failed' && dep.error ? (
+            <div className="text-[10px] font-mono text-red-400/80 truncate" title={dep.error}>
+              {dep.error}
+            </div>
+          ) : (
+            <div className="text-[10px] font-mono text-gray-600 truncate" title={dep.market_id}>
+              {dep.market_id}
+            </div>
+          )}
+        </div>
+      </div>
+      {dep.status !== 'failed' && (
+        <span className="text-[10px] font-mono text-gray-600 shrink-0">
+          waiting for the engine
+        </span>
+      )}
+    </div>
+  );
+}
+
 // ── Empty state ───────────────────────────────────────────────────────────────
 
 function EmptyState({ isLoading }: { isLoading: boolean }) {
@@ -228,6 +280,29 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, 
     { refreshInterval: 15_000 }
   );
 
+  // In-flight and failed deployments. Polled faster than the squadron list
+  // because this is exactly the window the operator is staring at: the engine's
+  // own queue poll is 5s, so anything slower would make the UI look stuck for
+  // reasons that have nothing to do with the engine.
+  const { data: deployments } = useSWR<DeploymentStatus[]>(
+    'deployment-queue',
+    getDeployments,
+    { refreshInterval: 3_000 }
+  );
+
+  // A queued row is only worth showing until its squadron exists — after that
+  // the real row carries the state, and showing both would double-count.
+  const liveClasses = new Set(squadrons
+    .filter(s => s.state !== 'STOOD_DOWN')
+    .map(s => s.asset.toLowerCase()));
+  const inFlight = (deployments ?? []).filter(d =>
+    (d.status === 'pending' || d.status === 'processing') && !liveClasses.has(d.market_type.toLowerCase()));
+  // Failures are shown until the class is running again, so a failed deploy
+  // cannot vanish unseen between two poll ticks.
+  const failed = (deployments ?? []).filter(d =>
+    d.status === 'failed' && !liveClasses.has(d.market_type.toLowerCase()));
+  const queueRows = [...inFlight, ...failed];
+
   // Build mission count map: asset -> count
   const missionCounts: Record<string, number> = {};
   if (allPositions) {
@@ -243,7 +318,7 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, 
         <div className="flex items-center justify-between px-4 py-3 border-b border-[#1e1e32]">
           <div className="flex items-center gap-2">
             <span className="text-sm font-mono font-semibold text-gray-200">✈️ CAG Registry</span>
-            {!isLoading && squadrons.length > 0 && (
+            {!isLoading && (squadrons.length > 0 || queueRows.length > 0) && (
               <span className="text-[10px] font-mono bg-green-500/10 text-green-400 border border-green-500/20 rounded-full px-2 py-0.5">
                 {active.length} active
               </span>
@@ -263,10 +338,19 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, 
         </div>
 
         {/* Body */}
-        {isLoading || squadrons.length === 0 ? (
+        {isLoading || (squadrons.length === 0 && queueRows.length === 0) ? (
           <EmptyState isLoading={isLoading} />
         ) : (
         <>
+          {/* Deployments the engine has not picked up yet, and ones that failed */}
+          {queueRows.length > 0 && (
+            <div>
+              {queueRows.map(dep => (
+                <PendingDeploymentRow key={dep.id} dep={dep} />
+              ))}
+            </div>
+          )}
+
           {/* Active squadrons */}
           {active.length > 0 && (
             <div>

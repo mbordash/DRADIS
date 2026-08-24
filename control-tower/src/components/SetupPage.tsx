@@ -1286,8 +1286,9 @@ function GlobalConfigPanel() {
       <div>
         <h3 className="text-sm font-mono text-gray-200">Deployment</h3>
         <p className="text-[11px] text-gray-500 mt-1 leading-relaxed">
-          Applies when you deploy a squadron. Unlike the per-viper settings on a
-          squadron page, these are instance-wide.
+          Govern which squadrons DRADIS runs and which market it picks for them,
+          whether you deploy one yourself or leave it to the engine. Unlike the
+          per-viper settings on a squadron page, these are instance-wide.
         </p>
       </div>
       {fields.map(f => (

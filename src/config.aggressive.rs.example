@@ -426,6 +426,17 @@ pub const MAKER_INVENTORY_SKEW_MAX: Decimal = dec!(0.04);
 
 /// Posts immediately after 3 minutes — high adverse-selection risk on new markets.
 pub const MAKER_MIN_MARKET_AGE_SECS: i64 = 180;
+/// Ceiling on the maturation wait, expressed as a fraction of the market's own
+/// lifetime. The absolute `MAKER_MIN_MARKET_AGE_SECS` wait is right for a daily
+/// market and nonsense for a 15-minute one: a 600s wait against a 13-minute
+/// Kalshi market left a two-minute quoting window once the 60s RTB cutoff took
+/// its share, so the Maker viper effectively never quoted there.
+///
+/// The effective wait is `min(MAKER_MIN_MARKET_AGE_SECS, fraction x market_life)`,
+/// where market_life is measured as observed age + seconds to close. At 0.25 a
+/// daily market still serves the full absolute wait, while a 13-minute market
+/// matures in ~195s and keeps most of its life tradeable.
+pub const MAKER_MATURATION_MAX_FRACTION: Decimal = dec!(0.25);
 /// Throttle interval (secs) for MakerStrategy gate-rejection diagnostics — a gate
 /// reason is logged when it changes or after this interval, without per-tick spam.
 pub const MAKER_GATE_LOG_INTERVAL_SECS: u64 = 30;
@@ -560,7 +571,14 @@ pub const SPORTS_ODDS_REGIONS: &str = "us";
 
 /// Seconds between Sports Raptor polls. The Odds API free tier is quota-limited
 /// (~500 requests/month), so poll conservatively — line movement is a slow signal.
-pub const SPORTS_POLL_SECS: u64 = 300;
+///
+/// Do the arithmetic before lowering this: 86_400 / SPORTS_POLL_SECS requests a
+/// day, times ~30. At 7200s that is 12/day (~360/month) and fits the free tier
+/// with headroom. At 300s it is 288/day (~8_640/month) — seventeen times over,
+/// which exhausts a fresh key in under two days and then leaves the Sports
+/// Raptor dark behind an HTTP 429. Raise it, don't lower it, unless the operator
+/// is on a paid plan.
+pub const SPORTS_POLL_SECS: u64 = 7200;
 pub const SPORTS_ODDS_LOW_BUDGET_WARN: i64 = 50;
 
 // ── Tennis Raptor (Live Tennis API live event-state feed) ────────────────────
@@ -1066,6 +1084,27 @@ pub const KALSHI_POLITICS_CATEGORIES: &str = "Elections,Politics";
 
 /// Kalshi categories that back DRADIS's `sports` market class.
 pub const KALSHI_SPORTS_CATEGORIES: &str = "Sports";
+
+/// Keep a politics squadron running without waiting to be asked.
+///
+/// Kalshi previously auto-started only its crypto rotation loop, while
+/// Polymarket US started all three of its wings at boot. The same customer saw
+/// three squadrons on one venue and one on the other, with nothing on screen to
+/// explain the difference. DRADIS now seeds a politics squadron on both.
+///
+/// The seeded squadron is an ordinary deployment: it appears in the Control
+/// Tower deployment list, obeys the same one-per-class rule as an operator
+/// deploy, and is replaced with a fresh market when its own market closes. Turn
+/// this off to stop DRADIS committing capital to the class on its own.
+pub const AUTO_DEPLOY_POLITICS: bool = true;
+
+/// Keep a sports squadron running without waiting to be asked.
+/// See [`AUTO_DEPLOY_POLITICS`] — same mechanism, same reasoning.
+///
+/// This does not depend on an Odds API key. The class trades Arbitrage and
+/// Maker, which read the venue's own book; the Sports Raptor is an additive
+/// signal, and without a key it idles and publishes a neutral snapshot.
+pub const AUTO_DEPLOY_SPORTS: bool = true;
 
 /// How far the exit price implied by collateral movement may sit from the bid
 /// observed at exit, before the reconciliation is distrusted.
