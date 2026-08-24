@@ -84,10 +84,20 @@ pub struct UsMarket {
     pub game_start_time: Option<String>,
     #[serde(default, rename = "marketType")]
     pub market_type: String,
-    /// Cumulative trading volume in USD. Used to rank markets by liquidity
-    /// so the trader can rotate to the hottest book when positions are flat.
+    /// Cumulative trading volume in USD, numeric form.
+    ///
+    /// The gateway documents two spellings of the same quantity — `volumeNum`
+    /// as a number and `volume` as a string — and does not send both on every
+    /// endpoint. Reading only `volumeNum` meant a response carrying `volume`
+    /// silently produced 0 for every market, which then failed any liquidity
+    /// floor and emptied the Control Tower's market browser while the trader's
+    /// own wings were happily trading those same markets. Read
+    /// [`Self::volume`] rather than either field directly.
     #[serde(default, rename = "volumeNum")]
-    pub volume: f64,
+    pub volume_num: Option<f64>,
+    /// Cumulative trading volume, string form. See [`Self::volume_num`].
+    #[serde(default, rename = "volume")]
+    pub volume_str: Option<String>,
     /// Primary instrument legs — contains `long: bool` + `identifier` fields.
     #[serde(default, rename = "marketSides")]
     pub market_sides: Vec<serde_json::Value>,
@@ -99,6 +109,18 @@ pub struct UsMarket {
     #[serde(default)]
     pub outcomes: serde_json::Value,
 }
+
+impl UsMarket {
+    /// Cumulative trading volume in USD, from whichever spelling the gateway
+    /// sent. Zero when it sent neither — which means "not reported on this
+    /// endpoint", not "nobody has traded it".
+    pub fn volume(&self) -> f64 {
+        self.volume_num
+            .or_else(|| self.volume_str.as_deref().and_then(|s| s.trim().parse::<f64>().ok()))
+            .unwrap_or(0.0)
+    }
+}
+
 
 #[cfg(any())]
 mod legacy {
@@ -334,3 +356,46 @@ pub struct SearchEvent {
 
 
 
+
+#[cfg(test)]
+mod volume_parsing_tests {
+    use super::UsMarket;
+
+    /// The gateway documents two spellings of the same quantity. Reading only
+    /// `volumeNum` produced 0 for every market on any endpoint that sends the
+    /// string form, which then failed the Control Tower's liquidity floor and
+    /// emptied the market browser for all three classes.
+    #[test]
+    fn reads_the_numeric_spelling() {
+        let m: UsMarket = serde_json::from_str(r#"{"volumeNum": 12345.5}"#).unwrap();
+        assert_eq!(m.volume(), 12345.5);
+    }
+
+    #[test]
+    fn reads_the_string_spelling() {
+        let m: UsMarket = serde_json::from_str(r#"{"volume": "12345.5"}"#).unwrap();
+        assert_eq!(m.volume(), 12345.5);
+    }
+
+    /// When both arrive the numeric form wins — no parsing step to get wrong.
+    #[test]
+    fn prefers_the_numeric_spelling_when_both_are_sent() {
+        let m: UsMarket = serde_json::from_str(r#"{"volumeNum": 7.0, "volume": "9999"}"#).unwrap();
+        assert_eq!(m.volume(), 7.0);
+    }
+
+    /// Neither field means "not reported on this endpoint", which must not be
+    /// confused with a market nobody has traded — see the browser's filter.
+    #[test]
+    fn missing_volume_is_zero_not_an_error() {
+        let m: UsMarket = serde_json::from_str(r#"{"slug": "x"}"#).unwrap();
+        assert_eq!(m.volume(), 0.0);
+    }
+
+    /// A malformed string degrades to zero rather than dropping the market.
+    #[test]
+    fn an_unparseable_string_degrades_to_zero() {
+        let m: UsMarket = serde_json::from_str(r#"{"volume": "n/a"}"#).unwrap();
+        assert_eq!(m.volume(), 0.0);
+    }
+}

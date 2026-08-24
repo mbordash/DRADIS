@@ -177,6 +177,8 @@ pub fn pair_markets(markets: Vec<types::UsMarket>) -> Vec<UsMarketPair> {
             }
         }
         if let (Some(l), Some(s)) = (long_sym, short_sym) {
+            // Read before the struct is picked apart below.
+            let volume = m.volume();
             out.push(UsMarketPair {
                 slug: m.slug,
                 question: m.question,
@@ -185,7 +187,7 @@ pub fn pair_markets(markets: Vec<types::UsMarket>) -> Vec<UsMarketPair> {
                 long: MarketId::new(l),
                 short: MarketId::new(s),
                 close_time: parse_close_time(&m.end_date),
-                volume: m.volume,
+                volume,
             });
         }
     }
@@ -271,7 +273,8 @@ mod tests {
             closed: false,
             game_start_time: None,
             market_type: String::new(),
-            volume: 10_000.0,
+            volume_num: Some(10_000.0),
+            volume_str: None,
             market_sides: Vec::new(),
             instruments,
             outcomes: serde_json::Value::Array(Vec::new()),

@@ -482,6 +482,19 @@ struct UsDeploymentRunner {
     tennis_rx: watch::Receiver<TennisSnapshot>,
 }
 
+/// Does `pair` belong to `class` on this venue?
+///
+/// The single definition of what a Polymarket US class contains, shared by the
+/// trader's wings and by the Control Tower's market browser. Kept in one place
+/// deliberately: the browser previously applied no class filter at all and
+/// labelled every discovered market with whatever class was asked for, so
+/// browsing "politics" listed Premier League football and tennis — and a deploy
+/// from that list then failed at run time, because the politics wing quite
+/// correctly did not recognise a tennis match as one of its markets.
+pub async fn pair_matches_class(pair: &super::markets::UsMarketPair, class: &str) -> bool {
+    wing_for_class(class).claims(pair).await
+}
+
 /// The wing a deployed market belongs to.
 ///
 /// A deployment names a class, and the wings already encode what each class
@@ -489,7 +502,7 @@ struct UsDeploymentRunner {
 /// shard as one the wing discovered itself. Anything unrecognised goes to
 /// Sports, matching `Wing::claims`, which keeps an oddly-labelled market traded
 /// rather than dropped.
-fn wing_for_class(class: &str) -> Wing {
+pub(crate) fn wing_for_class(class: &str) -> Wing {
     match class {
         "politics" => Wing::Politics,
         "crypto" => Wing::Crypto,
@@ -560,7 +573,12 @@ impl crate::venues::deployment::DeploymentRunner for UsDeploymentRunner {
                     left > 0 && left <= max_secs
                 }
             })
-            .max_by(|a, b| a.volume.partial_cmp(&b.volume).unwrap_or(std::cmp::Ordering::Equal))
+            // Soonest close first, NOT highest volume: the Polymarket US
+            // gateway reports no volume, so every pair is 0 and a max_by on it
+            // returns whichever the iterator happened to reach first. Closing
+            // soonest is at least a real ordering, and it favours a market that
+            // will resolve inside a session rather than a 2026 future.
+            .min_by_key(|p| p.close_time.unwrap_or(chrono::DateTime::<Utc>::MAX_UTC))
             .map(|p| p.slug)
     }
 }

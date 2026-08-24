@@ -2763,17 +2763,31 @@ async fn fetch_markets_by_type(
     };
 
     let now = chrono::Utc::now();
-    let mut out: Vec<AvailableMarket> = pairs
-        .into_iter()
-        .filter(|p| p.volume >= min_liquidity)
-        .filter(|p| match p.close_time {
-            Some(ct) => {
-                let secs_left = (ct - now).num_seconds();
-                secs_left >= 300 && secs_left <= max_expiry_secs
+    let mut out: Vec<AvailableMarket> = Vec::new();
+    for p in pairs {
+        // Class membership comes from the venue's own wing definition, so a
+        // market listed here is one the deploy runner will actually find. The
+        // browser used to apply no class filter and stamp every market with the
+        // requested class, which listed football under politics and produced
+        // deploys that failed at run time.
+        if !crate::venues::us::trader::pair_matches_class(&p, market_type).await {
+            continue;
+        }
+        // The Polymarket US gateway returns no volume field, so every pair
+        // reports 0 and a liquidity floor removes the entire venue. Treat 0 as
+        // "not reported" rather than "no interest": filtering on a number the
+        // venue never sends is how this list came back empty for all three
+        // classes while three wings were trading happily.
+        if p.volume > 0.0 && p.volume < min_liquidity {
+            continue;
+        }
+        if let Some(ct) = p.close_time {
+            let secs_left = (ct - now).num_seconds();
+            if secs_left < 300 || secs_left > max_expiry_secs {
+                continue;
             }
-            None => true, // no endDate → venue treats as always open
-        })
-        .map(|p| AvailableMarket {
+        }
+        out.push(AvailableMarket {
             condition_id: p.slug,
             question: p.question,
             market_class: market_type.to_string(),
@@ -2783,10 +2797,12 @@ async fn fetch_markets_by_type(
                 yes_id: p.long.to_string(),
                 no_id: p.short.to_string(),
             },
-        })
-        .collect();
+        });
+    }
 
-    out.sort_by(|a, b| b.liquidity.partial_cmp(&a.liquidity).unwrap_or(std::cmp::Ordering::Equal));
+    // Soonest close first. Ranking by volume is meaningless here — every market
+    // reports 0 — so it produced an arbitrary order that merely looked ranked.
+    out.sort_by_key(|m| m.end_date.clone().unwrap_or_else(|| "9999".to_string()));
     out.truncate(50);
     info!("📊 fetch_markets_by_type: found {} US markets for type '{}'", out.len(), market_type);
     out
