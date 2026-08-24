@@ -19,6 +19,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import useSWR from 'swr';
 import dynamic from 'next/dynamic';
+import ChunkBoundary from '@/components/ChunkBoundary';
 
 import ViperCard       from '@/components/ViperCard';
 import LlmAdvisorCard  from '@/components/LlmAdvisorCard';
@@ -40,8 +41,25 @@ import { getSetupStatus } from '@/lib/setupApi';
 import type { DynamicConfig, SquadronSummary } from '@/lib/types';
 
 // Recharts must be loaded client-side only
-const PnlChart = dynamic(() => import('@/components/PnlChart'), { ssr: false });
-const TelemetryPage = dynamic(() => import('@/components/TelemetryPage'), { ssr: false });
+// Loading states are explicit: without one these render nothing at all while
+// their chunk is in flight, which on a slow connection is indistinguishable
+// from a broken page.
+const PnlChart = dynamic(() => import('@/components/PnlChart'), {
+  ssr: false,
+  loading: () => (
+    <div className="card p-6 flex items-center justify-center h-64 text-gray-600 text-sm">
+      Loading portfolio history…
+    </div>
+  ),
+});
+const TelemetryPage = dynamic(() => import('@/components/TelemetryPage'), {
+  ssr: false,
+  loading: () => (
+    <div className="card p-6 flex items-center justify-center h-64 text-gray-600 text-sm">
+      Loading telemetry…
+    </div>
+  ),
+});
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -667,7 +685,9 @@ export default function DashboardPage() {
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
           <ErrorBoundary label="Telemetry">
-            <TelemetryPage availableAssets={availableAssets} venue={setupStatus?.venue} />
+            <ChunkBoundary name="Telemetry">
+              <TelemetryPage availableAssets={availableAssets} venue={setupStatus?.venue} />
+            </ChunkBoundary>
           </ErrorBoundary>
           <Footer />
         </main>
@@ -730,14 +750,16 @@ export default function DashboardPage() {
             Loading portfolio history…
           </div>
         ) : (
-          <PnlChart
-            data={pnl ?? []}
-            startingBalance={startingBal}
-            ghostMode={config?.ghost_mode}
-            currentPortfolio={portfolio}
-            trades={allTrades ?? []}
-            openPositions={allOpenPositions ?? []}
-          />
+          <ChunkBoundary name="Portfolio history">
+            <PnlChart
+              data={pnl ?? []}
+              startingBalance={startingBal}
+              ghostMode={config?.ghost_mode}
+              currentPortfolio={portfolio}
+              trades={allTrades ?? []}
+              openPositions={allOpenPositions ?? []}
+            />
+          </ChunkBoundary>
         )}
 
         {/* ── CAG-level stats ───────────────────────────────────────────── */}
