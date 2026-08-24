@@ -934,6 +934,10 @@ async fn trade_one_market(
                 info!("US trader: cancelled — standing down");
                 lifecycle.cancel_all(venue.as_ref()).await;
                 cag.update_state(&squadron_id, SquadronState::StoodDown);
+                // Leave the registry on an operator stand-down, matching the other
+                // venues. A lingering row that a redeploy revives is indistinguishable
+                // from a squadron that came back by itself.
+                cag.remove(&squadron_id);
                 publish_us_raptor_health(raptor_health_tx, asset, false);
                 return MarketOutcome::Cancelled;
             }

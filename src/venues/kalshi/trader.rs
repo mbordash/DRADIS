@@ -1026,6 +1026,13 @@ async fn trade_one_market(
                 info!("Kalshi trader: cancelled — standing down");
                 lifecycle.cancel_all(venue.as_ref()).await;
                 cag.update_state(&squadron_id, SquadronState::StoodDown);
+                // Leave the registry, like every other exit path and like the
+                // intl venue. Without this an operator stand-down left the row
+                // in place forever, and a redeploy re-registered the same id —
+                // so the list showed one row flipping STOOD_DOWN → PATROLLING,
+                // which reads as "it came back on its own and my deploy did
+                // nothing" rather than as two deliberate acts.
+                cag.remove(&squadron_id);
                 if pair.is_crypto() { publish_raptor_health(raptor_health_tx, pair.underlying, false); }
                 return MarketOutcome::Cancelled;
             }

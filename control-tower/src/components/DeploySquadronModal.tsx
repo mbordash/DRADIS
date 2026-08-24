@@ -338,6 +338,7 @@ export default function DeploySquadronModal({ isOpen, onClose, onDeployed }: Dep
 
   // Deployment state
   const [deploying, setDeploying] = useState(false);
+  const [confirmed, setConfirmed] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
 
   // Fetch deployment region
@@ -424,6 +425,7 @@ export default function DeploySquadronModal({ isOpen, onClose, onDeployed }: Dep
     
     setDeploying(true);
     setError(null);
+    setConfirmed(null);
     
     // Collect valid budgets for selected vipers only (blank = keep default)
     const budgets: Record<string, number> = {};
@@ -447,8 +449,14 @@ export default function DeploySquadronModal({ isOpen, onClose, onDeployed }: Dep
       });
       
       if (response.success && response.squadron_id) {
+        // Confirm before closing. A deploy is QUEUED, not executed — the engine
+        // picks it up on its own poll, so the squadron appears several seconds
+        // later. Closing instantly left the operator watching an unchanged list
+        // with nothing to say their click had landed, which reads as a dead
+        // button even when the deployment succeeded.
+        setConfirmed(`Queued. ${selectedType} squadron starting — it appears in the CAG registry shortly.`);
         onDeployed?.(response.squadron_id);
-        onClose();
+        setTimeout(onClose, 1800);
       } else {
         setError(response.error || 'Deployment failed');
       }
@@ -630,9 +638,11 @@ export default function DeploySquadronModal({ isOpen, onClose, onDeployed }: Dep
 
         {/* Footer */}
         <div className="flex items-center justify-end gap-3 px-5 py-4 border-t border-[#1e1e32] bg-[#0a0a14]">
-          {blockedReason && (
+          {confirmed ? (
+            <span className="mr-auto text-[10px] font-mono text-green-400">✓ {confirmed}</span>
+          ) : blockedReason ? (
             <span className="mr-auto text-[10px] font-mono text-amber-400/80">{blockedReason}</span>
-          )}
+          ) : null}
           <button
             onClick={onClose}
             className="px-4 py-2 text-xs font-mono text-gray-400 hover:text-gray-300 transition-colors"
