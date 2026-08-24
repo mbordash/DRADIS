@@ -2267,7 +2267,19 @@ fn default_expiry_secs(market_type: &str) -> i64 {
         "crypto" => 2_592_000,    // 30d
         _ => 604_800,
     }
-    #[cfg(not(all(not(feature = "intl_clob"), feature = "kalshi")))]
+    // Polymarket US structures crypto as year-scale price targets ("Will Bitcoin
+    // be above $200,000 in 2026?"), not the 15-minute and daily strikes the
+    // other venues list. A 30-day horizon excluded every crypto market it has —
+    // including the one its own crypto wing was trading — so browsing crypto
+    // returned nothing on a venue that demonstrably had crypto markets.
+    #[cfg(all(not(feature = "intl_clob"), not(feature = "kalshi")))]
+    match market_type.to_lowercase().as_str() {
+        "sports" => 86_400,      // 24h — game-day markets
+        "crypto" => 63_072_000,  // 2y — year-scale price targets
+        "politics" => 31_536_000,// 1y — election cycles
+        _ => 604_800,            // 7d fallback
+    }
+    #[cfg(feature = "intl_clob")]
     match market_type.to_lowercase().as_str() {
         "sports" => 86_400,     // 24h — game-day markets
         "crypto" => 2_592_000,  // 30d — price targets have longer horizons
@@ -2744,17 +2756,13 @@ async fn fetch_markets_by_type(
         return Vec::new();
     };
 
-    // Crypto has its own discovery path on this venue: the gateway ignores a
-    // category filter for it, so `discover_binary_markets` never surfaces the
-    // crypto markets the crypto wing trades. Browsing crypto without this
-    // returned an empty list — which read as "this venue has no crypto markets"
-    // while a crypto squadron was patrolling one.
-    let discovered = if market_type == "crypto" {
-        venue.discover_crypto_markets_via_search().await
-    } else {
-        venue.discover_binary_markets().await
-    };
-    let pairs = match discovered {
+    // Every class discovers differently on this venue — `/v1/markets` is
+    // sports-dominated, so politics and crypto go through `/v1/search` instead.
+    // Browsing used `/v1/markets` for all three, which is why politics and
+    // crypto came back empty while both of those wings were trading. Routing
+    // through the same helper the wings use means the browser can only show
+    // markets the deploy runner will also find.
+    let pairs = match crate::venues::us::trader::discover_for_class(&venue, market_type).await {
         Ok(p) => p,
         Err(e) => {
             warn!("US venue {market_type} discovery failed: {e:#}");

@@ -131,7 +131,7 @@ pub const US_POLITICS_ASSET: &str = "us-politics";
 /// targets crypto-class markets and feeds them the full Raptor intelligence
 /// stack so all nine vipers can fly.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Wing {
+pub(crate) enum Wing {
     /// Sports — the bulk of what Polymarket US lists (over a thousand NFL
     /// markets alone).
     Sports,
@@ -183,7 +183,7 @@ impl Wing {
     /// default query never surfaced crypto (3000 pairs, zero crypto,
     /// 2026-08-08). No volume floor — hourly crypto markets rotate and start
     /// near zero volume.
-    async fn discover(
+    pub(crate) async fn discover(
         self,
         venue: &UsRetailVenue,
     ) -> anyhow::Result<Vec<super::markets::UsMarketPair>> {
@@ -480,6 +480,21 @@ struct UsDeploymentRunner {
     process_heartbeat_secs: Arc<AtomicU64>,
     sports_rx: watch::Receiver<SportsSnapshot>,
     tennis_rx: watch::Receiver<TennisSnapshot>,
+}
+
+/// Discover the markets a class trades, using that class's own path.
+///
+/// Each class discovers differently — `/v1/markets` is sports-dominated, so
+/// politics and crypto go through `/v1/search` instead. The Control Tower's
+/// market browser used `/v1/markets` for everything, which is why browsing
+/// politics or crypto returned nothing while both wings were trading. Sharing
+/// this with the wings means the browser can only ever show markets the deploy
+/// runner will also find.
+pub async fn discover_for_class(
+    venue: &UsRetailVenue,
+    class: &str,
+) -> anyhow::Result<Vec<super::markets::UsMarketPair>> {
+    wing_for_class(class).discover(venue).await
 }
 
 /// Does `pair` belong to `class` on this venue?

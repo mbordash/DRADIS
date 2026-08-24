@@ -224,6 +224,25 @@ impl UsRetailVenue {
                 anyhow::bail!("markets endpoint returned HTTP {}: {}", http_status, text);
             }
 
+            // One-shot record of what the gateway actually sends. This venue's
+            // schema has drifted more than once — `asks` vs `offers`, prices
+            // nested under `px.value`, two spellings of volume — and each time
+            // the symptom was a silently-zero or silently-empty field rather
+            // than a parse error. Logging the key set of the first market on the
+            // first page turns the next such drift into one log line instead of
+            // an investigation.
+            if page == 1 {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(first) = v.get("markets").and_then(|m| m.as_array()).and_then(|a| a.first()) {
+                        if let Some(obj) = first.as_object() {
+                            let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+                            keys.sort_unstable();
+                            info!("🔎 US /v1/markets field set: {}", keys.join(", "));
+                        }
+                    }
+                }
+            }
+
             let parsed: types::MarketsResponse = serde_json::from_str(&text)
                 .context("markets JSON parse failed")?;
 
