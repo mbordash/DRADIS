@@ -150,32 +150,42 @@ function SquadronRow({
         </div>
       </div>
 
-      {/* Right — mission count + state + deployed time + id */}
-      <div className="flex items-center gap-3 shrink-0">
-        {sq.market_class && sq.market_class !== 'unknown' && (
+      {/* Right — tags on one line, metadata beneath.
+          Stacked rather than run together on a single line: rows carry a
+          varying number of tags (a squadron may have no mission count, or an
+          unknown market class), so on one line the deployed-time and id slid
+          horizontally from row to row and no column lined up. Splitting them
+          gives the tags a row of their own, right-aligned, so they read as a
+          column down the panel. */}
+      <div className="flex flex-col items-end gap-1 shrink-0">
+        <div className="flex items-center gap-2">
+          {sq.market_class && sq.market_class !== 'unknown' && (
+            <span
+              className="text-[10px] font-mono uppercase tracking-wide bg-violet-500/10 text-violet-300 border border-violet-500/20 rounded px-2 py-0.5"
+              title={`Market class: ${sq.market_class}`}
+            >
+              {sq.market_class}
+            </span>
+          )}
+          {sq.market_class && <ViperCoverage marketClass={sq.market_class} />}
+          {missionCount !== undefined && missionCount > 0 && (
+            <span className="text-[10px] font-mono bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 rounded px-2 py-0.5" title={`${missionCount} active mission${missionCount === 1 ? '' : 's'}`}>
+              ✈️ {missionCount}
+            </span>
+          )}
+          <StateBadge state={sq.state} />
+        </div>
+        <div className="flex items-center gap-2">
+          <span className="text-[10px] font-mono text-gray-600" title={sq.deployed_at}>
+            {timeAgo(sq.deployed_at)}
+          </span>
           <span
-            className="text-[10px] font-mono uppercase tracking-wide bg-violet-500/10 text-violet-300 border border-violet-500/20 rounded px-2 py-0.5"
-            title={`Market class: ${sq.market_class}`}
+            className="hidden lg:inline text-[9px] font-mono text-gray-700 truncate max-w-[180px]"
+            title={sq.id}
           >
-            {sq.market_class}
+            {sq.id}
           </span>
-        )}
-        {sq.market_class && <ViperCoverage marketClass={sq.market_class} />}
-        {missionCount !== undefined && missionCount > 0 && (
-          <span className="text-[10px] font-mono bg-cyan-500/10 text-cyan-300 border border-cyan-500/20 rounded px-2 py-0.5" title={`${missionCount} active mission${missionCount === 1 ? '' : 's'}`}>
-            ✈️ {missionCount}
-          </span>
-        )}
-        <StateBadge state={sq.state} />
-        <span className="text-[10px] font-mono text-gray-600" title={sq.deployed_at}>
-          {timeAgo(sq.deployed_at)}
-        </span>
-        <span
-          className="hidden lg:inline text-[9px] font-mono text-gray-700 truncate max-w-[180px]"
-          title={sq.id}
-        >
-          {sq.id}
-        </span>
+        </div>
       </div>
     </button>
   );
