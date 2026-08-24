@@ -2128,8 +2128,12 @@ async fn get_deployment_region() -> Response {
     #[cfg(all(not(feature = "intl_clob"), feature = "kalshi"))]
     let (region, types) = ("kalshi", vec!["politics", "sports", "crypto"]);
 
+    // Crypto belongs here as much as on the other venues: the crypto wing is
+    // live and trading (`us-crypto-open`), and "the wing manages it" is no more
+    // a reason to hide the class than Kalshi's rotation loop is for its crypto.
+    // The list predates that wing existing.
     #[cfg(all(not(feature = "intl_clob"), not(feature = "kalshi")))]
-    let (region, types) = ("us", vec!["politics", "sports"]);
+    let (region, types) = ("us", vec!["politics", "sports", "crypto"]);
     
     Json(DeploymentRegionResponse {
         region: region.to_string(),
@@ -2233,11 +2237,13 @@ struct AvailableMarketsResponse {
 /// over the on-chain wallet Provider. Kalshi has its own consumer,
 /// `kalshi::trader::run_deployment_processor`, spawned beside its rotation loop.
 ///
-/// US retail has neither, so a deploy there is still refused rather than written
-/// and abandoned. Named rather than inlined so the coupling is greppable from
-/// both ends when that changes.
-const DEPLOY_QUEUE_HAS_CONSUMER: bool =
-    cfg!(feature = "intl_clob") || cfg!(feature = "kalshi");
+/// Polymarket US now shares Kalshi's consumer through
+/// `venues::deployment::DeploymentRunner`, so every venue drains the queue and
+/// this is true everywhere. Kept rather than deleted because the coupling is
+/// worth being able to grep from both ends: if a future venue ships without a
+/// consumer, this is where it says so, and the deploy endpoint refuses cleanly
+/// instead of writing a row nothing will ever collect.
+const DEPLOY_QUEUE_HAS_CONSUMER: bool = true;
 
 /// Default max-time-to-close for a market class, in seconds.
 ///
@@ -2738,10 +2744,20 @@ async fn fetch_markets_by_type(
         return Vec::new();
     };
 
-    let pairs = match venue.discover_binary_markets().await {
+    // Crypto has its own discovery path on this venue: the gateway ignores a
+    // category filter for it, so `discover_binary_markets` never surfaces the
+    // crypto markets the crypto wing trades. Browsing crypto without this
+    // returned an empty list — which read as "this venue has no crypto markets"
+    // while a crypto squadron was patrolling one.
+    let discovered = if market_type == "crypto" {
+        venue.discover_crypto_markets_via_search().await
+    } else {
+        venue.discover_binary_markets().await
+    };
+    let pairs = match discovered {
         Ok(p) => p,
         Err(e) => {
-            warn!("US venue market discovery failed: {e:#}");
+            warn!("US venue {market_type} discovery failed: {e:#}");
             return Vec::new();
         }
     };
@@ -2993,10 +3009,11 @@ async fn deploy_squadron(
     }
     
     // Validate market type against deployment region.
-    // US is politics/sports (its crypto wing is auto-managed by the trader loop,
-    // not deployable from the builder). Kalshi accepts all three: politics and
-    // sports are the bulk of that venue, and the two venue-agnostic vipers
-    // (Arbitrage, Maker) have always been mapped to those classes.
+    // Every venue now accepts all three classes: politics and sports are the
+    // bulk of Kalshi and Polymarket US, and the two venue-agnostic vipers
+    // (Arbitrage, Maker) have always been mapped to those classes. Crypto is
+    // deployable everywhere too — a venue's own rotation loop or wing owning a
+    // class is not a reason the operator cannot add a squadron to it.
     #[cfg(all(not(feature = "intl_clob"), feature = "kalshi"))]
     if !matches!(req.market_type.as_str(), "crypto" | "politics" | "sports") {
         return Json(DeploySquadronResponse {
@@ -3008,14 +3025,7 @@ async fn deploy_squadron(
             )),
         }).into_response();
     }
-    #[cfg(all(not(feature = "intl_clob"), not(feature = "kalshi")))]
-    if req.market_type == "crypto" {
-        return Json(DeploySquadronResponse {
-            success: false,
-            squadron_id: None,
-            error: Some("Crypto markets are not available in US deployment".to_string()),
-        }).into_response();
-    }
+
     
     // ── Duplicate-squadron guard ─────────────────────────────────────────────
     // The engine's identity model is one squadron per asset/market-class:

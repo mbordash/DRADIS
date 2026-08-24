@@ -428,6 +428,23 @@ pub async fn run_us_trader(
     // and the other never got a look: Polymarket US lists over a thousand NFL
     // markets, which meant its 133 politics markets were effectively invisible.
     // Kalshi runs three concurrent squadrons; this brings the venues level.
+    // Drain the deployment queue alongside the wings, exactly as Kalshi does.
+    // Operator-deployed markets run concurrently with the venue's own selection
+    // — a different market on a different cadence, not a replacement for it.
+    tokio::spawn(crate::venues::deployment::run_deployment_processor(
+        Arc::new(UsDeploymentRunner {
+            venue: Arc::clone(&venue),
+            cag: cag.clone(),
+            raptor_health_tx: Arc::clone(&raptor_health_tx),
+            markets_tx: Arc::clone(&markets_tx),
+            process_heartbeat_secs: Arc::clone(&process_heartbeat_secs),
+            sports_rx: sports_rx.clone(),
+            tennis_rx: tennis_rx.clone(),
+        }),
+        cag.clone(),
+        cancel.clone(),
+    ));
+
     tokio::join!(
         run_wing(
             Wing::Sports, &venue, &cag, &raptor_health_tx, &markets_tx,
@@ -442,6 +459,110 @@ pub async fn run_us_trader(
             &process_heartbeat_secs, &sports_rx, &tennis_rx, &filter, &cancel,
         ),
     );
+}
+
+
+// ── Deployment runner ────────────────────────────────────────────────────────
+
+/// Polymarket US's half of the shared deployment-queue consumer.
+///
+/// This venue previously had no consumer at all: the Control Tower offered a
+/// Deploy button, `deploy_squadron` refused every request before it reached a
+/// class, and the operator was told the venue "manages its own markets". It
+/// does — via its wings — but that is not a reason to refuse a deployment, any
+/// more than it is on Kalshi, whose rotation loop owns crypto and which still
+/// accepts operator-deployed markets.
+struct UsDeploymentRunner {
+    venue: Arc<UsRetailVenue>,
+    cag: Cag,
+    raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
+    markets_tx: Arc<watch::Sender<HashMap<String, String>>>,
+    process_heartbeat_secs: Arc<AtomicU64>,
+    sports_rx: watch::Receiver<SportsSnapshot>,
+    tennis_rx: watch::Receiver<TennisSnapshot>,
+}
+
+/// The wing a deployed market belongs to.
+///
+/// A deployment names a class, and the wings already encode what each class
+/// trades — so a deployed market runs with the same raptors, vipers and DB
+/// shard as one the wing discovered itself. Anything unrecognised goes to
+/// Sports, matching `Wing::claims`, which keeps an oddly-labelled market traded
+/// rather than dropped.
+fn wing_for_class(class: &str) -> Wing {
+    match class {
+        "politics" => Wing::Politics,
+        "crypto" => Wing::Crypto,
+        _ => Wing::Sports,
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::venues::deployment::DeploymentRunner for UsDeploymentRunner {
+    fn venue_label(&self) -> &'static str { "Polymarket US" }
+
+    async fn run_pinned(
+        &self,
+        market_id: &str,
+        class: &str,
+        _name: Option<&str>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
+        let wing = wing_for_class(class);
+
+        // Resolve the id against what this wing discovers, so a deployed market
+        // is the same shape as a rotated one — the gateway has no single
+        // "market by id" call that returns the paired legs.
+        let pairs = wing.discover(&self.venue).await
+            .map_err(|e| anyhow::anyhow!("{class} discovery failed: {e}"))?;
+        let pair = pairs.into_iter()
+            .find(|p| p.slug == market_id)
+            .ok_or_else(|| anyhow::anyhow!(
+                "market {market_id} is no longer listed under {class} — it may have closed"
+            ))?;
+
+        info!("📋 Deploying {class} squadron on \"{}\" [{}]", pair.question, pair.slug);
+        let outcome = trade_one_market(
+            &self.venue,
+            &self.cag,
+            &self.raptor_health_tx,
+            &self.markets_tx,
+            &self.process_heartbeat_secs,
+            &self.sports_rx,
+            &self.tennis_rx,
+            &cancel,
+            wing,
+            UsMarketSelection { primary: pair, maker: None },
+        ).await;
+        let _ = outcome;
+        info!("📋 Deployed {class} squadron finished");
+        Ok(())
+    }
+
+    async fn select_market(&self, class: &str, max_days_to_close: u32) -> Option<String> {
+        let wing = wing_for_class(class);
+        let pairs = match wing.discover(&self.venue).await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!("📋 Auto-deploy {class} discovery failed: {e}");
+                return None;
+            }
+        };
+        let now = Utc::now();
+        let max_secs = max_days_to_close as i64 * 86_400;
+        pairs.into_iter()
+            .filter(|p| match p.close_time {
+                // A market with no close time is "always open" by this venue's
+                // convention and passes the horizon rather than being dropped.
+                None => true,
+                Some(ct) => {
+                    let left = (ct - now).num_seconds();
+                    left > 0 && left <= max_secs
+                }
+            })
+            .max_by(|a, b| a.volume.partial_cmp(&b.volume).unwrap_or(std::cmp::Ordering::Equal))
+            .map(|p| p.slug)
+    }
 }
 
 /// Run one wing's market rotation loop until `cancel` fires: select a market

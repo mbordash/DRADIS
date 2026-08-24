@@ -62,6 +62,10 @@ fn taker_fee_rate() -> Decimal { Decimal::ZERO }
 /// US drives it today, intl migrates onto it next.
 pub mod lifecycle;
 
+/// Venue-neutral deployment-queue consumer, shared by every venue that accepts
+/// operator-deployed squadrons.
+pub mod deployment;
+
 #[cfg(feature = "intl_clob")]
 pub mod intl;
 

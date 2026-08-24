@@ -429,14 +429,17 @@ pub async fn run_kalshi_trader(
     // Drain the deployment queue alongside the rotation loop. Operator-deployed
     // markets run concurrently with the venue's own selection — they are a
     // different market class on a different cadence, not a replacement for it.
-    tokio::spawn(run_deployment_processor(
-        Arc::clone(&venue),
+    tokio::spawn(crate::venues::deployment::run_deployment_processor(
+        Arc::new(KalshiDeploymentRunner {
+            venue: Arc::clone(&venue),
+            cag: cag.clone(),
+            raptor_health_tx: Arc::clone(&raptor_health_tx),
+            markets_tx: Arc::clone(&markets_tx),
+            process_heartbeat_secs: Arc::clone(&process_heartbeat_secs),
+            sports_rx: sports_rx.clone(),
+            tennis_rx: tennis_rx.clone(),
+        }),
         cag.clone(),
-        Arc::clone(&raptor_health_tx),
-        Arc::clone(&markets_tx),
-        Arc::clone(&process_heartbeat_secs),
-        sports_rx.clone(),
-        tennis_rx.clone(),
         cancel.clone(),
     ));
 
@@ -519,30 +522,17 @@ async fn discover_pairs(venue: &KalshiVenue, series: &[String]) -> Vec<KalshiPai
     pairs
 }
 
-/// Selected primary market and optional daily maker venue.
-/// How often the deployment queue is polled. Operational plumbing rather than a
-/// trading parameter, so it stays a compile-time constant alongside the loop's
-/// other cadences rather than becoming a Control Tower knob.
-const DEPLOY_POLL_SECS: u64 = 5;
 
-/// Market classes DRADIS keeps a squadron running for on its own, subject to
-/// the `auto_deploy_*` switches. Crypto is absent because the venue's rotation
-/// loop already owns it.
-const AUTO_DEPLOY_CLASSES: [&str; 2] = ["politics", "sports"];
+// ── Deployment runner ────────────────────────────────────────────────────────
 
-/// Trade the markets an operator deployed from the Control Tower.
+/// Kalshi's half of the shared deployment-queue consumer.
 ///
-/// The deploy endpoint writes a row to `deployment_queue`. On the intl CLOB that
-/// queue is drained by `run_adama_processor`, which is generic over the on-chain
-/// wallet Provider and so cannot run here — which is why, until this existed, a
-/// Kalshi deploy was accepted, written, and then silently ignored forever.
-///
-/// Each deployment gets its own task running the same trade loop the rotation
-/// path uses, pinned to the chosen market: no volume rotation, and a neutral
-/// Raptor stack when the market has no crypto underlying. The class-to-viper
-/// mapping in the database decides which vipers actually run, so a politics
-/// market picks up the politics set rather than inheriting crypto's.
-pub async fn run_deployment_processor(
+/// Everything about draining the queue — claiming rows, status transitions,
+/// requeue-on-restart, the auto-deploy seeder — lives in
+/// `crate::venues::deployment`. This supplies only what is genuinely
+/// venue-shaped: resolving a Kalshi ticker into a tradeable pair, and choosing
+/// one for a class.
+struct KalshiDeploymentRunner {
     venue: Arc<KalshiVenue>,
     cag: Cag,
     raptor_health_tx: Arc<watch::Sender<HashMap<String, AssetRaptorHealth>>>,
@@ -550,174 +540,50 @@ pub async fn run_deployment_processor(
     process_heartbeat_secs: Arc<AtomicU64>,
     sports_rx: watch::Receiver<SportsSnapshot>,
     tennis_rx: watch::Receiver<TennisSnapshot>,
-    cancel: CancellationToken,
-) {
-    let mut ticker = tokio::time::interval(Duration::from_secs(DEPLOY_POLL_SECS));
-    info!("📋 Kalshi deployment processor started — operator-deployed squadrons enabled");
-
-    // Nothing can be mid-flight at startup, so any row still marked active or
-    // processing belongs to a previous process. Return it to the queue rather
-    // than stranding it: the Control Tower restarts the engine for ordinary
-    // config changes, and an operator should not silently lose every squadron
-    // they deployed each time they adjust a setting.
-    match db::requeue_interrupted_deployments().await {
-        0 => {}
-        n => info!("📋 Requeued {n} deployment(s) interrupted by the last restart"),
-    }
-
-    loop {
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                info!("📋 Kalshi deployment processor stopping");
-                return;
-            }
-            _ = ticker.tick() => {}
-        }
-
-        // Seed the classes DRADIS is configured to keep running. Ordered after
-        // the requeue above so a squadron restored from the last process is
-        // already visible and is not duplicated.
-        seed_auto_deployments(&venue, &cag).await;
-
-        for dep in db::fetch_pending_deployments().await {
-            // Claim it first. fetch_pending_deployments only returns rows still
-            // marked 'pending', so this is what stops the next tick — two
-            // seconds away — from starting the same market a second time.
-            if let Err(e) = db::update_deployment_status(&dep.id, "processing", None, None).await {
-                warn!("📋 Could not claim deployment {}: {e}", dep.id);
-                continue;
-            }
-
-            let market = match venue.market(&dep.market_id).await {
-                Ok(m) => m,
-                Err(e) => {
-                    let msg = format!("could not load market {}: {e}", dep.market_id);
-                    warn!("📋 Deployment {} failed — {msg}", dep.id);
-                    let _ = db::update_deployment_status(&dep.id, "failed", None, Some(&msg)).await;
-                    continue;
-                }
-            };
-
-            let pair = pair_from_market_untethered(&market);
-            info!(
-                "📋 Deploying {} squadron on \"{}\" [{}] close={:?}",
-                dep.market_type, pair.question, pair.ticker, pair.close_time,
-            );
-            if let Err(e) = db::update_deployment_status(&dep.id, "active", None, None).await {
-                warn!("📋 Could not mark deployment {} active: {e}", dep.id);
-            }
-
-            let (venue_t, cag_t) = (Arc::clone(&venue), cag.clone());
-            let (sports_t, tennis_t) = (sports_rx.clone(), tennis_rx.clone());
-            let health_t = Arc::clone(&raptor_health_tx);
-            let markets_t = Arc::clone(&markets_tx);
-            let hb_t = Arc::clone(&process_heartbeat_secs);
-            // A child token so standing the venue down stops deployed markets too.
-            let cancel_t = cancel.child_token();
-            let dep_id = dep.id.clone();
-            let class = dep.market_type.clone();
-            let dep_name = Some(dep.name.clone()).filter(|n| !n.is_empty());
-
-            tokio::spawn(async move {
-                let outcome = trade_one_market(
-                    &venue_t,
-                    &cag_t,
-                    &health_t,
-                    &markets_t,
-                    &hb_t,
-                    // Rotation series are irrelevant to a pinned market; the
-                    // rescan branch returns early before ever reading them.
-                    &[],
-                    &cancel_t,
-                    MarketSelection { primary: pair, maker: None },
-                    MarketMandate::Pinned,
-                    Some(&class),
-                    dep_name.as_deref(),
-                    &sports_t,
-                    &tennis_t,
-                ).await;
-                info!("📋 Deployed {class} squadron finished: {outcome:?}");
-                let _ = db::update_deployment_status(&dep_id, "completed", None, None).await;
-            });
-        }
-    }
 }
 
-/// Keep a squadron running for every market class DRADIS is configured to
-/// deploy on its own.
-///
-/// Kalshi ran only its crypto rotation loop at boot while Polymarket US started
-/// all three of its wings, so the same customer saw one squadron on one venue
-/// and three on the other for reasons nothing on screen explained.
-///
-/// The seed goes through the ordinary deployment queue rather than spawning a
-/// second lifecycle beside it: the resulting squadron is indistinguishable from
-/// one an operator deployed, shows up in the Control Tower deployment list with
-/// the same status transitions, and is stood down the same way. It also means
-/// this function does not need to know how to trade — only how to choose.
-///
-/// Idempotent by construction: it seeds a class only when that class has no
-/// live squadron and no row already waiting in the queue, so it is safe to call
-/// on every tick. When a seeded market closes, its squadron ends and the next
-/// tick picks a fresh market — that, rather than an internal rotation, is what
-/// keeps the class populated.
-async fn seed_auto_deployments(venue: &Arc<KalshiVenue>, cag: &Cag) {
-    let Some(pool) = db::pool() else {
-        warn!("📋 Auto-deploy: DB unavailable, skipping this pass");
-        return;
-    };
-    let live: Vec<String> = cag
-        .list_squadrons()
-        .into_iter()
-        .filter(|sq| sq.state != "STOOD_DOWN")
-        .map(|sq| sq.asset.to_ascii_lowercase())
-        .collect();
-    // Every class with a deployment still in flight — including one being
-    // claimed right now, which is briefly in neither the pending queue nor the
-    // squadron list.
-    let queued = db::deployment_classes_in_flight(pool).await;
+#[async_trait::async_trait]
+impl crate::venues::deployment::DeploymentRunner for KalshiDeploymentRunner {
+    fn venue_label(&self) -> &'static str { "Kalshi" }
 
-    // Read the operator's switches fresh each pass so turning one off takes
-    // effect without a restart. Cheap enough at this cadence, and only reached
-    // when a class actually needs seeding.
-    let mut cfg: Option<Arc<DynamicConfig>> = None;
+    async fn run_pinned(
+        &self,
+        market_id: &str,
+        class: &str,
+        name: Option<&str>,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
+        let market = self.venue.market(market_id).await
+            .map_err(|e| anyhow::anyhow!("could not load market {market_id}: {e}"))?;
+        let pair = pair_from_market_untethered(&market);
+        info!(
+            "📋 Deploying {class} squadron on \"{}\" [{}] close={:?}",
+            pair.question, pair.ticker, pair.close_time,
+        );
 
-    for class in AUTO_DEPLOY_CLASSES {
-        if live.iter().any(|a| a == class) || queued.iter().any(|q| q == class) {
-            continue;
-        }
-        let cfg = match &cfg {
-            Some(c) => Arc::clone(c),
-            None => {
-                let c = DynamicConfig::load_or_default().await;
-                cfg = Some(Arc::clone(&c));
-                c
-            }
-        };
-        let enabled = match class {
-            "politics" => cfg.auto_deploy_politics,
-            "sports" => cfg.auto_deploy_sports,
-            _ => false,
-        };
-        if !enabled {
-            continue;
-        }
+        let outcome = trade_one_market(
+            &self.venue,
+            &self.cag,
+            &self.raptor_health_tx,
+            &self.markets_tx,
+            &self.process_heartbeat_secs,
+            // Rotation series are irrelevant to a pinned market; the rescan
+            // branch returns early before ever reading them.
+            &[],
+            &cancel,
+            MarketSelection { primary: pair, maker: None },
+            MarketMandate::Pinned,
+            Some(class),
+            name,
+            &self.sports_rx,
+            &self.tennis_rx,
+        ).await;
+        info!("📋 Deployed {class} squadron finished: {outcome:?}");
+        Ok(())
+    }
 
-        let Some(market_id) = select_auto_deploy_market(venue, class, cfg.deploy_max_days_to_close).await else {
-            // Nothing suitable open right now (out-of-season sports, a quiet
-            // politics calendar). Not an error — the next tick tries again.
-            debug!("📋 Auto-deploy: no {class} market available yet");
-            continue;
-        };
-
-        let raptors = db::raptors_for_class(pool, class).await;
-        let vipers  = db::vipers_for_class(pool, class).await;
-
-        let id = format!("autodeploy-{class}-{}", Utc::now().timestamp());
-        match db::queue_deployment(&id, &market_id, class, "", &raptors, &vipers, &Default::default()).await {
-            Ok(()) => info!("📋 Auto-deploying {class} squadron on [{market_id}]"),
-            Err(e) => warn!("📋 Auto-deploy of {class} failed to queue: {e}"),
-        }
+    async fn select_market(&self, class: &str, max_days_to_close: u32) -> Option<String> {
+        select_auto_deploy_market(&self.venue, class, max_days_to_close).await
     }
 }
 
