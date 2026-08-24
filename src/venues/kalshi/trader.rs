@@ -1070,8 +1070,15 @@ async fn trade_one_market(
                             best.question, best.volume, pair.question, pair.volume, ROTATION_VOLUME_THRESHOLD
                         );
                         lifecycle.cancel_all(venue.as_ref()).await;
-                        cag.update_state(&squadron_id, SquadronState::StoodDown);
-                        cag.remove(&squadron_id);
+                        // A rotation is not an ending — the same squadron is
+                        // moving to a new market and re-registers under this id
+                        // moments later. Marking it STOOD_DOWN and removing it
+                        // made the row vanish from the Control Tower for the
+                        // ten-second gap and reappear afterwards, which reads as
+                        // the squadron dying; it is alarming next to an
+                        // unrelated stand-down the operator has just performed.
+                        // RTB is what is actually true here.
+                        cag.update_state(&squadron_id, SquadronState::Rtb);
                         if pair.is_crypto() { publish_raptor_health(raptor_health_tx, pair.underlying, false); }
                         return MarketOutcome::BetterMarketFound;
                     }
@@ -1124,8 +1131,10 @@ async fn trade_one_market(
                     &market_cfg, maker_cfg.as_ref(), maker_pair.as_ref(), &raptors, starting,
                     dyn_cfg.ghost_mode,
                 ).await;
-                cag.update_state(&squadron_id, SquadronState::StoodDown);
-                cag.remove(&squadron_id);
+                // Its market closed, but the squadron itself continues onto
+                // the next one — see the rotation note above. Held in the
+                // registry as RTB so the row stays put across the gap.
+                cag.update_state(&squadron_id, SquadronState::Rtb);
                 if pair.is_crypto() { publish_raptor_health(raptor_health_tx, pair.underlying, false); }
                 return MarketOutcome::Closed;
             }

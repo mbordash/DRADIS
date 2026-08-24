@@ -975,7 +975,11 @@ async fn trade_one_market(
                                     best.question, best.volume, pair.question, pair.volume, ROTATION_VOLUME_THRESHOLD
                                 );
                                 lifecycle.cancel_all(venue.as_ref()).await;
-                                cag.update_state(&squadron_id, SquadronState::StoodDown);
+                                // Rotating, not ending — the same squadron
+                                // takes a new market and re-registers under this
+                                // id. STOOD_DOWN parked it in the stood-down
+                                // drawer for the gap, which reads as a death.
+                                cag.update_state(&squadron_id, SquadronState::Rtb);
                                 publish_us_raptor_health(raptor_health_tx, asset, false);
                                 return MarketOutcome::BetterMarketFound;
                             }
@@ -1044,7 +1048,8 @@ async fn trade_one_market(
                     &market_cfg, maker_cfg.as_ref(), maker_feeds.as_ref(),
                     raptors.as_ref(), starting, dyn_cfg.ghost_mode,
                 ).await;
-                cag.update_state(&squadron_id, SquadronState::StoodDown);
+                // Its market closed; the squadron continues onto the next.
+                cag.update_state(&squadron_id, SquadronState::Rtb);
                 publish_us_raptor_health(raptor_health_tx, asset, false);
                 return MarketOutcome::Closed;
             }
