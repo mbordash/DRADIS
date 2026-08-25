@@ -325,34 +325,88 @@ pub struct MarketInfo {
     pub no_token: String,
 }
 
-/// Fetch full market details from Gamma API by condition_id.
+/// Fetch full market details from Gamma API by condition id.
+///
+/// The filter parameter is `condition_ids`, plural. Gamma does not reject an
+/// unknown query parameter — it ignores it and returns the unfiltered first
+/// page — so the singular `condition_id` this used to send matched nothing and
+/// silently handed back whichever market happened to top the list. That market
+/// carries a perfectly valid `clobTokenIds`, so the deploy did not fail: it
+/// resolved to a market nobody chose and traded it. The identity check below is
+/// the real defence, since it holds whatever Gamma does with the parameter.
 pub async fn fetch_market_info(http: &reqwest::Client, condition_id: &str) -> Option<MarketInfo> {
     let url = format!(
-        "https://gamma-api.polymarket.com/markets?condition_id={}",
+        "https://gamma-api.polymarket.com/markets?condition_ids={}",
         condition_id
     );
     
-    let resp = http.get(&url).send().await.ok()?;
-    let markets: Vec<serde_json::Value> = resp.json().await.ok()?;
+    // Each failure says which one it was. This used to be a chain of `.ok()?`,
+    // so every cause — transport error, unexpected shape, empty result —
+    // collapsed into the same bare None and the caller could only report
+    // "could not load market details", which is true of all of them and
+    // actionable for none.
+    let resp = match http.get(&url).send().await {
+        Ok(r) => r,
+        Err(e) => { warn!(%url, "Gamma request failed: {e}"); return None; }
+    };
+    let status = resp.status();
+    let body = match resp.text().await {
+        Ok(b) => b,
+        Err(e) => { warn!(%status, "Gamma response unreadable: {e}"); return None; }
+    };
+    let markets: Vec<serde_json::Value> = match serde_json::from_str(&body) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(%status, body = %body.chars().take(200).collect::<String>(),
+                  "Gamma response was not a market list: {e}");
+            return None;
+        }
+    };
+
+    let Some(market) = markets.first() else {
+        warn!(%condition_id, %status, "Gamma knows no market with this condition id");
+        return None;
+    };
+
+    // Refuse anything that is not the market that was asked for. Deploying the
+    // wrong market is worse than not deploying at all: the squadron trades real
+    // size on a question the operator never selected.
+    let returned = market.get("conditionId").and_then(|c| c.as_str()).unwrap_or_default();
+    if !returned.eq_ignore_ascii_case(condition_id) {
+        warn!(
+            requested = %condition_id,
+            returned = %returned,
+            "Gamma returned a different market than requested — refusing to deploy it"
+        );
+        return None;
+    }
     
-    let market = markets.first()?;
-    
-    let question = market.get("question")
-        .and_then(|q| q.as_str())
-        .map(String::from)?;
-    
-    // Token IDs are in the clobTokenIds array: [yes_token, no_token]
-    let clob_tokens = market.get("clobTokenIds")
-        .and_then(|t| t.as_array())?;
-    
-    let yes_token = clob_tokens.first()
-        .and_then(|t| t.as_str())
-        .map(String::from)?;
-    
-    let no_token = clob_tokens.get(1)
-        .and_then(|t| t.as_str())
-        .map(String::from)?;
-    
+    let Some(question) = market.get("question").and_then(|q| q.as_str()).map(String::from) else {
+        warn!(%condition_id, "Gamma market has no question field");
+        return None;
+    };
+
+    // Token ids come back as a JSON-encoded STRING — `"[\"123\", \"456\"]"` —
+    // not as a JSON array, the same way `outcomes` does. `as_array()` therefore
+    // returned None on every market Gamma has ever served, and the `?` swallowed
+    // it: intl deployments failed here, silently, from the first one. The array
+    // form is still accepted in case Gamma ever normalises the field.
+    let tokens: Vec<String> = match market.get("clobTokenIds") {
+        Some(serde_json::Value::Array(a)) =>
+            a.iter().filter_map(|t| t.as_str().map(String::from)).collect(),
+        Some(serde_json::Value::String(s)) =>
+            serde_json::from_str::<Vec<String>>(s).unwrap_or_default(),
+        _ => Vec::new(),
+    };
+
+    let (Some(yes_token), Some(no_token)) = (tokens.first().cloned(), tokens.get(1).cloned()) else {
+        warn!(
+            %condition_id, count = tokens.len(),
+            "Gamma market does not expose a YES/NO token pair — cannot trade it"
+        );
+        return None;
+    };
+
     Some(MarketInfo { question, yes_token, no_token })
 }
 
@@ -434,6 +488,52 @@ where
         found.into_iter()
             .max_by(|a, b| a.liquidity.total_cmp(&b.liquidity))
             .map(|m| m.condition_id)
+    }
+}
+
+#[cfg(test)]
+mod gamma_shape_tests {
+    /// Extract the YES/NO pair exactly as `fetch_market_info` does.
+    fn tokens_of(market: &serde_json::Value) -> Vec<String> {
+        match market.get("clobTokenIds") {
+            Some(serde_json::Value::Array(a)) =>
+                a.iter().filter_map(|t| t.as_str().map(String::from)).collect(),
+            Some(serde_json::Value::String(s)) =>
+                serde_json::from_str::<Vec<String>>(s).unwrap_or_default(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Gamma serialises `clobTokenIds` as a JSON-encoded string, not an array.
+    ///
+    /// The original code called `.as_array()` on it and let `?` swallow the
+    /// None, so every intl deployment failed at this line reporting only
+    /// "could not load market details". This payload is copied from a live
+    /// Gamma response.
+    #[test]
+    fn token_ids_arrive_as_a_json_encoded_string() {
+        let market: serde_json::Value = serde_json::json!({
+            "question": "Will Renan Santos win the 2026 Brazilian presidential election?",
+            "clobTokenIds": "[\"93998891488819623915454849994768171534113749478841216025646247933473925258016\", \"7565921021555775006041943394390068423142281108\"]",
+        });
+        assert!(market["clobTokenIds"].as_array().is_none(), "the field is a string, not an array");
+        let tokens = tokens_of(&market);
+        assert_eq!(tokens.len(), 2, "both legs must be recovered from the encoded string");
+        assert!(tokens[0].starts_with("9399889"));
+    }
+
+    /// Still accepted if Gamma ever normalises the field to a real array.
+    #[test]
+    fn a_real_array_is_still_accepted() {
+        let market = serde_json::json!({ "clobTokenIds": ["111", "222"] });
+        assert_eq!(tokens_of(&market), vec!["111".to_string(), "222".to_string()]);
+    }
+
+    /// A market with one leg (or none) must not deploy half a position.
+    #[test]
+    fn an_incomplete_pair_yields_no_market() {
+        let market = serde_json::json!({ "clobTokenIds": "[\"only-one\"]" });
+        assert!(tokens_of(&market).get(1).is_none(), "a single leg must not pass as a pair");
     }
 }
 

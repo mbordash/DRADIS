@@ -138,6 +138,27 @@ const LLM_FEWSHOT_EXAMPLES: i64 = 6;
 
 // ── Ollama API types ──────────────────────────────────────────────────────────
 
+
+/// Truncate to at most `max_bytes`, stopping on a character boundary.
+///
+/// `&s[..n]` panics outright when byte `n` lands inside a multi-byte character,
+/// and every string these call sites slice comes from outside the process:
+/// market questions carry accented player and candidate names, and model prose
+/// is full of em dashes and quotation marks. A tennis market whose name
+/// straddled byte 32 panicked the advisor task, which then took its whole
+/// analysis cycle down with it — a display-only truncation killing a background
+/// worker.
+fn truncate_on_char_boundary(s: &str, max_bytes: usize) -> &str {
+    if s.len() <= max_bytes {
+        return s;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    &s[..end]
+}
+
 #[derive(Serialize)]
 struct OllamaRequest {
     model: String,
@@ -580,7 +601,7 @@ fn build_user_prompt(
 
     lines.push(format!(
         "Session: {}  |  P&L: ${:.2}  |  Starting collateral: ${:.2}  |  Session trades: {}",
-        &session_id[..16.min(session_id.len())], // trim to readable date+time prefix
+        truncate_on_char_boundary(session_id, 16), // trim to readable date+time prefix
         session_pnl, starting_collateral, session_trades.len()
     ));
     lines.push(String::new());
@@ -597,7 +618,7 @@ fn build_user_prompt(
                 "{} | {} | {} | {} | {} | {} | {} | ${} | {}",
                 &t.ts[5..16],
                 t.strategy.replace("Strategy", ""),
-                if t.market.len() > 32 { &t.market[..32] } else { &t.market },
+                truncate_on_char_boundary(&t.market, 32),
                 t.side,
                 t.entry_price,
                 t.exit_price,
@@ -669,9 +690,9 @@ fn build_user_prompt(
             for t in prior {
                 lines.push(format!(
                     "{} | {} | {} | {} | {} | {} | {} | ${} | {}",
-                    &t.ts[..16.min(t.ts.len())],
+                    truncate_on_char_boundary(&t.ts, 16),
                     t.strategy.replace("Strategy", ""),
-                    if t.market.len() > 32 { &t.market[..32] } else { &t.market },
+                    truncate_on_char_boundary(&t.market, 32),
                     t.side,
                     t.entry_price,
                     t.exit_price,
@@ -757,7 +778,7 @@ fn build_user_prompt(
                 "{} | {} | {} | {} | {} | {}",
                 p.strategy.replace("Strategy", ""),
                 p.side,
-                if p.market.len() > 32 { &p.market[..32] } else { &p.market },
+                truncate_on_char_boundary(&p.market, 32),
                 p.entry_price,
                 p.shares,
                 if p.ghost_mode { "ghost" } else { "live" },
@@ -1382,7 +1403,7 @@ pub async fn run_llm_advisor_loop(
             "🤖 LLM Advisor: calling {} ({}) for session {} ({} session + {} prior trades, P&L ${:.2})...",
             provider.model(),
             provider.name(),
-            &session_id[..16.min(session_id.len())],
+            truncate_on_char_boundary(&session_id, 16),
             session_trade_count,
             total_trade_count - session_trade_count,
             current_pnl,
@@ -1512,7 +1533,7 @@ pub async fn run_llm_advisor_loop(
                 // Telegram report cannot be told apart from the others.
                 let prose = format!("[{squadron_id} · {market_class}]\n{prose}");
                 let message = if prose.len() > 4000 {
-                    format!("{}\n\n[truncated — full response in logs]", &prose[..3980])
+                    format!("{}\n\n[truncated — full response in logs]", truncate_on_char_boundary(&prose, 3980))
                 } else {
                     prose.clone()
                 };
@@ -1646,5 +1667,37 @@ mod anthropic_sampling_tests {
         assert!(anthropic_accepts_temperature("  claude-haiku-4-5  "));
         assert!(anthropic_accepts_temperature("Claude-Haiku-4-5"));
         assert!(!anthropic_accepts_temperature("  claude-sonnet-5  "));
+    }
+}
+
+#[cfg(test)]
+mod truncation_tests {
+    use super::truncate_on_char_boundary;
+
+    /// The advisor formats market names into a fixed-width table by slicing
+    /// them at byte 32. `&s[..32]` panics when that byte lands inside a
+    /// multi-byte character, and prediction markets are full of accented
+    /// names — this one panicked the advisor task in a live session.
+    #[test]
+    fn a_multibyte_character_across_the_cut_does_not_panic() {
+        let market = "US Open: Jarrý vs Tsitsipás — who wins?";
+        assert!(!market.is_char_boundary(32), "this name must straddle byte 32 to be a regression test");
+        let out = truncate_on_char_boundary(market, 32);
+        assert!(out.len() <= 32);
+        assert!(market.starts_with(out), "truncation must be a prefix");
+    }
+
+    #[test]
+    fn short_strings_are_returned_whole() {
+        assert_eq!(truncate_on_char_boundary("Will Renan win?", 32), "Will Renan win?");
+    }
+
+    /// Model prose is truncated at ~4000 bytes and is dense with em dashes.
+    #[test]
+    fn model_prose_truncates_cleanly() {
+        let prose = "—".repeat(2000);
+        let out = truncate_on_char_boundary(&prose, 3980);
+        assert!(out.len() <= 3980);
+        assert!(prose.starts_with(out));
     }
 }

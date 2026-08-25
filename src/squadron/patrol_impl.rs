@@ -291,10 +291,22 @@ impl Squadron {
         let oracle_rx   = self.raptors.oracle.clone();
         let velocity_rx = self.raptors.velocity.clone();
         let drift_rx    = self.raptors.drift.clone();
-        let funding_rx  = self.raptors.funding
-            .as_ref()
-            .expect("funding raptor always present")
-            .clone();
+        // Funding is optional BY CONSTRUCTION: `SquadronRaptors::empty()` and
+        // `sports_only()` both leave it None, and between them those cover every
+        // politics and sports squadron. This used to
+        // `.expect("funding raptor always present")`, so the first tick of any
+        // non-crypto squadron panicked the patrol task — the comment asserted an
+        // invariant the type had already refused to make.
+        //
+        // A neutral 0% rate is the right stand-in: funding is a crypto-perp
+        // signal with no meaning on an election or a tennis match, and the
+        // strategies that read it treat zero as "no skew to fade". The dropped
+        // sender matches how `empty()` builds its other idle feeds — nothing
+        // waits on a change, `borrow()` just keeps returning the neutral value.
+        let funding_rx = self.raptors.funding.clone().unwrap_or_else(|| {
+            let (_neutral_tx, rx) = tokio::sync::watch::channel(Decimal::ZERO);
+            rx
+        });
         // Tide Raptor is optional (BTC-only); `None` for ETH/SOL squadrons and
         // momentum-only deployments. Read into a local so no borrow guard is held
         // across an .await when the snapshot is built below.
