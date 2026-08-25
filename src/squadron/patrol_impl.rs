@@ -1290,6 +1290,45 @@ impl Squadron {
                                             }
                                         }
                                     }
+                                    // Ghost mode has no fill to wait for, so record here.
+                                    //
+                                    // The verification block above is gated on `!ghosting` and has
+                                    // no ghost counterpart, so a simulated round trip removed the
+                                    // position, logged its P&L, and wrote NOTHING: no trade row, no
+                                    // closed position, no session-P&L credit. Everything an operator
+                                    // reads — the dashboard, P&L history, win rate, and the trade
+                                    // context the LLM advisor is given — comes from that table.
+                                    //
+                                    // This is the DEFAULT first-run experience, which is what makes
+                                    // it worth more than tidiness: GHOST_MODE_DEFAULT is true for a
+                                    // new install and intl_clob is the default build, so a customer's
+                                    // first hour is an engine visibly trading in the log beside a
+                                    // dashboard insisting nothing has happened. Kalshi records its
+                                    // simulated exits; this venue did not.
+                                    //
+                                    // The simulated exit IS the fill — there is nothing to confirm —
+                                    // so the same three effects the confirmed-fill branch applies are
+                                    // applied here, immediately.
+                                    if ghosting && rs_m > dec!(0) {
+                                        *total_pnl.lock().await += pnl_m;
+                                        let scope_g = scope.clone();
+                                        let sn_g = sn.clone();
+                                        let mn_g = params.market_name.clone();
+                                        let sid_g = side_of(&tid_m).to_string();
+                                        let asset_g = asset_lc.clone();
+                                        let tid_g = tid_m.to_string();
+                                        let (fees_g, re_g, aep_g, rs_g, pnl_g, r_g) =
+                                            (fees_m, re_m, exit_fill_price.unwrap_or(params.price), rs_m, pnl_m, reason.clone());
+                                        tokio::spawn(async move {
+                                            metrics::record_trade(
+                                                &scope_g, fees_g, sn_g.clone(), mn_g, sid_g,
+                                                re_g, aep_g, rs_g, pnl_g, r_g,
+                                            ).await;
+                                            if let Some(pool) = db::pool_for(&asset_g) {
+                                                db::close_open_position(&pool, &sn_g, &tid_g).await;
+                                            }
+                                        });
+                                    }
                                     info!("📊 Exit order placed [{}]: est. PnL ${:.4} — awaiting fill verification", sn, pnl_m + paired_pnl);
                                     let reason_lc = reason.to_lowercase();
                                     if reason_lc.contains("sl")
