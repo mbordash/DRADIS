@@ -100,6 +100,10 @@ tools/dedupe-duplicate-settlements.sh
 # Private keys
 *.pem
 data/
+# Per-instance data directories created by start-local.sh when several venues
+# run from one checkout. Each holds a secrets.env with real credentials — the
+# same reason data/ is ignored, and the pattern that must match it.
+data-*/
 
 # Sonar study artifacts (tools/sonar_backtest.py) — bulky API caches, not source
 tools/.sonar_cache/

@@ -52,6 +52,33 @@ PID_FILE=".dradis-${INSTANCE}.pid"
 STOP_FILE=".dradis-${INSTANCE}.stop"
 BIN="target/release/dradis-${INSTANCE}"
 
+# The UI-managed secrets file must be per-instance too, and it was the one thing
+# here that was not.
+#
+# `$DRADIS_DATA_DIR/secrets.env` holds every value the Setup view writes, and
+# `load_secrets_file()` OVERRIDES the process environment from it at startup. So
+# three venues sharing ./data shared one file: setting the AI autonomy tier on
+# one venue rewrote it for all of them, and the next restart brought every
+# instance up on whichever tier had been set last. Measured 2026-08-25 — the
+# operator had set Polymarket US to tier 3, Kalshi to 2 and intl to 1, and every
+# llm_actions row on all three venues was stamped tier 1. The tiers cannot be
+# tested at all while the file is shared, and nothing reports the collision.
+#
+# Production is unaffected: one AMI runs one venue with one data directory. This
+# is a cost of running three venues out of a single checkout, so the fix belongs
+# in the dev launcher rather than the engine.
+DATA_DIR="data-${INSTANCE}"
+if [ ! -d "$DATA_DIR" ]; then
+    mkdir -p "$DATA_DIR"
+    # Seed from the shared directory so credentials and the admin password
+    # carry over rather than dropping the operator into the first-boot wizard.
+    if [ -f "data/secrets.env" ]; then
+        cp "data/secrets.env" "$DATA_DIR/secrets.env"
+        echo "🔐 Seeded $DATA_DIR/secrets.env from data/secrets.env"
+    fi
+fi
+export DRADIS_DATA_DIR="$DATA_DIR"
+
 # Map the selected venue to its cargo feature flags + runtime asset.
 case "$VENUE" in
     us|us_retail)
