@@ -60,6 +60,42 @@ fn take_entry_signals_json(token_id: &str) -> Option<String> {
 /// Records a completed trade to the SQLite database.
 ///
 /// `asset` — lowercase crypto symbol, e.g. `"btc"`.  Drives the SQLite pool selection.
+
+// ── Realised session P&L ─────────────────────────────────────────────────────
+
+/// Realised profit and loss for this process, summed across every venue.
+///
+/// Exists because the venues derive session P&L from portfolio VALUE —
+/// `total - starting`, where total is live collateral plus live positions. That
+/// is correct against real money and structurally always zero in ghost mode:
+/// the wallet never moves because no order is placed, and a simulated position
+/// is not one the venue reports, so closing one returns total to its baseline
+/// and the realised result vanishes.
+///
+/// The consequence was not cosmetic. `is_drawdown_limit_hit` reads session P&L,
+/// so the session drawdown limit could never fire in ghost mode: measured
+/// overnight on 2026-08-25, Kalshi realised -$26.42 against a $4.00 limit and
+/// the guard never once engaged. The LLM circuit breaker reads the same figure,
+/// so autonomy ran with no safety net either — and ghost mode is exactly where
+/// an operator would satisfy themselves that their risk settings work before
+/// trusting them with money.
+///
+/// Every venue's realised trade funnels through `record_trade_with_timestamp`,
+/// so accumulating here covers all of them without touching a trade loop.
+static REALISED_PNL: std::sync::Mutex<Decimal> = std::sync::Mutex::new(Decimal::ZERO);
+
+/// Realised P&L so far this process.
+pub fn realised_session_pnl() -> Decimal {
+    REALISED_PNL.lock().map(|g| *g).unwrap_or(Decimal::ZERO)
+}
+
+/// Reset the accumulator — for a new session, and for tests.
+pub fn reset_realised_session_pnl() {
+    if let Ok(mut g) = REALISED_PNL.lock() {
+        *g = Decimal::ZERO;
+    }
+}
+
 pub async fn record_trade(
     scope: &TradeScope,
     fees: Decimal,
@@ -90,6 +126,11 @@ pub async fn record_trade_with_timestamp(
     reason: String,
     timestamp: Option<DateTime<Utc>>,
 ) {
+    // Counted before persistence so a DB hiccup cannot silently drop a realised
+    // loss from the figure the drawdown limit reads.
+    if let Ok(mut acc) = REALISED_PNL.lock() {
+        *acc += profit_usdc;
+    }
     if let Some(pool) = db::pool_for(&scope.shard) {
         db::record_trade_db(&pool, scope, fees, &strategy, &market, &side, entry_price, exit_price, shares, profit_usdc, &reason, timestamp).await;
         info!("📊 Trade recorded to database: {} {} {} [venue={} class={} underlying={}]",
@@ -210,3 +251,52 @@ pub async fn lookup_entry_price_from_csv(token_id_str: &str) -> Option<Decimal> 
     lookup_entry_from_csv(token_id_str).await.map(|(price, _)| price)
 }
 
+
+#[cfg(test)]
+mod realised_pnl_tests {
+    use super::{realised_session_pnl, reset_realised_session_pnl, REALISED_PNL};
+    use crate::vipers::is_drawdown_limit_hit;
+    use rust_decimal_macros::dec;
+
+    fn add(v: rust_decimal::Decimal) {
+        *REALISED_PNL.lock().unwrap() += v;
+    }
+
+    /// One test rather than four, deliberately: the accumulator is a process
+    /// global and Rust runs tests in parallel, so separate cases sharing it
+    /// would interleave and fail intermittently. Sequencing the phases here
+    /// keeps it deterministic.
+    #[test]
+    fn realised_pnl_drives_the_drawdown_limit() {
+        // Losses accumulate. The venues derive session P&L from portfolio
+        // value, which never moves in ghost mode, so this is the only figure
+        // that reflects a simulated loss — and the drawdown guard reads it.
+        reset_realised_session_pnl();
+        add(dec!(-3.13));
+        add(dec!(-1.45));
+        assert_eq!(realised_session_pnl(), dec!(-4.58));
+
+        // Wins net against losses, so a profitable session does not drift
+        // toward a drawdown trip it has not earned.
+        reset_realised_session_pnl();
+        add(dec!(2.00));
+        add(dec!(-0.50));
+        assert_eq!(realised_session_pnl(), dec!(1.50));
+
+        // A small loss inside the limit must NOT trip it, or the guard would
+        // halt trading the moment a session went a cent negative.
+        reset_realised_session_pnl();
+        add(dec!(-1.00));
+        assert!(!is_drawdown_limit_hit(realised_session_pnl(), dec!(120)));
+
+        // The exact case that went unguarded overnight on 2026-08-25: Kalshi
+        // realised -$26.42 against a $4.00 limit and the guard never fired,
+        // because the figure it reads was structurally zero in ghost mode.
+        reset_realised_session_pnl();
+        add(dec!(-26.42));
+        assert!(is_drawdown_limit_hit(realised_session_pnl(), dec!(120)),
+                "a -$26.42 session must trip a $4.00 drawdown limit");
+
+        reset_realised_session_pnl();
+    }
+}

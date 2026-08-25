@@ -1075,7 +1075,7 @@ async fn trade_one_market(
     if let Some(p) = &pool {
         let (coll, total) = sync_dashboard(&squadron_id, venue.as_ref(), p, Some(&positions), starting).await;
         available_collateral = coll;
-        session_pnl = total - starting;
+        session_pnl = if dyn_cfg.ghost_mode { crate::helpers::metrics::realised_session_pnl() } else { total - starting };
     }
 
     // ── Tick loop ────────────────────────────────────────────────────────────
@@ -1106,7 +1106,7 @@ async fn trade_one_market(
                 if let Some(p) = &pool {
                     let (coll, total) = sync_dashboard(&squadron_id, venue.as_ref(), p, Some(&positions), starting).await;
                     available_collateral = coll;
-                    session_pnl = total - starting;
+                    session_pnl = if dyn_cfg.ghost_mode { crate::helpers::metrics::realised_session_pnl() } else { total - starting };
                 }
                 // Pick up any Control Tower config edits for this squadron.
                 dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;

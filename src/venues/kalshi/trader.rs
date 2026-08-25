@@ -904,7 +904,7 @@ async fn trade_one_market(
     if let Some(p) = &pool {
         let (coll, total) = sync_dashboard(&squadron_id, venue.as_ref(), p, &positions, starting).await;
         available_collateral = coll;
-        session_pnl = total - starting;
+        session_pnl = if dyn_cfg.ghost_mode { crate::helpers::metrics::realised_session_pnl() } else { total - starting };
     }
 
     // ── Tick loop ────────────────────────────────────────────────────────────
@@ -944,7 +944,7 @@ async fn trade_one_market(
                 if let Some(p) = &pool {
                     let (coll, total) = sync_dashboard(&squadron_id, venue.as_ref(), p, &positions, starting).await;
                     available_collateral = coll;
-                    session_pnl = total - starting;
+                    session_pnl = if dyn_cfg.ghost_mode { crate::helpers::metrics::realised_session_pnl() } else { total - starting };
                 }
                 dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
                 continue;
