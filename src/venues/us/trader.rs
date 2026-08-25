@@ -1676,6 +1676,12 @@ fn build_snapshot(
             snap.vix_velocity = h.vix_velocity;
         }
     }
+    // Book-feed health, recorded wherever the snapshot is built so a dark feed
+    // is reported rather than merely declined by every gate.
+    crate::state::price_state::book_feed::note(
+        &market.market_name,
+        crate::state::price_state::snapshot_has_book(&yes_state, &no_state),
+    );
     crate::state::price_state::log_heartbeat(
         &market.market_name, &yes_state, &no_state, snap.oracle_price,
     );

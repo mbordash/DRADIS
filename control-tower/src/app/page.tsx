@@ -145,6 +145,42 @@ function StatCard({ label, value, sub, valueClass = '' }: {
 
 // ── Ghost mode banner ─────────────────────────────────────────────────────────
 
+/// Order-book feeds that have stopped arriving.
+///
+/// Nothing else on this dashboard reports it. When the venue's book stops, the
+/// API still answers 200, the squadron still reads PATROLLING and the Maker
+/// still logs that it is quoting — every gate correctly declines an empty book,
+/// and declining quietly looks exactly like a quiet market. An operator whose
+/// connection drops would otherwise see a healthy engine that has silently
+/// stopped being able to trade.
+function DarkFeedBanner({ feeds }: { feeds?: { market: string; dark_for_secs: number }[] }) {
+  if (!feeds || feeds.length === 0) return null;
+  return (
+    <div className="card px-4 py-3 border border-red-500/30 bg-red-500/10">
+      <div className="flex items-start gap-3">
+        <span className="text-lg leading-none">📡</span>
+        <div className="min-w-0">
+          <p className="text-sm font-mono text-red-300">
+            Market data has stopped for {feeds.length} market{feeds.length === 1 ? '' : 's'}
+          </p>
+          <p className="text-[11px] text-gray-400 mt-1 leading-relaxed">
+            The engine is still running and your positions are untouched, but with no order book
+            it cannot evaluate entries or exits. Usually a connection problem or a venue
+            restriction — check network access to the venue.
+          </p>
+          <ul className="mt-2 space-y-0.5">
+            {feeds.map(f => (
+              <li key={f.market} className="text-[11px] font-mono text-red-400/90 truncate">
+                {f.market} — no book for {Math.floor(f.dark_for_secs / 60)}m {f.dark_for_secs % 60}s
+              </li>
+            ))}
+          </ul>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function GhostBanner({ ghost }: { ghost: boolean }) {
   return ghost ? (
     <div className="bg-amber-500/10 border border-amber-500/30 rounded-lg px-4 py-2 text-amber-300 text-xs font-mono flex items-center gap-2">
@@ -601,6 +637,7 @@ export default function DashboardPage() {
 
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6">
           {config?.ghost_mode && <GhostBanner ghost />}
+          <DarkFeedBanner feeds={status?.dark_market_feeds} />
           <SquadronDetailView squadron={focusedSquadron} onBack={handleBackToCag} />
           <div className="mt-12"><Footer /></div>
         </main>
@@ -675,6 +712,7 @@ export default function DashboardPage() {
       {activeView === 'tradelog' && (
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
+          <DarkFeedBanner feeds={status?.dark_market_feeds} />
           <TradelogPage availableAssets={availableAssets} />
           <Footer />
         </main>
@@ -684,6 +722,7 @@ export default function DashboardPage() {
       {activeView === 'telemetry' && (
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
+          <DarkFeedBanner feeds={status?.dark_market_feeds} />
           <ErrorBoundary label="Telemetry">
             <ChunkBoundary name="Telemetry">
               <TelemetryPage availableAssets={availableAssets} venue={setupStatus?.venue} />
@@ -697,6 +736,7 @@ export default function DashboardPage() {
       {activeView === 'ai' && (
         <main className="max-w-7xl mx-auto px-4 sm:px-6 py-6 space-y-6">
           {config?.ghost_mode && <GhostBanner ghost />}
+          <DarkFeedBanner feeds={status?.dark_market_feeds} />
           <ErrorBoundary label="AI Actions">
             <AiActionsPage />
           </ErrorBoundary>
@@ -730,6 +770,7 @@ export default function DashboardPage() {
 
         {/* Ghost mode banner */}
         {config?.ghost_mode && <GhostBanner ghost />}
+          <DarkFeedBanner feeds={status?.dark_market_feeds} />
 
         {/* ── Portfolio Value Banner ─────────────────────────────────── */}
         <PortfolioValueBanner

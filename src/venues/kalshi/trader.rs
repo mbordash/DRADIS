@@ -1338,6 +1338,12 @@ async fn build_snapshot(
         timestamp: now,
     };
     snap.oracle_price = *raptors.oracle.borrow();
+    // Book-feed health, recorded wherever the snapshot is built so a dark feed
+    // is reported rather than merely declined by every gate.
+    crate::state::price_state::book_feed::note(
+        ticker,
+        crate::state::price_state::snapshot_has_book(&yes_state, &no_state),
+    );
     crate::state::price_state::log_heartbeat(ticker, &yes_state, &no_state, snap.oracle_price);
     let (vel, vel_1s, accel) = *raptors.velocity.borrow();
     snap.velocity = vel;

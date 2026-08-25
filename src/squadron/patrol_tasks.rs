@@ -396,6 +396,12 @@ pub fn spawn_status_task(
                     let (yb, ybd, ya, yad, _, ybd_all, yad_all) = *yes_price_rx.borrow();
                     let (nb, nbd, na, nad, _, nbd_all, nad_all) = *no_price_rx.borrow();
                     // Compute OBI for heartbeat visibility so thresholds can be tuned empirically.
+                    // Book-feed health. This venue heartbeats here rather than
+                    // through log_heartbeat, so the check belongs here too.
+                    crate::state::price_state::book_feed::note(
+                        &asset,
+                        ya < dec!(1) || na < dec!(1) || yb > dec!(0) || nb > dec!(0),
+                    );
                     let yes_obi = if ybd + yad > dec!(0) { (ybd - yad) / (ybd + yad) } else { dec!(0) };
                     let no_obi  = if nbd + nad > dec!(0) { (nbd - nad) / (nbd + nad) } else { dec!(0) };
                     // The same ratio over EVERY published level, logged beside the

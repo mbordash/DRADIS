@@ -444,6 +444,8 @@ export interface StatusResponse {
   session_started_at?: string;
   /** Per-asset Binance Raptor connection health. Key = asset symbol (e.g. "btc"). */
   raptors?: Record<string, AssetRaptorHealth>;
+  /** Markets whose order-book feed has gone dark. Empty is the healthy case. */
+  dark_market_feeds?: { market: string; dark_for_secs: number }[];
 }
 
 /** Portfolio value response from /api/portfolio — cash + open positions at live prices. */

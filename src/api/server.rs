@@ -80,6 +80,13 @@ use crate::cag::Cag;
 
 // ─── Raptor health types ──────────────────────────────────────────────────────
 
+/// A market whose order-book feed has stopped arriving.
+#[derive(Debug, Clone, Serialize)]
+pub struct DarkFeed {
+    pub market: String,
+    pub dark_for_secs: u64,
+}
+
 /// Connection health for a single asset's pair of Binance Raptors.
 ///
 /// `price_connected`   — true when the Price Raptor WebSocket is live and
@@ -951,6 +958,15 @@ struct StatusResponse {
     session_started_at: String,
     /// Per-asset Binance Raptor connection health.
     raptors: HashMap<String, AssetRaptorHealth>,
+    /// Markets whose order-book feed has gone dark, with seconds since the last
+    /// real book. Empty is the healthy case.
+    ///
+    /// Reported because nothing else does. The Raptor health above covers the
+    /// SIGNAL feeds; when the venue's own book stopped arriving, health stayed
+    /// 200, the squadron stayed PATROLLING and the Maker went on logging
+    /// "✅ Maker quoting" — every gate correctly declined to trade an empty
+    /// book, and declining quietly is indistinguishable from a quiet market.
+    dark_market_feeds: Vec<DarkFeed>,
 }
 
 async fn get_status(State(s): State<ApiState>) -> Response {
@@ -958,8 +974,12 @@ async fn get_status(State(s): State<ApiState>) -> Response {
     let markets = s.markets_rx.borrow().clone();
     let raptors = s.raptor_health_rx.borrow().clone();
     let session_started_at = db::current_session_id().to_string();
+    let dark_market_feeds: Vec<DarkFeed> = crate::state::price_state::book_feed::dark_markets()
+        .into_iter()
+        .map(|(market, secs)| DarkFeed { market, dark_for_secs: secs })
+        .collect();
     debug!("Successfully retrieved status");
-    Json(StatusResponse { strategy_markets: markets, session_started_at, raptors }).into_response()
+    Json(StatusResponse { strategy_markets: markets, session_started_at, raptors, dark_market_feeds }).into_response()
 }
 
 /// GET /api/telemetry

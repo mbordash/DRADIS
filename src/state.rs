@@ -332,6 +332,99 @@ pub mod price_state {
     /// markets at once — Kalshi a primary and a maker market, US a general and a
     /// crypto wing — and one global gate would let whichever ticked first
     /// silence the others.
+    /// Health of a venue's own order-book feed, per market.
+    ///
+    /// The Raptor health already reported in `/api/status` covers the SIGNAL
+    /// feeds — Binance, Alpaca. Nothing covered the venue's own book, so when it
+    /// went dark every surface an operator can see still read healthy: the API
+    /// answered 200, the squadron reported PATROLLING, and the Maker logged
+    /// "✅ Maker quoting". Observed 2026-08-25, when a VPN change cut the intl
+    /// feed and the book ran on sentinels for minutes with nothing saying so.
+    ///
+    /// Not a silent value either: the transition each way is logged once, so the
+    /// answer is in the log as well as the API.
+    pub mod book_feed {
+        use std::collections::HashMap;
+        use std::sync::{Mutex, OnceLock};
+        use std::time::{Duration, Instant};
+        use tracing::{info, warn};
+
+        /// A book with no data for this long is reported dark. Comfortably above
+        /// a normal gap between updates on a quiet market, well below the point
+        /// at which an operator would have noticed something else was wrong.
+        pub const DARK_AFTER: Duration = Duration::from_secs(90);
+
+        #[derive(Clone, Debug)]
+        pub struct FeedState {
+            /// When this market last carried real book data.
+            pub last_live: Instant,
+            /// Whether it is currently reported dark (used to log each edge once).
+            pub dark: bool,
+        }
+
+        fn registry() -> &'static Mutex<HashMap<String, FeedState>> {
+            static REG: OnceLock<Mutex<HashMap<String, FeedState>>> = OnceLock::new();
+            REG.get_or_init(|| Mutex::new(HashMap::new()))
+        }
+
+        /// Record whether `label` currently has a book, logging either edge once.
+        pub fn note(label: &str, has_book: bool) {
+            let Ok(mut reg) = registry().lock() else { return };
+            let now = Instant::now();
+            let entry = reg.entry(label.to_string()).or_insert(FeedState { last_live: now, dark: false });
+            if has_book {
+                entry.last_live = now;
+                if entry.dark {
+                    entry.dark = false;
+                    info!("📡 Market data recovered for {label} — book is live again");
+                }
+                return;
+            }
+            if !entry.dark && now.duration_since(entry.last_live) >= DARK_AFTER {
+                entry.dark = true;
+                warn!(
+                    "📡 MARKET DATA DARK: no order book for {label} in {}s. The engine keeps \
+                     running and every gate correctly declines to trade an empty book, so nothing \
+                     else will report this — check venue connectivity.",
+                    DARK_AFTER.as_secs(),
+                );
+            }
+        }
+
+        /// Markets currently reported dark, with how long they have been so.
+        pub fn dark_markets() -> Vec<(String, u64)> {
+            let Ok(reg) = registry().lock() else { return Vec::new() };
+            let now = Instant::now();
+            reg.iter()
+                .filter(|(_, s)| s.dark)
+                .map(|(k, s)| (k.clone(), now.duration_since(s.last_live).as_secs()))
+                .collect()
+        }
+
+        /// Forget a market — called when its squadron stands down or rotates
+        /// away, so a closed market is not reported dark forever.
+        pub fn forget(label: &str) {
+            if let Ok(mut reg) = registry().lock() {
+                reg.remove(label);
+            }
+        }
+    }
+
+    /// Is there any real order book behind this snapshot?
+    ///
+    /// An absent level is filled in with the value LEAST attractive to us — a
+    /// missing ask at $1.00, a missing bid at $0.00 — so a feed that has gone
+    /// dark does not read as an error anywhere. It reads as a market where
+    /// nobody will sell below the full payout and nobody is bidding, which every
+    /// gate correctly declines to trade. Correct, and indistinguishable from a
+    /// quiet market unless something asks this question.
+    pub fn snapshot_has_book(yes: &PriceState, no: &PriceState) -> bool {
+        let (yes_bid, yes_ask) = (yes.0, yes.2);
+        let (no_bid, no_ask) = (no.0, no.2);
+        yes_ask < Decimal::ONE || no_ask < Decimal::ONE
+            || yes_bid > Decimal::ZERO || no_bid > Decimal::ZERO
+    }
+
     pub fn log_heartbeat(label: &str, yes: &PriceState, no: &PriceState, oracle: Decimal) {
         use std::collections::HashMap;
         use std::sync::{Mutex, OnceLock};
@@ -1036,5 +1129,64 @@ mod position_key_tests {
             .map(|(_, p)| p.shares)
             .sum();
         assert_eq!(mine, dec!(30), "another squadron's size leaked into this budget");
+    }
+}
+
+#[cfg(test)]
+mod book_feed_tests {
+    use super::price_state::{book_feed, snapshot_has_book};
+    use rust_decimal_macros::dec;
+    use chrono::Utc;
+
+    /// The sentinel book observed on 2026-08-25 when a VPN change cut the intl
+    /// feed: every ask at the full payout, every bid at zero. Correct values for
+    /// "no data", and the reason nothing else reports the outage — every gate
+    /// declines them exactly as it would decline a genuinely empty market.
+    #[test]
+    fn an_all_sentinel_book_is_recognised_as_no_book() {
+        let dead_yes = (dec!(0), dec!(0), dec!(1), dec!(0), Utc::now(), dec!(0), dec!(0));
+        let dead_no  = (dec!(0), dec!(0), dec!(1), dec!(0), Utc::now(), dec!(0), dec!(0));
+        assert!(!snapshot_has_book(&dead_yes, &dead_no));
+    }
+
+    /// A single real level on either side is a live book. A market can genuinely
+    /// have no sellers on one leg — that is a decided market, not an outage —
+    /// so requiring all four levels would report healthy venues as dark.
+    #[test]
+    fn one_real_level_is_enough_to_count_as_live() {
+        let now = Utc::now();
+        let yes_has_ask = (dec!(0), dec!(0), dec!(0.01), dec!(50), now, dec!(0), dec!(0));
+        let no_empty    = (dec!(0), dec!(0), dec!(1), dec!(0), now, dec!(0), dec!(0));
+        assert!(snapshot_has_book(&yes_has_ask, &no_empty));
+
+        let yes_empty  = (dec!(0), dec!(0), dec!(1), dec!(0), now, dec!(0), dec!(0));
+        let no_has_bid = (dec!(0.99), dec!(10), dec!(1), dec!(0), now, dec!(0), dec!(0));
+        assert!(snapshot_has_book(&yes_empty, &no_has_bid));
+    }
+
+    /// A live book is never reported dark, and a market is not reported dark the
+    /// instant it goes quiet — only after DARK_AFTER, so a normal gap between
+    /// updates cannot raise a false alarm.
+    #[test]
+    fn a_live_feed_is_never_reported_dark() {
+        let label = "test-live-feed";
+        book_feed::forget(label);
+        book_feed::note(label, true);
+        assert!(!book_feed::dark_markets().iter().any(|(m, _)| m == label));
+
+        // Newly quiet, but well inside the window.
+        book_feed::note(label, false);
+        assert!(!book_feed::dark_markets().iter().any(|(m, _)| m == label));
+        book_feed::forget(label);
+    }
+
+    /// Forgetting a market removes it, so a closed or rotated-away market is not
+    /// reported dark forever after its feed legitimately stops.
+    #[test]
+    fn a_forgotten_market_is_not_reported() {
+        let label = "test-forgotten-feed";
+        book_feed::note(label, true);
+        book_feed::forget(label);
+        assert!(!book_feed::dark_markets().iter().any(|(m, _)| m == label));
     }
 }
