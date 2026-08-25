@@ -446,6 +446,10 @@ pub async fn run_kalshi_trader(
         cancel.clone(),
     ));
 
+    // The squadron the rotation loop currently owns, so the next rotation can
+    // retire it when it lands on a different underlying.
+    let mut last_rotation_squadron: Option<String> = None;
+
     loop {
         if cancel.is_cancelled() {
             return;
@@ -469,6 +473,7 @@ pub async fn run_kalshi_trader(
             MarketMandate::Rotating,
             None,
             None,
+            Some(&mut last_rotation_squadron),
             &sports_rx,
             &tennis_rx,
         ).await;
@@ -578,6 +583,7 @@ impl crate::venues::deployment::DeploymentRunner for KalshiDeploymentRunner {
             MarketMandate::Pinned,
             Some(class),
             name,
+            None,
             &self.sports_rx,
             &self.tennis_rx,
         ).await;
@@ -734,6 +740,10 @@ async fn trade_one_market(
     // Operator-chosen name; folded into the squadron id so a second squadron of
     // this class gets its own config, budgets and positions.
     squadron_name: Option<&str>,
+    // The squadron the rotation loop registered last time round, so a rotation
+    // that lands on a DIFFERENT underlying can retire it. `None` for pinned
+    // deployments, which do not rotate.
+    last_rotation_squadron: Option<&mut Option<String>>,
     sports_rx: &watch::Receiver<SportsSnapshot>,
     tennis_rx: &watch::Receiver<TennisSnapshot>,
 ) -> MarketOutcome {
@@ -760,6 +770,22 @@ async fn trade_one_market(
     // ── Register the squadron so the Control Tower lists it ─────────────────
     let squadron = register_kalshi_squadron(cag, &pair, &raptors, deployed_as, squadron_name, sports_rx, tennis_rx, cancel);
     let squadron_id = squadron.id.clone();
+    // Retire the squadron this rotation replaced, but only when the id actually
+    // changed. Rotating BTC→BTC re-registers the same id and must NOT be
+    // removed — that flicker is what made a healthy squadron look like it was
+    // dying every fifteen minutes. Rotating BTC→ETH is a different squadron,
+    // and leaving the old one registered accumulated a permanent RTB row per
+    // underlying the loop had ever visited: two crypto squadrons on screen, one
+    // of them trading nothing and never able to again.
+    if let Some(slot) = last_rotation_squadron {
+        if let Some(prev) = slot.as_ref() {
+            if prev != &squadron_id {
+                info!("🔀 Kalshi rotation left {prev} — retiring it for {squadron_id}");
+                cag.remove(prev);
+            }
+        }
+        *slot = Some(squadron_id.clone());
+    }
     // The squadron registers under the crypto underlying (so the taxonomy
     // classifies it as crypto), but this venue's DB scope is KALSHI_ASSET.
     // Alias the two so the Control Tower's `?asset=btc` queries reach this
