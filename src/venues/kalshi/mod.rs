@@ -234,7 +234,7 @@ impl KalshiVenue {
     /// One market by ticker.
     /// Every open market under the given Kalshi categories, paged.
     ///
-    /// Kalshi organises discovery by series ticker, and there are thousands of
+    /// Kalshi organizes discovery by series ticker, and there are thousands of
     /// them — 2,226 under Politics, 3,491 under Sports — so fetching markets
     /// series by series is not viable. `/events?with_nested_markets=true`
     /// carries the category on each event and nests its markets, so one sweep

@@ -266,7 +266,7 @@ impl CryptoRaptors {
     /// — so a neutral snapshot is what the remaining vipers should see.
     ///
     /// The senders are dropped immediately; a `watch::Receiver` keeps serving
-    /// its last value after the sender goes, which is exactly the behaviour
+    /// its last value after the sender goes, which is exactly the behavior
     /// wanted here.
     fn neutral() -> Self {
         let (_, oracle) = watch::channel(dec!(0));
@@ -1660,7 +1660,7 @@ async fn dispatch_single(
 ///
 /// Without this the Control Tower's positions panel had to fall back on
 /// [`sync_dashboard`]'s venue sweep, which knows the ticker but not which viper
-/// owns it — every live position was mislabelled as ArbitrageStrategy.
+/// owns it — every live position was mislabeled as ArbitrageStrategy.
 async fn record_entry(
     // Squadron credited with the position in the database.
     squadron_id: &str,
@@ -1918,7 +1918,7 @@ fn register_kalshi_squadron(
 /// `budgets` is empty for a rotated market — the venue chose it, not an
 /// operator — and non-empty only for a pinned deployment. Applying them after
 /// the row exists rather than only when seeding it means a redeploy onto a
-/// squadron id that already has config still honours the numbers just entered,
+/// squadron id that already has config still honors the numbers just entered,
 /// which is what the deploy dialog implies and what Polymarket International
 /// has always done.
 async fn seed_squadron_config(squadron_id: &str, budgets: &std::collections::HashMap<String, f64>) {
@@ -2143,7 +2143,7 @@ mod deployed_market_tests {
     }
 
     /// The question is built the same way on both paths, so a deployed squadron
-    /// is labelled in the UI exactly as the rotation loop would label it.
+    /// is labeled in the UI exactly as the rotation loop would label it.
     #[test]
     fn the_subtitle_is_appended_to_the_title() {
         let mut m = market("KXNBA-26", "Who wins the 2027 Final?");

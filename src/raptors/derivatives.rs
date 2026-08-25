@@ -56,7 +56,7 @@ use tracing::{debug, warn};
 use crate::config;
 use crate::api::server::AssetRaptorHealth;
 
-/// Normalised derivatives-market snapshot broadcast to every consuming Viper.
+/// Normalized derivatives-market snapshot broadcast to every consuming Viper.
 ///
 /// `Copy` so the `watch` channel hands out cheap value clones, and `Default`
 /// (all-zero) so the channel can be seeded before the first successful poll.

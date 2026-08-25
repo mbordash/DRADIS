@@ -270,7 +270,7 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         // ToxicFill confirmation gates. These apply only once a quote has FILLED —
         // an unfilled quote is still pulled the instant OBI breaches. Raising them
         // makes the maker sit through more book noise to let the spread convert;
-        // lowering them returns toward the old exit-on-any-adverse-book behaviour.
+        // lowering them returns toward the old exit-on-any-adverse-book behavior.
         v.push(F::new(g, e, "maker_toxic_min_hold_secs", "Toxic Min Hold", "secs", true,
             "Minimum seconds a filled position is held before ToxicFill may fire. Covers the window where OBI is dominated by our own quote being lifted.").min(0.0).step(5.0).unit("s"));
         v.push(F::new(g, e, "maker_toxic_min_adverse_pct", "Toxic Min Adverse Move", "pct", true,
@@ -596,7 +596,7 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(g, e, "sports_odds_sport", "Sports Key", "string", true,
             "The Odds API sport key, passed to the provider verbatim. 'upcoming' = next games across all in-season sports; or a specific key such as 'americanfootball_nfl'. ⚠️ Not validated — a wrong key returns no events and the raptor simply reads as offline. Valid keys: the-odds-api.com/sports-odds-data/sports-apis.html"));
         v.push(F::new(g, e, "sports_odds_regions", "Sports Regions", "string", true,
-            "Comma-separated bookmaker regions for the odds query: us, us2, uk, eu, au. ⚠️ Not validated — an unrecognised region returns no bookmakers."));
+            "Comma-separated bookmaker regions for the odds query: us, us2, uk, eu, au. ⚠️ Not validated — an unrecognized region returns no bookmakers."));
         v.push(F::new(g, e, "tennis_tour", "Tennis Tour", "string", true,
             "Live Tennis API tour filter: atp, wta, challenger, itf, juniors — or blank for all tours. ⚠️ Not validated, and this one fails SILENTLY: a misspelt tour returns an empty match list, which is indistinguishable from tennis being off-season or between sessions. Leave blank if unsure."));
     }

@@ -543,7 +543,7 @@ pub fn spawn_cleanup_task(
                         // only say what the model BELIEVED, so there is no way to
                         // tell whether a gate blocked a winner or saved a loss —
                         // which is the entire question the entry stack turns on.
-                        // Capped per sweep so a long unlabelled backlog cannot
+                        // Capped per sweep so a long unlabeled backlog cannot
                         // monopolise the 45s cleanup budget.
                         if let Some(pool) = crate::helpers::db::pool_for(&asset) {
                             let http = Arc::clone(&shared_http);
@@ -936,7 +936,7 @@ pub fn spawn_lifecycle_task(
                         };
                         let pnl = (leg.exit_price - avg_entry) * leg.shares;
                         // Resolve the leg's real YES/NO outcome from the entries
-                        // table so the trade isn't mislabelled "Sell" (the bare order
+                        // table so the trade isn't mislabeled "Sell" (the bare order
                         // direction). The venue-neutral lifecycle only knows token ids.
                         let side = match db::pool_for(&asset) {
                             Some(p) => db::lookup_entry_side_db(&p, &leg.token_id.to_string())

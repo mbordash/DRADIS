@@ -113,7 +113,7 @@ impl KalshiVenue {
             Some(f) => f,
             None => {
                 tracing::error!(
-                    "🛑 Kalshi order response had no recognisable fill count — treating as \
+                    "🛑 Kalshi order response had no recognizable fill count — treating as \
                      UNFILLED. If the order did fill, lifecycle reconciliation must re-adopt \
                      it. Raw response: {}",
                     super::truncate(&raw.to_string(), 400)

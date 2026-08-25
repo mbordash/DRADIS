@@ -35,7 +35,7 @@
 /// │ book_dispersion  │ max−min of per-book implied probs (0..1); book disagreement│
 /// │ num_books        │ bookmakers contributing to the sample (0 = no data)     │
 ///
-/// Per book the two-way vig is removed by normalising the raw implied probs
+/// Per book the two-way vig is removed by normalizing the raw implied probs
 /// (`1/decimal_odds`) so they sum to 1; the reference-outcome prob is then
 /// averaged across books for the consensus.
 ///
@@ -61,7 +61,7 @@ use crate::config;
 /// its telemetry, alongside the per-asset crypto entries ("btc"/"eth"/…).
 pub const SPORTS_HEALTH_KEY: &str = "sports";
 
-/// Normalised sports-market snapshot broadcast to every consuming Squadron.
+/// Normalized sports-market snapshot broadcast to every consuming Squadron.
 ///
 /// `Copy` so the `watch` channel hands out cheap value clones, and `Default`
 /// (all-zero, `num_books = 0` meaning "no data") so the channel can be seeded
@@ -370,7 +370,7 @@ fn first_h2h_outcome_name(books: &[serde_json::Value]) -> Option<String> {
 }
 
 /// Vig-free implied probability of `ref_name` within a single book's two-way
-/// h2h market. Removes the overround by normalising both raw `1/odds` implied
+/// h2h market. Removes the overround by normalizing both raw `1/odds` implied
 /// probs to sum to 1. Returns `None` if the book lacks the outcome or has bad odds.
 fn vig_free_prob_for(book: &serde_json::Value, ref_name: &str) -> Option<Decimal> {
     let outcomes = h2h_outcomes(book)?;

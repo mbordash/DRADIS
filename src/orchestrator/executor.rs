@@ -265,7 +265,7 @@ pub struct SignalConflictInfo {
 /// exiting the same token are selling from their own independent position slots.
 ///
 /// This function therefore simply passes all signals through with exit signals
-/// prioritised before entry signals.  The `conflicts` vec is always empty but
+/// prioritized before entry signals.  The `conflicts` vec is always empty but
 /// kept in the return type for API compatibility.
 pub fn aggregate_and_resolve_signals(
     eval_result: &StrategyEvaluationResult,

@@ -70,7 +70,7 @@ use crate::raptors::tide::{SharedQuoteMap, is_us_market_open};
 
 // ─── Public Snapshot ──────────────────────────────────────────────────────────
 
-/// Normalised TradFi/VIX snapshot broadcast to every consuming Squadron.
+/// Normalized TradFi/VIX snapshot broadcast to every consuming Squadron.
 ///
 /// `Copy` so the `watch` channel hands out cheap value clones, and `Default`
 /// (all-zero) so the channel can be seeded before the first compute tick.

@@ -291,7 +291,7 @@ pub struct OrderResponse {
 /// Pull the order out of a create-order response.
 ///
 /// `POST /portfolio/events/orders` returns the order's fields at the top level,
-/// not wrapped in `{"order": …}`. Deserialising the wrapper against a flat
+/// not wrapped in `{"order": …}`. Deserializing the wrapper against a flat
 /// payload succeeds into an all-default `KalshiOrder` (every field is
 /// `#[serde(default)]`), which is how an empty `order_id` and a fabricated fill
 /// count reached the trader unnoticed. Accept either shape.
@@ -376,7 +376,7 @@ impl KalshiOrder {
     ///
     /// Prefers the explicit `fill_count`; falls back to `requested − remaining`
     /// only when both of those are present. Returns `None` when the shape is
-    /// unrecognised — callers must treat that as "unknown", never as "filled".
+    /// unrecognized — callers must treat that as "unknown", never as "filled".
     pub fn filled_count(&self) -> Option<Decimal> {
         if let Some(f) = fp(&self.fill_count) {
             return Some(f.max(Decimal::ZERO));
@@ -524,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn unrecognised_shape_reports_unknown_not_filled() {
+    fn unrecognized_shape_reports_unknown_not_filled() {
         let o = parse(r#"{"something_else":"1.00"}"#);
         assert!(o.order_id.is_empty());
         assert_eq!(o.filled_count(), None, "unknown must never read as filled");

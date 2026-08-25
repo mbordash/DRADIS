@@ -707,7 +707,7 @@ impl Squadron {
                     // Control Tower. Until 2026-08-20 the intl order paths read only the
                     // constant, so the runtime switch was inert on this venue — the UI
                     // said simulation while real orders went out. (Kalshi and Polymarket
-                    // US always honoured it; see `params.ghost_mode` in their traders.)
+                    // US always honored it; see `params.ghost_mode` in their traders.)
                     //
                     // Deliberately ONE value for the whole tick rather than a check per
                     // call site: eleven separate conditions is precisely the shape of
@@ -836,7 +836,7 @@ impl Squadron {
                             }
                         };
 
-                        // ── YES/NO labelling ─────────────────────────────────
+                        // ── YES/NO labeling ─────────────────────────────────
                         // Resolve a token's side from the market it ACTUALLY
                         // belongs to, never from `target_yes_token`.
                         //
@@ -877,7 +877,7 @@ impl Squadron {
                                 // A resting post-only ask COMMITS the shares at the
                                 // exchange: leaving it on the book would make this sell
                                 // fail "not enough balance" and silently defeat the stop
-                                // it is trying to honour. Stops always outrank spread
+                                // it is trying to honor. Stops always outrank spread
                                 // capture, so the ask is pulled first.
                                 //
                                 // Whatever the ask managed to trade before the pull is
@@ -2252,7 +2252,7 @@ mod trade_accounting_tests {
         ).expect("a settled pre-entry baseline should reconcile");
         assert_eq!(pnl, dec!(0.713382));
         // Derived, not measured: entry + pnl/shares. The book showed an ask of
-        // $0.91 twenty seconds later, so ~$0.916 is the right neighbourhood.
+        // $0.91 twenty seconds later, so ~$0.916 is the right neighborhood.
         assert!(px > dec!(0.91) && px < dec!(0.92), "derived exit was {px}");
     }
 
@@ -2415,8 +2415,8 @@ mod trade_accounting_tests {
     /// intl venue — entries and exits went to the exchange for real while the UI
     /// reported simulation. Both are now folded once per tick into `ghosting`.
     ///
-    /// This asserts the idiom rather than the behaviour, because the failure mode
-    /// is someone adding a NEW order path with the old habit. Behaviour tests
+    /// This asserts the idiom rather than the behavior, because the failure mode
+    /// is someone adding a NEW order path with the old habit. Behavior tests
     /// cannot catch a site that does not exist yet.
     #[test]
     fn no_order_path_reads_the_build_ghost_switch_directly() {

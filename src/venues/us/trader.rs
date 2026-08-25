@@ -129,7 +129,7 @@ pub const US_CRYPTO_ASSET: &str = "us-crypto";
 pub const US_POLITICS_ASSET: &str = "us-politics";
 
 /// Which market domain a US trading wing hunts. The venue runs one wing per
-/// domain concurrently: the general wing keeps the original behaviour (sports /
+/// domain concurrently: the general wing keeps the original behavior (sports /
 /// politics / anything non-crypto → order-book vipers), while the crypto wing
 /// targets crypto-class markets and feeds them the full Raptor intelligence
 /// stack so all nine vipers can fly.
@@ -505,10 +505,10 @@ pub async fn discover_for_class(
 /// The single definition of what a Polymarket US class contains, shared by the
 /// trader's wings and by the Control Tower's market browser. Kept in one place
 /// deliberately: the browser previously applied no class filter at all and
-/// labelled every discovered market with whatever class was asked for, so
+/// labeled every discovered market with whatever class was asked for, so
 /// browsing "politics" listed Premier League football and tennis — and a deploy
 /// from that list then failed at run time, because the politics wing quite
-/// correctly did not recognise a tennis match as one of its markets.
+/// correctly did not recognize a tennis match as one of its markets.
 pub async fn pair_matches_class(pair: &super::markets::UsMarketPair, class: &str) -> bool {
     wing_for_class(class).claims(pair).await
 }
@@ -517,8 +517,8 @@ pub async fn pair_matches_class(pair: &super::markets::UsMarketPair, class: &str
 ///
 /// A deployment names a class, and the wings already encode what each class
 /// trades — so a deployed market runs with the same raptors, vipers and DB
-/// shard as one the wing discovered itself. Anything unrecognised goes to
-/// Sports, matching `Wing::claims`, which keeps an oddly-labelled market traded
+/// shard as one the wing discovered itself. Anything unrecognized goes to
+/// Sports, matching `Wing::claims`, which keeps an oddly-labeled market traded
 /// rather than dropped.
 pub(crate) fn wing_for_class(class: &str) -> Wing {
     match class {
@@ -595,7 +595,7 @@ impl crate::venues::deployment::DeploymentRunner for UsDeploymentRunner {
             // Soonest close first, NOT highest volume: the Polymarket US
             // gateway reports no volume, so every pair is 0 and a max_by on it
             // returns whichever the iterator happened to reach first. Closing
-            // soonest is at least a real ordering, and it favours a market that
+            // soonest is at least a real ordering, and it favors a market that
             // will resolve inside a session rather than a 2026 future.
             .min_by_key(|p| p.close_time.unwrap_or(chrono::DateTime::<Utc>::MAX_UTC))
             .map(|p| p.slug)
@@ -1453,9 +1453,9 @@ mod wing_claim_tests {
     /// dropped — the sports wing keeps everything non-crypto that politics does
     /// not claim.
     #[tokio::test]
-    async fn an_unlabelled_market_still_finds_a_wing() {
+    async fn an_unlabeled_market_still_finds_a_wing() {
         let p = pair("", "aec-xyz-2026");
-        assert!(Wing::Sports.claims(&p).await, "an unlabelled market fell through every wing");
+        assert!(Wing::Sports.claims(&p).await, "an unlabeled market fell through every wing");
         assert!(!Wing::Politics.claims(&p).await);
     }
 
@@ -1950,7 +1950,7 @@ async fn dispatch_single(
 ///
 /// Without this the Control Tower's positions panel had to fall back on
 /// [`sync_dashboard`]'s venue sweep, which knows the instrument but not which
-/// viper owns it — every live position was mislabelled as ArbitrageStrategy.
+/// viper owns it — every live position was mislabeled as ArbitrageStrategy.
 async fn record_entry(
     // Squadron credited with the position in the database.
     squadron_id: &str,
@@ -2230,7 +2230,7 @@ fn us_squadron_name(class: &str) -> String {
 /// `budgets` is empty for a rotated market — the venue chose it, not an
 /// operator — and non-empty only for a pinned deployment. Applying them after
 /// the row exists rather than only when seeding it means a redeploy onto a
-/// squadron id that already has config still honours the numbers just entered,
+/// squadron id that already has config still honors the numbers just entered,
 /// which is what the deploy dialog implies and what Polymarket International
 /// has always done.
 async fn seed_squadron_config(squadron_id: &str, budgets: &std::collections::HashMap<String, f64>) {

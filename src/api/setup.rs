@@ -301,7 +301,7 @@ fn bin_dir() -> PathBuf {
 ///
 /// Empty means single-venue: a dev build, or the production image built with
 /// the default `DRADIS_VENUES`. The UI hides the venue switcher in that case
-/// rather than offering a choice that cannot be honoured.
+/// rather than offering a choice that cannot be honored.
 fn available_venues() -> Vec<String> {
     let Ok(entries) = std::fs::read_dir(bin_dir()) else { return Vec::new() };
     let mut v: Vec<String> = entries
@@ -349,7 +349,7 @@ fn unescape_secret(v: &str) -> String {
 /// Without this, a pasted PEM private key — which is inherently multi-line —
 /// was written verbatim across several lines. The reader took only the first,
 /// so the key came back as the literal string `-----BEGIN RSA PRIVATE KEY-----`,
-/// signing failed, and the venue silently never initialised.
+/// signing failed, and the venue silently never initialized.
 fn escape_secret(v: &str) -> String {
     v.replace('\\', "\\\\").replace('\n', "\\n").replace('\r', "\\r")
 }
@@ -1901,7 +1901,7 @@ mod tests {
         }
     }
 
-    /// Tiers drive the UI badges, so an unrecognised value would render blank.
+    /// Tiers drive the UI badges, so an unrecognized value would render blank.
     /// A pasted PEM is multi-line, but the secrets file is one KEY=value per
     /// line. Escaping on write and unescaping on read must round-trip it
     /// exactly, or Kalshi request signing fails with a key that looks present.

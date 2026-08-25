@@ -47,7 +47,7 @@ use crate::state::TradeScope;
 
 // ─── Shared pool ────────────────────────────────────────────────────────────
 
-/// Primary-asset pool — the first asset initialised owns this slot.
+/// Primary-asset pool — the first asset initialized owns this slot.
 /// Kept for backward-compat callers that use `pool()` without an asset key.
 static DB_POOL: OnceLock<SqlitePool> = OnceLock::new();
 
@@ -56,7 +56,7 @@ static DB_POOL: OnceLock<SqlitePool> = OnceLock::new();
 static DB_POOLS: OnceLock<std::sync::Mutex<std::collections::HashMap<String, SqlitePool>>> =
     OnceLock::new();
 
-/// Convenience accessor for the per-asset pool map (lazy-initialised on first call).
+/// Convenience accessor for the per-asset pool map (lazy-initialized on first call).
 fn pools_map() -> &'static std::sync::Mutex<std::collections::HashMap<String, SqlitePool>> {
     DB_POOLS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
@@ -90,7 +90,7 @@ pub fn venue_for_pool(pool: &SqlitePool) -> String {
         .unwrap_or_default()
 }
 
-/// Which venue owns a shard. Empty string when the shard was initialised
+/// Which venue owns a shard. Empty string when the shard was initialized
 /// without one (tests, or the legacy `init_for_asset` path).
 pub fn venue_for_shard(shard: &str) -> String {
     shard_venues()
@@ -130,7 +130,7 @@ pub async fn init_for_asset(asset: &str, path: &str) -> Result<()> {
     init_shard(asset, path, "").await
 }
 
-/// Initialise a shard and record which venue owns it.
+/// Initialize a shard and record which venue owns it.
 ///
 /// The shard key ("asset") is a storage location, not a market attribute — it is
 /// an underlying symbol on the intl CLOB but a venue name elsewhere. Binding the
@@ -166,7 +166,7 @@ pub async fn init_shard(shard: &str, path: &str, venue: &str) -> Result<()> {
     Ok(())
 }
 
-/// Backward-compat wrapper: initialises for a single asset, deriving the asset
+/// Backward-compat wrapper: initializes for a single asset, deriving the asset
 /// name from the file stem (e.g. `"logs/btc-dradis.db"` → `"btc"`).
 /// New code should call `init_for_asset` directly.
 pub async fn init(path: &str) -> Result<()> {
@@ -178,8 +178,8 @@ pub async fn init(path: &str) -> Result<()> {
     init_for_asset(asset, path).await
 }
 
-/// Returns a reference to the **primary** asset's pool (first initialised),
-/// or `None` if no pool has been initialised yet.
+/// Returns a reference to the **primary** asset's pool (first initialized),
+/// or `None` if no pool has been initialized yet.
 ///
 /// Use `pool_for(asset)` to retrieve a specific asset's pool.
 pub fn pool() -> Option<&'static SqlitePool> {
@@ -195,7 +195,7 @@ fn pool_aliases() -> &'static std::sync::Mutex<std::collections::HashMap<String,
     POOL_ALIASES.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
-/// Point `alias` at an already-initialised pool key.
+/// Point `alias` at an already-initialized pool key.
 ///
 /// A venue's DB scope and its squadron's asset identity are not always the same
 /// name: the Kalshi venue owns one pool (`"kalshi"`), but its squadron registers
@@ -252,7 +252,7 @@ pub fn pool_for_opt(asset: Option<&str>) -> Option<SqlitePool> {
 /// Like [`pool_for_opt`], but retries briefly when the pool is missing so API
 /// handlers that fire during process startup don't error while pool init is
 /// still in flight (roadmap bug #7: the API server can bind before all asset
-/// pools are initialised — e.g. the `us` pool inits after venue connect).
+/// pools are initialized — e.g. the `us` pool inits after venue connect).
 /// Steady-state cost is zero: the first attempt succeeds once pools exist.
 pub async fn pool_for_opt_retry(asset: Option<&str>) -> Option<SqlitePool> {
     const ATTEMPTS: u32 = 6;
@@ -267,7 +267,7 @@ pub async fn pool_for_opt_retry(asset: Option<&str>) -> Option<SqlitePool> {
     None
 }
 
-/// Return the lowercase asset names for all initialised pools, sorted
+/// Return the lowercase asset names for all initialized pools, sorted
 /// alphabetically.  Used by `GET /api/assets` to tell the Control Tower
 /// which asset views are available.
 pub fn available_assets() -> Vec<String> {
@@ -384,7 +384,7 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
     //               NULL = not yet resolved. Encoded from the strategy's point of
     //               view (not "did YES win") so scoring needs no side arithmetic.
     // settle_price: the winning-token price the label was derived from, kept for
-    //               auditability — a mislabelled row should be traceable.
+    //               auditability — a mislabeled row should be traceable.
     let _ = sqlx::query("ALTER TABLE gboost_vetoes ADD COLUMN outcome INTEGER")
         .execute(pool).await;
     let _ = sqlx::query("ALTER TABLE gboost_vetoes ADD COLUMN settle_price TEXT")
@@ -862,7 +862,7 @@ async fn run_migrations(pool: &SqlitePool) {
         .execute(pool).await;
 
     // Trade filing dimensions. Until now the only discriminator on a trade row
-    // was which database file it lived in — the shard key the UI mislabelled as
+    // was which database file it lived in — the shard key the UI mislabeled as
     // "Asset". That cannot express "a sports market has no underlying", and it
     // could not tell a Kalshi BTC trade from a Kalshi ETH trade at all, since
     // both squadrons share the `kalshi` shard. See `state::TradeScope`.
@@ -917,7 +917,7 @@ async fn backfill_venue(pool: &SqlitePool, venue: &str) {
 
 // ─── Session lifecycle ───────────────────────────────────────────────────────
 
-/// Create a new session row in **all** initialised asset pools and set the
+/// Create a new session row in **all** initialized asset pools and set the
 /// process-lifetime session ID.
 ///
 /// Call once immediately after all `init_for_asset()` calls complete so every
@@ -928,7 +928,7 @@ pub async fn init_session(note: Option<&str>) -> String {
     let session_id = Utc::now().to_rfc3339();
     let _ = CURRENT_SESSION_ID.set(session_id.clone());
 
-    // Collect all initialised pools so we can write a session row to each.
+    // Collect all initialized pools so we can write a session row to each.
     let all_pools: Vec<SqlitePool> = {
         let guard = pools_map().lock().unwrap();
         guard.values().cloned().collect()
@@ -1229,7 +1229,7 @@ pub async fn record_gboost_veto_db(
 /// A resolved binary token settles at $1.00 (won) or $0.00 (lost). Prices at or
 /// beyond these bounds are treated as final; anything between them means the
 /// market has not resolved yet (or the read was unreliable) and the row is left
-/// unlabelled for a later sweep. Deliberately strict — a wrong label is far worse
+/// unlabeled for a later sweep. Deliberately strict — a wrong label is far worse
 /// than a late one, because it silently corrupts the gate-calibration evidence
 /// this table exists to provide.
 const VETO_SETTLE_WON_MIN:  Decimal = rust_decimal_macros::dec!(0.95);
@@ -1239,7 +1239,7 @@ const VETO_SETTLE_LOST_MAX: Decimal = rust_decimal_macros::dec!(0.05);
 /// signals it actually blocked.
 #[derive(Debug, Clone, Serialize)]
 pub struct GboostVetoScore {
-    /// Gate family, normalised from the free-text veto reason.
+    /// Gate family, normalized from the free-text veto reason.
     pub gate: String,
     /// Vetoed signals attributable to this gate.
     pub total: i64,
@@ -1373,7 +1373,7 @@ pub async fn condition_id_for_veto_token(pool: &SqlitePool, token_id: &str) -> O
 ///
 /// `resolve_price(token_id) -> Option<Decimal>` fetches the token's CURRENT price;
 /// the caller supplies it so this module keeps no dependency on the venue SDK.
-/// Returns the number of rows newly labelled.
+/// Returns the number of rows newly labeled.
 ///
 /// Only rows whose market should already have closed are attempted — close time
 /// is reconstructed as `ts + secs_to_expiry`, which is exactly what was recorded
@@ -1440,7 +1440,7 @@ where
         } else if price <= VETO_SETTLE_LOST_MAX {
             0
         } else {
-            continue; // ambiguous — leave unlabelled rather than guess
+            continue; // ambiguous — leave unlabeled rather than guess
         };
 
         if let Err(e) = sqlx::query(
@@ -1819,7 +1819,7 @@ pub async fn requeue_interrupted_deployments() -> u64 {
 ///
 /// Public because adding a viper means touching more than this table: the deploy
 /// budget router in `cag::adama` needs a matching arm, and a kind seeded without
-/// one has its operator-chosen budget silently dropped in favour of the
+/// one has its operator-chosen budget silently dropped in favor of the
 /// compile-time default while the deploy UI reports success. FairValue shipped
 /// exactly that way. A test in `cag::adama` pins the two lists together.
 pub const VIPER_KINDS: &[(&str, &str, i32)] = &[
@@ -2065,10 +2065,10 @@ pub async fn record_config_change(
 
 // ─── Static config snapshot ──────────────────────────────────────────────────
 
-/// Serialisable snapshot of the compile-time constants in `config.rs`.
+/// Serializable snapshot of the compile-time constants in `config.rs`.
 ///
 /// All fields are `String` (for Decimal) or primitive types so the struct is
-/// trivially serialisable without bringing extra dependencies into `db.rs`.
+/// trivially serializable without bringing extra dependencies into `db.rs`.
 /// Stored as a JSON blob in `config_history` so operators can diff consecutive
 /// sessions to see exactly what changed between two compiles.
 #[derive(Serialize)]
@@ -2226,7 +2226,7 @@ pub async fn record_static_config_snapshot(pool: &SqlitePool) {
             info!("📸 Static config snapshot recorded for session {}", current_session_id());
         }
         Err(e) => {
-            error!("❌ DB static_config_snapshot serialise failed: {}", e);
+            error!("❌ DB static_config_snapshot serialize failed: {}", e);
         }
     }
 }
@@ -2524,7 +2524,7 @@ pub async fn purge_stale_open_positions(
     for (id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price, entry_fee) in rows {
         // Dollars already paid to open this leg. Absent on rows written before
         // the column existed, and on venues that do not report a fee — both
-        // degrade to the old gross-only behaviour rather than inventing a cost.
+        // degrade to the old gross-only behavior rather than inventing a cost.
         let entry_fee = entry_fee
             .as_deref()
             .and_then(|f| f.parse::<Decimal>().ok())
@@ -4156,7 +4156,7 @@ mod venue_category_tests {
     /// classified as `unknown`, so it lost the Sports Raptor and displayed as
     /// "US Retail Squadron" rather than "US Sports Squadron".
     #[tokio::test]
-    async fn the_venue_category_rescues_an_unrecognised_sports_symbol() {
+    async fn the_venue_category_rescues_an_unrecognized_sports_symbol() {
         let pool = seeded().await;
         let symbols = ["atc-lal-elc-fcb-2026-08-23-fcb#long", "atc-lal-elc-fcb-2026-08-23-fcb#short"];
         let title = "Will FC Barcelona win against Elche CF in the La Liga match scheduled for Aug 23, 2026?";
@@ -4196,19 +4196,19 @@ mod deployed_class_tests {
     }
 
     /// A Kalshi politics ticker carries nothing the symbol or slug rules
-    /// recognise — "KXCITRINI-28JUL01" is not "election" or "senate". Without
+    /// recognize — "KXCITRINI-28JUL01" is not "election" or "senate". Without
     /// the operator's declared class such a market classified as "unknown",
     /// which is how a squadron someone deliberately deployed as politics ends up
     /// filed as something else.
     #[tokio::test]
-    async fn a_declared_class_wins_over_an_unrecognisable_ticker() {
+    async fn a_declared_class_wins_over_an_unrecognizable_ticker() {
         let pool = seeded_pool().await;
         let symbols = ["KXCITRINI-28JUL01#yes", "KXCITRINI-28JUL01#no"];
         let title = "Who will win the Citrini Prize?";
 
         // Undeclared: nothing in the ticker or the title matches a rule.
         let derived = classify_market(&pool, "", &symbols, title).await;
-        assert_ne!(derived, "politics", "test premise broken — this title is recognisable");
+        assert_ne!(derived, "politics", "test premise broken — this title is recognizable");
 
         // Declared: the category rule matches exactly, at the highest priority.
         let declared = classify_market(&pool, "politics", &symbols, title).await;
@@ -4219,7 +4219,7 @@ mod deployed_class_tests {
     /// wings pass "us" / "us-crypto" as their Custom asset name and must keep
     /// falling through to the symbol and slug rules exactly as before.
     #[tokio::test]
-    async fn an_unrecognised_category_still_falls_through() {
+    async fn an_unrecognized_category_still_falls_through() {
         let pool = seeded_pool().await;
         let sports = ["aec-nfl-lac-ten-2026#yes", "aec-nfl-lac-ten-2026#no"];
 
@@ -4228,7 +4228,7 @@ mod deployed_class_tests {
         assert_eq!(
             classify_market(&pool, "us", &sports, "Chargers at Titans").await,
             classify_market(&pool, "", &sports, "Chargers at Titans").await,
-            "declaring an unrecognised category changed the outcome",
+            "declaring an unrecognized category changed the outcome",
         );
     }
 
@@ -4664,7 +4664,7 @@ mod squadron_column_migration_tests {
     }
 
     /// The same squadron topping up must NOT create a second row — the
-    /// behaviour the original dedupe existed for, which the squadron column
+    /// behavior the original dedupe existed for, which the squadron column
     /// must not weaken.
     #[tokio::test]
     async fn one_squadron_topping_up_does_not_duplicate() {

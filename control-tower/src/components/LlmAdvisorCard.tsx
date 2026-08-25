@@ -22,7 +22,7 @@
  * One row: latest analysis metadata (time, model, P&L at analysis) plus a
  * "N proposals pending" badge that jumps to the AI Actions tab (the detail
  * surface for the approval queue and audit trail). The full prose analysis
- * expands inline on demand; older analyses are browsable while expanded.
+ * expands inline on demand; older analyzes are browsable while expanded.
  */
 
 import { useState } from 'react';

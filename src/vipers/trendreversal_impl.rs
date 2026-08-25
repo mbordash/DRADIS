@@ -35,7 +35,7 @@
 ///   - Strong UP spike   → BUY NO  (fade the unabsorbed up-spike)
 ///   - Strong DOWN spike → BUY YES (fade the unabsorbed down-spike)
 ///   Set `TRENDREVERSAL_MODE = false` to restore the legacy trend-FOLLOWING
-///   behaviour (UP→YES, DOWN→NO).
+///   behavior (UP→YES, DOWN→NO).
 ///
 /// Example — BTC flash dip in a flat hour (fade mode):
 ///   drift_10m = −$150, drift_60m = +$40 (spike against a flat macro — chop)

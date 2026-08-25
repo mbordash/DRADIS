@@ -19,7 +19,7 @@
 /// Endpoints
 /// ─────────────────────────────────────────────────────────────────────────────
 ///   GET    /api/health                — liveness check
-///   GET    /api/assets                — list of initialised asset pools (Phase 3f-7)
+///   GET    /api/assets                — list of initialized asset pools (Phase 3f-7)
 ///   GET    /api/config                — current DynamicConfig as JSON
 ///   PATCH  /api/config               — JSON merge-patch; hot-reloads strategies
 ///   GET    /api/config/schema         — editable-config field schema (drives Advanced UI)
@@ -29,12 +29,12 @@
 ///   DELETE /api/positions/{token_id}  — purge a specific stale row from open_positions
 ///   POST   /api/positions/sync        — trigger immediate chain-sync against Polymarket wallet
 ///   POST   /api/positions/manual-exit — manual "Return to Base" exit (FAK market sell)
-///   GET    /api/llm/recommendations   — recent LLM Advisor analyses (?limit=10&asset=btc)
+///   GET    /api/llm/recommendations   — recent LLM Advisor analyzes (?limit=10&asset=btc)
 ///   GET    /api/squadrons             — list all active squadrons (Phase 3d)
 ///   GET    /api/squadrons/{id}        — get one squadron by id    (Phase 3d)
 ///
 /// All data endpoints accept an optional `?asset=btc` query param (Phase 3f-7).
-/// When absent, the primary (first initialised) asset pool is used.
+/// When absent, the primary (first initialized) asset pool is used.
 ///
 /// The server binds to 0.0.0.0:$API_PORT (default 9000).
 /// CORS is open so the Next.js Control Tower on any port can reach it.
@@ -618,7 +618,7 @@ async fn health() -> &'static str {
 /// GET /api/assets
 ///
 /// Returns the list of asset symbols for which a SQLite pool has been
-/// initialised, sorted alphabetically.  The Control Tower uses this to
+/// initialized, sorted alphabetically.  The Control Tower uses this to
 /// populate the asset selector tabs.
 ///
 /// Response: `["btc", "eth", "sol"]`
@@ -1422,7 +1422,7 @@ async fn manual_exit(
         let mut pos_map = session.positions.lock().await;
         // The operator names a strategy and a token, not a squadron, so remove
         // every squadron's entry for that pair. On this venue there is one
-        // squadron per asset, which makes it exactly the previous behaviour;
+        // squadron per asset, which makes it exactly the previous behavior;
         // once several squadrons can hold the same token, a manual RTB from
         // this endpoint should carry the squadron so it targets just one.
         let market = crate::venues::intl::market_id_from_u256(token_id);
@@ -1455,7 +1455,7 @@ async fn manual_exit(
 
 /// GET /api/llm/recommendations?limit=10&asset=btc
 ///
-/// Returns up to `limit` LLM Advisor analyses, newest first.
+/// Returns up to `limit` LLM Advisor analyzes, newest first.
 /// Each row: { id, ts, model, trade_count, session_pnl, analysis }
 async fn get_llm_recommendations(Query(q): Query<AssetQuery>) -> Response {    debug!("Received GET /api/llm/recommendations request with limit: {:?}", q.limit);
     let limit = q.limit.unwrap_or(10).clamp(1, 50);
@@ -2057,7 +2057,7 @@ async fn get_squadron_config(
     }
 
     // Retry-aware: this endpoint is polled by the dashboard immediately at boot,
-    // before the primary pool may have initialised (roadmap bug #7).
+    // before the primary pool may have initialized (roadmap bug #7).
     match db::pool_for_opt_retry(None).await {
         Some(pool) => {
             if let Some(json) = db::squadron_config_get(&pool, &id).await {

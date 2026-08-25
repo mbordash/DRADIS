@@ -1259,7 +1259,7 @@ mod tests {
         assert_eq!(edge.round_dp(3), dec!(0.145));
 
         // A conservative profile demands 1.5x entry-grade edge and would still
-        // have taken this stop — the knob genuinely spans both behaviours.
+        // have taken this stop — the knob genuinely spans both behaviors.
         assert!(
             FairValueStrategyImpl::stop_vetoed_by_model(Some(fair_no), no_ask, req, dec!(1.5))
                 .is_none()

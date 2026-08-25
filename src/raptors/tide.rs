@@ -79,7 +79,7 @@ use tracing::{info, warn};
 use crate::config;
 use crate::api::server::AssetRaptorHealth;
 
-/// Normalised institutional-tide snapshot broadcast to every consuming Squadron.
+/// Normalized institutional-tide snapshot broadcast to every consuming Squadron.
 ///
 /// `Copy` so the `watch` channel hands out cheap value clones, and `Default`
 /// (all-zero, `market_open = false`) so the channel can be seeded before the

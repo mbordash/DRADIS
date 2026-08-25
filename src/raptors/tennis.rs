@@ -84,7 +84,7 @@ use crate::config;
 /// its telemetry, alongside "sports" and the per-asset crypto entries.
 pub const TENNIS_HEALTH_KEY: &str = "tennis";
 
-/// Normalised tennis event-state snapshot broadcast to every consuming Squadron.
+/// Normalized tennis event-state snapshot broadcast to every consuming Squadron.
 ///
 /// `Copy` so the `watch` channel hands out cheap value clones, and `Default`
 /// (all-zero, `num_live = 0` meaning "no data") so the channel can be seeded

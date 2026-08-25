@@ -75,7 +75,7 @@ pub struct UsRetailVenue {
     base_url: String,
     auth: Arc<UsAuth>,
     /// Shared HTTP client — used for raw market-discovery requests that bypass
-    /// the SDK's typed deserialisers (which are too strict for the live API).
+    /// the SDK's typed deserializers (which are too strict for the live API).
     http: Arc<reqwest::Client>,
     /// Fan-out sender for the private account fill feed (`/v1/ws/private`).
     /// The pump task is spawned in [`Self::connect`] and lives for the venue's
@@ -149,7 +149,7 @@ impl UsRetailVenue {
     /// We intentionally bypass the SDK's typed `markets_list_authenticated()` here
     /// because the live API returns `"outcomes":"[...]"` as a JSON-encoded *string*,
     /// not a JSON array.  The SDK's strict `Vec<Value>` field rejects the string and
-    /// the whole response fails to deserialise.  Using a raw HTTP call lets us parse
+    /// the whole response fails to deserialize.  Using a raw HTTP call lets us parse
     /// into our own lenient `types::MarketsResponse` where `outcomes: Value` accepts
     /// any JSON shape without error.
     pub async fn discover_binary_markets(&self) -> Result<Vec<markets::UsMarketPair>> {
@@ -425,7 +425,7 @@ impl UsRetailVenue {
 
     /// Derive the instrument outcome leg (`LONG`/`SHORT`) from a `MarketId`
     /// symbol suffix — the symbol uniquely identifies the side, so no catalog
-    /// lookup is needed. Recognises the `yes/long/up` and `no/short/down`
+    /// lookup is needed. Recognizes the `yes/long/up` and `no/short/down`
     /// conventions Polymarket US uses across sports and crypto markets.
     fn outcome_side_from_symbol(symbol: &str) -> Result<polymarket_us::types::OrderSide> {
         // The leg suffix is authoritative. Live symbols end in a TEAM
@@ -480,7 +480,7 @@ impl UsRetailVenue {
     /// Build the JSON order body for one neutral intent (pure — no network).
     fn build_order(intent: &OrderIntent) -> Result<types::PlaceOrderRequest> {
         // Side comes from the leg suffix; the wire gets the bare symbol, which is
-        // the only form the venue recognises.
+        // the only form the venue recognizes.
         let outcome_side = Self::outcome_side_from_symbol(intent.market.as_str())?;
         let symbol = markets::bare_symbol(intent.market.as_str()).to_string();
         let quantity = Self::map_quantity(intent.quantity)?;

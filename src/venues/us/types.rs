@@ -29,7 +29,7 @@ pub use polymarket_us::types::*;
 //
 // The live API returns `"outcomes":"[...]"` as a JSON-encoded *string*, not a
 // JSON array.  The SDK's `UsMarket.outcomes: Vec<serde_json::Value>` fails to
-// deserialise that — `#[serde(default)]` only helps when the key is *absent*,
+// deserialize that — `#[serde(default)]` only helps when the key is *absent*,
 // not when the value has the wrong JSON type.
 //
 // Defining `MarketsResponse` and `UsMarket` here (after the glob import) causes
@@ -48,7 +48,7 @@ pub struct MarketsResponse {
 
 /// Lenient market record — tolerates the API's non-standard field shapes:
 /// * `outcomes` arrives as a JSON-encoded string `"[...]"` (not an array) —
-///   captured as a raw `Value` so deserialisation never fails.
+///   captured as a raw `Value` so deserialization never fails.
 /// * `marketSides` contains deeply nested team/player objects — kept as `Value`.
 #[derive(Debug, Clone, Deserialize)]
 pub struct UsMarket {

@@ -1474,7 +1474,7 @@ pub async fn detect_orphaned_arb_settlements(safe_address: Address, squadron_ass
     };
 
     // Token ids (decimal strings) with an on-chain redemption in the window.
-    // Defensive re-filter on activity_type: the server honours the filter today,
+    // Defensive re-filter on activity_type: the server honors the filter today,
     // but booking a phantom settlement is expensive enough to not rely on that.
     let redeemed_tokens: HashSet<String> = redemptions
         .iter()
@@ -1748,7 +1748,7 @@ mod settlement_evidence_tests {
         println!("activity(REDEEM) returned {} rows", acts.len());
         assert!(
             acts.iter().all(|a| a.activity_type == ActivityType::Redeem),
-            "the type filter must be honoured server-side"
+            "the type filter must be honored server-side"
         );
     }
 }

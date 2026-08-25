@@ -361,7 +361,7 @@ async fn run() -> Result<()> {
         .collect();
     let primary_asset = assets.first().cloned().unwrap_or_else(|| crypto_filter.clone());
 
-    // Phase 3f-7: initialise a per-asset SQLite pool for EVERY asset in the fleet.
+    // Phase 3f-7: initialize a per-asset SQLite pool for EVERY asset in the fleet.
     // The first call claims the global "primary" pool slot for backward-compat
     // callers that use db::pool() (API handlers, LLM advisor, etc.).
     for asset in &assets {
@@ -468,7 +468,7 @@ async fn run() -> Result<()> {
         let advisor_cfg_tx = Arc::clone(&config_tx);
         let advisor_cag = cag.clone();
         tokio::spawn(async move {
-            // Give the venue a moment to initialise its shard and write a first
+            // Give the venue a moment to initialize its shard and write a first
             // dashboard snapshot; the loop skips cycles until one exists anyway.
             tokio::time::sleep(std::time::Duration::from_secs(20)).await;
             dradis::helpers::llm_advisor::run_llm_advisor_loop(
@@ -786,7 +786,7 @@ async fn run() -> Result<()> {
     //   • process_heartbeat_secs    (process-level OS watchdog — ANY asset tick counts)
     //   • LLM Advisor               (ONE global loop reading all asset DBs — spawned after this loop)
     //
-    // ⚠️  DB: Phase 3f-7 — each asset has its own SQLite pool initialised above.
+    // ⚠️  DB: Phase 3f-7 — each asset has its own SQLite pool initialized above.
     //     The pools are looked up by asset slug in patrol_impl / patrol_tasks
     //     via db::pool_for(&asset_lc) so secondary assets write to their own DB.
     info!("️  Asset fleet: [{}] ({} asset{})",

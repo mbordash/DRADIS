@@ -99,7 +99,7 @@ pub fn global_config_tx() -> Option<&'static Arc<tokio::sync::watch::Sender<Arc<
 ///
 /// Fails safe: if the global handle is not up yet, only the compile-time switch
 /// applies, which is the same answer the code gave before the runtime switch was
-/// honoured at all.
+/// honored at all.
 pub fn ghosting_now() -> bool {
     if crate::config::GHOST_MODE { return true; }
     global_config_tx().map(|tx| tx.borrow().ghost_mode).unwrap_or(false)
@@ -1194,7 +1194,7 @@ impl DynamicConfig {
         patch_json: &str,
         actor: &str,
     ) -> Result<Arc<Self>> {
-        // Serialised across all squadrons for the whole read-merge-write.
+        // Serialized across all squadrons for the whole read-merge-write.
         //
         // This is a read-modify-write on a whole config document, and without a
         // lock two concurrent patches on one squadron lose an update: both read

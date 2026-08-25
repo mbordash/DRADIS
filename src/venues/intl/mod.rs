@@ -161,7 +161,7 @@ pub struct IntlClobVenue {
 
 impl IntlClobVenue {
     /// Bootstrap the intl venue: load the private key, authenticate the CLOB
-    /// client, derive the Safe/EOA addresses, and initialise the nonce from the
+    /// client, derive the Safe/EOA addresses, and initialize the nonce from the
     /// Polymarket API.
     ///
     /// Encapsulates the signer/nonce bootstrap that previously lived inline in

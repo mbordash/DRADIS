@@ -657,7 +657,7 @@ pub struct MarketSnapshot {
     //
     // These carry the sum across every published level so a strategy can choose.
     // Nothing reads them yet — they are plumbed first, deliberately without
-    // behavioural change, so the two series can be compared on live books before
+    // behavioral change, so the two series can be compared on live books before
     // any threshold moves.
     /// Total size across every published YES bid level.
     pub yes_bid_depth_total: Decimal,
@@ -1029,7 +1029,7 @@ mod ask_presence_tests {
 
     /// The exact shape seen on Kalshi's KXLAKECONF politics market: YES offered
     /// at a penny, no NO sellers at all. Read naively the two asks sum to $0.01
-    /// for a $1.00 payout, which is why this must be recognised as an absent
+    /// for a $1.00 payout, which is why this must be recognized as an absent
     /// leg rather than priced.
     #[test]
     fn decided_market_with_one_empty_leg() {
@@ -1143,7 +1143,7 @@ mod book_feed_tests {
     /// "no data", and the reason nothing else reports the outage — every gate
     /// declines them exactly as it would decline a genuinely empty market.
     #[test]
-    fn an_all_sentinel_book_is_recognised_as_no_book() {
+    fn an_all_sentinel_book_is_recognized_as_no_book() {
         let dead_yes = (dec!(0), dec!(0), dec!(1), dec!(0), Utc::now(), dec!(0), dec!(0));
         let dead_no  = (dec!(0), dec!(0), dec!(1), dec!(0), Utc::now(), dec!(0), dec!(0));
         assert!(!snapshot_has_book(&dead_yes, &dead_no));

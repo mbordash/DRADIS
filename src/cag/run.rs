@@ -280,7 +280,7 @@ where
     'market_loop: loop {
         // Check external cancellation token — fired by Cag::stand_down_asset().
         // Checked first so a stand-down during bootstrap or fee-rate fetch is
-        // honoured immediately without waiting for the next I/O timeout.
+        // honored immediately without waiting for the next I/O timeout.
         if cancel.is_cancelled() {
             info!("🛬  run_market_loop [{}]: cancellation token fired — exiting loop", crypto_filter.to_uppercase());
             break 'market_loop;

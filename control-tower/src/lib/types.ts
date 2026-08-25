@@ -290,7 +290,7 @@ export interface LlmRecommendationRow {
   ts:                 string;   // ISO 8601
   session_id:         string;   // session that produced this recommendation
   model:              string;   // ollama model name
-  trade_count:        number;   // trades analysed
+  trade_count:        number;   // trades analyzed
   session_pnl:        string;   // Decimal string
   analysis:           string;   // full LLM output text
   is_current_session: boolean;  // true when generated in the currently-running session

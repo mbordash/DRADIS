@@ -372,7 +372,7 @@ impl Squadron {
     /// flag flipped, the matching squadrons light them up with no code change.
     ///
     /// Returns the resolved class. No-op-safe (`"unknown"`) if the DB pool is
-    /// not yet initialised. Call after the squadron's config row is seeded.
+    /// not yet initialized. Call after the squadron's config row is seeded.
     pub async fn classify_and_link(&self) -> String {
         let Some(pool) = crate::helpers::db::pool() else {
             return "unknown".to_string();
@@ -566,7 +566,7 @@ fn spawn_ws_task(
                                 // (`Vec<OrderBookLevel>`); until now everything but the
                                 // best level was discarded, which is why order-book
                                 // imbalance was really a top-of-book ratio. Published for
-                                // comparison only — no consumer's behaviour changes yet.
+                                // comparison only — no consumer's behavior changes yet.
                                 let bid_depth_total: rust_decimal::Decimal = book.bids.iter().map(|l| l.size).sum();
                                 let ask_depth_total: rust_decimal::Decimal = book.asks.iter().map(|l| l.size).sum();
                                 // Stamp the WS update time at receipt, NOT at tick time.

@@ -266,7 +266,7 @@ pub trait Execution: Send + Sync {
 ///
 /// A wing that cannot read its balance cannot compute session P&L or its
 /// drawdown limit, so treating a failed read as "starting from zero" is the one
-/// answer that is certainly wrong. It was also the previous behaviour
+/// answer that is certainly wrong. It was also the previous behavior
 /// (`collateral().await.unwrap_or(Decimal::ZERO)`), and it poisons the whole
 /// session rather than one tick: `session_pnl = total - starting` then reports
 /// the entire balance as profit, for the lifetime of the process.

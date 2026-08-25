@@ -601,7 +601,7 @@ impl Strategy for ConvergenceStrategyImpl {
                 // loss from marking a fresh fill's ask against the bid; a bid-to-bid
                 // move has no spread component, so the artifact cannot occur.
                 // Requires a recorded entry bid — otherwise the normal post-MIN_HOLD
-                // stop remains the first line of defence, as before.
+                // stop remains the first line of defense, as before.
                 if recorded_entry_bid.is_some()
                     && secs_held < config::CONVERGENCE_MIN_HOLD_SECS
                     && cat_move <= -dc.convergence_stop_loss_pct

@@ -178,32 +178,59 @@ pub async fn run_latency_probe() {
 mod tests {
     use super::*;
 
+    /// Serializes the tests in this module against each other.
+    ///
+    /// `record` and `snapshot` operate on one process-wide `STATE`, and cargo
+    /// runs tests in parallel threads inside a single process — so without this
+    /// the two tests below interleave on the same static. That is exactly how
+    /// CI failed: `snapshot_reports_window_and_median` recorded a failed probe
+    /// and asserted `!snap.ok`, while `window_is_capped` recorded a success in
+    /// between and flipped `ok` back to true. It passed locally and failed in
+    /// CI purely on thread timing.
+    static TEST_GUARD: Mutex<()> = Mutex::new(());
+
+    /// Return the shared state to its initial values so each test starts from a
+    /// known point and can assert exact numbers rather than `>=` bounds.
+    fn reset() {
+        let mut s = state().lock().unwrap();
+        s.samples.clear();
+        s.last_ok = false;
+        s.probed = false;
+    }
+
     #[test]
     fn snapshot_reports_window_and_median() {
-        // Empty window → no data, not yet probed... but other tests share the
-        // static, so only assert invariants that hold regardless of ordering.
+        let _guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+
         record(Some(100));
         record(Some(300));
         record(Some(200));
+
         let snap = snapshot();
         assert!(snap.probed);
         assert!(snap.ok);
-        assert!(snap.samples >= 3);
-        assert!(snap.last_ms.is_some());
-        assert!(snap.p50_ms.is_some());
+        assert_eq!(snap.samples, 3);
+        assert_eq!(snap.last_ms, Some(200));
+        assert_eq!(snap.p50_ms, Some(200), "median of 100/200/300");
 
-        record(None); // failed probe keeps samples but flips ok
+        // A failed probe keeps the window but flips `ok`.
+        record(None);
         let snap = snapshot();
         assert!(!snap.ok);
-        assert!(snap.samples >= 3);
+        assert_eq!(snap.samples, 3, "a failure must not discard the window");
     }
 
     #[test]
     fn window_is_capped() {
+        let _guard = TEST_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        reset();
+
         for i in 0..(SAMPLE_CAP as u64 + 10) {
             record(Some(i));
         }
+
         let snap = snapshot();
-        assert!(snap.samples <= SAMPLE_CAP);
+        assert_eq!(snap.samples, SAMPLE_CAP, "the window must hold exactly the cap");
     }
 }

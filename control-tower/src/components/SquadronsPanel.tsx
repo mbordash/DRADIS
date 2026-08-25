@@ -317,7 +317,7 @@ export default function SquadronsPanel({ squadrons, isLoading, onSquadronClick, 
   // phase, not an ending: the squadron is alive and managing its open positions
   // to close, it has only stopped opening new ones. It is entered 60s before
   // every market close, so grouping it with STOOD_DOWN made a healthy crypto
-  // squadron drop into a collapsed drawer labelled "stood-down" every fifteen
+  // squadron drop into a collapsed drawer labeled "stood-down" every fifteen
   // minutes and reappear afterwards — routine rotation shown as a death.
   const active   = squadrons.filter(s =>
     s.state === 'PATROLLING' || s.state === 'DEPLOYED' || s.state === 'STAGED' || s.state === 'RTB');

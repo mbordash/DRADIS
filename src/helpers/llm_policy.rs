@@ -32,7 +32,7 @@
 //!   tier 1 on a drawdown trip.
 //!
 //! The kill switch (`LLM_AUTONOMY_KILL=1`) and a breaker demotion both force
-//! tier-1 behaviour regardless of the configured tier.
+//! tier-1 behavior regardless of the configured tier.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,7 +47,7 @@ use crate::helpers::db;
 use crate::helpers::dynamic_config::DynamicConfig;
 use crate::helpers::llm_patch::{ProposalBatch, ValidatedChange};
 
-/// Set when the circuit breaker trips; forces tier-1 behaviour until restart
+/// Set when the circuit breaker trips; forces tier-1 behavior until restart
 /// (or until an operator clears it via the Setup view, S5).
 static BREAKER_DEMOTED: AtomicBool = AtomicBool::new(false);
 

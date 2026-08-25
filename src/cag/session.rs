@@ -25,7 +25,7 @@
 /// │  Phase 3f-1 (current)                                               │
 /// │  Introduces the type and bundles the individual Arc vars that        │
 /// │  main.rs previously declared as loose locals.  All existing call    │
-/// │  sites still use the individual variables — no behaviour change.     │
+/// │  sites still use the individual variables — no behavior change.     │
 /// │                                                                      │
 /// │  Phase 3f-3                                                          │
 /// │  Squadron::patrol() will accept session.clone() directly, removing  │
@@ -86,7 +86,7 @@ pub struct SessionState {
 
     /// Starting collateral captured at session init.
     /// Used by the LLM Advisor for drawdown context and by StrategyContext
-    /// to compute session-level risk utilisation.
+    /// to compute session-level risk utilization.
     pub starting_collateral: Arc<Mutex<Decimal>>,
 
     /// Phantom cooldowns: block re-entry on tokens whose on-chain fill has

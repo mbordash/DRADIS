@@ -18,8 +18,8 @@
 /// and report external intelligence back to the CIC.
 ///
 /// Each Raptor polls a specific external data source on its own schedule and
-/// publishes a normalised signal the Viper strategies consume via `watch` channels.
-/// Raptors are intentionally dumb: they fetch, normalise, and broadcast — no
+/// publishes a normalized signal the Viper strategies consume via `watch` channels.
+/// Raptors are intentionally dumb: they fetch, normalize, and broadcast — no
 /// trading logic, no position awareness, no side effects.
 ///
 /// Current Raptors

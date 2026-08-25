@@ -179,7 +179,7 @@ function toTennisRow(s: TelemetrySample): TennisRow {
 
 // Player series colors. Amber/sky rather than the emerald/sky used elsewhere:
 // the two sides of a match are the one place on this page where two series must
-// stay tellable apart under colour-vision deficiency, and emerald↔sky separates
+// stay tellable apart under color-vision deficiency, and emerald↔sky separates
 // by only ΔE 3.0 under tritanopia, versus 27.5 for this pair.
 const P1_COLOR = '#f59e0b';
 const P2_COLOR = '#38bdf8';
@@ -1077,9 +1077,9 @@ export default function TelemetryPage({ availableAssets, venue }: { availableAss
                 )}
               </div>
 
-              {/* Score grid — one row per player, colour-keyed to the charts.
+              {/* Score grid — one row per player, color-keyed to the charts.
                   The serving side carries a ● marker, so "who is serving" is
-                  never conveyed by colour alone. */}
+                  never conveyed by color alone. */}
               <div className="mt-2.5 grid grid-cols-[1fr_auto_auto_auto] gap-x-4 gap-y-1 text-[11px] font-mono max-w-md">
                 <span className="text-gray-600" />
                 <span className="text-gray-600 text-right">sets</span>

@@ -640,8 +640,8 @@ export default function TradelogPage({ availableAssets }: Props) {
                         <TipCell full={e.market} maxChars={24} />
                       </td>
 
-                      {/* Entry → Exit. Side rides along as a LABEL plus colour,
-                          never colour alone, so it survives a mono display. */}
+                      {/* Entry → Exit. Side rides along as a LABEL plus color,
+                          never color alone, so it survives a mono display. */}
                       <td className="px-3 py-2 whitespace-nowrap">
                         <span className={`mr-1.5 text-[10px] font-bold ${isLong ? 'text-green-400' : 'text-red-400'}`}>
                           {e.side}

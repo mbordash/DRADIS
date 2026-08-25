@@ -33,7 +33,7 @@
 ///  [10]  oracle_drift_60m — 60-minute oracle drift (÷ 10000)
 ///  [11]  oracle_price    — Binance oracle price (÷ 100_000 to reach O(1))
 ///  [12]  secs_to_expiry_norm — seconds until market expiry, clamped to
-///                             [0, MAX_SECONDS_TO_EXPIRY_FOR_ENTRY] and normalised
+///                             [0, MAX_SECONDS_TO_EXPIRY_FOR_ENTRY] and normalized
 ///                             to [0.0, 1.0].  0 = expiry, 1 = 4h+ away.
 ///  [13]  yes_obi_change  — change in yes_obi from previous tick
 ///  [14]  yes_mid_change  — change in YES mid-price ((bid+ask)/2) from previous tick.
@@ -55,11 +55,11 @@
 ///                          Negative = spread tightening (liquidity improving, good for entry).
 ///                          Orthogonal to feature [4]: level vs. momentum of the spread.
 ///  [20]  hist_vol_regime  — rolling volatility of oracle log-returns over the last 60
-///                          history snapshots, normalised to [0, 1] (0 = calm, 1 = chaotic).
+///                          history snapshots, normalized to [0, 1] (0 = calm, 1 = chaotic).
 ///                          2% per-tick log-return std-dev maps to 1.0 (extreme regime).
 ///                          NOTE: "60 snapshots" is a proxy for ~1h; actual wall-clock
 ///                          duration depends on tick rate at runtime.
-///  [21]  tick_momentum    — net directionality of the last 10 YES bid ticks, normalised
+///  [21]  tick_momentum    — net directionality of the last 10 YES bid ticks, normalized
 ///                          to [-1, +1] over (N−1) comparisons.
 ///                          +1 = all 9 ticks up (strong up momentum).
 ///                          −1 = all 9 ticks down (strong down momentum).
@@ -94,7 +94,7 @@
 ///      threadpool never blocks the Tokio executor.
 ///   3. The trained model is swapped into `Arc<Mutex<Option<PerpetualBooster>>>`.
 ///   4. predict_proba() produces P(YES_UP) for each new tick.
-///   5. Model is serialised to GBOOST_MODEL_PATH after each successful retrain
+///   5. Model is serialized to GBOOST_MODEL_PATH after each successful retrain
 ///      and reloaded from disk on strategy construction.
 
 use async_trait::async_trait;
@@ -135,7 +135,7 @@ pub struct TrainingSample {
 
 // ── Feature extraction ────────────────────────────────────────────────────────
 
-/// Normalisation divisor for secs_to_expiry: same as MAX_SECONDS_TO_EXPIRY_FOR_ENTRY (4 h).
+/// Normalization divisor for secs_to_expiry: same as MAX_SECONDS_TO_EXPIRY_FOR_ENTRY (4 h).
 /// Values beyond this horizon all map to 1.0; at expiry the value is 0.0.
 const SECS_TO_EXPIRY_NORM: f64 = 14_400.0;
 
@@ -157,7 +157,7 @@ fn obi_from_depths(bid: rust_decimal::Decimal, ask: rust_decimal::Decimal) -> f6
 }
 
 /// Compute tick-direction momentum from a slice of YES bid prices.
-/// Returns (up_ticks − down_ticks) / (n−1), normalised to [−1, +1].
+/// Returns (up_ticks − down_ticks) / (n−1), normalized to [−1, +1].
 fn compute_tick_momentum(bids: &[rust_decimal::Decimal]) -> f64 {
     if bids.len() < 2 {
         return 0.0;
@@ -287,7 +287,7 @@ fn extract_features(s: &MarketSnapshot, prev_s: Option<&MarketSnapshot>, hist_vo
         0.0
     };
 
-    // Normalise secs_to_expiry to [0.0, 1.0]:
+    // Normalize secs_to_expiry to [0.0, 1.0]:
     //   0.0 = market has expired / about to expire
     //   1.0 = 4 hours or more until expiry (fully safe zone)
     let secs_to_expiry_norm = (s.secs_to_expiry.max(0) as f64)
@@ -404,7 +404,7 @@ pub struct GboostStrategyImpl {
     /// Trained booster. `std::sync::Mutex` (not tokio) because we never hold
     /// it across an `.await` — only for quick read/write of the model pointer.
     model: Arc<StdMutex<Option<PerpetualBooster>>>,
-    /// Ring buffer of recent market snapshots for feature engineering and labelling.
+    /// Ring buffer of recent market snapshots for feature engineering and labeling.
     history: Arc<StdMutex<VecDeque<MarketSnapshot>>>,
     /// Ticks accumulated since the last retrain trigger.
     ticks_since_retrain: Arc<StdMutex<usize>>,
@@ -792,7 +792,7 @@ impl GboostStrategyImpl {
                 let cur = snap.oracle_price.to_f64().unwrap_or(0.0);
                 let fut = future.oracle_price.to_f64().unwrap_or(0.0);
                 // Skip directionally-uninformative samples: oracle essentially flat
-                // (or missing) over the horizon. Force-labelling these 0 teaches the
+                // (or missing) over the horizon. Force-labeling these 0 teaches the
                 // model that "flat" equals "down".
                 if cur <= 0.0 || fut <= 0.0
                     || ((fut - cur).abs() / cur) < config::GBOOST_LABEL_MIN_ORACLE_MOVE_FRAC
@@ -2198,12 +2198,12 @@ mod tests {
         assert_eq!(feats.len(), NUM_FEATURES);
         assert!(feats[0].abs() <= 1.0, "yes_obi out of [-1,1]: {}", feats[0]);
         assert!(feats[1].abs() <= 1.0, "no_obi  out of [-1,1]: {}", feats[1]);
-        // oracle normalised: 95000 / 100000 = 0.95
+        // oracle normalized: 95000 / 100000 = 0.95
         assert!((feats[11] - 0.95).abs() < 0.01, "oracle_price feat: {}", feats[11]);
         // secs_to_expiry_norm: 3600 / 14400 = 0.25
         assert!((feats[12] - 0.25).abs() < 0.01, "secs_to_expiry_norm feat: {}", feats[12]);
         assert!(feats[12] >= 0.0 && feats[12] <= 1.0, "secs_to_expiry_norm out of [0,1]: {}", feats[12]);
-        // new features [19-21] should be in their normalised ranges
+        // new features [19-21] should be in their normalized ranges
         assert!(feats[19] >= -1.0 && feats[19] <= 1.0, "spread_velocity out of [-1,1]: {}", feats[19]);
         assert!(feats[20] >= 0.0 && feats[20] <= 1.0, "hist_vol out of [0,1]: {}", feats[20]);
         assert!(feats[21] >= -1.0 && feats[21] <= 1.0, "tick_momentum out of [-1,1]: {}", feats[21]);

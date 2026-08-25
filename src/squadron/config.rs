@@ -38,7 +38,7 @@ pub enum RaptorProfile {
 /// Which Vipers are deployed in this squadron.
 #[derive(Debug, Clone)]
 pub enum ViperProfile {
-    /// Every registered Viper flies (current default behaviour).
+    /// Every registered Viper flies (current default behavior).
     Full,
 
     /// Only the named Vipers fly.  Useful for targeted single-strategy runs
@@ -61,7 +61,7 @@ pub struct SquadronConfig {
 
 impl SquadronConfig {
     /// Standard full-wing config: all Raptors + all Vipers.
-    /// This mirrors the current hardcoded DRADIS behaviour.
+    /// This mirrors the current hardcoded DRADIS behavior.
     pub fn full_wing(name: impl Into<String>) -> Self {
         Self {
             name:           name.into(),

@@ -17,7 +17,7 @@
 /// LLM Advisor — periodic trade analysis with pluggable LLM providers + Telegram recommendations.
 ///
 /// ── Overview ─────────────────────────────────────────────────────────────────
-/// A background task that wakes every LLM_ADVISOR_INTERVAL_SECS and analyses
+/// A background task that wakes every LLM_ADVISOR_INTERVAL_SECS and analyzes
 /// trades in two tiers:
 ///
 ///   Tier 1 — CURRENT SESSION (primary)
@@ -214,7 +214,7 @@ struct LlmReply {
     truncated_by_length: bool,
 }
 
-/// Normalise an LLM API base URL.
+/// Normalize an LLM API base URL.
 ///
 /// Operators paste the endpoint from the provider's documentation — the
 /// Anthropic docs say `https://api.anthropic.com/v1/messages` — but this code
@@ -421,10 +421,10 @@ struct AnthropicRequest {
 ///
 /// Deliberately an ALLOW-list of families known to accept the parameter, not a
 /// deny-list of families known to reject it. The two fail in opposite
-/// directions: an unrecognised model under an allow-list simply runs with the
+/// directions: an unrecognized model under an allow-list simply runs with the
 /// provider's default sampling, while under a deny-list it repeats exactly the
 /// outage above. Anthropic is dropping these parameters as it goes, so the
-/// unrecognised model of the future is far more likely to reject than accept.
+/// unrecognized model of the future is far more likely to reject than accept.
 ///
 /// The cost of omitting it is that the advisor runs at the model's default
 /// sampling rather than the deliberately low `LLM_TEMPERATURE`, so its wording
@@ -526,7 +526,7 @@ inform your pattern recognition, but your primary recommendations should address
 current session's trades and conditions.
 
 == Your Role ==
-Analyse the recent trades (or absence of trades) provided and:
+Analyze the recent trades (or absence of trades) provided and:
 1. Identify loss patterns (repeated stop-losses, short hold times, common exit reasons).
 2. Flag any signals of structural issues (high entry_hb_age_sec, adverse OBI at entry).
 3. Suggest 2–5 specific, actionable DynamicConfig parameter changes with rationale.
@@ -544,7 +544,7 @@ Analyse the recent trades (or absence of trades) provided and:
 Reply ONLY in this exact structure (no preamble, no markdown headers outside this):
 
 📊 DRADIS LLM ADVISOR
-Session P&L: [value]  |  Trades analysed: [n]
+Session P&L: [value]  |  Trades analyzed: [n]
 
 🔍 OBSERVATIONS
 • [bullet 1]
@@ -766,7 +766,7 @@ fn build_user_prompt(
     ));
 
     lines.push(String::new());
-    lines.push("Please analyse the above and provide recommendations as instructed.".to_string());
+    lines.push("Please analyze the above and provide recommendations as instructed.".to_string());
 
     // ── Open positions (in-flight, not yet closed) ───────────────────────────
     if !open_positions.is_empty() {
@@ -845,7 +845,7 @@ fn build_user_prompt(
     if !fewshot.is_empty() {
         lines.push(String::new());
         lines.push("== Prior Proposal Outcomes ==".to_string());
-        lines.push("Your recent config proposals and their results. Do NOT repeat rejected or reverted changes; favour patterns that scored positive:".to_string());
+        lines.push("Your recent config proposals and their results. Do NOT repeat rejected or reverted changes; favor patterns that scored positive:".to_string());
         for a in fewshot {
             let change = format!(
                 "{}: {} -> {}",
@@ -1529,7 +1529,7 @@ pub async fn run_llm_advisor_loop(
                 ).await;
 
                 // Telegram has a 4096-char limit per message; truncate with notice if needed.
-                // Name the squadron: with a pass per squadron, an unlabelled
+                // Name the squadron: with a pass per squadron, an unlabeled
                 // Telegram report cannot be told apart from the others.
                 let prose = format!("[{squadron_id} · {market_class}]\n{prose}");
                 let message = if prose.len() > 4000 {
@@ -1650,7 +1650,7 @@ mod anthropic_sampling_tests {
         }
     }
 
-    /// An unrecognised model omits the parameter rather than sending it. This
+    /// An unrecognized model omits the parameter rather than sending it. This
     /// is the whole point of an allow-list: the unknown model of the future is
     /// far likelier to reject sampling than to accept it, and omitting costs
     /// only default sampling where sending costs the entire advisor.

@@ -645,7 +645,7 @@ pub const GBOOST_NUM_THREADS: usize = 2;
 pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.72); // 2026-06-30: lowered (0.88 startup default produced zero trades in 13d)
 pub const GBOOST_PRED_LOG_INTERVAL_SECS: u64 = 120; // periodic P(UP) conviction diagnostic
 
-/// Max `gboost_vetoes` rows labelled with their settled outcome per cleanup sweep.
+/// Max `gboost_vetoes` rows labeled with their settled outcome per cleanup sweep.
 ///
 /// The veto shadow-log records every entry-eligible signal a gate rejected; the
 /// cleanup task attaches each one's real market resolution so the gate stack can
@@ -1215,7 +1215,7 @@ pub const ENABLE_LLM_ADVISOR: bool = true;
 
 pub const LLM_INFERENCE_TIMEOUT_SECS: u64 = 480;
 
-/// How often (seconds) the advisor wakes up to analyse trades and send recommendations.
+/// How often (seconds) the advisor wakes up to analyze trades and send recommendations.
 /// Balanced: every 30 minutes — once per typical hourly market cycle.
 pub const LLM_ADVISOR_INTERVAL_SECS: u64 = 3600;
 

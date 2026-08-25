@@ -43,7 +43,7 @@ pub fn normalized_hist_vol(prices: &[f64]) -> f64 {
         .map(|r| (r - mean).powi(2))
         .sum::<f64>()
         / log_returns.len() as f64;
-    // Normalise: 0.020 (2% per-tick std-dev) → 1.0; cap at 1.0
+    // Normalize: 0.020 (2% per-tick std-dev) → 1.0; cap at 1.0
     (variance.sqrt() / 0.020).min(1.0)
 }
 
@@ -105,7 +105,7 @@ pub fn fair_yes_probability(
 }
 
 /// Std-dev of log-returns between consecutive samples of a price series,
-/// normalised to per-√second units given the average sample spacing.
+/// normalized to per-√second units given the average sample spacing.
 /// Returns None with fewer than `min_samples` prices or degenerate spacing.
 pub fn sigma_per_sqrt_sec(prices: &[f64], total_span_secs: f64, min_samples: usize) -> Option<f64> {
     if prices.len() < min_samples.max(3) || total_span_secs <= 0.0 {
@@ -163,7 +163,7 @@ mod tests {
     }
 
     #[test]
-    fn fair_probability_behaviour() {
+    fn fair_probability_behavior() {
         // At the strike → exactly 50/50.
         let p = fair_yes_probability(100_000.0, 100_000.0, 1e-4, 600.0).unwrap();
         assert!((p - 0.5).abs() < 1e-9);

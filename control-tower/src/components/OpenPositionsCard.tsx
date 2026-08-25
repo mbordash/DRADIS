@@ -68,7 +68,7 @@ function isLongSide(side: string): boolean {
   return s === 'YES' || s === 'UP' || s === 'BUY' || s === 'LONG';
 }
 
-/** Estimate unrealised P&L direction from side label colour only (no live price here). */
+/** Estimate unrealised P&L direction from side label color only (no live price here). */
 function strategyLabel(s: string) {
   return s.replace('Strategy', '');
 }

@@ -267,7 +267,7 @@ pub fn spawn_market_feed(
             let resync = false;
             // A rejected subscription used to be indistinguishable from silence,
             // because every field was #[serde(default)] and an error frame
-            // deserialised into an all-defaults event. Sampling the first few
+            // deserialized into an all-defaults event. Sampling the first few
             // frames keeps a protocol change visible without flooding a session.
             let mut sampled = 0u8;
             let mut subscribe_rejected = false;
@@ -292,7 +292,7 @@ pub fn spawn_market_feed(
 
                         // A rejected subscription is not silence. Every
                         // OrderBookEvent field is #[serde(default)], so an error
-                        // frame deserialises into an all-defaults event and is
+                        // frame deserializes into an all-defaults event and is
                         // dropped by the channel check below — which is how this
                         // venue's feed stayed dead while the log said
                         // "subscribed". Surface it once per connection.

@@ -98,7 +98,7 @@ struct AssetTask {
     cancel:       CancellationToken,
 }
 
-/// Lightweight, serialisable summary of a squadron — sent to the Control Tower UI.
+/// Lightweight, serializable summary of a squadron — sent to the Control Tower UI.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SquadronSummary {
     pub id:                SquadronId,
@@ -114,7 +114,7 @@ pub struct SquadronSummary {
 
     /// Market taxonomy, resolved from the DB at request time by the API layer.
     /// Empty in the in-registry copy (classification runs *after* registration);
-    /// `enrich_taxonomy()` populates these before the summary is serialised.
+    /// `enrich_taxonomy()` populates these before the summary is serialized.
     #[serde(default)]
     pub market_class:      String,
     /// Crypto underlying that feeds this squadron's raptors (e.g. "btc").

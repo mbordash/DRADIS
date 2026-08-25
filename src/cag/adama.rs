@@ -310,7 +310,7 @@ pub struct MarketInfo {
 /// silently handed back whichever market happened to top the list. That market
 /// carries a perfectly valid `clobTokenIds`, so the deploy did not fail: it
 /// resolved to a market nobody chose and traded it. The identity check below is
-/// the real defence, since it holds whatever Gamma does with the parameter.
+/// the real defense, since it holds whatever Gamma does with the parameter.
 pub async fn fetch_market_info(http: &reqwest::Client, condition_id: &str) -> Option<MarketInfo> {
     let url = format!(
         "https://gamma-api.polymarket.com/markets?condition_ids={}",
@@ -367,7 +367,7 @@ pub async fn fetch_market_info(http: &reqwest::Client, condition_id: &str) -> Op
     // not as a JSON array, the same way `outcomes` does. `as_array()` therefore
     // returned None on every market Gamma has ever served, and the `?` swallowed
     // it: intl deployments failed here, silently, from the first one. The array
-    // form is still accepted in case Gamma ever normalises the field.
+    // form is still accepted in case Gamma ever normalizes the field.
     let tokens: Vec<String> = match market.get("clobTokenIds") {
         Some(serde_json::Value::Array(a)) =>
             a.iter().filter_map(|t| t.as_str().map(String::from)).collect(),
@@ -479,7 +479,7 @@ mod market_channel_tests {
     /// event markets do not rotate, and it used to drop the sender immediately —
     /// making that arm permanently ready, starving strategy evaluation, and
     /// leaving the inner-loop heartbeat unpulsed until the stall watchdog killed
-    /// the squadron 240s after every deploy. This pins the tokio behaviour the
+    /// the squadron 240s after every deploy. This pins the tokio behavior the
     /// fix depends on.
     #[tokio::test]
     async fn a_dropped_sender_makes_changed_resolve_immediately() {
@@ -516,7 +516,7 @@ mod gamma_shape_tests {
         }
     }
 
-    /// Gamma serialises `clobTokenIds` as a JSON-encoded string, not an array.
+    /// Gamma serializes `clobTokenIds` as a JSON-encoded string, not an array.
     ///
     /// The original code called `.as_array()` on it and let `?` swallow the
     /// None, so every intl deployment failed at this line reporting only
@@ -534,7 +534,7 @@ mod gamma_shape_tests {
         assert!(tokens[0].starts_with("9399889"));
     }
 
-    /// Still accepted if Gamma ever normalises the field to a real array.
+    /// Still accepted if Gamma ever normalizes the field to a real array.
     #[test]
     fn a_real_array_is_still_accepted() {
         let market = serde_json::json!({ "clobTokenIds": ["111", "222"] });
