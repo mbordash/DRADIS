@@ -29,6 +29,7 @@
 //! venue can trade, and choosing a market for a class. Those are the two methods
 //! of [`DeploymentRunner`]; everything else lives here once.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -83,6 +84,56 @@ pub trait DeploymentRunner: Send + Sync + 'static {
     /// `None` is not an error: an out-of-season sport or a quiet politics
     /// calendar is ordinary, and the seeder simply tries again next tick.
     async fn select_market(&self, class: &str, max_days_to_close: u32) -> Option<String>;
+}
+
+
+/// Apply the per-viper capital budgets an operator chose in the deploy dialog.
+///
+/// Returns whether anything was applied, so the caller only persists on change.
+///
+/// This lived in `cag::adama` and so ran on Polymarket International alone. The
+/// deploy dialog collects these budgets on every venue and `queue_deployment`
+/// stores them on every venue, but Kalshi and Polymarket US never read them
+/// back: their squadrons flew the compile-time exposure while the UI reported
+/// the operator's number. It belongs beside the queue that carries it.
+pub(crate) fn apply_viper_budgets(
+    cfg: &mut DynamicConfig,
+    budgets: &HashMap<String, f64>,
+) -> bool {
+    let mut applied = false;
+    for (kind, usdc) in budgets {
+        if !usdc.is_finite() || *usdc < 0.0 {
+            warn!("Ignoring invalid deploy budget for viper '{}': {}", kind, usdc);
+            continue;
+        }
+        let Ok(amount) = rust_decimal::Decimal::try_from(*usdc) else {
+            warn!("Ignoring unrepresentable deploy budget for viper '{}': {}", kind, usdc);
+            continue;
+        };
+        let slot = match kind.as_str() {
+            "arbitrage"    => &mut cfg.arbitrage_max_exposure_usdc,
+            "time_decay"   => &mut cfg.time_decay_max_exposure_usdc,
+            "momentum"     => &mut cfg.momentum_max_exposure_usdc,
+            "maker"        => &mut cfg.maker_max_exposure_usdc,
+            "basis"        => &mut cfg.basis_max_exposure_usdc,
+            "gboost"       => &mut cfg.gboost_max_exposure_usdc,
+            "trendcapture" => &mut cfg.trendcapture_max_exposure_usdc,
+            "convergence"  => &mut cfg.convergence_max_exposure_usdc,
+            // Every id seeded into `viper_kind` needs an arm here or the
+            // operator's chosen budget is dropped and the squadron flies on the
+            // compile-time default — while the deploy UI reports success.
+            // `viper_kinds_all_have_a_budget_slot` pins the two lists together.
+            "fairvalue"    => &mut cfg.fairvalue_max_exposure_usdc,
+            other => {
+                warn!("Unknown viper kind '{}' in deploy budgets — skipped", other);
+                continue;
+            }
+        };
+        *slot = amount;
+        info!("💰 Deploy budget: {} max exposure set to ${}", kind, amount);
+        applied = true;
+    }
+    applied
 }
 
 /// Drain the deployment queue until `cancel` fires, seeding auto-deploy classes
@@ -253,5 +304,89 @@ mod tests {
         for c in AUTO_DEPLOY_CLASSES {
             assert_eq!(*c, c.to_ascii_lowercase(), "{c} would never match");
         }
+    }
+}
+
+#[cfg(test)]
+mod budget_coverage_tests {
+    /// Viper kinds `apply_viper_budgets` can route a deploy budget to. Kept
+    /// beside the match above so the two are edited together.
+    const BUDGETED_KINDS: &[&str] = &[
+        "arbitrage", "time_decay", "momentum", "maker", "basis",
+        "gboost", "trendcapture", "convergence", "fairvalue",
+    ];
+
+    /// A viper seeded into `viper_kind` with no arm in the budget match has its
+    /// deploy budget silently dropped: the squadron flies on the compile-time
+    /// exposure rather than the operator's, and the deploy UI still reports
+    /// success. FairValue shipped that way — seeded, with a
+    /// `fairvalue_max_exposure_usdc` field, and no route to reach it.
+    #[test]
+    fn every_seeded_viper_kind_has_a_budget_slot() {
+        let missing: Vec<&str> = crate::helpers::db::VIPER_KINDS
+            .iter()
+            .map(|(id, _, _)| *id)
+            .filter(|id| !BUDGETED_KINDS.contains(id))
+            .collect();
+        assert!(missing.is_empty(), "viper kinds with no deploy-budget slot: {missing:?}");
+    }
+
+    /// And the reverse: a budget arm for a kind nobody seeds is dead code that
+    /// reads as coverage.
+    #[test]
+    fn no_budget_slot_points_at_a_kind_that_does_not_exist() {
+        let seeded: Vec<&str> = crate::helpers::db::VIPER_KINDS.iter().map(|(id, _, _)| *id).collect();
+        let orphans: Vec<&&str> = BUDGETED_KINDS.iter().filter(|k| !seeded.contains(k)).collect();
+        assert!(orphans.is_empty(), "budget slots for unseeded kinds: {orphans:?}");
+    }
+}
+
+#[cfg(test)]
+mod budget_application_tests {
+    use super::apply_viper_budgets;
+    use crate::helpers::dynamic_config::DynamicConfig;
+    use rust_decimal_macros::dec;
+    use std::collections::HashMap;
+
+    /// The operator's number must actually land in the config the squadron flies.
+    ///
+    /// This ran on Polymarket International only: `apply_viper_budgets` lived in
+    /// `cag::adama`, so Kalshi and Polymarket US collected budgets in the deploy
+    /// dialog, stored them on the queue row, and then flew the compile-time
+    /// exposure while every surface reported the operator's figure.
+    #[test]
+    fn a_deploy_budget_reaches_the_config() {
+        let mut cfg = DynamicConfig::default();
+        let budgets = HashMap::from([("maker".to_string(), 42.0)]);
+
+        assert!(apply_viper_budgets(&mut cfg, &budgets), "an applied budget must report a change");
+        assert_eq!(cfg.maker_max_exposure_usdc, dec!(42));
+    }
+
+    /// A rotated market has no operator behind it, so nothing should change and
+    /// the caller should not persist.
+    #[test]
+    fn no_budgets_means_no_change() {
+        let mut cfg = DynamicConfig::default();
+        let before = cfg.maker_max_exposure_usdc;
+
+        assert!(!apply_viper_budgets(&mut cfg, &HashMap::new()));
+        assert_eq!(cfg.maker_max_exposure_usdc, before);
+    }
+
+    /// A nonsense figure must leave the compile-time default standing rather
+    /// than writing a negative or infinite exposure into the squadron's config.
+    #[test]
+    fn invalid_budgets_are_refused_without_touching_the_config() {
+        let mut cfg = DynamicConfig::default();
+        let before = cfg.maker_max_exposure_usdc;
+        let budgets = HashMap::from([
+            ("maker".to_string(), -5.0),
+            ("basis".to_string(), f64::INFINITY),
+            ("not_a_viper".to_string(), 10.0),
+        ]);
+
+        assert!(!apply_viper_budgets(&mut cfg, &budgets), "nothing valid was supplied");
+        assert_eq!(cfg.maker_max_exposure_usdc, before);
     }
 }

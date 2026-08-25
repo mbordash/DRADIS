@@ -42,6 +42,9 @@ use polymarket_client_sdk_v2::auth::Normal;
 
 use crate::cag::{Cag, SessionState};
 use crate::helpers::dynamic_config::DynamicConfig;
+// Shared with Kalshi and Polymarket US — a deploy budget must mean the same
+// thing on every venue, and it did not while this lived here.
+use crate::venues::deployment::apply_viper_budgets;
 use crate::squadron::{Squadron, SquadronConfig, SquadronRaptors, CryptoAsset, PatrolContext};
 use crate::squadron::raptors::SportsRaptorHandle;
 use crate::state::MarketConfig;
@@ -291,45 +294,6 @@ where
 /// Maps each viper kind id (taxonomy `viper_kind.id`) to its `*_max_exposure_usdc`
 /// field. Returns `true` if any budget was applied (caller persists the config).
 /// Unknown kinds and non-finite/negative amounts are ignored with a warning.
-fn apply_viper_budgets(
-    cfg: &mut DynamicConfig,
-    budgets: &HashMap<String, f64>,
-) -> bool {
-    let mut applied = false;
-    for (kind, usdc) in budgets {
-        if !usdc.is_finite() || *usdc < 0.0 {
-            warn!("Ignoring invalid deploy budget for viper '{}': {}", kind, usdc);
-            continue;
-        }
-        let Ok(amount) = rust_decimal::Decimal::try_from(*usdc) else {
-            warn!("Ignoring unrepresentable deploy budget for viper '{}': {}", kind, usdc);
-            continue;
-        };
-        let slot = match kind.as_str() {
-            "arbitrage"    => &mut cfg.arbitrage_max_exposure_usdc,
-            "time_decay"   => &mut cfg.time_decay_max_exposure_usdc,
-            "momentum"     => &mut cfg.momentum_max_exposure_usdc,
-            "maker"        => &mut cfg.maker_max_exposure_usdc,
-            "basis"        => &mut cfg.basis_max_exposure_usdc,
-            "gboost"       => &mut cfg.gboost_max_exposure_usdc,
-            "trendcapture" => &mut cfg.trendcapture_max_exposure_usdc,
-            "convergence"  => &mut cfg.convergence_max_exposure_usdc,
-            // Every id seeded into `viper_kind` needs an arm here or the
-            // operator's chosen budget is dropped and the squadron flies on the
-            // compile-time default — while the deploy UI reports success.
-            // `viper_kinds_all_have_a_budget_slot` pins the two lists together.
-            "fairvalue"    => &mut cfg.fairvalue_max_exposure_usdc,
-            other => {
-                warn!("Unknown viper kind '{}' in deploy budgets — skipped", other);
-                continue;
-            }
-        };
-        *slot = amount;
-        info!("💰 Deploy budget: {} max exposure set to ${}", kind, amount);
-        applied = true;
-    }
-    applied
-}
 
 /// Market info needed for squadron spawning.
 pub struct MarketInfo {
@@ -585,36 +549,3 @@ mod gamma_shape_tests {
     }
 }
 
-#[cfg(test)]
-mod budget_coverage_tests {
-    /// Viper kinds `apply_viper_budgets` can route a deploy budget to. Kept
-    /// beside the match above so the two are edited together.
-    const BUDGETED_KINDS: &[&str] = &[
-        "arbitrage", "time_decay", "momentum", "maker", "basis",
-        "gboost", "trendcapture", "convergence", "fairvalue",
-    ];
-
-    /// A viper seeded into `viper_kind` with no arm in the budget match has its
-    /// deploy budget silently dropped: the squadron flies on the compile-time
-    /// exposure rather than the operator's, and the deploy UI still reports
-    /// success. FairValue shipped that way — seeded, with a
-    /// `fairvalue_max_exposure_usdc` field, and no route to reach it.
-    #[test]
-    fn every_seeded_viper_kind_has_a_budget_slot() {
-        let missing: Vec<&str> = crate::helpers::db::VIPER_KINDS
-            .iter()
-            .map(|(id, _, _)| *id)
-            .filter(|id| !BUDGETED_KINDS.contains(id))
-            .collect();
-        assert!(missing.is_empty(), "viper kinds with no deploy-budget slot: {missing:?}");
-    }
-
-    /// And the reverse: a budget arm for a kind nobody seeds is dead code that
-    /// reads as coverage.
-    #[test]
-    fn no_budget_slot_points_at_a_kind_that_does_not_exist() {
-        let seeded: Vec<&str> = crate::helpers::db::VIPER_KINDS.iter().map(|(id, _, _)| *id).collect();
-        let orphans: Vec<&&str> = BUDGETED_KINDS.iter().filter(|k| !seeded.contains(k)).collect();
-        assert!(orphans.is_empty(), "budget slots for unseeded kinds: {orphans:?}");
-    }
-}

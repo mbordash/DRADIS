@@ -469,6 +469,8 @@ pub async fn run_kalshi_trader(
             &process_heartbeat_secs,
             &series,
             &market_cancel,
+            // The venue picked this market, so no operator budget applies.
+            &Default::default(),
             selection,
             MarketMandate::Rotating,
             None,
@@ -580,6 +582,7 @@ impl crate::venues::deployment::DeploymentRunner for KalshiDeploymentRunner {
             // branch returns early before ever reading them.
             &[],
             &cancel,
+            &dep.viper_budgets,
             MarketSelection { primary: pair, maker: None },
             MarketMandate::Pinned,
             Some(class),
@@ -732,6 +735,9 @@ async fn trade_one_market(
     process_heartbeat_secs: &AtomicU64,
     series: &[String],
     cancel: &CancellationToken,
+    // Per-viper capital budgets the operator set in the deploy dialog. Empty for
+    // a rotated market, which nobody chose the exposure for.
+    viper_budgets: &std::collections::HashMap<String, f64>,
     selection: MarketSelection,
     mandate: MarketMandate,
     // `deployed_as` is the class label for an operator-deployed market
@@ -800,7 +806,7 @@ async fn trade_one_market(
     // and the crypto one only registers when a market is already selected, which
     // leaves a window across restarts and underlying rotations.
     db::alias_pool(status_scope, asset);
-    seed_squadron_config(&squadron_id).await;
+    seed_squadron_config(&squadron_id, viper_budgets).await;
     let market_class = squadron.classify_and_link().await;
     // Filing dimensions for every row this market writes. `asset` above is
     // only the shard (one DB for all Kalshi squadrons); venue, class and
@@ -1906,11 +1912,28 @@ fn register_kalshi_squadron(
     squadron
 }
 
-async fn seed_squadron_config(squadron_id: &str) {
+/// Ensure the squadron has a config row, then apply the operator's deploy-time
+/// per-viper budgets on top of it.
+///
+/// `budgets` is empty for a rotated market — the venue chose it, not an
+/// operator — and non-empty only for a pinned deployment. Applying them after
+/// the row exists rather than only when seeding it means a redeploy onto a
+/// squadron id that already has config still honours the numbers just entered,
+/// which is what the deploy dialog implies and what Polymarket International
+/// has always done.
+async fn seed_squadron_config(squadron_id: &str, budgets: &std::collections::HashMap<String, f64>) {
     if let Some(pool) = db::pool() {
         if db::squadron_config_get(pool, squadron_id).await.is_none() {
             DynamicConfig::init_for_squadron(squadron_id).await;
         }
+    }
+    if budgets.is_empty() {
+        return;
+    }
+    let current = DynamicConfig::load_for_squadron(squadron_id).await;
+    let mut cfg = (*current).clone();
+    if crate::venues::deployment::apply_viper_budgets(&mut cfg, budgets) {
+        cfg.save_for_squadron(squadron_id).await;
     }
 }
 
