@@ -979,8 +979,13 @@ async fn run() -> Result<()> {
             process_heartbeat_secs: Arc::clone(&process_heartbeat_secs),
         });
         
-        // Spawn the Admiral Adama deployment processor
-        tokio::spawn(dradis::cag::adama::run_adama_processor(adama_infra));
+        // Drain the deployment queue with the SAME consumer Kalshi and
+        // Polymarket US use, rather than intl's own parallel one.
+        tokio::spawn(dradis::venues::deployment::run_deployment_processor(
+            std::sync::Arc::new(dradis::cag::adama::IntlDeploymentRunner { infra: adama_infra }),
+            cag.clone(),
+            CancellationToken::new(),
+        ));
         info!("✅ Admiral Adama processor started — user squadrons can now be deployed");
     }
 

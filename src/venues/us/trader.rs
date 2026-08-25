@@ -534,11 +534,11 @@ impl crate::venues::deployment::DeploymentRunner for UsDeploymentRunner {
 
     async fn run_pinned(
         &self,
-        market_id: &str,
-        class: &str,
-        _name: Option<&str>,
+        dep: &crate::helpers::db::PendingDeployment,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
+        let market_id = dep.market_id.as_str();
+        let class = dep.market_type.as_str();
         let wing = wing_for_class(class);
 
         // Resolve the id against what this wing discovers, so a deployed market

@@ -2231,19 +2231,19 @@ struct AvailableMarketsQuery {
 
 /// A market available for squadron deployment.
 #[derive(Serialize)]
-struct AvailableMarket {
-    condition_id: String,
-    question: String,
-    market_class: String,
-    end_date: Option<String>,
-    liquidity: f64,
-    tokens: AvailableMarketTokens,
+pub(crate) struct AvailableMarket {
+    pub(crate) condition_id: String,
+    pub(crate) question: String,
+    pub(crate) market_class: String,
+    pub(crate) end_date: Option<String>,
+    pub(crate) liquidity: f64,
+    pub(crate) tokens: AvailableMarketTokens,
 }
 
 #[derive(Serialize)]
-struct AvailableMarketTokens {
-    yes_id: String,
-    no_id: String,
+pub(crate) struct AvailableMarketTokens {
+    pub(crate) yes_id: String,
+    pub(crate) no_id: String,
 }
 
 #[derive(Serialize)]
@@ -2253,13 +2253,14 @@ struct AvailableMarketsResponse {
 
 /// Does this build run a deployment-queue consumer?
 ///
-/// The intl CLOB drains the queue with `run_adama_processor`, which is generic
-/// over the on-chain wallet Provider. Kalshi has its own consumer,
-/// `kalshi::trader::run_deployment_processor`, spawned beside its rotation loop.
-///
-/// Polymarket US now shares Kalshi's consumer through
-/// `venues::deployment::DeploymentRunner`, so every venue drains the queue and
-/// this is true everywhere. Kept rather than deleted because the coupling is
+/// Every venue now drains the queue with the one consumer,
+/// `venues::deployment::run_deployment_processor`, through its own
+/// `DeploymentRunner`: `KalshiDeploymentRunner`, `UsDeploymentRunner` and
+/// `cag::adama::IntlDeploymentRunner`. Intl had a second consumer of its own
+/// (`run_adama_processor`) until it was folded in — while it existed, intl
+/// silently lacked restart requeue, auto-deploy seeding and any cancellation
+/// path, because those were fixed once in the shared consumer and never
+/// back-ported. Kept rather than deleted because the coupling is
 /// worth being able to grep from both ends: if a future venue ships without a
 /// consumer, this is where it says so, and the deploy endpoint refuses cleanly
 /// instead of writing a row nothing will ever collect.
@@ -2523,7 +2524,7 @@ async fn get_available_markets(Query(q): Query<AvailableMarketsQuery>) -> Respon
 /// Uses existing helpers: fetch_simplified_crypto_candidates for crypto,
 /// tag-based filtering for sports, regex for politics.
 #[cfg(feature = "intl_clob")]
-async fn fetch_markets_by_type(
+pub(crate) async fn fetch_markets_by_type(
     http: &reqwest::Client,
     market_type: &str,
     _max_expiry_secs: i64,
@@ -2822,7 +2823,7 @@ async fn fetch_sports_markets_by_tags(
 /// Markets missing a close time degrade to "always open" (venue convention) and
 /// pass the expiry filter.
 #[cfg(all(not(feature = "intl_clob"), feature = "us_retail"))]
-async fn fetch_markets_by_type(
+pub(crate) async fn fetch_markets_by_type(
     http: &reqwest::Client,
     market_type: &str,
     max_expiry_secs: i64,
@@ -2908,7 +2909,7 @@ async fn fetch_markets_by_type(
 /// Public endpoints (no credentials needed for discovery). Only crypto-class
 /// markets exist in the hunted series, so non-crypto requests return empty.
 #[cfg(all(not(feature = "intl_clob"), not(feature = "us_retail"), feature = "kalshi"))]
-async fn fetch_markets_by_type(
+pub(crate) async fn fetch_markets_by_type(
     _http: &reqwest::Client,
     market_type: &str,
     max_expiry_secs: i64,
@@ -3027,7 +3028,7 @@ async fn fetch_markets_by_type(
 
 /// No venue features compiled in — market discovery unavailable.
 #[cfg(not(any(feature = "intl_clob", feature = "us_retail", feature = "kalshi")))]
-async fn fetch_markets_by_type(
+pub(crate) async fn fetch_markets_by_type(
     _http: &reqwest::Client,
     market_type: &str,
     _max_expiry_secs: i64,

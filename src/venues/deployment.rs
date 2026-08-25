@@ -65,11 +65,15 @@ pub trait DeploymentRunner: Send + Sync + 'static {
     /// market that trades and then closes is a success. The error text is
     /// recorded against the deployment row and shown to the operator, so it
     /// should say what went wrong in their terms.
+    /// The whole queue row is passed, not just the market id, because the
+    /// operator chose more than a market: `viper_budgets` carries the per-viper
+    /// exposure they set in the deploy dialog. Narrowing this to
+    /// `(market_id, class, name)` is what let Kalshi and Polymarket US collect
+    /// those budgets in the UI, store them, and then silently fly the
+    /// compile-time exposure instead.
     async fn run_pinned(
         &self,
-        market_id: &str,
-        class: &str,
-        name: Option<&str>,
+        dep: &db::PendingDeployment,
         cancel: CancellationToken,
     ) -> anyhow::Result<()>;
 
@@ -134,11 +138,10 @@ pub async fn run_deployment_processor<R: DeploymentRunner>(
             let dep_id = dep.id.clone();
             let class = dep.market_type.clone();
             let market_id = dep.market_id.clone();
-            let name = Some(dep.name.clone()).filter(|n| !n.is_empty());
 
             tokio::spawn(async move {
                 info!("📋 Deploying {class} squadron on [{market_id}]");
-                match runner_t.run_pinned(&market_id, &class, name.as_deref(), cancel_t).await {
+                match runner_t.run_pinned(&dep, cancel_t).await {
                     Ok(()) => {
                         info!("📋 Deployed {class} squadron finished");
                         let _ = db::update_deployment_status(&dep_id, "completed", None, None).await;

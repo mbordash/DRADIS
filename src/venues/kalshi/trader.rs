@@ -556,11 +556,12 @@ impl crate::venues::deployment::DeploymentRunner for KalshiDeploymentRunner {
 
     async fn run_pinned(
         &self,
-        market_id: &str,
-        class: &str,
-        name: Option<&str>,
+        dep: &crate::helpers::db::PendingDeployment,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
+        let market_id = dep.market_id.as_str();
+        let class = dep.market_type.as_str();
+        let name = Some(dep.name.as_str()).filter(|n| !n.is_empty());
         let market = self.venue.market(market_id).await
             .map_err(|e| anyhow::anyhow!("could not load market {market_id}: {e}"))?;
         let pair = pair_from_market_untethered(&market);

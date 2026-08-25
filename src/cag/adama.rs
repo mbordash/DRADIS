@@ -105,6 +105,11 @@ where
         _raptors: &[String],
         _vipers: &[String],
         viper_budgets: &HashMap<String, f64>,
+        // The token the patrol task selects on. Supplied by the caller rather
+        // than minted here: a token created inside this function and dropped at
+        // its end is one nothing can ever fire, which is exactly how deployed
+        // intl squadrons became unkillable.
+        cancel: CancellationToken,
     ) -> Result<(String, tokio::task::JoinHandle<()>), String> {
         info!(
             requested_squadron_id = %requested_squadron_id,
@@ -234,7 +239,6 @@ where
             consecutive_stop_losses: HashMap::new(),
         };
 
-        let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
 
         // Spawn the REAL patrol task
@@ -356,125 +360,82 @@ pub async fn fetch_market_info(http: &reqwest::Client, condition_id: &str) -> Op
 ///
 /// Polls the deployment_queue table and spawns real squadrons.
 /// MUST run in main.rs where we have access to the wallet_provider.
-pub async fn run_adama_processor<P>(infra: Arc<AdamaInfrastructure<P>>)
+/// Polymarket International's adapter onto the shared deployment queue.
+///
+/// Intl used to drain the queue with `run_adama_processor`, a second consumer
+/// written before `venues::deployment` existed. Keeping two consumers meant
+/// every fix landed twice or not at all, and intl quietly missed three that
+/// Kalshi and Polymarket US had: it never requeued deployments interrupted by a
+/// restart, so an operator lost every deployed squadron each time the Control
+/// Tower restarted the engine for a config change; it never seeded the
+/// auto-deploy classes, so politics and sports came up empty on intl while the
+/// other venues populated them; and it had no cancellation path at all.
+pub struct IntlDeploymentRunner<P> {
+    pub infra: Arc<AdamaInfrastructure<P>>,
+}
+
+#[async_trait::async_trait]
+impl<P> crate::venues::deployment::DeploymentRunner for IntlDeploymentRunner<P>
 where
     P: Provider + Clone + Send + Sync + 'static,
 {
-    use tokio::time::{interval, Duration};
-    use tracing::error;
-    
-    let mut ticker = interval(Duration::from_secs(5));
-    info!("📋 Admiral Adama processor started (real patrol infrastructure)");
-    
-    loop {
-        ticker.tick().await;
-        
-        // Fetch pending deployments (returns Vec directly)
-        let pending = crate::helpers::db::fetch_pending_deployments().await;
-        
-        if pending.is_empty() {
-            continue;
-        }
-        
-        info!("📋 Admiral Adama: {} pending deployment(s) found", pending.len());
-        
-        for dep in pending {
-            let crate::helpers::db::PendingDeployment {
-                id: deployment_id, market_id, market_type, raptors, vipers, viper_budgets, name,
-            } = dep;
-            // Mark as processing
-            if let Err(e) = crate::helpers::db::update_deployment_status(
-                &deployment_id, "processing", None, None
-            ).await {
-                warn!("Failed to update deployment status: {}", e);
-                continue;
-            }
-            
-            info!(
-                deployment_id = %deployment_id,
-                market_id = %market_id,
-                market_type = %market_type,
-                raptors = ?raptors,
-                vipers = ?vipers,
-                "🛫 Admiral Adama: processing deployment"
-            );
-            
-            // Fetch full market details from Gamma API
-            let market_info = match fetch_market_info(&infra.shared_http, &market_id).await {
-                Some(info) => info,
-                None => {
-                    warn!("Failed to fetch market details for {}", market_id);
-                    if let Err(e) = crate::helpers::db::update_deployment_status(
-                        &deployment_id, "failed", None, Some("Failed to fetch market details")
-                    ).await {
-                        warn!("Failed to update deployment status: {}", e);
-                    }
-                    continue;
-                }
-            };
-            
-            // Spawn a real trading squadron
-            let requested_squadron_id = format!("{}-sq", deployment_id);
-            match infra.spawn_squadron(
-                requested_squadron_id.clone(),
-                &market_id,
-                &market_type,
-                &market_info.question,
-                &name,
-                &market_info.yes_token,
-                &market_info.no_token,
-                &raptors,
-                &vipers,
-                &viper_budgets,
-            ).await {
-                // The squadron derives its own id; `squadron_id` above was only
-                // ever a guess made before construction. Everything downstream —
-                // the CAG registry and the deployment row — uses the real one.
-                Ok((squadron_id, handle)) => {
-                    // Register in CAG with the JoinHandle
-                    infra.cag.register_adama_squadron(
-                        &squadron_id,
-                        &market_id,
-                        &market_type,
-                        &market_info.question,
-                        &raptors,
-                        &vipers,
-                        handle,
-                    );
-                    
-                    // Mark as deployed in the queue
-                    if let Err(e) = crate::helpers::db::update_deployment_status(
-                        &deployment_id, "deployed", Some(&squadron_id), None
-                    ).await {
-                        warn!("Failed to mark deployment as deployed: {}", e);
-                    }
-                    
-                    info!(
-                        deployment_id = %deployment_id,
-                        squadron_id = %squadron_id,
-                        market_question = %market_info.question,
-                        "✅ Admiral Adama: {} squadron DEPLOYED and PATROLLING",
-                        market_type.to_uppercase()
-                    );
-                }
-                Err(e) => {
-                    error!(
-                        deployment_id = %deployment_id,
-                        error = %e,
-                        "❌ Admiral Adama: failed to spawn squadron"
-                    );
-                    if let Err(e) = crate::helpers::db::update_deployment_status(
-                        &deployment_id, "failed", None, Some(&format!("Spawn failed: {}", e))
-                    ).await {
-                        warn!("Failed to update deployment status: {}", e);
-                    }
-                }
-            }
+    fn venue_label(&self) -> &'static str { "Polymarket International" }
+
+    async fn run_pinned(
+        &self,
+        dep: &crate::helpers::db::PendingDeployment,
+        cancel: CancellationToken,
+    ) -> anyhow::Result<()> {
+        let info = fetch_market_info(&self.infra.shared_http, &dep.market_id).await
+            .ok_or_else(|| anyhow::anyhow!("could not load market details for {}", dep.market_id))?;
+
+        let (squadron_id, handle) = self.infra.spawn_squadron(
+            dep.id.clone(),
+            &dep.market_id,
+            &dep.market_type,
+            &info.question,
+            &dep.name,
+            &info.yes_token,
+            &info.no_token,
+            &dep.raptors,
+            &dep.vipers,
+            &dep.viper_budgets,
+            cancel.clone(),
+        ).await.map_err(|e| anyhow::anyhow!("{e}"))?;
+
+        // Registered with the SAME token the patrol task selects on, so a
+        // stand-down from the Control Tower actually reaches it.
+        self.infra.cag.register_adama_squadron(
+            &squadron_id,
+            &dep.market_id,
+            &dep.market_type,
+            &info.question,
+            &dep.raptors,
+            &dep.vipers,
+            cancel,
+        );
+
+        // A patrol that ends because its market closed is a success, and so is
+        // one an operator stood down. Only a panic is worth showing as failed.
+        match handle.await {
+            Ok(()) => Ok(()),
+            Err(e) if e.is_cancelled() => Ok(()),
+            Err(e) => Err(anyhow::anyhow!("squadron {squadron_id} patrol panicked: {e}")),
         }
     }
+
+    async fn select_market(&self, class: &str, max_days_to_close: u32) -> Option<String> {
+        // The same discovery the Control Tower's deploy browser uses, so a
+        // seeded squadron lands on the market an operator would have picked.
+        let horizon = max_days_to_close as i64 * 86_400;
+        let found = crate::api::server::fetch_markets_by_type(
+            &self.infra.shared_http, class, horizon, 0.0,
+        ).await;
+        found.into_iter()
+            .max_by(|a, b| a.liquidity.total_cmp(&b.liquidity))
+            .map(|m| m.condition_id)
+    }
 }
-
-
 
 #[cfg(test)]
 mod budget_coverage_tests {

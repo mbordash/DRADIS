@@ -336,6 +336,13 @@ impl Cag {
     ///
     /// The `handle` parameter is the JoinHandle from the spawned patrol task,
     /// allowing the CAG to track/cancel the squadron.
+    ///
+    /// `cancel_token` MUST be the token the patrol task actually selects on.
+    /// This used to fabricate one with `CancellationToken::new()` — the same
+    /// defect `register_with_cancel` above was written to fix — so `stand_down`
+    /// cancelled a token nothing observed, logged that the signal was sent,
+    /// returned true, and the squadron carried on trading. Operator-deployed
+    /// intl squadrons were unkillable, and every surface reported otherwise.
     pub fn register_adama_squadron(
         &self,
         squadron_id: &str,
@@ -344,9 +351,8 @@ impl Cag {
         market_question: &str,
         raptors: &[String],
         vipers: &[String],
-        handle: tokio::task::JoinHandle<()>,
+        cancel_token: CancellationToken,
     ) -> SquadronId {
-        let cancel_token = CancellationToken::new();
 
         let summary = SquadronSummary {
             id:                squadron_id.to_string(),
@@ -365,7 +371,9 @@ impl Cag {
         self.inner.registry.insert(squadron_id.to_string(), CagEntry {
             summary,
             cancel_token,
-            _handle: Some(handle),
+            // The deployment processor awaits the patrol task itself, so it
+            // keeps the JoinHandle; this field has never been read.
+            _handle: None,
         });
 
         info!(
@@ -498,5 +506,40 @@ pub struct SquadronBuilder {
 impl SquadronBuilder {
     pub fn new(asset: CryptoAsset, config: SquadronConfig) -> Self {
         Self { asset, config }
+    }
+}
+
+#[cfg(test)]
+mod adama_registration_tests {
+    use super::*;
+
+    /// The registry's token must BE the token the patrol task selects on.
+    ///
+    /// `register_adama_squadron` used to call `CancellationToken::new()` and
+    /// store that instead, while `spawn_squadron` minted a second one for the
+    /// patrol task and dropped its own handle to it. Nothing could reach the
+    /// running squadron: `stand_down` cancelled an orphan, logged that the
+    /// signal was sent, and returned `true`, so the Control Tower reported a
+    /// successful stand-down while the squadron kept trading. This is the same
+    /// defect `register_with_cancel` was written to fix on the `register` path,
+    /// which is why the assertion is on the caller's token rather than on any
+    /// return value.
+    #[test]
+    fn stand_down_cancels_the_token_the_patrol_task_holds() {
+        let cag = Cag::new();
+        let cancel = CancellationToken::new();
+
+        cag.register_adama_squadron(
+            "politics-open", "0xmarket", "politics", "Who wins?",
+            &["price".to_string()], &["maker".to_string()],
+            cancel.clone(),
+        );
+
+        assert!(!cancel.is_cancelled(), "registration must not pre-cancel the squadron");
+        assert!(cag.stand_down(&"politics-open".to_string()), "squadron should be registered");
+        assert!(
+            cancel.is_cancelled(),
+            "stand-down fired a token the patrol task does not hold — the squadron would keep trading",
+        );
     }
 }
