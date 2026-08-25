@@ -83,7 +83,14 @@ use crate::cag::Cag;
 /// A market whose order-book feed has stopped arriving.
 #[derive(Debug, Clone, Serialize)]
 pub struct DarkFeed {
+    /// The asset whose feed is dark ("btc").
     pub market: String,
+    /// The specific market it was following, when known.
+    ///
+    /// Without this the banner could only say "btc", which reads as a broken
+    /// connection even when every other market on that asset is trading fine.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub market_name: String,
     pub dark_for_secs: u64,
 }
 
@@ -976,7 +983,7 @@ async fn get_status(State(s): State<ApiState>) -> Response {
     let session_started_at = db::current_session_id().to_string();
     let dark_market_feeds: Vec<DarkFeed> = crate::state::price_state::book_feed::dark_markets()
         .into_iter()
-        .map(|(market, secs)| DarkFeed { market, dark_for_secs: secs })
+        .map(|(market, market_name, secs)| DarkFeed { market, market_name, dark_for_secs: secs })
         .collect();
     debug!("Successfully retrieved status");
     Json(StatusResponse { strategy_markets: markets, session_started_at, raptors, dark_market_feeds }).into_response()

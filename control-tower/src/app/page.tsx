@@ -153,7 +153,7 @@ function StatCard({ label, value, sub, valueClass = '' }: {
 /// and declining quietly looks exactly like a quiet market. An operator whose
 /// connection drops would otherwise see a healthy engine that has silently
 /// stopped being able to trade.
-function DarkFeedBanner({ feeds }: { feeds?: { market: string; dark_for_secs: number }[] }) {
+function DarkFeedBanner({ feeds }: { feeds?: { market: string; market_name?: string; dark_for_secs: number }[] }) {
   if (!feeds || feeds.length === 0) return null;
   return (
     <div className="card px-4 py-3 border border-red-500/30 bg-red-500/10">
@@ -165,13 +165,17 @@ function DarkFeedBanner({ feeds }: { feeds?: { market: string; dark_for_secs: nu
           </p>
           <p className="text-[11px] text-gray-400 mt-1 leading-relaxed">
             The engine is still running and your positions are untouched, but with no order book
-            it cannot evaluate entries or exits. Usually a connection problem or a venue
-            restriction — check network access to the venue.
+            it cannot evaluate entries or exits. If other markets are still trading, this market
+            simply has no book — a freshly rotated or untraded market often does. If every market
+            is listed here, check network access to the venue.
           </p>
           <ul className="mt-2 space-y-0.5">
             {feeds.map(f => (
               <li key={f.market} className="text-[11px] font-mono text-red-400/90 truncate">
-                {f.market} — no book for {Math.floor(f.dark_for_secs / 60)}m {f.dark_for_secs % 60}s
+                {/* Name the market, not just the asset: "btc" alone reads as a broken
+                    connection even when every other btc market is trading fine. */}
+                {f.market_name ? `${f.market} — "${f.market_name}"` : f.market}
+                {' '}— no book for {Math.floor(f.dark_for_secs / 60)}m {f.dark_for_secs % 60}s
               </li>
             ))}
           </ul>

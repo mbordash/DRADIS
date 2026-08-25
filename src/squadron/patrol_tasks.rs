@@ -373,6 +373,11 @@ pub fn spawn_status_task(
     oracle_rx:       watch::Receiver<Decimal>,
     process_heartbeat_secs: Arc<AtomicU64>,
     asset:  String,
+    // Live market channel, so a dark report names the market the squadron is on
+    // RIGHT NOW rather than whichever one it started with. Read as a temporary
+    // on each tick — never bound across an await, which is what deadlocked the
+    // patrol loop against this same family of watch channels.
+    market_rx: watch::Receiver<crate::tasks::market_monitor::MarketState>,
     cancel: CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -398,8 +403,12 @@ pub fn spawn_status_task(
                     // Compute OBI for heartbeat visibility so thresholds can be tuned empirically.
                     // Book-feed health. This venue heartbeats here rather than
                     // through log_heartbeat, so the check belongs here too.
-                    crate::state::price_state::book_feed::note(
+                    // Named so a dark report says WHICH market lost its book:
+                    // an hourly rotation onto a zero-volume market looks identical
+                    // to a venue outage when only the asset is reported.
+                    crate::state::price_state::book_feed::note_market(
                         &asset,
+                        &market_rx.borrow().2.clone(),
                         ya < dec!(1) || na < dec!(1) || yb > dec!(0) || nb > dec!(0),
                     );
                     let yes_obi = if ybd + yad > dec!(0) { (ybd - yad) / (ybd + yad) } else { dec!(0) };

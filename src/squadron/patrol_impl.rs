@@ -385,6 +385,7 @@ impl Squadron {
             oracle_rx.clone(),
             Arc::clone(&process_heartbeat_secs),
             asset_lc.clone(),
+            ctx.market_rx.clone(),
             peripheral_cancel.clone(),
         );
 

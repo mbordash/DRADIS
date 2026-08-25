@@ -360,6 +360,15 @@ pub mod price_state {
             pub last_live: Instant,
             /// Whether it is currently reported dark (used to log each edge once).
             pub dark: bool,
+            /// The market this feed is currently following.
+            ///
+            /// The registry is keyed by ASSET so a rotation reuses one entry
+            /// instead of leaving the previous market dark forever. But the asset
+            /// is not what goes dark — one market does, while others on the same
+            /// asset and the same connection keep trading. Reporting only "btc"
+            /// read as a connectivity fault and sent us looking at the network
+            /// when an hourly rotation had simply landed on a market with no book.
+            pub market: String,
         }
 
         fn registry() -> &'static Mutex<HashMap<String, FeedState>> {
@@ -368,36 +377,62 @@ pub mod price_state {
         }
 
         /// Record whether `label` currently has a book, logging either edge once.
-        pub fn note(label: &str, has_book: bool) {
+        ///
+        /// `label` is the asset; `market` names the market it is following, so a
+        /// dark report can say WHICH market lost its book.
+        pub fn note_market(label: &str, market: &str, has_book: bool) {
             let Ok(mut reg) = registry().lock() else { return };
             let now = Instant::now();
-            let entry = reg.entry(label.to_string()).or_insert(FeedState { last_live: now, dark: false });
+            let entry = reg.entry(label.to_string()).or_insert(FeedState {
+                last_live: now, dark: false, market: market.to_string(),
+            });
+            // A rotation onto a different market restarts the clock: the new
+            // market has not been dark, whatever the previous one was doing.
+            if !market.is_empty() && entry.market != market {
+                entry.market = market.to_string();
+                entry.last_live = now;
+                entry.dark = false;
+            }
             if has_book {
                 entry.last_live = now;
                 if entry.dark {
                     entry.dark = false;
-                    info!("📡 Market data recovered for {label} — book is live again");
+                    info!("📡 Market data recovered for {label} — book is live again");  // market name in the dark line above
                 }
                 return;
             }
             if !entry.dark && now.duration_since(entry.last_live) >= DARK_AFTER {
                 entry.dark = true;
+                let which = if entry.market.is_empty() {
+                    label.to_string()
+                } else {
+                    format!("{label} — \"{}\"", entry.market)
+                };
                 warn!(
-                    "📡 MARKET DATA DARK: no order book for {label} in {}s. The engine keeps \
+                    "📡 MARKET DATA DARK: no order book for {which} in {}s. The engine keeps \
                      running and every gate correctly declines to trade an empty book, so nothing \
-                     else will report this — check venue connectivity.",
+                     else will report this. Other markets on this asset may be trading normally — \
+                     if they are, this market has no book rather than the venue being unreachable.",
                     DARK_AFTER.as_secs(),
                 );
             }
         }
 
+        /// Back-compat shim for callers with no market name to hand.
+        pub fn note(label: &str, has_book: bool) {
+            note_market(label, "", has_book);
+        }
+
         /// Markets currently reported dark, with how long they have been so.
-        pub fn dark_markets() -> Vec<(String, u64)> {
+        ///
+        /// Returns `(asset, market, secs)` — the market is what an operator needs
+        /// in order to tell a dead market from a dead connection.
+        pub fn dark_markets() -> Vec<(String, String, u64)> {
             let Ok(reg) = registry().lock() else { return Vec::new() };
             let now = Instant::now();
             reg.iter()
                 .filter(|(_, s)| s.dark)
-                .map(|(k, s)| (k.clone(), now.duration_since(s.last_live).as_secs()))
+                .map(|(k, s)| (k.clone(), s.market.clone(), now.duration_since(s.last_live).as_secs()))
                 .collect()
         }
 
@@ -1172,11 +1207,30 @@ mod book_feed_tests {
         let label = "test-live-feed";
         book_feed::forget(label);
         book_feed::note(label, true);
-        assert!(!book_feed::dark_markets().iter().any(|(m, _)| m == label));
+        assert!(!book_feed::dark_markets().iter().any(|(m, _, _)| m == label));
 
         // Newly quiet, but well inside the window.
         book_feed::note(label, false);
-        assert!(!book_feed::dark_markets().iter().any(|(m, _)| m == label));
+        assert!(!book_feed::dark_markets().iter().any(|(m, _, _)| m == label));
+        book_feed::forget(label);
+    }
+
+    /// Rotating onto a different market restarts the clock.
+    ///
+    /// The registry is keyed by ASSET so a rotation reuses one entry rather than
+    /// leaving the old market dark forever — but the new market has not been
+    /// dark, whatever the previous one was doing, so its timer must reset.
+    #[test]
+    fn rotating_to_a_new_market_resets_the_dark_clock() {
+        let label = "test-rotating-feed";
+        book_feed::forget(label);
+        book_feed::note_market(label, "Bitcoin Up or Down - 5PM ET", true);
+        // A rotation onto a market with no book yet must not inherit any state.
+        book_feed::note_market(label, "Bitcoin above 76,600 - 7PM ET?", false);
+        assert!(
+            !book_feed::dark_markets().iter().any(|(m, _, _)| m == label),
+            "a freshly rotated market must start its own dark window",
+        );
         book_feed::forget(label);
     }
 
@@ -1187,6 +1241,6 @@ mod book_feed_tests {
         let label = "test-forgotten-feed";
         book_feed::note(label, true);
         book_feed::forget(label);
-        assert!(!book_feed::dark_markets().iter().any(|(m, _)| m == label));
+        assert!(!book_feed::dark_markets().iter().any(|(m, _, _)| m == label));
     }
 }

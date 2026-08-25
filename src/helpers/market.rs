@@ -318,7 +318,28 @@ pub async fn get_market_pair(http: &reqwest::Client, asset_filter: &str) -> (Mar
     // fall back to the full sorted list so the bot doesn't sit idle.
     let vol_floor = config::MIN_HOURLY_MARKET_VOL24H;
     let high_vol_hourly: Vec<_> = hourly_c.iter().filter(|c| c.3 >= vol_floor).cloned().collect();
-    let hourly_final = if !high_vol_hourly.is_empty() { &high_vol_hourly } else { &hourly_c };
+
+    // The fallback keeps its own floor: a market with NO volume at all is only
+    // acceptable if it is a high-priority "Up or Down" market (field .4).
+    //
+    // Those legitimately start at vol24h=0 — they are published fresh each hour
+    // and quoted immediately — which is why the soft floor above exists. A
+    // *strike* market at zero is a different animal: nobody has traded it and
+    // nobody is quoting it, so it has no order book to receive. On 2026-08-25
+    // the fallback landed on "Bitcoin above 76,600 on August 25, 7PM ET?"
+    // (vol24h=0) one rotation after a market doing 26k, and the feed went dark
+    // for twenty minutes with every strategy pointed at an empty book. Falling
+    // back exists so the bot does not sit idle; a market that cannot be traded
+    // buys nothing over sitting idle, and costs a false connectivity alarm.
+    let tradeable_fallback: Vec<_> =
+        hourly_c.iter().filter(|c| c.3 > 0.0 || c.4).cloned().collect();
+    let hourly_final = if !high_vol_hourly.is_empty() {
+        &high_vol_hourly
+    } else if !tradeable_fallback.is_empty() {
+        &tradeable_fallback
+    } else {
+        &hourly_c
+    };
 
     let hourly = hourly_final.first()
         .map(|b| MarketCandidate { yes_token: market_id_from_u256(b.0[0]), no_token: market_id_from_u256(b.0[1]), name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone(), strike_price: None })
@@ -498,4 +519,41 @@ pub async fn fetch_resolved_outcome_prices(
         out.insert(tid, price);
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod hourly_fallback_tests {
+    /// The fallback predicate from `pick_markets`: a candidate is tradeable if it
+    /// has any 24h volume, or is a high-priority "Up or Down" market.
+    fn tradeable(vol24h: f64, high_priority: bool) -> bool {
+        vol24h > 0.0 || high_priority
+    }
+
+    /// A freshly published "Up or Down" market is quoted immediately even though
+    /// its 24h volume is still zero — that is the case the soft floor's fallback
+    /// exists for, and it must keep working.
+    #[test]
+    fn a_fresh_up_or_down_market_is_still_selectable_at_zero_volume() {
+        assert!(tradeable(0.0, true));
+    }
+
+    /// A strike market at zero volume is a different animal: nobody has traded
+    /// it and nobody is quoting it, so it has no order book to receive.
+    ///
+    /// On 2026-08-25 the fallback rotated from a market doing 26k onto
+    /// "Bitcoin above 76,600 on August 25, 7PM ET?" at vol24h=0. The feed went
+    /// dark for twenty minutes with every strategy pointed at an empty book, and
+    /// it read as a venue outage. Falling back exists so the bot does not sit
+    /// idle — but an untradeable market buys nothing over sitting idle.
+    #[test]
+    fn a_zero_volume_strike_market_is_rejected() {
+        assert!(!tradeable(0.0, false));
+    }
+
+    /// Low volume is still acceptable in the fallback: the soft floor above
+    /// prefers liquid markets, and this tier only excludes the untradeable.
+    #[test]
+    fn a_thin_but_traded_strike_market_is_still_acceptable() {
+        assert!(tradeable(15.0, false));
+    }
 }
