@@ -974,6 +974,7 @@ async fn run() -> Result<()> {
             eoa_address,
             shared_http:    Arc::clone(&shared_http),
             wallet_provider: wallet_provider.clone(),
+            primary_asset:  primary_asset.clone(),
             cag:            cag.clone(),
             default_session: session.clone(),
             markets_tx:     Arc::clone(&markets_tx),

@@ -66,6 +66,12 @@ pub struct AdamaInfrastructure<P> {
     pub wallet_provider: P,
 
     // ── CAG and session ──────────────────────────────────────────────────────
+    /// The shard every deployed squadron files its rows under.
+    ///
+    /// The intl CLOB shards by underlying, so this is the primary asset ("btc").
+    /// A deployed politics or sports squadron has no shard of its own and must
+    /// be aliased onto this one — see `spawn_squadron`.
+    pub primary_asset: String,
     pub cag: Cag,
     pub default_session: SessionState,
     pub markets_tx: Arc<watch::Sender<HashMap<String, String>>>,
@@ -108,6 +114,8 @@ where
         _raptors: &[String],
         _vipers: &[String],
         viper_budgets: &HashMap<String, f64>,
+        // Gamma's end date for this market, or None when it has none.
+        market_close_time: Option<chrono::DateTime<chrono::Utc>>,
         // The token the patrol task selects on. Supplied by the caller rather
         // than minted here: a token created inside this function and dropped at
         // its end is one nothing can ever fire, which is exactly how deployed
@@ -130,7 +138,10 @@ where
             yes_token: yes_market_id.clone(),
             no_token: no_market_id.clone(),
             market_name: market_question.to_string(),
-            market_close_time: None, // Event markets resolve at event end
+            // Safe to populate now: the squadron's identity no longer depends on
+            // this field (the cadence component is a constant), so a close time
+            // cannot make the same squadron register under two ids.
+            market_close_time,
             strike_price: None,
             is_neg_risk: false,
             condition_id: market_id.to_string(),
@@ -145,6 +156,18 @@ where
         // field and compared case-sensitively in places, so `POLITICS` here read
         // differently from the `politics` Kalshi and Polymarket US produce.
         let asset = CryptoAsset::Custom(market_type.to_lowercase());
+
+        // Route this squadron's rows to the venue shard.
+        //
+        // `pool_for()` returns None on a miss rather than falling back, so
+        // without this every write from a deployed squadron was dropped: over a
+        // three-hour soak the intl database held 1,599 trades, all Bitcoin, and
+        // not one row from the politics or sports squadrons that had been
+        // patrolling the whole time. Worse than the missing rows, orphan
+        // detection bailed out with "No database pool available" on every sweep,
+        // so the safety net that flattens a one-sided arbitrage leg was not
+        // running for them. Kalshi and Polymarket US already alias this way.
+        crate::helpers::db::alias_pool(&market_type.to_lowercase(), &self.primary_asset);
         let squadron_config = SquadronConfig::full_wing(
             if squadron_name.is_empty() {
                 format!("{} Squadron — {}", market_type.to_uppercase(), &market_question[..market_question.len().min(40)])
@@ -201,7 +224,11 @@ where
             yes_market_id.clone(),
             no_market_id.clone(),
             market_question.to_string(),
-            None, // no close time
+            // The vipers read the close time from THIS channel, not from the
+            // MarketConfig above — patrol_impl rebuilds its context MarketConfig
+            // from the market channel each tick. Setting only one of the two
+            // would leave the gates exactly where they were.
+            market_close_time,
             None, // no strike
             String::new(),
             None, // no maker
@@ -300,6 +327,16 @@ pub struct MarketInfo {
     pub question: String,
     pub yes_token: String,
     pub no_token: String,
+    /// When the market resolves, from Gamma's `endDate`.
+    ///
+    /// Event markets DO have an end date — a tennis match finishes, an election
+    /// is called — and Gamma returns it right beside the tokens. This struct
+    /// used to drop it, so every deployed squadron flew with
+    /// `market_close_time: None` and the vipers that need one gated themselves
+    /// off permanently: over a single soak the Maker refused 276 times with
+    /// `no market_close_time` and TimeDecay 45 times with `market has no close
+    /// time`. The squadrons patrolled, quoted nothing, and looked healthy.
+    pub close_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Fetch full market details from Gamma API by condition id.
@@ -384,7 +421,17 @@ pub async fn fetch_market_info(http: &reqwest::Client, condition_id: &str) -> Op
         return None;
     };
 
-    Some(MarketInfo { question, yes_token, no_token })
+    // Absent or unparseable is not fatal: the squadron still trades, and the
+    // close-time-dependent vipers gate off exactly as they did before.
+    let close_time = market.get("endDate")
+        .and_then(|d| d.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&chrono::Utc));
+    if close_time.is_none() {
+        warn!(%condition_id, "Gamma market has no usable endDate — close-time vipers will stay gated");
+    }
+
+    Some(MarketInfo { question, yes_token, no_token, close_time })
 }
 
 /// Run the Admiral Adama deployment processor.
@@ -431,6 +478,7 @@ where
             &dep.raptors,
             &dep.vipers,
             &dep.viper_budgets,
+            info.close_time,
             cancel.clone(),
         ).await.map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -549,3 +597,52 @@ mod gamma_shape_tests {
     }
 }
 
+
+#[cfg(test)]
+mod deployed_squadron_wiring_tests {
+    use super::*;
+
+    /// Gamma returns the market's end date as `endDate`, beside the tokens.
+    ///
+    /// Dropping it left every deployed squadron with `market_close_time: None`,
+    /// which permanently gated the vipers that need one — 276 Maker refusals
+    /// and 45 TimeDecay refusals in a single soak, from squadrons that looked
+    /// healthy because they were patrolling and quoting nothing.
+    #[test]
+    fn an_end_date_is_parsed_from_the_gamma_payload() {
+        let market = serde_json::json!({ "endDate": "2026-10-04T00:00:00Z" });
+        let parsed = market.get("endDate")
+            .and_then(|d| d.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+            .map(|d| d.with_timezone(&chrono::Utc));
+        assert!(parsed.is_some(), "Gamma's endDate format must parse");
+        assert_eq!(parsed.unwrap().to_rfc3339(), "2026-10-04T00:00:00+00:00");
+    }
+
+    /// A market with no end date must still deploy — the close-time vipers gate
+    /// off exactly as before, which is a limitation, not a failure.
+    #[test]
+    fn a_missing_end_date_is_not_fatal() {
+        let market = serde_json::json!({ "question": "Who wins?" });
+        let parsed = market.get("endDate")
+            .and_then(|d| d.as_str())
+            .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok());
+        assert!(parsed.is_none());
+    }
+
+    /// A deployed squadron's asset must resolve to a pool via the alias.
+    ///
+    /// `pool_for` returns None on a miss rather than falling back, so without
+    /// the alias every row a deployed squadron wrote was silently dropped and
+    /// orphan detection skipped it entirely.
+    #[test]
+    fn a_deployed_class_resolves_to_the_venue_shard() {
+        crate::helpers::db::alias_pool("adamatest-politics", "adamatest-primary");
+        // The alias must not appear as an asset of its own — the selector lists
+        // one entry per real database.
+        assert!(
+            !crate::helpers::db::available_assets().contains(&"adamatest-politics".to_string()),
+            "an alias must not surface as a separate asset",
+        );
+    }
+}
