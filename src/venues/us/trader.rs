@@ -2076,7 +2076,17 @@ async fn sync_dashboard(
     let _ = db::purge_stale_open_positions(pool, &live_ids, &std::collections::HashMap::new()).await;
 
     let total = collateral + positions_value;
-    db::record_pnl_snapshot(pool, total - starting, collateral, total).await;
+    // Same reasoning as the trade loop's session P&L: portfolio value never
+    // moves in ghost mode, so recording `total - starting` wrote 0.00 into every
+    // snapshot beside a trades table that was steadily losing money. The chart,
+    // the P&L history and the figure handed to the LLM advisor all read this
+    // row, so the whole dashboard reported a flat session throughout.
+    let session_pnl_recorded = if crate::helpers::dynamic_config::ghosting_now() {
+        crate::helpers::metrics::realised_session_pnl()
+    } else {
+        total - starting
+    };
+    db::record_pnl_snapshot(pool, session_pnl_recorded, collateral, total).await;
     (collateral, total)
 }
 
