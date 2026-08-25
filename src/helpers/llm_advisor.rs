@@ -1000,6 +1000,8 @@ pub async fn run_llm_advisor_loop(
     starting_collateral: Option<Arc<Mutex<rust_decimal::Decimal>>>,
     mut config_rx: tokio::sync::watch::Receiver<Arc<DynamicConfig>>,
     config_tx: Arc<tokio::sync::watch::Sender<Arc<DynamicConfig>>>,
+    // The live registry, used to advise only on squadrons that actually exist.
+    cag: crate::cag::Cag,
 ) {
     // Resolve the enable flag: the ENABLE_LLM_ADVISOR env var (if set) overrides
     // the compile-time default. This lets a single binary run the advisor on the
@@ -1280,7 +1282,35 @@ pub async fn run_llm_advisor_loop(
         // Portfolio context (trades, P&L, open positions) stays fleet-wide — that
         // is genuinely global. The CONFIG half of the prompt, and every apply,
         // is now the squadron's own.
-        let squadrons = db::list_squadron_configs(&primary_pool).await;
+        // `squadron_configs` is a record of every squadron that has EVER run —
+        // rows persist so an operator's tuning survives restarts and rotations.
+        // Advising from it directly meant advising on squadrons that no longer
+        // exist: on 2026-08-24 the intl advisor spent a cycle on `btc-open`, a
+        // row left from an earlier era, and produced four recommendations the
+        // operator could approve and did. They were written to a config that
+        // nothing reads, while every surface reported them applied.
+        //
+        // Intersect with the live registry so a recommendation can always reach
+        // the squadron it is about.
+        let live: std::collections::HashSet<String> = cag
+            .list_squadrons()
+            .into_iter()
+            .filter(|sq| sq.state != "STOOD_DOWN")
+            .map(|sq| sq.id)
+            .collect();
+        let all_configured = db::list_squadron_configs(&primary_pool).await;
+        let skipped: Vec<&str> = all_configured.iter()
+            .filter(|(id, _)| !live.contains(id))
+            .map(|(id, _)| id.as_str())
+            .collect();
+        if !skipped.is_empty() {
+            debug!("🤖 LLM Advisor: skipping {} squadron(s) with config but no live squadron: {}",
+                   skipped.len(), skipped.join(", "));
+        }
+        let squadrons: Vec<(String, String)> = all_configured
+            .into_iter()
+            .filter(|(id, _)| live.contains(id))
+            .collect();
         if squadrons.is_empty() {
             info!("🤖 LLM Advisor: no squadrons configured yet — nothing to advise on this cycle");
             continue;

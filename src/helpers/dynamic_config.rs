@@ -1189,6 +1189,29 @@ impl DynamicConfig {
         patch_json: &str,
         actor: &str,
     ) -> Result<Arc<Self>> {
+        // Serialised across all squadrons for the whole read-merge-write.
+        //
+        // This is a read-modify-write on a whole config document, and without a
+        // lock two concurrent patches on one squadron lose an update: both read
+        // the same starting config, both merge their own field, and the second
+        // write carries the first's field at its ORIGINAL value. The change is
+        // reported as applied by the API, recorded as applied in `llm_actions`,
+        // and is simply not there.
+        //
+        // Observed 2026-08-24: an operator approved four LLM recommendations on
+        // btc-hourly within two seconds; three landed and
+        // `time_decay_max_entry_price -> 0.5` silently did not, while every
+        // surface said it had. The advisor's own auto-apply path was never
+        // exposed to this — it builds one combined patch and applies it once —
+        // so only hand-approval could trigger it, which is the path an operator
+        // uses to test recommendations.
+        //
+        // One global lock rather than one per squadron: patches are rare
+        // (operator clicks, an hourly advisory) and cheap, so there is nothing
+        // to gain from finer granularity and a map of locks to get wrong.
+        static PATCH_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+        let _guard = PATCH_LOCK.lock().await;
+
         let current = Self::load_for_squadron(squadron_id).await;
         let mut value = serde_json::to_value(current.as_ref())?;
         let patch: serde_json::Value = serde_json::from_str(patch_json)?;

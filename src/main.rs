@@ -466,6 +466,7 @@ async fn run() -> Result<()> {
     {
         let advisor_cfg_rx = config_rx.clone();
         let advisor_cfg_tx = Arc::clone(&config_tx);
+        let advisor_cag = cag.clone();
         tokio::spawn(async move {
             // Give the venue a moment to initialise its shard and write a first
             // dashboard snapshot; the loop skips cycles until one exists anyway.
@@ -477,6 +478,7 @@ async fn run() -> Result<()> {
                 None,
                 advisor_cfg_rx,
                 advisor_cfg_tx,
+                advisor_cag,
             ).await;
         });
     }
