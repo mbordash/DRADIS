@@ -204,7 +204,17 @@ where
             None, // no maker
             market_id.to_string(),
         );
-        let (_market_tx, market_rx) = watch::channel(dummy_market_state);
+        // The sender MUST outlive the patrol task, even though nothing ever
+        // sends on it. Event markets do not rotate, so this channel exists only
+        // to satisfy PatrolContext — but the patrol loop selects on
+        // `market_rx.changed()`, and a watch channel whose sender has been
+        // dropped resolves `changed()` immediately and forever. Binding this to
+        // `_market_tx` dropped it at the end of this function, so that arm was
+        // permanently ready and starved the strategy-evaluation arm beside it:
+        // politics and sports squadrons never evaluated a single strategy, never
+        // pulsed the inner-loop heartbeat, and were killed by the stall watchdog
+        // exactly 240s after deploy — then redeployed, and killed again.
+        let (market_tx_keepalive, market_rx) = watch::channel(dummy_market_state);
 
         // Build PatrolContext — same as run_market_loop does
         let mut patrol_ctx = PatrolContext {
@@ -243,6 +253,9 @@ where
 
         // Spawn the REAL patrol task
         let handle = tokio::spawn(async move {
+            // Moved in purely to hold the market channel open for as long as the
+            // patrol runs; see the comment where it is created.
+            let _market_tx_keepalive = market_tx_keepalive;
             info!(squadron_id = %squadron.id, "🛫 Admiral Adama squadron patrol started (REAL infrastructure)");
             squadron.patrol(cancel_clone, &mut patrol_ctx).await;
             info!(squadron_id = %squadron.id, "🛬 Admiral Adama squadron patrol ended");
@@ -488,6 +501,41 @@ where
         found.into_iter()
             .max_by(|a, b| a.liquidity.total_cmp(&b.liquidity))
             .map(|m| m.condition_id)
+    }
+}
+
+#[cfg(test)]
+mod market_channel_tests {
+    use tokio::sync::watch;
+
+    /// A watch channel whose sender has been dropped reports "changed" forever.
+    ///
+    /// The patrol loop selects on `market_rx.changed()` for market rotation
+    /// beside the strategy-evaluation tick. Adama builds a dummy channel because
+    /// event markets do not rotate, and it used to drop the sender immediately —
+    /// making that arm permanently ready, starving strategy evaluation, and
+    /// leaving the inner-loop heartbeat unpulsed until the stall watchdog killed
+    /// the squadron 240s after every deploy. This pins the tokio behaviour the
+    /// fix depends on.
+    #[tokio::test]
+    async fn a_dropped_sender_makes_changed_resolve_immediately() {
+        let (tx, mut rx) = watch::channel(0u8);
+        drop(tx);
+
+        // Resolves at once, and keeps resolving — this is the starvation.
+        for _ in 0..3 {
+            let r = tokio::time::timeout(std::time::Duration::from_millis(50), rx.changed()).await;
+            assert!(r.is_ok(), "changed() must resolve immediately on a closed channel");
+            assert!(r.unwrap().is_err(), "and it resolves as an error, which `_ =` discards");
+        }
+    }
+
+    /// Holding the sender keeps the arm pending, so the tick arm can run.
+    #[tokio::test]
+    async fn a_live_sender_leaves_changed_pending() {
+        let (_tx, mut rx) = watch::channel(0u8);
+        let r = tokio::time::timeout(std::time::Duration::from_millis(50), rx.changed()).await;
+        assert!(r.is_err(), "changed() must stay pending while the sender is alive");
     }
 }
 
