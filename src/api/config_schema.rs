@@ -556,6 +556,13 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              this off to decide for yourself when capital goes to work on the class; a squadron \
              already trading is left alone and runs to its market's close.")
             );
+        v.push(F::new(g, e, "llm_max_output_tokens", "AI Reply Budget", "secs", true,
+            "Token ceiling for one AI Advisor reply. It covers the whole response — the written \
+             analysis and the structured recommendations the engine parses — and the \
+             recommendations come last, so a budget that is too small does not shorten them, it \
+             removes them: you get readable analysis and nothing to approve. If the advisor keeps \
+             reporting analysis with no recommendations, raise this.")
+            .range(500.0, 8000.0).step(100.0).unit("tok"));
         v.push(F::new(g, e, "auto_deploy_sports", "Auto-Deploy Sports", "bool", false,
             "Keep a sports squadron running without waiting for you to deploy one — see Auto-Deploy \
              Politics for how the selection and replacement work. This does not need an Odds API \

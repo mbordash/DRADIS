@@ -85,6 +85,30 @@ const LLM_ADVISOR_PRIOR_SESSION_SUPPLEMENT: i64 = 5;
 /// against conditions that no longer exist. One advisory interval is the ceiling.
 const LLM_PROPOSAL_TTL_SECS: i64 = 1800;
 
+
+/// The newest `pnl_snapshots` row across every registered shard.
+///
+/// A venue may spread its snapshots over several shards (Polymarket US writes
+/// one per wing) and may also carry a vestigial shard that nothing writes. Asking
+/// the primary shard alone therefore answers "no data" on a venue that is busily
+/// recording it. Comparing timestamps across all of them is the only reading that
+/// survives both arrangements.
+async fn newest_pnl_snapshot_across_shards() -> Option<db::PnlSnapshotRow> {
+    let mut newest: Option<db::PnlSnapshotRow> = None;
+    for asset in db::available_assets() {
+        let Some(pool) = db::pool_for(&asset) else { continue };
+        let Some(row) = db::get_pnl_history(&pool, 1).await.into_iter().next() else { continue };
+        let replace = match &newest {
+            None => true,
+            Some(best) => row.ts > best.ts,
+        };
+        if replace {
+            newest = Some(row);
+        }
+    }
+    newest
+}
+
 /// Autonomy tier stamped on proposals (1 = human approval, 2 = limited
 /// auto-apply, 3 = autonomous). Env placeholder until the Setup-view control
 /// ships (Epic S5); the policy engine (S3) is the sole enforcement point.
@@ -830,7 +854,7 @@ fn build_user_prompt(
 
 /// Output token cap shared by all providers (Ollama `num_predict`,
 /// OpenAI/Anthropic `max_tokens`) — sized for the ≤250-word structured report.
-const LLM_MAX_OUTPUT_TOKENS: u32 = 900;
+use crate::config::LLM_MAX_OUTPUT_TOKENS;
 /// Low temperature: consistent, factual recommendations.
 const LLM_TEMPERATURE: f32 = 0.3;
 
@@ -1191,8 +1215,23 @@ pub async fn run_llm_advisor_loop(
         let (current_pnl, collateral) = match (&session_pnl, &starting_collateral) {
             (Some(p), Some(c)) => (*p.lock().await, *c.lock().await),
             _ => {
-                let latest = db::get_pnl_history(&primary_pool, 1).await;
-                match latest.first() {
+                // Freshest snapshot across EVERY registered shard, not the
+                // primary one.
+                //
+                // `db::pool()` returns whichever shard registered first, and on
+                // Polymarket US that is `us` — a vestigial shard left behind
+                // when the wings were renamed to us-sports / us-politics /
+                // us-crypto. Nothing has written to it since 2026-08-23, so the
+                // advisor found no snapshot and skipped EVERY cycle: that venue
+                // produced no recommendation at all, and the tier-3 autonomy an
+                // operator had switched on could never fire. It looked like a
+                // quiet advisor rather than a broken one.
+                //
+                // The P&L history endpoint already hit this and already picks
+                // the freshest pool for the same reason; this is that fix,
+                // applied where it was missed.
+                let latest = newest_pnl_snapshot_across_shards().await;
+                match latest.as_ref() {
                     Some(row) => (
                         row.session_pnl.parse().unwrap_or(rust_decimal::Decimal::ZERO),
                         row.collateral.parse().unwrap_or(rust_decimal::Decimal::ZERO),

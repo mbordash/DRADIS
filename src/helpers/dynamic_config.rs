@@ -216,6 +216,7 @@ fn default_sports_odds_regions()            -> String  { config::SPORTS_ODDS_REG
 fn default_tennis_tour()                    -> String  { config::TENNIS_TOUR.to_string()               }
 
 fn default_deploy_max_days_to_close()       -> u32     { config::DEPLOY_MAX_DAYS_TO_CLOSE             }
+fn default_llm_max_output_tokens()          -> u32     { config::LLM_MAX_OUTPUT_TOKENS                }
 fn default_auto_deploy_politics()           -> bool    { config::AUTO_DEPLOY_POLITICS                 }
 fn default_auto_deploy_sports()             -> bool    { config::AUTO_DEPLOY_SPORTS                   }
 fn default_obi_use_whole_book()             -> bool    { config::OBI_USE_WHOLE_BOOK                   }
@@ -451,6 +452,9 @@ pub struct DynamicConfig {
     /// Keep a sports squadron running without waiting for an operator deploy.
     #[serde(default = "default_auto_deploy_sports")]
     pub auto_deploy_sports:            bool,
+    /// Token ceiling for one LLM Advisor reply — prose plus proposal block.
+    #[serde(default = "default_llm_max_output_tokens")]
+    pub llm_max_output_tokens:         u32,
     /// Read whole-book depth rather than the touch in the OBI entry gates.
     /// Does not affect the GBoost feature vector — see the constant's note.
     #[serde(default = "default_obi_use_whole_book")]
@@ -835,6 +839,7 @@ impl Default for DynamicConfig {
             deploy_max_days_to_close:      config::DEPLOY_MAX_DAYS_TO_CLOSE,
             auto_deploy_politics:          config::AUTO_DEPLOY_POLITICS,
             auto_deploy_sports:            config::AUTO_DEPLOY_SPORTS,
+            llm_max_output_tokens:         config::LLM_MAX_OUTPUT_TOKENS,
             obi_use_whole_book:            config::OBI_USE_WHOLE_BOOK,
             maker_min_spread:              config::MAKER_MIN_SPREAD,
             maker_bid_buffer:              config::MAKER_BID_BUFFER,

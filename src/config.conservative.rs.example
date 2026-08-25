@@ -1252,6 +1252,20 @@ pub const LLM_INFERENCE_TIMEOUT_SECS: u64 = 480;
 /// waiting longer accumulates more meaningful samples before each analysis.
 pub const LLM_ADVISOR_INTERVAL_SECS: u64 = 2700;
 
+/// Maximum tokens the LLM Advisor may spend on one reply.
+///
+/// Covers the whole response: the prose analysis AND the structured proposal
+/// block the policy engine parses. The block comes last, so a cap that is too
+/// low does not truncate the recommendations — it removes them entirely, and
+/// the advisor reports "no proposal block in response" while looking otherwise
+/// healthy. Measured 2026-08-24 at 900 tokens: three consecutive Kalshi cycles
+/// produced readable analysis and not one actionable change.
+///
+/// Purely operational, so it is the same across profiles: an aggressive
+/// operator does not want a differently-sized reply, they want the same reply
+/// acted on differently.
+pub const LLM_MAX_OUTPUT_TOKENS: u32 = 2500;
+
 /// Number of most-recent completed trades to include in each LLM analysis.
 /// Conservative: 15 trades — smaller sessions mean fewer available samples.
 pub const LLM_ADVISOR_TRADES_LOOKBACK: i64 = 15;
