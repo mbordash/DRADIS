@@ -116,3 +116,8 @@ tools/sonar_addresses.json
 tools/sonar_backtest.py
 tools/check-config-drift.sh
 tools/check-profile-ladder.py
+
+# Runtime PID files written by start-local.sh / supervise-dradis.sh.
+# These were tracked by mistake and churned on every soak restart; they are
+# per-machine process ids with no meaning in the repository.
+*.pid
