@@ -65,8 +65,19 @@ COPY src ./src
 # never touches Setup, or who picks Conservative, is never running something
 # racier than they asked for.
 RUN cp src/config.conservative.rs.example src/config.rs
+# Each venue is built once and copied twice: the unstripped binary is kept for
+# symbols, the stripped one ships.
+#
+# `[profile.release] debug = 1` puts line tables in the binary so the OS
+# watchdog's thread dump can name source lines. `strip` removes exactly that,
+# and stripping is still right for the runtime image — debug info would land in
+# every customer's AMI to no purpose. So the symbols are copied aside first and
+# exported by the `debuginfo` stage below, which deploy/ami/provision.sh
+# extracts and build-ami.sh retrieves with the release. Without it a deadlock on
+# a customer's box produces stacks that cannot be symbolized, which is the one
+# place such a dump matters most.
 RUN set -eux; \
-    mkdir -p /out/bin; \
+    mkdir -p /out/bin /out/debug; \
     for v in $DRADIS_VENUES; do \
         case "$v" in \
             intl)   flags="" ;; \
@@ -77,10 +88,17 @@ RUN set -eux; \
         echo "── building venue: $v ──"; \
         touch src/main.rs; \
         cargo build --release --target x86_64-unknown-linux-musl $flags; \
+        cp target/x86_64-unknown-linux-musl/release/dradis "/out/debug/dradis-$v.debug"; \
         strip target/x86_64-unknown-linux-musl/release/dradis; \
         cp target/x86_64-unknown-linux-musl/release/dradis "/out/bin/dradis-$v"; \
     done; \
     rm -rf target /usr/local/cargo/registry /usr/local/cargo/git
+
+# Symbols for the binaries above, in a stage of their own so they never reach
+# the runtime image. Extracted with `docker create` + `docker cp` against
+# `--target debuginfo`; see deploy/ami/provision.sh.
+FROM scratch AS debuginfo
+COPY --from=builder /out/debug /
 
 FROM alpine:latest
 RUN apk --no-cache add ca-certificates tzdata

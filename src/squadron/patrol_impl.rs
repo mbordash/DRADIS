@@ -756,6 +756,40 @@ impl Squadron {
                         m.retain(|_, (_, touched)| touched.elapsed() < cutoff);
                     }
 
+                    // Read every raptor channel EXACTLY ONCE, before the
+                    // StrategyContext literal below.
+                    //
+                    // Rust keeps a temporary alive until the end of the enclosing
+                    // STATEMENT, so a `*rx.borrow()` written inside that literal
+                    // holds its read guard until the whole `let ctx = ...;`
+                    // completes — not just for its own field. The literal used to
+                    // borrow the same channels repeatedly (oracle twice, velocity
+                    // three times, drift three times, horizon four), which meant
+                    // holding a read guard and then asking for another on the same
+                    // lock.
+                    //
+                    // parking_lot's RwLock — which is what `tokio::sync::watch`
+                    // uses — is writer-fair: once a writer queues, further SHARED
+                    // acquisitions block behind it. So when the price raptor's
+                    // `oracle_tx.send()` landed between two of those borrows, the
+                    // second borrow blocked behind the writer, the writer waited
+                    // for the first guard to drop, and that guard could only drop
+                    // when the statement finished. A textbook recursive-read
+                    // deadlock, with the patrol task as both holder and waiter.
+                    //
+                    // It froze the intl venue twice on 2026-08-25, each time
+                    // reported by the OS watchdog as a silent SIGNAL_EVAL and
+                    // killed at 300s. Reading once into a local also means one
+                    // lock acquisition per channel per tick instead of three or
+                    // four.
+                    let oracle_now = *oracle_rx.borrow();
+                    let (velocity_now, velocity_1s_now, acceleration_now) = *velocity_rx.borrow();
+                    let (drift_60m_now, drift_10m_now, hist_vol_now) = *drift_rx.borrow();
+                    let funding_now = *funding_rx.borrow();
+                    let tide_now = tide_rx.as_ref().map(|r| *r.borrow());
+                    let horizon_now = horizon_rx.as_ref().map(|r| *r.borrow());
+                    let deriv_now = deriv_rx.as_ref().map(|r| *r.borrow());
+
                     let ctx = StrategyContext {
                         squadron_id: squadron_id.clone(),
                         market: hourly_market_config_for_ctx.clone(),
@@ -764,22 +798,22 @@ impl Squadron {
                             no_bid: hourly_nb, no_bid_depth: hourly_nbd, no_ask: hourly_na, no_ask_depth: hourly_nad,
                             yes_bid_depth_total: hourly_ybd_all, yes_ask_depth_total: hourly_yad_all,
                             no_bid_depth_total: hourly_nbd_all, no_ask_depth_total: hourly_nad_all,
-                            oracle_price: *oracle_rx.borrow(),
-                            velocity: velocity_rx.borrow().0,
-                            velocity_1s: velocity_rx.borrow().1,
-                            acceleration: velocity_rx.borrow().2,
-                            funding_rate: *funding_rx.borrow(),
-                            institutional_pulse: tide_rx.as_ref().map(|r| r.borrow().institutional_pulse).unwrap_or(Decimal::ZERO),
-                            tide_coherence: tide_rx.as_ref().map(|r| r.borrow().coherence).unwrap_or(Decimal::ZERO),
-                            tradfi_velocity: horizon_rx.as_ref().map(|r| r.borrow().tradfi_velocity).unwrap_or(Decimal::ZERO),
-                            macro_coherence: horizon_rx.as_ref().map(|r| r.borrow().macro_coherence).unwrap_or(Decimal::ZERO),
-                            vix_proxy: horizon_rx.as_ref().map(|r| r.borrow().vix_proxy).unwrap_or(Decimal::ZERO),
-                            vix_velocity: horizon_rx.as_ref().map(|r| r.borrow().vix_velocity).unwrap_or(Decimal::ZERO),
-                            oi_delta_pct: deriv_rx.as_ref().map(|r| r.borrow().oi_delta_pct).unwrap_or(Decimal::ZERO),
-                            cvd_ratio: deriv_rx.as_ref().map(|r| r.borrow().cvd_ratio).unwrap_or(Decimal::ZERO),
-                            oracle_drift_60m: drift_rx.borrow().0,
-                            oracle_drift_10m: drift_rx.borrow().1,
-                            hist_vol: drift_rx.borrow().2,
+                            oracle_price: oracle_now,
+                            velocity: velocity_now,
+                            velocity_1s: velocity_1s_now,
+                            acceleration: acceleration_now,
+                            funding_rate: funding_now,
+                            institutional_pulse: tide_now.map(|s| s.institutional_pulse).unwrap_or(Decimal::ZERO),
+                            tide_coherence: tide_now.map(|s| s.coherence).unwrap_or(Decimal::ZERO),
+                            tradfi_velocity: horizon_now.map(|s| s.tradfi_velocity).unwrap_or(Decimal::ZERO),
+                            macro_coherence: horizon_now.map(|s| s.macro_coherence).unwrap_or(Decimal::ZERO),
+                            vix_proxy: horizon_now.map(|s| s.vix_proxy).unwrap_or(Decimal::ZERO),
+                            vix_velocity: horizon_now.map(|s| s.vix_velocity).unwrap_or(Decimal::ZERO),
+                            oi_delta_pct: deriv_now.map(|s| s.oi_delta_pct).unwrap_or(Decimal::ZERO),
+                            cvd_ratio: deriv_now.map(|s| s.cvd_ratio).unwrap_or(Decimal::ZERO),
+                            oracle_drift_60m: drift_60m_now,
+                            oracle_drift_10m: drift_10m_now,
+                            hist_vol: hist_vol_now,
                             secs_to_expiry: hourly_market_close_time
                                 .map(|t| (t - Utc::now()).num_seconds())
                                 .unwrap_or(0),
@@ -797,17 +831,17 @@ impl Squadron {
                             no_bid: maker_nb, no_bid_depth: maker_nbd, no_ask: maker_na, no_ask_depth: maker_nad,
                             yes_bid_depth_total: maker_ybd_all, yes_ask_depth_total: maker_yad_all,
                             no_bid_depth_total: maker_nbd_all, no_ask_depth_total: maker_nad_all,
-                            oracle_price: *oracle_rx.borrow(), velocity: velocity_rx.borrow().0, velocity_1s: velocity_rx.borrow().1, acceleration: velocity_rx.borrow().2,
-                            funding_rate: *funding_rx.borrow(), oracle_drift_60m: drift_rx.borrow().0, oracle_drift_10m: drift_rx.borrow().1,
-                            hist_vol: drift_rx.borrow().2,
-                            institutional_pulse: tide_rx.as_ref().map(|r| r.borrow().institutional_pulse).unwrap_or(Decimal::ZERO),
-                            tide_coherence: tide_rx.as_ref().map(|r| r.borrow().coherence).unwrap_or(Decimal::ZERO),
-                            tradfi_velocity: horizon_rx.as_ref().map(|r| r.borrow().tradfi_velocity).unwrap_or(Decimal::ZERO),
-                            macro_coherence: horizon_rx.as_ref().map(|r| r.borrow().macro_coherence).unwrap_or(Decimal::ZERO),
-                            vix_proxy: horizon_rx.as_ref().map(|r| r.borrow().vix_proxy).unwrap_or(Decimal::ZERO),
-                            vix_velocity: horizon_rx.as_ref().map(|r| r.borrow().vix_velocity).unwrap_or(Decimal::ZERO),
-                            oi_delta_pct: deriv_rx.as_ref().map(|r| r.borrow().oi_delta_pct).unwrap_or(Decimal::ZERO),
-                            cvd_ratio: deriv_rx.as_ref().map(|r| r.borrow().cvd_ratio).unwrap_or(Decimal::ZERO),
+                            oracle_price: oracle_now, velocity: velocity_now, velocity_1s: velocity_1s_now, acceleration: acceleration_now,
+                            funding_rate: funding_now, oracle_drift_60m: drift_60m_now, oracle_drift_10m: drift_10m_now,
+                            hist_vol: hist_vol_now,
+                            institutional_pulse: tide_now.map(|s| s.institutional_pulse).unwrap_or(Decimal::ZERO),
+                            tide_coherence: tide_now.map(|s| s.coherence).unwrap_or(Decimal::ZERO),
+                            tradfi_velocity: horizon_now.map(|s| s.tradfi_velocity).unwrap_or(Decimal::ZERO),
+                            macro_coherence: horizon_now.map(|s| s.macro_coherence).unwrap_or(Decimal::ZERO),
+                            vix_proxy: horizon_now.map(|s| s.vix_proxy).unwrap_or(Decimal::ZERO),
+                            vix_velocity: horizon_now.map(|s| s.vix_velocity).unwrap_or(Decimal::ZERO),
+                            oi_delta_pct: deriv_now.map(|s| s.oi_delta_pct).unwrap_or(Decimal::ZERO),
+                            cvd_ratio: deriv_now.map(|s| s.cvd_ratio).unwrap_or(Decimal::ZERO),
                             secs_to_expiry: mk.market_close_time
                                 .map(|t| (t - Utc::now()).num_seconds())
                                 .unwrap_or(0),
@@ -2456,5 +2490,61 @@ mod trade_accounting_tests {
         assert!(combine(false, true),  "operator turned it on — must simulate");
         assert!(combine(true, false),  "ghost build — must simulate regardless");
         assert!(combine(true, true));
+    }
+}
+
+#[cfg(test)]
+mod context_borrow_tests {
+    /// No `borrow()` may appear inside the `StrategyContext` literal.
+    ///
+    /// Rust keeps a temporary alive until the end of the enclosing STATEMENT, so
+    /// a `rx.borrow()` written as a field value holds its read guard until the
+    /// whole `let ctx = StrategyContext { .. };` completes. The literal once
+    /// borrowed the same channels several times over — oracle twice, velocity
+    /// three times, drift three times, horizon four — which is a thread taking a
+    /// second read lock while still holding the first.
+    ///
+    /// `tokio::sync::watch` is built on a writer-fair parking_lot RwLock, so a
+    /// writer that queues between two of those borrows blocks the second one,
+    /// while itself waiting on the first guard that can only drop once the
+    /// statement finishes. That deadlocked the intl venue twice on 2026-08-25
+    /// (price raptor writing the oracle channel; patrol and the tide raptor
+    /// queued behind it) and the OS watchdog killed the process both times.
+    ///
+    /// Nothing at the call site hints at this — the code reads like a plain
+    /// field initializer — so the invariant is asserted against the source.
+    #[test]
+    fn the_strategy_context_literal_holds_no_borrow_guards() {
+        let src = include_str!("patrol_impl.rs");
+        let start = src.find("let ctx = StrategyContext {")
+            .expect("the StrategyContext literal must exist");
+
+        // Walk to the matching close brace so the scan covers exactly the statement.
+        let bytes = src[start..].as_bytes();
+        let (mut depth, mut end) = (0i32, None);
+        for (i, b) in bytes.iter().enumerate() {
+            match b {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 { end = Some(i); break; }
+                }
+                _ => {}
+            }
+        }
+        let literal = &src[start..start + end.expect("literal must be balanced")];
+
+        let offenders: Vec<&str> = literal
+            .lines()
+            .filter(|l| l.contains(".borrow()"))
+            .map(str::trim)
+            .collect();
+
+        assert!(
+            offenders.is_empty(),
+            "read guards inside the StrategyContext literal stay alive for the whole \
+             statement and deadlock against a queued writer — hoist these into locals \
+             above it: {offenders:#?}",
+        );
     }
 }

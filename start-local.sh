@@ -195,6 +195,22 @@ cp target/release/dradis "$BIN.tmp"
 mv -f "$BIN.tmp" "$BIN"
 echo "   binary → $BIN ($BUILT_VENUE)"
 
+# Pin the debug symbols to THIS binary.
+#
+# `[profile.release] debug = 1` emits target/release/dradis.dSYM, but that path
+# is rebuilt by any later `cargo build`/`cargo test`, while this instance keeps
+# running the binary copied above. The two then describe different code, and
+# symbolizing a stall dump against the drifted .dSYM silently produces plausible
+# but WRONG answers — on 2026-08-25 it named an axum handler as the thread
+# deadlocked in a raptor. Snapshotting the bundle beside the binary keeps them
+# matched for as long as this instance lives.
+if [ -d target/release/dradis.dSYM ]; then
+    rm -rf "$BIN.dSYM.tmp" "$BIN.dSYM"
+    cp -R target/release/dradis.dSYM "$BIN.dSYM.tmp"
+    mv -f "$BIN.dSYM.tmp" "$BIN.dSYM"
+    echo "   symbols → $BIN.dSYM"
+fi
+
 # Supervise the engine, the way the container does.
 #
 # "Restart engine" in the Control Tower works by exiting the process and letting

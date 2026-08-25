@@ -121,3 +121,12 @@ tools/check-profile-ladder.py
 # These were tracked by mistake and churned on every soak restart; they are
 # per-machine process ids with no meaning in the repository.
 *.pid
+
+# Unstripped release binaries retrieved by deploy/ami/build-ami.sh, kept so a
+# customer's thread dump can be symbolized against the build they are running.
+# Hundreds of megabytes per release and reproducible from the tagged source —
+# archive them alongside the AMI, do not commit them.
+deploy/ami/debuginfo/
+
+# Per-instance debug symbol bundles snapshotted by start-local.sh.
+*.dSYM/

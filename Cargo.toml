@@ -56,3 +56,22 @@ perpetual = "3.0.0-rc.2"
 sqlx = { version = "0.8", features = ["sqlite", "runtime-tokio"] }
 axum = "0.8"
 tower-http = { version = "0.6", features = ["cors"] }
+
+[profile.release]
+# Line tables in release builds, so a stall dump names source lines.
+#
+# The OS watchdog dumps thread stacks when the trading loop goes silent, and on
+# 2026-08-25 that caught a real deadlock on a tokio watch channel: the price
+# raptor waiting to write while the tide raptor and a squadron patrol queued
+# behind it as readers. The stacks were there, but the binary carried no
+# symbols, so `atos` returned mangled names with no file or line and the task
+# actually holding the read guard could not be identified.
+#
+# `1` is line tables only — enough to map an address to file:line, without the
+# full variable and type information of `2`. Debug info does not change code
+# generation, so the binary this produces executes exactly as before; it is
+# only larger on disk.
+debug = 1
+# Keep the debug info in a companion .dSYM on macOS rather than inflating the
+# executable. Ignored on Linux, where the AMI build carries it in the binary.
+split-debuginfo = "packed"

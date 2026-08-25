@@ -374,6 +374,29 @@ if [ "$PROV_RC" != 0 ]; then
     exit 1
 fi
 
+# ── 4b. Retrieve debug symbols before the box is scrubbed ────────────────────
+#
+# The shipped binaries are stripped, so a thread dump from a customer's instance
+# carries addresses and no source lines. These are the matching unstripped
+# builds, kept HERE rather than in the AMI: symbolize a customer's dump against
+# the file for the version they are running.
+#
+# Fetched before the hygiene sweep, which deletes the tarball from the builder
+# so it cannot reach the snapshot. A failure is non-fatal — losing symbols is
+# worth an audible warning, not the loss of an otherwise good AMI.
+DEBUG_DIR="deploy/ami/debuginfo"
+DEBUG_OUT="$DEBUG_DIR/dradis-debuginfo-$VERSION.tar.gz"
+echo "Retrieving debug symbols…"
+mkdir -p "$DEBUG_DIR"
+if "${SSH[@]}" "cat /tmp/dradis-debuginfo.tar.gz" > "$DEBUG_OUT" 2>/dev/null \
+   && [ -s "$DEBUG_OUT" ]; then
+    echo "   symbols saved: $DEBUG_OUT ($(du -h "$DEBUG_OUT" | cut -f1))"
+else
+    rm -f "$DEBUG_OUT"
+    echo "   ⚠️  could not retrieve debug symbols — a stall dump from this build"
+    echo "      will not symbolize. The AMI itself is unaffected."
+fi
+
 # ── 5. Marketplace hygiene sweep (last SSH command — it locks us out) ────────
 echo "Scrubbing instance for Marketplace…"
 # Split deliberately: everything here is idempotent, so it can be retried
@@ -385,6 +408,9 @@ set -e
 sudo cloud-init clean --logs
 sudo rm -f /root/.ssh/authorized_keys
 sudo truncate -s 0 /etc/machine-id
+# Also removes /tmp/dradis-debuginfo.tar.gz, which step 4b has already copied
+# back. That deletion is load-bearing now: the symbols must not reach the
+# snapshot a customer receives.
 sudo rm -rf /tmp/* /var/tmp/* || true
 sudo find /var/log -type f -exec truncate -s 0 {} \;
 rm -f ~/.bash_history ~/.lesshst ~/.viminfo

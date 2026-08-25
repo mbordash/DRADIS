@@ -52,6 +52,28 @@ echo "     wall clock of a single-venue image."
 cd "$SRC_DIR"
 docker build -t dradis-engine:latest --build-arg DRADIS_VENUES="$VENUES" .
 docker build -t dradis-control-tower:latest control-tower/
+
+# Export the unstripped binaries for offline symbolization.
+#
+# The engine images ship stripped, so a thread dump from a customer's box has
+# addresses and no source lines. These are the matching unstripped binaries;
+# build-ami.sh copies the tarball back to the operator's machine and the AMI
+# hygiene sweep deletes it, so it never reaches a customer.
+#
+# `--target debuginfo` is a scratch stage holding only the symbols, so this
+# reuses the build cache rather than compiling anything a second time. It is
+# never started — `docker create` alone is enough for `docker cp`.
+echo "── [2b/4] Exporting debug symbols ──────────────────────────────────────"
+docker build -t dradis-debuginfo:latest --target debuginfo \
+    --build-arg DRADIS_VENUES="$VENUES" .
+DEBUG_CID="$(docker create dradis-debuginfo:latest)"
+rm -rf /tmp/dradis-debuginfo && mkdir -p /tmp/dradis-debuginfo
+docker cp "$DEBUG_CID:/." /tmp/dradis-debuginfo/
+docker rm -f "$DEBUG_CID" >/dev/null
+tar czf /tmp/dradis-debuginfo.tar.gz -C /tmp/dradis-debuginfo .
+rm -rf /tmp/dradis-debuginfo
+chmod 0644 /tmp/dradis-debuginfo.tar.gz
+echo "     symbols: $(du -h /tmp/dradis-debuginfo.tar.gz | cut -f1) at /tmp/dradis-debuginfo.tar.gz"
 # Baked in rather than pulled on the customer's first boot: a fresh instance
 # should come up without needing egress to Docker Hub, and without a pull delay
 # on the very first thing a buyer does.
