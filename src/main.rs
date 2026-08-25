@@ -300,6 +300,13 @@ async fn run() -> Result<()> {
                              — last phase={} (in phase {}s, seq={})",
                             silent_secs, SOFT_WARN_SECS, phase, phase_secs, seq
                         );
+                        // Dumped at the SOFT warn as well as the hard kill: here
+                        // the process is still alive and the lock is still held,
+                        // so the holder is visible. By the time the hard limit
+                        // fires the picture may have changed, and if the loop
+                        // recovers on its own there would otherwise be no
+                        // evidence at all.
+                        dradis::helpers::watchdog::dump_thread_states();
                         soft_warned = true;
                     }
                 } else if silent_secs <= SOFT_WARN_SECS {
@@ -313,6 +320,7 @@ async fn run() -> Result<()> {
                          — calling process::exit(1) to trigger Docker restart",
                         silent_secs, PROCESS_WATCHDOG_TIMEOUT_SECS, phase, phase_secs, seq
                     );
+                    dradis::helpers::watchdog::dump_thread_states();
                     std::process::exit(1);
                 }
             }

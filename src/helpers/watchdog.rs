@@ -134,9 +134,33 @@ pub fn signal_detail_for(strategy_name: &str) -> u8 {
     else { 255 }
 }
 
+/// Setup-step detail codes for the `SignalEval` section that runs BEFORE the
+/// executor is reached.
+///
+/// A stall inside a viper renders as `SIGNAL_EVAL/gboost` because the executor
+/// tags the running strategy. A stall in the snapshot-and-context section ahead
+/// of it rendered as a bare `SIGNAL_EVAL`, which told us only that the freeze
+/// was somewhere in 150 lines containing one std `RwLock` read and five tokio
+/// mutex acquisitions. These name the individual step, so the next occurrence
+/// identifies the exact primitive instead of the region.
+pub const STEP_BOOK_SNAPSHOT: u8 = 100;
+pub const STEP_CONFIG_READ: u8 = 101;
+pub const STEP_PNL_LOCK: u8 = 102;
+pub const STEP_COLLATERAL_LOCK: u8 = 103;
+pub const STEP_POSITIONS_LOCK: u8 = 104;
+pub const STEP_QUOTE_EPOCHS_LOCK: u8 = 105;
+pub const STEP_CTX_BUILD: u8 = 106;
+
 /// Human-readable label for a `SignalEval` detail code. Extend as vipers change.
 fn detail_name(d: u8) -> Option<&'static str> {
     match d {
+        STEP_BOOK_SNAPSHOT => Some("setup:book_snapshot"),
+        STEP_CONFIG_READ => Some("setup:config_read"),
+        STEP_PNL_LOCK => Some("setup:pnl_lock"),
+        STEP_COLLATERAL_LOCK => Some("setup:collateral_lock"),
+        STEP_POSITIONS_LOCK => Some("setup:positions_lock"),
+        STEP_QUOTE_EPOCHS_LOCK => Some("setup:quote_epochs_lock"),
+        STEP_CTX_BUILD => Some("setup:ctx_build"),
         0 => Some("momentum"),
         1 => Some("arbitrage"),
         2 => Some("time_decay"),
@@ -163,4 +187,115 @@ pub fn snapshot() -> (String, u64, u64) {
         None => Phase::name(code).to_string(),
     };
     (label, secs, seq)
+}
+
+/// Best-effort dump of what every thread in this process is doing.
+///
+/// Called by the OS watchdog when the trading loop has gone silent. The point is
+/// that the phase breadcrumb names the region, but not who is holding the lock —
+/// on 2026-08-25 the intl venue froze in `SIGNAL_EVAL` for 358s and the process
+/// was killed with no way to tell which primitive was held or by which task.
+///
+/// Everything here is deliberately non-blocking and failure-tolerant: it runs
+/// inside a process that is already wedged, and a diagnostic that can itself
+/// hang would turn a recoverable restart into a hang. Nothing acquires a lock
+/// the trading loop could be holding.
+pub fn dump_thread_states() {
+    eprintln!("── OS WATCHDOG: thread dump ──────────────────────────────────");
+
+    #[cfg(target_os = "linux")]
+    {
+        // /proc is the dependency-free route and is what the AMI actually runs.
+        // `stat` field 3 is the scheduler state (D = uninterruptible sleep, the
+        // signature of a thread blocked in the kernel); `wchan` names the kernel
+        // function it is parked in, which is usually enough to tell a futex wait
+        // from a socket read.
+        match std::fs::read_dir("/proc/self/task") {
+            Ok(entries) => {
+                for e in entries.flatten() {
+                    let tid = e.file_name().to_string_lossy().to_string();
+                    let base = format!("/proc/self/task/{tid}");
+                    let comm = std::fs::read_to_string(format!("{base}/comm"))
+                        .unwrap_or_default().trim().to_string();
+                    let wchan = std::fs::read_to_string(format!("{base}/wchan"))
+                        .unwrap_or_default().trim().to_string();
+                    let state = std::fs::read_to_string(format!("{base}/stat"))
+                        .ok()
+                        .and_then(|s| s.rsplit(')').next().map(|r| r.trim().to_string()))
+                        .and_then(|r| r.split_whitespace().next().map(String::from))
+                        .unwrap_or_default();
+                    eprintln!("  tid={tid:<8} state={state:<2} thread={comm:<20} wchan={wchan}");
+                }
+            }
+            Err(e) => eprintln!("  (could not read /proc/self/task: {e})"),
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        // No /proc. `sample` ships with macOS and gives real per-thread stacks;
+        // it is bounded so it cannot hang the exit path. Local dev only — the
+        // AMI is Linux and takes the branch above.
+        let pid = std::process::id().to_string();
+        match std::process::Command::new("/usr/bin/sample")
+            .args([&pid, "1", "-mayDie"])
+            .stderr(std::process::Stdio::null())
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let text = String::from_utf8_lossy(&out.stdout);
+                // Only the call-graph section is useful; the header is noise.
+                for line in text.lines().take(400) {
+                    eprintln!("  {line}");
+                }
+            }
+            Ok(_) | Err(_) => eprintln!("  (`sample` unavailable — no per-thread stacks on this host)"),
+        }
+    }
+
+    eprintln!("── end thread dump ───────────────────────────────────────────");
+}
+
+#[cfg(test)]
+mod stall_label_tests {
+    use super::*;
+
+    /// A stall in the setup section must name the step, not just the region.
+    ///
+    /// The intl freeze on 2026-08-25 reported a bare `SIGNAL_EVAL`, which
+    /// covered ~150 lines holding one std `RwLock` read and five tokio mutex
+    /// acquisitions — enough to know the loop was wedged, not enough to know on
+    /// what. These codes make the next one self-identifying.
+    #[test]
+    fn setup_steps_render_a_distinct_label() {
+        for (code, want) in [
+            (STEP_BOOK_SNAPSHOT, "SIGNAL_EVAL/setup:book_snapshot"),
+            (STEP_CONFIG_READ, "SIGNAL_EVAL/setup:config_read"),
+            (STEP_PNL_LOCK, "SIGNAL_EVAL/setup:pnl_lock"),
+            (STEP_COLLATERAL_LOCK, "SIGNAL_EVAL/setup:collateral_lock"),
+            (STEP_POSITIONS_LOCK, "SIGNAL_EVAL/setup:positions_lock"),
+            (STEP_QUOTE_EPOCHS_LOCK, "SIGNAL_EVAL/setup:quote_epochs_lock"),
+        ] {
+            enter_eval(code);
+            let (label, _, _) = snapshot();
+            assert_eq!(label, want);
+        }
+    }
+
+    /// Setup codes must not collide with the viper codes the executor sets, or a
+    /// stall inside a strategy would be reported as a setup step.
+    #[test]
+    fn setup_codes_do_not_collide_with_viper_codes() {
+        for name in ["MomentumStrategy", "GboostStrategy", "MakerStrategy", "ConvergenceStrategy"] {
+            let viper = signal_detail_for(name);
+            assert!(viper < STEP_BOOK_SNAPSHOT, "{name} code {viper} overlaps the setup range");
+        }
+    }
+
+    /// The dump must be safe to call from the watchdog thread of a wedged
+    /// process — it must never panic, whatever the platform provides.
+    #[test]
+    fn thread_dump_does_not_panic() {
+        dump_thread_states();
+    }
 }

@@ -671,6 +671,7 @@ impl Squadron {
                     // before it reaches the executor still shows SIGNAL_EVAL.
                     crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::SignalEval);
 
+                    crate::helpers::watchdog::set_detail(crate::helpers::watchdog::STEP_BOOK_SNAPSHOT);
                     // Get hourly market snapshot
                     let (hourly_yb, hourly_ybd, hourly_ya, hourly_yad, hourly_yes_ws_ts, hourly_ybd_all, hourly_yad_all) = *yes_price_rx.borrow();
                     let (hourly_nb, hourly_nbd, hourly_na, hourly_nad, hourly_no_ws_ts, hourly_nbd_all, hourly_nad_all) = *no_price_rx.borrow();
@@ -691,6 +692,7 @@ impl Squadron {
 
                     let maker_market_config_for_ctx = maker_market_config.clone();
 
+                    crate::helpers::watchdog::set_detail(crate::helpers::watchdog::STEP_CONFIG_READ);
                     let dyn_cfg = Arc::new(dynamic_config.read().unwrap().clone());
                     // Snapshot the resting-exit knobs before `dyn_cfg` is moved
                     // into the StrategyContext below.
@@ -721,7 +723,9 @@ impl Squadron {
                     // snapshot fields are NOT alive at any .await point.
                     // Without this the future is non-Send and tokio::spawn rejects
                     // it (Phase 3f-6: concurrent multi-asset spawning).
+                    crate::helpers::watchdog::set_detail(crate::helpers::watchdog::STEP_PNL_LOCK);
                     let ctx_session_pnl          = *total_pnl.lock().await;
+                    crate::helpers::watchdog::set_detail(crate::helpers::watchdog::STEP_COLLATERAL_LOCK);
                     let ctx_starting_collateral  = *starting_collateral_store.lock().await;
                     let ctx_available_collateral = *live_collateral.lock().await;
 
@@ -734,6 +738,7 @@ impl Squadron {
                     // otherwise be baselined against its own post-buy collateral.
                     // Positions that vanish are dropped so the map cannot grow.
                     {
+                        crate::helpers::watchdog::set_detail(crate::helpers::watchdog::STEP_POSITIONS_LOCK);
                         let map = positions.lock().await;
                         for k in map.keys() {
                             pre_entry_collateral.entry(k.clone()).or_insert(ctx_available_collateral);
@@ -746,6 +751,7 @@ impl Squadron {
                     {
                         let cutoff = Duration::from_secs(
                             crate::helpers::balance::MAX_WAIT_SECS_WINDOW as u64 * 2);
+                        crate::helpers::watchdog::set_detail(crate::helpers::watchdog::STEP_QUOTE_EPOCHS_LOCK);
                         let mut m = quote_epochs.lock().await;
                         m.retain(|_, (_, touched)| touched.elapsed() < cutoff);
                     }

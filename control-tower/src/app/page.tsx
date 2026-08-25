@@ -804,12 +804,13 @@ export default function DashboardPage() {
         )}
 
         {/* ── CAG-level stats ───────────────────────────────────────────── */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-          <StatCard
-            label="Active Assets"
-            value={String(availableAssets.length || 1)}
-            sub="multi-asset ops"
-          />
+        {/* Three cards, not four: an "Active Assets" card used to sit here
+            showing `availableAssets.length`, which is the number of open SQLite
+            shards. On Polymarket International those shards are BTC/ETH/SOL so
+            it read as assets, but on Polymarket US and Kalshi they are market
+            wings plus the venue's own default shard — so it reported 4 for a
+            venue with three wings and no multi-asset ops at all. */}
+        <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <StatCard
             label="Active Squadrons"
             value={String(squadrons?.filter(s => s.state === 'PATROLLING' || s.state === 'DEPLOYED').length ?? 0)}
