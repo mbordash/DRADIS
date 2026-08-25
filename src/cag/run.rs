@@ -297,7 +297,11 @@ where
             hourly_condition_id,
         ) = patrol_ctx.market_rx.borrow().clone();
 
-        let (hourly_yes_token, hourly_no_token, hourly_market_name, hourly_market_close_time,
+        // `_hourly_market_close_time` is rebound here but no longer read in this
+        // scope: its only consumer was the squadron's identity MarketConfig, and
+        // identity must not depend on the market's close time. The patrol loop
+        // gets the real value from its own market channel.
+        let (hourly_yes_token, hourly_no_token, hourly_market_name, _hourly_market_close_time,
              hourly_strike_price, _hourly_desc, hourly_condition_id,
              hourly_is_neg_risk, hourly_yes_fee_rate, hourly_no_fee_rate)
             = if hourly_yes_token != market_id_from_u256(U256::ZERO)
@@ -355,7 +359,22 @@ where
             yes_token:         hourly_yes_token.clone(),
             no_token:          hourly_no_token.clone(),
             market_name:       hourly_market_name.clone(),
-            market_close_time: hourly_market_close_time,
+            // None deliberately, matching Kalshi and the US wings.
+            //
+            // The squadron id is `{asset}-{cadence}` and cadence is decided by
+            // whether THIS field is set — so passing the real close time made the
+            // id flip between `btc-hourly` and `btc-open` depending on which
+            // market the loop happened to pick up. That id is the persistence key
+            // for operator config and part of every PositionKey, so the same
+            // logical squadron accumulated two config rows: on 2026-08-24 the
+            // advisor proposed against `btc-open` while `btc-hourly` was the one
+            // running, and four operator approvals were written to a config
+            // nothing read.
+            //
+            // Only identity is affected. The vipers read close time from
+            // `hourly_market_config_for_ctx`, assembled separately below with the
+            // real value.
+            market_close_time: None,
             strike_price:      hourly_strike_price,
             is_neg_risk:       hourly_is_neg_risk,
             condition_id:      hourly_condition_id.clone(),

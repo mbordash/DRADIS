@@ -316,7 +316,24 @@ impl Squadron {
         // operator edits (e.g. a disabled viper re-enabling itself on restart).
         // `deployed_at` is retained as its own field for sorting/display, so we
         // lose no information by keeping the id stable across deployments.
-        let cadence = if market.market_close_time.is_some() { "hourly" } else { "open" };
+        // Constant, not derived from the market.
+        //
+        // This used to read `if market.market_close_time.is_some() { "hourly" }
+        // else { "open" }`, which made the squadron's IDENTITY depend on a
+        // property of whichever market it happened to pick up. The intl rotation
+        // loop passed a real close time and so produced `btc-hourly` on one
+        // market and `btc-open` on the next — the same logical squadron under two
+        // ids, and since the id is the persistence key for operator config and
+        // part of every PositionKey, two config rows. On 2026-08-24 the advisor
+        // proposed against the one that was not running and four operator
+        // approvals were written to a config nothing read.
+        //
+        // Every call site now passes None, so every id already ends in `-open`
+        // and nothing anywhere reads `-hourly`. Keeping the suffix rather than
+        // dropping it holds existing ids byte-identical, so no operator's saved
+        // config is orphaned; making it constant means a future caller cannot
+        // reintroduce the flip by passing a close time.
+        let cadence = "open";
         // A named squadron takes `{asset}-{cadence}-{name}`, so a second one of
         // the same class no longer collides with the first. Unnamed squadrons
         // keep exactly the id they had, which matters: that id is the key their
@@ -577,6 +594,71 @@ fn spawn_ws_task(
             }
         }
     });
+}
+
+#[cfg(test)]
+mod squadron_identity_tests {
+    use super::{CryptoAsset, Squadron, SquadronConfig, SquadronRaptors};
+    use crate::state::MarketConfig;
+    use crate::venues::core::MarketId;
+    use chrono::Utc;
+
+    fn market(close: Option<chrono::DateTime<Utc>>) -> MarketConfig {
+        MarketConfig {
+            yes_token: MarketId::new("y"), no_token: MarketId::new("n"),
+            market_name: "Test market".to_string(),
+            market_close_time: close,
+            strike_price: None, is_neg_risk: false,
+            condition_id: String::new(), yes_fee_bps: 0, no_fee_bps: 0,
+        }
+    }
+
+    fn build(asset: CryptoAsset, close: Option<chrono::DateTime<Utc>>, name: Option<&str>) -> String {
+        Squadron::new_named(
+            asset, SquadronConfig::arb_wing("t".to_string()), market(close),
+            SquadronRaptors::empty(), None, name,
+        ).id
+    }
+
+    /// A close time must not change the squadron's identity.
+    ///
+    /// The cadence in `{asset}-{cadence}` was decided by whether the market
+    /// carried a close time, so the intl rotation loop produced `btc-hourly` on
+    /// one market and `btc-open` on the next. Squadron id is the persistence key
+    /// for operator config and part of every PositionKey, so the same logical
+    /// squadron accumulated two config rows — and on 2026-08-24 the advisor
+    /// proposed against the one that was not running, with four operator
+    /// approvals written to a config nothing read.
+    #[test]
+    fn identity_does_not_depend_on_the_market_close_time() {
+        let with_close = build(CryptoAsset::Btc, Some(Utc::now()), None);
+        let without    = build(CryptoAsset::Btc, None, None);
+        assert_eq!(
+            with_close, without,
+            "a close time changed the squadron id: {with_close} vs {without}",
+        );
+    }
+
+    /// A named squadron takes its own identity, so a second squadron of a class
+    /// is distinguishable from the first.
+    #[test]
+    fn a_name_produces_a_distinct_identity() {
+        let unnamed = build(CryptoAsset::Btc, None, None);
+        let named   = build(CryptoAsset::Btc, None, Some("Scottie Scalper"));
+        assert_ne!(unnamed, named);
+        assert!(named.starts_with(&unnamed), "a named id should extend the unnamed one: {named}");
+        assert!(named.ends_with("scottie-scalper"), "{named}");
+    }
+
+    /// Custom assets — the classes a deployed squadron uses — slug the same way
+    /// whatever case the venue supplied, so `POLITICS` and `politics` cannot
+    /// produce two identities for one class.
+    #[test]
+    fn custom_asset_identity_is_case_insensitive() {
+        let upper = build(CryptoAsset::Custom("POLITICS".to_string()), None, None);
+        let lower = build(CryptoAsset::Custom("politics".to_string()), None, None);
+        assert_eq!(upper, lower, "{upper} vs {lower}");
+    }
 }
 
 #[cfg(test)]

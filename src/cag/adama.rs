@@ -92,7 +92,9 @@ where
     /// Event markets don't rotate, so we use a dummy market_rx that never fires.
     pub async fn spawn_squadron(
         &self,
-        squadron_id: String,
+        // Retained for log context only — the squadron derives its own id, and
+        // this parameter no longer decides it.
+        requested_squadron_id: String,
         market_id: &str,
         market_type: &str,
         market_question: &str,
@@ -103,9 +105,9 @@ where
         _raptors: &[String],
         _vipers: &[String],
         viper_budgets: &HashMap<String, f64>,
-    ) -> Result<tokio::task::JoinHandle<()>, String> {
+    ) -> Result<(String, tokio::task::JoinHandle<()>), String> {
         info!(
-            squadron_id = %squadron_id,
+            requested_squadron_id = %requested_squadron_id,
             market_id = %market_id,
             market_type = %market_type,
             "🚀 Admiral Adama: spawning squadron (using real patrol infrastructure)"
@@ -129,7 +131,12 @@ where
         };
 
         // Create Squadron
-        let asset = CryptoAsset::Custom(market_type.to_uppercase());
+        //
+        // Lowercase, matching every other venue: `CryptoAsset::slug()` lowercases
+        // for the id, but the asset is also reported as the squadron's `asset`
+        // field and compared case-sensitively in places, so `POLITICS` here read
+        // differently from the `politics` Kalshi and Polymarket US produce.
+        let asset = CryptoAsset::Custom(market_type.to_lowercase());
         let squadron_config = SquadronConfig::full_wing(
             if squadron_name.is_empty() {
                 format!("{} Squadron — {}", market_type.to_uppercase(), &market_question[..market_question.len().min(40)])
@@ -139,8 +146,24 @@ where
         );
         let squadron_raptors = self.build_raptors_for_type(market_type);
 
-        let mut squadron = Squadron::new(asset, squadron_config, market_config, squadron_raptors);
-        squadron.id = squadron_id.clone();
+        // Identity derived the same way as every other venue —
+        // `{asset}-{cadence}-{slug}` — rather than assigned from the deployment
+        // row. It used to be overwritten with `{deployment_id}-sq`, e.g.
+        // `deploy-politics-1787588190-sq`, which threw away the operator's name
+        // and produced an identity nothing else in the system could predict.
+        // Squadron id is the persistence key for operator config and part of
+        // every PositionKey, so an opaque id meant a named intl deploy could not
+        // be told apart from an unnamed one and its config lived under a key no
+        // other venue's conventions would find.
+        let name = if squadron_name.is_empty() { None } else { Some(squadron_name) };
+        let mut squadron = Squadron::new_named(
+            asset, squadron_config, market_config, squadron_raptors, None, name,
+        );
+        // The derived id stands. It used to be overwritten with the caller's
+        // `{deployment_id}-sq`, which is what made an intl squadron's identity
+        // unpredictable; the caller now records what the squadron actually
+        // registered under instead of assuming it.
+        let squadron_id = squadron.id.clone();
         squadron.start_patrol();
 
         // Subscribe to orderbook WS feeds
@@ -221,7 +244,10 @@ where
             info!(squadron_id = %squadron.id, "🛬 Admiral Adama squadron patrol ended");
         });
 
-        Ok(handle)
+        // The derived id goes back to the caller so the deployment row records
+        // what the squadron actually registered under, rather than the id the
+        // caller guessed before construction.
+        Ok((squadron_id, handle))
     }
 
     fn build_raptors_for_type(&self, market_type: &str) -> SquadronRaptors {
@@ -388,9 +414,9 @@ where
             };
             
             // Spawn a real trading squadron
-            let squadron_id = format!("{}-sq", deployment_id);
+            let requested_squadron_id = format!("{}-sq", deployment_id);
             match infra.spawn_squadron(
-                squadron_id.clone(),
+                requested_squadron_id.clone(),
                 &market_id,
                 &market_type,
                 &market_info.question,
@@ -401,7 +427,10 @@ where
                 &vipers,
                 &viper_budgets,
             ).await {
-                Ok(handle) => {
+                // The squadron derives its own id; `squadron_id` above was only
+                // ever a guess made before construction. Everything downstream —
+                // the CAG registry and the deployment row — uses the real one.
+                Ok((squadron_id, handle)) => {
                     // Register in CAG with the JoinHandle
                     infra.cag.register_adama_squadron(
                         &squadron_id,
