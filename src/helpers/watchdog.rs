@@ -29,7 +29,7 @@
 //! watchdog dumps the last phase, how long we have been in it, and a monotonic
 //! sequence number, which pinpoints the frozen operation.
 
-use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Coarse phase of the trading loop. Kept as a `u8` so it is a lock-free atomic.
@@ -76,6 +76,29 @@ impl Phase {
             _ => "OTHER",
         }
     }
+}
+
+/// Set while the engine is deliberately parked awaiting operator setup.
+///
+/// The AMI boots with no credentials and takes a "graceful boot" path: it brings
+/// the Control Tower API up and parks on `future::pending()` so the Setup view
+/// stays reachable. The OS watchdog knew nothing about that — it saw the trading
+/// heartbeat go stale, waited 300s, and killed the process. Docker restarted it
+/// and the cycle repeated, so a customer entering their credentials watched the
+/// engine crash-loop underneath them with "calling process::exit(1)" in the log.
+///
+/// Parking is intentional idleness, not a stall, so the watchdog stands down
+/// while this is set.
+static PARKED_FOR_SETUP: AtomicBool = AtomicBool::new(false);
+
+/// Declare that the engine is parked awaiting setup; the OS watchdog stands down.
+pub fn park_for_setup() {
+    PARKED_FOR_SETUP.store(true, Ordering::Relaxed);
+}
+
+/// Whether the engine is parked awaiting setup.
+pub fn is_parked_for_setup() -> bool {
+    PARKED_FOR_SETUP.load(Ordering::Relaxed)
 }
 
 static CURRENT_PHASE: AtomicU8 = AtomicU8::new(Phase::Idle as u8);
@@ -181,9 +204,16 @@ pub fn snapshot() -> (String, u64, u64) {
     let since = PHASE_SINCE_SECS.load(Ordering::Relaxed);
     let seq = PHASE_SEQ.load(Ordering::Relaxed);
     let detail = DETAIL.load(Ordering::Relaxed);
-    let secs = now_secs().saturating_sub(since);
+    // `PHASE_SINCE_SECS` starts at 0, so before the first `enter()` this computed
+    // `now - 0` and reported the whole Unix timestamp as an elapsed time —
+    // "in phase 1787762054s", i.e. 56 years. That is exactly the case the
+    // watchdog hits when the trading loop never started, which is when its
+    // output most needs to be readable.
+    let never_entered = seq == 0;
+    let secs = if never_entered { 0 } else { now_secs().saturating_sub(since) };
     let label = match detail_name(detail) {
         Some(d) => format!("{}/{}", Phase::name(code), d),
+        None if never_entered => format!("{} (never entered)", Phase::name(code)),
         None => Phase::name(code).to_string(),
     };
     (label, secs, seq)
@@ -254,6 +284,62 @@ pub fn dump_thread_states() {
     }
 
     eprintln!("── end thread dump ───────────────────────────────────────────");
+}
+
+#[cfg(test)]
+mod park_and_label_tests {
+    use super::*;
+
+    /// Before the first `enter()`, the phase clock must not report a Unix
+    /// timestamp as an elapsed duration.
+    ///
+    /// `PHASE_SINCE_SECS` starts at 0, so `now - 0` printed "in phase
+    /// 1787762054s" — 56 years — on a fresh AMI whose trading loop had not
+    /// started. That is precisely when the watchdog's output most needs to be
+    /// readable, and it sent the first read of the incident down the wrong path.
+    #[test]
+    fn a_phase_never_entered_reports_zero_and_says_so() {
+        // These are process-global atomics and the test binary is shared, so the
+        // never-entered state is reconstructed explicitly rather than assumed.
+        // Guarding on "if seq happens to be 0" would let another test's `enter()`
+        // turn this into an assertion that never runs.
+        let (seq0, since0, phase0, detail0) = (
+            PHASE_SEQ.load(Ordering::Relaxed),
+            PHASE_SINCE_SECS.load(Ordering::Relaxed),
+            CURRENT_PHASE.load(Ordering::Relaxed),
+            DETAIL.load(Ordering::Relaxed),
+        );
+        PHASE_SEQ.store(0, Ordering::Relaxed);
+        PHASE_SINCE_SECS.store(0, Ordering::Relaxed);
+        CURRENT_PHASE.store(Phase::Idle as u8, Ordering::Relaxed);
+        DETAIL.store(255, Ordering::Relaxed);
+
+        let (label, secs, seq) = snapshot();
+
+        PHASE_SEQ.store(seq0, Ordering::Relaxed);
+        PHASE_SINCE_SECS.store(since0, Ordering::Relaxed);
+        CURRENT_PHASE.store(phase0, Ordering::Relaxed);
+        DETAIL.store(detail0, Ordering::Relaxed);
+
+        assert_eq!(seq, 0);
+        assert_eq!(secs, 0, "never-entered must report 0s, not a Unix timestamp");
+        assert!(label.contains("never entered"), "label was {label}");
+    }
+
+    /// Parking is intentional idleness and must be distinguishable from a stall.
+    ///
+    /// The AMI's zero-credential boot parks so the Setup UI stays reachable. The
+    /// OS watchdog used to kill it every 300s and Docker restarted it, so a
+    /// customer entering credentials watched the engine crash-loop — twice on a
+    /// fresh ami.4 box before a venue was even chosen.
+    #[test]
+    fn parking_is_reported_and_is_not_a_stall() {
+        assert!(!is_parked_for_setup(), "must not start parked");
+        park_for_setup();
+        assert!(is_parked_for_setup(), "the watchdog must be able to see the park");
+        // Global flag in a shared test binary — leave it as we found it.
+        PARKED_FOR_SETUP.store(false, Ordering::Relaxed);
+    }
 }
 
 #[cfg(test)]

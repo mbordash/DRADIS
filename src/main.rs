@@ -279,6 +279,7 @@ async fn run() -> Result<()> {
             const PROCESS_WATCHDOG_TIMEOUT_SECS: u64 = 300; // 5 minutes
             const SOFT_WARN_SECS: u64 = 180; // early breadcrumb before the hard kill
             let mut soft_warned = false;
+            let mut parked_noted = false;
             loop {
                 std::thread::sleep(std::time::Duration::from_secs(60));
                 let last_beat = hb.load(AtomicOrdering::Relaxed);
@@ -287,6 +288,23 @@ async fn run() -> Result<()> {
                     .unwrap_or_default()
                     .as_secs();
                 let silent_secs = now_secs.saturating_sub(last_beat);
+
+                // Parked awaiting setup is intentional idleness, not a stall.
+                // Without this the AMI's zero-credential boot — which parks so
+                // the Setup UI stays reachable — was killed every 300s and
+                // restarted by Docker, so a customer entering credentials saw
+                // the engine crash-loop beneath them. Observed on a fresh ami.4
+                // box: two kills before the operator finished choosing a venue.
+                if dradis::helpers::watchdog::is_parked_for_setup() {
+                    if !parked_noted {
+                        eprintln!(
+                            " OS WATCHDOG: engine parked awaiting Control Tower setup — \
+                             standing down until the trading loop starts"
+                        );
+                        parked_noted = true;
+                    }
+                    continue;
+                }
                 // Lock-free read of the last activity breadcrumb — safe even if the
                 // tokio runtime is fully wedged on a std::sync primitive.
                 let (phase, phase_secs, seq) = dradis::helpers::watchdog::snapshot();
@@ -527,7 +545,8 @@ async fn run() -> Result<()> {
             && std::env::var(dradis::venues::us::auth::ENV_SECRET_KEY).is_ok();
         if !us_creds_present {
             tracing::debug!("US retail venue skipped — POLYMARKET_US_KEY_ID / POLYMARKET_US_SECRET_KEY not set");
-            std::future::pending::<()>().await;
+            dradis::helpers::watchdog::park_for_setup();
+        std::future::pending::<()>().await;
         }
         match dradis::venues::us::UsRetailVenue::connect(Arc::clone(&shared_http)).await {
             Ok(venue) => {
@@ -576,7 +595,8 @@ async fn run() -> Result<()> {
             }
             Err(e) => {
                 tracing::warn!("⚠️ US retail venue connect failed (Control Tower still live): {e}");
-                std::future::pending::<()>().await;
+                dradis::helpers::watchdog::park_for_setup();
+        std::future::pending::<()>().await;
             }
         }
     }
@@ -626,9 +646,11 @@ async fn run() -> Result<()> {
                     "⚠️ Kalshi venue init skipped (Control Tower still live): {e:#}. \
                      Set KALSHI_API_KEY_ID + KALSHI_PRIVATE_KEY_PATH (and KALSHI_DEMO=1 for paper trading)."
                 );
-                std::future::pending::<()>().await;
+                dradis::helpers::watchdog::park_for_setup();
+        std::future::pending::<()>().await;
             }
         }
+        dradis::helpers::watchdog::park_for_setup();
         std::future::pending::<()>().await;
     }
 
@@ -655,6 +677,7 @@ async fn run() -> Result<()> {
             alloy::primitives::Address::ZERO,
             cag.clone(),
         ));
+        dradis::helpers::watchdog::park_for_setup();
         std::future::pending::<()>().await;
         unreachable!();
     }
@@ -684,7 +707,8 @@ async fn run() -> Result<()> {
                 alloy::primitives::Address::ZERO,
                 cag.clone(),
             ));
-            std::future::pending::<()>().await;
+            dradis::helpers::watchdog::park_for_setup();
+        std::future::pending::<()>().await;
             unreachable!();
         }
     };
