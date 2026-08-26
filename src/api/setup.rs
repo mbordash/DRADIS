@@ -98,36 +98,43 @@ const INTERNAL_KEYS: &[&str] = &["DRADIS_ADMIN_HASH", "DRADIS_SESSION_KEY"];
 /// neutral snapshot) or "integration" (notifications, LLM advisor). The split
 /// matters because the two kinds fail differently, so first boot must not ask
 /// for Raptor keys as though they were required to trade.
-const MANAGED_KEYS: &[(&str, &str, &str, &str)] = &[
-    ("POLYMARKET_PRIVATE_KEY",   "Polymarket wallet private key", "intl",   "venue"),
-    ("POLYGON_RPC_URL",          "Polygon RPC endpoint",          "intl",   "venue"),
-    ("POLYMARKET_US_KEY_ID",     "Polymarket US API key ID",      "us",     "venue"),
-    ("POLYMARKET_US_SECRET_KEY", "Polymarket US secret key",      "us",     "venue"),
-    ("KALSHI_API_KEY_ID",        "Kalshi API key ID",             "kalshi", "venue"),
-    ("KALSHI_PRIVATE_KEY",       "Kalshi RSA private key (PEM)",  "kalshi", "venue"),
+/// `(key, label, scope, panel, kind)`.
+///
+/// `kind` tells the Setup panel what control to draw: "text" for a credential,
+/// "bool" for a true/false switch, "bool01" for one that persists 1/0. Without
+/// it every key rendered as a free-text box, so a yes/no setting like
+/// ENABLE_LLM_ADVISOR made the operator type the word "true" — and its label
+/// had to carry "(true/false)" to explain what to type.
+const MANAGED_KEYS: &[(&str, &str, &str, &str, &str)] = &[
+    ("POLYMARKET_PRIVATE_KEY",   "Polymarket wallet private key", "intl",   "venue", "text"),
+    ("POLYGON_RPC_URL",          "Polygon RPC endpoint",          "intl",   "venue", "text"),
+    ("POLYMARKET_US_KEY_ID",     "Polymarket US API key ID",      "us",     "venue", "text"),
+    ("POLYMARKET_US_SECRET_KEY", "Polymarket US secret key",      "us",     "venue", "text"),
+    ("KALSHI_API_KEY_ID",        "Kalshi API key ID",             "kalshi", "venue", "text"),
+    ("KALSHI_PRIVATE_KEY",       "Kalshi RSA private key (PEM)",  "kalshi", "venue", "text"),
     // Not a secret, but it decides which Kalshi you are talking to, and getting
     // it wrong presents as an authentication failure rather than as a wrong
     // environment: a production key sent to the demo API returns
     // "authentication_error / NOT_FOUND". Managed so it is visible and
     // changeable from Setup instead of living only in .env.
-    ("KALSHI_DEMO",              "Kalshi demo environment (1 = demo)", "kalshi", "venue"),
-    ("ALPACA_API_KEY_ID",        "Alpaca API key ID",             "shared", "raptor"),
-    ("ALPACA_API_SECRET_KEY",    "Alpaca API secret key",         "shared", "raptor"),
-    ("ODDS_API_KEY",             "The Odds API key",              "shared", "raptor"),
-    ("LIVETENNIS_API_KEY",       "Live Tennis API key",           "shared", "raptor"),
-    ("TELEGRAM_BOT_TOKEN",       "Telegram bot token",            "shared", "integration"),
-    ("TELEGRAM_CHAT_ID",         "Telegram chat ID",              "shared", "integration"),
-    ("LLM_PROVIDER",             "LLM provider (ollama | openai | anthropic)", "shared", "integration"),
-    ("OLLAMA_URL",               "Ollama URL (local or remote)",  "shared", "integration"),
-    ("OLLAMA_MODEL",             "Ollama model",                  "shared", "integration"),
-    ("LLM_API_BASE",             "Hosted LLM API base URL",       "shared", "integration"),
+    ("KALSHI_DEMO",              "Use the Kalshi demo environment", "kalshi", "venue", "bool01"),
+    ("ALPACA_API_KEY_ID",        "Alpaca API key ID",             "shared", "raptor", "text"),
+    ("ALPACA_API_SECRET_KEY",    "Alpaca API secret key",         "shared", "raptor", "text"),
+    ("ODDS_API_KEY",             "The Odds API key",              "shared", "raptor", "text"),
+    ("LIVETENNIS_API_KEY",       "Live Tennis API key",           "shared", "raptor", "text"),
+    ("TELEGRAM_BOT_TOKEN",       "Telegram bot token",            "shared", "integration", "text"),
+    ("TELEGRAM_CHAT_ID",         "Telegram chat ID",              "shared", "integration", "text"),
+    ("LLM_PROVIDER",             "LLM provider (ollama | openai | anthropic)", "shared", "integration", "text"),
+    ("OLLAMA_URL",               "Ollama URL (local or remote)",  "shared", "integration", "text"),
+    ("OLLAMA_MODEL",             "Ollama model",                  "shared", "integration", "text"),
+    ("LLM_API_BASE",             "Hosted LLM API base URL",       "shared", "integration", "text"),
     // Not a credential, but it decides whether the advisor runs at all. Left
     // out of the UI, an operator could configure a provider, press Test, see
     // "Connection OK", and then wait indefinitely for recommendations that were
     // never going to come — which is exactly what happened on 2026-08-23.
-    ("ENABLE_LLM_ADVISOR",       "Run the LLM Advisor (true/false)", "shared", "integration"),
-    ("LLM_API_KEY",              "Hosted LLM API key",            "shared", "integration"),
-    ("LLM_MODEL",                "Hosted LLM model",              "shared", "integration"),
+    ("ENABLE_LLM_ADVISOR",       "Run the LLM Advisor", "shared", "integration", "bool"),
+    ("LLM_API_KEY",              "Hosted LLM API key",            "shared", "integration", "text"),
+    ("LLM_MODEL",                "Hosted LLM model",              "shared", "integration", "text"),
 ];
 
 /// Raptor signal sources rendered as cards in the Setup view's Raptor panel.
@@ -750,7 +757,7 @@ async fn acknowledge_alpha() -> Response {
 /// secret values; only whether each is set plus a last-4 hint for recognition.
 async fn get_credentials() -> Response {
     let secrets = read_secrets();
-    let items: Vec<serde_json::Value> = MANAGED_KEYS.iter().map(|(key, label, scope, panel)| {
+    let items: Vec<serde_json::Value> = MANAGED_KEYS.iter().map(|(key, label, scope, panel, kind)| {
         // Prefer the managed file; fall back to process env (container .env).
         let val = secrets.get(*key).cloned()
             .filter(|v| !v.is_empty())
@@ -763,7 +770,7 @@ async fn get_credentials() -> Response {
             }
             None => (false, String::new(), "unset"),
         };
-        json!({ "key": key, "label": label, "scope": scope, "panel": panel,
+        json!({ "key": key, "label": label, "scope": scope, "panel": panel, "kind": kind,
                 "multiline": is_pem_key(key),
                 "set": set, "hint": hint, "source": source })
     }).collect();
@@ -798,7 +805,7 @@ struct PutCredentials {
 /// test endpoints and freshly-spawned tasks see new values immediately).
 async fn put_credentials(Json(body): Json<PutCredentials>) -> Response {
     for key in body.credentials.keys() {
-        if !MANAGED_KEYS.iter().any(|(k, _, _, _)| k == key) {
+        if !MANAGED_KEYS.iter().any(|(k, _, _, _, _)| k == key) {
             return (StatusCode::BAD_REQUEST,
                     Json(json!({"error": format!("'{}' is not a managed credential", key)}))).into_response();
         }
@@ -1407,7 +1414,7 @@ async fn import_bundle(Json(bundle): Json<ImportBundle>) -> Response {
     let mut map = read_secrets();
     let mut imported_secrets = 0usize;
     for (k, v) in &bundle.secrets {
-        let allowed = MANAGED_KEYS.iter().any(|(mk, _, _, _)| mk == k)
+        let allowed = MANAGED_KEYS.iter().any(|(mk, _, _, _, _)| mk == k)
             || k == "DRADIS_ADMIN_HASH"
             || k.starts_with("LLM_");   // autonomy knobs persisted by put_autonomy
         if !allowed || v.is_empty() { continue; }
@@ -1793,8 +1800,35 @@ mod tests {
     #[test]
     fn managed_key_whitelist_rejects_internal() {
         for k in INTERNAL_KEYS {
-            assert!(!MANAGED_KEYS.iter().any(|(mk, _, _, _)| mk == k));
+            assert!(!MANAGED_KEYS.iter().any(|(mk, _, _, _, _)| mk == k));
         }
+    }
+
+    /// Every managed key must declare a control the Setup panel can draw.
+    ///
+    /// `kind` decides between a credential box and a yes/no switch. A typo
+    /// silently falls through to a text box, which is what made turning the AI
+    /// advisor on require typing the word "true".
+    #[test]
+    fn every_managed_key_declares_a_known_kind() {
+        for (key, _, _, _, kind) in MANAGED_KEYS {
+            assert!(
+                matches!(*kind, "text" | "bool" | "bool01"),
+                "{key} declares unknown kind '{kind}' — it would render as a text box",
+            );
+        }
+    }
+
+    /// The two settings-shaped keys must stay switches, and must persist the
+    /// form their own readers parse: ENABLE_LLM_ADVISOR is parsed as a bool,
+    /// KALSHI_DEMO is compared against "1".
+    #[test]
+    fn the_yes_no_keys_are_switches() {
+        let kind = |want: &str| MANAGED_KEYS.iter()
+            .find(|(k, _, _, _, _)| *k == want)
+            .map(|(_, _, _, _, kd)| *kd);
+        assert_eq!(kind("ENABLE_LLM_ADVISOR"), Some("bool"));
+        assert_eq!(kind("KALSHI_DEMO"), Some("bool01"));
     }
 
     /// Every venue-scoped credential must be filed under a scope string that
@@ -1808,7 +1842,7 @@ mod tests {
     #[test]
     fn every_venue_scope_is_reachable_and_the_running_venue_is_configurable() {
         const KNOWN: &[&str] = &["intl", "us", "kalshi", "shared"];
-        for (key, _, scope, _) in MANAGED_KEYS {
+        for (key, _, scope, _, _) in MANAGED_KEYS {
             assert!(
                 KNOWN.contains(scope),
                 "credential '{key}' has scope '{scope}', which no build reports",
@@ -1816,7 +1850,7 @@ mod tests {
         }
         let venue = build_venue();
         assert!(
-            MANAGED_KEYS.iter().any(|(_, _, scope, panel)| *scope == venue && *panel == "venue"),
+            MANAGED_KEYS.iter().any(|(_, _, scope, panel, _)| *scope == venue && *panel == "venue"),
             "venue '{venue}' has no credential rows — its Setup card renders empty",
         );
     }
@@ -1829,8 +1863,8 @@ mod tests {
     fn raptor_sources_reference_managed_raptor_keys() {
         for r in RAPTOR_SOURCES {
             for k in r.keys {
-                let entry = MANAGED_KEYS.iter().find(|(mk, _, _, _)| mk == k);
-                let (_, _, _, panel) = entry.unwrap_or_else(|| {
+                let entry = MANAGED_KEYS.iter().find(|(mk, _, _, _, _)| mk == k);
+                let (_, _, _, panel, _) = entry.unwrap_or_else(|| {
                     panic!("Raptor '{}' references unmanaged key '{}' — add it to MANAGED_KEYS", r.id, k)
                 });
                 assert_eq!(
@@ -2134,7 +2168,7 @@ mod tests {
     /// one Raptor — otherwise it appears in no card and is unreachable in the UI.
     #[test]
     fn every_raptor_panel_key_belongs_to_a_raptor() {
-        for (key, _, _, _) in MANAGED_KEYS.iter().filter(|(_, _, _, p)| *p == "raptor") {
+        for (key, _, _, _, _) in MANAGED_KEYS.iter().filter(|(_, _, _, p, _)| *p == "raptor") {
             assert!(
                 RAPTOR_SOURCES.iter().any(|r| r.keys.contains(key)),
                 "credential '{}' is on the raptor panel but no Raptor in RAPTOR_SOURCES claims it",

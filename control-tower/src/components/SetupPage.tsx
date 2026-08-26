@@ -171,6 +171,45 @@ const VENUE_META: Record<VenueId, { label: string; missing: string }> = {
 };
 
 // Group layout: section title → credential keys + test kind.
+/**
+ * Yes/no credential control.
+ *
+ * Some managed keys are settings rather than secrets — ENABLE_LLM_ADVISOR and
+ * KALSHI_DEMO — and they used to render as free-text boxes, so turning the AI
+ * advisor on meant typing the word "true" and the label had to carry
+ * "(true/false)" to say so. The backend tags them with `kind`, and this draws
+ * the switch. `bool` persists "true"/"false"; `bool01` persists "1"/"0",
+ * matching what each key's reader parses.
+ */
+function BoolCredential({
+  c, value, onDraft,
+}: {
+  c: CredentialInfo;
+  value: string | undefined;
+  onDraft: (key: string, v: string) => void;
+}) {
+  const [on, off] = c.kind === 'bool01' ? ['1', '0'] : ['true', 'false'];
+  // Nothing is selected until the operator chooses or a value is already set,
+  // so an unset key cannot look like a deliberate "false".
+  const current = value ?? (c.set ? c.hint.replace(/^set\s*/, '') : undefined);
+  const pick = (v: string) =>
+    `px-3 py-1 text-xs font-mono rounded border transition-colors ${
+      current === v
+        ? 'bg-emerald-500/15 text-emerald-300 border-emerald-500/40'
+        : 'bg-transparent text-gray-500 border-gray-700 hover:text-gray-300'
+    }`;
+  return (
+    <div className="flex items-center gap-2">
+      <button type="button" className={pick(on)} onClick={() => onDraft(c.key, on)}>
+        {c.kind === 'bool01' ? 'Demo' : 'On'}
+      </button>
+      <button type="button" className={pick(off)} onClick={() => onDraft(c.key, off)}>
+        {c.kind === 'bool01' ? 'Live' : 'Off'}
+      </button>
+    </div>
+  );
+}
+
 function groupsForVenue(venue: VenueId) {
   const groups: { title: string; blurb: string; keys: string[]; test?: keyof typeof TEST_KINDS }[] = [];
   if (venue === 'intl') {
@@ -661,7 +700,9 @@ function CredentialGroup({
                 {c.set ? `set ${c.hint} · ${c.source}` : 'not set'}
               </span>
             </div>
-            {c.multiline ? (
+            {c.kind === 'bool' || c.kind === 'bool01' ? (
+              <BoolCredential c={c} value={drafts[c.key]} onDraft={onDraft} />
+            ) : c.multiline ? (
               // A PEM has to keep its line breaks, and a single-line <input>
               // cannot hold one — the browser strips the newlines on paste, so
               // the key arrives mangled and only fails much later, at signing.
@@ -970,7 +1011,9 @@ function RaptorCard({
                   {c.set ? `set ${c.hint} · ${c.source}` : 'not set'}
                 </span>
               </div>
-              {c.multiline ? (
+              {c.kind === 'bool' || c.kind === 'bool01' ? (
+              <BoolCredential c={c} value={drafts[c.key]} onDraft={onDraft} />
+            ) : c.multiline ? (
                 <textarea
                   className={`${inputCls} h-32 resize-y font-mono text-[11px] leading-snug`}
                   placeholder={c.set ? '•••••••• (leave blank to keep current)' : 'Paste the whole key'}

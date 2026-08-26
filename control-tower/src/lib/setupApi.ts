@@ -74,6 +74,10 @@ export interface CredentialInfo {
   scope: VenueId | 'shared';
   /** Which Setup panel owns this key: core venue, Raptor signal, or integration. */
   panel: 'venue' | 'raptor' | 'integration';
+  /** What control to draw. 'bool' persists "true"/"false", 'bool01' persists
+   *  "1"/"0". Without this every key was a free-text box and a yes/no setting
+   *  made the operator type the word "true". */
+  kind?: 'text' | 'bool' | 'bool01';
   set: boolean;
   hint: string;            // "…last4" when set
   source: 'managed' | 'env' | 'unset';

@@ -554,7 +554,17 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              it with a fresh one when that market closes. The squadron behaves exactly like one you \
              deployed by hand — same one-per-class rule, same entry in the deployment list. Turn \
              this off to decide for yourself when capital goes to work on the class; a squadron \
-             already trading is left alone and runs to its market's close.")
+             already trading is left alone and runs to its market's close.\n\n\
+             There is deliberately no equivalent switch for crypto: this venue's own rotation \
+             loop already keeps a crypto squadron running and replaces its market every hour, so \
+             seeding one here would produce a second crypto squadron competing with the first for \
+             the same capital. Politics and sports have no such loop, which is why they need one.")
+            );
+        v.push(F::new(g, e, "auto_deploy_sports", "Auto-Deploy Sports", "bool", false,
+            "Keep a sports squadron running without waiting for you to deploy one — see Auto-Deploy \
+             Politics for how the selection and replacement work. This does not need an Odds API \
+             key: the class trades Arbitrage and Maker off the venue's own book, and the Sports \
+             Raptor is an additive signal that idles harmlessly when no key is set.")
             );
         v.push(F::new(g, e, "llm_max_output_tokens", "AI Reply Budget", "secs", true,
             "Token ceiling for one AI Advisor reply. It covers the whole response — the written \
@@ -563,12 +573,6 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              removes them: you get readable analysis and nothing to approve. If the advisor keeps \
              reporting analysis with no recommendations, raise this.")
             .range(500.0, 8000.0).step(100.0).unit("tok"));
-        v.push(F::new(g, e, "auto_deploy_sports", "Auto-Deploy Sports", "bool", false,
-            "Keep a sports squadron running without waiting for you to deploy one — see Auto-Deploy \
-             Politics for how the selection and replacement work. This does not need an Odds API \
-             key: the class trades Arbitrage and Maker off the venue's own book, and the Sports \
-             Raptor is an additive signal that idles harmlessly when no key is set.")
-            );
     }
 
     {
