@@ -473,7 +473,31 @@ AMI_ID=$(AWS ec2 create-image --instance-id "$INSTANCE_ID" \
     --description "$AMI_DESCRIPTION" \
     --query 'ImageId' --output text)
 echo "AMI: $AMI_ID — waiting for 'available'…"
-AWS ec2 wait image-available --image-ids "$AMI_ID"
+# Poll rather than `aws ec2 wait image-available`.
+#
+# The built-in waiter gives up after 40 attempts at 15s — ten minutes — and a
+# 60 GB snapshot regularly takes longer. On 2026-08-26 it timed out, the script
+# bailed to its manual-finish path, and the AMI was left UNTAGGED with the
+# builder still running: the image was fine, only the bookkeeping was lost.
+# Tagging and cleanup are exactly the steps that must not be skipped, so this
+# waits generously and reports progress instead of failing the run.
+echo "   waiting for the snapshot to finish (this can take 10-25 minutes)…"
+AMI_WAIT_DEADLINE=$(( $(date +%s) + 2400 ))
+while :; do
+    AMI_STATE="$(AWS ec2 describe-images --image-ids "$AMI_ID" \
+        --query 'Images[0].State' --output text 2>/dev/null || echo unknown)"
+    case "$AMI_STATE" in
+        available) echo "   AMI available"; break ;;
+        failed|invalid|deregistered)
+            echo "❌ AMI entered state '$AMI_STATE' — aborting."; exit 1 ;;
+    esac
+    if [ "$(date +%s)" -ge "$AMI_WAIT_DEADLINE" ]; then
+        echo "⚠️  AMI still '$AMI_STATE' after 40 minutes — continuing anyway."
+        echo "    Tagging below is safe on a pending image; verify state before use."
+        break
+    fi
+    sleep 30
+done
 # `+` and NOT `,` as the separator. In the CLI's shorthand syntax the comma is
 # what delimits Key= from Value=, so "Value=intl,us,kalshi" is parsed as three
 # shorthand tokens and the value arrives as a LIST — which create-tags rejects
