@@ -339,6 +339,26 @@ pub struct MarketInfo {
     pub close_time: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// The question text if Gamma knows this market as CLOSED, else `None`.
+///
+/// Gamma's default listing omits closed markets, so a market that finished
+/// between discovery and deployment simply returns nothing — indistinguishable
+/// from an id that never existed. Asking again with `closed=true` separates the
+/// two, which is the difference between "this tennis match ended" and "this id
+/// is wrong". Only called on the failure path, so it costs nothing normally.
+async fn closed_market_question(http: &reqwest::Client, condition_id: &str) -> Option<String> {
+    let url = format!(
+        "https://gamma-api.polymarket.com/markets?condition_ids={condition_id}&closed=true"
+    );
+    let resp = http.get(&url).send().await.ok()?;
+    let markets: Vec<serde_json::Value> = resp.json().await.ok()?;
+    let m = markets.first()?;
+    if m.get("closed").and_then(|c| c.as_bool()) != Some(true) {
+        return None;
+    }
+    m.get("question").and_then(|q| q.as_str()).map(String::from)
+}
+
 /// Fetch full market details from Gamma API by condition id.
 ///
 /// The filter parameter is `condition_ids`, plural. Gamma does not reject an
@@ -464,8 +484,21 @@ where
         dep: &crate::helpers::db::PendingDeployment,
         cancel: CancellationToken,
     ) -> anyhow::Result<()> {
-        let info = fetch_market_info(&self.infra.shared_http, &dep.market_id).await
-            .ok_or_else(|| anyhow::anyhow!("could not load market details for {}", dep.market_id))?;
+        let info = match fetch_market_info(&self.infra.shared_http, &dep.market_id).await {
+            Some(i) => i,
+            None => {
+                // Name the cause the operator can act on. A closed market is a
+                // race, not a fault, and the shared processor retires a seeded
+                // one on this marker instead of leaving a FAILED row behind.
+                return Err(match closed_market_question(&self.infra.shared_http, &dep.market_id).await {
+                    Some(q) => anyhow::anyhow!(
+                        "{} — \"{q}\"",
+                        crate::venues::deployment::ERR_MARKET_CLOSED,
+                    ),
+                    None => anyhow::anyhow!("could not load market details for {}", dep.market_id),
+                });
+            }
+        };
 
         let (squadron_id, handle) = self.infra.spawn_squadron(
             dep.id.clone(),

@@ -50,6 +50,24 @@ pub const DEPLOY_POLL_SECS: u64 = 5;
 /// rotation loop or wing already owns it.
 pub const AUTO_DEPLOY_CLASSES: [&str; 2] = ["politics", "sports"];
 
+/// Id prefix identifying a deployment the seeder created rather than an operator.
+///
+/// The distinction decides how a failure is reported: an operator chose their
+/// market and must be told loudly if it did not start, whereas a seeded one is
+/// replaced by the next tick and should not leave a row demanding manual
+/// cleanup.
+pub const AUTO_DEPLOY_ID_PREFIX: &str = "autodeploy-";
+
+/// Marker text meaning "the market closed between discovery and deployment".
+///
+/// Auto-deploy discovery filters on `active=true&closed=false`, but a sports
+/// market can finish in the seconds between being picked and being resolved —
+/// a tennis match ends, and the per-market lookup returns nothing. Refusing to
+/// deploy is correct; leaving a FAILED row behind is not, because the seeder
+/// heals it on the very next tick. Both halves match on this constant rather
+/// than on free text so the two cannot drift apart.
+pub const ERR_MARKET_CLOSED: &str = "market closed before deployment could start";
+
 /// What a venue must supply for the shared queue consumer to drive it.
 ///
 /// Deliberately narrow. Anything expressible in terms of the queue belongs in
@@ -202,8 +220,22 @@ pub async fn run_deployment_processor<R: DeploymentRunner>(
                         // it. A deployment that fails silently is indistinguishable
                         // from one still starting, forever.
                         let msg = e.to_string();
-                        warn!("📋 Deployment {dep_id} failed — {msg}");
-                        let _ = db::update_deployment_status(&dep_id, "failed", None, Some(&msg)).await;
+                        // A seeded deployment that lost the race to a closing
+                        // market is retired rather than failed: nothing is wrong,
+                        // nobody chose that market, and the next tick picks a live
+                        // one. Left as FAILED these accumulate — sports markets
+                        // close constantly — and an operator faces a growing list
+                        // of hex ids to dismiss by hand, which reads as a broken
+                        // system when it is the opposite. Any OTHER failure still
+                        // fails loudly, seeded or not.
+                        let seeded = dep_id.starts_with(AUTO_DEPLOY_ID_PREFIX);
+                        if seeded && msg.contains(ERR_MARKET_CLOSED) {
+                            info!("📋 Seeded {class} deployment retired — {msg}");
+                            let _ = db::update_deployment_status(&dep_id, "dismissed", None, Some(&msg)).await;
+                        } else {
+                            warn!("📋 Deployment {dep_id} failed — {msg}");
+                            let _ = db::update_deployment_status(&dep_id, "failed", None, Some(&msg)).await;
+                        }
                     }
                 }
             });
@@ -275,7 +307,7 @@ async fn seed_auto_deployments<R: DeploymentRunner + ?Sized>(runner: &R, cag: &C
         let raptors = db::raptors_for_class(pool, class).await;
         let vipers  = db::vipers_for_class(pool, class).await;
 
-        let id = format!("autodeploy-{class}-{}", chrono::Utc::now().timestamp());
+        let id = format!("{AUTO_DEPLOY_ID_PREFIX}{class}-{}", chrono::Utc::now().timestamp());
         match db::queue_deployment(&id, &market_id, class, "", &raptors, &vipers, &Default::default()).await {
             Ok(()) => info!("📋 Auto-deploying {class} squadron on [{market_id}]"),
             Err(e) => warn!("📋 Auto-deploy of {class} failed to queue: {e}"),
@@ -388,5 +420,42 @@ mod budget_application_tests {
 
         assert!(!apply_viper_budgets(&mut cfg, &budgets), "nothing valid was supplied");
         assert_eq!(cfg.maker_max_exposure_usdc, before);
+    }
+}
+
+#[cfg(test)]
+mod seeded_failure_tests {
+    use super::{AUTO_DEPLOY_ID_PREFIX, ERR_MARKET_CLOSED};
+
+    /// The processor's rule: retire only a SEEDED deployment that lost the race
+    /// to a closing market. Everything else still fails loudly.
+    fn retires(dep_id: &str, err: &str) -> bool {
+        dep_id.starts_with(AUTO_DEPLOY_ID_PREFIX) && err.contains(ERR_MARKET_CLOSED)
+    }
+
+    /// A tennis match that ended between discovery and deployment. Nobody chose
+    /// it, the next tick picks a live market, and a FAILED row would only
+    /// accumulate — sports markets close constantly.
+    #[test]
+    fn a_seeded_deployment_onto_a_closed_market_is_retired() {
+        assert!(retires(
+            "autodeploy-sports-1787703837",
+            &format!("{ERR_MARKET_CLOSED} — \"Winston-Salem Open: Cerundolo vs Dhakshineswar\""),
+        ));
+    }
+
+    /// An operator picked their market deliberately and must be told loudly if
+    /// it did not start — even for the same cause.
+    #[test]
+    fn an_operator_deployment_onto_a_closed_market_still_fails() {
+        assert!(!retires("deploy-sports-1787597921", ERR_MARKET_CLOSED));
+    }
+
+    /// A seeded deployment failing for any OTHER reason is a real fault and must
+    /// not be swept away by this path.
+    #[test]
+    fn a_seeded_deployment_failing_otherwise_still_fails() {
+        assert!(!retires("autodeploy-sports-1787703837", "could not load market details for 0xe7c8"));
+        assert!(!retires("autodeploy-politics-1787703837", "discovery failed: HTTP 503"));
     }
 }
