@@ -789,6 +789,20 @@ async fn trade_one_market(
             if prev != &squadron_id {
                 info!("🔀 Kalshi rotation left {prev} — retiring it for {squadron_id}");
                 cag.remove(prev);
+                // Retire its REGISTRIES too, not just its CAG entry.
+                //
+                // The comment above describes a permanent RTB row per underlying;
+                // the viper and book-feed registries had exactly the same leak and
+                // were never given the same treatment. A rotated-away underlying
+                // left nine viper rows behind that counted toward "across N
+                // squadrons", then aged out and reported "N stale/error — check
+                // squadron detail" for a squadron no longer on screen.
+                //
+                // The asset is the first segment of `{asset}-{cadence}[-{slug}]`,
+                // which `Squadron::new_named` guarantees and a test pins.
+                let prev_asset = prev.split('-').next().unwrap_or(prev);
+                crate::helpers::viper_status::forget(prev_asset);
+                crate::state::price_state::book_feed::forget(prev_asset);
             }
         }
         *slot = Some(squadron_id.clone());

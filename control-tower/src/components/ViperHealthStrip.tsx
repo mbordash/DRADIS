@@ -41,10 +41,20 @@ export function ViperHealthStrip() {
     (r) => r.last_eval_secs_ago <= STALE_EVAL_SECS && r.last_outcome !== 'error' && r.last_outcome !== 'timeout',
   );
   const troubled = active.length - alive.length;
+  const disabled = data.length - active.length;
   // Distinct scopes, not distinct assets: every Kalshi squadron shares one DB
   // shard, so counting the shard name would report one squadron for all of them.
   // A row whose scope is empty predates the fix that gave non-crypto squadrons
   // their own key; count it rather than folding it into another squadron.
+  //
+  // Counted over `data`, deliberately: every deployed squadron is real even if
+  // all of its vipers are disabled, and reporting only those with a live viper
+  // would hide a squadron the operator can see on screen.
+  //
+  // The number that WAS missing is `disabled`. Without it the strip read
+  // "9/9 vipers alive across 3 squadrons" on an instance running 13 vipers,
+  // inviting the reader to conclude there were nine — the tally silently
+  // dropped the four disabled ones instead of accounting for them.
   const squadrons = new Set(data.map((r) => r.asset || '(unscoped)')).size;
   // Up to 3 distinct holding reasons for a quick "why quiet?" glance.
   const reasons = [...new Set(alive.map((r) => r.last_reason).filter(Boolean))].slice(0, 3);
@@ -59,6 +69,9 @@ export function ViperHealthStrip() {
       <span className={ok ? 'text-gray-400' : ''}>
         {alive.length}/{active.length} vipers alive
         {squadrons > 1 ? ` across ${squadrons} squadrons` : ''}
+        {/* Stated rather than silently subtracted, so the tally reconciles with
+            the viper cards an operator can count on screen. */}
+        {disabled > 0 ? ` · ${disabled} disabled` : ''}
       </span>
       {!ok && <span>{troubled} stale/error — check squadron detail</span>}
       {ok && reasons.length > 0 && (

@@ -115,7 +115,10 @@ function ViperCoverage({ marketClass }: { marketClass: string }) {
           : `All ${full.length} strategies apply to ${marketClass} markets.`
       }
     >
-      {mine.length}/{full.length} apply
+      {/* "strategies apply", not a bare fraction: sitting among health
+          information, "2/9" was read as two of nine vipers running rather than
+          two of nine strategies being applicable to this market class. */}
+      {mine.length}/{full.length} strategies apply
     </span>
   );
 }

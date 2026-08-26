@@ -69,6 +69,31 @@ fn key(asset: &str, strategy: &str) -> (String, String) {
     (asset.to_lowercase(), strategy.to_string())
 }
 
+/// Drop every viper row for an asset whose squadron no longer exists.
+///
+/// Without this the registry only ever grows. The Kalshi crypto loop rotates
+/// between underlyings, and `cag.remove(prev)` retires the old squadron from the
+/// CAG — but its nine viper rows stayed. They then counted toward "across N
+/// squadrons", stopped being evaluated, aged past the staleness window, and
+/// reported themselves as "N stale/error — check squadron detail" for a
+/// squadron the operator cannot see and cannot open. On a fresh AMI that is the
+/// first thing on screen: a red ribbon blaming a phantom.
+///
+/// Called wherever a squadron is retired, mirroring `cag.remove`.
+pub fn forget(asset: &str) {
+    let asset = asset.to_lowercase();
+    let mut map = match registry().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    let before = map.len();
+    map.retain(|(a, _), _| a != &asset);
+    let dropped = before - map.len();
+    if dropped > 0 {
+        tracing::info!("🧹 Retired {dropped} viper row(s) for '{asset}' — its squadron is gone");
+    }
+}
+
 /// Record the outcome of one entry evaluation (called by the executor per tick).
 pub fn record_eval(asset: &str, strategy: &str, outcome: EvalOutcome) {
     let now = Utc::now();
@@ -184,5 +209,44 @@ mod tests {
         assert_eq!(row.last_outcome, EvalOutcome::Signal);
         assert!(row.last_reason.is_none());
         assert!(row.last_signal_at.is_some());
+    }
+}
+
+#[cfg(test)]
+mod forget_tests {
+    use super::*;
+
+    /// A rotated-away underlying must leave nothing behind.
+    ///
+    /// The Kalshi crypto loop rotates BTC↔ETH and retires the old squadron from
+    /// the CAG, but its viper rows used to survive: they counted toward the
+    /// ribbon's "across N squadrons", stopped being evaluated, aged past the
+    /// staleness window, and then read as "5 stale/error — check squadron
+    /// detail" for a squadron that was no longer listed. On a fresh AMI that was
+    /// the first thing an operator saw.
+    #[test]
+    fn forgetting_an_asset_drops_all_of_its_rows() {
+        for s in ["MakerStrategy", "ArbitrageStrategy", "GboostStrategy"] {
+            record_eval("forgettest-eth", s, EvalOutcome::NoSignal);
+            record_eval("forgettest-btc", s, EvalOutcome::NoSignal);
+        }
+        let mine = |a: &str| snapshot(Some(a)).len();
+        assert_eq!(mine("forgettest-eth"), 3);
+        assert_eq!(mine("forgettest-btc"), 3);
+
+        forget("forgettest-eth");
+
+        assert_eq!(mine("forgettest-eth"), 0, "the retired underlying must leave no rows");
+        assert_eq!(mine("forgettest-btc"), 3, "the surviving squadron must be untouched");
+        forget("forgettest-btc");
+    }
+
+    /// Case-insensitive, since squadron ids are lowercased while callers may not be.
+    #[test]
+    fn forget_matches_regardless_of_case() {
+        record_eval("forgettest-ETH", "MakerStrategy", EvalOutcome::NoSignal);
+        assert_eq!(snapshot(Some("forgettest-eth")).len(), 1);
+        forget("FORGETTEST-ETH");
+        assert_eq!(snapshot(Some("forgettest-eth")).len(), 0);
     }
 }

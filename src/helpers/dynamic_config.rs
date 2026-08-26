@@ -1137,9 +1137,28 @@ impl DynamicConfig {
     /// Initialize a squadron's config by copying compile-time defaults to its DB row.
     /// Call this when deploying a new squadron.
     pub async fn init_for_squadron(squadron_id: &str) -> Arc<Self> {
-        let cfg = Arc::new(DynamicConfig::default());
+        // Seed from the PERSISTED GLOBAL config, not compile-time defaults.
+        //
+        // `apply_profile` in api/setup.rs writes the operator's chosen profile to
+        // the global row and fans it out to squadrons that are already deployed,
+        // on the stated understanding that this function seeds future ones from
+        // that same row. It did not — it used `DynamicConfig::default()`, which
+        // is whichever profile the binary was COMPILED with. The AMI compiles
+        // conservative, so on a fresh box the order is: choose a profile, restart
+        // the engine, squadrons deploy, and every one of them is seeded
+        // conservative regardless of the choice.
+        //
+        // The result was silent and total: the global row said aggressive while
+        // every squadron actually trading said conservative, with Momentum,
+        // Basis, Convergence and TrendReversal switched off. The first decision a
+        // customer makes had no effect on the money.
+        //
+        // `load_or_default` falls back to compile-time defaults when no global
+        // row exists, so a box where nobody has chosen a profile behaves exactly
+        // as before.
+        let cfg = Self::load_or_default().await;
         cfg.save_for_squadron(squadron_id).await;
-        info!("⚙️  Squadron config initialized: {}", squadron_id);
+        info!("⚙️  Squadron config initialized from global config: {}", squadron_id);
         cfg
     }
 
