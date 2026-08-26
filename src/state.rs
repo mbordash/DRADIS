@@ -537,6 +537,30 @@ pub struct Position {
     pub entry_fee: Decimal,
 }
 
+impl Position {
+    /// When this position's fill became effective, treating a GHOST fill as
+    /// confirmed at entry.
+    ///
+    /// `fill_confirmed_at` is stamped by the venue's event-driven fill listener
+    /// over the private WebSocket. Ghost mode places no real order, so no event
+    /// ever arrives and the field stays None for the position's whole life — and
+    /// the intl venue never stamps it at all.
+    ///
+    /// That silently disabled half the maker's exits, which gate on
+    /// `fill_confirmed_at.is_some()`: take-profit and stop-loss could never fire,
+    /// while the deliberately-ungated catastrophic floor still could. Ghost runs
+    /// therefore cut every loser and let every winner run to rotation or expiry —
+    /// a one-way ratchet that made simulated P&L systematically worse than the
+    /// strategy it was meant to measure. It also made every exit read
+    /// "(0s held)", because held time falls back to zero with no timestamp.
+    ///
+    /// A simulated fill is filled by definition, so ghost mode uses `opened_at`:
+    /// that restores both gates AND gives a truthful held time.
+    pub fn fill_effective_at(&self, ghost_mode: bool) -> Option<DateTime<Utc>> {
+        self.fill_confirmed_at.or(if ghost_mode { Some(self.opened_at) } else { None })
+    }
+}
+
 /// Compound key for the shared position map: (strategy_name, token_id).
 /// Each strategy has its own position slot per token, enabling fully independent
 /// capital allocation and eliminating cross-strategy entry conflicts (Option A).
@@ -1242,5 +1266,53 @@ mod book_feed_tests {
         book_feed::note(label, true);
         book_feed::forget(label);
         assert!(!book_feed::dark_markets().iter().any(|(m, _, _)| m == label));
+    }
+}
+
+#[cfg(test)]
+mod fill_effective_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    fn pos(confirmed: Option<DateTime<Utc>>, opened: DateTime<Utc>) -> Position {
+        Position {
+            shares: dec!(10), avg_entry: dec!(0.5), opened_at: opened, close_time: None,
+            market_name: "m".into(), pair_token_id: MarketId::new("t"),
+            fill_confirmed_at: confirmed, paired_leg_token_id: None, entry_fee: dec!(0),
+        }
+    }
+
+    /// In ghost mode a simulated fill is filled, so it must read as confirmed.
+    ///
+    /// Without this the maker's take-profit and stop-loss — both gated on a
+    /// confirmed fill — could never fire in ghost mode, while the ungated
+    /// catastrophic floor still could. Every loser was cut and every winner ran
+    /// to rotation, making simulated P&L worse than the strategy warranted.
+    #[test]
+    fn a_ghost_fill_counts_as_confirmed_at_entry() {
+        let opened = Utc::now() - chrono::Duration::minutes(37);
+        let p = pos(None, opened);
+        assert_eq!(p.fill_effective_at(true), Some(opened));
+        // …and yields a truthful held time rather than zero.
+        let held = (Utc::now() - p.fill_effective_at(true).unwrap()).num_minutes();
+        assert!((36..=38).contains(&held), "held {held}m, expected ~37");
+    }
+
+    /// Live trading is unchanged: an unconfirmed fill stays unconfirmed, so the
+    /// gates keep protecting against acting on a fill that never landed.
+    #[test]
+    fn a_live_unconfirmed_fill_stays_unconfirmed() {
+        assert_eq!(pos(None, Utc::now()).fill_effective_at(false), None);
+    }
+
+    /// A real confirmation always wins, ghost or not — never overwritten by
+    /// `opened_at`, which would misreport held time.
+    #[test]
+    fn a_real_confirmation_is_preferred_over_entry_time() {
+        let opened = Utc::now() - chrono::Duration::hours(2);
+        let confirmed = Utc::now() - chrono::Duration::minutes(5);
+        let p = pos(Some(confirmed), opened);
+        assert_eq!(p.fill_effective_at(true), Some(confirmed));
+        assert_eq!(p.fill_effective_at(false), Some(confirmed));
     }
 }

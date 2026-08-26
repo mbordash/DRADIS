@@ -613,7 +613,9 @@ impl Strategy for ConvergenceStrategyImpl {
                 }
 
                 // Before fill-confirmation, only the catastrophic move above may exit.
-                if position.fill_confirmed_at.is_none() {
+                // Ghost fills count as confirmed, or a simulated position could
+                // never reach the stop-loss and take-profit below.
+                if position.fill_effective_at(dc.ghost_mode).is_none() {
                     continue;
                 }
 

@@ -518,7 +518,10 @@ impl Strategy for MomentumStrategyImpl {
             // invariant hold for any value an operator can dial in from Control Tower.
             let catastrophic_sl_pct = dc.momentum_catastrophic_sl_pct.max(dc.momentum_stop_loss_pct);
 
-            if position.fill_confirmed_at.is_none() {
+            // Ghost fills count as confirmed; without this a simulated position
+            // sat in the fill-confirmation branch for its entire life, where only
+            // a catastrophic move may exit.
+            if position.fill_effective_at(dc.ghost_mode).is_none() {
                 let profit_margin_check = (bid - position.avg_entry) / position.avg_entry;
                 if secs_held < config::MOMENTUM_FILL_CONFIRM_MIN_HOLD_SECS {
                     // During the fill-confirmation window, allow an immediate escape
@@ -682,7 +685,8 @@ impl Strategy for MomentumStrategyImpl {
             //      `momentum_obi_exhaust_persist_secs`, and any normal reading resets
             //      the clock. Measured in wall-clock, not ticks: the patrol loop runs
             //      at 75ms, so a "3 tick" filter would be a quarter-second.
-            if position.fill_confirmed_at.is_some() {
+            // OBI-exhaustion exit — disabled in ghost mode before this.
+            if position.fill_effective_at(dc.ghost_mode).is_some() {
                 let yes_total_depth = ctx.snapshot.yes_bid_depth + ctx.snapshot.yes_ask_depth;
                 let no_total_depth  = ctx.snapshot.no_bid_depth  + ctx.snapshot.no_ask_depth;
                 let yes_obi = if yes_total_depth > dec!(0) {

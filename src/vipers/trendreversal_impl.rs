@@ -763,8 +763,10 @@ impl Strategy for TrendReversalStrategyImpl {
 
                 let secs_held = (Utc::now() - position.opened_at).num_seconds();
 
-                // Wait for fill confirmation before any non-catastrophic exit
-                if position.fill_confirmed_at.is_none() {
+                // Wait for fill confirmation before any non-catastrophic exit.
+                // Ghost fills count as confirmed — otherwise only catastrophic
+                // exits ever fired in simulation.
+                if position.fill_effective_at(dc.ghost_mode).is_none() {
                     let loss_pct = (avg_entry - bid) / avg_entry;
                     if loss_pct < catastrophic_sl_pct {
                         continue;

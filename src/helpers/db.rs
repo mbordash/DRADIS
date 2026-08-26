@@ -2880,10 +2880,42 @@ pub async fn get_pnl_history(pool: &SqlitePool, limit: i64) -> Vec<PnlSnapshotRo
     let cutoff = Utc::now() - chrono::Duration::hours(24);
     let cutoff_str = cutoff.to_rfc3339();
 
+    // Spread `limit` points across the whole 24 hours rather than returning the
+    // newest `limit` rows.
+    //
+    // Snapshots land every few seconds, so a day is tens of thousands of rows.
+    // Taking the newest 1000 covered under three hours of a 24-hour chart — and
+    // silently, because the response looked like a complete history. The
+    // portfolio chart also plots a marker only for trades falling BETWEEN its
+    // oldest and newest snapshot, so every trade older than that window vanished
+    // from the graph with no indication it had happened. On 2026-08-26 an
+    // overnight AMI run showed a flat line and neither of its two trades: both
+    // were three to six hours old against a window 2h40m wide.
+    //
+    // The stride is computed from the actual row count, so the window stays a
+    // full day whatever the snapshot cadence happens to be.
+    let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pnl_snapshots WHERE ts >= ?")
+        .bind(&cutoff_str)
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
+    let stride = if total > limit && limit > 0 { (total + limit - 1) / limit } else { 1 };
+
     match sqlx::query(
-        "SELECT ts, session_pnl, collateral, total_value FROM pnl_snapshots WHERE ts >= ? ORDER BY ts DESC LIMIT ?"
+        // `rn = 1` keeps the newest point whatever the stride, so the chart's
+        // right-hand edge is always the live value rather than up to one stride
+        // stale.
+        "WITH windowed AS ( \
+             SELECT ts, session_pnl, collateral, total_value, \
+                    ROW_NUMBER() OVER (ORDER BY ts DESC) AS rn \
+             FROM pnl_snapshots WHERE ts >= ? \
+         ) \
+         SELECT ts, session_pnl, collateral, total_value FROM windowed \
+         WHERE rn = 1 OR rn % ? = 0 \
+         ORDER BY ts DESC LIMIT ?"
     )
     .bind(&cutoff_str)
+    .bind(stride)
     .bind(limit)
     .fetch_all(pool)
     .await {
@@ -4682,5 +4714,56 @@ mod squadron_column_migration_tests {
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE token_id = 'tok-1'")
             .fetch_one(&pool).await.unwrap();
         assert_eq!(n, 1);
+    }
+}
+
+#[cfg(test)]
+mod pnl_history_window_tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    /// The chart must see a full day, whatever the snapshot cadence.
+    ///
+    /// `get_pnl_history` used to return the newest `limit` rows inside a 24-hour
+    /// cutoff. Snapshots land every few seconds, so 1000 rows covered under
+    /// three hours — and the portfolio chart plots a trade marker only for
+    /// trades between its oldest and newest snapshot, so anything older simply
+    /// vanished. An overnight AMI run on 2026-08-26 showed neither of its two
+    /// trades for exactly this reason.
+    #[tokio::test]
+    async fn history_spans_the_whole_day_not_just_the_newest_rows() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        sqlx::query(
+            "CREATE TABLE pnl_snapshots (
+                 id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL,
+                 session_pnl TEXT NOT NULL, collateral TEXT NOT NULL, total_value TEXT)",
+        ).execute(&pool).await.unwrap();
+
+        // 20 hours of snapshots at a 6-second cadence — the observed rate.
+        let start = Utc::now() - chrono::Duration::hours(20);
+        for i in 0..12_000i64 {
+            let ts = (start + chrono::Duration::seconds(i * 6)).to_rfc3339();
+            sqlx::query("INSERT INTO pnl_snapshots (ts, session_pnl, collateral, total_value) VALUES (?,?,?,?)")
+                .bind(&ts).bind("0").bind("100").bind("100")
+                .execute(&pool).await.unwrap();
+        }
+
+        let rows = get_pnl_history(&pool, 1000).await;
+        assert!(!rows.is_empty(), "history must not be empty");
+        assert!(rows.len() <= 1000, "must respect the point budget, got {}", rows.len());
+
+        let oldest = rows.iter().map(|r| r.ts.clone()).min().unwrap();
+        let newest = rows.iter().map(|r| r.ts.clone()).max().unwrap();
+        let span = chrono::DateTime::parse_from_rfc3339(&newest).unwrap()
+            - chrono::DateTime::parse_from_rfc3339(&oldest).unwrap();
+        assert!(
+            span.num_hours() >= 19,
+            "history spans only {}h — a trade older than that would not be plottable",
+            span.num_hours(),
+        );
     }
 }

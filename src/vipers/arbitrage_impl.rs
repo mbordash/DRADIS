@@ -589,7 +589,10 @@ impl Strategy for ArbitrageStrategyImpl {
             // helpers::balance is intl-only; mirror MAX_WAIT_SECS_WINDOW for US builds.
             #[cfg(not(feature = "intl_clob"))]
             let arbiter_window = 600 + 60;
-            if pos.fill_confirmed_at.is_some() && age_secs > arbiter_window && bid > Decimal::ZERO {
+            // Ghost fills count as confirmed, so the naked-leg flatten is
+            // exercised in simulation instead of silently never firing — this is
+            // the safety net for a one-sided arb, and it should be observable.
+            if pos.fill_effective_at(dc.ghost_mode).is_some() && age_secs > arbiter_window && bid > Decimal::ZERO {
                 info!(
                     " Arb naked-leg flatten — holding only {} leg ({} shares, age {}s) \
                      with no live arbiter; exiting at bid {:.3}",

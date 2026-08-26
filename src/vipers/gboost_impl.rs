@@ -1988,13 +1988,17 @@ impl Strategy for GboostStrategyImpl {
 
         // ── YES position ──────────────────────────────────────────────────────
         if let Some(pos) = pos_map.get(&PositionKey::new(&ctx.squadron_id, "GboostStrategy", target_market.yes_token.clone())) {
-            if pos.fill_confirmed_at.is_some() {
+            // Ghost fills count as confirmed (Position::fill_effective_at).
+            // This gate wraps the ENTIRE exit block for the leg, so in ghost mode
+            // GBoost had no exits whatsoever — not take-profit, not stop-loss,
+            // not the catastrophic floor. A simulated position could only leave
+            // by squadron stand-down or market expiry.
+            if let Some(fill_at) = pos.fill_effective_at(dc.ghost_mode) {
                 let bid = target_snapshot.yes_bid;
                 let profit_pct = if pos.avg_entry > dec!(0) {
                     ((bid - pos.avg_entry) / pos.avg_entry).to_f64().unwrap_or(0.0)
                 } else { 0.0 };
-                let secs_held = pos.fill_confirmed_at
-                    .map(|t| (Utc::now() - t).num_seconds()).unwrap_or(0);
+                let secs_held = (Utc::now() - fill_at).num_seconds();
 
                 let exit_params = || OrderParams {
                     token_id: target_market.yes_token.clone(),
@@ -2057,13 +2061,17 @@ impl Strategy for GboostStrategyImpl {
 
         // ── NO position ───────────────────────────────────────────────────────
         if let Some(pos) = pos_map.get(&PositionKey::new(&ctx.squadron_id, "GboostStrategy", target_market.no_token.clone())) {
-            if pos.fill_confirmed_at.is_some() {
+            // Ghost fills count as confirmed (Position::fill_effective_at).
+            // This gate wraps the ENTIRE exit block for the leg, so in ghost mode
+            // GBoost had no exits whatsoever — not take-profit, not stop-loss,
+            // not the catastrophic floor. A simulated position could only leave
+            // by squadron stand-down or market expiry.
+            if let Some(fill_at) = pos.fill_effective_at(dc.ghost_mode) {
                 let bid = target_snapshot.no_bid;
                 let profit_pct = if pos.avg_entry > dec!(0) {
                     ((bid - pos.avg_entry) / pos.avg_entry).to_f64().unwrap_or(0.0)
                 } else { 0.0 };
-                let secs_held = pos.fill_confirmed_at
-                    .map(|t| (Utc::now() - t).num_seconds()).unwrap_or(0);
+                let secs_held = (Utc::now() - fill_at).num_seconds();
 
                 let exit_params = || OrderParams {
                     token_id: target_market.no_token.clone(),

@@ -485,8 +485,10 @@ impl MakerStrategyImpl {
         if !dc.maker_resting_exit_enabled {
             return None;
         }
-        // Only a CONFIRMED fill owns shares that can back a sell order.
-        position.fill_confirmed_at?;
+        // Only a CONFIRMED fill owns shares that can back a sell order — and a
+        // ghost fill owns simulated shares just as a live one owns real ones, so
+        // the resting exit must be exercised in simulation too.
+        position.fill_effective_at(dc.ghost_mode)?;
         if position.shares < config::MIN_ORDER_SHARES || position.avg_entry <= dec!(0) {
             return None;
         }
@@ -1055,7 +1057,7 @@ impl Strategy for MakerStrategyImpl {
                     continue;
                 };
 
-                if position.fill_confirmed_at.is_none() {
+                if position.fill_effective_at(dc.ghost_mode).is_none() {
                     // Unfilled resting quote: arm/check the oracle-drift baseline.
                     let oracle_now = snapshot.oracle_price;
                     match maker_quote_oracle_drift(token_id.as_str(), oracle_now) {
@@ -1098,7 +1100,7 @@ impl Strategy for MakerStrategyImpl {
                 // Cancelling a quote that has not filled costs nothing and risks
                 // nothing, so this half of the mechanism stays as eager as it has
                 // always been. Only the FILLED path below is gated.
-                if position.fill_confirmed_at.is_none() {
+                if position.fill_effective_at(dc.ghost_mode).is_none() {
                     if breached {
                         arm_maker_toxic_cooldown(token_id.as_str());
                         clear_maker_quote_oracle_baseline(token_id.as_str());
@@ -1117,7 +1119,7 @@ impl Strategy for MakerStrategyImpl {
                     continue;
                 }
 
-                let held_secs = position.fill_confirmed_at
+                let held_secs = position.fill_effective_at(dc.ghost_mode)
                     .map(|t| (Utc::now() - t).num_seconds())
                     .unwrap_or(0);
                 let adverse_pct = if position.avg_entry > dec!(0) {
@@ -1205,9 +1207,18 @@ impl Strategy for MakerStrategyImpl {
             if position.avg_entry <= dec!(0) { continue; }
 
             let profit_pct = (bid - position.avg_entry) / position.avg_entry;
-            let secs_since_fill = position.fill_confirmed_at
+            // Ghost fills count as confirmed — see Position::fill_effective_at.
+            let fill_at = position.fill_effective_at(dc.ghost_mode);
+            let secs_since_fill = fill_at
                 .map(|t| (Utc::now() - t).num_seconds())
                 .unwrap_or(0);
+            // "0s" was reported whenever there was no timestamp at all, which
+            // read as an instant round trip and sent an investigation chasing a
+            // pricing bug that did not exist. Say "unconfirmed" when that is
+            // what it is.
+            let held_label = fill_at
+                .map(|t| format!("{}s", (Utc::now() - t).num_seconds()))
+                .unwrap_or_else(|| "unconfirmed".to_string());
 
             // Catastrophic floor — ungated by the min-hold and by fill confirmation,
             // so a fast adverse move during the stop's blind window (or on an adopted
@@ -1232,12 +1243,12 @@ impl Strategy for MakerStrategyImpl {
                         post_only: false,
                         ghost_mode: dc.ghost_mode,
                     },
-                    reason: format!("Maker Catastrophic: loss={:.2}% ({}s held)", profit_pct * dec!(100), secs_since_fill),
+                    reason: format!("Maker Catastrophic: loss={:.2}% ({held_label} held)", profit_pct * dec!(100)),
                     exit_pair: false,
                 });
             }
 
-            if position.fill_confirmed_at.is_some() && profit_pct >= dc.maker_target_profit_pct {
+            if fill_at.is_some() && profit_pct >= dc.maker_target_profit_pct {
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
                         token_id: token_id.clone(),                        price: bid,
@@ -1255,7 +1266,7 @@ impl Strategy for MakerStrategyImpl {
                 });
             }
 
-            if position.fill_confirmed_at.is_some()
+            if fill_at.is_some()
                 && secs_since_fill >= config::MAKER_MIN_HOLD_SECS_BEFORE_STOP
                 && profit_pct <= -effective_stop_pct
             {
@@ -1586,5 +1597,54 @@ mod spread_gate_wording_tests {
         assert_eq!(floor, Decimal::ZERO, "US Retail charges no taker fee");
         #[cfg(not(feature = "us_retail"))]
         assert!(floor > Decimal::ZERO, "fee-charging venues must have a real floor");
+    }
+}
+
+#[cfg(test)]
+mod ghost_exit_coverage_tests {
+    /// No viper may gate an exit on the RAW `fill_confirmed_at` field.
+    ///
+    /// That field is stamped only by the venue's fill listener (and, on intl, by
+    /// on-chain reconciliation). Ghost mode places no order and holds nothing
+    /// on-chain, so it stays None for a simulated position's whole life. Every
+    /// viper gated its non-catastrophic exits on it, which meant simulation cut
+    /// every loser and let every winner run to rotation or expiry — a one-way
+    /// ratchet that made ghost P&L worse than the strategy warranted. GBoost was
+    /// worst: the gate wrapped its entire exit block, so a ghost position had no
+    /// exits at all.
+    ///
+    /// `Position::fill_effective_at(ghost)` is the ghost-aware accessor. This
+    /// asserts against the source because the failure is invisible at the call
+    /// site — the code reads like an ordinary confirmation check.
+    #[test]
+    fn vipers_use_the_ghost_aware_fill_accessor() {
+        const VIPERS: &[(&str, &str)] = &[
+            ("maker",         include_str!("maker_impl.rs")),
+            ("gboost",        include_str!("gboost_impl.rs")),
+            ("momentum",      include_str!("momentum_impl.rs")),
+            ("convergence",   include_str!("convergence_impl.rs")),
+            ("trendreversal", include_str!("trendreversal_impl.rs")),
+            ("arbitrage",     include_str!("arbitrage_impl.rs")),
+        ];
+        let mut offenders = Vec::new();
+        for (name, src) in VIPERS {
+            // Production code only. Test modules legitimately construct and
+            // inspect the raw field — and this very test mentions the name, so
+            // scanning itself would make it fail on its own text.
+            let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+            for (i, line) in prod.lines().enumerate() {
+                let l = line.trim();
+                if l.starts_with("//") || !l.contains("fill_confirmed_at") { continue; }
+                // Constructing a Position (test fixtures, entry records) is fine;
+                // only READING it to gate behaviour is the hazard.
+                if l.contains("fill_confirmed_at:") { continue; }
+                offenders.push(format!("{name}:{} — {l}", i + 1));
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these read fill_confirmed_at directly and so are blind in ghost mode; \
+             use position.fill_effective_at(dc.ghost_mode): {offenders:#?}",
+        );
     }
 }

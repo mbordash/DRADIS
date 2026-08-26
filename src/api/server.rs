@@ -816,7 +816,11 @@ fn nearest_snapshot(
 /// (collateral + sum of all assets' positions_value per timestamp).
 async fn get_pnl_history(Query(q): Query<AssetQuery>) -> Response {
     debug!("Received GET /api/pnl/history request with limit: {:?}, asset: {:?}", q.limit, q.asset);
-    let limit = q.limit.unwrap_or(200).clamp(1, 1000);
+    // 2000, not 1000: the dashboard asks for 1440 and was silently cut to 1000.
+    // The number is now a POINT COUNT spread across 24 hours rather than a row
+    // count off the end of the table, so honouring the request costs nothing —
+    // the server downsamples to fit (see db::get_pnl_history).
+    let limit = q.limit.unwrap_or(200).clamp(1, 2000);
 
     // If asset is specified, return single-asset history (legacy behavior)
     if let Some(asset_name) = q.asset.as_deref() {
