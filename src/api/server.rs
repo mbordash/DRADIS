@@ -722,7 +722,7 @@ async fn get_latency() -> Response {
 /// only once `scored` is large enough to mean something.
 async fn get_gboost_veto_scores(Query(q): Query<AssetQuery>) -> Response {
     let Some(pool) = db::pool_for_opt_retry(q.asset.as_deref()).await else {
-        error!("Database pool not available for GET /api/gboost/veto-scores");
+        log_pool_unavailable("GET /api/gboost/veto-scores");
         return (StatusCode::SERVICE_UNAVAILABLE, "database not ready").into_response();
     };
     Json(db::gboost_veto_scoreboard(&pool).await).into_response()
@@ -744,7 +744,7 @@ async fn get_vipers_status(Query(q): Query<AssetQuery>) -> Response {
 /// offline review. Same per-asset DB selection as /api/trades.
 async fn export_trades(Query(q): Query<AssetQuery>) -> Response {
     let Some(pool) = db::pool_for_opt_retry(q.asset.as_deref()).await else {
-        error!("Database pool not available for GET /api/trades/export");
+        log_pool_unavailable("GET /api/trades/export");
         return (StatusCode::SERVICE_UNAVAILABLE, "database not ready").into_response();
     };
     let trades = db::get_all_trades(&pool).await;
@@ -831,7 +831,7 @@ async fn get_pnl_history(Query(q): Query<AssetQuery>) -> Response {
                 return Json(history).into_response();
             },
             None => {
-                error!("Database pool not available for asset: {}", asset_name);
+                log_pool_unavailable(&format!("asset: {asset_name}"));
                 return Json(Vec::<db::PnlSnapshotRow>::new()).into_response();
             },
         }
@@ -980,6 +980,26 @@ struct StatusResponse {
     dark_market_feeds: Vec<DarkFeed>,
 }
 
+
+/// Report a missing database pool at a severity that matches the situation.
+///
+/// Before the operator finishes Setup the engine is parked and has no pool, but
+/// the Control Tower dashboard polls regardless — a fresh AMI logged 32 ERROR
+/// lines in its first minute for a state that is expected, self-resolving, and
+/// the direct consequence of parking on purpose. That undercuts the calm the
+/// park fix was meant to create: a buyer watching the log during setup sees a
+/// wall of red.
+///
+/// Once the trading loop has started, a missing pool IS an error and still says
+/// so.
+fn log_pool_unavailable(what: &str) {
+    if crate::helpers::watchdog::is_parked_for_setup() {
+        debug!("Database pool not available for {what} — engine parked awaiting setup");
+    } else {
+        error!("Database pool not available for {what}");
+    }
+}
+
 async fn get_status(State(s): State<ApiState>) -> Response {
     debug!("Received GET /api/status request");
     let markets = s.markets_rx.borrow().clone();
@@ -1088,7 +1108,7 @@ async fn get_trades(Query(q): Query<AssetQuery>) -> Response {
             Json(trades).into_response()
         },
         None       => {
-            error!("Database pool not available for GET /api/trades");
+            log_pool_unavailable("GET /api/trades");
             Json(Vec::<db::TradeRow>::new()).into_response()
         },
     }
@@ -1104,7 +1124,7 @@ async fn get_trade_stats(Query(q): Query<AssetQuery>) -> Response {
     match db::pool_for_opt_retry(q.asset.as_deref()).await {
         Some(pool) => Json(db::get_trade_stats(&pool).await).into_response(),
         None => {
-            error!("Database pool not available for GET /api/trades/stats");
+            log_pool_unavailable("GET /api/trades/stats");
             Json(db::TradeStatsRow {
                 count: 0, wins: 0, losses: 0, realized_pnl: 0.0, fees: 0.0,
                 first_ts: None, last_ts: None,
@@ -1126,7 +1146,7 @@ async fn get_open_positions(Query(q): Query<AssetQuery>) -> Response {
             Json(positions).into_response()
         },
         None => {
-            error!("Database pool not available for GET /api/positions (asset={:?})", q.asset);
+            log_pool_unavailable(&format!("GET /api/positions (asset={:?})", q.asset));
             Json(Vec::<db::OpenPositionRow>::new()).into_response()
         },
     }
@@ -1143,7 +1163,7 @@ async fn get_pending_positions(Query(q): Query<AssetQuery>) -> Response {
             Json(positions).into_response()
         },
         None => {
-            error!("Database pool not available for GET /api/positions/pending");
+            log_pool_unavailable("GET /api/positions/pending");
             Json(Vec::<db::OpenPositionRow>::new()).into_response()
         },
     }
@@ -1160,7 +1180,7 @@ async fn get_confirmed_positions(Query(q): Query<AssetQuery>) -> Response {
             Json(positions).into_response()
         },
         None => {
-            error!("Database pool not available for GET /api/positions/confirmed");
+            log_pool_unavailable("GET /api/positions/confirmed");
             Json(Vec::<db::OpenPositionRow>::new()).into_response()
         },
     }
@@ -1174,7 +1194,7 @@ async fn delete_open_position(Path(token_id): Path<String>, Query(q): Query<Asse
     let pool = match db::pool_for_opt_retry(q.asset.as_deref()).await {
         Some(p) => p,
         None => {
-            error!("Database pool not available for DELETE /api/positions");
+            log_pool_unavailable("DELETE /api/positions");
             return (StatusCode::SERVICE_UNAVAILABLE, "DB unavailable").into_response();
         }
     };
@@ -1251,7 +1271,7 @@ async fn manual_exit(
     let pool = match db::pool_for(&req.asset) {
         Some(p) => p,
         None => {
-            error!("RTB: Database pool not available for asset {}", req.asset);
+            log_pool_unavailable(&format!("RTB: asset {}", req.asset));
             return (StatusCode::SERVICE_UNAVAILABLE, "DB unavailable").into_response();
         }
     };
@@ -1477,7 +1497,7 @@ async fn get_llm_recommendations(Query(q): Query<AssetQuery>) -> Response {    d
             Json(recs).into_response()
         },
         None => {
-            error!("Database pool not available for GET /api/llm/recommendations");
+            log_pool_unavailable("GET /api/llm/recommendations");
             Json(Vec::<db::LlmRecommendationRow>::new()).into_response()
         },
     }
@@ -2094,7 +2114,7 @@ async fn get_squadron_config(
             }
         },
         None => {
-            error!("Database pool not available for GET /api/squadrons/{}/config", id);
+            log_pool_unavailable(&format!("GET /api/squadrons/{id}/config"));
             (StatusCode::INTERNAL_SERVER_ERROR, "database unavailable").into_response()
         },
     }
@@ -3667,5 +3687,42 @@ mod tests {
         // 19:37 is 240s from 19:41 — outside a 120s window, inside a 300s one.
         assert!(nearest_snapshot(&snaps[2..3], secs("2026-08-14T19:41:15+00:00"), 120).is_none());
         assert!(nearest_snapshot(&snaps[2..3], secs("2026-08-14T19:41:15+00:00"), 300).is_some());
+    }
+}
+
+#[cfg(test)]
+mod pool_logging_tests {
+    /// A missing DB pool must not be logged at ERROR unconditionally.
+    ///
+    /// Before Setup completes the engine parks on purpose and has no pool, while
+    /// the dashboard polls anyway. A fresh AMI logged 32 ERROR lines in its first
+    /// minute for that expected state — a wall of red for a buyer who has done
+    /// nothing wrong, right after the watchdog fix stopped the engine
+    /// crash-looping in the same window.
+    ///
+    /// `log_pool_unavailable` picks the severity from
+    /// `watchdog::is_parked_for_setup()`. This asserts against the source because
+    /// a new endpoint copying the old `error!` line is the likely regression, and
+    /// nothing at the call site hints that severity is conditional.
+    #[test]
+    fn pool_unavailable_goes_through_the_severity_aware_helper() {
+        let src = include_str!("server.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        let offenders: Vec<String> = prod
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| {
+                let l = l.trim();
+                l.starts_with("error!(") && l.contains("Database pool not available")
+            })
+            .map(|(i, l)| format!("{}: {}", i + 1, l.trim()))
+            .collect();
+
+        // Exactly one is expected: the helper's own else-branch.
+        assert_eq!(
+            offenders.len(), 1,
+            "endpoints must call log_pool_unavailable() rather than error! directly, \
+             so a parked engine does not report expected idleness as failure: {offenders:#?}",
+        );
     }
 }
