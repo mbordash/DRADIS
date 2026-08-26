@@ -96,6 +96,28 @@ fn side_reject_reason(
         return Some(("toxic_cooldown", "toxic_cooldown (post-ToxicFill re-entry lockout)".to_string()));
     }
     if spread < dc.maker_min_spread {
+        // Distinguish a knob that is merely tight from a market that cannot pay.
+        //
+        // `maker_min_spread` is configurable, so "spread 0.001 < min 0.010" reads
+        // as an invitation to lower it — and usually that is right. But when the
+        // spread is below the ROUND-TRIP FEE, no setting rescues it: quoting
+        // would buy a guaranteed loss. Polymarket International's event markets
+        // quote a tenth of a cent against fees two to seventeen times larger, and
+        // an operator watching a squadron patrol without trading has no way to
+        // tell "raise your appetite" from "this market is unquotable".
+        //
+        // `round_trip_fee_pct` is a fraction of notional; multiplying by the
+        // price puts it in the same units as the spread. US Retail charges no
+        // taker fee, so this branch is inert there rather than wrong.
+        let fee_floor = crate::venues::round_trip_fee_pct(bid_price) * bid_price;
+        if spread < fee_floor {
+            return Some((
+                "spread_below_fee",
+                format!(
+                    "spread {spread:.4} below fee floor {fee_floor:.4} — unquotable at any min_spread"
+                ),
+            ));
+        }
         return Some(("spread", format!("spread {:.3} < min {:.3}", spread, dc.maker_min_spread)));
     }
     if bid_price < dc.maker_min_entry_price {
@@ -1510,5 +1532,59 @@ mod maturation_gate_tests {
     #[test]
     fn market_without_close_time_keeps_the_absolute_wait() {
         assert_eq!(effective_min_market_age(0, None, 600, dec!(0.25)), 600);
+    }
+}
+
+#[cfg(test)]
+mod spread_gate_wording_tests {
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+
+    /// The fee floor in price units, as the gate computes it.
+    fn fee_floor(price: Decimal) -> Decimal {
+        crate::venues::round_trip_fee_pct(price) * price
+    }
+
+    /// Below the fee, no `maker_min_spread` rescues the quote.
+    ///
+    /// The old message — "spread 0.001 < min 0.010" — reads as an invitation to
+    /// lower the knob, and an operator chasing it would only quote into a
+    /// guaranteed loss. Polymarket International's event books quote a tenth of
+    /// a cent against fees several times larger, which is what a squadron that
+    /// patrols and never trades is actually telling you.
+    #[test]
+    fn an_event_book_spread_is_below_the_fee_floor() {
+        // A tenth of a cent, as observed on the intl politics and sports books.
+        let spread = dec!(0.001);
+        for price in [dec!(0.50), dec!(0.10), dec!(0.03)] {
+            let floor = fee_floor(price);
+            // Venues with no taker fee cannot be below it — see the US case below.
+            if floor > Decimal::ZERO {
+                assert!(
+                    spread < floor,
+                    "at price {price} a 0.1c spread must be under the {floor} fee floor",
+                );
+            }
+        }
+    }
+
+    /// A workable spread must NOT be labelled unquotable — that would send an
+    /// operator away from a knob that really would help.
+    #[test]
+    fn a_healthy_spread_is_above_the_fee_floor() {
+        let floor = fee_floor(dec!(0.50));
+        assert!(dec!(0.04) > floor || floor == Decimal::ZERO,
+                "a 4c spread should clear the fee floor at mid");
+    }
+
+    /// US Retail takes no taker fee, so the fee branch is inert there rather
+    /// than wrong — every spread is "above" a zero floor.
+    #[test]
+    fn a_zero_fee_venue_never_reports_below_fee() {
+        let floor = fee_floor(dec!(0.50));
+        #[cfg(feature = "us_retail")]
+        assert_eq!(floor, Decimal::ZERO, "US Retail charges no taker fee");
+        #[cfg(not(feature = "us_retail"))]
+        assert!(floor > Decimal::ZERO, "fee-charging venues must have a real floor");
     }
 }
