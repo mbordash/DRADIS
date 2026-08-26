@@ -99,6 +99,11 @@ RUN set -eux; \
 # `--target debuginfo`; see deploy/ami/provision.sh.
 FROM scratch AS debuginfo
 COPY --from=builder /out/debug /
+# `docker create` refuses an image with no command — "no command specified" —
+# even though this container is never started; it exists only for `docker cp`.
+# A scratch image has no shell and no binary, so this path is deliberately one
+# that cannot execute. It satisfies the daemon and nothing more.
+CMD ["/dev/null"]
 
 FROM alpine:latest
 RUN apk --no-cache add ca-certificates tzdata

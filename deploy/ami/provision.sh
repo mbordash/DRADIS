@@ -70,7 +70,9 @@ DEBUG_CID="$(docker create dradis-debuginfo:latest)"
 rm -rf /tmp/dradis-debuginfo && mkdir -p /tmp/dradis-debuginfo
 docker cp "$DEBUG_CID:/." /tmp/dradis-debuginfo/
 docker rm -f "$DEBUG_CID" >/dev/null
-tar czf /tmp/dradis-debuginfo.tar.gz -C /tmp/dradis-debuginfo .
+# Only the symbol files: `docker cp` of a scratch image's root also yields the
+# empty /dev, /etc, /proc and /sys mount points the daemon creates.
+tar czf /tmp/dradis-debuginfo.tar.gz -C /tmp/dradis-debuginfo $(cd /tmp/dradis-debuginfo && ls *.debug 2>/dev/null || echo .)
 rm -rf /tmp/dradis-debuginfo
 chmod 0644 /tmp/dradis-debuginfo.tar.gz
 echo "     symbols: $(du -h /tmp/dradis-debuginfo.tar.gz | cut -f1) at /tmp/dradis-debuginfo.tar.gz"
