@@ -101,6 +101,62 @@ pub async fn evaluate_strategies(
 /// Phase 6 Note: For full concurrent execution, strategies should be Arc-wrapped
 /// at the StrategyRegistry level. This MVP version uses tokio::join! for true
 /// parallelism at the entry/exit evaluation level per strategy.
+/// Drop any part of an entry signal that would re-open a token the same
+/// strategy is closing on this tick.
+///
+/// `tokio::join!` runs entry and exit evaluation concurrently against one
+/// context snapshot, so the entry arm cannot see that the exit arm is about to
+/// stop the position out. A loss exit arms a re-entry lockout precisely to stop
+/// the maker re-quoting a falling side, but that lockout is armed while the
+/// entry decision is already in flight — it protects the next tick, not this
+/// one.
+///
+/// Observed on the AMI QA box 2026-08-27: the maker stopped out of YES at
+/// -31.37% and re-entered the identical position in the same second, booking
+/// -$3.76 twice, 31 seconds apart. Ghost mode made it cheap to see; the race is
+/// the same with real money.
+///
+/// A two-sided maker quote loses only the overlapping leg — closing YES is no
+/// reason to stop quoting NO.
+fn suppress_reentry(
+    strategy_name: &str,
+    signal: StrategySignal,
+    closing: &[MarketId],
+) -> StrategySignal {
+    if closing.is_empty() {
+        return signal;
+    }
+    let blocked = |t: &MarketId| closing.iter().any(|c| c == t);
+
+    match signal {
+        StrategySignal::MakerQuote { yes, no } => {
+            let yes_blocked = yes.as_ref().is_some_and(|p| blocked(&p.token_id));
+            let no_blocked = no.as_ref().is_some_and(|p| blocked(&p.token_id));
+            if yes_blocked || no_blocked {
+                warn!(
+                    "🚫 {strategy_name}: dropping maker quote leg(s) being closed this tick \
+                     (yes={yes_blocked} no={no_blocked}) — re-entry would rebook the exit's loss"
+                );
+            }
+            let yes = if yes_blocked { None } else { yes };
+            let no = if no_blocked { None } else { no };
+            if yes.is_none() && no.is_none() {
+                StrategySignal::NoSignal
+            } else {
+                StrategySignal::MakerQuote { yes, no }
+            }
+        }
+        other if other.tokens_opened().iter().any(blocked) => {
+            warn!(
+                "🚫 {strategy_name}: dropping entry into a position being closed this tick — \
+                 re-entry would rebook the exit's loss"
+            );
+            StrategySignal::NoSignal
+        }
+        other => other,
+    }
+}
+
 pub async fn execute_strategies_concurrent(
     strategies: &[Box<dyn Strategy>],
     ctx: &StrategyContext,
@@ -157,6 +213,42 @@ pub async fn execute_strategies_concurrent(
         let mut entry_tag = "⬜";
         let mut exit_tag  = "⬜";
 
+        let mut closing_tokens: Vec<MarketId> = Vec::new();
+
+        // Exit is handled BEFORE entry, and an entry that would re-open a token
+        // this same tick is closing is dropped.
+        //
+        // `tokio::join!` above evaluates entry and exit concurrently against one
+        // context snapshot, so the entry arm decides without knowing the exit arm
+        // is about to stop the position out. A loss exit arms a re-entry lockout
+        // (`arm_maker_toxic_cooldown`) precisely to stop the maker re-quoting a
+        // falling side — but the lockout is armed while the entry decision is
+        // already in flight, so it only protects the NEXT tick.
+        //
+        // Observed on the AMI QA box 2026-08-27: the maker stopped out of YES at
+        // -31.37% and re-entered the identical position in the SAME second,
+        // booking the same -$3.76 loss twice 31 seconds apart. Ghost mode made it
+        // cheap to see; the race is identical with real money.
+        //
+        // The exit wins: whatever the entry arm concluded, it was reasoning about
+        // a position that is being closed out from under it.
+        // Handle exit result
+        match exit_result {
+            Ok(signal) => {
+                if !matches!(signal, StrategySignal::NoSignal) {
+                    exit_tag = "🟨";
+                    // Signal detail at DEBUG — actual exit is logged at INFO by main.rs (💰 Position closed)
+                    debug!("📍 {} exit signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
+                    closing_tokens = signal.tokens_closed();
+                    exit_signals.push((strategy_name.clone(), signal));
+                }
+            }
+            Err(e) => {
+                exit_tag = "🔴";
+                warn!("⚠️ {} exit evaluation error: {}", strategy_name, e);
+            }
+        }
+
         // Handle entry result
         match entry_result {
             Ok(signal) => {
@@ -171,6 +263,7 @@ pub async fn execute_strategies_concurrent(
                         crate::helpers::viper_status::EvalOutcome::Signal
                     },
                 );
+                let signal = suppress_reentry(&strategy_name, signal, &closing_tokens);
                 if !matches!(signal, StrategySignal::NoSignal) {
                     entry_tag = "🟩";
                     // Signal detail at DEBUG — actual placement is logged at INFO by main.rs (📥 ENTRY)
@@ -183,22 +276,6 @@ pub async fn execute_strategies_concurrent(
                 crate::helpers::viper_status::record_eval(
                     &ctx.crypto_filter, &strategy_name, crate::helpers::viper_status::EvalOutcome::Error);
                 warn!("⚠️ {} entry evaluation error: {}", strategy_name, e);
-            }
-        }
-
-        // Handle exit result
-        match exit_result {
-            Ok(signal) => {
-                if !matches!(signal, StrategySignal::NoSignal) {
-                    exit_tag = "🟨";
-                    // Signal detail at DEBUG — actual exit is logged at INFO by main.rs (💰 Position closed)
-                    debug!("📍 {} exit signal: {:?} ({}ms)", strategy_name, signal, evaluation_time_ms);
-                    exit_signals.push((strategy_name.clone(), signal));
-                }
-            }
-            Err(e) => {
-                exit_tag = "🔴";
-                warn!("⚠️ {} exit evaluation error: {}", strategy_name, e);
             }
         }
 
@@ -283,4 +360,85 @@ pub fn aggregate_and_resolve_signals(
     }
 
     (final_signals, vec![])
+}
+
+#[cfg(test)]
+mod reentry_suppression_tests {
+    use super::*;
+    use crate::state::OrderParams;
+    use crate::venues::core::MarketId;
+    use rust_decimal_macros::dec;
+
+    fn params(token: &str) -> OrderParams {
+        OrderParams {
+            token_id: MarketId::new(token), price: dec!(0.51), shares: dec!(20),
+            fee_bps: 0, is_neg_risk: false, market_name: "m".into(),
+            condition_id: String::new(),
+            order_type: crate::venues::core::TimeInForce::Fak,
+            post_only: false, ghost_mode: true,
+        }
+    }
+
+    /// The bug this exists for: stop out of YES, re-enter YES in the same tick.
+    ///
+    /// On the AMI QA box the maker exited at -31.37% and immediately rebought
+    /// the identical position, booking -$3.76 twice 31 seconds apart. The
+    /// re-entry lockout the exit arms cannot help — it is armed while this
+    /// entry decision is already in flight.
+    #[test]
+    fn an_entry_into_a_token_being_closed_is_dropped() {
+        let entry = StrategySignal::Entry { params: params("yes"), pair_params: None };
+        let out = suppress_reentry("MakerStrategy", entry, &[MarketId::new("yes")]);
+        assert!(matches!(out, StrategySignal::NoSignal));
+    }
+
+    /// Closing YES is no reason to stop quoting NO — only the overlapping leg goes.
+    #[test]
+    fn a_two_sided_quote_loses_only_the_closing_leg() {
+        let q = StrategySignal::MakerQuote { yes: Some(params("yes")), no: Some(params("no")) };
+        match suppress_reentry("MakerStrategy", q, &[MarketId::new("yes")]) {
+            StrategySignal::MakerQuote { yes, no } => {
+                assert!(yes.is_none(), "the closing leg must be dropped");
+                assert!(no.is_some(), "the untouched leg must survive");
+            }
+            other => panic!("expected a MakerQuote, got {other:?}"),
+        }
+    }
+
+    /// Both legs closing leaves nothing to send.
+    #[test]
+    fn a_quote_with_both_legs_closing_becomes_no_signal() {
+        let q = StrategySignal::MakerQuote { yes: Some(params("yes")), no: Some(params("no")) };
+        let out = suppress_reentry("MakerStrategy", q,
+            &[MarketId::new("yes"), MarketId::new("no")]);
+        assert!(matches!(out, StrategySignal::NoSignal));
+    }
+
+    /// An ordinary tick with no exit must pass through untouched — this must not
+    /// become a filter that quietly suppresses normal trading.
+    #[test]
+    fn an_entry_with_no_exit_this_tick_is_untouched() {
+        let entry = StrategySignal::Entry { params: params("yes"), pair_params: None };
+        let out = suppress_reentry("MakerStrategy", entry, &[]);
+        assert!(matches!(out, StrategySignal::Entry { .. }));
+    }
+
+    /// An entry into a DIFFERENT token is unaffected by the exit.
+    #[test]
+    fn an_unrelated_entry_survives() {
+        let entry = StrategySignal::Entry { params: params("other"), pair_params: None };
+        let out = suppress_reentry("MakerStrategy", entry, &[MarketId::new("yes")]);
+        assert!(matches!(out, StrategySignal::Entry { .. }));
+    }
+
+    /// A paired entry (Arbitrage/TimeDecay) is dropped if EITHER leg is closing —
+    /// half a hedge is worse than none.
+    #[test]
+    fn a_paired_entry_is_dropped_if_either_leg_is_closing() {
+        let entry = StrategySignal::Entry {
+            params: params("yes"), pair_params: Some(params("no")),
+        };
+        let out = suppress_reentry("ArbitrageStrategy", entry, &[MarketId::new("no")]);
+        assert!(matches!(out, StrategySignal::NoSignal));
+    }
 }

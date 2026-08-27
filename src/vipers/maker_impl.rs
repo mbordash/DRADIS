@@ -54,6 +54,9 @@ use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
 use crate::venues::core::TimeInForce;
 use crate::helpers::price::{ceil_to_tick_size, floor_to_tick_size};
+
+/// One price tick on both venues (see `helpers::price::floor_to_tick_size`).
+const MAKER_TICK_SIZE: Decimal = dec!(0.01);
 // Import OrderType
 
 /// Tracks bid-depth at the previous evaluation tick for drain-rate computation.
@@ -761,8 +764,34 @@ impl Strategy for MakerStrategyImpl {
         // Previously used a hardcoded dec!(0.01) which allowed 1-tick spreads when
         // the skew (±0.03) exceeded the bid_buffer (0.025), triggering the cap.
         // Now uses the configured MAKER_CROSS_BUFFER constant (0.02) for consistency.
-        let yes_bid_price = floor_to_tick_size(raw_yes_price.min(snapshot.yes_ask - dc.maker_cross_buffer));
-        let no_bid_price  = floor_to_tick_size(raw_no_price.min(snapshot.no_ask  - dc.maker_cross_buffer));
+        // Also cap at best_bid + one tick, so the maker IMPROVES the bid instead
+        // of crossing the spread toward the ask.
+        //
+        // Both prices above are derived from the ASK. That is right on a tight
+        // book — ask 0.52 / bid 0.50 quotes 0.50, at the bid — but on a wide one
+        // it posts most of the way across. Kalshi, 2026-08-27: YES bid 0.35 /
+        // ask 0.53, quoted 0.51, marked to the bid instantly and tripped the
+        // catastrophic stop at -31.37%. The book never moved; the loss was
+        // entirely the entry price, and it repeated on the NO side by the same
+        // formula. `maker_min_spread` cannot catch it — that gate rejects books
+        // too TIGHT, so a wider spread makes the maker keener, not warier.
+        //
+        // Guarded by a knob rather than hardcoded: crossing to the ask fills
+        // faster, and an operator may want that on a venue where resting bids
+        // rarely get lifted. Default is to improve the bid.
+        let bid_cap = |best_bid: Decimal| best_bid + MAKER_TICK_SIZE;
+        let yes_capped = if dc.maker_improve_bid_only {
+            raw_yes_price.min(bid_cap(snapshot.yes_bid))
+        } else {
+            raw_yes_price
+        };
+        let no_capped = if dc.maker_improve_bid_only {
+            raw_no_price.min(bid_cap(snapshot.no_bid))
+        } else {
+            raw_no_price
+        };
+        let yes_bid_price = floor_to_tick_size(yes_capped.min(snapshot.yes_ask - dc.maker_cross_buffer));
+        let no_bid_price  = floor_to_tick_size(no_capped.min(snapshot.no_ask  - dc.maker_cross_buffer));
 
         let yes_spread = yes_ask - yes_bid;
         let no_spread  = no_ask - no_bid;
@@ -1646,5 +1675,66 @@ mod ghost_exit_coverage_tests {
             "these read fill_confirmed_at directly and so are blind in ghost mode; \
              use position.fill_effective_at(dc.ghost_mode): {offenders:#?}",
         );
+    }
+}
+
+#[cfg(test)]
+mod bid_anchoring_tests {
+    use super::*;
+
+    /// Reproduces the Kalshi book of 2026-08-27 that cost -31.37% at entry.
+    fn quote(ask: Decimal, bid: Decimal, buffer: Decimal, improve: bool) -> Decimal {
+        let raw = ask - buffer;
+        let capped = if improve { raw.min(bid + MAKER_TICK_SIZE) } else { raw };
+        floor_to_tick_size(capped.min(ask - dec!(0.02)))
+    }
+
+    /// The bug: on a wide book the ask-anchored price crosses the spread.
+    ///
+    /// YES bid 0.35 / ask 0.53. The maker quoted 0.51 — sixteen cents above the
+    /// best bid — the fill marked to the bid immediately, and the catastrophic
+    /// stop booked -31.37%. The book never moved; the loss was the entry price.
+    #[test]
+    fn a_wide_book_no_longer_crosses_the_spread() {
+        let (ask, bid) = (dec!(0.53), dec!(0.35));
+        assert_eq!(quote(ask, bid, dec!(0.02), false), dec!(0.51), "the old behaviour");
+        assert_eq!(quote(ask, bid, dec!(0.02), true), dec!(0.36), "improve the bid by one tick");
+    }
+
+    /// The NO side priced by the same formula and had the same exposure:
+    /// NO bid 0.47 / ask 0.65 would have quoted 0.63.
+    #[test]
+    fn the_no_side_is_capped_too() {
+        let (ask, bid) = (dec!(0.65), dec!(0.47));
+        assert_eq!(quote(ask, bid, dec!(0.02), false), dec!(0.63), "the old behaviour");
+        assert_eq!(quote(ask, bid, dec!(0.02), true), dec!(0.48));
+    }
+
+    /// On a tight book the cap must not bind — otherwise this would quietly
+    /// reprice every normal quote and change fill rates everywhere.
+    #[test]
+    fn a_tight_book_is_unaffected() {
+        let (ask, bid) = (dec!(0.52), dec!(0.50));
+        assert_eq!(quote(ask, bid, dec!(0.02), false), dec!(0.50));
+        assert_eq!(quote(ask, bid, dec!(0.02), true), dec!(0.50), "cap must not bind here");
+    }
+
+    /// Turning the knob off restores the previous behaviour exactly, so an
+    /// operator who wants faster fills can still have them.
+    #[test]
+    fn the_knob_restores_the_old_behaviour() {
+        for (ask, bid) in [(dec!(0.53), dec!(0.35)), (dec!(0.65), dec!(0.47)), (dec!(0.52), dec!(0.50))] {
+            let old = ask - dec!(0.02);
+            assert_eq!(quote(ask, bid, dec!(0.02), false), floor_to_tick_size(old.min(ask - dec!(0.02))));
+        }
+    }
+
+    /// The cross-buffer clamp still wins when it is the tighter of the two, so
+    /// inventory skew can never push the quote up against the ask.
+    #[test]
+    fn the_cross_buffer_still_binds() {
+        // A bid one tick under the ask would otherwise allow 0.52 on a 0.53 ask.
+        let q = quote(dec!(0.53), dec!(0.52), dec!(0.00), true);
+        assert!(q <= dec!(0.51), "cross buffer must keep the quote off the ask, got {q}");
     }
 }

@@ -304,6 +304,27 @@ pub const MAKER_BID_IMPROVEMENT_RATIO: Decimal = dec!(0.25);
 pub const MAKER_MIN_BID_IMPROVEMENT: Decimal = dec!(0.01);
 pub const MAKER_MAX_BID_IMPROVEMENT: Decimal = dec!(0.02);
 pub const MAKER_CROSS_BUFFER: Decimal = dec!(0.02);
+
+/// Anchor maker bids to the BEST BID rather than only to the ask.
+///
+/// The quote is priced `ask - maker_bid_buffer`, which is correct on a tight
+/// book: ask 0.52 / bid 0.50 quotes 0.50, right at the bid. On a WIDE book it
+/// posts a bid most of the way across the spread. Observed on Kalshi
+/// 2026-08-27: YES bid 0.35 / ask 0.53, the maker quoted 0.51 — sixteen cents
+/// above the best bid — and the position marked to the bid instantly, tripping
+/// the catastrophic stop at -31.37%. The book never moved; the whole loss was
+/// the entry price.
+///
+/// `maker_min_spread` cannot catch this: it rejects books that are too TIGHT,
+/// so the wider the spread the more eagerly the maker crosses it. The
+/// `maker_cross_buffer` clamp only stops the quote nearing the ask; nothing
+/// anchored it to the bid.
+///
+/// With this true (the default) the quote is additionally capped at
+/// `best_bid + one tick` — the maker improves the bid rather than crossing to
+/// the ask, which is what a maker is for. Set false to restore the ask-anchored
+/// behaviour.
+pub const MAKER_IMPROVE_BID_ONLY: bool = true;
 pub const CROSSES_BOOK_COOLDOWN_SECS: i64 = 60;
 /// Conservative: longer pause before retrying a rejected entry — lets the book
 /// settle before re-attempting to avoid repeated rejections.

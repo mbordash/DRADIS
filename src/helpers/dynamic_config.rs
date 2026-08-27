@@ -223,6 +223,7 @@ fn default_obi_use_whole_book()             -> bool    { config::OBI_USE_WHOLE_B
 fn default_maker_min_spread()               -> Decimal { config::MAKER_MIN_SPREAD                      }
 fn default_maker_bid_buffer()               -> Decimal { config::MAKER_BID_BUFFER                      }
 fn default_maker_cross_buffer()             -> Decimal { config::MAKER_CROSS_BUFFER                    }
+fn default_maker_improve_bid_only()          -> bool    { config::MAKER_IMPROVE_BID_ONLY }
 fn default_maker_quote_size_usdc()          -> Decimal { config::MAKER_QUOTE_SIZE_USDC                 }
 fn default_maker_max_combined_bid()         -> Decimal { config::MAKER_MAX_COMBINED_BID                }
 fn default_maker_max_complementary_price()  -> Decimal { config::MAKER_MAX_COMPLEMENTARY_PRICE         }
@@ -465,6 +466,14 @@ pub struct DynamicConfig {
     pub maker_bid_buffer:              Decimal,
     #[serde(default = "default_maker_cross_buffer")]
     pub maker_cross_buffer:            Decimal,
+
+    /// Cap the maker's bid at `best_bid + one tick` as well as `ask - buffer`.
+    ///
+    /// Ask-anchored pricing crosses most of a wide spread — on a 0.35/0.53 book
+    /// it quoted 0.51 and marked to the bid instantly at -31%. True (default)
+    /// makes the maker improve the bid instead of crossing to the ask.
+    #[serde(default = "default_maker_improve_bid_only")]
+    pub maker_improve_bid_only:        bool,
     #[serde(default = "default_maker_max_combined_bid")]
     pub maker_max_combined_bid:        Decimal,
     #[serde(default = "default_maker_max_complementary_price")]
@@ -844,6 +853,7 @@ impl Default for DynamicConfig {
             maker_min_spread:              config::MAKER_MIN_SPREAD,
             maker_bid_buffer:              config::MAKER_BID_BUFFER,
             maker_cross_buffer:            config::MAKER_CROSS_BUFFER,
+            maker_improve_bid_only:        config::MAKER_IMPROVE_BID_ONLY,
             maker_max_combined_bid:        config::MAKER_MAX_COMBINED_BID,
             maker_max_complementary_price: config::MAKER_MAX_COMPLEMENTARY_PRICE,
             maker_max_book_imbalance_ratio: config::MAKER_MAX_BOOK_IMBALANCE_RATIO,

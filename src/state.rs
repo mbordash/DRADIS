@@ -946,6 +946,33 @@ impl StrategySignal {
     pub fn opens_exposure(&self) -> bool {
         matches!(self, Self::Entry { .. } | Self::MakerQuote { .. })
     }
+
+    /// Tokens this signal would take a NEW position in.
+    pub fn tokens_opened(&self) -> Vec<MarketId> {
+        match self {
+            Self::Entry { params, pair_params } => std::iter::once(params.token_id.clone())
+                .chain(pair_params.iter().map(|p| p.token_id.clone()))
+                .collect(),
+            Self::MakerQuote { yes, no } => yes.iter().chain(no.iter())
+                .map(|p| p.token_id.clone())
+                .collect(),
+            _ => Vec::new(),
+        }
+    }
+
+    /// Tokens this signal CLOSES or reduces.
+    ///
+    /// Used to stop a strategy re-opening, in the same tick, a position it is
+    /// simultaneously closing — see `execute_strategies_concurrent`.
+    pub fn tokens_closed(&self) -> Vec<MarketId> {
+        match self {
+            Self::Exit { params, .. } | Self::MakerRestingExit { params, .. } => {
+                vec![params.token_id.clone()]
+            }
+            Self::MakerCancel { tokens } => tokens.clone(),
+            _ => Vec::new(),
+        }
+    }
 }
 
 #[cfg(test)]

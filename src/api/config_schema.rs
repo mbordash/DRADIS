@@ -245,6 +245,15 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Distance below best ask to place the resting bid.").range(0.0, 0.5).step(0.005));
         v.push(F::new(g, e, "maker_cross_buffer", "Cross Buffer", "price", true,
             "Anti-cross safety buffer to avoid taking the book.").range(0.0, 0.5).step(0.005));
+        v.push(F::new(g, e, "maker_improve_bid_only", "Improve The Bid", "bool", false,
+            "Cap the maker's bid at one tick above the best bid, instead of pricing it purely \
+             back from the ask. On a tight book the two agree — ask $0.52, bid $0.50, quote \
+             $0.50 — but on a wide one the ask-anchored price crosses most of the spread: with \
+             a $0.35 bid against a $0.53 ask it quotes $0.51, sixteen cents above anything \
+             anyone is bidding, and the position marks to the bid the moment it fills. That is \
+             a loss taken at entry, not a market move. Leave this on unless resting bids on \
+             your venue simply never get lifted and you would rather pay the spread for a fill.")
+            );
         v.push(F::new(g, e, "maker_max_combined_bid", "Max Combined Bid", "price", true,
             "Skip when YES_bid + NO_bid exceeds this (overpriced pair guard).").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "maker_max_complementary_price", "Max Complementary Price", "price", true,
