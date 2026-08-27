@@ -34,9 +34,14 @@ import type { VenueId, Edition } from '@/lib/setupApi';
 
 /** Display name per venue — used in the header, the jurisdiction heading, and
  *  the confirmation checkbox, so a Kalshi build never labels itself "US". */
+// Venues are named in full: "Polymarket US", "Polymarket International",
+// "Kalshi". Abbreviating to "US" / "International" made the acknowledgement
+// modal read "DRADIS US — read before proceeding", which names no venue a
+// customer would recognise — and this modal is the first thing they see, where
+// they are being asked to confirm eligibility to trade on that exact venue.
 const VENUE_NAME: Record<VenueId, string> = {
-  intl:   'International',
-  us:     'US',
+  intl:   'Polymarket International',
+  us:     'Polymarket US',
   kalshi: 'Kalshi',
 };
 
