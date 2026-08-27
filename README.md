@@ -13,7 +13,7 @@
 [![OpenClaw](https://img.shields.io/badge/OpenClaw-AI%20Integration-CC0000?logoColor=white)](https://openclaw.ai)
 [![License](https://img.shields.io/badge/License-AGPL%20v3-blue)](LICENSE)
 
-**WARNING**: This is **ALPHA** software. You will probably lose money. Start in GHOST mode and tune before going live. Make sure to regularly pull updates as our own LLM advises on config and Viper strategy impls daily.
+**WARNING**: You will probably lose money. Start in GHOST mode and tune before going live. Make sure to regularly pull updates as our own LLM advises on config and Viper strategy impls often.
 
 Public Demo Site: https://demo.dradis.live/
 
@@ -270,10 +270,42 @@ ASSETS=kalshi                            # keep the dashboard pool tidy (data in
 - **Parallel Dispatch**: Every 50ms heartbeat, the CIC evaluates all registered Vipers concurrently.
 - **Isolated budgets**: Each Viper has its own independent capital budget and position book — a loss in one sector can't drain another's fuel.
 - **Multi-asset concurrency**: Each asset runs in its own `tokio::spawn`ed task with independent raptors and session state. The tokio runtime sizes its worker pool to the host's core count (floor 2) to avoid oversubscribing small instances; set `TOKIO_WORKER_THREADS` to raise it for multi-asset boxes (e.g. BTC + ETH + SOL on a 4+ vCPU host). Blocking work runs on the dedicated `spawn_blocking` pool, so matching workers to cores is the correct configuration.
-- **OS-thread watchdog**: A native OS thread (outside the tokio runtime) checks an atomic heartbeat every 60 s. If the trading loop goes silent for 5 minutes, it calls `process::exit(1)` to trigger Docker's restart policy — immune to tokio runtime deadlocks.
+- **OS-thread watchdog**: A native OS thread (outside the tokio runtime) checks an atomic heartbeat every 60 s. If the trading loop goes silent for 5 minutes, it calls `process::exit(1)` to trigger Docker's restart policy — immune to tokio runtime deadlocks. It stands down while the engine is deliberately parked awaiting Setup, so a box with no credentials yet is not mistaken for a stalled one. On a stall it dumps every thread's stack before exiting — see Diagnosing a stall below.
 - **OBI Veto**: A built-in Order Book Imbalance gate at −0.60 blocks entries into toxic flow / distribution walls.
 - **Strategy Timeout**: Each Viper evaluation is hard-capped at 500ms. A hung Viper is skipped for that tick — the engine never freezes.
 - **REST API**: axum server on `:9000` exposes live config, P&L, positions, and trade history to the Control Tower.
+
+### Diagnosing a stall
+
+If the trading loop goes quiet, the OS-thread watchdog emits a soft warning at
+180 s and exits the process at 300 s so the supervisor restarts it. Both points
+dump the stack of **every** thread, and the soft warning is usually the more
+useful of the two: the process is still alive there, so whatever holds a lock is
+still holding it.
+
+The dump names the phase the loop was in (`SIGNAL_EVAL`, `MARKET_ROTATE`,
+`GBOOST_RETRAIN`, …) and, inside signal evaluation, which viper or setup step.
+That alone is often enough. When it is not, the stacks need symbolizing:
+
+- **Release builds carry line tables** (`[profile.release] debug = 1`). Debug
+  info does not change code generation — the binary runs exactly as it would
+  without it.
+- **The runtime image is stripped**, so the shipped binary stays small. The
+  matching **unstripped** binaries are published with each AMI release as
+  `dradis-debuginfo-v1.0.0-ami.N.tar.gz`.
+- Symbolize a customer's dump against the tarball **for the version they are
+  running** — the addresses are meaningless against any other build.
+
+```bash
+# macOS
+atos -o dradis-intl.debug -arch arm64 -l <LoadAddress> <address>
+# Linux
+eu-addr2line -e dradis-intl.debug -f -C <address>
+```
+
+The load address is printed at the top of the dump. A mismatch between binary
+and symbols yields confident nonsense rather than an error, so check the version
+before trusting a result.
 
 ### REST API Endpoints
 
@@ -479,13 +511,22 @@ The **+ Deploy** button in the CAG Registry panel opens the Squadron Builder mod
 | **Quick Deploy** | Select market type (crypto/sports/politics) → DRADIS auto-selects the highest-liquidity market and optimal raptors/vipers |
 | **Full Control** | Browse available markets, manually select raptors and vipers, see implementation status badges |
 
-**Regional restrictions:**
+**Market types by venue:**
 
-| Deployment | Squadron Builder Market Types | Notes |
-|------------|-------------------------------|-------|
-| US (`us_retail`) | Politics, Sports | Crypto runs as an auto-managed wing (`us-crypto` squadron) — deployed by the trader loop, not the builder |
-| Kalshi (`kalshi`) | Crypto | Kalshi lists sports/politics too, but DRADIS's Kalshi loop is crypto-first (15-min/hourly ladders) |
-| INTL (`intl_clob`) | Politics, Sports, Crypto | |
+Every venue accepts all three market types through the Squadron Builder. What
+differs is which classes DRADIS also keeps running *on its own*.
+
+| Deployment | Deployable | Auto-deployed | Notes |
+|------------|-----------|---------------|-------|
+| INTL (`intl_clob`) | Politics, Sports, Crypto | Politics, Sports | Crypto is kept running by the hourly rotation loop |
+| US (`us_retail`) | Politics, Sports, Crypto | Politics, Sports | Crypto runs as an auto-managed wing (`us-crypto`) |
+| Kalshi (`kalshi`) | Politics, Sports, Crypto | Politics, Sports | Crypto is kept running by the 15-minute rotation loop |
+
+Crypto is deliberately *not* auto-deployed anywhere: every venue's rotation loop
+or wing already keeps a crypto squadron running, so seeding another would put two
+squadrons on the same underlying competing for the same capital. Politics and
+sports have no such loop, which is why they need one. The two switches live in
+Control Tower under Auto-Deploy Politics / Auto-Deploy Sports.
 
 **Deployment flow:**
 ```
@@ -493,20 +534,39 @@ User → "+ Deploy" → Modal → POST /api/squadrons/deploy
                                     ↓
                         deployment_queue (pending)
                                     ↓
-                    Admiral Adama processor (5s poll)
+              venues::deployment::run_deployment_processor
+              (5s poll — one consumer, shared by all venues)
                                     ↓
-               CAG.register_staged_deployment() → STAGED in UI
+                  DeploymentRunner::run_pinned  →  squadron
+                  (KalshiDeploymentRunner | UsDeploymentRunner
+                   | cag::adama::IntlDeploymentRunner)
 ```
+
+The same consumer drains the queue on every venue and seeds the auto-deploy
+classes. Each venue supplies only a `DeploymentRunner` — how to resolve a market
+id and trade it. A deployment interrupted by a restart is requeued rather than
+lost, so restarting the engine for a config change does not silently drop the
+squadrons you deployed.
 
 Staged squadrons appear in the CAG Registry. The auto-discovery loops for crypto assets (BTC/ETH/SOL) adopt staged deployments on their next market rotation.
 
 ### Authentication
 
 ```bash
-# .env (production)
+# .env (production — self-hosted)
 CT_USERNAME=starbuck
 CT_PASSWORD=your-strong-password
 ```
+
+**On the AWS Marketplace AMI these are set for you at first boot**
+(`deploy/ami/dradis-firstboot.sh`): the username is `admin` and the password is
+the **EC2 instance ID**, fetched via IMDSv2. So the first login on a fresh
+instance is `admin` / `i-0abc123…`.
+
+Change it. An instance ID is not a secret — it appears in the EC2 console, in
+support tickets and in screenshots — so the credential is only as strong as the
+security group in front of it. Restrict 80/443 to your own address, and set a
+real `CT_PASSWORD` before opening the dashboard more widely.
 
 ---
 
@@ -836,8 +896,15 @@ The safe pattern: bump the suffix in `GBOOST_MODEL_PATH` (e.g. `v14f` → `v15f`
 |----------------------|-----------------------------------------------------------|--------------------------------------------|
 | Market data fidelity | Requires storing full L2 orderbook snapshots              | Real-time Polymarket CLOB — 100% authentic |
 | Strategy fidelity    | Must mock async execution, cooldown maps, drawdown guards | Full production code path runs unchanged   |
-| Fill simulation      | Assumes fills that may never occur in thin markets        | No fills in ghost — no wishful thinking    |
+| Fill simulation      | Assumes fills that may never occur in thin markets        | Fills ARE simulated, optimistically at the quoted price    |
 | Build/maintain cost  | Significant                                               | Zero — `GHOST_MODE = true` in `config.rs`  |
+
+**Read ghost P&L as a smoke test, not an expectancy estimate.** A ghost fill is
+booked at the price the strategy quoted, at the moment it quoted — no queue
+position, no partial fills, no adverse selection. Real books do not oblige. Ghost
+mode answers "does the whole path work end to end: signal → order → position →
+exit → booked trade", which is exactly what a backtest cannot tell you. It does
+not answer "is this strategy profitable".
 
 Workflow: ghost overnight → `tools/session_parser.py` → tune `config.rs` → repeat until positive expectancy.
 
