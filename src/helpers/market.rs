@@ -333,18 +333,43 @@ pub async fn get_market_pair(http: &reqwest::Client, asset_filter: &str) -> (Mar
     // buys nothing over sitting idle, and costs a false connectivity alarm.
     let tradeable_fallback: Vec<_> =
         hourly_c.iter().filter(|c| c.3 > 0.0 || c.4).cloned().collect();
+    // Nothing tradeable → select NOTHING and wait for the next tick.
+    //
+    // This used to fall back to the unfiltered list, which is the branch that
+    // actually bites: the middle tier above only helps while SOME candidate is
+    // tradeable. In the gap between hourly markets there are none — every
+    // remaining strike market has zero volume and no "Up or Down" has opened yet
+    // — so the chain fell straight through and picked a dead market anyway.
+    //
+    // Ireland, 2026-08-27: the 5PM "Up or Down" (vol24h=14877) closed, and the
+    // very next selection took "Bitcoin above 78,000 on August 27, 7PM ET?" at
+    // vol24h=0, re-picked it every ~90s, and left the feed dark for 26 minutes
+    // with every strategy pointed at an empty book.
+    //
+    // An empty selection is already a supported state — `.first()` yields None,
+    // the ZERO-token candidate falls out below, and the caller checks for it. The
+    // squadron sits idle for the few minutes until the next hourly market opens,
+    // which is the truthful state rather than a dead market dressed up as one.
+    let nothing: Vec<_> = Vec::new();
     let hourly_final = if !high_vol_hourly.is_empty() {
         &high_vol_hourly
     } else if !tradeable_fallback.is_empty() {
         &tradeable_fallback
     } else {
-        &hourly_c
+        &nothing
     };
 
     let hourly = hourly_final.first()
         .map(|b| MarketCandidate { yes_token: market_id_from_u256(b.0[0]), no_token: market_id_from_u256(b.0[1]), name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone(), strike_price: None })
         .unwrap_or(MarketCandidate { yes_token: market_id_from_u256(U256::ZERO), no_token: market_id_from_u256(U256::ZERO), name: String::new(), link: String::new(), description: String::new(), is_hot: false, close_time: None, volume: 0.0, condition_id: String::new(), strike_price: None });
 
+    if hourly.yes_token == market_id_from_u256(U256::ZERO) && !hourly_c.is_empty() {
+        info!(
+            "⏳ No tradeable hourly market right now ({} candidate(s), all zero-volume strike \
+             markets) — waiting for the next one rather than quoting into an empty book",
+            hourly_c.len(),
+        );
+    }
     if hourly.yes_token != market_id_from_u256(U256::ZERO) {
         info!("📈 Hourly market selected: \"{}\" (vol24h={:.0})", hourly.name, hourly.volume);
     }
@@ -519,6 +544,53 @@ pub async fn fetch_resolved_outcome_prices(
         out.insert(tid, price);
     }
     Some(out)
+}
+
+#[cfg(test)]
+mod hourly_selection_waits_tests {
+    /// The three-tier chain, as `pick_markets` applies it.
+    /// Candidates are `(vol24h, is_up_or_down)`.
+    fn chosen(cands: &[(f64, bool)], vol_floor: f64) -> Option<(f64, bool)> {
+        let high: Vec<_> = cands.iter().filter(|c| c.0 >= vol_floor).copied().collect();
+        let tradeable: Vec<_> = cands.iter().filter(|c| c.0 > 0.0 || c.1).copied().collect();
+        if !high.is_empty() { high.first().copied() }
+        else if !tradeable.is_empty() { tradeable.first().copied() }
+        else { None }
+    }
+
+    /// The gap between hourly markets: the liquid "Up or Down" has closed and
+    /// only zero-volume strike markets remain. Selecting nothing is correct —
+    /// the squadron waits a few minutes for the next market to open.
+    ///
+    /// Ireland, 2026-08-27: the 5PM Up-or-Down (vol24h=14877) closed and the next
+    /// selection took a vol24h=0 strike market, re-picked it every ~90s, and left
+    /// the feed dark for 26 minutes with every strategy on an empty book.
+    #[test]
+    fn nothing_tradeable_selects_nothing() {
+        let only_dead_strikes = [(0.0, false), (0.0, false), (0.0, false)];
+        assert_eq!(chosen(&only_dead_strikes, 500.0), None,
+                   "a dead market must not be selected just to have one");
+    }
+
+    /// A freshly published "Up or Down" legitimately has zero 24h volume and is
+    /// quoted immediately — it must still be selectable, or the bot would idle
+    /// through every rotation.
+    #[test]
+    fn a_fresh_up_or_down_is_still_chosen_at_zero_volume() {
+        assert_eq!(chosen(&[(0.0, false), (0.0, true)], 500.0), Some((0.0, true)));
+    }
+
+    /// A thin but genuinely traded strike market is still acceptable.
+    #[test]
+    fn a_thin_traded_market_is_chosen_over_nothing() {
+        assert_eq!(chosen(&[(0.0, false), (15.0, false)], 500.0), Some((15.0, false)));
+    }
+
+    /// The liquid tier still wins when it has anything in it.
+    #[test]
+    fn a_liquid_market_wins() {
+        assert_eq!(chosen(&[(14877.0, true), (15.0, false)], 500.0), Some((14877.0, true)));
+    }
 }
 
 #[cfg(test)]

@@ -17,7 +17,7 @@
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
 import { useCallback, useEffect, useRef, useState } from 'react';
-import useSWR from 'swr';
+import useSWR, { useSWRConfig } from 'swr';
 import dynamic from 'next/dynamic';
 import ChunkBoundary from '@/components/ChunkBoundary';
 
@@ -493,6 +493,27 @@ export default function DashboardPage() {
 
   const { data: status } =
     useSWR('status', getStatus, { refreshInterval: 30_000 });
+
+  // Refresh the portfolio history the moment the engine restarts.
+  //
+  // `pnl-global` polls every 60s — reasonable for a chart in steady state, and
+  // deliberately slower than its 10–15s siblings because the query downsamples a
+  // full day of snapshots. But it is also the number an operator stares at right
+  // after entering their venue credentials, and the engine has the balance
+  // within the same second while the card waits for its next tick: on a fresh
+  // Ireland box the log showed "Starting portfolio value: $59.49" immediately
+  // and the dashboard took ~30s to catch up, which reads as the key not having
+  // worked.
+  //
+  // `session_started_at` changes on every engine restart — including the one the
+  // Setup view triggers after saving credentials — so this refetches once, then
+  // goes back to the 60s cadence.
+  const { mutate: mutateKey } = useSWRConfig();
+  const sessionStartedAt = status?.session_started_at;
+  useEffect(() => {
+    if (!sessionStartedAt) return;
+    mutateKey('pnl-global');
+  }, [sessionStartedAt, mutateKey]);
 
   // Poll every 5 minutes — recommendations only arrive every 30 min at most.
   // Global LLM Advisor reads ALL asset databases and writes to primary pool,
