@@ -1101,6 +1101,19 @@ async fn get_telemetry_assets(State(s): State<ApiState>) -> Response {
 async fn get_trades(Query(q): Query<AssetQuery>) -> Response {
     debug!("Received GET /api/trades request with limit: {:?}", q.limit);
     let limit = q.limit.unwrap_or(100).clamp(1, 500);
+    // Unscoped reads span EVERY shard — see db::pools_for_opt. A venue that
+    // shards by wing (Polymarket US) writes nothing to its primary pool, so the
+    // single-pool read the dashboard issues returned an empty log while trades
+    // were landing.
+    if q.asset.is_none() {
+        let mut all: Vec<db::TradeRow> = Vec::new();
+        for pool in db::pools_for_opt(None) {
+            all.extend(db::get_recent_trades(&pool, limit).await);
+        }
+        all.sort_by(|a, b| b.ts.cmp(&a.ts));
+        all.truncate(limit as usize);
+        return Json(all).into_response();
+    }
     match db::pool_for_opt_retry(q.asset.as_deref()).await {
         Some(pool) => {
             let trades = db::get_recent_trades(&pool, limit).await;
@@ -1121,6 +1134,33 @@ async fn get_trades(Query(q): Query<AssetQuery>) -> Response {
 /// endpoint is a bounded recent window for the trade *list*, and summing it
 /// client-side silently truncated every "total" card on the dashboard.
 async fn get_trade_stats(Query(q): Query<AssetQuery>) -> Response {
+    // Summed across every shard when unscoped. These are the dashboard's "total"
+    // cards, so reading one shard on a wing-sharded venue reported zero trades
+    // and zero P&L while both were accumulating elsewhere.
+    if q.asset.is_none() {
+        let mut agg = db::TradeStatsRow {
+            count: 0, wins: 0, losses: 0, realized_pnl: 0.0, fees: 0.0,
+            first_ts: None, last_ts: None,
+        };
+        for pool in db::pools_for_opt(None) {
+            let s = db::get_trade_stats(&pool).await;
+            agg.count += s.count;
+            agg.wins += s.wins;
+            agg.losses += s.losses;
+            agg.realized_pnl += s.realized_pnl;
+            agg.fees += s.fees;
+            // Earliest first_ts and latest last_ts across the whole venue.
+            agg.first_ts = match (agg.first_ts.take(), s.first_ts) {
+                (Some(a), Some(b)) => Some(if a <= b { a } else { b }),
+                (a, b) => a.or(b),
+            };
+            agg.last_ts = match (agg.last_ts.take(), s.last_ts) {
+                (Some(a), Some(b)) => Some(if a >= b { a } else { b }),
+                (a, b) => a.or(b),
+            };
+        }
+        return Json(agg).into_response();
+    }
     match db::pool_for_opt_retry(q.asset.as_deref()).await {
         Some(pool) => Json(db::get_trade_stats(&pool).await).into_response(),
         None => {
@@ -1140,6 +1180,13 @@ async fn get_trade_stats(Query(q): Query<AssetQuery>) -> Response {
 /// of in-flight positions even before they appear as completed trades.
 async fn get_open_positions(Query(q): Query<AssetQuery>) -> Response {
     debug!("Received GET /api/positions request");
+    if q.asset.is_none() {
+        let mut all: Vec<db::OpenPositionRow> = Vec::new();
+        for pool in db::pools_for_opt(None) {
+            all.extend(db::get_open_positions(&pool).await);
+        }
+        return Json(all).into_response();
+    }
     match db::pool_for_opt_retry(q.asset.as_deref()).await {
         Some(pool) => {
             let positions = db::get_open_positions(&pool).await;

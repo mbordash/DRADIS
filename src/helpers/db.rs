@@ -267,6 +267,26 @@ pub async fn pool_for_opt_retry(asset: Option<&str>) -> Option<SqlitePool> {
     None
 }
 
+/// Pools to read for an optional asset filter: one when scoped, ALL when not.
+///
+/// `pool_for_opt(None)` returns the single primary pool, which is right on a
+/// venue that shards by underlying (intl: btc/eth/sol, primary btc). It is wrong
+/// on a venue that shards by WING. Polymarket US opens `us`, `us-crypto`,
+/// `us-politics` and `us-sports`; every squadron writes to a wing shard and
+/// nothing writes to `us` — so the unscoped read, which is what the Control
+/// Tower main view issues, resolved to an empty database.
+///
+/// On 2026-08-27 that hid 26 trades and $55 of realised P&L: the portfolio chart
+/// aggregates across shards so the cash climbed, while the trade log and stats
+/// read `us` and reported nothing. An operator saw money appear with no trades
+/// to explain it.
+pub fn pools_for_opt(asset: Option<&str>) -> Vec<SqlitePool> {
+    match asset {
+        Some(a) => pool_for(a).into_iter().collect(),
+        None => available_assets().iter().filter_map(|a| pool_for(a)).collect(),
+    }
+}
+
 /// Return the lowercase asset names for all initialized pools, sorted
 /// alphabetically.  Used by `GET /api/assets` to tell the Control Tower
 /// which asset views are available.
@@ -4765,5 +4785,51 @@ mod pnl_history_window_tests {
             "history spans only {}h — a trade older than that would not be plottable",
             span.num_hours(),
         );
+    }
+}
+
+#[cfg(test)]
+mod shard_scoping_tests {
+    use super::*;
+
+    /// An unscoped read must span every shard, not just the primary.
+    ///
+    /// `pool_for_opt(None)` returns the single primary pool. That is right on a
+    /// venue sharded by underlying (intl: btc/eth/sol, primary btc) and wrong on
+    /// one sharded by WING: Polymarket US opens us, us-crypto, us-politics and
+    /// us-sports, every squadron writes to a wing, and nothing writes to `us`.
+    ///
+    /// On 2026-08-27 that hid 26 trades and $55 of realised P&L behind an empty
+    /// trade log — the portfolio chart aggregates, so cash climbed on the
+    /// dashboard with nothing to explain it.
+    #[tokio::test]
+    async fn an_unscoped_read_sees_every_shard() {
+        for name in ["scopetest-us", "scopetest-us-sports", "scopetest-us-politics"] {
+            init_shard(name, ":memory:", "test").await.ok();
+        }
+        let all = pools_for_opt(None);
+        let mine = available_assets().iter().filter(|a| a.starts_with("scopetest-")).count();
+        assert!(mine >= 3, "expected the test shards to register, saw {mine}");
+        assert!(
+            all.len() >= mine,
+            "unscoped read returned {} pools but {mine} shards exist — a wing-sharded \
+             venue would report an empty trade log",
+            all.len(),
+        );
+    }
+
+    /// A scoped read still returns exactly one shard, so per-asset views and the
+    /// asset selector keep working.
+    #[tokio::test]
+    async fn a_scoped_read_returns_one_shard() {
+        init_shard("scopetest-single", ":memory:", "test").await.ok();
+        assert_eq!(pools_for_opt(Some("scopetest-single")).len(), 1);
+    }
+
+    /// An unknown asset yields nothing rather than silently falling back to the
+    /// primary — a typo must not quietly return another squadron's trades.
+    #[tokio::test]
+    async fn an_unknown_asset_returns_no_pool() {
+        assert!(pools_for_opt(Some("scopetest-does-not-exist")).is_empty());
     }
 }
