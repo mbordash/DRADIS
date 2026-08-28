@@ -1026,6 +1026,119 @@ async fn call_anthropic(
 
 // ── Main advisor loop ─────────────────────────────────────────────────────────
 
+/// Per-squadron memory of what the advisor last analyzed, so an unchanged
+/// situation is not re-analyzed at full price every interval.
+///
+/// The loop below used to call the LLM on every tick unconditionally, and the
+/// comment defending that said "0 trades is itself a meaningful signal". True the
+/// first time; false the twenty-fourth. On 2026-08-28 the Ireland instance made
+/// 33 provider calls in 4.5 hours and 24 of them analyzed byte-identical input:
+/// the same two trades, the same P&L, the same open positions. The advisor cannot
+/// say anything new about state it has already seen, and every customer running
+/// this pays their own provider for each repeat.
+///
+/// Value is (fingerprint of the last analyzed inputs, consecutive skips since).
+fn advisor_seen_state() -> &'static std::sync::Mutex<std::collections::HashMap<String, (u64, u32)>> {
+    static REG: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (u64, u32)>>,
+    > = std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Hash of everything that could change the advisor's answer. Deliberately
+/// coarse: trade identities and counts, realized P&L, open exposure, and the
+/// squadron's own config, since advice is relative to the settings in force.
+fn advisor_input_fingerprint(
+    trades: &[db::TradeRow],
+    positions: &[db::OpenPositionRow],
+    pnl: rust_decimal::Decimal,
+    collateral: rust_decimal::Decimal,
+    dyn_cfg: &DynamicConfig,
+) -> u64 {
+    use std::hash::{Hash, Hasher};
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    trades.len().hash(&mut h);
+    positions.len().hash(&mut h);
+    // TradeRow stores everything as strings and has no id column, so identity is
+    // the timestamp plus market plus realized P&L. Hashing the rendered decimals
+    // rather than floats keeps this exact and avoids float equality entirely.
+    pnl.to_string().hash(&mut h);
+    collateral.to_string().hash(&mut h);
+    for t in trades {
+        t.ts.hash(&mut h);
+        t.market.hash(&mut h);
+        t.pnl.hash(&mut h);
+    }
+    for p in positions {
+        p.token_id.hash(&mut h);
+        p.shares.hash(&mut h);
+    }
+    // Advice is relative to the config in force, so a tuning change warrants a
+    // fresh look even when the trades are identical.
+    serde_json::to_string(dyn_cfg).unwrap_or_default().hash(&mut h);
+    h.finish()
+}
+
+/// Whether to spend a provider call on this squadron now.
+///
+/// Skips while the inputs are unchanged, but not forever: after
+/// `LLM_ADVISOR_MAX_SKIPPED_CYCLES` consecutive skips it fires anyway, because
+/// market conditions can move underneath an idle engine and that is exactly the
+/// case the original always-call comment was protecting.
+fn advisor_should_call(squadron_id: &str, fingerprint: u64) -> bool {
+    let mut reg = match advisor_seen_state().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match reg.get(squadron_id) {
+        Some((prev, skips))
+            if *prev == fingerprint && *skips < config::LLM_ADVISOR_MAX_SKIPPED_CYCLES =>
+        {
+            let n = skips + 1;
+            reg.insert(squadron_id.to_string(), (fingerprint, n));
+            debug!(
+                "🤖 LLM Advisor: [{}] inputs unchanged, skipping provider call ({}/{} before a \
+                 forced refresh)",
+                squadron_id, n, config::LLM_ADVISOR_MAX_SKIPPED_CYCLES,
+            );
+            false
+        }
+        _ => {
+            reg.insert(squadron_id.to_string(), (fingerprint, 0));
+            true
+        }
+    }
+}
+
+/// Cycles remaining on a hard provider block, and the reason.
+fn advisor_hard_block() -> &'static std::sync::Mutex<Option<(String, u32)>> {
+    static REG: std::sync::OnceLock<std::sync::Mutex<Option<(String, u32)>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// True when a provider error is durable rather than transient: billing, quota
+/// and authentication failures do not recover by being retried.
+///
+/// The case that prompted this: an exhausted Anthropic balance returned HTTP 400
+/// "Your credit balance is too low" on every squadron, every cycle. Retrying that
+/// cannot succeed, and it costs a pair of ERROR lines per squadron forever until
+/// a human notices.
+fn advisor_error_is_durable(err: &str) -> bool {
+    let e = err.to_lowercase();
+    [
+        "credit balance is too low",
+        "insufficient_quota",
+        "invalid x-api-key",
+        "authentication_error",
+        "permission_error",
+        "401 unauthorized",
+        "403 forbidden",
+    ]
+    .iter()
+    .any(|needle| e.contains(needle))
+}
+
 /// Spawn this as a long-running tokio task at startup.
 ///
 /// The task immediately checks ENABLE_LLM_ADVISOR and exits early if disabled,
@@ -1145,6 +1258,30 @@ pub async fn run_llm_advisor_loop(
 
     loop {
         ticker.tick().await;
+
+        // A durable provider failure (billing, quota, bad key) cannot be fixed by
+        // trying again, so stand down instead of burning a call and a pair of
+        // ERROR lines per squadron every interval. Self-heals when the backoff
+        // expires, so topping up credits needs no restart.
+        {
+            let mut block = match advisor_hard_block().lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if let Some((reason, remaining)) = block.clone() {
+                if remaining > 0 {
+                    *block = Some((reason.clone(), remaining - 1));
+                    debug!(
+                        "🤖 LLM Advisor: standing down for {} more cycle(s) after a durable \
+                         provider failure: {}",
+                        remaining - 1, reason,
+                    );
+                    continue;
+                }
+                *block = None;
+                info!("🤖 LLM Advisor: provider backoff expired, retrying this cycle");
+            }
+        }
 
         // ── Gather data from ALL asset databases ──────────────────────────────
         // Collect trades from every registered asset pool (btc, eth, sol, etc.).
@@ -1385,6 +1522,16 @@ pub async fn run_llm_advisor_loop(
         let dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
         let allowed_vipers = db::vipers_for_class(&primary_pool, &market_class).await;
 
+        // Nothing new to analyze? Do not pay for a restatement. See
+        // `advisor_should_call` for why this is not a regression of the
+        // deliberate "0 trades is itself a signal" behavior.
+        let fingerprint = advisor_input_fingerprint(
+            &all_session_trades, &all_open_positions, current_pnl, collateral, &dyn_cfg,
+        );
+        if !advisor_should_call(&squadron_id, fingerprint) {
+            continue;
+        }
+
         // ── Build prompt & call LLM (with retries) ───────────────────────────
         // all_open_positions already collected above from all asset pools
         let user_prompt = build_user_prompt(
@@ -1549,11 +1696,30 @@ pub async fn run_llm_advisor_loop(
                 }
             }
             None => {
+                let durable = advisor_error_is_durable(&last_err.to_string());
                 error!(
                     "🤖 LLM Advisor: [{}] {} call failed after {} retries ({}@{}): {}",
                     squadron_id, provider.name(), MAX_RETRIES, provider.model(),
                     provider.display_url(), last_err
                 );
+                if durable {
+                    let mut block = match advisor_hard_block().lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
+                    if block.is_none() {
+                        *block = Some((
+                            last_err.to_string(),
+                            config::LLM_ADVISOR_HARD_FAIL_BACKOFF_CYCLES,
+                        ));
+                        error!(
+                            "🤖 LLM Advisor: that failure is durable, not transient — standing \
+                             down for {} cycle(s). Fix the provider credentials or billing; no \
+                             restart needed.",
+                            config::LLM_ADVISOR_HARD_FAIL_BACKOFF_CYCLES,
+                        );
+                    }
+                }
             }
         }
         } // end per-squadron pass
@@ -1699,5 +1865,79 @@ mod truncation_tests {
         let out = truncate_on_char_boundary(&prose, 3980);
         assert!(out.len() <= 3980);
         assert!(prose.starts_with(out));
+    }
+}
+
+#[cfg(test)]
+mod advisor_call_economy_tests {
+    use super::{advisor_error_is_durable, advisor_should_call};
+    use crate::config;
+
+    /// The Ireland case: 33 provider calls in 4.5 hours, 24 of them against
+    /// byte-identical input. An unchanged fingerprint must not buy a call.
+    #[test]
+    fn unchanged_inputs_do_not_buy_a_call() {
+        let sq = "economy-test-unchanged";
+        assert!(advisor_should_call(sq, 111), "first sight of a state must analyze it");
+        assert!(!advisor_should_call(sq, 111));
+        assert!(!advisor_should_call(sq, 111));
+    }
+
+    /// A new trade, a P&L move or a config change must reach the advisor at once.
+    #[test]
+    fn changed_inputs_call_immediately() {
+        let sq = "economy-test-changed";
+        assert!(advisor_should_call(sq, 200));
+        assert!(!advisor_should_call(sq, 200));
+        assert!(advisor_should_call(sq, 201), "a changed fingerprint must not be skipped");
+    }
+
+    /// The skip is a rate limit, not a mute. Market conditions move underneath an
+    /// idle engine, which is exactly what the original always-call behavior
+    /// protected, so a forced refresh has to arrive on schedule.
+    #[test]
+    fn an_unchanged_squadron_is_still_refreshed_eventually() {
+        let sq = "economy-test-refresh";
+        assert!(advisor_should_call(sq, 300));
+        for i in 0..config::LLM_ADVISOR_MAX_SKIPPED_CYCLES {
+            assert!(!advisor_should_call(sq, 300), "skip {} came too early", i);
+        }
+        assert!(advisor_should_call(sq, 300), "forced refresh never arrived");
+    }
+
+    /// Squadrons are tracked independently, so a quiet one cannot suppress a busy one.
+    #[test]
+    fn squadrons_are_tracked_independently() {
+        assert!(advisor_should_call("economy-test-a", 400));
+        assert!(advisor_should_call("economy-test-b", 400));
+        assert!(!advisor_should_call("economy-test-a", 400));
+    }
+
+    /// The exact body that stood the advisor down on 2026-08-28.
+    #[test]
+    fn a_billing_failure_is_durable() {
+        assert!(advisor_error_is_durable(
+            "Anthropic HTTP 400 Bad Request: {\"type\":\"error\",\"error\":{\"type\":\
+             \"invalid_request_error\",\"message\":\"Your credit balance is too low to access \
+             the Anthropic API. Please go to Plans & Billing to upgrade or purchase credits.\"}}"
+        ));
+    }
+
+    /// Bad or missing credentials are durable too.
+    #[test]
+    fn auth_failures_are_durable() {
+        assert!(advisor_error_is_durable("401 Unauthorized"));
+        assert!(advisor_error_is_durable("authentication_error: invalid x-api-key"));
+        assert!(advisor_error_is_durable("403 Forbidden"));
+    }
+
+    /// Transient failures must NOT arm the backoff, or a blip would silence the
+    /// advisor for twelve cycles.
+    #[test]
+    fn transient_failures_are_not_durable() {
+        assert!(!advisor_error_is_durable("error sending request: connection timed out"));
+        assert!(!advisor_error_is_durable("HTTP 529 overloaded_error"));
+        assert!(!advisor_error_is_durable("HTTP 500 Internal Server Error"));
+        assert!(!advisor_error_is_durable("429 rate_limit_error"));
     }
 }

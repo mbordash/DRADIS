@@ -1291,6 +1291,17 @@ pub const LLM_MAX_OUTPUT_TOKENS: u32 = 2500;
 
 /// Number of most-recent completed trades to include in each LLM analysis.
 pub const LLM_ADVISOR_TRADES_LOOKBACK: i64 = 25;
+/// How many consecutive unchanged cycles the LLM Advisor may skip before it
+/// calls the provider anyway. Market conditions can move underneath an idle
+/// engine, which is what the original always-call behavior protected, so the skip
+/// is a rate limit rather than a mute. At the default interval this forces a
+/// fresh look every few hours even when nothing has traded.
+pub const LLM_ADVISOR_MAX_SKIPPED_CYCLES: u32 = 6;
+/// How many cycles to stand down after a DURABLE provider failure: billing,
+/// quota or authentication. Those do not recover by being retried, so retrying
+/// only burns provider spend and fills the log. Expires on its own so fixing the
+/// credentials needs no restart.
+pub const LLM_ADVISOR_HARD_FAIL_BACKOFF_CYCLES: u32 = 12;
 
 /// Default Ollama base URL.  Override with `OLLAMA_URL` env var.
 pub const LLM_OLLAMA_URL: &str = "http://localhost:11434";
