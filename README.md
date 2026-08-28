@@ -563,10 +563,26 @@ CT_PASSWORD=your-strong-password
 the **EC2 instance ID**, fetched via IMDSv2. So the first login on a fresh
 instance is `admin` / `i-0abc123…`.
 
-Change it. An instance ID is not a secret — it appears in the EC2 console, in
-support tickets and in screenshots — so the credential is only as strong as the
-security group in front of it. Restrict 80/443 to your own address, and set a
-real `CT_PASSWORD` before opening the dashboard more widely.
+That instance ID is a **claim token, not the real credential**. It proves you can
+see the instance in your own AWS console, and getting past it lands you on a
+screen that forces you to create an admin password before anything else is
+reachable. That password is hashed with argon2 under an OS-RNG salt and is the
+credential that actually protects the dashboard from then on. The setup status
+response advertises `admin_set` precisely so the UI can enforce this on first
+run.
+
+The reason the distinction matters: an instance ID is not a secret. It appears in
+the EC2 console listing, in tags, in any `ec2:DescribeInstances` response, in
+support tickets and in screenshots. Used as a standing password that would be
+weak, but used once to claim an instance it is the conventional appliance
+pattern, and it keeps first login simple for an operator who has just launched
+from the Marketplace.
+
+The residual risk is the claim window. Between first boot and your first login,
+anyone who already has read-only EC2 access to the same account could pass basic
+auth and claim the instance by setting the admin password before you do. So log
+in and set yours promptly, restrict 80/443 to your own address, and set your own
+`CT_PASSWORD` as well before opening the dashboard more widely.
 
 ---
 

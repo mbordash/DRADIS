@@ -487,6 +487,13 @@ pub const MAKER_GATE_LOG_INTERVAL_SECS: u64 = 30;
 /// for a whole market. Gives a recoverable on-disk history of which gate blocks
 /// it, which the in-memory viper_status registry alone cannot provide.
 pub const TIME_DECAY_GATE_LOG_INTERVAL_SECS: u64 = 300;
+/// How long to quiet REPEATS of the re-entry suppression notice in
+/// `orchestrator::executor`. The guard fires every tick while an exit is in
+/// flight, which produced 380 WARN lines in 40 minutes on 2026-08-27. A change
+/// in which legs are blocked still reports immediately; only unchanged repeats
+/// are held back. Log verbosity, not trading behavior — same treatment as
+/// TIME_DECAY_GATE_LOG_INTERVAL_SECS above.
+pub const REENTRY_SUPPRESS_LOG_INTERVAL_SECS: u64 = 300;
 pub const MOMENTUM_MIN_MARKET_AGE_SECS: i64 = 600;
 /// Must be strictly > MOMENTUM_EXPIRY_EXIT_SECS (1200s); 5 min breathing room.
 pub const MOMENTUM_MIN_SECS_TO_EXPIRY_FOR_ENTRY: i64 = 1500;

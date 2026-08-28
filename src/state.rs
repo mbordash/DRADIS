@@ -381,6 +381,39 @@ pub mod price_state {
         /// `label` is the asset; `market` names the market it is following, so a
         /// dark report can say WHICH market lost its book.
         pub fn note_market(label: &str, market: &str, has_book: bool) {
+    // An empty market name on THIS path means NO MARKET IS SELECTED — the squadron
+    // is deliberately waiting for a tradeable one rather than quoting into a dead
+    // book. There is no book to be missing, so reporting darkness raises a
+    // connectivity-shaped alarm for a state we chose on purpose.
+    //
+    // Ireland, 2026-08-27: after hourly selection correctly declined nine
+    // zero-volume strike markets, the wait itself logged "MARKET DATA DARK: no
+    // order book for btc in 90s" — the very alarm that had surfaced the original
+    // dead-market bug. Left alone it would train the operator to ignore it.
+    //
+    // `note()` below also passes an empty name, but there it means "this venue has
+    // no market name to hand", not "no market" — so the two paths are kept separate
+    // rather than sharing one overloaded sentinel.
+    if market.is_empty() {
+        stand_down(label);
+        return;
+    }
+    note_inner(label, market, has_book)
+}
+
+/// No market is selected: restart the dark clock and drop any dark flag, silently.
+/// Silent because "recovered" would be a lie — nothing recovered, the squadron
+/// simply stopped having a market to watch.
+fn stand_down(label: &str) {
+    let Ok(mut reg) = registry().lock() else { return };
+    if let Some(entry) = reg.get_mut(label) {
+        entry.last_live = Instant::now();
+        entry.dark = false;
+        entry.market.clear();
+    }
+}
+
+fn note_inner(label: &str, market: &str, has_book: bool) {
             let Ok(mut reg) = registry().lock() else { return };
             let now = Instant::now();
             let entry = reg.entry(label.to_string()).or_insert(FeedState {
@@ -420,7 +453,7 @@ pub mod price_state {
 
         /// Back-compat shim for callers with no market name to hand.
         pub fn note(label: &str, has_book: bool) {
-            note_market(label, "", has_book);
+            note_inner(label, "", has_book);
         }
 
         /// Markets currently reported dark, with how long they have been so.
@@ -1264,6 +1297,42 @@ mod book_feed_tests {
         book_feed::note(label, false);
         assert!(!book_feed::dark_markets().iter().any(|(m, _, _)| m == label));
         book_feed::forget(label);
+    }
+
+    /// No market selected is not a dark feed.
+    ///
+    /// Ireland, 2026-08-27: hourly selection correctly declined nine zero-volume
+    /// strike markets and waited. The wait itself then logged "MARKET DATA DARK:
+    /// no order book for btc in 90s" — a connectivity-shaped alarm for a state we
+    /// chose deliberately, and the same alarm that had surfaced the original
+    /// dead-market bug. Reporting it here would teach the operator to ignore it.
+    #[test]
+    fn no_market_selected_is_not_reported_dark() {
+        let label = "test-no-market-selected";
+        // Dark on a real market first, so we know the state is there to clear.
+        book_feed::note_market(label, "Bitcoin Up or Down - 11PM ET", false);
+        // Then the squadron releases it and has nothing: must stand down, not report.
+        book_feed::note_market(label, "", false);
+        assert!(
+            !book_feed::dark_markets().iter().any(|(l, _, _)| l == label),
+            "a squadron with no market must not be reported as a dark feed",
+        );
+    }
+
+    /// The `note()` shim also passes an empty name, but there it means "this venue
+    /// has no market name to hand" — not "no market". That path must keep
+    /// reporting, or Kalshi and Polymarket US would lose dark detection entirely.
+    #[test]
+    fn the_unnamed_venue_path_still_tracks_darkness() {
+        let label = "test-unnamed-venue";
+        book_feed::note(label, true);
+        // Not dark yet (DARK_AFTER has not elapsed), but the entry must exist and
+        // the call must not have stood the label down.
+        book_feed::note(label, false);
+        assert!(
+            !book_feed::dark_markets().iter().any(|(l, _, _)| l == label),
+            "should not be dark before DARK_AFTER elapses",
+        );
     }
 
     /// Rotating onto a different market restarts the clock.

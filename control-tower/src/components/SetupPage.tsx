@@ -1764,8 +1764,8 @@ export default function SetupPage() {
             <a href="https://dradis.live/support" target="_blank" rel="noreferrer" className={btnCls('primary')}>
               🛟 Contact support
             </a>
-            <a href="mailto:starbuck@dradis.live" className={btnCls('ghost')}>
-              ✉️ starbuck@dradis.live
+            <a href="mailto:support@dradis.live" className={btnCls('ghost')}>
+              ✉️ support@dradis.live
             </a>
           </div>
         </div>

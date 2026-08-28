@@ -93,6 +93,48 @@ pub async fn evaluate_strategies(
     })
 }
 
+/// Throttle for the re-entry suppression notices below.
+///
+/// Suppression fires on EVERY tick while an exit is in flight, and the maker
+/// re-quotes each tick, so the steady state is not one notice but hundreds: on
+/// 2026-08-27 the Ireland box logged 380 in 40 minutes (~9/min) at WARN, which
+/// reads like a fault and buries real signals.
+///
+/// The condition is worth surfacing — it is a guard preventing a real re-entry
+/// race — so the level stays WARN and only the repetition is cut. Keyed by
+/// strategy AND which legs were blocked, so a change in the pattern still reports
+/// immediately. Mirrors `time_decay_gate_log_permitted`.
+fn reentry_log_state()
+    -> &'static std::sync::Mutex<std::collections::HashMap<String, (String, Instant)>>
+{
+    static REG: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashMap<String, (String, Instant)>>,
+    > = std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// True when this notice should be logged: on any change of pattern, or once per
+/// `REENTRY_SUPPRESS_LOG_INTERVAL_SECS` while the pattern is unchanged.
+fn reentry_log_permitted(strategy_name: &str, pattern: &str) -> bool {
+    let mut reg = match reentry_log_state().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match reg.get(strategy_name) {
+        Some((prev, at))
+            if prev == pattern
+                && at.elapsed().as_secs()
+                    < crate::config::REENTRY_SUPPRESS_LOG_INTERVAL_SECS =>
+        {
+            false
+        }
+        _ => {
+            reg.insert(strategy_name.to_string(), (pattern.to_string(), Instant::now()));
+            true
+        }
+    }
+}
+
 /// Execute all strategies concurrently
 ///
 /// High-level function that spawns all strategies, waits for results,
@@ -132,10 +174,17 @@ fn suppress_reentry(
         StrategySignal::MakerQuote { yes, no } => {
             let yes_blocked = yes.as_ref().is_some_and(|p| blocked(&p.token_id));
             let no_blocked = no.as_ref().is_some_and(|p| blocked(&p.token_id));
-            if yes_blocked || no_blocked {
+            if (yes_blocked || no_blocked)
+                && reentry_log_permitted(
+                    strategy_name,
+                    &format!("quote:{yes_blocked}:{no_blocked}"),
+                )
+            {
                 warn!(
                     "🚫 {strategy_name}: dropping maker quote leg(s) being closed this tick \
-                     (yes={yes_blocked} no={no_blocked}) — re-entry would rebook the exit's loss"
+                     (yes={yes_blocked} no={no_blocked}) — re-entry would rebook the exit's \
+                     loss (repeats quieted for {}s)",
+                    crate::config::REENTRY_SUPPRESS_LOG_INTERVAL_SECS,
                 );
             }
             let yes = if yes_blocked { None } else { yes };
@@ -147,10 +196,13 @@ fn suppress_reentry(
             }
         }
         other if other.tokens_opened().iter().any(blocked) => {
-            warn!(
-                "🚫 {strategy_name}: dropping entry into a position being closed this tick — \
-                 re-entry would rebook the exit's loss"
-            );
+            if reentry_log_permitted(strategy_name, "entry") {
+                warn!(
+                    "🚫 {strategy_name}: dropping entry into a position being closed this tick \
+                     — re-entry would rebook the exit's loss (repeats quieted for {}s)",
+                    crate::config::REENTRY_SUPPRESS_LOG_INTERVAL_SECS,
+                );
+            }
             StrategySignal::NoSignal
         }
         other => other,
@@ -440,5 +492,39 @@ mod reentry_suppression_tests {
         };
         let out = suppress_reentry("ArbitrageStrategy", entry, &[MarketId::new("no")]);
         assert!(matches!(out, StrategySignal::NoSignal));
+    }
+}
+
+#[cfg(test)]
+mod reentry_log_throttle_tests {
+    use super::reentry_log_permitted;
+
+    /// The first notice is always logged; an identical repeat on the very next tick
+    /// is not. This is the 380-lines-in-40-minutes case from 2026-08-27.
+    #[test]
+    fn an_identical_repeat_is_quieted() {
+        let s = "throttle-test-identical";
+        assert!(reentry_log_permitted(s, "quote:true:false"));
+        assert!(!reentry_log_permitted(s, "quote:true:false"));
+        assert!(!reentry_log_permitted(s, "quote:true:false"));
+    }
+
+    /// A CHANGE in which legs are blocked reports immediately — the throttle cuts
+    /// repetition, never a new condition.
+    #[test]
+    fn a_changed_pattern_reports_immediately() {
+        let s = "throttle-test-changed";
+        assert!(reentry_log_permitted(s, "quote:true:false"));
+        assert!(reentry_log_permitted(s, "quote:false:true"));
+        assert!(reentry_log_permitted(s, "entry"));
+    }
+
+    /// Throttling is per strategy, so a noisy maker cannot mask a different
+    /// strategy's first notice.
+    #[test]
+    fn strategies_are_throttled_independently() {
+        assert!(reentry_log_permitted("throttle-test-a", "entry"));
+        assert!(reentry_log_permitted("throttle-test-b", "entry"));
+        assert!(!reentry_log_permitted("throttle-test-a", "entry"));
     }
 }

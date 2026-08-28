@@ -186,7 +186,7 @@ export default function AlphaGate({
                   — the form collects what is needed to diagnose a deployment.
                 </li>
                 <li>Or email{' '}
-                  <a href="mailto:starbuck@dradis.live" className="text-sky-400 hover:underline">starbuck@dradis.live</a>.
+                  <a href="mailto:support@dradis.live" className="text-sky-400 hover:underline">support@dradis.live</a>.
                 </li>
                 <li><strong className="text-gray-300">Support will never ask for your wallet private key, seed phrase or API secrets.</strong> Anyone who does is not us.</li>
               </ul>
