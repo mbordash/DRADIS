@@ -722,7 +722,7 @@ async fn get_latency() -> Response {
 /// only once `scored` is large enough to mean something.
 async fn get_gboost_veto_scores(Query(q): Query<AssetQuery>) -> Response {
     let Some(pool) = db::pool_for_opt_retry(q.asset.as_deref()).await else {
-        log_pool_unavailable("GET /api/gboost/veto-scores");
+        log_pool_unavailable("GET /api/gboost/veto-scores", q.asset.as_deref());
         return (StatusCode::SERVICE_UNAVAILABLE, "database not ready").into_response();
     };
     Json(db::gboost_veto_scoreboard(&pool).await).into_response()
@@ -744,7 +744,7 @@ async fn get_vipers_status(Query(q): Query<AssetQuery>) -> Response {
 /// offline review. Same per-asset DB selection as /api/trades.
 async fn export_trades(Query(q): Query<AssetQuery>) -> Response {
     let Some(pool) = db::pool_for_opt_retry(q.asset.as_deref()).await else {
-        log_pool_unavailable("GET /api/trades/export");
+        log_pool_unavailable("GET /api/trades/export", q.asset.as_deref());
         return (StatusCode::SERVICE_UNAVAILABLE, "database not ready").into_response();
     };
     let trades = db::get_all_trades(&pool).await;
@@ -831,7 +831,7 @@ async fn get_pnl_history(Query(q): Query<AssetQuery>) -> Response {
                 return Json(history).into_response();
             },
             None => {
-                log_pool_unavailable(&format!("asset: {asset_name}"));
+                log_pool_unavailable(&format!("asset: {asset_name}"), Some(asset_name));
                 return Json(Vec::<db::PnlSnapshotRow>::new()).into_response();
             },
         }
@@ -992,12 +992,32 @@ struct StatusResponse {
 ///
 /// Once the trading loop has started, a missing pool IS an error and still says
 /// so.
-fn log_pool_unavailable(what: &str) {
+fn log_pool_unavailable(what: &str, asset: Option<&str>) {
     if crate::helpers::watchdog::is_parked_for_setup() {
         debug!("Database pool not available for {what} — engine parked awaiting setup");
-    } else {
-        error!("Database pool not available for {what}");
+        return;
     }
+    // An asset this instance does not trade has no pool BY DESIGN, so a request
+    // for one is an expected condition rather than a fault. The Control Tower
+    // asks per-asset regardless of what is configured, so on 2026-08-28 a
+    // BTC-only instance logged six ERROR lines the moment the dashboard was
+    // opened: three endpoints times eth and sol. A customer who has done nothing
+    // wrong should not see red on first load.
+    //
+    // An EMPTY pool set is different, and stays an error: that means nothing is
+    // initialized at all, which is a real fault rather than an unconfigured asset.
+    if let Some(a) = asset {
+        let known = db::available_assets();
+        if !known.is_empty() && !known.iter().any(|k| k.eq_ignore_ascii_case(a)) {
+            debug!(
+                "Database pool not available for {what} — asset '{a}' is not traded \
+                 on this instance (configured: {})",
+                known.join(", "),
+            );
+            return;
+        }
+    }
+    error!("Database pool not available for {what}");
 }
 
 async fn get_status(State(s): State<ApiState>) -> Response {
@@ -1121,7 +1141,7 @@ async fn get_trades(Query(q): Query<AssetQuery>) -> Response {
             Json(trades).into_response()
         },
         None       => {
-            log_pool_unavailable("GET /api/trades");
+            log_pool_unavailable(&format!("GET /api/trades (asset={:?})", q.asset), q.asset.as_deref());
             Json(Vec::<db::TradeRow>::new()).into_response()
         },
     }
@@ -1164,7 +1184,7 @@ async fn get_trade_stats(Query(q): Query<AssetQuery>) -> Response {
     match db::pool_for_opt_retry(q.asset.as_deref()).await {
         Some(pool) => Json(db::get_trade_stats(&pool).await).into_response(),
         None => {
-            log_pool_unavailable("GET /api/trades/stats");
+            log_pool_unavailable(&format!("GET /api/trades/stats (asset={:?})", q.asset), q.asset.as_deref());
             Json(db::TradeStatsRow {
                 count: 0, wins: 0, losses: 0, realized_pnl: 0.0, fees: 0.0,
                 first_ts: None, last_ts: None,
@@ -1193,7 +1213,7 @@ async fn get_open_positions(Query(q): Query<AssetQuery>) -> Response {
             Json(positions).into_response()
         },
         None => {
-            log_pool_unavailable(&format!("GET /api/positions (asset={:?})", q.asset));
+            log_pool_unavailable(&format!("GET /api/positions (asset={:?})", q.asset), q.asset.as_deref());
             Json(Vec::<db::OpenPositionRow>::new()).into_response()
         },
     }
@@ -1210,7 +1230,7 @@ async fn get_pending_positions(Query(q): Query<AssetQuery>) -> Response {
             Json(positions).into_response()
         },
         None => {
-            log_pool_unavailable("GET /api/positions/pending");
+            log_pool_unavailable(&format!("GET /api/positions/pending (asset={:?})", q.asset), q.asset.as_deref());
             Json(Vec::<db::OpenPositionRow>::new()).into_response()
         },
     }
@@ -1227,7 +1247,7 @@ async fn get_confirmed_positions(Query(q): Query<AssetQuery>) -> Response {
             Json(positions).into_response()
         },
         None => {
-            log_pool_unavailable("GET /api/positions/confirmed");
+            log_pool_unavailable(&format!("GET /api/positions/confirmed (asset={:?})", q.asset), q.asset.as_deref());
             Json(Vec::<db::OpenPositionRow>::new()).into_response()
         },
     }
@@ -1241,7 +1261,7 @@ async fn delete_open_position(Path(token_id): Path<String>, Query(q): Query<Asse
     let pool = match db::pool_for_opt_retry(q.asset.as_deref()).await {
         Some(p) => p,
         None => {
-            log_pool_unavailable("DELETE /api/positions");
+            log_pool_unavailable(&format!("DELETE /api/positions (asset={:?})", q.asset), q.asset.as_deref());
             return (StatusCode::SERVICE_UNAVAILABLE, "DB unavailable").into_response();
         }
     };
@@ -1318,7 +1338,7 @@ async fn manual_exit(
     let pool = match db::pool_for(&req.asset) {
         Some(p) => p,
         None => {
-            log_pool_unavailable(&format!("RTB: asset {}", req.asset));
+            log_pool_unavailable(&format!("RTB: asset {}", req.asset), Some(req.asset.as_str()));
             return (StatusCode::SERVICE_UNAVAILABLE, "DB unavailable").into_response();
         }
     };
@@ -1544,7 +1564,7 @@ async fn get_llm_recommendations(Query(q): Query<AssetQuery>) -> Response {    d
             Json(recs).into_response()
         },
         None => {
-            log_pool_unavailable("GET /api/llm/recommendations");
+            log_pool_unavailable("GET /api/llm/recommendations", q.asset.as_deref());
             Json(Vec::<db::LlmRecommendationRow>::new()).into_response()
         },
     }
@@ -2161,7 +2181,7 @@ async fn get_squadron_config(
             }
         },
         None => {
-            log_pool_unavailable(&format!("GET /api/squadrons/{id}/config"));
+            log_pool_unavailable(&format!("GET /api/squadrons/{id}/config"), None);
             (StatusCode::INTERNAL_SERVER_ERROR, "database unavailable").into_response()
         },
     }
@@ -3739,6 +3759,34 @@ mod tests {
 
 #[cfg(test)]
 mod pool_logging_tests {
+    /// Every `log_pool_unavailable` call must pass an asset when one is in scope,
+    /// or the severity check below it can never fire.
+    ///
+    /// The failure this guards against is silent: a call site that passes `None`
+    /// while a `q.asset` sits right there still compiles, still logs, and still
+    /// produces the ERROR wall for an unconfigured asset. Only the endpoints with
+    /// genuinely no asset in scope are exempt, and they are named here so adding
+    /// one is a deliberate act.
+    #[test]
+    fn pool_unavailable_call_sites_pass_their_asset() {
+        let src = include_str!("server.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        const EXEMPT: &[&str] = &["squadrons"];
+        let offenders: Vec<String> = prod
+            .lines()
+            .enumerate()
+            .filter(|(_, l)| l.contains("log_pool_unavailable(") && l.trim().ends_with("None);"))
+            .filter(|(_, l)| !EXEMPT.iter().any(|e| l.contains(e)))
+            .map(|(i, l)| format!("{}: {}", i + 1, l.trim()))
+            .collect();
+        assert!(
+            offenders.is_empty(),
+            "these call sites pass None but are not exempt, so an unconfigured asset \
+             would log at ERROR:\n{}",
+            offenders.join("\n"),
+        );
+    }
+
     /// A missing DB pool must not be logged at ERROR unconditionally.
     ///
     /// Before Setup completes the engine parks on purpose and has no pool, while
