@@ -286,6 +286,14 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "ToxicFill also requires the bid to be this far below entry (0.02 = 2%). A hostile-looking book that hasn't moved price is noise.").range(0.0, 0.5).step(0.005));
         v.push(F::new(g, e, "maker_toxic_obi_confirm_ticks", "Toxic OBI Confirm Ticks", "decimal", true,
             "Consecutive OBI breaches required before ToxicFill fires. A healthy tick resets the count.").range(1.0, 20.0).step(1.0));
+        // Oracle-drift thresholds. The oracle (Binance) leads the Polymarket book by
+        // minutes, so these fire before OBI can confirm. Two separate knobs because the
+        // two actions have different costs: cancelling an unfilled quote is free, while
+        // exiting a filled position pays the spread to realize a loss.
+        v.push(F::new(g, e, "maker_oracle_drift_pull_frac", "Oracle Drift Quote Pull", "pct", true,
+            "Cancel an UNFILLED resting quote once the oracle moves this far against it (0.0003 = 0.03%). Cancelling costs nothing, so keep this tight.").range(0.0, 0.05).step(0.0001));
+        v.push(F::new(g, e, "maker_oracle_drift_exit_frac", "Oracle Drift Exit", "pct", true,
+            "Exit a FILLED position once the oracle moves this far against it since the quote was placed (0.0015 = 0.15%). Fires ahead of the OBI path, which lags by minutes. Set 0 to disable and rely on OBI alone.").range(0.0, 0.05).step(0.0005));
         // Resting maker exit — the spread-capture exit path.
         v.push(F::new(g, e, "maker_resting_exit_enabled", "Resting Exit", "bool", true,
             "Exit filled positions with a resting post-only ask (captures the spread) instead of only crossing back to the bid. Stops and the near-expiry flatten still cross."));

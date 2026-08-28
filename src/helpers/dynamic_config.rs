@@ -236,6 +236,8 @@ fn default_maker_toxic_reentry_cooldown_secs() -> i64  { config::MAKER_TOXIC_REE
 fn default_maker_toxic_min_hold_secs()      -> i64     { config::MAKER_TOXIC_MIN_HOLD_SECS            }
 fn default_maker_toxic_min_adverse_pct()    -> Decimal { config::MAKER_TOXIC_MIN_ADVERSE_PCT          }
 fn default_maker_toxic_obi_confirm_ticks()  -> u32     { config::MAKER_TOXIC_OBI_CONFIRM_TICKS        }
+fn default_maker_oracle_drift_pull_frac()   -> Decimal { config::MAKER_ORACLE_DRIFT_PULL_FRAC         }
+fn default_maker_oracle_drift_exit_frac()   -> Decimal { config::MAKER_ORACLE_DRIFT_EXIT_FRAC         }
 fn default_maker_resting_exit_enabled()     -> bool    { config::MAKER_RESTING_EXIT_ENABLED           }
 fn default_exit_reconcile_max_deviation()   -> Decimal { config::EXIT_RECONCILE_MAX_DEVIATION        }
 fn default_ghost_mode()                     -> bool    { config::GHOST_MODE_DEFAULT                 }
@@ -501,6 +503,16 @@ pub struct DynamicConfig {
     /// Consecutive OBI breaches required before ToxicFill fires.
     #[serde(default = "default_maker_toxic_obi_confirm_ticks")]
     pub maker_toxic_obi_confirm_ticks: u32,
+    /// Adverse oracle drift that pulls an UNFILLED resting quote. Cancelling costs
+    /// nothing, so this stays tight.
+    #[serde(default = "default_maker_oracle_drift_pull_frac")]
+    pub maker_oracle_drift_pull_frac:  Decimal,
+    /// Adverse oracle drift that exits a FILLED position, measured from the oracle
+    /// at quote placement. The oracle leads OBI by minutes, so this fires before
+    /// the OBI path can confirm. Looser than the pull above because exiting pays
+    /// the spread. Set 0 to disable and fall back to OBI alone.
+    #[serde(default = "default_maker_oracle_drift_exit_frac")]
+    pub maker_oracle_drift_exit_frac:  Decimal,
     /// Post a resting post-only ask against a filled maker position so it exits
     /// by being lifted (spread capture) instead of crossing back to the bid.
     #[serde(default = "default_maker_resting_exit_enabled")]
@@ -865,6 +877,8 @@ impl Default for DynamicConfig {
             maker_toxic_min_hold_secs:     config::MAKER_TOXIC_MIN_HOLD_SECS,
             maker_toxic_min_adverse_pct:   config::MAKER_TOXIC_MIN_ADVERSE_PCT,
             maker_toxic_obi_confirm_ticks: config::MAKER_TOXIC_OBI_CONFIRM_TICKS,
+            maker_oracle_drift_pull_frac:  config::MAKER_ORACLE_DRIFT_PULL_FRAC,
+            maker_oracle_drift_exit_frac:  config::MAKER_ORACLE_DRIFT_EXIT_FRAC,
             maker_resting_exit_enabled:    config::MAKER_RESTING_EXIT_ENABLED,
             exit_reconcile_max_deviation:  config::EXIT_RECONCILE_MAX_DEVIATION,
             maker_resting_exit_min_edge_pct: config::MAKER_RESTING_EXIT_MIN_EDGE_PCT,

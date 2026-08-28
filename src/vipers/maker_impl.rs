@@ -384,6 +384,21 @@ fn maker_toxic_cooldown_active(token_id: &str, cooldown_secs: i64) -> bool {
     false
 }
 
+/// Convert a raw oracle drift into an *adverse* drift for one side of the book.
+///
+/// A YES bid is hurt when the oracle falls; a NO bid is hurt when it rises. Shared by
+/// the unfilled-quote pull and the filled-position exit so the two can never disagree
+/// about which direction hurts — a sign error here would exit on favorable moves.
+fn maker_adverse_drift(drift: Decimal, is_yes_side: bool) -> Decimal {
+    if is_yes_side { -drift } else { drift }
+}
+
+/// Whether adverse oracle drift has reached an exit/pull threshold. A threshold of
+/// zero disables the mechanism.
+fn maker_drift_breached(adverse: Decimal, threshold: Decimal) -> bool {
+    threshold > dec!(0) && adverse >= threshold
+}
+
 /// Process-global oracle baseline per quoted token: token_id → oracle price at the
 /// moment the quote was (re)placed.  Global for the same rotation-survival reason as
 /// the trackers above.  Used by the oracle-drift quote pull: the oracle is the
@@ -1093,14 +1108,14 @@ impl Strategy for MakerStrategyImpl {
                         None => set_maker_quote_oracle_baseline(token_id.as_str(), oracle_now),
                         Some(drift) => {
                             // YES bid: oracle falling is adverse. NO bid: oracle rising.
-                            let adverse = if token_id == market.yes_token { -drift } else { drift };
-                            if adverse >= config::MAKER_ORACLE_DRIFT_PULL_FRAC {
+                            let adverse = maker_adverse_drift(drift, token_id == market.yes_token);
+                            if adverse >= dc.maker_oracle_drift_pull_frac {
                                 arm_maker_toxic_cooldown(token_id.as_str());
                                 clear_maker_quote_oracle_baseline(token_id.as_str());
                                 tracing::info!(
                                     "⚡ Maker quote-pull (oracle drift): oracle moved {:.3}% adverse to resting {} quote (threshold {:.3}%) — cancelling before the book turns, re-entry locked {}s",
                                     adverse * dec!(100), if token_id == market.yes_token { "YES" } else { "NO" },
-                                    config::MAKER_ORACLE_DRIFT_PULL_FRAC * dec!(100), dc.maker_toxic_reentry_cooldown_secs
+                                    dc.maker_oracle_drift_pull_frac * dec!(100), dc.maker_toxic_reentry_cooldown_secs
                                 );
                                 pull_tokens.push(token_id.clone());
                                 continue;
@@ -1108,8 +1123,13 @@ impl Strategy for MakerStrategyImpl {
                         }
                     }
                 } else {
-                    // Quote filled — baseline no longer meaningful.
-                    clear_maker_quote_oracle_baseline(token_id.as_str());
+                    // Quote filled — KEEP the baseline. It anchors at quote placement, the
+                    // price we actually committed to, so drift measured from it captures the
+                    // whole adverse move including whatever happened at the instant of the
+                    // fill. This used to clear it, which threw away the LEADING toxicity
+                    // signal at the one moment it matters most: a fill in an adverse move IS
+                    // the adverse-selection event, and from then on the position had only
+                    // OBI — documented above as lagging by minutes — to save it.
                 }
 
                 let (bid_depth, ask_depth, bid) = if token_id == market.yes_token {
@@ -1144,7 +1164,25 @@ impl Strategy for MakerStrategyImpl {
                 // (including non-breaching ones, which reset it) so the counter
                 // reflects consecutive breaches rather than cumulative ones.
                 let obi_streak = maker_toxic_obi_streak(token_id.as_str(), breached);
-                if !breached {
+
+                // Oracle-drift trigger. The whole ToxicFill path used to be gated on
+                // `breached` alone, so a position whose oracle had run away bled until
+                // OBI — the lagging signal — caught up, or until the stop-loss fired.
+                //
+                // Ireland, 2026-08-27: a filled NO position went 13.51% adverse over 363s
+                // at OBI -0.97 and exited for -$2.12, erasing two +6% wins. The 20% stop
+                // never triggered and OBI confirmed only after the damage was done.
+                //
+                // A quote that survives to fill has, by construction, drifted less than
+                // the (much tighter) pull threshold, so reaching the exit threshold means
+                // the move happened at or after the fill.
+                let drift_adverse = maker_quote_oracle_drift(token_id.as_str(), snapshot.oracle_price)
+                    .map(|d| maker_adverse_drift(d, token_id == market.yes_token))
+                    .unwrap_or(dec!(0));
+                let drift_breached =
+                    maker_drift_breached(drift_adverse, dc.maker_oracle_drift_exit_frac);
+
+                if !(breached || drift_breached) {
                     continue;
                 }
 
@@ -1160,7 +1198,10 @@ impl Strategy for MakerStrategyImpl {
 
                 let hold_ok   = held_secs >= dc.maker_toxic_min_hold_secs;
                 let price_ok  = adverse_pct >= dc.maker_toxic_min_adverse_pct;
-                let streak_ok = obi_streak >= confirm_ticks;
+                // The OBI confirmation streak gates only an OBI-triggered exit. Demanding
+                // it for a drift trigger would reinstate the lagging-signal wait this path
+                // exists to avoid — hold_ok and price_ok still confirm the move is real.
+                let streak_ok = drift_breached || obi_streak >= confirm_ticks;
 
                 if !(hold_ok && price_ok && streak_ok) {
                     // Held deliberately. The book looks hostile but at least one
@@ -1188,8 +1229,9 @@ impl Strategy for MakerStrategyImpl {
                 clear_maker_toxic_obi_streak(token_id.as_str());
                 if maker_toxic_log_permitted(token_id.as_str()) {
                     tracing::info!(
-                        "⚡ Maker ToxicFill exit triggered: OBI={:.2} (threshold={:.2}, confirmed {} ticks) | bid=${:.4} adverse={:.2}% held={}s | re-entry locked {}s",
-                        obi, dc.maker_toxic_flow_exit_obi, obi_streak, bid,
+                        "⚡ Maker ToxicFill exit triggered ({}): OBI={:.2} (threshold={:.2}, confirmed {} ticks) | drift={:.3}% | bid=${:.4} adverse={:.2}% held={}s | re-entry locked {}s",
+                        if drift_breached { "oracle drift" } else { "OBI" },
+                        obi, dc.maker_toxic_flow_exit_obi, obi_streak, drift_adverse * dec!(100), bid,
                         adverse_pct * dec!(100), held_secs, dc.maker_toxic_reentry_cooldown_secs
                     );
                 }
@@ -1736,5 +1778,53 @@ mod bid_anchoring_tests {
         // A bid one tick under the ask would otherwise allow 0.52 on a 0.53 ask.
         let q = quote(dec!(0.53), dec!(0.52), dec!(0.00), true);
         assert!(q <= dec!(0.51), "cross buffer must keep the quote off the ask, got {q}");
+    }
+}
+
+#[cfg(test)]
+mod maker_oracle_drift_exit_tests {
+    use super::{maker_adverse_drift, maker_drift_breached};
+    use rust_decimal_macros::dec;
+
+    /// A YES bid is hurt when the oracle FALLS.
+    #[test]
+    fn a_falling_oracle_is_adverse_to_yes() {
+        assert_eq!(maker_adverse_drift(dec!(-0.002), true), dec!(0.002));
+        assert_eq!(maker_adverse_drift(dec!(0.002),  true), dec!(-0.002));
+    }
+
+    /// A NO bid is hurt when the oracle RISES — the mirror image.
+    #[test]
+    fn a_rising_oracle_is_adverse_to_no() {
+        assert_eq!(maker_adverse_drift(dec!(0.002),  false), dec!(0.002));
+        assert_eq!(maker_adverse_drift(dec!(-0.002), false), dec!(-0.002));
+    }
+
+    /// The Ireland shape: a NO position with the oracle running up against it.
+    #[test]
+    fn an_adverse_move_past_the_threshold_exits() {
+        let adverse = maker_adverse_drift(dec!(0.0020), false);
+        assert!(maker_drift_breached(adverse, dec!(0.0015)));
+    }
+
+    /// A favorable move must never trigger an exit — the sign error that would make
+    /// this change actively harmful rather than merely useless.
+    #[test]
+    fn a_favorable_move_never_exits() {
+        assert!(!maker_drift_breached(maker_adverse_drift(dec!(-0.010), false), dec!(0.0015)));
+        assert!(!maker_drift_breached(maker_adverse_drift(dec!(0.010),  true),  dec!(0.0015)));
+    }
+
+    /// Ordinary noise below the threshold is held, so the maker still gets paid for
+    /// sitting through normal book chop.
+    #[test]
+    fn noise_below_the_threshold_is_held() {
+        assert!(!maker_drift_breached(maker_adverse_drift(dec!(0.0009), false), dec!(0.0015)));
+    }
+
+    /// Zero disables the mechanism, falling back to the OBI path alone.
+    #[test]
+    fn zero_disables_the_drift_exit() {
+        assert!(!maker_drift_breached(dec!(0.05), dec!(0)));
     }
 }

@@ -120,6 +120,8 @@ export interface DynamicConfig {
   maker_toxic_min_hold_secs:     number;
   maker_toxic_min_adverse_pct:   string;
   maker_toxic_obi_confirm_ticks: number;
+  maker_oracle_drift_pull_frac:  string;
+  maker_oracle_drift_exit_frac:  string;
   maker_resting_exit_enabled:    boolean;
   maker_resting_exit_min_edge_pct: string;
   maker_resting_exit_ask_improvement_ticks: number;

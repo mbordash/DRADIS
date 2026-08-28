@@ -56,6 +56,19 @@ pub type MarketState = (
     String,                      // condition_id (NEW)
 );
 
+/// Whether a held market should be released when no replacement candidate exists.
+///
+/// Only *proven* expiry releases. A missing close time means unknown, not dead:
+/// releasing on unknown would drop live markets whose close time simply never got
+/// populated, which is a worse failure than holding one a little too long.
+fn should_release_held_market(
+    holding_a_market: bool,
+    close_time: Option<chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    holding_a_market && close_time.is_some_and(|ct| (ct - now).num_seconds() <= 0)
+}
+
 /// Resolve the maker/daily candidate's strike price before broadcasting it.
 ///
 /// The CAG only resolves the maker strike ONCE at startup; every market-switch
@@ -152,7 +165,46 @@ pub async fn run_market_monitor(
                 continue;
             }
         };
-        if candidate.yes_token == market_id_from_u256(U256::ZERO) { continue; }
+        // No tradeable market this scan. Before skipping, check whether the market we
+        // are ALREADY holding has expired — releasing it is the whole point of this arm.
+        //
+        // This guard used to be a bare `continue`, which sat ABOVE the expiry logic below
+        // and therefore made `cur_secs_left <= 0` — the branch whose entire job is
+        // releasing a dead market — unreachable whenever no replacement existed. A
+        // squadron that could not find a successor clung to its expired market forever.
+        //
+        // Ireland, 2026-08-27: a squadron sat on a market that had closed 28 minutes
+        // earlier, reporting `secs_to_expiry -1684s` and counting down by 30s a tick,
+        // with every viper gate correctly refusing to quote it. Nothing was at risk, but
+        // nothing could recover either — only a process restart would clear it.
+        //
+        // Releasing publishes the ZERO sentinel, which is the same state the channel is
+        // seeded with at startup before any market is found, so every consumer already
+        // handles it. The maker candidate is carried through untouched: the hourly market
+        // expiring says nothing about the maker market, which has its own lifecycle.
+        if candidate.yes_token == market_id_from_u256(U256::ZERO) {
+            let (cur_yes, _, cur_name, cur_close_time, _, _, cur_maker, _) =
+                market_tx.borrow().clone();
+            let holding_a_market = cur_yes != market_id_from_u256(U256::ZERO);
+            if should_release_held_market(holding_a_market, cur_close_time, Utc::now()) {
+                info!(
+                    "🛑 Releasing expired market \"{}\" — no replacement available; \
+                     squadron waits rather than holding a market that closed",
+                    cur_name,
+                );
+                let _ = market_tx.send((
+                    market_id_from_u256(U256::ZERO),
+                    market_id_from_u256(U256::ZERO),
+                    String::new(),
+                    None,
+                    None,
+                    String::new(),
+                    cur_maker,
+                    String::new(),
+                ));
+            }
+            continue;
+        }
 
         let (cur_yes, _, cur_name, cur_close_time, _, _, _, _cur_cid) = market_tx.borrow().clone();
 
@@ -227,5 +279,51 @@ pub async fn run_market_monitor(
             maker_candidate,
             candidate.condition_id.clone(),
         ));
+    }
+}
+
+#[cfg(test)]
+mod release_expired_market_tests {
+    use super::should_release_held_market;
+    use chrono::{Duration, Utc};
+
+    /// The Ireland case: the held market closed 28 minutes ago and the scan found no
+    /// replacement. Before this, the bare `continue` above the expiry logic meant the
+    /// squadron held it forever, reporting `secs_to_expiry -1684s` and counting down.
+    #[test]
+    fn an_expired_market_is_released_when_nothing_replaces_it() {
+        let now = Utc::now();
+        assert!(should_release_held_market(true, Some(now - Duration::minutes(28)), now));
+    }
+
+    /// A live market is kept — this arm must not evict a market that is still trading
+    /// just because one scan came back empty.
+    #[test]
+    fn a_live_market_is_kept() {
+        let now = Utc::now();
+        assert!(!should_release_held_market(true, Some(now + Duration::minutes(20)), now));
+    }
+
+    /// Unknown close time is not evidence of death. Releasing here would drop live
+    /// markets whose close time never got populated.
+    #[test]
+    fn an_unknown_close_time_is_not_treated_as_expired() {
+        assert!(!should_release_held_market(true, None, Utc::now()));
+    }
+
+    /// Already holding nothing — releasing again would republish the sentinel every
+    /// scan and wake every consumer of the channel for no reason.
+    #[test]
+    fn holding_nothing_releases_nothing() {
+        let now = Utc::now();
+        assert!(!should_release_held_market(false, Some(now - Duration::hours(1)), now));
+    }
+
+    /// Exactly at the close boundary counts as expired, matching `cur_secs_left <= 0`
+    /// in the switch logic below so the two paths agree.
+    #[test]
+    fn the_close_boundary_counts_as_expired() {
+        let now = Utc::now();
+        assert!(should_release_held_market(true, Some(now), now));
     }
 }

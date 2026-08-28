@@ -282,6 +282,13 @@ pub const MAKER_VELOCITY_BIAS_THRESHOLD: Decimal = dec!(25.0);
 /// Oracle-drift quote pull: cancel unfilled resting quote on adverse oracle move.
 /// Conservative: 3 bps — pulls at the first hint of adverse drift.
 pub const MAKER_ORACLE_DRIFT_PULL_FRAC: Decimal = dec!(0.0002); // 08-04: tightened from 0.0003 in line with prod cancel-race evidence.
+/// Oracle-drift ToxicFill exit: bail out of a FILLED position when the oracle has
+/// moved this far against it since the quote was placed. The oracle leads OBI by
+/// minutes, so waiting for OBI to confirm is how a filled position bleeds — on
+/// 2026-08-27 one went 13.51% adverse over 363s before OBI breached. Looser than
+/// the pull threshold above on purpose: cancelling an unfilled quote is free,
+/// while exiting a position pays the spread to realize a loss. Set 0 to disable.
+pub const MAKER_ORACLE_DRIFT_EXIT_FRAC: Decimal = dec!(0.0010);
 /// Gate-dwell: gates must pass continuously this long before quoting.
 /// Conservative: 30s — only quote into persistently calm books.
 pub const MAKER_GATE_DWELL_SECS: i64 = 30;
