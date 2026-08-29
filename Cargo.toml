@@ -1,6 +1,6 @@
 [package]
 name = "dradis"
-version = "1.0.4"
+version = "1.0.5"
 edition = "2021"
 license = "AGPL-3.0-only"
 description = "Low-latency Rust prediction-market trading bot for Polymarket. Six autonomous strategies (Momentum, Maker, Arbitrage, Time Decay, Basis, GBoost ML), real-time Next.js Control Tower, and an LLM Advisor that delivers optimization recommendations via Ollama (local or remote) + Telegram."
