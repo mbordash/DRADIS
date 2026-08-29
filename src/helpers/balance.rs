@@ -291,6 +291,94 @@ pub async fn cancel_resting_orders_for_token(
     }
 }
 
+/// Ordered strategy names to try when adopting an orphaned position, best first.
+///
+/// `adoption_order` is the set of strategies the calling squadron actually runs,
+/// in registry priority order. The two candidates ahead of it are shortcuts:
+/// `logged` is the strategy the entry log recorded for this token, and the maker
+/// shortcut exists because adopting a maker fill under whichever strategy happens
+/// to be first applies the wrong TP/SL (2026-07-30 trade 304: a maker fill adopted
+/// under MomentumStrategy was stop-lossed the same second at -37%).
+///
+/// Both shortcuts are then filtered against `adoption_order`, which is the part
+/// that matters once a squadron's market class restricts its vipers. An entry log
+/// written before that restriction names a strategy that may no longer run here,
+/// and the maker shortcut assumes MakerStrategy is present at all. Adopting into a
+/// strategy that never evaluates is strictly worse than leaving the position
+/// orphaned: the orphan is still reported and retried, whereas an adopted position
+/// with no owner rides to settlement with no stop and no take-profit. That is the
+/// shape of the -$3.09 Kalshi loss on 2026-08-10.
+fn adoption_candidates(
+    logged: Option<&str>,
+    is_maker_side: bool,
+    adoption_order: &[String],
+) -> Vec<String> {
+    let mut candidates: Vec<String> = Vec::new();
+    if let Some(logged) = logged {
+        candidates.push(logged.to_string());
+    }
+    if is_maker_side {
+        candidates.push("MakerStrategy".to_string());
+    }
+    candidates.extend(adoption_order.iter().cloned());
+    candidates.retain(|c| adoption_order.iter().any(|a| a == c));
+    candidates
+}
+
+#[cfg(test)]
+mod adoption_candidate_tests {
+    use super::adoption_candidates;
+
+    fn order(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn logged_strategy_wins_when_it_is_running() {
+        let got = adoption_candidates(
+            Some("TimeDecayStrategy"), false,
+            &order(&["MomentumStrategy", "TimeDecayStrategy"]),
+        );
+        assert_eq!(got.first().map(String::as_str), Some("TimeDecayStrategy"));
+    }
+
+    /// The regression this guard exists for: a politics squadron restricted to
+    /// Arbitrage and Maker must not adopt an orphan under TimeDecay just because
+    /// an older entry log names it. Nothing would ever exit that position.
+    #[test]
+    fn logged_strategy_is_dropped_when_it_no_longer_runs() {
+        let got = adoption_candidates(
+            Some("TimeDecayStrategy"), false,
+            &order(&["ArbitrageStrategy", "MakerStrategy"]),
+        );
+        assert!(!got.iter().any(|c| c == "TimeDecayStrategy"), "{got:?}");
+        assert_eq!(got, order(&["ArbitrageStrategy", "MakerStrategy"]));
+    }
+
+    #[test]
+    fn maker_shortcut_applies_only_when_maker_runs() {
+        let with = adoption_candidates(None, true, &order(&["ArbitrageStrategy", "MakerStrategy"]));
+        assert_eq!(with.first().map(String::as_str), Some("MakerStrategy"));
+
+        let without = adoption_candidates(None, true, &order(&["ArbitrageStrategy"]));
+        assert_eq!(without, order(&["ArbitrageStrategy"]));
+    }
+
+    /// No running strategies means no adoption at all, rather than adoption into
+    /// a strategy that cannot manage the position.
+    #[test]
+    fn empty_running_set_yields_no_candidates() {
+        assert!(adoption_candidates(Some("MakerStrategy"), true, &[]).is_empty());
+    }
+
+    #[test]
+    fn registry_priority_order_is_preserved() {
+        let ord = order(&["MomentumStrategy", "ArbitrageStrategy", "TimeDecayStrategy"]);
+        assert_eq!(adoption_candidates(None, false, &ord), ord);
+    }
+}
+
+
 /// Reconcile on-chain token balances against the in-memory position map.
 /// `adoption_order` is the ordered list of strategy names to try when assigning an
 /// orphaned position — derived from `StrategyRegistry::strategy_names()` so that
@@ -402,14 +490,11 @@ pub async fn reconcile_orphaned_positions(
         // MomentumStrategy was stop-lossed the same second at −37%), (3) first available
         // strategy in adoption_order.
         let adopted_strategy = {
-            let mut candidates: Vec<String> = Vec::new();
-            if let Some(ref logged) = logged_strategy {
-                candidates.push(logged.clone());
-            }
-            if side_label.contains("maker") {
-                candidates.push("MakerStrategy".to_string());
-            }
-            candidates.extend(adoption_order.iter().cloned());
+            let candidates = adoption_candidates(
+                logged_strategy.as_deref(),
+                side_label.contains("maker"),
+                adoption_order,
+            );
             let map = positions.lock().await;
             candidates.into_iter().find(|s| !map.contains_key(&PositionKey::new(squadron_id, s.clone(), market.clone())))
         };

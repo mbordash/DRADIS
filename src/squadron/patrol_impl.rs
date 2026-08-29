@@ -449,7 +449,23 @@ impl Squadron {
                 self.id, market_class,
             );
         }
-        let adoption_order = StrategyRegistry::strategy_names();
+        // Adopt orphans only into strategies this squadron actually runs.
+        //
+        // `strategy_names()` is all nine in adoption-priority order; keeping that
+        // order matters (balance.rs relies on it), so filter rather than rebuild.
+        // Without this the class filter above would create the very bug the US
+        // and Kalshi close-phase handlers were written to prevent: an on-chain
+        // orphan on a politics market adopted under, say, MomentumStrategy, which
+        // no longer runs there and so never evaluates an exit for it. The intl
+        // path has no `flatten_before_stand_down`, so such a position would ride
+        // to settlement with no stop and no take-profit — the shape of the
+        // -$3.09 Kalshi loss on 2026-08-10.
+        let running: std::collections::HashSet<String> =
+            strategies.iter().map(|s| s.name().to_string()).collect();
+        let adoption_order: Vec<String> = StrategyRegistry::strategy_names()
+            .into_iter()
+            .filter(|n| running.contains(n))
+            .collect();
         let live_collateral = Arc::clone(&live_collateral);
 
         // Allow CLOB API and WS orderbook snapshots to settle before reconciling.
