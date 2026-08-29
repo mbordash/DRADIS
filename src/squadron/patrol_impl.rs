@@ -279,6 +279,16 @@ impl Squadron {
             .as_ref()
             .map_or_else(String::new, |m| m.condition_id.clone());
 
+        // One market, no split, no rotation — see `Squadron::single_market`. Read
+        // once here because both consumers below sit inside the tick loop.
+        let single_market = self.single_market;
+        // Throttles the "waiting to go flat before retiring" line to once a
+        // minute; the patrol tick is 50ms. Starts a full interval in the past so
+        // the first one prints immediately.
+        let mut retire_wait_logged_at = Instant::now()
+            .checked_sub(Duration::from_secs(60))
+            .unwrap_or_else(Instant::now);
+
         // Squadron's hourly market fields
         let hourly_yes_token         = self.market.yes_token.clone();
         let hourly_no_token          = self.market.no_token.clone();
@@ -604,7 +614,13 @@ impl Squadron {
             let venue = strategy.venue();
             let market_name_attached = match venue {
                 "Hourly" => hourly_market_name.clone(),
-                "Window/Daily" => maker_market_config.as_ref().map_or_else(String::new, |m| m.market_name.clone()),
+                // On a single-market squadron the window/daily vipers run on the
+                // one market too (see `single_market_arb` in the tick), so name
+                // it rather than reporting a blank attachment.
+                "Window/Daily" => maker_market_config
+                    .as_ref()
+                    .map(|m| m.market_name.clone())
+                    .unwrap_or_else(|| if single_market { hourly_market_name.clone() } else { String::new() }),
                 _ => String::from("Unknown"),
             };
             let status_key = sn
@@ -662,32 +678,7 @@ impl Squadron {
                     }
                     info!("🔄 Market switch detected — restarting trading loop with new market context");
                     crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::MarketRotate);
-                    let mut cancel_success = false;
-                    for i in 0..MAX_CANCEL_RETRIES {
-                        let delay = BASE_CANCEL_RETRY_DELAY_MS * (1 << i);
-                        match tokio::time::timeout(
-                            Duration::from_secs(8),
-                            trading_client.as_ref().cancel_all_orders(),
-                        ).await {
-                            Ok(Ok(_)) => {
-                                info!("✅ Successfully cancelled all orders after {} retries.", i);
-                                cancel_success = true;
-                                break;
-                            },
-                            Ok(Err(e)) => {
-                                warn!("⚠️ Failed to cancel all orders (attempt {}/{}) with error: {}", i + 1, MAX_CANCEL_RETRIES, e);
-                                if i < MAX_CANCEL_RETRIES - 1 {
-                                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                                }
-                            },
-                            Err(_) => {
-                                warn!("⚠️ cancel_all_orders timed out (8s) (attempt {}/{}) — retrying in {}ms", i + 1, MAX_CANCEL_RETRIES, delay);
-                                if i < MAX_CANCEL_RETRIES - 1 {
-                                    tokio::time::sleep(Duration::from_millis(delay)).await;
-                                }
-                            }
-                        }
-                    }
+                    let cancel_success = cancel_all_orders_with_retries(trading_client.as_ref()).await;
                     if !cancel_success {
                         error!("❌ Failed to cancel all orders after {} attempts. Proceeding with market switch, but orders may remain open.", MAX_CANCEL_RETRIES);
                     }
@@ -717,6 +708,71 @@ impl Squadron {
                             .as_secs(),
                         AtomicOrdering::Relaxed,
                     );
+                    // ── Event-market retirement ─────────────────────────────
+                    // A single-market squadron has no rotation behind it, so it
+                    // has to retire itself. Nothing else will: the auto-deploy
+                    // seeder skips a class while a squadron for it is live, so
+                    // one that lingers on a resolved market blocks every fresh
+                    // market behind it. Observed on the v1.0.4 Marketplace AMI —
+                    // a sports squadron held a resolved League of Legends market
+                    // for hours with both its vipers gated out.
+                    //
+                    // Ahead of the snapshot build deliberately. A resolved market
+                    // whose WS has since dropped reads as the all-defaults book,
+                    // which the "at least one market has valid prices" guard
+                    // below turns into a `continue` — the squadron would never
+                    // reach a retirement check placed after it.
+                    if single_market {
+                        // Retire only when flat. The intl path has no
+                        // `flatten_before_stand_down`, so standing down on top of
+                        // a position strands it with no viper left to evaluate
+                        // its exit. Keep patrolling instead: the exit paths below
+                        // are exactly what closes it out, and the next tick
+                        // re-checks. Cheap enough to compute every tick — the
+                        // lock is held for one `any()` over an in-memory map.
+                        let holding = {
+                            let map = positions.lock().await;
+                            map.keys().any(|k| k.squadron == squadron_id)
+                        };
+                        let now = Utc::now();
+                        let grace = dynamic_config.read().unwrap().event_market_retire_grace_secs;
+                        if event_market_retire_due(true, hourly_market_close_time, now, grace, holding) {
+                            let overdue = hourly_market_close_time
+                                .map_or(0, |c| (now - c).num_seconds());
+                            info!(
+                                "🏁 Squadron [{}] retiring: market \"{}\" closed {}s ago and the squadron is flat — the class is free for the next deploy",
+                                self.id, hourly_market_name, overdue,
+                            );
+                            // Flat means no POSITION; resting quotes are still
+                            // orders, and they hold collateral until the venue
+                            // clears them at resolution. Same treatment the
+                            // rotation arm gives them.
+                            crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::MarketRotate);
+                            if !cancel_all_orders_with_retries(trading_client.as_ref()).await {
+                                error!("❌ Failed to cancel all orders after {} attempts. Standing down anyway; the venue clears the rest at resolution.", MAX_CANCEL_RETRIES);
+                            }
+                            self.stand_down();
+                            cag.update_state(&self.id, crate::squadron::SquadronState::StoodDown);
+                            cag.remove(&self.id);
+                            self.cancel_ws();
+                            break;
+                        }
+                        // Past its close but still holding: say so, throttled,
+                        // because from the outside this is indistinguishable from
+                        // the squadron simply being stuck.
+                        if holding
+                            && hourly_market_close_time.is_some_and(|c| (now - c).num_seconds() >= grace)
+                            && retire_wait_logged_at.elapsed() >= Duration::from_secs(60)
+                        {
+                            info!(
+                                "🕰️ Squadron [{}] market \"{}\" closed {}s ago — holding to exit its position before standing down",
+                                self.id, hourly_market_name,
+                                hourly_market_close_time.map_or(0, |c| (now - c).num_seconds()),
+                            );
+                            retire_wait_logged_at = Instant::now();
+                        }
+                    }
+
                     // Watchdog breadcrumb: we are building the market snapshot + evaluating
                     // strategies. The executor refines this to the specific viper; a stall
                     // before it reaches the executor still shows SIGNAL_EVAL.
@@ -841,10 +897,10 @@ impl Squadron {
                     let horizon_now = horizon_rx.as_ref().map(|r| *r.borrow());
                     let deriv_now = deriv_rx.as_ref().map(|r| *r.borrow());
 
-                    let ctx = StrategyContext {
-                        squadron_id: squadron_id.clone(),
-                        market: hourly_market_config_for_ctx.clone(),
-                        snapshot: MarketSnapshot {
+                    // Hoisted out of the StrategyContext literal so the
+                    // single-market arbitrage path below can hand Arbitrage the
+                    // very same snapshot as its maker leg.
+                    let hourly_snapshot = MarketSnapshot {
                             yes_bid: hourly_yb, yes_bid_depth: hourly_ybd, yes_ask: hourly_ya, yes_ask_depth: hourly_yad,
                             no_bid: hourly_nb, no_bid_depth: hourly_nbd, no_ask: hourly_na, no_ask_depth: hourly_nad,
                             yes_bid_depth_total: hourly_ybd_all, yes_ask_depth_total: hourly_yad_all,
@@ -869,7 +925,40 @@ impl Squadron {
                                 .map(|t| (t - Utc::now()).num_seconds())
                                 .unwrap_or(0),
                             timestamp: hourly_snap_ts,
-                        },
+                    };
+
+                    // ── Single-market arbitrage ─────────────────────────────
+                    // Arbitrage reads the maker (window/daily) venue, and refuses
+                    // to run without one: on a split venue the hourly leg is a
+                    // different market, so a half-filled pair there is a naked
+                    // directional bet the arbiter has to flatten at a loss (the
+                    // 2026-06-19 episode in `arbitrage_impl`).
+                    //
+                    // A single-market squadron has no split to fall back FROM.
+                    // Its one market is the venue, both legs quote on the same
+                    // book, and a pair placed there is the ordinary hedged trade
+                    // the guard was written to protect. Passing None left
+                    // Arbitrage idling on "no daily/window venue available" for
+                    // the life of every politics and sports squadron, while the
+                    // class taxonomy went on advertising it as one of their two
+                    // vipers. The US wing resolved the identical shape the same
+                    // way on 2026-08-08 (`venues/us/trader.rs`).
+                    //
+                    // Scoped to `single_market` on purpose. A crypto squadron
+                    // that transiently loses its daily market must keep idling:
+                    // there the guard is load-bearing.
+                    let single_market_arb =
+                        single_market_arb_enabled(single_market, maker_market_config.is_some());
+                    let maker_market_config_for_ctx = if single_market_arb {
+                        Some(hourly_market_config_for_ctx.clone())
+                    } else {
+                        maker_market_config_for_ctx
+                    };
+
+                    let ctx = StrategyContext {
+                        squadron_id: squadron_id.clone(),
+                        market: hourly_market_config_for_ctx.clone(),
+                        snapshot: hourly_snapshot.clone(),
                         positions: Arc::clone(&positions),
                         session_pnl:          ctx_session_pnl,
                         starting_collateral:  ctx_starting_collateral,
@@ -877,7 +966,9 @@ impl Squadron {
                         crypto_filter: crypto_filter.clone(),
                         market_started_at,
                         maker_market: maker_market_config_for_ctx,
-                        maker_snapshot: maker_market_config.as_ref().map(|mk| MarketSnapshot {
+                        maker_snapshot: if single_market_arb {
+                            Some(hourly_snapshot)
+                        } else { maker_market_config.as_ref().map(|mk| MarketSnapshot {
                             yes_bid: maker_yb, yes_bid_depth: maker_ybd, yes_ask: maker_ya, yes_ask_depth: maker_yad,
                             no_bid: maker_nb, no_bid_depth: maker_nbd, no_ask: maker_na, no_ask_depth: maker_nad,
                             yes_bid_depth_total: maker_ybd_all, yes_ask_depth_total: maker_yad_all,
@@ -897,7 +988,7 @@ impl Squadron {
                                 .map(|t| (t - Utc::now()).num_seconds())
                                 .unwrap_or(0),
                             timestamp: maker_snap_ts,
-                        }),
+                        }) },
                         dynamic_config: dyn_cfg,
                         arb_market_lockouts: Some(arb_market_lockouts.clone()),
                     };
@@ -2321,6 +2412,152 @@ impl Squadron {
         // firing and the lifecycle task exiting.
         ctx.session.venue.clear_active_tokens().await;
         peripheral_cancel.cancel();
+    }
+}
+
+/// Cancel every resting order, retrying with exponential backoff.
+///
+/// Shared by the two paths that end a squadron's tenure on a market: the market
+/// rotation arm and event-market retirement. Returns false when every attempt
+/// failed, which the caller reports but does not treat as fatal — the venue
+/// cancels what is left when the market resolves.
+pub(crate) async fn cancel_all_orders_with_retries(
+    trading_client: &polymarket_client_sdk_v2::clob::Client<
+        polymarket_client_sdk_v2::auth::state::Authenticated<
+            polymarket_client_sdk_v2::auth::Normal,
+        >,
+    >,
+) -> bool {
+    for i in 0..MAX_CANCEL_RETRIES {
+        let delay = BASE_CANCEL_RETRY_DELAY_MS * (1 << i);
+        match tokio::time::timeout(
+            Duration::from_secs(8),
+            trading_client.cancel_all_orders(),
+        ).await {
+            Ok(Ok(_)) => {
+                info!("✅ Successfully cancelled all orders after {} retries.", i);
+                return true;
+            }
+            Ok(Err(e)) => {
+                warn!("⚠️ Failed to cancel all orders (attempt {}/{}) with error: {}", i + 1, MAX_CANCEL_RETRIES, e);
+                if i < MAX_CANCEL_RETRIES - 1 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+            }
+            Err(_) => {
+                warn!("⚠️ cancel_all_orders timed out (8s) (attempt {}/{}) — retrying in {}ms", i + 1, MAX_CANCEL_RETRIES, delay);
+                if i < MAX_CANCEL_RETRIES - 1 {
+                    tokio::time::sleep(Duration::from_millis(delay)).await;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Is a single-market squadron due to stand itself down?
+///
+/// Extracted from the patrol tick so the rule is testable: the tick that calls
+/// it is a 2,000-line async loop, and the two facts this encodes — retire only
+/// after the grace, and never on top of a position — are exactly the ones a
+/// future edit could quietly invert.
+///
+/// `holding_position` is deliberately a caller-computed bool rather than the
+/// position map: the caller already holds the lock and knows the squadron id.
+pub(crate) fn event_market_retire_due(
+    single_market: bool,
+    close_time: Option<chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+    grace_secs: i64,
+    holding_position: bool,
+) -> bool {
+    if !single_market || holding_position {
+        return false;
+    }
+    match close_time {
+        // A market with no close time never retires on its own. Nothing to
+        // measure against, and guessing would stand down a live squadron.
+        None => false,
+        Some(close) => (now - close).num_seconds() >= grace_secs,
+    }
+}
+
+/// May this squadron's own market serve as its maker (window/daily) venue?
+///
+/// True only when the squadron was deployed onto one market to begin with. The
+/// negative case is the safety-critical one: a crypto squadron whose daily
+/// market is transiently unavailable must keep Arbitrage idle rather than let
+/// it fall back to the hourly leg. See `Squadron::single_market`.
+pub(crate) fn single_market_arb_enabled(single_market: bool, has_maker_venue: bool) -> bool {
+    single_market && !has_maker_venue
+}
+
+#[cfg(test)]
+mod event_market_retire_tests {
+    use super::*;
+
+    fn at(secs_from_close: i64) -> (chrono::DateTime<Utc>, chrono::DateTime<Utc>) {
+        let close = Utc::now();
+        (close, close + chrono::Duration::seconds(secs_from_close))
+    }
+
+    #[test]
+    fn holds_until_the_grace_has_elapsed() {
+        let (close, now) = at(299);
+        assert!(!event_market_retire_due(true, Some(close), now, 300, false));
+    }
+
+    #[test]
+    fn retires_once_the_grace_has_elapsed() {
+        let (close, now) = at(300);
+        assert!(event_market_retire_due(true, Some(close), now, 300, false));
+    }
+
+    /// The intl path has no `flatten_before_stand_down`, so retiring on top of a
+    /// position strands it with no viper left to evaluate its exit.
+    #[test]
+    fn never_retires_while_holding_a_position() {
+        let (close, now) = at(86_400);
+        assert!(!event_market_retire_due(true, Some(close), now, 300, true));
+    }
+
+    /// A crypto squadron is rotated by the venue's own loop. If this fired on
+    /// one it would stand down the wing with nothing to respawn it.
+    #[test]
+    fn never_retires_a_split_venue_squadron() {
+        let (close, now) = at(86_400);
+        assert!(!event_market_retire_due(false, Some(close), now, 300, false));
+    }
+
+    #[test]
+    fn a_market_with_no_close_time_never_retires() {
+        assert!(!event_market_retire_due(true, None, Utc::now(), 300, false));
+    }
+
+    /// A zero grace is a legal operator setting: retire at the close itself.
+    #[test]
+    fn zero_grace_retires_at_the_close() {
+        let (close, now) = at(0);
+        assert!(event_market_retire_due(true, Some(close), now, 0, false));
+    }
+
+    #[test]
+    fn single_market_squadron_uses_its_own_market_as_the_maker_venue() {
+        assert!(single_market_arb_enabled(true, false));
+    }
+
+    /// The load-bearing case: a split venue that has lost its daily market keeps
+    /// Arbitrage idle rather than falling back to the hourly leg.
+    #[test]
+    fn split_venue_without_a_maker_market_does_not_fall_back() {
+        assert!(!single_market_arb_enabled(false, false));
+    }
+
+    /// A single-market squadron that somehow does have a maker venue uses it.
+    #[test]
+    fn a_real_maker_venue_always_wins() {
+        assert!(!single_market_arb_enabled(true, true));
+        assert!(!single_market_arb_enabled(false, true));
     }
 }
 

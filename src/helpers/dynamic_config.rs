@@ -219,6 +219,7 @@ fn default_deploy_max_days_to_close()       -> u32     { config::DEPLOY_MAX_DAYS
 fn default_llm_max_output_tokens()          -> u32     { config::LLM_MAX_OUTPUT_TOKENS                }
 fn default_auto_deploy_politics()           -> bool    { config::AUTO_DEPLOY_POLITICS                 }
 fn default_auto_deploy_sports()             -> bool    { config::AUTO_DEPLOY_SPORTS                   }
+fn default_event_market_retire_grace_secs() -> i64     { config::EVENT_MARKET_RETIRE_GRACE_SECS       }
 fn default_obi_use_whole_book()             -> bool    { config::OBI_USE_WHOLE_BOOK                   }
 fn default_maker_min_spread()               -> Decimal { config::MAKER_MIN_SPREAD                      }
 fn default_maker_bid_buffer()               -> Decimal { config::MAKER_BID_BUFFER                      }
@@ -455,6 +456,11 @@ pub struct DynamicConfig {
     /// Keep a sports squadron running without waiting for an operator deploy.
     #[serde(default = "default_auto_deploy_sports")]
     pub auto_deploy_sports:            bool,
+    /// Seconds after an event market closes before its squadron stands down,
+    /// freeing the class for the next auto-deploy. A squadron still holding a
+    /// position keeps patrolling regardless and retires once flat.
+    #[serde(default = "default_event_market_retire_grace_secs")]
+    pub event_market_retire_grace_secs: i64,
     /// Token ceiling for one LLM Advisor reply — prose plus proposal block.
     #[serde(default = "default_llm_max_output_tokens")]
     pub llm_max_output_tokens:         u32,
@@ -860,6 +866,7 @@ impl Default for DynamicConfig {
             deploy_max_days_to_close:      config::DEPLOY_MAX_DAYS_TO_CLOSE,
             auto_deploy_politics:          config::AUTO_DEPLOY_POLITICS,
             auto_deploy_sports:            config::AUTO_DEPLOY_SPORTS,
+            event_market_retire_grace_secs: config::EVENT_MARKET_RETIRE_GRACE_SECS,
             llm_max_output_tokens:         config::LLM_MAX_OUTPUT_TOKENS,
             obi_use_whole_book:            config::OBI_USE_WHOLE_BOOK,
             maker_min_spread:              config::MAKER_MIN_SPREAD,

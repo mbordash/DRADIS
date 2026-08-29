@@ -1141,6 +1141,26 @@ pub const AUTO_DEPLOY_POLITICS: bool = true;
 /// signal, and without a key it idles and publishes a neutral snapshot.
 pub const AUTO_DEPLOY_SPORTS: bool = true;
 
+/// Grace period, in seconds, between an event market's close and the squadron
+/// on it standing itself down.
+///
+/// Only event-market squadrons retire this way — the ones auto-deployed or
+/// hand-deployed onto a single politics or sports market. A crypto squadron is
+/// rotated onto its next market by the venue's own loop and never reaches this
+/// path.
+///
+/// Retirement is what makes auto-deploy's documented promise true: the seeder
+/// skips a class while a squadron for it is live, so a squadron that never
+/// stands down holds the class slot forever. On the v1.0.4 Marketplace AMI a
+/// sports squadron sat on a resolved market for hours, arbitrage and maker both
+/// gated out, while live markets went unclaimed.
+///
+/// The grace exists because "closed" is the venue's word against our clock, and
+/// because a position can still be exiting. A squadron still holding a position
+/// waits regardless of this value: it keeps patrolling so its exits evaluate,
+/// and retires once flat.
+pub const EVENT_MARKET_RETIRE_GRACE_SECS: i64 = 300;
+
 /// How far the exit price implied by collateral movement may sit from the bid
 /// observed at exit, before the reconciliation is distrusted.
 ///

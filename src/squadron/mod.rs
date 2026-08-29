@@ -238,6 +238,29 @@ pub struct Squadron {
     /// The venue's own `category` field says "sports" outright. Prefer it.
     pub venue_category: Option<String>,
 
+    /// True when this squadron was deployed onto exactly ONE market, with no
+    /// hourly/window-daily split and no rotation behind it.
+    ///
+    /// That is the shape every event-market deploy has: `adama` hands the patrol
+    /// loop a dummy `market_rx` nothing ever sends on, and no maker venue. Two
+    /// behaviors hang off it, and both were wrong while it did not exist:
+    ///
+    /// 1. Arbitrage refuses to run without a maker venue, because on a split
+    ///    venue falling back to the hourly leg turns a half-filled pair into a
+    ///    naked directional bet. With no split there is nothing to fall back
+    ///    *from* — the single market is the venue — so the hourly pair is fed
+    ///    through as the maker pair, exactly as the US wing does
+    ///    (`venues/us/trader.rs`, 2026-08-08).
+    /// 2. Nothing rotates the market, so the squadron must retire itself when
+    ///    its market closes or it holds the class slot forever. Observed on the
+    ///    v1.0.4 Marketplace AMI: a sports squadron sat on a resolved League of
+    ///    Legends market for hours while `seed_auto_deployments` skipped the
+    ///    class because a squadron for it was still live.
+    ///
+    /// Set post-construction rather than threaded through all three
+    /// constructors, matching how `SquadronRaptors::tennis` is attached.
+    pub single_market: bool,
+
     /// Cancellation token used to stop WS reconnect loops on market rotation.
     ///
     /// A fresh token is created on each `subscribe_markets()` call; the
@@ -328,11 +351,12 @@ impl Squadron {
         // proposed against the one that was not running and four operator
         // approvals were written to a config nothing read.
         //
-        // Every call site now passes None, so every id already ends in `-open`
-        // and nothing anywhere reads `-hourly`. Keeping the suffix rather than
-        // dropping it holds existing ids byte-identical, so no operator's saved
-        // config is orphaned; making it constant means a future caller cannot
-        // reintroduce the flip by passing a close time.
+        // Nothing anywhere reads `-hourly`, so every live id already ends in
+        // `-open`. Keeping the suffix rather than dropping it holds existing ids
+        // byte-identical, so no operator's saved config is orphaned; making it a
+        // constant means a caller cannot reintroduce the flip by passing a close
+        // time — which callers now do again, because the vipers read their close
+        // time from this same MarketConfig and blanking it blinded them.
         let cadence = "open";
         // A named squadron takes `{asset}-{cadence}-{name}`, so a second one of
         // the same class no longer collides with the first. Unnamed squadrons
@@ -351,6 +375,8 @@ impl Squadron {
             state: SquadronState::Deployed,
             deployed_at,
             venue_category,
+            // Split-venue by default: only the event-market deploy path sets it.
+            single_market: false,
             ws_cancel: CancellationToken::new(),
         }
     }

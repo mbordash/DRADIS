@@ -190,6 +190,11 @@ where
         let mut squadron = Squadron::new_named(
             asset, squadron_config, market_config, squadron_raptors, None, name,
         );
+        // One market, no hourly/daily split, no rotation behind it. Lets the
+        // patrol loop hand Arbitrage this market as its own maker venue, and
+        // retire the squadron when the market closes so the class frees up for
+        // the next auto-deploy. See `Squadron::single_market`.
+        squadron.single_market = true;
         // The derived id stands. It used to be overwritten with the caller's
         // `{deployment_id}-sq`, which is what made an intl squadron's identity
         // unpredictable; the caller now records what the squadron actually

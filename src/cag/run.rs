@@ -297,11 +297,11 @@ where
             hourly_condition_id,
         ) = patrol_ctx.market_rx.borrow().clone();
 
-        // `_hourly_market_close_time` is rebound here but no longer read in this
-        // scope: its only consumer was the squadron's identity MarketConfig, and
-        // identity must not depend on the market's close time. The patrol loop
-        // gets the real value from its own market channel.
-        let (hourly_yes_token, hourly_no_token, hourly_market_name, _hourly_market_close_time,
+        // Shadowing rebind. The `else` branch below resolves to no hourly market
+        // and yields None here, so this is the binding to read afterwards — the
+        // outer one still holds whatever the channel last published and would
+        // hand a stale close time to a zero-token market.
+        let (hourly_yes_token, hourly_no_token, hourly_market_name, hourly_market_close_time,
              hourly_strike_price, _hourly_desc, hourly_condition_id,
              hourly_is_neg_risk, hourly_yes_fee_rate, hourly_no_fee_rate)
             = if hourly_yes_token != market_id_from_u256(U256::ZERO)
@@ -359,22 +359,27 @@ where
             yes_token:         hourly_yes_token.clone(),
             no_token:          hourly_no_token.clone(),
             market_name:       hourly_market_name.clone(),
-            // None deliberately, matching Kalshi and the US wings.
+            // The real close time. This MarketConfig is BOTH the squadron's
+            // identity and the `ctx.market` every hourly-venue viper reads, so
+            // it has to carry it.
             //
-            // The squadron id is `{asset}-{cadence}` and cadence is decided by
-            // whether THIS field is set — so passing the real close time made the
-            // id flip between `btc-hourly` and `btc-open` depending on which
-            // market the loop happened to pick up. That id is the persistence key
-            // for operator config and part of every PositionKey, so the same
-            // logical squadron accumulated two config rows: on 2026-08-24 the
-            // advisor proposed against `btc-open` while `btc-hourly` was the one
-            // running, and four operator approvals were written to a config
-            // nothing read.
+            // d90e18d set this to None to stop the squadron id flipping between
+            // `btc-hourly` and `btc-open` — the cadence component used to be
+            // derived from whether this field was set, which split one logical
+            // squadron across two config rows. That was a real defect, but the
+            // cure was applied to the wrong layer: `Squadron::new` now hardcodes
+            // `let cadence = "open"`, so identity no longer depends on this field
+            // at all, and blanking it only blinded the vipers. Its comment
+            // pointed at a `hourly_market_config_for_ctx` that was never written.
             //
-            // Only identity is affected. The vipers read close time from
-            // `hourly_market_config_for_ctx`, assembled separately below with the
-            // real value.
-            market_close_time: None,
+            // Observed on the v1.0.4 Marketplace AMI 2026-08-29: TimeDecay idled
+            // on "market has no close time" on every tick for five hours, and
+            // Momentum's `if let Some(close_time)` expiry guard silently never
+            // ran — it would have entered inside the min-secs-to-expiry window.
+            //
+            // Kalshi (trader.rs:856) and the US wing (trader.rs:1000) pass the
+            // real value here; adama.rs does too, and says so at line 142.
+            market_close_time: hourly_market_close_time,
             strike_price:      hourly_strike_price,
             is_neg_risk:       hourly_is_neg_risk,
             condition_id:      hourly_condition_id.clone(),

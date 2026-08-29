@@ -104,6 +104,7 @@ export interface DynamicConfig {
   deploy_max_days_to_close:      number;
   auto_deploy_politics:          boolean;
   auto_deploy_sports:            boolean;
+  event_market_retire_grace_secs: number;
   llm_max_output_tokens:         number;
   obi_use_whole_book:            boolean;
   maker_min_spread:              string;

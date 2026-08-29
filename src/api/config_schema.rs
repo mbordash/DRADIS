@@ -583,6 +583,17 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              key: the class trades Arbitrage and Maker off the venue's own book, and the Sports \
              Raptor is an additive signal that idles harmlessly when no key is set.")
             );
+        v.push(F::new(g, e, "event_market_retire_grace_secs", "Event Market Retire Delay", "secs", false,
+            "How long a politics or sports squadron waits after its market closes before standing \
+             itself down, in seconds. Standing down is what frees the class: DRADIS runs one \
+             squadron per class and the auto-deploy seeder skips a class while a squadron for it \
+             is still live, so a squadron that lingers on a resolved market blocks every fresh \
+             market behind it. The delay exists because the close time is the venue's, not \
+             yours, and a market can still print a late trade around it.\n\n\
+             A squadron still holding a position ignores this entirely — it keeps patrolling so \
+             its exits keep evaluating, and retires once it is flat. Crypto squadrons never reach \
+             this path; this venue's own loop rotates them onto the next market instead.")
+            .range(0.0, 86_400.0).step(30.0).unit("s"));
         v.push(F::new(g, e, "llm_max_output_tokens", "AI Reply Budget", "secs", true,
             "Token ceiling for one AI Advisor reply. It covers the whole response — the written \
              analysis and the structured recommendations the engine parses — and the \
