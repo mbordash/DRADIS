@@ -332,7 +332,16 @@ fn extract_features(s: &MarketSnapshot, prev_s: Option<&MarketSnapshot>, hist_vo
 
 /// Build and train a fresh `PerpetualBooster` from a slice of `TrainingSample`s.
 /// Called exclusively from `tokio::task::spawn_blocking` — never on an async thread.
-fn train_model(samples: Vec<TrainingSample>) -> Result<PerpetualBooster> {
+///
+/// `budget` and `iteration_limit` are passed in rather than read from `config`
+/// so they can be tuned live from the Control Tower: this runs on a blocking
+/// thread with no access to the dynamic config, so the caller reads them off its
+/// own `dc` snapshot and hands them over.
+fn train_model(
+    samples: Vec<TrainingSample>,
+    budget: f32,
+    iteration_limit: u32,
+) -> Result<PerpetualBooster> {
     let n = samples.len();
 
     if n < config::GBOOST_MIN_TRAINING_SAMPLES {
@@ -355,11 +364,15 @@ fn train_model(samples: Vec<TrainingSample>) -> Result<PerpetualBooster> {
 
     let mut booster = PerpetualBooster::default()
         .set_objective(Objective::LogLoss)
-        .set_budget(config::GBOOST_BUDGET as f32)
+        .set_budget(budget)
         .set_num_threads(Some(config::GBOOST_NUM_THREADS as usize))
-        .set_log_iterations(0)  // silent: suppress perpetual's stdout logging
+        // Suppresses perpetual's own stdout progress lines. It does NOT silence
+        // the crate's `tracing` output — that is filtered at the subscriber in
+        // main.rs, which is where its "iteration cap" WARN was reaching operator
+        // logs from.
+        .set_log_iterations(0)
         .set_max_bin(63)        // 63 bins is fast and sufficient for these features
-        .set_iteration_limit(Some(1000))
+        .set_iteration_limit(Some(iteration_limit as usize))
         .set_stopping_rounds(None)
         .set_save_node_stats(true); // Required for drift detection via perpetual::drift
 
@@ -744,6 +757,11 @@ impl GboostStrategyImpl {
             td.iter().cloned().collect()
         };
 
+        // Captured before the move below. The retrain line reports it, and it is a
+        // genuinely different quantity from the positive-label count they were
+        // once conflated with — see the log call at the end of this function.
+        let real_count = real_samples.len();
+
         let training_samples: Vec<TrainingSample> = if real_samples.len() >= config::GBOOST_MIN_TRAINING_SAMPLES {
             // Enough real trade outcomes — use them exclusively for the cleanest signal.
             real_samples
@@ -858,9 +876,16 @@ impl GboostStrategyImpl {
         *self.ticks_since_retrain.lock().unwrap() = 0;
         *self.last_retrain_at.lock().unwrap() = Some(Instant::now());
         self.is_training.store(true, Ordering::Relaxed);
+        // `real_count` and `pos_count` are different things and were once both
+        // printed as "real outcomes": this line passed `pos_count` into a slot
+        // labeled that way, so on 2026-08-29 a production box that had taken
+        // ZERO trades reported "372 samples (231 real outcomes)". 231 was simply
+        // 62% of 372. Meanwhile the "retrain waiting" line above uses the phrase
+        // for `training_data.len()`, its true meaning, so two adjacent lines
+        // disagreed about what a real outcome was.
         tracing::info!(
-            " GboostStrategy: retraining model — {} samples ({} real outcomes, {:.0}% positive labels)",
-            training_samples.len(), pos_count, pos_fraction * 100.0
+            " GboostStrategy: retraining model — {} samples ({} from real trade outcomes, {} labeled up = {:.0}%)",
+            training_samples.len(), real_count, pos_count, pos_fraction * 100.0
         );
 
         let model_arc   = Arc::clone(&self.model);
@@ -887,9 +912,14 @@ impl GboostStrategyImpl {
             h.iter().skip(h.len().saturating_sub(n)).cloned().collect()
         };
 
+        // Read off the config snapshot before the move — `dc` is borrowed and the
+        // blocking closure outlives this scope.
+        let train_budget = dc.gboost_budget.to_f32().unwrap_or(0.8);
+        let train_iteration_limit = dc.gboost_iteration_limit.max(1);
+
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let model = train_model(training_samples)?;
+                let model = train_model(training_samples, train_budget, train_iteration_limit)?;
                 let drift  = compute_concept_drift(&model, &history_for_drift);
                 Ok::<(PerpetualBooster, f32), anyhow::Error>((model, drift))
             }).await;
@@ -2230,8 +2260,68 @@ mod tests {
                 entry_timestamp: Utc::now(),
             });
         }
-        let booster = train_model(samples).expect("train_model should succeed");
+        let booster = train_model(samples, config::GBOOST_BUDGET.to_f32().unwrap_or(0.8), config::GBOOST_ITERATION_LIMIT)
+            .expect("train_model should succeed");
         assert!(!booster.trees.is_empty(), "booster should have trees after training");
+    }
+
+    /// Synthesize a learnable dataset: feature[0] separates the classes, the
+    /// rest is noise. The existing `train_model_returns_booster` fixture uses
+    /// identical snapshots with alternating labels, which is pure noise — the
+    /// booster stops almost immediately on it, so it cannot show whether the
+    /// budget knob is doing anything.
+    fn learnable_samples(n: usize) -> Vec<TrainingSample> {
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let profitable = i % 2 == 0;
+            let mut features = [0.0f64; NUM_FEATURES];
+            // Signal with overlap, so the fit has something to keep refining
+            // rather than separating the classes in one split.
+            features[0] = if profitable { 0.60 } else { 0.40 }
+                + ((i % 17) as f64) * 0.01;
+            for (k, f) in features.iter_mut().enumerate().skip(1) {
+                *f = (((i * 31 + k * 7) % 100) as f64) / 100.0;
+            }
+            out.push(TrainingSample {
+                features,
+                is_profitable: profitable,
+                entry_timestamp: Utc::now(),
+            });
+        }
+        out
+    }
+
+    /// The budget knob has to reach the booster. It was a compile-time constant
+    /// read inside `train_model`; it is now a `DynamicConfig` field passed in, so
+    /// this proves the value is actually consumed rather than shadowed by the
+    /// constant it used to read.
+    #[test]
+    fn training_budget_changes_how_many_trees_are_grown() {
+        let n = config::GBOOST_MIN_TRAINING_SAMPLES + 10;
+        let lean = train_model(learnable_samples(n), 0.15, config::GBOOST_ITERATION_LIMIT)
+            .expect("low-budget fit succeeds");
+        let rich = train_model(learnable_samples(n), 1.50, config::GBOOST_ITERATION_LIMIT)
+            .expect("high-budget fit succeeds");
+        assert!(
+            rich.trees.len() > lean.trees.len(),
+            "budget is not reaching the booster: 0.15 gave {} trees, 1.50 gave {}",
+            lean.trees.len(),
+            rich.trees.len(),
+        );
+    }
+
+    /// The iteration cap has to bound the fit regardless of budget. This is the
+    /// wall-clock guard: training runs on a blocking thread.
+    #[test]
+    fn iteration_limit_caps_a_generous_budget() {
+        let n = config::GBOOST_MIN_TRAINING_SAMPLES + 10;
+        let capped = train_model(learnable_samples(n), 1.50, 5)
+            .expect("capped fit succeeds");
+        assert!(
+            capped.trees.len() <= 5,
+            "iteration limit of 5 produced {} trees",
+            capped.trees.len(),
+        );
     }
 
     #[tokio::test]
@@ -2254,7 +2344,7 @@ mod tests {
                 entry_timestamp: Utc::now(),
             });
         }
-        *strategy.model.lock().unwrap() = Some(train_model(samples).unwrap());
+        *strategy.model.lock().unwrap() = Some(train_model(samples, config::GBOOST_BUDGET.to_f32().unwrap_or(0.8), config::GBOOST_ITERATION_LIMIT).unwrap());
         // Must not panic — signal depends on the dummy snapshot's feature values.
         let _ = strategy.evaluate_entry(&make_ctx()).await.unwrap();
         let _ = strategy.evaluate_exit(&make_ctx()).await.unwrap();

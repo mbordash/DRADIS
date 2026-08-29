@@ -220,6 +220,8 @@ fn default_llm_max_output_tokens()          -> u32     { config::LLM_MAX_OUTPUT_
 fn default_auto_deploy_politics()           -> bool    { config::AUTO_DEPLOY_POLITICS                 }
 fn default_auto_deploy_sports()             -> bool    { config::AUTO_DEPLOY_SPORTS                   }
 fn default_event_market_retire_grace_secs() -> i64     { config::EVENT_MARKET_RETIRE_GRACE_SECS       }
+fn default_gboost_budget()                  -> Decimal { config::GBOOST_BUDGET                       }
+fn default_gboost_iteration_limit()         -> u32     { config::GBOOST_ITERATION_LIMIT               }
 fn default_obi_use_whole_book()             -> bool    { config::OBI_USE_WHOLE_BOOK                   }
 fn default_maker_min_spread()               -> Decimal { config::MAKER_MIN_SPREAD                      }
 fn default_maker_bid_buffer()               -> Decimal { config::MAKER_BID_BUFFER                      }
@@ -461,6 +463,14 @@ pub struct DynamicConfig {
     /// position keeps patrolling regardless and retires once flat.
     #[serde(default = "default_event_market_retire_grace_secs")]
     pub event_market_retire_grace_secs: i64,
+    /// How hard `perpetual` works on one GBoost retrain. Higher grows more trees
+    /// and fits the label pool more closely; too high overfits a small pool.
+    #[serde(default = "default_gboost_budget")]
+    pub gboost_budget:                 Decimal,
+    /// Hard iteration ceiling for one retrain, so a fit cannot hold a blocking
+    /// thread indefinitely. Caps whatever the budget would otherwise spend.
+    #[serde(default = "default_gboost_iteration_limit")]
+    pub gboost_iteration_limit:        u32,
     /// Token ceiling for one LLM Advisor reply — prose plus proposal block.
     #[serde(default = "default_llm_max_output_tokens")]
     pub llm_max_output_tokens:         u32,
@@ -867,6 +877,8 @@ impl Default for DynamicConfig {
             auto_deploy_politics:          config::AUTO_DEPLOY_POLITICS,
             auto_deploy_sports:            config::AUTO_DEPLOY_SPORTS,
             event_market_retire_grace_secs: config::EVENT_MARKET_RETIRE_GRACE_SECS,
+            gboost_budget:                 config::GBOOST_BUDGET,
+            gboost_iteration_limit:        config::GBOOST_ITERATION_LIMIT,
             llm_max_output_tokens:         config::LLM_MAX_OUTPUT_TOKENS,
             obi_use_whole_book:            config::OBI_USE_WHOLE_BOOK,
             maker_min_spread:              config::MAKER_MIN_SPREAD,
@@ -1008,6 +1020,56 @@ pub fn read_only_mode() -> bool {
         .unwrap_or(false)
 }
 
+/// Fields whose runtime value is capped by a compile-time constant.
+///
+/// These three are re-clamped on EVERY read of a persisted config, in
+/// `load_or_default` and `load_for_squadron`, under a "stricter wins" rule: a
+/// stale database row must never loosen a limit the build has tightened. That
+/// rule earned its place — on 2026-06-01 a DB row carrying an 8% momentum stop
+/// survived a code change to 5% and exited a losing trade three points late.
+///
+/// The consequence is that raising one of these at runtime does nothing, and
+/// for a long time it did nothing *silently*: on 2026-08-29 an operator
+/// approved `time_decay_max_entry_price -> 0.5` on the live Marketplace
+/// instance, the write succeeded, the audit ledger stamped it `applied`, and
+/// every reader went on seeing 0.46 because the cap re-applied underneath. The
+/// proposal had passed validation because the schema range says 0.0 to 1.0 and
+/// nothing consulted the build cap.
+///
+/// So the caps live here, in one place, and both sides consult them: the read
+/// path through [`apply_build_caps`] and the LLM proposal validator through
+/// [`build_cap_for`]. Adding a fourth cap means adding it to `BUILD_CAPPED_KEYS`
+/// and to both functions; `build_caps_cover_every_declared_key` fails if you
+/// miss one.
+pub const BUILD_CAPPED_KEYS: &[&str] = &[
+    "time_decay_max_entry_price",
+    "time_decay_stop_loss_pct",
+    "momentum_stop_loss_pct",
+];
+
+/// The build's hard ceiling for `field`, or `None` when it has no cap.
+///
+/// A runtime value above this is not an error, it is simply unreachable: the
+/// read path lowers it back on the next load.
+pub fn build_cap_for(field: &str) -> Option<Decimal> {
+    match field {
+        "time_decay_max_entry_price" => Some(config::TIME_DECAY_MAX_ENTRY_PRICE),
+        "time_decay_stop_loss_pct"   => Some(config::TIME_DECAY_STOP_LOSS_PERCENT),
+        "momentum_stop_loss_pct"     => Some(config::MOMENTUM_STOP_LOSS_PERCENT),
+        _ => None,
+    }
+}
+
+/// Lower any capped field back to its build ceiling. "Stricter wins."
+pub fn apply_build_caps(cfg: &mut DynamicConfig) {
+    cfg.time_decay_max_entry_price =
+        cfg.time_decay_max_entry_price.min(config::TIME_DECAY_MAX_ENTRY_PRICE);
+    cfg.time_decay_stop_loss_pct =
+        cfg.time_decay_stop_loss_pct.min(config::TIME_DECAY_STOP_LOSS_PERCENT);
+    cfg.momentum_stop_loss_pct =
+        cfg.momentum_stop_loss_pct.min(config::MOMENTUM_STOP_LOSS_PERCENT);
+}
+
 impl DynamicConfig {
     /// Load the most recent DynamicConfig from SQLite.
     /// If no record exists (first run), seeds defaults and writes them to DB.
@@ -1020,26 +1082,19 @@ impl DynamicConfig {
             if let Some(json) = db::config_get(pool, DB_KEY).await {
                 match serde_json::from_str::<DynamicConfig>(&json) {
                     Ok(mut cfg) => {
-                        // ── Safety floor enforcement ─────────────────────────────────
-                        // Compile-time constants are the hard limits.  A stale DB row can
+                        // ── Build-cap enforcement ────────────────────────────────────
+                        // Compile-time constants are the hard limits. A stale DB row can
                         // never override a tightened constant — code fixes take effect
                         // immediately on the next startup without a manual DB reset.
+                        // Rule: "stricter wins".
                         //
-                        // Rule: "stricter wins" — for upper bounds use .min(), for lower
-                        // bounds (OBI block is negative) the code already uses .max(db, config).
-                        cfg.time_decay_max_entry_price = cfg.time_decay_max_entry_price
-                            .min(config::TIME_DECAY_MAX_ENTRY_PRICE);
-                        cfg.time_decay_stop_loss_pct = cfg.time_decay_stop_loss_pct
-                            .min(config::TIME_DECAY_STOP_LOSS_PERCENT);
-
-                        // Momentum SL safety floor: a stale DB row (e.g. from when
-                        // MOMENTUM_STOP_LOSS_PERCENT was 8%) must never override a
-                        // code-tightened constant.  Root cause of 2026-06-01 13:39 loss
-                        // (-$0.6122): DB had 0.08 persisted while config.rs was 0.05 —
-                        // no safety floor let the old value survive, causing exits at
-                        // -8% instead of -5%.
-                        cfg.momentum_stop_loss_pct = cfg.momentum_stop_loss_pct
-                            .min(config::MOMENTUM_STOP_LOSS_PERCENT);
+                        // Root cause of the 2026-06-01 13:39 loss (-$0.6122): the DB had
+                        // an 8% momentum stop persisted while config.rs said 5%, and with
+                        // no cap the old value survived, exiting at -8%.
+                        //
+                        // Shared with the LLM proposal validator so the two cannot
+                        // disagree about what is reachable — see `apply_build_caps`.
+                        apply_build_caps(&mut cfg);
 
                         info!("⚙️  DynamicConfig loaded from SQLite (safety floors applied)");
 
@@ -1144,13 +1199,8 @@ impl DynamicConfig {
             if let Some(json) = db::squadron_config_get(pool, squadron_id).await {
                 match serde_json::from_str::<DynamicConfig>(&json) {
                     Ok(mut cfg) => {
-                        // Apply safety floors (same as global config)
-                        cfg.time_decay_max_entry_price = cfg.time_decay_max_entry_price
-                            .min(config::TIME_DECAY_MAX_ENTRY_PRICE);
-                        cfg.time_decay_stop_loss_pct = cfg.time_decay_stop_loss_pct
-                            .min(config::TIME_DECAY_STOP_LOSS_PERCENT);
-                        cfg.momentum_stop_loss_pct = cfg.momentum_stop_loss_pct
-                            .min(config::MOMENTUM_STOP_LOSS_PERCENT);
+                        // Same build caps as the global config — see `apply_build_caps`.
+                        apply_build_caps(&mut cfg);
 
                         info!("⚙️  Squadron config loaded from DB: {}", squadron_id);
                         return Arc::new(cfg);
@@ -1364,6 +1414,77 @@ mod tests {
             grace < 20,
             "grace {grace}s must stay under ARBITER_LATE_FILL_WATCH_SECS (20s), \
              the watcher that bounds the cost of committing early"
+        );
+    }
+}
+
+#[cfg(test)]
+mod build_cap_tests {
+    use super::*;
+
+    /// The drift guard. `BUILD_CAPPED_KEYS` is the declared list, `build_cap_for`
+    /// is what the LLM validator consults, and `apply_build_caps` is what the
+    /// read path enforces. A cap added to only some of the three is precisely
+    /// the shape of the 2026-08-29 defect, so this proves all three agree by
+    /// pushing every declared key above its cap and watching it come back.
+    #[test]
+    fn build_caps_cover_every_declared_key() {
+        for key in BUILD_CAPPED_KEYS {
+            let cap = build_cap_for(key)
+                .unwrap_or_else(|| panic!("{key} is declared capped but build_cap_for returns None"));
+
+            let mut value = serde_json::to_value(DynamicConfig::default()).expect("serializes");
+            let over = cap + Decimal::ONE;
+            value[*key] = serde_json::Value::String(over.to_string());
+
+            let mut cfg: DynamicConfig =
+                serde_json::from_value(value).unwrap_or_else(|e| panic!("{key}: {e}"));
+            apply_build_caps(&mut cfg);
+
+            let after = serde_json::to_value(&cfg).expect("serializes");
+            let got: Decimal = after[*key]
+                .as_str()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or_else(|| panic!("{key} is not a Decimal-shaped field"));
+            assert_eq!(got, cap, "apply_build_caps does not enforce the cap on {key}");
+        }
+    }
+
+    /// A cap must never RAISE a value. "Stricter wins" is one-way.
+    #[test]
+    fn a_value_under_the_cap_is_left_alone() {
+        for key in BUILD_CAPPED_KEYS {
+            let cap = build_cap_for(key).expect("declared");
+            let under = cap / Decimal::TWO;
+
+            let mut value = serde_json::to_value(DynamicConfig::default()).expect("serializes");
+            value[*key] = serde_json::Value::String(under.to_string());
+            let mut cfg: DynamicConfig = serde_json::from_value(value).expect("deserializes");
+            apply_build_caps(&mut cfg);
+
+            let after = serde_json::to_value(&cfg).expect("serializes");
+            let got: Decimal = after[*key].as_str().and_then(|s| s.parse().ok()).expect("decimal");
+            assert_eq!(got, under, "apply_build_caps raised {key} toward its cap");
+        }
+    }
+
+    #[test]
+    fn an_uncapped_field_reports_no_cap() {
+        assert!(build_cap_for("maker_max_entry_price").is_none());
+        assert!(build_cap_for("not_a_field_at_all").is_none());
+    }
+
+    /// Applying the caps twice must equal applying them once.
+    #[test]
+    fn applying_the_caps_is_idempotent() {
+        let mut once = DynamicConfig::default();
+        once.time_decay_max_entry_price = Decimal::ONE;
+        apply_build_caps(&mut once);
+        let mut twice = once.clone();
+        apply_build_caps(&mut twice);
+        assert_eq!(
+            serde_json::to_value(&once).unwrap(),
+            serde_json::to_value(&twice).unwrap(),
         );
     }
 }

@@ -397,7 +397,8 @@ impl Squadron {
             no_price_rx.clone(),
             maker_yes_price_rx.clone(),
             maker_no_price_rx.clone(),
-            oracle_rx.clone(),
+            // Omitted for squadrons with no Price Raptor — see `has_price_feed`.
+            self.raptors.has_price_feed.then(|| oracle_rx.clone()),
             Arc::clone(&process_heartbeat_secs),
             asset_lc.clone(),
             ctx.market_rx.clone(),

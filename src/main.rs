@@ -244,9 +244,16 @@ async fn run() -> Result<()> {
     // UI-managed secrets (data/secrets.env) override container env — the .env
     // baked in at `docker create` is a stale copy once the setup UI has run.
     dradis::api::setup::load_secrets_file();
+    // Filter construction lives in `helpers::logbuf::build_env_filter` so it can
+    // be tested — it silences the `perpetual` booster's routine iteration-cap
+    // WARN, which reached a customer's log on the v1.0.5 AMI, while leaving an
+    // explicit RUST_LOG directive for that crate intact.
+    let log_filter = dradis::helpers::logbuf::build_env_filter(
+        std::env::var("RUST_LOG").ok().as_deref(),
+    );
     tracing_subscriber::fmt()
         .with_timer(EasternTime)
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(log_filter)
         // Tee every formatted line into the in-memory ring that backs the
         // Control Tower Console view (GET /api/logs) — stdout is unchanged.
         .with_writer(dradis::helpers::logbuf::TeeMakeWriter)

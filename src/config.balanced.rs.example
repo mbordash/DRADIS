@@ -675,8 +675,22 @@ pub const GBOOST_RETRAIN_EVERY_N: usize = 600;
 /// Hard minimum wall-clock interval (seconds) between successful GBoost retrains.
 /// Prevents a fast tick rate from storming booster.fit() and starving the runtime.
 pub const GBOOST_MIN_RETRAIN_INTERVAL_SECS: u64 = 300;
-pub const GBOOST_BUDGET: f32 = 0.80; // raised from 0.65 — gives perpetual room to grow past 1 tree
+pub const GBOOST_BUDGET: Decimal = dec!(0.80); // raised from 0.65 — gives perpetual room to grow past 1 tree
+// Decimal rather than f32 so it matches every other fractional tunable, is
+// readable by tools/generate-profiles.py, and round-trips through DynamicConfig
+// without a float artifact. Converted to f32 at the booster call site.
 pub const GBOOST_NUM_THREADS: usize = 2;
+
+/// Hard ceiling on boosting iterations for one GBoost retrain.
+///
+/// `perpetual` grows trees until its budget is spent or this limit is hit,
+/// whichever comes first, so this is the wall-clock guard: training runs inside
+/// `spawn_blocking`, and an unbounded fit on a large label pool would hold a
+/// blocking thread long enough to matter. Reaching it is not an error, it means
+/// the budget had more to spend than the limit allowed.
+///
+/// Raise it together with the budget, or the extra budget simply cannot be used.
+pub const GBOOST_ITERATION_LIMIT: u32 = 1000;
 pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.72); // 2026-06-30: lowered (0.88 startup default produced zero trades in 13d)
 pub const GBOOST_PRED_LOG_INTERVAL_SECS: u64 = 120; // periodic P(UP) conviction diagnostic
 

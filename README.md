@@ -12,10 +12,27 @@
 ![Docker](https://img.shields.io/badge/Docker-compose-2496ED?logo=docker&logoColor=white)
 [![OpenClaw](https://img.shields.io/badge/OpenClaw-AI%20Integration-CC0000?logoColor=white)](https://openclaw.ai)
 [![License](https://img.shields.io/badge/License-AGPL%20v3-blue)](LICENSE)
+[![AWS Marketplace](https://img.shields.io/badge/AWS%20Marketplace-Available-FF9900?logo=amazonaws&logoColor=white)](https://aws.amazon.com/marketplace/pp/prodview-dv5dats2bmm5q)
 
 **WARNING**: You will probably lose money. Start in GHOST mode and tune before going live. Make sure to regularly pull updates as our own LLM advises on config and Viper strategy impls often.
 
 Public Demo Site: https://demo.dradis.live/
+
+## Two ways to run it
+
+**Prebuilt AMI — [AWS Marketplace](https://aws.amazon.com/marketplace/pp/prodview-dv5dats2bmm5q)**
+Launches a configured instance in your own AWS account. All three venues ship in
+the image, the Control Tower comes with it, and your API keys stay on your
+infrastructure. Marketplace subscribers receive a **commercial license**, not the
+AGPL, so the copyleft obligations below do not apply to that deployment.
+Install and upgrade guides: <https://dradis.live/docs>
+
+**From source — this repository**
+Clone, pick a risk profile, run it with Docker. The full engine, all nine
+strategies and the Control Tower are here; nothing is held back for the paid
+image. **AGPL v3** — see [LICENSE](LICENSE).
+
+The rest of this README covers the source route.
 
 
 ---

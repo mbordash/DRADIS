@@ -81,6 +81,20 @@ pub struct SquadronRaptors {
     /// construction (`raptors.tennis = Some(rx)`), the same way the US general
     /// wing attaches its sports feed, so the constructor signatures stay stable.
     pub tennis: Option<watch::Receiver<TennisSnapshot>>,
+
+    /// Whether `oracle`, `velocity` and `drift` are fed by a real Price Raptor.
+    ///
+    /// Those three are not `Option` like the rest, because every consumer reads
+    /// them unconditionally. A squadron with no Price Raptor is handed
+    /// placeholder channels whose senders are dropped at construction, so they
+    /// read a permanent zero. That is fine for the vipers, which gate on the
+    /// signals derived from them, but not for anything that REPORTS the value:
+    /// the 60s heartbeat printed `Binance: $0.00` on every politics and sports
+    /// squadron, which is indistinguishable from a Price Raptor that has died.
+    ///
+    /// A bool rather than inferring from a zero reading, because a genuinely
+    /// broken Binance feed also reads zero and must keep looking broken.
+    pub has_price_feed: bool,
     // ── Future Raptors ────────────────────────────────────────────────────────
     // pub politics: Option<watch::Receiver<PoliticsSignal>>,
 }
@@ -109,6 +123,7 @@ impl SquadronRaptors {
             horizon,
             sports,
             tennis: None,
+            has_price_feed: true,
         }
     }
 
@@ -119,7 +134,7 @@ impl SquadronRaptors {
         velocity: watch::Receiver<(Decimal, Decimal, Decimal)>,
         drift:    watch::Receiver<(Decimal, Decimal, Decimal)>,
     ) -> Self {
-        Self { oracle, velocity, drift, funding: None, derivatives: None, tide: None, horizon: None, sports: None, tennis: None }
+        Self { oracle, velocity, drift, funding: None, derivatives: None, tide: None, horizon: None, sports: None, tennis: None, has_price_feed: true }
     }
 
     /// Compose a sports-only bundle for Admiral Adama sports market squadrons.
@@ -138,6 +153,8 @@ impl SquadronRaptors {
             horizon: None,
             sports: Some(sports),
             tennis: None,
+            // Placeholder channels above; there is no Price Raptor here.
+            has_price_feed: false,
         }
     }
 
@@ -157,6 +174,8 @@ impl SquadronRaptors {
             horizon: None,
             sports: None,
             tennis: None,
+            // Placeholder channels above; there is no Price Raptor here.
+            has_price_feed: false,
         }
     }
 }
@@ -164,3 +183,38 @@ impl SquadronRaptors {
 /// Handle to a Sports Raptor signal channel — cloneable for sharing across squadrons.
 pub type SportsRaptorHandle = watch::Receiver<SportsSnapshot>;
 
+
+#[cfg(test)]
+mod price_feed_tests {
+    use super::*;
+
+    /// `has_price_feed` must describe the channels the constructor actually
+    /// installed. It is a hand-maintained claim about `oracle`/`velocity`/
+    /// `drift`, so a new constructor that forgets it, or one that starts handing
+    /// out placeholders, silently makes the heartbeat lie again.
+    #[test]
+    fn placeholder_bundles_report_no_price_feed() {
+        assert!(!SquadronRaptors::empty().has_price_feed);
+
+        let (_tx, sports_rx) = watch::channel(SportsSnapshot::default());
+        assert!(!SquadronRaptors::sports_only(sports_rx).has_price_feed);
+    }
+
+    #[test]
+    fn price_only_reports_a_price_feed() {
+        let (_o, oracle) = watch::channel(Decimal::ZERO);
+        let (_v, velocity) = watch::channel((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
+        let (_d, drift) = watch::channel((Decimal::ZERO, Decimal::ZERO, Decimal::ZERO));
+        assert!(SquadronRaptors::price_only(oracle, velocity, drift).has_price_feed);
+    }
+
+    /// A placeholder bundle reads a permanent zero, which is exactly the value a
+    /// dead Price Raptor reports. The flag is what tells the two apart, so it
+    /// must not be inferred from the reading.
+    #[test]
+    fn a_placeholder_oracle_reads_zero_like_a_dead_feed_would() {
+        let r = SquadronRaptors::empty();
+        assert_eq!(*r.oracle.borrow(), Decimal::ZERO);
+        assert!(!r.has_price_feed);
+    }
+}

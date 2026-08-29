@@ -139,3 +139,120 @@ mod tests {
         assert!(tail(usize::MAX).len() <= LOG_RING_CAPACITY);
     }
 }
+
+// ── Subscriber filter ─────────────────────────────────────────────────────────
+
+/// Build the `EnvFilter` the engine's subscriber runs with.
+///
+/// Lives here rather than inline in `main.rs` so it can be tested: it is the
+/// only thing standing between a dependency's internal chatter and an operator's
+/// log, and "we added a directive" is not the same claim as "the directive
+/// rejects the line we meant it to".
+///
+/// Starts from `RUST_LOG` and then silences the `perpetual` gradient booster
+/// below ERROR. That crate logs a WARN whenever a fit spends its whole iteration
+/// budget: "Reached the configured iteration cap before auto stopping. Try to
+/// decrease the budget or increase the iteration limit." For GBoost that is
+/// routine — the retrain succeeds a second later — but it names knobs by their
+/// crate-internal names, so to an operator it reads as a fault in a library they
+/// have never heard of, with advice they cannot act on. It reached a customer's
+/// log on the v1.0.5 Marketplace AMI on 2026-08-29.
+///
+/// `set_log_iterations(0)` in `gboost_impl` silences that crate's stdout
+/// progress lines but NOT this, which comes through `tracing` — a distinction
+/// the comment there used to get wrong.
+///
+/// The suppression yields to an explicit request: if `RUST_LOG` mentions
+/// `perpetual` at all, whatever it says stands, so the booster stays debuggable.
+pub fn build_env_filter(rust_log: Option<&str>) -> tracing_subscriber::EnvFilter {
+    let mut filter = match rust_log {
+        Some(spec) => tracing_subscriber::EnvFilter::new(spec),
+        None => tracing_subscriber::EnvFilter::from_default_env(),
+    };
+    if !rust_log.unwrap_or_default().contains("perpetual") {
+        filter = filter.add_directive(
+            "perpetual=error".parse().expect("static directive parses"),
+        );
+    }
+    filter
+}
+
+#[cfg(test)]
+mod env_filter_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// Capture writer: collects everything the subscriber formats.
+    #[derive(Clone, Default)]
+    struct Capture(Arc<Mutex<Vec<u8>>>);
+
+    impl std::io::Write for Capture {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Capture {
+        type Writer = Capture;
+        fn make_writer(&'a self) -> Self::Writer { self.clone() }
+    }
+
+    /// Run `body` under a subscriber wired with the filter under test, and
+    /// return everything it emitted. Exercises the real path — filter, layer and
+    /// formatter — rather than asking the filter a question in isolation.
+    fn emitted(rust_log: &str, body: impl FnOnce()) -> String {
+        let cap = Capture::default();
+        let subscriber = tracing_subscriber::fmt()
+            .with_env_filter(build_env_filter(Some(rust_log)))
+            .with_writer(cap.clone())
+            .with_ansi(false)
+            .finish();
+        tracing::subscriber::with_default(subscriber, body);
+        let bytes = cap.0.lock().unwrap().clone();
+        String::from_utf8_lossy(&bytes).into_owned()
+    }
+
+    /// The exact line that reached a customer's log on the v1.0.5 AMI.
+    #[test]
+    fn a_perpetual_warn_is_suppressed() {
+        let out = emitted("info,dradis=info", || {
+            tracing::warn!(
+                target: "perpetual::booster::core",
+                "Reached the configured iteration cap before auto stopping."
+            );
+        });
+        assert!(out.is_empty(), "perpetual WARN reached the log: {out}");
+    }
+
+    /// Suppression is not a blackout — a real fault in the booster still shows.
+    #[test]
+    fn a_perpetual_error_still_passes() {
+        let out = emitted("info,dradis=info", || {
+            tracing::error!(target: "perpetual::booster::core", "fit failed");
+        });
+        assert!(out.contains("fit failed"), "perpetual ERROR was swallowed: {out:?}");
+    }
+
+    /// The escape hatch: asking for it explicitly wins, so the booster stays
+    /// debuggable for anyone who needs it.
+    #[test]
+    fn an_explicit_rust_log_directive_wins() {
+        let out = emitted("info,perpetual=warn", || {
+            tracing::warn!(target: "perpetual::booster::core", "iteration cap");
+        });
+        assert!(out.contains("iteration cap"), "explicit RUST_LOG was overridden: {out:?}");
+    }
+
+    /// Nothing else is affected — DRADIS's own output must be untouched.
+    #[test]
+    fn dradis_output_is_untouched() {
+        let out = emitted("info,dradis=info", || {
+            tracing::warn!(target: "dradis::vipers::gboost_impl", "degenerate retrain");
+            tracing::info!(target: "dradis::squadron::patrol_impl", "squadron deployed");
+        });
+        assert!(out.contains("degenerate retrain"), "{out:?}");
+        assert!(out.contains("squadron deployed"), "{out:?}");
+    }
+}

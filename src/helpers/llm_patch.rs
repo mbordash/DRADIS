@@ -46,7 +46,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::api::config_schema::{config_schema, ConfigFieldSchema};
-use crate::helpers::dynamic_config::DynamicConfig;
+use crate::helpers::dynamic_config::{build_cap_for, DynamicConfig};
+use rust_decimal::prelude::ToPrimitive;
 
 /// Hard cap on changes per advisory cycle — anything beyond is rejected.
 /// Mirrors the "up to 4 recommendations" instruction in the system prompt.
@@ -292,6 +293,41 @@ pub fn validate_proposals(raw: Vec<RawProposal>, current: &DynamicConfig) -> Pro
             continue;
         };
 
+        // Reject anything the build will not let take effect.
+        //
+        // Three fields are re-clamped to a compile-time constant on every config
+        // read ("stricter wins", so a stale DB row cannot loosen a limit the
+        // build has tightened). On 2026-08-29 an operator approved
+        // `time_decay_max_entry_price -> 0.5` against a 0.46 cap on the live
+        // Marketplace instance: it validated, it was written, the audit ledger
+        // stamped it `applied`, and every reader went on seeing 0.46.
+        //
+        // Deliberately BEFORE `encode_target`, and against the raw proposed
+        // value. The schema max now carries the cap too, so encoding would
+        // quietly clamp 0.5 to 0.46 and the proposal would come out the far side
+        // as "no-op (target equals current value)" — rejected, but for a reason
+        // that teaches the advisor nothing. It re-proposes 0.5 next cycle.
+        //
+        // Rejecting rather than clamping silently: rejections are fed back to
+        // the advisor, and an operator who approves a change is entitled to have
+        // it mean something.
+        if let Some(cap) = build_cap_for(field.key) {
+            let over = cap
+                .to_f64()
+                .is_some_and(|c| coerce_number(&p.to).is_some_and(|n| n > c));
+            if over {
+                batch.rejected.push(RejectedProposal {
+                    field: p.field,
+                    to: p.to,
+                    why: format!(
+                        "capped at {cap} by a build safety limit — a higher value is \
+                         written but never read, so this change cannot take effect"
+                    ),
+                });
+                continue;
+            }
+        }
+
         match encode_target(field, &from, &p.to) {
             Ok((to, clamped)) => {
                 if to == from {
@@ -462,6 +498,56 @@ mod tests {
 
     fn cfg() -> DynamicConfig {
         DynamicConfig::default()
+    }
+
+    fn propose(field: &str, to: serde_json::Value) -> ProposalBatch {
+        validate_proposals(
+            vec![RawProposal { field: field.into(), to, reason: "t".into() }],
+            &cfg(),
+        )
+    }
+
+    /// The live regression. On 2026-08-29 the advisor proposed
+    /// `time_decay_max_entry_price: 0.46 -> 0.5` on the Marketplace instance.
+    /// The schema range is 0.0 to 1.0 so it validated, the write succeeded, the
+    /// audit ledger said `applied`, and the build cap of 0.46 silently put it
+    /// back on the next read. It must be rejected before any of that.
+    #[test]
+    fn rejects_a_value_above_its_build_cap() {
+        let b = propose("time_decay_max_entry_price", serde_json::json!(0.5));
+        assert!(b.accepted.is_empty(), "must not accept an unreachable value");
+        let why = &b.rejected.first().expect("one rejection").why;
+        assert!(why.contains("0.46"), "the message must name the cap: {why}");
+        assert!(why.contains("cannot take effect"), "and say why: {why}");
+    }
+
+    /// Every capped field, not just the one that was caught in production.
+    #[test]
+    fn rejects_above_cap_for_every_capped_field() {
+        use crate::helpers::dynamic_config::{build_cap_for, BUILD_CAPPED_KEYS};
+        use rust_decimal::prelude::ToPrimitive;
+        for key in BUILD_CAPPED_KEYS {
+            let cap = build_cap_for(key).expect("declared");
+            let over = cap.to_f64().expect("finite") + 0.01;
+            let b = propose(key, serde_json::json!(over));
+            assert!(b.accepted.is_empty(), "{key}: accepted {over}, above its {cap} cap");
+        }
+    }
+
+    /// The cap is one-way. TIGHTENING a capped field is exactly the kind of
+    /// proposal that should still get through.
+    #[test]
+    fn accepts_a_value_below_its_build_cap() {
+        let b = propose("time_decay_max_entry_price", serde_json::json!(0.40));
+        assert_eq!(b.accepted.len(), 1, "tightening must still be allowed: {:?}", b.rejected);
+        assert!(b.rejected.is_empty());
+    }
+
+    /// An uncapped field keeps its old behavior, bounded only by the schema.
+    #[test]
+    fn an_uncapped_field_is_unaffected_by_the_cap_check() {
+        let b = propose("maker_max_entry_price", serde_json::json!(0.55));
+        assert_eq!(b.accepted.len(), 1, "{:?}", b.rejected);
     }
 
     #[test]

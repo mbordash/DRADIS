@@ -31,6 +31,7 @@
 //! to derive it via a proc-macro so it can never drift.
 
 use serde::Serialize;
+use rust_decimal::prelude::ToPrimitive;
 
 /// Metadata for one editable config field.
 #[derive(Debug, Clone, Serialize)]
@@ -346,6 +347,25 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         let g = "GBoost"; let e = Some("enable_gboost");
         v.push(F::new(g, e, "enable_gboost", "Enabled", "bool", false,
             "Online gradient-boosted orderbook classifier."));
+        v.push(F::new(g, e, "gboost_budget", "Training Budget", "decimal", true,
+            "How hard the model works on each retrain. The booster keeps adding trees until this \
+             budget is spent, so a higher number fits the recorded outcomes more closely and a \
+             lower one stops earlier. Raising it is not free in either direction: more trees on a \
+             small pool of trades learns that pool's noise as if it were signal, and the model \
+             then reports high conviction on setups it has never really seen. Too low is the \
+             sharper failure: a model under 20 trees is discarded as a stump and the strategy \
+             backs off instead of trading, so if the log reports degenerate retrains, raise this \
+             before touching anything else. How many trees a given budget buys depends entirely \
+             on the data — the same setting produced 5 trees on one pool and 390 on another — so \
+             judge it by the tree count in the retrain log, never by the number here.")
+            .range(0.1, 3.0).step(0.05));
+        v.push(F::new(g, e, "gboost_iteration_limit", "Training Iteration Cap", "secs", true,
+            "Hard ceiling on boosting rounds per retrain, whichever comes first with the budget. \
+             It exists to bound wall-clock time: training runs on a blocking thread, and an \
+             unbounded fit on a large pool holds that thread long enough to matter. Hitting the \
+             cap is normal and harmless, it just means the budget had more to spend than the cap \
+             allowed — so raise this and the budget together, or the extra budget cannot be used.")
+            .range(50.0, 20_000.0).step(50.0).unit("iter"));
         v.push(F::new(g, e, "gboost_entry_threshold", "Entry Threshold", "decimal", false,
             "Classifier probability required to enter (0.88 = 88%).").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "gboost_stop_loss_pct", "Stop Loss", "pct", false,
@@ -633,6 +653,27 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Live Tennis API tour filter: atp, wta, challenger, itf, juniors — or blank for all tours. ⚠️ Not validated, and this one fails SILENTLY: a misspelt tour returns an empty match list, which is indistinguishable from tennis being off-season or between sessions. Leave blank if unsure."));
     }
 
+    // ── Build caps narrow the declared range ─────────────────────────────────
+    //
+    // Three fields are re-clamped to a compile-time constant on every config
+    // read, so a value above that constant is written but never honored. The
+    // hand-written ranges above are the STRATEGY's bounds and are wider: the
+    // schema said `time_decay_max_entry_price` accepted 0.0 to 1.0 while the
+    // build capped it at 0.46, which is how an operator came to save 0.5, be
+    // told it applied, and watch it read back 0.46 forever.
+    //
+    // Applied here rather than at each `.range(...)` call so a new cap reaches
+    // the UI automatically, and so the strategy's own bound and the build's stay
+    // separately readable. Narrowing only — a cap never widens a range, and a
+    // field with no declared max gains one.
+    for f in &mut v {
+        if let Some(cap) = crate::helpers::dynamic_config::build_cap_for(f.key) {
+            if let Some(cap) = cap.to_f64() {
+                f.max = Some(f.max.map_or(cap, |m: f64| m.min(cap)));
+            }
+        }
+    }
+
     v
 }
 
@@ -693,6 +734,40 @@ mod tests {
                 assert_eq!(f.value_type, "bool", "{} should render as a switch", f.key);
                 assert!(!f.advanced, "{} must not be hidden in the Advanced modal", f.key);
                 assert_eq!(f.group, "Deployment", "{} must render in a group the UI shows", f.key);
+            }
+        }
+    }
+
+    /// A capped field's slider must stop at the cap, not at the strategy's own
+    /// wider bound. `time_decay_max_entry_price` declared 0.0 to 1.0 while the
+    /// build honored at most 0.46, so the UI invited operators to save a value
+    /// that could never take effect — which one did, on the live Marketplace
+    /// instance on 2026-08-29.
+    #[test]
+    fn build_caps_narrow_the_rendered_range() {
+        use crate::helpers::dynamic_config::{build_cap_for, BUILD_CAPPED_KEYS};
+        use rust_decimal::prelude::ToPrimitive;
+        let schema = config_schema();
+        for key in BUILD_CAPPED_KEYS {
+            let cap = build_cap_for(key).expect("declared").to_f64().expect("finite");
+            let f = schema.iter().find(|f| &f.key == key)
+                .unwrap_or_else(|| panic!("{key} is capped but absent from the schema"));
+            let max = f.max.unwrap_or_else(|| panic!("{key} renders with no upper bound"));
+            assert!(max <= cap, "{key} renders a max of {max}, above its {cap} build cap");
+        }
+    }
+
+    /// Narrowing only. A cap must never widen a range the strategy declared
+    /// tighter than the build's own limit.
+    #[test]
+    fn a_cap_never_widens_a_declared_range() {
+        use crate::helpers::dynamic_config::build_cap_for;
+        for f in config_schema() {
+            if let Some(cap) = build_cap_for(f.key) {
+                use rust_decimal::prelude::ToPrimitive;
+                if let (Some(max), Some(cap)) = (f.max, cap.to_f64()) {
+                    assert!(max <= cap, "{}: max {max} exceeds cap {cap}", f.key);
+                }
             }
         }
     }

@@ -105,6 +105,8 @@ export interface DynamicConfig {
   auto_deploy_politics:          boolean;
   auto_deploy_sports:            boolean;
   event_market_retire_grace_secs: number;
+  gboost_budget:                 string;
+  gboost_iteration_limit:        number;
   llm_max_output_tokens:         number;
   obi_use_whole_book:            boolean;
   maker_min_spread:              string;

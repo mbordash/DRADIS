@@ -375,7 +375,11 @@ pub fn spawn_status_task(
     // market, so the heartbeat has to be able to follow it there.
     maker_yes_price_rx: Option<watch::Receiver<PriceState>>,
     maker_no_price_rx:  Option<watch::Receiver<PriceState>>,
-    oracle_rx:       watch::Receiver<Decimal>,
+    // `None` when this squadron has no Price Raptor. A politics or sports
+    // squadron gets placeholder price channels that read a permanent zero, and
+    // printing that as `Binance: $0.00` is how a squadron with no crypto oracle
+    // by design came to look identical to one whose oracle had died.
+    oracle_rx:       Option<watch::Receiver<Decimal>>,
     process_heartbeat_secs: Arc<AtomicU64>,
     asset:  String,
     // Live market channel, so a dark report names the market the squadron is on
@@ -445,12 +449,21 @@ pub fn spawn_status_task(
                     // between +0.9 and -0.3 on an unremarkable book.
                     let yes_obi_all = if ybd_all + yad_all > dec!(0) { (ybd_all - yad_all) / (ybd_all + yad_all) } else { dec!(0) };
                     let no_obi_all  = if nbd_all + nad_all > dec!(0) { (nbd_all - nad_all) / (nbd_all + nad_all) } else { dec!(0) };
+                    // Built as a segment rather than a format argument: a
+                    // squadron with no Price Raptor omits it entirely instead of
+                    // reporting a zero it was never going to have. The borrow
+                    // guard lives and dies inside this statement, never across
+                    // an await.
+                    let oracle_seg = match &oracle_rx {
+                        Some(rx) => format!(" | Binance: ${:.2}", *rx.borrow()),
+                        None => String::new(),
+                    };
                     info!(
                         " Heartbeat [{}] | Ask Sum ${:.4} (Y ask ${:.2} / N ask ${:.2}) | \
-                         Bid Sum ${:.4} (Y bid ${:.2} / N bid ${:.2}) | \
-                         Binance: ${:.2} | OBI Y={:.2} N={:.2} | OBIall Y={:.2} N={:.2} (depth Y {:.0}/{:.0} N {:.0}/{:.0})",
+                         Bid Sum ${:.4} (Y bid ${:.2} / N bid ${:.2}){} | \
+                         OBI Y={:.2} N={:.2} | OBIall Y={:.2} N={:.2} (depth Y {:.0}/{:.0} N {:.0}/{:.0})",
                         venue,
-                        ya + na, ya, na, yb + nb, yb, nb, *oracle_rx.borrow(), yes_obi, no_obi,
+                        ya + na, ya, na, yb + nb, yb, nb, oracle_seg, yes_obi, no_obi,
                         yes_obi_all, no_obi_all, ybd_all, yad_all, nbd_all, nad_all,
                     );
 
