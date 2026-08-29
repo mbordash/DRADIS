@@ -32,6 +32,14 @@ configuration. Treat the file exactly as you would treat the keys themselves.
 Subscribe to or launch the new version from AWS Marketplace as you did the first
 time. Use the same instance type unless you have a reason to change it.
 
+Give it a Name tag carrying the new version, for example `dradis-v1.0.5`. For
+the next few minutes two DRADIS instances will be running against the same
+wallet and you will need to stop exactly one of them; two unnamed rows in the
+EC2 console is how the wrong one gets stopped. A one-click Marketplace launch
+leaves the Name tag blank, because the instance is created in your account and
+the seller cannot tag it. The Control Tower footer also shows the running
+version, so an open tab is never ambiguous.
+
 Do not enter any credentials on the new instance. The import will supply them.
 
 **3. Import the bundle.**

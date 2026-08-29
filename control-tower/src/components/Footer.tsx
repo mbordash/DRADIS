@@ -18,6 +18,8 @@
 
 import useSWR from 'swr';
 import { getLatency } from '@/lib/api';
+import { getSetupStatus } from '@/lib/setupApi';
+import { DEMO_MODE } from '@/lib/demo';
 
 /**
  * Venue latency pill — rolling engine→venue round-trip measured server-side
@@ -62,7 +64,40 @@ function LatencyMeter() {
   );
 }
 
-/** Shared page footer: branding line + venue latency meter. */
+/**
+ * Running engine version, e.g. "v1.0.4".
+ *
+ * The instance itself carries no version label an operator can see: AWS
+ * Marketplace launches the image into the buyer's own account, so a seller
+ * cannot set the EC2 Name tag, and a one-click launch leaves it blank. That
+ * matters most during an upgrade, where the documented procedure has the old
+ * and new instances running at once and the operator has to stop the right one.
+ * Naming the version here means two open tabs identify themselves regardless of
+ * what the EC2 console calls them.
+ *
+ * Shares the `setupStatus` SWR key with the dashboard, so this costs no extra
+ * request — SWR dedupes by key and the value is already cached. Skipped on the
+ * public demo, which does not serve the setup endpoint.
+ */
+function EngineVersion() {
+  const { data } = useSWR(!DEMO_MODE ? 'setupStatus' : null, getSetupStatus, {
+    refreshInterval: 60_000,
+    revalidateOnFocus: false,
+  });
+
+  if (!data?.app_version) return null;
+
+  return (
+    <span
+      className="text-gray-600"
+      title="DRADIS engine version running on this instance"
+    >
+      v{data.app_version}
+    </span>
+  );
+}
+
+/** Shared page footer: branding line + venue latency meter + engine version. */
 export default function Footer() {
   return (
     <footer className="text-center text-xs text-gray-700 pb-4 font-mono space-y-2">
@@ -71,7 +106,8 @@ export default function Footer() {
       </div>
       <div>
         DRADIS Control Tower  Polymarket CLOB Orchestrator{' '}
-        <span className="text-gray-600">So say we all.</span>
+        <span className="text-gray-600">So say we all.</span>{' '}
+        <EngineVersion />
       </div>
     </footer>
   );
