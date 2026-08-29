@@ -1549,6 +1549,7 @@ export default function SetupPage() {
         setRestarting(false);
         setNotice({ kind: 'ok', text: 'Engine is back online.' });
         loadCreds();
+        loadStatus();
         // Drop every cached dashboard read in the same breath.
         //
         // This 3s poll is the earliest and most reliable knowledge in the app
@@ -1748,9 +1749,22 @@ export default function SetupPage() {
                   const r = await importBundle(text);
                   setNotice({
                     kind: 'ok',
-                    text: `Imported ${r.secrets_imported} secret(s), global config: ${r.dynamic_config_restored ? 'yes' : 'no'}, ${r.squadron_configs_restored} squadron config(s). Restart the engine to apply.`,
+                    text: `Imported ${r.secrets_imported} secret(s), global config: ${r.dynamic_config_restored ? 'yes' : 'no'}, ${r.squadron_configs_restored} squadron config(s). Nothing to save — restart the engine to apply.`,
                   });
                   loadCreds();
+                  // Import changes configuration state, so refresh what reads it.
+                  //
+                  // `venue_configured` is computed server-side from the secrets
+                  // file, which the import has just written, so it flips true
+                  // the instant this call returns — before any restart. Without
+                  // these two lines nothing notices: this view keeps its stale
+                  // `status`, and the dashboard keeps showing "ENGINE IDLE —
+                  // venue credentials not configured" over an instance that is
+                  // fully configured. That banner is the first thing a customer
+                  // sees after a migration, and it says their import failed when
+                  // it did not.
+                  loadStatus();
+                  mutateAll(() => true);
                 } catch (err) {
                   setNotice({ kind: 'err', text: err instanceof Error ? err.message : 'Import failed' });
                 }

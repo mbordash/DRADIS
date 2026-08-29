@@ -543,8 +543,17 @@ export default function DashboardPage() {
     useSWR('squadrons', getSquadrons, { refreshInterval: 10_000 });
 
   // Setup state — drives the "engine idle, complete Setup" first-run banner.
+  //
+  // Polled at the same cadence as trades and positions rather than the 60s it
+  // used to use. This value's whole job is to make a warning disappear the
+  // moment setup is complete, so a stale minute of "ENGINE IDLE — venue
+  // credentials not configured" on a correctly configured instance is the
+  // worst-case cost of the slower interval, and it lands on a first-run or
+  // post-migration operator with no way to tell whether their import worked.
+  // Explicit revalidation on import and on restart is the fast path; this is
+  // the ceiling on how wrong the banner can be if either is missed.
   const { data: setupStatus, mutate: mutateSetupStatus } =
-    useSWR(!DEMO_MODE ? 'setupStatus' : null, getSetupStatus, { refreshInterval: 60_000 });
+    useSWR(!DEMO_MODE ? 'setupStatus' : null, getSetupStatus, { refreshInterval: 15_000 });
 
   // ── First-run overlays, in order ──────────────────────────────────────────
   //
