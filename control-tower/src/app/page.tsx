@@ -494,25 +494,31 @@ export default function DashboardPage() {
   const { data: status } =
     useSWR('status', getStatus, { refreshInterval: 30_000 });
 
-  // Refresh the portfolio history the moment the engine restarts.
+  // Refresh EVERY server-backed card the moment the engine restarts.
   //
-  // `pnl-global` polls every 60s — reasonable for a chart in steady state, and
-  // deliberately slower than its 10–15s siblings because the query downsamples a
-  // full day of snapshots. But it is also the number an operator stares at right
-  // after entering their venue credentials, and the engine has the balance
-  // within the same second while the card waits for its next tick: on a fresh
-  // Ireland box the log showed "Starting portfolio value: $59.49" immediately
-  // and the dashboard took ~30s to catch up, which reads as the key not having
-  // worked.
+  // This used to revalidate only `pnl-global` — the chart — because that was the
+  // card the complaint named. It was the wrong scope. The number an operator
+  // actually stares at after entering their venue credentials is the wallet
+  // balance on the `portfolio` key, which polls on its own unsynchronized 30s
+  // interval, and `config` does not poll at all (`refreshInterval: 0`). So the
+  // balance card kept showing the pre-restart value while the chart beside it had
+  // already caught up, which reads as the key not having worked. On a fresh
+  // Ireland box the log showed "Starting portfolio value: $59.49" within the same
+  // second while the card was still empty.
   //
-  // `session_started_at` changes on every engine restart — including the one the
-  // Setup view triggers after saving credentials — so this refetches once, then
-  // goes back to the 60s cadence.
+  // A restart invalidates all server state at once, so revalidate all of it at
+  // once rather than curating a list that the next new card will fall off.
+  //
+  // `session_started_at` changes on every engine restart, so this refetches once
+  // and then every key goes back to its own cadence. Note this is the BACKSTOP:
+  // `status` itself polls at 30s, so a restart can go unnoticed here for that
+  // long. The Setup view, which knows precisely when the engine went down and
+  // polls at 3s for its return, does the same revalidation immediately.
   const { mutate: mutateKey } = useSWRConfig();
   const sessionStartedAt = status?.session_started_at;
   useEffect(() => {
     if (!sessionStartedAt) return;
-    mutateKey('pnl-global');
+    mutateKey(() => true);
   }, [sessionStartedAt, mutateKey]);
 
   // Poll every 5 minutes — recommendations only arrive every 30 min at most.

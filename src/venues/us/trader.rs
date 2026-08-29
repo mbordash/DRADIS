@@ -61,7 +61,7 @@ use crate::helpers::dynamic_config::DynamicConfig;
 use crate::helpers::time::{extract_strike_price, fetch_historical_strike_price};
 use crate::helpers::metrics;
 use crate::orchestrator::{
-    aggregate_and_resolve_signals, evaluate_strategies, Strategy, StrategyContext,
+    aggregate_and_resolve_signals, evaluate_strategies, StrategyContext,
     StrategyRegistry,
 };
 use crate::squadron::{CryptoAsset, Squadron, SquadronConfig, SquadronRaptors, SquadronState};
@@ -980,7 +980,7 @@ async fn trade_one_market(
         Some(p) => db::vipers_for_class(p, &market_class).await,
         None => Vec::new(),
     };
-    let strategies = build_strategies(&viper_kinds);
+    let strategies = StrategyRegistry::create_strategies_for_kinds(&viper_kinds);
     info!(
         "🎯 US loop will run {} viper(s) for class '{}': {:?}",
         strategies.len(),
@@ -1329,33 +1329,6 @@ fn touch_heartbeat(hb: &AtomicU64) {
         .unwrap_or_default()
         .as_secs();
     hb.store(now, AtomicOrdering::Relaxed);
-}
-
-/// Instantiate the strategy impls whose viper kind is in `viper_kinds`.
-/// The shared registry builds all strategies; we keep only the resolved ones.
-fn build_strategies(viper_kinds: &[String]) -> Vec<Box<dyn Strategy>> {
-    StrategyRegistry::create_all_strategies()
-        .into_iter()
-        .filter(|s| viper_kinds.iter().any(|k| k == strategy_name_to_kind(&s.name())))
-        .collect()
-}
-
-/// Map a registry strategy name (`"ArbitrageStrategy"`) to its taxonomy viper
-/// kind id (`"arbitrage"`) so resolved kinds can select strategy impls.
-fn strategy_name_to_kind(name: &str) -> &'static str {
-    match name {
-        "ArbitrageStrategy"    => "arbitrage",
-        "MakerStrategy"        => "maker",
-        "MomentumStrategy"     => "momentum",
-        "TimeDecayStrategy"    => "time_decay",
-        "BasisStrategy"        => "basis",
-        "GboostStrategy"       => "gboost",
-        "ConvergenceStrategy"  => "convergence",
-        "FairValueStrategy"    => "fairvalue",
-        "TrendReversalStrategy" => "trendcapture",
-        "TrendCaptureStrategy" => "trendcapture", // legacy alias (pre-rename positions)
-        _ => "",
-    }
 }
 
 #[cfg(test)]

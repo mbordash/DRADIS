@@ -370,6 +370,11 @@ pub fn spawn_status_task(
     trading_client:  Arc<ClobClient<Authenticated<Normal>>>,
     yes_price_rx:    watch::Receiver<PriceState>,
     no_price_rx:     watch::Receiver<PriceState>,
+    // The window/daily books, when this squadron has that venue. A squadron
+    // waiting out the gap between hourly markets is still trading its maker
+    // market, so the heartbeat has to be able to follow it there.
+    maker_yes_price_rx: Option<watch::Receiver<PriceState>>,
+    maker_no_price_rx:  Option<watch::Receiver<PriceState>>,
     oracle_rx:       watch::Receiver<Decimal>,
     process_heartbeat_secs: Arc<AtomicU64>,
     asset:  String,
@@ -398,8 +403,27 @@ pub fn spawn_status_task(
                         AtomicOrdering::Relaxed,
                     );
 
-                    let (yb, ybd, ya, yad, _, ybd_all, yad_all) = *yes_price_rx.borrow();
-                    let (nb, nbd, na, nad, _, nbd_all, nad_all) = *no_price_rx.borrow();
+                    // Pick the venue this squadron is actually on before reading a
+                    // book. `spawn_status_task` used to be wired to the hourly
+                    // feed unconditionally, so a squadron holding only a
+                    // window/daily market — the normal state while the hourly
+                    // wait added in v1.0.1 is in effect — heartbeat an all-zero
+                    // book every 60s. That line is indistinguishable from a dead
+                    // feed, and it read as one: an empty book on a market that
+                    // was in fact quoting 0.42/0.44 with $4.3k of resting
+                    // liquidity. Report the book the vipers are looking at.
+                    let (hourly_name, maker_name) = {
+                        let ms = market_rx.borrow();
+                        (ms.2.clone(), ms.6.as_ref().map(|c| c.name.clone()).unwrap_or_default())
+                    };
+                    let maker_feeds = maker_yes_price_rx.as_ref().zip(maker_no_price_rx.as_ref());
+                    let (venue, market_name, yrx, nrx) = match maker_feeds {
+                        Some((my, mn)) if hourly_name.is_empty() =>
+                            ("Window/Daily", maker_name, my, mn),
+                        _ => ("Hourly", hourly_name, &yes_price_rx, &no_price_rx),
+                    };
+                    let (yb, ybd, ya, yad, _, ybd_all, yad_all) = *yrx.borrow();
+                    let (nb, nbd, na, nad, _, nbd_all, nad_all) = *nrx.borrow();
                     // Compute OBI for heartbeat visibility so thresholds can be tuned empirically.
                     // Book-feed health. This venue heartbeats here rather than
                     // through log_heartbeat, so the check belongs here too.
@@ -408,7 +432,7 @@ pub fn spawn_status_task(
                     // to a venue outage when only the asset is reported.
                     crate::state::price_state::book_feed::note_market(
                         &asset,
-                        &market_rx.borrow().2.clone(),
+                        &market_name,
                         ya < dec!(1) || na < dec!(1) || yb > dec!(0) || nb > dec!(0),
                     );
                     let yes_obi = if ybd + yad > dec!(0) { (ybd - yad) / (ybd + yad) } else { dec!(0) };
@@ -422,9 +446,10 @@ pub fn spawn_status_task(
                     let yes_obi_all = if ybd_all + yad_all > dec!(0) { (ybd_all - yad_all) / (ybd_all + yad_all) } else { dec!(0) };
                     let no_obi_all  = if nbd_all + nad_all > dec!(0) { (nbd_all - nad_all) / (nbd_all + nad_all) } else { dec!(0) };
                     info!(
-                        " Heartbeat | Ask Sum ${:.4} (Y ask ${:.2} / N ask ${:.2}) | \
+                        " Heartbeat [{}] | Ask Sum ${:.4} (Y ask ${:.2} / N ask ${:.2}) | \
                          Bid Sum ${:.4} (Y bid ${:.2} / N bid ${:.2}) | \
                          Binance: ${:.2} | OBI Y={:.2} N={:.2} | OBIall Y={:.2} N={:.2} (depth Y {:.0}/{:.0} N {:.0}/{:.0})",
+                        venue,
                         ya + na, ya, na, yb + nb, yb, nb, *oracle_rx.borrow(), yes_obi, no_obi,
                         yes_obi_all, no_obi_all, ybd_all, yad_all, nbd_all, nad_all,
                     );

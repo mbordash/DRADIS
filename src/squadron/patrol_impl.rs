@@ -233,10 +233,13 @@ impl Squadron {
         // key and the underlying coincide — this venue is where the two concepts
         // were originally conflated — but they are recorded separately so the
         // tradelog reads the same across venues. See `state::TradeScope`.
+        // Resolved once and reused: `scope` files every row under it, and the
+        // viper set below is selected from it.
+        let market_class = self.classify_and_link().await;
         let scope = TradeScope::new(
             asset_lc.clone(),
             crate::venues::intl::INTL_VENUE,
-            Some(self.classify_and_link().await),
+            Some(market_class.clone()),
             Some(asset_lc.clone()),
         );
 
@@ -382,6 +385,8 @@ impl Squadron {
             Arc::clone(&trading_client),
             yes_price_rx.clone(),
             no_price_rx.clone(),
+            maker_yes_price_rx.clone(),
+            maker_no_price_rx.clone(),
             oracle_rx.clone(),
             Arc::clone(&process_heartbeat_secs),
             asset_lc.clone(),
@@ -414,7 +419,36 @@ impl Squadron {
             peripheral_cancel.clone(),
         );
 
-        let strategies = StrategyRegistry::create_all_strategies();
+        // Run exactly the vipers this market's class calls for.
+        //
+        // The class was already resolved above for `scope`, and `vipers_for_class`
+        // is the same taxonomy the Setup view edits and `/api/squadrons` reports.
+        // Until now the intl CLOB alone ignored it and built all nine: the US and
+        // Kalshi traders each filtered with a private copy of the same helper,
+        // and this path had none. On the live Ireland box that put nine vipers on
+        // a tennis match and a political market whose taxonomy allows two, and
+        // the only reason it did no harm is that the seven crypto strategies
+        // idled on missing oracle data rather than by design — TimeDecay, which
+        // needs no oracle, was one theta window away from resting bids on
+        // "Trump out as President by August 31?".
+        let viper_kinds = match db::pool_for(&asset_lc) {
+            Some(p) => crate::helpers::db::vipers_for_class(&p, &market_class).await,
+            None => Vec::new(),
+        };
+        let strategies = StrategyRegistry::create_strategies_for_kinds(&viper_kinds);
+        info!(
+            "🎯 Squadron [{}] will run {} viper(s) for class '{}': {:?}",
+            self.id,
+            strategies.len(),
+            market_class,
+            strategies.iter().map(|s| s.name()).collect::<Vec<_>>(),
+        );
+        if strategies.is_empty() {
+            warn!(
+                "Squadron [{}]: no runnable vipers for class '{}' — dashboard only",
+                self.id, market_class,
+            );
+        }
         let adoption_order = StrategyRegistry::strategy_names();
         let live_collateral = Arc::clone(&live_collateral);
 

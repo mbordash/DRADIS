@@ -50,7 +50,7 @@ use crate::helpers::db;
 use crate::helpers::dynamic_config::DynamicConfig;
 use crate::helpers::metrics;
 use crate::orchestrator::{
-    aggregate_and_resolve_signals, evaluate_strategies, Strategy, StrategyContext,
+    aggregate_and_resolve_signals, evaluate_strategies, StrategyContext,
     StrategyRegistry,
 };
 use crate::raptors::derivatives::DerivativesSnapshot;
@@ -838,7 +838,7 @@ async fn trade_one_market(
         Some(p) => db::vipers_for_class(p, &market_class).await,
         None => Vec::new(),
     };
-    let strategies = build_strategies(&viper_kinds);
+    let strategies = StrategyRegistry::create_strategies_for_kinds(&viper_kinds);
     info!(
         "🎯 Kalshi loop will run {} viper(s) for class '{}': {:?}",
         strategies.len(),
@@ -1257,29 +1257,6 @@ fn touch_heartbeat(hb: &AtomicU64) {
         .unwrap_or_default()
         .as_secs();
     hb.store(now, AtomicOrdering::Relaxed);
-}
-
-fn build_strategies(viper_kinds: &[String]) -> Vec<Box<dyn Strategy>> {
-    StrategyRegistry::create_all_strategies()
-        .into_iter()
-        .filter(|s| viper_kinds.iter().any(|k| k == strategy_name_to_kind(&s.name())))
-        .collect()
-}
-
-fn strategy_name_to_kind(name: &str) -> &'static str {
-    match name {
-        "ArbitrageStrategy"    => "arbitrage",
-        "MakerStrategy"        => "maker",
-        "MomentumStrategy"     => "momentum",
-        "TimeDecayStrategy"    => "time_decay",
-        "BasisStrategy"        => "basis",
-        "GboostStrategy"       => "gboost",
-        "ConvergenceStrategy"  => "convergence",
-        "FairValueStrategy"    => "fairvalue",
-        "TrendReversalStrategy" => "trendcapture",
-        "TrendCaptureStrategy" => "trendcapture",
-        _ => "",
-    }
 }
 
 /// Build a venue-neutral [`MarketSnapshot`] from the live Kalshi book +

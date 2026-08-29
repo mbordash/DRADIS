@@ -124,6 +124,23 @@ impl StrategyRegistry {
         ]
     }
 
+    /// Instantiate exactly the strategies meaningful for a market class.
+    ///
+    /// `kinds` comes from `db::vipers_for_class`, the taxonomy that says a
+    /// politics market gets Arbitrage and Maker while a crypto market gets all
+    /// nine. Filtering here is what makes that taxonomy load-bearing rather than
+    /// descriptive.
+    ///
+    /// An empty `kinds` yields no strategies. That is deliberate and matches the
+    /// venue traders, which warn and run dashboard-only: a class with no vipers
+    /// configured should sit out, not silently fall back to all nine.
+    pub fn create_strategies_for_kinds(kinds: &[String]) -> Vec<Box<dyn Strategy>> {
+        Self::create_all_strategies()
+            .into_iter()
+            .filter(|s| kinds.iter().any(|k| k == strategy_name_to_kind(&s.name())))
+            .collect()
+    }
+
     /// Create only momentum strategy
     pub fn create_momentum() -> Box<dyn Strategy> {
         Box::new(MomentumStrategyImpl::new())
@@ -165,5 +182,84 @@ impl StrategyRegistry {
     /// Returns None if the strategy name is not found.
     pub fn get_strategy_priority(strategy_name: &str) -> Option<usize> {
         Self::strategy_names().iter().position(|s| s == strategy_name)
+    }
+}
+
+/// Map a registry strategy name (`"ArbitrageStrategy"`) to its taxonomy viper
+/// kind id (`"arbitrage"`) so resolved kinds can select strategy impls.
+///
+/// Lives here rather than beside each venue loop because all three venues need
+/// the same mapping, and two of them had grown byte-identical private copies
+/// while the third had none — which is precisely why the intl CLOB ran all nine
+/// vipers on markets its own taxonomy limited to two.
+pub fn strategy_name_to_kind(name: &str) -> &'static str {
+    match name {
+        "ArbitrageStrategy"     => "arbitrage",
+        "MakerStrategy"         => "maker",
+        "MomentumStrategy"      => "momentum",
+        "TimeDecayStrategy"     => "time_decay",
+        "BasisStrategy"         => "basis",
+        "GboostStrategy"        => "gboost",
+        "ConvergenceStrategy"   => "convergence",
+        "FairValueStrategy"     => "fairvalue",
+        "TrendReversalStrategy" => "trendcapture",
+        "TrendCaptureStrategy"  => "trendcapture", // legacy alias (pre-rename positions)
+        _ => "",
+    }
+}
+
+#[cfg(test)]
+mod class_filter_tests {
+    use super::*;
+
+    // These build real strategy impls, and `GboostStrategyImpl`'s constructor
+    // spawns its model-load task, so they need a runtime to exist.
+
+    fn kinds(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Every strategy the registry builds must map to a non-empty kind, or it
+    /// would be silently unselectable for every market class.
+    #[tokio::test]
+    async fn every_registry_strategy_maps_to_a_kind() {
+        for s in StrategyRegistry::create_all_strategies() {
+            assert_ne!(
+                strategy_name_to_kind(&s.name()), "",
+                "{} has no taxonomy kind — it can never be selected", s.name(),
+            );
+        }
+    }
+
+    /// The case from production: a politics squadron is limited to two vipers,
+    /// and must not instantiate the seven crypto ones.
+    #[tokio::test]
+    async fn politics_class_gets_only_its_two_vipers() {
+        let got = StrategyRegistry::create_strategies_for_kinds(&kinds(&["arbitrage", "maker"]));
+        let mut names: Vec<_> = got.iter().map(|s| s.name()).collect();
+        names.sort();
+        assert_eq!(names, vec!["ArbitrageStrategy", "MakerStrategy"]);
+    }
+
+    #[tokio::test]
+    async fn crypto_class_gets_all_nine() {
+        let all = StrategyRegistry::create_all_strategies();
+        let kinds: Vec<String> = all
+            .iter()
+            .map(|s| strategy_name_to_kind(&s.name()).to_string())
+            .collect();
+        assert_eq!(StrategyRegistry::create_strategies_for_kinds(&kinds).len(), all.len());
+    }
+
+    #[tokio::test]
+    async fn empty_class_runs_nothing_rather_than_everything() {
+        assert!(StrategyRegistry::create_strategies_for_kinds(&[]).is_empty());
+    }
+
+    /// The pre-rename position label still selects the renamed impl.
+    #[test]
+    fn legacy_trendcapture_alias_still_resolves() {
+        assert_eq!(strategy_name_to_kind("TrendCaptureStrategy"), "trendcapture");
+        assert_eq!(strategy_name_to_kind("TrendReversalStrategy"), "trendcapture");
     }
 }

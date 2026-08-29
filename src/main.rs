@@ -723,7 +723,13 @@ async fn run() -> Result<()> {
         .wallet(signer.clone())
         .connect(&polygon_rpc_url)
         .await?;
-    info!("✅ CTF auto-settlement client ready (rpc={})", polygon_rpc_url);
+    // Host only: the RPC URL carries the provider API key (Alchemy and Infura in
+    // the path, Helius in the query), and this line is exactly what a customer
+    // pastes into a support ticket.
+    info!(
+        "✅ CTF auto-settlement client ready (rpc={})",
+        dradis::helpers::redact::redact_endpoint(&polygon_rpc_url),
+    );
 
 
     // ── Spawn Control Tower API server ───────────────────────────────────────

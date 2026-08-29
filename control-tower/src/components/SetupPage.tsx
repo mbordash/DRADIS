@@ -40,7 +40,7 @@ import {
   getAdminToken, clearAdminToken, SetupApiError,
 } from '@/lib/setupApi';
 import { useConfirm } from '@/components/ConfirmDialog';
-import useSWR from 'swr';
+import useSWR, { useSWRConfig } from 'swr';
 import { getConfig, patchConfig, getConfigSchema } from '@/lib/api';
 import { AdvancedRow } from '@/components/AdvancedConfigModal';
 import type { DynamicConfig, ConfigFieldSchema } from '@/lib/types';
@@ -1458,6 +1458,9 @@ export default function SetupPage() {
   const [notice, setNotice] = useState<{ kind: 'ok' | 'err' | 'info'; text: string } | null>(null);
   const [showChangePw, setShowChangePw] = useState(false);
   const [confirm, confirmDialog] = useConfirm();
+  // Global SWR revalidator, used after a restart to drop every cached
+  // dashboard read at once (see `restart` below).
+  const { mutate: mutateAll } = useSWRConfig();
 
   const loadStatus = useCallback(async () => {
     try {
@@ -1546,6 +1549,16 @@ export default function SetupPage() {
         setRestarting(false);
         setNotice({ kind: 'ok', text: 'Engine is back online.' });
         loadCreds();
+        // Drop every cached dashboard read in the same breath.
+        //
+        // This 3s poll is the earliest and most reliable knowledge in the app
+        // that a new engine is up. Without this the operator switches back to the
+        // dashboard and reads pre-restart numbers — most visibly an empty wallet
+        // balance, because `portfolio` polls on its own 30s interval and `config`
+        // does not poll at all — until each card happens to tick. The dashboard
+        // has a `session_started_at` backstop for restarts that do not originate
+        // here, but that only fires when `status` next polls, up to 30s later.
+        mutateAll(() => true);
       } catch {
         if (Date.now() - started > 120_000) {
           clearInterval(poll);

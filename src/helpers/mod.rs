@@ -38,6 +38,7 @@ pub mod watchdog;
 pub mod logbuf;
 pub mod latency;
 pub mod viper_status;
+pub mod redact;
 
 pub use price::*;
 pub use json::*;
