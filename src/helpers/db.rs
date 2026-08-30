@@ -505,13 +505,6 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE open_positions ADD COLUMN squadron_id TEXT NOT NULL DEFAULT ''"
     ).execute(pool).await;
 
-    // Operator-chosen squadron name, so a second squadron of a class can be
-    // told apart from the first. Blank for every deployment made before naming
-    // existed, which keeps their squadron ids exactly as they were.
-    let _ = sqlx::query(
-        "ALTER TABLE deployment_queue ADD COLUMN name TEXT NOT NULL DEFAULT ''"
-    ).execute(pool).await;
-
     let _ = sqlx::query(
         "ALTER TABLE open_positions ADD COLUMN current_price TEXT"
     ).execute(pool).await;
@@ -691,6 +684,25 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
             updated_at   TEXT    NOT NULL DEFAULT (datetime('now'))
         )"
     ).execute(pool).await?;
+
+    // Operator-chosen squadron name, so a second squadron of a class can be told
+    // apart from the first. Blank for every deployment made before naming
+    // existed, which keeps their squadron ids exactly as they were.
+    //
+    // This must sit AFTER the CREATE above. It used to live ~170 lines earlier,
+    // among the `open_positions` migrations, so on a brand-new database it ran
+    // against a table that did not exist yet, failed, and was swallowed by
+    // `let _ =`; the CREATE then built the table without the column. Every
+    // auto-deploy failed with "table deployment_queue has no column named name",
+    // retried every few seconds forever.
+    //
+    // It self-healed on the SECOND boot — by then the table existed, so the
+    // ALTER landed — which is why it hid for so long: a normal install restarts
+    // once during Setup and is on boot two before the seeder first runs. A demo
+    // or CI box that starts fresh and never restarts stays broken.
+    let _ = sqlx::query(
+        "ALTER TABLE deployment_queue ADD COLUMN name TEXT NOT NULL DEFAULT ''"
+    ).execute(pool).await;
 
     // Migration for queues created before per-viper deploy budgets existed
     // (no-op-safe: duplicate-column error is silently suppressed).
@@ -3798,6 +3810,37 @@ pub async fn set_llm_action_outcome(
 mod reconcile_tests {
     use super::*;
     use std::collections::HashSet;
+
+    /// A brand-new database must be able to queue a deployment.
+    ///
+    /// `deployment_queue` gained a `name` column via ALTER, but that ALTER sits
+    /// ~170 lines ABOVE the table's own CREATE inside `init_schema`. On a fresh
+    /// database the ALTER runs against a table that does not exist yet, fails,
+    /// is swallowed by `let _ =`, and then CREATE builds the table without the
+    /// column. Every auto-deploy then fails forever with "table
+    /// deployment_queue has no column named name", retried every few seconds.
+    ///
+    /// Asserting the INSERT rather than the column list, because the INSERT is
+    /// what actually breaks and it fails the same way whichever mechanism is
+    /// meant to supply the column.
+    #[tokio::test]
+    async fn a_fresh_database_can_queue_a_deployment() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        init_schema(&pool).await.unwrap();
+        run_migrations(&pool).await;
+
+        sqlx::query(
+            "INSERT INTO deployment_queue (id, market_id, market_type, raptors, vipers, name) \
+             VALUES ('t','0xabc','politics','[]','[]','')"
+        )
+        .execute(&pool)
+        .await
+        .expect("a fresh schema must accept a deployment row, name column included");
+    }
 
     /// A database created before the filing columns existed must gain them, and
     /// its legacy rows must be stamped with the shard's venue while keeping

@@ -401,7 +401,9 @@ struct OpenAiChoice {
 #[derive(Serialize)]
 struct AnthropicRequest {
     model: String,
-    system: String,
+    /// Sent as a content-block array rather than a bare string so it can carry a
+    /// cache breakpoint. See `AnthropicSystemBlock`.
+    system: Vec<AnthropicSystemBlock>,
     messages: Vec<ChatMessage>,
     max_tokens: u32,
     /// Omitted entirely for models that no longer accept sampling parameters.
@@ -409,6 +411,42 @@ struct AnthropicRequest {
     /// the field, so this cannot be sent hopefully.
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+}
+
+/// One system content block, optionally marked as a prompt-cache breakpoint.
+///
+/// Anthropic bills a cached prefix at roughly a tenth of the input price, and
+/// our system prompt is an ideal candidate: it is a raw string literal with no
+/// interpolation, so it is byte-identical on every request. Each advisory cycle
+/// makes one call per squadron seconds apart, so the second and third read the
+/// entry the first one wrote.
+///
+/// The prompt is around 1,650 tokens. That clears the 1,024-token minimum for
+/// `claude-sonnet-5` — but the minimum is NOT uniform across models: it is 512
+/// on Opus 5 and 4,096 on Opus 4.6 and Haiku 4.5. On one of those the marker is
+/// silently ignored and nothing caches, with no error. That is why
+/// `cache_read_input_tokens` is logged: a persistent zero is the only visible
+/// symptom.
+///
+/// Default (five-minute) TTL deliberately. Cycles are an hour apart, which sits
+/// exactly on the one-hour TTL boundary, and that TTL costs double to write — a
+/// poor trade for a coin flip. The within-cycle reads are the reliable win.
+///
+/// Nothing per-request may be added ahead of this block: caching is a prefix
+/// match, so a single differing byte earlier invalidates everything after it.
+#[derive(Serialize)]
+struct AnthropicSystemBlock {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cache_control: Option<AnthropicCacheControl>,
+}
+
+#[derive(Serialize)]
+struct AnthropicCacheControl {
+    #[serde(rename = "type")]
+    kind: &'static str,
 }
 
 /// Does this Anthropic model still accept `temperature`?
@@ -449,6 +487,25 @@ fn anthropic_accepts_temperature(model: &str) -> bool {
 struct AnthropicResponse {
     content: Vec<AnthropicContent>,
     stop_reason: Option<String>,
+    /// Absent on providers that do not report it; treated as all-zero.
+    #[serde(default)]
+    usage: AnthropicUsage,
+}
+
+/// Token accounting, kept so caching can be verified rather than assumed.
+#[derive(Deserialize, Default)]
+struct AnthropicUsage {
+    #[serde(default)]
+    input_tokens: u32,
+    /// Tokens billed at the cache-write premium — nonzero on the call that
+    /// populates the entry.
+    #[serde(default)]
+    cache_creation_input_tokens: u32,
+    /// Tokens served from cache at roughly a tenth of input price. A persistent
+    /// zero across repeated calls means caching is NOT working, which is the
+    /// only symptom a too-short prefix or a silent invalidator produces.
+    #[serde(default)]
+    cache_read_input_tokens: u32,
 }
 
 #[derive(Deserialize)]
@@ -1003,7 +1060,12 @@ async fn call_anthropic(
     }
     let request = AnthropicRequest {
         model: model.to_string(),
-        system: system_prompt(),
+        // One breakpoint, on the only block that is byte-identical every call.
+        system: vec![AnthropicSystemBlock {
+            kind: "text",
+            text: system_prompt(),
+            cache_control: Some(AnthropicCacheControl { kind: "ephemeral" }),
+        }],
         messages: vec![ChatMessage { role: "user".to_string(), content: user_prompt.to_string() }],
         max_tokens: max_output_tokens(),
         temperature,
@@ -1032,6 +1094,26 @@ async fn call_anthropic(
         .join("")
         .trim()
         .to_string();
+    // Report the cache counters every call. A cached prefix bills at roughly a
+    // tenth of input price, but the failure mode is silent: too short a prefix,
+    // or any byte changing ahead of the breakpoint, simply produces no cache
+    // entry with no error. A run of calls where `read` stays 0 is the only
+    // evidence that would show, so it is logged rather than presumed.
+    let u = &parsed.usage;
+    if u.cache_creation_input_tokens > 0 || u.cache_read_input_tokens > 0 {
+        debug!(
+            "🤖 LLM Advisor: tokens in={} cache write={} cache read={}",
+            u.input_tokens, u.cache_creation_input_tokens, u.cache_read_input_tokens,
+        );
+    } else if u.input_tokens > 0 {
+        debug!(
+            "🤖 LLM Advisor: tokens in={} — nothing cached this call. Expected on the \
+             first call of a cycle; persistent zeros mean the prompt prefix is not \
+             caching (model minimum not met, or something varies ahead of the breakpoint).",
+            u.input_tokens,
+        );
+    }
+
     if content.is_empty() {
         return Err(anyhow::anyhow!("Anthropic response had no text content"));
     }
@@ -1740,6 +1822,78 @@ pub async fn run_llm_advisor_loop(
             }
         }
         } // end per-squadron pass
+    }
+}
+
+#[cfg(test)]
+mod prompt_cache_tests {
+    use super::*;
+
+    /// The system prompt must be byte-identical every call, or the cache
+    /// breakpoint is worthless: caching is a prefix match, so one differing byte
+    /// invalidates everything after it. This is the property that makes the
+    /// whole optimization work, and it would be quietly lost the first time
+    /// someone interpolates a timestamp or a session id into the prompt.
+    #[test]
+    fn the_system_prompt_is_byte_identical_across_calls() {
+        assert_eq!(system_prompt(), system_prompt());
+        assert_eq!(system_prompt(), system_prompt(), "second comparison, for a time-dependent value");
+    }
+
+    /// It must also clear the model's minimum cacheable prefix or the marker is
+    /// silently ignored. 1,024 tokens is the `claude-sonnet-5` minimum, the
+    /// shipped default; four chars per token is the conventional rough estimate
+    /// and deliberately conservative here.
+    #[test]
+    fn the_system_prompt_is_long_enough_to_cache() {
+        let approx_tokens = system_prompt().len() / 4;
+        assert!(
+            approx_tokens > 1100,
+            "system prompt is ~{approx_tokens} tokens — too close to the 1024-token \
+             minimum for claude-sonnet-5 to cache reliably",
+        );
+    }
+
+    /// The request must carry exactly one breakpoint, on the system block.
+    #[test]
+    fn the_request_marks_the_system_block_for_caching() {
+        let req = AnthropicRequest {
+            model: "claude-sonnet-5".into(),
+            system: vec![AnthropicSystemBlock {
+                kind: "text",
+                text: system_prompt(),
+                cache_control: Some(AnthropicCacheControl { kind: "ephemeral" }),
+            }],
+            messages: vec![],
+            max_tokens: 100,
+            temperature: None,
+        };
+        let v = serde_json::to_value(&req).expect("serializes");
+        assert_eq!(v["system"][0]["type"], "text");
+        assert_eq!(
+            v["system"][0]["cache_control"]["type"], "ephemeral",
+            "the system block must carry the cache breakpoint",
+        );
+    }
+
+    /// Absent usage must not break parsing — some providers omit it entirely.
+    #[test]
+    fn a_response_without_usage_still_parses() {
+        let r: AnthropicResponse = serde_json::from_str(
+            r#"{"content":[{"text":"hi"}],"stop_reason":"end_turn"}"#
+        ).expect("parses without a usage field");
+        assert_eq!(r.usage.cache_read_input_tokens, 0);
+    }
+
+    #[test]
+    fn cache_counters_are_read_when_present() {
+        let r: AnthropicResponse = serde_json::from_str(
+            r#"{"content":[{"text":"hi"}],"stop_reason":"end_turn",
+                "usage":{"input_tokens":5000,"cache_creation_input_tokens":1650,
+                         "cache_read_input_tokens":1650}}"#
+        ).expect("parses");
+        assert_eq!(r.usage.cache_creation_input_tokens, 1650);
+        assert_eq!(r.usage.cache_read_input_tokens, 1650);
     }
 }
 
