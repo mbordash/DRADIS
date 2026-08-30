@@ -661,13 +661,106 @@ async fn get_config(State(s): State<ApiState>) -> Response {
 /// Uses JSON merge-patch semantics: unknown keys are ignored.
 /// On success, broadcasts the new config on the watch channel so all
 /// in-flight strategy tick contexts pick it up within 50 ms.
-async fn patch_config(State(s): State<ApiState>, body: String) -> Response {
+/// Does a global PATCH also reach the squadrons that are already deployed?
+///
+/// Global config seeds a squadron at deploy time and is read by nothing
+/// afterwards: a deployed squadron reads its OWN `squadron_configs` row via
+/// `load_or_init_for_squadron`, and nothing in the CAG subscribes to the global
+/// broadcast. So a global-only write is invisible to every running patrol loop.
+///
+/// That cost real trust on 2026-08-29. An operator used the Control Tower's
+/// GHOST/LIVE header button to go live on the production Marketplace instance.
+/// The button calls this endpoint, the global row genuinely flipped, the API
+/// returned 200 and every surface rendered LIVE — while all three deployed
+/// squadrons kept their own `ghost_mode: true` and went on simulating fills for
+/// a day. The operator believed they were trading real money and were not.
+///
+/// The same defect had already been diagnosed on 2026-08-11 and fixed for the
+/// profile-apply endpoint alone (`setup.rs`, `ProfileScope`), leaving the other
+/// callers of this endpoint broken. So the default here matches that one: reach
+/// the deployed squadrons unless explicitly told not to.
+///
+/// A merge patch only touches the fields it names, so fanning out sets exactly
+/// the fields the operator edited and leaves every other per-squadron value
+/// alone. `?scope=global_only` restores the old seed-only behavior for a caller
+/// that genuinely wants to change future deployments without disturbing what is
+/// running.
+#[derive(Deserialize, Default, PartialEq, Eq, Clone, Copy, Debug)]
+#[serde(rename_all = "snake_case")]
+enum PatchScope {
+    /// Global row only. Seeds squadrons deployed LATER; changes nothing running.
+    GlobalOnly,
+    /// Global row plus every currently-deployed squadron (default).
+    #[default]
+    GlobalAndDeployed,
+}
+
+#[derive(Deserialize, Default)]
+struct PatchConfigQuery {
+    #[serde(default)]
+    scope: PatchScope,
+}
+
+async fn patch_config(
+    State(s): State<ApiState>,
+    Query(q): Query<PatchConfigQuery>,
+    body: String,
+) -> Response {
     info!("📥 Received PATCH /api/config (global) with body: {}", body);
     let current = s.config_rx.borrow().clone();
     match DynamicConfig::apply_patch(&current, &body).await {
         Ok(new_cfg) => {
             // Broadcast to all strategy tick loops.
             let _ = s.config_tx.send(new_cfg.clone());
+
+            // Fan out to what is actually running. See `PatchScope`.
+            if q.scope == PatchScope::GlobalAndDeployed {
+                // Target set = registered live handles UNION persisted squadron
+                // rows.
+                //
+                // The handle registry alone is not enough, and relying on it
+                // silently broke two of the three venues. Only the intl paths
+                // call `register_squadron_config_handle` (cag/run.rs and
+                // cag/adama.rs); the Kalshi and Polymarket US traders never do,
+                // so the registry is permanently EMPTY on those builds. That is
+                // why the 2026-08-11 profile fan-out has never worked there
+                // either: it reported success over zero squadrons while the
+                // Setup dialog told the operator "no squadrons are currently
+                // deployed" with PATROLLING squadrons listed beside it.
+                //
+                // Those traders hold a plain `Arc<DynamicConfig>` that they
+                // reload from the DB roughly every 30s, so writing the row is
+                // what reaches them. `apply_squadron_patch_as` writes the row and
+                // additionally pushes into the live handle when one is
+                // registered, so intl still applies on the next tick.
+                //
+                // Rows for stood-down squadrons are included deliberately: they
+                // are not running, so the write is harmless, and it means a
+                // squadron redeployed later starts from the operator's current
+                // settings rather than resurrecting stale ones.
+                let mut ids = crate::helpers::dynamic_config::registered_squadron_ids();
+                if let Some(pool) = crate::helpers::db::pool() {
+                    for id in crate::helpers::db::squadron_config_list(pool).await {
+                        if !ids.contains(&id) {
+                            ids.push(id);
+                        }
+                    }
+                }
+                let mut reached = 0usize;
+                for id in &ids {
+                    match DynamicConfig::apply_squadron_patch_as(id, &body, "operator").await {
+                        Ok(_) => reached += 1,
+                        // Reported, never fatal: the global write already
+                        // succeeded, and failing the request would leave the
+                        // caller unsure whether ANY of it landed.
+                        Err(e) => warn!("⚙️  Global patch did not reach squadron {id}: {e}"),
+                    }
+                }
+                if !ids.is_empty() {
+                    info!("⚙️  Global patch applied to {reached}/{} deployed squadron(s)", ids.len());
+                }
+            }
+
             match serde_json::to_value(new_cfg.as_ref()) {
                 Ok(val) => {
                     debug!("Successfully processed PATCH /api/config");
@@ -2158,9 +2251,20 @@ async fn get_squadron_config(
     // before the primary pool may have initialized (roadmap bug #7).
     match db::pool_for_opt_retry(None).await {
         Some(pool) => {
-            if let Some(json) = db::squadron_config_get(&pool, &id).await {
-                match serde_json::from_str::<DynamicConfig>(&json) {
-                    Ok(cfg) => match serde_json::to_value(&cfg) {
+            if db::squadron_config_get(&pool, &id).await.is_some() {
+                // Served through `load_for_squadron`, not raw from the row.
+                //
+                // That function applies the build caps and reconciles the
+                // instance-level fields, so the raw row can differ from what the
+                // engine actually uses — a `time_decay_max_entry_price` above its
+                // build cap, or a stale `ghost_mode`. Returning the raw row made
+                // the squadron page display values already overridden underneath
+                // it, which is the exact "surface shows state it does not govern"
+                // pattern behind today's incidents, on the page whose entire job
+                // is showing operative config.
+                let cfg = DynamicConfig::load_for_squadron(&id).await;
+                match Ok::<_, serde_json::Error>(cfg) {
+                    Ok(cfg) => match serde_json::to_value(cfg.as_ref()) {
                         Ok(val) => {
                             debug!("Successfully retrieved squadron config for {}", id);
                             (StatusCode::OK, Json(val)).into_response()
@@ -2215,6 +2319,45 @@ async fn patch_squadron_config(
             error!("Error applying patch for squadron {}: {}", id, e);
             (StatusCode::BAD_REQUEST, e.to_string()).into_response()
         },
+    }
+}
+
+#[cfg(test)]
+mod patch_scope_tests {
+    use super::*;
+
+    /// The default is the whole point. If `PatchScope` ever defaults back to
+    /// `GlobalOnly`, the GHOST/LIVE button silently stops reaching the running
+    /// squadrons again and every surface goes on claiming it worked — which is
+    /// exactly what happened on the production Marketplace instance on
+    /// 2026-08-29, for a day, with the operator believing they were live.
+    #[test]
+    fn a_patch_reaches_deployed_squadrons_by_default() {
+        assert_eq!(PatchScope::default(), PatchScope::GlobalAndDeployed);
+    }
+
+    /// An absent `scope` must mean the default, not a deserialization failure.
+    #[test]
+    fn an_omitted_scope_defaults_to_reaching_deployed_squadrons() {
+        let q: PatchConfigQuery = serde_json::from_str("{}").expect("empty query deserializes");
+        assert_eq!(q.scope, PatchScope::GlobalAndDeployed);
+    }
+
+    /// The escape hatch still exists for a caller that means "seed only".
+    #[test]
+    fn global_only_can_be_requested_explicitly() {
+        let q: PatchConfigQuery =
+            serde_json::from_str(r#"{"scope":"global_only"}"#).expect("deserializes");
+        assert_eq!(q.scope, PatchScope::GlobalOnly);
+    }
+
+    /// The wire spelling the Control Tower would send, kept in step with the
+    /// profile endpoint's `ProfileScope` so the two cannot drift apart.
+    #[test]
+    fn scope_spellings_match_the_profile_endpoint() {
+        let q: PatchConfigQuery =
+            serde_json::from_str(r#"{"scope":"global_and_deployed"}"#).expect("deserializes");
+        assert_eq!(q.scope, PatchScope::GlobalAndDeployed);
     }
 }
 

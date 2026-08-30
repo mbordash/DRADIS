@@ -53,6 +53,15 @@ pub use context::PatrolContext;
 /// Kept in a separate file to avoid bloating mod.rs.
 #[cfg(feature = "intl_clob")]
 mod patrol_impl;
+/// Bulk order cancellation, shared by the three paths that end a squadron's
+/// tenure on a market: hourly rotation, operator stand-down, and process
+/// shutdown. Exported so `main` can register it as the shutdown hook — the
+/// `Execution` trait has no cancel-all, so this is the venue SDK call.
+///
+/// intl-only, like the module it comes from: the Kalshi and Polymarket US
+/// traders own their own order lifecycles and do not route through `patrol()`.
+#[cfg(feature = "intl_clob")]
+pub use patrol_impl::cancel_all_orders_with_retries;
 
 /// Peripheral tasks spawned by `patrol()` — Phase 3f-4.
 /// Kept in a separate file for clarity; each function spawns one Tokio task.

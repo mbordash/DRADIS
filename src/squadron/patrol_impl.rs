@@ -236,7 +236,7 @@ impl Squadron {
         // Resolved once and reused: `scope` files every row under it, and the
         // viper set below is selected from it.
         let market_class = self.classify_and_link().await;
-        let scope = TradeScope::new(
+        let mut scope = TradeScope::new(
             asset_lc.clone(),
             crate::venues::intl::INTL_VENUE,
             Some(market_class.clone()),
@@ -656,6 +656,22 @@ impl Squadron {
                 // In Phase 3f-3 / 3f-4 the CAG never fires this; the watchdog does.
                 _ = cancel.cancelled() => {
                     info!("🛬  Squadron [{}] patrol cancelled — standing down", self.id);
+                    // Cancel resting orders first. The market-rotation arm below
+                    // has always done this; this arm did not, so a stand-down
+                    // left maker quotes and TimeDecay GTC bids live and fillable
+                    // on a squadron the operator had just stopped — while the
+                    // confirm dialog told them "resting orders are cancelled".
+                    //
+                    // Positions are left to settle rather than flattened: the
+                    // intl path has no `flatten_before_stand_down`, and the
+                    // dialog says "flattened or left to settle" for that reason.
+                    crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::MarketRotate);
+                    if !cancel_all_orders_with_retries(trading_client.as_ref()).await {
+                        error!(
+                            "❌ Squadron [{}] stand-down: failed to cancel all orders after {} attempts — resting orders may remain open.",
+                            self.id, MAX_CANCEL_RETRIES,
+                        );
+                    }
                     self.cancel_ws();
                     break;
                 }
@@ -825,6 +841,10 @@ impl Squadron {
                     // several of them. The tick value is also fresher than the one
                     // captured on a signal when it was emitted.
                     let ghosting = config::GHOST_MODE || dyn_cfg.ghost_mode;
+                    // Stamp the filing scope with the mode in force THIS tick, so
+                    // every clone taken into a spawned exit task records the mode
+                    // the trade actually happened under. See `TradeScope::ghost`.
+                    scope.ghost = ghosting;
 
                     // Hoist mutex-await calls OUT of the struct literal so that
                     // borrow() Ref guards (oracle_rx, velocity_rx, etc.) in the
@@ -2422,7 +2442,7 @@ impl Squadron {
 /// rotation arm and event-market retirement. Returns false when every attempt
 /// failed, which the caller reports but does not treat as fatal — the venue
 /// cancels what is left when the market resolves.
-pub(crate) async fn cancel_all_orders_with_retries(
+pub async fn cancel_all_orders_with_retries(
     trading_client: &polymarket_client_sdk_v2::clob::Client<
         polymarket_client_sdk_v2::auth::state::Authenticated<
             polymarket_client_sdk_v2::auth::Normal,

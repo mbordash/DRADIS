@@ -876,6 +876,23 @@ fn build_user_prompt(
 /// Output token cap shared by all providers (Ollama `num_predict`,
 /// OpenAI/Anthropic `max_tokens`) — sized for the ≤250-word structured report.
 use crate::config::LLM_MAX_OUTPUT_TOKENS;
+
+/// The operator's output-token ceiling, live.
+///
+/// `llm_max_output_tokens` is a Deployment-group knob, editable in Setup, and
+/// all three risk profiles set it — but every provider call read the
+/// compile-time `LLM_MAX_OUTPUT_TOKENS` instead, so the knob governed nothing.
+/// Its own help text tells the operator to raise it when recommendations arrive
+/// truncated, advice that could not work: raising it changed no behavior at all.
+///
+/// Read from the live global broadcast rather than the DB — this sits on the
+/// request path and the value is global by definition. Falls back to the
+/// compile-time constant before the sender is registered.
+fn max_output_tokens() -> u32 {
+    crate::helpers::dynamic_config::global_config_tx()
+        .map(|tx| tx.borrow().llm_max_output_tokens)
+        .unwrap_or(LLM_MAX_OUTPUT_TOKENS)
+}
 /// Low temperature: consistent, factual recommendations.
 const LLM_TEMPERATURE: f32 = 0.3;
 
@@ -901,7 +918,7 @@ async fn call_ollama(
         ],
         stream: false,
         options: OllamaOptions {
-            num_predict: LLM_MAX_OUTPUT_TOKENS,
+            num_predict: max_output_tokens(),
             temperature: LLM_TEMPERATURE,
             num_ctx: 4096,     // Room for prompt + machine-editable key list + full recommendation
         },
@@ -941,7 +958,7 @@ async fn call_openai_compatible(
             ChatMessage { role: "system".to_string(), content: system_prompt() },
             ChatMessage { role: "user".to_string(), content: user_prompt.to_string() },
         ],
-        max_tokens: LLM_MAX_OUTPUT_TOKENS,
+        max_tokens: max_output_tokens(),
         temperature: LLM_TEMPERATURE,
     };
 
@@ -988,7 +1005,7 @@ async fn call_anthropic(
         model: model.to_string(),
         system: system_prompt(),
         messages: vec![ChatMessage { role: "user".to_string(), content: user_prompt.to_string() }],
-        max_tokens: LLM_MAX_OUTPUT_TOKENS,
+        max_tokens: max_output_tokens(),
         temperature,
     };
 
@@ -1573,7 +1590,7 @@ pub async fn run_llm_advisor_loop(
                     if reply.truncated_by_length {
                         warn!(
                             "🤖 LLM Advisor: output hit the {}-token output cap — consider increasing if recommendations still end mid-thought",
-                            LLM_MAX_OUTPUT_TOKENS,
+                            max_output_tokens(),
                         );
                     }
                     analysis_opt = Some(reply.content);

@@ -154,7 +154,13 @@ function assetToEntries(shard: string, trades: TradeRow[], positions: OpenPositi
       shares:     parseFloat(t.shares),
       pnl:        parseFloat(t.pnl),
       reason:     t.reason,
-      ghost:      false,
+      // Was hardcoded false, which told every viewer that every completed trade
+      // was real money. Open positions were badged correctly from
+      // `open_positions.ghost_mode` all along, so a customer stuck in simulation
+      // saw ghost badges disappear the moment a trade closed — and a P&L ledger
+      // that looked entirely real. Rows written before the column existed report
+      // false, which is what they already displayed.
+      ghost:      t.ghost ?? false,
       chainAdopted: false,
     });
   }

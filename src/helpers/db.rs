@@ -893,6 +893,16 @@ async fn run_migrations(pool: &SqlitePool) {
     // `pnl` is stored NET of this; subtracting it back recovers the gross figure.
     let _ = sqlx::query("ALTER TABLE trades ADD COLUMN fees TEXT")
         .execute(pool).await;
+    // `ghost`: was this trade simulated? `open_positions` has always carried a
+    // `ghost_mode` column, so the Control Tower badged OPEN positions correctly
+    // while completed trades had nowhere to record it and the UI hardcoded
+    // "real" for every row. Defaults to 0 for pre-existing rows, which is a
+    // guess — but every row written before this column existed came from a
+    // build where the trade log claimed "real" anyway, so the default preserves
+    // exactly what those rows already displayed rather than inventing a new
+    // claim about them.
+    let _ = sqlx::query("ALTER TABLE trades ADD COLUMN ghost INTEGER NOT NULL DEFAULT 0")
+        .execute(pool).await;
     // `entry_fee`: dollars already paid to the venue to OPEN this position.
     // Needed because a position can leave via settlement or off-strategy close
     // rather than the strategy's exit path, and those bookings live here — with
@@ -1014,8 +1024,8 @@ pub async fn record_trade_db(
     let venue = resolved_venue(scope);
     if let Err(e) = sqlx::query(
         "INSERT INTO trades (ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason, session_id,
-                             venue, market_class, underlying, fees)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+                             venue, market_class, underlying, fees, ghost)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&ts)
     .bind(strategy)
@@ -1031,6 +1041,7 @@ pub async fn record_trade_db(
     .bind(scope.market_class.clone())
     .bind(scope.underlying.clone())
     .bind(fees.to_string())
+    .bind(scope.ghost as i32)
     .execute(pool)
     .await {
         error!("❌ DB trade write failed: {}", e);
@@ -2530,8 +2541,25 @@ pub async fn purge_stale_open_positions(
     // by its phantom mark-to-market (observed: +$14.85 of redeemed ETH arb legs).
     const STALE_PENDING_GRACE_SECS: i64 = 3600; // 60 min ≫ indexer lag, ≪ orphan lifetime
 
+    // Ghost rows are excluded at the query.
+    //
+    // This whole function reconciles the DB against the CHAIN: a row whose token
+    // the wallet does not hold is treated as closed off-strategy and booked or
+    // deleted. A simulated position holds nothing on-chain by definition, so
+    // every ghost row looks exactly like an orphan — the sweep would book them as
+    // real "ChainReconcile" trades at last mark, or delete them outright.
+    //
+    // That corrupts the very thing a customer evaluating DRADIS is looking at:
+    // the simulated P&L they are using to decide whether to fund it. Worse in
+    // combination with the ghost-mode incident (see `GLOBAL_SEMANTICS_KEYS`) —
+    // a customer stuck in simulation would have watched their paper positions
+    // silently convert into real-looking booked trades.
+    //
+    // `clear_live_open_positions` already preserves ghost rows for the same
+    // reason; this path simply never got the same treatment.
+
     let rows: Vec<(i64, String, Option<String>, String, String, String, String, String, String, Option<String>, Option<String>)> = match sqlx::query_as(
-        "SELECT id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price, entry_fee FROM open_positions"
+        "SELECT id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price, entry_fee FROM open_positions WHERE ghost_mode = 0"
     )
     .fetch_all(pool)
     .await {
@@ -2861,6 +2889,9 @@ pub struct TradeRow {
     /// Underlying symbol. `None` is meaningful — sports and politics markets
     /// have no underlying instrument.
     pub underlying: Option<String>,
+    /// Was this a simulated fill? `false` on rows written before the column
+    /// existed — see the migration note.
+    pub ghost: bool,
     /// Total venue fees for the round trip. `pnl` is already net of this;
     /// `pnl + fees` recovers the gross figure. `None` on pre-fee rows.
     pub fees: Option<String>,
@@ -3044,7 +3075,7 @@ pub async fn get_trade_stats(pool: &SqlitePool) -> TradeStatsRow {
 pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
     match sqlx::query(
         "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
-                venue, market_class, underlying, fees
+                venue, market_class, underlying, fees, ghost
          FROM trades ORDER BY ts DESC LIMIT ?"
     )
     .bind(limit)
@@ -3064,6 +3095,7 @@ pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
             market_class: r.try_get::<Option<String>, _>(10).ok().flatten(),
             underlying:   r.try_get::<Option<String>, _>(11).ok().flatten(),
             fees:         r.try_get::<Option<String>, _>(12).ok().flatten(),
+            ghost:        r.try_get::<i64, _>(13).map(|v| v != 0).unwrap_or(false),
         })).collect(),
         Err(e) => { error!("❌ DB get_recent_trades failed: {}", e); vec![] }
     }
@@ -3075,7 +3107,7 @@ pub async fn get_recent_trades(pool: &SqlitePool, limit: i64) -> Vec<TradeRow> {
 pub async fn get_all_trades(pool: &SqlitePool) -> Vec<TradeRow> {
     match sqlx::query(
         "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
-                venue, market_class, underlying, fees
+                venue, market_class, underlying, fees, ghost
          FROM trades ORDER BY ts ASC"
     )
     .fetch_all(pool)
@@ -3094,6 +3126,7 @@ pub async fn get_all_trades(pool: &SqlitePool) -> Vec<TradeRow> {
             market_class: r.try_get::<Option<String>, _>(10).ok().flatten(),
             underlying:   r.try_get::<Option<String>, _>(11).ok().flatten(),
             fees:         r.try_get::<Option<String>, _>(12).ok().flatten(),
+            ghost:        r.try_get::<i64, _>(13).map(|v| v != 0).unwrap_or(false),
         })).collect(),
         Err(e) => { error!("❌ DB get_all_trades failed: {}", e); vec![] }
     }
@@ -3195,7 +3228,7 @@ pub async fn get_session_trades(pool: &SqlitePool) -> Vec<TradeRow> {
     let sid = current_session_id();
     match sqlx::query(
         "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
-                venue, market_class, underlying, fees
+                venue, market_class, underlying, fees, ghost
          FROM trades WHERE session_id = ? ORDER BY ts DESC"
     )
     .bind(sid)
@@ -3215,6 +3248,7 @@ pub async fn get_session_trades(pool: &SqlitePool) -> Vec<TradeRow> {
             market_class: r.try_get::<Option<String>, _>(10).ok().flatten(),
             underlying:   r.try_get::<Option<String>, _>(11).ok().flatten(),
             fees:         r.try_get::<Option<String>, _>(12).ok().flatten(),
+            ghost:        r.try_get::<i64, _>(13).map(|v| v != 0).unwrap_or(false),
         })).collect(),
         Err(e) => { error!("❌ DB get_session_trades failed: {}", e); vec![] }
     }
@@ -3231,7 +3265,7 @@ pub async fn get_previous_session_trades(pool: &SqlitePool, limit: i64) -> Vec<T
     let sid = current_session_id();
     match sqlx::query(
         "SELECT ts, strategy, market, side, entry_price, exit_price, shares, pnl, reason,
-                venue, market_class, underlying, fees
+                venue, market_class, underlying, fees, ghost
          FROM trades
          WHERE (session_id IS NULL OR session_id != ?)
          ORDER BY ts DESC LIMIT ?"
@@ -3254,6 +3288,7 @@ pub async fn get_previous_session_trades(pool: &SqlitePool, limit: i64) -> Vec<T
             market_class: r.try_get::<Option<String>, _>(10).ok().flatten(),
             underlying:   r.try_get::<Option<String>, _>(11).ok().flatten(),
             fees:         r.try_get::<Option<String>, _>(12).ok().flatten(),
+            ghost:        r.try_get::<i64, _>(13).map(|v| v != 0).unwrap_or(false),
         })).collect(),
         Err(e) => { error!("❌ DB get_previous_session_trades failed: {}", e); vec![] }
     }

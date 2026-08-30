@@ -749,9 +749,15 @@ pub async fn arb_pair_fill_monitor(
     //         measured on 2026-08-15): every second here is a second of naked
     //         directional exposure, and the post-flatten late-fill watcher bounds
     //         the cost of cutting it too fine.
-    let settle_grace = crate::helpers::dynamic_config::global_config_tx()
-        .map(|tx| tx.borrow().arb_settle_grace_secs)
-        .unwrap_or(crate::config::ARB_SETTLE_GRACE_SECS);
+    //         Read from the SQUADRON whose position is being reconciled, not the
+    //         global row. This knob renders in the Arbitrage card on a squadron's
+    //         page and is written per-squadron by `patchSquadronConfig`, so
+    //         reading it globally meant editing "Orphan Settle Grace" in the UI
+    //         updated a row nobody read, while the value actually used came from
+    //         a row no UI control writes.
+    let settle_grace = crate::helpers::dynamic_config::DynamicConfig::load_for_squadron(squadron_id)
+        .await
+        .arb_settle_grace_secs;
     tokio::time::sleep(Duration::from_secs(settle_grace)).await;
 
     // Step 3: Re-check the missing leg's on-chain balance (settle-lag race guard).

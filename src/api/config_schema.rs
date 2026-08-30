@@ -33,6 +33,50 @@
 use serde::Serialize;
 use rust_decimal::prelude::ToPrimitive;
 
+/// Which configuration row a field actually lives in.
+///
+/// DRADIS has two config scopes that look identical in the schema and behave
+/// completely differently: the global `dynamic_config` row, and each deployed
+/// squadron's `squadron_configs` row. Nothing recorded which one a field
+/// belonged to, so a field could be RENDERED at one scope and READ at the other
+/// and no part of the system would notice.
+///
+/// It went unnoticed three times. `arb_settle_grace_secs` rendered in the
+/// Arbitrage card (per-squadron) and was read from the global row, so editing
+/// "Orphan Settle Grace" wrote a row nobody read. `llm_max_output_tokens`
+/// rendered in the Deployment panel and was never read at all — every provider
+/// call used the compile-time constant, while its help text told operators to
+/// raise it. `intl_taker_fee_rate` is read at BOTH scopes, so one round trip can
+/// book at two different fee rates.
+///
+/// Declared per GROUP rather than per field because the group already decides
+/// where the UI renders a field, and the two must agree by construction: the
+/// Control Tower renders `Deployment` in Setup, and `Order Book` plus
+/// `Exit Accounting` plus the viper-named groups on a squadron page.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum ConfigScope {
+    /// Lives in the global row. Read via `global_config_tx()` or `load_or_default`.
+    Global,
+    /// Lives in each squadron's row. Read from the per-tick config snapshot.
+    Squadron,
+}
+
+/// The scope every group belongs to. Exhaustive on purpose: a new group with no
+/// entry here fails `every_group_declares_a_scope` rather than defaulting to a
+/// guess, because guessing is what produced the three defects above.
+pub fn scope_for_group(group: &str) -> Option<ConfigScope> {
+    Some(match group {
+        // Instance-wide: rendered in Setup, read from the global row.
+        "Global" | "Deployment" | "Raptor Polling" => ConfigScope::Global,
+        // Per-squadron: rendered on a squadron page, read from its own row.
+        "Order Book" | "Exit Accounting" => ConfigScope::Squadron,
+        "Arbitrage" | "Basis" | "Convergence" | "FairValue" | "GBoost"
+        | "Maker" | "Momentum" | "Time Decay" | "TrendReversal" => ConfigScope::Squadron,
+        _ => return None,
+    })
+}
+
 /// Metadata for one editable config field.
 #[derive(Debug, Clone, Serialize)]
 pub struct ConfigFieldSchema {
@@ -59,6 +103,10 @@ pub struct ConfigFieldSchema {
     pub advanced: bool,
     /// Short tooltip describing what the field does.
     pub description: &'static str,
+    /// Which config row this field lives in — see [`ConfigScope`]. Filled in by
+    /// the post-pass at the end of `config_schema()` from the field's group, so
+    /// a field cannot declare a scope that contradicts where it renders.
+    pub scope: ConfigScope,
 }
 
 impl ConfigFieldSchema {
@@ -75,6 +123,9 @@ impl ConfigFieldSchema {
             key, group, enable_key, label, value_type,
             unit: None, min: None, max: None, step: None,
             advanced, description,
+            // Placeholder; the post-pass at the end of `config_schema()` resolves
+            // it from the group so the two can never disagree.
+            scope: ConfigScope::Squadron,
         }
     }
     fn range(mut self, min: f64, max: f64) -> Self { self.min = Some(min); self.max = Some(max); self }
@@ -666,6 +717,15 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
     // the UI automatically, and so the strategy's own bound and the build's stay
     // separately readable. Narrowing only — a cap never widens a range, and a
     // field with no declared max gains one.
+    // Resolve each field's scope from its group. Unknown groups are left as the
+    // constructor default and caught by `every_group_declares_a_scope`, which is
+    // louder than silently filing a new field under the wrong config row.
+    for f in &mut v {
+        if let Some(scope) = scope_for_group(f.group) {
+            f.scope = scope;
+        }
+    }
+
     for f in &mut v {
         if let Some(cap) = crate::helpers::dynamic_config::build_cap_for(f.key) {
             if let Some(cap) = cap.to_f64() {
@@ -743,6 +803,88 @@ mod tests {
     /// build honored at most 0.46, so the UI invited operators to save a value
     /// that could never take effect — which one did, on the live Marketplace
     /// instance on 2026-08-29.
+    /// Every group must declare a scope. A new group with no entry in
+    /// `scope_for_group` silently inherits the constructor default, which is the
+    /// "guess and hope" this whole mechanism exists to end.
+    #[test]
+    fn every_group_declares_a_scope() {
+        let mut missing: Vec<&str> = config_schema()
+            .iter()
+            .filter(|f| scope_for_group(f.group).is_none())
+            .map(|f| f.group)
+            .collect();
+        missing.sort_unstable();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "these groups have no declared scope — add them to scope_for_group: {missing:?}",
+        );
+    }
+
+    /// The load-bearing test: a field that lives in a SQUADRON row must never be
+    /// read from the global one.
+    ///
+    /// `global_config_tx()` is the global read. Any squadron-scoped key reached
+    /// through it is a field the UI writes per-squadron and the engine reads
+    /// instance-wide, so operator edits land in a row nobody reads. That is
+    /// exactly what `arb_settle_grace_secs` did, and this scan is what would have
+    /// caught it — the same source-scanning approach `config_profiles_complete`
+    /// already uses for constants.
+    #[test]
+    fn no_squadron_scoped_field_is_read_from_the_global_row() {
+        let squadron_keys: Vec<&str> = config_schema()
+            .iter()
+            .filter(|f| f.scope == ConfigScope::Squadron)
+            .map(|f| f.key)
+            .collect();
+
+        let mut offenders: Vec<String> = Vec::new();
+        for entry in walk_rs_files("src") {
+            let Ok(src) = std::fs::read_to_string(&entry) else { continue };
+            // Skip this file: it NAMES every key, it does not read them.
+            if entry.ends_with("config_schema.rs") {
+                continue;
+            }
+            for (idx, _) in src.match_indices("global_config_tx()") {
+                // The read normally reads `...borrow().some_field` within a short
+                // window of the call. Widen only as far as the statement plausibly
+                // runs, to avoid matching an unrelated field further down.
+                let window = &src[idx..src.len().min(idx + 200)];
+                for key in &squadron_keys {
+                    if window.contains(&format!(".{key}")) {
+                        offenders.push(format!("{}: {key}", entry));
+                    }
+                }
+            }
+        }
+        offenders.sort();
+        offenders.dedup();
+        assert!(
+            offenders.is_empty(),
+            "squadron-scoped field(s) read from the global row — the UI writes these \
+             per-squadron, so these edits go to a row nobody reads:\n  {}",
+            offenders.join("\n  "),
+        );
+    }
+
+    /// Recursively collect `.rs` files under `dir`, skipping build output.
+    fn walk_rs_files(dir: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        let mut stack = vec![std::path::PathBuf::from(dir)];
+        while let Some(p) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&p) else { continue };
+            for e in entries.flatten() {
+                let path = e.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().is_some_and(|x| x == "rs") {
+                    out.push(path.to_string_lossy().into_owned());
+                }
+            }
+        }
+        out
+    }
+
     #[test]
     fn build_caps_narrow_the_rendered_range() {
         use crate::helpers::dynamic_config::{build_cap_for, BUILD_CAPPED_KEYS};

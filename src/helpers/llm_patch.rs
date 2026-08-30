@@ -293,6 +293,28 @@ pub fn validate_proposals(raw: Vec<RawProposal>, current: &DynamicConfig) -> Pro
             continue;
         };
 
+        // Instance-level fields are not squadron knobs.
+        //
+        // Advisor proposals are applied squadron-scoped, so a proposal to change
+        // one of these could only ever set it on ONE squadron — which is not a
+        // setting, it is a divergence. `ghost_mode` is the live case:
+        // `llm_policy` already holds it from auto-apply at every tier, but it
+        // routes to the Approve button, and approving would have written a
+        // squadron row saying the opposite of the instance. The write path now
+        // reconciles that away, which would leave the operator with an approval
+        // marked applied that changed nothing. Better not to offer it: rejections
+        // are fed back to the advisor, so it learns not to ask.
+        if crate::helpers::dynamic_config::GLOBAL_SEMANTICS_KEYS.contains(&field.key) {
+            batch.rejected.push(RejectedProposal {
+                field: p.field,
+                to: p.to,
+                why: "instance-level setting — applies to the whole engine, not one squadron, \
+                      so it is an operator decision and cannot be proposed per squadron"
+                    .into(),
+            });
+            continue;
+        }
+
         // Reject anything the build will not let take effect.
         //
         // Three fields are re-clamped to a compile-time constant on every config
@@ -507,6 +529,28 @@ mod tests {
         )
     }
 
+    /// The advisor must not be able to put one squadron in a different mode
+    /// from the instance. `llm_policy` already holds `ghost_mode` from
+    /// auto-apply, but it routed to the Approve button, and approving would have
+    /// written a squadron row contradicting the global one — exactly the split
+    /// that let a production box simulate for a day while every screen said LIVE.
+    #[test]
+    fn rejects_instance_level_fields_outright() {
+        use crate::helpers::dynamic_config::GLOBAL_SEMANTICS_KEYS;
+        for key in GLOBAL_SEMANTICS_KEYS {
+            let current = cfg();
+            let flipped = serde_json::to_value(&current).expect("serializes")[*key].clone();
+            let to = match flipped {
+                serde_json::Value::Bool(b) => serde_json::json!(!b),
+                other => panic!("{key} is {other:?} — extend this test for non-bool fields"),
+            };
+            let b = propose(key, to);
+            assert!(b.accepted.is_empty(), "{key} must never be proposable per squadron");
+            let why = &b.rejected.first().expect("one rejection").why;
+            assert!(why.contains("instance-level"), "{key}: unhelpful reason: {why}");
+        }
+    }
+
     /// The live regression. On 2026-08-29 the advisor proposed
     /// `time_decay_max_entry_price: 0.46 -> 0.5` on the Marketplace instance.
     /// The schema range is 0.0 to 1.0 so it validated, the write succeeded, the
@@ -641,10 +685,13 @@ mod tests {
 
     #[test]
     fn bool_field_accepts_bool_and_string() {
+        // Uses `obi_use_whole_book` rather than `ghost_mode`: the latter is an
+        // instance-level field and is now rejected outright, so it can no longer
+        // stand in as a generic bool. See `rejects_instance_level_fields_outright`.
         let d = cfg();
-        let flip = !d.ghost_mode;
+        let flip = !d.obi_use_whole_book;
         for to in [serde_json::json!(flip), serde_json::json!(flip.to_string())] {
-            let raw = vec![RawProposal { field: "ghost_mode".into(), to, reason: String::new() }];
+            let raw = vec![RawProposal { field: "obi_use_whole_book".into(), to, reason: String::new() }];
             let batch = validate_proposals(raw, &d);
             assert_eq!(batch.accepted.len(), 1);
             assert_eq!(batch.accepted[0].to, serde_json::json!(flip));
@@ -653,10 +700,11 @@ mod tests {
 
     #[test]
     fn noop_change_rejected() {
+        // Not `ghost_mode` — see the note in `bool_field_accepts_bool_and_string`.
         let d = cfg();
         let raw = vec![RawProposal {
-            field: "ghost_mode".into(),
-            to: serde_json::json!(d.ghost_mode),
+            field: "obi_use_whole_book".into(),
+            to: serde_json::json!(d.obi_use_whole_book),
             reason: String::new(),
         }];
         let batch = validate_proposals(raw, &d);

@@ -219,6 +219,16 @@ export interface ConfigFieldSchema {
   max:         number | null;
   step:        number | null;
   advanced:    boolean;         // false → Basic panel, true → Advanced modal
+  /**
+   * Which config row this field lives in. 'global' fields are written by
+   * PATCH /api/config and read instance-wide; 'squadron' fields are written by
+   * patchSquadronConfig and read from that squadron's own row.
+   *
+   * Rendering a field at the wrong scope means operator edits land in a row
+   * nothing reads — it happened three times before the engine started declaring
+   * this. Prefer it over inferring scope from the group name.
+   */
+  scope:       'global' | 'squadron';
   description: string;
 }
 
@@ -273,6 +283,8 @@ export interface TradeRow {
    * `pnl + fees` recovers the gross figure. Null on rows predating fee capture.
    */
   fees?:         string | null;
+  /** Was this a simulated fill? False on rows written before the column existed. */
+  ghost?:        boolean;
 }
 
 /** A position that has been entered but not yet exited (all strategies, ghost+live). */

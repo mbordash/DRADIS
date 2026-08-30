@@ -1020,6 +1020,46 @@ pub fn read_only_mode() -> bool {
         .unwrap_or(false)
 }
 
+/// Fields that describe the INSTANCE rather than a squadron's risk appetite,
+/// and must therefore read the same everywhere.
+///
+/// `ghost_mode` is the archetype: it says whether real money moves at all. A
+/// squadron holding a different answer from the global row is not a
+/// customization, it is a lie about what the engine is doing.
+///
+/// This registry exists because that lie was told. On 2026-08-29 the operator of
+/// the production Marketplace instance pressed the Control Tower's GHOST/LIVE
+/// button to go live. The global row flipped, every surface rendered LIVE, and
+/// all three deployed squadrons kept `ghost_mode: true` and went on simulating
+/// fills for a day. Worse, the divergence then survived a machine migration: the
+/// config bundle exported global `false` alongside three squadron rows saying
+/// `true`, and the import restored that state faithfully onto a new box.
+///
+/// Two places consult this, for the two halves of that failure:
+/// [`reconcile_global_semantics`] is applied when a squadron's config is read,
+/// so a divergent row can never be honored, and again on bundle import, so a
+/// divergent row is not persisted in the first place. Adding a field means
+/// adding it here and to the function; `reconciles_every_declared_key` fails if
+/// you miss one.
+pub const GLOBAL_SEMANTICS_KEYS: &[&str] = &["ghost_mode"];
+
+/// Force `cfg`'s instance-level fields to agree with `global`.
+///
+/// Returns the keys it had to correct, so callers can say so loudly rather than
+/// fixing the problem in silence — silence is what made the original incident
+/// cost a day.
+pub fn reconcile_global_semantics(
+    cfg: &mut DynamicConfig,
+    global: &DynamicConfig,
+) -> Vec<&'static str> {
+    let mut corrected = Vec::new();
+    if cfg.ghost_mode != global.ghost_mode {
+        cfg.ghost_mode = global.ghost_mode;
+        corrected.push("ghost_mode");
+    }
+    corrected
+}
+
 /// Fields whose runtime value is capped by a compile-time constant.
 ///
 /// These three are re-clamped on EVERY read of a persisted config, in
@@ -1202,6 +1242,35 @@ impl DynamicConfig {
                         // Same build caps as the global config — see `apply_build_caps`.
                         apply_build_caps(&mut cfg);
 
+                        // Instance-level fields follow the global row, always.
+                        // A squadron row that disagrees is never honored — see
+                        // `GLOBAL_SEMANTICS_KEYS` for the incident that earned
+                        // this. Loud on purpose: the original failure was silent.
+                        // Read the global value from the live broadcast, NOT
+                        // `load_or_default`: that function writes a full-config
+                        // `session_start_snapshot` row to config_history on every
+                        // call, and the Kalshi and US traders call
+                        // `load_for_squadron` every 30s per squadron. Routing
+                        // through it here would have written ~2,880 history rows
+                        // per squadron per day, growing the DB without bound and
+                        // burying the audit trail this table exists to provide.
+                        // The sender is registered at startup and holds the same
+                        // value the DB does, so this is both cheaper and fresher;
+                        // the DB fallback covers the pre-registration window.
+                        let global = match global_config_tx() {
+                            Some(tx) => tx.borrow().clone(),
+                            None => Self::load_or_default().await,
+                        };
+                        let corrected = reconcile_global_semantics(&mut cfg, &global);
+                        if !corrected.is_empty() {
+                            warn!(
+                                "⚠️  Squadron [{}] config disagreed with the global row on {:?} — \
+                                 overridden to match. The stored row is stale; re-save it from the \
+                                 Control Tower to clear this.",
+                                squadron_id, corrected,
+                            );
+                        }
+
                         info!("⚙️  Squadron config loaded from DB: {}", squadron_id);
                         return Arc::new(cfg);
                     }
@@ -1327,7 +1396,36 @@ impl DynamicConfig {
             }
         }
 
-        let updated: DynamicConfig = serde_json::from_value(value)?;
+        let mut updated: DynamicConfig = serde_json::from_value(value)?;
+
+        // A squadron patch may not set an instance-level field.
+        //
+        // `current` above came through `load_for_squadron`, so it was already
+        // reconciled — but the merge just layered the caller's patch on top and
+        // could have reintroduced a divergence. Every writer of a squadron row
+        // funnels through here, so this is the chokepoint: the AI Actions Approve
+        // button, a hand-rolled `PATCH /api/squadrons/{id}/config`, and the
+        // global fan-out all land on this line.
+        //
+        // The fan-out is unaffected: `patch_config` writes and persists the
+        // global row BEFORE fanning out, so reconciling against global here
+        // yields exactly the value the operator asked for. What it stops is a
+        // squadron being set to a mode the instance is not in — one squadron
+        // quietly trading real money while the header, the banner and
+        // `GET /api/config` all report GHOST, with no API surface exposing the
+        // split.
+        let global: Arc<DynamicConfig> = match global_config_tx() {
+            Some(tx) => tx.borrow().clone(),
+            None => Self::load_or_default().await,
+        };
+        let overridden = reconcile_global_semantics(&mut updated, &global);
+        if !overridden.is_empty() {
+            warn!(
+                "⚠️  Squadron [{}] patch by {} tried to set instance-level field(s) {:?} — \
+                 ignored; these follow the global config. Change them globally instead.",
+                squadron_id, actor, overridden,
+            );
+        }
 
         // Record the diff BEFORE overwriting so the change stays revertable.
         // Keyed per squadron so the history view can tell which squadron moved.
@@ -1486,5 +1584,117 @@ mod build_cap_tests {
             serde_json::to_value(&once).unwrap(),
             serde_json::to_value(&twice).unwrap(),
         );
+    }
+}
+
+#[cfg(test)]
+mod global_semantics_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    /// Drift guard, matching `build_caps_cover_every_declared_key`. Every key in
+    /// `GLOBAL_SEMANTICS_KEYS` must actually be reconciled by the function; a key
+    /// declared but not handled is a field that silently stays divergent, which
+    /// is precisely the 2026-08-29 failure.
+    #[test]
+    fn reconciles_every_declared_key() {
+        for key in GLOBAL_SEMANTICS_KEYS {
+            let global = DynamicConfig::default();
+            let mut value = serde_json::to_value(&global).expect("serializes");
+
+            // Flip the declared key so it disagrees with global.
+            match &value[*key] {
+                serde_json::Value::Bool(b) => value[*key] = serde_json::Value::Bool(!b),
+                other => panic!(
+                    "{key} is {other:?}, which this test cannot flip — extend the test \
+                     when adding a non-bool global-semantics field"
+                ),
+            }
+
+            let mut cfg: DynamicConfig =
+                serde_json::from_value(value).unwrap_or_else(|e| panic!("{key}: {e}"));
+            let corrected = reconcile_global_semantics(&mut cfg, &global);
+
+            assert!(corrected.contains(key), "{key} declared but not reconciled");
+            let after = serde_json::to_value(&cfg).expect("serializes");
+            let want = serde_json::to_value(&global).expect("serializes");
+            assert_eq!(after[*key], want[*key], "{key} still disagrees after reconciliation");
+        }
+    }
+
+    /// The exact production state: global says live, the squadron says ghost.
+    /// The squadron must lose.
+    #[test]
+    fn a_ghosting_squadron_under_a_live_global_is_forced_live() {
+        let mut global = DynamicConfig::default();
+        global.ghost_mode = false;
+        let mut squadron = DynamicConfig::default();
+        squadron.ghost_mode = true;
+
+        let corrected = reconcile_global_semantics(&mut squadron, &global);
+        assert_eq!(corrected, vec!["ghost_mode"]);
+        assert!(!squadron.ghost_mode, "squadron kept simulating under a live global");
+    }
+
+    /// And the safe direction too: a global set to ghost must pull a squadron
+    /// back out of live trading, not only the other way around.
+    #[test]
+    fn a_live_squadron_under_a_ghost_global_is_forced_to_ghost() {
+        let mut global = DynamicConfig::default();
+        global.ghost_mode = true;
+        let mut squadron = DynamicConfig::default();
+        squadron.ghost_mode = false;
+
+        let corrected = reconcile_global_semantics(&mut squadron, &global);
+        assert_eq!(corrected, vec!["ghost_mode"]);
+        assert!(squadron.ghost_mode, "squadron stayed live under a ghost global");
+    }
+
+    /// Agreement is silent: reconciliation must report nothing when there is
+    /// nothing to correct, or every config read logs a warning.
+    #[test]
+    fn agreement_reports_no_corrections() {
+        let global = DynamicConfig::default();
+        let mut squadron = DynamicConfig::default();
+        assert!(reconcile_global_semantics(&mut squadron, &global).is_empty());
+    }
+
+    /// The write-path chokepoint. Every squadron-row writer funnels through
+    /// `apply_squadron_patch_as`, so reconciling AFTER the merge is what stops a
+    /// caller reintroducing a divergence the read path would only mask later.
+    /// This asserts the ordering property the fix depends on: merging a patch
+    /// that sets an instance-level field, then reconciling, yields the global
+    /// value rather than the patch's.
+    #[test]
+    fn a_patch_cannot_reintroduce_a_divergence_after_reconciliation() {
+        let mut global = DynamicConfig::default();
+        global.ghost_mode = false;
+
+        // Start from an already-reconciled base, as `load_for_squadron` returns.
+        let mut merged = DynamicConfig::default();
+        merged.ghost_mode = false;
+        assert!(reconcile_global_semantics(&mut merged, &global).is_empty());
+
+        // A squadron-scoped patch layers ghost_mode back on.
+        merged.ghost_mode = true;
+
+        // Reconciling after the merge is what makes the write safe.
+        let overridden = reconcile_global_semantics(&mut merged, &global);
+        assert_eq!(overridden, vec!["ghost_mode"]);
+        assert!(!merged.ghost_mode, "a squadron patch escaped the chokepoint");
+    }
+
+    /// Reconciliation is scoped: it must not touch a squadron's own risk
+    /// settings, which are legitimately per-squadron.
+    #[test]
+    fn per_squadron_risk_settings_are_left_alone() {
+        let global = DynamicConfig::default();
+        let mut squadron = DynamicConfig::default();
+        squadron.maker_max_entry_price = dec!(0.61);
+        squadron.momentum_max_exposure_usdc = dec!(42);
+
+        reconcile_global_semantics(&mut squadron, &global);
+        assert_eq!(squadron.maker_max_entry_price, dec!(0.61));
+        assert_eq!(squadron.momentum_max_exposure_usdc, dec!(42));
     }
 }

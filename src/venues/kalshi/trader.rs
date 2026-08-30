@@ -825,7 +825,7 @@ async fn trade_one_market(
     // Filing dimensions for every row this market writes. `asset` above is
     // only the shard (one DB for all Kalshi squadrons); venue, class and
     // underlying are the attributes that actually describe the trade.
-    let scope = TradeScope::new(
+    let mut scope = TradeScope::new(
         asset,
         KALSHI_VENUE,
         Some(market_class.clone()),
@@ -922,6 +922,8 @@ async fn trade_one_market(
     let mut available_collateral = starting;
     let mut session_pnl = Decimal::ZERO;
     let mut dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
+    // See `TradeScope::ghost`: the ledger records whether a trade was real.
+    scope.ghost = crate::config::GHOST_MODE || dyn_cfg.ghost_mode;
     if let Some(p) = &pool {
         let (coll, total) = sync_dashboard(&squadron_id, venue.as_ref(), p, &positions, starting).await;
         available_collateral = coll;
@@ -968,6 +970,8 @@ async fn trade_one_market(
                     session_pnl = if dyn_cfg.ghost_mode { crate::helpers::metrics::realised_session_pnl() } else { total - starting };
                 }
                 dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
+                // Track a mid-session mode flip in the filing scope too.
+                scope.ghost = crate::config::GHOST_MODE || dyn_cfg.ghost_mode;
                 continue;
             }
             _ = rescan_tick.tick() => {

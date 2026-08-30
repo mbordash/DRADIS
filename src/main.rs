@@ -802,6 +802,25 @@ async fn run() -> Result<()> {
         }
     }
 
+    // ── Graceful shutdown ────────────────────────────────────────────────────
+    // Registered here because this is where the venue client is known good, and
+    // because `Execution` has no cancel-all — the bulk cancel is an SDK call.
+    // Without this, SIGTERM (what `docker stop` and systemd send) killed the
+    // process mid-tick and left Maker quotes and TimeDecay GTC bids resting and
+    // fillable with nothing running to manage a fill. See helpers::shutdown.
+    {
+        let client_for_shutdown = Arc::clone(&trading_client);
+        dradis::helpers::shutdown::register(Box::new(move || {
+            let client = Arc::clone(&client_for_shutdown);
+            Box::pin(async move {
+                if !dradis::squadron::cancel_all_orders_with_retries(client.as_ref()).await {
+                    error!("❌ Shutdown: failed to cancel all resting orders — they may remain open on the book.");
+                }
+            })
+        }));
+    }
+    dradis::helpers::shutdown::spawn_signal_handler();
+
     // ── Startup: sync open_positions DB with on-chain state (LIVE mode only) ──
     // NOTE: We intentionally do NOT call purge_all_live_open_positions here.
     //

@@ -1309,6 +1309,12 @@ async fn restart() -> Response {
     warn!("🔄 Setup: restart requested via UI — exiting in 1s (supervisor will respawn)");
     tokio::spawn(async {
         tokio::time::sleep(std::time::Duration::from_millis(1000)).await;
+        // Cancel resting orders first. This is a deliberate, healthy shutdown
+        // requested by the operator, so there is a live runtime to await — unlike
+        // the watchdog's stall exit, which deliberately does not do this.
+        // Previously this called `process::exit(0)` directly, leaving Maker
+        // quotes and TimeDecay GTC bids on the book across the restart window.
+        crate::helpers::shutdown::run().await;
         std::process::exit(0);
     });
     Json(json!({"ok": true, "message": "restarting — back in ~30-60s"})).into_response()
@@ -1448,9 +1454,32 @@ async fn import_bundle(Json(bundle): Json<ImportBundle>) -> Response {
                 }
             }
         }
+        // The global row is loaded ONCE, after it has been restored above, so the
+        // squadron rows are reconciled against the bundle's own global config
+        // rather than whatever this box happened to hold before the import.
+        let restored_global = crate::helpers::dynamic_config::DynamicConfig::load_or_default().await;
+
         for (sid, v) in &bundle.squadron_configs {
             match serde_json::from_value::<crate::helpers::dynamic_config::DynamicConfig>(v.clone()) {
-                Ok(cfg) => {
+                Ok(mut cfg) => {
+                    // A bundle can carry a mode divergence across machines, and
+                    // one did: the 2026-08-29 export held global `ghost_mode:
+                    // false` beside three squadron rows saying `true`, and
+                    // restoring it verbatim put the new box straight back into
+                    // simulated trading while every screen said LIVE. Correct it
+                    // at import so the PERSISTED row is truthful — the read path
+                    // enforces this too, but a stored value nobody honors is its
+                    // own source of confusion.
+                    let corrected = crate::helpers::dynamic_config::reconcile_global_semantics(
+                        &mut cfg, &restored_global,
+                    );
+                    if !corrected.is_empty() {
+                        warn!(
+                            "📦 Bundle import: squadron '{}' disagreed with the bundle's global \
+                             config on {:?} — reconciled to the global value.",
+                            sid, corrected,
+                        );
+                    }
                     if let Ok(migrated) = serde_json::to_string(&cfg) {
                         crate::helpers::db::squadron_config_set(pool, sid, &migrated).await;
                         squadrons_restored += 1;
@@ -1499,10 +1528,38 @@ async fn list_profiles() -> Response {
     if let Some(obj) = v.as_object_mut() {
         obj.insert(
             "deployed_squadrons".to_string(),
-            json!(crate::helpers::dynamic_config::registered_squadron_ids()),
+            // Same target set the writes use, so the Setup dialog cannot tell an
+            // operator "no squadrons are currently deployed, so this changes
+            // nothing that is trading right now" while PATROLLING squadrons are
+            // listed on the panel beside it — which is what it did on Kalshi and
+            // Polymarket US, where the handle registry is always empty.
+            json!(config_write_targets().await),
         );
     }
     Json(v).into_response()
+}
+
+/// Every squadron a config write should reach: live handles UNION persisted rows.
+///
+/// `registered_squadron_ids()` alone covers only the intl venue — the Kalshi and
+/// Polymarket US traders never call `register_squadron_config_handle`, so the
+/// registry is permanently empty on those builds. Anything scoped to the
+/// registry therefore reported success over zero squadrons there, which is how
+/// the profile picker came to silently do nothing on two of the three venues
+/// this product sells.
+///
+/// Those traders reload their config from the DB every ~30s, so the persisted
+/// row is what reaches them; intl additionally gets a live handle push.
+async fn config_write_targets() -> Vec<String> {
+    let mut ids = crate::helpers::dynamic_config::registered_squadron_ids();
+    if let Some(pool) = crate::helpers::db::pool() {
+        for id in crate::helpers::db::squadron_config_list(pool).await {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+    }
+    ids
 }
 
 /// How far a profile apply reaches.
@@ -1571,7 +1628,7 @@ async fn apply_profile(Json(req): Json<ApplyProfileRequest>) -> Response {
     let mut squadrons_applied: Vec<String> = Vec::new();
     let mut squadron_errors: Vec<serde_json::Value> = Vec::new();
     if req.scope == ProfileScope::GlobalAndDeployed {
-        for sid in dyncfg::registered_squadron_ids() {
+        for sid in config_write_targets().await {
             match DynamicConfig::apply_squadron_patch_as(&sid, &patch, &actor).await {
                 Ok(_) => squadrons_applied.push(sid),
                 Err(e) => {

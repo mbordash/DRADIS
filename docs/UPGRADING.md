@@ -84,6 +84,30 @@ with each other in ways that lose money:
 Stopping the old instance is the whole mitigation. Sequence the cutover so the
 two never trade at once.
 
+## Check your trading mode after upgrading to 1.0.6 or later
+
+Read this before starting a 1.0.6 engine if you upgraded from 1.0.5 or earlier.
+
+In those versions the Control Tower's GHOST/LIVE button wrote only the
+instance-wide setting and did not reach squadrons that were already running. If
+you pressed LIVE on an older instance, the screens said LIVE while the squadrons
+went on simulating. Many operators are in that state without knowing it.
+
+From 1.0.6 the two are kept in agreement, and the instance-wide setting is the
+one that wins. So the first time a 1.0.6 engine starts, any squadron that was
+quietly still simulating begins **trading real money**, with no further
+confirmation, because that is what the saved setting has been asking for.
+
+Before you start the new instance, open Setup and confirm the mode is what you
+actually intend. If you are not sure which state you were in, switch to ghost
+mode first, start the engine, watch the Console for a few minutes, and go live
+deliberately once you can see what it is doing.
+
+One related consequence: a 1.0.5 trade log could not record whether a trade was
+simulated, and displayed every completed trade as real. If your P&L history was
+built on an older instance it may mix simulated and real results with no way to
+tell them apart. Trades recorded from 1.0.6 onward carry the distinction.
+
 ## What does not transfer
 
 The bundle carries configuration, not history. The new instance starts fresh on:

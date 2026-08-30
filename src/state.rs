@@ -62,6 +62,27 @@ pub struct TradeScope {
     /// win" or "who takes the Senate" has no underlying instrument. Any design
     /// that forces a symbol here has to invent one.
     pub underlying: Option<String>,
+    /// Was this trade simulated?
+    ///
+    /// The `trades` ledger had no such field, so a ghost exit was written
+    /// through the same path as a real one and was indistinguishable from it
+    /// afterwards. `open_positions` has carried a `ghost_mode` column all along,
+    /// so the Control Tower badged OPEN positions correctly while the completed
+    /// trade log hardcoded `ghost: false` for every row — a customer stuck in
+    /// simulation (see `GLOBAL_SEMANTICS_KEYS`) saw a ledger of unmarked
+    /// "completed" trades with P&L, which is the most persuasive possible
+    /// evidence that they were trading for real.
+    ///
+    /// Set per tick by the trading loops, immediately beside the value the order
+    /// paths gate on, so a scope cloned into a spawned task snapshots the mode
+    /// that was in force when the trade happened rather than the mode now.
+    ///
+    /// KNOWN GAP: reconciliation and settlement paths construct their own scope
+    /// without a live squadron to ask and currently default this to `false`.
+    /// Those bookings can still mislabel a simulated position as real. Fixing it
+    /// means carrying the flag from the `open_positions` row being closed, which
+    /// is keyed by token id while `trades.market` holds a market name.
+    pub ghost: bool,
 }
 
 impl TradeScope {
@@ -71,7 +92,7 @@ impl TradeScope {
         market_class: Option<String>,
         underlying: Option<String>,
     ) -> Self {
-        Self { shard: shard.into(), venue: venue.into(), market_class, underlying }
+        Self { shard: shard.into(), venue: venue.into(), market_class, underlying, ghost: false }
     }
 
     /// Scope for paths that know only which database to write to — chain-sync
@@ -79,7 +100,7 @@ impl TradeScope {
     /// still resolves from the shard registry; class and underlying stay `NULL`
     /// rather than being guessed.
     pub fn shard_only(shard: impl Into<String>) -> Self {
-        Self { shard: shard.into(), venue: String::new(), market_class: None, underlying: None }
+        Self { shard: shard.into(), venue: String::new(), market_class: None, underlying: None, ghost: false }
     }
 
     /// Convenience for crypto markets, where the underlying and the taxonomy
@@ -178,6 +199,43 @@ mod strategy_market_key_tests {
         assert_eq!(k, strategy_market_key("us-crypto-open", "fairvalue"));
         assert!(k.contains("us-crypto-open"));
         assert!(k.contains("fairvalue"));
+    }
+}
+
+#[cfg(test)]
+mod trade_scope_ghost_tests {
+    use super::*;
+
+    /// A trade's filing scope must be able to say the trade was simulated.
+    /// Without it the ledger recorded ghost and real exits identically, and the
+    /// Control Tower asserted "real" for every completed row.
+    #[test]
+    fn a_scope_carries_whether_the_trade_was_real() {
+        let mut scope = TradeScope::new("btc", "intl", Some("crypto".into()), Some("btc".into()));
+        assert!(!scope.ghost, "a scope must default to real, never to simulated");
+        scope.ghost = true;
+        assert!(scope.ghost);
+    }
+
+    /// Clones snapshot the mode at the moment they are taken. Exit bookings run
+    /// in spawned tasks that outlive the tick, so a clone must record the mode
+    /// the trade happened under rather than the mode when the task finally runs.
+    #[test]
+    fn a_clone_snapshots_the_mode_at_the_time_of_the_trade() {
+        let mut scope = TradeScope::new("btc", "intl", None, None);
+        scope.ghost = true;
+        let booked = scope.clone();      // captured into the exit task
+        scope.ghost = false;             // operator goes live mid-flight
+        assert!(booked.ghost, "the booking must stay labeled as the simulation it was");
+        assert!(!scope.ghost);
+    }
+
+    /// Reconciliation scopes have no live squadron to ask. They default to real,
+    /// which is the documented KNOWN GAP on `TradeScope::ghost` — pinned here so
+    /// the limitation is visible rather than discovered.
+    #[test]
+    fn a_shard_only_scope_defaults_to_real() {
+        assert!(!TradeScope::shard_only("btc").ghost);
     }
 }
 

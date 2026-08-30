@@ -86,6 +86,17 @@ fn referenced_constants() -> BTreeSet<String> {
         let Ok(src) = std::fs::read_to_string(&file) else { continue };
         let src = strip_line_comments(&src);
         for (idx, _) in src.match_indices("config::") {
+            // Require a word boundary before `config`, or every reference to a
+            // constant in ANOTHER module whose name ends in `config` is read as
+            // one of this module's. `dynamic_config::GLOBAL_SEMANTICS_KEYS` was
+            // reported as a missing `config::GLOBAL_SEMANTICS_KEYS` in all three
+            // profile templates — a constant that does not belong in config.rs
+            // and never will.
+            let boundary_ok = idx == 0
+                || !matches!(src.as_bytes()[idx - 1], b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'_');
+            if !boundary_ok {
+                continue;
+            }
             let rest = &src[idx + "config::".len()..];
             let ident: String = rest
                 .chars()

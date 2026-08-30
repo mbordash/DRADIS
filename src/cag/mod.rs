@@ -542,4 +542,64 @@ mod adama_registration_tests {
             "stand-down fired a token the patrol task does not hold — the squadron would keep trading",
         );
     }
+
+    /// The other half of the test above, and the half that was missing.
+    ///
+    /// Firing the registered token only helps if the token the patrol loop
+    /// selects on is DERIVED from it. On the intl venue it was not:
+    /// `run_market_loop` minted a fresh `CancellationToken::new()` and moved it
+    /// straight into `patrol()`, so `patrol()` awaited a token no other code
+    /// held. The registered token fired into nothing, and the squadron kept
+    /// entering, quoting and resting GTC bids with real money until the next
+    /// hourly rotation — up to about 55 minutes — while the Control Tower showed
+    /// STOOD_DOWN and promised resting orders had been cancelled.
+    ///
+    /// The test above passed throughout, because the CAG side was always
+    /// correct. What was never asserted is this relationship.
+    #[test]
+    fn a_derived_patrol_token_is_cancelled_by_stand_down() {
+        let cag = Cag::new();
+        let cancel = CancellationToken::new();
+
+        cag.register_adama_squadron(
+            "politics-open", "0xmarket", "politics", "Who wins?",
+            &["price".to_string()], &["maker".to_string()],
+            cancel.clone(),
+        );
+
+        // Derived exactly as `run_market_loop` now derives it.
+        let patrol_cancel = cancel.child_token();
+        assert!(!patrol_cancel.is_cancelled(), "must not be pre-cancelled");
+
+        assert!(cag.stand_down(&"politics-open".to_string()));
+        assert!(
+            patrol_cancel.is_cancelled(),
+            "the token patrol() selects on was not reached by stand-down — \
+             the squadron would keep trading real money",
+        );
+    }
+
+    /// Regression guard naming the exact shape of the defect: a token minted
+    /// independently of the registered one is NOT reached. If someone
+    /// reintroduces `CancellationToken::new()` at the `patrol()` call site, this
+    /// is what they have done.
+    #[test]
+    fn an_independent_patrol_token_is_never_reached_by_stand_down() {
+        let cag = Cag::new();
+        let cancel = CancellationToken::new();
+
+        cag.register_adama_squadron(
+            "politics-open", "0xmarket", "politics", "Who wins?",
+            &["price".to_string()], &["maker".to_string()],
+            cancel.clone(),
+        );
+
+        let independent = CancellationToken::new(); // what run.rs used to pass
+        assert!(cag.stand_down(&"politics-open".to_string()));
+        assert!(cancel.is_cancelled(), "the registered token fires");
+        assert!(
+            !independent.is_cancelled(),
+            "an independent token is unreachable — this is why the derived token above matters",
+        );
+    }
 }

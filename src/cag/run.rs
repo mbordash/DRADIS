@@ -507,9 +507,26 @@ where
         }
 
         // Delegate the inner tick loop to Squadron::patrol().
-        // Returns when market_rx.changed() fires (rotation) or the watchdog
-        // forces a restart via patrol_cancel.
-        let patrol_cancel = tokio_util::sync::CancellationToken::new();
+        // Returns when market_rx.changed() fires (rotation) or when this
+        // squadron is stood down.
+        //
+        // A CHILD of the loop's registered token, not a fresh one. This used to
+        // mint `CancellationToken::new()` here and move it straight into
+        // `patrol()`, so nothing anywhere could ever fire it: `patrol()` selected
+        // on a token no other code held. The registered token — the one
+        // `Cag::stand_down` fires, attached at `register_with_cancel` above — was
+        // only examined at the top of `'market_loop`, which is not reached until
+        // `patrol()` has already returned at the next hourly rotation.
+        //
+        // So Stand Down did nothing for up to ~55 minutes on this venue while the
+        // Control Tower showed STOOD_DOWN and its confirm dialog promised resting
+        // orders were cancelled. The squadron kept entering, quoting and resting
+        // GTC bids with real money. Kalshi and Polymarket US were never affected;
+        // their tick loops select on the registered token directly.
+        //
+        // A child rather than a clone so that a future edit inside `patrol()`
+        // cancelling its own token cannot tear down the whole market loop.
+        let patrol_cancel = cancel.child_token();
         squadron.patrol(patrol_cancel, &mut patrol_ctx).await;
     }
 }
