@@ -127,6 +127,22 @@ type QuoteEpochs = std::collections::HashMap<PositionKey, (u64, Instant)>;
 /// Called both when a quote is PLACED (claiming an epoch for its own fill
 /// watcher) and when one is PULLED (so the pulled quote's watcher can no longer
 /// claim a later fill).
+/// Would a resting BUY limit at `quote_price` have been filled by this book?
+///
+/// A resting bid fills when somebody is willing to sell into it, which is when
+/// the best ASK falls to the quote or below. Simulating anything sooner is the
+/// simulator handing itself a trade: the maker quotes at least `maker_cross_buffer`
+/// below the ask by construction, so a quote treated as instantly filled is born
+/// in profit against the live bid and satisfies its own take-profit on the next
+/// tick. That produced the 2026-08-30 ghost treadmill — 60 recorded trades in 45
+/// minutes, 6 of them distinct, every one fabricated.
+///
+/// `ask == 1` is the "no book" sentinel the price channel defaults to, not an
+/// offer to sell at a dollar, and `ask == 0` is an empty book. Neither fills.
+fn ghost_quote_is_crossed(ask: Decimal, quote_price: Decimal) -> bool {
+    ask > dec!(0) && ask < dec!(1) && ask <= quote_price
+}
+
 fn bump_quote_epoch(map: &mut QuoteEpochs, key: &PositionKey) -> u64 {
     let e = map.entry(key.clone()).or_insert((0, Instant::now()));
     e.0 += 1;
@@ -568,6 +584,29 @@ impl Squadron {
         let mut maker_resting_exits: std::collections::HashMap<PositionKey, MakerRestingExit> =
             std::collections::HashMap::new();
 
+        // Simulated maker quotes that have been placed but NOT yet filled.
+        //
+        // Ghost mode used to stamp a maker quote `fill_confirmed_at: Some(now)`
+        // the instant it was placed, which is not what a resting bid does. The
+        // quote sits two or more ticks below the ask by construction
+        // (`maker_cross_buffer`), so it was born in profit against the live bid
+        // and satisfied its take-profit on the very next tick. The result was a
+        // treadmill: quote, "fill", take profit, re-quote, roughly every five
+        // seconds. On 2026-08-30 a local ghost session booked 60 trades in 45
+        // minutes with only 6 distinct outcomes among them, all fabricated.
+        //
+        // That is the DEFAULT first-run experience — GHOST_MODE_DEFAULT is true
+        // for a new install — so it is what a customer's first hour looks like,
+        // and it poisons exactly the paper record ghost mode exists to produce.
+        //
+        // These are held OUT of the position map on purpose: an unfilled quote
+        // is not a position, and keeping it out means `fill_effective_at`'s ghost
+        // fallback (which treats any ghost position as filled at `opened_at`)
+        // stays correct for the taker entries it was written for, where an
+        // immediate fill really is the right simulation.
+        let mut ghost_resting_quotes: std::collections::HashMap<PositionKey, Position> =
+            std::collections::HashMap::new();
+
         // Collateral as it read BEFORE a position was entered, keyed like the
         // position map.
         //
@@ -845,6 +884,58 @@ impl Squadron {
                     // every clone taken into a spawned exit task records the mode
                     // the trade actually happened under. See `TradeScope::ghost`.
                     scope.ghost = ghosting;
+
+                    // ── Ghost maker fills: rest until the book crosses the quote ──
+                    //
+                    // A resting BUY at Q fills when somebody is willing to sell at
+                    // Q, i.e. when the best ASK falls to Q or below. Anything
+                    // sooner is not a fill, it is the simulator handing itself a
+                    // trade. Evaluated before the vipers run so a quote that fills
+                    // this tick is visible to its own exit logic on the same tick.
+                    //
+                    // Deliberately conservative: the ask is sampled once per tick,
+                    // so a book that dips through the quote and recovers between
+                    // samples is missed. Under-reporting simulated fills is the
+                    // right direction to be wrong in — the alternative is the
+                    // fabricated profit this replaced.
+                    if ghosting && !ghost_resting_quotes.is_empty() {
+                        let crossed: Vec<PositionKey> = ghost_resting_quotes
+                            .iter()
+                            .filter(|(pk, pos)| {
+                                let Some(ref mk) = maker_market_config else { return false };
+                                let ask = if pk.market == mk.yes_token {
+                                    maker_ya
+                                } else if pk.market == mk.no_token {
+                                    maker_na
+                                } else {
+                                    // The quote's market has rotated away from under
+                                    // it; there is no book to fill against.
+                                    return false;
+                                };
+                                ghost_quote_is_crossed(ask, pos.avg_entry)
+                            })
+                            .map(|(pk, _)| pk.clone())
+                            .collect();
+                        for pk in crossed {
+                            if let Some(mut pos) = ghost_resting_quotes.remove(&pk) {
+                                let rested = (Utc::now() - pos.opened_at).num_seconds();
+                                pos.fill_confirmed_at = Some(Utc::now());
+                                info!(
+                                    "👻 GHOST_MODE MakerFill [{}]: {} | shares={:.2} @ ${:.4} — ask crossed after {}s resting (simulated)",
+                                    pk.strategy, pos.market_name, pos.shares, pos.avg_entry, rested,
+                                );
+                                positions.lock().await.insert(pk, pos);
+                            }
+                        }
+                    }
+                    // A quote whose market has rotated away can never fill; drop it
+                    // rather than let the map grow across rotations.
+                    if let Some(ref mk) = maker_market_config {
+                        ghost_resting_quotes
+                            .retain(|pk, _| pk.market == mk.yes_token || pk.market == mk.no_token);
+                    } else {
+                        ghost_resting_quotes.clear();
+                    }
 
                     // Hoist mutex-await calls OUT of the struct literal so that
                     // borrow() Ref guards (oracle_rx, velocity_rx, etc.) in the
@@ -1976,9 +2067,31 @@ impl Squadron {
                                     let pk = PositionKey::new(sq_key.clone(), sn.clone(), p_token_m.clone());
                                     { let pending = pending_orders.lock().await; if let Some(expiry) = pending.get(&pk) { if expiry > &Instant::now() { continue; } } }
                                     if ghosting {
+                                        // Already holding a filled position on this leg.
                                         if positions.lock().await.contains_key(&pk) { continue; }
-                                        positions.lock().await.insert(pk.clone(), Position { shares: p.shares, avg_entry: p.price, opened_at: Utc::now(), close_time: None, market_name: p.market_name.clone(), pair_token_id: p_token_m.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None, entry_fee: Decimal::ZERO });
-                                        info!("👻 GHOST_MODE MakerQuote [{}]: {} | shares={:.2}, bid=${:.4} (simulated)", sn, p.market_name, p.shares, p.price);
+                                        // The quote RESTS. It becomes a position only when
+                                        // the ask crosses it — see the fill simulation at
+                                        // the top of the tick. Re-emitting the same signal
+                                        // each tick repositions the existing quote instead
+                                        // of stacking duplicates, which is what a real
+                                        // maker does when it reprices.
+                                        match ghost_resting_quotes.get_mut(&pk) {
+                                            Some(resting) => {
+                                                if resting.avg_entry != p.price || resting.shares != p.shares {
+                                                    info!("👻 GHOST_MODE MakerReprice [{}]: {} | ${:.4} → ${:.4} (simulated)", sn, p.market_name, resting.avg_entry, p.price);
+                                                    resting.avg_entry = p.price;
+                                                    resting.shares = p.shares;
+                                                    // A repriced quote loses its queue position,
+                                                    // so its rest clock starts again.
+                                                    resting.opened_at = Utc::now();
+                                                }
+                                                continue;
+                                            }
+                                            None => {
+                                                ghost_resting_quotes.insert(pk.clone(), Position { shares: p.shares, avg_entry: p.price, opened_at: Utc::now(), close_time: None, market_name: p.market_name.clone(), pair_token_id: p_token_m.clone(), fill_confirmed_at: None, paired_leg_token_id: None, entry_fee: Decimal::ZERO });
+                                            }
+                                        }
+                                        info!("👻 GHOST_MODE MakerQuote [{}]: {} | shares={:.2}, bid=${:.4} — resting until ask crosses (simulated)", sn, p.market_name, p.shares, p.price);
                                         placed = true;
                                     } else {
                                         if !positions.lock().await.contains_key(&pk) {
@@ -2059,6 +2172,15 @@ impl Squadron {
                             StrategySignal::MakerCancel { tokens } => {
                                 for tok in tokens {
                                     let pk = PositionKey::new(sq_key.clone(), sn.clone(), tok.clone());
+                                    // In ghost mode an unfilled quote is not in the
+                                    // position map at all — pulling it is just dropping
+                                    // the simulated resting order.
+                                    if ghosting {
+                                        if let Some(pulled) = ghost_resting_quotes.remove(&pk) {
+                                            info!("👻 GHOST_MODE MakerCancel [{}]: {} | pulling unfilled quote @ ${:.4} (simulated)", sn, pulled.market_name, pulled.avg_entry);
+                                        }
+                                        continue;
+                                    }
                                     // Never touch a CONFIRMED fill — only pull unfilled resting quotes.
                                     let is_unfilled = {
                                         let pos = positions.lock().await;
@@ -2070,8 +2192,10 @@ impl Squadron {
                                     // endpoint, and without this it would adopt the NEXT quote's
                                     // fill as its own and write a second entry row.
                                     bump_quote_epoch(&mut *quote_epochs.lock().await, &pk);
+                                    // Defensive only: ghost pulls return above, where the
+                                    // simulated resting quote actually lives. Kept so this
+                                    // never reaches a venue call if that guard is ever moved.
                                     let matched = if ghosting {
-                                        info!("👻 GHOST_MODE MakerCancel [{}]: {} (simulated quote-pull)", sn, tok);
                                         dec!(0)
                                     } else {
                                         let (order_found, m) = crate::helpers::balance::cancel_resting_orders_for_token(&trading_client, &tok).await;
@@ -2511,6 +2635,48 @@ pub(crate) fn event_market_retire_due(
 /// it fall back to the hourly leg. See `Squadron::single_market`.
 pub(crate) fn single_market_arb_enabled(single_market: bool, has_maker_venue: bool) -> bool {
     single_market && !has_maker_venue
+}
+
+#[cfg(test)]
+mod ghost_maker_fill_tests {
+    use super::ghost_quote_is_crossed;
+    use rust_decimal_macros::dec;
+
+    /// Reproduces the 2026-08-30 ghost treadmill and asserts it cannot recur.
+    ///
+    /// The maker quoted a NO leg at $0.15 while the book showed a $0.16 bid and
+    /// a far higher ask. Stamped filled on placement, the position was instantly
+    /// 6.66% in profit against the live bid, took its target on the next tick,
+    /// re-quoted at the same price, and repeated every five seconds: 60 trades in
+    /// 45 minutes, 6 distinct. A resting bid at $0.15 under an ask of $0.21 does
+    /// not fill, and now does not pretend to.
+    #[test]
+    fn the_quote_that_started_the_treadmill_does_not_fill() {
+        assert!(
+            !ghost_quote_is_crossed(dec!(0.21), dec!(0.15)),
+            "an ask of $0.21 is nobody offering to sell at our $0.15 bid",
+        );
+        // Nor at any ask above the quote, however close.
+        assert!(!ghost_quote_is_crossed(dec!(0.16), dec!(0.15)));
+    }
+
+    /// The fill that SHOULD happen still does: a seller reaching our price.
+    #[test]
+    fn an_ask_reaching_the_quote_fills_it() {
+        assert!(ghost_quote_is_crossed(dec!(0.15), dec!(0.15)), "ask AT the quote fills");
+        assert!(ghost_quote_is_crossed(dec!(0.14), dec!(0.15)), "ask through the quote fills");
+    }
+
+    /// An absent book is not a counterparty. `1` is the price channel's "no
+    /// quotes" default and `0` is an empty side; treating either as a fill would
+    /// hand the simulator a trade at the exact moment it knows the least.
+    #[test]
+    fn an_empty_book_never_fills() {
+        assert!(!ghost_quote_is_crossed(dec!(1), dec!(0.15)), "the no-book sentinel must not fill");
+        assert!(!ghost_quote_is_crossed(dec!(0), dec!(0.15)), "an empty ask side must not fill");
+        // Including when the quote itself is at the top of the range.
+        assert!(!ghost_quote_is_crossed(dec!(1), dec!(0.99)));
+    }
 }
 
 #[cfg(test)]
