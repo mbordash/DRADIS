@@ -432,7 +432,11 @@ export default function TradelogPage({ availableAssets }: Props) {
   // is fine for a glance and useless for deciding whether to close a position by
   // hand. This asks the venue directly and shows the BID, because that is what a
   // manual exit sells into. Only polls while positions are actually open.
-  const { data: quotes = [] } = useSWR(
+  //
+  // `fresh` is threaded through the fetcher rather than captured from state so a
+  // press cannot race the poll into serving a cached read: the flag travels with
+  // the request that the press initiated.
+  const { data: quotes = [], mutate: mutateQuotes } = useSWR(
     allPositions.length > 0 ? ['tradelog-quotes', assets.join(',')] : null,
     async () => {
       const results = await Promise.allSettled(assets.map(a => getPositionQuotes(a)));
@@ -440,6 +444,26 @@ export default function TradelogPage({ availableAssets }: Props) {
     },
     { refreshInterval: 4_000 },
   );
+
+  // Manual refresh: bypass the server's quote cache and repaint from the venue.
+  //
+  // The 4s poll is paced for a dashboard left open; an operator deciding whether
+  // to call RTB on a position wants the book as of the moment they ask. Disabled
+  // with nothing open, because there would be no quote to fetch.
+  const [refreshing, setRefreshing] = useState(false);
+  const quotesRefreshable = allPositions.length > 0;
+  async function refreshQuotes() {
+    if (refreshing || !quotesRefreshable) return;
+    setRefreshing(true);
+    try {
+      await mutateQuotes(async () => {
+        const results = await Promise.allSettled(assets.map(a => getPositionQuotes(a, true)));
+        return results.flatMap(r => (r.status === 'fulfilled' ? r.value : []));
+      }, { revalidate: false });
+    } finally {
+      setRefreshing(false);
+    }
+  }
 
   const quoteByToken = useMemo(() => {
     const m: Record<string, PositionQuote> = {};
@@ -596,6 +620,21 @@ export default function TradelogPage({ availableAssets }: Props) {
             <p className="label-muted">Mission Tradelog</p>
           </div>
           <div className="flex items-center gap-3">
+            <button
+              type="button"
+              onClick={refreshQuotes}
+              disabled={refreshing || !quotesRefreshable}
+              title={
+                quotesRefreshable
+                  ? 'Refresh live bid/ask for open positions, bypassing the server quote cache'
+                  : 'No open positions to refresh'
+              }
+              aria-label="Refresh live quotes"
+              className="text-xs font-mono text-gray-500 hover:text-indigo-400 disabled:opacity-40 disabled:hover:text-gray-500 transition-colors"
+            >
+              <span className={refreshing ? 'inline-block animate-spin' : 'inline-block'}>⟳</span>
+              <span className="ml-1">{refreshing ? 'Refreshing…' : 'Refresh quotes'}</span>
+            </button>
             <ExportCsvButton assets={assets} />
             <span className="text-xs font-mono text-gray-600">
               {isLoading ? 'Loading…' : `${filtered.length} entries`}

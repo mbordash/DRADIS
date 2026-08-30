@@ -1319,7 +1319,43 @@ impl Strategy for MakerStrategyImpl {
                 });
             }
 
-            if fill_at.is_some() && profit_pct >= dc.maker_target_profit_pct {
+            // Take-profit target, floored so it actually clears the exit it pays for.
+            //
+            // The Maker quote is post-only and is charged NO taker fee; only the
+            // FAK that closes it is. So the cost to beat is the single-leg
+            // `exit_only_fee_pct`, half the round trip Momentum floors against —
+            // charging the full round trip here would roughly double the target
+            // and stall the viper on exactly the cheap entries it is built for.
+            //
+            // Unfloored, the flat target is below break-even across the bottom of
+            // the permitted entry band: the exit fee is `rate × (1 − p)` of
+            // notional, so at rate 0.07 a $0.18 entry owes 5.7% before it profits
+            // at all and the 7% target clears it by a hair, while a $0.15 entry
+            // owes 6.0%. Observed 2026-08-30 on a $0.18 → $0.19 round trip:
+            // "Maker TP: gain=5.55%" booked −$0.052, a loss logged as a win.
+            //
+            // The fee is charged at the EXIT, and on a quadratic schedule a
+            // higher exit costs more on any contract below ~$0.50 — so pricing
+            // the floor at the entry price understates it by
+            // `rate · g · (1 − p(2 + g))` right across Maker's band. Two passes:
+            // price the fee at the configured target, then re-price it at the
+            // floor that produced, which is where the exit will actually land.
+            // It converges immediately; a third pass moves nothing.
+            let mut tp_target = dc.maker_target_profit_pct;
+            for _ in 0..2 {
+                let fee_floor = crate::venues::exit_fee_pct_at_gain(position.avg_entry, tp_target)
+                    * dc.maker_tp_fee_margin_mult;
+                tp_target = dc.maker_target_profit_pct.max(fee_floor);
+            }
+            if tp_target > dc.maker_target_profit_pct {
+                tracing::debug!(
+                    "Maker TP floor: target {:.2}% → {:.2}% (exit fee {:.2}% at entry ${:.4})",
+                    dc.maker_target_profit_pct * dec!(100), tp_target * dec!(100),
+                    crate::venues::exit_fee_pct_at_gain(position.avg_entry, tp_target) * dec!(100),
+                    position.avg_entry,
+                );
+            }
+            if fill_at.is_some() && profit_pct >= tp_target {
                 return Ok(StrategySignal::Exit {
                     params: OrderParams {
                         token_id: token_id.clone(),                        price: bid,
@@ -1332,7 +1368,11 @@ impl Strategy for MakerStrategyImpl {
                         post_only: false,
                         ghost_mode: dc.ghost_mode,
                     },
-                    reason: format!("Maker TP: gain={:.2}%", profit_pct * dec!(100)),
+                    reason: format!(
+                        "Maker TP: gain={:.2}% (target {:.2}%, exit fee {:.2}%)",
+                        profit_pct * dec!(100), tp_target * dec!(100),
+                        crate::venues::exit_fee_pct_at_gain(position.avg_entry, profit_pct) * dec!(100),
+                    ),
                     exit_pair: false,
                 });
             }
@@ -1548,6 +1588,118 @@ mod toxic_obi_streak_tests {
     #[test]
     fn unknown_token_starts_at_zero() {
         assert_eq!(maker_toxic_obi_streak("test_tok_streak_unknown", false), 0);
+    }
+}
+
+#[cfg(test)]
+mod tp_fee_floor_tests {
+    use crate::helpers::dynamic_config::DynamicConfig;
+    use rust_decimal_macros::dec;
+
+    /// A Maker take-profit must clear the exit it pays for.
+    ///
+    /// The quote is post-only and is charged nothing; the closing FAK pays
+    /// `rate × p × (1 − p)` per share, which against an entry notional of `p` is
+    /// `rate × (1 − p)` — 5.7% at a $0.18 entry, 6.0% at $0.15. A flat 7% target
+    /// clears those by a hair and fails outright once the exit prints below the
+    /// entry-price approximation, which is exactly what happened on 2026-08-30:
+    /// $0.18 → $0.19 booked "Maker TP: gain=5.55%" and −$0.052.
+    #[test]
+    fn take_profit_target_clears_the_exit_fee_across_the_entry_band() {
+        let dc = DynamicConfig::default();
+        let mut price = dc.maker_min_entry_price;
+        while price <= dc.maker_max_entry_price {
+            // Mirror the two-pass floor from `evaluate_exit`.
+            let mut effective = dc.maker_target_profit_pct;
+            for _ in 0..2 {
+                let floor = crate::venues::exit_fee_pct_at_gain(price, effective)
+                    * dc.maker_tp_fee_margin_mult;
+                effective = dc.maker_target_profit_pct.max(floor);
+            }
+            // Price the fee where it is actually charged: at the exit this
+            // target implies. Checking it at the ENTRY price is what let the
+            // original bug through, and would let it through again here.
+            let fee_at_exit = crate::venues::exit_fee_pct_at_gain(price, effective);
+            assert!(
+                effective > fee_at_exit,
+                "at entry ${price:.2} the effective TP target {:.2}% does not clear \
+                 the exit fee it will actually pay, {:.2}% — a take-profit there books a loss",
+                effective * dec!(100),
+                fee_at_exit * dec!(100),
+            );
+            price += dec!(0.01);
+        }
+    }
+
+    /// The entry-price approximation is optimistic, and the test above must be
+    /// able to see that. Pins the direction of the error Fable identified:
+    /// on any contract below ~$0.50 the exit fee EXCEEDS the entry-price
+    /// estimate, so a floor built on the estimate alone is too low.
+    #[cfg(not(feature = "us_retail"))]
+    #[test]
+    fn pricing_the_fee_at_entry_understates_what_the_exit_pays() {
+        let entry = dec!(0.18);
+        let gain = dec!(0.07);
+        let at_entry = crate::venues::exit_only_fee_pct(entry);
+        let at_exit = crate::venues::exit_fee_pct_at_gain(entry, gain);
+        assert!(
+            at_exit > at_entry,
+            "exit fee {at_exit} must exceed the entry-price estimate {at_entry} \
+             on a cheap contract — this is why the floor is priced at the exit",
+        );
+        // And the approximation is exactly the zero-gain case.
+        assert_eq!(crate::venues::exit_fee_pct_at_gain(entry, dec!(0)), at_entry);
+    }
+
+    /// The floor must charge ONE leg, not two. Maker pays no entry fee, so
+    /// flooring against the round trip would roughly double the target and stall
+    /// the viper on the cheap entries it is built for.
+    #[test]
+    fn maker_floors_against_one_leg_not_the_round_trip() {
+        let entry = dec!(0.18);
+        let single = crate::venues::exit_only_fee_pct(entry);
+        let round_trip = crate::venues::round_trip_fee_pct(entry);
+        assert_eq!(
+            round_trip, single * dec!(2),
+            "the round trip is exactly two legs; Maker must be charged one",
+        );
+        // US Retail charges no taker fee, so the floor is inert there rather than
+        // wrong — assert it binds only on the venues that actually charge one.
+        #[cfg(not(feature = "us_retail"))]
+        assert!(
+            single > dec!(0), "this venue charges a taker fee, so the floor must bind",
+        );
+    }
+
+    /// The observed trade must no longer qualify as a take-profit.
+    ///
+    /// intl-only: it replays a Polymarket International round trip and prices it
+    /// with that venue's own fee function, which is not compiled for the others.
+    #[cfg(feature = "intl_clob")]
+    #[test]
+    fn the_losing_take_profit_of_2026_08_30_no_longer_fires() {
+        let dc = DynamicConfig::default();
+        let entry = dec!(0.18);
+        let bid = dec!(0.19);
+        let profit_pct = (bid - entry) / entry;
+
+        let fee_floor = crate::venues::exit_only_fee_pct(entry) * dc.maker_tp_fee_margin_mult;
+        let target = dc.maker_target_profit_pct.max(fee_floor);
+        assert!(
+            profit_pct < target,
+            "gain {:.2}% must not clear target {:.2}% — it netted -$0.052 in production",
+            profit_pct * dec!(100), target * dec!(100),
+        );
+
+        // And confirm the arithmetic that made it a loss, from the venue's own
+        // fee function rather than a restatement of it.
+        let shares = dec!(66.666666666666666666666666667);
+        let gross = (bid - entry) * shares;
+        let exit_fee = crate::venues::intl::taker_fee(crate::config::INTL_TAKER_FEE_RATE, bid, shares);
+        assert!(
+            gross - exit_fee < dec!(0),
+            "gross ${gross:.4} minus exit fee ${exit_fee:.4} was a net loss",
+        );
     }
 }
 

@@ -138,6 +138,28 @@ struct FairValueGlobals {
     /// second stop-out on a re-entered token from the same stop-out re-emitted,
     /// so a re-entry still counts while a retry does not.
     sl_counted: StdMutex<HashMap<String, DateTime<Utc>>>,
+
+    /// Positions whose stop-loss veto has been withdrawn, keyed token_id →
+    /// `Position::opened_at`.
+    ///
+    /// Once the model is judged to be retreating, that verdict must STICK for
+    /// the life of the position. Without the latch the withdrawal is undone by
+    /// its own success: `arm_cooldown` clears the `entry_fair` anchor on every
+    /// exit EMISSION, but an emission is not a close — a stop FAK into a
+    /// collapsing bid can miss, and the collapsing book is exactly the one this
+    /// guard fires on. On the next tick `reversal_baseline` would fall back to
+    /// `avg_entry`, which entry rules guarantee is BELOW the true entry fair, so
+    /// the withdrawal threshold drops and the veto re-engages on the position
+    /// the strategy just decided to dump.
+    ///
+    /// Replaying incident A with one missed fill: the anchor 0.723 is cleared,
+    /// the baseline falls back to the $0.58 entry, the threshold collapses from
+    /// 0.687 to 0.551, and fair 0.677 re-arms the veto — restoring the exact
+    /// unbounded ride to the catastrophic stop that the guard exists to end.
+    ///
+    /// Keyed the same way as `sl_counted`: same token AND same open instant is
+    /// the same position, so a genuine re-entry starts clean.
+    veto_withdrawn: StdMutex<HashMap<String, DateTime<Utc>>>,
 }
 
 impl FairValueGlobals {
@@ -153,6 +175,7 @@ impl FairValueGlobals {
             entry_fair:       StdMutex::new(HashMap::new()),
             fair_history:     StdMutex::new(HashMap::new()),
             sl_counted:       StdMutex::new(HashMap::new()),
+            veto_withdrawn:   StdMutex::new(HashMap::new()),
         }
     }
 }
@@ -334,6 +357,60 @@ impl FairValueStrategyImpl {
     /// Polymarket dynamic taker fee fraction at price p: rate · p · (1−p).
     fn fee_frac(price: Decimal) -> Decimal {
         config::CRYPTO_FEE_RATE * price * (dec!(1) - price)
+    }
+
+    /// Is the model still standing where it was at entry, so the stop-loss veto
+    /// may be considered at all?
+    ///
+    /// Split out from `evaluate_exit` because it is the half of the veto that is
+    /// worth asserting on: the arithmetic half widens as a position loses, so
+    /// this is what actually distinguishes "the market is coming to us" from
+    /// "we were wrong". `decay_limit <= 0` disables the guard, restoring the
+    /// previous behavior where the veto only ever ended at the catastrophic stop.
+    ///
+    /// A model that cannot price at all (`None`) does not get to veto a stop.
+    fn veto_allowed_by_model_direction(
+        fair_side: Option<f64>,
+        baseline: f64,
+        decay_limit: f64,
+    ) -> bool {
+        if decay_limit <= 0.0 {
+            return true;
+        }
+        fair_side.map_or(false, |p| p >= baseline * (1.0 - decay_limit))
+    }
+
+    /// Latch the veto-withdrawal verdict for the life of a position.
+    ///
+    /// Returns `(withdrawn, newly_withdrawn)`. `withdrawn` is true either because
+    /// the model is retreating right now or because it already was on an earlier
+    /// tick for this same position; `newly_withdrawn` is true only on the
+    /// transition. See `FairValueGlobals::veto_withdrawn` for why the verdict has
+    /// to stick rather than being recomputed each tick.
+    ///
+    /// The caller logs on the transition alone: `evaluate_exit` runs ~20×/s and
+    /// the stop can stay breached for minutes on a vaporized bid, so logging the
+    /// standing state would bury the log in the one condition an operator most
+    /// needs to read.
+    fn veto_withdrawn_for_position(
+        &self,
+        asset: &str,
+        token_id: &str,
+        opened_at: DateTime<Utc>,
+        retreating_now: bool,
+    ) -> (bool, bool) {
+        let mut latched = match globals(asset).veto_withdrawn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if latched.get(token_id) == Some(&opened_at) {
+            return (true, false);
+        }
+        if retreating_now {
+            latched.insert(token_id.to_string(), opened_at);
+            return (true, true);
+        }
+        (false, false)
     }
 
     /// Does the model still justify holding a position that has hit its stop?
@@ -1022,8 +1099,42 @@ impl Strategy for FairValueStrategyImpl {
                 // cannot drift apart: whatever it takes to open is what it takes
                 // to keep holding. Catastrophic stops are never vetoed, so the
                 // veto only ever spans one to two stop widths.
+                //
+                // ── Model-DIRECTION guard on the veto ────────────────────────
+                // The edge above is arithmetic: `fair − ask − fees`. Fair value
+                // barely moves tick to tick while the ask collapses, so a losing
+                // position MECHANICALLY widens its own edge and strengthens the
+                // very veto that is holding it open. The veto is therefore
+                // anti-correlated with risk — loudest when the stop matters most.
+                //
+                // Raising `fairvalue_stop_model_confirm_frac` cannot fix this:
+                // the inflated edge clears any multiple of the requirement. What
+                // separates "the market is coming to us" from "we were wrong" is
+                // not the size of the gap but whether the MODEL still stands
+                // where it did at entry.
+                //
+                // 2026-08-30, intl, real money: NO at $0.58 against fair 0.723,
+                // vetoed at −13.8%/−19.0%/−20.7% on an edge widening +0.166 →
+                // +0.196, while fair itself retreated 0.723 → 0.666. The thesis
+                // was draining the entire way down and the veto never noticed.
+                // Reuses `baseline` from the model-reversal exit above, so the
+                // two read the same entry-relative record.
+                let veto_decay_limit = dc.fairvalue_stop_veto_max_model_decay_pct
+                    .to_f64().unwrap_or(0.0);
+                // Latched per position: a withdrawal survives a stop FAK that
+                // misses, which is precisely when the anchor it was computed
+                // from has already been cleared by `arm_cooldown`.
+                let model_retreating_now = !Self::veto_allowed_by_model_direction(
+                    fair_side, baseline, veto_decay_limit,
+                );
+                let (veto_withdrawn, veto_newly_withdrawn) = self.veto_withdrawn_for_position(
+                    &ctx.crypto_filter, token_id.as_str(), position.opened_at,
+                    model_retreating_now,
+                );
+                let model_holding = !veto_withdrawn;
+
                 let confirm = dc.fairvalue_stop_model_confirm_frac;
-                if !catastrophic {
+                if !catastrophic && model_holding {
                     let ask = if token_is_yes { snap.yes_ask } else { snap.no_ask };
                     let req = Self::required_edge(dc, secs_left);
                     if let Some(live_edge) =
@@ -1036,6 +1147,13 @@ impl Strategy for FairValueStrategyImpl {
                         );
                         continue;
                     }
+                } else if !catastrophic && veto_newly_withdrawn {
+                    tracing::info!(
+                        " FairValue stop veto withdrawn [{}]: model retreating — fair {:.3} < {:.3} ({:.1}% below entry fair {:.3}) | bid=${:.4} ({:.2}%) held={}s",
+                        market.market_name, fair_side.unwrap_or(0.0),
+                        baseline * (1.0 - veto_decay_limit), veto_decay_limit * 100.0,
+                        baseline, bid, profit_margin * dec!(100), secs_held,
+                    );
                 }
 
                 if bid < config::FAIRVALUE_MIN_EXIT_BID {
@@ -1192,6 +1310,105 @@ mod tests {
         let mid = FairValueStrategyImpl::sigma_floor(h, h + h / 2);
         assert!(mid > FairValueStrategyImpl::sigma_floor(h, h));
         assert!(mid < full);
+    }
+
+    /// The stop-loss veto must lapse when the model itself is retreating.
+    ///
+    /// Replays intl trade 1 (2026-08-30, real money). NO bought at $0.58 against
+    /// a fair value of 0.723; over the next 164s the bid fell to $0.44 while fair
+    /// walked 0.723 → 0.710 → 0.677 → 0.666. The arithmetic edge WIDENED the
+    /// whole way (+0.166 → +0.196) because the ask was collapsing, so the veto
+    /// fired at −13.8%, −19.0% and −20.7% and the position was only closed by the
+    /// 2× catastrophic stop at −24.1%, for −$1.06.
+    #[test]
+    fn stop_veto_lapses_once_the_model_starts_retreating() {
+        let baseline = 0.723_f64;
+        let limit = crate::config::FAIRVALUE_STOP_VETO_MAX_MODEL_DECAY_PCT
+            .to_f64()
+            .unwrap();
+
+        // Fair as it actually printed, in order, with the veto verdict we want.
+        let walk = [
+            (0.723, true,  "at entry — nothing has happened yet"),
+            (0.710, true,  "1.8% back: inside noise, veto still legitimate"),
+            (0.677, false, "6.4% back: thesis draining, stop must be allowed"),
+            (0.666, false, "7.9% back: the reading that closed the real trade"),
+        ];
+        for (fair, expected, why) in walk {
+            assert_eq!(
+                FairValueStrategyImpl::veto_allowed_by_model_direction(
+                    Some(fair), baseline, limit,
+                ),
+                expected,
+                "fair {fair:.3} vs baseline {baseline:.3} ({why})",
+            );
+        }
+    }
+
+    /// A withdrawn veto must survive the stop FAK that misses.
+    ///
+    /// `arm_cooldown` clears the entry-fair anchor on every exit EMISSION, but an
+    /// emission is not a close: a stop into a collapsing bid can fail to fill,
+    /// and that is exactly the book this guard fires on. Without the latch the
+    /// next tick falls back to `avg_entry` as the baseline — always below the
+    /// true entry fair, because entry requires fair > ask — and the veto
+    /// re-engages on the position the strategy just decided to dump.
+    #[test]
+    fn a_withdrawn_veto_stays_withdrawn_after_a_missed_stop_fill() {
+        let strat = FairValueStrategyImpl::default();
+        let asset = "btc-veto-latch";
+        let token = "tok-veto-latch";
+        let opened = Utc::now();
+
+        // Tick 1: fair 0.677 against the 0.723 anchor — retreating, so withdrawn.
+        assert_eq!(
+            strat.veto_withdrawn_for_position(asset, token, opened, true),
+            (true, true),
+            "a retreating model must withdraw the veto, and say so once",
+        );
+
+        // The stop is emitted, `arm_cooldown` wipes the anchor, the FAK misses.
+        // `reversal_baseline` now falls back to avg_entry 0.58, so fair 0.677
+        // reads as "holding" and `retreating_now` is false. The latch must not
+        // care.
+        assert_eq!(
+            strat.veto_withdrawn_for_position(asset, token, opened, false),
+            (true, false),
+            "the withdrawal must survive the anchor being cleared mid-stop-out, \
+             and must not re-log on every one of the ~20 ticks per second",
+        );
+
+        // A genuine RE-ENTRY on the same token is a new position and starts clean.
+        let reopened = opened + chrono::Duration::seconds(1);
+        assert_eq!(
+            strat.veto_withdrawn_for_position(asset, token, reopened, false),
+            (false, false),
+            "a new position must not inherit the previous one's withdrawal",
+        );
+    }
+
+    /// A model that cannot price must not be able to veto a risk control, and an
+    /// explicit 0 must restore the old always-veto behavior for anyone who wants
+    /// it back.
+    #[test]
+    fn veto_direction_guard_handles_its_edges() {
+        assert!(
+            !FairValueStrategyImpl::veto_allowed_by_model_direction(None, 0.72, 0.05),
+            "an unpriceable model must not veto a stop",
+        );
+        assert!(
+            FairValueStrategyImpl::veto_allowed_by_model_direction(None, 0.72, 0.0),
+            "decay_limit 0 disables the guard entirely, even with no model",
+        );
+        assert!(
+            FairValueStrategyImpl::veto_allowed_by_model_direction(Some(0.40), 0.72, 0.0),
+            "decay_limit 0 must not start blocking vetoes it used to allow",
+        );
+        // A model moving the RIGHT way is the case the veto exists for.
+        assert!(
+            FairValueStrategyImpl::veto_allowed_by_model_direction(Some(0.80), 0.72, 0.05),
+            "a model that has strengthened must still be able to hold the position",
+        );
     }
 
     /// A steady model leaves the base edge in charge; a thrashing one does not.

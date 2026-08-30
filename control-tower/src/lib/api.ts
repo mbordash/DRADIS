@@ -259,8 +259,13 @@ export async function rejectLlmAction(id: number): Promise<LlmActionRow> {
  * number to show when the operator is deciding whether to sell right now. Bid,
  * not mid: a manual exit executes against the bid.
  */
-export async function getPositionQuotes(asset: string): Promise<PositionQuote[]> {
-  const res = await fetch(`${BASE}/api/positions/quotes?asset=${encodeURIComponent(asset)}`, { cache: 'no-store' });
+// `fresh` bypasses the server's quote cache. The automatic poll leaves it off so
+// a dashboard left open all day does not hammer the venue; the Trade Log's manual
+// refresh sets it, because someone about to close a position by hand needs the
+// book as of now rather than as of up to `position_quote_ttl_secs` ago.
+export async function getPositionQuotes(asset: string, fresh = false): Promise<PositionQuote[]> {
+  const q = `asset=${encodeURIComponent(asset)}${fresh ? '&fresh=1' : ''}`;
+  const res = await fetch(`${BASE}/api/positions/quotes?${q}`, { cache: 'no-store' });
   if (!res.ok) throw new Error(`GET /api/positions/quotes → ${res.status}`);
   return res.json();
 }

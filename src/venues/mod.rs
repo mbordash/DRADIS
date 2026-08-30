@@ -45,6 +45,43 @@ pub fn round_trip_fee_pct(entry_price: Decimal) -> Decimal {
     dec!(2) * taker_fee_rate() * (Decimal::ONE - entry_price)
 }
 
+/// Single-leg taker cost, as a fraction of the entry notional.
+///
+/// The sibling of [`round_trip_fee_pct`] for strategies that only pay a fee on
+/// ONE leg. A post-only maker quote is never charged a taker fee by the CLOB —
+/// only the FAK that closes it is — so charging Maker the round-trip figure
+/// would overstate its cost by exactly 2× and push its take-profit target to
+/// roughly double what the trade actually has to clear.
+///
+/// Same approximation as the round trip: the exit price is taken at the entry
+/// price, which is where it sits when a profit target is being set, giving
+/// `rate × (1 − p)` of notional.
+pub fn exit_only_fee_pct(entry_price: Decimal) -> Decimal {
+    if entry_price <= Decimal::ZERO || entry_price >= Decimal::ONE { return Decimal::ZERO; }
+    taker_fee_rate() * (Decimal::ONE - entry_price)
+}
+
+/// Single-leg taker cost as a fraction of ENTRY notional, when the exit happens
+/// at a given gain above the entry price.
+///
+/// [`exit_only_fee_pct`] approximates the exit price by the entry price, which is
+/// where it sits when a target is first being set. That approximation is not
+/// neutral: the fee is actually charged at the exit, and on a quadratic schedule
+/// a higher exit price costs MORE on any contract below ~$0.50. The error is
+/// `rate · g · (1 − p(2 + g))`, positive across the whole of Maker's $0.10–$0.48
+/// entry band — so a target floored on the entry-price figure alone can still
+/// book a small net loss at the bottom of the band.
+///
+/// Returns zero for a gain that would carry the exit to $1.00 or beyond, where
+/// the contract has resolved and no taker fee is charged.
+pub fn exit_fee_pct_at_gain(entry_price: Decimal, gain: Decimal) -> Decimal {
+    if entry_price <= Decimal::ZERO || entry_price >= Decimal::ONE { return Decimal::ZERO; }
+    let exit_price = entry_price * (Decimal::ONE + gain);
+    if exit_price <= Decimal::ZERO || exit_price >= Decimal::ONE { return Decimal::ZERO; }
+    // rate · p_exit · (1 − p_exit) per share, over an entry notional of p_entry.
+    taker_fee_rate() * exit_price * (Decimal::ONE - exit_price) / entry_price
+}
+
 /// The venue's quadratic taker-fee coefficient.
 #[cfg(feature = "intl_clob")]
 fn taker_fee_rate() -> Decimal { crate::venues::intl::live_taker_fee_rate() }

@@ -262,6 +262,8 @@ fn default_momentum_obi_exhaust_max_adverse_pct() -> Decimal { config::MOMENTUM_
 fn default_momentum_obi_exhaust_min_hold_secs()   -> i64     { config::MOMENTUM_OBI_EXHAUST_MIN_HOLD_SECS   }
 fn default_momentum_obi_exhaust_persist_secs()    -> i64     { config::MOMENTUM_OBI_EXHAUST_PERSIST_SECS    }
 fn default_momentum_tp_fee_margin_mult()          -> Decimal { config::MOMENTUM_TP_FEE_MARGIN_MULT          }
+fn default_maker_tp_fee_margin_mult()             -> Decimal { config::MAKER_TP_FEE_MARGIN_MULT             }
+fn default_fairvalue_stop_veto_max_model_decay_pct() -> Decimal { config::FAIRVALUE_STOP_VETO_MAX_MODEL_DECAY_PCT }
 
 fn default_time_decay_max_fast_velocity_pct()      -> Decimal { config::TIME_DECAY_MAX_FAST_VELOCITY_PCT      }
 fn default_time_decay_max_slow_drift_pct()         -> Decimal { config::TIME_DECAY_MAX_SLOW_DRIFT_PCT         }
@@ -446,6 +448,10 @@ pub struct DynamicConfig {
     pub maker_min_entry_price:    Decimal,
     pub maker_stop_loss_pct:      Decimal,
     pub maker_target_profit_pct:  Decimal,
+    /// Multiple of the single-leg exit fee a Maker take-profit must clear.
+    /// The quote is post-only and pays nothing; only the closing FAK is charged.
+    #[serde(default = "default_maker_tp_fee_margin_mult")]
+    pub maker_tp_fee_margin_mult: Decimal,
     pub maker_max_exposure_usdc:  Decimal,
     #[serde(default = "default_maker_quote_size_usdc")]
     pub maker_quote_size_usdc:    Decimal,
@@ -682,6 +688,12 @@ pub struct DynamicConfig {
     /// model-reversal exit fires. Entry-relative, never an absolute floor.
     #[serde(default = "default_fairvalue_reversal_decay")]
     pub fairvalue_model_reversal_decay_pct: Decimal,
+    /// How far fair value may retreat from its entry level before the stop-loss
+    /// veto is withdrawn. The veto's arithmetic edge grows as the position
+    /// loses, so without this it is strongest exactly when the stop is most
+    /// needed. 0 disables the guard.
+    #[serde(default = "default_fairvalue_stop_veto_max_model_decay_pct")]
+    pub fairvalue_stop_veto_max_model_decay_pct: Decimal,
     /// Forecast horizon at or below which the σ floor stops binding, ramping to
     /// full strength at twice this. Trust an in-sample vol measurement; floor
     /// only what it cannot see.
@@ -875,6 +887,7 @@ impl Default for DynamicConfig {
             maker_min_entry_price:    config::MAKER_MIN_ENTRY_PRICE,
             maker_stop_loss_pct:      config::MAKER_STOP_LOSS_PERCENT,
             maker_target_profit_pct:  config::MAKER_TARGET_PROFIT_PERCENT,
+            maker_tp_fee_margin_mult: config::MAKER_TP_FEE_MARGIN_MULT,
             maker_max_exposure_usdc:  config::MAKER_MAX_EXPOSURE_USDC,
             maker_quote_size_usdc:    config::MAKER_QUOTE_SIZE_USDC,
             deploy_max_days_to_close:      config::DEPLOY_MAX_DAYS_TO_CLOSE,
@@ -972,6 +985,7 @@ impl Default for DynamicConfig {
             fairvalue_target_profit_pct:      config::FAIRVALUE_TARGET_PROFIT_PERCENT,
             fairvalue_stop_loss_pct:          config::FAIRVALUE_STOP_LOSS_PERCENT,
             fairvalue_model_reversal_decay_pct: config::FAIRVALUE_MODEL_REVERSAL_DECAY_PCT,
+            fairvalue_stop_veto_max_model_decay_pct: config::FAIRVALUE_STOP_VETO_MAX_MODEL_DECAY_PCT,
             fairvalue_sigma_floor_horizon_secs: config::FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS,
             fairvalue_post_exit_cooldown_secs: config::FAIRVALUE_POST_EXIT_COOLDOWN_SECS,
             fairvalue_max_stop_losses_per_market: config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET,

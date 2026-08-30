@@ -284,6 +284,15 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Entry-relative stop loss (0.05 = 5%).").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "maker_target_profit_pct", "Take Profit", "pct", false,
             "Entry-relative take profit.").range(0.0, 1.0).step(0.01));
+        v.push(F::new(g, e, "maker_tp_fee_margin_mult", "TP Fee Margin", "decimal", true,
+            "Multiple of the EXIT taker fee the take-profit must clear. A Maker quote is post-only and pays no \
+             fee to open; only the order that closes it is charged, so this floors against one leg (rate × \
+             (1 − entry) of notional), not the round trip. Without it the flat target sits below break-even on \
+             cheap entries — at a $0.18 entry the exit alone costs 5.7%, so a 5.55% \"take-profit\" books a loss. \
+             Raising this makes Maker hold out for a wider move and take fewer profits. The minimum is 1.1, not \
+             1.0: the fee is charged at the EXIT price, which at a take-profit is above the entry price this \
+             floor is computed from, so a bare 1.0 still books a small net loss on cheap entries.")
+            .range(1.1, 3.0).step(0.05));
         v.push(F::new(g, e, "maker_max_exposure_usdc", "Max Exposure", "usd", false,
             "Hard cap on total maker capital at risk.").min(0.0).step(0.5).unit("USDC"));
         v.push(F::new(g, e, "maker_quote_size_usdc", "Quote Size", "usd", false,
@@ -557,6 +566,15 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(g, e, "fairvalue_base_edge", "Base Edge", "price", false,
             "Required (fair − ask − fee) edge mid-session; tapers to Min Edge inside the final 30 min.").range(0.0, 0.5).step(0.005));
         // Advanced
+        v.push(F::new(g, e, "fairvalue_stop_veto_max_model_decay_pct", "Stop Veto Decay Limit", "pct", true,
+            "How far fair value may retreat from its level AT ENTRY before the stop-loss veto is withdrawn. \
+             The veto holds a position through its stop while the model still sees entry-grade edge — but fair \
+             value barely moves as the ask collapses, so a losing position widens its own edge and strengthens \
+             the veto keeping it open. This reads the model's DIRECTION instead: once fair has given back this \
+             fraction of its entry level, the thesis is judged to be draining and the stop is allowed to fire. \
+             Deliberately far tighter than Reversal Decay, which closes a position outright — a veto overrides \
+             a risk control, so it should lapse early. Set to 0 to disable and let the veto run to the \
+             catastrophic stop as before.").range(0.0, 0.5).step(0.01));
         v.push(F::new(g, e, "fairvalue_model_reversal_decay_pct", "Reversal Decay", "pct", true,
             "Exit once the model's probability for the held side has lost this fraction of its value AT ENTRY \
              (0.35 = an entry at fair 0.30 exits below 0.195). Entry-relative on purpose: cheap-tail entries are \

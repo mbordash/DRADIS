@@ -583,6 +583,18 @@ async fn enforce_read_only(
 struct AssetQuery {
     asset: Option<String>,
     limit: Option<i64>,
+    /// `?fresh=1` bypasses the quote cache for this request.
+    ///
+    /// Only the intl-gated quotes endpoint reads it, so it is dead on the other
+    /// venue builds by construction rather than by oversight.
+    #[cfg_attr(not(feature = "intl_clob"), allow(dead_code))]
+    ///
+    /// Only `/api/positions/quotes` reads it. The operator-facing case is the
+    /// Trade Log's manual refresh control: someone about to close a position by
+    /// hand wants the book as it is now, not as it was up to
+    /// `position_quote_ttl_secs` ago. Every other endpoint deserializing this
+    /// struct simply ignores the field.
+    fresh: Option<u8>,
 }
 
 /// Request body for manual "Return to Base" exit.
@@ -1314,6 +1326,12 @@ async fn get_trade_stats(Query(q): Query<AssetQuery>) -> Response {
 /// within the window; it is NOT single-flight, so concurrent viewers who both
 /// miss will both fetch. At the default TTL the dashboard's poll deliberately
 /// outruns the window — freshness is the whole point of this endpoint.
+///
+/// `?fresh=1` skips the cache read and refetches every open position from the
+/// venue. It is the Trade Log's manual refresh control: the automatic poll is
+/// paced for a dashboard left open all day, and an operator deciding whether to
+/// close a position by hand needs the book as of now. The refetch still writes
+/// through to the cache, so the press benefits every other viewer too.
 #[cfg(feature = "intl_clob")]
 async fn get_position_quotes(State(s): State<ApiState>, Query(q): Query<AssetQuery>) -> Response {
     use std::collections::HashMap as StdHashMap;
@@ -1349,17 +1367,52 @@ async fn get_position_quotes(State(s): State<ApiState>, Query(q): Query<AssetQue
         s.config_rx.borrow().position_quote_ttl_secs.max(1),
     );
 
+    // An explicit refresh skips the cache READ but still writes through below,
+    // so one operator pressing refresh also re-primes the entry every polling
+    // viewer is served from. Bypassing the write instead would leave the stale
+    // entry in place and make the button a no-op for everyone else.
+    //
+    // Two limits, because this parameter is an amplifier: each bypassed position
+    // costs two sequential venue REST calls, made with the SAME credentials the
+    // engine trades on, so an unthrottled caller does not merely slow the
+    // dashboard — it can get the trading path rate-limited.
+    //
+    //  * Read-only deployments (the public demo) never honor it. Nobody there is
+    //    about to close a position by hand, which is the only thing it is for.
+    //  * Otherwise a floor of `FRESH_BYPASS_MIN_INTERVAL` between bypasses, which
+    //    is far below a human refresh cadence and far above a loop's. The button
+    //    disables itself while in flight; this bounds every other caller,
+    //    including one with no API key on an exposed :9000.
+    const FRESH_BYPASS_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+    static LAST_BYPASS: OnceLock<StdMutex<Option<Instant>>> = OnceLock::new();
+    let bypass_cache = q.fresh.unwrap_or(0) != 0
+        && !s.read_only
+        && {
+            let cell = LAST_BYPASS.get_or_init(|| StdMutex::new(None));
+            match cell.lock() {
+                Ok(mut last) => {
+                    let ok = last.map_or(true, |t| t.elapsed() >= FRESH_BYPASS_MIN_INTERVAL);
+                    if ok { *last = Some(Instant::now()); }
+                    ok
+                }
+                // A poisoned lock must not become a way to bypass the throttle.
+                Err(_) => false,
+            }
+        };
+
     let mut out: Vec<Quote> = Vec::new();
     for pos in db::get_open_positions(&pool).await {
         // Serve from cache when it is young enough. The lock is a std Mutex held
         // only for the lookup — never across the awaits below.
-        if let Ok(guard) = cache.lock() {
-            if let Some((q, at)) = guard.get(&pos.token_id) {
-                if at.elapsed() < ttl {
-                    let mut q = q.clone();
-                    q.age_secs = at.elapsed().as_secs();
-                    out.push(q);
-                    continue;
+        if !bypass_cache {
+            if let Ok(guard) = cache.lock() {
+                if let Some((q, at)) = guard.get(&pos.token_id) {
+                    if at.elapsed() < ttl {
+                        let mut q = q.clone();
+                        q.age_secs = at.elapsed().as_secs();
+                        out.push(q);
+                        continue;
+                    }
                 }
             }
         }

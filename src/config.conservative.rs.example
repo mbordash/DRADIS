@@ -348,6 +348,18 @@ pub const MAKER_MAX_COMPLEMENTARY_PRICE: Decimal = dec!(0.58);
 pub const MAKER_MIN_ENTRY_PRICE: Decimal = dec!(0.10);
 
 pub const MAKER_TARGET_PROFIT_PERCENT: Decimal = dec!(0.10);
+
+/// Multiple of the single-leg taker fee that a Maker take-profit must clear.
+///
+/// The Maker quote is post-only and pays no taker fee; only the FAK that closes
+/// it does, so the cost to beat is `venues::exit_only_fee_pct` — half the round
+/// trip Momentum floors against. Unfloored, a flat target is below break-even on
+/// cheap entries: at rate 0.07 a $0.18 entry owes 5.7% of notional just to exit,
+/// so "Maker TP: gain=5.55%" books a LOSS (observed 2026-08-30, -$0.052).
+///
+/// Inert on venues with no taker fee (US Retail).
+/// Conservative: 1.50.
+pub const MAKER_TP_FEE_MARGIN_MULT: Decimal = dec!(1.50);
 pub const MAKER_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
 pub const MAKER_LATE_MARKET_STOP_TIGHTEN_SECS: i64 = 3600;
 pub const MAKER_LATE_MARKET_STOP_LOSS_PERCENT: Decimal = dec!(0.05);
@@ -974,6 +986,22 @@ pub const FAIRVALUE_MAX_EXPOSURE_USDC: Decimal = dec!(6);
 /// Aggressive: widest edge requirement — only strong mispricings.
 pub const FAIRVALUE_BASE_EDGE: Decimal = dec!(0.10);
 pub const FAIRVALUE_MIN_EDGE: Decimal = dec!(0.03);
+/// How far the model's fair value may retreat from its entry level before the
+/// stop-loss veto is withdrawn, as a fraction of the entry baseline.
+///
+/// The veto re-runs the entry test, and fair value barely moves while the ask
+/// collapses — so a losing position MECHANICALLY widens its own edge and
+/// strengthens the veto holding it open. Raising the confirm fraction cannot fix
+/// that; only the model's DIRECTION distinguishes "the market is coming to us"
+/// from "we were wrong". Observed 2026-08-30 (real money): vetoed at -13.8%,
+/// -19.0% and -20.7% while fair retreated 0.723 -> 0.666, closed by the
+/// catastrophic stop at -24.1% for -$1.06.
+///
+/// Far tighter than FAIRVALUE_MODEL_REVERSAL_DECAY_PCT: a veto overrides a risk
+/// control, so it should lapse at the first real sign of retreat. 0 disables it.
+/// Conservative: 0.03.
+pub const FAIRVALUE_STOP_VETO_MAX_MODEL_DECAY_PCT: Decimal = dec!(0.03);
+
 pub const FAIRVALUE_EDGE_TAPER_SECS: i64 = 1800;
 // Horizon-scaled edge: beyond the taper, req edge grows as sqrt(T/taper), capped.
 pub const FAIRVALUE_EDGE_HORIZON_CAP: Decimal = dec!(0.30);
