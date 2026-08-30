@@ -407,15 +407,12 @@ impl Strategy for BasisStrategyImpl {
             let (strategy_name, token_id) = (&key.strategy, &key.market);
             if strategy_name != "BasisStrategy" || key.squadron != ctx.squadron_id { continue; }
 
-            // Match current venue for the held token
-            let (target_market, snap) = if let Some(mk) = &ctx.maker_market {
-                if token_id == &mk.yes_token || token_id == &mk.no_token {
-                    (mk, ctx.maker_snapshot.as_ref().unwrap())
-                } else {
-                    (&ctx.market, &ctx.snapshot)
-                }
-            } else {
-                (&ctx.market, &ctx.snapshot)
+            // The venue that actually quotes this token, or nothing. The old
+            // shape fell through to the hourly market unchecked — see
+            // `vipers::venue_for_token`.
+            let Some((target_market, snap)) = crate::vipers::venue_for_token(ctx, token_id) else {
+                crate::vipers::note_position_without_venue(strategy_name, token_id);
+                continue;
             };
 
             let position_bid = if token_id == &target_market.yes_token {

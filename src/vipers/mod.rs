@@ -88,3 +88,191 @@ pub fn entry_liquidity_gate(
     }
     None
 }
+
+// ── Venue resolution for an open position ────────────────────────────────────
+
+/// Which of this tick's two markets actually quotes `token_id`?
+///
+/// Returns `None` when the token belongs to NEITHER, which is the case for any
+/// position that has outlived a market rotation. Callers must skip such a
+/// position, not price it against a venue that does not quote it.
+///
+/// Every exit path used to assume the answer instead of checking it. The shape
+/// was: test the token against the maker market, and if it does not match, fall
+/// through to the hourly market without testing it there either. After an hourly
+/// rotation a surviving token matches nothing, so it silently inherited an
+/// unrelated market's prices, close time and token identity.
+///
+/// That ran in production on 2026-08-30. A winning YES position on the 11PM ET
+/// market was carried past the rotation onto the 12AM ET market, and FairValue
+/// priced it there: `token_is_yes` compared the old token against the NEW
+/// market's yes_token, came back false, so the position was read as NO and
+/// valued at the new market's NO bid of $0.31. The strategy concluded the
+/// position had reversed 62.65% and exited a position that was actually worth
+/// $1.00 and about to redeem. The sell landed on the correct token so the money
+/// was not lost, but it paid $0.06 of avoidable exit fees, and the trade was
+/// written to the ledger against the wrong market, on the wrong side, with a
+/// reason describing a loss that never happened.
+///
+/// Skipping is the honest answer. A rotated-away market is closing, so the
+/// position redeems on-chain and the settlement path books it correctly. The
+/// alternative, acting on prices from an unrelated market, is how the above
+/// happened.
+pub fn venue_for_token<'a>(
+    ctx: &'a crate::orchestrator::strategy::StrategyContext,
+    token_id: &crate::venues::core::MarketId,
+) -> Option<(&'a crate::state::MarketConfig, &'a crate::state::MarketSnapshot)> {
+    if let (Some(mk), Some(ms)) = (&ctx.maker_market, &ctx.maker_snapshot) {
+        if token_id == &mk.yes_token || token_id == &mk.no_token {
+            return Some((mk, ms));
+        }
+    }
+    if token_id == &ctx.market.yes_token || token_id == &ctx.market.no_token {
+        return Some((&ctx.market, &ctx.snapshot));
+    }
+    None
+}
+
+/// Report, at most once a minute per token, that a position has no live venue.
+///
+/// Skipping such a position is correct but silent, and silence is how the
+/// original defect survived: the strategy appeared to be managing the position
+/// while pricing it against an unrelated market. An operator watching a position
+/// ride to settlement is entitled to know why nothing is acting on it.
+pub fn note_position_without_venue(strategy: &str, token_id: &crate::venues::core::MarketId) {
+    use std::collections::HashMap;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::Instant;
+
+    static LAST: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+    let map = LAST.get_or_init(|| Mutex::new(HashMap::new()));
+    let Ok(mut guard) = map.lock() else { return };
+
+    let key = format!("{strategy}:{token_id}");
+    let due = guard.get(&key).is_none_or(|t| t.elapsed().as_secs() >= 60);
+    if !due {
+        return;
+    }
+    guard.insert(key, Instant::now());
+    // Prune so a long session cannot grow this without bound as markets rotate.
+    guard.retain(|_, t| t.elapsed().as_secs() < 3600);
+
+    info!(
+        "⏸️  [{}] position on token {} has no live venue this tick — its market has rotated away. \
+         Holding to settlement rather than pricing it against a different market.",
+        strategy, token_id,
+    );
+}
+
+#[cfg(test)]
+mod venue_resolution_tests {
+    use super::*;
+    use crate::orchestrator::strategy::StrategyContext;
+    use crate::state::{MarketConfig, MarketSnapshot, PositionMap};
+    use crate::venues::core::MarketId;
+    use crate::helpers::dynamic_config::DynamicConfig;
+    use chrono::Utc;
+    use rust_decimal_macros::dec;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn market(yes: &str, no: &str, name: &str) -> MarketConfig {
+        MarketConfig {
+            yes_token: MarketId::new(yes), no_token: MarketId::new(no),
+            market_name: name.to_string(),
+            market_close_time: Some(Utc::now() + chrono::Duration::hours(1)),
+            strike_price: None, is_neg_risk: false,
+            condition_id: "cid".to_string(), yes_fee_bps: 0, no_fee_bps: 0,
+        }
+    }
+
+    fn snap(yes_bid: rust_decimal::Decimal) -> MarketSnapshot {
+        MarketSnapshot {
+            yes_bid, yes_bid_depth: dec!(200),
+            yes_ask: dec!(0.52), yes_ask_depth: dec!(150),
+            no_bid: dec!(0.48), no_bid_depth: dec!(180),
+            no_ask: dec!(0.50), no_ask_depth: dec!(160),
+            yes_bid_depth_total: dec!(1200), yes_ask_depth_total: dec!(900),
+            no_bid_depth_total: dec!(1100), no_ask_depth_total: dec!(950),
+            oracle_price: dec!(95000),
+            velocity: dec!(0), velocity_1s: dec!(0), acceleration: dec!(0),
+            funding_rate: dec!(0), oracle_drift_60m: dec!(0),
+            oracle_drift_10m: dec!(0), hist_vol: dec!(0.003),
+            institutional_pulse: dec!(0), tide_coherence: dec!(0),
+            tradfi_velocity: dec!(0), macro_coherence: dec!(0),
+            vix_proxy: dec!(0), vix_velocity: dec!(0),
+            oi_delta_pct: dec!(0), cvd_ratio: dec!(1),
+            secs_to_expiry: 3600, timestamp: Utc::now(),
+        }
+    }
+
+    fn ctx(maker: Option<MarketConfig>) -> StrategyContext {
+        StrategyContext {
+            squadron_id: "btc-open".to_string(),
+            market: market("h-yes", "h-no", "Hourly"),
+            snapshot: snap(dec!(0.40)),
+            positions: Arc::new(Mutex::new(PositionMap::new())),
+            session_pnl: dec!(0), starting_collateral: dec!(100),
+            available_collateral: dec!(100),
+            crypto_filter: "btc".to_string(),
+            market_started_at: Utc::now(),
+            maker_snapshot: maker.as_ref().map(|_| snap(dec!(0.70))),
+            maker_market: maker,
+            dynamic_config: Arc::new(DynamicConfig::default()),
+            arb_market_lockouts: None,
+        }
+    }
+
+    /// The production incident, reduced. A token from a rotated-away market
+    /// matches neither venue and must resolve to nothing — NOT silently to the
+    /// hourly market, whose prices describe a different event entirely.
+    #[test]
+    fn a_token_from_a_rotated_away_market_resolves_to_no_venue() {
+        let c = ctx(Some(market("m-yes", "m-no", "Window/Daily")));
+        assert!(venue_for_token(&c, &MarketId::new("stale-token")).is_none());
+    }
+
+    /// And with no maker venue at all, which is the state during the gap between
+    /// window markets — still must not adopt the hourly market by default.
+    #[test]
+    fn a_stale_token_resolves_to_nothing_when_there_is_no_maker_venue() {
+        let c = ctx(None);
+        assert!(venue_for_token(&c, &MarketId::new("stale-token")).is_none());
+    }
+
+    #[test]
+    fn a_maker_token_resolves_to_the_maker_venue() {
+        let c = ctx(Some(market("m-yes", "m-no", "Window/Daily")));
+        for t in ["m-yes", "m-no"] {
+            let (m, s) = venue_for_token(&c, &MarketId::new(t)).expect("maker token resolves");
+            assert_eq!(m.market_name, "Window/Daily");
+            assert_eq!(s.yes_bid, dec!(0.70), "must carry the MAKER snapshot, not the hourly one");
+        }
+    }
+
+    #[test]
+    fn an_hourly_token_resolves_to_the_hourly_venue() {
+        let c = ctx(Some(market("m-yes", "m-no", "Window/Daily")));
+        for t in ["h-yes", "h-no"] {
+            let (m, s) = venue_for_token(&c, &MarketId::new(t)).expect("hourly token resolves");
+            assert_eq!(m.market_name, "Hourly");
+            assert_eq!(s.yes_bid, dec!(0.40));
+        }
+    }
+
+    /// The mislabel that made a YES position book as NO: whichever venue is
+    /// resolved must be the one that actually contains the token, so a
+    /// `token == market.yes_token` test downstream answers truthfully.
+    #[test]
+    fn the_resolved_venue_always_contains_the_token() {
+        let c = ctx(Some(market("m-yes", "m-no", "Window/Daily")));
+        for t in ["m-yes", "m-no", "h-yes", "h-no"] {
+            let id = MarketId::new(t);
+            let (m, _) = venue_for_token(&c, &id).expect("resolves");
+            assert!(
+                id == m.yes_token || id == m.no_token,
+                "{t} resolved to a venue that does not quote it",
+            );
+        }
+    }
+}

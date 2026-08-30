@@ -665,6 +665,16 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              its exits keep evaluating, and retires once it is flat. Crypto squadrons never reach \
              this path; this venue's own loop rotates them onto the next market instead.")
             .range(0.0, 86_400.0).step(30.0).unit("s"));
+        v.push(F::new(g, e, "position_quote_ttl_secs", "Position Quote Freshness", "secs", true,
+            "How long a live price quote for an open position is reused before the venue is asked \
+             again. This is what the Trade Log shows you when you are deciding whether to close a \
+             position by hand, so it is a trade between freshness and how often DRADIS calls the \
+             venue: a second request for the same position inside the window is answered from \
+             memory rather than re-asked. It is not request pooling, so two people watching at \
+             once can still both trigger a fetch, and at the default the dashboard's own poll \
+             usually outruns the window on purpose, because a fresh price is the point. Raise it \
+             if you are running many positions and do not need second-by-second prices.")
+            .range(1.0, 300.0).step(1.0).unit("s"));
         v.push(F::new(g, e, "llm_max_output_tokens", "AI Reply Budget", "secs", true,
             "Token ceiling for one AI Advisor reply. It covers the whole response — the written \
              analysis and the structured recommendations the engine parses — and the \

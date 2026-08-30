@@ -903,15 +903,15 @@ impl Strategy for FairValueStrategyImpl {
                 continue;
             }
 
-            // Match the venue holding this token.
-            let (market, snap) = if let Some(mk) = &ctx.maker_market {
-                if token_id == &mk.yes_token || token_id == &mk.no_token {
-                    (mk, ctx.maker_snapshot.as_ref().unwrap())
-                } else {
-                    (&ctx.market, &ctx.snapshot)
-                }
-            } else {
-                (&ctx.market, &ctx.snapshot)
+            // The venue that actually quotes this token, or nothing.
+            //
+            // This used to fall through to the hourly market whenever the token
+            // did not match the maker market, without checking it matched the
+            // hourly one either. See `vipers::venue_for_token` for the
+            // production incident that came out of that.
+            let Some((market, snap)) = crate::vipers::venue_for_token(ctx, token_id) else {
+                crate::vipers::note_position_without_venue(strategy_name, token_id);
+                continue;
             };
 
             let token_is_yes = token_id == &market.yes_token;

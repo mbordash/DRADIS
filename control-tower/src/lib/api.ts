@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU Affero General Public License along
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
-import type { DynamicConfig, ConfigFieldSchema, PnlSnapshotRow, TradeRow, TradeStats, OpenPositionRow, LlmRecommendationRow, LlmActionRow, ViperDef, StatusResponse, PortfolioValue, SquadronSummary, TelemetrySnapshot, TelemetrySample } from './types';
+import type { DynamicConfig, ConfigFieldSchema, PnlSnapshotRow, TradeRow, TradeStats, OpenPositionRow, LlmRecommendationRow, LlmActionRow, ViperDef, StatusResponse, PortfolioValue, PositionQuote, SquadronSummary, TelemetrySnapshot, TelemetrySample } from './types';
 
 // In development, NEXT_PUBLIC_API_URL=http://localhost:9000 (set in .env.local)
 // hits the DRADIS API directly.
@@ -249,6 +249,19 @@ export async function approveLlmAction(id: number): Promise<LlmActionRow> {
 export async function rejectLlmAction(id: number): Promise<LlmActionRow> {
   const res = await fetch(`${BASE}/api/llm/actions/${id}/reject`, { method: 'POST', cache: 'no-store' });
   if (!res.ok) throw new Error(`POST /api/llm/actions/${id}/reject → ${res.status}: ${await res.text()}`);
+  return res.json();
+}
+
+/**
+ * Live bid/ask/mid for open positions, straight from the venue.
+ *
+ * The position rows carry a mark price refreshed by a 300s sweep; this is the
+ * number to show when the operator is deciding whether to sell right now. Bid,
+ * not mid: a manual exit executes against the bid.
+ */
+export async function getPositionQuotes(asset: string): Promise<PositionQuote[]> {
+  const res = await fetch(`${BASE}/api/positions/quotes?asset=${encodeURIComponent(asset)}`, { cache: 'no-store' });
+  if (!res.ok) throw new Error(`GET /api/positions/quotes → ${res.status}`);
   return res.json();
 }
 

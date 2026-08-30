@@ -706,6 +706,24 @@ pub const GBOOST_NUM_THREADS: usize = 2;
 ///
 /// Raise it together with the budget, or the extra budget simply cannot be used.
 pub const GBOOST_ITERATION_LIMIT: u32 = 1000;
+
+/// How long a live position quote is reused before the venue is asked again.
+///
+/// The Trade Log's mark price came from a 300s chain-sync sweep reading an
+/// indexer-backed API, so an operator timing a manual exit could be looking at a
+/// number minutes behind the book. On 2026-08-30 that gap was 16 cents on a
+/// binary in its final minutes, which is exactly when the number matters.
+///
+/// The TTL bounds how often the venue is asked when polls coincide — a second
+/// request for the same token inside the window is served from memory.
+///
+/// It is not request coalescing: there is no single-flight, so two viewers who
+/// both miss the window fetch concurrently. And at the 2s default against the
+/// dashboard's 4s poll, a single viewer misses on essentially every poll by
+/// design, because freshness is the point of this number. Raise it if you have
+/// many open positions and do not need second-by-second prices; the saving comes
+/// from viewers overlapping, not from any one of them.
+pub const POSITION_QUOTE_TTL_SECS: u64 = 2;
 pub const GBOOST_ENTRY_THRESHOLD: Decimal = dec!(0.68); // 2026-06-30: lowered (0.88 startup default produced zero trades in 13d)
 pub const GBOOST_PRED_LOG_INTERVAL_SECS: u64 = 120; // periodic P(UP) conviction diagnostic
 

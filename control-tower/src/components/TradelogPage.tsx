@@ -18,8 +18,8 @@
 
 import { useState, useMemo } from 'react';
 import useSWR from 'swr';
-import type { TradeRow, OpenPositionRow, TradeStats } from '@/lib/types';
-import { getTrades, getTradeStats, getOpenPositions, downloadTradelogCsv } from '@/lib/api';
+import type { TradeRow, OpenPositionRow, TradeStats, PositionQuote } from '@/lib/types';
+import { getTrades, getTradeStats, getOpenPositions, getPositionQuotes, downloadTradelogCsv } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -48,6 +48,8 @@ interface LogEntry {
   side:      string;
   entry:     number;
   curOrExit: number | null; // current_price for open; exit_price for completed
+  priceAgeSecs: number | null; // seconds since the shown price was fetched (open rows only)
+  priceIsLiveBid: boolean;    // true when the price is a live venue bid, not the stored mark
   shares:    number;
   pnl:       number | null; // realized for completed; unrealized for open
   reason:    string;
@@ -133,7 +135,13 @@ function TipCell({ full, maxChars, className = '' }: { full: string; maxChars: n
 }
 
 // Convert API data → LogEntry array for one asset
-function assetToEntries(shard: string, trades: TradeRow[], positions: OpenPositionRow[]): LogEntry[] {
+function assetToEntries(
+  shard: string,
+  trades: TradeRow[],
+  positions: OpenPositionRow[],
+  /** Live venue quotes by token id. Empty until the first poll returns. */
+  quoteByToken: Record<string, PositionQuote>,
+): LogEntry[] {
   const entries: LogEntry[] = [];
 
   for (const t of trades) {
@@ -151,6 +159,8 @@ function assetToEntries(shard: string, trades: TradeRow[], positions: OpenPositi
       side:       t.side,
       entry:      parseFloat(t.entry_price),
       curOrExit:  parseFloat(t.exit_price),
+      priceAgeSecs: null, // a completed trade's exit price is final, not a mark
+      priceIsLiveBid: false,
       shares:     parseFloat(t.shares),
       pnl:        parseFloat(t.pnl),
       reason:     t.reason,
@@ -168,7 +178,11 @@ function assetToEntries(shard: string, trades: TradeRow[], positions: OpenPositi
   for (const p of positions) {
     const status: LogStatus = p.status === 'pending' ? 'launch' : 'inflight';
     const entry = parseFloat(p.entry_price);
-    const cur   = p.current_price ? parseFloat(p.current_price) : null;
+    // Prefer the live bid: it is both fresher and the price a manual exit would
+    // actually get. Fall back to the stored mark, which the age badge labels.
+    const liveQuote = quoteByToken[p.token_id];
+    const liveBid   = liveQuote?.bid ? parseFloat(liveQuote.bid) : null;
+    const cur   = liveBid ?? (p.current_price ? parseFloat(p.current_price) : null);
     const shares = parseFloat(p.shares);
     const unrealized = fmtUnrealized(entry, cur, shares);
     entries.push({
@@ -187,6 +201,12 @@ function assetToEntries(shard: string, trades: TradeRow[], positions: OpenPositi
       side:        p.side,
       entry,
       curOrExit:   cur,
+      priceIsLiveBid: liveBid !== null,
+      priceAgeSecs: liveBid !== null
+        ? (liveQuote?.age_secs ?? 0)
+        : p.price_updated_at
+          ? Math.max(0, Math.round((Date.now() - new Date(p.price_updated_at).getTime()) / 1000))
+          : null,
       shares,
       pnl:         unrealized,
       reason:      '',
@@ -406,6 +426,27 @@ export default function TradelogPage({ availableAssets }: Props) {
     { refreshInterval: 15_000 },
   );
 
+  // Live venue quotes for open positions, polled far faster than the rows.
+  //
+  // The row's own `current_price` is refreshed by a 300s chain-sync sweep, which
+  // is fine for a glance and useless for deciding whether to close a position by
+  // hand. This asks the venue directly and shows the BID, because that is what a
+  // manual exit sells into. Only polls while positions are actually open.
+  const { data: quotes = [] } = useSWR(
+    allPositions.length > 0 ? ['tradelog-quotes', assets.join(',')] : null,
+    async () => {
+      const results = await Promise.allSettled(assets.map(a => getPositionQuotes(a)));
+      return results.flatMap(r => (r.status === 'fulfilled' ? r.value : []));
+    },
+    { refreshInterval: 4_000 },
+  );
+
+  const quoteByToken = useMemo(() => {
+    const m: Record<string, PositionQuote> = {};
+    for (const q of quotes) m[q.token_id] = q;
+    return m;
+  }, [quotes]);
+
   const isLoading = tradesLoading || positionsLoading;
 
   // ── Build unified log ────────────────────────────────────────────────────────
@@ -429,11 +470,11 @@ export default function TradelogPage({ availableAssets }: Props) {
 
     const entries: LogEntry[] = [];
     for (const a of assets) {
-      entries.push(...assetToEntries(a, byAsset[a].trades, byAsset[a].positions));
+      entries.push(...assetToEntries(a, byAsset[a].trades, byAsset[a].positions, quoteByToken));
     }
     entries.sort((a, b) => b.ts.getTime() - a.ts.getTime());
     return entries;
-  }, [allTrades, allPositions, assets]);
+  }, [allTrades, allPositions, assets, quoteByToken]);
 
   // ── Derived filter options ──────────────────────────────────────────────────
   const strategies = useMemo(() => {
@@ -665,12 +706,50 @@ export default function TradelogPage({ availableAssets }: Props) {
                           const delta = e.curOrExit - e.entry;
                           const color = delta > 0 ? 'text-green-400' : delta < 0 ? 'text-red-400' : 'text-gray-300';
                           return (
-                            <span className={color} title={isOpen ? 'Current mark price' : 'Exit price'}>
+                            <span
+                              className={color}
+                              title={
+                                !isOpen
+                                  ? 'Exit price'
+                                  : e.priceIsLiveBid
+                                    ? `Live best bid from the venue (${e.priceAgeSecs ?? 0}s old). This is what a manual exit would sell into.`
+                                    : e.priceAgeSecs === null
+                                      ? 'Stored mark price; refresh time unknown'
+                                      : `Stored mark price, ${e.priceAgeSecs}s old. Refreshed on a 300s sweep, so it can lag the live book.`
+                              }
+                            >
                               {e.curOrExit.toFixed(4)}
                               {isOpen && delta !== 0 && (
                                 <span className="ml-1 opacity-60 text-[10px]">
                                   {delta > 0 ? '▲' : '▼'}
                                 </span>
+                              )}
+                              {/* Age of the mark, shown whenever it is old enough
+                                  to matter. A stale price that LOOKS live is what
+                                  makes an operator mistime a manual exit. */}
+                              {/* A live bid is the number a manual exit gets, so
+                                  say so. Anything else is a stored mark that can
+                                  be minutes behind the book, and the operator
+                                  needs to see which one they are looking at. */}
+                              {isOpen && e.priceIsLiveBid && (
+                                <span className="ml-1 text-[10px] text-emerald-400/70">
+                                  {/* Age inline, not just in the tooltip. The
+                                      quote TTL is operator-tunable up to 300s,
+                                      so "bid" alone could label a five-minute-old
+                                      number — the same trap the amber mark badge
+                                      exists to avoid. */}
+                                  {(e.priceAgeSecs ?? 0) > 0 ? `bid ${e.priceAgeSecs}s` : 'bid'}
+                                </span>
+                              )}
+                              {isOpen && !e.priceIsLiveBid && e.priceAgeSecs !== null && e.priceAgeSecs >= 45 && (
+                                <span className="ml-1 text-[10px] text-amber-400/80">
+                                  {e.priceAgeSecs >= 90
+                                    ? `mark ${Math.round(e.priceAgeSecs / 60)}m old`
+                                    : `mark ${e.priceAgeSecs}s old`}
+                                </span>
+                              )}
+                              {isOpen && !e.priceIsLiveBid && e.priceAgeSecs === null && (
+                                <span className="ml-1 text-[10px] text-amber-400/80">mark, age unknown</span>
                               )}
                             </span>
                           );

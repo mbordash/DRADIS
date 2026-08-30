@@ -69,7 +69,10 @@ use rust_decimal::prelude::FromStr;
 use crate::helpers::dynamic_config::DynamicConfig;
 use crate::helpers::db;
 #[cfg(feature = "intl_clob")]
-use crate::helpers::orders::place_limit_order;
+use crate::helpers::orders::place_limit_order_filled;
+// Only `manual_exit` uses this, and that handler is intl-only.
+#[cfg(feature = "intl_clob")]
+use rust_decimal_macros::dec;
 #[cfg(feature = "intl_clob")]
 use crate::helpers::price::round_to_tick_size;
 #[cfg(feature = "intl_clob")]
@@ -1291,6 +1294,144 @@ async fn get_trade_stats(Query(q): Query<AssetQuery>) -> Response {
 /// Returns all currently open positions for this session (inserted on entry, removed on exit).
 /// Covers all strategies and both ghost/live modes so the UI always has a complete picture
 /// of in-flight positions even before they appear as completed trades.
+/// GET /api/positions/quotes?asset=btc
+///
+/// Live bid/ask/mid for every open position, straight from the venue.
+///
+/// The Trade Log's mark price is refreshed by a 300s chain-sync sweep reading
+/// the indexer-backed Data API. That is fine for a dashboard glance and useless
+/// for the thing an operator actually does with it: deciding whether to close a
+/// position by hand right now. On 2026-08-30 an operator watched $0.82 on a
+/// position the book had at $0.98, sixteen cents adrift on a binary minutes from
+/// resolution.
+///
+/// The BID is the number that matters here and it is returned first. A manual
+/// exit sells into the bid, so the mid flatters the decision on a wide book; the
+/// mid is returned too because that is what a portfolio is conventionally marked
+/// at, but the two are labeled rather than silently interchanged.
+///
+/// Results are cached for `position_quote_ttl_secs`. That bounds repeat asks
+/// within the window; it is NOT single-flight, so concurrent viewers who both
+/// miss will both fetch. At the default TTL the dashboard's poll deliberately
+/// outruns the window — freshness is the whole point of this endpoint.
+#[cfg(feature = "intl_clob")]
+async fn get_position_quotes(State(s): State<ApiState>, Query(q): Query<AssetQuery>) -> Response {
+    use std::collections::HashMap as StdHashMap;
+    use std::sync::{Mutex as StdMutex, OnceLock};
+    use std::time::Instant;
+
+    #[derive(Clone, Serialize)]
+    struct Quote {
+        token_id: String,
+        /// What a sale would execute against right now. `null` when the venue
+        /// has no bid, which is itself the answer: the position cannot be sold.
+        bid: Option<String>,
+        ask: Option<String>,
+        mid: Option<String>,
+        /// Age of this quote in seconds. Zero means it was just fetched.
+        age_secs: u64,
+    }
+
+    static CACHE: OnceLock<StdMutex<StdHashMap<String, (Quote, Instant)>>> = OnceLock::new();
+    let cache = CACHE.get_or_init(|| StdMutex::new(StdHashMap::new()));
+
+    let Some(asset) = q.asset.clone() else {
+        return (StatusCode::BAD_REQUEST, "asset query parameter is required").into_response();
+    };
+    let Some(session) = s.cag.session_for_asset(&asset) else {
+        return (StatusCode::BAD_REQUEST, "Asset not found").into_response();
+    };
+    let Some(pool) = db::pool_for_opt_retry(Some(&asset)).await else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "database not ready").into_response();
+    };
+
+    let ttl = std::time::Duration::from_secs(
+        s.config_rx.borrow().position_quote_ttl_secs.max(1),
+    );
+
+    let mut out: Vec<Quote> = Vec::new();
+    for pos in db::get_open_positions(&pool).await {
+        // Serve from cache when it is young enough. The lock is a std Mutex held
+        // only for the lookup — never across the awaits below.
+        if let Ok(guard) = cache.lock() {
+            if let Some((q, at)) = guard.get(&pos.token_id) {
+                if at.elapsed() < ttl {
+                    let mut q = q.clone();
+                    q.age_secs = at.elapsed().as_secs();
+                    out.push(q);
+                    continue;
+                }
+            }
+        }
+
+        let Ok(token) = U256::from_str(&pos.token_id) else { continue };
+        let bid = fetch_side_price(&session, token, Side::Buy).await;
+        let ask = fetch_side_price(&session, token, Side::Sell).await;
+        let mid = match (bid, ask) {
+            (Some(b), Some(a)) => Some((b + a) / Decimal::TWO),
+            _ => None,
+        };
+
+        // Write the mid through so every DB-derived consumer inherits the
+        // freshness instead of waiting for the next 300s sweep.
+        //
+        // `refresh_position_mark`, NOT `update_position_current_price`: the
+        // latter also confirms the row, and a book existing is not evidence a
+        // fill happened. See that function's doc for the fabricated-trade chain
+        // that caused. Skipped entirely in read-only mode, where a GET must not
+        // write.
+        if let Some(m) = mid {
+            if !s.read_only {
+                db::refresh_position_mark(&pool, &pos.token_id, m).await;
+            }
+        }
+
+        let quote = Quote {
+            token_id: pos.token_id.clone(),
+            bid: bid.map(|d| d.to_string()),
+            ask: ask.map(|d| d.to_string()),
+            mid: mid.map(|d| d.to_string()),
+            age_secs: 0,
+        };
+        if let Ok(mut guard) = cache.lock() {
+            guard.insert(pos.token_id.clone(), (quote.clone(), Instant::now()));
+            // Drop tokens that are no longer open so a long session's rotations
+            // cannot grow this without bound.
+            guard.retain(|_, (_, at)| at.elapsed().as_secs() < 3600);
+        }
+        out.push(quote);
+    }
+
+    Json(out).into_response()
+}
+
+/// One side's best price, or `None` when the venue has no quote or is slow.
+///
+/// A missing price is reported as missing rather than substituted, because the
+/// caller is an operator deciding whether to sell: an invented number is worse
+/// than a blank.
+#[cfg(feature = "intl_clob")]
+async fn fetch_side_price(
+    session: &crate::cag::session::SessionState,
+    token: U256,
+    side: Side,
+) -> Option<Decimal> {
+    let req = PriceRequest::builder().token_id(token).side(side).build();
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        session.venue.trading_client().price(&req),
+    ).await {
+        // A zero is not a price. The venue returns it rather than an error when
+        // a side is empty — manual_exit already guards on `current_bid <= 0` for
+        // this reason. Passing it through would paint a $0.0000 row wearing the
+        // green "bid" badge, with unrealized P&L of the entire position.
+        Ok(Ok(r)) if r.price > Decimal::ZERO => Some(r.price),
+        Ok(Ok(_)) => { debug!("quote: venue returned a non-positive price for {token}"); None }
+        Ok(Err(e)) => { debug!("quote: price fetch failed for {token}: {e}"); None }
+        Err(_)     => { debug!("quote: price fetch timed out for {token}"); None }
+    }
+}
+
 async fn get_open_positions(Query(q): Query<AssetQuery>) -> Response {
     debug!("Received GET /api/positions request");
     if q.asset.is_none() {
@@ -1440,17 +1581,27 @@ async fn manual_exit(
     struct PositionRow {
         entry_price: String,
         shares: String,
+        /// Was this position simulated? RTB had no ghost gate at all, so pressing
+        /// it on a ghost row fired a REAL sell for shares the wallet does not
+        /// hold. The order normally bounces, but the handler booked a completed
+        /// exit either way.
+        ghost_mode: i64,
+        /// Dollars already paid to open this position. The automated exit books
+        /// `entry_fee + exit_fee`; the manual one booked neither, so a manual
+        /// close overstated P&L by the entry fee and then deleted the row that
+        /// carried it, losing the record entirely.
+        entry_fee: Option<String>,
     }
 
     let pos_result = sqlx::query_as::<_, PositionRow>(
-        "SELECT entry_price, shares FROM open_positions WHERE token_id = ? AND strategy = ?"
+        "SELECT entry_price, shares, ghost_mode, entry_fee FROM open_positions WHERE token_id = ? AND strategy = ?"
     )
     .bind(&req.token_id)
     .bind(&req.strategy)
     .fetch_one(&pool)
     .await;
 
-    let (entry_price, shares) = match pos_result {
+    let (entry_price, shares, position_is_ghost, entry_fee) = match pos_result {
         Ok(row) => {
             let entry = match Decimal::from_str(&row.entry_price) {
                 Ok(p) => p,
@@ -1466,7 +1617,10 @@ async fn manual_exit(
                     return (StatusCode::INTERNAL_SERVER_ERROR, "Invalid shares").into_response();
                 }
             };
-            (entry, shares)
+            let entry_fee = row.entry_fee.as_deref()
+                .and_then(|f| Decimal::from_str(f).ok())
+                .unwrap_or(Decimal::ZERO);
+            (entry, shares, row.ghost_mode != 0, entry_fee)
         }
         Err(sqlx::Error::RowNotFound) => {
             warn!("RTB: Position not found in DB (token={}, strategy={})", req.token_id, req.strategy);
@@ -1550,9 +1704,59 @@ async fn manual_exit(
     let sell_price = round_to_tick_size(
         (current_bid - crate::config::SELL_PRICE_OFFSET).max(crate::config::MIN_SELL_LIMIT_PRICE)
     );
+
+    // ── Ghost gate ────────────────────────────────────────────────────────────
+    // A simulated position holds nothing on-chain. Selling it for real is both
+    // wrong and, when the venue happens to accept it, a real trade the operator
+    // never asked for. Book the simulated exit at the live bid and stop here.
+    if position_is_ghost {
+        // Ghost mode exists so an operator can trust the numbers before risking
+        // money, so a simulated exit must be booked as completely as a real one.
+        // The automated ghost path books a simulated EXIT fee and credits the
+        // session; this one did neither on its first draft. Ghost entries carry
+        // no entry fee today (patrol inserts them with `entry_fee: ZERO`), so
+        // the two terms agree at zero — but subtract the reported `fees` rather
+        // than the exit fee alone, so the P&L and the fees column cannot drift
+        // apart if ghost entries ever gain a simulated entry fee.
+        let fee_rate = crate::venues::intl::live_taker_fee_rate();
+        let sim_exit_fee = crate::venues::intl::taker_fee(fee_rate, current_bid, shares);
+        let fees = entry_fee + sim_exit_fee;
+        let pnl = (current_bid - entry_price) * shares - fees;
+        info!("👻 RTB (ghost): {} shares | entry ${:.4} → bid ${:.4} | simulated P&L ${:.4} (net of ${:.4} fees)",
+              shares, entry_price, current_bid, pnl, fees);
+
+        let mut scope = crate::state::TradeScope::shard_only(&req.asset);
+        scope.ghost = true;
+        metrics::record_trade(
+            &scope, fees, req.strategy.clone(), req.market.clone(), req.side.clone(),
+            entry_price, current_bid, shares, pnl,
+            "Manual RTB (ghost)".to_string(),
+        ).await;
+        *session.total_pnl.lock().await += pnl;
+
+        db::close_open_position(&pool, &req.strategy, &req.token_id).await;
+        let market = crate::venues::intl::market_id_from_u256(token_id);
+        {
+            let mut pos_map = session.positions.lock().await;
+            pos_map.retain(|k, _| !(k.strategy == req.strategy && k.market == market));
+        }
+        // Ghost entries claim token ownership exactly like real ones, and the
+        // automated exit releases the claim for both. Omitting it here left the
+        // token unenterable for the rest of the session — the same leak the real
+        // close path below documents, in the branch a new customer hits first,
+        // since ghost is the default first-run mode.
+        session.token_ownership.lock().await.remove(&market);
+
+        return Json(serde_json::json!({
+            "status": "closed", "ghost": true,
+            "shares": shares.to_string(), "exit_price": current_bid.to_string(),
+            "pnl": pnl.to_string(), "fees": fees.to_string(),
+        })).into_response();
+    }
+
     info!(" RTB: Placing FAK sell order — {} shares @ ${:.4} (live bid ${:.4})", shares, sell_price, current_bid);
 
-    let order_result = place_limit_order(
+    let order_result = place_limit_order_filled(
         session.venue.trading_client(),
         session.venue.nonce_manager(),
         session.venue.signer(),
@@ -1570,10 +1774,26 @@ async fn manual_exit(
         session.venue.shared_http(),
     ).await;
 
-    let order_id = match order_result {
-        Ok(id) => {
-            info!("✅ RTB: FAK sell order placed (order_id={})", id);
-            id
+    // ── Step 5: Read the ACTUAL fill from the FAK response ────────────────────
+    //
+    // A FAK fills or dies inside the POST, so `place_limit_order_filled` returns
+    // the matched amounts synchronously and there is nothing to wait for. This
+    // used to call the wrapper that DISCARDS those amounts, sleep 10 seconds,
+    // and then book the full share count at the shaved limit price with zero
+    // fees — the same one-tick understatement the automated path fixed on
+    // 2026-08-11, plus a killed or partial FAK booked as a completed exit.
+    let (order_id, filled_shares, fill_price) = match order_result {
+        Ok((id, making, taking)) => {
+            // SELL orientation: making = shares given up, taking = USDC received.
+            let px = if making > dec!(0) && taking > dec!(0) {
+                let p = taking / making;
+                if p > dec!(0) && p <= dec!(1) { p } else { sell_price }
+            } else {
+                sell_price
+            };
+            info!("✅ RTB: FAK responded (order_id={}) — filled {} of {} @ ${:.4}",
+                  id, making, shares, px);
+            (id, making, px)
         }
         Err(e) => {
             error!("RTB: Order placement failed: {}", e);
@@ -1581,66 +1801,164 @@ async fn manual_exit(
         }
     };
 
-    // ── Step 5: Wait for fill confirmation ─────────────────────────────────────
-    // FAK orders fill immediately or cancel. Give it 10s to confirm on-chain.
-    tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+    // Nothing matched. The position is untouched, so touch nothing: booking here
+    // is what left a real position closed in the ledger and unmanaged in memory.
+    if filled_shares <= dec!(0) {
+        warn!("RTB: FAK missed — no fill. Position left intact.");
+        return (
+            StatusCode::CONFLICT,
+            "FAK missed the book — nothing filled, position unchanged. Try again.",
+        ).into_response();
+    }
 
-    // ── Step 6: Calculate P&L and record trade ────────────────────────────────
-    let pnl = (sell_price - entry_price) * shares;
-    info!(" RTB: Trade recorded — {} shares | entry ${:.4} → exit ${:.4} | P&L ${:.4}",
-          shares, entry_price, sell_price, pnl);
+    // ── Step 6: Book the real fill, net of fees ───────────────────────────────
+    // A remainder below the venue's minimum order size cannot be traded, so it is
+    // not a partial fill — it is a full close with dust. Using a tighter
+    // threshold than `MIN_ORDER_SHARES` would manufacture sub-minimum positions
+    // that no exit path can ever close normally, which is the one failure mode
+    // this handler must not create.
+    let remaining_raw = (shares - filled_shares).max(dec!(0));
+    let partial = remaining_raw >= crate::config::MIN_ORDER_SHARES;
+    let remaining = if partial { remaining_raw } else { dec!(0) };
+    let booked_shares = if partial { filled_shares } else { shares };
+
+    // Both ends of the round trip. The entry fee is prorated to the portion being
+    // booked; a partial leaves the rest on the row for whatever closes it later.
+    let fee_rate = crate::venues::intl::live_taker_fee_rate();
+    let exit_fee = crate::venues::intl::taker_fee(fee_rate, fill_price, filled_shares);
+    let entry_fee_booked = if partial && shares > dec!(0) {
+        entry_fee * (booked_shares / shares)
+    } else {
+        entry_fee
+    };
+    let fees = entry_fee_booked + exit_fee;
+    let pnl = (fill_price - entry_price) * booked_shares - fees;
+
+    info!(" RTB: {} — {} of {} shares | entry ${:.4} → exit ${:.4} | P&L ${:.4} (net of ${:.4} fees)",
+          if partial { "PARTIAL" } else { "closed" },
+          filled_shares, shares, entry_price, fill_price, pnl, fees);
 
     // A manual RTB knows which book to write to but nothing about the market's
     // taxonomy — file it under the shard's venue and leave the rest NULL.
     metrics::record_trade(
         &crate::state::TradeScope::shard_only(&req.asset),
-        Decimal::ZERO,
+        fees,
         req.strategy.clone(),
         req.market.clone(),
         req.side.clone(),
         entry_price,
-        sell_price,
-        shares,
+        fill_price,
+        booked_shares,
         pnl,
-        "Manual RTB (Return to Base)".to_string(),
+        if partial {
+            "Manual RTB (partial fill)".to_string()
+        } else {
+            "Manual RTB (Return to Base)".to_string()
+        },
     ).await;
 
-    // ── Step 7: Close position in DB ───────────────────────────────────────────
-    db::close_open_position(&pool, &req.strategy, &req.token_id).await;
+    // Credit the session. Every automated exit does this; the manual one never
+    // did, so a session's P&L silently omitted whatever the operator closed by
+    // hand and the drawdown guard was computed from an incomplete figure.
+    *session.total_pnl.lock().await += pnl;
 
-    // ── Step 8: Remove from in-memory positions map ────────────────────────────
-    {
-        let mut pos_map = session.positions.lock().await;
-        // The operator names a strategy and a token, not a squadron, so remove
-        // every squadron's entry for that pair. On this venue there is one
-        // squadron per asset, which makes it exactly the previous behavior;
-        // once several squadrons can hold the same token, a manual RTB from
-        // this endpoint should carry the squadron so it targets just one.
-        let market = crate::venues::intl::market_id_from_u256(token_id);
-        let before = pos_map.len();
-        pos_map.retain(|k, _| !(k.strategy == req.strategy && k.market == market));
-        if before - pos_map.len() > 1 {
-            warn!("RTB: removed {} squadrons' entries for {}/{}", before - pos_map.len(), req.strategy, market);
+    // ── Step 7: Close, or reduce on a partial fill ────────────────────────────
+    let market = crate::venues::intl::market_id_from_u256(token_id);
+    if partial {
+        // The rest is still on the book and still ours. Booking a full close
+        // here is what left real shares with no strategy managing them.
+        // Prorate the surviving entry fee with the surviving shares, the same way
+        // the chain-adoption path rewrites it. Leaving the full fee on a reduced
+        // row would double-count it against whatever closes the remainder.
+        let remaining_entry_fee = if shares > dec!(0) {
+            entry_fee * (remaining / shares)
+        } else {
+            Decimal::ZERO
+        };
+        if let Err(e) = sqlx::query(
+            "UPDATE open_positions SET shares = ?, entry_fee = ? WHERE token_id = ? AND strategy = ?"
+        )
+        .bind(remaining.to_string())
+        .bind(remaining_entry_fee.to_string())
+        .bind(&req.token_id)
+        .bind(&req.strategy)
+        .execute(&pool)
+        .await {
+            error!("RTB: could not reduce position after partial fill: {e}");
         }
+        let mut pos_map = session.positions.lock().await;
+        for (k, p) in pos_map.iter_mut() {
+            if k.strategy == req.strategy && k.market == market {
+                // Scale the in-memory entry fee with the shares, exactly as the
+                // DB row above. The automated exit computes fees from the
+                // in-memory Position, so leaving the full original fee here
+                // would charge it a second time when the strategy closes the
+                // remainder.
+                if p.shares > dec!(0) {
+                    p.entry_fee = p.entry_fee * (remaining / p.shares);
+                }
+                p.shares = remaining;
+            }
+        }
+        warn!("RTB: partial fill — {} shares remain open and still managed", remaining);
+    } else {
+        db::close_open_position(&pool, &req.strategy, &req.token_id).await;
+
+        // ── Step 8: Remove from in-memory positions map ────────────────────────
+        {
+            let mut pos_map = session.positions.lock().await;
+            // The operator names a strategy and a token, not a squadron, so remove
+            // every squadron's entry for that pair. On this venue there is one
+            // squadron per asset, which makes it exactly the previous behavior;
+            // once several squadrons can hold the same token, a manual RTB from
+            // this endpoint should carry the squadron so it targets just one.
+            let before = pos_map.len();
+            pos_map.retain(|k, _| !(k.strategy == req.strategy && k.market == market));
+            if before - pos_map.len() > 1 {
+                warn!("RTB: removed {} squadrons' entries for {}/{}", before - pos_map.len(), req.strategy, market);
+            }
+        }
+
+        // Release the token-ownership claim. Without this the token stayed
+        // claimed for the rest of the session and no strategy could re-enter it,
+        // which is invisible until an operator wonders why nothing trades a
+        // market they exited hours ago.
+        session.token_ownership.lock().await.remove(&market);
     }
 
     info!("✅ RTB: Manual exit complete — order_id={}", order_id);
 
+    /// What actually happened, not what was requested.
+    ///
+    /// The old response echoed the requested share count and the shaved LIMIT
+    /// price, so a partial fill and a full one were indistinguishable to the UI
+    /// and the operator was shown a price they did not get.
     #[derive(Serialize)]
     struct ExitResponse {
         success: bool,
+        /// "closed" or "partial".
+        status: &'static str,
         order_id: String,
+        /// Real average fill price from the FAK response.
         exit_price: String,
-        shares: String,
+        /// Shares actually sold.
+        filled_shares: String,
+        /// Shares still open and still managed. "0" on a full close.
+        remaining_shares: String,
+        /// Net of the exit taker fee.
         pnl: String,
+        fees: String,
     }
 
     Json(ExitResponse {
         success: true,
+        status: if partial { "partial" } else { "closed" },
         order_id,
-        exit_price: sell_price.to_string(),
-        shares: shares.to_string(),
+        exit_price: fill_price.to_string(),
+        filled_shares: filled_shares.to_string(),
+        remaining_shares: remaining.to_string(),
         pnl: pnl.to_string(),
+        fees: fees.to_string(),
     }).into_response()
 }
 
@@ -3761,7 +4079,10 @@ pub async fn run_api_server(
     #[cfg(feature = "intl_clob")]
     let protected_routes = protected_routes
         .route("/api/positions/sync",        axum::routing::post(sync_positions))
-        .route("/api/positions/manual-exit", axum::routing::post(manual_exit));
+        .route("/api/positions/manual-exit", axum::routing::post(manual_exit))
+        // Live bid/ask/mid for open positions — the surface a manual exit is
+        // decided from, and intl-only for the same reason manual-exit is.
+        .route("/api/positions/quotes",      get(get_position_quotes));
 
     let protected_routes = protected_routes
         // API-key check applied to all matched routes (inner layer — runs after CORS).

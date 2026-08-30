@@ -903,6 +903,19 @@ async fn run_migrations(pool: &SqlitePool) {
     // claim about them.
     let _ = sqlx::query("ALTER TABLE trades ADD COLUMN ghost INTEGER NOT NULL DEFAULT 0")
         .execute(pool).await;
+    // `price_updated_at`: when `current_price` was last refreshed.
+    //
+    // That price comes from the 300s chain-sync sweep reading the Polymarket
+    // Data API, which is itself indexer-backed and lags. On 2026-08-30 an
+    // operator watching the Trade Log to time a manual exit saw $0.82 on a
+    // position the live book had at $0.98 — a 16-cent gap on a binary minutes
+    // from resolution, which is exactly the moment the number matters most.
+    //
+    // Recording freshness does not make the price fresher. It stops the display
+    // presenting a four-minute-old number as if it were live, which is the part
+    // that can cost an operator money.
+    let _ = sqlx::query("ALTER TABLE open_positions ADD COLUMN price_updated_at TEXT")
+        .execute(pool).await;
     // `entry_fee`: dollars already paid to the venue to OPEN this position.
     // Needed because a position can leave via settlement or off-strategy close
     // rather than the strategy's exit path, and those bookings live here — with
@@ -2746,22 +2759,28 @@ pub async fn update_position_from_chain(
     // existing entry_price.
     let result = if avg_price > rust_decimal::Decimal::ZERO {
         sqlx::query(
-            "UPDATE open_positions SET entry_fee = CAST(COALESCE(entry_fee,'0') AS REAL) * (CAST(? AS REAL) / NULLIF(CAST(shares AS REAL),0)), shares = ?, entry_price = ?, chain_adopted = 1, current_price = COALESCE(?, current_price) WHERE token_id = ?"
+            "UPDATE open_positions SET entry_fee = CAST(COALESCE(entry_fee,'0') AS REAL) * (CAST(? AS REAL) / NULLIF(CAST(shares AS REAL),0)), shares = ?, entry_price = ?, chain_adopted = 1, current_price = COALESCE(?, current_price), price_updated_at = CASE WHEN ? IS NULL THEN price_updated_at ELSE ? END WHERE token_id = ?"
         )
         .bind(shares.to_string())
         .bind(shares.to_string())
         .bind(avg_price.to_string())
         .bind(&cur_price_str)
+        // Stamp the refresh time only when a price actually came through, so a
+        // shares-only correction cannot claim a freshness it did not deliver.
+        .bind(&cur_price_str)
+        .bind(chrono::Utc::now().to_rfc3339())
         .bind(token_id)
         .execute(pool)
         .await
     } else {
         sqlx::query(
-            "UPDATE open_positions SET entry_fee = CAST(COALESCE(entry_fee,'0') AS REAL) * (CAST(? AS REAL) / NULLIF(CAST(shares AS REAL),0)), shares = ?, chain_adopted = 1, current_price = COALESCE(?, current_price) WHERE token_id = ?"
+            "UPDATE open_positions SET entry_fee = CAST(COALESCE(entry_fee,'0') AS REAL) * (CAST(? AS REAL) / NULLIF(CAST(shares AS REAL),0)), shares = ?, chain_adopted = 1, current_price = COALESCE(?, current_price), price_updated_at = CASE WHEN ? IS NULL THEN price_updated_at ELSE ? END WHERE token_id = ?"
         )
         .bind(shares.to_string())
         .bind(shares.to_string())
         .bind(&cur_price_str)
+        .bind(&cur_price_str)
+        .bind(chrono::Utc::now().to_rfc3339())
         .bind(token_id)
         .execute(pool)
         .await
@@ -2777,15 +2796,54 @@ pub async fn update_position_from_chain(
 /// holding is, by definition, confirmed (not an un-indexed in-flight order). Without this,
 /// a row first written as 'pending' by the strategy order path could stay 'pending'
 /// indefinitely after its fill, making it permanently immune to purge_stale_open_positions.
+/// Refresh a position's mark price WITHOUT asserting anything about its status.
+///
+/// `update_position_current_price` also flips `status` to `confirmed`, which is
+/// sound for its original caller: the chain-sync sweep only calls it for tokens
+/// the Data API reports as live on-chain holdings, so confirmation is earned.
+///
+/// The live-quote endpoint has no such evidence. It knows only that the venue
+/// publishes a book for the token, which is true of every unfilled order ever
+/// placed. Routing it through the confirming variant flipped freshly inserted
+/// `pending` rows to `confirmed` within one 4-second dashboard poll, defeating
+/// the 3600s grace window `purge_stale_open_positions` gives pending rows
+/// precisely because the Data API indexer lags fills. A confirmed row the
+/// indexer has not caught up to yet is booked as "closed off-strategy" at its
+/// mark and deleted — a fabricated exit for a position DRADIS still holds,
+/// followed by a re-adoption from chain. Ordinary conditions trigger it: a new
+/// position, the Trade Log open, and normal indexer lag.
+///
+/// So this variant touches only the mark, and only on rows already confirmed.
+/// The COALESCE matters — rows predating the status column are NULL, not
+/// 'confirmed'.
+pub async fn refresh_position_mark(
+    pool: &SqlitePool,
+    token_id: &str,
+    cur_price: rust_decimal::Decimal,
+) {
+    if let Err(e) = sqlx::query(
+        "UPDATE open_positions SET current_price = ?, price_updated_at = ? \
+         WHERE token_id = ? AND COALESCE(status, 'confirmed') = 'confirmed'"
+    )
+    .bind(cur_price.to_string())
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(token_id)
+    .execute(pool)
+    .await {
+        error!("❌ DB refresh_position_mark failed for {}: {}", token_id, e);
+    }
+}
+
 pub async fn update_position_current_price(
     pool: &SqlitePool,
     token_id: &str,
     cur_price: rust_decimal::Decimal,
 ) {
     if let Err(e) = sqlx::query(
-        "UPDATE open_positions SET current_price = ?, status = 'confirmed' WHERE token_id = ?"
+        "UPDATE open_positions SET current_price = ?, price_updated_at = ?, status = 'confirmed' WHERE token_id = ?"
     )
     .bind(cur_price.to_string())
+    .bind(chrono::Utc::now().to_rfc3339())
     .bind(token_id)
     .execute(pool)
     .await {
@@ -2911,6 +2969,11 @@ pub struct OpenPositionRow {
     pub status:         String,
     /// Live mark-to-market price from Polymarket Data API; None until first chain-sync.
     pub current_price:  Option<String>,
+    /// When `current_price` was last refreshed (RFC3339). `None` on rows written
+    /// before the column existed, and on a brand-new position that has not yet
+    /// been through a chain-sync sweep. The UI must show this: the price can be
+    /// minutes old, and an operator timing a manual exit needs to know that.
+    pub price_updated_at: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3143,7 +3206,7 @@ pub async fn get_open_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
         // keep only the most recent row (MAX(id)) so the UI and portfolio calculations see
         // exactly one entry per token — preventing phantom double-counting of positions.
         "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted,
-         COALESCE(status, 'confirmed') as status, current_price
+         COALESCE(status, 'confirmed') as status, current_price, price_updated_at
          FROM open_positions
          WHERE id IN (SELECT MAX(id) FROM open_positions GROUP BY token_id)
          ORDER BY ts ASC"
@@ -3162,6 +3225,7 @@ pub async fn get_open_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
             chain_adopted:  r.try_get::<i64, _>(8).ok()? != 0,
             status:         r.try_get::<String, _>(9).ok()?,
             current_price:  r.try_get::<Option<String>, _>(10).ok().flatten(),
+            price_updated_at: r.try_get::<Option<String>, _>(11).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_open_positions failed: {}", e); vec![] }
     }
@@ -3170,7 +3234,7 @@ pub async fn get_open_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
 /// Return only pending positions (Viper Launches) - orders placed but not yet confirmed on-chain.
 pub async fn get_pending_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
     match sqlx::query(
-        "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted, status, current_price
+        "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted, status, current_price, price_updated_at
          FROM open_positions WHERE status = 'pending' ORDER BY ts ASC"
     )
     .fetch_all(pool)
@@ -3187,6 +3251,7 @@ pub async fn get_pending_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
             chain_adopted:  r.try_get::<i64, _>(8).ok()? != 0,
             status:         r.try_get::<String, _>(9).ok()?,
             current_price:  r.try_get::<Option<String>, _>(10).ok().flatten(),
+            price_updated_at: r.try_get::<Option<String>, _>(11).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_pending_positions failed: {}", e); vec![] }
     }
@@ -3196,7 +3261,7 @@ pub async fn get_pending_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
 pub async fn get_confirmed_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
     match sqlx::query(
         "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted,
-         COALESCE(status, 'confirmed') as status, current_price
+         COALESCE(status, 'confirmed') as status, current_price, price_updated_at
          FROM open_positions WHERE COALESCE(status, 'confirmed') = 'confirmed' ORDER BY ts ASC"
     )
     .fetch_all(pool)
@@ -3213,6 +3278,7 @@ pub async fn get_confirmed_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> 
             chain_adopted:  r.try_get::<i64, _>(8).ok()? != 0,
             status:         r.try_get::<String, _>(9).ok()?,
             current_price:  r.try_get::<Option<String>, _>(10).ok().flatten(),
+            price_updated_at: r.try_get::<Option<String>, _>(11).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_confirmed_positions failed: {}", e); vec![] }
     }

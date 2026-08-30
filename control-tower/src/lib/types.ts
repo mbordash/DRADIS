@@ -107,6 +107,7 @@ export interface DynamicConfig {
   event_market_retire_grace_secs: number;
   gboost_budget:                 string;
   gboost_iteration_limit:        number;
+  position_quote_ttl_secs:       number;
   llm_max_output_tokens:         number;
   obi_use_whole_book:            boolean;
   maker_min_spread:              string;
@@ -232,6 +233,17 @@ export interface ConfigFieldSchema {
   description: string;
 }
 
+/** Live venue quote for one open position — see GET /api/positions/quotes. */
+export interface PositionQuote {
+  token_id: string;
+  /** What a sale would execute against right now. Null means no bid exists. */
+  bid:      string | null;
+  ask:      string | null;
+  mid:      string | null;
+  /** Seconds since this quote was fetched from the venue. */
+  age_secs: number;
+}
+
 export interface PnlSnapshotRow {
   ts:          string; // ISO 8601
   session_pnl: string; // Decimal string
@@ -300,6 +312,14 @@ export interface OpenPositionRow {
   chain_adopted:  boolean; // true when re-adopted from on-chain (ts = adoption time, not original entry)
   status:         string;  // "pending" (Viper Launch) | "confirmed" (Mission In-Flight)
   current_price?: string;  // Live mark-to-market price from Polymarket Data API (null until first chain-sync)
+  /**
+   * When current_price was last refreshed (RFC3339), or null if never.
+   *
+   * The price is refreshed by a 300s chain-sync sweep off an indexer-backed
+   * API, so it can be minutes old. An operator timing a manual RTB needs to
+   * see that, or they act on a number the book left behind.
+   */
+  price_updated_at?: string | null;
 }
 
 export interface LlmRecommendationRow {

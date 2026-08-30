@@ -222,6 +222,7 @@ fn default_auto_deploy_sports()             -> bool    { config::AUTO_DEPLOY_SPO
 fn default_event_market_retire_grace_secs() -> i64     { config::EVENT_MARKET_RETIRE_GRACE_SECS       }
 fn default_gboost_budget()                  -> Decimal { config::GBOOST_BUDGET                       }
 fn default_gboost_iteration_limit()         -> u32     { config::GBOOST_ITERATION_LIMIT               }
+fn default_position_quote_ttl_secs()        -> u64     { config::POSITION_QUOTE_TTL_SECS              }
 fn default_obi_use_whole_book()             -> bool    { config::OBI_USE_WHOLE_BOOK                   }
 fn default_maker_min_spread()               -> Decimal { config::MAKER_MIN_SPREAD                      }
 fn default_maker_bid_buffer()               -> Decimal { config::MAKER_BID_BUFFER                      }
@@ -471,6 +472,9 @@ pub struct DynamicConfig {
     /// thread indefinitely. Caps whatever the budget would otherwise spend.
     #[serde(default = "default_gboost_iteration_limit")]
     pub gboost_iteration_limit:        u32,
+    /// Seconds a live position quote is reused before re-asking the venue.
+    #[serde(default = "default_position_quote_ttl_secs")]
+    pub position_quote_ttl_secs:       u64,
     /// Token ceiling for one LLM Advisor reply — prose plus proposal block.
     #[serde(default = "default_llm_max_output_tokens")]
     pub llm_max_output_tokens:         u32,
@@ -879,6 +883,7 @@ impl Default for DynamicConfig {
             event_market_retire_grace_secs: config::EVENT_MARKET_RETIRE_GRACE_SECS,
             gboost_budget:                 config::GBOOST_BUDGET,
             gboost_iteration_limit:        config::GBOOST_ITERATION_LIMIT,
+            position_quote_ttl_secs:       config::POSITION_QUOTE_TTL_SECS,
             llm_max_output_tokens:         config::LLM_MAX_OUTPUT_TOKENS,
             obi_use_whole_book:            config::OBI_USE_WHOLE_BOOK,
             maker_min_spread:              config::MAKER_MIN_SPREAD,
