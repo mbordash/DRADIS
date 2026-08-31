@@ -969,7 +969,7 @@ a separate commercial license is available. Contact **starbuck@dradis.live** wit
 a short description of your intended use.
 
 Dual licensing is possible because the project's contributions are covered by a
-Contributor License Agreement — see [CONTRIBUTING.md](CONTRIBUTING.md).
+Contributor License Agreement — see [CONTRIBUTING.md](docs/CONTRIBUTING.md).
 
 ### Contributing
 

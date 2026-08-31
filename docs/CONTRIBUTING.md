@@ -7,12 +7,12 @@ the execution path is high — please read this before opening one.
 
 DRADIS is **dual-licensed**: AGPL-3.0 for open-source use, with commercial
 licenses available for hosted/SaaS and proprietary deployments (see
-[README](README.md#license)).
+[README](../README.md#license)).
 
 That model only works if the maintainer holds the right to license *every* line
 in the tree under both sets of terms — including code you write. So before your
 first pull request can be merged, you'll be asked to sign the
-[Contributor License Agreement](docs/CLA.md).
+[Contributor License Agreement](CLA.md).
 
 It's a one-time, automated step: a bot comments on your pull request with a link
 and the exact phrase to reply with. You keep ownership of your contribution; the

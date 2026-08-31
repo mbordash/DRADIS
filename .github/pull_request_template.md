@@ -35,7 +35,7 @@ a review would raise anyway — running through it first usually saves a round t
       `MANAGED_KEYS` in `src/api/setup.rs`, and for a Raptor key also to
       `RAPTOR_SOURCES` with a `signup_url`. Keep the `.env.example` entry too;
       headless deployments provision without a browser.
-- [ ] **No AI co-author trailers in the commit messages.** See CONTRIBUTING.md —
+- [ ] **No AI co-author trailers in the commit messages.** See docs/CONTRIBUTING.md —
       those addresses resolve to real GitHub accounts and render as linked
       contributor avatars.
 - [ ] **CLA signed.** First-time contributors: comment the phrase the bot asks
