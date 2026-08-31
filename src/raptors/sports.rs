@@ -212,6 +212,34 @@ struct EventSample {
 ///
 /// Returns `Err(reason)` on any failure so the caller can log *why* the poll
 /// produced no signal (bad key, quota exhausted, error payload, no events, …).
+/// Blank out any `apiKey=...` value in a string destined for a log.
+///
+/// The Odds API takes its credential in the query string, so every URL this
+/// module builds carries the operator's key. Anything that renders such a URL —
+/// most notably `reqwest::Error`'s `Display`, which names the request it failed
+/// on — would otherwise write that key to disk in plain text.
+///
+/// Deliberately operates on the rendered STRING rather than the URL, because the
+/// leak arrives inside an error message with surrounding prose, not as a bare
+/// URL that could be parsed and rebuilt.
+fn redact_url_secrets(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut rest = s;
+    while let Some(i) = rest.find("apiKey=") {
+        let (head, tail) = rest.split_at(i + "apiKey=".len());
+        out.push_str(head);
+        out.push_str("<redacted>");
+        // The value runs to the next query separator or whitespace; whatever
+        // follows (`&markets=...`, a closing paren, trailing prose) is kept.
+        let end = tail
+            .find(|c: char| c == '&' || c == '#' || c.is_whitespace() || c == ')')
+            .unwrap_or(tail.len());
+        rest = &tail[end..];
+    }
+    out.push_str(rest);
+    out
+}
+
 async fn try_fetch_nearest_event(http: &reqwest::Client, url: &str, low_budget_warn: i64) -> Result<EventSample, String> {
     let resp = tokio::time::timeout(
         std::time::Duration::from_secs(8),
@@ -219,7 +247,11 @@ async fn try_fetch_nearest_event(http: &reqwest::Client, url: &str, low_budget_w
     )
     .await
     .map_err(|_| "request timed out after 8s".to_string())?
-    .map_err(|e| format!("transport error: {e}"))?;
+    // `reqwest::Error` renders the URL it was fetching, and this provider takes
+    // its credential as `?apiKey=...` — so the raw Display leaks the operator's
+    // key into `dradis.log`, which is the file that gets pulled to laptops and
+    // pasted into support threads. Redact before the message can be logged.
+    .map_err(|e| format!("transport error: {}", redact_url_secrets(&e.to_string())))?;
 
     let status = resp.status();
     // The Odds API returns the remaining monthly quota on every response. Capture
@@ -401,4 +433,42 @@ fn h2h_outcomes(book: &serde_json::Value) -> Option<&Vec<serde_json::Value>> {
         .find(|m| m.get("key").and_then(|k| k.as_str()) == Some("h2h"))?
         .get("outcomes")
         .and_then(|o| o.as_array())
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::redact_url_secrets;
+
+    /// The shape the leak actually arrives in: a `reqwest::Error` names the URL
+    /// it failed on, and this provider's URL carries the credential.
+    #[test]
+    fn a_transport_error_does_not_carry_the_key() {
+        let leak = "error sending request for url \
+                    (https://api.the-odds-api.com/v4/sports/soccer_epl/odds?regions=uk\
+&markets=h2h&oddsFormat=decimal&apiKey=abcd1234deadbeef)";
+        let safe = redact_url_secrets(leak);
+        assert!(!safe.contains("abcd1234deadbeef"), "key survived redaction: {safe}");
+        assert!(safe.contains("apiKey=<redacted>"), "{safe}");
+        // Everything around the secret must survive, or the log stops being useful.
+        assert!(safe.contains("error sending request"));
+        assert!(safe.contains("soccer_epl"));
+        assert!(safe.ends_with(')'), "trailing context lost: {safe}");
+    }
+
+    /// The key is not always last in the query string.
+    #[test]
+    fn a_key_followed_by_more_parameters_is_redacted() {
+        let safe = redact_url_secrets("...?apiKey=SECRET&markets=h2h&oddsFormat=decimal");
+        assert!(!safe.contains("SECRET"));
+        assert_eq!(safe, "...?apiKey=<redacted>&markets=h2h&oddsFormat=decimal");
+    }
+
+    /// More than one occurrence, and text with none at all.
+    #[test]
+    fn every_occurrence_goes_and_clean_text_is_untouched() {
+        let safe = redact_url_secrets("a apiKey=one b apiKey=two c");
+        assert!(!safe.contains("one") && !safe.contains("two"), "{safe}");
+        assert_eq!(redact_url_secrets("HTTP 401: quota reached"), "HTTP 401: quota reached");
+        assert_eq!(redact_url_secrets(""), "");
+    }
 }

@@ -21,8 +21,16 @@ use tracing::{info, warn, error};
 
 /// Fetch nonce for an address from the CLOB API
 pub async fn fetch_next_nonce(http: &reqwest::Client, address: Address) -> Option<u64> {
-    let url = format!("{}/nonce?address={}", crate::config::CLOB_API_BASE, address);
-    match http.get(&url).send().await {
+    // Built with the query API rather than `format!` so the address can never be
+    // read as part of the URL structure.
+    //
+    // Not a live vulnerability — `CLOB_API_BASE` is a compile-time constant and
+    // `Address` is 20 bytes that Display as hex, so neither the host nor the path
+    // is reachable from any input. But a string-formatted URL is what static
+    // analysis flags (CodeQL "server-side request forgery", 2026-08), and this
+    // form is both unflaggable and correct by construction.
+    let url = format!("{}/nonce", crate::config::CLOB_API_BASE);
+    match http.get(&url).query(&[("address", address.to_string())]).send().await {
         Ok(resp) => {
             let status = resp.status();
             if status == reqwest::StatusCode::NOT_FOUND {
