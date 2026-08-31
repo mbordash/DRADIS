@@ -108,9 +108,16 @@ pub async fn run_sports_raptor(
     // The sport/region selectors are live config, so the URL is rebuilt each
     // cycle rather than once here — changing the sport must not require a
     // restart, and a stale URL would keep polling the previous feed.
+    // The credential is deliberately NOT in this string.
+    //
+    // The Odds API accepts its key only as `?apiKey=` (no header form exists), so
+    // it has to reach the wire in the query. But it does not have to sit in a
+    // `String` that is then passed between functions, held across awaits and one
+    // careless `info!("polling {url}")` away from disk. It is attached to the
+    // request itself, at the point of sending, and nowhere else.
     let odds_url = |sport: &str, regions: &str| format!(
         "https://api.the-odds-api.com/v4/sports/{sport}/odds?regions={regions}\
-&markets=h2h&oddsFormat=decimal&apiKey={api_key}",
+&markets=h2h&oddsFormat=decimal",
     );
 
     // Track the last consensus per event id so `line_drift` measures movement on
@@ -125,7 +132,7 @@ pub async fn run_sports_raptor(
             (c.sports_low_budget_warn, c.sports_odds_sport.clone(), c.sports_odds_regions.clone())
         };
         let url = odds_url(&sport, &regions);
-        match try_fetch_nearest_event(&http, &url, low_budget_warn).await {
+        match try_fetch_nearest_event(&http, &url, &api_key, low_budget_warn).await {
             Ok(sample) => {
                 consecutive_failures = 0;
                 let line_drift = match &prev_event {
@@ -240,10 +247,18 @@ fn redact_url_secrets(s: &str) -> String {
     out
 }
 
-async fn try_fetch_nearest_event(http: &reqwest::Client, url: &str, low_budget_warn: i64) -> Result<EventSample, String> {
+async fn try_fetch_nearest_event(
+    http: &reqwest::Client,
+    url: &str,
+    api_key: &str,
+    low_budget_warn: i64,
+) -> Result<EventSample, String> {
     let resp = tokio::time::timeout(
         std::time::Duration::from_secs(8),
-        http.get(url).send(),
+        // Applied here, not baked into `url`. reqwest still renders the finished
+        // URL in its error Display, which is why the redaction below is a second
+        // layer rather than a replacement for this one.
+        http.get(url).query(&[("apiKey", api_key)]).send(),
     )
     .await
     .map_err(|_| "request timed out after 8s".to_string())?

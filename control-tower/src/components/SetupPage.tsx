@@ -1594,7 +1594,9 @@ export default function SetupPage() {
   const groups = groupsForVenue(status.venue);
 
   return (
-    <div className="space-y-6">
+    // `pb-20` reserves room for the fixed status bar below, so the last control
+    // on the page can still be reached and clicked while a notice is showing.
+    <div className="space-y-6 pb-20">
       {!status.venue_configured && (
         <div className="bg-amber-500/10 border border-amber-500/30 rounded-xl px-4 py-3 text-xs font-mono text-amber-300">
           ⚠️ Venue credentials not configured — DRADIS cannot trade until the{' '}
@@ -1633,16 +1635,6 @@ export default function SetupPage() {
 
       {showChangePw && (
         <PasswordCard mode="create" onDone={() => { setShowChangePw(false); setNotice({ kind: 'ok', text: 'Admin password updated.' }); }} />
-      )}
-
-      {notice && (
-        <div className={`text-xs font-mono rounded-xl px-4 py-3 border ${
-          notice.kind === 'ok'   ? 'bg-emerald-500/10 border-emerald-500/30 text-emerald-300'
-          : notice.kind === 'err' ? 'bg-rose-500/10 border-rose-500/30 text-rose-300'
-          :                         'bg-indigo-500/10 border-indigo-500/30 text-indigo-300'
-        }`}>
-          {notice.text}
-        </div>
       )}
 
       <VenueCard
@@ -1848,6 +1840,47 @@ export default function SetupPage() {
         Changes take effect after an engine restart (Docker respawns the container automatically).
       </p>
       {confirmDialog}
+
+      {/* Persistent status bar.
+        *
+        * Fixed to the viewport rather than rendered inline near the top of the
+        * page. Setup is a long form: the credential groups, the profile picker
+        * and the Save / Restart buttons all sit well below the fold, so an
+        * inline notice reported the result of an action the operator could not
+        * see without scrolling back up. That matters most for the message they
+        * most need — "Engine restarting — back in ~30-60s…" — which is emitted
+        * by a button at the very bottom of the page.
+        *
+        * `aria-live="polite"` so a change is announced rather than only read on
+        * focus, since attention is on the button that was just pressed. */}
+      {notice && (
+        <div
+          role="status"
+          aria-live="polite"
+          className="fixed inset-x-0 bottom-0 z-40 px-4 pb-4 pointer-events-none"
+        >
+          <div
+            className={`pointer-events-auto mx-auto max-w-3xl flex items-start gap-3 text-xs font-mono rounded-xl px-4 py-3 border shadow-lg backdrop-blur-sm ${
+              notice.kind === 'ok'   ? 'bg-emerald-950/90 border-emerald-500/40 text-emerald-300'
+              : notice.kind === 'err' ? 'bg-rose-950/90 border-rose-500/40 text-rose-300'
+              :                         'bg-indigo-950/90 border-indigo-500/40 text-indigo-300'
+            }`}
+          >
+            <span aria-hidden="true" className="mt-px">
+              {notice.kind === 'ok' ? '✅' : notice.kind === 'err' ? '⚠️' : '⏳'}
+            </span>
+            <span className="flex-1 whitespace-pre-wrap break-words">{notice.text}</span>
+            <button
+              type="button"
+              onClick={() => setNotice(null)}
+              aria-label="Dismiss status message"
+              className="shrink-0 opacity-60 hover:opacity-100 transition-opacity px-1 leading-none"
+            >
+              ✕
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

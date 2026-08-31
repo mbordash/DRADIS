@@ -54,10 +54,26 @@ function MarkerTooltip({ active, payload, label }: any) {
     const { trade, pnl } = tradeEntry.payload._tradeMarker as { trade: TradeRow; pnl: number };
     const pnlColor = pnl > 0 ? 'text-emerald-400' : pnl < 0 ? 'text-red-400' : 'text-gray-400';
     const symbol = trade.market.split(' ')[0];
+    // Amber border and a header chip for simulated trades. The badge sits in the
+    // HEADER rather than in the detail rows because the question this tooltip has
+    // to answer first is "was this real money?", and a mixed chart — paper trades
+    // from a ghost soak beside live ones — is the normal case after an operator
+    // flips modes. Amber is already the ghost colour elsewhere in this file.
+    const isGhost = trade.ghost === true;
     return (
-      <div className="card px-3 py-2 text-xs font-mono space-y-1.5 shadow-xl border-2 border-emerald-500/30">
-        <div className="text-emerald-300 font-semibold flex items-center gap-1.5">
-          <span>✅</span><span>Trade Close</span>
+      <div className={`card px-3 py-2 text-xs font-mono space-y-1.5 shadow-xl border-2 ${
+        isGhost ? 'border-amber-500/40' : 'border-emerald-500/30'
+      }`}>
+        <div className={`font-semibold flex items-center gap-1.5 ${
+          isGhost ? 'text-amber-300' : 'text-emerald-300'
+        }`}>
+          <span>{isGhost ? '👻' : '✅'}</span>
+          <span>Trade Close</span>
+          {isGhost && (
+            <span className="ml-auto text-[10px] font-normal px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300">
+              GHOST
+            </span>
+          )}
         </div>
         <div className="text-gray-400 text-[10px] border-t border-gray-700 pt-1">{label}</div>
         <div className="space-y-0.5 pt-1">
@@ -80,10 +96,21 @@ function MarkerTooltip({ active, payload, label }: any) {
     const entryPrice = parseFloat(position.entry_price);
     const shares = parseFloat(position.shares);
     const symbol = position.market.split(' ')[0];
+    const isGhost = position.ghost_mode === true;
     return (
-      <div className="card px-3 py-2 text-xs font-mono space-y-1.5 shadow-xl border-2 border-indigo-500/30">
-        <div className="text-indigo-300 font-semibold flex items-center gap-1.5">
-          <span>🎯</span><span>Position Entry</span>
+      <div className={`card px-3 py-2 text-xs font-mono space-y-1.5 shadow-xl border-2 ${
+        isGhost ? 'border-amber-500/40' : 'border-indigo-500/30'
+      }`}>
+        <div className={`font-semibold flex items-center gap-1.5 ${
+          isGhost ? 'text-amber-300' : 'text-indigo-300'
+        }`}>
+          <span>{isGhost ? '👻' : '🎯'}</span>
+          <span>Position Entry</span>
+          {isGhost && (
+            <span className="ml-auto text-[10px] font-normal px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300">
+              GHOST
+            </span>
+          )}
         </div>
         <div className="text-gray-400 text-[10px] border-t border-gray-700 pt-1">{label}</div>
         <div className="space-y-0.5 pt-1">
@@ -95,9 +122,6 @@ function MarkerTooltip({ active, payload, label }: any) {
           <div className="flex justify-between gap-3 pt-1 border-t border-gray-700">
             <span className="text-gray-500">Status</span><span className="text-yellow-400">Open</span>
           </div>
-          {position.ghost_mode && (
-            <div className="flex justify-between gap-3"><span className="text-gray-500">Mode</span><span className="text-amber-400 text-[10px]">👻 ghost</span></div>
-          )}
         </div>
       </div>
     );
