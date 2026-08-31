@@ -95,6 +95,90 @@ fn taker_fee_rate() -> Decimal { dec!(0.07) }
 #[cfg(feature = "us_retail")]
 fn taker_fee_rate() -> Decimal { Decimal::ZERO }
 
+/// Cancel every resting order the VENUE reports, before trading begins.
+///
+/// A crashed or restarted session leaves its GTC orders working. Polymarket
+/// International has swept them at startup since the beginning (`main.rs`), but
+/// Kalshi and Polymarket US relied on `OrderLifecycle::cancel_all`, which drains
+/// an in-memory tracked list — and that list is empty in a fresh process. So a
+/// previous session's resting order survived the restart, could fill with nothing
+/// watching it, and arrived later as a chain-adopted position with no entry of its
+/// own: real money in a position no strategy had decided to hold.
+///
+/// Asks the venue what is actually open rather than trusting local state, which is
+/// the whole point — local state is what was lost. A venue with no open-orders
+/// surface returns an empty list and this is a no-op.
+///
+/// Failures are logged and never fatal. Refusing to start because a cancel failed
+/// would leave the same orders working with no engine at all, which is strictly
+/// worse than starting and reconciling.
+pub async fn cancel_leftover_orders_at_startup<V: core::Execution + ?Sized>(venue: &V) {
+    // NEVER cancel while simulating.
+    //
+    // The sweep cannot tell its own leftovers from the account's other orders —
+    // Kalshi lists the whole account with no filter by series, ticker or client
+    // order id. On a self-custody intl wallet that is fine, because nothing else
+    // trades it. A Kalshi or Polymarket US account is a RETAIL account that a
+    // human also uses.
+    //
+    // So consider the AMI's default first-run posture: a customer connects their
+    // personal account to evaluate DRADIS, ghost mode is on, the engine will never
+    // place a real order — and the first thing it does is cancel every order they
+    // placed by hand. Worse, it repeats on every watchdog restart. Simulating is a
+    // promise not to touch the account, and cancelling is touching it.
+    //
+    // The cost of this gate is real and accepted: a leftover from a previous LIVE
+    // session is not swept if the operator restarts into ghost. It is reported
+    // instead, so the operator can act, and it is swept the moment they run live.
+    if crate::config::GHOST_MODE
+        || crate::helpers::dynamic_config::global_config_tx()
+            .map(|tx| tx.borrow().ghost_mode)
+            .unwrap_or(false)
+    {
+        match venue.open_orders().await {
+            Ok(open) if !open.is_empty() => tracing::warn!(
+                "👻 Startup cancel skipped in ghost mode — {} resting order(s) on this account were LEFT ALONE. \
+                 If any belong to a previous live DRADIS session, run live once to sweep them, or cancel them on the venue.",
+                open.len(),
+            ),
+            _ => tracing::info!("👻 Startup cancel skipped — simulating, so the account is not touched"),
+        }
+        return;
+    }
+
+    let open = match venue.open_orders().await {
+        Ok(o) => o,
+        Err(e) => {
+            // Says "unchecked", never "clean". A venue that cannot list its open
+            // orders has not told us there are none.
+            tracing::warn!("⚠️ Startup cancel SKIPPED — could not list open orders ({e}). \
+                            Any order left working by a previous session is still live and \
+                            unmanaged until its market is next traded.");
+            return;
+        }
+    };
+    if open.is_empty() {
+        tracing::info!("✅ Startup cancel: no leftover orders from a previous session");
+        return;
+    }
+    tracing::info!("🧹 Startup cancel: {} leftover order(s) from a previous session", open.len());
+    let mut failed = 0usize;
+    for ord in &open {
+        if let Err(e) = venue.cancel(ord.order_id.clone()).await {
+            failed += 1;
+            tracing::warn!("⚠️ Startup cancel failed for {} ({}): {e}", ord.order_id, ord.market);
+        }
+    }
+    if failed == 0 {
+        tracing::info!("✅ Startup cancel complete ({} order(s))", open.len());
+    } else {
+        tracing::error!(
+            "❌ Startup cancel: {}/{} order(s) could not be cancelled — they are still working on the venue",
+            failed, open.len(),
+        );
+    }
+}
+
 /// Venue-neutral order lifecycle engine (Option C). Compiled for every venue;
 /// US drives it today, intl migrates onto it next.
 pub mod lifecycle;

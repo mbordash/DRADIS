@@ -207,8 +207,36 @@ async fn onchain_shares(
 /// downward correction to nothing is only trusted once the row is older than the
 /// settlement grace. Non-zero readings are always trusted: they cannot erase
 /// anything, and they are how a partial fill or partial exit gets recorded.
-fn persist_chain_correction(chain_shares: Decimal, row_ts: &str, now: chrono::DateTime<chrono::Utc>) -> bool {
+///
+/// # A resting maker quote reads zero because it has not filled
+///
+/// The settlement grace is a timing guard, and it is the wrong question to ask
+/// about an order that has not filled yet: a resting bid is SUPPOSED to hold
+/// zero shares on-chain, for as long as it rests, which can be hours. Once the
+/// 90-second grace expired the correction fired and rewrote the row to zero
+/// shares while stamping `chain_adopted = 1` — which then permanently disarmed
+/// the unconfirmed-phantom guard in `shares_to_value` for that row.
+///
+/// Observed on the v1.0.8 production instance, 2026-08-31: a real $8.00 NO quote
+/// (26.66 shares at $0.30) was recorded correctly, then rewritten to `shares=0,
+/// chain_adopted=1` by the next chain-sync pass, leaving the Control Tower
+/// showing a launch-mode position holding nothing. A YES quote placed seven
+/// minutes later still read `19.51 shares, chain_adopted=0`, having not yet met a
+/// sync pass — the same row on either side of the bug.
+///
+/// So a pending, never-confirmed row reading zero is left alone. It resolves the
+/// way it should: `confirm_position_status` when the quote fills, or removal when
+/// it is pulled.
+fn persist_chain_correction(
+    chain_shares: Decimal,
+    row_ts: &str,
+    now: chrono::DateTime<chrono::Utc>,
+    status: &str,
+    chain_adopted: bool,
+) -> bool {
     if chain_shares > dec!(0) { return true; }
+    // Still resting: zero is the expected reading, not a correction.
+    if status == "pending" && !chain_adopted { return false; }
     match chrono::DateTime::parse_from_rfc3339(row_ts) {
         Ok(opened) => (now - opened.with_timezone(&chrono::Utc)).num_seconds()
             >= crate::config::FRESH_FILL_SETTLEMENT_GRACE_SECS,
@@ -239,7 +267,14 @@ fn shares_to_value(
     db_shares: Decimal,
     status: &str,
     chain_adopted: bool,
+    ghost_mode: bool,
 ) -> Option<Decimal> {
+    // A simulated position is never asked about on-chain, so `None` here means
+    // "not applicable" rather than "the read failed". The row IS the truth for it,
+    // and it is valued so a simulated portfolio moves.
+    if ghost_mode {
+        return Some(db_shares);
+    }
     match chain_shares {
         Some(on_chain) => Some(on_chain.max(dec!(0))),
         // Unconfirmed phantom: an order we placed that the chain never
@@ -314,28 +349,57 @@ async fn calculate_positions_value(
             Err(_) => continue,
         };
 
+        // A simulated position holds nothing on-chain BY DEFINITION, so the chain
+        // has no opinion worth writing back about it — but it IS still valued.
+        //
+        // Not skipped outright: ghost positions count toward portfolio value, so
+        // that an operator evaluating DRADIS in simulation sees a portfolio that
+        // moves. What must not happen is the chain CORRECTING one.
+        //
+        // This is the bug that zeroed a real resting quote (see
+        // `persist_chain_correction`) wearing a different status. A ghost taker
+        // entry is written `ghost_mode=1, status="confirmed"`, so the resting-quote
+        // guard below does not cover it: the chain reads zero for a token the
+        // wallet genuinely does not hold, `drifted` fires, and the correction
+        // rewrites the simulated position to `shares=0, chain_adopted=1` — erasing
+        // the open paper position that customer is looking at, and spraying drift
+        // warnings while it does. Reachable whenever ghost mode runs with live
+        // credentials, which is the AMI's evaluation posture and its default.
+        //
+        // `purge_stale_open_positions` already excludes ghost rows at its query
+        // for exactly this reason; this loop simply never learned to.
+        //
         // Ask the chain what we actually hold. Typically 1-3 open positions, so
         // this is a handful of calls a minute against a task that already makes
         // one; each is individually timed out and a failure falls back to the
         // DB row rather than erasing the position.
-        let chain = onchain_shares(client, &pos.token_id).await;
+        let chain = if pos.ghost_mode {
+            None
+        } else {
+            onchain_shares(client, &pos.token_id).await
+        };
         if let Some(c) = chain {
             let c = c.max(dec!(0));
             // 5% tolerance absorbs rounding on fractional share sizes; anything
             // larger is real drift and gets written back so the API, the banner
             // and the next snapshot all agree.
             let drifted = (c - db_shares).abs() > (db_shares.abs() * dec!(0.05)).max(dec!(0.0001));
-            if drifted && persist_chain_correction(c, &pos.ts, chrono::Utc::now()) {
+            if drifted && persist_chain_correction(c, &pos.ts, chrono::Utc::now(), &pos.status, pos.chain_adopted) {
                 warn!("⚠️ Position drift [{}]: DB says {:.4} shares, chain says {:.4} — correcting the row",
                       pos.token_id, db_shares, c);
                 let entry = pos.entry_price.parse::<Decimal>().unwrap_or(dec!(0));
                 db::update_position_from_chain(pool, &pos.token_id, c, entry, None).await;
             } else if drifted {
-                debug!("Position drift [{}] within settlement grace ({:.4} vs {:.4}) — not persisting yet",
-                       pos.token_id, db_shares, c);
+                if c <= dec!(0) && pos.status == "pending" && !pos.chain_adopted {
+                    debug!("Position drift [{}]: chain says 0 for a quote still resting ({:.4} on the row) — not a correction",
+                           pos.token_id, db_shares);
+                } else {
+                    debug!("Position drift [{}] within settlement grace ({:.4} vs {:.4}) — not persisting yet",
+                           pos.token_id, db_shares, c);
+                }
             }
         }
-        let shares = match shares_to_value(chain, db_shares, &pos.status, pos.chain_adopted) {
+        let shares = match shares_to_value(chain, db_shares, &pos.status, pos.chain_adopted, pos.ghost_mode) {
             Some(s) => s,
             None => continue,
         };
@@ -353,7 +417,24 @@ async fn calculate_positions_value(
             .or_else(|| pos.entry_price.parse::<Decimal>().ok())
             .unwrap_or(dec!(0));
 
-        total_value += shares * price_to_use;
+        // A REAL position contributes its full mark, because opening it debited
+        // collateral by roughly the same amount: the total barely moves on entry
+        // and then tracks the position, which is what a portfolio should do.
+        //
+        // A SIMULATED position debited nothing, so crediting its full mark would
+        // add the whole notional at entry and take it back at exit. The banner
+        // would jump $8 on opening an $8 paper position that has made nothing,
+        // and every entry would read as a gain on the evaluation chart a customer
+        // is using to judge the system. Ghost rows therefore contribute only what
+        // they have actually made — `shares × (mark − entry)` — which is the same
+        // arithmetic a real position produces once its entry debit is accounted
+        // for, and which can legitimately be negative.
+        if pos.ghost_mode {
+            let entry = pos.entry_price.parse::<Decimal>().unwrap_or(dec!(0));
+            total_value += shares * (price_to_use - entry);
+        } else {
+            total_value += shares * price_to_use;
+        }
     }
 
     total_value
@@ -559,6 +640,7 @@ pub fn spawn_cleanup_task(
                                 hourly_market_name.clone(),
                                 hourly_yes_token.clone(), hourly_no_token.clone(),
                                 hourly_market_close_time,
+                                &asset,
                             ).await;
                         }
                         if let Some(ref mk) = maker_market_config {
@@ -567,6 +649,7 @@ pub fn spawn_cleanup_task(
                                 mk.market_name.clone(),
                                 mk.yes_token.clone(), mk.no_token.clone(),
                                 mk.market_close_time,
+                                &asset,
                             ).await;
                         }
 
@@ -1047,7 +1130,7 @@ mod portfolio_valuation_tests {
     #[test]
     fn a_position_the_chain_no_longer_holds_is_worth_nothing() {
         assert_eq!(
-            shares_to_value(Some(dec!(0)), dec!(18), "confirmed", true),
+            shares_to_value(Some(dec!(0)), dec!(18), "confirmed", true, false),
             Some(dec!(0)),
         );
     }
@@ -1058,7 +1141,7 @@ mod portfolio_valuation_tests {
     #[test]
     fn a_settled_fill_counts_even_while_the_row_says_pending() {
         assert_eq!(
-            shares_to_value(Some(dec!(18)), dec!(18), "pending", false),
+            shares_to_value(Some(dec!(18)), dec!(18), "pending", false, false),
             Some(dec!(18)),
             "the chain says we hold them; the row's status is just lag",
         );
@@ -1069,7 +1152,7 @@ mod portfolio_valuation_tests {
     #[test]
     fn an_unreachable_chain_falls_back_to_the_database() {
         assert_eq!(
-            shares_to_value(None, dec!(18), "confirmed", true),
+            shares_to_value(None, dec!(18), "confirmed", true, false),
             Some(dec!(18)),
         );
     }
@@ -1079,24 +1162,24 @@ mod portfolio_valuation_tests {
     /// filled, and valuing it invents profit.
     #[test]
     fn an_unconfirmed_phantom_is_still_skipped_when_the_chain_is_unreachable() {
-        assert_eq!(shares_to_value(None, dec!(18), "pending", false), None);
+        assert_eq!(shares_to_value(None, dec!(18), "pending", false, false), None);
         // Chain-adopted rescues it: chain-sync stamped it to real holdings.
-        assert_eq!(shares_to_value(None, dec!(18), "pending", true), Some(dec!(18)));
+        assert_eq!(shares_to_value(None, dec!(18), "pending", true, false), Some(dec!(18)));
     }
 
     /// The chain is authoritative even when it disagrees with the row, in either
     /// direction — a partial fill or a partial exit both land here.
     #[test]
     fn the_chain_wins_over_a_stale_share_count() {
-        assert_eq!(shares_to_value(Some(dec!(9)), dec!(18), "confirmed", true), Some(dec!(9)));
-        assert_eq!(shares_to_value(Some(dec!(25)), dec!(18), "confirmed", true), Some(dec!(25)));
+        assert_eq!(shares_to_value(Some(dec!(9)), dec!(18), "confirmed", true, false), Some(dec!(9)));
+        assert_eq!(shares_to_value(Some(dec!(25)), dec!(18), "confirmed", true, false), Some(dec!(25)));
     }
 
     /// A negative balance is not physically meaningful; clamp rather than
     /// subtract from the portfolio.
     #[test]
     fn a_negative_chain_balance_clamps_to_zero() {
-        assert_eq!(shares_to_value(Some(dec!(-5)), dec!(18), "confirmed", true), Some(dec!(0)));
+        assert_eq!(shares_to_value(Some(dec!(-5)), dec!(18), "confirmed", true, false), Some(dec!(0)));
     }
 
     // ── Write-back safety ──────────────────────────────────────────────────
@@ -1107,13 +1190,88 @@ mod portfolio_valuation_tests {
         ((now - chrono::Duration::seconds(secs_ago)).to_rfc3339(), now)
     }
 
+    /// A simulated position is valued from its row and never chain-corrected.
+    ///
+    /// Ghost positions count toward portfolio value on purpose: an operator
+    /// evaluating DRADIS in simulation should see a portfolio that moves. What
+    /// must not happen is the chain having an opinion about one — a ghost row
+    /// holds nothing on-chain by definition, so a chain read of zero is not
+    /// evidence the position closed.
+    ///
+    /// This is the bug of 2026-08-31 wearing a different status: the pending
+    /// guard did not cover ghost rows, which are written `status="confirmed"`,
+    /// so the drift corrector rewrote simulated positions to zero shares and
+    /// stamped them chain-adopted, erasing the paper record in the AMI's default
+    /// evaluation posture.
+    #[test]
+    fn a_ghost_position_is_valued_from_its_row_whatever_the_chain_says() {
+        // The chain is not consulted for a ghost row, so `None` arrives here.
+        assert_eq!(
+            shares_to_value(None, dec!(18), "confirmed", false, true),
+            Some(dec!(18)),
+            "a simulated position must still be valued",
+        );
+        // Even a pending, never-adopted ghost row is valued: the phantom guard
+        // exists to keep unconfirmed REAL orders out of the portfolio.
+        assert_eq!(
+            shares_to_value(None, dec!(18), "pending", false, true),
+            Some(dec!(18)),
+        );
+        // And a stray zero from the chain must not zero it either.
+        assert_eq!(
+            shares_to_value(Some(dec!(0)), dec!(18), "confirmed", true, true),
+            Some(dec!(18)),
+            "the chain has no opinion about a simulated position",
+        );
+    }
+
+    /// A resting maker quote holds zero shares because it has not filled, and
+    /// may rest for hours. The 90-second settlement grace is a timing guard and
+    /// answers the wrong question about it.
+    ///
+    /// Replays the v1.0.8 production row of 2026-08-31: a real $8.00 NO quote
+    /// (26.66 shares at $0.30) recorded correctly, then rewritten by the next
+    /// chain-sync pass to `shares=0, chain_adopted=1`, leaving the Control Tower
+    /// showing a launch-mode position holding nothing — and disarming the
+    /// unconfirmed-phantom guard in `shares_to_value` for that row from then on.
+    #[test]
+    fn a_resting_unfilled_quote_is_never_zeroed_however_long_it_rests() {
+        for age in [10, 91, 600, 36_000] {
+            let (ts, now) = at(age);
+            assert!(
+                !persist_chain_correction(dec!(0), &ts, now, "pending", false),
+                "a pending, never-confirmed quote {age}s old must not be zeroed — \
+                 it is resting, and zero is what resting looks like on-chain",
+            );
+        }
+    }
+
+    /// The guard is narrow: it protects only rows never confirmed and never
+    /// adopted. Anything else still follows the settlement grace, so a real
+    /// position that genuinely went to zero is still corrected.
+    #[test]
+    fn the_resting_quote_guard_does_not_cover_confirmed_or_adopted_rows() {
+        let (ts, now) = at(600);
+        assert!(
+            persist_chain_correction(dec!(0), &ts, now, "confirmed", false),
+            "a CONFIRMED row that went to zero is a real exit and must be written",
+        );
+        assert!(
+            persist_chain_correction(dec!(0), &ts, now, "pending", true),
+            "an adopted row is backed by a chain read and follows the grace",
+        );
+        // A non-zero reading is always trusted whatever the row's state: that is
+        // how a maker quote's fill gets recorded in the first place.
+        assert!(persist_chain_correction(dec!(26.66), &ts, now, "pending", false));
+    }
+
     /// The balance endpoint has read 0 for positions that genuinely existed
     /// (trades 294, 300, 308 and 310 all turned on exactly this). Writing that
     /// zero back would erase a real position from the row every consumer reads.
     #[test]
     fn a_zero_reading_on_a_fresh_fill_is_not_persisted() {
         let (ts, now) = at(10);
-        assert!(!persist_chain_correction(dec!(0), &ts, now));
+        assert!(!persist_chain_correction(dec!(0), &ts, now, "confirmed", true));
     }
 
     /// Past the settlement grace a zero is believable — this is the case that
@@ -1121,7 +1279,7 @@ mod portfolio_valuation_tests {
     #[test]
     fn a_zero_reading_past_the_settlement_grace_is_persisted() {
         let (ts, now) = at(crate::config::FRESH_FILL_SETTLEMENT_GRACE_SECS + 30);
-        assert!(persist_chain_correction(dec!(0), &ts, now));
+        assert!(persist_chain_correction(dec!(0), &ts, now, "confirmed", true));
     }
 
     /// A non-zero reading cannot erase anything, so it is always trusted — that
@@ -1129,14 +1287,14 @@ mod portfolio_valuation_tests {
     #[test]
     fn a_non_zero_reading_is_always_persisted() {
         let (fresh, now) = at(1);
-        assert!(persist_chain_correction(dec!(9), &fresh, now));
+        assert!(persist_chain_correction(dec!(9), &fresh, now, "confirmed", true));
     }
 
     /// An unparseable timestamp must not license zeroing the row.
     #[test]
     fn an_unparseable_timestamp_blocks_a_zeroing_write() {
         let now = chrono::Utc::now();
-        assert!(!persist_chain_correction(dec!(0), "not-a-timestamp", now));
-        assert!(persist_chain_correction(dec!(9), "not-a-timestamp", now));
+        assert!(!persist_chain_correction(dec!(0), "not-a-timestamp", now, "confirmed", true));
+        assert!(persist_chain_correction(dec!(9), "not-a-timestamp", now, "confirmed", true));
     }
 }

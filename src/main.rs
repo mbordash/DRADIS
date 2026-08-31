@@ -425,6 +425,18 @@ async fn run() -> Result<()> {
     let (config_tx, config_rx) = watch::channel(initial_dyn_cfg);
     let config_tx = Arc::new(config_tx);
 
+    // Registered HERE, immediately, rather than only inside the API server.
+    //
+    // Anything that reads the global config before registration gets `None` and
+    // falls back — and one of those fallbacks decides whether a venue's startup
+    // order sweep runs. `unwrap_or(false)` there means "not simulating", so an
+    // unregistered channel makes the sweep cancel a ghost operator's own resting
+    // orders. It happens to be safe today because registration wins the race
+    // comfortably, but nothing enforced that ordering and the failure is silent
+    // and account-visible. Registering at the point of creation makes it a fact
+    // rather than a timing accident.
+    dradis::helpers::dynamic_config::register_global_config_tx(Arc::clone(&config_tx));
+
     // ── Strategy→market status channel (feeds /api/status) ───────────────────
     let (markets_tx, markets_rx) = watch::channel::<std::collections::HashMap<String, String>>(std::collections::HashMap::new());
     let markets_tx = Arc::new(markets_tx);

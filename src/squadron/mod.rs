@@ -452,6 +452,11 @@ impl Squadron {
     /// Mark squadron stood-down (market expired or manual override).
     pub fn stand_down(&mut self) {
         self.state = SquadronState::StoodDown;
+        // A simulated resting quote must not outlive the squadron that placed it.
+        // The registry is process-global and keyed by squadron, so without this a
+        // stood-down squadron's quote would sit there until the process ended and
+        // could be crossed by a later squadron trading the same market.
+        crate::helpers::ghost_quotes::clear_squadron(&self.id.to_string());
     }
 
     /// Returns true when the squadron should cease all trading activity.

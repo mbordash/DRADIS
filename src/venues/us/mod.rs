@@ -48,7 +48,8 @@ use std::str::FromStr;
 use tracing::{debug, info};
 
 use crate::venues::core::{
-    Execution, Fill, FillStream, MarketId, OrderId, OrderIntent, Position, Side, TimeInForce,
+    Execution, Fill, FillStream, MarketId, OpenOrder, OrderId, OrderIntent, Position, Side,
+    TimeInForce,
 };
 
 use auth::UsAuth;
@@ -599,6 +600,74 @@ impl Execution for UsRetailVenue {
             price: intent.price, fee: Decimal::ZERO
         };
         Ok([to_fill(&ack.orders[0], &a), to_fill(&ack.orders[1], &b)])
+    }
+
+    /// Resting orders as the VENUE reports them.
+    ///
+    /// Implemented against `polymarket-us` 0.8, where `GET /v1/orders/open` now
+    /// deserializes into a full `OpenOrder`. Before that the SDK typed the response
+    /// as the place-order acknowledgement, which carries no market, side or price,
+    /// so this venue inherited the trait default and reported nothing — and the
+    /// startup order sweep silently swept nothing while logging that the account
+    /// was clean.
+    ///
+    /// Orders whose market or side cannot be resolved are SKIPPED rather than
+    /// guessed at: this list drives cancellation, and a wrong market id would
+    /// either cancel the wrong order or hide a real one behind a filter that can
+    /// never match.
+    async fn open_orders(&self) -> Result<Vec<OpenOrder>> {
+        let resp = self
+            .client
+            .orders()
+            .open(None::<&()>)
+            .await
+            .context("open orders GET failed")?;
+
+        let mut out = Vec::with_capacity(resp.orders.len());
+        for o in resp.orders {
+            if o.id.is_empty() || o.market_slug.is_empty() {
+                continue;
+            }
+            // DRADIS names a US leg `{slug}#long` / `{slug}#short`; the API reports
+            // the outcome as YES / NO. See `markets::leg_is_long`.
+            let leg = match o.outcome_side {
+                Some(types::OutcomeSide::Yes) => markets::LEG_LONG,
+                Some(types::OutcomeSide::No) => markets::LEG_SHORT,
+                _ => continue,
+            };
+            let side = match o.side {
+                Some(types::OrderSideDirection::Buy) => Side::Buy,
+                Some(types::OrderSideDirection::Sell) => Side::Sell,
+                _ => continue,
+            };
+            let tif = match o.tif {
+                Some(types::TimeInForce::GoodTillCancel) => TimeInForce::Gtc,
+                Some(types::TimeInForce::GoodTillDate) => TimeInForce::Gtd,
+                Some(types::TimeInForce::ImmediateOrCancel) => TimeInForce::Fak,
+                Some(types::TimeInForce::FillOrKill) => TimeInForce::Fok,
+                // An order the venue is still reporting as open is resting, whatever
+                // it calls its time-in-force. Treating an unknown value as GTC keeps
+                // it visible to `is_resting`, so the sweep can still cancel it.
+                _ => TimeInForce::Gtc,
+            };
+            let price = o
+                .price
+                .as_ref()
+                .and_then(|p| Decimal::from_str(&p.value).ok())
+                .unwrap_or(Decimal::ZERO);
+
+            out.push(OpenOrder {
+                order_id: OrderId(o.id),
+                market: MarketId::new(format!("{}{}", o.market_slug, leg)),
+                side,
+                price,
+                original_qty: Decimal::try_from(o.quantity).unwrap_or(Decimal::ZERO),
+                filled_qty: Decimal::try_from(o.cum_quantity).unwrap_or(Decimal::ZERO),
+                tif,
+                pair_market: None,
+            });
+        }
+        Ok(out)
     }
 
     async fn cancel(&self, id: OrderId) -> Result<()> {

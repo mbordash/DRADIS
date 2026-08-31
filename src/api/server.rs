@@ -2337,11 +2337,29 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
                 Decimal::from_str(&pos.entry_price),
             ) {
                 let cost_basis = shares * entry_price;
+                // A SIMULATED position contributes only what it has MADE.
+                //
+                // Opening a real position debits collateral by roughly its cost, so
+                // crediting the full mark leaves the total steady on entry and then
+                // tracking the position. A paper entry debits nothing, so crediting
+                // the full mark adds the whole notional the moment it opens and
+                // takes it back on exit: the banner jumps $8 for an $8 paper
+                // position that has made nothing, and every entry reads as a gain on
+                // the very chart an operator uses to judge the system.
+                //
+                // Kept in step with `calculate_positions_value`, which books the
+                // same `shares × (mark − entry)` into pnl_snapshots. The two are
+                // meant to be one source of truth and briefly were not.
+                let ghost = pos.ghost_mode;
                 if let Some(ref cp_str) = pos.current_price {
                     if let Ok(cur_price) = Decimal::from_str(cp_str) {
                         if cur_price > Decimal::ZERO {
                             let market_value = shares * cur_price;
-                            asset_positions_value += market_value;
+                            asset_positions_value += if ghost {
+                                market_value - cost_basis
+                            } else {
+                                market_value
+                            };
                             asset_unrealized_pnl += market_value - cost_basis;
                             has_live_prices = true;
                             debug!(" [{}] token {} {} shares × cur=${:.4} = ${:.4} (entry=${:.4} pnl={:+.4})",
@@ -2353,8 +2371,12 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
                     }
                 }
                 // No current_price — fall through to snapshot or cost basis below
-                // (tracked separately so we can mix per-position accuracy)
-                asset_positions_value += cost_basis;
+                // (tracked separately so we can mix per-position accuracy).
+                // A simulated position with no mark has made nothing yet, so it
+                // contributes nothing rather than its cost.
+                if !ghost {
+                    asset_positions_value += cost_basis;
+                }
             }
         }
 
@@ -4048,6 +4070,11 @@ pub async fn run_api_server(
         .unwrap_or(9000);
 
     // Expose the config broadcast to routes outside ApiState (Setup profile picker).
+    //
+    // Idempotent: `main` registers the same sender at the moment it creates the
+    // channel, so anything reading the global config during startup sees it. This
+    // call remains for callers that start an API server without going through
+    // `main`, and re-registering the same Arc is a no-op.
     crate::helpers::dynamic_config::register_global_config_tx(Arc::clone(&config_tx));
 
     let api_key = std::env::var("DRADIS_API_KEY").ok();

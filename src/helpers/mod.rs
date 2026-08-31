@@ -30,6 +30,8 @@ pub mod metrics;
 pub mod config_helpers;
 pub mod db;
 pub mod dynamic_config;
+/// Venue-neutral simulation of resting maker quotes in ghost mode.
+pub mod ghost_quotes;
 pub mod llm_advisor;
 pub mod llm_patch;
 pub mod llm_policy;

@@ -426,6 +426,8 @@ pub async fn run_kalshi_trader(
     let series = configured_series();
     info!("🏛️ Kalshi trader starting — series={series:?} filter={filter:?}");
 
+    crate::venues::cancel_leftover_orders_at_startup(venue.as_ref()).await;
+
     // Venue-lifetime private fill feed (event-precise fill confirmation).
     venue.start_fill_feed(cancel.clone());
 
@@ -777,6 +779,23 @@ async fn trade_one_market(
     // ── Register the squadron so the Control Tower lists it ─────────────────
     let squadron = register_kalshi_squadron(cag, &pair, &raptors, deployed_as, squadron_name, sports_rx, tennis_rx, cancel);
     let squadron_id = squadron.id.clone();
+    // Previous tick's ghost mode, so the registry is swept on the LIVE edge rather
+    // than on every live tick: a level-triggered clear takes the registry's global
+    // lock and walks the whole map on each pass to do nothing. Starts true so a
+    // market entered live sweeps once.
+    let mut was_ghosting = true;
+    // Start this market clean of simulated resting quotes.
+    //
+    // Cleared on the way IN rather than on each way out, because there are many
+    // return paths and only one entry. Kalshi and Polymarket US tear down through
+    // `Cag::update_state`, which rewrites a summary string and does NOT call
+    // `Squadron::stand_down`, so the stand-down hook that clears the registry on
+    // intl never runs here. Without this a rotation orphaned that market's quotes
+    // for the life of the process; worse, rotation keeps the same squadron id and
+    // can return to a ticker traded earlier, so a quote frozen hours ago became
+    // priceable again and crossed immediately into a fabricated entry. The stale
+    // key also BLOCKED quoting, because `rest` refuses an occupied key.
+    crate::helpers::ghost_quotes::clear_squadron(&squadron_id);
     // Retire the squadron this rotation replaced, but only when the id actually
     // changed. Rotating BTC→BTC re-registers the same id and must NOT be
     // removed — that flicker is what made a healthy squadron look like it was
@@ -1100,6 +1119,61 @@ async fn trade_one_market(
             }
             _ => (Some(market_cfg.clone()), Some(snapshot.clone())),
         };
+
+        // ── Ghost maker fills: rest until the book crosses the quote ──────
+        //
+        // Simulated maker quotes are held in the venue-neutral registry and
+        // become positions only when the best ASK reaches them. Before this,
+        // `dispatch_single` stamped a full fill at the quote price the instant
+        // it was placed, and since the Maker viper quotes below the ask by
+        // construction the position was born in profit and took its target on
+        // the next tick — the treadmill measured on intl, which lived here too.
+        // Leaving ghost mode drops this squadron's simulated quotes. Without it a
+        // quote rested in ghost survives a GHOST → LIVE → GHOST round trip and can
+        // cross hours later at a stale price, booking a fabricated entry on top of
+        // whatever the key holds by then.
+        if was_ghosting && !dyn_cfg.ghost_mode {
+            crate::helpers::ghost_quotes::clear_squadron(&squadron_id);
+        }
+        was_ghosting = dyn_cfg.ghost_mode;
+        if dyn_cfg.ghost_mode {
+            let ask_for = |m: &crate::venues::core::MarketId| -> Option<Decimal> {
+                if m == &market_cfg.yes_token { return Some(snapshot.yes_ask); }
+                if m == &market_cfg.no_token  { return Some(snapshot.no_ask); }
+                if let (Some(mcfg), Some(ms)) = (mk_market.as_ref(), mk_snapshot.as_ref()) {
+                    if m == &mcfg.yes_token { return Some(ms.yes_ask); }
+                    if m == &mcfg.no_token  { return Some(ms.no_ask); }
+                }
+                None
+            };
+            for (pk, resting) in crate::helpers::ghost_quotes::take_crossed(&squadron_id, ask_for) {
+                let pos = resting.position;
+                let rested = (Utc::now() - pos.opened_at).num_seconds();
+                {
+                    let mut map = positions.lock().await;
+                    // Never overwrite an occupied slot: reconciliation writes real
+                    // positions here without consulting ghost mode.
+                    if map.contains_key(&pk) {
+                        warn!("👻 GHOST_MODE MakerFill [{}]: {} | dropping simulated fill @ ${:.4} — slot already occupied",
+                              pk.strategy, pos.market_name, pos.avg_entry);
+                        continue;
+                    }
+                    info!("👻 GHOST_MODE MakerFill [{}]: {} | shares={:.2} @ ${:.4} — ask crossed after {}s resting (simulated)",
+                          pk.strategy, pos.market_name, pos.shares, pos.avg_entry, rested);
+                    map.insert(pk.clone(), pos.clone());
+                }
+                // The entry is booked HERE rather than at placement, so the paper
+                // record carries fills that a counterparty actually caused.
+                let fill = Fill {
+                    order_id: OrderId(String::new()),
+                    market: resting.params.token_id.clone(),
+                    filled: pos.shares,
+                    price: pos.avg_entry,
+                    fee: Decimal::ZERO,
+                };
+                record_entry(&squadron_id, &pool, &scope, &pk.strategy, &resting.params, &fill).await;
+            }
+        }
 
         let ctx = StrategyContext {
             market: market_cfg.clone(),
@@ -1483,6 +1557,31 @@ async fn dispatch_signal(
         StrategySignal::MakerQuote { yes, no } => {
             let mut acted = false;
             for q in [yes.as_ref(), no.as_ref()].into_iter().flatten() {
+                // Ghost quotes REST; they do not fill. See `helpers::ghost_quotes`
+                // and the crossing check in the tick loop. Routing them through
+                // `dispatch_single` instead would stamp an instant full fill at
+                // the quote price, which is the treadmill this replaced.
+                if q.ghost_mode {
+                    let pk = PositionKey::new(squadron_id, strategy_name, q.token_id.clone());
+                    if positions.lock().await.contains_key(&pk) { continue; }
+                    let resting = Position {
+                        shares: q.shares,
+                        avg_entry: q.price,
+                        opened_at: Utc::now(),
+                        close_time: None,
+                        market_name: q.market_name.clone(),
+                        pair_token_id: q.token_id.clone(),
+                        fill_confirmed_at: None,
+                        paired_leg_token_id: None,
+                        entry_fee: Decimal::ZERO,
+                    };
+                    if crate::helpers::ghost_quotes::rest(pk, resting, (*q).clone()) {
+                        info!("👻 [{strategy_name}] ghost maker quote: {} @ {:.4} × {:.2} — resting until ask crosses",
+                              q.token_id, q.price, q.shares);
+                        acted = true;
+                    }
+                    continue;
+                }
                 if dispatch_single(squadron_id, venue, pool, scope, positions, lifecycle, strategy_name, q, Side::Buy, starting)
                     .await
                     .is_some()
@@ -1494,6 +1593,30 @@ async fn dispatch_signal(
         }
         StrategySignal::MakerCancel { tokens } => {
             let mut acted = false;
+            // SIMULATING: pull the simulated quote and touch nothing else.
+            //
+            // This arm was unreachable in ghost mode until the maker viper learned
+            // to see resting ghost quotes — and the moment it could emit
+            // `MakerCancel` for one, the loop below started listing the ACCOUNT's
+            // real open orders and cancelling any resting on that token. Ghost mode
+            // never places a real order, so every match there is either the
+            // operator's own manual order or a leftover from a previous live
+            // session that the startup sweep just promised to leave alone.
+            //
+            // The intl patrol has always returned before its real cancel path for
+            // this reason; this mirrors it.
+            if scope.ghost {
+                for tok in tokens {
+                    let pk = PositionKey::new(squadron_id, strategy_name, tok.clone());
+                    if let Some(pulled) = crate::helpers::ghost_quotes::pull(&pk) {
+                        info!("👻 [{strategy_name}] ghost maker quote-pulled: {} @ {:.4} (simulated)",
+                              tok, pulled.position.avg_entry);
+                        acted = true;
+                    }
+                    positions.lock().await.remove(&pk);
+                }
+                return acted;
+            }
             let open = venue.open_orders().await.unwrap_or_default();
             for tok in tokens {
                 for ord in open.iter().filter(|o| &o.market == tok) {

@@ -1094,14 +1094,37 @@ impl Strategy for MakerStrategyImpl {
             let pos_map = ctx.positions.lock().await;
             let mut pull_tokens = Vec::new();
             for token_id in [market.yes_token.clone(), market.no_token.clone()] {
-                let Some(position) = pos_map.get(&PositionKey::new(&ctx.squadron_id, "MakerStrategy", token_id.clone())) else {
+                let pos_key = PositionKey::new(&ctx.squadron_id, "MakerStrategy", token_id.clone());
+                let position = pos_map.get(&pos_key);
+
+                // A SIMULATED resting quote is deliberately NOT in the position map
+                // — see `helpers::ghost_quotes` — so it has to be asked about
+                // separately or this whole mechanism is blind to it.
+                //
+                // Blind is worse than it sounds. Without this, a ghost quote could
+                // never be pulled: neither the oracle-drift pull nor the toxic-OBI
+                // pull could see it, so simulation kept exactly the fills that live
+                // trading would have cancelled — the adversely-selected ones. And
+                // because the no-entry branch below clears the drift baseline every
+                // tick, a quote that did fill arrived with no anchor, disabling the
+                // oracle-drift half of ToxicFill for its whole life. Ghost results
+                // would have understated the Maker as systematically as the
+                // instant-fill treadmill once overstated it.
+                let ghost_resting = position.is_none()
+                    && crate::helpers::ghost_quotes::is_resting(&pos_key);
+
+                if position.is_none() && !ghost_resting {
                     // No quote/position on this token — drop any stale drift baseline.
                     clear_maker_quote_oracle_baseline(token_id.as_str());
                     clear_maker_toxic_obi_streak(token_id.as_str());
                     continue;
-                };
+                }
 
-                if position.fill_effective_at(dc.ghost_mode).is_none() {
+                // Resting and unfilled, whether the quote is real or simulated.
+                let unfilled = ghost_resting
+                    || position.is_some_and(|p| p.fill_effective_at(dc.ghost_mode).is_none());
+
+                if unfilled {
                     // Unfilled resting quote: arm/check the oracle-drift baseline.
                     let oracle_now = snapshot.oracle_price;
                     match maker_quote_oracle_drift(token_id.as_str(), oracle_now) {
@@ -1149,7 +1172,7 @@ impl Strategy for MakerStrategyImpl {
                 // Cancelling a quote that has not filled costs nothing and risks
                 // nothing, so this half of the mechanism stays as eager as it has
                 // always been. Only the FILLED path below is gated.
-                if position.fill_effective_at(dc.ghost_mode).is_none() {
+                if unfilled {
                     if breached {
                         arm_maker_toxic_cooldown(token_id.as_str());
                         clear_maker_quote_oracle_baseline(token_id.as_str());
@@ -1158,6 +1181,10 @@ impl Strategy for MakerStrategyImpl {
                     }
                     continue;
                 }
+
+                // Past here the quote has FILLED, so the map entry exists by
+                // construction: `unfilled` is false only when `position` is Some.
+                let Some(position) = position else { continue };
 
                 // ── CONFIRMED FILL: require all three confirmations ───────────
                 // See MAKER_TOXIC_* in config.rs. Track the streak on EVERY tick

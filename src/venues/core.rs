@@ -231,11 +231,19 @@ pub trait Execution: Send + Sync {
 
     /// Currently resting/working orders, as reported by the venue.
     ///
-    /// Foundation for the shared `OrderLifecycle` (Option C). Default returns an
-    /// empty set so a venue that has not yet wired its open-orders query compiles
-    /// and degrades to positions-poll reconciliation rather than failing.
+    /// Foundation for the shared `OrderLifecycle` (Option C). The default is an
+    /// ERROR, not an empty list, and the distinction is load-bearing: "this venue
+    /// holds no resting orders" and "this venue cannot tell you" are different
+    /// answers, and only one of them is safe to act on.
+    ///
+    /// The default used to be `Ok(vec![])`. Every reconciliation caller unwraps to
+    /// default and so degrades identically either way — but the startup order
+    /// sweep reads the result as fact, and on Polymarket US (which has never
+    /// implemented this) it logged "no leftover orders from a previous session"
+    /// having checked nothing at all. A sweep that cannot see is worse than no
+    /// sweep, because it reports success.
     async fn open_orders(&self) -> Result<Vec<OpenOrder>> {
-        Ok(Vec::new())
+        anyhow::bail!("this venue does not implement open_orders()")
     }
 
     /// Subscribe to the venue's fill-event feed, if it has one.

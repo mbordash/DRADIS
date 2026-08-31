@@ -2413,6 +2413,32 @@ pub async fn confirm_position_status(
     }
 }
 
+/// Close SIMULATED open rows for a token, whatever strategy holds them.
+///
+/// Deliberately scoped to `ghost_mode = 1`. A real row is reconciled against the
+/// chain and swept by `purge_stale_open_positions`; a ghost row is excluded from
+/// both, by design, because the chain has no opinion about a simulation. That
+/// leaves market expiry as the only moment a still-held ghost position can be
+/// closed, and nothing was doing it — the row stayed open, kept contributing to
+/// portfolio value at its last mark, and outlived the market resolving.
+///
+/// Keyed by token rather than (strategy, token) because the caller is dropping
+/// every position on an expiring market, not one viper's.
+pub async fn close_ghost_open_position(pool: &SqlitePool, token_id: &str) {
+    match sqlx::query("DELETE FROM open_positions WHERE token_id = ? AND ghost_mode = 1")
+        .bind(token_id)
+        .execute(pool)
+        .await
+    {
+        Ok(r) if r.rows_affected() > 0 => info!(
+            "👻 Closed {} simulated position row(s) for expired token {}",
+            r.rows_affected(), token_id,
+        ),
+        Ok(_) => {}
+        Err(e) => error!("❌ DB close_ghost_open_position failed for {}: {}", token_id, e),
+    }
+}
+
 /// Remove a row from `open_positions` when a position is closed (any exit reason).
 /// Keyed by (strategy, token_id) — unique across all sessions.
 pub async fn close_open_position(

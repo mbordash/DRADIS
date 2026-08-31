@@ -311,6 +311,10 @@ pub async fn cleanup_expired_positions(
     yes_token: MarketId,
     no_token: MarketId,
     close_time: Option<DateTime<Utc>>,
+    // Asset shard whose `open_positions` rows belong to this market, so a dropped
+    // SIMULATED position can have its row closed too. See below for why only
+    // ghost rows are touched here.
+    asset: &str,
 ) {
     crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::Cleanup);
     let mut pos_map = positions.lock().await;
@@ -325,9 +329,34 @@ pub async fn cleanup_expired_positions(
         let is_expiring_soon = (ct - now).num_seconds() < 60;
 
         if is_expired || is_expiring_soon {
+            // Simulated positions being dropped need their DB row closed HERE,
+            // because nothing else will ever close it.
+            //
+            // A real position's row is reconciled against the chain and swept by
+            // `purge_stale_open_positions`. A ghost row is excluded from both by
+            // design (the chain has no opinion about a simulation), so dropping it
+            // from the map without closing the row leaks it permanently: it stays
+            // open, keeps contributing to portfolio value at its last mark, and
+            // survives the market resolving worthless. One leak per rotation that
+            // ends with a ghost position still held, which is ordinary ghost
+            // operation, not an edge case.
+            let expiring_ghosts: Vec<String> = pos_map
+                .iter()
+                .filter(|(k, _)| k.market == yes_market || k.market == no_market)
+                .filter_map(|(k, p)| p.fill_confirmed_at.map(|_| k.market.to_string()))
+                .collect();
+
             let before = pos_map.len();
             pos_map.retain(|k, _| k.market != yes_market && k.market != no_market);
             let removed = before - pos_map.len();
+
+            if !expiring_ghosts.is_empty() {
+                if let Some(pool) = crate::helpers::db::pool_for(asset) {
+                    for token in &expiring_ghosts {
+                        crate::helpers::db::close_ghost_open_position(&pool, token).await;
+                    }
+                }
+            }
 
             if removed > 0 {
                 warn!(" Cleaned up {} position(s) for market \"{}\" (expires {})",

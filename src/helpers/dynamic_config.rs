@@ -84,7 +84,11 @@ pub fn register_global_config_tx(tx: Arc<tokio::sync::watch::Sender<Arc<DynamicC
     let _ = GLOBAL_CONFIG_TX.set(tx);
 }
 
-/// The registered global config sender, if the API server has booted.
+/// The registered global config sender.
+///
+/// Registered by `main` at the moment the channel is created, so this is
+/// populated for the whole of startup — including venue code that decides
+/// whether it is simulating before any server is listening.
 pub fn global_config_tx() -> Option<&'static Arc<tokio::sync::watch::Sender<Arc<DynamicConfig>>>> {
     GLOBAL_CONFIG_TX.get()
 }
