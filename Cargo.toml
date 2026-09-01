@@ -36,7 +36,12 @@ rust_decimal_macros = "1.36"
 chrono = { version = "0.4", features = ["serde"] }
 chrono-tz = "0.10.4"
 futures = "0.3"
-reqwest = { version = "0.13.4", features = ["json"] }
+# `query` is needed by `RequestBuilder::query`, which keeps credentials out of
+# hand-built URL strings (see `raptors::sports`). It compiled without this on the
+# intl and US builds only because a transitive dependency happened to enable the
+# feature — Kalshi, which pulls neither, failed to build. Declared explicitly so
+# the shared code does not depend on which venue is selected.
+reqwest = { version = "0.13.4", features = ["json", "query"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 

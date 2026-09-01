@@ -2413,6 +2413,43 @@ pub async fn confirm_position_status(
     }
 }
 
+/// Close simulated rows left behind by an earlier session.
+///
+/// The restart half of the ghost-row leak. A simulated position holds nothing on
+/// chain, so it is excluded from the chain reconciler and from
+/// `purge_stale_open_positions` by design — and nothing rehydrates ghost rows into
+/// the in-memory map after a restart, so a paper position open when the process
+/// died is never exited, never closed, and stays open forever.
+///
+/// Ghost state is meaningless across a process boundary: the map that owned those
+/// positions is gone, so no viper can act on them. Anything simulated that does not
+/// belong to the running session is therefore dead by definition.
+///
+/// Deliberately keyed on session rather than age. A clock threshold has to guess how
+/// long a paper position may legitimately live; session identity does not guess.
+pub async fn close_stale_ghost_positions(pool: &SqlitePool, current_session_id: &str) -> u64 {
+    match sqlx::query(
+        "DELETE FROM open_positions
+         WHERE ghost_mode = 1 AND COALESCE(session_id, '') <> ?"
+    )
+    .bind(current_session_id)
+    .execute(pool)
+    .await
+    {
+        Ok(r) => {
+            let n = r.rows_affected();
+            if n > 0 {
+                info!("👻 Startup: closed {} simulated position row(s) left by an earlier session", n);
+            }
+            n
+        }
+        Err(e) => {
+            error!("❌ DB close_stale_ghost_positions failed: {}", e);
+            0
+        }
+    }
+}
+
 /// Close SIMULATED open rows for a token, whatever strategy holds them.
 ///
 /// Deliberately scoped to `ghost_mode = 1`. A real row is reconciled against the
@@ -4031,6 +4068,70 @@ mod reconcile_tests {
         init_schema(&pool).await.expect("init schema");
         run_migrations(&pool).await;
         pool
+    }
+
+    /// Insert a SIMULATED position belonging to a named session.
+    async fn insert_ghost_open(pool: &SqlitePool, session: &str, token: &str) {
+        sqlx::query(
+            "INSERT INTO open_positions
+             (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted, status, current_price)
+             VALUES (?, ?, 'FairValueStrategy', ?, 'Bitcoin Up or Down', 'YES', '0.32', '11.36', 1, 0, 'confirmed', NULL)"
+        )
+        .bind(Utc::now().to_rfc3339())
+        .bind(session).bind(token)
+        .execute(pool).await.expect("insert ghost open_position");
+    }
+
+    async fn open_tokens(pool: &SqlitePool) -> Vec<String> {
+        sqlx::query_scalar::<_, String>("SELECT token_id FROM open_positions ORDER BY token_id")
+            .fetch_all(pool).await.expect("select")
+    }
+
+    /// A simulated position left by an earlier session must not survive a restart.
+    ///
+    /// Replays the v1.0.9 production row of 2026-08-31: a paper FairValue position
+    /// opened at 02:41 was still an open row nine hours and five rotations later,
+    /// because nothing rehydrates ghost rows into the in-memory map after a restart
+    /// and every other sweep excludes them by design. It had no viper that could
+    /// ever exit it.
+    #[tokio::test]
+    async fn a_ghost_row_from_a_previous_session_is_closed_at_startup() {
+        let pool = mem_pool().await;
+        insert_ghost_open(&pool, "session-A", "tok-old").await;
+        insert_ghost_open(&pool, "session-B", "tok-current").await;
+
+        let closed = close_stale_ghost_positions(&pool, "session-B").await;
+        assert_eq!(closed, 1, "exactly the foreign-session row should go");
+        assert_eq!(open_tokens(&pool).await, vec!["tok-current".to_string()],
+                   "the running session's own paper position must survive");
+    }
+
+    /// The sweep is scoped to simulation. A REAL position from an earlier session
+    /// is a real holding on chain and must never be deleted by this path.
+    #[tokio::test]
+    async fn the_startup_sweep_never_touches_a_real_position() {
+        let pool = mem_pool().await;
+        // A real row, deliberately stamped with a foreign session.
+        insert_open(&pool, "MakerStrategy", "tok-real", "MarketR", "NO",
+                    "0.30", "26.66", Some("0.31"), "pending").await;
+        insert_ghost_open(&pool, "session-old", "tok-ghost").await;
+
+        let closed = close_stale_ghost_positions(&pool, "session-new").await;
+        assert_eq!(closed, 1, "only the ghost row is in scope");
+        assert_eq!(open_tokens(&pool).await, vec!["tok-real".to_string()]);
+    }
+
+    /// A row with no usable session is orphaned by definition and is swept.
+    ///
+    /// `session_id` is NOT NULL in the schema, so the reachable shape is the empty
+    /// string — what a legacy row or a failed session init leaves behind. It can
+    /// never match a running session, so it can never be exited.
+    #[tokio::test]
+    async fn a_ghost_row_with_an_empty_session_is_closed() {
+        let pool = mem_pool().await;
+        insert_ghost_open(&pool, "", "tok-nosess").await;
+        assert_eq!(close_stale_ghost_positions(&pool, "session-new").await, 1);
+        assert!(open_tokens(&pool).await.is_empty());
     }
 
     #[allow(clippy::too_many_arguments)]

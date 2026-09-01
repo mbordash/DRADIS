@@ -411,6 +411,26 @@ async fn run() -> Result<()> {
     // are all anchored to this ID for the lifetime of the process.
     let _session_id = db::init_session(Some("dradis startup")).await;
 
+    // Retire simulated positions left open by an earlier session.
+    //
+    // Nothing rehydrates ghost rows into the in-memory position map after a
+    // restart — chain adoption is real-only by construction, since a simulated
+    // position holds nothing on chain — so a paper position open when the process
+    // died has no viper that can ever exit it. Its row would otherwise stay open
+    // forever, show in the Control Tower beside real positions, and block the
+    // NOT-EXISTS insert for a later paper entry on the same token.
+    //
+    // Runs after `init_session` so the current id is registered, and before any
+    // squadron deploys, so the operator never sees the stale rows.
+    for asset in &assets {
+        match db::pool_for(asset) {
+            Some(pool) => { db::close_stale_ghost_positions(&pool, db::current_session_id()).await; }
+            // Worth a line: a shard whose init failed keeps its leaked ghost rows,
+            // and a silent skip makes that indistinguishable from having none.
+            None => tracing::debug!("👻 Startup ghost sweep skipped for {asset}: no pool registered"),
+        }
+    }
+
     // Snapshot the compile-time constants (config.rs) into config_history.
     // This runs BEFORE DynamicConfig::load_or_default() so both snapshots land
     // in the same session with the static one first.  Because these constants can
@@ -600,6 +620,28 @@ async fn run() -> Result<()> {
                     dradis::venues::us::trader::US_VENUE,
                 ).await {
                     tracing::warn!("⚠️ US crypto DB pool init failed (crypto wing dashboard disabled): {e}");
+                }
+                // Retire simulated positions left by an earlier session, on the
+                // shards that actually hold them.
+                //
+                // The sweep near `init_session` iterates the env-derived asset list,
+                // which on this venue is just `["us"]` — and `logs/us-dradis.db` is
+                // the one shard nothing writes positions to. Every Polymarket US
+                // squadron writes to a WING shard, and those are registered here,
+                // after venue connect. Without this the restart half of the
+                // ghost-row sweep was a no-op on this venue.
+                for wing in [
+                    dradis::venues::us::trader::US_ASSET,
+                    dradis::venues::us::trader::US_POLITICS_ASSET,
+                    dradis::venues::us::trader::US_CRYPTO_ASSET,
+                ] {
+                    if let Some(pool) = dradis::helpers::db::pool_for(wing) {
+                        dradis::helpers::db::close_stale_ghost_positions(
+                            &pool, dradis::helpers::db::current_session_id(),
+                        ).await;
+                    } else {
+                        tracing::debug!("👻 Startup ghost sweep skipped for {wing}: no pool registered");
+                    }
                 }
                 dradis::venues::us::trader::run_us_trader(
                     venue,
