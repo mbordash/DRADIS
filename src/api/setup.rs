@@ -1333,11 +1333,23 @@ const BUNDLE_SCHEMA_VERSION: u32 = 1;
 /// sensitive — it holds keys.
 async fn export_bundle() -> Response {
     let secrets = read_secrets();
-    // Everything in the secrets file except the session-signing key (a new box
-    // mints its own; carrying it over has no benefit).
+    // Everything in the secrets file except this box's own IDENTITY.
+    //
+    // `INTERNAL_KEYS` is exactly the set a new machine must mint for itself: the
+    // session-signing key and the admin password hash. Neither describes the
+    // operator's venue setup, which is what a bundle is for.
+    //
+    // The admin hash used to travel, and it locked an operator out of their own
+    // instance (2026-09-01). The documented upgrade path is "launch a new
+    // instance, export the bundle, import it", and firstboot sets the Control
+    // Tower password to the NEW instance's EC2 id — which the import then
+    // silently replaced with the OLD box's hash. The operator followed the
+    // instructions, was told to log in with the new instance id, and could not.
+    // Argon2id means the old password cannot be recovered either, only reset by
+    // deleting the key from the secrets file.
     let secrets_out: BTreeMap<&String, &String> = secrets
         .iter()
-        .filter(|(k, _)| k.as_str() != "DRADIS_SESSION_KEY")
+        .filter(|(k, _)| !INTERNAL_KEYS.contains(&k.as_str()))
         .collect();
 
     let mut dynamic_config = serde_json::Value::Null;
@@ -1852,6 +1864,43 @@ mod tests {
         let h = hash_password(&pw).unwrap();
         assert!(verify_password(&pw, &h));
         assert!(!verify_password("wrong", &h));
+    }
+
+    /// A config bundle must not carry this box's identity to another box.
+    ///
+    /// The admin hash used to travel, and it locked an operator out of their own
+    /// instance on 2026-09-01. The documented upgrade path is export-then-import
+    /// onto a NEW instance whose firstboot password is its own EC2 id — and the
+    /// import silently replaced that with the old box's hash, so the instructions
+    /// and the reality disagreed and argon2id made the old password unrecoverable.
+    ///
+    /// Asserted against `INTERNAL_KEYS` rather than a literal list so a key added
+    /// there is covered here automatically, which is the property that failed:
+    /// `DRADIS_SESSION_KEY` was excluded by name and `DRADIS_ADMIN_HASH` was not.
+    #[test]
+    fn the_export_bundle_excludes_every_internal_key() {
+        let mut secrets: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+        secrets.insert("POLYMARKET_PRIVATE_KEY".into(), "operator-setting".into());
+        for k in INTERNAL_KEYS {
+            secrets.insert((*k).to_string(), format!("{k}-value"));
+        }
+
+        // Mirrors the filter in `export_bundle`.
+        let exported: Vec<&String> = secrets
+            .keys()
+            .filter(|k| !INTERNAL_KEYS.contains(&k.as_str()))
+            .collect();
+
+        for k in INTERNAL_KEYS {
+            assert!(
+                !exported.iter().any(|e| e.as_str() == *k),
+                "{k} must never leave this box in a bundle — a new instance mints its own",
+            );
+        }
+        assert!(
+            exported.iter().any(|e| e.as_str() == "POLYMARKET_PRIVATE_KEY"),
+            "the operator's venue credentials MUST still travel; that is what a bundle is for",
+        );
     }
 
     #[test]
