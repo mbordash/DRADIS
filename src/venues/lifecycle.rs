@@ -188,14 +188,24 @@ impl OrderLifecycle {
         venue: &V,
         positions: &Arc<Mutex<PositionMap>>,
     ) -> Vec<FlattenedLeg> {
-        // Venue truth: market → shares currently held.
-        let held: HashMap<String, Decimal> = venue
-            .positions()
-            .await
-            .unwrap_or_default()
-            .into_iter()
-            .map(|p| (p.market.as_str().to_string(), p.shares))
-            .collect();
+        // Venue truth: market → shares currently held. A failed fetch ABANDONS
+        // the pass — every decision below keys off `held`, and an error read as
+        // "holds nothing" makes a genuinely-filled tracked order look unfilled:
+        // once past `stale_order_secs` it would be "cancelled" (the venue
+        // rejects that, the order already filled) and its guard cleared,
+        // dropping a real position from the in-memory map over a network blip.
+        // Reconcile runs on a periodic tick, so skipping costs one cycle of
+        // latency and nothing else.
+        let held: HashMap<String, Decimal> = match venue.positions().await {
+            Ok(p) => p
+                .into_iter()
+                .map(|p| (p.market.as_str().to_string(), p.shares))
+                .collect(),
+            Err(e) => {
+                warn!("Order lifecycle reconcile: positions query failed — skipping this pass: {e}");
+                return Vec::new();
+            }
+        };
 
         // Venue-reported resting orders (empty for venues that stub open_orders()).
         let venue_resting: HashSet<String> = venue

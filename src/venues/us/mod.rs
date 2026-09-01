@@ -45,7 +45,7 @@ use polymarket_us::PolymarketUsClient;
 use rust_decimal::prelude::ToPrimitive;
 use rust_decimal::Decimal;
 use std::str::FromStr;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use crate::venues::core::{
     Execution, Fill, FillStream, MarketId, OpenOrder, OrderId, OrderIntent, Position, Side,
@@ -317,6 +317,92 @@ impl UsRetailVenue {
         Ok(pairs)
     }
 
+    /// What the venue says `leg_symbol` settled at, if its market settled.
+    ///
+    /// Polymarket US settlement mechanics: the venue is CUSTODIAL — there is no
+    /// on-chain redemption and nothing for the account holder to do. When a
+    /// market resolves, the gateway cash-settles positions internally and drops
+    /// them from `/v1/portfolio/positions`, so a settled winner vanishes
+    /// between two dashboard sweeps with no event the trader observes. The
+    /// venue's settlement record is the market object itself: at
+    /// `MARKET_STATUS_RESOLVED` each side's `price` is pinned to its payout
+    /// (verified live 2026-08-31; see [`markets::settlement_from_market`]).
+    ///
+    /// NOT used: the SDK's dedicated `/v1/markets/{symbol}/settlement`
+    /// endpoint. Probed live first, it returns `200` with an EMPTY price even
+    /// for resolved markets — designing around it untested would have shipped a
+    /// sweep that reports coverage while checking nothing.
+    ///
+    /// Fetched raw with the `?slug=` filter — verified to return exactly the
+    /// one market, and ZERO for an unknown slug, unlike `symbol=`/`search=`
+    /// which the gateway ignores and answers with a default 20-market page
+    /// (booking from THAT would read some unrelated market's resolution).
+    /// Raw rather than through the SDK for the same reason as
+    /// [`Self::discover_binary_markets`]: the SDK's strict deserializers reject
+    /// the live API's string-encoded arrays.
+    pub(crate) async fn settlement_resolution(
+        &self,
+        leg_symbol: &str,
+    ) -> crate::venues::core::TokenResolution {
+        use crate::venues::core::TokenResolution as R;
+
+        // The leg must be identifiable or no settlement value can ever be
+        // attributed — and retrying never changes a symbol, so deferring would
+        // only delay the fallback. `NotClosed` leaves the row to the
+        // pre-existing mark-priced path, which at least books an estimate.
+        let is_long = match Self::outcome_side_from_symbol(leg_symbol) {
+            Ok(polymarket_us::types::OrderSide::Long) => true,
+            Ok(_) => false,
+            Err(e) => {
+                warn!("US settlement sweep: cannot infer side for '{leg_symbol}' ({e}) — leaving to mark-priced reconciliation");
+                return R::NotClosed;
+            }
+        };
+        let slug = markets::bare_symbol(leg_symbol);
+
+        let path = "/v1/markets";
+        let url = format!("{}{}?slug={}", self.base_url, path, slug);
+        // Auth headers are signed against the path only (no query string) —
+        // same contract as the discovery fetches above.
+        let signed = self.auth.signed_headers("GET", path);
+        let mut rb = self.http.get(&url).header("Content-Type", "application/json");
+        for (name, value) in signed {
+            rb = rb.header(name, value);
+        }
+        let text = match rb.send().await {
+            Ok(resp) if resp.status().is_success() => match resp.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    debug!("US settlement lookup read failed for {slug}: {e}");
+                    return R::Unknown;
+                }
+            },
+            Ok(resp) => {
+                debug!("US settlement lookup for {slug} returned HTTP {}", resp.status());
+                return R::Unknown;
+            }
+            Err(e) => {
+                debug!("US settlement lookup request failed for {slug}: {e}");
+                return R::Unknown;
+            }
+        };
+        let parsed: types::MarketsResponse = match serde_json::from_str(&text) {
+            Ok(p) => p,
+            Err(e) => {
+                debug!("US settlement lookup parse failed for {slug}: {e}");
+                return R::Unknown;
+            }
+        };
+        match parsed.markets.first() {
+            Some(m) => markets::settlement_from_market(m, is_long),
+            // An empty filtered answer means the gateway does not list this
+            // market (at all, or any more). That is NOT proof it is still open,
+            // so it must not be `NotClosed` — defer, and past the age bound the
+            // row falls back to mark-priced reconciliation with a warning.
+            None => R::Unknown,
+        }
+    }
+
     /// Crypto market discovery via `GET /v1/search` (the gateway ignores the
     /// `categories=` filter on `/v1/markets`, see 2026-08-08 field logs).
     ///
@@ -542,8 +628,8 @@ impl UsRetailVenue {
     /// Fetch open positions (`GET /v1/portfolio/positions`).
     ///
     /// Kept independent from [`fetch_balances`] so a transient `5xx` here only
-    /// affects the positions view (dashboard sync tolerates it via
-    /// `unwrap_or_default`) and never the auth/collateral path.
+    /// affects the positions view (dashboard sync skips its reconcile/purge
+    /// pass on error) and never the auth/collateral path.
     async fn fetch_positions(&self) -> Result<Vec<types::UsPosition>> {
         let pos_data = self
             .client
@@ -915,3 +1001,57 @@ mod tests {
     }
 }
 
+
+// Live smoke for the settlement sweep's gateway lookup — run with:
+// cargo test --no-default-features --features us_retail us_settlement_resolution_live_smoke -- --ignored --nocapture
+//
+// Asserts the resolution path against real gateway data: a known-resolved
+// market's legs price decisively and complementarily, an open market's legs
+// answer NotClosed, and an unknown slug answers Unknown (the `?slug=` filter
+// returning empty — NOT the default 20-market page, which would have this
+// sweep reading some unrelated market's resolution). This is the runtime path
+// `sync_dashboard` exercises for a vanished position; a green unit suite alone
+// cannot prove the gateway still sends what this code reads.
+#[cfg(test)]
+#[tokio::test]
+#[ignore]
+async fn us_settlement_resolution_live_smoke() {
+    use crate::venues::core::TokenResolution as R;
+    dotenv::dotenv().ok();
+    let v = UsRetailVenue::connect(Arc::new(reqwest::Client::new()))
+        .await
+        .expect("venue");
+
+    // A long-resolved NFL market (2025-11-02, Chargers over Titans — long side
+    // paid $1). Resolved markets stay in the catalog; verified still listed on
+    // 2026-08-31. If the gateway ever delists it this prints Unknown and the
+    // assertion tells you the fixture needs refreshing.
+    let resolved = "aec-nfl-lac-ten-2025-11-02";
+    let long = v.settlement_resolution(&format!("{resolved}{}", markets::LEG_LONG)).await;
+    let short = v.settlement_resolution(&format!("{resolved}{}", markets::LEG_SHORT)).await;
+    println!("resolved market: long={long:?} short={short:?}");
+    match (&long, &short) {
+        (R::Resolved(l), R::Resolved(s)) => {
+            assert_eq!(*l + *s, rust_decimal::Decimal::ONE, "legs must be complementary");
+        }
+        other => panic!("resolved market must price both legs decisively, got {other:?}"),
+    }
+
+    // An open market: neither leg may claim a settlement.
+    if let Some(pair) = v
+        .discover_crypto_markets_via_search()
+        .await
+        .expect("crypto discovery")
+        .first()
+    {
+        let r = v.settlement_resolution(pair.long.as_str()).await;
+        println!("open {}: {r:?}", pair.slug);
+        assert_eq!(r, R::NotClosed, "an open market's position left by a trade, not settlement");
+    }
+
+    // An unknown slug must answer Unknown — never NotClosed (it is not
+    // verifiably open) and never some other market's resolution.
+    let ghost = v.settlement_resolution("dradis-smoke-no-such-market#long").await;
+    println!("unknown slug: {ghost:?}");
+    assert_eq!(ghost, R::Unknown);
+}

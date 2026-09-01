@@ -482,6 +482,83 @@ pub async fn fetch_simplified_crypto_candidates(http: &reqwest::Client, filter: 
     out
 }
 
+// The three-state settlement answer lives in `venues::core` so the Kalshi and
+// Polymarket US sweeps (compiled without this intl-only module) share the same
+// type and the same collapsing-states discipline. Re-exported here because this
+// module's `resolution_for_token` is the intl authority that produces it.
+pub use crate::venues::core::TokenResolution;
+
+/// Final resolved price for ONE CLOB token.
+///
+/// Sibling of [`fetch_resolved_outcome_prices`], keyed by token rather than by
+/// condition. `open_positions` rows carry a token id and no condition id, and the
+/// settlement path needs an answer for a position whose market has already resolved
+/// and redeemed — at which point the chain no longer reports it and there is nothing
+/// left to look the condition up from.
+///
+/// `closed=true` is required for the same reason as the sibling: Gamma's default
+/// filter excludes closed markets, so the settled markets this exists to price are
+/// exactly the ones it would otherwise omit. `clob_token_ids=` is the plural form;
+/// the singular is silently ignored and returns the unfiltered market list.
+///
+/// # Why a decisive price is required
+///
+/// Gamma's `closed` flag can flip when TRADING ends, ahead of oracle resolution, and
+/// in that window `outcomePrices` may still carry a mid or a 0.5/0.5 placeholder. The
+/// settlement booking downstream snaps at 0.5, so a YES position last marked 0.49 in a
+/// market that ultimately resolves YES would be booked as a total loss — and the row is
+/// deleted, so nothing can correct it afterwards. A price that is not within a cent of
+/// $0 or $1 is therefore reported as `Unknown` and retried, not treated as final.
+pub async fn resolution_for_token(
+    http: &reqwest::Client,
+    token_id: &str,
+) -> TokenResolution {
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
+
+    // Anything that fails below is genuinely unknown rather than open.
+    macro_rules! unknown {
+        ($e:expr) => { match $e { Some(v) => v, None => return TokenResolution::Unknown } };
+    }
+
+    let url = format!(
+        "https://gamma-api.polymarket.com/markets?clob_token_ids={}&closed=true",
+        token_id
+    );
+    let resp = unknown!(http.get(&url).send().await.ok());
+    let data: serde_json::Value = unknown!(resp.json().await.ok());
+    let arr = unknown!(data.as_array().cloned()
+        .or_else(|| data.get("data").and_then(|v| v.as_array()).cloned()));
+
+    // An EMPTY result under `closed=true` is Gamma's way of saying "this market is
+    // not closed" — the filter excluded it. That is a positive answer, not a failure,
+    // and it is what keeps an off-strategy sale on the mark-priced path.
+    let Some(m) = arr.first() else { return TokenResolution::NotClosed };
+
+    if !m.get("closed").and_then(|v| v.as_bool()).unwrap_or(false) {
+        return TokenResolution::NotClosed;
+    }
+
+    // Both arrive as JSON arrays that are sometimes string-encoded.
+    let as_vec = |v: &serde_json::Value| -> Option<Vec<serde_json::Value>> {
+        if let Some(a) = v.as_array() { return Some(a.clone()); }
+        v.as_str().and_then(|s| serde_json::from_str::<Vec<serde_json::Value>>(s).ok())
+    };
+    let toks = unknown!(m.get("clobTokenIds").and_then(as_vec));
+    let prices = unknown!(m.get("outcomePrices").and_then(as_vec));
+
+    // Position matters: index i of clobTokenIds prices at index i of outcomePrices.
+    let idx = unknown!(toks.iter().position(|t| t.as_str() == Some(token_id)));
+    let raw = unknown!(prices.get(idx).and_then(|p| p.as_str()));
+    let px = unknown!(Decimal::from_str(raw).ok());
+
+    // Closed but not yet decisive — see the note above.
+    if px > Decimal::new(1, 2) && px < Decimal::new(99, 2) {
+        return TokenResolution::Unknown;
+    }
+    TokenResolution::Resolved(px)
+}
+
 /// Resolved settlement prices for a market, keyed by CLOB token id (decimal string).
 ///
 /// Authoritative source for "did this side win?", used to label `gboost_vetoes`
@@ -627,5 +704,43 @@ mod hourly_fallback_tests {
     #[test]
     fn a_thin_but_traded_strike_market_is_still_acceptable() {
         assert!(tradeable(15.0, false));
+    }
+}
+
+#[cfg(test)]
+mod resolution_tests {
+    use super::TokenResolution;
+    use rust_decimal::Decimal;
+
+    /// The three states must stay distinct. Collapsing NotClosed into Unknown routes
+    /// an off-strategy sale onto the settlement path, where it books at $1.00 or
+    /// $0.00 instead of its actual sale price — and the row is then deleted, so
+    /// nothing can correct it.
+    #[test]
+    fn the_three_states_are_distinct() {
+        assert_ne!(TokenResolution::NotClosed, TokenResolution::Unknown);
+        assert_ne!(
+            TokenResolution::Resolved(Decimal::ONE),
+            TokenResolution::Resolved(Decimal::ZERO),
+        );
+    }
+
+    /// Only a decisive price counts as resolved.
+    ///
+    /// Gamma's `closed` flag can flip when trading ends, ahead of oracle resolution,
+    /// and `outcomePrices` may still carry a mid. The booking downstream snaps at
+    /// 0.5, so a YES position last marked 0.49 in a market that resolves YES would be
+    /// booked as a total loss, irreversibly.
+    #[test]
+    fn an_indecisive_price_is_not_a_resolution() {
+        // Mirrors the gate inside `resolution_for_token`.
+        let decisive = |px: Decimal| !(px > Decimal::new(1, 2) && px < Decimal::new(99, 2));
+        assert!(decisive(Decimal::ZERO), "$0.00 is final");
+        assert!(decisive(Decimal::ONE), "$1.00 is final");
+        assert!(decisive(Decimal::new(1, 2)), "$0.01 is final enough");
+        assert!(decisive(Decimal::new(99, 2)), "$0.99 is final enough");
+        assert!(!decisive(Decimal::new(49, 2)), "$0.49 is a mid, not a resolution");
+        assert!(!decisive(Decimal::new(50, 2)), "$0.50 placeholder must never book");
+        assert!(!decisive(Decimal::new(95, 2)), "$0.95 is still a mark");
     }
 }

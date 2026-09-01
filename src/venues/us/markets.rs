@@ -73,6 +73,79 @@ pub struct UsMarketPair {
     pub volume: f64,
 }
 
+/// Map one market's catalog entry to a leg's settlement answer.
+///
+/// Pure so the mapping is testable against captured gateway responses. The
+/// discipline is the one on [`crate::venues::core::TokenResolution`]: only a
+/// decisive venue answer books, "cannot have settled" is distinct from "no
+/// answer yet", and everything else defers.
+///
+/// The gateway's market object is the venue's own settlement record: once a
+/// market reaches `MARKET_STATUS_RESOLVED`, each `marketSides` entry's `price`
+/// is pinned to that side's settlement value — exactly `"1"` for the paying
+/// side and `"0"` for the other (verified live 2026-08-31 across resolved
+/// NFL/NBA listings; open markets carry live mids like `"0.0800"` instead,
+/// which is why the status gate comes first).
+///
+/// The leg's own side is read first; when its price is absent — the live API
+/// has been seen sending one-element `outcomePrices` and side entries without
+/// a price — the complement of the OTHER side's decisive value is used. A
+/// resolved market with no decisive price on either side answers `Unknown`,
+/// never a guess: the caller defers and this parser must not be the component
+/// that fabricates a settlement.
+///
+/// The decisive gate also rejects any value above $1.00, so if the gateway
+/// ever hands back something that is not a binary contract payout (an index
+/// level, a notional), it becomes "no answer" rather than a booked win.
+pub fn settlement_from_market(
+    m: &types::UsMarket,
+    is_long: bool,
+) -> crate::venues::core::TokenResolution {
+    use crate::venues::core::TokenResolution as R;
+    use rust_decimal::Decimal;
+
+    let status = m.status.to_ascii_uppercase();
+    // Still trading: the position cannot have settled — settlement only exists
+    // after resolution — so it left the account by a trade, which belongs on
+    // the mark-priced reconciliation path.
+    if status.ends_with("OPEN") || status.ends_with("ACTIVE") || (status.is_empty() && !m.closed) {
+        return R::NotClosed;
+    }
+    if !status.ends_with("RESOLVED") {
+        // Closed/suspended/unmodeled: resolution may be imminent. Defer.
+        return R::Unknown;
+    }
+
+    // $0.00 or $1.00, within a cent — anything else is not a settlement value.
+    let decisive = |px: Decimal| -> Option<Decimal> {
+        if px >= Decimal::ZERO && px <= Decimal::new(1, 2) {
+            Some(Decimal::ZERO)
+        } else if px >= Decimal::new(99, 2) && px <= Decimal::ONE {
+            Some(Decimal::ONE)
+        } else {
+            None
+        }
+    };
+    let side_price = |want_long: bool| -> Option<Decimal> {
+        m.market_sides.iter().find_map(|s| {
+            if s.get("long").and_then(|v| v.as_bool())? != want_long {
+                return None;
+            }
+            s.get("price")
+                .and_then(|v| v.as_str())
+                .and_then(|p| p.trim().parse::<Decimal>().ok())
+        })
+    };
+
+    if let Some(v) = side_price(is_long).and_then(decisive) {
+        return R::Resolved(v);
+    }
+    if let Some(v) = side_price(!is_long).and_then(decisive) {
+        return R::Resolved(Decimal::ONE - v);
+    }
+    R::Unknown
+}
+
 /// Parse the gateway's `endDate` string into a UTC instant.
 ///
 /// Accepts RFC3339 (`2026-06-16T20:00:00Z`); returns `None` for empty or
@@ -325,6 +398,112 @@ mod tests {
         // "multi" still pairs the first LONG + first SHORT; the others are dropped.
         assert_eq!(pairs.len(), 1);
         assert_eq!(pairs[0].slug, "multi");
+    }
+
+    /// Parse a raw market object the way `settlement_resolution`'s fetch does.
+    fn market_from_json(raw: &str) -> UsMarket {
+        serde_json::from_str(raw).expect("fixture must parse")
+    }
+
+    /// A resolved market prices each leg at its side's pinned settlement value.
+    ///
+    /// The fixture is the live shape captured from api.polymarket.us on
+    /// 2026-08-31: `MARKET_STATUS_RESOLVED` with each `marketSides` entry's
+    /// `price` at `"1"` or `"0"`, and — a trap — `active` STILL `true`, which
+    /// is why the status string and not the `active` flag gates this path.
+    #[test]
+    fn a_resolved_market_prices_both_legs_from_their_own_sides() {
+        use crate::venues::core::TokenResolution as R;
+        let m = market_from_json(r#"{
+            "slug": "aec-nfl-atl-ne-2025-11-02",
+            "status": "MARKET_STATUS_RESOLVED",
+            "active": true,
+            "closed": true,
+            "marketSides": [
+                {"identifier": "aec-nfl-atl-ne-2025-11-02", "long": true,  "price": "0"},
+                {"identifier": "aec-nfl-atl-ne-2025-11-02", "long": false, "price": "1"}
+            ]
+        }"#);
+        assert_eq!(settlement_from_market(&m, true), R::Resolved(rust_decimal::Decimal::ZERO));
+        assert_eq!(settlement_from_market(&m, false), R::Resolved(rust_decimal::Decimal::ONE));
+    }
+
+    /// An OPEN market's side prices are live mids, not settlement values — a
+    /// position gone from the portfolio while its market trades left by a
+    /// trade, and must go to mark-priced reconciliation, not to a $1/$0 book.
+    #[test]
+    fn an_open_market_is_not_closed_even_when_a_side_price_looks_decisive() {
+        use crate::venues::core::TokenResolution as R;
+        // Live shape 2026-08-31: a long-shot whose mid is $0.0100 — decisive-
+        // looking, but the market is open. Without the status gate this would
+        // book a total loss on a position that was merely sold.
+        let m = market_from_json(r#"{
+            "slug": "cpc-btc-150k-08-31-2026",
+            "status": "MARKET_STATUS_OPEN",
+            "active": true,
+            "closed": false,
+            "marketSides": [
+                {"identifier": "cpc-btc-150k-08-31-2026", "long": true, "price": "0.0100"}
+            ]
+        }"#);
+        assert_eq!(settlement_from_market(&m, true), R::NotClosed);
+        assert_eq!(settlement_from_market(&m, false), R::NotClosed);
+    }
+
+    /// A missing side price is recovered from the other side's complement —
+    /// the live API has been seen dropping a side (one-element `outcomePrices`,
+    /// side entries without a `price`).
+    #[test]
+    fn a_missing_side_price_is_recovered_from_the_complement() {
+        use crate::venues::core::TokenResolution as R;
+        let m = market_from_json(r#"{
+            "slug": "half",
+            "status": "MARKET_STATUS_RESOLVED",
+            "active": false,
+            "closed": true,
+            "marketSides": [
+                {"identifier": "half", "long": true, "price": "1"}
+            ]
+        }"#);
+        assert_eq!(settlement_from_market(&m, false), R::Resolved(rust_decimal::Decimal::ZERO));
+    }
+
+    /// A resolved market with no decisive price answers Unknown — deferred by
+    /// the caller — never a guess. This also catches any non-payout value the
+    /// gateway might hand back (an index level, a stale mid): anything outside
+    /// a cent of $0/$1 must not book.
+    #[test]
+    fn a_resolved_market_without_a_decisive_price_defers() {
+        use crate::venues::core::TokenResolution as R;
+        let m = market_from_json(r#"{
+            "slug": "mid",
+            "status": "MARKET_STATUS_RESOLVED",
+            "active": false,
+            "closed": true,
+            "marketSides": [
+                {"identifier": "mid", "long": true,  "price": "0.55"},
+                {"identifier": "mid", "long": false, "price": "78787.32"}
+            ]
+        }"#);
+        assert_eq!(settlement_from_market(&m, true), R::Unknown);
+        assert_eq!(settlement_from_market(&m, false), R::Unknown);
+    }
+
+    /// Statuses this parser does not model — closed-awaiting-resolution,
+    /// suspended, or a future addition — defer rather than guessing either way.
+    #[test]
+    fn an_unmodeled_status_defers() {
+        use crate::venues::core::TokenResolution as R;
+        let m = market_from_json(r#"{
+            "slug": "s",
+            "status": "MARKET_STATUS_SUSPENDED",
+            "active": false,
+            "closed": true,
+            "marketSides": [
+                {"identifier": "s", "long": true, "price": "1"}
+            ]
+        }"#);
+        assert_eq!(settlement_from_market(&m, true), R::Unknown);
     }
 }
 

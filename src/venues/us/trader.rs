@@ -92,6 +92,17 @@ const ACTION_COOLDOWN_SECS: u64 = 30;
 const DISCOVERY_RETRY_SECS: u64 = 300; // 5 min — avoid hammering when no markets are live
 /// How often to refresh the dashboard + reload squadron config / collateral.
 const DASHBOARD_SYNC_SECS: u64 = 30;
+/// Process-wide backoff on settlement lookups that keep answering `Unknown`.
+///
+/// `sync_dashboard` runs every [`DASHBOARD_SYNC_SECS`], after every entry and
+/// dispatched fill, and from the idle-heartbeat task — and squadrons sharing
+/// the shard sweep the same pool-wide stale-row set — so without this gate one
+/// unanswerable row (a market between close and resolution, or a gateway
+/// outage) cost ~2,880 live API calls over its 24h defer window, from inside
+/// the trading loop. See [`crate::venues::core::SettlementProbeGate`] for the
+/// policy and why in-memory state is safe here.
+static SETTLEMENT_PROBES: std::sync::LazyLock<crate::venues::core::SettlementProbeGate> =
+    std::sync::LazyLock::new(crate::venues::core::SettlementProbeGate::new);
 /// Skip selecting any market that closes within this many seconds — not worth
 /// committing capital we can't work before resolution.
 const MIN_TIME_TO_CLOSE_SECS: i64 = 300; // 5 minutes
@@ -2145,7 +2156,27 @@ async fn sync_dashboard(
         // (which safely gates strategies off) without writing a P&L snapshot.
         Err(e) => { warn!("US dashboard sync: collateral query failed: {e}"); return (Decimal::ZERO, starting); }
     };
-    let positions = venue.positions().await.unwrap_or_default();
+    // A failed positions fetch ABANDONS the sweep — it must never read as "the
+    // account holds nothing". This used to be `unwrap_or_default()`, which
+    // turned any transient error (timeout, 5xx, auth blip, rate limit) into an
+    // empty `live_ids`: every confirmed row then read as stale, and the purge
+    // below booked-and-deleted the venue's entire open-positions table — plus,
+    // since the settlement sweep probes every non-live confirmed row, a burst
+    // of resolution calls on the way. The intl chain-sync has always treated a
+    // positions() error as "skip this pass" (`sync_open_positions_with_chain`
+    // in tasks/cleanup.rs); same rule here and on the Kalshi loop.
+    //
+    // Collateral was already fetched successfully, so the caller gets the real
+    // figure; `starting` as the total keeps its session P&L flat for the pass
+    // rather than reporting a phantom drop equal to the unpriced positions, and
+    // no P&L snapshot is written from a total we could not compute.
+    let positions = match venue.positions().await {
+        Ok(p) => p,
+        Err(e) => {
+            warn!("US dashboard sync: positions query failed — skipping reconcile/purge this pass: {e}");
+            return (collateral, starting);
+        }
+    };
 
     // token → (owning viper, market name) from the live guard map, so a venue
     // holding is attributed to the viper that opened it. Holdings with no guard
@@ -2181,8 +2212,74 @@ async fn sync_dashboard(
         }
         positions_value += p.shares * p.avg_price;
     }
-    // Drop rows for positions the venue no longer reports (settled to cash).
-    let _ = db::purge_stale_open_positions(pool, &live_ids, &std::collections::HashMap::new()).await;
+    // ── Settled positions the venue already cash-settled ────────────────────
+    //
+    // Polymarket US is custodial: when a market resolves, the gateway settles
+    // positions to cash internally and drops them from
+    // `/v1/portfolio/positions` — there is no redemption step and no event this
+    // loop observes. A position that settles between two sweeps therefore
+    // arrives at the purge as "not live", where it used to be booked at its
+    // last mark or, with no usable mark (a loser marks near $0.00, failing the
+    // mark's own `> 0` guard), deleted with nothing booked at all — real cash
+    // moved and the ledger stayed empty. Same incident class as the 2026-08-31
+    // Polymarket International loss of a winning $0.80 settlement.
+    //
+    // So ask the gateway what each stale market resolved to, rather than
+    // inferring anything. A decisive answer feeds the purge's EXISTING
+    // settlement branch (booked at exactly $1.00/$0.00, idempotent,
+    // deduplicated); a verifiably-still-trading market is left to the
+    // mark-priced reconcile path; anything unanswered is DEFERRED — not booked,
+    // not deleted — and retried on [`SETTLEMENT_PROBES`]'s per-token backoff
+    // (this sweep also runs on every fill, so retry-every-sweep was a polling
+    // storm), bounded by age so an unanswerable row cannot pin the table
+    // forever.
+    //
+    // Size ZERO is passed deliberately: the settlement branch falls back to the
+    // row's own share count, which US rows retain (nothing zeroes them — the
+    // intl chain-drift corrector does not run here).
+    let mut resolved_marks: HashMap<String, (Decimal, Decimal)> = HashMap::new();
+    let mut deferred: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for (token, row_ts) in db::confirmed_open_positions(pool).await {
+        if live_ids.contains(&token) {
+            // Live again (a portfolio blip that briefly hid it, or re-adopted):
+            // clear any backoff so its NEXT stale spell probes immediately.
+            SETTLEMENT_PROBES.record_decisive(&token);
+            continue;
+        }
+        // Inside its backoff window after earlier `Unknown` answers: treat it
+        // exactly as a fresh `Unknown` — defer, book nothing, delete nothing —
+        // WITHOUT spending a live API call. Only a token the gateway has not
+        // answered for gets here, so a normal settlement (which answers
+        // decisively on first sight) is never delayed by the gate.
+        if !SETTLEMENT_PROBES.should_probe(&token) {
+            deferred.insert(token);
+            continue;
+        }
+        use crate::venues::core::TokenResolution as R;
+        let age_secs = chrono::DateTime::parse_from_rfc3339(&row_ts)
+            .map(|t| (Utc::now() - t.with_timezone(&Utc)).num_seconds())
+            .unwrap_or(i64::MAX);
+        match venue.settlement_resolution(&token).await {
+            R::Resolved(px) => {
+                SETTLEMENT_PROBES.record_decisive(&token);
+                info!("🧾 Settled position detected [{}]: market resolution prices this leg at ${:.2} — booking", token, px);
+                resolved_marks.insert(token, (px, Decimal::ZERO));
+            }
+            // Decisive too — the row leaves the table via the mark-priced
+            // reconcile path this same sweep, so no backoff to keep.
+            R::NotClosed => { SETTLEMENT_PROBES.record_decisive(&token); }
+            R::Unknown if age_secs < db::SETTLEMENT_DEFER_MAX_SECS => {
+                SETTLEMENT_PROBES.record_unknown(&token);
+                deferred.insert(token);
+            }
+            R::Unknown => {
+                SETTLEMENT_PROBES.record_unknown(&token);
+                warn!("⚠️ Polymarket US settlement resolution unavailable for {} after {}h — falling back to mark-priced reconciliation",
+                      token, age_secs / 3600);
+            }
+        }
+    }
+    let _ = db::purge_stale_open_positions(pool, &live_ids, &resolved_marks, &deferred).await;
 
     let total = collateral + positions_value;
     // Same reasoning as the trade loop's session P&L: portfolio value never

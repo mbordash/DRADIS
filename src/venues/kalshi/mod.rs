@@ -231,7 +231,6 @@ impl KalshiVenue {
         Ok(out)
     }
 
-    /// One market by ticker.
     /// Every open market under the given Kalshi categories, paged.
     ///
     /// Kalshi organizes discovery by series ticker, and there are thousands of
@@ -274,9 +273,33 @@ impl KalshiVenue {
         Ok(out)
     }
 
+    /// One market by ticker.
     pub async fn market(&self, ticker: &str) -> anyhow::Result<types::KalshiMarket> {
         let resp: types::MarketResponse = self.get_json(&format!("/markets/{ticker}")).await?;
         Ok(resp.market)
+    }
+
+    /// What the exchange says a leg of `market_id` settled at, if it settled.
+    ///
+    /// Kalshi settlement mechanics: there is no redemption step. Once the
+    /// exchange determines a market's result, winning contracts pay $1.00 each
+    /// and losing contracts pay $0.00, credited straight to the account balance
+    /// — which is exactly why a settled position vanishes from
+    /// `/portfolio/positions` between two dashboard sweeps with no event the
+    /// trader ever observes. The market's `result` field is the exchange's own
+    /// record of which side paid, and the authoritative input here.
+    pub async fn settlement_resolution(&self, market_id: &str) -> crate::venues::core::TokenResolution {
+        let (ticker, is_yes) = split_market_id(market_id);
+        match self.market(&ticker).await {
+            Ok(m) => interpret_settlement(&m.result, &m.status, is_yes, market_id),
+            // No answer is not "no settlement" — a transient REST failure must
+            // not route a possibly-settled position onto a path that books an
+            // estimate or deletes the row. The caller defers and retries.
+            Err(e) => {
+                tracing::debug!("Kalshi settlement lookup failed for {market_id}: {e}");
+                crate::venues::core::TokenResolution::Unknown
+            }
+        }
     }
 
     /// Current orderbook for a market.
@@ -322,6 +345,56 @@ pub fn leg_id(ticker: &str, yes: bool) -> String {
     format!("{ticker}#{}", if yes { "yes" } else { "no" })
 }
 
+/// Map a market's `result` + `status` to the leg's settlement answer.
+///
+/// Pure so the mapping is testable without the exchange. The discipline is the
+/// one on [`crate::venues::core::TokenResolution`]: only a decisive exchange
+/// answer books, "cannot have settled" is distinct from "no answer yet", and
+/// everything else defers.
+///
+///   * `result` `yes`/`no` — decisive. A binary contract's settlement value is
+///     fully determined by which side paid: this leg is worth exactly $1.00 if
+///     it matches the result, $0.00 if it does not. (Verified live 2026-08-31:
+///     finalized `KXBTC15M` markets carry `result: "yes"` with
+///     `settlement_value_dollars: "1.0000"`.)
+///   * `result` empty, market still trading (or not yet open) — the position
+///     cannot have settled, because settlement only exists after determination.
+///     It left the account by a trade, which belongs on the mark-priced
+///     reconciliation path.
+///   * `result` empty, market `closed` or beyond — determination is imminent
+///     (minutes on the crypto hourlies). Defer and ask again rather than
+///     booking a guess; nothing can trade after close, so the row is not an
+///     off-strategy sale waiting to be reconciled.
+///   * `result` `void` — every contract is refunded at its purchase price, so
+///     a $1.00/$0.00 booking would fabricate a win or a loss that never
+///     happened. Deferred; past the age bound the row falls back to
+///     mark-priced reconciliation, which at least books an estimate.
+///   * anything else — a scalar or unmodeled result; same treatment as void.
+fn interpret_settlement(
+    result: &str,
+    status: &str,
+    is_yes: bool,
+    market_id: &str,
+) -> crate::venues::core::TokenResolution {
+    use crate::venues::core::TokenResolution as R;
+    use rust_decimal::Decimal;
+    match result {
+        "yes" => R::Resolved(if is_yes { Decimal::ONE } else { Decimal::ZERO }),
+        "no" => R::Resolved(if is_yes { Decimal::ZERO } else { Decimal::ONE }),
+        "" => match status {
+            "initialized" | "unopened" | "open" | "active" | "paused" => R::NotClosed,
+            _ => R::Unknown,
+        },
+        other => {
+            tracing::warn!(
+                "⚠️ Kalshi market {market_id} carries non-binary result {other:?} — \
+                 cannot book a $1/$0 settlement from it; deferring"
+            );
+            R::Unknown
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +424,56 @@ mod tests {
         // Bare ticker defaults to the YES leg.
         assert_eq!(split_market_id("KXBTC-X"), ("KXBTC-X".to_string(), true));
     }
+
+    /// A determined result prices each leg at exactly $1.00 or $0.00.
+    ///
+    /// The whole point of the settlement sweep: a winner that Kalshi paid and
+    /// dropped from the portfolio between two sweeps must book its real value,
+    /// not a last mark and not nothing (the 2026-08-31 incident class).
+    #[test]
+    fn a_determined_result_prices_both_legs_decisively() {
+        use crate::venues::core::TokenResolution as R;
+        use rust_decimal::Decimal;
+        assert_eq!(interpret_settlement("yes", "finalized", true, "T#yes"), R::Resolved(Decimal::ONE));
+        assert_eq!(interpret_settlement("yes", "finalized", false, "T#no"), R::Resolved(Decimal::ZERO));
+        assert_eq!(interpret_settlement("no", "settled", true, "T#yes"), R::Resolved(Decimal::ZERO));
+        assert_eq!(interpret_settlement("no", "settled", false, "T#no"), R::Resolved(Decimal::ONE));
+    }
+
+    /// While trading is open the position cannot have settled — it left by a
+    /// trade, and belongs on the mark-priced reconciliation path. Collapsing
+    /// this into Unknown would defer an ordinary sale for a day.
+    #[test]
+    fn an_undetermined_open_market_is_not_closed_rather_than_unknown() {
+        use crate::venues::core::TokenResolution as R;
+        assert_eq!(interpret_settlement("", "active", true, "T#yes"), R::NotClosed);
+        assert_eq!(interpret_settlement("", "initialized", false, "T#no"), R::NotClosed);
+    }
+
+    /// Closed-but-undetermined must DEFER: determination is imminent, and
+    /// booking from the last mark now would misprice the settlement that
+    /// arrives minutes later. Same for an unknown future status string —
+    /// guessing "still open" from a status we do not recognize would route a
+    /// possibly-settled position to an estimated booking.
+    #[test]
+    fn closed_but_undetermined_defers_until_the_result_exists() {
+        use crate::venues::core::TokenResolution as R;
+        assert_eq!(interpret_settlement("", "closed", true, "T#yes"), R::Unknown);
+        assert_eq!(interpret_settlement("", "determined", true, "T#yes"), R::Unknown);
+        assert_eq!(interpret_settlement("", "some_future_status", true, "T#yes"), R::Unknown);
+    }
+
+    /// A void market refunds every contract at cost. $1/$0 cannot express a
+    /// refund, so booking either side would fabricate a win or a loss that
+    /// never happened — the answer is "no answer", never a guess.
+    #[test]
+    fn a_void_result_never_books_a_win_or_a_loss() {
+        use crate::venues::core::TokenResolution as R;
+        assert_eq!(interpret_settlement("void", "finalized", true, "T#yes"), R::Unknown);
+        assert_eq!(interpret_settlement("void", "finalized", false, "T#no"), R::Unknown);
+        // Scalar results on non-binary markets get the same treatment.
+        assert_eq!(interpret_settlement("73800", "finalized", true, "T#yes"), R::Unknown);
+    }
 }
 // Live smoke test vs demo.kalshi.co — run with: cargo test --features kalshi kalshi_demo_live_smoke -- --ignored --nocapture
 #[cfg(test)]
@@ -372,5 +495,47 @@ async fn kalshi_demo_live_smoke() {
         println!("first: {} strike={:?} close={:?}", m.ticker, m.strike(), m.close_time_utc());
         let ask = v.best_ask(&crate::venues::core::MarketId::new(crate::venues::kalshi::leg_id(&m.ticker, true))).await.expect("ask");
         println!("best yes ask: {ask:?}");
+    }
+}
+
+// Live smoke for the settlement sweep's exchange lookup — run with:
+// cargo test --no-default-features --features kalshi kalshi_settlement_resolution_live_smoke -- --ignored --nocapture
+//
+// Finds a recently SETTLED KXBTC15M market on the exchange and asserts the
+// resolution path prices its two legs decisively and complementarily, and an
+// OPEN market's legs as NotClosed. This is the runtime path `sync_dashboard`
+// exercises for a vanished position; a green unit suite alone cannot prove the
+// exchange still sends `result` where this code looks for it.
+#[cfg(test)]
+#[tokio::test]
+#[ignore]
+async fn kalshi_settlement_resolution_live_smoke() {
+    use crate::venues::core::TokenResolution as R;
+    dotenv::dotenv().ok();
+    let v = KalshiVenue::from_env().expect("venue");
+
+    // A settled market: both legs must resolve, decisively and complementarily.
+    let settled: types::MarketsResponse = v
+        .get_json("/markets?limit=1&status=settled&series_ticker=KXBTC15M")
+        .await
+        .expect("settled markets");
+    let m = settled.markets.first().expect("at least one settled KXBTC15M market");
+    println!("settled: {} status={} result={}", m.ticker, m.status, m.result);
+    let yes = v.settlement_resolution(&leg_id(&m.ticker, true)).await;
+    let no = v.settlement_resolution(&leg_id(&m.ticker, false)).await;
+    println!("yes leg: {yes:?}, no leg: {no:?}");
+    match (&yes, &no) {
+        (R::Resolved(y), R::Resolved(n)) => {
+            assert_eq!(*y + *n, rust_decimal::Decimal::ONE, "legs must be complementary");
+        }
+        other => panic!("settled market must price both legs decisively, got {other:?}"),
+    }
+
+    // An open market: neither leg may claim a settlement.
+    let open = v.markets_for_series("KXBTC15M").await.expect("open markets");
+    if let Some(m) = open.first() {
+        let r = v.settlement_resolution(&leg_id(&m.ticker, true)).await;
+        println!("open {}: {r:?}", m.ticker);
+        assert_eq!(r, R::NotClosed, "an open market's position left by a trade, not settlement");
     }
 }

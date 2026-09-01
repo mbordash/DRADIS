@@ -90,9 +90,20 @@ pub struct KalshiMarket {
     pub yes_sub_title: String,
     #[serde(default)]
     pub no_sub_title: String,
-    /// `active`, `initialized`, `closed`, `settled`, …
+    /// `active`, `initialized`, `closed`, `finalized`, `settled`, …
     #[serde(default)]
     pub status: String,
+    /// Which side paid, once the exchange has determined the market: `yes`,
+    /// `no`, `void`, scalar values on non-binary markets — or empty while
+    /// undetermined, INCLUDING on markets already closed to trading.
+    ///
+    /// This is the exchange's own settlement record and the authoritative input
+    /// for settlement booking (verified live 2026-08-31: a finalized
+    /// `KXBTC15M-26AUG312345-45` carried `result: "yes"` alongside
+    /// `settlement_value_dollars: "1.0000"`). Only `yes`/`no` are decisive for
+    /// a binary leg; everything else must be treated as no answer.
+    #[serde(default)]
+    pub result: String,
     #[serde(default)]
     pub market_type: String,
     /// `greater` | `less` | `between` (strike semantics).

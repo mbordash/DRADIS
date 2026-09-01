@@ -509,6 +509,19 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
         "ALTER TABLE open_positions ADD COLUMN current_price TEXT"
     ).execute(pool).await;
 
+    // Share count as it stood before a chain read of ZERO overwrote it.
+    //
+    // A settled position vanishes from the chain, so the drift corrector writes
+    // `shares = 0` — and that erases the one number a settlement booking needs.
+    // On 2026-08-31 a real winning FairValue position (4.050628 shares at $0.79,
+    // redeemed at $1.00 for +$0.80) was deleted with no ledger row because
+    // `purge_stale_open_positions` reached its booking branch after the zero write
+    // and failed its own `qty > 0` guard. Preserved here so the booking that runs
+    // moments later still knows what settled.
+    let _ = sqlx::query(
+        "ALTER TABLE open_positions ADD COLUMN settled_shares TEXT"
+    ).execute(pool).await;
+
     // llm_recommendations: LLM Advisor analysis results persisted for the dashboard
     sqlx::query(
         "CREATE TABLE IF NOT EXISTS llm_recommendations (
@@ -2540,6 +2553,81 @@ pub async fn market_has_matching_trade(pool: &SqlitePool, market: &str, shares: 
     })
 }
 
+/// Has a settled arb PAIR already been booked for this market at this size?
+///
+/// TWO paths book a resolved YES+NO pair as ONE row (side "YES", shares = pairs),
+/// and both must be recognized here:
+///
+///   * `record_settled_arb_trade` — `Settlement (YES+NO → $1.00)`
+///   * `detect_orphaned_arb_settlements` — `Settlement (auto-redeemed by Polymarket)`
+///
+/// Either way both legs are covered by that single row and the pair's economics are
+/// already netted in it. Missing the second reason leaves the same double-book alive
+/// through a sibling path — and that path's own row cleanup is a `let _ = DELETE`,
+/// so a busy database silently leaves the leg rows behind for this sweep to find.
+///
+/// Side-scoped settlement dedup therefore cannot see it from the NO leg: a leftover
+/// NO row whose market has resolved finds no side="NO" settlement and books a
+/// spurious extra loss of `entry × qty` on top of the netted pair. Leftover legs are
+/// reachable in ordinary operation — a crash between the redeem transaction and
+/// `purge_settled_legs`, a failed purge, or the operator redeeming in the Polymarket
+/// UI rather than in-app.
+///
+/// Matched on the exact combined reason rather than by widening the side-scoped
+/// check, because the legitimate two-leg "pending redemption" accrual books one row
+/// PER side and must not suppress its own second leg.
+pub async fn market_has_settled_arb_pair(
+    pool: &SqlitePool,
+    market: &str,
+    shares: Decimal,
+) -> bool {
+    let share_dust = Decimal::new(1, 3); // 0.001
+    let rows: Vec<String> = sqlx::query_scalar(
+        "SELECT shares FROM trades
+          WHERE market = ?
+            AND reason IN ('Settlement (YES+NO → $1.00)',
+                           'Settlement (auto-redeemed by Polymarket)')"
+    )
+        .bind(market)
+        .fetch_all(pool)
+        .await
+        .unwrap_or_default();
+    rows.iter().any(|s| {
+        s.parse::<Decimal>()
+            .map(|booked| (booked - shares).abs() <= share_dust)
+            .unwrap_or(false)
+    })
+}
+
+/// How long a stale `open_positions` row may be deferred awaiting a settlement
+/// answer before the sweep stops deferring and lets it fall back to the
+/// pre-existing mark-priced reconciliation.
+///
+/// Bounded by AGE rather than by attempts — attempt counts do not survive a
+/// restart, and an unbounded defer would replace a permanent silent delete with
+/// a permanent phantom row, which is the same bug wearing the opposite sign.
+/// Shared by every venue's settlement sweep so the policy cannot drift apart.
+pub const SETTLEMENT_DEFER_MAX_SECS: i64 = 24 * 3600;
+
+/// Non-ghost, venue-confirmed `open_positions` rows as `(token_id, ts)` —
+/// the candidate set every venue's settlement sweep starts from.
+///
+/// `pending` rows are excluded on purpose: a pending row may be an order that
+/// never filled, and asking a venue what a never-held position settled at can
+/// only fabricate a booking. Ghost rows hold nothing at any venue by
+/// definition, so a settlement lookup for one is meaningless (and booking one
+/// would corrupt the simulated ledger — see the ghost exclusion on
+/// `purge_stale_open_positions`).
+pub async fn confirmed_open_positions(pool: &SqlitePool) -> Vec<(String, String)> {
+    sqlx::query_as::<_, (String, String)>(
+        "SELECT token_id, ts FROM open_positions
+          WHERE ghost_mode = 0 AND COALESCE(status,'confirmed') = 'confirmed'"
+    )
+    .fetch_all(pool)
+    .await
+    .unwrap_or_default()
+}
+
 /// Returns true if a SETTLEMENT trade row already exists for `market` + `side` with a
 /// share count matching `shares` within dust tolerance.
 ///
@@ -2609,11 +2697,31 @@ pub async fn market_has_pending_redemption_settlement(pool: &SqlitePool, market:
 /// dip negative for minutes-to-hours on every settled arb pair. Instead, book both
 /// legs HERE at their resolved value with reason "Settlement (won/lost — pending
 /// redemption)"; auto_settle's later redemption becomes a cash-only event.
+///
+/// **Caller contract — `live_token_ids` must come from a SUCCESSFUL positions
+/// fetch.** An empty set is legitimate input (an account that genuinely holds
+/// nothing still needs its stale rows cleaned, and the per-asset intl sweep
+/// passes empty sets routinely), so no guard HERE can tell "asked and got none"
+/// from "could not ask" — that distinction exists only at the fetch site. A
+/// caller that substitutes an empty set on a fetch error turns a transient
+/// timeout into the book-and-delete of every confirmed row in the table; the
+/// Kalshi and Polymarket US dashboard syncs did exactly that via
+/// `unwrap_or_default()` until v1.1.0. On any fetch failure, skip the sweep for
+/// that pass — the intl chain-sync's long-standing rule.
 pub async fn purge_stale_open_positions(
     pool: &SqlitePool,
     live_token_ids: &std::collections::HashSet<String>,
     // token_id → (resolved cur_price, on-chain size) for redeemable positions
     redeemable_marks: &std::collections::HashMap<String, (Decimal, Decimal)>,
+    // Tokens whose resolution could not be determined THIS sweep. Left entirely
+    // alone — not booked, not deleted — so the next pass can try again.
+    //
+    // The alternative is the silent-purge arm, which deletes a row that moved real
+    // cash and books nothing. On 2026-08-31 that lost a winning $0.80 settlement
+    // from the ledger while the wallet was correct. Retaining a row costs nothing
+    // but a few minutes of a stale dashboard entry; deleting one costs the record
+    // permanently.
+    defer_tokens: &std::collections::HashSet<String>,
 ) -> usize {
     // A row may legitimately sit `status='pending'` for a SHORT time between the
     // strategy's INSERT and the Polymarket Data API indexing the resulting fill.
@@ -2646,8 +2754,8 @@ pub async fn purge_stale_open_positions(
     // `clear_live_open_positions` already preserves ghost rows for the same
     // reason; this path simply never got the same treatment.
 
-    let rows: Vec<(i64, String, Option<String>, String, String, String, String, String, String, Option<String>, Option<String>)> = match sqlx::query_as(
-        "SELECT id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price, entry_fee FROM open_positions WHERE ghost_mode = 0"
+    let rows: Vec<(i64, String, Option<String>, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>)> = match sqlx::query_as(
+        "SELECT id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price, entry_fee, settled_shares FROM open_positions WHERE ghost_mode = 0"
     )
     .fetch_all(pool)
     .await {
@@ -2657,7 +2765,21 @@ pub async fn purge_stale_open_positions(
 
     let now = Utc::now();
     let mut purged = 0usize;
-    for (id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price, entry_fee) in rows {
+    for (id, token_id, status, ts, strategy, market, side, entry_price, shares, current_price, entry_fee, settled_shares) in rows {
+        // The size that actually settled, when the chain has already zeroed the row.
+        //
+        // `shares` is what the position holds NOW; for a settled position that is
+        // zero, and every booking branch below guards on a positive quantity. The
+        // drift corrector preserves the pre-zero count in `settled_shares` for
+        // exactly this read.
+        let shares = {
+            let live = shares.parse::<Decimal>().unwrap_or(Decimal::ZERO);
+            if live > Decimal::ZERO {
+                shares
+            } else {
+                settled_shares.clone().unwrap_or(shares)
+            }
+        };
         // Dollars already paid to open this leg. Absent on rows written before
         // the column existed, and on venues that do not report a fee — both
         // degrade to the old gross-only behavior rather than inventing a cost.
@@ -2667,6 +2789,11 @@ pub async fn purge_stale_open_positions(
             .unwrap_or(Decimal::ZERO);
         // Still held on-chain (size > 0, not redeemable) — keep.
         if live_token_ids.contains(&token_id) {
+            continue;
+        }
+
+        // Resolution unknown this pass — leave it entirely alone and retry later.
+        if defer_tokens.contains(&token_id) {
             continue;
         }
 
@@ -2689,7 +2816,19 @@ pub async fn purge_stale_open_positions(
             let won = resolved_px == Decimal::ONE;
 
             if entry > Decimal::ZERO && qty > Decimal::ZERO {
-                if market_has_settlement_trade(pool, &market, &side, qty).await {
+                // Only an ArbitrageStrategy row can be a leftover pair leg, and the
+                // check is side- and strategy-blind: without this gate a separate
+                // single-leg position on the same market with a coincidentally equal
+                // share count would be suppressed, silently dropping exactly the kind
+                // of record this whole path exists to preserve.
+                if strategy == "ArbitrageStrategy"
+                    && market_has_settled_arb_pair(pool, &market, qty).await
+                {
+                    debug!(
+                        "🧾 Resolution booking: {} {} {} sh already covered by a settled arb pair — skipping",
+                        market, side, qty
+                    );
+                } else if market_has_settlement_trade(pool, &market, &side, qty).await {
                     debug!(
                         "🧾 Resolution booking: settlement already recorded for {} {} {} sh — skipping",
                         market, side, qty
@@ -2699,9 +2838,21 @@ pub async fn purge_stale_open_positions(
                     // collateral on 2026-08-13 (3.04 shares in the money paid
                     // exactly $3.0400). So the round trip owes the entry leg only.
                     let pnl = (resolved_px - entry) * qty - entry_fee;
+                    // Wording follows the mechanics, keyed off `chain_size`:
+                    // a positive size means the account still HOLDS the resolved
+                    // token and its cash arrives with a later redemption (the
+                    // intl accrual path). Size zero means the position is
+                    // already gone — the venue settled it and the cash has
+                    // landed (Kalshi pays winners straight to the balance,
+                    // Polymarket US cash-settles custodially, Polymarket
+                    // auto-redeems on-chain) — so "pending redemption" would
+                    // describe an event that already happened. Both spellings
+                    // stay under the `Settlement%` prefix the dedup checks key
+                    // on.
                     let reason = format!(
-                        "Settlement ({} — pending redemption)",
-                        if won { "won" } else { "lost" }
+                        "Settlement ({} — {})",
+                        if won { "won" } else { "lost" },
+                        if *chain_size > Decimal::ZERO { "pending redemption" } else { "cash settled" }
                     );
                     let inserted = record_settlement_trade_idempotent(
                         pool, &strategy, &market, &side, entry, resolved_px, qty, pnl, entry_fee, &reason, None,
@@ -2806,11 +2957,6 @@ pub async fn purge_stale_open_positions(
     purged
 }
 
-/// Re-adopt a single on-chain position that is missing from `open_positions`.
-///
-/// Uses `INSERT ... WHERE NOT EXISTS` so it is safe to call repeatedly — it is a
-/// no-op if a row for `token_id` already exists.  Returns `true` if a row was
-/// inserted.
 /// Update an existing open position's share count and avg_price from on-chain data.
 ///
 /// Called by `sync_open_positions_with_chain` whenever the Polymarket Data API
@@ -2832,10 +2978,39 @@ pub async fn update_position_from_chain(
     // genuine $0.55 entry overwritten to $0.00 then mark-to-markets as +100% "profit").
     // When avg_price is non-positive, correct shares + current_price ONLY and keep the
     // existing entry_price.
+    // A chain read of ZERO is a SETTLEMENT, not a correction to nothing.
+    //
+    // The scaling expression below multiplies `entry_fee` by `new/old`, which for
+    // a zero read is a multiply by zero — so the fee is destroyed alongside the
+    // share count, and any later attempt to book the settlement has neither the
+    // quantity nor the cost to book. Capture both before the write. `settled_shares`
+    // is only ever set on the zero transition, so it always holds the size that
+    // actually settled rather than the size of some earlier partial correction.
+    if shares <= rust_decimal::Decimal::ZERO {
+        if let Err(e) = sqlx::query(
+            "UPDATE open_positions
+                SET settled_shares = shares
+              WHERE token_id = ? AND CAST(shares AS REAL) > 0"
+        )
+        .bind(token_id)
+        .execute(pool)
+        .await
+        {
+            // Do NOT proceed to zero the row. Zeroing without a captured size
+            // recreates the exact incident state (shares=0, settled_shares NULL) and
+            // the settlement booking is lost permanently. The corrector retries on
+            // the next sweep; a row that is briefly one pass stale costs nothing.
+            error!("❌ DB settled_shares capture failed for {} — skipping the zero write this pass: {}",
+                   token_id, e);
+            return;
+        }
+    }
+
     let result = if avg_price > rust_decimal::Decimal::ZERO {
         sqlx::query(
-            "UPDATE open_positions SET entry_fee = CAST(COALESCE(entry_fee,'0') AS REAL) * (CAST(? AS REAL) / NULLIF(CAST(shares AS REAL),0)), shares = ?, entry_price = ?, chain_adopted = 1, current_price = COALESCE(?, current_price), price_updated_at = CASE WHEN ? IS NULL THEN price_updated_at ELSE ? END WHERE token_id = ?"
+            "UPDATE open_positions SET entry_fee = CASE WHEN CAST(? AS REAL) <= 0 THEN entry_fee ELSE CAST(COALESCE(entry_fee,'0') AS REAL) * (CAST(? AS REAL) / NULLIF(CAST(shares AS REAL),0)) END, shares = ?, entry_price = ?, chain_adopted = 1, current_price = COALESCE(?, current_price), price_updated_at = CASE WHEN ? IS NULL THEN price_updated_at ELSE ? END WHERE token_id = ?"
         )
+        .bind(shares.to_string())
         .bind(shares.to_string())
         .bind(shares.to_string())
         .bind(avg_price.to_string())
@@ -2849,8 +3024,9 @@ pub async fn update_position_from_chain(
         .await
     } else {
         sqlx::query(
-            "UPDATE open_positions SET entry_fee = CAST(COALESCE(entry_fee,'0') AS REAL) * (CAST(? AS REAL) / NULLIF(CAST(shares AS REAL),0)), shares = ?, chain_adopted = 1, current_price = COALESCE(?, current_price), price_updated_at = CASE WHEN ? IS NULL THEN price_updated_at ELSE ? END WHERE token_id = ?"
+            "UPDATE open_positions SET entry_fee = CASE WHEN CAST(? AS REAL) <= 0 THEN entry_fee ELSE CAST(COALESCE(entry_fee,'0') AS REAL) * (CAST(? AS REAL) / NULLIF(CAST(shares AS REAL),0)) END, shares = ?, chain_adopted = 1, current_price = COALESCE(?, current_price), price_updated_at = CASE WHEN ? IS NULL THEN price_updated_at ELSE ? END WHERE token_id = ?"
         )
+        .bind(shares.to_string())
         .bind(shares.to_string())
         .bind(shares.to_string())
         .bind(&cur_price_str)
@@ -2926,6 +3102,11 @@ pub async fn update_position_current_price(
     }
 }
 
+/// Re-adopt a single on-chain position that is missing from `open_positions`.
+///
+/// Uses `INSERT ... WHERE NOT EXISTS` so it is safe to call repeatedly — it is a
+/// no-op if a row for `token_id` already exists.  Returns `true` if a row was
+/// inserted.
 pub async fn adopt_chain_position(
     pool: &SqlitePool,
     token_id: &str,
@@ -4070,6 +4251,179 @@ mod reconcile_tests {
         pool
     }
 
+    /// A settled position whose row the chain corrector already zeroed must still
+    /// book, using the size preserved in `settled_shares`.
+    ///
+    /// Replays the v1.0.9 production incident of 2026-08-31. FairValue bought
+    /// 4.050628 shares at $0.79; the market resolved in its favor and the shares
+    /// auto-redeemed at $1.00 for +$0.80, which the wallet showed and the ledger did
+    /// not. The drift corrector ran first and wrote `shares = 0`, so the booking
+    /// branch failed its own `qty > 0` guard and the row was deleted silently.
+    #[tokio::test]
+    async fn a_settled_position_books_from_the_preserved_share_count() {
+        let pool = mem_pool().await;
+        insert_open(&pool, "FairValueStrategy", "tok-settled", "Bitcoin Up or Down - 9PM",
+                    "YES", "0.79", "4.050628", Some("0.99"), "confirmed").await;
+        // What the drift corrector does when the chain reports the position gone.
+        sqlx::query("UPDATE open_positions SET settled_shares = shares, shares = '0' WHERE token_id = 'tok-settled'")
+            .execute(&pool).await.unwrap();
+
+        // Gamma priced the market at $1.00; size 0 makes the branch use the row qty.
+        let mut marks = std::collections::HashMap::new();
+        marks.insert("tok-settled".to_string(), (Decimal::ONE, Decimal::ZERO));
+
+        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &marks, &HashSet::new()).await;
+        assert_eq!(purged, 1, "the row is booked and then removed");
+
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT side, reason, pnl FROM trades WHERE market = 'Bitcoin Up or Down - 9PM'"
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(rows.len(), 1, "the settlement must be booked, not silently purged");
+        assert!(rows[0].1.starts_with("Settlement"), "reason was {:?}", rows[0].1);
+        // (1.00 − 0.79) × 4.050628 = 0.85063…, before the entry fee.
+        let pnl: f64 = rows[0].2.parse().unwrap();
+        assert!((0.80..0.86).contains(&pnl), "pnl {pnl} should be the real +$0.80-ish win");
+    }
+
+    /// A leftover arb leg must not book a second time against the combined pair row.
+    ///
+    /// `record_settled_arb_trade` books a resolved YES+NO pair as ONE row (side YES,
+    /// shares = pairs), and the pair's economics are already netted in it. The
+    /// side-scoped settlement dedup cannot see that row from the NO leg, so routing a
+    /// leftover leg through the settlement branch would fabricate an extra loss of
+    /// `entry × qty`. Leftover legs are reachable in ordinary operation: a crash
+    /// between the redeem transaction and `purge_settled_legs`, or the operator
+    /// redeeming in the Polymarket UI.
+    #[tokio::test]
+    async fn a_leftover_arb_leg_does_not_double_book_against_the_pair_row() {
+        let pool = mem_pool().await;
+        // The combined pair row, as record_settled_arb_trade writes it.
+        record_trade_db(
+            &pool, &TradeScope::new("", "polymarket-intl", None, None), Decimal::ZERO,
+            "ArbitrageStrategy", "MarketArb", "YES",
+            Decimal::new(99, 2), Decimal::ONE, Decimal::new(10, 0),
+            Decimal::new(10, 2), "Settlement (YES+NO → $1.00)", None,
+        ).await;
+        // The NO leg that purge_settled_legs never got to.
+        insert_open(&pool, "ArbitrageStrategy", "tok-no-leg", "MarketArb", "NO",
+                    "0.09", "10", Some("0.00"), "confirmed").await;
+
+        let mut marks = std::collections::HashMap::new();
+        marks.insert("tok-no-leg".to_string(), (Decimal::ZERO, Decimal::ZERO));
+
+        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &marks, &HashSet::new()).await;
+        assert_eq!(purged, 1, "the leftover row is still cleaned up");
+
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM trades WHERE market = 'MarketArb'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1, "only the original combined pair row may exist — no fabricated second loss");
+    }
+
+    /// The OTHER combined-pair writer must dedup too.
+    ///
+    /// `detect_orphaned_arb_settlements` books a redeemed pair as one row with reason
+    /// `Settlement (auto-redeemed by Polymarket)`, and its own row cleanup is a
+    /// `let _ = DELETE` — so a busy database leaves the leg rows behind for this
+    /// sweep to find. Matching only the other reason left the NO-leg double-book
+    /// alive through that path.
+    #[tokio::test]
+    async fn an_auto_redeemed_pair_also_suppresses_the_leftover_leg() {
+        let pool = mem_pool().await;
+        record_trade_db(
+            &pool, &TradeScope::new("", "polymarket-intl", None, None), Decimal::ZERO,
+            "ArbitrageStrategy", "MarketAuto", "YES",
+            Decimal::new(98, 2), Decimal::ONE, Decimal::new(12, 0),
+            Decimal::new(24, 2), "Settlement (auto-redeemed by Polymarket)", None,
+        ).await;
+        insert_open(&pool, "ArbitrageStrategy", "tok-auto-no", "MarketAuto", "NO",
+                    "0.10", "12", Some("0.00"), "confirmed").await;
+
+        let mut marks = std::collections::HashMap::new();
+        marks.insert("tok-auto-no".to_string(), (Decimal::ZERO, Decimal::ZERO));
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &marks, &HashSet::new()).await, 1);
+
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM trades WHERE market = 'MarketAuto'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1, "no fabricated second loss against the auto-redeemed pair row");
+    }
+
+    /// The pair check must not suppress a NON-arb position that merely shares a
+    /// market and a share count. Dropping that record is the very failure this
+    /// patch exists to prevent.
+    #[tokio::test]
+    async fn a_non_arb_position_still_books_beside_a_settled_pair() {
+        let pool = mem_pool().await;
+        record_trade_db(
+            &pool, &TradeScope::new("", "polymarket-intl", None, None), Decimal::ZERO,
+            "ArbitrageStrategy", "MarketBoth", "YES",
+            Decimal::new(97, 2), Decimal::ONE, Decimal::new(8, 0),
+            Decimal::new(24, 2), "Settlement (YES+NO → $1.00)", None,
+        ).await;
+        // Same market and size, different strategy and side — a genuinely separate
+        // position. The side differs deliberately: the PRE-EXISTING side-scoped
+        // dedup (`market_has_settlement_trade`) also collides on market+side+shares,
+        // which is a known limitation this patch does not change. Using the other
+        // side isolates the behavior actually under test — that the side-blind PAIR
+        // check no longer suppresses a non-arb row.
+        insert_open(&pool, "FairValueStrategy", "tok-fv", "MarketBoth", "NO",
+                    "0.55", "8", Some("0.01"), "confirmed").await;
+
+        let mut marks = std::collections::HashMap::new();
+        marks.insert("tok-fv".to_string(), (Decimal::ZERO, Decimal::ZERO));
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &marks, &HashSet::new()).await, 1);
+
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM trades WHERE market = 'MarketBoth' AND strategy = 'FairValueStrategy'"
+        ).fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1, "the FairValue settlement must be booked, not swallowed by the arb dedup");
+    }
+
+    /// A token whose resolution could not be determined is left completely alone —
+    /// not booked, not deleted — so the next sweep can try again.
+    ///
+    /// Deleting it is what lost the record in the first place. Retaining a row costs
+    /// a stale dashboard entry for a few minutes; deleting one costs it permanently.
+    #[tokio::test]
+    async fn a_deferred_token_is_neither_booked_nor_deleted() {
+        let pool = mem_pool().await;
+        insert_open(&pool, "FairValueStrategy", "tok-unknown", "MarketU", "YES",
+                    "0.50", "10", Some("0.50"), "confirmed").await;
+
+        let mut defer = HashSet::new();
+        defer.insert("tok-unknown".to_string());
+
+        let purged = purge_stale_open_positions(
+            &pool, &HashSet::new(), &std::collections::HashMap::new(), &defer,
+        ).await;
+        assert_eq!(purged, 0, "a deferred row must survive the sweep");
+
+        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM open_positions WHERE token_id = 'tok-unknown'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(n, 1, "the row is still there for the next pass");
+        let t: i64 = sqlx::query_scalar("SELECT count(*) FROM trades WHERE market = 'MarketU'")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(t, 0, "and nothing was invented for it");
+    }
+
+    /// A losing settlement books too, at exactly $0.00.
+    #[tokio::test]
+    async fn a_losing_settlement_books_at_zero() {
+        let pool = mem_pool().await;
+        insert_open(&pool, "FairValueStrategy", "tok-lost", "MarketL", "NO",
+                    "0.60", "5", Some("0.01"), "confirmed").await;
+        sqlx::query("UPDATE open_positions SET settled_shares = shares, shares = '0' WHERE token_id = 'tok-lost'")
+            .execute(&pool).await.unwrap();
+
+        let mut marks = std::collections::HashMap::new();
+        marks.insert("tok-lost".to_string(), (Decimal::ZERO, Decimal::ZERO));
+
+        assert_eq!(purge_stale_open_positions(&pool, &HashSet::new(), &marks, &HashSet::new()).await, 1);
+        let pnl: String = sqlx::query_scalar("SELECT pnl FROM trades WHERE market = 'MarketL'")
+            .fetch_one(&pool).await.unwrap();
+        // (0.00 − 0.60) × 5 = −3.00
+        assert!(pnl.starts_with('-'), "a lost settlement must book a loss, got {pnl}");
+    }
+
     /// Insert a SIMULATED position belonging to a named session.
     async fn insert_ghost_open(pool: &SqlitePool, session: &str, token: &str) {
         sqlx::query(
@@ -4150,6 +4504,26 @@ mod reconcile_tests {
         .execute(pool).await.expect("insert open_position");
     }
 
+    /// The settlement-sweep candidate set carries only rows a venue actually
+    /// confirmed holding: `pending` rows may be orders that never filled, and
+    /// ghost rows hold nothing anywhere — asking a venue what either settled at
+    /// can only fabricate a booking.
+    #[tokio::test]
+    async fn settlement_candidates_exclude_pending_and_ghost_rows() {
+        let pool = mem_pool().await;
+        insert_open(&pool, "MakerStrategy", "tok-confirmed", "M1", "YES", "0.40", "10", None, "confirmed").await;
+        insert_open(&pool, "MakerStrategy", "tok-pending", "M2", "YES", "0.40", "10", None, "pending").await;
+        insert_ghost_open(&pool, "ghost-sess", "tok-ghost").await;
+
+        let tokens: std::collections::HashSet<String> = confirmed_open_positions(&pool)
+            .await
+            .into_iter()
+            .map(|(t, _)| t)
+            .collect();
+        assert_eq!(tokens, std::collections::HashSet::from(["tok-confirmed".to_string()]),
+            "only the venue-confirmed real row is a settlement candidate");
+    }
+
     // An off-strategy exit (position vanished from wallet, no matching trade) is
     // booked to the ledger with an estimated P&L from the last mark.
     #[tokio::test]
@@ -4157,7 +4531,7 @@ mod reconcile_tests {
         let pool = mem_pool().await;
         insert_open(&pool, "MakerStrategy", "tok1", "MarketA", "YES", "0.33", "11.44", Some("0.40"), "confirmed").await;
 
-        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &std::collections::HashMap::new()).await;
+        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &std::collections::HashMap::new(), &std::collections::HashSet::new()).await;
         assert_eq!(purged, 1);
 
         let rows: Vec<(String, String)> =
@@ -4237,7 +4611,7 @@ mod reconcile_tests {
             Decimal::new(10, 2), "Settlement (auto-redeemed by Polymarket)", None).await;
         insert_open(&pool, "MakerStrategy", "tok2", "MarketB", "YES", "0.33", "11.44", Some("0.40"), "confirmed").await;
 
-        purge_stale_open_positions(&pool, &HashSet::new(), &std::collections::HashMap::new()).await;
+        purge_stale_open_positions(&pool, &HashSet::new(), &std::collections::HashMap::new(), &std::collections::HashSet::new()).await;
 
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE market = 'MarketB'")
             .fetch_one(&pool).await.unwrap();
@@ -4251,7 +4625,7 @@ mod reconcile_tests {
         let pool = mem_pool().await;
         insert_open(&pool, "MakerStrategy", "tok3", "MarketC", "YES", "0.33", "11.44", Some("0.40"), "pending").await;
 
-        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &std::collections::HashMap::new()).await;
+        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &std::collections::HashMap::new(), &std::collections::HashSet::new()).await;
         assert_eq!(purged, 0);
 
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE market = 'MarketC'")
@@ -4266,7 +4640,7 @@ mod reconcile_tests {
         let pool = mem_pool().await;
         insert_open(&pool, "MakerStrategy", "tok4", "MarketD", "YES", "0.33", "11.44", None, "confirmed").await;
 
-        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &std::collections::HashMap::new()).await;
+        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &std::collections::HashMap::new(), &std::collections::HashSet::new()).await;
         assert_eq!(purged, 1);
 
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE market = 'MarketD'")
@@ -4287,7 +4661,7 @@ mod reconcile_tests {
         marks.insert("tokY".to_string(), (Decimal::new(9995, 4), Decimal::new(15003, 3))); // winner ~1.00
         marks.insert("tokN".to_string(), (Decimal::new(5, 4),    Decimal::new(15, 0)));    // loser ~0.00
 
-        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &marks).await;
+        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &marks, &HashSet::new()).await;
         assert_eq!(purged, 2);
 
         let rows: Vec<(String, String, String)> =
@@ -4317,7 +4691,7 @@ mod reconcile_tests {
         let mut marks = std::collections::HashMap::new();
         marks.insert("tokY2".to_string(), (Decimal::new(9995, 4), Decimal::new(15, 0)));
 
-        purge_stale_open_positions(&pool, &HashSet::new(), &marks).await;
+        purge_stale_open_positions(&pool, &HashSet::new(), &marks, &HashSet::new()).await;
 
         let n: i64 = sqlx::query_scalar(
             "SELECT COUNT(*) FROM trades WHERE market = 'MarketF' AND reason LIKE 'Settlement%'"
@@ -4335,7 +4709,7 @@ mod reconcile_tests {
         let mut marks = std::collections::HashMap::new();
         marks.insert("tokP".to_string(), (Decimal::new(5, 4), Decimal::new(15, 0)));
 
-        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &marks).await;
+        let purged = purge_stale_open_positions(&pool, &HashSet::new(), &marks, &HashSet::new()).await;
         assert_eq!(purged, 1);
 
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM trades WHERE market = 'MarketG'")

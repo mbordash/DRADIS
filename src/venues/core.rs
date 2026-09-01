@@ -146,6 +146,277 @@ pub struct Position {
     pub avg_price: Decimal,
 }
 
+/// What a venue says about a market whose position has left the account.
+///
+/// Every venue's settlement sweep answers the same question — "did this leg
+/// settle, and at what final value?" — from its own authority: Polymarket
+/// International asks Gamma for resolved outcome prices, Kalshi asks the
+/// exchange's market `result`, Polymarket US asks the gateway's market status.
+/// Three states, and collapsing any two of them misbooks real money:
+///
+///   * Resolved  + NotClosed collapsed → an off-strategy SALE booked at $1.00
+///     or $0.00 instead of its actual sale price, and the row then deleted so
+///     nothing can correct it.
+///   * Resolved  + Unknown collapsed → a guess booked as a settlement.
+///   * NotClosed + Unknown collapsed → an ordinary sale deferred forever, or a
+///     transient outage treated as proof the market is still open.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TokenResolution {
+    /// The market resolved and the price is FINAL: $1.00 or $0.00.
+    Resolved(Decimal),
+    /// The market is verifiably still open. A position cannot have settled,
+    /// because settlement only exists after resolution — so it left the account
+    /// by a trade, and belongs on the mark-priced reconciliation path, not the
+    /// settlement one.
+    NotClosed,
+    /// No answer: unreachable, unparseable, or closed but not yet carrying a
+    /// final price. Never assume anything from this — defer and ask again.
+    Unknown,
+}
+
+// ─── Settlement probe backoff (Kalshi / Polymarket US) ──────────────────────
+
+/// Base retry delay after a token's first [`TokenResolution::Unknown`] answer.
+///
+/// Equal to the dashboard sweep cadence on both venues that use this gate, so
+/// the FIRST retry is not delayed at all relative to the old behavior — a
+/// market that determines within a sweep or two of closing (the normal Kalshi
+/// crypto-hourly case) is still booked within a minute of resolution.
+#[cfg(any(feature = "kalshi", feature = "us_retail"))]
+const PROBE_BASE_DELAY_SECS: u64 = 30;
+
+/// Ceiling on the per-token retry delay, however many misses accumulate.
+///
+/// Reached after five consecutive `Unknown`s (~13 minutes of no answer), which
+/// on a 15-minute Kalshi market means determination is genuinely delayed —
+/// exchange review, a voided market — not merely in flight. Ten minutes keeps
+/// a stuck row at ~144 venue calls/day instead of 2,880, while still booking
+/// an eventually-resolved market within ten minutes of the answer appearing.
+/// The 24h [`crate::helpers::db::SETTLEMENT_DEFER_MAX_SECS`] age bound is
+/// stretched by at most this much, which it can absorb.
+#[cfg(any(feature = "kalshi", feature = "us_retail"))]
+const PROBE_MAX_DELAY_SECS: u64 = 600;
+
+#[cfg(any(feature = "kalshi", feature = "us_retail"))]
+struct ProbeState {
+    /// Earliest instant at which the venue may be asked about this token again.
+    next_probe: std::time::Instant,
+    /// Consecutive `Unknown` answers so far; drives the exponential delay.
+    misses: u32,
+    /// Last time any sweep consulted this entry — the prune clock.
+    last_touch: std::time::Instant,
+}
+
+/// Per-token rate limiter for settlement lookups that keep answering
+/// [`TokenResolution::Unknown`].
+///
+/// Why this exists: `sync_dashboard` on Kalshi and Polymarket US runs every 30
+/// seconds AND after every entry and every dispatched fill, and each run makes
+/// one live venue API call per stale confirmed row. A row the venue cannot
+/// answer for — a Kalshi market closed but not yet determined, a voided
+/// market, a transient REST failure — therefore burned ~2,880 calls over its
+/// 24h defer window, multiplied by the stale-row population (Kalshi runs seven
+/// squadrons against one shard, each sweeping the same pool-wide row set) and
+/// by the fill-driven extra sweeps. All of that sits in the trading loop, so a
+/// slow venue turned settlement lookups into tick delay. The same per-row loop
+/// was fine on the intl chain-sync path because that sweep runs every 300s in
+/// a background task; the cost model does not carry to a 30s in-loop tick.
+///
+/// Mechanism: exponential per-token backoff on consecutive `Unknown` answers
+/// (30s, 60s, 120s, … capped at [`PROBE_MAX_DELAY_SECS`]). A token inside its
+/// backoff window is DEFERRED without a venue call — exactly the treatment a
+/// fresh `Unknown` gets, so nothing is booked or deleted on a skipped probe. A
+/// decisive answer (`Resolved`/`NotClosed`) clears the entry, and a token
+/// never seen before probes immediately, so the first lookup after a position
+/// vanishes — the one that books the normal settlement — is never delayed.
+///
+/// Deliberately in-memory and NOT the correctness bound: this state dies on
+/// restart, which only means one immediate re-probe per deferred token and a
+/// rebuilt backoff — more calls, never a missed settlement. The durable bound
+/// remains the row-age check against `SETTLEMENT_DEFER_MAX_SECS` in the
+/// sweeps, precisely because attempt counters that die on restart were
+/// rejected as a bound when the age check was designed.
+///
+/// Process-wide by design: the seven Kalshi squadrons share one SQLite shard,
+/// so each sweeps the same stale rows. A shared gate means the first squadron
+/// to probe a token backs the other six off too.
+#[cfg(any(feature = "kalshi", feature = "us_retail"))]
+pub struct SettlementProbeGate {
+    inner: std::sync::Mutex<std::collections::HashMap<String, ProbeState>>,
+}
+
+#[cfg(any(feature = "kalshi", feature = "us_retail"))]
+impl Default for SettlementProbeGate {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+#[cfg(any(feature = "kalshi", feature = "us_retail"))]
+impl SettlementProbeGate {
+    pub fn new() -> Self {
+        Self { inner: std::sync::Mutex::new(std::collections::HashMap::new()) }
+    }
+
+    /// May the venue be asked about `token` right now?
+    ///
+    /// `true` for a token with no recorded miss (first sight probes
+    /// immediately) or whose backoff has expired. `false` means: treat the
+    /// token exactly as a fresh `Unknown` — defer it, book nothing, delete
+    /// nothing — and ask again on a later sweep.
+    pub fn should_probe(&self, token: &str) -> bool {
+        self.should_probe_at(token, std::time::Instant::now())
+    }
+
+    fn should_probe_at(&self, token: &str, now: std::time::Instant) -> bool {
+        let mut map = self.inner.lock().unwrap();
+        match map.get_mut(token) {
+            Some(st) if now < st.next_probe => {
+                st.last_touch = now;
+                false
+            }
+            // Expired or absent — probe. The entry (and its miss count) is kept
+            // so a chronically unanswerable token continues its long delays
+            // instead of restarting from 30s on every successful skip cycle.
+            _ => true,
+        }
+    }
+
+    /// The venue answered `Unknown` for `token`: extend its backoff.
+    pub fn record_unknown(&self, token: &str) {
+        self.record_unknown_at(token, std::time::Instant::now());
+    }
+
+    fn record_unknown_at(&self, token: &str, now: std::time::Instant) {
+        let mut map = self.inner.lock().unwrap();
+        // Opportunistic prune, piggybacked here because misses are the only
+        // path that grows the map. Entries can outlive their row — the row
+        // ages out at SETTLEMENT_DEFER_MAX_SECS and is reconciled away, or the
+        // token goes live again — so anything untouched for the full defer
+        // bound is dead weight. The map is tiny (bounded by the deferred-row
+        // population) so a linear scan costs nothing.
+        let idle_bound =
+            std::time::Duration::from_secs(crate::helpers::db::SETTLEMENT_DEFER_MAX_SECS as u64);
+        map.retain(|_, st| now.duration_since(st.last_touch) < idle_bound);
+
+        let st = map.entry(token.to_string()).or_insert(ProbeState {
+            next_probe: now,
+            misses: 0,
+            last_touch: now,
+        });
+        st.misses = st.misses.saturating_add(1);
+        // 30s · 2^(misses−1), capped. checked_shl saturates a huge shift to the
+        // cap rather than wrapping to a tiny delay.
+        let delay = PROBE_BASE_DELAY_SECS
+            .checked_shl(st.misses - 1)
+            .unwrap_or(u64::MAX)
+            .min(PROBE_MAX_DELAY_SECS);
+        st.next_probe = now + std::time::Duration::from_secs(delay);
+        st.last_touch = now;
+    }
+
+    /// The venue gave a decisive answer (`Resolved`/`NotClosed`) for `token`,
+    /// or the token is live at the venue again: forget its backoff, so a later
+    /// stale spell starts from an immediate probe.
+    pub fn record_decisive(&self, token: &str) {
+        self.inner.lock().unwrap().remove(token);
+    }
+}
+
+#[cfg(all(test, any(feature = "kalshi", feature = "us_retail")))]
+mod probe_gate_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_token_never_probed_before_is_probed_immediately() {
+        let gate = SettlementProbeGate::new();
+        assert!(gate.should_probe_at("tok", Instant::now()));
+    }
+
+    #[test]
+    fn an_unknown_answer_blocks_reprobing_until_the_backoff_expires() {
+        let gate = SettlementProbeGate::new();
+        let t0 = Instant::now();
+        gate.record_unknown_at("tok", t0);
+        assert!(!gate.should_probe_at("tok", t0 + Duration::from_secs(1)));
+        assert!(!gate.should_probe_at("tok", t0 + Duration::from_secs(PROBE_BASE_DELAY_SECS - 1)));
+        assert!(gate.should_probe_at("tok", t0 + Duration::from_secs(PROBE_BASE_DELAY_SECS)));
+    }
+
+    #[test]
+    fn consecutive_unknowns_double_the_backoff_up_to_the_cap() {
+        let gate = SettlementProbeGate::new();
+        let t0 = Instant::now();
+        // Miss n leaves a delay of 30·2^(n−1)s, saturating at the cap.
+        let mut now = t0;
+        let mut expected = PROBE_BASE_DELAY_SECS;
+        for _ in 0..8 {
+            gate.record_unknown_at("tok", now);
+            assert!(!gate.should_probe_at("tok", now + Duration::from_secs(expected - 1)));
+            assert!(gate.should_probe_at("tok", now + Duration::from_secs(expected)));
+            now += Duration::from_secs(expected);
+            expected = (expected * 2).min(PROBE_MAX_DELAY_SECS);
+        }
+        // Well past saturation the delay must still be exactly the cap.
+        gate.record_unknown_at("tok", now);
+        assert!(!gate.should_probe_at("tok", now + Duration::from_secs(PROBE_MAX_DELAY_SECS - 1)));
+        assert!(gate.should_probe_at("tok", now + Duration::from_secs(PROBE_MAX_DELAY_SECS)));
+    }
+
+    #[test]
+    fn a_huge_miss_count_saturates_instead_of_wrapping_to_a_tiny_delay() {
+        // 30 << 63 would overflow; the shift must saturate to the cap, because a
+        // wrapped delay of ~0s would silently restore the very polling storm
+        // this gate exists to prevent.
+        let gate = SettlementProbeGate::new();
+        let t0 = Instant::now();
+        {
+            let mut map = gate.inner.lock().unwrap();
+            map.insert("tok".into(), ProbeState { next_probe: t0, misses: u32::MAX - 1, last_touch: t0 });
+        }
+        gate.record_unknown_at("tok", t0);
+        assert!(!gate.should_probe_at("tok", t0 + Duration::from_secs(PROBE_MAX_DELAY_SECS - 1)));
+        assert!(gate.should_probe_at("tok", t0 + Duration::from_secs(PROBE_MAX_DELAY_SECS)));
+    }
+
+    #[test]
+    fn a_decisive_answer_clears_the_backoff_entirely() {
+        let gate = SettlementProbeGate::new();
+        let t0 = Instant::now();
+        gate.record_unknown_at("tok", t0);
+        gate.record_unknown_at("tok", t0);
+        gate.record_decisive("tok");
+        // Immediately probeable again, and the miss count restarted: one new
+        // miss yields the BASE delay, not a continuation of the doubling.
+        assert!(gate.should_probe_at("tok", t0));
+        gate.record_unknown_at("tok", t0);
+        assert!(gate.should_probe_at("tok", t0 + Duration::from_secs(PROBE_BASE_DELAY_SECS)));
+    }
+
+    #[test]
+    fn entries_idle_past_the_defer_bound_are_pruned() {
+        let gate = SettlementProbeGate::new();
+        let t0 = Instant::now();
+        gate.record_unknown_at("stale-row-token", t0);
+        // A different token missing a day later triggers the piggybacked prune.
+        let later = t0 + Duration::from_secs(
+            crate::helpers::db::SETTLEMENT_DEFER_MAX_SECS as u64 + 1,
+        );
+        gate.record_unknown_at("other", later);
+        assert!(!gate.inner.lock().unwrap().contains_key("stale-row-token"));
+        assert!(gate.inner.lock().unwrap().contains_key("other"));
+    }
+
+    #[test]
+    fn one_tokens_backoff_never_delays_a_different_token() {
+        let gate = SettlementProbeGate::new();
+        let t0 = Instant::now();
+        gate.record_unknown_at("stuck", t0);
+        assert!(gate.should_probe_at("fresh", t0));
+    }
+}
+
 // ─── Order-lifecycle primitives (Option C foundation) ───────────────────────
 
 /// A venue-neutral snapshot of a resting/working order, as reported by the venue.

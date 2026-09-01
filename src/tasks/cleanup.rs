@@ -653,6 +653,22 @@ fn infer_asset_from_title(title: &str) -> Option<&'static str> {
     }
 }
 
+/// HTTP client for the resolution lookups below.
+///
+/// Built once and reused: the sweep runs every 300s across every asset shard, and a
+/// fresh client per pass would discard the connection pool each time. Timeouts are
+/// short because a slow answer and no answer are handled identically here — the row
+/// is deferred to the next sweep either way.
+fn resolution_http() -> &'static reqwest::Client {
+    static HTTP: std::sync::OnceLock<reqwest::Client> = std::sync::OnceLock::new();
+    HTTP.get_or_init(|| {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(8))
+            .build()
+            .unwrap_or_default()
+    })
+}
+
 /// Sync the `open_positions` DB table against the wallet's actual live holdings on
 /// Polymarket.  Runs at startup and every 300 s.
 ///
@@ -765,8 +781,74 @@ pub async fn sync_open_positions_with_chain(safe_address: Address) {
             .map(|m| m.keys().cloned().collect())
             .unwrap_or_default();
 
+        // ── Settled-and-already-redeemed positions ───────────────────────────
+        //
+        // A winner that redeems between two sync passes is never seen as
+        // `redeemable`: it goes from live to gone, so it enters the purge in
+        // neither set and hits the silent-delete arm — a real cash move with no
+        // ledger row. That is what happened on 2026-08-31 to a FairValue position
+        // (4.050628 shares at $0.79, settled at $1.00, +$0.80) whose row was
+        // deleted and never booked.
+        //
+        // So ask the market what it resolved to, rather than inferring anything.
+        // Gamma is authoritative and refuses to answer for a market that has not
+        // closed. A token it prices is handed to `redeemable_marks`, where the
+        // EXISTING resolution branch books it at exactly $1.00 or $0.00 with no
+        // exit fee, idempotently and deduplicated — no new booking path.
+        //
+        // A size of zero is passed deliberately: the branch falls back to the row's
+        // own quantity, which `settled_shares` preserves across the drift
+        // corrector's zero write.
+        //
+        // Anything Gamma will not price — unresolved, or unreachable — is DEFERRED
+        // rather than deleted. Retaining a row costs a stale dashboard entry for a
+        // few minutes; deleting one costs the record permanently.
+        let mut resolved_marks = redeemable_marks.clone();
+        let mut deferred: HashSet<String> = HashSet::new();
+        {
+            // Deferral is bounded by AGE, not by attempts (see the shared
+            // constant's doc). Past the bound the row falls through to the
+            // pre-existing reconcile/purge path with a loud warning.
+            let candidates: Vec<(String, String)> = db::confirmed_open_positions(&pool)
+                .await
+                .into_iter()
+                .filter(|(t, _)| !live_ids.contains(t) && !redeemable_marks.contains_key(t))
+                .collect();
+
+            for (token, row_ts) in candidates {
+                use crate::helpers::market::TokenResolution as R;
+                let age_secs = chrono::DateTime::parse_from_rfc3339(&row_ts)
+                    .map(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds())
+                    .unwrap_or(i64::MAX);
+                match crate::helpers::market::resolution_for_token(resolution_http(), &token).await {
+                    R::Resolved(px) => {
+                        info!("🧾 Settled position detected [{}]: market resolved at ${:.2} — booking",
+                              &token[..token.len().min(12)], px);
+                        resolved_marks.insert(token, (px, Decimal::ZERO));
+                    }
+                    // Verifiably still OPEN, so the position cannot have settled —
+                    // redemption only exists after resolution. It left the wallet by
+                    // a trade, which is the mark-priced ChainReconcile path's whole
+                    // purpose. Adding it to neither set leaves that path reachable.
+                    //
+                    // Routing these to settlement instead would book an off-strategy
+                    // sale at $1.00 or $0.00 rather than its actual sale price, and
+                    // then delete the row so nothing could correct it.
+                    R::NotClosed => {}
+                    // No answer at all: never guess, retry next sweep — but not
+                    // forever. A token the market API will never price again would
+                    // otherwise pin its row open for the life of the process.
+                    R::Unknown if age_secs < db::SETTLEMENT_DEFER_MAX_SECS => { deferred.insert(token); }
+                    R::Unknown => {
+                        warn!("⚠️ Resolution unavailable for {} after {}h — falling back to mark-priced reconciliation",
+                              &token[..token.len().min(12)], age_secs / 3600);
+                    }
+                }
+            }
+        }
+
         // Purge stale rows in this asset's DB (books resolved legs at settlement value).
-        total_purged += db::purge_stale_open_positions(&pool, &live_ids, &redeemable_marks).await;
+        total_purged += db::purge_stale_open_positions(&pool, &live_ids, &resolved_marks, &deferred).await;
 
         // Re-adopt on-chain positions missing from this asset's DB.
         // Query AFTER the purge so we don't re-adopt something just removed.
