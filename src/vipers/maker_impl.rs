@@ -2296,21 +2296,48 @@ pub mod maker_edge {
             assert!(exit_fee_ticks(RATE, dec!(0.10)) < dec!(0.7));
         }
 
-        /// At the shipped `maker_min_spread` a lifted fill nets two ticks, and
-        /// the cheapest possible forced exit — the bid one tick below the fill,
-        /// plus the fee — costs about 2.7. Even that best case needs a win rate
-        /// above a coin flip, on fills that are adversely selected by
-        /// construction. That is the structural reason the Maker bled.
+        /// The historical finding, pinned to the 4-tick spread DRADIS actually
+        /// shipped until 2026-09-02 — a literal, not the live constant, because
+        /// the constant has since been raised and this test documents why.
+        ///
+        /// A lifted fill nets two ticks; the cheapest possible forced exit — the
+        /// bid one tick below the fill, plus the fee — costs about 2.7. Even that
+        /// best case needed a win rate above a coin flip, on fills that are
+        /// adversely selected by construction. That is the structural reason the
+        /// Maker bled.
         #[test]
-        fn at_the_shipped_min_spread_even_a_coin_flip_loses() {
-            let dc = DynamicConfig::default();
-            let win = win_ticks(dc.maker_min_spread, dec!(1), dc.maker_resting_exit_ask_improvement_ticks);
-            assert_eq!(win, dec!(2), "4-tick spread nets 2 ticks when lifted");
+        fn at_the_old_four_tick_min_spread_even_a_coin_flip_lost() {
+            let win = win_ticks(dec!(0.04), dec!(1), 1);
+            assert_eq!(win, dec!(2), "a 4-tick spread nets 2 ticks when lifted");
             let entry = dec!(0.42);
             let cheapest_loss = loss_ticks(RATE, entry, entry - dec!(0.01));
             assert!(cheapest_loss > dec!(2.6) && cheapest_loss < dec!(2.8), "was {cheapest_loss}");
             let be = break_even_win_rate(win, cheapest_loss);
-            assert!(be > dec!(0.5), "break-even win rate {be:.3} must exceed 50% at the default spread");
+            assert!(be > dec!(0.5), "break-even win rate {be:.3} must exceed 50% at a 4-tick spread");
+        }
+
+        /// The regression guard for the fix: whatever `maker_min_spread` ships,
+        /// it must put break-even BELOW a coin flip against the cheapest forced
+        /// exit — otherwise the Maker is quoting at negative expectancy again.
+        ///
+        /// This reads the live constant deliberately, so lowering the shipped
+        /// spread back under ~5 ticks fails here rather than in production. It
+        /// also fails if the example configs and `src/config.rs` drift apart,
+        /// which is how the 4-tick assertion above reached CI green locally and
+        /// red on the balanced profile.
+        #[test]
+        fn the_shipped_min_spread_puts_break_even_below_a_coin_flip() {
+            let dc = DynamicConfig::default();
+            let win = win_ticks(dc.maker_min_spread, dec!(1), dc.maker_resting_exit_ask_improvement_ticks);
+            let entry = dec!(0.42);
+            let cheapest_loss = loss_ticks(RATE, entry, entry - dec!(0.01));
+            let be = break_even_win_rate(win, cheapest_loss);
+            assert!(
+                be < dec!(0.5),
+                "shipped min_spread {} nets {win} ticks -> break-even {be:.3}; a resting bid is \
+                 adversely selected and wins under half its fills, so this loses money",
+                dc.maker_min_spread
+            );
         }
 
         /// The two live wins netted exactly 1 and 2 ticks; the five ToxicFill
