@@ -101,6 +101,38 @@ function fmtUptime(iso: string): string {
   }
 }
 
+// ── Engine status badge ───────────────────────────────────────────────────────
+
+/// Reachability of the engine's API, which is a different question from whether
+/// the engine is trading real money — that is the GHOST/LIVE control beside it.
+/// Both badges used to render the word "LIVE" whenever the engine was reachable
+/// and not simulating, so the header read "LIVE LIVE" and neither word explained
+/// which axis it described.
+///
+/// Three states, not two: SWR's `data` is `undefined` until the first poll
+/// resolves, and treating that as `health !== 'ok'` painted a red OFFLINE on
+/// every first render — an alarming way to say "not asked yet".
+function EngineStatus({ health }: { health?: string }) {
+  const state =
+    health === undefined ? 'pending' : health === 'ok' ? 'up' : 'down';
+
+  const { label, dot, text, pulse, title } = {
+    up:      { label: 'UP',      dot: 'bg-green-400',  text: 'text-green-400',  pulse: true,
+               title: 'Engine API reachable' },
+    down:    { label: 'DOWN',    dot: 'bg-red-500',    text: 'text-red-400',    pulse: false,
+               title: 'Engine API unreachable' },
+    pending: { label: 'PENDING', dot: 'bg-amber-400',  text: 'text-amber-400',  pulse: true,
+               title: 'Contacting the engine API' },
+  }[state];
+
+  return (
+    <div className="flex items-center gap-1.5 cursor-default" title={title}>
+      <span className={`h-2 w-2 rounded-full ${dot} ${pulse ? 'animate-pulse' : ''}`} />
+      <span className={`text-xs font-mono ${text}`}>{label}</span>
+    </div>
+  );
+}
+
 // ── Session badge ─────────────────────────────────────────────────────────────
 
 function SessionBadge({ startedAt }: { startedAt?: string }) {
@@ -613,7 +645,6 @@ export default function DashboardPage() {
     await refreshConfig();
   }, [refreshConfig]);
 
-  const isConnected = health === 'ok';
 
   // ── Squadron navigation ────────────────────────────────────────────────────
   const handleSquadronClick = useCallback((sq: SquadronSummary) => {
@@ -651,12 +682,7 @@ export default function DashboardPage() {
             {/* Right cluster */}
             <div className="flex items-center gap-3">
               <SessionBadge startedAt={status?.session_started_at} />
-              <div className="flex items-center gap-1.5">
-                <span className={`h-2 w-2 rounded-full ${isConnected ? 'bg-green-400 animate-pulse' : 'bg-red-500'}`} />
-                <span className={`text-xs font-mono ${isConnected ? 'text-green-400' : 'text-red-400'}`}>
-                  {isConnected ? 'LIVE' : 'OFFLINE'}
-                </span>
-              </div>
+              <EngineStatus health={health} />
               {config && !DEMO_MODE && (
                 <button
                   onClick={() => handlePatch({ ghost_mode: !config.ghost_mode })}
@@ -711,12 +737,7 @@ export default function DashboardPage() {
           {/* Right cluster */}
           <div className="flex items-center gap-3">
             <SessionBadge startedAt={status?.session_started_at} />
-            <div className="flex items-center gap-1.5">
-              <span className={`h-2 w-2 rounded-full ${isConnected ? 'bg-green-400 animate-pulse' : 'bg-red-500'}`} />
-              <span className={`text-xs font-mono ${isConnected ? 'text-green-400' : 'text-red-400'}`}>
-                {isConnected ? 'LIVE' : 'OFFLINE'}
-              </span>
-            </div>
+            <EngineStatus health={health} />
             {config && !DEMO_MODE && (
               <button
                 onClick={() => handlePatch({ ghost_mode: !config.ghost_mode })}

@@ -60,6 +60,71 @@ const VERSION: &str = "2";
 /// We add 90 seconds (1.5 minutes) as a safety buffer.
 const EXPIRATION_BUFFER_SECS: u64 = 90;
 
+/// How an order-placement failure should be charged by the caller's fault
+/// accounting (the patrol loop's trade cooldown and circuit breaker).
+///
+/// The patrol used to treat every placement error as the strategy's fault:
+/// arm `TRADE_COOLDOWN_SECS` and count one of `MAX_CONSECUTIVE_FAILURES`
+/// toward the breaker (with a lone substring carve-out for "crosses book").
+/// On 2026-09-01 Polymarket's order manager was down ~18:58:09–19:00:56 and
+/// FairValue went 0-for-3 on the day — two of its three entry attempts were
+/// the venue's own 425 "order manager not ready, please retry", each billed
+/// as a strategy failure against a breaker threshold of 3.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementFault {
+    /// The venue explicitly said it did NOT process the order — the 425
+    /// "order manager not ready, please retry" condition. Not the strategy's
+    /// fault: the right response is to re-evaluate next tick and enter
+    /// naturally once the venue recovers, not to sit out a 60s cooldown or
+    /// march toward the breaker.
+    VenueUnavailable,
+    /// The book moved between pricing and placement: a post-only bid now
+    /// "crosses book", or a FAK found "no orders" resting at its limit.
+    /// A definitive answer about liquidity, not a malfunction — the next
+    /// evaluation reprices from a fresh snapshot.
+    BookRace,
+    /// The venue failed WITHOUT stating whether the order was processed —
+    /// the execution-engine 500 "could not run the execution". Polymarket's
+    /// error-codes reference documents not-processed semantics explicitly
+    /// where they hold ("order timed out" 500: "rejected before reaching the
+    /// order book and can be safely resubmitted"; 425: "Engine restarting —
+    /// retry with backoff") and this message is absent from that table, so no
+    /// such statement exists for it. Not the strategy's fault, so no cooldown
+    /// and no breaker count — but it must NEVER be resent by a retry loop:
+    /// every resend is a fresh salt and a distinct order id the venue cannot
+    /// dedupe, and if the original request landed, the resend is a second
+    /// live order. The next tick re-reads positions and balances, and
+    /// chain-sync reconciliation adopts the order if it did land.
+    Ambiguous,
+    /// Everything else (bad params, balance/allowance, auth, unknown) —
+    /// charged to the strategy exactly as before.
+    Strategy,
+}
+
+/// Classify an intl CLOB placement error for fault accounting.
+///
+/// Still substring matching underneath — the SDK error is stringly typed once
+/// it crosses the `anyhow` boundary — but the substrings live HERE, in the
+/// module that wraps the SDK error, instead of scattered as `.contains()`
+/// calls through the patrol loop. The SDK's `Status` Display is
+/// `error(<code> <reason>) making <method> call to <path> with <body>`, so the
+/// status-code form `error(425` is matched as well as the body text, in case
+/// the venue ever rewords the message. Matching a bare "425" would be unsafe:
+/// token ids and share amounts appear in these strings.
+pub fn classify_placement_error(e: &anyhow::Error) -> PlacementFault {
+    let es = e.to_string().to_lowercase();
+    if es.contains("order manager not ready") || es.contains("error(425") {
+        return PlacementFault::VenueUnavailable;
+    }
+    if es.contains("crosses book") || es.contains("no orders found") {
+        return PlacementFault::BookRace;
+    }
+    if es.contains("could not run the execution") {
+        return PlacementFault::Ambiguous;
+    }
+    PlacementFault::Strategy
+}
+
 /// Map the venue-neutral [`TimeInForce`] onto the intl SDK's `OrderType`.
 /// Confines the SDK enum to this module — callers speak only `TimeInForce`.
 fn to_clob(tif: TimeInForce) -> OrderType {
@@ -254,6 +319,14 @@ pub async fn place_limit_order_filled(
             Ok(resp) => return Ok((resp.order_id, resp.making_amount, resp.taking_amount)),
             Err(e) => {
                 let err_msg = format!("{:?}", e).to_lowercase();
+                // "invalid nonce" is a resend that STAYS: it is a
+                // content-validation refusal — the venue evaluated the order's
+                // fields and rejected them, and an order refused at validation
+                // cannot have been accepted, so the resend cannot duplicate.
+                // (Definitive by the nature of the error, unlike an engine
+                // failure that occurs after acceptance.) In V2 the order
+                // struct carries no nonce field, so this branch is expected to
+                // be dead; it is kept as a harmless vestige for the V1 shape.
                 if err_msg.contains("invalid nonce") && attempt == 0 {
                     warn!("⚠️ Nonce error (unexpected in V2). Re-syncing from API...");
                     if let Some(fresh_nonce) = fetch_next_nonce(http, safe_address).await {
@@ -262,8 +335,32 @@ pub async fn place_limit_order_filled(
                     }
                     continue;
                 }
-                if err_msg.contains("could not run the execution") && attempt == 0 {
-                    warn!("⚠️ Execution engine 500 — retrying in 500ms (attempt {}/2)", attempt + 1);
+                // The execution-engine 500 ("could not run the execution") is
+                // deliberately NOT retried here any more. The old resend was
+                // written on the belief the error was transient-and-unprocessed,
+                // but no evidence supports the unprocessed half: the message
+                // appears nowhere in Polymarket's error-codes reference, which
+                // states not-processed semantics explicitly where they hold —
+                // and a resend from this loop is a fresh salt and a distinct
+                // order id (see `build_signed_order`), so if the original
+                // request DID land, the resend is a second live order paid for
+                // with real money. It now surfaces to the caller, classifies as
+                // `PlacementFault::Ambiguous` (no cooldown, no breaker count),
+                // and the strategy re-evaluates next tick against re-read
+                // balances — with chain-sync reconciliation adopting the order
+                // if it did land.
+                // 425 "order manager not ready, please retry": the venue has
+                // explicitly stated it did not process the order, so ONE resend
+                // cannot double-fill. That statement is the entire safety case —
+                // each attempt of this loop re-signs with a fresh salt (see
+                // `build_signed_order` above), so the venue cannot dedupe a
+                // resend by order identity; a timeout or generic 5xx, where the
+                // order may have reached the book and the reply been lost, must
+                // therefore never take this branch. Covers sub-second blips
+                // only: the 2026-09-01 outage ran ~3 minutes, which is the
+                // caller's fault-classification problem, not a retry loop's.
+                if err_msg.contains("order manager not ready") && attempt == 0 {
+                    warn!("⚠️ Order manager not ready (425) — venue did not process the order; retrying in 500ms (attempt {}/2)", attempt + 1);
                     tokio::time::sleep(std::time::Duration::from_millis(500)).await;
                     continue;
                 }
@@ -416,6 +513,9 @@ pub async fn place_limit_orders_atomic(
             }
             Err(e) => {
                 let err_msg = format!("{:?}", e).to_lowercase();
+                // Validation refusal — safe to resend for the same reason as
+                // the single-order path (the refusal is the venue's statement
+                // that nothing was accepted). Dead in V2; kept as a vestige.
                 if err_msg.contains("invalid nonce") && attempt == 0 {
                     warn!("⚠️ Nonce error in atomic batch — re-syncing from API...");
                     if let Some(fresh_nonce) = fetch_next_nonce(http, safe_address).await {
@@ -424,11 +524,12 @@ pub async fn place_limit_orders_atomic(
                     }
                     continue;
                 }
-                if err_msg.contains("could not run the execution") && attempt == 0 {
-                    warn!("⚠️ Execution engine 500 on atomic batch — retrying in 500ms", );
-                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-                    continue;
-                }
+                // The execution-engine 500 is NOT retried — see the
+                // single-order path for the evidence. The batch case is the
+                // worse one: a resend here is a second PAIR of freshly-salted
+                // legs, and the orphan machinery is built for one leg failing
+                // to fill, not for two extra legs arriving. Surfaces to the
+                // caller as `PlacementFault::Ambiguous`.
                 return Err(anyhow::anyhow!("Atomic order placement failed: {}", e));
             }
         }
@@ -436,3 +537,108 @@ pub async fn place_limit_orders_atomic(
     Err(anyhow::anyhow!("Max retries reached for atomic batch"))
 }
 
+
+#[cfg(test)]
+mod placement_fault_tests {
+    use super::{classify_placement_error, PlacementFault};
+
+    /// The 2026-09-01 incident. Polymarket's order manager was down roughly
+    /// 18:58:09–19:00:56; FairValue's two entry attempts in that window (15s
+    /// apart) both drew the 425 below, and each armed the 60s trade cooldown
+    /// and counted one of MAX_CONSECUTIVE_FAILURES = 3 toward the breaker.
+    /// With the earlier FAK no-match at 17:44:46 that made the strategy
+    /// 0-for-3 on the day without ever doing anything wrong. A venue reply of
+    /// "I did not process your order, please retry" must never be charged to
+    /// the strategy.
+    #[test]
+    fn a_425_order_manager_not_ready_is_the_venues_fault_not_the_strategys() {
+        let e = anyhow::Error::msg(
+            "Order placement failed: Status: error(425 Too Early) making POST \
+             call to /order with {\"error\":\"order manager not ready, please retry\"}"
+        );
+        assert_eq!(classify_placement_error(&e), PlacementFault::VenueUnavailable);
+    }
+
+    /// The status-code form must classify on its own: the body text is the
+    /// venue's to reword, but the SDK's Status Display always carries
+    /// "error(<code> <reason>)".
+    #[test]
+    fn a_425_classifies_by_status_code_even_if_the_venue_rewords_the_body() {
+        let e = anyhow::anyhow!(
+            "Order placement failed: Status: error(425 Too Early) making POST \
+             call to /order with try later"
+        );
+        assert_eq!(classify_placement_error(&e), PlacementFault::VenueUnavailable);
+    }
+
+    /// The 17:44:46 failure from the same production day: a FAK that found no
+    /// resting liquidity at its limit (400). A definitive answer about the
+    /// book, not a malfunction — it must not count toward the breaker, and it
+    /// gets the short book-race pause rather than the full 60s cooldown.
+    #[test]
+    fn a_fak_no_match_400_is_a_book_race_not_a_strategy_fault() {
+        let e = anyhow::Error::msg(
+            "Order placement failed: Status: error(400 Bad Request) making POST \
+             call to /order with {\"error\":\"no orders found to match with FAK order. \
+             FAK orders are partially filled or killed if no match is found.\"}"
+        );
+        assert_eq!(classify_placement_error(&e), PlacementFault::BookRace);
+    }
+
+    /// The execution-engine 500 that used to be blindly resent from inside
+    /// `place_limit_order_filled` / `place_limit_orders_atomic`. Payload shape
+    /// as reported against the live CLOB (py-clob-client issue #331, BTC5M,
+    /// 2026-04-15): a 500 whose body never states whether the order was
+    /// processed — and Polymarket's error-codes reference, which spells out
+    /// not-processed semantics wherever they hold, omits this message
+    /// entirely. Ambiguous means never resend: each resend is a fresh salt
+    /// and a distinct order id, so a landed original plus a resend is two
+    /// live orders. It also means no cooldown and no breaker count, because
+    /// an engine failure is not the strategy's fault.
+    #[test]
+    fn an_execution_engine_500_is_ambiguous_never_resent_and_never_charged() {
+        let e = anyhow::Error::msg(
+            "Order placement failed: Status: error(500 Internal Server Error) making POST \
+             call to /order with {\"error\":\"could not run the execution\"}"
+        );
+        assert_eq!(classify_placement_error(&e), PlacementFault::Ambiguous);
+    }
+
+    /// The historical carve-out keeps working through the classifier.
+    #[test]
+    fn a_post_only_crosses_book_rejection_is_a_book_race() {
+        let e = anyhow::anyhow!("Order placement failed: invalid: order crosses book");
+        assert_eq!(classify_placement_error(&e), PlacementFault::BookRace);
+    }
+
+    /// Everything unrecognized keeps today's accounting — cooldown plus a
+    /// breaker count. The breaker exists to stop a genuinely broken loop
+    /// (bad params, drained wallet) from machine-gunning the venue, and this
+    /// change must not widen the exemption beyond the classes above. A
+    /// GENERIC 500 stays charged: only the specific execution-engine message
+    /// is known-ambiguous, and the client-side 12s timeout keeps its
+    /// historical accounting too.
+    #[test]
+    fn an_unrecognized_rejection_is_still_charged_to_the_strategy() {
+        for msg in [
+            "Order placement failed: not enough balance / allowance",
+            "Order placement timed out after 12s",
+            "Order placement failed: Status: error(500 Internal Server Error) making POST call to /order with oops",
+            "Signing failed: signature error",
+        ] {
+            let e = anyhow::anyhow!("{msg}");
+            assert_eq!(classify_placement_error(&e), PlacementFault::Strategy, "{msg}");
+        }
+    }
+
+    /// Token ids are long digit strings that can embed "425"; only the SDK's
+    /// status form "error(425" may classify as venue-unavailable.
+    #[test]
+    fn a_425_inside_a_token_id_does_not_classify_as_venue_unavailable() {
+        let e = anyhow::anyhow!(
+            "Order placement failed: Status: error(400 Bad Request) making POST \
+             call to /order with invalid token 76043073756653678226373981964254"
+        );
+        assert_eq!(classify_placement_error(&e), PlacementFault::Strategy);
+    }
+}

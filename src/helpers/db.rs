@@ -949,7 +949,14 @@ async fn run_migrations(pool: &SqlitePool) {
     // recorded against +$0.7201 of actual collateral movement).
     let _ = sqlx::query("ALTER TABLE open_positions ADD COLUMN entry_fee TEXT")
         .execute(pool).await;
-    for table in ["trades", "entries"] {
+    // `open_positions` gets the same three columns as `trades` / `entries`. It
+    // was missed when they landed there, so the Control Tower's tradelog showed
+    // a completed row filed under its venue directly above an in-flight row that
+    // could only fall back to the shard — Venue rendered "—" and Subject only
+    // resolved when the shard happened to be an underlying symbol (intl). Same
+    // NULL semantics: NULL means "recorded before we tracked this", never a
+    // guess.
+    for table in ["trades", "entries", "open_positions"] {
         for col in ["venue", "market_class", "underlying"] {
             let _ = sqlx::query(&format!("ALTER TABLE {table} ADD COLUMN {col} TEXT"))
                 .execute(pool).await;
@@ -968,7 +975,7 @@ async fn run_migrations(pool: &SqlitePool) {
 /// `market_class` and `underlying` are left NULL rather than guessed, so a NULL
 /// reads honestly as "recorded before we tracked this".
 async fn backfill_venue(pool: &SqlitePool, venue: &str) {
-    for table in ["trades", "entries"] {
+    for table in ["trades", "entries", "open_positions"] {
         match sqlx::query(&format!("UPDATE {table} SET venue = ? WHERE venue IS NULL"))
             .bind(venue)
             .execute(pool)
@@ -2339,8 +2346,13 @@ pub async fn get_open_position_entry_fee(pool: &SqlitePool, token_id: &str) -> O
     row.and_then(|(f,)| f).and_then(|s| s.parse::<Decimal>().ok())
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn record_open_position(
     pool: &SqlitePool,
+    // Filing dimensions (venue / market class / underlying), same as
+    // `record_trade_db`. Reconciliation callers that only know the book pass
+    // `TradeScope::shard_only` and the class/underlying columns stay NULL.
+    scope: &TradeScope,
     // Squadron that owns the position; '' for callers that predate squadrons.
     squadron_id: &str,
     strategy: &str,
@@ -2351,14 +2363,22 @@ pub async fn record_open_position(
     shares: Decimal,
     ghost_mode: bool,
 ) {
-    record_open_position_with_status(pool, squadron_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, "confirmed").await;
+    record_open_position_with_status(pool, scope, squadron_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, "confirmed").await;
 }
 
 /// Record an open position with explicit status.
 /// status: "pending" = Viper Launch (order placed, waiting chain confirmation)
 ///         "confirmed" = Mission In-Flight (on-chain confirmed)
+///
+/// `ghost_mode` stays an explicit parameter rather than reading `scope.ghost`:
+/// several callers write a live row from a scope whose ghost flag tracks the
+/// squadron's *current* mode, and the two can disagree mid-flip. The order
+/// path's own flag is the truth for this row.
+#[allow(clippy::too_many_arguments)]
 pub async fn record_open_position_with_status(
     pool: &SqlitePool,
+    // Filing dimensions — see `record_open_position`.
+    scope: &TradeScope,
     // Squadron that owns the position; '' for callers that predate squadrons.
     squadron_id: &str,
     strategy: &str,
@@ -2372,6 +2392,7 @@ pub async fn record_open_position_with_status(
 ) {
     let ts = Utc::now().to_rfc3339();
     let sid = current_session_id();
+    let venue = resolved_venue(scope);
     // Use INSERT WHERE NOT EXISTS to prevent duplicate rows for the same token_id.
     // Without a UNIQUE constraint on token_id, `INSERT OR REPLACE` would always INSERT
     // a new row (never replacing), causing duplicate open_positions rows when the
@@ -2380,8 +2401,9 @@ pub async fn record_open_position_with_status(
     // we skip the insert — chain-sync will keep the shares count accurate via UPDATE.
     match sqlx::query(
         "INSERT INTO open_positions
-         (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, status, squadron_id)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
+         (ts, session_id, strategy, token_id, market, side, entry_price, shares, ghost_mode, status, squadron_id,
+          venue, market_class, underlying)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?
          WHERE NOT EXISTS (
              SELECT 1 FROM open_positions
              WHERE token_id = ? AND strategy = ?
@@ -2399,6 +2421,9 @@ pub async fn record_open_position_with_status(
     .bind(ghost_mode as i32)
     .bind(status)
     .bind(squadron_id)
+    .bind(venue)
+    .bind(scope.market_class.clone())
+    .bind(scope.underlying.clone())
     .bind(token_id)
     .bind(strategy)
     .bind(squadron_id)
@@ -3230,6 +3255,17 @@ pub struct OpenPositionRow {
     /// been through a chain-sync sweep. The UI must show this: the price can be
     /// minutes old, and an operator timing a manual exit needs to know that.
     pub price_updated_at: Option<String>,
+    /// Exchange that holds the position. `None` only on rows written before the
+    /// column existed *and* before the shard's backfill ran — the tradelog falls
+    /// back to the shard for those.
+    pub venue: Option<String>,
+    /// `crypto` | `sports` | `politics` | `unknown`; `None` on legacy rows and
+    /// on reconciliation writes (chain adoption, orphan re-hedge) that know the
+    /// book but not the market's class.
+    pub market_class: Option<String>,
+    /// Underlying symbol. `None` is meaningful — sports and politics markets
+    /// have no underlying instrument.
+    pub underlying: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -3462,7 +3498,8 @@ pub async fn get_open_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
         // keep only the most recent row (MAX(id)) so the UI and portfolio calculations see
         // exactly one entry per token — preventing phantom double-counting of positions.
         "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted,
-         COALESCE(status, 'confirmed') as status, current_price, price_updated_at
+         COALESCE(status, 'confirmed') as status, current_price, price_updated_at,
+         venue, market_class, underlying
          FROM open_positions
          WHERE id IN (SELECT MAX(id) FROM open_positions GROUP BY token_id)
          ORDER BY ts ASC"
@@ -3482,6 +3519,9 @@ pub async fn get_open_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
             status:         r.try_get::<String, _>(9).ok()?,
             current_price:  r.try_get::<Option<String>, _>(10).ok().flatten(),
             price_updated_at: r.try_get::<Option<String>, _>(11).ok().flatten(),
+            venue:          r.try_get::<Option<String>, _>(12).ok().flatten(),
+            market_class:   r.try_get::<Option<String>, _>(13).ok().flatten(),
+            underlying:     r.try_get::<Option<String>, _>(14).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_open_positions failed: {}", e); vec![] }
     }
@@ -3490,7 +3530,8 @@ pub async fn get_open_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
 /// Return only pending positions (Viper Launches) - orders placed but not yet confirmed on-chain.
 pub async fn get_pending_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
     match sqlx::query(
-        "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted, status, current_price, price_updated_at
+        "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted, status, current_price, price_updated_at,
+         venue, market_class, underlying
          FROM open_positions WHERE status = 'pending' ORDER BY ts ASC"
     )
     .fetch_all(pool)
@@ -3508,6 +3549,9 @@ pub async fn get_pending_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
             status:         r.try_get::<String, _>(9).ok()?,
             current_price:  r.try_get::<Option<String>, _>(10).ok().flatten(),
             price_updated_at: r.try_get::<Option<String>, _>(11).ok().flatten(),
+            venue:          r.try_get::<Option<String>, _>(12).ok().flatten(),
+            market_class:   r.try_get::<Option<String>, _>(13).ok().flatten(),
+            underlying:     r.try_get::<Option<String>, _>(14).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_pending_positions failed: {}", e); vec![] }
     }
@@ -3517,7 +3561,8 @@ pub async fn get_pending_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
 pub async fn get_confirmed_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> {
     match sqlx::query(
         "SELECT ts, strategy, token_id, market, side, entry_price, shares, ghost_mode, chain_adopted,
-         COALESCE(status, 'confirmed') as status, current_price, price_updated_at
+         COALESCE(status, 'confirmed') as status, current_price, price_updated_at,
+         venue, market_class, underlying
          FROM open_positions WHERE COALESCE(status, 'confirmed') = 'confirmed' ORDER BY ts ASC"
     )
     .fetch_all(pool)
@@ -3535,6 +3580,9 @@ pub async fn get_confirmed_positions(pool: &SqlitePool) -> Vec<OpenPositionRow> 
             status:         r.try_get::<String, _>(9).ok()?,
             current_price:  r.try_get::<Option<String>, _>(10).ok().flatten(),
             price_updated_at: r.try_get::<Option<String>, _>(11).ok().flatten(),
+            venue:          r.try_get::<Option<String>, _>(12).ok().flatten(),
+            market_class:   r.try_get::<Option<String>, _>(13).ok().flatten(),
+            underlying:     r.try_get::<Option<String>, _>(14).ok().flatten(),
         })).collect(),
         Err(e) => { error!("❌ DB get_confirmed_positions failed: {}", e); vec![] }
     }
@@ -4152,6 +4200,82 @@ mod reconcile_tests {
         assert_eq!(rows, vec!["btc".to_string(), "eth".to_string()]);
     }
 
+    /// An in-flight row must file under the same dimensions as the completed
+    /// trade it will become. `open_positions` was missed when the filing
+    /// columns landed on `trades` / `entries`, so the tradelog showed a
+    /// completed row with a venue directly above an open row rendering "—" —
+    /// two rows for the same strategy on the same market, filed differently.
+    /// Asserted through `get_open_positions` because that reader is exactly
+    /// what the API hands the Control Tower.
+    #[tokio::test]
+    async fn open_position_rows_carry_the_same_filing_columns_as_trades() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::crypto("kalshi", "kalshi", "btc");
+        record_open_position_with_status(&pool, &scope, "btc-open", "FairValueStrategy",
+            "KXBTCD-XYZ", "BTC above $64k", "YES", dec_of("0.42"), dec_of("10"), false, "pending").await;
+
+        let rows = get_open_positions(&pool).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].venue.as_deref(), Some("kalshi"));
+        assert_eq!(rows[0].market_class.as_deref(), Some("crypto"));
+        assert_eq!(rows[0].underlying.as_deref(), Some("btc"));
+    }
+
+    /// Reconciliation paths (chain adoption, orphan re-hedge) know which
+    /// venue's book they are reading but not the market's class or underlying.
+    /// They must file the venue — that is the column the tradelog renders as
+    /// "—" today — while leaving the other two honestly NULL, never guessed.
+    #[tokio::test]
+    async fn adoption_writes_file_the_venue_without_guessing_class_or_underlying() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::new("", "polymarket-us", None, None);
+        record_open_position(&pool, &scope, "us-open", "ChainAdopted",
+            "tok-adopted", "tok-adopted", "YES", dec_of("0.61"), dec_of("5"), false).await;
+
+        let rows = get_open_positions(&pool).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].venue.as_deref(), Some("polymarket-us"));
+        assert_eq!(rows[0].market_class, None, "class must not be guessed");
+        assert_eq!(rows[0].underlying, None, "underlying must not be guessed");
+    }
+
+    /// A database created before the filing columns reached `open_positions`
+    /// must gain them and have its surviving open rows stamped with the shard's
+    /// venue — same contract `legacy_db_gains_filing_columns_and_backfills_venue`
+    /// pins for `trades`. Open rows outlive deploys (they are deleted on exit,
+    /// not superseded), so a legacy row really can still be alive when the
+    /// migrated build first reads it.
+    #[tokio::test]
+    async fn legacy_open_positions_gain_filing_columns_and_backfill_venue() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        // Pre-migration shape: no venue / market_class / underlying.
+        sqlx::query(
+            "CREATE TABLE open_positions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT NOT NULL, session_id TEXT NOT NULL,
+                strategy TEXT NOT NULL, token_id TEXT NOT NULL, market TEXT NOT NULL,
+                side TEXT NOT NULL, entry_price TEXT NOT NULL, shares TEXT NOT NULL,
+                ghost_mode INTEGER NOT NULL DEFAULT 0, chain_adopted INTEGER NOT NULL DEFAULT 0)"
+        ).execute(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO open_positions (ts, session_id, strategy, token_id, market, side, entry_price, shares)
+             VALUES ('2026-08-09T00:00:00Z','s1','MakerStrategy','tok-legacy','BTC hourly','YES','0.40','12')"
+        ).execute(&pool).await.unwrap();
+
+        init_schema(&pool).await.unwrap();
+        run_migrations(&pool).await;
+        backfill_venue(&pool, "polymarket-intl").await;
+
+        let rows = get_open_positions(&pool).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].venue.as_deref(), Some("polymarket-intl"));
+        assert_eq!(rows[0].market_class, None, "class must not be guessed");
+        assert_eq!(rows[0].underlying, None, "underlying must not be guessed");
+    }
+
     /// Recorded P&L must be net of fees, with the gross figure recoverable.
     ///
     /// Reproduces the 2026-08-10 Kalshi round trip that exposed the gap: YES
@@ -4193,7 +4317,7 @@ mod reconcile_tests {
         let entry_fee = dec_of("0.0399"); // 0.07 · p · (1−p) · shares
         let gross = (Decimal::ONE - entry) * shares;
 
-        record_open_position(&pool, "test-squadron", "FairValueStrategy", "tok-356",
+        record_open_position(&pool, &TradeScope::shard_only("test"), "test-squadron", "FairValueStrategy", "tok-356",
             "Bitcoin Up or Down - August 13, 2PM ET", "YES", entry, shares, false).await;
         set_open_position_entry_fee(&pool, "tok-356", entry_fee).await;
 
@@ -4221,7 +4345,7 @@ mod reconcile_tests {
         let filled = dec_of("3.04");
         let fee_at_request = dec_of("0.07") * dec_of("0.75") * dec_of("0.25") * requested;
 
-        record_open_position(&pool, "test-squadron", "FairValueStrategy", "tok-sync", "mkt", "YES",
+        record_open_position(&pool, &TradeScope::shard_only("test"), "test-squadron", "FairValueStrategy", "tok-sync", "mkt", "YES",
             dec_of("0.75"), requested, false).await;
         set_open_position_entry_fee(&pool, "tok-sync", fee_at_request).await;
 
@@ -5333,7 +5457,7 @@ mod squadron_column_migration_tests {
              VALUES ('2026-08-23T00:00:00Z','s1','MakerStrategy','tok-1','BTC','YES','0.42','10','')"
         ).execute(&pool).await.unwrap();
 
-        record_open_position(&pool, "btc-open", "MakerStrategy", "tok-1", "BTC", "YES", dec!(0.42), dec!(10), false).await;
+        record_open_position(&pool, &TradeScope::shard_only("test"), "btc-open", "MakerStrategy", "tok-1", "BTC", "YES", dec!(0.42), dec!(10), false).await;
 
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE token_id = 'tok-1'")
             .fetch_one(&pool).await.unwrap();
@@ -5352,8 +5476,8 @@ mod squadron_column_migration_tests {
         init_schema(&pool).await.unwrap();
         run_migrations(&pool).await;
 
-        record_open_position(&pool, "btc-open", "MakerStrategy", "tok-1", "BTC", "YES", dec!(0.42), dec!(10), false).await;
-        record_open_position(&pool, "btc-15m",  "MakerStrategy", "tok-1", "BTC", "YES", dec!(0.44), dec!(25), false).await;
+        record_open_position(&pool, &TradeScope::shard_only("test"), "btc-open", "MakerStrategy", "tok-1", "BTC", "YES", dec!(0.42), dec!(10), false).await;
+        record_open_position(&pool, &TradeScope::shard_only("test"), "btc-15m",  "MakerStrategy", "tok-1", "BTC", "YES", dec!(0.44), dec!(25), false).await;
 
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE token_id = 'tok-1'")
             .fetch_one(&pool).await.unwrap();
@@ -5373,8 +5497,8 @@ mod squadron_column_migration_tests {
         init_schema(&pool).await.unwrap();
         run_migrations(&pool).await;
 
-        record_open_position(&pool, "btc-open", "MakerStrategy", "tok-1", "BTC", "YES", dec!(0.42), dec!(10), false).await;
-        record_open_position(&pool, "btc-open", "MakerStrategy", "tok-1", "BTC", "YES", dec!(0.43), dec!(15), false).await;
+        record_open_position(&pool, &TradeScope::shard_only("test"), "btc-open", "MakerStrategy", "tok-1", "BTC", "YES", dec!(0.42), dec!(10), false).await;
+        record_open_position(&pool, &TradeScope::shard_only("test"), "btc-open", "MakerStrategy", "tok-1", "BTC", "YES", dec!(0.43), dec!(15), false).await;
 
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM open_positions WHERE token_id = 'tok-1'")
             .fetch_one(&pool).await.unwrap();

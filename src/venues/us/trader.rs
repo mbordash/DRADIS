@@ -434,7 +434,7 @@ pub async fn run_us_trader(
     let filter = std::env::var(ENV_MARKET_FILTER).ok().filter(|s| !s.is_empty());
     info!("🇺🇸 US trader starting — market filter={filter:?}");
 
-    crate::venues::cancel_leftover_orders_at_startup(venue.as_ref()).await;
+    crate::venues::cancel_leftover_orders_at_startup(venue.as_ref(), crate::helpers::dynamic_config::ghosting_now()).await;
 
     // Three concurrent wings over the same venue connection — sports, politics
     // and crypto — each with its own squadron, DB shard and rotation loop.
@@ -2085,7 +2085,7 @@ async fn record_entry(
         // promotes it. Ghost entries have no venue truth to wait for.
         let status = if params.ghost_mode { "confirmed" } else { "pending" };
         db::record_open_position_with_status(
-            p, squadron_id, strategy_name, params.token_id.as_str(), &params.market_name,
+            p, scope, squadron_id, strategy_name, params.token_id.as_str(), &params.market_name,
             side, fill.price, fill.filled, params.ghost_mode, status,
         ).await;
     }
@@ -2192,6 +2192,12 @@ async fn sync_dashboard(
 
     let mut live_ids = std::collections::HashSet::new();
     let mut positions_value = Decimal::ZERO;
+    // Reconciliation scope: this sweep knows the venue but not a holding's
+    // market class or underlying, so those columns stay honestly NULL rather
+    // than guessed — same rule as the off-strategy booking path in db.rs. It
+    // only reaches rows adopted HERE: a row the owning viper already wrote
+    // carries its full filing columns and the insert below is a no-op for it.
+    let adopt_scope = TradeScope::new("", US_VENUE, None, None);
     for p in &positions {
         let sym = p.market.as_str();
         live_ids.insert(sym.to_string());
@@ -2200,13 +2206,13 @@ async fn sync_dashboard(
             // holding is what promotes it out of `pending`.
             Some((strategy, market_name)) => {
                 db::record_open_position(
-                    pool, squadron_id, strategy, sym, market_name, side_label(sym), p.avg_price, p.shares, false,
+                    pool, &adopt_scope, squadron_id, strategy, sym, market_name, side_label(sym), p.avg_price, p.shares, false,
                 ).await;
                 db::confirm_position_status(pool, strategy, sym).await;
             }
             None => {
                 db::record_open_position(
-                    pool, squadron_id, "ChainAdopted", sym, sym, side_label(sym), p.avg_price, p.shares, false,
+                    pool, &adopt_scope, squadron_id, "ChainAdopted", sym, sym, side_label(sym), p.avg_price, p.shares, false,
                 ).await;
             }
         }

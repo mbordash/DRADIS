@@ -20,4 +20,7 @@
 //! `venues::intl` (see `docs/VENUE_ABSTRACTION.md`, Step 1). This module re-exports
 //! those symbols so existing call sites (`crate::helpers::orders::place_limit_order`,
 //! `place_limit_orders_atomic`) continue to compile unchanged.
-pub use crate::venues::intl::orders::{place_limit_order, place_limit_order_filled, place_limit_orders_atomic};
+pub use crate::venues::intl::orders::{
+    classify_placement_error, place_limit_order, place_limit_order_filled,
+    place_limit_orders_atomic, PlacementFault,
+};

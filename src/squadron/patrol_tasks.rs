@@ -620,6 +620,11 @@ pub fn spawn_cleanup_task(
     tg_token:             String,
     tg_chat_id:           String,
     asset:                String,
+    // Filing dimensions for the re-hedge row this task can write. Cloned from
+    // the patrol loop's scope so an orphan re-hedge files under the same
+    // venue/class/underlying as the leg it repairs, instead of leaving the
+    // in-flight row's Venue column NULL.
+    scope:                crate::state::TradeScope,
     cancel:               CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -834,7 +839,7 @@ pub fn spawn_cleanup_task(
                                                             // Write pending position immediately (Viper Launch)
                                                             if let Some(pool) = db::pool_for(&rh_asset) {
                                                                 db::record_open_position_with_status(
-                                                                    &pool, &rh_squadron, "ArbitrageStrategy",
+                                                                    &pool, &scope, &rh_squadron, "ArbitrageStrategy",
                                                                     &rh_tid, &rh_mkt, &rh_sd,
                                                                     rh_ep, rh_sh, false, "pending",
                                                                 ).await;

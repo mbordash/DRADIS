@@ -112,14 +112,24 @@ fn taker_fee_rate() -> Decimal { Decimal::ZERO }
 /// Failures are logged and never fatal. Refusing to start because a cancel failed
 /// would leave the same orders working with no engine at all, which is strictly
 /// worse than starting and reconciling.
-pub async fn cancel_leftover_orders_at_startup<V: core::Execution + ?Sized>(venue: &V) {
+/// `simulating` is passed by the caller (from `dynamic_config::ghosting_now()`)
+/// rather than read from process globals in here, so the gate below — a shipped
+/// v1.0.9 promise — is pinned by tests instead of depending on global state no
+/// test can safely mutate.
+pub async fn cancel_leftover_orders_at_startup<V: core::Execution + ?Sized>(
+    venue: &V,
+    simulating: bool,
+) {
     // NEVER cancel while simulating.
     //
     // The sweep cannot tell its own leftovers from the account's other orders —
     // Kalshi lists the whole account with no filter by series, ticker or client
-    // order id. On a self-custody intl wallet that is fine, because nothing else
-    // trades it. A Kalshi or Polymarket US account is a RETAIL account that a
-    // human also uses.
+    // order id. A Kalshi or Polymarket US account is a RETAIL account that a
+    // human also uses. (This comment used to add that the self-custody intl
+    // wallet was fine "because nothing else trades it" — disproved in production
+    // on 2026-09-01, when a ghost-mode restart ran the intl legacy sweep against
+    // a wallet the operator also trades by hand. The intl paths now carry the
+    // same gate: `squadron::cancel_all_orders_unless_simulating`.)
     //
     // So consider the AMI's default first-run posture: a customer connects their
     // personal account to evaluate DRADIS, ghost mode is on, the engine will never
@@ -130,11 +140,7 @@ pub async fn cancel_leftover_orders_at_startup<V: core::Execution + ?Sized>(venu
     // The cost of this gate is real and accepted: a leftover from a previous LIVE
     // session is not swept if the operator restarts into ghost. It is reported
     // instead, so the operator can act, and it is swept the moment they run live.
-    if crate::config::GHOST_MODE
-        || crate::helpers::dynamic_config::global_config_tx()
-            .map(|tx| tx.borrow().ghost_mode)
-            .unwrap_or(false)
-    {
+    if simulating {
         match venue.open_orders().await {
             Ok(open) if !open.is_empty() => tracing::warn!(
                 "👻 Startup cancel skipped in ghost mode — {} resting order(s) on this account were LEFT ALONE. \
@@ -219,3 +225,89 @@ compile_error!("Pick exactly one venue: intl_clob OR us_retail OR kalshi");
 #[cfg(not(any(feature = "intl_clob", feature = "us_retail", feature = "kalshi")))]
 compile_error!("Pick a venue: --features intl_clob | us_retail | kalshi");
 
+
+#[cfg(test)]
+mod startup_sweep_gate_tests {
+    use super::core::{Execution, Fill, OpenOrder, OrderId, OrderIntent, Position, Side, TimeInForce};
+    use crate::venues::core::MarketId;
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use rust_decimal_macros::dec;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Venue double for the startup sweep: serves a fixed open-orders list and
+    /// counts cancels. Everything the sweep must never touch panics, so a
+    /// regression that starts placing or flattening from this path fails loudly
+    /// rather than passing by accident.
+    struct CountingVenue {
+        open: Vec<OpenOrder>,
+        cancels: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl Execution for CountingVenue {
+        async fn place_order(&self, _: OrderIntent) -> Result<Fill> {
+            unreachable!("the startup sweep must never place an order")
+        }
+        async fn place_atomic(&self, _: [OrderIntent; 2]) -> Result<[Fill; 2]> {
+            unreachable!("the startup sweep must never place an order")
+        }
+        async fn cancel(&self, _: OrderId) -> Result<()> {
+            self.cancels.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn collateral(&self) -> Result<rust_decimal::Decimal> {
+            unreachable!("the startup sweep does not read collateral")
+        }
+        async fn positions(&self) -> Result<Vec<Position>> {
+            unreachable!("the startup sweep does not read positions")
+        }
+        async fn open_orders(&self) -> Result<Vec<OpenOrder>> {
+            Ok(self.open.clone())
+        }
+    }
+
+    fn resting_order(id: &str) -> OpenOrder {
+        OpenOrder {
+            order_id: OrderId(id.to_string()),
+            market: MarketId::new("mkt-1"),
+            side: Side::Buy,
+            price: dec!(0.42),
+            original_qty: dec!(10),
+            filled_qty: dec!(0),
+            tif: TimeInForce::Gtc,
+            pair_market: None,
+        }
+    }
+
+    /// The v1.0.9 release-note promise, pinned: "Neither of those runs while
+    /// simulating now." On 2026-09-01 at 21:52 a production ghost-mode restart
+    /// issued a real account-wide cancel through the intl legacy path this
+    /// sweep's gate never covered — the gate itself must stay exactly this
+    /// strict: a simulating startup lists the account (reporting is allowed)
+    /// but cancels NOTHING, however many orders are resting.
+    #[tokio::test]
+    async fn a_simulating_startup_reports_leftover_orders_but_cancels_none() {
+        let venue = CountingVenue {
+            open: vec![resting_order("ord-1"), resting_order("ord-2")],
+            cancels: AtomicUsize::new(0),
+        };
+        super::cancel_leftover_orders_at_startup(&venue, true).await;
+        assert_eq!(venue.cancels.load(Ordering::SeqCst), 0,
+            "simulating is a promise not to touch the account");
+    }
+
+    /// The other half of the v1.0.9 decision must survive too: a LIVE startup
+    /// still asks the venue what is open and sweeps every leftover, because a
+    /// crashed session's GTC orders are exactly what local state cannot know.
+    #[tokio::test]
+    async fn a_live_startup_still_sweeps_every_leftover_order() {
+        let venue = CountingVenue {
+            open: vec![resting_order("ord-1"), resting_order("ord-2")],
+            cancels: AtomicUsize::new(0),
+        };
+        super::cancel_leftover_orders_at_startup(&venue, false).await;
+        assert_eq!(venue.cancels.load(Ordering::SeqCst), 2,
+            "a live startup must sweep all leftovers the venue reports");
+    }
+}

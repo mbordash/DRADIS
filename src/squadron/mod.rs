@@ -61,7 +61,7 @@ mod patrol_impl;
 /// intl-only, like the module it comes from: the Kalshi and Polymarket US
 /// traders own their own order lifecycles and do not route through `patrol()`.
 #[cfg(feature = "intl_clob")]
-pub use patrol_impl::cancel_all_orders_with_retries;
+pub use patrol_impl::{cancel_all_orders_unless_simulating, cancel_all_orders_with_retries};
 
 /// Peripheral tasks spawned by `patrol()` — Phase 3f-4.
 /// Kept in a separate file for clarity; each function spawns one Tokio task.

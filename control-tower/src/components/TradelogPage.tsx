@@ -189,11 +189,14 @@ function assetToEntries(
       key:         `${shard}-${status}-${p.ts}-${p.token_id}`,
       ts:          new Date(p.ts),
       shard,
-      // open_positions carries no filing columns yet; the shard is the
-      // underlying on the intl venue and a venue name elsewhere.
-      venue:       null,
-      marketClass: null,
-      underlying:  ASSET_EMOJI[shard] ? shard : null,
+      venue:       p.venue ?? null,
+      marketClass: p.market_class ?? null,
+      // Legacy rows and chain adoptions predating the filing columns keep the
+      // old shard heuristic (the shard IS the underlying on the intl venue),
+      // so their Subject does not regress to "—" after the upgrade. A row
+      // that carries the column always wins — the heuristic mislabels every
+      // non-intl shard.
+      underlying:  p.underlying ?? (ASSET_EMOJI[shard] ? shard : null),
       fees:        null,
       status,
       strategy:    p.strategy,

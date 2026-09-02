@@ -416,6 +416,10 @@ impl Squadron {
             tg_token.clone(),
             tg_chat_id.clone(),
             asset_lc.clone(),
+            // Filing dimensions for any row the cleanup task writes (orphan
+            // re-hedge). Only venue/class/underlying are read from this clone;
+            // its ghost flag is NOT — the task's writes carry their own.
+            scope.clone(),
             peripheral_cancel.clone(),
         );
 
@@ -707,7 +711,7 @@ impl Squadron {
                     // intl path has no `flatten_before_stand_down`, and the
                     // dialog says "flattened or left to settle" for that reason.
                     crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::MarketRotate);
-                    if !cancel_all_orders_with_retries(trading_client.as_ref()).await {
+                    if !cancel_all_orders_unless_simulating(trading_client.as_ref()).await {
                         error!(
                             "❌ Squadron [{}] stand-down: failed to cancel all orders after {} attempts — resting orders may remain open.",
                             self.id, MAX_CANCEL_RETRIES,
@@ -754,7 +758,7 @@ impl Squadron {
                     }
                     info!("🔄 Market switch detected — restarting trading loop with new market context");
                     crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::MarketRotate);
-                    let cancel_success = cancel_all_orders_with_retries(trading_client.as_ref()).await;
+                    let cancel_success = cancel_all_orders_unless_simulating(trading_client.as_ref()).await;
                     if !cancel_success {
                         error!("❌ Failed to cancel all orders after {} attempts. Proceeding with market switch, but orders may remain open.", MAX_CANCEL_RETRIES);
                     }
@@ -852,7 +856,7 @@ impl Squadron {
                             // clears them at resolution. Same treatment the
                             // rotation arm gives them.
                             crate::helpers::watchdog::enter(crate::helpers::watchdog::Phase::MarketRotate);
-                            if !cancel_all_orders_with_retries(trading_client.as_ref()).await {
+                            if !cancel_all_orders_unless_simulating(trading_client.as_ref()).await {
                                 error!("❌ Failed to cancel all orders after {} attempts. Standing down anyway; the venue clears the rest at resolution.", MAX_CANCEL_RETRIES);
                             }
                             self.stand_down();
@@ -1017,7 +1021,7 @@ impl Squadron {
                                 // entry owns, and nothing else ever removes one.
                                 if let Some(pool) = db::pool_for(&asset_lc) {
                                     db::record_open_position(
-                                        &pool, &squadron_id, &pk.strategy,
+                                        &pool, &scope, &squadron_id, &pk.strategy,
                                         &pk.market.to_string(), &pos.market_name,
                                         if is_yes { "YES" } else { "NO" },
                                         pos.avg_entry, pos.shares, true,
@@ -1892,7 +1896,7 @@ impl Squadron {
                                     info!("👻 GHOST_MODE ENTRY {} [{}]: {} | ${:.4} x {:.1} (simulated)", side_g, sn, params.market_name, params.price, params.shares);
                                     { let side_g = side_of(&params.token_id); let sn_g = sn.clone(); let tid_g = params.token_id.to_string(); let mn_g = params.market_name.clone(); let side_gs = side_g.to_string(); let ep_g = actual_entry_price; let sh_g = params.shares; let asset_g = asset_lc.clone(); let scope_g = scope.clone(); tokio::spawn(async move { metrics::record_entry(&scope_g, sn_g, tid_g, mn_g, side_gs, ep_g, sh_g).await; }); }
                                     { let side_g = side_of(&params.token_id); let sn_g = sn.clone(); let tid_g = params.token_id.to_string(); let mn_g = params.market_name.clone(); let side_gs = side_g.to_string(); let ep_g = actual_entry_price; let sh_g = params.shares; let asset_g = asset_lc.clone(); let snap_g = entry_snap.clone(); tokio::spawn(async move { metrics::record_entry_signal(&asset_g, sn_g, tid_g, mn_g, side_gs, ep_g, sh_g, &snap_g).await; }); }
-                                    if let Some(pool) = db::pool_for(&asset_lc) { let side_g = side_of(&params.token_id); db::record_open_position(&pool, &squadron_id, &sn, &params.token_id.to_string(), &params.market_name, side_g, actual_entry_price, params.shares, true).await; }
+                                    if let Some(pool) = db::pool_for(&asset_lc) { let side_g = side_of(&params.token_id); db::record_open_position(&pool, &scope, &squadron_id, &sn, &params.token_id.to_string(), &params.market_name, side_g, actual_entry_price, params.shares, true).await; }
                                     if let Some(pp) = pair_params {
                                         let pp_close_time = target_market_close_time;
                                         // Same as the primary leg: simulate at the touch.
@@ -1902,7 +1906,7 @@ impl Squadron {
                                         let side_gp = side_of(&pp.token_id);
                                         info!("👻 GHOST_MODE ENTRY {} (paired) [{}]: {} | ${:.4} x {:.1} (simulated)", side_gp, sn, pp.market_name, pp.price, pp.shares);
                                         { let side_gp = side_of(&pp.token_id); let sn_gp = sn.clone(); let tid_gp = pp.token_id.to_string(); let mn_gp = pp.market_name.clone(); let side_gps = side_gp.to_string(); let ep_gp = actual_paired_entry_price; let sh_gp = pp.shares; let asset_gp = asset_lc.clone(); let scope_gp = scope.clone(); tokio::spawn(async move { metrics::record_entry(&scope_gp, sn_gp, tid_gp, mn_gp, side_gps, ep_gp, sh_gp).await; }); }
-                                        if let Some(pool) = db::pool_for(&asset_lc) { let side_gp = side_of(&pp.token_id); db::record_open_position(&pool, &squadron_id, &sn, &pp.token_id.to_string(), &pp.market_name, side_gp, actual_paired_entry_price, pp.shares, true).await; }
+                                        if let Some(pool) = db::pool_for(&asset_lc) { let side_gp = side_of(&pp.token_id); db::record_open_position(&pool, &scope, &squadron_id, &sn, &pp.token_id.to_string(), &pp.market_name, side_gp, actual_paired_entry_price, pp.shares, true).await; }
                                     }
                                     last_trade_time.insert(sn.clone(), Instant::now());
                                 } else {
@@ -1973,8 +1977,24 @@ impl Squadron {
                                                     own.remove(&token_m);
                                                     own.remove(&pp_token_m);
                                                 }
-                                                last_trade_time.insert(sn.clone(), Instant::now());
-                                                consecutive_failures += 1; continue;
+                                                // Only venue-side failures are exempted here — the 425
+                                                // (venue said not processed) and the execution-engine
+                                                // 500 (`Ambiguous`, which the placement helper no
+                                                // longer resends: a batch resend would be a second
+                                                // PAIR of freshly-salted legs). Narrower than the
+                                                // single-leg entry arm's carve-out, deliberately: the
+                                                // batch path had no crosses-book exemption before, and
+                                                // this change should not loosen its fault accounting
+                                                // beyond the venue-failure classes.
+                                                if matches!(classify_placement_error(&e),
+                                                            PlacementFault::VenueUnavailable | PlacementFault::Ambiguous) {
+                                                    info!("⏸️ Arb batch [{}]: venue-side failure (not a strategy fault) — no cooldown, no breaker count; retrying after {}s", sn, config::CROSSES_BOOK_RETRY_PAUSE_SECS);
+                                                    tokio::time::sleep(Duration::from_secs(config::CROSSES_BOOK_RETRY_PAUSE_SECS)).await;
+                                                } else {
+                                                    last_trade_time.insert(sn.clone(), Instant::now());
+                                                    consecutive_failures += 1;
+                                                }
+                                                continue;
                                             }
                                             Ok((leg_a_id, leg_b_id)) => {
                                                 let primary_wait_secs = if target_yes_token == hourly_yes_token { crate::helpers::balance::MAX_WAIT_SECS_HOURLY } else { crate::helpers::balance::MAX_WAIT_SECS_WINDOW };
@@ -1983,7 +2003,7 @@ impl Squadron {
                                                 let db_side_a = side_of(&params.token_id); let db_ep_a = actual_entry_price; let db_sh_a = params.shares; let asset_a = asset_lc.clone(); let scope_a = scope.clone();
                                                 // Write pending position immediately (Viper Launch)
                                                 if let Some(pool) = db::pool_for(&asset_a) {
-                                                    db::record_open_position_with_status(&pool, &squadron_id, &sn, &db_tid_a, &db_mn_a, db_side_a, db_ep_a, db_sh_a, false, "pending").await;
+                                                    db::record_open_position_with_status(&pool, &scope, &squadron_id, &sn, &db_tid_a, &db_mn_a, db_side_a, db_ep_a, db_sh_a, false, "pending").await;
                                                 }
                                                 let sq_bal = squadron_id.clone();
                                                 tokio::spawn(async move {
@@ -2007,7 +2027,7 @@ impl Squadron {
                                                 let db_side_b = side_of(&pp.token_id); let db_ep_b = actual_pair_entry_price; let db_sh_b = pp.shares; let asset_b = asset_lc.clone(); let scope_b = scope.clone();
                                                 // Write pending position immediately (Viper Launch)
                                                 if let Some(pool) = db::pool_for(&asset_b) {
-                                                    db::record_open_position_with_status(&pool, &squadron_id, &sn, &db_tid_b, &db_mn_b, db_side_b, db_ep_b, db_sh_b, false, "pending").await;
+                                                    db::record_open_position_with_status(&pool, &scope, &squadron_id, &sn, &db_tid_b, &db_mn_b, db_side_b, db_ep_b, db_sh_b, false, "pending").await;
                                                 }
                                                 let sq_bal = squadron_id.clone();
                                                 tokio::spawn(async move {
@@ -2038,6 +2058,7 @@ impl Squadron {
                                                     };
                                                     let arb_asset = asset_lc.clone();
                                                     let arb_tp = Arc::clone(&total_pnl);
+                                                    let arb_scope = scope.clone();
                                                     let sq_bal = squadron_id.clone();
                                                     tokio::spawn(async move {
                                                         crate::helpers::balance::arb_pair_fill_monitor(
@@ -2045,6 +2066,7 @@ impl Squadron {
                                                             arb_cl, arb_nm, arb_sg, safe_address, eoa_address, vc, vc_p,
                                                             arb_ps, arb_pc, arb_to, arb_sn, &arb_tok_a, &arb_tok_b,
                                                             arb_base_a, arb_base_b, arb_side_a, arb_side_b, arb_wait, arb_http, arb_asset,
+                                                            arb_scope,
                                                             arb_tp,
                                                         ).await;
                                                     });
@@ -2098,7 +2120,48 @@ impl Squadron {
                                         // Mirror of the exit-side fix above, and of the fix already
                                         // living in `IntlClobVenue::place_order`.
                                         let (leg_a_order_id, entry_fill_price) = match place_limit_order_filled(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &params.token_id, Side::Buy, params.shares, actual_entry_price, target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await {
-                                            Err(e) => { warn!("⚠️ ENTRY order failed [{}]: {}", sn, e); positions.lock().await.remove(&pos_key); pending_orders.lock().await.remove(&pos_key); token_ownership.lock().await.remove(&token_m); if !e.to_string().contains("crosses book") { last_trade_time.insert(sn.clone(), Instant::now()); consecutive_failures += 1; } else { tokio::time::sleep(Duration::from_secs(config::CROSSES_BOOK_RETRY_PAUSE_SECS)).await; } continue; }
+                                            Err(e) => {
+                                                warn!("⚠️ ENTRY order failed [{}]: {}", sn, e);
+                                                positions.lock().await.remove(&pos_key);
+                                                pending_orders.lock().await.remove(&pos_key);
+                                                token_ownership.lock().await.remove(&token_m);
+                                                match classify_placement_error(&e) {
+                                                    // Venue said it did not process the order (425
+                                                    // "order manager not ready"). Charging the 60s
+                                                    // cooldown plus a breaker count for a venue outage
+                                                    // is what left FairValue 0-for-3 on 2026-09-01: two
+                                                    // of its three entry attempts were 425s inside a
+                                                    // ~3-minute order-manager outage, two counts against
+                                                    // a breaker threshold of 3. Pause briefly so an
+                                                    // extended outage is probed at ~1 attempt / 5s
+                                                    // instead of every 50ms tick, then re-evaluate and
+                                                    // enter naturally once the venue recovers.
+                                                    // `Ambiguous` (execution-engine 500, no statement of
+                                                    // whether the order was processed) rides with it: also
+                                                    // not the strategy's fault, also never resent — by next
+                                                    // tick balances are re-read and chain reconciliation
+                                                    // adopts the order if it landed.
+                                                    PlacementFault::VenueUnavailable | PlacementFault::Ambiguous => {
+                                                        info!("⏸️ ENTRY [{}]: venue-side failure (not a strategy fault) — no cooldown, no breaker count; retrying after {}s", sn, config::CROSSES_BOOK_RETRY_PAUSE_SECS);
+                                                        tokio::time::sleep(Duration::from_secs(config::CROSSES_BOOK_RETRY_PAUSE_SECS)).await;
+                                                    }
+                                                    // Book moved between pricing and placement — the
+                                                    // historical "crosses book" carve-out, now joined by
+                                                    // the FAK no-match 400 ("no orders found to match"),
+                                                    // which is the same race in taker form: a definitive
+                                                    // no-liquidity answer, not a malfunction. It used to
+                                                    // eat the full 60s cooldown AND a breaker count; the
+                                                    // next evaluation reprices from a fresh snapshot.
+                                                    PlacementFault::BookRace => {
+                                                        tokio::time::sleep(Duration::from_secs(config::CROSSES_BOOK_RETRY_PAUSE_SECS)).await;
+                                                    }
+                                                    PlacementFault::Strategy => {
+                                                        last_trade_time.insert(sn.clone(), Instant::now());
+                                                        consecutive_failures += 1;
+                                                    }
+                                                }
+                                                continue;
+                                            }
                                             Ok((id, making, taking)) => {
                                                 // BUY orientation: making = USDC paid, taking = shares
                                                 // received. Ratio is unit-invariant. A post_only order
@@ -2133,7 +2196,7 @@ impl Squadron {
                                         let feat_snap_s = entry_snap.clone();
                                         // Write pending position immediately (Viper Launch)
                                         if let Some(pool) = db::pool_for(&asset_s) {
-                                            db::record_open_position_with_status(&pool, &squadron_id, &sn, &db_tid_s, &db_mn_s, db_side_s, db_ep_s, db_sh_s, false, "pending").await;
+                                            db::record_open_position_with_status(&pool, &scope, &squadron_id, &sn, &db_tid_s, &db_mn_s, db_side_s, db_ep_s, db_sh_s, false, "pending").await;
                                             // Stamp what opening this leg cost. If the position
                                             // later leaves via settlement or an off-strategy
                                             // close, that booking happens in db.rs with no view
@@ -2201,17 +2264,29 @@ impl Squadron {
                                                 positions.lock().await.remove(&pk);
                                                 // Release token claim — order placement failed.
                                                 token_ownership.lock().await.remove(&p_token_m);
-                                                if e.to_string().contains("crosses book") {
-                                                    // Post-only quote crossed the book: the viper re-signals
-                                                    // every ~50ms tick while the book stays crossed, hammering
-                                                    // the CLOB (2026-07-25: 84 rejected placements in ~2s).
-                                                    // Park a pending-order expiry to suppress re-quoting until
-                                                    // the book has had time to move.
-                                                    pending_orders.lock().await.insert(pk.clone(), Instant::now() + Duration::from_secs(config::MAKER_CROSSES_BOOK_COOLDOWN_SECS));
-                                                    info!("⏸️ Maker quote crossed book [{}]: {} — re-quote suppressed {}s", sn, p.market_name, config::MAKER_CROSSES_BOOK_COOLDOWN_SECS);
-                                                } else {
-                                                    pending_orders.lock().await.remove(&pk);
-                                                    consecutive_failures += 1;
+                                                match classify_placement_error(&e) {
+                                                    PlacementFault::BookRace => {
+                                                        // Post-only quote crossed the book: the viper re-signals
+                                                        // every ~50ms tick while the book stays crossed, hammering
+                                                        // the CLOB (2026-07-25: 84 rejected placements in ~2s).
+                                                        // Park a pending-order expiry to suppress re-quoting until
+                                                        // the book has had time to move.
+                                                        pending_orders.lock().await.insert(pk.clone(), Instant::now() + Duration::from_secs(config::MAKER_CROSSES_BOOK_COOLDOWN_SECS));
+                                                        info!("⏸️ Maker quote crossed book [{}]: {} — re-quote suppressed {}s", sn, p.market_name, config::MAKER_CROSSES_BOOK_COOLDOWN_SECS);
+                                                    }
+                                                    // Venue said it did not process the quote (425). Not the
+                                                    // maker's fault, so no breaker count — but still pause
+                                                    // before the next attempt so an extended outage is probed
+                                                    // at ~1 quote / 5s rather than at tick rate.
+                                                    PlacementFault::VenueUnavailable | PlacementFault::Ambiguous => {
+                                                        pending_orders.lock().await.remove(&pk);
+                                                        info!("⏸️ Maker quote [{}]: venue-side failure (not a strategy fault) — no breaker count; retrying after {}s", sn, config::CROSSES_BOOK_RETRY_PAUSE_SECS);
+                                                        tokio::time::sleep(Duration::from_secs(config::CROSSES_BOOK_RETRY_PAUSE_SECS)).await;
+                                                    }
+                                                    PlacementFault::Strategy => {
+                                                        pending_orders.lock().await.remove(&pk);
+                                                        consecutive_failures += 1;
+                                                    }
                                                 }
                                                 continue;
                                             }
@@ -2225,7 +2300,7 @@ impl Squadron {
                                             let feat_snap_m = ctx.maker_snapshot.clone().unwrap_or_else(|| ctx.snapshot.clone());
                                             // Write pending position immediately (Viper Launch)
                                             if let Some(pool) = db::pool_for(&asset_em) {
-                                                db::record_open_position_with_status(&pool, &squadron_id, &sn, &tid_em, &mn_em, &side_em, ep_em, sh_em, false, "pending").await;
+                                                db::record_open_position_with_status(&pool, &scope, &squadron_id, &sn, &tid_em, &mn_em, &side_em, ep_em, sh_em, false, "pending").await;
                                             }
                                             // Claim this quote's epoch. Anything that pulls or
                                             // replaces the quote bumps it, which is how the task
@@ -2353,6 +2428,17 @@ impl Squadron {
                                             metrics::record_entry(&scope, sn.clone(), tok.to_string(), mn.clone(), side.clone(), ep, matched).await;
                                             let feat_snap = ctx.maker_snapshot.clone().unwrap_or_else(|| ctx.snapshot.clone());
                                             metrics::record_entry_signal(&asset_lc, sn.clone(), tok.to_string(), mn, side, ep, matched, &feat_snap).await;
+                                            // This position was born from a pull that had ALREADY
+                                            // confirmed the toxic/drift condition — the cancel just
+                                            // lost the race to the fill. Exempt it from the ToxicFill
+                                            // min_hold, whose confirmation it has pre-served: the
+                                            // `fill_confirmed_at = now` stamped above restarts
+                                            // `held_secs` at zero (the true fill time is unknowable
+                                            // here — cancel-sweep matched size and the balance
+                                            // endpoint carry no timestamp), and on 2026-09-01 that
+                                            // fresh 30s wait turned a $0.4100 exit into $0.3900,
+                                            // ~$0.36 of a −$0.8864 realized loss.
+                                            crate::vipers::maker_impl::mark_maker_fill_adopted_under_pull(tok.as_str());
                                             warn!("⚡ Maker quote-pull [{}]: {} — quote FILLED ({:.4} shares @ ${:.4}) before cancel; adopting as live position", sn, tok, matched, ep);
                                             continue;
                                         }
@@ -2662,6 +2748,37 @@ impl Squadron {
 /// rotation arm and event-market retirement. Returns false when every attempt
 /// failed, which the caller reports but does not treat as fatal — the venue
 /// cancels what is left when the market resolves.
+/// Account-wide cancel of every resting order — unless the engine is simulating.
+///
+/// The gate every account-wide cancel path on this venue must pass through.
+/// Five paths issue `DELETE /cancel-all` against the live wallet: the startup
+/// sweep, the SIGTERM shutdown handler, and the patrol's stand-down, market
+/// rotation and event-retirement arms. None of them checked ghost mode, so on
+/// 2026-09-01 at 21:52:12 a production restart in ghost mode fired a real
+/// account-wide cancel five times (answered 503 "cancels are disabled" — the
+/// only reason nothing was touched) — the exact behavior the v1.0.9 release
+/// notes promise no longer happens while simulating. In ghost mode the engine
+/// has placed nothing, so the only orders this could ever cancel are a
+/// previous live session's leftovers or the operator's own hand-placed orders.
+///
+/// While simulating, the resting orders are REPORTED instead (split by the
+/// placing API key, so the operator can see which are the engine's own), and
+/// `true` is returned: a deliberate skip is not a cancel failure, and the
+/// callers' error arms describe failures.
+pub async fn cancel_all_orders_unless_simulating(
+    trading_client: &polymarket_client_sdk_v2::clob::Client<
+        polymarket_client_sdk_v2::auth::state::Authenticated<
+            polymarket_client_sdk_v2::auth::Normal,
+        >,
+    >,
+) -> bool {
+    if crate::helpers::dynamic_config::ghosting_now() {
+        crate::helpers::balance::report_resting_orders_while_simulating(trading_client).await;
+        return true;
+    }
+    cancel_all_orders_with_retries(trading_client).await
+}
+
 pub async fn cancel_all_orders_with_retries(
     trading_client: &polymarket_client_sdk_v2::clob::Client<
         polymarket_client_sdk_v2::auth::state::Authenticated<

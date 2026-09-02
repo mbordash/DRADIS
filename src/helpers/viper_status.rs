@@ -242,11 +242,18 @@ mod forget_tests {
     }
 
     /// Case-insensitive, since squadron ids are lowercased while callers may not be.
+    ///
+    /// The underlying key must be unique to this test. `REGISTRY` is a process
+    /// global and cargo runs these two tests on parallel threads, so when this
+    /// used "forgettest-ETH" it shared a logical key with the test above — which
+    /// records three rows under the same name and then forgets them. The row
+    /// counts asserted here would intermittently read 4, or 0, depending on the
+    /// interleaving, and the suite failed perhaps one run in three.
     #[test]
     fn forget_matches_regardless_of_case() {
-        record_eval("forgettest-ETH", "MakerStrategy", EvalOutcome::NoSignal);
-        assert_eq!(snapshot(Some("forgettest-eth")).len(), 1);
-        forget("FORGETTEST-ETH");
-        assert_eq!(snapshot(Some("forgettest-eth")).len(), 0);
+        record_eval("forgettest-case-ETH", "MakerStrategy", EvalOutcome::NoSignal);
+        assert_eq!(snapshot(Some("forgettest-case-eth")).len(), 1);
+        forget("FORGETTEST-CASE-ETH");
+        assert_eq!(snapshot(Some("forgettest-case-eth")).len(), 0);
     }
 }

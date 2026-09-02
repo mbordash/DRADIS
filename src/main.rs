@@ -840,18 +840,31 @@ async fn run() -> Result<()> {
     info!(" Starting portfolio value: ${:.2}", startup_balance);
 
     // ── Startup: cancel any GTC orders left over from the previous session ───
-    info!(" Cancelling any leftover open orders from previous session...");
-    for i in 0..MAX_CANCEL_RETRIES {
-        let delay = BASE_CANCEL_RETRY_DELAY_MS * (1 << i);
-        match tokio::time::timeout(Duration::from_secs(8), trading_client.as_ref().cancel_all_orders()).await {
-            Ok(Ok(_)) => { info!("✅ Startup cancel complete (attempt {}).", i + 1); break; }
-            Ok(Err(e)) => {
-                warn!("⚠️ Startup cancel failed (attempt {}/{}): {}", i + 1, MAX_CANCEL_RETRIES, e);
-                if i < MAX_CANCEL_RETRIES - 1 { tokio::time::sleep(Duration::from_millis(delay)).await; }
-            }
-            Err(_) => {
-                warn!("⚠️ Startup cancel timed out (attempt {}/{})", i + 1, MAX_CANCEL_RETRIES);
-                if i < MAX_CANCEL_RETRIES - 1 { tokio::time::sleep(Duration::from_millis(delay)).await; }
+    // NEVER while simulating. This sweep predates the venue-neutral
+    // `cancel_leftover_orders_at_startup` and was missed when that sweep gained
+    // its ghost gate — the gate's comment assumed nothing but the engine trades
+    // the self-custody intl wallet, which is not a safe assumption for a wallet
+    // the operator also uses by hand. On 2026-09-01 at 21:52:13 a production
+    // restart in GHOST mode ran this loop against the live wallet (five real
+    // DELETE /cancel-all attempts, each answered 503 "cancels are disabled" —
+    // the only reason nothing was touched). Simulating is a promise not to
+    // touch the account; the ghost branch reports what is resting instead.
+    if dradis::helpers::dynamic_config::ghosting_now() {
+        dradis::helpers::balance::report_resting_orders_while_simulating(trading_client.as_ref()).await;
+    } else {
+        info!(" Cancelling any leftover open orders from previous session...");
+        for i in 0..MAX_CANCEL_RETRIES {
+            let delay = BASE_CANCEL_RETRY_DELAY_MS * (1 << i);
+            match tokio::time::timeout(Duration::from_secs(8), trading_client.as_ref().cancel_all_orders()).await {
+                Ok(Ok(_)) => { info!("✅ Startup cancel complete (attempt {}).", i + 1); break; }
+                Ok(Err(e)) => {
+                    warn!("⚠️ Startup cancel failed (attempt {}/{}): {}", i + 1, MAX_CANCEL_RETRIES, e);
+                    if i < MAX_CANCEL_RETRIES - 1 { tokio::time::sleep(Duration::from_millis(delay)).await; }
+                }
+                Err(_) => {
+                    warn!("⚠️ Startup cancel timed out (attempt {}/{})", i + 1, MAX_CANCEL_RETRIES);
+                    if i < MAX_CANCEL_RETRIES - 1 { tokio::time::sleep(Duration::from_millis(delay)).await; }
+                }
             }
         }
     }
@@ -867,7 +880,10 @@ async fn run() -> Result<()> {
         dradis::helpers::shutdown::register(Box::new(move || {
             let client = Arc::clone(&client_for_shutdown);
             Box::pin(async move {
-                if !dradis::squadron::cancel_all_orders_with_retries(client.as_ref()).await {
+                // Ghost-gated at FIRE time, not registration time — the mode
+                // can flip during the session, and what matters is whether the
+                // engine is simulating at the moment SIGTERM arrives.
+                if !dradis::squadron::cancel_all_orders_unless_simulating(client.as_ref()).await {
                     error!("❌ Shutdown: failed to cancel all resting orders — they may remain open on the book.");
                 }
             })

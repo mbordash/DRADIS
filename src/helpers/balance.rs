@@ -247,6 +247,95 @@ async fn cancel_resting_orders(client: &Arc<ClobClient<Authenticated<Normal>>>, 
     (true, matched)
 }
 
+/// Report — never cancel — the account's resting orders while simulating.
+///
+/// The ghost-mode side of every account-wide cancel path. Simulating is a
+/// promise not to touch the account (the v1.0.9 gate on the Kalshi/US startup
+/// sweep states it exactly), so this lists what is resting and says so loudly
+/// instead of acting. Listing is reading; reading is not touching.
+///
+/// The report splits the orders by the `owner` field, which on this venue is
+/// the API KEY that placed the order — not the wallet. The Polymarket web app
+/// derives its own key, DRADIS derives its own, so on a shared wallet this
+/// cleanly separates "this engine's live-session leftovers" from "orders the
+/// human placed by hand". That distinction is venue-supported and worth
+/// showing the operator, because the two halves need different action: the
+/// engine's own leftovers are swept by the next live run, the human's are
+/// theirs to keep.
+pub async fn report_resting_orders_while_simulating(
+    client: &ClobClient<Authenticated<Normal>>,
+) {
+    let req = OrdersRequest::builder().build();
+    let orders = match tokio::time::timeout(Duration::from_secs(8), client.orders(&req, None)).await {
+        Ok(Ok(page)) => page.data,
+        _ => {
+            warn!("👻 Simulating: could not list resting orders — the account was NOT touched, \
+                   but any leftover live orders are unverified this pass");
+            return;
+        }
+    };
+    if orders.is_empty() {
+        info!("👻 Simulating: account-wide cancel skipped — no resting orders on the account");
+        return;
+    }
+    let ours = client.credentials().key();
+    let (own, foreign) = split_by_owner(orders.iter().map(|o| o.owner), ours);
+    warn!(
+        "👻 Simulating: account-wide cancel SKIPPED — {} resting order(s) LEFT ALONE: \
+         {} placed through this engine's API key (live-session leftovers that stay working \
+         and UNMANAGED until a live run sweeps them) and {} placed by other credentials \
+         (e.g. by hand on the venue). Run live once to sweep the engine's own, or cancel \
+         them on the venue.",
+        own + foreign, own, foreign,
+    );
+}
+
+/// Count `owners` into (engine-placed, other-credentials). Pure so the split —
+/// the load-bearing claim in the ghost report above — is pinned by tests.
+fn split_by_owner(
+    owners: impl Iterator<Item = polymarket_client_sdk_v2::auth::ApiKey>,
+    ours: polymarket_client_sdk_v2::auth::ApiKey,
+) -> (usize, usize) {
+    let mut own = 0usize;
+    let mut foreign = 0usize;
+    for o in owners {
+        if o == ours { own += 1; } else { foreign += 1; }
+    }
+    (own, foreign)
+}
+
+#[cfg(test)]
+mod ghost_sweep_report_tests {
+    use super::split_by_owner;
+    use polymarket_client_sdk_v2::auth::ApiKey;
+
+    /// 2026-09-01, 21:52:12 EDT: the production engine was restarted in ghost
+    /// mode and issued a real account-wide DELETE /cancel-all five times
+    /// (each answered 503 "cancels are disabled") — the exact behavior the
+    /// v1.0.9 release notes promised no longer happens while simulating.
+    /// The replacement report must tell the operator whose orders are resting,
+    /// and the venue supports that: `owner` is the placing API key, so the
+    /// engine's own leftovers and the human's hand-placed orders count apart.
+    #[test]
+    fn orders_placed_by_other_credentials_are_counted_apart_from_the_engines_own() {
+        let engine: ApiKey = ApiKey::new_v4();
+        let human:  ApiKey = ApiKey::new_v4();
+        let (own, foreign) = split_by_owner(
+            vec![engine, human, engine, human, human].into_iter(),
+            engine,
+        );
+        assert_eq!((own, foreign), (2, 3));
+    }
+
+    /// An account with nothing resting must report (0, 0) — the caller uses
+    /// that to print the calmer "no resting orders" line instead of a warning.
+    #[test]
+    fn an_empty_account_counts_nothing_on_either_side() {
+        let engine: ApiKey = ApiKey::new_v4();
+        assert_eq!(split_by_owner(std::iter::empty(), engine), (0, 0));
+    }
+}
+
 /// One-shot on-chain conditional-token balance lookup (shares, 6-dp scaled).
 /// Used by the Maker quote-pull to detect a quote that FULLY filled before the
 /// pull: a fully-matched order vanishes from the CLOB open-orders list, so
@@ -622,6 +711,11 @@ pub async fn arb_pair_fill_monitor(
     max_wait_secs: i64,
     http: Arc<reqwest::Client>,
     asset: String,
+    // Filing dimensions for the re-hedge row this monitor may write. Cloned
+    // from the patrol loop's scope so a re-hedged leg files under the same
+    // venue/class/underlying as the entry it repairs, instead of leaving the
+    // in-flight row's Venue column NULL.
+    scope: crate::state::TradeScope,
     // Session P&L counter. Orphan flattens are real realised losses and must
     // land here as well as in the `trades` table, or the dashboard's session
     // figure drifts from the ledger.
@@ -922,7 +1016,7 @@ pub async fn arb_pair_fill_monitor(
 
                     // Write the re-hedged fill to the DB.
                     if let Some(pool) = crate::helpers::db::pool_for(&asset) {
-                        crate::helpers::db::record_open_position(&pool, squadron_id,
+                        crate::helpers::db::record_open_position(&pool, &scope, squadron_id,
                             &strategy_name,
                             &missing_token.to_string(),
                             &ref_pos.market_name,

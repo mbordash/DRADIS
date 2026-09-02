@@ -320,6 +320,17 @@ export interface OpenPositionRow {
    * see that, or they act on a number the book left behind.
    */
   price_updated_at?: string | null;
+  /**
+   * Same filing dimensions as TradeRow, so an in-flight row files like the
+   * completed trade it becomes. Null on rows written before the columns
+   * existed and on reconciliation writes that only know the book — the
+   * tradelog falls back to the shard for those.
+   */
+  venue?:        string | null;
+  /** 'crypto' | 'sports' | 'politics' | 'unknown'. Null on legacy rows. */
+  market_class?: string | null;
+  /** Underlying symbol. Null is meaningful — sports/politics have none. */
+  underlying?:   string | null;
 }
 
 export interface LlmRecommendationRow {

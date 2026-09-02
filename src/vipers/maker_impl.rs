@@ -331,6 +331,75 @@ fn clear_maker_toxic_obi_streak(token_id: &str) {
     reg.remove(token_id);
 }
 
+/// Tokens whose filled quote was adopted through the quote-pull race — the
+/// pull's cancel lost to an on-chain fill, so the position was born with the
+/// toxic/drift condition already confirmed.
+///
+/// Process-global like the trackers above; a restart loses the mark and the
+/// position simply serves the full `maker_toxic_min_hold_secs` again, which is
+/// today's behavior and costs at most one min_hold window — conservative in
+/// exactly the direction the gate errs anyway.
+fn maker_pull_race_adoptions() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static REG: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        std::sync::OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+/// Mark `token_id` as adopted through the quote-pull race. Called by the intl
+/// patrol's `MakerCancel` handler when a pulled quote turns out to have FILLED
+/// before the cancel reached the book, at the moment it adopts the fill as a
+/// live position.
+pub fn mark_maker_fill_adopted_under_pull(token_id: &str) {
+    let mut reg = match maker_pull_race_adoptions().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.insert(token_id.to_string());
+}
+
+fn maker_fill_adopted_under_pull(token_id: &str) -> bool {
+    let reg = match maker_pull_race_adoptions().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.contains(token_id)
+}
+
+/// Drop the adoption mark (position closed, or token idle). Must be cleared
+/// wherever the position's other per-token state dies: a stale mark surviving
+/// into the maker's NEXT quote on the same token would exempt a genuinely
+/// fresh fill from min_hold.
+fn clear_maker_fill_adopted_under_pull(token_id: &str) {
+    let mut reg = match maker_pull_race_adoptions().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.remove(token_id);
+}
+
+/// The ToxicFill min_hold gate for one token.
+///
+/// min_hold exists so a FRESH fill does not whipsaw out on a transient blip
+/// before the hostile reading is confirmed. A position adopted through the
+/// quote-pull race inverts that premise: the pull that raced the fill was
+/// itself the confirmation — oracle drift past the pull threshold, or a toxic
+/// book — established and acted on BEFORE the position existed. Making such a
+/// position serve min_hold again waits out a confirmation that already
+/// happened, on a book already known to be hostile.
+///
+/// Polymarket International, 2026-09-01: a YES $0.4200×19.04 quote resting
+/// since 17:25:57 was pulled at 17:28:33 (drift 0.037% adverse + OBI < −0.50),
+/// found FILLED at 17:28:48, and adoption restamped `fill_confirmed_at` to
+/// Utc::now() — so `held_secs` restarted at zero and ToxicFill sat out a full
+/// fresh 30s while the bid fell $0.4100 → $0.3900. The wait cost ~$0.36 of the
+/// −$0.8864 realized. (The true fill time was never observable: the fill is
+/// discovered via cancel-sweep matched size or the lagging balance endpoint,
+/// neither of which carries a timestamp, so the clock cannot be honestly
+/// backdated — the gate is exempted instead.)
+fn toxic_hold_satisfied(token_id: &str, held_secs: i64, min_hold_secs: i64) -> bool {
+    maker_fill_adopted_under_pull(token_id) || held_secs >= min_hold_secs
+}
+
 /// Price the resting post-only ASK for a filled maker position, or `None` when
 /// no valid ask can rest right now.
 ///
@@ -1117,6 +1186,7 @@ impl Strategy for MakerStrategyImpl {
                     // No quote/position on this token — drop any stale drift baseline.
                     clear_maker_quote_oracle_baseline(token_id.as_str());
                     clear_maker_toxic_obi_streak(token_id.as_str());
+                    clear_maker_fill_adopted_under_pull(token_id.as_str());
                     continue;
                 }
 
@@ -1223,7 +1293,7 @@ impl Strategy for MakerStrategyImpl {
                 };
                 let confirm_ticks = dc.maker_toxic_obi_confirm_ticks.max(1);
 
-                let hold_ok   = held_secs >= dc.maker_toxic_min_hold_secs;
+                let hold_ok   = toxic_hold_satisfied(token_id.as_str(), held_secs, dc.maker_toxic_min_hold_secs);
                 let price_ok  = adverse_pct >= dc.maker_toxic_min_adverse_pct;
                 // The OBI confirmation streak gates only an OBI-triggered exit. Demanding
                 // it for a drift trigger would reinstate the lagging-signal wait this path
@@ -1254,6 +1324,7 @@ impl Strategy for MakerStrategyImpl {
                 arm_maker_toxic_cooldown(token_id.as_str());
                 clear_maker_quote_oracle_baseline(token_id.as_str());
                 clear_maker_toxic_obi_streak(token_id.as_str());
+                clear_maker_fill_adopted_under_pull(token_id.as_str());
                 if maker_toxic_log_permitted(token_id.as_str()) {
                     tracing::info!(
                         "⚡ Maker ToxicFill exit triggered ({}): OBI={:.2} (threshold={:.2}, confirmed {} ticks) | drift={:.3}% | bid=${:.4} adverse={:.2}% held={}s | re-entry locked {}s",
@@ -1488,6 +1559,55 @@ mod toxic_cooldown_tests {
         // and is pruned on read. Use cooldown_secs so small it is already expired.
         std::thread::sleep(std::time::Duration::from_millis(1100));
         assert!(!maker_toxic_cooldown_active(tok, 1));
+    }
+}
+
+#[cfg(test)]
+mod toxic_min_hold_adoption_tests {
+    use super::{
+        clear_maker_fill_adopted_under_pull, mark_maker_fill_adopted_under_pull,
+        toxic_hold_satisfied,
+    };
+
+    /// The 2026-09-01 production loss. A YES $0.4200×19.04 quote resting since
+    /// 17:25:57 was pulled at 17:28:33 for confirmed adverse drift and a toxic
+    /// book (OBI −0.61), then found FILLED at 17:28:48 and adopted — with
+    /// `fill_confirmed_at` restamped to adoption time, so `held_secs` restarted
+    /// at 0 and ToxicFill logged "min_hold 0s/30s", "5s/30s", "15s/30s",
+    /// "20s/30s" while the bid fell $0.4100 → $0.3900. The full fresh 30s hold
+    /// cost ~$0.36 of the −$0.8864 realized. A position adopted through that
+    /// race must pass the hold gate immediately: the pull already WAS the
+    /// confirmation min_hold stands in for.
+    #[test]
+    fn a_fill_adopted_through_the_quote_pull_race_skips_the_min_hold_wait() {
+        let tok = "test_tok_pull_race_adopted";
+        // Not adopted (a genuinely fresh fill): every held reading short of the
+        // window must wait, exactly as before this fix.
+        assert!(!toxic_hold_satisfied(tok, 0, 30));
+        assert!(!toxic_hold_satisfied(tok, 20, 30));
+        assert!(toxic_hold_satisfied(tok, 30, 30));
+
+        // Adopted through the race: the gate is satisfied at 0s held — the
+        // exit that fired at 17:29:18 would have fired at 17:28:48 with the
+        // bid still $0.4100.
+        mark_maker_fill_adopted_under_pull(tok);
+        assert!(toxic_hold_satisfied(tok, 0, 30));
+        clear_maker_fill_adopted_under_pull(tok);
+    }
+
+    /// The mark must die with the position. The maker re-quotes the same token
+    /// after the 180s re-entry cooldown, and a stale mark surviving into that
+    /// NEXT life would exempt a genuinely fresh fill from min_hold — quietly
+    /// removing the whipsaw protection for every later position on the token.
+    #[test]
+    fn a_cleared_adoption_mark_restores_the_full_min_hold_for_the_next_fill() {
+        let tok = "test_tok_pull_race_cleared";
+        mark_maker_fill_adopted_under_pull(tok);
+        assert!(toxic_hold_satisfied(tok, 0, 30));
+
+        clear_maker_fill_adopted_under_pull(tok);
+        assert!(!toxic_hold_satisfied(tok, 0, 30));
+        assert!(toxic_hold_satisfied(tok, 30, 30));
     }
 }
 

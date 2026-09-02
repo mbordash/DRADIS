@@ -509,6 +509,24 @@ pub use crate::venues::core::TokenResolution;
 /// market that ultimately resolves YES would be booked as a total loss — and the row is
 /// deleted, so nothing can correct it afterwards. A price that is not within a cent of
 /// $0 or $1 is therefore reported as `Unknown` and retried, not treated as final.
+///
+/// # Why "not closed" is corroborated against the market's schedule
+///
+/// The `closed` flag also lags in the OPPOSITE direction, and trusting the lagging
+/// answer books real money wrong. Production, 2026-09-01 (trades row 16): a FairValue
+/// NO leg held to settlement on "Bitcoin Up or Down - September 1, 8PM ET" was
+/// auto-redeemed on-chain minutes after the 21:00 EDT end; Gamma's own record carries
+/// `closedTime` 21:11:21 EDT, yet at 21:15:21 this query still answered "not closed" —
+/// so the sweep concluded the token "left the wallet by a trade" and booked a
+/// mark-priced ChainReconcile exit at $0.9995 instead of settlement at $1.00, then
+/// deleted the row, leaving the estimate as the permanent record and the genuine
+/// settlement booking suppressed forever by the double-book guard.
+///
+/// So a "not closed" reading is only believed for a market still inside its scheduled
+/// life. Past `endDate`, "not closed" cannot mean "still trading" — it means the
+/// resolution is not visible YET (UMA pending, or Gamma's flag/CDN lagging the chain),
+/// and the truthful answer is `Unknown`, which the sweep defers (bounded by
+/// `SETTLEMENT_DEFER_MAX_SECS`) until Gamma prices the market decisively.
 pub async fn resolution_for_token(
     http: &reqwest::Client,
     token_id: &str,
@@ -530,13 +548,19 @@ pub async fn resolution_for_token(
     let arr = unknown!(data.as_array().cloned()
         .or_else(|| data.get("data").and_then(|v| v.as_array()).cloned()));
 
-    // An EMPTY result under `closed=true` is Gamma's way of saying "this market is
-    // not closed" — the filter excluded it. That is a positive answer, not a failure,
-    // and it is what keeps an off-strategy sale on the mark-priced path.
-    let Some(m) = arr.first() else { return TokenResolution::NotClosed };
+    // An EMPTY result under `closed=true` is Gamma saying "this market is not
+    // closed" — the filter excluded it. Before 2026-09-01 that was trusted
+    // outright; now it is corroborated against the market's own schedule (see
+    // the doc above), because during the resolution race this very answer came
+    // back four minutes AFTER Gamma's recorded closedTime.
+    let Some(m) = arr.first() else {
+        return not_closed_or_pending(http, token_id).await;
+    };
 
     if !m.get("closed").and_then(|v| v.as_bool()).unwrap_or(false) {
-        return TokenResolution::NotClosed;
+        // The market object is in hand here, so corroborate from its own endDate
+        // without a second request.
+        return corroborate_not_closed(parse_end_date(m), chrono::Utc::now());
     }
 
     // Both arrive as JSON arrays that are sometimes string-encoded.
@@ -557,6 +581,71 @@ pub async fn resolution_for_token(
         return TokenResolution::Unknown;
     }
     TokenResolution::Resolved(px)
+}
+
+/// The market's scheduled end, from a Gamma market object. `None` when the
+/// field is absent or unparseable — which corroboration treats as "cannot
+/// confirm still trading", never as an answer.
+fn parse_end_date(m: &serde_json::Value) -> Option<chrono::DateTime<chrono::Utc>> {
+    m.get("endDate")
+        .and_then(|v| v.as_str())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+        .map(|t| t.with_timezone(&chrono::Utc))
+}
+
+/// Second opinion on a "not closed" answer: fetch the market WITHOUT the closed
+/// filter (Gamma's default view shows only open markets — verified live against
+/// the 2026-09-01 token: `closed=true` returns the resolved market, the bare
+/// query returns `[]`) and judge by its `endDate`.
+///
+/// The mid-flip race maps to `Unknown` by construction: a market being flipped
+/// can be momentarily invisible in BOTH views (excluded from the open view
+/// already, not yet served by the closed view), and invisible-everywhere is
+/// precisely "no answer", not "still trading".
+async fn not_closed_or_pending(http: &reqwest::Client, token_id: &str) -> TokenResolution {
+    let url = format!(
+        "https://gamma-api.polymarket.com/markets?clob_token_ids={}",
+        token_id
+    );
+    let end_date = async {
+        let resp = http.get(&url).send().await.ok()?;
+        let data: serde_json::Value = resp.json().await.ok()?;
+        let arr = data.as_array().cloned()
+            .or_else(|| data.get("data").and_then(|v| v.as_array()).cloned())?;
+        parse_end_date(arr.first()?)
+    }
+    .await;
+    corroborate_not_closed(end_date, chrono::Utc::now())
+}
+
+/// What a "not closed" reading from Gamma is worth, given the market's own
+/// schedule.
+///
+/// `NotClosed` is a load-bearing answer downstream: the sweep reads it as "the
+/// position verifiably left the wallet by a TRADE" and books a mark-priced
+/// off-strategy exit, then deletes the row — unappealable. That inference is
+/// sound only while the market is actually trading. Past `endDate` nothing
+/// trades, so a token that vanished can only have settled; reporting
+/// `NotClosed` there is how the 2026-09-01 FairValue leg was booked at its
+/// $0.9995 mark instead of its $1.00 settlement (see `resolution_for_token`).
+///
+/// The deliberate trade-off: an OFF-STRATEGY sale in the final seconds before
+/// `endDate`, discovered only after it, is now deferred and eventually booked
+/// at the resolved price rather than its last mark. Both are estimates; near
+/// expiry they differ by at most the final spread, and the currently-closed
+/// window (after Gamma's flag flips) already books such sales at the resolved
+/// price today. The settled-and-redeemed position booked at a stale mark was
+/// the real and observed loss.
+fn corroborate_not_closed(
+    end_date: Option<chrono::DateTime<chrono::Utc>>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> TokenResolution {
+    match end_date {
+        Some(end) if now < end => TokenResolution::NotClosed,
+        // Past its end, or no schedule visible at all: resolution pending —
+        // defer, never book from a mark.
+        _ => TokenResolution::Unknown,
+    }
 }
 
 /// Resolved settlement prices for a market, keyed by CLOB token id (decimal string).
@@ -742,5 +831,50 @@ mod resolution_tests {
         assert!(!decisive(Decimal::new(49, 2)), "$0.49 is a mid, not a resolution");
         assert!(!decisive(Decimal::new(50, 2)), "$0.50 placeholder must never book");
         assert!(!decisive(Decimal::new(95, 2)), "$0.95 is still a mark");
+    }
+
+    /// The 2026-09-01 settlement race, with the production values. FairValue's
+    /// NO leg (5.093297 sh @ $0.9339…) on "Bitcoin Up or Down - September 1,
+    /// 8PM ET" (endDate 2026-09-02T01:00:00Z) was auto-redeemed at $1.00, but
+    /// at 01:15:21Z Gamma's closed-markets view still answered "not closed" —
+    /// four minutes after the market's own recorded closedTime of 01:11:21Z.
+    /// Trusting that answer booked a mark-priced exit at $0.9995 and deleted
+    /// the row, permanently suppressing the genuine settlement booking. Past
+    /// endDate, "not closed" must defer, not book.
+    #[test]
+    fn a_not_closed_answer_after_the_markets_end_is_deferred_not_booked_from_a_mark() {
+        use chrono::{DateTime, Utc};
+        let end: DateTime<Utc> = "2026-09-02T01:00:00Z".parse().unwrap();
+        let reconcile_fired_at: DateTime<Utc> = "2026-09-02T01:15:21Z".parse().unwrap();
+        assert_eq!(
+            super::corroborate_not_closed(Some(end), reconcile_fired_at),
+            TokenResolution::Unknown,
+            "15 minutes past endDate nothing trades — a vanished token can only have settled"
+        );
+    }
+
+    /// Inside the market's scheduled life "not closed" keeps its original
+    /// meaning, so a genuine off-strategy sale still reaches the mark-priced
+    /// reconcile path instead of being frozen behind a deferral.
+    #[test]
+    fn a_not_closed_answer_before_the_markets_end_still_means_trading() {
+        use chrono::{DateTime, Utc};
+        let end: DateTime<Utc> = "2026-09-02T01:00:00Z".parse().unwrap();
+        let mid_session: DateTime<Utc> = "2026-09-02T00:30:00Z".parse().unwrap();
+        assert_eq!(
+            super::corroborate_not_closed(Some(end), mid_session),
+            TokenResolution::NotClosed,
+        );
+    }
+
+    /// A market invisible in BOTH Gamma views (excluded from the open view,
+    /// not yet served by the closed view — the mid-flip race) yields no
+    /// endDate at all. That is "no answer", never "still trading": defer.
+    #[test]
+    fn a_market_invisible_to_both_gamma_views_defers_rather_than_guesses() {
+        assert_eq!(
+            super::corroborate_not_closed(None, chrono::Utc::now()),
+            TokenResolution::Unknown,
+        );
     }
 }

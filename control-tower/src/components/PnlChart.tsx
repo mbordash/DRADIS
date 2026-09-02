@@ -42,93 +42,156 @@ function fmt(iso: string) {
   });
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function MarkerTooltip({ active, payload, label }: any) {
-  if (!active || !payload?.length) return null;
+/** One trade close snapped to a chart point. */
+type TradeEvent = { trade: TradeRow; pnl: number };
+/** One position entry snapped to a chart point. */
+type PositionEvent = { position: OpenPositionRow };
 
-  // Only show tooltip when hovering over a B/S marker point
-  const tradeEntry = payload.find((p: any) => p.dataKey === 'tradeDot' && p.payload?._tradeMarker);
-  const posEntry   = payload.find((p: any) => p.dataKey === 'positionDot' && p.payload?._positionMarker);
+/** Amber GHOST chip shared by both tooltip headers. */
+function GhostChip({ text }: { text: string }) {
+  return (
+    <span className="text-[10px] font-normal px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300 whitespace-nowrap">
+      {text}
+    </span>
+  );
+}
 
-  if (tradeEntry) {
-    const { trade, pnl } = tradeEntry.payload._tradeMarker as { trade: TradeRow; pnl: number };
-    const pnlColor = pnl > 0 ? 'text-emerald-400' : pnl < 0 ? 'text-red-400' : 'text-gray-400';
-    const symbol = trade.market.split(' ')[0];
-    // Amber border and a header chip for simulated trades. The badge sits in the
-    // HEADER rather than in the detail rows because the question this tooltip has
-    // to answer first is "was this real money?", and a mixed chart — paper trades
-    // from a ghost soak beside live ones — is the normal case after an operator
-    // flips modes. Amber is already the ghost colour elsewhere in this file.
-    const isGhost = trade.ghost === true;
-    return (
-      <div className={`card px-3 py-2 text-xs font-mono space-y-1.5 shadow-xl border-2 ${
-        isGhost ? 'border-amber-500/40' : 'border-emerald-500/30'
+/** Emerald LIVE chip — only shown beside a GHOST chip, to flag a mixed group. */
+function LiveChip({ text }: { text: string }) {
+  return (
+    <span className="text-[10px] font-normal px-1.5 py-0.5 rounded bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 whitespace-nowrap">
+      {text}
+    </span>
+  );
+}
+
+function pnlColorOf(pnl: number) {
+  return pnl > 0 ? 'text-emerald-400' : pnl < 0 ? 'text-red-400' : 'text-gray-400';
+}
+function fmtSignedUsd(pnl: number) {
+  return `${pnl >= 0 ? '+' : ''}$${pnl.toFixed(2)}`;
+}
+
+/**
+ * Tooltip body for every trade close snapped to ONE chart point.
+ *
+ * Takes an array, not a single event: snapshots land every 30s
+ * (DASHBOARD_SYNC_SECS), so two closes inside one window snap to the same
+ * point. The old single-value shape made the second close silently replace the
+ * first, and on a mixed chart the vanished marker could be the real-money one.
+ *
+ * Ghost handling per event, not per point. The amber border and a header chip
+ * flag simulation the moment the tooltip opens — the question it has to answer
+ * first is "was this real money?", and a mixed chart (paper trades from a
+ * ghost soak beside live ones) is the normal case after an operator flips
+ * modes. A group holding both kinds shows BOTH counts in the header and tags
+ * each ghost row, because rendering a mixed group as all-live would be a
+ * worse lie than dropping a marker was. For the same reason the aggregate
+ * P&L line never blends the two: paper P&L added into a real number would
+ * manufacture a result no wallet saw.
+ */
+function TradeCloseTip({ events, label }: { events: TradeEvent[]; label: string }) {
+  const ghostEvents = events.filter(e => e.trade.ghost === true);
+  const liveEvents  = events.filter(e => e.trade.ghost !== true);
+  const allGhost = liveEvents.length === 0;
+  const mixed    = ghostEvents.length > 0 && liveEvents.length > 0;
+  const livePnl  = liveEvents.reduce((s, e) => s + e.pnl, 0);
+  const ghostPnl = ghostEvents.reduce((s, e) => s + e.pnl, 0);
+  const grouped  = events.length > 1;
+  return (
+    <div className={`card px-3 py-2 text-xs font-mono space-y-1.5 shadow-xl border-2 w-52 ${
+      ghostEvents.length > 0 ? 'border-amber-500/40' : 'border-emerald-500/30'
+    }`}>
+      <div className={`font-semibold flex items-center gap-1.5 ${
+        allGhost ? 'text-amber-300' : 'text-emerald-300'
       }`}>
-        <div className={`font-semibold flex items-center gap-1.5 ${
-          isGhost ? 'text-amber-300' : 'text-emerald-300'
-        }`}>
-          <span>{isGhost ? '👻' : '✅'}</span>
-          <span>Trade Close</span>
-          {isGhost && (
-            <span className="ml-auto text-[10px] font-normal px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300">
-              GHOST
+        <span>{allGhost ? '👻' : '✅'}</span>
+        <span>{grouped ? `Trade Closes ×${events.length}` : 'Trade Close'}</span>
+        <span className="ml-auto flex items-center gap-1">
+          {ghostEvents.length > 0 && (
+            <GhostChip text={allGhost ? 'GHOST' : `${ghostEvents.length} GHOST`} />
+          )}
+          {mixed && <LiveChip text={`${liveEvents.length} LIVE`} />}
+        </span>
+      </div>
+      <div className="text-gray-400 text-[10px] border-t border-gray-700 pt-1">{label}</div>
+      {grouped && (
+        <div className="flex justify-between gap-3 border-t border-gray-700 pt-1">
+          <span className="text-gray-500">Σ P&L</span>
+          {mixed ? (
+            <span>
+              <span className={`font-semibold ${pnlColorOf(livePnl)}`}>{fmtSignedUsd(livePnl)}</span>
+              <span className="text-gray-500"> live · </span>
+              <span className="text-amber-300">{fmtSignedUsd(ghostPnl)} 👻</span>
             </span>
+          ) : (
+            <span className={`font-semibold ${pnlColorOf(livePnl + ghostPnl)}`}>{fmtSignedUsd(livePnl + ghostPnl)}</span>
           )}
         </div>
-        <div className="text-gray-400 text-[10px] border-t border-gray-700 pt-1">{label}</div>
-        <div className="space-y-0.5 pt-1">
-          <div className="flex justify-between gap-3"><span className="text-gray-500">Strategy</span><span className="text-white">{trade.strategy}</span></div>
-          <div className="flex justify-between gap-3"><span className="text-gray-500">Symbol</span><span className="text-white">{symbol}</span></div>
+      )}
+      {events.map(({ trade, pnl }, i) => (
+        <div key={`${trade.ts}-${trade.market}-${i}`} className="space-y-0.5 pt-1 border-t border-gray-700">
+          <div className="flex justify-between gap-3">
+            <span className="text-gray-500">Strategy</span>
+            <span className="text-white truncate">{grouped && trade.ghost === true ? '👻 ' : ''}{trade.strategy}</span>
+          </div>
+          <div className="flex justify-between gap-3"><span className="text-gray-500">Market</span><span className="text-white text-[10px] truncate max-w-[110px]">{trade.market.split(' ').slice(0, 3).join(' ')}</span></div>
           <div className="flex justify-between gap-3"><span className="text-gray-500">Side</span><span className="text-cyan-300">{trade.side}</span></div>
           <div className="flex justify-between gap-3"><span className="text-gray-500">Shares</span><span className="text-white">{parseFloat(trade.shares).toFixed(2)}</span></div>
-          <div className="flex justify-between gap-3 pt-1 border-t border-gray-700">
+          <div className="flex justify-between gap-3">
             <span className="text-gray-500">P&L</span>
-            <span className={`font-semibold ${pnlColor}`}>{pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}</span>
+            <span className={`font-semibold ${pnlColorOf(pnl)}`}>{fmtSignedUsd(pnl)}</span>
           </div>
-          <div className="flex justify-between gap-3"><span className="text-gray-500">Reason</span><span className="text-gray-400 text-[10px]">{trade.reason}</span></div>
+          <div className="flex justify-between gap-3"><span className="text-gray-500">Reason</span><span className="text-gray-400 text-[10px] truncate max-w-[110px]">{trade.reason}</span></div>
         </div>
-      </div>
-    );
-  }
+      ))}
+    </div>
+  );
+}
 
-  if (posEntry) {
-    const { position } = posEntry.payload._positionMarker as { position: OpenPositionRow };
-    const entryPrice = parseFloat(position.entry_price);
-    const shares = parseFloat(position.shares);
-    const symbol = position.market.split(' ')[0];
-    const isGhost = position.ghost_mode === true;
-    return (
-      <div className={`card px-3 py-2 text-xs font-mono space-y-1.5 shadow-xl border-2 ${
-        isGhost ? 'border-amber-500/40' : 'border-indigo-500/30'
+/**
+ * Tooltip body for every position entry snapped to ONE chart point.
+ * Same array shape and ghost rules as `TradeCloseTip`; indigo is the live
+ * accent for entries, amber still means simulated.
+ */
+function PositionEntryTip({ events, label }: { events: PositionEvent[]; label: string }) {
+  const ghostEvents = events.filter(e => e.position.ghost_mode === true);
+  const liveCount = events.length - ghostEvents.length;
+  const allGhost = liveCount === 0;
+  const mixed    = ghostEvents.length > 0 && liveCount > 0;
+  const grouped  = events.length > 1;
+  return (
+    <div className={`card px-3 py-2 text-xs font-mono space-y-1.5 shadow-xl border-2 w-52 ${
+      ghostEvents.length > 0 ? 'border-amber-500/40' : 'border-indigo-500/30'
+    }`}>
+      <div className={`font-semibold flex items-center gap-1.5 ${
+        allGhost ? 'text-amber-300' : 'text-indigo-300'
       }`}>
-        <div className={`font-semibold flex items-center gap-1.5 ${
-          isGhost ? 'text-amber-300' : 'text-indigo-300'
-        }`}>
-          <span>{isGhost ? '👻' : '🎯'}</span>
-          <span>Position Entry</span>
-          {isGhost && (
-            <span className="ml-auto text-[10px] font-normal px-1.5 py-0.5 rounded bg-amber-500/15 border border-amber-500/30 text-amber-300">
-              GHOST
-            </span>
+        <span>{allGhost ? '👻' : '🎯'}</span>
+        <span>{grouped ? `Position Entries ×${events.length}` : 'Position Entry'}</span>
+        <span className="ml-auto flex items-center gap-1">
+          {ghostEvents.length > 0 && (
+            <GhostChip text={allGhost ? 'GHOST' : `${ghostEvents.length} GHOST`} />
           )}
-        </div>
-        <div className="text-gray-400 text-[10px] border-t border-gray-700 pt-1">{label}</div>
-        <div className="space-y-0.5 pt-1">
-          <div className="flex justify-between gap-3"><span className="text-gray-500">Strategy</span><span className="text-white">{position.strategy}</span></div>
-          <div className="flex justify-between gap-3"><span className="text-gray-500">Symbol</span><span className="text-white">{symbol}</span></div>
-          <div className="flex justify-between gap-3"><span className="text-gray-500">Side</span><span className="text-cyan-300">{position.side}</span></div>
-          <div className="flex justify-between gap-3"><span className="text-gray-500">Entry Price</span><span className="text-white">{entryPrice.toFixed(4)}</span></div>
-          <div className="flex justify-between gap-3"><span className="text-gray-500">Shares</span><span className="text-white">{shares.toFixed(2)}</span></div>
-          <div className="flex justify-between gap-3 pt-1 border-t border-gray-700">
-            <span className="text-gray-500">Status</span><span className="text-yellow-400">Open</span>
-          </div>
-        </div>
+          {mixed && <LiveChip text={`${liveCount} LIVE`} />}
+        </span>
       </div>
-    );
-  }
-
-  // No marker at this point — render nothing (value is shown in the top display)
-  return null;
+      <div className="text-gray-400 text-[10px] border-t border-gray-700 pt-1">{label}</div>
+      {events.map(({ position }, i) => (
+        <div key={`${position.token_id}-${i}`} className="space-y-0.5 pt-1 border-t border-gray-700">
+          <div className="flex justify-between gap-3">
+            <span className="text-gray-500">Strategy</span>
+            <span className="text-white truncate">{grouped && position.ghost_mode === true ? '👻 ' : ''}{position.strategy}</span>
+          </div>
+          <div className="flex justify-between gap-3"><span className="text-gray-500">Market</span><span className="text-white text-[10px] truncate max-w-[110px]">{position.market.split(' ').slice(0, 3).join(' ')}</span></div>
+          <div className="flex justify-between gap-3"><span className="text-gray-500">Side</span><span className="text-cyan-300">{position.side}</span></div>
+          <div className="flex justify-between gap-3"><span className="text-gray-500">Entry Price</span><span className="text-white">{parseFloat(position.entry_price).toFixed(4)}</span></div>
+          <div className="flex justify-between gap-3"><span className="text-gray-500">Shares</span><span className="text-white">{parseFloat(position.shares).toFixed(2)}</span></div>
+          <div className="flex justify-between gap-3"><span className="text-gray-500">Status</span><span className="text-yellow-400">Open</span></div>
+        </div>
+      ))}
+    </div>
+  );
 }
 
 export default function PnlChart({ data, startingBalance, ghostMode, currentPortfolio, trades, openPositions }: Props) {
@@ -143,14 +206,24 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
   // isTooltipActive survive), so the index is the only handle back to the row.
   // It is resolved against `chartDataWithMarkers` below.
   const [hoveredIndex, setHoveredIndex] = useState<number | null>(null);
-  // Custom marker tooltip — bypasses Recharts hit-area limitations
+  // Custom marker tooltip — bypasses Recharts hit-area limitations.
+  //
+  // Carries the whole EVENT ARRAY for the hovered point plus the point's raw
+  // `ts`. The ts is what the dot renderers compare against for the active
+  // halo: the arrays are rebuilt on every render, so identity comparison
+  // against a payload captured at mouse-enter time would silently stop
+  // matching after any refetch re-render.
   type MarkerTipState = {
     kind: 'trade';
-    data: { trade: TradeRow; pnl: number };
+    events: TradeEvent[];
+    pointTs: string;
+    label: string;
     x: number; y: number;
   } | {
     kind: 'position';
-    data: { position: OpenPositionRow };
+    events: PositionEvent[];
+    pointTs: string;
+    label: string;
     x: number; y: number;
   } | null;
   const [markerTip, setMarkerTip] = useState<MarkerTipState>(null);
@@ -241,8 +314,15 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
   // `time` string, and since the dot is painted on every point whose key is in
   // the map, a single trade rendered *two* overlay markers. `ts` is unique per
   // point, so each event marks exactly the point it snapped to.
-  const tradeMarkerMap = new Map<string, { pnl: number; trade: TradeRow }>();
-  const positionMarkerMap = new Map<string, { position: OpenPositionRow }>();
+  //
+  // Each key holds an ARRAY of events. With the 30s cadence, two closes (or
+  // two entries) inside one window snap to the same point; the previous
+  // single-value maps made `Map.set` keep only the last one, so the earlier
+  // event silently vanished from the chart. Always an undercount, never a
+  // spurious marker — and on a mixed ghost/live chart the dropped one could
+  // be the real-money trade.
+  const tradeMarkerMap = new Map<string, TradeEvent[]>();
+  const positionMarkerMap = new Map<string, PositionEvent[]>();
 
   tradesInRange.forEach(trade => {
     const tradeTime = new Date(trade.ts).getTime();
@@ -252,7 +332,10 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
       return Math.abs(pointTime - tradeTime) < Math.abs(closestTime - tradeTime) ? point : closest;
     }, chartData[0]);
     if (closestPoint) {
-      tradeMarkerMap.set(closestPoint.ts, { pnl: parseFloat(trade.pnl), trade });
+      const event: TradeEvent = { pnl: parseFloat(trade.pnl), trade };
+      const group = tradeMarkerMap.get(closestPoint.ts);
+      if (group) group.push(event);
+      else tradeMarkerMap.set(closestPoint.ts, [event]);
     }
   });
 
@@ -264,7 +347,9 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
       return Math.abs(pointTime - positionTime) < Math.abs(closestTime - positionTime) ? point : closest;
     }, chartData[0]);
     if (closestPoint) {
-      positionMarkerMap.set(closestPoint.ts, { position });
+      const group = positionMarkerMap.get(closestPoint.ts);
+      if (group) group.push({ position });
+      else positionMarkerMap.set(closestPoint.ts, [{ position }]);
     }
   });
 
@@ -274,8 +359,8 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
     ...point,
     tradeDot:    tradeMarkerMap.has(point.ts)    ? point.totalValue + yRange * 0.15 : undefined,
     positionDot: positionMarkerMap.has(point.ts) ? point.totalValue + yRange * 0.08 : undefined,
-    _tradeMarker:    tradeMarkerMap.get(point.ts),
-    _positionMarker: positionMarkerMap.get(point.ts),
+    _tradeMarkers:    tradeMarkerMap.get(point.ts),
+    _positionMarkers: positionMarkerMap.get(point.ts),
   }));
 
   // Header readout follows the cursor; falls back to the latest point when idle.
@@ -381,42 +466,9 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
               top: Math.max(markerTip.y - 10, 0),
             }}
           >
-            {markerTip.kind === 'trade' ? (() => {
-              const { trade, pnl } = markerTip.data;
-              const pnlColor = pnl > 0 ? 'text-emerald-400' : pnl < 0 ? 'text-red-400' : 'text-gray-400';
-              return (
-                <div className="card px-3 py-2 text-xs font-mono space-y-1.5 shadow-xl border-2 border-emerald-500/30 w-48">
-                  <div className="text-emerald-300 font-semibold flex items-center gap-1.5"><span>✅</span><span>Trade Close</span></div>
-                  <div className="space-y-0.5 pt-1">
-                    <div className="flex justify-between gap-3"><span className="text-gray-500">Strategy</span><span className="text-white truncate">{trade.strategy}</span></div>
-                    <div className="flex justify-between gap-3"><span className="text-gray-500">Market</span><span className="text-white text-[10px] truncate max-w-[110px]">{trade.market.split(' ').slice(0,3).join(' ')}</span></div>
-                    <div className="flex justify-between gap-3"><span className="text-gray-500">Side</span><span className="text-cyan-300">{trade.side}</span></div>
-                    <div className="flex justify-between gap-3"><span className="text-gray-500">Shares</span><span className="text-white">{parseFloat(trade.shares).toFixed(2)}</span></div>
-                    <div className="flex justify-between gap-3 pt-1 border-t border-gray-700">
-                      <span className="text-gray-500">P&L</span>
-                      <span className={`font-semibold ${pnlColor}`}>{pnl >= 0 ? '+' : ''}${pnl.toFixed(2)}</span>
-                    </div>
-                    <div className="flex justify-between gap-3"><span className="text-gray-500">Reason</span><span className="text-gray-400 text-[10px] truncate max-w-[110px]">{trade.reason}</span></div>
-                  </div>
-                </div>
-              );
-            })() : (() => {
-              const { position } = markerTip.data;
-              return (
-                <div className="card px-3 py-2 text-xs font-mono space-y-1.5 shadow-xl border-2 border-indigo-500/30 w-48">
-                  <div className="text-indigo-300 font-semibold flex items-center gap-1.5"><span>🎯</span><span>Position Entry</span></div>
-                  <div className="space-y-0.5 pt-1">
-                    <div className="flex justify-between gap-3"><span className="text-gray-500">Strategy</span><span className="text-white truncate">{position.strategy}</span></div>
-                    <div className="flex justify-between gap-3"><span className="text-gray-500">Market</span><span className="text-white text-[10px] truncate max-w-[110px]">{position.market.split(' ').slice(0,3).join(' ')}</span></div>
-                    <div className="flex justify-between gap-3"><span className="text-gray-500">Side</span><span className="text-cyan-300">{position.side}</span></div>
-                    <div className="flex justify-between gap-3"><span className="text-gray-500">Entry Price</span><span className="text-white">{parseFloat(position.entry_price).toFixed(4)}</span></div>
-                    <div className="flex justify-between gap-3"><span className="text-gray-500">Shares</span><span className="text-white">{parseFloat(position.shares).toFixed(2)}</span></div>
-                    <div className="flex justify-between gap-3 pt-1 border-t border-gray-700"><span className="text-gray-500">Status</span><span className="text-yellow-400">Open</span></div>
-                    {position.ghost_mode && <div className="flex justify-between gap-3"><span className="text-gray-500">Mode</span><span className="text-amber-400 text-[10px]">👻 ghost</span></div>}
-                  </div>
-                </div>
-              );
-            })()}
+            {markerTip.kind === 'trade'
+              ? <TradeCloseTip events={markerTip.events} label={markerTip.label} />
+              : <PositionEntryTip events={markerTip.events} label={markerTip.label} />}
           </div>
         )}
 
@@ -494,15 +546,15 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
               dot={(props: any) => {
                 if (props.payload.positionDot === undefined) return <g key={props.key} />;
                 const { cx, cy, payload } = props;
-                const isActive = markerTip?.kind === 'position' &&
-                  markerTip.data.position === payload._positionMarker?.position;
+                const events: PositionEvent[] = payload._positionMarkers ?? [];
+                const isActive = markerTip?.kind === 'position' && markerTip.pointTs === payload.ts;
                 return (
                   <g
                     key={props.key}
                     style={{ cursor: 'pointer' }}
                     onMouseEnter={(e) => {
                       const rect = chartContainerRef.current?.getBoundingClientRect();
-                      if (rect) setMarkerTip({ kind: 'position', data: payload._positionMarker, x: e.clientX - rect.left, y: e.clientY - rect.top });
+                      if (rect) setMarkerTip({ kind: 'position', events, pointTs: payload.ts, label: payload.time, x: e.clientX - rect.left, y: e.clientY - rect.top });
                     }}
                     onMouseLeave={() => setMarkerTip(null)}
                   >
@@ -511,6 +563,14 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
                     {isActive && <circle cx={cx} cy={cy} r={14} fill="#6366f1" fillOpacity={0.2} stroke="#6366f1" strokeWidth={1.5} strokeDasharray="3 2" />}
                     <circle cx={cx} cy={cy} r={8} fill="#6366f1" stroke="#0a0a12" strokeWidth={1.5} opacity={0.95} />
                     <text x={cx} y={cy} textAnchor="middle" dominantBaseline="central" fill="#ffffff" fontSize="10" fontWeight="600" fontFamily="monospace" pointerEvents="none">B</text>
+                    {/* Count badge: one dot per point, so a group of entries has to
+                        say it is a group or the extra events read as absent. */}
+                    {events.length > 1 && (
+                      <>
+                        <circle cx={cx + 8} cy={cy - 8} r={5.5} fill="#0a0a12" stroke="#6366f1" strokeWidth={1} />
+                        <text x={cx + 8} y={cy - 8} textAnchor="middle" dominantBaseline="central" fill="#c7d2fe" fontSize="8" fontWeight="700" fontFamily="monospace" pointerEvents="none">{events.length}</text>
+                      </>
+                    )}
                   </g>
                 );
               }}
@@ -526,17 +586,20 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
               dot={(props: any) => {
                 if (props.payload.tradeDot === undefined) return <g key={props.key} />;
                 const { cx, cy, payload } = props;
-                const pnl = payload._tradeMarker?.pnl ?? 0;
+                const events: TradeEvent[] = payload._tradeMarkers ?? [];
+                // The dot is one glyph for the whole group, so it is colored by
+                // the group's NET P&L — the number the point reads as at a
+                // glance. Per-event signs live in the tooltip.
+                const pnl = events.reduce((s: number, ev: TradeEvent) => s + ev.pnl, 0);
                 const color = pnl > 0 ? '#10b981' : pnl < 0 ? '#ef4444' : '#6b7280';
-                const isActive = markerTip?.kind === 'trade' &&
-                  markerTip.data.trade === payload._tradeMarker?.trade;
+                const isActive = markerTip?.kind === 'trade' && markerTip.pointTs === payload.ts;
                 return (
                   <g
                     key={props.key}
                     style={{ cursor: 'pointer' }}
                     onMouseEnter={(e) => {
                       const rect = chartContainerRef.current?.getBoundingClientRect();
-                      if (rect) setMarkerTip({ kind: 'trade', data: payload._tradeMarker, x: e.clientX - rect.left, y: e.clientY - rect.top });
+                      if (rect) setMarkerTip({ kind: 'trade', events, pointTs: payload.ts, label: payload.time, x: e.clientX - rect.left, y: e.clientY - rect.top });
                     }}
                     onMouseLeave={() => setMarkerTip(null)}
                   >
@@ -545,6 +608,14 @@ export default function PnlChart({ data, startingBalance, ghostMode, currentPort
                     {isActive && <circle cx={cx} cy={cy} r={14} fill={color} fillOpacity={0.2} stroke={color} strokeWidth={1.5} strokeDasharray="3 2" />}
                     <circle cx={cx} cy={cy} r={8} fill={color} stroke="#0a0a12" strokeWidth={1.5} opacity={0.95} />
                     <text x={cx} y={cy} textAnchor="middle" dominantBaseline="central" fill="#ffffff" fontSize="10" fontWeight="600" fontFamily="monospace" pointerEvents="none">S</text>
+                    {/* Count badge: one dot per point, so a group of closes has to
+                        say it is a group or the extra events read as absent. */}
+                    {events.length > 1 && (
+                      <>
+                        <circle cx={cx + 8} cy={cy - 8} r={5.5} fill="#0a0a12" stroke={color} strokeWidth={1} />
+                        <text x={cx + 8} y={cy - 8} textAnchor="middle" dominantBaseline="central" fill="#e5e7eb" fontSize="8" fontWeight="700" fontFamily="monospace" pointerEvents="none">{events.length}</text>
+                      </>
+                    )}
                   </g>
                 );
               }}
