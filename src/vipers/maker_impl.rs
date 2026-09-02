@@ -121,7 +121,18 @@ fn side_reject_reason(
                 ),
             ));
         }
-        return Some(("spread", format!("spread {:.3} < min {:.3}", spread, dc.maker_min_spread)));
+        // Say what the spread is WORTH, not just that it is under the knob. A
+        // fill nets `spread − 2` ticks when lifted (one tick given back
+        // improving the bid on entry, one undercutting the ask on exit) and a
+        // forced exit pays the fee in ticks on top of the move — see
+        // `maker_edge`. Nine live fills at the 4-tick default netted 1–2 ticks
+        // per win against ≥2.7 ticks per forced exit.
+        let nets = maker_edge::win_ticks(spread, dec!(1), dc.maker_resting_exit_ask_improvement_ticks);
+        let fee_ticks = maker_edge::exit_fee_ticks(crate::venues::taker_fee_rate(), bid_price);
+        return Some(("spread", format!(
+            "spread {:.3} < min {:.3} (nets {:.0} tick(s) if lifted; a forced exit pays \u{2248}{:.1} ticks of fee on top of the move)",
+            spread, dc.maker_min_spread, nets, fee_ticks
+        )));
     }
     if bid_price < dc.maker_min_entry_price {
         return Some(("min_entry", format!("bid {:.3} < min_entry {:.3}", bid_price, dc.maker_min_entry_price)));
@@ -398,6 +409,12 @@ fn clear_maker_fill_adopted_under_pull(token_id: &str) {
 /// backdated — the gate is exempted instead.)
 fn toxic_hold_satisfied(token_id: &str, held_secs: i64, min_hold_secs: i64) -> bool {
     maker_fill_adopted_under_pull(token_id) || held_secs >= min_hold_secs
+}
+
+/// Is an UNFILLED resting quote inside the window where the entry gate would
+/// refuse to place it? Mirrors that gate exactly, so the two cannot drift.
+fn expiry_pull_due(secs_to_expiry: i64, min_secs_to_expiry: i64) -> bool {
+    secs_to_expiry < min_secs_to_expiry
 }
 
 /// Price the resting post-only ASK for a filled maker position, or `None` when
@@ -1195,6 +1212,29 @@ impl Strategy for MakerStrategyImpl {
                     || position.is_some_and(|p| p.fill_effective_at(dc.ghost_mode).is_none());
 
                 if unfilled {
+                    // ── Expiry pull ─────────────────────────────────────────
+                    // The entry gate refuses to OPEN a quote inside
+                    // `maker_min_secs_to_expiry`; until now nothing pulled one
+                    // already resting there. Both existing pulls are PRICE
+                    // signals, so a quote placed with an hour left simply sat
+                    // through the final half hour — 2026-09-02, real money: a
+                    // YES $0.48 × 16.67 quote rested 41 minutes and was released
+                    // only by market rotation a minute AFTER close, while 63
+                    // entry refusals cited this very threshold. Those final
+                    // minutes are where adverse selection is worst: the outcome
+                    // is becoming known, and whoever lifts the quote knows it.
+                    // No re-entry cooldown is armed — entry is already gated
+                    // by the same threshold, so there is nothing to protect.
+                    if expiry_pull_due(secs_to_expiry, dc.maker_min_secs_to_expiry) {
+                        clear_maker_quote_oracle_baseline(token_id.as_str());
+                        tracing::info!(
+                            "⏳ Maker quote-pull (expiry): {}s to expiry < {}s — pulling resting {} quote",
+                            secs_to_expiry, dc.maker_min_secs_to_expiry,
+                            if token_id == market.yes_token { "YES" } else { "NO" },
+                        );
+                        pull_tokens.push(token_id.clone());
+                        continue;
+                    }
                     // Unfilled resting quote: arm/check the oracle-drift baseline.
                     let oracle_now = snapshot.oracle_price;
                     match maker_quote_oracle_drift(token_id.as_str(), oracle_now) {
@@ -2125,5 +2165,213 @@ mod maker_oracle_drift_exit_tests {
     #[test]
     fn zero_disables_the_drift_exit() {
         assert!(!maker_drift_breached(dec!(0.05), dec!(0)));
+    }
+}
+
+
+/// Unit economics of ONE Maker fill, in TICKS.
+///
+/// Ticks are the honest unit for this viper. Its win is a resting ask being
+/// lifted a few ticks above entry; its loss is a forced taker exit that pays the
+/// venue's quadratic fee `rate · x · (1 − x)` per share — which in ticks is
+/// `100 · rate · x · (1 − x)`, SYMMETRIC about $0.50 and at most 1.75 ticks
+/// (rate 0.07). Stated as a fraction of notional the same fee reads
+/// `rate · (1 − p)`, which makes the favorite half of the book look cheap
+/// (0.7%–3.4% against the underdog's 3.6%–6.3%); per share, where the Maker
+/// actually earns and pays, the two halves cost the same. So a wider entry
+/// band cannot buy the Maker cheaper exits. What decides expectancy is the
+/// spread the book offers against the fee-plus-move a forced exit costs.
+///
+/// The arithmetic is deterministic, unlike the win rate, and every function
+/// here is pinned against the nine live fills of 2026-08-30 – 2026-09-01.
+pub mod maker_edge {
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+
+    const TICK: Decimal = dec!(0.01);
+
+    /// The taker fee on one share sold at `exit_price`, in ticks.
+    pub fn exit_fee_ticks(fee_rate: Decimal, exit_price: Decimal) -> Decimal {
+        if exit_price <= Decimal::ZERO || exit_price >= Decimal::ONE {
+            return Decimal::ZERO;
+        }
+        fee_rate * exit_price * (Decimal::ONE - exit_price) / TICK
+    }
+
+    /// Ticks netted when the resting ask is lifted: the book's spread, less the
+    /// tick given back to improve the bid on entry, less the tick(s) the ask
+    /// undercuts the offer by on exit. No fee — both legs are post-only.
+    pub fn win_ticks(spread: Decimal, entry_improvement_ticks: Decimal, ask_improvement_ticks: i64) -> Decimal {
+        let improve = Decimal::from(ask_improvement_ticks.max(0));
+        (spread / TICK - entry_improvement_ticks - improve).max(Decimal::ZERO)
+    }
+
+    /// Ticks a forced (FAK) exit costs: the adverse move from entry to the exit
+    /// price, plus the fee charged at the exit price.
+    pub fn loss_ticks(fee_rate: Decimal, entry: Decimal, exit: Decimal) -> Decimal {
+        (entry - exit) / TICK + exit_fee_ticks(fee_rate, exit)
+    }
+
+    /// Dollars a forced exit realizes on `shares`: gross move minus exit fee.
+    pub fn forced_exit_pnl(fee_rate: Decimal, entry: Decimal, exit: Decimal, shares: Decimal) -> Decimal {
+        (exit - entry) * shares - fee_rate * exit * (Decimal::ONE - exit) * shares
+    }
+
+    /// The win rate at which expected ticks per fill is zero: `L / (W + L)`.
+    pub fn break_even_win_rate(win_ticks: Decimal, loss_ticks: Decimal) -> Decimal {
+        let total = win_ticks + loss_ticks;
+        if total <= Decimal::ZERO { return Decimal::ONE; }
+        loss_ticks / total
+    }
+
+    /// Spread (in ticks) a book must offer for positive expectancy at an
+    /// assumed win rate, given what a forced exit costs and the two ticks of
+    /// improvement the round trip gives back.
+    pub fn required_spread_ticks(loss_ticks: Decimal, win_rate: Decimal, improvement_ticks_total: Decimal) -> Decimal {
+        if win_rate <= Decimal::ZERO { return Decimal::MAX; }
+        (loss_ticks * (Decimal::ONE - win_rate) / win_rate).ceil() + improvement_ticks_total
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use crate::helpers::dynamic_config::DynamicConfig;
+
+        const RATE: Decimal = dec!(0.07);
+
+        /// (entry, exit, shares, booked P&L) for every forced Maker exit in the
+        /// 17-trade live record. #19 is the bug-#29 exit-FAK collapse and is
+        /// included only to show the formula still holds — its size is not
+        /// representative of a correct exit path.
+        const LOSSES: [(Decimal, Decimal, Decimal, Decimal); 6] = [
+            (dec!(0.31), dec!(0.3061), dec!(3),  dec!(-0.056)),  // #13 ToxicFill
+            (dec!(0.42), dec!(0.40),   dec!(19), dec!(-0.699)),  // #1  ToxicFill OBI −0.53, 59s
+            (dec!(0.42), dec!(0.39),   dec!(19), dec!(-0.886)),  // #7  ToxicFill OBI −0.77, 30s
+            (dec!(0.28), dec!(0.2448), dec!(42), dec!(-2.023)),  // #15 ToxicFill OBI −0.67
+            (dec!(0.31), dec!(0.2702), dec!(38), dec!(-2.037)),  // #14 ToxicFill OBI −0.91
+            (dec!(0.30), dec!(0.19),   dec!(32), dec!(-3.865)),  // #19 Catastrophic (bug #29)
+        ];
+
+        /// Every one of the six losses is exactly "price move plus exit fee at
+        /// the exit price" — nothing else is in them. This is the verification
+        /// that the fee formula fitted from six fills also explains the losses,
+        /// and it is what makes the rest of this module's arithmetic sound.
+        #[test]
+        fn every_production_maker_loss_reproduces_from_the_move_plus_the_exit_fee() {
+            for (entry, exit, shares, booked) in LOSSES {
+                let predicted = forced_exit_pnl(RATE, entry, exit, shares);
+                assert!((predicted - booked).abs() < dec!(0.002),
+                    "entry {entry} → {exit} × {shares}: predicted {predicted:.4}, booked {booked}");
+            }
+        }
+
+        /// The fee is the FLOOR of a forced exit, not its bulk: across the six
+        /// it is about a fifth of the dollars lost, the rest is the adverse move
+        /// the exit path let run. Both halves have to shrink.
+        #[test]
+        fn the_exit_fee_is_a_fifth_of_the_losses_and_the_move_is_the_rest() {
+            let mut fee_total = Decimal::ZERO;
+            let mut loss_total = Decimal::ZERO;
+            for (_, exit, shares, booked) in LOSSES {
+                fee_total += RATE * exit * (Decimal::ONE - exit) * shares;
+                loss_total += -booked;
+            }
+            let share = fee_total / loss_total;
+            assert!(share > dec!(0.20) && share < dec!(0.25), "fee share of losses was {share:.3}");
+        }
+
+        /// The fee in ticks is symmetric about $0.50: an exit at $0.42 and one
+        /// at $0.58 pay the same per share. The "cheap-fee half of the book"
+        /// exists only as a fraction of notional — and the Maker's win is a
+        /// count of ticks per share, so that framing does not apply to it.
+        /// Widening `maker_max_entry_price` past 0.48 therefore buys nothing on
+        /// the fee side.
+        #[test]
+        fn the_exit_fee_in_ticks_is_the_same_on_both_halves_of_the_book() {
+            for (under, fav) in [(dec!(0.42), dec!(0.58)), (dec!(0.30), dec!(0.70)), (dec!(0.10), dec!(0.90))] {
+                assert_eq!(exit_fee_ticks(RATE, under), exit_fee_ticks(RATE, fav));
+            }
+            assert_eq!(exit_fee_ticks(RATE, dec!(0.50)), dec!(1.75), "the fee peaks at 1.75 ticks at mid");
+            // And it only gets cheap at the EXTREMES, both ends alike.
+            assert!(exit_fee_ticks(RATE, dec!(0.10)) < dec!(0.7));
+        }
+
+        /// At the shipped `maker_min_spread` a lifted fill nets two ticks, and
+        /// the cheapest possible forced exit — the bid one tick below the fill,
+        /// plus the fee — costs about 2.7. Even that best case needs a win rate
+        /// above a coin flip, on fills that are adversely selected by
+        /// construction. That is the structural reason the Maker bled.
+        #[test]
+        fn at_the_shipped_min_spread_even_a_coin_flip_loses() {
+            let dc = DynamicConfig::default();
+            let win = win_ticks(dc.maker_min_spread, dec!(1), dc.maker_resting_exit_ask_improvement_ticks);
+            assert_eq!(win, dec!(2), "4-tick spread nets 2 ticks when lifted");
+            let entry = dec!(0.42);
+            let cheapest_loss = loss_ticks(RATE, entry, entry - dec!(0.01));
+            assert!(cheapest_loss > dec!(2.6) && cheapest_loss < dec!(2.8), "was {cheapest_loss}");
+            let be = break_even_win_rate(win, cheapest_loss);
+            assert!(be > dec!(0.5), "break-even win rate {be:.3} must exceed 50% at the default spread");
+        }
+
+        /// The two live wins netted exactly 1 and 2 ticks; the five ToxicFill
+        /// losses cost 2.7 to 5.7 ticks each. With the observed forced-exit
+        /// cost the break-even win rate is about two thirds — and at a 6-tick
+        /// spread it drops to roughly a coin flip, at 8 ticks well below one.
+        #[test]
+        fn a_wider_spread_is_what_moves_the_break_even_below_a_coin_flip() {
+            // Mean forced-exit cost of the five ToxicFill exits (#19 excluded).
+            let mut sum = Decimal::ZERO;
+            for (entry, exit, _, _) in &LOSSES[..5] {
+                sum += loss_ticks(RATE, *entry, *exit);
+            }
+            let typical_loss = sum / dec!(5);
+            assert!(typical_loss > dec!(4.0) && typical_loss < dec!(4.6), "was {typical_loss}");
+
+            let be = |spread: Decimal| break_even_win_rate(win_ticks(spread, dec!(1), 1), typical_loss);
+            assert!(be(dec!(0.04)) > dec!(0.65), "4 ticks: {:.3}", be(dec!(0.04)));
+            assert!(be(dec!(0.06)) > dec!(0.49) && be(dec!(0.06)) < dec!(0.55), "6 ticks: {:.3}", be(dec!(0.06)));
+            assert!(be(dec!(0.08)) < dec!(0.45), "8 ticks: {:.3}", be(dec!(0.08)));
+        }
+
+        /// The knob to set, from an assumed win rate: at a coin flip the book
+        /// must offer 5 ticks against the cheapest forced exit and 7 against
+        /// the observed one. `maker_min_spread` is already in these units.
+        #[test]
+        fn the_required_spread_at_a_coin_flip_is_five_to_seven_ticks() {
+            let cheapest = loss_ticks(RATE, dec!(0.42), dec!(0.41));
+            assert_eq!(required_spread_ticks(cheapest, dec!(0.5), dec!(2)), dec!(5));
+            let observed = dec!(4.3);
+            assert_eq!(required_spread_ticks(observed, dec!(0.5), dec!(2)), dec!(7));
+        }
+    }
+}
+
+#[cfg(test)]
+mod expiry_pull_tests {
+    use super::expiry_pull_due;
+
+    /// 2026-09-02, "Bitcoin Up or Down - September 2, 12:00PM-4:00PM ET": a
+    /// YES $0.48 × 16.67 quote placed at 15:20:56 with 2344s left rested until
+    /// rotation at 16:01:06. With `maker_min_secs_to_expiry` = 1800 it must be
+    /// pulled the moment the entry gate would have refused it — at 15:30:00,
+    /// not left out for the final half hour.
+    #[test]
+    fn a_resting_quote_is_pulled_once_inside_the_entry_gates_expiry_window() {
+        assert!(!expiry_pull_due(2344, 1800), "at placement, 2344s left: keep resting");
+        assert!(!expiry_pull_due(1800, 1800), "exactly at the threshold the gate still admits");
+        assert!(expiry_pull_due(1799, 1800), "one second inside: pull");
+        assert!(expiry_pull_due(-66, 1800), "past close (the 16:01:06 state): certainly pull");
+    }
+
+    /// The pull and the entry gate share one threshold and one comparison, so
+    /// a quote can never rest where a new one would be refused.
+    #[test]
+    fn the_pull_is_the_exact_mirror_of_the_entry_gate() {
+        for min in [600i64, 1800, 3600] {
+            for secs in [min - 1, min, min + 1] {
+                let entry_refuses = secs < min;
+                assert_eq!(expiry_pull_due(secs, min), entry_refuses, "min={min} secs={secs}");
+            }
+        }
     }
 }

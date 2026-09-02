@@ -316,7 +316,7 @@ function RtbModal({
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/70 backdrop-blur-sm">
       <div className="bg-[#13131f] border border-amber-500/30 rounded-lg shadow-2xl p-6 max-w-md w-full mx-4">
         <h3 className="text-lg font-semibold text-amber-400 mb-3 flex items-center gap-2">
-          🛬 Return to Base Confirmation
+          🎯 Close Now
         </h3>
         <div className="space-y-2 text-sm text-gray-300 mb-5">
           <p><strong className="text-white">Venue:</strong> {entry.venue ? (VENUE_LABEL[entry.venue] ?? entry.venue) : entry.shard.toUpperCase()}</p>
@@ -328,11 +328,12 @@ function RtbModal({
           </p>
           <p><strong className="text-white">Shares:</strong> {entry.shares.toFixed(2)}</p>
           <div className="bg-orange-500/10 border border-orange-500/30 rounded p-3 mt-3">
-            <p className="text-orange-300 font-semibold mb-1">⚠️ Warning:</p>
+            <p className="text-orange-300 font-semibold mb-1">⚠️ What this does:</p>
             <ul className="text-xs text-gray-400 space-y-1 list-disc list-inside">
-              <li>This places a <strong>market order (FAK)</strong></li>
+              <li>Sells the <strong>whole position immediately</strong> at the live bid with a fill-or-kill market order (FAK)</li>
               <li>Taker fees apply (~2% on Polymarket)</li>
-              <li>Alternative: let position settle naturally (no fees)</li>
+              <li>The squadron keeps patrolling — this closes one position, it does not stand anything down</li>
+              <li>Alternative: let the position settle naturally (no fees)</li>
             </ul>
           </div>
         </div>
@@ -349,7 +350,7 @@ function RtbModal({
             disabled={loading}
             className="flex-1 px-4 py-2 rounded bg-orange-500 hover:bg-orange-600 text-white font-semibold transition-colors disabled:opacity-50"
           >
-            {loading ? 'Closing…' : '🛬 Confirm RTB'}
+            {loading ? 'Closing…' : '🎯 Close Now'}
           </button>
         </div>
       </div>
@@ -542,13 +543,13 @@ export default function TradelogPage({ availableAssets }: Props) {
         }),
       });
       if (!res.ok) {
-        alert(`RTB failed: ${await res.text()}`);
+        alert(`Close Now failed: ${await res.text()}`);
       } else {
         alert('Position closed! Refreshing…');
         window.location.reload();
       }
     } catch (err) {
-      alert(`RTB error: ${err}`);
+      alert(`Close Now error: ${err}`);
     } finally {
       setRtbLoading(false);
       setRtbEntry(null);
@@ -840,9 +841,9 @@ export default function TradelogPage({ availableAssets }: Props) {
                           <button
                             onClick={() => setRtbEntry(e)}
                             className="px-2 py-0.5 text-[10px] rounded bg-orange-500/10 text-orange-300 border border-orange-500/30 hover:bg-orange-500/20 transition-colors"
-                            title="Return to Base: manually close this position"
+                            title="Close Now: sell this position at the live bid immediately"
                           >
-                            🛬 RTB
+                            🎯 Close Now
                           </button>
                         )}
                       </td>

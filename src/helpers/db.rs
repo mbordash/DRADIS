@@ -2699,6 +2699,67 @@ pub async fn market_has_pending_redemption_settlement(pool: &SqlitePool, market:
         .is_some()
 }
 
+/// Tokens whose `open_positions` row the chain sweep has just booked and
+/// deleted, waiting for the venue loop that owns the in-memory position map
+/// to release the matching entry.
+///
+/// The sweep is DB-only by design and has no handle on the session's position
+/// map, so until now nothing released a settle-held position from memory:
+/// `cleanup_expired_positions` only ever looks at the CURRENT market's tokens,
+/// `auto_settle` never touches the map, and a rotated-away token matches
+/// nothing. Observed 2026-09-01: a FairValue leg the sweep had booked was
+/// still being evaluated 29 minutes later, and its $4.76 counted against a
+/// $12 exposure cap for the rest of the session. Process-global for the same
+/// reason as the venue registries above; a restart empties both the set and
+/// the map it feeds, so nothing can go stale across one.
+fn released_positions() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static REG: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+    REG.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
+fn note_position_released(token_id: &str) {
+    if let Ok(mut reg) = released_positions().lock() {
+        reg.insert(token_id.to_string());
+    }
+}
+
+/// Drain the tokens the sweep has closed since the last call. Each venue loop
+/// calls this on its own cadence and drops the matching map entries.
+pub fn take_released_positions() -> Vec<String> {
+    match released_positions().lock() {
+        Ok(mut reg) => reg.drain().collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// Delete a LIVE `pending` row for `token_id` — an order that was placed and
+/// never filled.
+///
+/// The rotation half of the pending-row leak (the live twin of the ghost-row
+/// fix). At rotation the venue confirms every resting order cancelled, so a
+/// `pending` row for the market being left behind describes an order that no
+/// longer exists. Nothing else closed it for an hour: the purge protects
+/// pending rows through `STALE_PENDING_GRACE_SECS` (60 min), so the Control
+/// Tower showed a "Launch" for a dead quote until then. Observed 2026-09-02:
+/// `MakerStrategy YES 0.48 pending` still open a minute after the rotation
+/// cancel. Ghost rows are untouched — they have their own path.
+pub async fn close_pending_open_position(pool: &SqlitePool, token_id: &str) {
+    match sqlx::query(
+        "DELETE FROM open_positions WHERE token_id = ? AND status = 'pending' AND ghost_mode = 0"
+    )
+        .bind(token_id)
+        .execute(pool)
+        .await
+    {
+        Ok(r) if r.rows_affected() > 0 => info!(
+            "🧹 Closed {} pending row(s) for {} — its resting order was cancelled at rotation",
+            r.rows_affected(), token_id,
+        ),
+        Ok(_) => {}
+        Err(e) => error!("❌ DB close_pending_open_position failed for {}: {}", token_id, e),
+    }
+}
+
 /// Delete every `open_positions` row whose token_id is NOT in `live_token_ids`.
 ///
 /// Called by the chain-sync task after it fetches the wallet's actual live positions
@@ -2906,6 +2967,7 @@ pub async fn purge_stale_open_positions(
                 error!("❌ DB purge_stale_open_positions delete failed for id {}: {}", id, e);
             } else {
                 purged += 1;
+            note_position_released(&token_id);
             }
             continue;
         }
@@ -2977,6 +3039,7 @@ pub async fn purge_stale_open_positions(
             error!("❌ DB purge_stale_open_positions delete failed for id {}: {}", id, e);
         } else {
             purged += 1;
+            note_position_released(&token_id);
         }
     }
     purged
@@ -5600,5 +5663,59 @@ mod shard_scoping_tests {
     #[tokio::test]
     async fn an_unknown_asset_returns_no_pool() {
         assert!(pools_for_opt(Some("scopetest-does-not-exist")).is_empty());
+    }
+}
+
+#[cfg(test)]
+mod released_position_tests {
+    use super::*;
+    use crate::state::TradeScope;
+    use rust_decimal_macros::dec;
+
+    async fn mem_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        init_schema(&pool).await.unwrap();
+        run_migrations(&pool).await;
+        pool
+    }
+
+    /// The 2026-09-01 FairValue leg: the sweep booked and deleted its row, but
+    /// nothing told the session map, so the $4.76 position kept counting
+    /// against a $12 exposure cap for 29 minutes. A row the sweep deletes must
+    /// be published so the map's owner can release it.
+    #[tokio::test]
+    async fn a_row_the_sweep_deletes_is_published_for_the_map_to_release() {
+        let pool = mem_pool().await;
+        let tok = "tok-b27-4798783897131821";
+        record_open_position(&pool, &TradeScope::crypto("btc", "polymarket-intl", "btc"), "btc-open",
+            "FairValueStrategy", tok, "Bitcoin Up or Down - September 1, 8PM ET", "NO",
+            dec!(0.934), dec!(5.093297), false).await;
+        let live = std::collections::HashSet::new();
+        let mut resolved = std::collections::HashMap::new();
+        resolved.insert(tok.to_string(), (dec!(1.0), Decimal::ZERO));
+        let purged = purge_stale_open_positions(&pool, &live, &resolved, &std::collections::HashSet::new()).await;
+        assert_eq!(purged, 1, "the settled row must be booked and deleted");
+        let released = take_released_positions();
+        assert!(released.iter().any(|t| t == tok), "the deleted row's token must be published");
+        assert!(!take_released_positions().iter().any(|t| t == tok), "a drain empties the set");
+    }
+
+    /// Only the live pending row goes: a confirmed live row is a real holding
+    /// the chain reconciles, and a ghost row has its own rotation path.
+    #[tokio::test]
+    async fn rotation_closes_only_the_live_pending_row_for_a_token() {
+        let pool = mem_pool().await;
+        let scope = TradeScope::crypto("btc", "polymarket-intl", "btc");
+        record_open_position_with_status(&pool, &scope, "btc-open", "MakerStrategy", "tok-b31", "Bitcoin Up or Down - September 2, 12:00PM-4:00PM ET", "YES", dec!(0.48), dec!(16.67), false, "pending").await;
+        record_open_position_with_status(&pool, &scope, "btc-open", "FairValueStrategy", "tok-b31", "same market", "YES", dec!(0.50), dec!(10), false, "confirmed").await;
+        record_open_position_with_status(&pool, &scope, "btc-open", "ArbitrageStrategy", "tok-b31", "same market", "YES", dec!(0.47), dec!(5), true, "pending").await;
+        close_pending_open_position(&pool, "tok-b31").await;
+        let left: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT strategy, COALESCE(status,'confirmed'), ghost_mode FROM open_positions WHERE token_id = 'tok-b31' ORDER BY strategy"
+        ).fetch_all(&pool).await.unwrap();
+        assert_eq!(left, vec![
+            ("ArbitrageStrategy".to_string(), "pending".to_string(), 1),
+            ("FairValueStrategy".to_string(), "confirmed".to_string(), 0),
+        ]);
     }
 }

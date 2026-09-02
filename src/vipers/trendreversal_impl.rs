@@ -231,6 +231,7 @@ impl Strategy for TrendReversalStrategyImpl {
                 // "TrendCaptureStrategy" tag too so any position opened under the old
                 // name (pre-rename) is still exposure-counted across a deploy.
                 .filter(|(k, _)| (k.strategy == "TrendReversalStrategy" || k.strategy == "TrendCaptureStrategy") && k.squadron == ctx.squadron_id)
+                .filter(|(_, p)| p.counts_toward_exposure(chrono::Utc::now()))
                 .map(|(_, p)| p.shares * p.avg_entry)
                 .sum::<Decimal>()
         };

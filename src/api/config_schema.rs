@@ -561,6 +561,8 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Entry-relative stop loss (0.12 = 12%). Catastrophic bypass at 2× this.").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "fairvalue_obi_adverse_block", "OBI Adverse Block", "decimal", true,
             "Reject entries when the book on the side being bought is this offer-heavy. OBI = (bid_depth − ask_depth)/total; −1.0 is an all-offer book with no bid support, which cannot be exited without giving back far more than the stop width.").range(-1.0, 0.0).step(0.05));
+        v.push(F::new(g, e, "fairvalue_obi_clear_secs", "OBI Clear Dwell", "secs", true,
+            "How long the book on the side being bought must stay clear of the OBI block before an entry is allowed. The block reads a single sample, and at the best price that is often one or two orders — it can flip from all-offers to clear and back within seconds. Requiring the book to stay clear for this long keeps a momentary flicker from admitting a buy into a market with no bid support. 0 restores the instant check.").min(0.0).step(5.0).unit("s"));
         v.push(F::new(g, e, "fairvalue_target_profit_pct", "Take Profit", "pct", false,
             "Entry-relative take profit (0.20 = 20%). Skipped in favor of fee-free settlement when the model is ≥0.90 near expiry.").range(0.0, 1.0).step(0.01));
         v.push(F::new(g, e, "fairvalue_base_edge", "Base Edge", "price", false,
@@ -640,6 +642,14 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(g, e, "exit_reconcile_max_deviation", "Exit Reconcile Band", "decimal", true,
             "When the exchange rejects a sell because the shares are already gone, the profit or loss is taken from how much your collateral actually moved across the round trip. Trust it only if the exit price that implies lands within this distance of the bid showing at the time — a wider gap means something else moved collateral and the figure cannot be relied on, so the trade is booked with zero P&L rather than a guess. Raise it if genuine exits are being left unreconciled; lower it to be stricter.")
             .range(0.0, 0.50).step(0.01));
+        // Filed here rather than under Global: an operator tuning how an exit
+        // behaves looks at the exit card, and this applies to every viper's
+        // exit, not to one strategy. The 1s minimum is also enforced in code
+        // (`DynamicConfig::exit_retry_cooldown_secs_floored`), because the PATCH
+        // path does not validate against this schema.
+        v.push(F::new(g, e, "exit_retry_cooldown_secs", "Exit Retry Pace", "secs", true,
+            "Seconds between one strategy's exit attempts. When a sell finds no liquidity the engine retries at the fresh bid after this pause. Lower it so a position on a collapsing book is retried sooner (each second of waiting on a fast-falling bid costs price); raise it if exits are hammering a thin book. Cannot go below 1s: below that the engine would resubmit against the same order-book snapshot many times a second.")
+            .min(1.0).step(1.0).unit("s"));
     }
 
     {

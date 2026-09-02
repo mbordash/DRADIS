@@ -160,6 +160,70 @@ struct FairValueGlobals {
     /// Keyed the same way as `sl_counted`: same token AND same open instant is
     /// the same position, so a genuine re-entry starts clean.
     veto_withdrawn: StdMutex<HashMap<String, DateTime<Utc>>>,
+    /// When each (condition_id, side) book last became — and has since stayed —
+    /// clear of `fairvalue_obi_adverse_block`. Feeds the OBI clear dwell.
+    obi_clear_since: StdMutex<HashMap<(String, bool), Instant>>,
+}
+
+/// Record this tick's OBI verdict for one (market, side): a clear book keeps
+/// its first-clear instant, a breached one forgets it. Pure so the dwell rule
+/// is pinned by tests with explicit clocks.
+fn obi_dwell_update(
+    since: &mut HashMap<(String, bool), Instant>,
+    condition_id: &str,
+    want_yes: bool,
+    clear: bool,
+    now: Instant,
+) {
+    let key = (condition_id.to_string(), want_yes);
+    if clear {
+        since.entry(key).or_insert(now);
+    } else {
+        since.remove(&key);
+    }
+}
+
+/// Has this (market, side) been continuously clear for at least `dwell_secs`?
+/// A dwell of zero restores the instantaneous gate exactly.
+fn obi_dwell_satisfied(
+    since: &HashMap<(String, bool), Instant>,
+    condition_id: &str,
+    want_yes: bool,
+    now: Instant,
+    dwell_secs: u64,
+) -> bool {
+    if dwell_secs == 0 { return true; }
+    since.get(&(condition_id.to_string(), want_yes))
+        .is_some_and(|first| now.duration_since(*first).as_secs() >= dwell_secs)
+}
+
+/// The market FairValue prices and gates on this tick: the hourly book
+/// when preferred and viable, otherwise the Window/Daily maker venue.
+///
+/// ONE binding for both the pricing and the liquidity veto. The veto used
+/// to read `ctx.snapshot` on its own, which is the hourly book whatever
+/// this returns — so on the maker venue it measured a market the entry was
+/// not buying. Pinned by `the_obi_veto_reads_the_book_the_entry_prices_from`.
+fn entry_book<'a>(ctx: &'a StrategyContext, prefer_hourly: bool) -> (&'a MarketConfig, &'a MarketSnapshot) {
+    let hourly_viable = ctx.market.strike_price.is_some_and(|s| s > dec!(0))
+        && ctx.market.market_close_time
+            .is_some_and(|ct| (ct - Utc::now()).num_seconds() >= config::FAIRVALUE_MIN_SECS_TO_EXPIRY);
+    match (&ctx.maker_market, &ctx.maker_snapshot) {
+        (Some(mk_mkt), Some(mk_snap)) => {
+            if prefer_hourly && hourly_viable { (&ctx.market, &ctx.snapshot) } else { (mk_mkt, mk_snap) }
+        }
+        _ => (&ctx.market, &ctx.snapshot),
+    }
+}
+
+/// Order-book imbalance on the side being bought, from the given book.
+/// No depth at all reads as maximally adverse rather than neutral: an
+/// empty book is the case the gate most needs to reject, and a 0/0 ratio
+/// would otherwise sail through as 0.0.
+fn side_obi_of(snap: &MarketSnapshot, want_yes: bool, whole_book: bool) -> Decimal {
+    let (bid_depth, ask_depth) = if want_yes { snap.yes_depths(whole_book) } else { snap.no_depths(whole_book) };
+    let total_depth = bid_depth + ask_depth;
+    if total_depth > dec!(0) { (bid_depth - ask_depth) / total_depth } else { dec!(-1) }
 }
 
 impl FairValueGlobals {
@@ -176,6 +240,7 @@ impl FairValueGlobals {
             fair_history:     StdMutex::new(HashMap::new()),
             sl_counted:       StdMutex::new(HashMap::new()),
             veto_withdrawn:   StdMutex::new(HashMap::new()),
+            obi_clear_since:  StdMutex::new(HashMap::new()),
         }
     }
 }
@@ -613,20 +678,7 @@ impl Strategy for FairValueStrategyImpl {
         // observed edge distribution does reach. So prefer the hourly whenever it
         // is structurally usable, and fall back to the daily only when it is not.
         // `fairvalue_prefer_hourly` restores the old daily-first order if needed.
-        let hourly_viable = ctx.market.strike_price.is_some_and(|s| s > dec!(0))
-            && ctx.market.market_close_time
-                .is_some_and(|ct| (ct - Utc::now()).num_seconds() >= config::FAIRVALUE_MIN_SECS_TO_EXPIRY);
-
-        let (market, snap) = match (&ctx.maker_market, &ctx.maker_snapshot) {
-            (Some(mk_mkt), Some(mk_snap)) => {
-                if dc.fairvalue_prefer_hourly && hourly_viable {
-                    (&ctx.market, &ctx.snapshot)
-                } else {
-                    (mk_mkt, mk_snap)
-                }
-            }
-            _ => (&ctx.market, &ctx.snapshot),
-        };
+        let (market, snap) = entry_book(ctx, dc.fairvalue_prefer_hourly);
 
         // ── Structural requirements ──────────────────────────────────────────
         let strike = match market.strike_price.and_then(|s| s.to_f64()) {
@@ -645,6 +697,22 @@ impl Strategy for FairValueStrategyImpl {
         if snap_age > config::FAIRVALUE_MAX_SNAPSHOT_AGE_SECS {
             idle("snapshot stale");
             return Ok(StrategySignal::NoSignal);
+        }
+        // OBI clear dwell bookkeeping, both sides, every tick this book is
+        // live — so by the time the edge has persisted its 45s the book's own
+        // history is already known, and a clean book costs no extra wait.
+        {
+            let now = Instant::now();
+            let mut since = globals(&ctx.crypto_filter).obi_clear_since.lock().unwrap();
+            for want_yes in [true, false] {
+                let clear = side_obi_of(snap, want_yes, dc.obi_use_whole_book) >= dc.fairvalue_obi_adverse_block;
+                obi_dwell_update(&mut since, &market.condition_id, want_yes, clear, now);
+            }
+            // Keys for markets this squadron no longer prices are dead weight.
+            let live: Vec<String> = std::iter::once(ctx.market.condition_id.clone())
+                .chain(ctx.maker_market.as_ref().map(|m| m.condition_id.clone()))
+                .collect();
+            since.retain(|(cid, _), _| live.contains(cid));
         }
 
         // ── Model inputs: self-sampled realized vol (sampled above) ──────────
@@ -831,6 +899,7 @@ impl Strategy for FairValueStrategyImpl {
             }
             let current_exposure: Decimal = pos_map.iter()
                 .filter(|(k, _)| (k.strategy == "FairValueStrategy") && k.squadron == ctx.squadron_id)
+                .filter(|(_, p)| p.counts_toward_exposure(chrono::Utc::now()))
                 .map(|(_, p)| p.shares * p.avg_entry)
                 .sum();
             if current_exposure + dc.fairvalue_trade_size_usdc > dc.fairvalue_max_exposure_usdc {
@@ -886,20 +955,12 @@ impl Strategy for FairValueStrategyImpl {
         // and the catastrophic stop filled at −30% against a nominal 12% stop.
         // Across 25 trades, entries into an adverse book carried −3.04 of
         // FairValue's −5.71 cumulative P&L.
-        let (bid_depth, ask_depth) = if want_yes {
-            ctx.snapshot.yes_depths(dc.obi_use_whole_book)
-        } else {
-            ctx.snapshot.no_depths(dc.obi_use_whole_book)
-        };
-        let total_depth = bid_depth + ask_depth;
-        // No depth at all reads as maximally adverse rather than neutral: an
-        // empty book is the case this gate most needs to reject, and a 0/0
-        // ratio would otherwise sail through as 0.0.
-        let side_obi = if total_depth > dec!(0) {
-            (bid_depth - ask_depth) / total_depth
-        } else {
-            dec!(-1)
-        };
+        // Measured on `snap` — the book the entry is priced from — not on
+        // `ctx.snapshot`, which is always the HOURLY book. Until 2026-09-02
+        // this read `ctx.snapshot` unconditionally, so whenever FairValue was
+        // trading the Window/Daily venue the liquidity check was run against
+        // a different market from the one being bought.
+        let side_obi = side_obi_of(snap, want_yes, dc.obi_use_whole_book);
         if side_obi < dc.fairvalue_obi_adverse_block {
             // Throttled: an offer-heavy book persists for minutes while this
             // gate re-evaluates every 50ms tick. The idle() reason below is
@@ -921,6 +982,24 @@ impl Strategy for FairValueStrategyImpl {
             }
             idle("OBI adverse — no bid support on the entry side");
             return Ok(StrategySignal::NoSignal);
+        }
+        // ── OBI clear dwell ─────────────────────────────────────────────────
+        // The block above is a single 50ms sample of a figure that, at the
+        // touch, is one or two resting orders wide. 2026-09-02 17:44: YES OBI
+        // read −0.987 (all offers) at 17:44:36 and the entry fired at 17:44:39
+        // on the first tick the touch flickered clear — while the whole book
+        // moved only +0.14 → −0.32 across the surrounding three minutes. The
+        // 2026-08-16 loss recorded above has the same shape. The edge has to
+        // persist 45s before it may act; the book's support now has to persist
+        // too. A book that genuinely clears stays clear for seconds; one order
+        // arriving at the touch does not.
+        {
+            let now = Instant::now();
+            let since = globals(&ctx.crypto_filter).obi_clear_since.lock().unwrap();
+            if !obi_dwell_satisfied(&since, &market.condition_id, want_yes, now, dc.fairvalue_obi_clear_secs) {
+                idle("OBI clear dwell — bid support too recent to trust");
+                return Ok(StrategySignal::NoSignal);
+            }
         }
 
         let side = if want_yes { "YES" } else { "NO" };
@@ -1713,5 +1792,166 @@ mod tests {
             dec!(0), NO_EDGE, dec!(0), NO_EDGE, dec!(0.12), "",
         );
         assert!(line.contains("FairValue"));
+    }
+}
+
+#[cfg(test)]
+mod entry_book_tests {
+    use super::*;
+    use crate::state::PositionMap;
+    use crate::helpers::dynamic_config::DynamicConfig;
+    use crate::venues::core::MarketId;
+    use chrono::Utc;
+    use rust_decimal_macros::dec;
+    use std::sync::Arc;
+    use tokio::sync::Mutex;
+
+    fn market(yes: &str, no: &str, name: &str, cid: &str) -> MarketConfig {
+        MarketConfig {
+            yes_token: MarketId::new(yes), no_token: MarketId::new(no),
+            market_name: name.to_string(),
+            market_close_time: Some(Utc::now() + chrono::Duration::hours(1)),
+            strike_price: Some(dec!(65000)), is_neg_risk: false,
+            condition_id: cid.to_string(), yes_fee_bps: 0, no_fee_bps: 0,
+        }
+    }
+
+    /// A book with the given YES depths (touch AND whole-book set alike, so the
+    /// source knob cannot mask the test).
+    fn book(yes_bid_depth: Decimal, yes_ask_depth: Decimal) -> MarketSnapshot {
+        MarketSnapshot {
+            yes_bid: dec!(0.59), yes_bid_depth,
+            yes_ask: dec!(0.61), yes_ask_depth,
+            no_bid: dec!(0.39), no_bid_depth: dec!(100),
+            no_ask: dec!(0.41), no_ask_depth: dec!(100),
+            yes_bid_depth_total: yes_bid_depth, yes_ask_depth_total: yes_ask_depth,
+            no_bid_depth_total: dec!(100), no_ask_depth_total: dec!(100),
+            oracle_price: dec!(65000),
+            velocity: dec!(0), velocity_1s: dec!(0), acceleration: dec!(0),
+            funding_rate: dec!(0), oracle_drift_60m: dec!(0),
+            oracle_drift_10m: dec!(0), hist_vol: dec!(0.003),
+            institutional_pulse: dec!(0), tide_coherence: dec!(0),
+            tradfi_velocity: dec!(0), macro_coherence: dec!(0),
+            vix_proxy: dec!(0), vix_velocity: dec!(0),
+            oi_delta_pct: dec!(0), cvd_ratio: dec!(1),
+            secs_to_expiry: 3600, timestamp: Utc::now(),
+        }
+    }
+
+    fn ctx(hourly: MarketSnapshot, maker: MarketSnapshot) -> StrategyContext {
+        StrategyContext {
+            squadron_id: "btc-open".to_string(),
+            market: market("h-yes", "h-no", "Bitcoin Up or Down - September 2, 5PM ET", "cid-hourly"),
+            snapshot: hourly,
+            positions: Arc::new(Mutex::new(PositionMap::new())),
+            session_pnl: dec!(0), starting_collateral: dec!(100),
+            available_collateral: dec!(100),
+            crypto_filter: "btc".to_string(),
+            market_started_at: Utc::now(),
+            maker_snapshot: Some(maker),
+            maker_market: Some(market("m-yes", "m-no", "Bitcoin Up or Down - September 2, 12:00PM-4:00PM ET", "cid-maker")),
+            dynamic_config: Arc::new(DynamicConfig::default()),
+            arb_market_lockouts: None,
+        }
+    }
+
+    /// The veto must measure the book the entry is priced from. Here the
+    /// hourly book is bid-supported (YES OBI +0.14 — the whole-book reading
+    /// from the 2026-09-02 heartbeat) while the maker book is all offers
+    /// (OBI −1). With the maker venue selected, the veto must see −1 and
+    /// block; reading `ctx.snapshot` would have seen +0.14 and admitted a buy
+    /// into a market with no bid at all.
+    #[test]
+    fn the_obi_veto_reads_the_book_the_entry_prices_from() {
+        let c = ctx(book(dec!(200), dec!(150)), book(dec!(0), dec!(150)));
+        let block = DynamicConfig::default().fairvalue_obi_adverse_block;
+
+        let (m, snap) = entry_book(&c, false);
+        assert_eq!(m.condition_id, "cid-maker", "prefer_hourly=false selects the maker venue");
+        let gated = side_obi_of(snap, true, false);
+        assert_eq!(gated, dec!(-1), "the maker book has no YES bid");
+        assert!(gated < block, "the veto must block on the book being bought");
+
+        let hourly_obi = side_obi_of(&c.snapshot, true, false);
+        assert!(hourly_obi > block, "the hourly book would have admitted it — that was the bug");
+
+        let (m, _) = entry_book(&c, true);
+        assert_eq!(m.condition_id, "cid-hourly", "prefer_hourly=true with a viable hourly selects the hourly");
+    }
+
+    /// The call site itself, pinned against the source: the production half of
+    /// this file must never again read the hourly book's depths directly.
+    #[test]
+    fn the_veto_never_reads_the_hourly_snapshot_directly() {
+        let src = include_str!("fairvalue_impl.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or(src);
+        for needle in ["ctx.snapshot.yes_depths", "ctx.snapshot.no_depths"] {
+            assert!(!prod.contains(needle), "{needle} is back — the veto is measuring the wrong market again");
+        }
+    }
+}
+
+#[cfg(test)]
+mod obi_dwell_tests {
+    use super::{obi_dwell_satisfied, obi_dwell_update};
+    use std::collections::HashMap;
+    use std::time::{Duration, Instant};
+
+    const CID: &str = "cid-5pm";
+    const DWELL: u64 = 15;
+
+    /// 2026-09-02 17:44: the YES book read −0.987 at 17:44:36 and the entry
+    /// fired at 17:44:39 on the first clear tick. With the dwell, the first
+    /// clear tick starts a clock and admits nothing; only a book still clear
+    /// fifteen seconds later may be bought.
+    #[test]
+    fn a_book_that_clears_for_one_tick_is_not_admitted() {
+        let t0 = Instant::now();
+        let mut since = HashMap::new();
+        obi_dwell_update(&mut since, CID, true, false, t0);                 // 17:44:36 — all offers
+        obi_dwell_update(&mut since, CID, true, true, t0 + Duration::from_secs(3)); // 17:44:39 — flickers clear
+        assert!(!obi_dwell_satisfied(&since, CID, true, t0 + Duration::from_secs(3), DWELL),
+            "the first clear tick must not admit");
+        assert!(!obi_dwell_satisfied(&since, CID, true, t0 + Duration::from_secs(17), DWELL),
+            "fourteen seconds clear is not fifteen");
+        assert!(obi_dwell_satisfied(&since, CID, true, t0 + Duration::from_secs(18), DWELL),
+            "fifteen continuous seconds clear admits");
+    }
+
+    /// A single breach — the touch flickering back — restarts the clock.
+    #[test]
+    fn a_breach_restarts_the_dwell() {
+        let t0 = Instant::now();
+        let mut since = HashMap::new();
+        obi_dwell_update(&mut since, CID, true, true, t0);
+        obi_dwell_update(&mut since, CID, true, false, t0 + Duration::from_secs(10));
+        obi_dwell_update(&mut since, CID, true, true, t0 + Duration::from_secs(11));
+        assert!(!obi_dwell_satisfied(&since, CID, true, t0 + Duration::from_secs(20), DWELL));
+        assert!(obi_dwell_satisfied(&since, CID, true, t0 + Duration::from_secs(26), DWELL));
+    }
+
+    /// The YES and NO books, and different markets, dwell independently: a
+    /// clear NO book says nothing about YES, and the maker venue's book says
+    /// nothing about the hourly's.
+    #[test]
+    fn sides_and_markets_dwell_independently() {
+        let t0 = Instant::now();
+        let mut since = HashMap::new();
+        obi_dwell_update(&mut since, CID, false, true, t0);
+        obi_dwell_update(&mut since, "cid-maker", true, true, t0);
+        let later = t0 + Duration::from_secs(30);
+        assert!(!obi_dwell_satisfied(&since, CID, true, later, DWELL), "YES never cleared on this market");
+        assert!(obi_dwell_satisfied(&since, CID, false, later, DWELL));
+        assert!(obi_dwell_satisfied(&since, "cid-maker", true, later, DWELL));
+    }
+
+    /// Zero is the instantaneous gate exactly — the pre-dwell behavior, for an
+    /// operator who wants it back.
+    #[test]
+    fn a_zero_dwell_restores_the_instantaneous_gate() {
+        let t0 = Instant::now();
+        let mut since = HashMap::new();
+        obi_dwell_update(&mut since, CID, true, true, t0);
+        assert!(obi_dwell_satisfied(&since, CID, true, t0, 0));
     }
 }

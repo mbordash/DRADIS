@@ -418,6 +418,7 @@ impl Strategy for ArbitrageStrategyImpl {
 
             pos_map.iter()
                 .filter(|(k, _)| (k.strategy == STRATEGY_NAME) && k.squadron == ctx.squadron_id)
+                .filter(|(_, p)| p.counts_toward_exposure(chrono::Utc::now()))
                 .map(|(_, p)| p.shares * p.avg_entry)
                 .sum::<Decimal>()
         };

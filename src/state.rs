@@ -650,6 +650,53 @@ impl Position {
     pub fn fill_effective_at(&self, ghost_mode: bool) -> Option<DateTime<Utc>> {
         self.fill_confirmed_at.or(if ghost_mode { Some(self.opened_at) } else { None })
     }
+
+    /// Should this position count against a viper's exposure budget?
+    ///
+    /// Not once its market has closed. A position whose market has ended
+    /// cannot be added to or reduced by the viper — there is no book to act
+    /// on — so charging it against the budget for NEW entries only shrinks
+    /// what the viper may do elsewhere, silently. 2026-09-01: a settle-held
+    /// FairValue leg worth $4.76 sat in the map after the sweep had booked
+    /// it, and FairValue ran on $7.24 of its $12 cap for the rest of the
+    /// session. This is the second line behind the map release itself; the
+    /// collateral gate, which reads the wallet, is unaffected either way.
+    pub fn counts_toward_exposure(&self, now: DateTime<Utc>) -> bool {
+        self.close_time.map_or(true, |c| c > now)
+    }
+}
+
+#[cfg(test)]
+mod exposure_counting_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    fn pos(close_time: Option<DateTime<Utc>>) -> Position {
+        Position {
+            shares: dec!(5.093297), avg_entry: dec!(0.934), opened_at: Utc::now(),
+            close_time, market_name: "Bitcoin Up or Down - September 1, 8PM ET".into(),
+            pair_token_id: MarketId::new("t"), fill_confirmed_at: Some(Utc::now()),
+            paired_leg_token_id: None, entry_fee: Decimal::ZERO,
+        }
+    }
+
+    /// The 2026-09-01 phantom: $4.76 on a market closed at 21:00 kept
+    /// counting against FairValue's $12 cap. Past close it must not.
+    #[test]
+    fn a_position_on_a_closed_market_does_not_count_against_exposure() {
+        let now = Utc::now();
+        let p = pos(Some(now - chrono::Duration::minutes(15)));
+        assert!(!p.counts_toward_exposure(now));
+        assert!((p.shares * p.avg_entry - dec!(4.757)).abs() < dec!(0.001), "the phantom was worth $4.76");
+    }
+
+    /// A live position and one with no known close time both count.
+    #[test]
+    fn open_and_unscheduled_positions_still_count() {
+        let now = Utc::now();
+        assert!(pos(Some(now + chrono::Duration::hours(1))).counts_toward_exposure(now));
+        assert!(pos(None).counts_toward_exposure(now));
+    }
 }
 
 /// Compound key for the shared position map: (strategy_name, token_id).

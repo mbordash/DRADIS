@@ -999,6 +999,7 @@ async fn trade_one_market(
                     available_collateral = coll;
                     session_pnl = if dyn_cfg.ghost_mode { crate::helpers::metrics::realised_session_pnl() } else { total - starting };
                 }
+                release_swept_positions(&positions).await;
                 dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
                 // Track a mid-session mode flip in the filing scope too.
                 scope.ghost = crate::config::GHOST_MODE || dyn_cfg.ghost_mode;
@@ -2375,5 +2376,22 @@ mod deployed_market_tests {
             pair_from_market_untethered(&m).question,
             "Who wins the 2027 Final? — Philadelphia",
         );
+    }
+}
+
+/// Drop map entries for tokens whose `open_positions` row the settlement
+/// sweep in `sync_dashboard` has just booked and deleted. The sweep is
+/// DB-only; the map is this loop's to keep honest, or a settle-held leg keeps
+/// counting against every exposure cap until the process restarts.
+async fn release_swept_positions(positions: &Arc<Mutex<PositionMap>>) {
+    for tok in db::take_released_positions() {
+        let m = crate::venues::core::MarketId::new(tok.as_str());
+        let mut map = positions.lock().await;
+        let before = map.len();
+        map.retain(|k, _| k.market != m);
+        let dropped = before - map.len();
+        if dropped > 0 {
+            info!("🧾 Released {} in-memory position(s) on {} — the settlement sweep booked and closed the row", dropped, tok);
+        }
     }
 }

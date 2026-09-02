@@ -597,6 +597,33 @@ struct AssetQuery {
     fresh: Option<u8>,
 }
 
+/// How an operator-initiated close ended, for the ledger reason.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OperatorExit { Full, Partial, Simulated }
+
+/// The ledger reason for a position the operator closed from the Control
+/// Tower.
+///
+/// Plain and mechanical, like its neighbors (`FairValueSL: bid=$0.5400`,
+/// `Maker resting exit: lifted @ $0.6300`): who acted, and at what price. It
+/// replaced `Manual RTB (Return to Base)`, the one piece of themed jargon in
+/// a customer-facing financial record — and one that collided with RTB's real
+/// meaning, the squadron's wind-down state. Theme lives on the console; the
+/// ledger stays plain. Historical `Manual RTB` rows are not rewritten.
+///
+/// Two matchers read reason text and must never match these: the patrol's
+/// `reason_lc.contains("sl" | "stop" | "toxic" | "skewcollapse" | "expir")`
+/// and `recent_stop_loss_exists`' `%SL:%` / `%Catastrophic%`. A reason
+/// containing `SL:` would silently count toward TrendReversal's revenge-trade
+/// guard. Pinned by `operator_exit_reasons_never_read_as_a_stop_loss`.
+pub fn operator_exit_reason(kind: OperatorExit, price: Decimal, sold: Decimal, of: Decimal) -> String {
+    match kind {
+        OperatorExit::Full      => format!("Operator exit: bid=${:.4}", price),
+        OperatorExit::Partial   => format!("Operator exit (partial fill): bid=${:.4}, sold {:.2}/{:.2}", price, sold, of),
+        OperatorExit::Simulated => format!("Operator exit (simulated): bid=${:.4}", price),
+    }
+}
+
 /// Request body for manual "Return to Base" exit.
 ///
 /// POST /api/positions/manual-exit
@@ -1783,7 +1810,7 @@ async fn manual_exit(
         metrics::record_trade(
             &scope, fees, req.strategy.clone(), req.market.clone(), req.side.clone(),
             entry_price, current_bid, shares, pnl,
-            "Manual RTB (ghost)".to_string(),
+            operator_exit_reason(OperatorExit::Simulated, current_bid, shares, shares),
         ).await;
         *session.total_pnl.lock().await += pnl;
 
@@ -1903,11 +1930,10 @@ async fn manual_exit(
         fill_price,
         booked_shares,
         pnl,
-        if partial {
-            "Manual RTB (partial fill)".to_string()
-        } else {
-            "Manual RTB (Return to Base)".to_string()
-        },
+        operator_exit_reason(
+            if partial { OperatorExit::Partial } else { OperatorExit::Full },
+            fill_price, booked_shares, shares,
+        ),
     ).await;
 
     // Credit the session. Every automated exit does this; the manual one never
@@ -4363,5 +4389,41 @@ mod pool_logging_tests {
             "endpoints must call log_pool_unavailable() rather than error! directly, \
              so a parked engine does not report expected idleness as failure: {offenders:#?}",
         );
+    }
+}
+
+#[cfg(test)]
+mod operator_exit_reason_tests {
+    use super::{operator_exit_reason, OperatorExit};
+    use rust_decimal_macros::dec;
+
+    /// The three shipped strings, byte-exact, in the house style.
+    #[test]
+    fn the_ledger_reasons_name_the_operator_and_the_price() {
+        assert_eq!(operator_exit_reason(OperatorExit::Full, dec!(0.64), dec!(32), dec!(32)),
+                   "Operator exit: bid=$0.6400");
+        assert_eq!(operator_exit_reason(OperatorExit::Partial, dec!(0.64), dec!(13.53), dec!(32)),
+                   "Operator exit (partial fill): bid=$0.6400, sold 13.53/32.00");
+        assert_eq!(operator_exit_reason(OperatorExit::Simulated, dec!(0.64), dec!(32), dec!(32)),
+                   "Operator exit (simulated): bid=$0.6400");
+    }
+
+    /// The live trap: two matchers key on reason text. The patrol's stop-loss
+    /// streak matcher is a bare lowercase `contains("sl")`, and TrendReversal's
+    /// revenge-trade guard matches `%SL:%` / `%Catastrophic%`. An operator
+    /// closing a position by hand is neither a stop nor a toxic exit, and must
+    /// never be counted as one — so no variant may contain any of these.
+    #[test]
+    fn operator_exit_reasons_never_read_as_a_stop_loss() {
+        for kind in [OperatorExit::Full, OperatorExit::Partial, OperatorExit::Simulated] {
+            let r = operator_exit_reason(kind, dec!(0.64), dec!(13.53), dec!(32));
+            let lc = r.to_lowercase();
+            for needle in ["sl", "stop", "toxic", "skewcollapse", "expir"] {
+                assert!(!lc.contains(needle), "{r:?} contains {needle:?} — the patrol would count it as a stop");
+            }
+            assert!(!r.contains("SL:") && !r.contains("Catastrophic"),
+                    "{r:?} would match recent_stop_loss_exists");
+            assert!(!r.contains("RTB") && !r.contains("Return to Base"), "{r:?} still carries the jargon");
+        }
     }
 }

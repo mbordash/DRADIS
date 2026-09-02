@@ -794,6 +794,37 @@ impl Squadron {
                         if !toks.is_empty() {
                             close_ghost_rows_for_market(&asset_lc, &toks).await;
                         }
+                        // The LIVE twin of the ghost sweep above. The venue has
+                        // just confirmed every resting order cancelled, so an
+                        // UNFILLED quote on the market being left behind is an
+                        // order that no longer exists: its map entry is a zombie
+                        // and its `pending` row would otherwise sit in the
+                        // Control Tower as a "Launch" for an hour until the
+                        // pending grace expires. Only when the cancel actually
+                        // succeeded — if it did not, the order may still be
+                        // working and the row is the record of that. Filled
+                        // positions are untouched: the chain reconciles those.
+                        if !toks.is_empty() && cancel_success && !crate::helpers::dynamic_config::ghosting_now() {
+                            let dead: Vec<PositionKey> = {
+                                let map = positions.lock().await;
+                                map.iter()
+                                    .filter(|(k, p)| toks.iter().any(|t| **t == k.market) && p.fill_effective_at(false).is_none())
+                                    .map(|(k, _)| k.clone())
+                                    .collect()
+                            };
+                            if !dead.is_empty() {
+                                let mut map = positions.lock().await;
+                                let mut own = token_ownership.lock().await;
+                                for k in &dead {
+                                    map.remove(k);
+                                    if own.get(&k.market) == Some(&k.strategy) { own.remove(&k.market); }
+                                }
+                                info!("🧹 Rotation: dropped {} unfilled quote(s) whose orders were just cancelled", dead.len());
+                            }
+                            if let Some(pool) = db::pool_for(&asset_lc) {
+                                for t in &toks { db::close_pending_open_position(&pool, &t.to_string()).await; }
+                            }
+                        }
                     }
                     self.stand_down();
                     info!("️  Squadron [{}] → state={}", self.id, self.state);
@@ -913,6 +944,27 @@ impl Squadron {
                     // into the StrategyContext below.
                     let resting_exit_reprice_threshold = dyn_cfg.maker_resting_exit_reprice_threshold;
                     let resting_exit_enabled = dyn_cfg.maker_resting_exit_enabled;
+                    // Read through the floored accessor — see its doc for why the
+                    // schema minimum alone is not enough.
+                    let exit_retry_cooldown_secs = dyn_cfg.exit_retry_cooldown_secs_floored();
+                    // ── Release positions the chain sweep has closed ──────────
+                    // The sweep books and deletes the ROW; the map entry is this
+                    // loop's to drop. Wallet-wide: a token the wallet no longer
+                    // holds is gone for every squadron on this asset.
+                    for tok in db::take_released_positions() {
+                        let m = MarketId::new(tok.as_str());
+                        let dead: Vec<PositionKey> = {
+                            let map = positions.lock().await;
+                            map.keys().filter(|k| k.market == m).cloned().collect()
+                        };
+                        if dead.is_empty() { continue; }
+                        {
+                            let mut map = positions.lock().await;
+                            for k in &dead { map.remove(k); maker_resting_exits.remove(k); }
+                        }
+                        token_ownership.lock().await.remove(&m);
+                        info!("🧾 Released {} in-memory position(s) on {} — the chain sweep booked and closed the row", dead.len(), tok);
+                    }
                     let intl_taker_fee_rate = dyn_cfg.intl_taker_fee_rate;
                     // Hoisted like the two above: dyn_cfg is moved into `ctx` below.
                     let exit_reconcile_max_dev = dyn_cfg.exit_reconcile_max_deviation;
@@ -1261,7 +1313,7 @@ impl Squadron {
                             // ════════════════════ EXIT ════════════════════
                             StrategySignal::Exit { params, reason, exit_pair } => {
                                 if let Some(lt) = last_exit_attempt_time.get(&sn) {
-                                    if lt.elapsed() < Duration::from_secs(config::EXIT_RETRY_COOLDOWN_SECS) {
+                                    if lt.elapsed() < Duration::from_secs(exit_retry_cooldown_secs) {
                                         continue;
                                     }
                                 }
@@ -1283,6 +1335,10 @@ impl Squadron {
                                 // generic fallback would book it at the observed bid and
                                 // record a spread-capturing win as a loss.
                                 let resting_rec = if ghosting { None } else { maker_resting_exits.get(&pos_key).cloned() };
+                                // Kept past the block below: if the venue later rejects the
+                                // stop because the shares are already gone, this ask is the
+                                // only order that could have taken them.
+                                let resting_ask_price = resting_rec.as_ref().map(|r| r.price);
                                 if let Some(rest) = resting_rec {
                                     let (_found, matched) =
                                         cancel_resting_orders_for_token(&trading_client, &tid_m).await;
@@ -1375,12 +1431,16 @@ impl Squadron {
                                 // Same class of bug as intl trade 56 (2026-06-21), already
                                 // fixed inside `IntlClobVenue::place_order`.
                                 let mut exit_fill_price: Option<Decimal> = None;
+                                // Shares the venue matched on THIS order, from its synchronous
+                                // response. `None` only when placement returned Err.
+                                let mut exit_filled_shares: Option<Decimal> = None;
                                 if !ghosting {
                                     if let Err(e) = place_limit_order_filled(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, vc, &tid, Side::Sell, shares, (params.price - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), target_yes_fee_bps as u16, params.order_type, params.post_only, 0, &shared_http).await
                                         .map(|(_oid, making, taking)| {
                                             // SELL orientation: making = shares given, taking = USDC received.
                                             // Ratio is unit-invariant. Clamp to a valid binary price; anything
                                             // outside means an unexpected orientation → fall back below.
+                                            exit_filled_shares = Some(making);
                                             if making > dec!(0) && taking > dec!(0) {
                                                 let p = taking / making;
                                                 if p > dec!(0) && p <= dec!(1) { exit_fill_price = Some(p); }
@@ -1406,7 +1466,7 @@ impl Squadron {
                                                 // (b) settlement lag — shares are still held. Keep the position
                                                 // under management and retry the exit after the cooldown.
                                                 warn!("⚠️ EXIT rejected but {:.4} shares still held on-chain [{}]: settlement lag — holding position, retrying exit in {}s",
-                                                      held, sn, config::EXIT_RETRY_COOLDOWN_SECS);
+                                                      held, sn, exit_retry_cooldown_secs);
                                                 if let Some(p) = positions.lock().await.get_mut(&pos_key) { p.shares = held; }
                                                 last_trade_time.insert(sn.clone(), Instant::now());
                                                 // Bug #6: placement was rejected — clear the viper's exit-signal
@@ -1432,7 +1492,7 @@ impl Squadron {
                                             };
                                             if fill_is_fresh {
                                                 warn!("⚠️ EXIT rejected [{}] but fill confirmed <{}s ago: settlement lag (balance endpoint not caught up) — holding position, retrying exit in {}s",
-                                                      sn, config::FRESH_FILL_SETTLEMENT_GRACE_SECS, config::EXIT_RETRY_COOLDOWN_SECS);
+                                                      sn, config::FRESH_FILL_SETTLEMENT_GRACE_SECS, exit_retry_cooldown_secs);
                                                 last_trade_time.insert(sn.clone(), Instant::now());
                                                 // Bug #6: placement was rejected — clear the viper's exit-signal cooldown.
                                                 if let Some(strat) = strategies.iter().find(|s| s.name() == sn) { strat.on_exit_order_failed(&tid_m); }
@@ -1463,35 +1523,62 @@ impl Squadron {
                                                         p.avg_entry, params.price, exit_reconcile_max_dev,
                                                     );
                                                     let sid3 = side_of(&tid).to_string();
-                                                    let (aep3, pnl3, tag) = match implied {
+                                                    let market_open = target_market_close_time.map_or(true, |c| c > Utc::now());
+                                                    let outcome: Option<(Decimal, Decimal, String)> = match implied {
                                                         Some((px, pnl)) => {
                                                             warn!(
                                                                 "⚠️ EXIT rejected by exchange [{}] (\"{}\"): position already gone — reconciled from collateral: pnl=${:.4} (implies exit @ ${:.4} against bid ${:.4})",
                                                                 sn, es.chars().take(80).collect::<String>(), pnl, px, params.price
                                                             );
-                                                            (px, pnl, format!("{} (ExitReconciled: pnl taken from collateral movement)", reason))
+                                                            Some((px, pnl, format!("{} (ExitReconciled: pnl taken from collateral movement)", reason)))
+                                                        }
+                                                        // Collateral could not confirm it — but a resting ask on
+                                                        // these exact shares CAN. A post-only limit cannot slip,
+                                                        // so if the venue says the shares are gone and our own
+                                                        // ask was the only order that could have taken them,
+                                                        // the exit price is that ask, exactly. Trade 18,
+                                                        // 2026-09-01: the 13.53-share remainder of a partial
+                                                        // lift at $0.63 was booked "$0.61 → $0.61, pnl 0" here
+                                                        // while its own reason string claimed +9.83%.
+                                                        None => fak_exit::attribute_to_resting_ask(
+                                                            resting_ask_price, market_open, p.avg_entry, p.entry_fee, p.shares,
+                                                        ).map(|(px, pnl)| {
+                                                            info!(
+                                                                "✅ Maker resting exit filled [{}]: {:.4} shares lifted @ ${:.4} (entry ${:.4}) pnl=${:.4} — attributed: the venue rejected \"{}\" because the ask had already filled",
+                                                                sn, p.shares, px, p.avg_entry, pnl, reason
+                                                            );
+                                                            (px, pnl, format!(
+                                                                "Maker resting exit: lifted @ ${:.4} (spread captured, gain={:.2}%) (attributed from the resting ask after the venue rejected the stop)",
+                                                                px, (px - p.avg_entry) / p.avg_entry * dec!(100)
+                                                            ))
+                                                        }),
+                                                    };
+                                                    match outcome {
+                                                        Some((aep3, pnl3, tag)) => {
+                                                            *total_pnl.lock().await += pnl3;
+                                                            metrics::record_trade(
+                                                                &scope, Decimal::ZERO, sn.clone(), params.market_name.clone(), sid3,
+                                                                p.avg_entry, aep3, p.shares, pnl3, tag,
+                                                            ).await;
+                                                            if let Some(pool) = db::pool_for(&asset_lc) { db::close_open_position(&pool, &sn, &tid_m.to_string()).await; }
                                                         }
                                                         None => {
-                                                            // Not confidently knowable. Book the trade so the
-                                                            // count stays honest, but do NOT invent a P&L: a
-                                                            // fabricated loss corrupts session P&L and every
-                                                            // statistic derived from it. Log what a human needs
-                                                            // to reconcile by hand.
+                                                            // Nothing verifiable: write NO trade row and leave the
+                                                            // open_positions row OPEN. A row with a fabricated $0
+                                                            // is worse than none — it is a financial record that
+                                                            // claims a gain and books nothing — and deleting the
+                                                            // open row is how a real settlement was lost before.
+                                                            // The chain sweep owns it from here and books it at a
+                                                            // SOURCED price: settlement value if the market
+                                                            // resolved, else the stored mark, labelled as such.
                                                             warn!(
-                                                                "⚠️ EXIT rejected by exchange [{}] (\"{}\"): position already gone and the exit price is NOT verifiable                                                                  — booking pnl=$0.00. entry=${:.4} shares={:.4} bid_at_exit=${:.4} collateral_now=${:.4} baseline={}                                                                  — reconcile against the venue's fill history",
+                                                                "⚠️ EXIT rejected by exchange [{}] (\"{}\"): position already gone and the exit price is NOT verifiable — no trade row written; open row left for the chain sweep. entry=${:.4} shares={:.4} bid_at_exit=${:.4} collateral_now=${:.4} baseline={}",
                                                                 sn, es.chars().take(80).collect::<String>(),
                                                                 p.avg_entry, p.shares, params.price, now_collateral,
                                                                 fill_baseline.map(|b| format!("${:.4}", b)).unwrap_or_else(|| "unknown".into()),
                                                             );
-                                                            (p.avg_entry, dec!(0), format!("{} (ExitUnreconciled: shares gone, exit price unverifiable — pnl booked as 0)", reason))
                                                         }
-                                                    };
-                                                    *total_pnl.lock().await += pnl3;
-                                                    metrics::record_trade(
-                                                        &scope, Decimal::ZERO, sn.clone(), params.market_name.clone(), sid3,
-                                                        p.avg_entry, aep3, p.shares, pnl3, tag,
-                                                    ).await;
-                                                    if let Some(pool) = db::pool_for(&asset_lc) { db::close_open_position(&pool, &sn, &tid_m.to_string()).await; }
+                                                    }
                                                 } else {
                                                     // Entry fill never confirmed and the shares read gone — nothing
                                                     // verifiable to record. Log loudly so this is never a silent
@@ -1528,6 +1615,7 @@ impl Squadron {
 
                                         {
                                             let re_m;
+                                            let remainder_m: Decimal;
                                             let rs_m;
                                             let rc_m;
                                             let pnl_m;
@@ -1537,138 +1625,106 @@ impl Squadron {
                                             {
                                                 let mut map = positions.lock().await;
                                                 if let Some(p) = map.remove(&pos_key) {
-                                                    let actual_exit_price = exit_fill_price.unwrap_or(params.price);
-                                                    // Net of BOTH legs' taker fees. The venue takes them
-                                                    // straight out of collateral and reports them nowhere,
-                                                    // so a gross-only P&L drifts from the wallet on every
-                                                    // round trip and always in the flattering direction
-                                                    // (2026-08-12: −$0.64 booked, −$1.56 real).
-                                                    let gross = (actual_exit_price - p.avg_entry) * p.shares;
-                                                    let exit_fee = crate::venues::intl::taker_fee(
-                                                        intl_taker_fee_rate, actual_exit_price, p.shares,
+                                                    // Settle from the venue's OWN answer, synchronously.
+                                                    //
+                                                    // A FAK is filled-or-killed at the matching engine and
+                                                    // the response carries the matched size (`making`, in
+                                                    // shares for a SELL). The old path used it only for the
+                                                    // fill PRICE and left the QUANTITY to a 2.5s/5s/10s
+                                                    // balance poll — during which the position was out of
+                                                    // the map, so the strategy could not re-fire. Trade 19,
+                                                    // 2026-09-01: the venue matched 0 of 24 at 21:30:52, the
+                                                    // engine polled for 18s while the bid fell $0.24 → $0.19,
+                                                    // and the retry sold 32 shares at $0.19 for −$3.8647.
+                                                    // The retry was fresh-priced; the blackout was the loss.
+                                                    //
+                                                    // In simulation there is no venue answer: the simulated
+                                                    // exit IS the fill.
+                                                    let matched = if ghosting { Some(p.shares) } else { exit_filled_shares };
+                                                    let st = fak_exit::settle(
+                                                        p.shares, matched, exit_fill_price, params.price,
+                                                        p.avg_entry, p.entry_fee, intl_taker_fee_rate,
                                                     );
-                                                    let fees = p.entry_fee + exit_fee;
-                                                    let pnl = gross - fees;
-                                                    if !fees.is_zero() {
+                                                    if st.filled >= config::MIN_ORDER_SHARES && !st.fees().is_zero() {
                                                         info!("🧾 [{}] round trip {}: gross ${:.4} − fees ${:.4} (entry ${:.4} + exit ${:.4}) = ${:.4}",
-                                                              sn, tid_m, gross, fees, p.entry_fee, exit_fee, pnl);
+                                                              sn, tid_m, (st.exit_price - p.avg_entry) * st.filled, st.fees(), st.entry_fee_booked, st.exit_fee, st.pnl);
+                                                    }
+                                                    // Anything the venue did not sell stays under management
+                                                    // as the SAME position — its hold clock, entry fee and
+                                                    // pair link intact — so the strategy re-evaluates it at
+                                                    // the fresh bid on the next eligible tick. Re-inserting a
+                                                    // brand-new Position here restamped `fill_confirmed_at`
+                                                    // (the "0s held" family of Bug #22) and zeroed the entry
+                                                    // fee out of the eventual round trip.
+                                                    if st.remainder >= config::MIN_ORDER_SHARES {
+                                                        map.insert(pos_key.clone(), fak_exit::retain_remainder(&p, st.remainder, st.entry_fee_left));
                                                     }
 
                                                     re_m = p.avg_entry;
-                                                    rs_m = p.shares;
+                                                    rs_m = st.filled;
                                                     rc_m = p.close_time;
-                                                    pnl_m = pnl;
-                                                    fees_m = fees;
-                                                    entry_fee_m = p.entry_fee;
-
-                                                    // session_pnl credit, record_trade, and close_open_position are
-                                                    // ALL deferred to the FAK verification block below so the running
-                                                    // PnL counter and the trades table are updated together, only once
-                                                    // a fill is confirmed. Crediting here (on order placement) caused
-                                                    // phantom PnL + unbooked wins when the verify spawn returned early
-                                                    // or was killed by a restart before it could record/reverse.
+                                                    pnl_m = st.pnl;
+                                                    fees_m = st.fees();
+                                                    entry_fee_m = st.entry_fee_booked;
+                                                    remainder_m = st.remainder;
                                                 } else { continue; }
                                             }
-                                            // Release token claim — position is fully closed.
-                                            token_ownership.lock().await.remove(&tid_m);
+                                            let _ = (rc_m, entry_fee_m);
+                                            // Release the token claim only when nothing is left to manage.
+                                            if remainder_m < config::MIN_ORDER_SHARES {
+                                                token_ownership.lock().await.remove(&tid_m);
+                                            }
 
-                                        if rs_m > dec!(0) && !ghosting {
-                                            let ps = Arc::clone(&positions); let cl = Arc::clone(&trading_client); let tp = Arc::clone(&total_pnl); let m_name = params.market_name.clone();
-                                            let sn_async = sn.clone();
-                                            let sq_key = squadron_id.clone();
-                                            let tid_async = tid_m.clone(); // neutral key moved into the spawn
-                                            // Capture all vars needed for deferred DB recording.
-                                            let sid_m = side_of(&tid).to_string();
-                                            let aep_exit = exit_fill_price.unwrap_or(params.price);
-                                            let r_m = reason.clone();
-                                            let asset_t = asset_lc.clone();
-                                            let scope_t = scope.clone();
-                                            let sn_rec = sn.clone();
-                                            let tid_rec = tid.to_string();
-                                            let fee_rate_t = intl_taker_fee_rate;
-                                            tokio::spawn(async move {
-                                                // Poll the balance with escalating delays (2.5s, +5s, +10s).
-                                                // The balance API can lag a filled FAK by several seconds; a
-                                                // single stale read here showed 10/10 shares still held on
-                                                // 2026-07-16 for a FAK that HAD filled, resurrecting the
-                                                // position → retry exit → exchange reject → phantom P&L.
-                                                // Only trust a "nothing filled" answer after the final poll;
-                                                // any read showing a reduced balance is accepted immediately.
-                                                let mut rem: Option<Decimal> = None;
-                                                for (i, delay_ms) in [2500u64, 5000, 10000].iter().enumerate() {
-                                                    tokio::time::sleep(Duration::from_millis(*delay_ms)).await;
-                                                    let mut req = BalanceAllowanceRequest::default(); req.asset_type = AssetType::Conditional; req.token_id = Some(u256_from_market_id(&tid_async).unwrap_or_default());
-                                                    match cl.balance_allowance(req).await {
-                                                        Ok(r) => {
-                                                            let b = Decimal::from_str(&r.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
-                                                            rem = Some(b);
-                                                            if b < rs_m { break; } // fill visible — no need to keep polling
-                                                            if i < 2 {
-                                                                warn!("⏳ FAK verify [{}]: balance still shows {:.4}/{:.4} unfilled — re-polling (attempt {}/3)", sn_async, b, rs_m, i + 2);
-                                                            }
-                                                        }
-                                                        Err(_) => { /* transient RPC error — try next poll */ }
-                                                    }
-                                                }
-                                                let rem = match rem {
-                                                    Some(r) => r,
-                                                    None => {
-                                                        // All balance reads failed — we can't confirm the fill. Re-insert the
-                                                        // position (no PnL credit, no DB write) so a later exit retry
-                                                        // reconciles it, instead of leaking it out of the position map.
-                                                        warn!("⚠️ FAK verify [{}]: all balance reads failed — fill unknown; re-inserting {:.4} shares for retry (no PnL booked)", sn_async, rs_m);
-                                                        let mut map = ps.lock().await;
-                                                        map.entry(PositionKey::new(sq_key.clone(), sn_async.clone(), tid_async.clone())).or_insert_with(|| Position { shares: rs_m, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name.clone(), pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None, entry_fee: Decimal::ZERO });
-                                                        return;
-                                                    }
-                                                };
-
-                                                let other_strats_shares = {
-                                                    let map = ps.lock().await;
-                                                    map.iter()
-                                                        .filter(|(k, _)| k.market == tid_async && k.strategy != sn_async && k.squadron == sq_key)
-                                                        .map(|(_, p)| p.shares)
-                                                        .fold(dec!(0), |a, b| a + b)
-                                                };
-                                                let our_rem = (rem - other_strats_shares).max(dec!(0));
-
-                                                if our_rem >= config::MIN_ORDER_SHARES {
-                                                    let fill = (rs_m - our_rem).max(dec!(0));
-                                                    if fill < config::MIN_ORDER_SHARES {
-                                                        warn!("⚠️ PARTIAL EXIT [{}]: FAK filled 0/{:.4} shares (our_rem={:.4}, other_strats={:.4}) — re-inserting for retry.", sn_async, rs_m, our_rem, other_strats_shares);
-                                                        let mut map = ps.lock().await;
-                                                        if !map.contains_key(&PositionKey::new(sq_key.clone(), sn_async.clone(), tid_async.clone())) {
-                                                            map.insert(PositionKey::new(sq_key.clone(), sn_async.clone(), tid_async.clone()), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name, pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None, entry_fee: Decimal::ZERO });
-                                                        }
-                                                        // 0 fills — no PnL credit, no DB write; position re-inserted for retry.
-                                                    } else {
-                                                        warn!("⚠️ PARTIAL EXIT [{}]: sold {:.4}/{:.4} (our_rem={:.4}, other_strats={:.4}) — re-inserting.", sn_async, fill, rs_m, our_rem, other_strats_shares);
-                                                        {
-                                                            let mut map = ps.lock().await;
-                                                            if !map.contains_key(&PositionKey::new(sq_key.clone(), sn_async.clone(), tid_async.clone())) {
-                                                                map.insert(PositionKey::new(sq_key.clone(), sn_async.clone(), tid_async.clone()), Position { shares: our_rem, avg_entry: re_m, opened_at: Utc::now(), close_time: rc_m, market_name: m_name.clone(), pair_token_id: tid_async.clone(), fill_confirmed_at: Some(Utc::now()), paired_leg_token_id: None, entry_fee: Decimal::ZERO });
-                                                            }
-                                                        }
-                                                        // Partial fill — credit and record ONLY the filled portion, together.
-                                                        // Fees prorate with the filled fraction: the entry fee was
-                                                        // charged on the whole position, and the exit fee only on
-                                                        // what actually sold.
-                                                        let filled_frac = if rs_m > dec!(0) { fill / rs_m } else { dec!(0) };
-                                                        let partial_fees = entry_fee_m * filled_frac
-                                                            + crate::venues::intl::taker_fee(fee_rate_t, aep_exit, fill);
-                                                        let partial_pnl = (aep_exit - re_m) * fill - partial_fees;
-                                                        *tp.lock().await += partial_pnl;
-                                                        metrics::record_trade(&scope_t, partial_fees, sn_rec, m_name, sid_m, re_m, aep_exit, fill, partial_pnl, r_m).await;
-                                                        if let Some(pool) = db::pool_for(&asset_t) { db::close_open_position(&pool, &sn_async, &tid_async.to_string()).await; }
-                                                    }
+                                        if !ghosting {
+                                            if rs_m >= config::MIN_ORDER_SHARES {
+                                                // Book what the venue sold, now — P&L credit, trade row and
+                                                // row close together, as before, but from the venue's
+                                                // synchronous answer rather than a lagging balance read.
+                                                let aep_exit = exit_fill_price.unwrap_or(params.price);
+                                                if remainder_m >= config::MIN_ORDER_SHARES {
+                                                    warn!("⚠️ PARTIAL EXIT [{}]: venue matched {:.4}, {:.4} retained @ ${:.4} pnl=${:.4} (net of ${:.4} fees) — remainder re-fires at the fresh bid", sn, rs_m, remainder_m, aep_exit, pnl_m, fees_m);
                                                 } else {
-                                                    // Full fill confirmed — credit session PnL and write to DB together.
-                                                    info!("✅ FAK exit confirmed [{sn_async}]: {rs_m:.4} shares sold @ ${aep_exit:.4} pnl=${pnl_m:.4} (net of ${fees_m:.4} fees)");
-                                                    *tp.lock().await += pnl_m;
-                                                    metrics::record_trade(&scope_t, fees_m, sn_rec, m_name, sid_m, re_m, aep_exit, rs_m, pnl_m, r_m).await;
-                                                    if let Some(pool) = db::pool_for(&asset_t) { db::close_open_position(&pool, &sn_async, &tid_async.to_string()).await; }
+                                                    info!("✅ FAK exit confirmed [{}]: {:.4} shares sold @ ${:.4} pnl=${:.4} (net of ${:.4} fees)", sn, rs_m, aep_exit, pnl_m, fees_m);
                                                 }
-                                            });
+                                                *total_pnl.lock().await += pnl_m;
+                                                metrics::record_trade(&scope, fees_m, sn.clone(), params.market_name.clone(), side_of(&tid).to_string(), re_m, aep_exit, rs_m, pnl_m, reason.clone()).await;
+                                                if let Some(pool) = db::pool_for(&asset_lc) {
+                                                    if remainder_m >= config::MIN_ORDER_SHARES {
+                                                        db::update_position_from_chain(&pool, tid_m.as_str(), remainder_m, re_m, None).await;
+                                                    } else {
+                                                        db::close_open_position(&pool, &sn, &tid_m.to_string()).await;
+                                                    }
+                                                }
+                                            } else {
+                                                // The venue matched nothing: no P&L, no ledger row, the
+                                                // position is exactly as it was. The strategy re-fires at
+                                                // the fresh bid after `exit_retry_cooldown_secs` — the only
+                                                // wait left on this path, and it paces retries rather than
+                                                // blacking them out.
+                                                warn!("⚠️ EXIT [{}]: FAK matched nothing at ${:.4} — {:.4} shares retained, re-firing at the fresh bid", sn, params.price, remainder_m);
+                                            }
+
+                                            // The fill-oracle assumption, watched rather than trusted: one
+                                            // balance read after the endpoint has had time to catch up,
+                                            // logged if it disagrees with what the venue told us. Telemetry
+                                            // only — it moves no state, so it can neither resurrect a sold
+                                            // position nor fabricate an exit.
+                                            {
+                                                let cl = Arc::clone(&trading_client);
+                                                let tid_chk = tid_m.clone();
+                                                let sn_chk = sn.clone();
+                                                let expected = remainder_m;
+                                                tokio::spawn(async move {
+                                                    tokio::time::sleep(Duration::from_secs(config::SETTLEMENT_LAG_RETRY_DELAY_SECS)).await;
+                                                    let mut req = BalanceAllowanceRequest::default(); req.asset_type = AssetType::Conditional; req.token_id = Some(u256_from_market_id(&tid_chk).unwrap_or_default());
+                                                    if let Ok(r) = cl.balance_allowance(req).await {
+                                                        let b = Decimal::from_str(&r.balance.to_string()).unwrap_or(dec!(0)) / dec!(1_000_000);
+                                                        if (b - expected).abs() >= config::MIN_ORDER_SHARES {
+                                                            warn!("⚠️ FAK fill-oracle check [{}]: venue response implied {:.4} shares retained, balance reads {:.4} — investigate before trusting either", sn_chk, expected, b);
+                                                        }
+                                                    }
+                                                });
+                                            }
                                         }
                                     let mut paired_pnl = dec!(0);
                                     if exit_pair {
@@ -3192,5 +3248,203 @@ mod context_borrow_tests {
              statement and deadlock against a queued writer — hoist these into locals \
              above it: {offenders:#?}",
         );
+    }
+}
+
+
+/// Settlement of one exit FAK from the venue's synchronous response.
+///
+/// Pure, so the accounting on the most dangerous path in the engine — the
+/// exit of a position that is already losing on a moving book — is pinned by
+/// tests against the real fills rather than exercised only on real money.
+pub mod fak_exit {
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+    use crate::state::Position;
+
+    /// What one FAK actually did.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct Settlement {
+        /// Shares the venue matched (clamped to what was requested).
+        pub filled: Decimal,
+        /// Shares still held afterwards.
+        pub remainder: Decimal,
+        /// Average price the matched shares sold at.
+        pub exit_price: Decimal,
+        /// Taker fee on the matched shares, at the exit price.
+        pub exit_fee: Decimal,
+        /// The entry fee attributable to the matched shares (prorated).
+        pub entry_fee_booked: Decimal,
+        /// The entry fee that stays with the remainder.
+        pub entry_fee_left: Decimal,
+        /// Net P&L on the matched shares.
+        pub pnl: Decimal,
+    }
+
+    impl Settlement {
+        pub fn fees(&self) -> Decimal { self.entry_fee_booked + self.exit_fee }
+    }
+
+    /// `matched` is the venue's matched size; `None` means the response carried
+    /// no answer and is treated as nothing sold — never as everything sold,
+    /// because the only safe error is to keep managing shares we may still hold.
+    pub fn settle(
+        requested: Decimal,
+        matched: Option<Decimal>,
+        venue_price: Option<Decimal>,
+        fallback_price: Decimal,
+        entry: Decimal,
+        entry_fee: Decimal,
+        fee_rate: Decimal,
+    ) -> Settlement {
+        let filled = matched.unwrap_or(Decimal::ZERO).max(Decimal::ZERO).min(requested);
+        let remainder = requested - filled;
+        let exit_price = venue_price.unwrap_or(fallback_price);
+        let frac = if requested > Decimal::ZERO { filled / requested } else { Decimal::ZERO };
+        let entry_fee_booked = entry_fee * frac;
+        let exit_fee = crate::venues::intl::taker_fee(fee_rate, exit_price, filled);
+        let pnl = (exit_price - entry) * filled - entry_fee_booked - exit_fee;
+        Settlement {
+            filled, remainder, exit_price, exit_fee, entry_fee_booked,
+            entry_fee_left: entry_fee - entry_fee_booked, pnl,
+        }
+    }
+
+    /// When a stop is rejected because the shares are already gone, can the
+    /// exit be attributed to the resting ask that was on those shares?
+    ///
+    /// Only if such an ask existed AND the market was still open — past close
+    /// the shares could have left by settlement, whose price is $1 or $0, not
+    /// the ask. A post-only ask pays no taker fee, so only the entry fee is
+    /// netted. `None` means nothing verifiable: the caller writes no row.
+    pub fn attribute_to_resting_ask(
+        resting_ask: Option<Decimal>,
+        market_open: bool,
+        entry: Decimal,
+        entry_fee: Decimal,
+        shares: Decimal,
+    ) -> Option<(Decimal, Decimal)> {
+        let px = resting_ask?;
+        if !market_open || shares <= Decimal::ZERO || px <= Decimal::ZERO {
+            return None;
+        }
+        Some((px, (px - entry) * shares - entry_fee))
+    }
+
+    /// The SAME position, holding only what the venue did not sell. Every
+    /// timestamp and link survives; only size and the unbooked entry fee change.
+    pub fn retain_remainder(p: &Position, remainder: Decimal, entry_fee_left: Decimal) -> Position {
+        let mut kept = p.clone();
+        kept.shares = remainder;
+        kept.entry_fee = entry_fee_left.max(dec!(0));
+        kept
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use chrono::{Duration, Utc};
+        use crate::venues::core::MarketId;
+
+        const RATE: Decimal = dec!(0.07);
+
+        /// Trade 19, first attempt, 21:30:52: 24 shares requested at bid $0.24,
+        /// the venue matched nothing. The right settlement is "nothing sold,
+        /// everything retained, no P&L" — immediately, not after 18 seconds of
+        /// balance polling while the bid fell to $0.19.
+        #[test]
+        fn a_fak_the_venue_matched_nothing_on_retains_everything_and_books_nothing() {
+            let st = settle(dec!(24), Some(dec!(0)), None, dec!(0.24), dec!(0.30), dec!(0), RATE);
+            assert_eq!(st.filled, dec!(0));
+            assert_eq!(st.remainder, dec!(24));
+            assert_eq!(st.pnl, dec!(0));
+            assert_eq!(st.fees(), dec!(0));
+        }
+
+        /// Trade 19, second attempt, 21:31:10: 32 shares matched at $0.19.
+        /// Booked −$3.8647 net of $0.3447 fees — the venue's own numbers,
+        /// reproduced from its response rather than from a balance read.
+        #[test]
+        fn a_fully_matched_fak_books_the_venues_price_fee_and_pnl() {
+            let taking = dec!(0.19) * dec!(32);
+            let st = settle(dec!(32), Some(dec!(32)), Some(taking / dec!(32)), dec!(0.20), dec!(0.30), dec!(0), RATE);
+            assert_eq!(st.filled, dec!(32));
+            assert_eq!(st.remainder, dec!(0));
+            assert!((st.exit_fee - dec!(0.3447)).abs() < dec!(0.0001), "fee {}", st.exit_fee);
+            assert!((st.pnl - dec!(-3.8647)).abs() < dec!(0.0002), "pnl {}", st.pnl);
+        }
+
+        /// A partial match books only what sold, prorates the entry fee to it,
+        /// and leaves the rest of the fee with the retained shares — so the
+        /// eventual second exit still nets the whole round trip.
+        #[test]
+        fn a_partial_match_prorates_the_entry_fee_and_keeps_the_rest_with_the_remainder() {
+            let st = settle(dec!(32), Some(dec!(8)), Some(dec!(0.24)), dec!(0.24), dec!(0.30), dec!(0.64), RATE);
+            assert_eq!(st.filled, dec!(8));
+            assert_eq!(st.remainder, dec!(24));
+            assert_eq!(st.entry_fee_booked, dec!(0.16));
+            assert_eq!(st.entry_fee_left, dec!(0.48));
+        }
+
+        /// A response with no answer must read as "nothing sold", never as
+        /// "everything sold": the only safe error is to keep managing shares we
+        /// may still hold. A retry sells at most the remainder, so this cannot
+        /// sell a position twice.
+        #[test]
+        fn no_answer_from_the_venue_is_treated_as_nothing_sold() {
+            let st = settle(dec!(32), None, None, dec!(0.24), dec!(0.30), dec!(0), RATE);
+            assert_eq!(st.remainder, dec!(32));
+            assert_eq!(st.pnl, dec!(0));
+            // And an over-report cannot make us book more than we asked for.
+            let over = settle(dec!(32), Some(dec!(40)), None, dec!(0.24), dec!(0.30), dec!(0), RATE);
+            assert_eq!(over.filled, dec!(32));
+        }
+
+        /// Trade 18, 2026-09-01: 13.53 shares, entry $0.61, remainder of a
+        /// partial lift with the ask still resting at $0.63. The venue rejected
+        /// the take-profit FAK — the ask had already been lifted — and the
+        /// engine wrote "$0.61 → $0.61, pnl 0" under a reason claiming +9.83%.
+        /// The ask was the only order on those shares, and a resting limit
+        /// cannot slip: the exit is $0.63, exactly, for +$0.2706 before the
+        /// entry fee.
+        #[test]
+        fn a_rejected_stop_with_a_resting_ask_books_the_ask_price_not_zero() {
+            let (px, pnl) = attribute_to_resting_ask(Some(dec!(0.63)), true, dec!(0.61), dec!(0), dec!(13.53))
+                .expect("attributable");
+            assert_eq!(px, dec!(0.63));
+            assert_eq!(pnl, dec!(0.2706));
+        }
+
+        /// Without a resting ask there is no sourced price, and past close the
+        /// shares may have settled at $1/$0 rather than sold — in both cases
+        /// the answer is "nothing verifiable", never a guess.
+        #[test]
+        fn no_resting_ask_or_a_closed_market_is_not_attributable() {
+            assert_eq!(attribute_to_resting_ask(None, true, dec!(0.61), dec!(0), dec!(13.53)), None);
+            assert_eq!(attribute_to_resting_ask(Some(dec!(0.63)), false, dec!(0.61), dec!(0), dec!(13.53)), None);
+        }
+
+        /// The Bug #22 family in this path: the old re-insert built a brand-new
+        /// Position with `fill_confirmed_at = now`, so a minutes-old position
+        /// read "0s held" and every hold-gated protection saw a fresh fill.
+        /// The retained remainder must be the same position.
+        #[test]
+        fn the_retained_remainder_keeps_its_hold_clock_entry_fee_and_pair_link() {
+            let opened = Utc::now() - Duration::minutes(7);
+            let confirmed = Utc::now() - Duration::minutes(6);
+            let p = Position {
+                shares: dec!(32), avg_entry: dec!(0.30), opened_at: opened,
+                close_time: Some(Utc::now() + Duration::hours(1)),
+                market_name: "Bitcoin Up or Down - September 1, 9PM ET".into(),
+                pair_token_id: MarketId::new("tok"), fill_confirmed_at: Some(confirmed),
+                paired_leg_token_id: Some(MarketId::new("pair")), entry_fee: dec!(0.64),
+            };
+            let kept = retain_remainder(&p, dec!(24), dec!(0.48));
+            assert_eq!(kept.shares, dec!(24));
+            assert_eq!(kept.entry_fee, dec!(0.48));
+            assert_eq!(kept.fill_confirmed_at, Some(confirmed), "the hold clock must not restart");
+            assert_eq!(kept.opened_at, opened);
+            assert_eq!(kept.paired_leg_token_id, Some(MarketId::new("pair")));
+        }
     }
 }

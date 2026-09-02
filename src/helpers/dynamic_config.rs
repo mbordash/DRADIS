@@ -211,6 +211,7 @@ fn default_convergence_velocity_opposition_pct()      -> Decimal { config::CONVE
 fn default_convergence_skip_band_low()      -> Decimal { config::CONVERGENCE_SKIP_BAND_LOW             }
 fn default_convergence_skip_band_high()     -> Decimal { config::CONVERGENCE_SKIP_BAND_HIGH            }
 fn default_fairvalue_obi_adverse_block()    -> Decimal { config::FAIRVALUE_OBI_ADVERSE_BLOCK           }
+fn default_fairvalue_obi_clear_secs()       -> u64     { config::FAIRVALUE_OBI_CLEAR_SECS              }
 fn default_sports_poll_secs()               -> u64     { config::SPORTS_POLL_SECS                      }
 fn default_sports_low_budget_warn()         -> i64     { config::SPORTS_ODDS_LOW_BUDGET_WARN           }
 fn default_tennis_poll_secs()               -> u64     { config::TENNIS_POLL_SECS                      }
@@ -248,6 +249,7 @@ fn default_maker_oracle_drift_pull_frac()   -> Decimal { config::MAKER_ORACLE_DR
 fn default_maker_oracle_drift_exit_frac()   -> Decimal { config::MAKER_ORACLE_DRIFT_EXIT_FRAC         }
 fn default_maker_resting_exit_enabled()     -> bool    { config::MAKER_RESTING_EXIT_ENABLED           }
 fn default_exit_reconcile_max_deviation()   -> Decimal { config::EXIT_RECONCILE_MAX_DEVIATION        }
+fn default_exit_retry_cooldown_secs()       -> u64     { config::EXIT_RETRY_COOLDOWN_SECS              }
 fn default_ghost_mode()                     -> bool    { config::GHOST_MODE_DEFAULT                 }
 fn default_maker_resting_exit_min_edge_pct() -> Decimal { config::MAKER_RESTING_EXIT_MIN_EDGE_PCT     }
 fn default_maker_resting_exit_ask_improvement_ticks() -> i64 { config::MAKER_RESTING_EXIT_ASK_IMPROVEMENT_TICKS }
@@ -552,6 +554,18 @@ pub struct DynamicConfig {
     /// See `config::EXIT_RECONCILE_MAX_DEVIATION`.
     #[serde(default = "default_exit_reconcile_max_deviation")]
     pub exit_reconcile_max_deviation:  Decimal,
+    /// Seconds between one strategy's exit attempts.
+    ///
+    /// The pace between a FAK that sold nothing (the venue's synchronous
+    /// answer) and the next attempt at the fresh bid. It was a compile-time
+    /// constant an operator could not reach, and it is the one wait left on
+    /// the intl exit path after Bug #29 — on an 11-tick/18s collapse like
+    /// trade 19 (2026-09-01) a 5s pace costs about 3 ticks. Read through
+    /// [`DynamicConfig::exit_retry_cooldown_secs_floored`], never directly:
+    /// the Control Tower PATCH path does not run the build caps, so the floor
+    /// is enforced where the value is used.
+    #[serde(default = "default_exit_retry_cooldown_secs")]
+    pub exit_retry_cooldown_secs:      u64,
     /// Price floor for the resting ask, as a fraction over avg entry.
     #[serde(default = "default_maker_resting_exit_min_edge_pct")]
     pub maker_resting_exit_min_edge_pct: Decimal,
@@ -783,6 +797,11 @@ pub struct DynamicConfig {
     /// See FAIRVALUE_OBI_ADVERSE_BLOCK for the incident that motivated it.
     #[serde(default = "default_fairvalue_obi_adverse_block")]
     pub fairvalue_obi_adverse_block:      Decimal,
+    /// Seconds the entry side's OBI must stay clear of the block before an
+    /// entry is admitted. The block is a single 50ms sample; at the touch it
+    /// is one or two orders wide and flickers. Zero restores the instant gate.
+    #[serde(default = "default_fairvalue_obi_clear_secs")]
+    pub fairvalue_obi_clear_secs:         u64,
 
     /// Seconds between Sports Raptor (The Odds API) polls.
     #[serde(default = "default_sports_poll_secs")]
@@ -922,6 +941,7 @@ impl Default for DynamicConfig {
             maker_oracle_drift_exit_frac:  config::MAKER_ORACLE_DRIFT_EXIT_FRAC,
             maker_resting_exit_enabled:    config::MAKER_RESTING_EXIT_ENABLED,
             exit_reconcile_max_deviation:  config::EXIT_RECONCILE_MAX_DEVIATION,
+            exit_retry_cooldown_secs:      config::EXIT_RETRY_COOLDOWN_SECS,
             maker_resting_exit_min_edge_pct: config::MAKER_RESTING_EXIT_MIN_EDGE_PCT,
             maker_resting_exit_ask_improvement_ticks: config::MAKER_RESTING_EXIT_ASK_IMPROVEMENT_TICKS,
             maker_resting_exit_reprice_threshold: config::MAKER_RESTING_EXIT_REPRICE_THRESHOLD,
@@ -1014,6 +1034,7 @@ impl Default for DynamicConfig {
             convergence_skip_band_high:       config::CONVERGENCE_SKIP_BAND_HIGH,
 
             fairvalue_obi_adverse_block:      config::FAIRVALUE_OBI_ADVERSE_BLOCK,
+            fairvalue_obi_clear_secs:         config::FAIRVALUE_OBI_CLEAR_SECS,
             sports_poll_secs:                 config::SPORTS_POLL_SECS,
             sports_low_budget_warn:           config::SPORTS_ODDS_LOW_BUDGET_WARN,
             tennis_poll_secs:                 config::TENNIS_POLL_SECS,
@@ -1124,6 +1145,28 @@ pub fn build_cap_for(field: &str) -> Option<Decimal> {
 }
 
 /// Lower any capped field back to its build ceiling. "Stricter wins."
+/// The shortest pace the exit path will run at, whatever the config says.
+///
+/// One second, because below it the pace stops being a pace: the patrol
+/// ticks every 50ms and every exit attempt is a freshly signed FAK, so a zero
+/// here would submit up to twenty orders a second per strategy against a book
+/// the venue has just said holds no liquidity — the WebSocket snapshot the
+/// price is taken from does not refresh faster than a few hundred
+/// milliseconds, so those resubmissions would price against the SAME
+/// snapshot and could only draw rate limiting. At 1s the cost on a trade-19
+/// collapse (11 ticks in 18s) is at most ~0.6 tick, and attempts are bounded
+/// at one per second. Enforced in code, not only in the schema: a PATCH from
+/// the Control Tower or the LLM advisor does not pass through `apply_build_caps`.
+pub const EXIT_RETRY_COOLDOWN_FLOOR_SECS: u64 = 1;
+
+impl DynamicConfig {
+    /// `exit_retry_cooldown_secs` with the floor applied. The only way the
+    /// patrol reads the knob.
+    pub fn exit_retry_cooldown_secs_floored(&self) -> u64 {
+        self.exit_retry_cooldown_secs.max(EXIT_RETRY_COOLDOWN_FLOOR_SECS)
+    }
+}
+
 pub fn apply_build_caps(cfg: &mut DynamicConfig) {
     cfg.time_decay_max_entry_price =
         cfg.time_decay_max_entry_price.min(config::TIME_DECAY_MAX_ENTRY_PRICE);
@@ -1719,5 +1762,48 @@ mod global_semantics_tests {
         reconcile_global_semantics(&mut squadron, &global);
         assert_eq!(squadron.maker_max_entry_price, dec!(0.61));
         assert_eq!(squadron.momentum_max_exposure_usdc, dec!(42));
+    }
+}
+
+#[cfg(test)]
+mod exit_retry_cooldown_tests {
+    use super::*;
+
+    /// Promoting the constant to a knob must not move the default: a knob that
+    /// silently ships a new value is two changes wearing one hat. The shipped
+    /// pace stays exactly `config::EXIT_RETRY_COOLDOWN_SECS`.
+    #[test]
+    fn the_knob_defaults_to_the_compile_time_constant_and_changes_no_behavior() {
+        let dc = DynamicConfig::default();
+        assert_eq!(dc.exit_retry_cooldown_secs, config::EXIT_RETRY_COOLDOWN_SECS);
+        assert_eq!(dc.exit_retry_cooldown_secs_floored(), config::EXIT_RETRY_COOLDOWN_SECS);
+        // A persisted config written before the field existed — yesterday's
+        // full record, minus this key — reads the same.
+        let mut legacy = serde_json::to_value(DynamicConfig::default()).unwrap();
+        legacy.as_object_mut().unwrap().remove("exit_retry_cooldown_secs");
+        let legacy: DynamicConfig = serde_json::from_value(legacy).expect("pre-field config parses");
+        assert_eq!(legacy.exit_retry_cooldown_secs_floored(), config::EXIT_RETRY_COOLDOWN_SECS);
+    }
+
+    /// The Control Tower PATCH path merges JSON and never runs `apply_build_caps`,
+    /// so a value below the floor CAN be persisted. The read must clamp it: an
+    /// operator who patches 0 gets one attempt per second, not twenty.
+    #[test]
+    fn a_patched_value_below_the_floor_is_clamped_where_it_is_read() {
+        let mut v = serde_json::to_value(DynamicConfig::default()).unwrap();
+        v["exit_retry_cooldown_secs"] = serde_json::json!(0);
+        let patched: DynamicConfig = serde_json::from_value(v).expect("patched config parses");
+        assert_eq!(patched.exit_retry_cooldown_secs, 0, "the raw field keeps what was patched");
+        assert_eq!(patched.exit_retry_cooldown_secs_floored(), EXIT_RETRY_COOLDOWN_FLOOR_SECS);
+    }
+
+    /// Above the floor the operator's value is honored as-is.
+    #[test]
+    fn a_value_at_or_above_the_floor_is_used_unchanged() {
+        let mut dc = DynamicConfig::default();
+        dc.exit_retry_cooldown_secs = 2;
+        assert_eq!(dc.exit_retry_cooldown_secs_floored(), 2);
+        dc.exit_retry_cooldown_secs = EXIT_RETRY_COOLDOWN_FLOOR_SECS;
+        assert_eq!(dc.exit_retry_cooldown_secs_floored(), EXIT_RETRY_COOLDOWN_FLOOR_SECS);
     }
 }

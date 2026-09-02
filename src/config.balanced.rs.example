@@ -295,7 +295,16 @@ pub const MAKER_HORIZON_TRADFI_VETO: Decimal = dec!(0.15);
 /// Directional TradFi vetoes require at least this QQQ-vs-BTC macro coherence.
 pub const MAKER_HORIZON_COHERENCE_MIN: Decimal = dec!(0.5);
 pub const MAKER_BID_BUFFER: Decimal = dec!(0.025);
-pub const MAKER_MIN_SPREAD: Decimal = dec!(0.04);
+// 2026-09-02: raised to 0.08 across ALL profiles. Entry rests at best_bid+1 and the
+// resting exit at ask-1, so a lifted fill nets (spread - 2) ticks, while a forced exit
+// costs >=1 tick (the bid sits below the fill by construction) plus ~1.7 ticks of taker
+// fee -- 2.7 ticks at best, 4.3 observed across six live losses. Break-even win rate is
+// therefore 57-68% at 0.04 and 73-81% at 0.03, while a resting bid is adversely selected
+// by construction and wins well under half its fills. At 0.08 break-even falls to 31-42%.
+// This is the break-even threshold, NOT a risk-appetite dial: quoting under it is not
+// 'aggressive', it is negative expectancy. Express risk appetite in size and exposure.
+// Do not lower this without first showing the forced-exit cost has fallen below 2.7 ticks.
+pub const MAKER_MIN_SPREAD: Decimal = dec!(0.08);
 pub const MAKER_BID_IMPROVEMENT: Decimal = dec!(-0.01);
 pub const MAKER_BID_IMPROVEMENT_RATIO: Decimal = dec!(0.00);
 pub const MAKER_MIN_BID_IMPROVEMENT: Decimal = dec!(-0.02);
@@ -1071,6 +1080,16 @@ pub const FAIRVALUE_STOP_LOSS_PERCENT: Decimal = dec!(0.12);
 /// −0.60 matches MOMENTUM_OBI_ADVERSE_BLOCK and the documented OBI circuit
 /// breaker.
 pub const FAIRVALUE_OBI_ADVERSE_BLOCK: Decimal = dec!(-0.60);
+/// Seconds the entry side's OBI must stay clear of the block before an entry
+/// is admitted (the OBI clear dwell). The block above is a single 50ms sample
+/// of a touch figure that is one or two orders wide: on 2026-09-02 YES read
+/// −0.987 at 17:44:36 and the entry fired at 17:44:39 on the first tick the
+/// touch flickered clear, while the whole book barely moved. 15s matches
+/// MAKER_GATE_DWELL_SECS, the same discipline on the Maker's gates: a book
+/// that genuinely clears stays clear for seconds; one order arriving does not.
+/// Shorter than the 45s edge persistence deliberately, and tracked alongside it
+/// rather than after it, so a clean book adds no wait. 0 = instant gate.
+pub const FAIRVALUE_OBI_CLEAR_SECS: u64 = 15;
 pub const FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 120;
 /// Fraction of the ENTRY fair value the model may lose before the reversal exit
 /// fires (0.35 = entry fair 0.30 exits below 0.195). Entry-relative, not an
@@ -1150,6 +1169,9 @@ pub const PARTIAL_FILL_COOLDOWN_SECS: i64 = 30;
 pub const STOP_LOSS_COOLDOWN_SECS: u64 = 180;
 /// Cooldown period (in seconds) before retrying a failed exit order.
 /// This prevents log floods and API hammering when FAK exits fail due to thin books.
+/// Compile-time default of the `exit_retry_cooldown_secs` DynamicConfig knob
+/// (Control Tower: Exit Accounting → Exit Retry Pace). The engine never runs
+/// it below 1s whatever is configured — see `EXIT_RETRY_COOLDOWN_FLOOR_SECS`.
 pub const EXIT_RETRY_COOLDOWN_SECS: u64 = 5;
 
 /// Kalshi categories that back DRADIS's `politics` market class.

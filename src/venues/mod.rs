@@ -84,16 +84,16 @@ pub fn exit_fee_pct_at_gain(entry_price: Decimal, gain: Decimal) -> Decimal {
 
 /// The venue's quadratic taker-fee coefficient.
 #[cfg(feature = "intl_clob")]
-fn taker_fee_rate() -> Decimal { crate::venues::intl::live_taker_fee_rate() }
+pub fn taker_fee_rate() -> Decimal { crate::venues::intl::live_taker_fee_rate() }
 
 /// Kalshi quotes the same quadratic schedule as a per-contract ceiling of 1.75¢ at
 /// P=0.5 (`KALSHI_FEE_BPS`), which is exactly `rate/4` — so the coefficient is 0.07.
 #[cfg(feature = "kalshi")]
-fn taker_fee_rate() -> Decimal { dec!(0.07) }
+pub fn taker_fee_rate() -> Decimal { dec!(0.07) }
 
 /// US Retail takes no taker fee.
 #[cfg(feature = "us_retail")]
-fn taker_fee_rate() -> Decimal { Decimal::ZERO }
+pub fn taker_fee_rate() -> Decimal { Decimal::ZERO }
 
 /// Cancel every resting order the VENUE reports, before trading begins.
 ///
