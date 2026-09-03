@@ -690,7 +690,7 @@ export default function DashboardPage() {
                     'flex items-center gap-2 text-xs font-mono px-3 py-1.5 rounded-lg border transition-colors',
                     config.ghost_mode
                       ? 'bg-amber-500/10 border-amber-500/30 text-amber-300 hover:bg-amber-500/20'
-                      : 'bg-[#13131f] border-[#1e1e32] text-gray-400 hover:border-gray-600',
+                      : 'bg-indigo-500/15 border-indigo-400/50 text-indigo-200 hover:bg-indigo-500/25 hover:border-indigo-300 shadow-[0_0_10px_-2px_rgba(99,102,241,0.5)]',
                   ].join(' ')}
                 >
                   <span>{config.ghost_mode ? '' : '⚡'}</span>
@@ -745,7 +745,7 @@ export default function DashboardPage() {
                   'flex items-center gap-2 text-xs font-mono px-3 py-1.5 rounded-lg border transition-colors',
                   config.ghost_mode
                     ? 'bg-amber-500/10 border-amber-500/30 text-amber-300 hover:bg-amber-500/20'
-                    : 'bg-[#13131f] border-[#1e1e32] text-gray-400 hover:border-gray-600',
+                    : 'bg-indigo-500/15 border-indigo-400/50 text-indigo-200 hover:bg-indigo-500/25 hover:border-indigo-300 shadow-[0_0_10px_-2px_rgba(99,102,241,0.5)]',
                 ].join(' ')}
               >
                 <span>{config.ghost_mode ? '' : '⚡'}</span>
