@@ -29,7 +29,7 @@ use tracing::info;
 
 use crate::config;
 use crate::helpers::market::{get_market_pair, MarketCandidate};
-use crate::helpers::time::{fetch_historical_strike_price, fetch_strike_price_from_close_time};
+use crate::helpers::time::{fetch_historical_strike_price, fetch_strike_price_from_close_time, hourly_window_reference_time};
 use crate::venues::core::MarketId;
 use crate::venues::intl::market_id_from_u256;
 
@@ -55,6 +55,24 @@ pub type MarketState = (
     Option<MarketCandidate>,     // maker_market_candidate
     String,                      // condition_id (NEW)
 );
+
+/// Whether the held hourly market is owed a strike it did not have at rotation.
+///
+/// An "Up or Down" market's strike is the open of the Binance candle that
+/// starts its window, and the squadron rotates onto the next hour's market
+/// before that window opens — so the strike legitimately does not exist at
+/// rotation time. It exists from the window open onward, and it has to be
+/// fetched then: the monitor is the only task that resolves strikes, and its
+/// switch path runs once. Due while the market is live, its strike is still
+/// unknown, and its window has opened. Never due for a closed market.
+fn strike_refresh_due(
+    strike: Option<Decimal>,
+    close_time: Option<chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+) -> bool {
+    strike.is_none()
+        && close_time.is_some_and(|ct| ct > now && hourly_window_reference_time(ct, now).is_some())
+}
 
 /// Whether a held market should be released when no replacement candidate exists.
 ///
@@ -209,6 +227,31 @@ pub async fn run_market_monitor(
         let (cur_yes, _, cur_name, cur_close_time, _, _, _, _cur_cid) = market_tx.borrow().clone();
 
         if candidate.yes_token == cur_yes {
+            // ── Strike arriving after rotation ───────────────────────────────
+            // Re-broadcast the SAME market with its strike filled in. The patrol
+            // loop treats an unchanged condition id as a no-op rather than a
+            // rotation (no order cancel, no redeploy) and reads the strike live
+            // from this channel on every tick — see `live_hourly_strike`.
+            let (cur_strike, cur_close) = {
+                let ms = market_tx.borrow();
+                (ms.4, ms.3)
+            };
+            if strike_refresh_due(cur_strike, cur_close, Utc::now()) {
+                match fetch_strike_price_from_close_time(&http, &crypto_filter, cur_close).await {
+                    Some(strike) => {
+                        info!(
+                            "✅ Hourly strike resolved at window open: ${} for \"{}\"",
+                            strike, cur_name,
+                        );
+                        let (y, n, nm, ct, _, ds, mk, cid) = market_tx.borrow().clone();
+                        let _ = market_tx.send((y, n, nm, ct, Some(strike), ds, mk, cid));
+                    }
+                    None => tracing::warn!(
+                        "⚠️ Hourly strike still unresolved for \"{}\" after its window opened — retrying next scan",
+                        cur_name,
+                    ),
+                }
+            }
             // Hourly market unchanged — still check if maker market changed
             let cur_maker_yes = market_tx.borrow().6.as_ref().map(|m| m.yes_token.clone());
             let new_maker_yes = maker_candidate.as_ref().map(|m| m.yes_token.clone());
@@ -268,6 +311,18 @@ pub async fn run_market_monitor(
         if strike.is_none() {
             strike = fetch_strike_price_from_close_time(&http, &crypto_filter, candidate.close_time).await;
         }
+        match (strike, candidate.close_time) {
+            (Some(s), _) => info!("✅ Hourly strike resolved: ${} for \"{}\"", s, candidate.name),
+            // The normal state for a fresh "Up or Down" market: it is picked
+            // up before its window opens, and no strike exists until then.
+            // Strike-dependent vipers idle on it; the refresh above fills it in.
+            (None, Some(ct)) if hourly_window_reference_time(ct, Utc::now()).is_none() => info!(
+                "⏳ \"{}\" opens at {} — no strike until then; strike-dependent vipers idle on it until the open",
+                candidate.name,
+                (ct - chrono::Duration::hours(1)).with_timezone(&chrono_tz::US::Eastern).format("%H:%M ET"),
+            ),
+            (None, _) => tracing::warn!("⚠️ Hourly strike unresolved for \"{}\"", candidate.name),
+        }
         if let Some(ref mut mk) = maker_candidate {
             let prev_mk = market_tx.borrow().6.clone();
             resolve_maker_strike(&http, &crypto_filter, prev_mk.as_ref(), mk).await;
@@ -279,6 +334,39 @@ pub async fn run_market_monitor(
             maker_candidate,
             candidate.condition_id.clone(),
         ));
+    }
+}
+
+#[cfg(test)]
+mod strike_refresh_tests {
+    use super::strike_refresh_due;
+    use chrono::{Duration, TimeZone, Utc};
+    use rust_decimal_macros::dec;
+
+    fn utc(s: &str) -> chrono::DateTime<Utc> {
+        Utc.datetime_from_str(s, "%Y-%m-%dT%H:%M:%SZ").unwrap()
+    }
+
+    /// The 2026-09-03 6AM ET market (10:00-11:00 UTC), held from before its
+    /// open: not due until the window opens, due from then until close, never
+    /// due once it has closed or once it has a strike.
+    #[test]
+    fn a_strike_is_owed_only_while_the_window_is_open_and_the_strike_unknown() {
+        let close = Some(utc("2026-09-03T11:00:00Z"));
+        assert!(!strike_refresh_due(None, close, utc("2026-09-03T09:55:00Z")), "pre-open: nothing to fetch yet");
+        assert!(strike_refresh_due(None, close, utc("2026-09-03T10:00:30Z")), "just opened: owed");
+        assert!(strike_refresh_due(None, close, utc("2026-09-03T10:48:00Z")), "mid-hour: still owed");
+        assert!(!strike_refresh_due(None, close, utc("2026-09-03T11:00:01Z")), "closed: nothing to price");
+        assert!(!strike_refresh_due(Some(dec!(77600)), close, utc("2026-09-03T10:30:00Z")), "already known");
+    }
+
+    /// The ZERO sentinel (no market held) and a market with no close time can
+    /// never owe a strike; the fetch would have nothing to reference.
+    #[test]
+    fn no_close_time_means_nothing_is_owed() {
+        let now = Utc::now();
+        assert!(!strike_refresh_due(None, None, now));
+        assert!(!strike_refresh_due(None, Some(now + Duration::minutes(30)), now - Duration::hours(2)));
     }
 }
 

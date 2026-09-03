@@ -683,7 +683,18 @@ impl Strategy for FairValueStrategyImpl {
         // ── Structural requirements ──────────────────────────────────────────
         let strike = match market.strike_price.and_then(|s| s.to_f64()) {
             Some(s) if s > 0.0 => s,
-            _ => { idle("market has no strike price"); return Ok(StrategySignal::NoSignal) },
+            _ => {
+                // An "Up or Down" market has no strike until its window opens
+                // (its strike IS the window's opening print), and the squadron
+                // is on it minutes before that. Say so, rather than reporting
+                // a market that merely lacks a strike: the two look identical
+                // from the registry and only one of them resolves itself.
+                let pre_open = market.market_close_time.is_some_and(|ct| {
+                    crate::helpers::time::hourly_window_reference_time(ct, Utc::now()).is_none()
+                });
+                idle(if pre_open { "window not open yet — no strike exists until the open" } else { "market has no strike price" });
+                return Ok(StrategySignal::NoSignal)
+            }
         };
         let secs_left = match market.market_close_time {
             Some(ct) => (ct - Utc::now()).num_seconds(),
@@ -791,8 +802,8 @@ impl Strategy for FairValueStrategyImpl {
             if due {
                 *last = Some(Instant::now());
                 tracing::info!(
-                    " FairValue: fair(YES)={:.3} (d={:+.2}σ, σ/√s={:.2e}, T={}s) | yes_ask=${:.2} edge={:+.3} | no_ask=${:.2} edge={:+.3} | req={:.3} | noise{}={}{}",
-                    fair_yes, d_sigma, sigma, secs_left,
+                    " FairValue: fair(YES)={:.3} (d={:+.2}σ, σ/√s={:.2e}, T={}s, K=${:.2}) | yes_ask=${:.2} edge={:+.3} | no_ask=${:.2} edge={:+.3} | req={:.3} | noise{}={}{}",
+                    fair_yes, d_sigma, sigma, secs_left, strike,
                     snap.yes_ask, yes_edge, snap.no_ask, no_edge, req_edge,
                     config::FAIRVALUE_EDGE_NOISE_HORIZON_SECS,
                     fair_noise.map_or_else(|| "warmup".to_string(), |n| format!("{:.3}", n)),
@@ -1014,8 +1025,8 @@ impl Strategy for FairValueStrategyImpl {
             if due {
                 *last = Some(Instant::now());
                 tracing::info!(
-                    " FairValue {} entry: fair={:.3} ask=${:.2} edge={:+.3} (req {:.3}) | d={:+.2}σ T={}s | shares={:.2}",
-                    side, if want_yes { fair_yes } else { 1.0 - fair_yes }, ask, edge, req_edge, d_sigma, secs_left, shares,
+                    " FairValue {} entry: fair={:.3} ask=${:.2} edge={:+.3} (req {:.3}) | d={:+.2}σ T={}s K=${:.2} | shares={:.2}",
+                    side, if want_yes { fair_yes } else { 1.0 - fair_yes }, ask, edge, req_edge, d_sigma, secs_left, strike, shares,
                 );
                 crate::helpers::metrics::stash_entry_signals_json(token_id.as_str(), serde_json::json!({
                     "viper": "FairValue",
@@ -1023,6 +1034,7 @@ impl Strategy for FairValueStrategyImpl {
                     "fair_yes": fair_yes,
                     "d_sigma": d_sigma,
                     "sigma_per_sqrt_sec": sigma,
+                    "strike": strike,
                     "secs_left": secs_left,
                     "ask": ask.to_string(),
                     "edge": edge.to_string(),
@@ -1252,12 +1264,30 @@ impl Strategy for FairValueStrategyImpl {
                         );
                     }
                 }
+                // The book the stop was read from rides along in the reason.
+                // 2026-09-03: three catastrophic stops were reconstructed from
+                // heartbeats 45s either side of the exit, which is the wrong
+                // instrument — the heartbeat and this stop read the same watch
+                // channel, and that channel only moves on a `book` event. The
+                // ask, the spread it implies and the size at the touch say at
+                // once whether the mark was a thin bid under a standing ask or
+                // a repriced market.
+                let (ask, bid_depth) = if token_is_yes {
+                    (snap.yes_ask, snap.yes_bid_depth)
+                } else {
+                    (snap.no_ask, snap.no_bid_depth)
+                };
+                let book = format!(
+                    " | ask=${:.4} spread=${:.2} bid_depth={:.0} fair={}",
+                    ask, ask - bid, bid_depth,
+                    fair_side.map_or_else(|| "n/a".to_string(), |p| format!("{:.3}", p)),
+                );
                 return Ok(StrategySignal::Exit {
                     params: exit_params(bid),
                     reason: if catastrophic {
-                        format!("FairValueCatastrophicSL: bid=${:.4}, loss={:.2}% (min-hold bypassed @ {}s)", bid, profit_margin * dec!(100), secs_held)
+                        format!("FairValueCatastrophicSL: bid=${:.4}, loss={:.2}% (min-hold bypassed @ {}s){}", bid, profit_margin * dec!(100), secs_held, book)
                     } else {
-                        format!("FairValueSL: bid=${:.4}, loss={:.2}%", bid, profit_margin * dec!(100))
+                        format!("FairValueSL: bid=${:.4}, loss={:.2}%{}", bid, profit_margin * dec!(100), book)
                     },
                     exit_pair: false,
                 });

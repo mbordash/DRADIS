@@ -185,8 +185,17 @@ struct MakerRestingExit {
     /// since a resting limit order cannot slip.
     price: Decimal,
     /// Share count the position held when the ask was placed. A drop below this
-    /// on-chain means the ask (partially) filled.
+    /// on-chain means the ask (partially) filled. Re-based to the remainder each
+    /// time the sweep books a partial lift.
     shares: Decimal,
+    /// Shares of THIS ask the sweep has already written to the ledger.
+    ///
+    /// The venue reports an open order's `size_matched` cumulatively since
+    /// placement, so a path that reads it (reprice, stop, stand-down) must take
+    /// the sweep's bookings off first or it re-books them. 2026-09-03 trade 5
+    /// did exactly that: a 5.31-share partial the sweep had booked 21s earlier
+    /// was counted again at reprice.
+    booked: Decimal,
     /// Entry price captured at placement, for P&L on fill.
     avg_entry: Decimal,
     market_name: String,
@@ -931,6 +940,9 @@ impl Squadron {
                     // Only proceed if at least one market has valid prices
                     if (hourly_ya == dec!(1) && hourly_na == dec!(1)) && (maker_ya == dec!(1) && maker_na == dec!(1)) { continue; }
 
+                    // The strike can arrive after deploy — see `live_hourly_strike`.
+                    let hourly_strike_price =
+                        live_hourly_strike(&ctx.market_rx, &hourly_condition_id, hourly_strike_price);
                     // Part of every PositionKey the vipers build this tick.
                     let hourly_market_config_for_ctx = MarketConfig {
                         yes_token: hourly_yes_token.clone(), no_token: hourly_no_token.clone(), market_name: hourly_market_name.clone(), market_close_time: hourly_market_close_time, strike_price: hourly_strike_price, is_neg_risk: hourly_is_neg_risk, condition_id: hourly_condition_id.clone(), yes_fee_bps: hourly_yes_fee_rate, no_fee_bps: hourly_no_fee_rate,
@@ -1340,8 +1352,12 @@ impl Squadron {
                                 // only order that could have taken them.
                                 let resting_ask_price = resting_rec.as_ref().map(|r| r.price);
                                 if let Some(rest) = resting_rec {
-                                    let (_found, matched) =
-                                        cancel_resting_orders_for_token(&trading_client, &tid_m).await;
+                                    // Leaving the position: pull everything we have resting
+                                    // on the token, the ask AND any residual entry bid. Only
+                                    // the ASK's matched size is an exit fill, though — the
+                                    // bid's is the entry, already in the position.
+                                    let cancel = cancel_resting_orders_for_token(
+                                        &trading_client, &tid_m, RestingSide::Both).await;
                                     maker_resting_exits.remove(&pos_key);
 
                                     // How much do we still hold? A single balance read of
@@ -1369,7 +1385,10 @@ impl Squadron {
                                     };
                                     // Trust the balance over `matched`: a fully-lifted ask
                                     // has already left the book and reports no matched
-                                    // size at all.
+                                    // size at all. What the venue does report is cumulative,
+                                    // so the sweep's earlier bookings come off first.
+                                    let matched = resting_exit::lift_since_booking(
+                                        cancel.ask_found, cancel.ask_matched, rest.booked, prior_shares);
                                     let lifted = (prior_shares - held).max(matched).max(dec!(0));
 
                                     if lifted >= config::MIN_ORDER_SHARES {
@@ -2425,7 +2444,13 @@ impl Squadron {
                                     let matched = if ghosting {
                                         dec!(0)
                                     } else {
-                                        let (order_found, m) = crate::helpers::balance::cancel_resting_orders_for_token(&trading_client, &tok).await;
+                                        // The quote is a BID; pull that side only. A resting
+                                        // exit ask on this token belongs to the resting-exit
+                                        // path, and its matched size is an exit, not a fill
+                                        // to adopt.
+                                        let cancel = crate::helpers::balance::cancel_resting_orders_for_token(
+                                            &trading_client, &tok, crate::helpers::balance::RestingSide::Bids).await;
+                                        let (order_found, m) = (cancel.bid_found, cancel.bid_matched);
                                         // ── Complete-fill guard ──────────────────────────
                                         // A quote that FULLY filled vanishes from the CLOB
                                         // open-orders list, so the cancel sweep reports zero
@@ -2536,7 +2561,7 @@ impl Squadron {
                                         maker_resting_exits.insert(pk.clone(), MakerRestingExit {
                                             price: params.price, shares: live_shares, avg_entry,
                                             market_name: params.market_name.clone(), last_poll: Instant::now(),
-                                            short_reads: 0, max_short_read: dec!(0),
+                                            short_reads: 0, max_short_read: dec!(0), booked: dec!(0),
                                         });
                                     }
                                     continue;
@@ -2554,14 +2579,40 @@ impl Squadron {
                                     // Repricing: pull the stale ask so the shares are free
                                     // to back the new one.
                                     let stale_price = existing.price;
-                                    let (_found, matched) =
-                                        cancel_resting_orders_for_token(&trading_client, &tok).await;
+                                    let already_booked = existing.booked;
+                                    let ask_baseline = existing.shares;
+                                    // Pull OUR ASK only. The Maker's entry bid can still be
+                                    // resting on this same token (a GTC quote keeps working
+                                    // after a partial fill), and it belongs to the quote
+                                    // lifecycle, not this one: it holds none of the shares,
+                                    // and its matched size is the ENTRY fill — already in the
+                                    // position, not something that left it.
+                                    let cancel = cancel_resting_orders_for_token(
+                                        &trading_client, &tok, RestingSide::Asks).await;
                                     // The record MUST go regardless of what the cancel
                                     // found: after this point no ask of ours rests, and
                                     // leaving the entry behind would make the next tick's
                                     // deadband check believe one still does — silently
                                     // stranding the position with no exit order at all.
                                     maker_resting_exits.remove(&pk);
+
+                                    // What the venue says left THIS ask beyond what the
+                                    // sweep has already booked. `ask_matched` is cumulative
+                                    // since placement, so the sweep's partials come off
+                                    // first — 2026-09-03 trade 5 re-booked a 5.31-share
+                                    // partial the sweep had written 21s earlier, on top of
+                                    // the entry bid's own 7.35 fill, and closed a 7.35-share
+                                    // position as 17.98 shares sold.
+                                    let venue_lift = resting_exit::lift_since_booking(
+                                        cancel.ask_found, cancel.ask_matched, already_booked, live_shares);
+                                    // Cross-check the chain, once and without sleeping in
+                                    // the tick: a fully lifted ask has already left the
+                                    // open-orders list, and the only reading trusted here is
+                                    // a POSITIVE one below the baseline (the endpoint lags
+                                    // high, never low, and reads 0 on any failure).
+                                    let held = onchain_balance_for_token(&trading_client, &tok).await;
+                                    let chain_lift = resting_exit::chain_drop(ask_baseline, held);
+                                    let matched = venue_lift.max(chain_lift);
 
                                     if matched >= config::MIN_ORDER_SHARES {
                                         // Lifted while we were deciding. Book that slice
@@ -2581,7 +2632,7 @@ impl Squadron {
                                         ).await;
                                         last_trade_time.insert(sn.clone(), Instant::now());
 
-                                        let remaining = live_shares - matched;
+                                        let remaining = resting_exit::remaining_after(live_shares, matched, held);
                                         if remaining < config::MIN_ORDER_SHARES {
                                             positions.lock().await.remove(&pk);
                                             token_ownership.lock().await.remove(&tok);
@@ -2594,6 +2645,16 @@ impl Squadron {
                                         // the strategy has priced it against a fresh book.
                                         if let Some(p) = positions.lock().await.get_mut(&pk) { p.shares = remaining; }
                                         continue;
+                                    } else if !cancel.ask_found {
+                                        // Nothing verifiable sold: the ask is gone from the
+                                        // book and the chain shows no drop. Either it was
+                                        // pulled from outside or a full lift has not reached
+                                        // the balance endpoint yet. Book nothing — the
+                                        // re-post below fails on "not enough balance" if
+                                        // the shares are gone, and the chain sweep then
+                                        // closes the row from the wallet, not from a guess.
+                                        info!("ℹ️ Maker resting exit [{}]: ask @ ${:.4} was no longer on the book and the chain shows no lift — re-posting against a fresh book",
+                                              sn, stale_price);
                                     }
                                 }
 
@@ -2608,7 +2669,7 @@ impl Squadron {
                                         maker_resting_exits.insert(pk.clone(), MakerRestingExit {
                                             price: params.price, shares: live_shares, avg_entry,
                                             market_name: params.market_name.clone(), last_poll: Instant::now(),
-                                            short_reads: 0, max_short_read: dec!(0),
+                                            short_reads: 0, max_short_read: dec!(0), booked: dec!(0),
                                         });
                                         info!("📤 Maker resting exit [{}]: {} | ASK {:.4} shares @ ${:.4} (entry ${:.4}) | {}",
                                               sn, params.market_name, live_shares, params.price, avg_entry, reason);
@@ -2739,7 +2800,7 @@ impl Squadron {
                                 // real on-chain size so the next poll measures against
                                 // the right baseline.
                                 if let Some(p) = positions.lock().await.get_mut(&pk) { p.shares = held; }
-                                if let Some(r) = maker_resting_exits.get_mut(&pk) { r.shares = held; }
+                                if let Some(r) = maker_resting_exits.get_mut(&pk) { r.shares = held; r.booked += filled; }
                             }
                         }
                     }
@@ -2761,8 +2822,12 @@ impl Squadron {
         // config directly rather than the build constant alone.
         if !maker_resting_exits.is_empty() && !crate::helpers::dynamic_config::ghosting_now() {
             for (pk, rec) in maker_resting_exits.iter() {
-                let (_found, matched) =
-                    cancel_resting_orders_for_token(&trading_client, &pk.market).await;
+                let cancel = cancel_resting_orders_for_token(
+                    &trading_client, &pk.market, RestingSide::Both).await;
+                // Only the ask's fill is an exit, and only the part the sweep
+                // has not already booked.
+                let matched = resting_exit::lift_since_booking(
+                    cancel.ask_found, cancel.ask_matched, rec.booked, rec.shares);
                 if matched >= config::MIN_ORDER_SHARES {
                     // Lifted during tear-down: book it here at the resting price
                     // rather than leaving a silent cash move for the reconciler.
@@ -2904,6 +2969,34 @@ pub(crate) fn event_market_retire_due(
 /// it fall back to the hourly leg. See `Squadron::single_market`.
 pub(crate) fn single_market_arb_enabled(single_market: bool, has_maker_venue: bool) -> bool {
     single_market && !has_maker_venue
+}
+
+/// The hourly strike as the market channel holds it RIGHT NOW, for the market
+/// this squadron deployed on.
+///
+/// An "Up or Down" market's strike is the opening print of its window, and the
+/// squadron rotates onto the next hour's market before that window opens — so
+/// the strike is legitimately unknown at deploy and arrives later, when the
+/// market monitor re-broadcasts the same market with it filled in. That
+/// re-broadcast carries the same condition id and is deliberately not a
+/// rotation (rotation cancels every order and redeploys), so the value
+/// captured at deploy would never see it. Read the channel each tick instead.
+///
+/// A different condition id on the channel is a rotation in flight; the
+/// deployed value stands until the rotation arm handles it. One short borrow,
+/// never held across an await — the same discipline as every other watch
+/// channel read in the patrol tick.
+fn live_hourly_strike(
+    market_rx: &tokio::sync::watch::Receiver<crate::tasks::market_monitor::MarketState>,
+    deployed_condition_id: &str,
+    deployed_strike: Option<Decimal>,
+) -> Option<Decimal> {
+    let ms = market_rx.borrow();
+    if !deployed_condition_id.is_empty() && ms.7 == deployed_condition_id {
+        ms.4
+    } else {
+        deployed_strike
+    }
 }
 
 #[cfg(test)]
@@ -3252,6 +3345,110 @@ mod context_borrow_tests {
 }
 
 
+/// Pure arithmetic for booking a resting maker ask that gets pulled — by a
+/// reprice, by a stop, or at stand-down. Kept free of I/O so the shapes from
+/// the 2026-09-03 incident are pinned by tests.
+pub(crate) mod resting_exit {
+    use rust_decimal::Decimal;
+    use crate::config;
+
+    /// Shares the venue says left THIS ask that the ledger has not seen yet.
+    ///
+    /// `ask_matched` is the open order's `size_matched`: cumulative since the
+    /// ask was placed, not since anyone last looked. The balance sweep books
+    /// partial lifts as they land and counts them in `booked`, so only the
+    /// excess is new. Clamped to `live` because no more than the position can
+    /// have been sold. An ask that is not on the book (`found` false) has no
+    /// venue figure at all — a fully lifted order vanishes from the list, and
+    /// so does an externally cancelled one — so this reports zero rather than
+    /// guess; the caller's chain read decides.
+    pub fn lift_since_booking(found: bool, ask_matched: Decimal, booked: Decimal, live: Decimal) -> Decimal {
+        if !found { return Decimal::ZERO; }
+        (ask_matched - booked).max(Decimal::ZERO).min(live.max(Decimal::ZERO))
+    }
+
+    /// Shares the chain says left the wallet since the ask was sized to
+    /// `baseline`, from ONE balance reading.
+    ///
+    /// A single read is trusted only in the direction it cannot lie: the
+    /// balance endpoint lags a fill and so reads HIGH, never low, and it reads
+    /// 0 on any failure. A POSITIVE reading below the baseline is therefore
+    /// evidence of a lift; a zero is ambiguous (full lift or a failed lookup)
+    /// and reports nothing.
+    pub fn chain_drop(baseline: Decimal, held: Decimal) -> Decimal {
+        if held < config::MIN_ORDER_SHARES { return Decimal::ZERO; }
+        (baseline - held).max(Decimal::ZERO)
+    }
+
+    /// What the position holds after booking `lifted`: the ledger's figure,
+    /// lowered — never raised — to a positive chain reading.
+    pub fn remaining_after(live: Decimal, lifted: Decimal, held: Decimal) -> Decimal {
+        let ledger = (live - lifted).max(Decimal::ZERO);
+        if held >= config::MIN_ORDER_SHARES && held < ledger { held } else { ledger }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use rust_decimal_macros::dec;
+
+        /// 2026-09-03 trade 5, exactly. The ask (7.35 @ $0.35) had 5.314284
+        /// matched, all of it booked by the sweep at 22:20:05; 2.035716 shares
+        /// were still resting when the reprice pulled it 21s later. The right
+        /// figure to book at that moment is nothing.
+        #[test]
+        fn a_partial_the_sweep_already_booked_is_not_booked_again() {
+            assert_eq!(lift_since_booking(true, dec!(5.314284), dec!(5.314284), dec!(2.035716)), dec!(0));
+        }
+
+        /// Belt and braces for the same trade: even had the side-blind 12.664284
+        /// reached here with nothing booked, no more than the position could
+        /// have been sold.
+        #[test]
+        fn nothing_beyond_the_position_can_be_lifted() {
+            assert_eq!(lift_since_booking(true, dec!(12.664284), dec!(0), dec!(2.035716)), dec!(2.035716));
+        }
+
+        /// A partial the sweep has NOT seen yet is exactly the case this path is for.
+        #[test]
+        fn an_unbooked_partial_is_booked_in_full() {
+            assert_eq!(lift_since_booking(true, dec!(3), dec!(0), dec!(7.35)), dec!(3));
+            assert_eq!(lift_since_booking(true, dec!(5.314284), dec!(3), dec!(7.35)), dec!(2.314284));
+        }
+
+        /// An ask that is no longer on the book carries no venue figure, whatever
+        /// the caller thinks it remembers.
+        #[test]
+        fn a_vanished_ask_reports_nothing() {
+            assert_eq!(lift_since_booking(false, dec!(5), dec!(0), dec!(7.35)), dec!(0));
+        }
+
+        #[test]
+        fn a_stale_figure_below_what_was_booked_is_not_negative() {
+            assert_eq!(lift_since_booking(true, dec!(1), dec!(2), dec!(7.35)), dec!(0));
+        }
+
+        /// The balance endpoint reads 0 on failure, so 0 proves nothing; a
+        /// positive reading below the baseline is a lift; a reading at or above
+        /// it (lag reads high) is not.
+        #[test]
+        fn a_chain_drop_needs_a_positive_reading_below_the_baseline() {
+            assert_eq!(chain_drop(dec!(7.35), dec!(0)), dec!(0));
+            assert_eq!(chain_drop(dec!(7.35), dec!(2.035716)), dec!(5.314284));
+            assert_eq!(chain_drop(dec!(7.35), dec!(7.35)), dec!(0));
+            assert_eq!(chain_drop(dec!(7.35), dec!(9)), dec!(0));
+        }
+
+        #[test]
+        fn the_remainder_follows_the_ledger_unless_the_chain_reads_lower() {
+            assert_eq!(remaining_after(dec!(7.35), dec!(5.314284), dec!(0)), dec!(2.035716));
+            assert_eq!(remaining_after(dec!(7.35), dec!(5.314284), dec!(1.5)), dec!(1.5));
+            assert_eq!(remaining_after(dec!(7.35), dec!(5.314284), dec!(9)), dec!(2.035716));
+            assert_eq!(remaining_after(dec!(2), dec!(5), dec!(0)), dec!(0));
+        }
+    }
+}
+
 /// Settlement of one exit FAK from the venue's synchronous response.
 ///
 /// Pure, so the accounting on the most dangerous path in the engine — the
@@ -3446,5 +3643,48 @@ pub mod fak_exit {
             assert_eq!(kept.opened_at, opened);
             assert_eq!(kept.paired_leg_token_id, Some(MarketId::new("pair")));
         }
+    }
+}
+
+#[cfg(test)]
+mod live_strike_tests {
+    use super::live_hourly_strike;
+    use crate::tasks::market_monitor::MarketState;
+    use crate::venues::core::MarketId;
+    use rust_decimal_macros::dec;
+    use tokio::sync::watch;
+
+    fn state(cid: &str, strike: Option<rust_decimal::Decimal>) -> MarketState {
+        (
+            MarketId::new("y"), MarketId::new("n"), "Bitcoin Up or Down - September 3, 6AM ET".to_string(),
+            Some(chrono::Utc::now() + chrono::Duration::hours(1)), strike, String::new(), None, cid.to_string(),
+        )
+    }
+
+    /// Deployed pre-open without a strike; the monitor later re-broadcasts the
+    /// same market with the window's opening print. The tick must pick it up
+    /// without a rotation — the re-broadcast has the same condition id, and the
+    /// rotation arm ignores it on purpose.
+    #[test]
+    fn a_strike_published_after_deploy_reaches_the_tick() {
+        let (tx, rx) = watch::channel(state("cid-6am", None));
+        assert_eq!(live_hourly_strike(&rx, "cid-6am", None), None, "pre-open: still no strike");
+
+        tx.send(state("cid-6am", Some(dec!(77600.02)))).unwrap();
+        assert_eq!(live_hourly_strike(&rx, "cid-6am", None), Some(dec!(77600.02)));
+    }
+
+    /// A different market on the channel is a rotation the rotation arm has
+    /// not processed yet. Its strike belongs to the other market and must not
+    /// be applied to this one.
+    #[test]
+    fn another_markets_strike_is_never_borrowed() {
+        let (tx, rx) = watch::channel(state("cid-6am", Some(dec!(77600))));
+        tx.send(state("cid-7am", Some(dec!(77900)))).unwrap();
+        assert_eq!(live_hourly_strike(&rx, "cid-6am", Some(dec!(77600))), Some(dec!(77600)));
+        // And a squadron with no hourly market (empty condition id) keeps its
+        // None rather than matching the sentinel's empty id.
+        let (_tx2, rx2) = watch::channel(state("", Some(dec!(1))));
+        assert_eq!(live_hourly_strike(&rx2, "", None), None);
     }
 }

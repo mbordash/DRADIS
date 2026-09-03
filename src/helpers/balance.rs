@@ -147,7 +147,7 @@ pub async fn sync_position_balance(
                     // zero balance AND zero resting orders while Polygon settles the fill.
                     // After cancelling, wait one grace period and re-check the balance
                     // before declaring phantom — this catches the settlement-lag race.
-                    let (had_resting, _) = cancel_resting_orders(client, token_id).await;
+                    let had_resting = cancel_resting_orders(client, token_id, RestingSide::Both).await.any_found();
                     if had_resting {
                         // Order was live → may have been matching. Wait for on-chain settlement.
                         tokio::time::sleep(Duration::from_secs(20)).await;
@@ -221,30 +221,170 @@ pub async fn sync_position_balance(
     }
 }
 
-/// Fetch all open orders for a token and cancel them.
-/// Returns `(had_orders, size_matched_total)` — whether any orders were found
-/// (and cancelled), and the total shares already matched on those orders at
-/// cancel time. A resting GTC quote can partially fill in the seconds before a
-/// quote-pull (2026-07-23 trade 280: 5 of 9.09 shares filled in the 16s window);
-/// callers MUST inspect `size_matched_total` and adopt any filled shares instead
-/// of discarding the position.
-async fn cancel_resting_orders(client: &Arc<ClobClient<Authenticated<Normal>>>, token_id: U256) -> (bool, Decimal) {
+/// Which of our resting orders on a token a cancel sweep targets.
+///
+/// The Maker can have BOTH sides working on one token at once: the residual
+/// of its entry bid (a GTC quote keeps resting after a partial fill) and the
+/// exit ask it posts against the filled part. They belong to different
+/// lifecycles — the bid to `MakerQuote`/`MakerCancel`, the ask to the resting
+/// exit — so a caller names the side its own order lives on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RestingSide {
+    /// Our resting BUY quote(s): the Maker's entry bid.
+    Bids,
+    /// Our resting SELL order(s): the Maker's resting exit ask.
+    Asks,
+    /// Everything we have resting on the token — for paths that are leaving
+    /// the position or the market altogether.
+    Both,
+}
+
+impl RestingSide {
+    fn includes(self, side: Side) -> bool {
+        match (self, side) {
+            (RestingSide::Both, _) => true,
+            (RestingSide::Bids, Side::Buy) => true,
+            (RestingSide::Asks, Side::Sell) => true,
+            _ => false,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            RestingSide::Bids => "BUY",
+            RestingSide::Asks => "SELL",
+            RestingSide::Both => "",
+        }
+    }
+}
+
+/// What a cancel sweep found on the book, reported PER SIDE.
+///
+/// `size_matched` on an open order is CUMULATIVE since placement, and it means
+/// a different thing on each side. On the bid it is the entry fill — shares
+/// that are already in the position. On the ask it is the exit fill — shares
+/// that have already left it. Adding the two together booked an entry as an
+/// exit on 2026-09-03 (trade 5: "12.66 shares lifted" on a 7.35-share
+/// position, the 7.35 being the bid's own fill). A caller reads the side its
+/// order lives on and nothing else.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct RestingCancel {
+    /// At least one resting BUY was on the book (and is now cancelled).
+    pub bid_found: bool,
+    /// Shares matched on the cancelled BUY order(s), cumulative since placement.
+    pub bid_matched: Decimal,
+    /// At least one resting SELL was on the book (and is now cancelled).
+    pub ask_found: bool,
+    /// Shares matched on the cancelled SELL order(s), cumulative since placement.
+    pub ask_matched: Decimal,
+}
+
+impl RestingCancel {
+    /// Anything at all was resting and got cancelled.
+    pub fn any_found(&self) -> bool { self.bid_found || self.ask_found }
+}
+
+/// Fold `(side, size_matched)` pairs into per-side totals. Pure, so the side
+/// split — the load-bearing claim of [`RestingCancel`] — is pinned by tests.
+/// `Side::Unknown` is cancelled by a `Both` sweep but credited to neither side.
+fn tally_by_side(orders: impl Iterator<Item = (Side, Decimal)>) -> RestingCancel {
+    let mut out = RestingCancel::default();
+    for (side, matched) in orders {
+        match side {
+            Side::Buy => { out.bid_found = true; out.bid_matched += matched; }
+            Side::Sell => { out.ask_found = true; out.ask_matched += matched; }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// Fetch our open orders for a token on the requested side(s) and cancel them.
+///
+/// Returns what was found, per side. A resting GTC quote can partially fill in
+/// the seconds before a quote-pull (2026-07-23 trade 280: 5 of 9.09 shares
+/// filled in the 16s window); callers MUST inspect the matched size on THEIR
+/// side and adopt (bid) or book (ask) those shares instead of discarding them.
+async fn cancel_resting_orders(
+    client: &Arc<ClobClient<Authenticated<Normal>>>,
+    token_id: U256,
+    target: RestingSide,
+) -> RestingCancel {
     let req = OrdersRequest::builder().asset_id(token_id).build();
     let orders = match client.orders(&req, None).await {
         Ok(page) => page.data,
-        Err(_) => return (false, dec!(0)),
+        Err(_) => return RestingCancel::default(),
     };
-    if orders.is_empty() {
-        return (false, dec!(0));
+    let ours: Vec<_> = orders.into_iter().filter(|o| target.includes(o.side)).collect();
+    if ours.is_empty() {
+        return RestingCancel::default();
     }
-    let matched: Decimal = orders.iter().map(|o| o.size_matched).sum();
-    let order_ids: Vec<String> = orders.into_iter().map(|o| o.id).collect();
+    let tally = tally_by_side(ours.iter().map(|o| (o.side, o.size_matched)));
+    let order_ids: Vec<String> = ours.into_iter().map(|o| o.id).collect();
     let id_refs: Vec<&str> = order_ids.iter().map(|s| s.as_str()).collect();
-    warn!(" Cancelling {} resting GTC order(s) for token {} — preventing orphan fills{}",
-          id_refs.len(), token_id,
-          if matched > dec!(0) { format!(" ({matched:.4} shares already matched)") } else { String::new() });
+    let mut detail = String::new();
+    if tally.bid_matched > dec!(0) { detail.push_str(&format!(" (bid: {:.4} shares already matched)", tally.bid_matched)); }
+    if tally.ask_matched > dec!(0) { detail.push_str(&format!(" (ask: {:.4} shares already matched)", tally.ask_matched)); }
+    warn!(" Cancelling {} resting GTC {}order(s) for token {} — preventing orphan fills{}",
+          id_refs.len(),
+          if target.label().is_empty() { String::new() } else { format!("{} ", target.label()) },
+          token_id, detail);
     let _ = client.cancel_orders(&id_refs).await;
-    (true, matched)
+    tally
+}
+
+#[cfg(test)]
+mod resting_cancel_tests {
+    use super::{tally_by_side, RestingCancel, RestingSide};
+    use polymarket_client_sdk_v2::clob::types::Side;
+    use rust_decimal_macros::dec;
+
+    /// The 2026-09-03 book, verbatim: the entry bid (24.24 @ $0.33, 7.35 matched)
+    /// still resting next to the exit ask (7.35 @ $0.35, 5.314284 matched).
+    /// The old side-blind sum reported 12.664284 "matched" and the reprice
+    /// path booked all of it as lifted at the ask. Only the ask's figure is an
+    /// exit fill.
+    #[test]
+    fn the_bids_fill_is_never_credited_to_the_ask() {
+        let got = tally_by_side([(Side::Buy, dec!(7.35)), (Side::Sell, dec!(5.314284))].into_iter());
+        assert_eq!(got, RestingCancel {
+            bid_found: true, bid_matched: dec!(7.35),
+            ask_found: true, ask_matched: dec!(5.314284),
+        });
+    }
+
+    #[test]
+    fn an_empty_book_finds_nothing_on_either_side() {
+        assert_eq!(tally_by_side(std::iter::empty()), RestingCancel::default());
+        assert!(!tally_by_side(std::iter::empty()).any_found());
+    }
+
+    /// Several orders on one side add up; the other side stays untouched.
+    #[test]
+    fn same_side_orders_sum_and_the_other_side_stays_zero() {
+        let got = tally_by_side([(Side::Sell, dec!(1.5)), (Side::Sell, dec!(0.25))].into_iter());
+        assert!(got.ask_found && !got.bid_found);
+        assert_eq!(got.ask_matched, dec!(1.75));
+        assert_eq!(got.bid_matched, dec!(0));
+    }
+
+    /// An order the venue reports with a side we do not know is cancelled by a
+    /// `Both` sweep but credited to neither ledger.
+    #[test]
+    fn an_unknown_side_is_credited_to_neither() {
+        let got = tally_by_side([(Side::Unknown, dec!(3))].into_iter());
+        assert_eq!(got, RestingCancel::default());
+    }
+
+    #[test]
+    fn a_side_target_selects_only_its_own_orders() {
+        assert!(RestingSide::Asks.includes(Side::Sell));
+        assert!(!RestingSide::Asks.includes(Side::Buy));
+        assert!(RestingSide::Bids.includes(Side::Buy));
+        assert!(!RestingSide::Bids.includes(Side::Sell));
+        assert!(RestingSide::Both.includes(Side::Buy) && RestingSide::Both.includes(Side::Sell));
+        assert!(!RestingSide::Asks.includes(Side::Unknown) && !RestingSide::Bids.includes(Side::Unknown));
+    }
 }
 
 /// Report — never cancel — the account's resting orders while simulating.
@@ -357,26 +497,26 @@ pub async fn onchain_balance_for_token(
     }
 }
 
-/// Public reactive quote-pull entry point: cancel any resting order on `token_id`.
-/// Used by the Maker's book-turn quote-pull (patrol `MakerCancel` handling) to pull
-/// an UNFILLED resting quote before informed flow picks it off. Resolves the
-/// on-chain U256 from the venue-neutral `MarketId`, then delegates to
-/// [`cancel_resting_orders`]. Returns `(order_found, matched)`:
-/// - `order_found` is true when at least one resting order was still on the book
-///   (it was cancelled). False means the order VANISHED — either it fully filled
-///   (shares held but possibly not yet visible on the balance endpoint) or it was
-///   never resting; callers must NOT treat this as "unfilled" without re-checking
-///   the on-chain balance with settlement-lag retries.
-/// - `matched` is the total shares already MATCHED on the cancelled order(s) —
-///   non-zero means a partial fill landed before the pull and the caller must
-///   adopt those shares as a live position instead of dropping them.
+/// Cancel our resting order(s) on `token_id` on the requested side(s).
+///
+/// Resolves the on-chain U256 from the venue-neutral `MarketId`, then delegates
+/// to [`cancel_resting_orders`]. The result is per side — see [`RestingCancel`]
+/// for why the two sides must never be summed. On the caller's side:
+/// - `*_found` true means at least one order was still on the book (it was
+///   cancelled). False means the order VANISHED — either it fully filled
+///   (shares moved but possibly not yet visible on the balance endpoint) or it
+///   was never resting; callers must NOT treat this as "unfilled" without
+///   re-checking the on-chain balance with settlement-lag retries.
+/// - `*_matched` is the total shares MATCHED on the cancelled order(s), which
+///   is cumulative since placement — not since the caller last looked.
 pub async fn cancel_resting_orders_for_token(
     client: &Arc<ClobClient<Authenticated<Normal>>>,
     token_id: &MarketId,
-) -> (bool, Decimal) {
+    target: RestingSide,
+) -> RestingCancel {
     match u256_from_market_id(token_id) {
-        Ok(u) => cancel_resting_orders(client, u).await,
-        Err(_) => (false, dec!(0)),
+        Ok(u) => cancel_resting_orders(client, u, target).await,
+        Err(_) => RestingCancel::default(),
     }
 }
 
@@ -835,7 +975,7 @@ pub async fn arb_pair_fill_monitor(
     // Step 1: Cancel any remaining GTC on the missing leg (idempotent if already cancelled
     //         by the individual sync task — the CLOB rejects cancels of non-existent orders
     //         gracefully).
-    let _ = cancel_resting_orders(&client, missing_token).await;
+    let _ = cancel_resting_orders(&client, missing_token, RestingSide::Both).await;
 
     // Step 2: Short settlement grace — the cancel may have raced against a taker fill
     //         that was mid-settlement on-chain. Live knob (was a hardcoded 10s, the

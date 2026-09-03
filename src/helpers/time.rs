@@ -56,54 +56,80 @@ pub fn extract_strike_price(market_name: &str) -> Option<Decimal> {
     None
 }
 
-/// Fetch strike price from Binance using market close time as reference
+/// The Binance 1m kline whose OPEN is a market's reference price, for a market
+/// whose reference is the start of a fixed window ending at `close_time`.
+///
+/// `None` while the window has not opened: the reference price does not exist
+/// yet, and nothing should stand in for it. Until 2026-09-03 this fell back to
+/// "the latest completed minute" for a not-yet-open window, so a squadron that
+/// rotated onto the next hour's "Up or Down" market minutes before the hour
+/// carried the price at rotation time as that market's strike for the whole
+/// hour. Three real-money FairValue losses on 2026-09-02/03 came from that
+/// single defect: on the 6AM market the model's strike sat ~$280 (1.2 sigma)
+/// above the actual window open, so it priced a coin flip at 0.87 and bought
+/// the side that settled at zero.
+pub fn hourly_window_reference_time(
+    close_time: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let window_start = close_time - chrono::Duration::hours(1);
+    (window_start <= now).then_some(window_start)
+}
+
+/// The OPEN of a Binance kline row (`[open_time, open, high, low, close, …]`).
+///
+/// Open, not close. Polymarket's "Up or Down" markets resolve on the open and
+/// close of the 1H (or 1D) Binance candle that begins at the named time, and a
+/// candle's open is its first trade, so the 1m candle that starts at the same
+/// instant opens at exactly the same price. Its CLOSE is one minute of drift
+/// later, and that minute was silently folded into every strike this read.
+pub fn kline_open_price(kline: &serde_json::Value) -> Option<Decimal> {
+    let row = kline.as_array()?;
+    let open = row.get(1)?.as_str()?;
+    Decimal::from_str(open).ok()
+}
+
+async fn fetch_kline_open(
+    http: &reqwest::Client,
+    filter: &str,
+    at: DateTime<Utc>,
+) -> Option<Decimal> {
+    let binance_symbol = match filter {
+        "eth" => "ETHUSDT",
+        "sol" => "SOLUSDT",
+        _ => "BTCUSDT",
+    };
+    let url = format!(
+        "https://api.binance.com/api/v3/klines?symbol={}&interval=1m&startTime={}&limit=1",
+        binance_symbol, at.timestamp_millis(),
+    );
+    let resp = http.get(&url).send().await.ok()?;
+    let json = resp.json::<serde_json::Value>().await.ok()?;
+    let candle = json.as_array().and_then(|a| a.first())?;
+    // Binance answers a request for a minute that has not started with an
+    // EMPTY array, so a future `at` falls out here as None rather than as some
+    // other candle. The callers guard the time anyway; this is the backstop.
+    kline_open_price(candle)
+}
+
+/// Strike for a fixed one-hour window market from its close time: the open of
+/// the Binance 1m candle at the window start. `None` before the window opens.
 pub async fn fetch_strike_price_from_close_time(
     http: &reqwest::Client,
     filter: &str,
     close_time: Option<DateTime<Utc>>,
 ) -> Option<Decimal> {
     let close_time = close_time?;
-    let now = Utc::now();
-
-    // If close_time is in the future, the market hasn't closed yet.
-    // Use close_time - 1 hour as the reference (approximates the market start/reference time
-    // for standard hourly markets like "Bitcoin Up or Down - April 7, 9AM ET").
-    // If even that is in the future (very short window), fall back to the latest completed minute.
-    let reference_time = if close_time > now {
-        let one_hour_before = close_time - chrono::Duration::hours(1);
-        if one_hour_before < now - chrono::Duration::minutes(1) {
-            one_hour_before
-        } else {
-            // Market window is shorter than 1 hour; use the latest available candle
-            now - chrono::Duration::minutes(1)
-        }
-    } else {
-        close_time
+    let Some(reference_time) = hourly_window_reference_time(close_time, Utc::now()) else {
+        debug!(
+            "Window closing {} has not opened yet — no strike exists for it",
+            close_time.with_timezone(&Eastern).format("%H:%M ET"),
+        );
+        return None;
     };
-
-    let utc_millis = reference_time.timestamp_millis();
-
-    let binance_symbol = match filter {
-        "eth" => "ETHUSDT",
-        "sol" => "SOLUSDT",
-        _ => "BTCUSDT",
-    };
-
-    let url = format!("https://api.binance.com/api/v3/klines?symbol={}&interval=1m&startTime={}&limit=1", binance_symbol, utc_millis);
-
-    if let Ok(resp) = http.get(&url).send().await {
-        if let Ok(json) = resp.json::<serde_json::Value>().await {
-            if let Some(candle) = json.as_array().and_then(|a| a.first()) {
-                if let Some(close_str) = candle.as_array().and_then(|a| a.get(4)).and_then(|v| v.as_str()) {
-                    if let Ok(price) = Decimal::from_str(close_str) {
-                        debug!("✅ Fetched strike price from Binance at market close time: ${}", price);
-                        return Some(price);
-                    }
-                }
-            }
-        }
-    }
-    None
+    let price = fetch_kline_open(http, filter, reference_time).await?;
+    debug!("✅ Fetched strike price from Binance at window open: ${}", price);
+    Some(price)
 }
 
 /// Fetch historical strike price by parsing market description for date/time
@@ -155,26 +181,17 @@ pub async fn fetch_historical_strike_price(
         Some(t) => t,
         None => return None,
     };
-    let utc_millis = et_time.with_timezone(&Utc).timestamp_millis();
-
-    let binance_symbol = match filter {
-        "eth" => "ETHUSDT",
-        "sol" => "SOLUSDT",
-        _ => "BTCUSDT",
-    };
-
-    let url = format!("https://api.binance.com/api/v3/klines?symbol={}&interval=1m&startTime={}&limit=1", binance_symbol, utc_millis);
-
-    if let Ok(resp) = http.get(&url).send().await {
-        if let Ok(json) = resp.json::<serde_json::Value>().await {
-            if let Some(candle) = json.as_array().and_then(|a| a.first()) {
-                if let Some(close_str) = candle.as_array().and_then(|a| a.get(4)).and_then(|v| v.as_str()) {
-                    return Decimal::from_str(close_str).ok();
-                }
-            }
-        }
+    let reference_time = et_time.with_timezone(&Utc);
+    if reference_time > Utc::now() {
+        // The named candle has not opened. There is no reference price yet,
+        // and the caller must not be handed a stand-in for one.
+        debug!(
+            "Reference time {} is in the future — no strike exists for it yet",
+            et_time.format("%b %-d %H:%M ET"),
+        );
+        return None;
     }
-    None
+    fetch_kline_open(http, filter, reference_time).await
 }
 
 /// Generate candidate market names for hourly crypto events
@@ -273,3 +290,61 @@ pub fn generate_daily_market_names(crypto_filter: &str, current_time_utc: DateTi
 }
 
 
+
+#[cfg(test)]
+mod strike_reference_tests {
+    use super::*;
+    use chrono::TimeZone;
+
+    fn utc(s: &str) -> DateTime<Utc> {
+        Utc.datetime_from_str(s, "%Y-%m-%dT%H:%M:%SZ").unwrap()
+    }
+
+    /// The 2026-09-03 6AM ET incident, replayed against the clock.
+    ///
+    /// The squadron rotated onto "Bitcoin Up or Down - September 3, 6AM ET"
+    /// (window 10:00-11:00 UTC) well before 10:00 UTC. The old fallback answered
+    /// "the latest completed minute" for a window that had not opened, and that
+    /// price became the strike for the whole hour. Before the window opens there
+    /// is no reference price, and the function has to say so.
+    #[test]
+    fn a_window_that_has_not_opened_has_no_reference_price() {
+        let close = utc("2026-09-03T11:00:00Z");
+        for now in ["2026-09-03T09:20:00Z", "2026-09-03T09:50:00Z", "2026-09-03T09:59:59Z"] {
+            assert_eq!(
+                hourly_window_reference_time(close, utc(now)),
+                None,
+                "at {now} the 10:00 window has not opened; no strike exists",
+            );
+        }
+    }
+
+    /// From the first second of the window onward the reference is the window
+    /// open — including after the market has closed, when the same reference
+    /// is what the settlement was judged against.
+    #[test]
+    fn an_open_window_references_its_own_start() {
+        let close = utc("2026-09-03T11:00:00Z");
+        let open = utc("2026-09-03T10:00:00Z");
+        for now in ["2026-09-03T10:00:00Z", "2026-09-03T10:00:05Z", "2026-09-03T10:48:00Z", "2026-09-03T11:30:00Z"] {
+            assert_eq!(hourly_window_reference_time(close, utc(now)), Some(open), "at {now}");
+        }
+    }
+
+    /// Binance kline row: `[open_time, open, high, low, close, volume, ...]`.
+    /// The strike is the OPEN. Reading index 4 (the close) folded a minute of
+    /// drift into every strike; on a 1.4-sigma-per-minute BTC tape that is not
+    /// noise.
+    #[test]
+    fn strike_is_the_candle_open_not_its_close() {
+        let row = serde_json::json!([
+            1788091200000_i64, "77600.02000000", "77640.00000000", "77571.00000000",
+            "77630.10000000", "12.5", 1788091259999_i64, "0", 100, "0", "0", "0"
+        ]);
+        assert_eq!(kline_open_price(&row), Some(Decimal::from_str("77600.02").unwrap()));
+        // An empty answer (Binance's reply for a minute that has not started)
+        // must not be mistaken for a price.
+        assert_eq!(kline_open_price(&serde_json::json!([])), None);
+        assert_eq!(kline_open_price(&serde_json::json!(null)), None);
+    }
+}
