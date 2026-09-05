@@ -19,6 +19,7 @@
 import { useCallback, useState } from 'react';
 import useSWR from 'swr';
 import type { SquadronSummary, DynamicConfig, AssetRaptorHealth } from '@/lib/types';
+import { marketLabel } from '@/lib/types';
 import {
   getTrades,
   getTradeStats,
@@ -31,7 +32,7 @@ import {
   standDownSquadron,
   VIPER_DEFS,
 } from '@/lib/api';
-import ViperCard, { fmtAgo, STALE_EVAL_SECS } from '@/components/ViperCard';
+import ViperCard, { fmtAgo, isTroubled } from '@/components/ViperCard';
 import { AdvancedRow } from '@/components/AdvancedConfigModal';
 import OpenPositionsCard from '@/components/OpenPositionsCard';
 import { useConfirm } from '@/components/ConfirmDialog';
@@ -196,7 +197,9 @@ function SquadronInfoCard({ squadron }: { squadron: SquadronSummary }) {
           <span className="text-gray-500">
             {squadron.asset.toLowerCase().startsWith('us') ? 'Active Market' : 'Primary Market (Hourly)'}
           </span>
-          <span className="text-gray-300 text-[11px] break-words">{squadron.market_name}</span>
+          <span className={`text-[11px] break-words ${squadron.market_name ? 'text-gray-300' : 'text-gray-500 italic'}`}>
+            {squadron.market_name ? squadron.market_name : `⏳ ${marketLabel(squadron.market_name)}`}
+          </span>
         </div>
         {squadron.maker_market_name && (
           <div className="flex flex-col gap-1 pt-2 border-t border-[#1e1e32]">
@@ -559,9 +562,7 @@ export default function SquadronDetailView({ squadron, onBack }: Props) {
           <div className="mt-3 px-4 py-2 rounded-lg border border-amber-500/20 bg-amber-500/5 text-[11px] font-mono text-amber-300/80">
             <span className="font-semibold">Reporting without a card:</span>{' '}
             {unmapped.map((r, i) => {
-              const bad = r.last_eval_secs_ago > STALE_EVAL_SECS
-                || r.last_outcome === 'error'
-                || r.last_outcome === 'timeout';
+              const bad = isTroubled(r);
               return (
                 <span key={r.strategy}>
                   {i > 0 && ' · '}

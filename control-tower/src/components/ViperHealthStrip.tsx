@@ -18,7 +18,7 @@
 
 import useSWR from 'swr';
 import { getVipersStatus } from '@/lib/api';
-import { STALE_EVAL_SECS } from '@/components/ViperCard';
+import { isTroubled } from '@/components/ViperCard';
 
 /**
  * One-line CAG-level rollup: "N/N vipers alive across all squadrons".
@@ -37,10 +37,14 @@ export function ViperHealthStrip() {
   if (!data || data.length === 0) return null;
 
   const active = data.filter((r) => r.last_reason !== 'disabled in config');
-  const alive = active.filter(
-    (r) => r.last_eval_secs_ago <= STALE_EVAL_SECS && r.last_outcome !== 'error' && r.last_outcome !== 'timeout',
-  );
+  const alive = active.filter((r) => !isTroubled(r));
   const troubled = active.length - alive.length;
+  // Alive but with nothing to trade: the squadron holds no market and the
+  // engine says so every tick. Counted as alive (the loop is ticking) and
+  // stated separately, so the ribbon reads "waiting" rather than either
+  // hiding the state or, as it did on a fresh Marketplace instance
+  // 2026-09-04, reporting nine waiting vipers as "9 stale/error".
+  const waiting = alive.filter((r) => r.last_outcome === 'idle').length;
   const disabled = data.length - active.length;
   // Distinct scopes, not distinct assets: every Kalshi squadron shares one DB
   // shard, so counting the shard name would report one squadron for all of them.
@@ -56,8 +60,11 @@ export function ViperHealthStrip() {
   // inviting the reader to conclude there were nine — the tally silently
   // dropped the four disabled ones instead of accounting for them.
   const squadrons = new Set(data.map((r) => r.asset || '(unscoped)')).size;
-  // Up to 3 distinct holding reasons for a quick "why quiet?" glance.
-  const reasons = [...new Set(alive.map((r) => r.last_reason).filter(Boolean))].slice(0, 3);
+  // Up to 3 distinct holding reasons for a quick "why quiet?" glance. Waiting
+  // rows are stated by count above; their one reason would only crowd these out.
+  const reasons = [...new Set(
+    alive.filter((r) => r.last_outcome !== 'idle').map((r) => r.last_reason).filter(Boolean),
+  )].slice(0, 3);
 
   const ok = troubled === 0;
   return (
@@ -72,6 +79,7 @@ export function ViperHealthStrip() {
         {/* Stated rather than silently subtracted, so the tally reconciles with
             the viper cards an operator can count on screen. */}
         {disabled > 0 ? ` · ${disabled} disabled` : ''}
+        {waiting > 0 ? ` · ${waiting} waiting for a market` : ''}
       </span>
       {!ok && <span>{troubled} stale/error — check squadron detail</span>}
       {ok && reasons.length > 0 && (

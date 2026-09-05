@@ -511,6 +511,22 @@ export interface PortfolioValue {
 /** Lifecycle state string returned by the CAG registry. */
 export type SquadronState = 'STAGED' | 'DEPLOYED' | 'PATROLLING' | 'RTB' | 'STOOD_DOWN';
 
+/**
+ * What to print where a market name goes when the squadron holds no market.
+ *
+ * `market_name` is the empty string while a crypto squadron waits out the gap
+ * between hourly markets (the hourly expired, and nothing has cleared the volume
+ * floor yet). That is a deliberate, healthy state — the engine refuses to quote
+ * into an empty book — and a blank line asked the operator to guess whether
+ * something had broken. Say what is happening instead.
+ */
+export const NO_MARKET_LABEL = 'waiting for a tradeable market';
+
+/** A squadron's market name for display, never blank. */
+export function marketLabel(name: string | undefined | null): string {
+  return name && name.length > 0 ? name : NO_MARKET_LABEL;
+}
+
 /** Summary of one active squadron — returned by GET /api/squadrons and GET /api/squadrons/{id}. */
 export interface SquadronSummary {
   id:                string;        // e.g. "btc-hourly-2026-05-29T14:00:00Z"

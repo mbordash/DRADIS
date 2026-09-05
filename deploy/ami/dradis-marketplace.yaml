@@ -1,0 +1,266 @@
+AWSTemplateFormatVersion: "2010-09-09"
+
+# =============================================================================
+# DRADIS — AWS Marketplace CloudFormation launch template
+#
+# Exists to fix the post-subscribe experience. Launching the bare AMI leaves a
+# customer to discover their public IP, open two ports, guess that the login is
+# admin / their instance ID, and walk into a self-signed certificate warning
+# with no warning. This template does all four for them and prints the result
+# in the Outputs tab.
+#
+# Region: the AMI is registered in us-east-1 only (Marketplace sources AMIs
+# from us-east-1). Supporting another region means copying the AMI there and
+# adding it to RegionMap.
+# =============================================================================
+
+Description: >-
+  DRADIS — low-latency trading bot for crypto prediction markets
+  (Polymarket International, Polymarket US, Kalshi). Launches one instance and
+  outputs the Control Tower URL and sign-in credentials.
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: Trading venue
+        Parameters:
+          - VenueSelection
+      - Label:
+          default: Network
+        Parameters:
+          - VpcId
+          - SubnetId
+      - Label:
+          default: Access
+        Parameters:
+          - AllowedCidr
+          - SshKeyName
+          - SshCidr
+      - Label:
+          default: Instance
+        Parameters:
+          - InstanceType
+          - VolumeSize
+    ParameterLabels:
+      VenueSelection:
+        default: Which venue will this instance trade?
+      VpcId:
+        default: VPC
+      SubnetId:
+        default: Subnet (must be public)
+      AllowedCidr:
+        default: Who may reach the Control Tower?
+      SshKeyName:
+        default: SSH key pair (optional)
+      SshCidr:
+        default: Who may reach SSH?
+      InstanceType:
+        default: Instance type
+      VolumeSize:
+        default: Disk size (GiB)
+
+Parameters:
+
+  # Deliberately defaults to no selection. The engine records a write-once
+  # jurisdiction acknowledgment stamped with the running venue, so a customer
+  # who boots into a seeded default files a permanent acknowledgment against a
+  # venue they may not legally trade. Leaving this unset makes the Control
+  # Tower ask, which is the only way the choice is genuinely the customer's.
+  VenueSelection:
+    Type: String
+    Default: choose-in-the-control-tower
+    AllowedValues:
+      - choose-in-the-control-tower
+      - intl
+      - us
+      - kalshi
+    Description: >-
+      Leave as "choose-in-the-control-tower" to pick after sign-in
+      (recommended). "intl" = Polymarket International, "us" = Polymarket US,
+      "kalshi" = Kalshi. Your jurisdiction acknowledgment is recorded once
+      against the venue you select and cannot be changed afterwards, so only
+      preselect a venue you are eligible to trade.
+
+  # Asked for explicitly rather than relying on the default VPC. An account
+  # with no default VPC would otherwise fail the stack with a message that
+  # tells the customer nothing, which is the class of first-impression failure
+  # this template exists to remove.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: VPC to launch into. Pick the default VPC unless you have a reason not to.
+
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+    Description: >-
+      Subnet within that VPC. It must be a PUBLIC subnet (one routed to an
+      internet gateway) — the instance is given a public IP so you can reach
+      the Control Tower from your browser.
+
+  AllowedCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    Description: >-
+      CIDR allowed to reach the Control Tower on 80/443. The default
+      0.0.0.0/0 opens it to the internet; the Control Tower requires a
+      password, but restricting this to your own address (e.g. 203.0.113.7/32)
+      is strongly recommended for a live trading instance.
+
+  SshKeyName:
+    Type: String
+    Default: ""
+    Description: >-
+      Optional. Leave blank for no SSH access at all — DRADIS is operated
+      entirely from the Control Tower and does not require a shell. Provide an
+      EC2 key pair name only if you want console access for troubleshooting.
+
+  SshCidr:
+    Type: String
+    Default: 0.0.0.0/0
+    AllowedPattern: ^(\d{1,3}\.){3}\d{1,3}/\d{1,2}$
+    Description: >-
+      CIDR allowed to reach SSH. Ignored unless an SSH key pair is given.
+
+  InstanceType:
+    Type: String
+    Default: t3.medium
+    AllowedValues:
+      - t3.small
+      - t3.medium
+      - t3.large
+      - c5.large
+      - c5.xlarge
+    Description: >-
+      t3.medium (2 vCPU / 4 GiB) is the recommended starting point and runs
+      the engine, Control Tower and proxy comfortably. Larger types help only
+      if you run several underlyings at once.
+
+  VolumeSize:
+    Type: Number
+    Default: 60
+    MinValue: 30
+    MaxValue: 500
+    Description: >-
+      Root volume size in GiB. 60 matches the image default and leaves room
+      for trade history and the retrained model.
+
+Mappings:
+  RegionMap:
+    us-east-1:
+      AMI: ami-07afea10064eafdbb
+
+Conditions:
+  PreselectVenue: !Not [!Equals [!Ref VenueSelection, choose-in-the-control-tower]]
+  EnableSsh: !Not [!Equals [!Ref SshKeyName, ""]]
+
+Resources:
+
+  SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: !Sub "DRADIS Control Tower access (${AWS::StackName})"
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref AllowedCidr
+          Description: Control Tower (redirects to HTTPS)
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref AllowedCidr
+          Description: Control Tower over TLS
+      Tags:
+        - Key: Name
+          Value: !Sub "${AWS::StackName}-sg"
+
+  SshIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Condition: EnableSsh
+    Properties:
+      GroupId: !GetAtt SecurityGroup.GroupId
+      IpProtocol: tcp
+      FromPort: 22
+      ToPort: 22
+      CidrIp: !Ref SshCidr
+      Description: SSH (optional troubleshooting access)
+
+  Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: !FindInMap [RegionMap, !Ref "AWS::Region", AMI]
+      InstanceType: !Ref InstanceType
+      KeyName: !If [EnableSsh, !Ref SshKeyName, !Ref "AWS::NoValue"]
+      # A NetworkInterface rather than SecurityGroupIds + SubnetId, so that
+      # AssociatePublicIpAddress can be forced true. A public subnet whose
+      # MapPublicIpOnLaunch is false would otherwise produce an instance with
+      # no public IP and an Outputs URL that resolves to nothing.
+      NetworkInterfaces:
+        - DeviceIndex: "0"
+          SubnetId: !Ref SubnetId
+          AssociatePublicIpAddress: true
+          DeleteOnTermination: true
+          GroupSet:
+            - !GetAtt SecurityGroup.GroupId
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            VolumeSize: !Ref VolumeSize
+            VolumeType: gp3
+            DeleteOnTermination: true
+            Encrypted: true
+      # Read by dradis-firstboot.sh from IMDS on first boot. Plain text on
+      # purpose: firstboot greps for the dradis_venue line rather than
+      # executing user data, so this must not be a cloud-init script.
+      UserData: !If
+        - PreselectVenue
+        - Fn::Base64: !Sub "dradis_venue=${VenueSelection}"
+        - !Ref "AWS::NoValue"
+      Tags:
+        - Key: Name
+          Value: !Ref "AWS::StackName"
+
+Outputs:
+
+  ControlTowerURL:
+    Description: >-
+      Open this to reach DRADIS. Your browser will show a certificate warning
+      the first time — see CertificateWarning below.
+    Value: !Sub "https://${Instance.PublicIp}/"
+
+  Username:
+    Description: Control Tower sign-in user.
+    Value: admin
+
+  Password:
+    Description: >-
+      Control Tower sign-in password. It is this instance's EC2 instance ID —
+      no default password ships in the image. Change it after signing in.
+    Value: !Ref Instance
+
+  CertificateWarning:
+    Description: >-
+      Expected, not a fault.
+    Value: >-
+      DRADIS generates a unique self-signed TLS certificate on this instance at
+      first boot. A publicly trusted certificate cannot be issued for a bare IP
+      address, and shipping one inside the image would put its private key in
+      every customer's hands. Your browser will therefore warn once on first
+      visit — choose Advanced, then Proceed. Replace cert.pem and key.pem in
+      /opt/dradis/data/tls with your own certificate to remove the warning.
+
+  VenueSelected:
+    Description: Trading venue seeded at launch.
+    Value: !If
+      - PreselectVenue
+      - !Ref VenueSelection
+      - "Not preselected — the Control Tower will ask you to choose."
+
+  NoteOnRestart:
+    Description: Public IP stability.
+    Value: >-
+      This instance uses an auto-assigned public IP, which changes if the
+      instance is stopped and started. The sign-in password is the instance ID
+      and does not change. Attach an Elastic IP if you need a stable URL.

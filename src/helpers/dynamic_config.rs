@@ -1160,6 +1160,31 @@ pub fn build_cap_for(field: &str) -> Option<Decimal> {
 pub const EXIT_RETRY_COOLDOWN_FLOOR_SECS: u64 = 1;
 
 impl DynamicConfig {
+    /// Is the named strategy switched on in this config?
+    ///
+    /// Each viper reads its own `enable_*` flag inside `evaluate_entry` and
+    /// reports "disabled in config" when it is off. The patrol loop needs the
+    /// same answer BEFORE evaluation when it records an idle tick for a
+    /// squadron with no market: a viper the operator has switched off must keep
+    /// its "disabled in config" row rather than be re-labeled as waiting, or
+    /// the Control Tower ribbon's disabled tally drifts for the length of the
+    /// gap. Unknown names count as enabled, matching the executor, which runs
+    /// everything the registry builds.
+    pub fn strategy_enabled(&self, strategy_name: &str) -> bool {
+        match crate::orchestrator::registry::strategy_name_to_kind(strategy_name) {
+            "arbitrage"    => self.enable_arbitrage,
+            "maker"        => self.enable_maker,
+            "momentum"     => self.enable_momentum,
+            "time_decay"   => self.enable_time_decay,
+            "basis"        => self.enable_basis,
+            "gboost"       => self.enable_gboost,
+            "convergence"  => self.enable_convergence,
+            "fairvalue"    => self.enable_fairvalue,
+            "trendcapture" => self.enable_trendcapture,
+            _ => true,
+        }
+    }
+
     /// `exit_retry_cooldown_secs` with the floor applied. The only way the
     /// patrol reads the knob.
     pub fn exit_retry_cooldown_secs_floored(&self) -> u64 {
@@ -1805,5 +1830,31 @@ mod exit_retry_cooldown_tests {
         assert_eq!(dc.exit_retry_cooldown_secs_floored(), 2);
         dc.exit_retry_cooldown_secs = EXIT_RETRY_COOLDOWN_FLOOR_SECS;
         assert_eq!(dc.exit_retry_cooldown_secs_floored(), EXIT_RETRY_COOLDOWN_FLOOR_SECS);
+    }
+
+    /// Every registry name must resolve to its own flag: a name that fell
+    /// through to the `_ => true` arm would be recorded as waiting even when
+    /// the operator had switched it off.
+    #[test]
+    fn strategy_enabled_follows_each_vipers_own_flag() {
+        let mut dc = DynamicConfig::default();
+        let setters: [(&str, fn(&mut DynamicConfig, bool)); 9] = [
+            ("ArbitrageStrategy",     |d, v| d.enable_arbitrage = v),
+            ("MakerStrategy",         |d, v| d.enable_maker = v),
+            ("MomentumStrategy",      |d, v| d.enable_momentum = v),
+            ("TimeDecayStrategy",     |d, v| d.enable_time_decay = v),
+            ("BasisStrategy",         |d, v| d.enable_basis = v),
+            ("GboostStrategy",        |d, v| d.enable_gboost = v),
+            ("ConvergenceStrategy",   |d, v| d.enable_convergence = v),
+            ("FairValueStrategy",     |d, v| d.enable_fairvalue = v),
+            ("TrendReversalStrategy", |d, v| d.enable_trendcapture = v),
+        ];
+        for (name, set) in setters {
+            set(&mut dc, true);
+            assert!(dc.strategy_enabled(name), "{name} should read enabled");
+            set(&mut dc, false);
+            assert!(!dc.strategy_enabled(name), "{name} should read disabled");
+        }
+        assert!(dc.strategy_enabled("NoSuchStrategy"), "unknown names run, as in the executor");
     }
 }

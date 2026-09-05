@@ -167,9 +167,14 @@ All tools send `X-API-Key: {{DRADIS_API_KEY}}`.
 - **Endpoint:** `{{DRADIS_API_URL}}/vipers/status`
 - **Query Param:** `asset` (optional, e.g. `btc`; omit for all squadrons)
 - **Response:** JSON array of `{asset, strategy, last_eval_at, last_eval_secs_ago, last_outcome, last_reason, last_reason_secs_ago, last_signal_at, last_signal_secs_ago}`
-- **Note:** **This is the correct tool for "why isn't DRADIS trading?"** `last_outcome` is one of `signal | no_signal | error | timeout`. `last_reason` is the named gate that vetoed the most recent entry attempt ("edge below required", "cooldown active"); only instrumented vipers populate it, so `null` means "reports liveness only", not "no veto". Interpretation rules:
+- **Note:** **This is the correct tool for "why isn't DRADIS trading?"** `last_outcome` is one of `signal | no_signal | idle | error | timeout`. `last_reason` is the named gate that vetoed the most recent entry attempt ("edge below required", "cooldown active"); only instrumented vipers populate it, so `null` means "reports liveness only", not "no veto". Interpretation rules:
   - All vipers evaluating recently with named reasons → the engine is healthy and correctly sitting out. Say so; do not imply a fault.
-  - `last_eval_secs_ago > 120` → the evaluation loop is not reporting. Flag as a probable fault.
+  - `last_outcome` of `idle` → the squadron holds no tradeable market right now (between hourly markets, or a
+    venue gap). The engine is alive and waiting; `last_reason` reads "waiting for a tradeable market" and
+    `last_reason_secs_ago` is how long the wait has lasted. This is NOT a fault — say the engine is waiting,
+    and never report idle vipers as stale, errored or dead.
+  - `last_eval_secs_ago > 120` → the evaluation loop is not reporting. Flag as a probable fault. This still
+    applies to idle rows: idle is refreshed every tick, so a genuinely wedged loop stops refreshing it too.
   - `last_outcome` of `error` or `timeout` → flag as a fault regardless of age.
   - The registry is in-memory and empty after a restart, so an absent viper means "not yet evaluated", not "never trades".
 

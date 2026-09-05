@@ -138,7 +138,10 @@ export interface ViperStatusRow {
   strategy: string;
   last_eval_at: string;
   last_eval_secs_ago: number;
-  last_outcome: 'signal' | 'no_signal' | 'error' | 'timeout';
+  /** `idle`: the squadron ticked but holds no market to evaluate against.
+   *  Liveness is real (the row stays fresh); it is the waiting state, not a
+   *  fault. See `EvalOutcome::Idle` in the engine. */
+  last_outcome: 'signal' | 'no_signal' | 'error' | 'timeout' | 'idle';
   last_reason: string | null;
   last_reason_secs_ago: number | null;
   last_signal_at: string | null;

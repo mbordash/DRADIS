@@ -19,6 +19,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import useSWR from 'swr';
 import type { SquadronSummary, SquadronState, DeploymentStatus } from '@/lib/types';
+import { marketLabel } from '@/lib/types';
 import { getOpenPositions, getVipersForClass, getDeployments, retryDeployment, dismissDeployment } from '@/lib/api';
 import DeploySquadronModal from './DeploySquadronModal';
 
@@ -142,8 +143,11 @@ function SquadronRow({
         <AssetChip asset={sq.asset} />
         <div className="min-w-0">
           <p className="text-xs font-mono text-gray-200 truncate" title={sq.name}>{sq.name}</p>
-          <p className="text-[10px] font-mono text-gray-500 truncate mt-0.5" title={sq.market_name}>
-            ⚔️ {sq.market_name}
+          <p
+            className={`text-[10px] font-mono truncate mt-0.5 ${sq.market_name ? 'text-gray-500' : 'text-gray-600 italic'}`}
+            title={marketLabel(sq.market_name)}
+          >
+            {sq.market_name ? '⚔️' : '⏳'} {marketLabel(sq.market_name)}
           </p>
           {sq.maker_market_name && (
             <p className="text-[10px] font-mono text-gray-600 truncate mt-0.5" title={sq.maker_market_name}>

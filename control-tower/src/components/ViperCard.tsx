@@ -19,7 +19,7 @@
 import { useState, useCallback } from 'react';
 import useSWR from 'swr';
 import type { DynamicConfig, ViperDef, ConfigFieldSchema, FieldType } from '@/lib/types';
-import { toDisplay, fromDisplay, fieldUnit } from '@/lib/types';
+import { toDisplay, fromDisplay, fieldUnit, NO_MARKET_LABEL } from '@/lib/types';
 import { getConfigSchema, type ViperStatusRow } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
 import AdvancedConfigModal from '@/components/AdvancedConfigModal';
@@ -37,26 +37,52 @@ const ACCENT: Record<string, { ring: string; badge: string; dot: string }> = {
 
 // ── Runtime status helpers ────────────────────────────────────────────────────
 
+/** Duration, e.g. "12m". */
+export function fmtDur(secs: number | null | undefined): string {
+  if (secs === null || secs === undefined) return '—';
+  if (secs < 60) return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs / 60)}m`;
+  if (secs < 86400) return `${Math.floor(secs / 3600)}h`;
+  return `${Math.floor(secs / 86400)}d`;
+}
+
 /** Relative age, e.g. "12m ago". */
 export function fmtAgo(secs: number | null | undefined): string {
   if (secs === null || secs === undefined) return '—';
   if (secs < 5) return 'just now';
-  if (secs < 60) return `${secs}s ago`;
-  if (secs < 3600) return `${Math.floor(secs / 60)}m ago`;
-  if (secs < 86400) return `${Math.floor(secs / 3600)}h ago`;
-  return `${Math.floor(secs / 86400)}d ago`;
+  return `${fmtDur(secs)} ago`;
 }
 
 /** Evaluations tick sub-second; nothing for 2 minutes means the loop is wedged. */
 export const STALE_EVAL_SECS = 120;
 
-type RuntimeState = 'DISABLED' | 'PENDING' | 'STALE' | 'ERROR' | 'TIMEOUT' | 'ACTIVE';
+type RuntimeState = 'DISABLED' | 'PENDING' | 'STALE' | 'ERROR' | 'TIMEOUT' | 'WAITING' | 'ACTIVE';
+
+/**
+ * Is this row a fault the operator should look at?
+ *
+ * One definition, shared by the CAG-level ribbon and the squadron detail view,
+ * so the ribbon's count and the cards' red badges can never disagree.
+ *
+ * `idle` is NOT trouble. The engine records it every tick a squadron has no
+ * market to evaluate against, so the row stays fresh: the loop is alive and
+ * deliberately waiting. A loop that has actually wedged stops recording
+ * anything, idle included, and ages past `STALE_EVAL_SECS` exactly as before.
+ * On a fresh Marketplace instance 2026-09-04 the old derivation counted nine
+ * such waiting vipers as "9 stale/error" on a healthy system.
+ */
+export function isTroubled(status: ViperStatusRow): boolean {
+  return status.last_eval_secs_ago > STALE_EVAL_SECS
+    || status.last_outcome === 'error'
+    || status.last_outcome === 'timeout';
+}
 
 /**
  * Collapse config state + the engine's last evaluation into one badge state.
  * `enabled` comes from DynamicConfig; everything else from /api/vipers/status.
  * PENDING means the engine has not evaluated this viper since startup — the
  * registry is in-memory, so it is empty for a few ticks after a restart.
+ * WAITING means the squadron holds no market right now; see `isTroubled`.
  */
 export function runtimeState(enabled: boolean, status?: ViperStatusRow): RuntimeState {
   if (!enabled) return 'DISABLED';
@@ -64,6 +90,7 @@ export function runtimeState(enabled: boolean, status?: ViperStatusRow): Runtime
   if (status.last_eval_secs_ago > STALE_EVAL_SECS) return 'STALE';
   if (status.last_outcome === 'error') return 'ERROR';
   if (status.last_outcome === 'timeout') return 'TIMEOUT';
+  if (status.last_outcome === 'idle') return 'WAITING';
   return 'ACTIVE';
 }
 
@@ -73,6 +100,7 @@ const STATE_BADGE: Record<Exclude<RuntimeState, 'ACTIVE'>, { cls: string; title:
   STALE:    { cls: 'bg-red-500/10 text-red-400 border border-red-500/30', title: `No evaluation in over ${STALE_EVAL_SECS}s — the patrol loop may be wedged` },
   ERROR:    { cls: 'bg-red-500/10 text-red-400 border border-red-500/30', title: 'Last evaluate_entry returned an error' },
   TIMEOUT:  { cls: 'bg-amber-500/10 text-amber-300 border border-amber-500/30', title: 'Last evaluation exceeded the executor timeout' },
+  WAITING:  { cls: 'bg-gray-800 text-gray-400 border border-gray-700', title: 'The squadron holds no tradeable market right now. The engine is alive and will evaluate again as soon as one opens.' },
 };
 
 // ── Toggle switch ─────────────────────────────────────────────────────────────
@@ -261,6 +289,17 @@ export default function ViperCard({ viper, config, onPatch, market, status }: Pr
         {enabled && (
           <>
             <div className="text-[11px] font-mono leading-snug">
+              {/* An idle row is not held by a gate; it is waiting for a market,
+                  and the age is how long the wait has lasted (the engine stamps
+                  it once, when the wait began). A few minutes at the top of the
+                  hour is routine; a wait that outlives an hour deserves a look. */}
+              {status?.last_outcome === 'idle' ? (
+                <>
+                  <span className="text-gray-600">⏳ </span>
+                  <span className="text-gray-400">{status.last_reason ?? NO_MARKET_LABEL}</span>
+                  <span className="text-gray-600"> · for {fmtDur(status.last_reason_secs_ago)}</span>
+                </>
+              ) : (<>
               <span className="text-gray-600">holding: </span>
               {status?.last_reason ? (
                 <>
@@ -279,6 +318,7 @@ export default function ViperCard({ viper, config, onPatch, market, status }: Pr
                   {status ? 'no active veto' : '—'}
                 </span>
               )}
+              </>)}
             </div>
             <div className="text-[11px] font-mono leading-snug" title={status?.last_signal_at ?? undefined}>
               <span className="text-gray-600">last signal: </span>

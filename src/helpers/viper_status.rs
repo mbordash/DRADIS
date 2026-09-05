@@ -43,7 +43,31 @@ pub enum EvalOutcome {
     Error,
     /// Evaluation exceeded the executor's hard timeout.
     Timeout,
+    /// Not evaluated this tick because the squadron holds no market to
+    /// evaluate against. The patrol loop is alive and ticking; there is simply
+    /// nothing to trade until a tradeable market opens.
+    ///
+    /// Recorded every tick the squadron idles, so `last_eval_at` stays fresh
+    /// and the Control Tower can tell "waiting" from "wedged": a loop that
+    /// stops recording anything at all still ages into STALE, which is the
+    /// fault that badge exists to catch.
+    Idle,
 }
+
+/// The reason attached to every `Idle` row. One string, so the Control Tower
+/// can key its "waiting" rendering on the outcome and print this verbatim.
+pub const IDLE_NO_MARKET: &str = "waiting for a tradeable market";
+
+/// The reason a viper the operator has switched off reports.
+///
+/// Each viper writes this itself from its own `evaluate_entry`, but that never
+/// runs while the squadron holds no market — the patrol tick `continue`s first.
+/// So a viper toggled off DURING an idle window would otherwise keep whatever
+/// row it had, age past the staleness threshold and surface as a fault: exactly
+/// the false positive the idle path exists to remove. The idle path therefore
+/// stamps this itself. Must stay byte-identical to the literal the vipers use,
+/// because the Control Tower's health ribbon keys "active" off this exact string.
+pub const DISABLED_IN_CONFIG: &str = "disabled in config";
 
 #[derive(Debug, Clone)]
 struct ViperStatus {
@@ -115,6 +139,45 @@ pub fn record_eval(asset: &str, strategy: &str, outcome: EvalOutcome) {
         // A fresh signal supersedes any stale veto reason.
         entry.last_reason = None;
         entry.last_reason_at = None;
+    }
+}
+
+/// Record that the squadron ticked but had no market to evaluate `strategy`
+/// against. See `EvalOutcome::Idle`.
+///
+/// Refreshes liveness on every call, but stamps `last_reason_at` only when the
+/// row was not already idle for this reason. That timestamp is what the
+/// Control Tower shows as the age of the wait, and the wait began when the
+/// squadron released its market, not on the most recent 50ms tick. A gap that
+/// outlives an hour is worth an operator's attention; a few minutes at the top
+/// of the hour is routine, and the age is what tells the two apart.
+///
+/// Observed on a fresh Marketplace instance 2026-09-04: the BTC hourly expired,
+/// no replacement cleared the volume floor, the squadron correctly released
+/// the market and waited, and its nine vipers stopped being recorded at all.
+/// Their rows aged past the staleness window and the first thing the
+/// customer saw was "9 stale/error — check squadron detail" on a system that
+/// was healthy and idle by design.
+pub fn record_idle(asset: &str, strategy: &str, reason: &str) {
+    let now = Utc::now();
+    let mut map = match registry().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    let entry = map.entry(key(asset, strategy)).or_insert_with(|| ViperStatus {
+        last_eval_at: now,
+        last_outcome: EvalOutcome::Idle,
+        last_reason: None,
+        last_reason_at: None,
+        last_signal_at: None,
+    });
+    entry.last_eval_at = now;
+    let already_idle = entry.last_outcome == EvalOutcome::Idle
+        && entry.last_reason.as_deref() == Some(reason);
+    entry.last_outcome = EvalOutcome::Idle;
+    if !already_idle {
+        entry.last_reason = Some(reason.to_string());
+        entry.last_reason_at = Some(now);
     }
 }
 
@@ -209,6 +272,109 @@ mod tests {
         assert_eq!(row.last_outcome, EvalOutcome::Signal);
         assert!(row.last_reason.is_none());
         assert!(row.last_signal_at.is_some());
+    }
+}
+
+#[cfg(test)]
+mod idle_tests {
+    use super::*;
+
+    /// An idle tick is liveness, not an evaluation outcome from a dead market.
+    /// The row must read as fresh, as idle, and must say why.
+    #[test]
+    fn idle_refreshes_liveness_and_names_the_wait() {
+        record_eval("idletest-a", "MakerStrategy", EvalOutcome::NoSignal);
+        report_reason("idletest-a", "MakerStrategy", "secs_to_expiry -43s < min 1800s");
+        record_idle("idletest-a", "MakerStrategy", IDLE_NO_MARKET);
+        let snap = snapshot(Some("idletest-a"));
+        let row = snap.iter().find(|r| r.strategy == "MakerStrategy").unwrap();
+        assert_eq!(row.last_outcome, EvalOutcome::Idle);
+        assert!(row.last_eval_secs_ago <= 1, "idle must count as a fresh tick");
+        assert_eq!(
+            row.last_reason.as_deref(),
+            Some(IDLE_NO_MARKET),
+            "the dead market's last gate must not survive as the displayed reason",
+        );
+        forget("idletest-a");
+    }
+
+    /// A viper switched off DURING an idle window never reaches its own
+    /// `evaluate_entry` — the patrol tick `continue`s before the executor runs —
+    /// so the idle path has to stamp "disabled in config" for it. Skipping it
+    /// would freeze its row and age it into a fault, which is exactly the false
+    /// positive the idle path exists to remove.
+    ///
+    /// The string must stay byte-identical to the literal the vipers write,
+    /// because the Control Tower's health ribbon keys "active" off it.
+    #[test]
+    fn a_viper_disabled_during_an_idle_window_still_reports_fresh() {
+        record_eval("idletest-e", "GboostStrategy", EvalOutcome::NoSignal);
+        report_reason("idletest-e", "GboostStrategy", "target snapshot stale");
+        // Operator toggles it off mid-wait: the idle path stamps it rather than
+        // skipping it.
+        record_idle("idletest-e", "GboostStrategy", DISABLED_IN_CONFIG);
+        let snap = snapshot(Some("idletest-e"));
+        let row = snap.iter().find(|r| r.strategy == "GboostStrategy").unwrap();
+        assert!(
+            row.last_eval_secs_ago <= 1,
+            "a disabled viper must keep reporting liveness or it ages into a fault",
+        );
+        assert_eq!(
+            row.last_reason.as_deref(),
+            Some(DISABLED_IN_CONFIG),
+            "must read as disabled, not as waiting for a market it would not trade",
+        );
+        assert_ne!(
+            row.last_reason.as_deref(),
+            Some(IDLE_NO_MARKET),
+            "a switched-off viper is not waiting for anything",
+        );
+        forget("idletest-e");
+    }
+
+    /// The reason timestamp marks when the wait BEGAN, so repeated idle ticks
+    /// must leave it alone. Otherwise every wait reads as "just now".
+    #[test]
+    fn repeated_idle_ticks_keep_the_original_wait_start() {
+        record_idle("idletest-b", "MomentumStrategy", IDLE_NO_MARKET);
+        let first = {
+            let map = registry().lock().unwrap();
+            map.get(&key("idletest-b", "MomentumStrategy")).unwrap().last_reason_at
+        };
+        assert!(first.is_some());
+        std::thread::sleep(std::time::Duration::from_millis(15));
+        record_idle("idletest-b", "MomentumStrategy", IDLE_NO_MARKET);
+        let (again, eval_at) = {
+            let map = registry().lock().unwrap();
+            let st = map.get(&key("idletest-b", "MomentumStrategy")).unwrap();
+            (st.last_reason_at, st.last_eval_at)
+        };
+        assert_eq!(first, again, "the wait start must not move on a later idle tick");
+        assert!(eval_at > first.unwrap(), "liveness must still advance");
+        forget("idletest-b");
+    }
+
+    /// A row that comes back to life must not keep reading as idle: a real
+    /// evaluation overwrites the outcome, and a fresh signal clears the reason.
+    #[test]
+    fn a_real_evaluation_ends_the_idle_state() {
+        record_idle("idletest-c", "GboostStrategy", IDLE_NO_MARKET);
+        record_eval("idletest-c", "GboostStrategy", EvalOutcome::NoSignal);
+        let snap = snapshot(Some("idletest-c"));
+        let row = snap.iter().find(|r| r.strategy == "GboostStrategy").unwrap();
+        assert_eq!(row.last_outcome, EvalOutcome::NoSignal);
+        // The waiting text lingers until a gate or a signal replaces it, exactly
+        // like any other reason; the badge is keyed on the outcome, not on it.
+        record_eval("idletest-c", "GboostStrategy", EvalOutcome::Signal);
+        let snap = snapshot(Some("idletest-c"));
+        let row = snap.iter().find(|r| r.strategy == "GboostStrategy").unwrap();
+        assert!(row.last_reason.is_none());
+        forget("idletest-c");
+    }
+
+    #[test]
+    fn idle_serializes_as_the_string_the_control_tower_keys_on() {
+        assert_eq!(serde_json::to_string(&EvalOutcome::Idle).unwrap(), "\"idle\"");
     }
 }
 

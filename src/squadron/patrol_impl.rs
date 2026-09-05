@@ -938,7 +938,46 @@ impl Squadron {
                     let maker_snap_ts = maker_yes_ws_ts.min(maker_no_ws_ts);
 
                     // Only proceed if at least one market has valid prices
-                    if (hourly_ya == dec!(1) && hourly_na == dec!(1)) && (maker_ya == dec!(1) && maker_na == dec!(1)) { continue; }
+                    if (hourly_ya == dec!(1) && hourly_na == dec!(1)) && (maker_ya == dec!(1) && maker_na == dec!(1)) {
+                        // A squadron with NO market at all is idle on purpose:
+                        // the hourly expired and nothing cleared the volume
+                        // floor, so the monitor released it and this loop waits
+                        // (see `should_release_held_market`). Say so in the
+                        // viper registry every tick, or the vipers simply stop
+                        // being recorded — which is exactly what a wedged loop
+                        // looks like from the outside. On a fresh Marketplace
+                        // instance 2026-09-04 that read as "9 stale/error" over
+                        // a healthy, correctly idle system.
+                        //
+                        // Deliberately NOT recorded when a market is held but
+                        // its book is empty: that is a dark feed, which is a
+                        // real anomaly and already has its own banner.
+                        //
+                        // Vipers the operator has switched off keep their own
+                        // "disabled in config" row; only the ones that WOULD run
+                        // are the ones waiting.
+                        if squadron_has_no_market(&hourly_yes_token, maker_market_config.is_some()) {
+                            let cfg = dynamic_config.read().unwrap();
+                            for s in strategies.iter() {
+                                // Every viper is stamped, not just the enabled
+                                // ones. A viper switched off during this window
+                                // never reaches its own `evaluate_entry` — the
+                                // `continue` below sees to that — so skipping it
+                                // here would freeze its row and age it into a
+                                // fault, which is the very thing this path
+                                // exists to prevent.
+                                let reason = if cfg.strategy_enabled(&s.name()) {
+                                    crate::helpers::viper_status::IDLE_NO_MARKET
+                                } else {
+                                    crate::helpers::viper_status::DISABLED_IN_CONFIG
+                                };
+                                crate::helpers::viper_status::record_idle(
+                                    &crypto_filter, &s.name(), reason,
+                                );
+                            }
+                        }
+                        continue;
+                    }
 
                     // The strike can arrive after deploy — see `live_hourly_strike`.
                     let hourly_strike_price =
@@ -2971,6 +3010,16 @@ pub(crate) fn single_market_arb_enabled(single_market: bool, has_maker_venue: bo
     single_market && !has_maker_venue
 }
 
+/// Does this squadron hold nothing to evaluate against?
+///
+/// True only when the hourly slot carries the ZERO sentinel AND no maker
+/// (window/daily) venue was resolved. Either one alone is a market the vipers
+/// can run on; a held market whose book is merely empty is a different state
+/// (a dark feed) and must not be reported as idle.
+pub(crate) fn squadron_has_no_market(hourly_yes_token: &MarketId, has_maker_venue: bool) -> bool {
+    *hourly_yes_token == market_id_from_u256(U256::ZERO) && !has_maker_venue
+}
+
 /// The hourly strike as the market channel holds it RIGHT NOW, for the market
 /// this squadron deployed on.
 ///
@@ -3065,6 +3114,35 @@ mod event_market_retire_tests {
     fn a_real_maker_venue_always_wins() {
         assert!(!single_market_arb_enabled(true, true));
         assert!(!single_market_arb_enabled(false, true));
+    }
+}
+
+#[cfg(test)]
+mod no_market_tests {
+    use super::*;
+
+    fn zero() -> MarketId { market_id_from_u256(U256::ZERO) }
+    fn real() -> MarketId { market_id_from_u256(U256::from(42u64)) }
+
+    /// The 2026-09-04 shape: hourly released, no daily venue. Idle, not stale.
+    #[test]
+    fn released_hourly_and_no_maker_venue_is_idle() {
+        assert!(squadron_has_no_market(&zero(), false));
+    }
+
+    /// A maker venue alone is a market to evaluate; the vipers run on it and
+    /// their own rows stay fresh, so this must not be labeled idle.
+    #[test]
+    fn a_maker_venue_alone_is_not_idle() {
+        assert!(!squadron_has_no_market(&zero(), true));
+    }
+
+    /// A held hourly market with no book is a dark feed — a real anomaly with
+    /// its own banner — and must never be dressed up as a deliberate wait.
+    #[test]
+    fn a_held_market_is_never_idle() {
+        assert!(!squadron_has_no_market(&real(), false));
+        assert!(!squadron_has_no_market(&real(), true));
     }
 }
 
