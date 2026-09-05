@@ -1742,7 +1742,17 @@ impl Squadron {
                                                 if remainder_m >= config::MIN_ORDER_SHARES {
                                                     warn!("⚠️ PARTIAL EXIT [{}]: venue matched {:.4}, {:.4} retained @ ${:.4} pnl=${:.4} (net of ${:.4} fees) — remainder re-fires at the fresh bid", sn, rs_m, remainder_m, aep_exit, pnl_m, fees_m);
                                                 } else {
-                                                    info!("✅ FAK exit confirmed [{}]: {:.4} shares sold @ ${:.4} pnl=${:.4} (net of ${:.4} fees)", sn, rs_m, aep_exit, pnl_m, fees_m);
+                                                    info!("✅ FAK exit confirmed [{}]: {:.4} shares sold @ ${:.4} (marked ${:.4}) pnl=${:.4} (net of ${:.4} fees)", sn, rs_m, aep_exit, params.price, pnl_m, fees_m);
+                                                }
+                                                // A fill materially ABOVE the bid the strategy marked
+                                                // against means the book it read was behind the venue.
+                                                // 2026-09-05 (intl, real money): a FairValue stop marked
+                                                // at $0.58 filled at $0.67; at $0.67 the position was
+                                                // inside its stop and would not have been sold. One tick
+                                                // of slack: a fill exactly at the mark is the norm and a
+                                                // one-tick improvement is ordinary queue movement.
+                                                if aep_exit > params.price + dec!(0.01) {
+                                                    warn!("⚠️ Stale mark [{}]: venue filled ${:.4} against a marked bid of ${:.4} (+${:.4}) — the book this exit was priced from was behind the venue", sn, aep_exit, params.price, aep_exit - params.price);
                                                 }
                                                 *total_pnl.lock().await += pnl_m;
                                                 metrics::record_trade(&scope, fees_m, sn.clone(), params.market_name.clone(), side_of(&tid).to_string(), re_m, aep_exit, rs_m, pnl_m, reason.clone()).await;

@@ -439,6 +439,20 @@ pub const DEPLOY_MAX_DAYS_TO_CLOSE: u32 = 30;
 // would leave it predicting from a distribution it never saw.
 pub const OBI_USE_WHOLE_BOOK: bool = false;
 
+// ── Intl order-book feed (B36) ───────────────────────────────────────────────
+// Polymarket publishes the full book on subscribe and after each trade, and
+// publishes order placements and cancellations as `price_change` messages.
+// Until 2026-09-05 DRADIS consumed only the full snapshots, so between trades
+// every intl strategy read the book as the last trade had left it: a FairValue
+// stop marked a $0.58 bid that had refilled to $0.67, fired at −22.66%, and
+// sold a winning position. With this on, the WebSocket task folds
+// `price_change` updates into a local level map between snapshots. Every
+// snapshot remains the authority; a level map that cannot be reconciled with
+// the venue's own best bid/ask falls back to the last snapshot. Runtime knob
+// `book_apply_price_changes` in the Control Tower is the kill switch — off
+// restores the snapshot-only feed exactly.
+pub const BOOK_APPLY_PRICE_CHANGES: bool = true;
+
 // ── ToxicFill confirmation gates ────────────────────────────────────────────
 // Applied ONLY to a confirmed fill; an unfilled resting quote is still pulled
 // instantly. Without them the exit fires on the OBI dip caused by our own quote
@@ -717,6 +731,10 @@ pub const GBOOST_LABEL_HORIZON_SECS: i64 = 300; // conservative: longer horizon,
 pub const GBOOST_LABEL_MIN_ORACLE_MOVE_FRAC: f64 = 0.0003; // skip flat samples (<3bp move)
 pub const GBOOST_MIN_TRAINING_SAMPLES: usize = 320;
 pub const GBOOST_LABEL_POOL_CAP: usize = 8000; // conservative: larger pool — more data, smoother model
+/// Wall-clock cap on lookahead label age (hours). Samples older than this are
+/// pruned from the pool at every harvest, whether restored from the persisted
+/// pool file (B33) or labeled by this process. Hot-tunable: gboost_label_max_age_hours.
+pub const GBOOST_LABEL_MAX_AGE_HOURS: i64 = 48;
 pub const GBOOST_MIN_RETRAIN_INTERVAL_SECS: u64 = 300;
 pub const GBOOST_RETRAIN_EVERY_N: usize = 200;
 pub const GBOOST_BUDGET: Decimal = dec!(0.80); // raised from 0.65 — gives perpetual room to grow past 1 tree

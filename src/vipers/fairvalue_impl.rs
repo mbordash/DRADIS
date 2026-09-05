@@ -493,12 +493,71 @@ impl FairValueStrategyImpl {
         req_edge: Decimal,
         confirm: Decimal,
     ) -> Option<Decimal> {
-        if confirm <= dec!(0) || ask <= dec!(0) || ask >= dec!(1) {
+        if confirm <= dec!(0) {
+            return None;
+        }
+        let live_edge = Self::model_live_edge(fair, ask)?;
+        (live_edge >= req_edge * confirm).then_some(live_edge)
+    }
+
+    /// The arithmetic half of the veto on its own: the model's edge at the
+    /// live ASK, net of the round trip — the entry test re-run at the price
+    /// it would cost to buy the position back. `None` when there is nothing
+    /// to measure: no model reading, or an unquoted ask.
+    ///
+    /// Note what this is not: it is not fair-versus-entry, and it is not
+    /// fair-versus-bid. A position can sit above its entry price on the
+    /// model and still show NO edge here, because the ask has moved away.
+    fn model_live_edge(fair: Option<f64>, ask: Decimal) -> Option<Decimal> {
+        if ask <= dec!(0) || ask >= dec!(1) {
             return None;
         }
         let fair_dec = Decimal::from_f64_retain(fair?).map(|d| d.round_dp(10))?;
-        let live_edge = fair_dec - ask - Self::fee_frac(ask) - Self::fee_frac(fair_dec);
-        (live_edge >= req_edge * confirm).then_some(live_edge)
+        Some(fair_dec - ask - Self::fee_frac(ask) - Self::fee_frac(fair_dec))
+    }
+
+    /// Why the model-confirmation veto did not hold a stop that is about to
+    /// fire, for the ledger reason.
+    ///
+    /// 2026-09-05, intl, real money: a NO stop at −22.66% was booked with
+    /// `ask=$0.83 fair=0.776` in its reason, and the question "the model was
+    /// above the entry price, so why did the veto not hold it?" had to be
+    /// answered by reverse-engineering this file. The answer — the veto is
+    /// measured against the ask, and 0.776 sits BELOW an $0.83 ask — is
+    /// three numbers the stop already had in hand. Record them.
+    ///
+    /// Exactly one branch is reachable per stop, in the order the exit path
+    /// consults them; the note is only built for a stop that fires, so an
+    /// `edge` note always carries an edge below the requirement.
+    fn stop_veto_note(
+        catastrophic: bool,
+        withdrawn: bool,
+        confirm: Decimal,
+        fair: Option<f64>,
+        ask: Decimal,
+        req_edge: Decimal,
+        baseline: f64,
+        decay_limit: f64,
+    ) -> String {
+        if catastrophic {
+            return "veto=n/a(catastrophic)".to_string();
+        }
+        if withdrawn {
+            return match fair {
+                Some(p) => format!(
+                    "veto=withdrawn(fair {:.3} < {:.3})", p, baseline * (1.0 - decay_limit)
+                ),
+                None => "veto=withdrawn(no model)".to_string(),
+            };
+        }
+        if confirm <= dec!(0) {
+            return "veto=off".to_string();
+        }
+        match Self::model_live_edge(fair, ask) {
+            Some(edge) => format!("veto=edge{:+.3}<{:.3}", edge, req_edge * confirm),
+            None if fair.is_none() => "veto=n/a(no model)".to_string(),
+            None => "veto=n/a(no ask)".to_string(),
+        }
     }
 
     fn cooldown_active(&self, asset: &str, token_id: &str, cooldown_secs: i64) -> bool {
@@ -1225,9 +1284,9 @@ impl Strategy for FairValueStrategyImpl {
                 let model_holding = !veto_withdrawn;
 
                 let confirm = dc.fairvalue_stop_model_confirm_frac;
+                let req = Self::required_edge(dc, secs_left);
                 if !catastrophic && model_holding {
                     let ask = if token_is_yes { snap.yes_ask } else { snap.no_ask };
-                    let req = Self::required_edge(dc, secs_left);
                     if let Some(live_edge) =
                         Self::stop_vetoed_by_model(fair_side, ask, req, confirm)
                     {
@@ -1272,15 +1331,30 @@ impl Strategy for FairValueStrategyImpl {
                 // ask, the spread it implies and the size at the touch say at
                 // once whether the mark was a thin bid under a standing ask or
                 // a repriced market.
+                //
+                // 2026-09-05: the next stop with those fields read `bid=$0.58
+                // ask=$0.83 fair=0.776` and then FILLED at $0.67 — nine cents
+                // above the bid it was marked at, which would not have
+                // breached the stop. Two more figures decide that case and
+                // neither was recorded: how old the snapshot was (the intl
+                // feed only moves on a `book` event, so a quiet market can
+                // sit on one reading for minutes), and what the veto actually
+                // measured. Both ride along now.
                 let (ask, bid_depth) = if token_is_yes {
                     (snap.yes_ask, snap.yes_bid_depth)
                 } else {
                     (snap.no_ask, snap.no_bid_depth)
                 };
+                let snap_age_secs = (Utc::now() - snap.timestamp).num_seconds().max(0);
+                let veto_note = Self::stop_veto_note(
+                    catastrophic, veto_withdrawn, confirm, fair_side, ask, req,
+                    baseline, veto_decay_limit,
+                );
                 let book = format!(
-                    " | ask=${:.4} spread=${:.2} bid_depth={:.0} fair={}",
+                    " | ask=${:.4} spread=${:.2} bid_depth={:.0} fair={} age={}s {}",
                     ask, ask - bid, bid_depth,
                     fair_side.map_or_else(|| "n/a".to_string(), |p| format!("{:.3}", p)),
+                    snap_age_secs, veto_note,
                 );
                 return Ok(StrategySignal::Exit {
                     params: exit_params(bid),
@@ -1590,6 +1664,88 @@ mod tests {
             FairValueStrategyImpl::stop_vetoed_by_model(Some(fair_no), no_ask, req, dec!(1.5))
                 .is_none()
         );
+    }
+
+    /// 2026-09-05, intl, real money. The stop that sold "Bitcoin Up or Down -
+    /// September 5, 6AM ET" NO at −22.66% booked `ask=$0.8300 fair=0.776`
+    /// against a $0.75 entry, and the market resolved NO. The natural reading
+    /// is "fair above entry, thesis intact, the veto should have held". The
+    /// veto does not measure fair against entry: it measures the edge at the
+    /// ASK, and 0.776 is below 0.83 before fees are even counted. The edge is
+    /// −0.077 against a +0.036 requirement (488s left on the balanced taper).
+    /// No setting of `fairvalue_stop_model_confirm_frac` can flip a negative
+    /// edge, so the knob was not the cause either.
+    #[test]
+    fn the_2026_09_05_stop_could_not_be_vetoed_at_any_confirm() {
+        let fair_no = Some(0.776);
+        let no_ask = dec!(0.83);
+        let req = dec!(0.0363);
+
+        let edge = FairValueStrategyImpl::model_live_edge(fair_no, no_ask)
+            .expect("both a model reading and a quoted ask were present");
+        assert_eq!(edge.round_dp(3), dec!(-0.077));
+        assert!(edge < dec!(0), "the veto's edge was negative: fair sat below the ask");
+
+        for confirm in [dec!(0.01), dec!(0.5), dec!(1.0), dec!(1.5)] {
+            assert!(
+                FairValueStrategyImpl::stop_vetoed_by_model(fair_no, no_ask, req, confirm).is_none(),
+                "confirm {confirm} cannot rescue a negative edge",
+            );
+        }
+
+        // And the ledger now says so in the stop's own reason. (`Decimal`'s
+        // precision formatter truncates: −0.0767 prints as −0.076, the same
+        // way the production row printed an exact −22.666% as −22.66%.)
+        let note = FairValueStrategyImpl::stop_veto_note(
+            false, false, dec!(1.0), fair_no, no_ask, req, 0.85, 0.05,
+        );
+        assert_eq!(note, "veto=edge-0.076<0.036");
+    }
+
+    /// The other half of the 2026-09-05 reading. "fair 0.776 > entry 0.75"
+    /// is not "the thesis is intact": entry requires fair to clear the ask
+    /// PLUS round-trip fees PLUS the horizon-scaled edge, so the smallest fair
+    /// that could have opened a NO at $0.75 was about 0.80. At 0.776 the
+    /// net edge at the entry's own ask is already below zero — the position
+    /// would not have been opened at 0.776, whatever the model-direction
+    /// guard made of the decay from the (unrecorded) entry fair.
+    #[test]
+    fn a_fair_above_entry_price_is_not_an_intact_thesis() {
+        let edge_at_entry_ask = FairValueStrategyImpl::model_live_edge(Some(0.776), dec!(0.75))
+            .expect("quoted");
+        assert!(
+            edge_at_entry_ask < dec!(0),
+            "net of fees, fair 0.776 has no edge at the $0.75 it was bought at: {edge_at_entry_ask}",
+        );
+        // The floor of every profile's `fairvalue_min_edge` is 0.015; the
+        // entry needed at least that on top of fees. Solve for the fair that
+        // just clears it: ~0.80, above the exit reading.
+        let smallest_admissible = (776..=820)
+            .map(|m| m as f64 / 1000.0)
+            .find(|f| {
+                FairValueStrategyImpl::model_live_edge(Some(*f), dec!(0.75))
+                    .is_some_and(|e| e >= dec!(0.015))
+            })
+            .expect("some fair below 0.82 admits the entry");
+        assert!(smallest_admissible > 0.79, "was {smallest_admissible}");
+    }
+
+    /// Every way the veto can fail to hold gets its own note, so the ledger
+    /// never again needs this file to explain a stop.
+    #[test]
+    fn veto_note_names_each_way_the_veto_can_fail() {
+        let n = |cat, wd, confirm, fair, ask| {
+            FairValueStrategyImpl::stop_veto_note(cat, wd, confirm, fair, ask, dec!(0.05), 0.80, 0.05)
+        };
+        assert_eq!(n(true, false, dec!(1), Some(0.9), dec!(0.5)), "veto=n/a(catastrophic)");
+        assert_eq!(n(false, true, dec!(1), Some(0.70), dec!(0.5)), "veto=withdrawn(fair 0.700 < 0.760)");
+        assert_eq!(n(false, true, dec!(1), None, dec!(0.5)), "veto=withdrawn(no model)");
+        assert_eq!(n(false, false, dec!(0), Some(0.9), dec!(0.5)), "veto=off");
+        assert_eq!(n(false, false, dec!(1), None, dec!(0.5)), "veto=n/a(no model)");
+        assert_eq!(n(false, false, dec!(1), Some(0.9), dec!(1)), "veto=n/a(no ask)");
+        // The 2026-08-30 case: the ask-based edge widened as the bid fell,
+        // the direction guard withdrew the veto, and the note says which.
+        assert_eq!(n(false, true, dec!(1), Some(0.666), dec!(0.50)), "veto=withdrawn(fair 0.666 < 0.760)");
     }
 
     /// Zero is the escape hatch: the veto disappears and the stop is price-only
@@ -1907,6 +2063,63 @@ mod entry_book_tests {
 
         let (m, _) = entry_book(&c, true);
         assert_eq!(m.condition_id, "cid-hourly", "prefer_hourly=true with a viable hourly selects the hourly");
+    }
+
+    /// The 2026-09-05 stop, driven through the real exit path: NO bought at
+    /// $0.75, the hourly book reading bid $0.58 / ask $0.83 with 304 at the
+    /// touch, snapshot four minutes old. The stop fires (no model reading here
+    /// means no veto, which is the safe direction), and the reason must now
+    /// carry the snapshot's age and the veto's verdict alongside the book —
+    /// the two figures the incident could not be settled without.
+    #[tokio::test]
+    async fn a_stop_reason_records_the_snapshot_age_and_the_veto_verdict() {
+        use crate::state::Position;
+
+        let mut hourly = book(dec!(200), dec!(150));
+        hourly.no_bid = dec!(0.58); hourly.no_bid_depth = dec!(304);
+        hourly.no_ask = dec!(0.83); hourly.no_ask_depth = dec!(50);
+        hourly.yes_bid = dec!(0.17); hourly.yes_ask = dec!(0.42);
+        hourly.timestamp = Utc::now() - chrono::Duration::seconds(240);
+
+        let mut c = ctx(hourly, book(dec!(100), dec!(100)));
+        // Globals are keyed by asset: a private key keeps this run's stop
+        // count and cooldown out of every other test's.
+        c.crypto_filter = "btc-0905-stop-reason".to_string();
+        let mut dc = DynamicConfig::default();
+        dc.enable_fairvalue = true;
+        dc.fairvalue_stop_loss_pct = dec!(0.12);
+        dc.fairvalue_stop_model_confirm_frac = dec!(1.0);
+        dc.fairvalue_stop_veto_max_model_decay_pct = dec!(0.05);
+        c.dynamic_config = Arc::new(dc);
+
+        let no_token = c.market.no_token.clone();
+        let opened = Utc::now() - chrono::Duration::seconds(600);
+        c.positions.lock().await.insert(
+            PositionKey::new(c.squadron_id.clone(), "FairValueStrategy", no_token.clone()),
+            Position {
+                shares: dec!(7.09), avg_entry: dec!(0.75), opened_at: opened,
+                close_time: c.market.market_close_time,
+                market_name: c.market.market_name.clone(),
+                pair_token_id: c.market.yes_token.clone(),
+                fill_confirmed_at: Some(opened), paired_leg_token_id: None,
+                entry_fee: dec!(0.0957),
+            },
+        );
+
+        let strat = FairValueStrategyImpl::default();
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        let StrategySignal::Exit { params, reason, .. } = sig else {
+            panic!("a −22.66% mark past the min hold must stop out, got {sig:?}");
+        };
+        assert_eq!(params.price, dec!(0.58), "the stop sells at the bid it was marked against");
+        assert!(reason.starts_with("FairValueSL: bid=$0.5800, loss=-22.6"), "{reason}");
+        assert!(reason.contains("ask=$0.8300 spread=$0.25 bid_depth=304 fair=n/a"), "{reason}");
+        // Age is read at evaluation time; allow the test its own few seconds.
+        let age: i64 = reason
+            .split(" age=").nth(1).and_then(|s| s.split('s').next()).and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| panic!("no age field in {reason}"));
+        assert!((240..245).contains(&age), "age={age} in {reason}");
+        assert!(reason.ends_with(" veto=withdrawn(no model)"), "{reason}");
     }
 
     /// The call site itself, pinned against the source: the production half of

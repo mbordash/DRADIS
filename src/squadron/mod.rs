@@ -63,6 +63,13 @@ mod patrol_impl;
 #[cfg(feature = "intl_clob")]
 pub use patrol_impl::{cancel_all_orders_unless_simulating, cancel_all_orders_with_retries};
 
+/// Local order book built from the venue's `book` snapshots and `price_change`
+/// updates — B36. Venue-neutral core; `spawn_ws_task` feeds it.
+#[cfg(feature = "intl_clob")]
+mod local_book;
+#[cfg(feature = "intl_clob")]
+pub use local_book::{ApplyOutcome, BookSide, BookStats, LevelChange, LocalBook};
+
 /// Peripheral tasks spawned by `patrol()` — Phase 3f-4.
 /// Kept in a separate file for clarity; each function spawns one Tokio task.
 #[cfg(feature = "intl_clob")]
@@ -92,7 +99,21 @@ use tracing::{info, warn};
 use tracing::info;
 
 #[cfg(feature = "intl_clob")]
-use polymarket_client_sdk_v2::clob::ws::Client as WsClient;
+use polymarket_client_sdk_v2::clob::ws::{
+    interest::InterestTracker, subscription::SubscriptionManager, PriceChangeBatchEntry, WsMessage,
+};
+#[cfg(feature = "intl_clob")]
+use polymarket_client_sdk_v2::clob::types::Side;
+#[cfg(feature = "intl_clob")]
+use polymarket_client_sdk_v2::ws::{config::Config as WsConfig, ConnectionManager};
+#[cfg(feature = "intl_clob")]
+use std::sync::Arc;
+
+/// Polymarket International market-data channel. The SDK's `Client` appends
+/// `/ws/market` to its base endpoint; this is the assembled form because
+/// `spawn_ws_task` builds the channel itself (see `open_market_stream`).
+#[cfg(feature = "intl_clob")]
+const INTL_MARKET_WS_ENDPOINT: &str = "wss://ws-subscriptions-clob.polymarket.com/ws/market";
 
 use crate::state::{MarketConfig, PriceState};
 
@@ -552,10 +573,71 @@ impl Squadron {
 
 // ─── Private helpers ─────────────────────────────────────────────────────────
 
+/// Open the market channel for one token and return the unfiltered, ordered
+/// `WsMessage` stream.
+///
+/// Assembled the way the SDK's `Client` assembles it — one `ConnectionManager`
+/// (heartbeats, backoff reconnect) and one `SubscriptionManager` (re-sends the
+/// subscription after a reconnect, which is what makes the venue send a fresh
+/// `book`) — but without `Client::subscribe_orderbook`'s filter, which drops
+/// every message that is not a `book`. Consuming `price_change` is the point
+/// of B36, and it has to come from the *same* stream as the snapshots: two
+/// filtered streams over the same broadcast could hand back a `price_change`
+/// before the `book` it belongs after, and the book would then be rebuilt
+/// without it.
+///
+/// The `SubscriptionManager` is returned alongside the stream because the
+/// connection lives only as long as a `ConnectionManager` clone does; the
+/// caller keeps both for the life of the subscription.
+#[cfg(feature = "intl_clob")]
+fn open_market_stream(
+    token: U256,
+) -> polymarket_client_sdk_v2::Result<(
+    Arc<SubscriptionManager>,
+    impl futures::Stream<Item = polymarket_client_sdk_v2::Result<WsMessage>>,
+)> {
+    let interest = Arc::new(InterestTracker::new());
+    let connection = ConnectionManager::new(
+        INTL_MARKET_WS_ENDPOINT.to_string(), WsConfig::default(), Arc::clone(&interest),
+    )?;
+    let subscriptions = Arc::new(SubscriptionManager::new(connection, interest));
+    subscriptions.start_reconnection_handler();
+    let stream = subscriptions.subscribe_market(vec![token])?;
+    Ok((subscriptions, stream))
+}
+
+/// One `price_change` entry as the local book understands it. `None` when the
+/// SDK could not classify the side — the caller distrusts the book rather than
+/// guess which side a level belongs to.
+#[cfg(feature = "intl_clob")]
+fn level_change(e: &PriceChangeBatchEntry) -> Option<LevelChange> {
+    let side = match e.side {
+        Side::Buy  => BookSide::Bid,
+        Side::Sell => BookSide::Ask,
+        _          => return None,
+    };
+    Some(LevelChange {
+        side, price: e.price, size: e.size, best_bid: e.best_bid, best_ask: e.best_ask,
+    })
+}
+
+#[cfg(feature = "intl_clob")]
+fn publish_book(tx: &watch::Sender<PriceState>, book: &LocalBook) {
+    if let Some(state) = book.price_state() {
+        let _ = tx.send(state);
+    }
+}
+
 /// Spawn one auto-reconnecting WebSocket orderbook subscriber task.
 ///
 /// Pushes `PriceState` updates into `tx`.  Stops cleanly when `cancel` fires.
 /// The `venue` label is used only for log messages.
+///
+/// B36: the task keeps a [`LocalBook`]. Every `book` message resets it; every
+/// `price_change` for this token is folded in between snapshots while the
+/// `book_apply_price_changes` knob is on and the book can reconcile itself
+/// against the venue's own best bid/ask. When it cannot, it publishes the last
+/// snapshot — the feed as it was before B36 — until the next `book` arrives.
 #[cfg(feature = "intl_clob")]
 fn spawn_ws_task(
     token:  U256,
@@ -567,8 +649,7 @@ fn spawn_ws_task(
         loop {
             if cancel.is_cancelled() { return; }
 
-            let client = WsClient::default();
-            let stream = match client.subscribe_orderbook(vec![token]) {
+            let (_subscriptions, stream) = match open_market_stream(token) {
                 Ok(s)  => s,
                 Err(e) => {
                     warn!(
@@ -586,35 +667,85 @@ fn spawn_ws_task(
             let mut stream = Box::pin(stream);
             info!("✅ WS orderbook subscribed for {} token {}", venue, token);
 
+            // Fresh per connection: a reconnect always brings a new snapshot.
+            let mut book = LocalBook::new();
+            let mut announced = false;
+
             loop {
                 tokio::select! {
                     biased;
                     _ = cancel.cancelled() => { return; }
                     result = stream.next() => {
                         match result {
-                            Some(Ok(book)) => {
-                                let (bid, bid_depth) = book.bids.iter()
-                                    .max_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
-                                    .map(|l| (l.price, l.size))
-                                    .unwrap_or((dec!(0), dec!(0)));
-                                let (ask, ask_depth) = book.asks.iter()
-                                    .min_by(|a, b| a.price.partial_cmp(&b.price).unwrap())
-                                    .map(|l| (l.price, l.size))
-                                    .unwrap_or((dec!(1), dec!(0)));
-                                // Aggregate depth across EVERY published level, alongside
-                                // the touch sizes above. The venue sends the whole book
-                                // (`Vec<OrderBookLevel>`); until now everything but the
-                                // best level was discarded, which is why order-book
-                                // imbalance was really a top-of-book ratio. Published for
-                                // comparison only — no consumer's behavior changes yet.
-                                let bid_depth_total: rust_decimal::Decimal = book.bids.iter().map(|l| l.size).sum();
-                                let ask_depth_total: rust_decimal::Decimal = book.asks.iter().map(|l| l.size).sum();
+                            Some(Ok(WsMessage::Book(snapshot))) => {
+                                let stats = book.take_stats();
+                                let held_back = book.inconsistency().map(str::to_string);
                                 // Stamp the WS update time at receipt, NOT at tick time.
-                                let _ = tx.send((
-                                    bid, bid_depth, ask, ask_depth, Utc::now(),
-                                    bid_depth_total, ask_depth_total,
-                                ));
+                                book.reset(
+                                    snapshot.timestamp,
+                                    snapshot.bids.iter().map(|l| (l.price, l.size)),
+                                    snapshot.asks.iter().map(|l| (l.price, l.size)),
+                                    Utc::now(),
+                                );
+                                if let Some(reason) = held_back {
+                                    info!(
+                                        "📖 Book feed resynced for {} token {}: snapshot replaced a book held back for `{}` ({} price_changes applied before that)",
+                                        venue, token, reason, stats.applied
+                                    );
+                                } else if stats.applied > 0 || stats.dropped_older > 0 {
+                                    tracing::debug!(
+                                        "📖 Book snapshot for {} token {}: reset after {} price_changes applied, {} dropped as older than the previous snapshot",
+                                        venue, token, stats.applied, stats.dropped_older
+                                    );
+                                }
+                                publish_book(&tx, &book);
                             }
+                            Some(Ok(WsMessage::PriceChange(pc))) => {
+                                // Kill switch. Off is the pre-B36 feed exactly: snapshots only.
+                                if !crate::helpers::dynamic_config::book_price_changes_enabled() {
+                                    continue;
+                                }
+                                let mine: Vec<&PriceChangeBatchEntry> = pc.price_changes.iter()
+                                    .filter(|e| e.asset_id == token)
+                                    .collect();
+                                if mine.is_empty() { continue; }
+                                let was_consistent = book.is_consistent();
+                                let outcome = match mine.iter().map(|e| level_change(e)).collect::<Option<Vec<_>>>() {
+                                    Some(changes) => book.apply(pc.timestamp, &changes, Utc::now()),
+                                    None => book.distrust(format!(
+                                        "price_change carried a side the SDK could not classify: {:?}",
+                                        mine.iter().map(|e| e.side).collect::<Vec<_>>()
+                                    )),
+                                };
+                                match outcome {
+                                    ApplyOutcome::Applied => {
+                                        if !announced {
+                                            info!(
+                                                "📖 Book feed for {} token {}: folding price_change updates into the book between snapshots (B36; knob book_apply_price_changes)",
+                                                venue, token
+                                            );
+                                            announced = true;
+                                        }
+                                        publish_book(&tx, &book);
+                                    }
+                                    ApplyOutcome::Inconsistent(reason) if was_consistent => {
+                                        // Transition only: the snapshot is republished once,
+                                        // with its own receipt time, and stays until the next
+                                        // `book`. Consumers see exactly the pre-B36 feed.
+                                        warn!(
+                                            "⚠️ Book feed inconsistent for {} token {}: {} — publishing the last full snapshot until the venue sends the next book",
+                                            venue, token, reason
+                                        );
+                                        publish_book(&tx, &book);
+                                    }
+                                    ApplyOutcome::Inconsistent(_)
+                                    | ApplyOutcome::DroppedOlder
+                                    | ApplyOutcome::NoSnapshot => {}
+                                }
+                            }
+                            // `last_trade_price`, `tick_size_change`, and anything the
+                            // venue adds later: no book content, nothing to publish.
+                            Some(Ok(_)) => {}
                             Some(Err(_)) | None => {
                                 warn!(
                                     "⚠️ WS stream error for {} token {}. Restarting…",
@@ -741,5 +872,114 @@ mod squadron_naming_tests {
         assert!(!s.ends_with('-'));
         let s2 = slugify(&format!("{} x", "b".repeat(31)));
         assert!(!s2.ends_with('-'), "truncation left a trailing dash: {s2:?}");
+    }
+}
+
+/// Live check of the B36 feed against the venue's REST book — the test that
+/// would catch a wrong reading of `price_change.size`.
+///
+/// Ignored by default: it needs the network and a live token. Run it as
+///
+/// ```text
+/// DRADIS_PROBE_TOKEN=<token id> DRADIS_PROBE_SECS=180 \
+///   cargo test live_book_matches_rest -- --ignored --nocapture
+/// ```
+///
+/// It drives the production path exactly — `open_market_stream`,
+/// `level_change`, `LocalBook` — and every 15s compares every level of the
+/// derived book with `GET /book`. A level-for-level match across the run is
+/// the evidence that `size` is the absolute level size; a delta reading
+/// diverges on the first poll.
+#[cfg(all(test, feature = "intl_clob"))]
+mod live_book_probe {
+    use super::*;
+    use std::collections::BTreeMap;
+    use std::str::FromStr;
+    use rust_decimal::Decimal;
+
+    fn rest_levels(v: &serde_json::Value) -> BTreeMap<Decimal, Decimal> {
+        v.as_array().into_iter().flatten().filter_map(|l| {
+            let p = Decimal::from_str(l["price"].as_str()?).ok()?;
+            let s = Decimal::from_str(l["size"].as_str()?).ok()?;
+            (s > Decimal::ZERO).then_some((p, s))
+        }).collect()
+    }
+
+    #[tokio::test]
+    #[ignore = "needs the network and a live token; see the module docs"]
+    async fn live_book_matches_rest() {
+        let token = std::env::var("DRADIS_PROBE_TOKEN").expect("DRADIS_PROBE_TOKEN");
+        let secs: u64 = std::env::var("DRADIS_PROBE_SECS").ok().and_then(|s| s.parse().ok()).unwrap_or(180);
+        let token_u256 = U256::from_str(&token).expect("token id");
+        // The binary installs this in `main`; a test process has to do it itself
+        // or the TLS handshake panics inside the SDK's connection task.
+        let _ = rustls::crypto::ring::default_provider().install_default();
+
+        let (_subs, stream) = open_market_stream(token_u256).expect("subscribe");
+        let mut stream = Box::pin(stream);
+        let http = reqwest::Client::builder().user_agent("dradis-live-book-probe").build().unwrap();
+        let mut book = LocalBook::new();
+        let mut levels: (BTreeMap<Decimal, Decimal>, BTreeMap<Decimal, Decimal>) = Default::default();
+        let mut polls = 0u32;
+        let mut polls_with_diffs = 0u32;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
+        let mut poll = tokio::time::interval(std::time::Duration::from_secs(15));
+        poll.tick().await;
+
+        loop {
+            tokio::select! {
+                _ = tokio::time::sleep_until(deadline) => break,
+                _ = poll.tick() => {
+                    if !book.has_snapshot() { println!("[poll] no snapshot yet"); continue; }
+                    let url = format!("https://clob.polymarket.com/book?token_id={token}");
+                    let rest: serde_json::Value = http.get(&url).send().await.unwrap().json().await.unwrap();
+                    let (rb, ra) = (rest_levels(&rest["bids"]), rest_levels(&rest["asks"]));
+                    let diff = |mine: &BTreeMap<Decimal, Decimal>, theirs: &BTreeMap<Decimal, Decimal>| -> Vec<String> {
+                        mine.keys().chain(theirs.keys()).collect::<std::collections::BTreeSet<_>>().into_iter()
+                            .filter(|p| mine.get(p) != theirs.get(p))
+                            .map(|p| format!("{p}: local={:?} rest={:?}", mine.get(p), theirs.get(p)))
+                            .collect()
+                    };
+                    let (db, da) = (diff(&levels.0, &rb), diff(&levels.1, &ra));
+                    polls += 1;
+                    if !db.is_empty() || !da.is_empty() { polls_with_diffs += 1; }
+                    let s = book.price_state().unwrap();
+                    println!(
+                        "[poll {polls}] consistent={} derived bid/ask={}/{} levels={}/{} | REST levels={}/{} | diffs bids={db:?} asks={da:?} | stats={:?}",
+                        book.is_consistent(), s.0, s.2, levels.0.len(), levels.1.len(), rb.len(), ra.len(), book.stats()
+                    );
+                }
+                msg = stream.next() => match msg {
+                    Some(Ok(WsMessage::Book(b))) => {
+                        levels.0 = b.bids.iter().filter(|l| l.size > Decimal::ZERO).map(|l| (l.price, l.size)).collect();
+                        levels.1 = b.asks.iter().filter(|l| l.size > Decimal::ZERO).map(|l| (l.price, l.size)).collect();
+                        book.reset(b.timestamp, b.bids.iter().map(|l| (l.price, l.size)), b.asks.iter().map(|l| (l.price, l.size)), Utc::now());
+                        println!("[book] ts={} bids={} asks={}", b.timestamp, b.bids.len(), b.asks.len());
+                    }
+                    Some(Ok(WsMessage::PriceChange(pc))) => {
+                        let mine: Vec<LevelChange> = pc.price_changes.iter()
+                            .filter(|e| e.asset_id == token_u256).filter_map(level_change).collect();
+                        if mine.is_empty() { continue; }
+                        let out = book.apply(pc.timestamp, &mine, Utc::now());
+                        if out == ApplyOutcome::Applied {
+                            // Mirror the level map so the poll can diff it level for level.
+                            for c in &mine {
+                                let m = if c.side == BookSide::Bid { &mut levels.0 } else { &mut levels.1 };
+                                match c.size { Some(s) if s > Decimal::ZERO => { m.insert(c.price, s); } _ => { m.remove(&c.price); } }
+                            }
+                        } else {
+                            println!("[pc] ts={} outcome={out:?} entries={mine:?}", pc.timestamp);
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(e)) => panic!("stream error: {e}"),
+                    None => panic!("stream ended"),
+                }
+            }
+        }
+        println!("FINAL polls={polls} polls_with_diffs={polls_with_diffs} stats={:?} consistent={}", book.stats(), book.is_consistent());
+        assert!(polls >= 2, "too few polls to conclude anything");
+        assert!(polls_with_diffs <= 1, "derived book diverged from REST on {polls_with_diffs} of {polls} polls");
+        assert!(book.is_consistent(), "book ended inconsistent: {:?}", book.inconsistency());
     }
 }

@@ -109,6 +109,17 @@ pub fn ghosting_now() -> bool {
     global_config_tx().map(|tx| tx.borrow().ghost_mode).unwrap_or(false)
 }
 
+/// Should the intl order-book feed fold `price_change` updates into its local
+/// book between full snapshots (B36)? Read by the per-token WebSocket tasks on
+/// every `price_change`, so flipping the Control Tower knob takes effect on
+/// the next message without a resubscribe. Before the global handle is up, the
+/// build's own default applies.
+pub fn book_price_changes_enabled() -> bool {
+    global_config_tx()
+        .map(|tx| tx.borrow().book_apply_price_changes)
+        .unwrap_or(crate::config::BOOK_APPLY_PRICE_CHANGES)
+}
+
 /// Register (or replace) the live config handle a running squadron's patrol loop
 /// reads each tick.  Called once per squadron deploy / market rotation.
 pub fn register_squadron_config_handle(squadron_id: &str, handle: Arc<RwLock<DynamicConfig>>) {
@@ -229,6 +240,7 @@ fn default_gboost_budget()                  -> Decimal { config::GBOOST_BUDGET  
 fn default_gboost_iteration_limit()         -> u32     { config::GBOOST_ITERATION_LIMIT               }
 fn default_position_quote_ttl_secs()        -> u64     { config::POSITION_QUOTE_TTL_SECS              }
 fn default_obi_use_whole_book()             -> bool    { config::OBI_USE_WHOLE_BOOK                   }
+fn default_book_apply_price_changes()      -> bool    { config::BOOK_APPLY_PRICE_CHANGES             }
 fn default_maker_min_spread()               -> Decimal { config::MAKER_MIN_SPREAD                      }
 fn default_maker_bid_buffer()               -> Decimal { config::MAKER_BID_BUFFER                      }
 fn default_maker_cross_buffer()             -> Decimal { config::MAKER_CROSS_BUFFER                    }
@@ -282,12 +294,26 @@ fn default_gboost_min_entry_price()         -> Decimal { config::GBOOST_MIN_ENTR
 fn default_gboost_obi_adverse_block()       -> Decimal { config::GBOOST_OBI_ADVERSE_BLOCK              }
 fn default_gboost_obi_exhaustion_block()    -> Decimal { config::GBOOST_OBI_EXHAUSTION_BLOCK           }
 fn default_gboost_min_edge_from_fair()      -> Decimal { config::GBOOST_MIN_EDGE_FROM_FAIR             }
+fn default_gboost_min_hist_vol()            -> Decimal { decimal_from_f64(config::GBOOST_MIN_HIST_VOL) }
 fn default_gboost_min_net_profit_usdc()     -> Decimal { config::GBOOST_MIN_NET_PROFIT_USDC            }
 fn default_gboost_min_secs_to_expiry()      -> i64     { config::GBOOST_MIN_SECS_TO_EXPIRY             }
 fn default_gboost_signal_exit_threshold()   -> Decimal { config::GBOOST_SIGNAL_EXIT_THRESHOLD          }
 fn default_gboost_concept_drift_threshold() -> Decimal { config::GBOOST_CONCEPT_DRIFT_THRESHOLD        }
 fn default_gboost_drift_consecutive_required()  -> i64 { config::GBOOST_DRIFT_CONSECUTIVE_REQUIRED as i64 }
 fn default_gboost_drift_stable_clear_required() -> i64 { config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED as i64 }
+fn default_gboost_label_max_age_hours()     -> i64     { config::GBOOST_LABEL_MAX_AGE_HOURS             }
+
+/// Bridge for knobs whose profile constant is an `f64` (`GBOOST_MIN_HIST_VOL`):
+/// every DynamicConfig knob is a `Decimal`, because the Control Tower edits and
+/// PATCHes them as strings and the LLM patch path treats a JSON number as an
+/// integer field. Rounded so 0.0015f64 becomes 0.0015, not its binary expansion.
+/// `tools/generate-profiles.py` sees through this wrapper when it maps the
+/// Default impl back to the profile constants.
+fn decimal_from_f64(v: f64) -> Decimal {
+    Decimal::from_f64_retain(v)
+        .map(|d| d.round_dp(6))
+        .unwrap_or(Decimal::ZERO)
+}
 
 fn default_trendcapture_min_entry_price()      -> Decimal { config::TRENDCAPTURE_MIN_ENTRY_PRICE          }
 fn default_trendcapture_max_entry_ask_sum()    -> Decimal { config::TRENDCAPTURE_MAX_ENTRY_ASK_SUM        }
@@ -494,6 +520,12 @@ pub struct DynamicConfig {
     /// Does not affect the GBoost feature vector — see the constant's note.
     #[serde(default = "default_obi_use_whole_book")]
     pub obi_use_whole_book:            bool,
+    /// Fold the venue's `price_change` updates into the intl order book between
+    /// full snapshots (B36). Off restores the snapshot-only feed, which is the
+    /// book as the last trade left it. Instance-level: the WebSocket tasks read
+    /// the global row, so a squadron cannot hold a different answer.
+    #[serde(default = "default_book_apply_price_changes")]
+    pub book_apply_price_changes:      bool,
     #[serde(default = "default_maker_min_spread")]
     pub maker_min_spread:              Decimal,
     #[serde(default = "default_maker_bid_buffer")]
@@ -620,6 +652,16 @@ pub struct DynamicConfig {
     pub gboost_obi_exhaustion_block:  Decimal,
     #[serde(default = "default_gboost_min_edge_from_fair")]
     pub gboost_min_edge_from_fair:    Decimal,
+    /// Floor on the oracle's 60-minute realized volatility (the Price raptor's
+    /// normalized `hist_vol`, 0.02 per-tick std-dev = 1.0) below which GBoost
+    /// vetoes entries as "oracle too flat". Was the compile-time
+    /// `GBOOST_MIN_HIST_VOL`, which the conservative profile bakes at 0.0015 —
+    /// roughly the median of normal live BTC — so the only way to test whether
+    /// the quiet-regime veto earns its keep was an AMI rebuild. Hot-tunable now;
+    /// every veto is shadow-logged with its `hist_vol` so the scoreboard can
+    /// score any candidate floor against settled outcomes before it is applied.
+    #[serde(default = "default_gboost_min_hist_vol")]
+    pub gboost_min_hist_vol:          Decimal,
     #[serde(default = "default_gboost_min_net_profit_usdc")]
     pub gboost_min_net_profit_usdc:   Decimal,
     #[serde(default = "default_gboost_min_secs_to_expiry")]
@@ -637,6 +679,12 @@ pub struct DynamicConfig {
     /// Consecutive below-threshold retrains required to clear suppression.
     #[serde(default = "default_gboost_drift_stable_clear_required")]
     pub gboost_drift_stable_clear_required: i64,
+    /// Wall-clock cap (hours) on lookahead label age. The label pool is persisted
+    /// to `logs/` across restarts (B33); samples older than this are pruned at
+    /// every harvest, restored or not, so a pool reloaded after a long stop cannot
+    /// train the model on a regime that is days gone. Values below 1 are clamped.
+    #[serde(default = "default_gboost_label_max_age_hours")]
+    pub gboost_label_max_age_hours: i64,
 
     // ── TrendCapture Viper ────────────────────────────────────────────────────
     #[serde(default = "default_trendcapture_min_trade_size")]
@@ -922,6 +970,7 @@ impl Default for DynamicConfig {
             position_quote_ttl_secs:       config::POSITION_QUOTE_TTL_SECS,
             llm_max_output_tokens:         config::LLM_MAX_OUTPUT_TOKENS,
             obi_use_whole_book:            config::OBI_USE_WHOLE_BOOK,
+            book_apply_price_changes:      config::BOOK_APPLY_PRICE_CHANGES,
             maker_min_spread:              config::MAKER_MIN_SPREAD,
             maker_bid_buffer:              config::MAKER_BID_BUFFER,
             maker_cross_buffer:            config::MAKER_CROSS_BUFFER,
@@ -971,12 +1020,14 @@ impl Default for DynamicConfig {
             gboost_obi_adverse_block:     config::GBOOST_OBI_ADVERSE_BLOCK,
             gboost_obi_exhaustion_block:  config::GBOOST_OBI_EXHAUSTION_BLOCK,
             gboost_min_edge_from_fair:    config::GBOOST_MIN_EDGE_FROM_FAIR,
+            gboost_min_hist_vol:          decimal_from_f64(config::GBOOST_MIN_HIST_VOL),
             gboost_min_net_profit_usdc:   config::GBOOST_MIN_NET_PROFIT_USDC,
             gboost_min_secs_to_expiry:    config::GBOOST_MIN_SECS_TO_EXPIRY,
             gboost_signal_exit_threshold: config::GBOOST_SIGNAL_EXIT_THRESHOLD,
             gboost_concept_drift_threshold: config::GBOOST_CONCEPT_DRIFT_THRESHOLD,
             gboost_drift_consecutive_required: config::GBOOST_DRIFT_CONSECUTIVE_REQUIRED as i64,
             gboost_drift_stable_clear_required: config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED as i64,
+            gboost_label_max_age_hours: config::GBOOST_LABEL_MAX_AGE_HOURS,
 
             trendcapture_min_trade_size_usdc: config::TRENDCAPTURE_MIN_TRADE_SIZE_USDC,
             trendcapture_max_trade_size_usdc: config::TRENDCAPTURE_MAX_TRADE_SIZE_USDC,
@@ -1085,7 +1136,7 @@ pub fn read_only_mode() -> bool {
 /// divergent row is not persisted in the first place. Adding a field means
 /// adding it here and to the function; `reconciles_every_declared_key` fails if
 /// you miss one.
-pub const GLOBAL_SEMANTICS_KEYS: &[&str] = &["ghost_mode"];
+pub const GLOBAL_SEMANTICS_KEYS: &[&str] = &["ghost_mode", "book_apply_price_changes"];
 
 /// Force `cfg`'s instance-level fields to agree with `global`.
 ///
@@ -1100,6 +1151,13 @@ pub fn reconcile_global_semantics(
     if cfg.ghost_mode != global.ghost_mode {
         cfg.ghost_mode = global.ghost_mode;
         corrected.push("ghost_mode");
+    }
+    // The intl book feed is one WebSocket task per token reading the global
+    // row; a squadron row saying otherwise would describe a feed that does not
+    // exist.
+    if cfg.book_apply_price_changes != global.book_apply_price_changes {
+        cfg.book_apply_price_changes = global.book_apply_price_changes;
+        corrected.push("book_apply_price_changes");
     }
     corrected
 }

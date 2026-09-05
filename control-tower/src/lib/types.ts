@@ -110,6 +110,7 @@ export interface DynamicConfig {
   position_quote_ttl_secs:       number;
   llm_max_output_tokens:         number;
   obi_use_whole_book:            boolean;
+  book_apply_price_changes:      boolean;
   maker_min_spread:              string;
   maker_bid_buffer:              string;
   maker_cross_buffer:            string;
@@ -154,12 +155,14 @@ export interface DynamicConfig {
   gboost_obi_adverse_block:     string;
   gboost_obi_exhaustion_block:  string;
   gboost_min_edge_from_fair:    string;
+  gboost_min_hist_vol:          string;
   gboost_min_net_profit_usdc:   string;
   gboost_min_secs_to_expiry:    number;
   gboost_signal_exit_threshold: string;
   gboost_concept_drift_threshold: string;
   gboost_drift_consecutive_required: number;
   gboost_drift_stable_clear_required: number;
+  gboost_label_max_age_hours: number;
 
   // TrendCapture Viper
   trendcapture_min_trade_size_usdc: string;

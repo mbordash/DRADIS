@@ -1309,8 +1309,27 @@ function ProfilesPanel({ onAuthError }: { onAuthError: () => void }) {
  * named for anything else were registered in the Rust schema and rendered
  * nowhere. These read the global config — the deploy endpoint reads the process
  * config, not a squadron's — so they belong here rather than on a squadron page.
+ *
+ * "Global" is the schema's instance-level group (the engine reconciles every
+ * squadron row to the global value for its switches). `ghost_mode` lives there
+ * too but has its own GHOST/LIVE control on the main page, so it is left out.
  */
-const GLOBAL_CONFIG_GROUPS = ['Deployment'];
+const GLOBAL_CONFIG_GROUPS: { group: string; title: string; blurb: string; omit?: string[] }[] = [
+  {
+    group: 'Deployment',
+    title: 'Deployment',
+    blurb: 'Govern which squadrons DRADIS runs and which market it picks for them, ' +
+      'whether you deploy one yourself or leave it to the engine. Unlike the ' +
+      'per-viper settings on a squadron page, these are instance-wide.',
+  },
+  {
+    group: 'Global',
+    title: 'Engine',
+    blurb: 'Instance-wide switches the whole engine reads — every squadron sees the ' +
+      'same value, so they cannot be set per squadron.',
+    omit: ['ghost_mode'],
+  },
+];
 
 function GlobalConfigPanel() {
   const { data: schema } = useSWR('configSchema', getConfigSchema);
@@ -1321,23 +1340,26 @@ function GlobalConfigPanel() {
     await mutate();
   }, [mutate]);
 
-  const fields = (schema ?? []).filter(f => GLOBAL_CONFIG_GROUPS.includes(f.group));
-  if (!config || fields.length === 0) return null;
+  if (!config || !schema) return null;
+  const sections = GLOBAL_CONFIG_GROUPS
+    .map(g => ({ ...g, fields: schema.filter(f => f.group === g.group && !(g.omit ?? []).includes(f.key)) }))
+    .filter(g => g.fields.length > 0);
+  if (sections.length === 0) return null;
 
   return (
-    <div className="card p-4 space-y-3">
-      <div>
-        <h3 className="text-sm font-mono text-gray-200">Deployment</h3>
-        <p className="text-[11px] text-gray-500 mt-1 leading-relaxed">
-          Govern which squadrons DRADIS runs and which market it picks for them,
-          whether you deploy one yourself or leave it to the engine. Unlike the
-          per-viper settings on a squadron page, these are instance-wide.
-        </p>
-      </div>
-      {fields.map(f => (
-        <AdvancedRow key={f.key} field={f} config={config} onPatch={patch} disabled={false} />
+    <>
+      {sections.map(g => (
+        <div key={g.group} className="card p-4 space-y-3">
+          <div>
+            <h3 className="text-sm font-mono text-gray-200">{g.title}</h3>
+            <p className="text-[11px] text-gray-500 mt-1 leading-relaxed">{g.blurb}</p>
+          </div>
+          {g.fields.map(f => (
+            <AdvancedRow key={f.key} field={f} config={config} onPatch={patch} disabled={false} />
+          ))}
+        </div>
       ))}
-    </div>
+    </>
   );
 }
 

@@ -151,6 +151,15 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
          from actual collateral movement — the venue's fee-rate endpoint advertises 1000 bps, but that is \
          the ceiling an order authorizes, not what is charged. Only change this if Polymarket's schedule \
          changes; setting it wrong silently skews every recorded trade.").range(0.0, 0.5).step(0.005));
+    v.push(F::new("Global", None, "book_apply_price_changes", "Apply Price Changes", "bool", false,
+        "Polymarket International only. Keep the order book current between trades by folding the \
+         venue's price_change messages (order placements and cancellations) into the book. Off, the \
+         book is refreshed only when a trade prints, so between trades every strategy reads the book \
+         as the last trade left it — on 2026-09-05 a stop marked a $0.58 bid that had refilled to \
+         $0.67 and sold a winning position at a loss. Leave this on. It is a kill switch: turn it off \
+         only if the log shows repeated 'Book feed inconsistent' warnings, which means the venue's \
+         message shape has changed and the feed is already protecting itself by falling back to the \
+         last full snapshot. Instance-wide, like Ghost Mode — the feed reads the global setting."));
 
     // ── Arbitrage ───────────────────────────────────────────────────────────────
     {
@@ -447,6 +456,11 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Block entry when order-book imbalance signals exhaustion above this.").range(0.0, 1.0).step(0.05));
         v.push(F::new(g, e, "gboost_min_edge_from_fair", "Min Edge from Fair", "price", true,
             "Minimum edge vs classifier fair value required to enter.").range(0.0, 0.5).step(0.005));
+        v.push(F::new(g, e, "gboost_min_hist_vol", "Min Oracle Volatility", "decimal", true,
+            "Veto entries while the oracle's 60-minute realized volatility (normalized: 0.02 per-tick std-dev = 1.0) \
+             is below this. Meant to reject a frozen or stale oracle (~0.000). Live BTC normally reads 0.001–0.004, so a \
+             floor at 0.0015 also vetoes genuinely quiet hours. Each veto is logged with its hist_vol; use \
+             GET /api/gboost/veto-scores?max_hist_vol=… to score a candidate floor against settled outcomes first.").range(0.0, 0.05).step(0.0001));
         v.push(F::new(g, e, "gboost_min_net_profit_usdc", "Min Net Profit", "usd", true,
             "Minimum net expected profit (after fees) required to enter.").min(0.0).step(0.05).unit("USDC"));
         v.push(F::new(g, e, "gboost_min_secs_to_expiry", "Min Secs to Expiry", "secs", true,
@@ -459,6 +473,12 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Consecutive above-threshold retrains required before entries are suppressed.").range(1.0, 10.0).step(1.0));
         v.push(F::new(g, e, "gboost_drift_stable_clear_required", "Drift Stable Clear Required", "int", true,
             "Consecutive below-threshold retrains required before suppression is lifted.").range(1.0, 10.0).step(1.0));
+        v.push(F::new(g, e, "gboost_label_max_age_hours", "Label Max Age", "int", true,
+            "Oldest lookahead label the retrain pool may hold, in hours. The pool is persisted under logs/ across \
+             restarts; labels older than this are dropped at every harvest, so a pool restored after a long stop \
+             cannot retrain the model on a regime that is days gone. In normal operation the FIFO cap already \
+             keeps the pool to a few hours of data, so this mostly governs what a reload is allowed to bring back.")
+            .range(1.0, 720.0).step(1.0).unit("h"));
     }
 
     // ── TrendReversal ─────────────────────────────────────────────────────────────

@@ -411,6 +411,13 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
         .execute(pool).await;
     let _ = sqlx::query("ALTER TABLE gboost_vetoes ADD COLUMN scored_at TEXT")
         .execute(pool).await;
+    // hist_vol (2026-09-05): the oracle's normalized 60m realized volatility at
+    // veto time — the regime the gate fired in. Without it the scoreboard can
+    // say how a gate did overall but not whether its verdict differs between a
+    // quiet and an active market, which is the question the `oracle too flat`
+    // floor turns on. NULL on rows written before the column existed.
+    let _ = sqlx::query("ALTER TABLE gboost_vetoes ADD COLUMN hist_vol REAL")
+        .execute(pool).await;
     let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_gboost_vetoes_unscored ON gboost_vetoes(outcome, ts)")
         .execute(pool).await;
 
@@ -1275,14 +1282,15 @@ pub async fn record_gboost_veto_db(
     oracle_price: &str,
     drift_60m: &str,
     secs_to_expiry: i64,
+    hist_vol: f64,
 ) {
     let ts = Utc::now().to_rfc3339();
     let sid = current_session_id();
     if let Err(e) = sqlx::query(
         "INSERT INTO gboost_vetoes
             (ts, session_id, market, condition_id, side, token_id, ask_price,
-             p_up, veto_reason, oracle_price, drift_60m, secs_to_expiry)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+             p_up, veto_reason, oracle_price, drift_60m, secs_to_expiry, hist_vol)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
     )
     .bind(&ts)
     .bind(sid)
@@ -1296,6 +1304,7 @@ pub async fn record_gboost_veto_db(
     .bind(oracle_price)
     .bind(drift_60m)
     .bind(secs_to_expiry)
+    .bind(hist_vol)
     .execute(pool)
     .await {
         error!("❌ DB gboost_veto write failed: {}", e);
@@ -1343,6 +1352,37 @@ pub struct GboostVetoScore {
     /// `avg_pnl_per_share`; when the two diverge sharply, the raw figure is being
     /// driven by signal concentration rather than by a repeatable edge.
     pub avg_pnl_per_market: f64,
+    /// Mean oracle `hist_vol` across this gate's vetoes (all rows, scored or
+    /// not) — where on the quiet/active axis the gate actually fires. `None`
+    /// when every row predates the column.
+    pub avg_hist_vol: Option<f64>,
+}
+
+/// Optional regime slice for the scoreboard: keep only vetoes whose recorded
+/// `hist_vol` lies in `[min_hist_vol, max_hist_vol]`. Either bound alone is
+/// fine. Rows without a `hist_vol` (written before the column existed) are
+/// excluded whenever any bound is set, so a slice never silently mixes in
+/// rows whose regime is unknown.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VetoRegime {
+    pub min_hist_vol: Option<f64>,
+    pub max_hist_vol: Option<f64>,
+}
+
+impl VetoRegime {
+    /// SQL predicate (always safe to AND onto a WHERE clause). Bounds are
+    /// numbers formatted by Rust, never user text, and non-finite values are
+    /// dropped rather than interpolated.
+    fn sql(&self) -> String {
+        let mut out = String::from("1=1");
+        if let Some(lo) = self.min_hist_vol.filter(|v| v.is_finite()) {
+            out.push_str(&format!(" AND hist_vol IS NOT NULL AND hist_vol >= {lo:.8}"));
+        }
+        if let Some(hi) = self.max_hist_vol.filter(|v| v.is_finite()) {
+            out.push_str(&format!(" AND hist_vol IS NOT NULL AND hist_vol <= {hi:.8}"));
+        }
+        out
+    }
 }
 
 /// SQL CASE mapping a free-text `veto_reason` onto a stable gate family.
@@ -1367,17 +1407,23 @@ const VETO_GATE_CASE: &str = "CASE
 ///
 /// Only rows with a resolved `outcome` participate; unscored rows are reported in
 /// `total − scored` so a thin sample is never mistaken for a confident verdict.
-pub async fn gboost_veto_scoreboard(pool: &SqlitePool) -> Vec<GboostVetoScore> {
+///
+/// `regime` slices the table by the oracle volatility recorded at veto time, so
+/// the same gate can be scored separately in quiet and active markets.
+pub async fn gboost_veto_scoreboard(pool: &SqlitePool, regime: VetoRegime) -> Vec<GboostVetoScore> {
+    let regime_sql = regime.sql();
     let group_sql = format!(
         "SELECT {case} AS gate,
                 COUNT(*) AS total,
                 SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) AS scored,
-                SUM(CASE WHEN outcome IS NOT NULL THEN outcome ELSE 0 END) AS wins
+                SUM(CASE WHEN outcome IS NOT NULL THEN outcome ELSE 0 END) AS wins,
+                AVG(hist_vol) AS avg_hist_vol
            FROM gboost_vetoes
+          WHERE {regime}
           GROUP BY gate",
-        case = VETO_GATE_CASE
+        case = VETO_GATE_CASE, regime = regime_sql
     );
-    let rows: Vec<(String, i64, i64, Option<i64>)> = match sqlx::query_as(&group_sql)
+    let rows: Vec<(String, i64, i64, Option<i64>, Option<f64>)> = match sqlx::query_as(&group_sql)
         .fetch_all(pool).await {
         Ok(r) => r,
         Err(e) => { error!("❌ DB gboost veto scoreboard failed: {}", e); return vec![]; }
@@ -1388,8 +1434,8 @@ pub async fn gboost_veto_scoreboard(pool: &SqlitePool) -> Vec<GboostVetoScore> {
     let avg_sql = format!(
         "SELECT AVG(CAST(outcome AS REAL) - CAST(ask_price AS REAL))
            FROM gboost_vetoes
-          WHERE outcome IS NOT NULL AND {case} = ?",
-        case = VETO_GATE_CASE
+          WHERE outcome IS NOT NULL AND {regime} AND {case} = ?",
+        case = VETO_GATE_CASE, regime = regime_sql
     );
     // Per-market aggregation first, then a mean over markets — one busy market
     // must not outvote the rest. See `distinct_markets`.
@@ -1397,14 +1443,14 @@ pub async fn gboost_veto_scoreboard(pool: &SqlitePool) -> Vec<GboostVetoScore> {
         "SELECT COUNT(*), AVG(m_avg) FROM (
              SELECT AVG(CAST(outcome AS REAL) - CAST(ask_price AS REAL)) AS m_avg
                FROM gboost_vetoes
-              WHERE outcome IS NOT NULL AND {case} = ?
+              WHERE outcome IS NOT NULL AND {regime} AND {case} = ?
               GROUP BY market
          )",
-        case = VETO_GATE_CASE
+        case = VETO_GATE_CASE, regime = regime_sql
     );
 
     let mut out = Vec::with_capacity(rows.len());
-    for (gate, total, scored, wins) in rows {
+    for (gate, total, scored, wins, avg_hist_vol) in rows {
         let avg: Option<f64> = sqlx::query_as::<_, (Option<f64>,)>(&avg_sql)
         .bind(&gate)
         .fetch_optional(pool).await.ok().flatten().and_then(|(v,)| v);
@@ -1422,6 +1468,7 @@ pub async fn gboost_veto_scoreboard(pool: &SqlitePool) -> Vec<GboostVetoScore> {
             avg_pnl_per_share: avg.unwrap_or(0.0),
             distinct_markets: markets,
             avg_pnl_per_market: per_market.unwrap_or(0.0),
+            avg_hist_vol,
         });
     }
     out.sort_by(|a, b| b.total.cmp(&a.total));
@@ -4160,6 +4207,82 @@ pub async fn set_llm_action_outcome(
     }
 }
 
+
+#[cfg(test)]
+mod gboost_veto_tests {
+    use super::*;
+
+    async fn fresh_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        init_schema(&pool).await.unwrap();
+        run_migrations(&pool).await;
+        pool
+    }
+
+    async fn veto(pool: &SqlitePool, market: &str, reason: &str, ask: &str, hist_vol: f64, outcome: Option<i64>) {
+        record_gboost_veto_db(
+            pool, market, "0xcond", "YES", "tok-yes", ask, 0.9, reason,
+            "100000", "0", 3600, hist_vol,
+        ).await;
+        if let Some(o) = outcome {
+            sqlx::query("UPDATE gboost_vetoes SET outcome = ? WHERE id = (SELECT MAX(id) FROM gboost_vetoes)")
+                .bind(o).execute(pool).await.unwrap();
+        }
+    }
+
+    /// The regime a veto fired in has to reach the table, or the scoreboard can
+    /// never separate a quiet-market verdict from an active-market one.
+    #[tokio::test]
+    async fn a_veto_records_the_oracle_volatility_it_fired_in() {
+        let pool = fresh_pool().await;
+        veto(&pool, "m", "oracle too flat (hist_vol=0.0008 < min=0.0015)", "0.43", 0.0008, None).await;
+        let (hv,): (Option<f64>,) = sqlx::query_as("SELECT hist_vol FROM gboost_vetoes")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(hv, Some(0.0008));
+    }
+
+    /// One gate, four vetoes: two in a quiet regime that would have lost, two in
+    /// an active regime that would have won. Unsliced, the gate looks like a
+    /// coin flip; sliced, it is protective when quiet and costly when active —
+    /// the distinction the operator's question depends on. A row with no
+    /// recorded regime must never leak into a slice.
+    #[tokio::test]
+    async fn scoreboard_slices_by_regime_and_excludes_unknown_regimes() {
+        let pool = fresh_pool().await;
+        let flat = "oracle too flat (hist_vol=x < min=y)";
+        veto(&pool, "quiet-1",  flat, "0.45", 0.0008, Some(0)).await;
+        veto(&pool, "quiet-2",  flat, "0.45", 0.0009, Some(0)).await;
+        veto(&pool, "active-1", flat, "0.45", 0.0030, Some(1)).await;
+        veto(&pool, "active-2", flat, "0.45", 0.0040, Some(1)).await;
+        // Legacy row: predates the column.
+        sqlx::query(
+            "INSERT INTO gboost_vetoes (ts, market, condition_id, side, token_id, ask_price, p_up,
+                                        veto_reason, oracle_price, drift_60m, secs_to_expiry, outcome)
+             VALUES ('2026-08-01T00:00:00+00:00', 'legacy', 'c', 'YES', 't', '0.45', 0.9, ?, '1', '0', 60, 1)"
+        ).bind(flat).execute(&pool).await.unwrap();
+
+        let all = gboost_veto_scoreboard(&pool, VetoRegime::default()).await;
+        let row = all.iter().find(|r| r.gate == "low volatility").expect("gate row");
+        assert_eq!((row.total, row.scored, row.would_have_won), (5, 5, 3));
+        assert!((row.avg_pnl_per_share - 0.15).abs() < 1e-9, "unsliced: {}", row.avg_pnl_per_share);
+        let avg_hv = row.avg_hist_vol.expect("four rows carry a regime");
+        assert!((avg_hv - 0.002175).abs() < 1e-9, "avg_hist_vol {avg_hv}");
+
+        let quiet = gboost_veto_scoreboard(&pool, VetoRegime { min_hist_vol: None, max_hist_vol: Some(0.0015) }).await;
+        let row = quiet.iter().find(|r| r.gate == "low volatility").expect("quiet row");
+        assert_eq!((row.total, row.scored, row.would_have_won, row.distinct_markets), (2, 2, 0, 2));
+        assert!((row.avg_pnl_per_share + 0.45).abs() < 1e-9, "quiet: {}", row.avg_pnl_per_share);
+
+        let active = gboost_veto_scoreboard(&pool, VetoRegime { min_hist_vol: Some(0.0015), max_hist_vol: None }).await;
+        let row = active.iter().find(|r| r.gate == "low volatility").expect("active row");
+        assert_eq!((row.total, row.scored, row.would_have_won, row.distinct_markets), (2, 2, 2, 2));
+        assert!((row.avg_pnl_per_share - 0.55).abs() < 1e-9, "active: {}", row.avg_pnl_per_share);
+    }
+}
 
 #[cfg(test)]
 mod reconcile_tests {

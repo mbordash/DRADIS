@@ -126,7 +126,11 @@ const NUM_FEATURES: usize = 30;
 
 /// Represents a single training sample for the Gboost model.
 /// Contains the features at the time of entry and whether the trade was profitable.
-#[derive(Debug, Clone)]
+///
+/// Serializable because the lookahead label pool is persisted to `logs/`
+/// (see [`LabelPoolFile`]); the `[f64; 30]` array is within serde's 32-element
+/// array support, so no custom impl is needed.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct TrainingSample {
     pub features: [f64; NUM_FEATURES],
     pub is_profitable: bool, // Label: true if profitable, false if loss
@@ -540,19 +544,324 @@ fn gboost_shared_training_data() -> Arc<StdMutex<VecDeque<TrainingSample>>> {
     }))
 }
 
-/// Cumulative lookahead-label pool: (labeled samples, timestamp of the last
-/// history snapshot already harvested).  Each retrain cycle labels only NEW
-/// snapshots (timestamp > last-harvest) and appends the deadband survivors here,
-/// so informative samples ACCUMULATE across hours and rotations instead of having
-/// to all come from one 18-min window.  Flat nights fill slowly, volatile hours
-/// fill fast; FIFO-capped at GBOOST_LABEL_POOL_CAP so stale regimes age out.
-fn gboost_label_pool()
-    -> &'static StdMutex<(VecDeque<TrainingSample>, Option<chrono::DateTime<chrono::Utc>>)>
-{
-    static REG: std::sync::OnceLock<
-        StdMutex<(VecDeque<TrainingSample>, Option<chrono::DateTime<chrono::Utc>>)>,
-    > = std::sync::OnceLock::new();
-    REG.get_or_init(|| StdMutex::new((VecDeque::new(), None)))
+/// Cumulative lookahead-label pool.  Each retrain cycle labels only NEW history
+/// snapshots (timestamp > `last_harvest_ts`) and appends the deadband survivors
+/// here, so informative samples ACCUMULATE across hours and rotations instead of
+/// having to all come from one 18-min window.  Flat nights fill slowly, volatile
+/// hours fill fast; FIFO-capped at GBOOST_LABEL_POOL_CAP so stale regimes age out.
+///
+/// Persisted (B33): until v1.1.3 this lived only in memory, so every restart,
+/// redeploy or container recreate dropped it to 0 against
+/// GBOOST_MIN_TRAINING_SAMPLES. It is now written to `logs/` (the bind-mounted
+/// directory that survives container recreation) at most once per
+/// `LABEL_POOL_SAVE_INTERVAL_SECS` after a harvest that added samples, and
+/// reloaded once per process on the first `GboostStrategyImpl::new()`. Samples
+/// older than the `gboost_label_max_age_hours` knob are pruned at every harvest,
+/// whether they came from disk or from this process, so a reloaded pool can be
+/// stale by at most that window.
+#[derive(Debug, Default)]
+struct LabelPool {
+    samples: VecDeque<TrainingSample>,
+    /// Timestamp of the last history snapshot already harvested.
+    last_harvest_ts: Option<chrono::DateTime<chrono::Utc>>,
+    /// Snapshots the harvester examined since boot, deadband survivors or not.
+    /// A pool that is "filling slowly" and one whose labeling input is frozen
+    /// look identical in the sample count; this separates them.
+    candidates_total: u64,
+    /// Deadband survivors appended since boot.
+    kept_total: u64,
+    /// Samples dropped by the wall-clock age cap since boot.
+    pruned_total: u64,
+    /// Samples restored from the pool file at boot (0 = cold start).
+    restored: usize,
+    /// Counter values at the last "retrain waiting" status line, so it can
+    /// report deltas rather than totals.
+    status_candidates: u64,
+    status_kept: u64,
+    status_pruned: u64,
+    /// Samples were added since the last save was handed off.
+    dirty: bool,
+    last_save_at: Option<Instant>,
+}
+
+fn gboost_label_pool() -> &'static StdMutex<LabelPool> {
+    static REG: std::sync::OnceLock<StdMutex<LabelPool>> = std::sync::OnceLock::new();
+    REG.get_or_init(|| StdMutex::new(LabelPool::default()))
+}
+
+// ── Label pool persistence ───────────────────────────────────────────────────
+
+/// File name suffix; prefixed with the DB shard key exactly as the SQLite shards
+/// are (`logs/btc-dradis.db` → `logs/btc-gboost_label_pool.json`).
+const LABEL_POOL_FILENAME: &str = "gboost_label_pool.json";
+/// Minimum wall-clock gap between two pool writes. A full conservative pool is
+/// ~5 MB of JSON; the harvester runs every 10–30 s while the pool is filling,
+/// so writing on every harvest would burn several GB/day of EBS writes for no
+/// benefit. Five minutes bounds the loss on a hard kill to a few hundred
+/// samples against a pool that took hours to build. I/O plumbing, deliberately
+/// not a tuning knob.
+const LABEL_POOL_SAVE_INTERVAL_SECS: u64 = 300;
+/// Bumped whenever [`LabelPoolFile`] changes shape.
+const LABEL_POOL_FORMAT_VERSION: u32 = 1;
+
+/// On-disk form of the label pool. The header fields exist so a file written
+/// under a different feature set or label horizon is rejected rather than
+/// silently mixed in: a "BTC higher after 300 s" label is a different training
+/// target from a "BTC higher after 180 s" one, and a profile switch that changes
+/// GBOOST_LABEL_HORIZON_SECS must start a fresh pool.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct LabelPoolFile {
+    format_version: u32,
+    num_features: usize,
+    label_horizon_secs: i64,
+    saved_at: chrono::DateTime<chrono::Utc>,
+    last_harvest_ts: Option<chrono::DateTime<chrono::Utc>>,
+    samples: Vec<TrainingSample>,
+}
+
+/// Set once the first `GboostStrategyImpl::new()` has kicked off the disk load;
+/// every hourly rotation constructs a new strategy object and must not reload.
+static LABEL_POOL_LOAD_STARTED: AtomicBool = AtomicBool::new(false);
+/// A save is already on a blocking thread; the next harvest will not stack another.
+static LABEL_POOL_SAVE_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+
+/// Where this process keeps its label pool, or `None` when persistence is off.
+///
+/// Keyed on the PRIMARY SQLite shard — the first `db::init_shard` call, which
+/// every venue makes before it deploys a squadron — so an intl instance writes
+/// `logs/btc-gboost_label_pool.json`, Kalshi `logs/kalshi-…` and Polymarket US
+/// `logs/us-…`, and two venues sharing a `logs/` directory never read each
+/// other's labels. The model file keys on `CRYPTO_FILTER` with a hard "btc"
+/// fallback, which DOES collide across venues when the variable is unset; the
+/// pool does not repeat that.
+///
+/// `GBOOST_LABEL_POOL_PATH` overrides the whole path (parity with
+/// `GBOOST_MODEL_PATH`). With no primary shard — tests, or a DB init failure —
+/// persistence is skipped rather than guessed at.
+fn label_pool_path() -> Option<std::path::PathBuf> {
+    if let Ok(p) = std::env::var("GBOOST_LABEL_POOL_PATH") {
+        if !p.trim().is_empty() {
+            return Some(std::path::PathBuf::from(p));
+        }
+    }
+    let db_file = crate::helpers::db::pool()?
+        .connect_options()
+        .get_filename()
+        .to_path_buf();
+    label_pool_path_for_shard_file(&db_file)
+}
+
+/// `logs/<shard>-dradis.db` → `logs/<shard>-gboost_label_pool.json`.
+/// Split out from [`label_pool_path`] so the mapping is testable without a DB.
+fn label_pool_path_for_shard_file(db_file: &std::path::Path) -> Option<std::path::PathBuf> {
+    let stem = db_file.file_stem()?.to_str()?;
+    let shard = stem.strip_suffix("-dradis").unwrap_or(stem);
+    if shard.is_empty() {
+        return None;
+    }
+    let dir = db_file.parent().map(|p| p.to_path_buf()).unwrap_or_default();
+    Some(dir.join(format!("{}-{}", shard, LABEL_POOL_FILENAME)))
+}
+
+/// Atomic write: serialize to `<path>.tmp` in the same directory, then rename
+/// over the target. A container killed mid-write leaves at worst a stray `.tmp`,
+/// never a truncated pool file that fails to parse on every subsequent boot.
+fn write_label_pool_file(path: &std::path::Path, file: &LabelPoolFile) -> std::io::Result<()> {
+    use std::io::Write as _;
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() {
+            std::fs::create_dir_all(dir)?;
+        }
+    }
+    let bytes = serde_json::to_vec(file)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = std::path::PathBuf::from(tmp);
+    {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(&bytes)?;
+        f.sync_all()?;
+    }
+    std::fs::rename(&tmp, path)
+}
+
+/// Read and validate a pool file. Every failure is a `String` reason for the
+/// log, never a panic: a corrupt or foreign pool file must not break startup.
+fn read_label_pool_file(path: &std::path::Path) -> Result<LabelPoolFile, String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read failed: {e}"))?;
+    let file: LabelPoolFile = serde_json::from_slice(&bytes)
+        .map_err(|e| format!("parse failed: {e}"))?;
+    if file.format_version != LABEL_POOL_FORMAT_VERSION {
+        return Err(format!(
+            "format version {} (this build writes {})", file.format_version, LABEL_POOL_FORMAT_VERSION
+        ));
+    }
+    if file.num_features != NUM_FEATURES {
+        return Err(format!(
+            "{} features per sample (this build uses {})", file.num_features, NUM_FEATURES
+        ));
+    }
+    if file.label_horizon_secs != config::GBOOST_LABEL_HORIZON_SECS {
+        return Err(format!(
+            "labels use a {}s horizon (this build labels at {}s)",
+            file.label_horizon_secs, config::GBOOST_LABEL_HORIZON_SECS
+        ));
+    }
+    Ok(file)
+}
+
+/// Fold a loaded file into the live pool. Restored samples are older than
+/// anything harvested since boot, so they go in FRONT; the FIFO cap then
+/// evicts from the front as usual. The harvest watermark keeps whichever is
+/// newer. Returns the number of samples actually restored after capping.
+fn merge_restored_into_pool(pool: &mut LabelPool, file: LabelPoolFile) -> usize {
+    let mut merged: VecDeque<TrainingSample> = file.samples.into_iter().collect();
+    let restored_before_cap = merged.len();
+    let in_memory = pool.samples.len();
+    merged.extend(pool.samples.drain(..));
+    while merged.len() > config::GBOOST_LABEL_POOL_CAP {
+        merged.pop_front();
+    }
+    // Eviction is from the front, so it consumes restored samples first.
+    let evicted = (restored_before_cap + in_memory).saturating_sub(merged.len());
+    pool.samples = merged;
+    pool.last_harvest_ts = match (pool.last_harvest_ts, file.last_harvest_ts) {
+        (Some(a), Some(b)) => Some(a.max(b)),
+        (a, b) => a.or(b),
+    };
+    let restored = restored_before_cap.saturating_sub(evicted);
+    pool.restored = restored;
+    restored
+}
+
+/// Drop samples older than `max_age` from the pool. Applied at every harvest,
+/// not only at reload, so the wall-clock cap means the same thing for samples
+/// this process labeled and for ones read back from disk. Returns the count
+/// dropped.
+fn prune_stale_samples(
+    pool: &mut LabelPool,
+    now: chrono::DateTime<chrono::Utc>,
+    max_age: chrono::Duration,
+) -> usize {
+    let before = pool.samples.len();
+    pool.samples.retain(|s| now - s.entry_timestamp <= max_age);
+    let dropped = before - pool.samples.len();
+    pool.pruned_total += dropped as u64;
+    dropped
+}
+
+/// Kick off the one-per-process reload of the persisted pool. Runs the file
+/// read on a blocking thread and merges under the pool lock when done; the
+/// first harvest cannot happen before GBOOST_LABEL_HORIZON_SECS of history
+/// exists, so the merge lands well ahead of it in practice and is correct in
+/// either order regardless.
+fn spawn_label_pool_load() {
+    if LABEL_POOL_LOAD_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tokio::spawn(async move {
+        let Some(path) = label_pool_path() else {
+            tracing::info!(
+                " GboostStrategy: label pool persistence off — no primary DB shard to key it on \
+                 (set GBOOST_LABEL_POOL_PATH to force a location)"
+            );
+            return;
+        };
+        load_label_pool_from(path).await;
+    });
+}
+
+/// Body of the startup reload: read `path` on a blocking thread, validate it,
+/// merge it into the live pool, and log what happened. Every outcome, including
+/// a missing, corrupt or foreign file, ends in a log line and a usable pool.
+/// Returns the number of samples restored (0 on any rejection).
+async fn load_label_pool_from(path: std::path::PathBuf) -> usize {
+    if !path.exists() {
+        tracing::info!(
+            " GboostStrategy: no persisted label pool at '{}' — starting from an empty pool",
+            path.display()
+        );
+        return 0;
+    }
+    let read_path = path.clone();
+    let loaded = tokio::task::spawn_blocking(move || read_label_pool_file(&read_path)).await;
+    match loaded {
+        Ok(Ok(file)) => {
+            let saved_at = file.saved_at;
+            let (oldest, newest) = (
+                file.samples.first().map(|s| s.entry_timestamp),
+                file.samples.last().map(|s| s.entry_timestamp),
+            );
+            let n_in_file = file.samples.len();
+            let restored = {
+                let mut pool = gboost_label_pool().lock().unwrap();
+                merge_restored_into_pool(&mut pool, file)
+            };
+            let age_h = (Utc::now() - saved_at).num_minutes() as f64 / 60.0;
+            tracing::info!(
+                " GboostStrategy: restored {} of {} label samples from '{}' (saved {:.1}h ago, \
+                 samples span {} → {}); older than {}h are pruned at the first harvest",
+                restored, n_in_file, path.display(), age_h,
+                oldest.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_else(|| "-".into()),
+                newest.map(|t| t.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)).unwrap_or_else(|| "-".into()),
+                config::GBOOST_LABEL_MAX_AGE_HOURS,
+            );
+            restored
+        }
+        Ok(Err(reason)) => {
+            tracing::warn!(
+                " GboostStrategy: ignoring persisted label pool at '{}' ({}) — starting from an empty pool; \
+                 the file is overwritten at the next save",
+                path.display(), reason
+            );
+            0
+        }
+        Err(e) => {
+            tracing::warn!(
+                " GboostStrategy: label pool load task panicked ({}); starting from an empty pool", e
+            );
+            0
+        }
+    }
+}
+
+/// Hand a snapshot of the pool to a blocking thread for an atomic write.
+/// `payload` is built under the pool lock by the caller; nothing here touches it.
+fn spawn_label_pool_save(path: std::path::PathBuf, payload: LabelPoolFile) {
+    if LABEL_POOL_SAVE_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        // Leave `dirty` as the caller set it (false); the next harvest that
+        // adds samples re-arms it and the interval gate retries.
+        return;
+    }
+    tokio::spawn(async move {
+        let n = payload.samples.len();
+        let write_path = path.clone();
+        let result = tokio::task::spawn_blocking(move || write_label_pool_file(&write_path, &payload)).await;
+        match result {
+            Ok(Ok(())) => {
+                // First save per process at INFO so an operator on the default
+                // log level sees, once, that persistence is working and where;
+                // the every-five-minutes repeats stay at DEBUG.
+                static FIRST_SAVE_LOGGED: AtomicBool = AtomicBool::new(false);
+                if !FIRST_SAVE_LOGGED.swap(true, Ordering::SeqCst) {
+                    tracing::info!(
+                        " GboostStrategy: label pool persisted — {} samples → '{}' (rewritten at most every {}s)",
+                        n, path.display(), LABEL_POOL_SAVE_INTERVAL_SECS
+                    );
+                } else {
+                    tracing::debug!(
+                        " GboostStrategy: label pool saved — {} samples → '{}'", n, path.display()
+                    );
+                }
+            }
+            Ok(Err(e)) => tracing::warn!(
+                " GboostStrategy: label pool save failed [{}]: {}", path.display(), e
+            ),
+            Err(e) => tracing::warn!(" GboostStrategy: label pool save task panicked: {}", e),
+        }
+        LABEL_POOL_SAVE_IN_FLIGHT.store(false, Ordering::SeqCst);
+    });
 }
 
 impl GboostStrategyImpl {
@@ -626,6 +935,11 @@ impl GboostStrategyImpl {
                 ),
             }
         }); }
+
+        // B33: the lookahead label pool used to restart at 0 on every process
+        // start. Reload it once per process (guarded inside), same lifecycle as
+        // the model above.
+        spawn_label_pool_load();
 
         Self {
             model: model_arc,
@@ -740,11 +1054,16 @@ impl GboostStrategyImpl {
 
         // Throttled INFO status (once per 10 min): abort paths below are otherwise
         // silent/debug-only, which made a 17h cold-start stall invisible in prod logs.
-        let status = |msg: String| {
+        // Returns whether the line was emitted, so a caller reporting deltas can
+        // reset its baseline only when the reader actually saw them.
+        let status = |msg: String| -> bool {
             let mut guard = self.last_retrain_status_log.lock().unwrap();
             if guard.map_or(true, |t| t.elapsed().as_secs() >= 600) {
                 tracing::info!(" GboostStrategy: retrain waiting — {}", msg);
                 *guard = Some(Instant::now());
+                true
+            } else {
+                false
             }
         };
 
@@ -761,6 +1080,10 @@ impl GboostStrategyImpl {
         // genuinely different quantity from the positive-label count they were
         // once conflated with — see the log call at the end of this function.
         let real_count = real_samples.len();
+
+        // A pool save handed off by the harvest below, spawned once the pool and
+        // history locks are released.
+        let mut pool_save: Option<(std::path::PathBuf, LabelPoolFile)> = None;
 
         let training_samples: Vec<TrainingSample> = if real_samples.len() >= config::GBOOST_MIN_TRAINING_SAMPLES {
             // Enough real trade outcomes — use them exclusively for the cleanest signal.
@@ -780,7 +1103,21 @@ impl GboostStrategyImpl {
             let n = h.len();
             let horizon = chrono::Duration::seconds(config::GBOOST_LABEL_HORIZON_SECS);
             let mut pool_guard = gboost_label_pool().lock().unwrap();
-            let (pool, last_harvest_ts) = &mut *pool_guard;
+            // Wall-clock age cap, applied before the harvest so it covers samples
+            // restored from disk and ones this process labeled alike. Hot-tunable
+            // (`gboost_label_max_age_hours`); clamped to [1h, 1y] so a typo can
+            // neither empty the pool on every cycle nor overflow `Duration::hours`,
+            // which panics rather than saturates.
+            let max_age = chrono::Duration::hours(dc.gboost_label_max_age_hours.clamp(1, 24 * 365));
+            let pruned_now = prune_stale_samples(&mut pool_guard, Utc::now(), max_age);
+            if pruned_now > 0 {
+                tracing::debug!(
+                    " GboostStrategy: pruned {} label samples older than {}h ({} remain)",
+                    pruned_now, max_age.num_hours(), pool_guard.samples.len()
+                );
+            }
+            let kept_before = pool_guard.kept_total;
+            let LabelPool { samples: pool, last_harvest_ts, candidates_total, kept_total, .. } = &mut *pool_guard;
             // `usable` = number of leading samples whose label horizon is fully inside
             // the buffer (a future snapshot ≥ horizon later exists for them).
             let usable = match (h.front(), h.back()) {
@@ -807,6 +1144,7 @@ impl GboostStrategyImpl {
                 let future = &h[j];
                 // Mark processed regardless of whether the deadband keeps it below.
                 *last_harvest_ts = Some(snap.timestamp);
+                *candidates_total += 1;
                 let cur = snap.oracle_price.to_f64().unwrap_or(0.0);
                 let fut = future.oracle_price.to_f64().unwrap_or(0.0);
                 // Skip directionally-uninformative samples: oracle essentially flat
@@ -825,25 +1163,76 @@ impl GboostStrategyImpl {
                     is_profitable: fut > cur,
                     entry_timestamp: snap.timestamp,
                 });
+                *kept_total += 1;
                 if pool.len() > config::GBOOST_LABEL_POOL_CAP {
                     pool.pop_front(); // FIFO: stale regimes age out
                 }
             }
             let mut combined = real_samples; // Real outcomes first (highest quality)
             combined.extend(pool.iter().cloned());
+
+            // ── Persist (B33) ─────────────────────────────────────────────────
+            // Only after a harvest that added samples, and no more often than the
+            // save interval. The payload is cloned here under the lock; the
+            // serialize + atomic write happen on a blocking thread afterwards.
+            if pool_guard.kept_total > kept_before {
+                pool_guard.dirty = true;
+            }
+            let save_due = pool_guard.dirty
+                && pool_guard.last_save_at
+                    .map_or(true, |t| t.elapsed().as_secs() >= LABEL_POOL_SAVE_INTERVAL_SECS)
+                && !LABEL_POOL_SAVE_IN_FLIGHT.load(Ordering::SeqCst);
+            if save_due {
+                if let Some(path) = label_pool_path() {
+                    pool_save = Some((path, LabelPoolFile {
+                        format_version: LABEL_POOL_FORMAT_VERSION,
+                        num_features: NUM_FEATURES,
+                        label_horizon_secs: config::GBOOST_LABEL_HORIZON_SECS,
+                        saved_at: Utc::now(),
+                        last_harvest_ts: pool_guard.last_harvest_ts,
+                        samples: pool_guard.samples.iter().cloned().collect(),
+                    }));
+                    pool_guard.dirty = false;
+                    pool_guard.last_save_at = Some(Instant::now());
+                }
+            }
             combined
         };
+
+        if let Some((path, payload)) = pool_save.take() {
+            spawn_label_pool_save(path, payload);
+        }
 
         if training_samples.len() < config::GBOOST_MIN_TRAINING_SAMPLES {
             // Re-arm the tick counter so the trigger fires again after a full
             // GBOOST_RETRAIN_EVERY_N cycle instead of on every 50ms tick.  The pool
             // accumulates across cycles, so this state always progresses toward a train.
-            status(format!(
-                "label pool filling ({} of {} — {} real outcomes; flat regimes fill slowly)",
-                training_samples.len(), config::GBOOST_MIN_TRAINING_SAMPLES, {
-                    let td = self.training_data.lock().unwrap(); td.len()
-                }
-            ));
+            //
+            // The deltas answer the question the bare count cannot: a pool that is
+            // filling slowly shows candidates scanned with few kept (flat oracle,
+            // deadband rejects them); a pool whose labeling input has stopped shows
+            // zero candidates. Both used to print as the same unchanging number.
+            let real_outcomes = { let td = self.training_data.lock().unwrap(); td.len() };
+            let (line, snapshot) = {
+                let p = gboost_label_pool().lock().unwrap();
+                let scanned = p.candidates_total - p.status_candidates;
+                let kept    = p.kept_total - p.status_kept;
+                let pruned  = p.pruned_total - p.status_pruned;
+                (
+                    format!(
+                        "label pool filling ({} of {} — {} real outcomes; {} restored from disk; \
+                         since last report: {} snapshots scanned, {} kept, {} aged out; \
+                         flat regimes fill slowly)",
+                        training_samples.len(), config::GBOOST_MIN_TRAINING_SAMPLES, real_outcomes,
+                        p.restored, scanned, kept, pruned,
+                    ),
+                    (p.candidates_total, p.kept_total, p.pruned_total),
+                )
+            };
+            if status(line) {
+                let mut p = gboost_label_pool().lock().unwrap();
+                (p.status_candidates, p.status_kept, p.status_pruned) = snapshot;
+            }
             *self.ticks_since_retrain.lock().unwrap() = 0;
             return;
         }
@@ -1595,10 +1984,16 @@ impl Strategy for GboostStrategyImpl {
                             let ask          = veto_ask.to_string();
                             let oracle       = ctx.snapshot.oracle_price.to_string();
                             let drift        = ctx.snapshot.oracle_drift_60m.to_string();
+                            // The regime the veto fired in. Same raptor value the
+                            // flatness gate reads (the history's newest snapshot is
+                            // the one pushed from ctx.snapshot this tick), read from
+                            // ctx so the macro is usable before precomp_* exists.
+                            let hist_vol     = ctx.snapshot.hist_vol.to_f64().unwrap_or(0.0);
                             tokio::spawn(async move {
                                 crate::helpers::db::record_gboost_veto_db(
                                     &pool, &market_name, &condition_id, veto_side, token_id.as_str(),
                                     &ask, p_yes_up, &reason, &oracle, &drift, veto_secs_to_expiry,
+                                    hist_vol,
                                 ).await;
                             });
                         }
@@ -1635,8 +2030,12 @@ impl Strategy for GboostStrategyImpl {
         // to flip hard on the next retrain once the price finally moves.
         // Diagnosed from 2026-05-30 T1: vol=0.00 at entry → P(UP) flipped from
         // 0.087 → 0.779 in 12 min → SignalRev exit for -$0.1636.
-        if precomp_hist_vol < config::GBOOST_MIN_HIST_VOL {
-            veto!(format!("oracle too flat (hist_vol={:.4} < min={:.4})", precomp_hist_vol, config::GBOOST_MIN_HIST_VOL));
+        // Hot-tunable (`gboost_min_hist_vol`, defaults to the profile's
+        // GBOOST_MIN_HIST_VOL). Score a candidate floor with
+        // /api/gboost/veto-scores?max_hist_vol=… before lowering it.
+        let min_hist_vol = dc.gboost_min_hist_vol.to_f64().unwrap_or(config::GBOOST_MIN_HIST_VOL);
+        if precomp_hist_vol < min_hist_vol {
+            veto!(format!("oracle too flat (hist_vol={:.4} < min={:.4})", precomp_hist_vol, min_hist_vol));
         }
 
         // ── Gate: trend-alignment ─────────────────────────────────────────────
@@ -2350,6 +2749,62 @@ mod tests {
         let _ = strategy.evaluate_exit(&make_ctx()).await.unwrap();
     }
 
+    /// The flatness floor used to be `config::GBOOST_MIN_HIST_VOL` read inside the
+    /// gate; it is now the `gboost_min_hist_vol` knob. Prove the knob is what the
+    /// gate consumes: the same snapshot (hist_vol 0.003) is vetoed as "oracle too
+    /// flat" under a 0.5 floor and passes the gate under a 0.0001 floor. Read back
+    /// through the viper-status registry, which the veto! macro feeds on every
+    /// tick regardless of the model's conviction.
+    #[tokio::test]
+    async fn min_hist_vol_knob_reaches_the_flatness_gate() {
+        let strategy = GboostStrategyImpl::new_isolated();
+        let n = config::GBOOST_MIN_TRAINING_SAMPLES + 10;
+        let booster = train_model(learnable_samples(n), 1.50, config::GBOOST_ITERATION_LIMIT)
+            .expect("fit succeeds");
+        assert!(
+            booster.trees.len() >= config::GBOOST_MIN_USABLE_TREES,
+            "fixture model has {} trees, below the {} the predictor requires",
+            booster.trees.len(), config::GBOOST_MIN_USABLE_TREES,
+        );
+        *strategy.model.lock().unwrap() = Some(booster);
+
+        // The registry keeps the LAST reason a viper reported, and a tick whose
+        // prediction is below the entry threshold falls through the gate stack
+        // without reporting anything. So each floor gets its own asset key: a
+        // fresh row whose reason is either the flatness veto or nothing at all.
+        let last_reason = |asset: &str| crate::helpers::viper_status::snapshot(Some(asset))
+            .into_iter()
+            .find(|r| r.strategy == "GboostStrategy")
+            .and_then(|r| r.last_reason)
+            .unwrap_or_default();
+
+        let strict_asset = "btc-histvol-knob-strict";
+        let mut strict = DynamicConfig::default();
+        strict.gboost_min_hist_vol = dec!(0.5);
+        let mut ctx = make_ctx();
+        ctx.crypto_filter = strict_asset.to_string();
+        ctx.dynamic_config = Arc::new(strict);
+        let signal = strategy.evaluate_entry(&ctx).await.unwrap();
+        assert!(matches!(signal, StrategySignal::NoSignal));
+        let reason = last_reason(strict_asset);
+        assert!(
+            reason.starts_with("oracle too flat") && reason.contains("min=0.5000"),
+            "a 0.5 floor should veto hist_vol 0.003 as too flat, got {reason:?}",
+        );
+
+        let lax_asset = "btc-histvol-knob-lax";
+        let mut lax = DynamicConfig::default();
+        lax.gboost_min_hist_vol = dec!(0.0001);
+        ctx.crypto_filter = lax_asset.to_string();
+        ctx.dynamic_config = Arc::new(lax);
+        let _ = strategy.evaluate_entry(&ctx).await.unwrap();
+        let reason = last_reason(lax_asset);
+        assert!(
+            !reason.starts_with("oracle too flat"),
+            "a 0.0001 floor must not veto hist_vol 0.003, got {reason:?}",
+        );
+    }
+
     #[tokio::test]
     async fn pending_entry_is_kept_when_no_exit_signal() {
         let strategy = GboostStrategyImpl::new_isolated();
@@ -2414,5 +2869,243 @@ mod tests {
         assert!(matches!(signal, StrategySignal::Exit { reason, .. } if reason.contains("GBoost TP YES")));
         assert_eq!(strategy.pending_entries.lock().unwrap().len(), 0);
         assert_eq!(strategy.training_data.lock().unwrap().len(), 1);
+    }
+
+    // ── Label pool persistence (B33) ─────────────────────────────────────────
+
+    fn sample_at(ts: chrono::DateTime<Utc>, tag: f64) -> TrainingSample {
+        let mut features = [0.0f64; NUM_FEATURES];
+        features[0] = tag;
+        features[NUM_FEATURES - 1] = -tag;
+        TrainingSample { features, is_profitable: tag > 0.5, entry_timestamp: ts }
+    }
+
+    fn pool_file(samples: Vec<TrainingSample>) -> LabelPoolFile {
+        LabelPoolFile {
+            format_version: LABEL_POOL_FORMAT_VERSION,
+            num_features: NUM_FEATURES,
+            label_horizon_secs: config::GBOOST_LABEL_HORIZON_SECS,
+            saved_at: Utc::now(),
+            last_harvest_ts: samples.last().map(|s| s.entry_timestamp),
+            samples,
+        }
+    }
+
+    /// A scratch path under the OS temp dir, unique per test and process so
+    /// parallel test threads never share a file.
+    fn scratch_path(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("dradis-gboost-pool-{}-{}", std::process::id(), name));
+        let _ = std::fs::remove_dir_all(&dir);
+        dir.join("logs").join("btc-gboost_label_pool.json")
+    }
+
+    /// The pool file follows the SQLite shard convention exactly, so the venue
+    /// that owns `logs/kalshi-dradis.db` owns `logs/kalshi-gboost_label_pool.json`
+    /// and never reads an intl instance's labels off a shared `logs/` mount.
+    #[test]
+    fn label_pool_path_follows_the_db_shard_name() {
+        let p = |s: &str| label_pool_path_for_shard_file(std::path::Path::new(s))
+            .map(|p| p.to_string_lossy().into_owned());
+        assert_eq!(p("logs/btc-dradis.db").as_deref(),    Some("logs/btc-gboost_label_pool.json"));
+        assert_eq!(p("logs/kalshi-dradis.db").as_deref(), Some("logs/kalshi-gboost_label_pool.json"));
+        assert_eq!(p("logs/us-dradis.db").as_deref(),     Some("logs/us-gboost_label_pool.json"));
+        assert_eq!(p("/app/logs/eth-dradis.db").as_deref(), Some("/app/logs/eth-gboost_label_pool.json"));
+        // A shard file without the suffix still keys on its stem.
+        assert_eq!(p("logs/custom.db").as_deref(), Some("logs/custom-gboost_label_pool.json"));
+        assert!(p("").is_none());
+    }
+
+    #[test]
+    fn label_pool_round_trips_through_an_atomic_write() {
+        let path = scratch_path("roundtrip");
+        let now = Utc::now();
+        let samples: Vec<_> = (0..5).map(|i| sample_at(now - chrono::Duration::minutes(i), i as f64 / 10.0)).collect();
+        let file = pool_file(samples.clone());
+
+        write_label_pool_file(&path, &file).expect("write into a directory that did not exist yet");
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        assert!(!std::path::Path::new(&tmp).exists(), "temp file must be renamed away, not left beside the pool");
+
+        let back = read_label_pool_file(&path).expect("what we wrote parses");
+        assert_eq!(back.samples.len(), samples.len());
+        assert_eq!(back.last_harvest_ts, file.last_harvest_ts);
+        for (a, b) in back.samples.iter().zip(&samples) {
+            assert_eq!(a.features, b.features);
+            assert_eq!(a.is_profitable, b.is_profitable);
+            assert_eq!(a.entry_timestamp, b.entry_timestamp);
+        }
+
+        // A second save replaces the first in place.
+        write_label_pool_file(&path, &pool_file(samples[..2].to_vec())).unwrap();
+        assert_eq!(read_label_pool_file(&path).unwrap().samples.len(), 2);
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    /// A corrupt, truncated, missing or foreign pool file is a logged reason
+    /// and an empty pool — never a panic on the startup path.
+    #[test]
+    fn corrupt_or_foreign_label_pool_files_are_rejected_without_panicking() {
+        let path = scratch_path("reject");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+
+        assert!(read_label_pool_file(&path).unwrap_err().starts_with("read failed"), "missing file");
+
+        std::fs::write(&path, b"{\"format_version\":1,\"num_features\":30,\"sam").unwrap();
+        assert!(read_label_pool_file(&path).unwrap_err().starts_with("parse failed"), "truncated file");
+
+        std::fs::write(&path, b"\x00\xff not json at all").unwrap();
+        assert!(read_label_pool_file(&path).unwrap_err().starts_with("parse failed"), "garbage");
+
+        let good = pool_file(vec![sample_at(Utc::now(), 0.7)]);
+        let mut wrong_horizon = pool_file(vec![sample_at(Utc::now(), 0.7)]);
+        wrong_horizon.label_horizon_secs = config::GBOOST_LABEL_HORIZON_SECS + 60;
+        write_label_pool_file(&path, &wrong_horizon).unwrap();
+        assert!(read_label_pool_file(&path).unwrap_err().contains("horizon"), "different label target");
+
+        let mut wrong_width = pool_file(vec![sample_at(Utc::now(), 0.7)]);
+        wrong_width.num_features = NUM_FEATURES - 1;
+        write_label_pool_file(&path, &wrong_width).unwrap();
+        assert!(read_label_pool_file(&path).unwrap_err().contains("features"), "different feature set");
+
+        let mut wrong_version = pool_file(vec![sample_at(Utc::now(), 0.7)]);
+        wrong_version.format_version = LABEL_POOL_FORMAT_VERSION + 1;
+        write_label_pool_file(&path, &wrong_version).unwrap();
+        assert!(read_label_pool_file(&path).unwrap_err().contains("format version"));
+
+        write_label_pool_file(&path, &good).unwrap();
+        assert!(read_label_pool_file(&path).is_ok(), "the matching file still loads");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    #[test]
+    fn stale_samples_are_pruned_by_wall_clock() {
+        let now = Utc::now();
+        let mut pool = LabelPool::default();
+        pool.samples.push_back(sample_at(now - chrono::Duration::hours(49), 0.1));
+        pool.samples.push_back(sample_at(now - chrono::Duration::hours(47), 0.2));
+        pool.samples.push_back(sample_at(now - chrono::Duration::minutes(5), 0.3));
+
+        let dropped = prune_stale_samples(&mut pool, now, chrono::Duration::hours(48));
+        assert_eq!(dropped, 1);
+        assert_eq!(pool.pruned_total, 1);
+        let tags: Vec<f64> = pool.samples.iter().map(|s| s.features[0]).collect();
+        assert_eq!(tags, vec![0.2, 0.3], "only the 49h-old sample goes; the 47h one is inside the window");
+
+        assert_eq!(prune_stale_samples(&mut pool, now, chrono::Duration::hours(48)), 0, "idempotent");
+    }
+
+    /// Restored samples are older than anything harvested since boot, so they
+    /// sit in front of the live ones; the FIFO cap evicts from that end first,
+    /// and the watermark keeps the newer of the two.
+    #[test]
+    fn restored_samples_merge_ahead_of_live_ones_and_respect_the_cap() {
+        let now = Utc::now();
+        let cap = config::GBOOST_LABEL_POOL_CAP;
+
+        let mut pool = LabelPool::default();
+        pool.samples.push_back(sample_at(now - chrono::Duration::minutes(2), 0.91));
+        pool.samples.push_back(sample_at(now - chrono::Duration::minutes(1), 0.92));
+        pool.last_harvest_ts = Some(now - chrono::Duration::minutes(1));
+
+        let restored: Vec<_> = (0..cap)
+            .map(|i| sample_at(now - chrono::Duration::hours(3) + chrono::Duration::seconds(i as i64), 0.1))
+            .collect();
+        let mut file = pool_file(restored);
+        file.last_harvest_ts = Some(now - chrono::Duration::hours(2));
+
+        let n = merge_restored_into_pool(&mut pool, file);
+        assert_eq!(pool.samples.len(), cap, "never exceeds the cap");
+        assert_eq!(n, cap - 2, "two restored samples were evicted to make room for the live ones");
+        assert_eq!(pool.restored, cap - 2);
+        let tail: Vec<f64> = pool.samples.iter().rev().take(2).map(|s| s.features[0]).collect();
+        assert_eq!(tail, vec![0.92, 0.91], "live samples stay at the back, in order");
+        assert_eq!(pool.last_harvest_ts, Some(now - chrono::Duration::minutes(1)), "newer watermark wins");
+
+        // An empty live pool takes the file's watermark.
+        let mut fresh = LabelPool::default();
+        let mut file = pool_file(vec![sample_at(now, 0.5)]);
+        file.last_harvest_ts = Some(now);
+        assert_eq!(merge_restored_into_pool(&mut fresh, file), 1);
+        assert_eq!(fresh.last_harvest_ts, Some(now));
+    }
+
+    /// The whole B33 path, on the real code rather than its pieces: a history
+    /// spanning the label horizon is harvested by `maybe_retrain`, the pool is
+    /// handed to the atomic writer, the process-global pool is then wiped to
+    /// simulate a restart, and the startup loader brings every sample back.
+    ///
+    /// Drives the process-global pool and the `GBOOST_LABEL_POOL_PATH` override,
+    /// so it is the only test that may harvest; the other GBoost tests feed a
+    /// single snapshot each and never reach the horizon.
+    #[tokio::test]
+    async fn harvest_saves_the_pool_and_a_restart_reloads_it() {
+        let path = scratch_path("e2e");
+        std::env::set_var("GBOOST_LABEL_POOL_PATH", &path);
+        {
+            let mut p = gboost_label_pool().lock().unwrap();
+            *p = LabelPool::default();
+        }
+
+        let strategy = GboostStrategyImpl::new_isolated();
+        // Well under GBOOST_MIN_TRAINING_SAMPLES on every profile, so the harvest
+        // takes the "pool filling" branch and never spawns a training job.
+        let candidates = 100i64;
+        let span = config::GBOOST_LABEL_HORIZON_SECS + candidates;
+        let start = Utc::now() - chrono::Duration::seconds(span + 5);
+        for i in 0..=span {
+            let mut snap = make_snapshot();
+            snap.timestamp = start + chrono::Duration::seconds(i);
+            // Monotone climb, far outside the deadband over any horizon.
+            snap.oracle_price = dec!(95000) + Decimal::from(i * 10);
+            strategy.push_snapshot(snap);
+        }
+        assert_eq!(strategy.history.lock().unwrap().len(), span as usize + 1);
+
+        // Arm the tick trigger so this call harvests.
+        *strategy.ticks_since_retrain.lock().unwrap() = config::GBOOST_RETRAIN_EVERY_N - 1;
+        strategy.maybe_retrain(&DynamicConfig::default());
+
+        let kept = {
+            let p = gboost_label_pool().lock().unwrap();
+            assert!(p.candidates_total >= candidates as u64 - 1, "scanned {} candidates", p.candidates_total);
+            assert_eq!(p.kept_total as usize, p.samples.len(), "every survivor lands in the pool");
+            assert!(!p.dirty, "the harvest handed its samples to the writer");
+            assert!(p.last_save_at.is_some());
+            p.samples.len()
+        };
+        assert!(kept > 0, "a climbing oracle must yield labels");
+
+        // The save is a spawned task; let it run.
+        let mut waited = 0;
+        while !path.exists() && waited < 100 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            waited += 1;
+        }
+        assert!(path.exists(), "pool file was written by the harvest");
+        let mut tmp = path.as_os_str().to_owned();
+        tmp.push(".tmp");
+        assert!(!std::path::Path::new(&tmp).exists());
+        let on_disk = read_label_pool_file(&path).expect("harvest output parses");
+        assert_eq!(on_disk.samples.len(), kept);
+        assert_eq!(on_disk.label_horizon_secs, config::GBOOST_LABEL_HORIZON_SECS);
+
+        // "Restart": the process-global pool is gone; the loader brings it back.
+        {
+            let mut p = gboost_label_pool().lock().unwrap();
+            *p = LabelPool::default();
+        }
+        let restored = load_label_pool_from(path.clone()).await;
+        assert_eq!(restored, kept);
+        {
+            let p = gboost_label_pool().lock().unwrap();
+            assert_eq!(p.samples.len(), kept);
+            assert_eq!(p.restored, kept);
+            assert_eq!(p.last_harvest_ts, on_disk.last_harvest_ts, "harvest watermark survives the restart");
+        }
+
+        std::env::remove_var("GBOOST_LABEL_POOL_PATH");
+        let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
     }
 }

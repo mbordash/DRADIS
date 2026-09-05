@@ -846,7 +846,17 @@ async fn get_latency() -> Response {
     Json(crate::helpers::latency::snapshot()).into_response()
 }
 
-/// GET /api/gboost/veto-scores?asset=btc
+/// Query for the veto scoreboard: the usual asset selector plus an optional
+/// oracle-volatility slice. `?max_hist_vol=0.0015` scores only vetoes that
+/// fired in a quiet market; `?min_hist_vol=0.0015` only the active ones.
+#[derive(Deserialize)]
+struct VetoScoreQuery {
+    asset: Option<String>,
+    min_hist_vol: Option<f64>,
+    max_hist_vol: Option<f64>,
+}
+
+/// GET /api/gboost/veto-scores?asset=btc[&min_hist_vol=..][&max_hist_vol=..]
 ///
 /// Per-gate scoreboard for GBoost's entry stack, scored against SETTLED market
 /// outcomes rather than the model's own probability. Each row answers the only
@@ -854,13 +864,20 @@ async fn get_latency() -> Response {
 /// how many would actually have won, and what was the realised edge per share?
 ///
 /// `total - scored` is the still-unresolved backlog — read `avg_pnl_per_share`
-/// only once `scored` is large enough to mean something.
-async fn get_gboost_veto_scores(Query(q): Query<AssetQuery>) -> Response {
+/// only once `scored` is large enough to mean something, and judge significance
+/// on `distinct_markets`, not `scored`: a persistent veto writes one row every
+/// two minutes, so one market can contribute dozens of correlated rows.
+///
+/// The hist_vol bounds slice the table by the regime each veto fired in, so a
+/// candidate `gboost_min_hist_vol` floor can be scored before it is applied.
+/// Rows written before `hist_vol` was recorded are excluded from any slice.
+async fn get_gboost_veto_scores(Query(q): Query<VetoScoreQuery>) -> Response {
     let Some(pool) = db::pool_for_opt_retry(q.asset.as_deref()).await else {
         log_pool_unavailable("GET /api/gboost/veto-scores", q.asset.as_deref());
         return (StatusCode::SERVICE_UNAVAILABLE, "database not ready").into_response();
     };
-    Json(db::gboost_veto_scoreboard(&pool).await).into_response()
+    let regime = db::VetoRegime { min_hist_vol: q.min_hist_vol, max_hist_vol: q.max_hist_vol };
+    Json(db::gboost_veto_scoreboard(&pool, regime).await).into_response()
 }
 
 /// GET /api/vipers/status?asset=btc

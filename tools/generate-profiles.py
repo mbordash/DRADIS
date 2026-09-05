@@ -36,8 +36,22 @@ def field_const_map() -> dict[str, str]:
     m = re.search(r"impl Default for DynamicConfig \{.*?\n\}", src, re.S)
     if not m:
         sys.exit("Default impl not found in dynamic_config.rs")
-    pairs = re.findall(r"^\s+([a-z0-9_]+):\s+config::([A-Z0-9_]+)", m.group(0), re.M)
+    # A field may wrap its constant in a conversion helper, e.g.
+    # `gboost_min_hist_vol: decimal_from_f64(config::GBOOST_MIN_HIST_VOL)`,
+    # when the profile constant's Rust type differs from the field's.
+    pairs = re.findall(
+        r"^\s+([a-z0-9_]+):\s+(?:[A-Za-z_][A-Za-z0-9_:]*\()?config::([A-Z0-9_]+)",
+        m.group(0), re.M,
+    )
     return dict(pairs)
+
+
+def decimal_fields() -> set[str]:
+    """Struct fields typed `Decimal`. They serialize as JSON strings, so a
+    profile value for one must be a string even when the constant it comes
+    from is an `f64`."""
+    src = DYN.read_text()
+    return set(re.findall(r"^\s+pub\s+([a-z0-9_]+):\s+Decimal\b", src, re.M))
 
 
 def const_values(path: Path) -> dict[str, object]:
@@ -89,12 +103,16 @@ def main() -> None:
     result = {"schema_version": 1, "profiles": {}}
     missing_report: list[str] = []
 
+    decimals = decimal_fields()
     for pname, ppath in PROFILES.items():
         consts = const_values(ppath)
         values: dict[str, object] = {}
         for field, const in mapping.items():
             if const in consts:
-                values[field] = consts[const]
+                value = consts[const]
+                if field in decimals and isinstance(value, float):
+                    value = repr(value)
+                values[field] = value
             else:
                 missing_report.append(f"{pname}: {field} <- config::{const}")
         result["profiles"][pname] = {
