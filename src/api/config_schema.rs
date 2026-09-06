@@ -160,6 +160,21 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
          only if the log shows repeated 'Book feed inconsistent' warnings, which means the venue's \
          message shape has changed and the feed is already protecting itself by falling back to the \
          last full snapshot. Instance-wide, like Ghost Mode — the feed reads the global setting."));
+    v.push(F::new("Global", None, "collateral_sweep_enabled", "Collateral Sweep", "bool", false,
+        "Polymarket International only. Wrap settlement proceeds that arrive in your Safe as USDC.e \
+         back into pUSD, the collateral the exchange trades. Polymarket still mints its crypto hourly \
+         markets with USDC.e, so when DRADIS redeems a won position the payout lands beside your pUSD \
+         and the exchange does not count it: the trade books a profit while Cash appears to drop by the \
+         whole stake, and the money cannot be traded until it is wrapped. On, DRADIS approves \
+         Polymarket's CollateralOnramp for the exact stranded amount and wraps it, as two transactions \
+         from your Safe paid for by your signer's gas, and logs both hashes. Off, the stranded amount \
+         is still shown on the main page and in the log so nothing is hidden. Off by default because \
+         it moves funds on-chain; turn it on once you have seen the stranded figure and want it back \
+         in play."));
+    v.push(F::new("Global", None, "collateral_sweep_min_usdc", "Sweep Minimum", "usd", true,
+        "Smallest stranded USDC.e balance worth a sweep, in dollars. Each sweep costs one or two Polygon \
+         transactions of gas, so dust below this is left in the Safe; anything at or above it is wrapped \
+         in full.").range(0.01, 1000.0).step(0.5).unit("USDC"));
 
     // ── Arbitrage ───────────────────────────────────────────────────────────────
     {

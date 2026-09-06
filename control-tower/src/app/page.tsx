@@ -271,10 +271,10 @@ function AssetTabs({
 // ── Portfolio value banner ────────────────────────────────────────────────────
 
 function PortfolioValueBanner({
-  totalValue, collateral, positionsValue, unrealizedPnl,
+  totalValue, collateral, strandedCollateral, positionsValue, unrealizedPnl,
   positionCount, sessionPnl, ghostMode, pricesLive, isLoading,
 }: {
-  totalValue: number; collateral: number; positionsValue: number;
+  totalValue: number; collateral: number; strandedCollateral: number; positionsValue: number;
   unrealizedPnl: number; positionCount: number; sessionPnl: number;
   ghostMode?: boolean; pricesLive: boolean; isLoading: boolean;
 }) {
@@ -320,6 +320,17 @@ function PortfolioValueBanner({
         <div className="flex flex-col gap-0.5">
           <span className="text-gray-500">Cash</span>
           <span className="text-gray-300">{isLoading ? '—' : fmt$(collateral)}</span>
+          {/* Settlement proceeds paid as USDC.e sit in the Safe until wrapped into
+              pUSD; the exchange cannot see them, so they are shown here rather than
+              folded into Cash. Not counted in Portfolio Value. */}
+          {!isLoading && strandedCollateral > 0 && (
+            <span
+              className="text-amber-400"
+              title="USDC.e settlement proceeds in your Safe, not yet wrapped into pUSD. Real cash, not tradeable, not counted above. Enable Collateral Sweep in Setup to wrap it."
+            >
+              + {fmt$(strandedCollateral)} unwrapped
+            </span>
+          )}
         </div>
         <div className="flex flex-col gap-0.5">
           <span className="text-gray-500">Positions</span>
@@ -837,6 +848,7 @@ export default function DashboardPage() {
         <PortfolioValueBanner
           totalValue={portfolioLoading ? 0 : parseFloat(portfolio?.total_value ?? '0')}
           collateral={portfolioLoading ? 0 : parseFloat(portfolio?.collateral ?? '0')}
+          strandedCollateral={portfolioLoading ? 0 : parseFloat(portfolio?.stranded_collateral ?? '0')}
           positionsValue={portfolioLoading ? 0 : parseFloat(portfolio?.positions_value ?? '0')}
           unrealizedPnl={portfolioLoading ? 0 : parseFloat(portfolio?.unrealized_pnl ?? '0')}
           positionCount={portfolio?.position_count ?? 0}

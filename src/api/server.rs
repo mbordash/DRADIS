@@ -2219,6 +2219,11 @@ async fn reject_llm_action(AxumPath(id): AxumPath<i64>) -> Response {
 #[derive(Serialize)]
 struct PortfolioValue {
     collateral: String,
+    /// USDC.e settlement proceeds sitting in the Safe that are not yet wrapped
+    /// into pUSD: real cash the exchange cannot see. Reported beside
+    /// `collateral`, never added to `total_value`, so the figure stays one
+    /// source of truth with `pnl_snapshots`. Zero on venues without a Safe.
+    stranded_collateral: String,
     positions_value: String,
     total_value: String,
     unrealized_pnl: String,
@@ -2470,8 +2475,14 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
     debug!(" Portfolio summary: collateral=${:.4} positions=${:.4} total=${:.4} count={} live={}",
            total_collateral, total_positions_value, total_value, total_position_count, all_prices_live);
 
+    #[cfg(feature = "intl_clob")]
+    let stranded_collateral = crate::tasks::collateral_sweep::stranded_usdce().unwrap_or(Decimal::ZERO);
+    #[cfg(not(feature = "intl_clob"))]
+    let stranded_collateral = Decimal::ZERO;
+
     Json(PortfolioValue {
         collateral: total_collateral.to_string(),
+        stranded_collateral: stranded_collateral.to_string(),
         positions_value: total_positions_value.to_string(),
         total_value: total_value.to_string(),
         unrealized_pnl: total_unrealized_pnl.to_string(),

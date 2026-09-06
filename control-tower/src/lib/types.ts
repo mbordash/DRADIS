@@ -105,6 +105,8 @@ export interface DynamicConfig {
   auto_deploy_politics:          boolean;
   auto_deploy_sports:            boolean;
   event_market_retire_grace_secs: number;
+  collateral_sweep_enabled:      boolean;
+  collateral_sweep_min_usdc:     string;
   gboost_budget:                 string;
   gboost_iteration_limit:        number;
   position_quote_ttl_secs:       number;
@@ -502,6 +504,8 @@ export interface StatusResponse {
 /** Portfolio value response from /api/portfolio — cash + open positions at live prices. */
 export interface PortfolioValue {
   collateral:      string; // pUSD cash on deposit
+  /** USDC.e settlement proceeds sitting in the Safe that are not yet wrapped into pUSD — real cash, not tradeable, not counted in total_value. */
+  stranded_collateral: string;
   positions_value: string; // Σ(shares × current mid-price)
   total_value:     string; // collateral + positions_value
   unrealized_pnl:  string; // Σ(shares × (current_mid − entry_price))

@@ -144,6 +144,22 @@ pub fn spawn_settlement_task<P>(
                         Err(_) => warn!("⚠️ settlement task timed out (60s) — skipping this cycle"),
                     }
 
+                    // Settlement proceeds from a USDC.e-collateral condition land in
+                    // the Safe as USDC.e, outside the pUSD the CLOB trades. Observe
+                    // the stranded balance every cycle and, when the operator has
+                    // enabled it, wrap it back into pUSD. Two Safe transactions at
+                    // 30s receipt caps each, plus view calls: 120s is generous.
+                    match tokio::time::timeout(Duration::from_secs(120),
+                        crate::tasks::collateral_sweep::sweep_stranded_collateral(
+                            wallet_provider.clone(),
+                            safe_address,
+                            eoa_address,
+                        )
+                    ).await {
+                        Ok(_) => {}
+                        Err(_) => warn!("⚠️ collateral sweep timed out (120s) — next cycle re-reads the chain"),
+                    }
+
                     // After processing explicit settlements, scan for positions that were
                     // auto-settled by Polymarket (outside our settlement ticker).
                     // Pass the squadron's asset so it only scans its own database pool.
@@ -547,6 +563,22 @@ pub fn spawn_status_task(
                         ya + na, ya, na, yb + nb, yb, nb, oracle_seg, yes_obi, no_obi,
                         yes_obi_all, no_obi_all, ybd_all, yad_all, nbd_all, nad_all,
                     );
+
+                    // A confirmed collateral sweep changed the Safe's pUSD balance
+                    // outside the CLOB's view; ask it to re-read the chain before
+                    // this tick's balance read so the snapshot below is current.
+                    if crate::tasks::collateral_sweep::take_clob_refresh_needed() {
+                        let mut upd = BalanceAllowanceRequest::default();
+                        upd.asset_type = AssetType::Collateral;
+                        match tokio::time::timeout(
+                            Duration::from_secs(10),
+                            trading_client.update_balance_allowance(upd),
+                        ).await {
+                            Ok(Ok(()))  => info!("🔄 CLOB collateral cache refresh requested after sweep"),
+                            Ok(Err(e))  => warn!("⚠️ CLOB collateral cache refresh failed after sweep: {}", e),
+                            Err(_)      => warn!("⚠️ CLOB collateral cache refresh timed out (10s) after sweep"),
+                        }
+                    }
 
                     // Refresh live pUSD balance so strategies can self-gate on insufficient funds.
                     // Hard 10 s timeout — a TCP-level CLOB API stall must not block this task.

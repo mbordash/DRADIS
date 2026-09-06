@@ -103,9 +103,10 @@ pub fn is_money_field(key: &str) -> bool {
     key.ends_with("_usdc") || key.contains("budget") || key.contains("collateral")
 }
 
-/// Mode flips (paper ↔ live) are an operator decision at every tier.
+/// Mode flips (paper ↔ live) are an operator decision at every tier, and so
+/// is the collateral sweep: it moves the operator's funds on-chain.
 pub fn is_mode_field(key: &str) -> bool {
-    key == "ghost_mode"
+    key == "ghost_mode" || key == "collateral_sweep_enabled"
 }
 
 /// Per-change policy verdict.
@@ -433,6 +434,14 @@ mod tests {
     #[test]
     fn ghost_mode_held_at_every_tier() {
         let c = change("ghost_mode", None);
+        for tier in 1..=3 {
+            assert!(matches!(evaluate_change(tier, &c, &knobs()), Verdict::Hold(_)));
+        }
+    }
+
+    #[test]
+    fn collateral_sweep_switch_held_at_every_tier() {
+        let c = change("collateral_sweep_enabled", None);
         for tier in 1..=3 {
             assert!(matches!(evaluate_change(tier, &c, &knobs()), Verdict::Hold(_)));
         }

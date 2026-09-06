@@ -1793,7 +1793,11 @@ mod tests {
             // conservative" — silently disarmed simulation, because
             // `apply_profile` patches every field a profile declares. Asserted
             // as an exact set so a genuine omission still fails here.
-            const NOT_IN_PROFILES: &[&str] = &["ghost_mode"];
+            //
+            // `collateral_sweep_enabled` is absent for the same reason: it
+            // decides whether DRADIS moves the operator's funds on-chain, and a
+            // profile switch must not quietly flip that either way.
+            const NOT_IN_PROFILES: &[&str] = &["ghost_mode", "collateral_sweep_enabled"];
             let missing: Vec<_> = schema_keys
                 .difference(&keys)
                 .filter(|k| !NOT_IN_PROFILES.contains(k))

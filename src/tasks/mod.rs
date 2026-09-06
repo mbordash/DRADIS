@@ -27,3 +27,5 @@
 pub mod market_monitor;
 #[cfg(feature = "intl_clob")]
 pub mod cleanup;
+#[cfg(feature = "intl_clob")]
+pub mod collateral_sweep;

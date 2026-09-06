@@ -1244,6 +1244,33 @@ pub const AUTO_DEPLOY_SPORTS: bool = true;
 /// and retires once flat.
 pub const EVENT_MARKET_RETIRE_GRACE_SECS: i64 = 300;
 
+/// Wrap USDC.e that settlement leaves in the trading Safe back into pUSD.
+///
+/// Polymarket's CLOB trades pUSD, and the collateral figure DRADIS reports is
+/// the Safe's on-chain pUSD balance. Redeeming a resolved position pays out in
+/// whatever token the condition was minted with, and the venue's crypto
+/// hourlies are still minted with USDC.e: on 2026-09-05 a won FairValue
+/// position was redeemed by DRADIS (tx 0x54d72b89...) and paid 5.053757 USDC.e
+/// into the Safe, where it sat beside 49.379608 pUSD. The CLOB balance never
+/// moved, the Control Tower showed the cash "lost", and nothing in DRADIS
+/// could trade it. Every such settlement shrinks the tradeable balance by the
+/// whole payout until someone wraps it.
+///
+/// The sweep approves Polymarket's permissionless CollateralOnramp for the
+/// exact stranded amount and calls its `wrap`, both through the Safe, and
+/// confirms the balance moved before it reports success. It moves funds
+/// on-chain from a code path that has never run in production, so it ships
+/// off: the log and the Control Tower show the stranded amount either way, and
+/// the operator turns the sweep on in Setup once they have seen the figure.
+/// The first sweep logs its transaction hashes for the operator to check.
+pub const COLLATERAL_SWEEP_ENABLED: bool = false;
+
+/// Smallest stranded USDC.e balance worth a sweep, in dollars.
+///
+/// A sweep is one or two Polygon transactions paid for from the EOA's gas, so
+/// dust is left where it is. Anything at or above this is wrapped in full.
+pub const COLLATERAL_SWEEP_MIN_USDC: Decimal = dec!(1.00);
+
 /// How far the exit price implied by collateral movement may sit from the bid
 /// observed at exit, before the reconciliation is distrusted.
 ///

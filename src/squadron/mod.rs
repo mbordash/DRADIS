@@ -68,7 +68,7 @@ pub use patrol_impl::{cancel_all_orders_unless_simulating, cancel_all_orders_wit
 #[cfg(feature = "intl_clob")]
 mod local_book;
 #[cfg(feature = "intl_clob")]
-pub use local_book::{ApplyOutcome, BookSide, BookStats, LevelChange, LocalBook};
+pub use local_book::{ApplyOutcome, BookSide, BookStats, Hold, LevelChange, LocalBook};
 
 /// Peripheral tasks spawned by `patrol()` — Phase 3f-4.
 /// Kept in a separate file for clarity; each function spawns one Tokio task.
@@ -628,6 +628,31 @@ fn publish_book(tx: &watch::Sender<PriceState>, book: &LocalBook) {
     }
 }
 
+/// A hold on the derived book that outlives this is worth a line in the log
+/// at INFO; shorter ones are the venue publishing a trade or a batched
+/// cancel across several frames (see `local_book`) and are routine, so they
+/// are logged at DEBUG and counted in the per-snapshot stats instead.
+#[cfg(feature = "intl_clob")]
+const LONG_BOOK_HOLD_MS: i64 = 1_000;
+
+/// Log the end of a hold: how long the derived book was withheld, why, and
+/// what lifted it.
+#[cfg(feature = "intl_clob")]
+fn log_hold_lifted(venue: &str, token: U256, hold: &Hold, lifted_by: &str, now: chrono::DateTime<Utc>) {
+    let held_ms = hold.held_for(now).num_milliseconds();
+    if hold.hard || held_ms >= LONG_BOOK_HOLD_MS {
+        info!(
+            "📖 Book feed for {} token {}: derived book held for {}ms for `{}` ({} price_changes folded in meanwhile), lifted by {}",
+            venue, token, held_ms, hold.reason, hold.batches, lifted_by
+        );
+    } else {
+        tracing::debug!(
+            "📖 Book feed for {} token {}: derived book held for {}ms for `{}`, lifted by {}",
+            venue, token, held_ms, hold.reason, lifted_by
+        );
+    }
+}
+
 /// Spawn one auto-reconnecting WebSocket orderbook subscriber task.
 ///
 /// Pushes `PriceState` updates into `tx`.  Stops cleanly when `cancel` fires.
@@ -635,9 +660,11 @@ fn publish_book(tx: &watch::Sender<PriceState>, book: &LocalBook) {
 ///
 /// B36: the task keeps a [`LocalBook`]. Every `book` message resets it; every
 /// `price_change` for this token is folded in between snapshots while the
-/// `book_apply_price_changes` knob is on and the book can reconcile itself
-/// against the venue's own best bid/ask. When it cannot, it publishes the last
-/// snapshot — the feed as it was before B36 — until the next `book` arrives.
+/// `book_apply_price_changes` knob is on and the book can prove itself
+/// against the venue's own best bid/ask. While it cannot — a trade or a
+/// batched cancel still being published, see `local_book` — it publishes the
+/// last snapshot, the feed as it was before B36, until the stamps agree again
+/// or the next `book` arrives.
 #[cfg(feature = "intl_clob")]
 fn spawn_ws_task(
     token:  U256,
@@ -679,23 +706,21 @@ fn spawn_ws_task(
                         match result {
                             Some(Ok(WsMessage::Book(snapshot))) => {
                                 let stats = book.take_stats();
-                                let held_back = book.inconsistency().map(str::to_string);
                                 // Stamp the WS update time at receipt, NOT at tick time.
-                                book.reset(
+                                let now = Utc::now();
+                                let cleared = book.reset(
                                     snapshot.timestamp,
                                     snapshot.bids.iter().map(|l| (l.price, l.size)),
                                     snapshot.asks.iter().map(|l| (l.price, l.size)),
-                                    Utc::now(),
+                                    now,
                                 );
-                                if let Some(reason) = held_back {
-                                    info!(
-                                        "📖 Book feed resynced for {} token {}: snapshot replaced a book held back for `{}` ({} price_changes applied before that)",
-                                        venue, token, reason, stats.applied
-                                    );
-                                } else if stats.applied > 0 || stats.dropped_older > 0 {
+                                if let Some(hold) = cleared {
+                                    log_hold_lifted(venue, token, &hold, "the next book snapshot", now);
+                                }
+                                if stats.applied > 0 || stats.dropped_older > 0 || stats.held > 0 {
                                     tracing::debug!(
-                                        "📖 Book snapshot for {} token {}: reset after {} price_changes applied, {} dropped as older than the previous snapshot",
-                                        venue, token, stats.applied, stats.dropped_older
+                                        "📖 Book snapshot for {} token {}: reset after {} price_changes applied, {} dropped as older than the previous snapshot, {} holds ({} released by the venue's stamps agreeing)",
+                                        venue, token, stats.applied, stats.dropped_older, stats.held, stats.released
                                     );
                                 }
                                 publish_book(&tx, &book);
@@ -709,13 +734,13 @@ fn spawn_ws_task(
                                     .filter(|e| e.asset_id == token)
                                     .collect();
                                 if mine.is_empty() { continue; }
-                                let was_consistent = book.is_consistent();
+                                let now = Utc::now();
                                 let outcome = match mine.iter().map(|e| level_change(e)).collect::<Option<Vec<_>>>() {
-                                    Some(changes) => book.apply(pc.timestamp, &changes, Utc::now()),
+                                    Some(changes) => book.apply(pc.timestamp, &changes, now),
                                     None => book.distrust(format!(
                                         "price_change carried a side the SDK could not classify: {:?}",
                                         mine.iter().map(|e| e.side).collect::<Vec<_>>()
-                                    )),
+                                    ), now),
                                 };
                                 match outcome {
                                     ApplyOutcome::Applied => {
@@ -728,17 +753,29 @@ fn spawn_ws_task(
                                         }
                                         publish_book(&tx, &book);
                                     }
-                                    ApplyOutcome::Inconsistent(reason) if was_consistent => {
-                                        // Transition only: the snapshot is republished once,
-                                        // with its own receipt time, and stays until the next
-                                        // `book`. Consumers see exactly the pre-B36 feed.
-                                        warn!(
-                                            "⚠️ Book feed inconsistent for {} token {}: {} — publishing the last full snapshot until the venue sends the next book",
-                                            venue, token, reason
-                                        );
+                                    ApplyOutcome::Released(hold) => {
+                                        log_hold_lifted(venue, token, &hold, "the venue's stamps agreeing", now);
                                         publish_book(&tx, &book);
                                     }
-                                    ApplyOutcome::Inconsistent(_)
+                                    ApplyOutcome::Held(hold) => {
+                                        // Transition only: the snapshot is republished once,
+                                        // with its own receipt time, and stays until the
+                                        // stamps agree or the next `book`. Consumers see
+                                        // exactly the pre-B36 feed meanwhile.
+                                        if hold.hard {
+                                            warn!(
+                                                "⚠️ Book feed for {} token {}: {} — publishing the last full snapshot until the venue sends the next book",
+                                                venue, token, hold.reason
+                                            );
+                                        } else {
+                                            tracing::debug!(
+                                                "📖 Book feed for {} token {}: derived book held, {} — publishing the last full snapshot until the venue's stamps agree",
+                                                venue, token, hold.reason
+                                            );
+                                        }
+                                        publish_book(&tx, &book);
+                                    }
+                                    ApplyOutcome::StillHeld
                                     | ApplyOutcome::DroppedOlder
                                     | ApplyOutcome::NoSnapshot => {}
                                 }
@@ -922,6 +959,24 @@ mod live_book_probe {
         let mut levels: (BTreeMap<Decimal, Decimal>, BTreeMap<Decimal, Decimal>) = Default::default();
         let mut polls = 0u32;
         let mut polls_with_diffs = 0u32;
+        // Hold accounting: how often the derived book was withheld, what
+        // lifted it, and the longest it was withheld — the before/after
+        // measure for the 2026-09-05 hold-and-release change.
+        let mut holds = 0u32;
+        let mut released_by_stamps = 0u32;
+        let mut released_by_book = 0u32;
+        let mut longest_hold_ms = 0i64;
+        let mut held_over_1s = 0u32;
+        let mut note_lift = |hold: &crate::squadron::Hold, now: DateTime<Utc>, by_book: bool| {
+            let ms = hold.held_for(now).num_milliseconds();
+            longest_hold_ms = longest_hold_ms.max(ms);
+            if ms > 1_000 { held_over_1s += 1; }
+            if by_book { released_by_book += 1; } else { released_by_stamps += 1; }
+            if ms > 250 || hold.hard {
+                println!("[hold] lifted after {ms}ms by {} (hard={}): {} ({} batches folded in while held)",
+                         if by_book { "book" } else { "stamps" }, hold.hard, hold.reason, hold.batches);
+            }
+        };
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(secs);
         let mut poll = tokio::time::interval(std::time::Duration::from_secs(15));
         poll.tick().await;
@@ -953,22 +1008,32 @@ mod live_book_probe {
                     Some(Ok(WsMessage::Book(b))) => {
                         levels.0 = b.bids.iter().filter(|l| l.size > Decimal::ZERO).map(|l| (l.price, l.size)).collect();
                         levels.1 = b.asks.iter().filter(|l| l.size > Decimal::ZERO).map(|l| (l.price, l.size)).collect();
-                        book.reset(b.timestamp, b.bids.iter().map(|l| (l.price, l.size)), b.asks.iter().map(|l| (l.price, l.size)), Utc::now());
+                        let now = Utc::now();
+                        if let Some(hold) = book.reset(b.timestamp, b.bids.iter().map(|l| (l.price, l.size)), b.asks.iter().map(|l| (l.price, l.size)), now) {
+                            note_lift(&hold, now, true);
+                        }
                         println!("[book] ts={} bids={} asks={}", b.timestamp, b.bids.len(), b.asks.len());
                     }
                     Some(Ok(WsMessage::PriceChange(pc))) => {
                         let mine: Vec<LevelChange> = pc.price_changes.iter()
                             .filter(|e| e.asset_id == token_u256).filter_map(level_change).collect();
                         if mine.is_empty() { continue; }
-                        let out = book.apply(pc.timestamp, &mine, Utc::now());
-                        if out == ApplyOutcome::Applied {
-                            // Mirror the level map so the poll can diff it level for level.
+                        let now = Utc::now();
+                        let out = book.apply(pc.timestamp, &mine, now);
+                        // Mirror the level map so the poll can diff it level for level.
+                        if matches!(out, ApplyOutcome::Applied | ApplyOutcome::Released(_) | ApplyOutcome::Held(_) | ApplyOutcome::StillHeld) {
                             for c in &mine {
                                 let m = if c.side == BookSide::Bid { &mut levels.0 } else { &mut levels.1 };
                                 match c.size { Some(s) if s > Decimal::ZERO => { m.insert(c.price, s); } _ => { m.remove(&c.price); } }
                             }
-                        } else {
-                            println!("[pc] ts={} outcome={out:?} entries={mine:?}", pc.timestamp);
+                        }
+                        match &out {
+                            ApplyOutcome::Held(_) => { holds += 1; }
+                            ApplyOutcome::Released(hold) => note_lift(hold, now, false),
+                            ApplyOutcome::DroppedOlder | ApplyOutcome::NoSnapshot => {
+                                println!("[pc] ts={} outcome={out:?} entries={mine:?}", pc.timestamp);
+                            }
+                            ApplyOutcome::Applied | ApplyOutcome::StillHeld => {}
                         }
                     }
                     Some(Ok(_)) => {}
@@ -977,9 +1042,13 @@ mod live_book_probe {
                 }
             }
         }
-        println!("FINAL polls={polls} polls_with_diffs={polls_with_diffs} stats={:?} consistent={}", book.stats(), book.is_consistent());
+        drop(note_lift);
+        println!(
+            "FINAL polls={polls} polls_with_diffs={polls_with_diffs} stats={:?} consistent={} holds={holds} released_by_stamps={released_by_stamps} released_by_book={released_by_book} longest_hold_ms={longest_hold_ms} held_over_1s={held_over_1s}",
+            book.stats(), book.is_consistent()
+        );
         assert!(polls >= 2, "too few polls to conclude anything");
         assert!(polls_with_diffs <= 1, "derived book diverged from REST on {polls_with_diffs} of {polls} polls");
-        assert!(book.is_consistent(), "book ended inconsistent: {:?}", book.inconsistency());
+        assert!(book.is_consistent(), "book ended held: {:?}", book.hold());
     }
 }

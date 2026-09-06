@@ -236,6 +236,8 @@ fn default_llm_max_output_tokens()          -> u32     { config::LLM_MAX_OUTPUT_
 fn default_auto_deploy_politics()           -> bool    { config::AUTO_DEPLOY_POLITICS                 }
 fn default_auto_deploy_sports()             -> bool    { config::AUTO_DEPLOY_SPORTS                   }
 fn default_event_market_retire_grace_secs() -> i64     { config::EVENT_MARKET_RETIRE_GRACE_SECS       }
+fn default_collateral_sweep_enabled()       -> bool    { config::COLLATERAL_SWEEP_ENABLED             }
+fn default_collateral_sweep_min_usdc()      -> Decimal { config::COLLATERAL_SWEEP_MIN_USDC            }
 fn default_gboost_budget()                  -> Decimal { config::GBOOST_BUDGET                       }
 fn default_gboost_iteration_limit()         -> u32     { config::GBOOST_ITERATION_LIMIT               }
 fn default_position_quote_ttl_secs()        -> u64     { config::POSITION_QUOTE_TTL_SECS              }
@@ -502,6 +504,14 @@ pub struct DynamicConfig {
     /// position keeps patrolling regardless and retires once flat.
     #[serde(default = "default_event_market_retire_grace_secs")]
     pub event_market_retire_grace_secs: i64,
+    /// Wrap USDC.e settlement proceeds sitting in the Safe back into pUSD so
+    /// they count as tradeable collateral again. Off by default: it moves funds
+    /// on-chain. Polymarket International only.
+    #[serde(default = "default_collateral_sweep_enabled")]
+    pub collateral_sweep_enabled:      bool,
+    /// Smallest stranded USDC.e balance worth a sweep transaction, in dollars.
+    #[serde(default = "default_collateral_sweep_min_usdc")]
+    pub collateral_sweep_min_usdc:     Decimal,
     /// How hard `perpetual` works on one GBoost retrain. Higher grows more trees
     /// and fits the label pool more closely; too high overfits a small pool.
     #[serde(default = "default_gboost_budget")]
@@ -965,6 +975,8 @@ impl Default for DynamicConfig {
             auto_deploy_politics:          config::AUTO_DEPLOY_POLITICS,
             auto_deploy_sports:            config::AUTO_DEPLOY_SPORTS,
             event_market_retire_grace_secs: config::EVENT_MARKET_RETIRE_GRACE_SECS,
+            collateral_sweep_enabled:      config::COLLATERAL_SWEEP_ENABLED,
+            collateral_sweep_min_usdc:     config::COLLATERAL_SWEEP_MIN_USDC,
             gboost_budget:                 config::GBOOST_BUDGET,
             gboost_iteration_limit:        config::GBOOST_ITERATION_LIMIT,
             position_quote_ttl_secs:       config::POSITION_QUOTE_TTL_SECS,

@@ -74,10 +74,10 @@ use sqlx;
 /// 2026-07-20 23:19 with 0 tokens burned, then blacklisted forever by
 /// PERMANENTLY_SETTLED_CONDITIONS).  Use `detect_condition_collateral` to pick the
 /// right collateral per condition instead of assuming pUSD.
-const PUSD_COLLATERAL: Address = alloy_address!("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB");
+pub(crate) const PUSD_COLLATERAL: Address = alloy_address!("0xC011a7E12a19f7B1f670d46F03B03f3342E82DFB");
 
 /// USDC.e (bridged USDC) on Polygon — collateral for pre-pUSD-migration positions.
-const USDCE_COLLATERAL: Address = alloy_address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
+pub(crate) const USDCE_COLLATERAL: Address = alloy_address!("0x2791Bca1f2de4661ED88A30C99A7a9449Aa84174");
 
 /// Gnosis Conditional Token Framework contract on Polygon.
 const CTF_ADDRESS: Address = alloy_address!("0x4D97DCd97eC945f40cF65F87097ACe5EA0476045");
@@ -216,6 +216,42 @@ async fn execute_via_safe<P: Provider + Clone>(
     ctf_contract: Address,
     calldata: Vec<u8>,
 ) -> anyhow::Result<alloy::primitives::TxHash> {
+    send_via_safe(provider, safe_address, eoa_address, ctf_contract, calldata)
+        .await
+        .map(|(hash, _)| hash)
+}
+
+/// `execute_via_safe`, but an on-chain revert is an error.
+///
+/// The Safe reverts the outer transaction (GS013) when the inner call fails, so
+/// the receipt's status is the inner call's status. `execute_via_safe` returns
+/// the hash regardless, which is right for redemption, where the callers treat
+/// a landed transaction as settled and re-check the chain later; the collateral
+/// sweep moves the operator's cash and must not report a reverted wrap as a
+/// success.
+pub(crate) async fn execute_via_safe_confirmed<P: Provider + Clone>(
+    provider: P,
+    safe_address: Address,
+    eoa_address: Address,
+    target: Address,
+    calldata: Vec<u8>,
+) -> anyhow::Result<alloy::primitives::TxHash> {
+    let (hash, succeeded) = send_via_safe(provider, safe_address, eoa_address, target, calldata).await?;
+    if !succeeded {
+        anyhow::bail!("Safe transaction {} reverted on-chain", hash);
+    }
+    Ok(hash)
+}
+
+/// Submit one Safe `execTransaction` and wait for its receipt; returns the hash
+/// and whether the receipt reports success.
+async fn send_via_safe<P: Provider + Clone>(
+    provider: P,
+    safe_address: Address,
+    eoa_address: Address,
+    ctf_contract: Address,
+    calldata: Vec<u8>,
+) -> anyhow::Result<(alloy::primitives::TxHash, bool)> {
     // Build the pre-approved owner signature (65 bytes).
     let mut sig = Vec::with_capacity(65);
     sig.extend_from_slice(&[0u8; 12]);           // left-pad address to 32 bytes
@@ -245,12 +281,12 @@ async fn execute_via_safe<P: Provider + Clone>(
     // Hard 30s cap on receipt wait — Polygon block time is ~2s; 30s is generous.
     // Without this the call can hang indefinitely if the RPC stalls post-submission,
     // which blocks the entire tokio select! event loop.
-    tokio::time::timeout(std::time::Duration::from_secs(30), pending.get_receipt())
+    let receipt = tokio::time::timeout(std::time::Duration::from_secs(30), pending.get_receipt())
         .await
         .map_err(|_| anyhow::anyhow!("execute_via_safe: get_receipt timed out (30s)"))?
         .map_err(|e| anyhow::anyhow!("execute_via_safe: get_receipt error: {}", e))?;
 
-    Ok(tx_hash)
+    Ok((tx_hash, receipt.status()))
 }
 
 /// Detect which collateral token a resolved condition's outcome tokens were minted with.
