@@ -1169,6 +1169,45 @@ pub const FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS: i64 = 120;
 pub const FAIRVALUE_MODEL_REVERSAL_DECAY_PCT: Decimal = dec!(0.28);
 pub const FAIRVALUE_SETTLE_HOLD_SECS: i64 = 600;
 pub const FAIRVALUE_SETTLE_HOLD_MIN_PROB: f64 = 0.95;
+/// Manage an entry whose take-profit is unreachable as a settlement snipe.
+///
+/// A binary contract never trades above $1.00, so `entry × (1 + TP)` does not
+/// exist once the entry is above 1/(1 + TP) — $0.8333 at a 20% TP. Above that
+/// line the position has no upside rung on its exit ladder: its profit path is
+/// settlement (which pays $1.00, fee-free, and beats any reachable target), and
+/// the percentage stop is the wrong instrument. A price that is also a
+/// probability touches a 15% stop from $0.92 about 4.6× as often as the
+/// contract actually settles against it, so the stop fires on ordinary
+/// excursions of a winning position (2026-09-06: NO at $0.92 stopped at $0.78
+/// for −$0.79 with the model still at 0.846; it settled at $1.00).
+///
+/// With this on, such a position drops the percentage stop and instead sells
+/// only when the bid, net of the taker fee, is worth at least what the model
+/// says settlement is worth — the model's own EV test, which is both its stop
+/// and its take-profit. The catastrophic floor (2× the stop width) is kept as
+/// insurance against a stale or broken model, and the endgame bail-out still
+/// applies. Off restores the percentage stop for every entry.
+pub const FAIRVALUE_SETTLE_SNIPE_HOLD: bool = true;
+/// Take profit with a resting post-only ask instead of a taker FAK.
+///
+/// FairValue enters at the ask and pays the taker fee; its take-profit then
+/// crossed back to the bid and paid it again. The exit half is the one that
+/// can rest safely: an ask at entry × (1 + TP) is lifted only when the market
+/// runs through the price the viper would have sold at anyway, so being
+/// filled is not evidence the thesis has turned — the adverse selection that
+/// makes a resting BID uncertain does not apply. A replay of the first four
+/// live entries (2026-09-06) had the ask lifted in two of them, saving the
+/// $0.362 exit fee that was 40% of all fees paid across the first three.
+///
+/// The ask rests at the take-profit price, fixed for the life of the
+/// position, so it never chases the book and never surrenders its queue
+/// position. Every stop, the model-reversal exit and the endgame bail-out
+/// still cross with a FAK and pull the ask first. Inside the settlement hold
+/// (model ≥ SETTLE_HOLD_MIN_PROB in the final SETTLE_HOLD_SECS) the ask is
+/// raised to $0.99, which is the same hold-for-settlement the taker path
+/// applies. An entry whose take-profit is unreachable (the settlement-snipe
+/// posture) rests nothing: no such price exists. Off restores the taker TP.
+pub const FAIRVALUE_RESTING_TP_ENABLED: bool = true;
 pub const FAIRVALUE_BAIL_SECS: i64 = 120;
 pub const FAIRVALUE_BAIL_PROB: f64 = 0.80;
 pub const FAIRVALUE_MIN_EXIT_BID: Decimal = dec!(0.05);

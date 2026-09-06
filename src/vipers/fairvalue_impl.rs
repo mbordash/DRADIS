@@ -57,6 +57,44 @@
 ///    thesis (observed 2026-08-12: three round trips, all exited at exactly
 ///    t+60s, the one "winner" saved only by TP firing at t+10s).
 /// 4. Endgame bail-out: final BAIL_SECS with fair probability < BAIL_PROB.
+///
+/// # Settlement-snipe posture (`fairvalue_settle_snipe_hold`)
+///
+/// Rule 1 is unreachable once entry × (1 + TP) ≥ $1.00 — $0.8333 at the
+/// shipped 20% — because no such price exists on a binary contract. Above
+/// that line the position's only profit path is settlement, and rule 2 is the
+/// wrong instrument: a price that is also a probability touches a 15% stop
+/// from $0.92 with probability (1 − 0.92)/(1 − 0.78) ≈ 36% under the market's
+/// own pricing, against an 8% chance of actually settling at $0. Observed
+/// 2026-09-06: NO at $0.92 stopped at $0.78 for −$0.79 with the model still at
+/// 0.846; the market recovered within a minute and settled at $1.00.
+///
+/// So for those entries the percentage stop stands down and the position is
+/// managed on the model's own EV test instead: sell only when the bid, net of
+/// the taker fee, is worth at least what the model says settlement is worth.
+/// That single rule is both the stop (thesis broken: model below market) and
+/// the take-profit (market overpaying versus the model), and its failure mode
+/// is cheap — a spurious fire sells at roughly fair value and costs one fee.
+/// The catastrophic stop (2× the width) is kept as insurance against a stale
+/// or broken model, which the EV test cannot see because it trusts the model;
+/// a position with no model reading falls back to the price stop for the same
+/// reason a model that cannot price does not get to veto one.
+///
+/// # Resting take-profit (`fairvalue_resting_tp_enabled`)
+///
+/// Rule 1 used to cross to the bid with a FAK and pay the taker fee a second
+/// time. Across the first five live trades (2026-09-06) direction was a coin
+/// flip and the entire net loss was transaction cost. The exit half of that
+/// toll can rest: a post-only ask at entry × (1 + TP) is lifted only when the
+/// market runs through the price rule 1 would have sold at anyway, so being
+/// filled carries none of the adverse selection a resting BID does. Once the
+/// fill is confirmed the viper emits [`StrategySignal::MakerRestingExit`] at
+/// that price every tick, deferred behind every hard exit so a stop on any
+/// position still wins the tick. The patrol owns the order: it places it once,
+/// leaves it alone while the price is unchanged, pulls it before any FAK exit
+/// needs the shares, and books the lift at the resting price net of the
+/// entry fee. Rule 1 is unchanged and still fires if the bid reaches the target
+/// while no ask rests (or before a lift has been confirmed on-chain).
 
 use async_trait::async_trait;
 use anyhow::Result;
@@ -66,6 +104,7 @@ use rust_decimal_macros::dec;
 use chrono::{DateTime, Utc};
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Mutex as StdMutex, OnceLock};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 
 use crate::orchestrator::{Strategy, StrategyContext};
@@ -73,6 +112,7 @@ use crate::state::{StrategySignal, StrategyStatus, OrderParams, MarketConfig, Ma
 use crate::vipers::is_drawdown_limit_hit;
 use crate::config;
 use crate::helpers::volatility::{fair_yes_probability, sigma_per_sqrt_sec};
+use crate::helpers::price::ceil_to_tick_size;
 use crate::venues::core::TimeInForce;
 
 /// All FairValue state outlives the strategy object, which is recreated on
@@ -514,6 +554,85 @@ impl FairValueStrategyImpl {
         }
         let fair_dec = Decimal::from_f64_retain(fair?).map(|d| d.round_dp(10))?;
         Some(fair_dec - ask - Self::fee_frac(ask) - Self::fee_frac(fair_dec))
+    }
+
+    /// Is the configured take-profit literally unreachable from this entry?
+    ///
+    /// A binary contract never trades above $1.00, so `entry × (1 + tp)` is a
+    /// price that does not exist once the entry is above `1 / (1 + tp)` —
+    /// $0.8333 at the shipped 20%. Above that line the exit ladder has no
+    /// upside rung at all: the profit path is settlement, and the rules have
+    /// to be built for that (see `settle_snipe_exit`).
+    fn tp_unreachable(avg_entry: Decimal, tp_pct: Decimal) -> bool {
+        avg_entry * (dec!(1) + tp_pct) >= dec!(1)
+    }
+
+    /// The exit test for a settlement-snipe position: sell only when the
+    /// market's bid, net of the taker fee, is worth at least what the model
+    /// says settlement is worth (fair × $1.00, fee-free).
+    ///
+    /// Returns the net proceeds per share when the position should be sold,
+    /// `None` when it should be held. No model reading is `None` too: the
+    /// caller then falls back to the price stop, because a model that cannot
+    /// price does not get to hold a position past its stop any more than it
+    /// gets to veto one.
+    fn settle_snipe_exit(fair_side: Option<f64>, bid: Decimal) -> Option<Decimal> {
+        if bid <= dec!(0) {
+            return None;
+        }
+        let fair = Decimal::from_f64_retain(fair_side?).map(|d| d.round_dp(10))?;
+        let net = bid - Self::fee_frac(bid);
+        (net >= fair).then_some(net)
+    }
+
+    /// Price of the resting post-only take-profit ask, or `None` when no ask
+    /// can rest.
+    ///
+    /// The ask sits at `entry × (1 + tp)` rounded UP to the tick — the price
+    /// rule 1 would sell at, held fixed for the life of the position so it
+    /// never chases the book and never gives up its place in the queue. It is
+    /// `None` when that price does not exist (`tp_unreachable`: the
+    /// settlement-snipe posture, which is managed to settlement instead), when
+    /// rounding carries it to $1.00, or when the bid is already at or through
+    /// it — a post-only sell there crosses the book and is rejected, and rule 1
+    /// takes that case with a FAK.
+    ///
+    /// Inside the settlement hold (`settle_hold`: the model reads at least
+    /// `FAIRVALUE_SETTLE_HOLD_MIN_PROB` in the final `FAIRVALUE_SETTLE_HOLD_SECS`)
+    /// the ask is raised to $0.99. Rule 1 declines a taker take-profit there
+    /// because the fee-free $1.00 settlement is worth more; a resting ask must
+    /// not undercut that by selling the same position at the target, so it is
+    /// moved to the top of the book, where it only catches a runaway.
+    fn resting_tp_price(avg_entry: Decimal, tp_pct: Decimal, bid: Decimal, settle_hold: bool) -> Option<Decimal> {
+        if avg_entry <= dec!(0) || Self::tp_unreachable(avg_entry, tp_pct) {
+            return None;
+        }
+        let mut price = ceil_to_tick_size(avg_entry * (dec!(1) + tp_pct));
+        if settle_hold {
+            price = price.max(dec!(0.99));
+        }
+        if price <= bid || price >= dec!(1) {
+            return None;
+        }
+        Some(price)
+    }
+
+    /// Restart the post-exit cooldown clock for a token whose exit is
+    /// resting on the book.
+    ///
+    /// A resting ask is lifted silently: the viper learns of it only when the
+    /// position vanishes from the map, so there is no exit emission to arm
+    /// the cooldown from. Touching the clock on every tick the ask rests
+    /// makes it run from the last tick the position was held, which is within
+    /// seconds of the lift. Unlike `arm_cooldown` this leaves the entry-fair
+    /// anchor alone — the position is still open and rule 2 still measures
+    /// decay from it.
+    fn touch_cooldown(&self, asset: &str, token_id: &str) {
+        let mut reg = match globals(asset).exit_cooldowns.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        reg.insert(token_id.to_string(), Instant::now());
     }
 
     /// Why the model-confirmation veto did not hold a stop that is about to
@@ -1123,6 +1242,11 @@ impl Strategy for FairValueStrategyImpl {
         let dc = &ctx.dynamic_config;
         let positions = ctx.positions.lock().await;
 
+        // Resting take-profit asks, deferred until every position has had its
+        // hard exits evaluated: a healthy position's ask must never preempt a
+        // stop still pending on another, since one signal leaves per tick.
+        let mut resting_tps: Vec<StrategySignal> = Vec::new();
+
         for (key, position) in positions.iter() {
             if key.squadron != ctx.squadron_id { continue; }
             let (strategy_name, token_id) = (&key.strategy, &key.market);
@@ -1157,6 +1281,16 @@ impl Strategy for FairValueStrategyImpl {
                 &ctx.crypto_filter, market, snap, token_is_yes,
                 dc.fairvalue_sigma_floor_horizon_secs,
             );
+
+            // ── Settlement-snipe posture ─────────────────────────────────────
+            // Entry × (1 + TP) at or above $1.00 is a take-profit that cannot
+            // fill, so rule 1 below is dead for this position and settlement is
+            // its only upside. Rule 4's percentage stop is then replaced by the
+            // model's EV test (rule 3b); only the catastrophic floor survives.
+            // Requires a model reading — without one the price stop stays armed.
+            let settle_snipe = dc.fairvalue_settle_snipe_hold
+                && Self::tp_unreachable(avg_entry, dc.fairvalue_target_profit_pct)
+                && fair_side.is_some();
 
             let exit_params = |price: Decimal| OrderParams {
                 token_id: token_id.clone(),
@@ -1225,6 +1359,42 @@ impl Strategy for FairValueStrategyImpl {
                 });
             }
 
+            // ── 3b. Settlement-snipe exit — the model's own EV test ──────────
+            // Sell when the fee-net bid is worth at least the model's settlement
+            // value. Below that, every dollar of drawdown is the market moving
+            // away from a model that still says hold, and selling realizes a
+            // loss on a position the entry test would open again. Counts as a
+            // stop-out for the circuit breaker when it books a loss: the model
+            // turned, which is the miscalibration the breaker exists to notice.
+            if settle_snipe
+                && secs_held >= config::FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS
+                && bid >= config::FAIRVALUE_MIN_EXIT_BID
+            {
+                if let Some(net) = Self::settle_snipe_exit(fair_side, bid) {
+                    self.arm_cooldown(&ctx.crypto_filter, token_id.as_str());
+                    if profit_margin < dec!(0) {
+                        if let Some(n) = self.count_stop_loss_once(
+                            &ctx.crypto_filter, token_id.as_str(), position.opened_at, &market.condition_id,
+                        ) {
+                            if n >= dc.fairvalue_max_stop_losses_per_market {
+                                tracing::warn!(
+                                    " FairValue circuit breaker: {} SL exits on \"{}\" — no further entries this market",
+                                    n, market.market_name
+                                );
+                            }
+                        }
+                    }
+                    return Ok(StrategySignal::Exit {
+                        params: exit_params(bid),
+                        reason: format!(
+                            "FairValueSnipeExit: bid=${:.4} net=${:.4} >= fair={:.3} ({:+.2}%), held={}s",
+                            bid, net, fair_side.unwrap_or(0.0), profit_margin * dec!(100), secs_held
+                        ),
+                        exit_pair: false,
+                    });
+                }
+            }
+
             // ── 4. Stop loss (min-hold gated, catastrophic bypass) ───────────
             // The catastrophic branch bypasses the min-hold so a genuine crash
             // isn't ridden down, but it still needs a floor: on a wide book the
@@ -1234,7 +1404,11 @@ impl Strategy for FairValueStrategyImpl {
             // gate decide once the book has had a chance to quote back.
             let catastrophic = profit_margin <= -(dc.fairvalue_stop_loss_pct * dec!(2))
                 && secs_held >= config::FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS / 2;
-            if profit_margin <= -dc.fairvalue_stop_loss_pct
+            // In the settlement-snipe posture only the catastrophic floor is
+            // armed; the percentage stop has been replaced by rule 3b.
+            let price_stop_armed = !settle_snipe || catastrophic;
+            if price_stop_armed
+                && profit_margin <= -dc.fairvalue_stop_loss_pct
                 && (catastrophic || secs_held >= config::FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS)
             {
                 // ── Model-confirmation veto ──────────────────────────────────
@@ -1351,10 +1525,11 @@ impl Strategy for FairValueStrategyImpl {
                     baseline, veto_decay_limit,
                 );
                 let book = format!(
-                    " | ask=${:.4} spread=${:.2} bid_depth={:.0} fair={} age={}s {}",
+                    " | ask=${:.4} spread=${:.2} bid_depth={:.0} fair={} age={}s {}{}",
                     ask, ask - bid, bid_depth,
                     fair_side.map_or_else(|| "n/a".to_string(), |p| format!("{:.3}", p)),
                     snap_age_secs, veto_note,
+                    if settle_snipe { " posture=settle-snipe" } else { "" },
                 );
                 return Ok(StrategySignal::Exit {
                     params: exit_params(bid),
@@ -1366,6 +1541,56 @@ impl Strategy for FairValueStrategyImpl {
                     exit_pair: false,
                 });
             }
+
+            // ── 5. Resting take-profit — the healthy position's way out ──────
+            // Every hard exit above declined, so let the position leave by
+            // being LIFTED at the target rather than crossing back to the bid
+            // for a second taker fee. Only a confirmed fill owns shares that
+            // can back a sell order. In the settlement-snipe posture the target
+            // price does not exist and `resting_tp_price` returns nothing —
+            // that position is managed to settlement by rule 3b. The consumer
+            // is idempotent, so re-emitting every tick is the contract.
+            if dc.fairvalue_resting_tp_enabled
+                && position.fill_effective_at(dc.ghost_mode).is_some()
+                && position.shares >= config::MIN_ORDER_SHARES
+            {
+                let settle_hold = secs_left < config::FAIRVALUE_SETTLE_HOLD_SECS
+                    && fair_side.map_or(false, |p| p >= config::FAIRVALUE_SETTLE_HOLD_MIN_PROB);
+                if let Some(price) = Self::resting_tp_price(
+                    avg_entry, dc.fairvalue_target_profit_pct, bid, settle_hold,
+                ) {
+                    self.touch_cooldown(&ctx.crypto_filter, token_id.as_str());
+                    resting_tps.push(StrategySignal::MakerRestingExit {
+                        params: OrderParams {
+                            token_id: token_id.clone(),
+                            price,
+                            shares: position.shares,
+                            fee_bps: if token_is_yes { market.yes_fee_bps as u16 } else { market.no_fee_bps as u16 },
+                            is_neg_risk: market.is_neg_risk,
+                            market_name: market.market_name.clone(),
+                            condition_id: market.condition_id.clone(),
+                            order_type: TimeInForce::Gtc,
+                            post_only: true,
+                            ghost_mode: dc.ghost_mode,
+                        },
+                        reason: format!(
+                            "FairValueRestingTP: ask=${:.4} entry=${:.4} target={:+.2}%{}",
+                            price, avg_entry, (price - avg_entry) / avg_entry * dec!(100),
+                            if settle_hold { " (settle-hold: raised to $0.99)" } else { "" },
+                        ),
+                    });
+                }
+            }
+        }
+
+        // One signal leaves per tick, so with several healthy positions the
+        // ask for each is emitted in turn. The consumer no-ops on the ones it
+        // already has resting, so rotation costs nothing and guarantees every
+        // position gets its ask placed within a few ticks.
+        if !resting_tps.is_empty() {
+            static ROTATION: AtomicUsize = AtomicUsize::new(0);
+            let i = ROTATION.fetch_add(1, Ordering::Relaxed) % resting_tps.len();
+            return Ok(resting_tps.swap_remove(i));
         }
 
         Ok(StrategySignal::NoSignal)
@@ -2122,6 +2347,221 @@ mod entry_book_tests {
         assert!(reason.ends_with(" veto=withdrawn(no model)"), "{reason}");
     }
 
+    /// The line above which the take-profit is a price that does not exist:
+    /// 1/(1 + TP), $0.8333 at 20%. Both live entries in the zone (#2 at $0.93,
+    /// #4 at $0.92) are in; the cheap-tail entries are out.
+    #[test]
+    fn the_take_profit_is_unreachable_above_one_over_one_plus_tp() {
+        let tp = dec!(0.20);
+        assert!(FairValueStrategyImpl::tp_unreachable(dec!(0.92), tp));
+        assert!(FairValueStrategyImpl::tp_unreachable(dec!(0.93), tp));
+        assert!(FairValueStrategyImpl::tp_unreachable(dec!(0.8334), tp));
+        assert!(!FairValueStrategyImpl::tp_unreachable(dec!(0.83), tp));
+        assert!(!FairValueStrategyImpl::tp_unreachable(dec!(0.75), tp));
+        assert!(!FairValueStrategyImpl::tp_unreachable(dec!(0.20), tp));
+        // The boundary moves with the knob that creates it.
+        assert!(FairValueStrategyImpl::tp_unreachable(dec!(0.95), dec!(0.06)));
+        assert!(!FairValueStrategyImpl::tp_unreachable(dec!(0.92), dec!(0.06)));
+    }
+
+    /// The EV test at the moment trade #4 stopped out: bid $0.78, model 0.846.
+    /// Net proceeds $0.768 are below what the model says settlement is worth,
+    /// so hold. Once the model has given up more than the market has, sell.
+    /// No model reading is no opinion.
+    #[test]
+    fn the_snipe_exit_holds_while_the_model_is_worth_more_than_the_bid() {
+        assert_eq!(FairValueStrategyImpl::settle_snipe_exit(Some(0.846), dec!(0.78)), None);
+        // Endgame: model 0.999 against a $0.99 bid — hold for the fee-free $1.00.
+        assert_eq!(FairValueStrategyImpl::settle_snipe_exit(Some(0.999), dec!(0.99)), None);
+        // Thesis gone: model 0.60 against a $0.78 bid — the market overpays, sell.
+        let net = FairValueStrategyImpl::settle_snipe_exit(Some(0.60), dec!(0.78))
+            .expect("a model below the fee-net bid must sell");
+        assert_eq!(net, dec!(0.78) - FairValueStrategyImpl::fee_frac(dec!(0.78)));
+        // The same rule is the take-profit: a $0.99 bid against a 0.95 model.
+        assert!(FairValueStrategyImpl::settle_snipe_exit(Some(0.95), dec!(0.99)).is_some());
+        assert_eq!(FairValueStrategyImpl::settle_snipe_exit(None, dec!(0.78)), None);
+        assert_eq!(FairValueStrategyImpl::settle_snipe_exit(Some(0.10), dec!(0)), None);
+    }
+
+    /// Seed the per-asset vol sampler so `fair_prob_for_side` can price: the
+    /// samples are flat enough that the σ floor binds, which makes the fair
+    /// value a pure function of spot, strike and time.
+    fn seed_flat_vol(asset: &str) {
+        let mut samples = globals(asset).vol_samples.lock().unwrap();
+        samples.clear();
+        let now = Instant::now();
+        let n = config::FAIRVALUE_MIN_VOL_SAMPLES + 5;
+        for i in 0..n {
+            let age = std::time::Duration::from_secs((config::FAIRVALUE_VOL_SAMPLE_SECS * (n - i) as u64).max(1));
+            let px = 65000.0 + if i % 2 == 0 { 0.01 } else { -0.01 };
+            samples.push_back((now.checked_sub(age).unwrap_or(now), px));
+        }
+    }
+
+    /// Trade #4 of 2026-09-06, driven through the real exit path: NO bought at
+    /// $0.92 (TP $1.104 — no such price), the book at bid $0.78 / ask $0.81,
+    /// held 391s, the model still reading ~0.85 for NO. Production stopped it
+    /// out for −$0.79; the market recovered within the minute and settled at
+    /// $1.00. In the settlement-snipe posture the percentage stop stands down
+    /// and the EV test holds, because $0.768 net is worth less than a 0.85
+    /// chance at $1.00. With the knob off the old stop fires, and the reason
+    /// carries no posture marker.
+    #[tokio::test]
+    async fn trade_4_is_held_in_the_settlement_snipe_posture() {
+        use crate::state::Position;
+
+        let asset = "btc-b40-trade-4";
+        seed_flat_vol(asset);
+
+        let mut hourly = book(dec!(200), dec!(150));
+        hourly.no_bid = dec!(0.78); hourly.no_bid_depth = dec!(5);
+        hourly.no_ask = dec!(0.81); hourly.no_ask_depth = dec!(50);
+        hourly.yes_bid = dec!(0.19); hourly.yes_ask = dec!(0.22);
+        // Spot just under the strike: with the σ floor binding and 1h left,
+        // fair(NO) lands near 0.85 — the reading production logged at the stop.
+        hourly.oracle_price = dec!(64830);
+
+        let mut c = ctx(hourly, book(dec!(100), dec!(100)));
+        c.crypto_filter = asset.to_string();
+        let mut dc = DynamicConfig::default();
+        dc.enable_fairvalue = true;
+        dc.fairvalue_target_profit_pct = dec!(0.20);
+        dc.fairvalue_stop_loss_pct = dec!(0.15);
+        dc.fairvalue_settle_snipe_hold = true;
+        dc.fairvalue_sigma_floor_horizon_secs = 0;
+        c.dynamic_config = Arc::new(dc);
+
+        let strat = FairValueStrategyImpl::default();
+        let fair_no = strat
+            .fair_prob_for_side(asset, &c.market, &c.snapshot, false, 0)
+            .expect("the seeded sampler must let the model price");
+        assert!((0.80..0.90).contains(&fair_no), "fair(NO)={fair_no} should sit near the logged 0.846");
+
+        let no_token = c.market.no_token.clone();
+        let opened = Utc::now() - chrono::Duration::seconds(391);
+        let position = Position {
+            shares: dec!(5.05), avg_entry: dec!(0.92), opened_at: opened,
+            close_time: c.market.market_close_time,
+            market_name: c.market.market_name.clone(),
+            pair_token_id: c.market.yes_token.clone(),
+            fill_confirmed_at: Some(opened), paired_leg_token_id: None,
+            entry_fee: dec!(0.026),
+        };
+        c.positions.lock().await.insert(
+            PositionKey::new(c.squadron_id.clone(), "FairValueStrategy", no_token.clone()),
+            position.clone(),
+        );
+
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        assert!(matches!(sig, StrategySignal::NoSignal), "a −15.2% mark with the model at {fair_no:.3} must be held, got {sig:?}");
+
+        // Knob off: the 2026-09-06 stop fires exactly as it did in production.
+        let mut dc = (*c.dynamic_config).clone();
+        dc.fairvalue_settle_snipe_hold = false;
+        c.dynamic_config = Arc::new(dc);
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        let StrategySignal::Exit { params, reason, .. } = sig else {
+            panic!("with the posture off the percentage stop must fire, got {sig:?}");
+        };
+        assert_eq!(params.price, dec!(0.78));
+        assert!(reason.starts_with("FairValueSL: bid=$0.7800, loss=-15.2"), "{reason}");
+        assert!(!reason.contains("posture="), "{reason}");
+    }
+
+    /// The two exits that remain armed in the posture. A model that has given
+    /// up more than the market (spot through the strike, fair(NO) ≈ 0.42
+    /// against a $0.78 bid) sells on the EV test and counts as a stop-out; a
+    /// bid two stop widths down fires the catastrophic floor regardless of what
+    /// the model says, and the reason records the posture.
+    #[tokio::test]
+    async fn the_posture_keeps_the_ev_exit_and_the_catastrophic_floor() {
+        use crate::state::Position;
+
+        let asset = "btc-b40-posture-exits";
+        seed_flat_vol(asset);
+
+        let mut hourly = book(dec!(200), dec!(150));
+        hourly.no_bid = dec!(0.78); hourly.no_bid_depth = dec!(5);
+        hourly.no_ask = dec!(0.81); hourly.no_ask_depth = dec!(50);
+        hourly.yes_bid = dec!(0.19); hourly.yes_ask = dec!(0.22);
+        // Spot above the strike: the NO thesis is gone.
+        hourly.oracle_price = dec!(65033);
+
+        let mut c = ctx(hourly, book(dec!(100), dec!(100)));
+        c.crypto_filter = asset.to_string();
+        let mut dc = DynamicConfig::default();
+        dc.enable_fairvalue = true;
+        dc.fairvalue_target_profit_pct = dec!(0.20);
+        dc.fairvalue_stop_loss_pct = dec!(0.15);
+        dc.fairvalue_settle_snipe_hold = true;
+        dc.fairvalue_sigma_floor_horizon_secs = 0;
+        // Wide enough that the entry-relative reversal (rule 2) stays out of the way.
+        dc.fairvalue_model_reversal_decay_pct = dec!(0.90);
+        dc.fairvalue_max_stop_losses_per_market = 1;
+        c.dynamic_config = Arc::new(dc);
+
+        let strat = FairValueStrategyImpl::default();
+        let fair_no = strat
+            .fair_prob_for_side(asset, &c.market, &c.snapshot, false, 0)
+            .expect("the seeded sampler must let the model price");
+        assert!(fair_no < 0.76, "fair(NO)={fair_no} must sit below the fee-net bid for the EV exit");
+
+        let no_token = c.market.no_token.clone();
+        let opened = Utc::now() - chrono::Duration::seconds(391);
+        let position = Position {
+            shares: dec!(5.05), avg_entry: dec!(0.92), opened_at: opened,
+            close_time: c.market.market_close_time,
+            market_name: c.market.market_name.clone(),
+            pair_token_id: c.market.yes_token.clone(),
+            fill_confirmed_at: Some(opened), paired_leg_token_id: None,
+            entry_fee: dec!(0.026),
+        };
+        c.positions.lock().await.insert(
+            PositionKey::new(c.squadron_id.clone(), "FairValueStrategy", no_token.clone()),
+            position.clone(),
+        );
+
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        let StrategySignal::Exit { params, reason, .. } = sig else {
+            panic!("a model below the fee-net bid must sell, got {sig:?}");
+        };
+        assert_eq!(params.price, dec!(0.78));
+        let net = dec!(0.78) - FairValueStrategyImpl::fee_frac(dec!(0.78));
+        assert!(reason.starts_with(&format!("FairValueSnipeExit: bid=$0.7800 net=${net:.4} >= fair=0.")), "{reason}");
+        assert!(reason.contains("(-15.21%), held=391s"), "{reason}");
+        // Booked at a loss, so it counted toward the breaker.
+        let counts = globals(asset).sl_counts.lock().unwrap();
+        assert_eq!(counts.get(&c.market.condition_id).copied(), Some(1));
+        drop(counts);
+
+        // Catastrophic floor, model back in NO's favor so only the floor can fire.
+        let mut hourly = book(dec!(200), dec!(150));
+        hourly.no_bid = dec!(0.60); hourly.no_bid_depth = dec!(5);
+        hourly.no_ask = dec!(0.63); hourly.no_ask_depth = dec!(50);
+        hourly.yes_bid = dec!(0.37); hourly.yes_ask = dec!(0.40);
+        hourly.oracle_price = dec!(64830);
+        let asset2 = "btc-b40-posture-catastrophic";
+        seed_flat_vol(asset2);
+        let mut c2 = ctx(hourly, book(dec!(100), dec!(100)));
+        c2.crypto_filter = asset2.to_string();
+        c2.dynamic_config = c.dynamic_config.clone();
+        let fair_no = strat
+            .fair_prob_for_side(asset2, &c2.market, &c2.snapshot, false, 0)
+            .expect("the seeded sampler must let the model price");
+        assert!(fair_no > 0.60 - 0.02, "fair(NO)={fair_no}: the EV test must NOT be what fires here");
+        c2.positions.lock().await.insert(
+            PositionKey::new(c2.squadron_id.clone(), "FairValueStrategy", c2.market.no_token.clone()),
+            position.clone(),
+        );
+        let sig = strat.evaluate_exit(&c2).await.expect("exit evaluation runs");
+        let StrategySignal::Exit { params, reason, .. } = sig else {
+            panic!("a −34.8% mark must hit the catastrophic floor, got {sig:?}");
+        };
+        assert_eq!(params.price, dec!(0.60));
+        assert!(reason.starts_with("FairValueCatastrophicSL: bid=$0.6000, loss=-34.7"), "{reason}");
+        assert!(reason.ends_with(" veto=n/a(catastrophic) posture=settle-snipe"), "{reason}");
+    }
+
     /// The call site itself, pinned against the source: the production half of
     /// this file must never again read the hourly book's depths directly.
     #[test]
@@ -2132,6 +2572,265 @@ mod entry_book_tests {
             assert!(!prod.contains(needle), "{needle} is back — the veto is measuring the wrong market again");
         }
     }
+    // ── Resting take-profit (E60) ───────────────────────────────────────────
+
+    /// The ask rests at entry × (1 + TP), rounded up to the tick. It does not
+    /// exist for a settlement-snipe entry, cannot sit at or under the bid, and
+    /// cannot reach $1.00; inside the settlement hold it moves to $0.99.
+    #[test]
+    fn the_resting_ask_sits_at_the_target_or_nowhere() {
+        let tp = dec!(0.20);
+        // Trade #3: NO at $0.20, bid $0.21 — ask at $0.24.
+        assert_eq!(FairValueStrategyImpl::resting_tp_price(dec!(0.20), tp, dec!(0.21), false), Some(dec!(0.24)));
+        // Rounds UP to the tick, never down: 0.2075 × 1.2 = 0.249 → $0.25.
+        assert_eq!(FairValueStrategyImpl::resting_tp_price(dec!(0.2075), tp, dec!(0.21), false), Some(dec!(0.25)));
+        // Settlement-snipe posture (#2 at 0.93, #4 at 0.92): no such price.
+        assert_eq!(FairValueStrategyImpl::resting_tp_price(dec!(0.92), tp, dec!(0.78), false), None);
+        assert_eq!(FairValueStrategyImpl::resting_tp_price(dec!(0.8334), tp, dec!(0.80), false), None);
+        // Just inside the reachable zone but rounding carries it to $1.00.
+        assert_eq!(FairValueStrategyImpl::resting_tp_price(dec!(0.83), tp, dec!(0.80), false), None);
+        // The bid has reached the target: rule 1's FAK owns that case.
+        assert_eq!(FairValueStrategyImpl::resting_tp_price(dec!(0.20), tp, dec!(0.24), false), None);
+        assert_eq!(FairValueStrategyImpl::resting_tp_price(dec!(0.20), tp, dec!(0.30), false), None);
+        // Settlement hold: raised to the top of the book.
+        assert_eq!(FairValueStrategyImpl::resting_tp_price(dec!(0.75), tp, dec!(0.85), true), Some(dec!(0.99)));
+        assert_eq!(FairValueStrategyImpl::resting_tp_price(dec!(0.75), tp, dec!(0.99), true), None);
+        assert_eq!(FairValueStrategyImpl::resting_tp_price(dec!(0), tp, dec!(0.21), false), None);
+    }
+
+    /// A confirmed, healthy FairValue position emits the resting ask every
+    /// tick: post-only GTC at the target, for the whole position. The knob
+    /// turns it off, an unconfirmed fill owns no shares to sell, and the
+    /// cooldown clock is touched so a silent lift still locks the token out.
+    #[tokio::test]
+    async fn a_healthy_position_rests_its_take_profit() {
+        use crate::state::Position;
+
+        let asset = "btc-e60-healthy";
+        let mut hourly = book(dec!(200), dec!(150));
+        hourly.no_bid = dec!(0.21); hourly.no_bid_depth = dec!(50);
+        hourly.no_ask = dec!(0.23); hourly.no_ask_depth = dec!(50);
+        hourly.yes_bid = dec!(0.77); hourly.yes_ask = dec!(0.79);
+        let mut c = ctx(hourly, book(dec!(100), dec!(100)));
+        c.crypto_filter = asset.to_string();
+        let mut dc = DynamicConfig::default();
+        dc.enable_fairvalue = true;
+        dc.fairvalue_target_profit_pct = dec!(0.20);
+        dc.fairvalue_stop_loss_pct = dec!(0.15);
+        dc.fairvalue_resting_tp_enabled = true;
+        dc.fairvalue_post_exit_cooldown_secs = 900;
+        // Live, not ghost: a ghost fill counts as owned before confirmation
+        // (see `Position::fill_effective_at`), which the last check below
+        // relies on NOT being the case.
+        dc.ghost_mode = false;
+        c.dynamic_config = Arc::new(dc);
+
+        let no_token = c.market.no_token.clone();
+        let opened = Utc::now() - chrono::Duration::seconds(30);
+        let position = Position {
+            shares: dec!(28), avg_entry: dec!(0.20), opened_at: opened,
+            close_time: c.market.market_close_time,
+            market_name: c.market.market_name.clone(),
+            pair_token_id: c.market.yes_token.clone(),
+            fill_confirmed_at: Some(opened), paired_leg_token_id: None,
+            entry_fee: dec!(0.3136),
+        };
+        let key = PositionKey::new(c.squadron_id.clone(), "FairValueStrategy", no_token.clone());
+        c.positions.lock().await.insert(key.clone(), position.clone());
+
+        let strat = FairValueStrategyImpl::default();
+        assert!(!strat.cooldown_active(asset, no_token.as_str(), 900), "fresh token must not start in cooldown");
+
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        let StrategySignal::MakerRestingExit { params, reason } = sig else {
+            panic!("a healthy confirmed position must rest its take-profit, got {sig:?}");
+        };
+        assert_eq!(params.token_id, no_token);
+        assert_eq!(params.price, dec!(0.24));
+        assert_eq!(params.shares, dec!(28));
+        assert!(params.post_only, "the ask must be post-only or it pays the taker fee it exists to avoid");
+        assert_eq!(params.order_type, TimeInForce::Gtc);
+        assert!(!params.ghost_mode);
+        assert!(reason.starts_with("FairValueRestingTP: ask=$0.2400 entry=$0.2000 target=+20.00%"), "{reason}");
+        assert!(!reason.contains("settle-hold"), "{reason}");
+        assert!(strat.cooldown_active(asset, no_token.as_str(), 900), "the resting ask must keep the post-exit cooldown armed");
+
+        // Re-emitted every tick: the consumer is idempotent.
+        let again = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        assert!(matches!(again, StrategySignal::MakerRestingExit { .. }), "{again:?}");
+
+        // Knob off: back to the taker take-profit — nothing rests, and at +5%
+        // rule 1 has nothing to do either.
+        let mut dc = (*c.dynamic_config).clone();
+        dc.fairvalue_resting_tp_enabled = false;
+        c.dynamic_config = Arc::new(dc);
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        assert!(matches!(sig, StrategySignal::NoSignal), "knob off must rest nothing, got {sig:?}");
+
+        // Knob on, fill not yet confirmed: no shares to back a sell order.
+        let mut dc = (*c.dynamic_config).clone();
+        dc.fairvalue_resting_tp_enabled = true;
+        c.dynamic_config = Arc::new(dc);
+        let mut pending = position.clone();
+        pending.fill_confirmed_at = None;
+        c.positions.lock().await.insert(key.clone(), pending);
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        assert!(matches!(sig, StrategySignal::NoSignal), "an unconfirmed fill must rest nothing, got {sig:?}");
+    }
+
+    /// A stop always outranks the resting ask, and the patrol pulls the ask
+    /// before the FAK needs the shares. Here the same position is 20% under
+    /// water past the min-hold with no model reading to veto: rule 4 fires
+    /// and no resting signal is offered.
+    #[tokio::test]
+    async fn a_stop_wins_the_tick_over_the_resting_ask() {
+        use crate::state::Position;
+
+        let asset = "btc-e60-stop";
+        let mut hourly = book(dec!(200), dec!(150));
+        hourly.no_bid = dec!(0.16); hourly.no_bid_depth = dec!(50);
+        hourly.no_ask = dec!(0.18); hourly.no_ask_depth = dec!(50);
+        hourly.yes_bid = dec!(0.82); hourly.yes_ask = dec!(0.84);
+        let mut c = ctx(hourly, book(dec!(100), dec!(100)));
+        c.crypto_filter = asset.to_string();
+        let mut dc = DynamicConfig::default();
+        dc.enable_fairvalue = true;
+        dc.fairvalue_target_profit_pct = dec!(0.20);
+        dc.fairvalue_stop_loss_pct = dec!(0.15);
+        dc.fairvalue_resting_tp_enabled = true;
+        c.dynamic_config = Arc::new(dc);
+
+        let no_token = c.market.no_token.clone();
+        let opened = Utc::now() - chrono::Duration::seconds(config::FAIRVALUE_MIN_HOLD_SECS_BEFORE_STOP_LOSS + 30);
+        c.positions.lock().await.insert(
+            PositionKey::new(c.squadron_id.clone(), "FairValueStrategy", no_token.clone()),
+            Position {
+                shares: dec!(28), avg_entry: dec!(0.20), opened_at: opened,
+                close_time: c.market.market_close_time,
+                market_name: c.market.market_name.clone(),
+                pair_token_id: c.market.yes_token.clone(),
+                fill_confirmed_at: Some(opened), paired_leg_token_id: None,
+                entry_fee: dec!(0.3136),
+            },
+        );
+
+        let strat = FairValueStrategyImpl::default();
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        let StrategySignal::Exit { params, reason, .. } = sig else {
+            panic!("a −20% mark past the min-hold must stop out, got {sig:?}");
+        };
+        assert_eq!(params.price, dec!(0.16));
+        assert!(!params.post_only && params.order_type == TimeInForce::Fak, "a stop crosses");
+        assert!(reason.starts_with("FairValueSL: bid=$0.1600, loss=-20.00%"), "{reason}");
+    }
+
+    /// B40 composition: an entry above 1/(1 + TP) has no target price, so it
+    /// rests nothing — with the snipe posture on (managed to settlement by the
+    /// EV test) and with it off (managed by the percentage stop). Trade #2's
+    /// YES at $0.93, marked at $0.90, held 30s.
+    #[tokio::test]
+    async fn a_settlement_snipe_entry_rests_nothing() {
+        use crate::state::Position;
+
+        let asset = "btc-e60-snipe";
+        let mut hourly = book(dec!(200), dec!(150));
+        hourly.yes_bid = dec!(0.90); hourly.yes_bid_depth = dec!(50);
+        hourly.yes_ask = dec!(0.92); hourly.yes_ask_depth = dec!(50);
+        hourly.no_bid = dec!(0.08); hourly.no_ask = dec!(0.10);
+        let mut c = ctx(hourly, book(dec!(100), dec!(100)));
+        c.crypto_filter = asset.to_string();
+        let yes_token = c.market.yes_token.clone();
+        let opened = Utc::now() - chrono::Duration::seconds(30);
+        c.positions.lock().await.insert(
+            PositionKey::new(c.squadron_id.clone(), "FairValueStrategy", yes_token.clone()),
+            Position {
+                shares: dec!(5.4), avg_entry: dec!(0.93), opened_at: opened,
+                close_time: c.market.market_close_time,
+                market_name: c.market.market_name.clone(),
+                pair_token_id: c.market.no_token.clone(),
+                fill_confirmed_at: Some(opened), paired_leg_token_id: None,
+                entry_fee: dec!(0.0246),
+            },
+        );
+        let strat = FairValueStrategyImpl::default();
+
+        for snipe in [true, false] {
+            let mut dc = DynamicConfig::default();
+            dc.enable_fairvalue = true;
+            dc.fairvalue_target_profit_pct = dec!(0.20);
+            dc.fairvalue_stop_loss_pct = dec!(0.15);
+            dc.fairvalue_resting_tp_enabled = true;
+            dc.fairvalue_settle_snipe_hold = snipe;
+            c.dynamic_config = Arc::new(dc);
+            let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+            assert!(
+                matches!(sig, StrategySignal::NoSignal),
+                "an entry whose target is $1.116 must rest nothing (snipe posture {snipe}), got {sig:?}"
+            );
+        }
+    }
+
+    /// Inside the settlement hold — the model at or above SETTLE_HOLD_MIN_PROB
+    /// with under SETTLE_HOLD_SECS to close — rule 1 declines a taker
+    /// take-profit in favor of the fee-free $1.00. The resting ask honors the
+    /// same call: it is raised to $0.99 rather than left to sell the position
+    /// at the target. NO at $0.75 (target $0.90), bid $0.85, spot under the
+    /// strike with 500s left so fair(NO) clears the hold threshold.
+    #[tokio::test]
+    async fn inside_the_settlement_hold_the_ask_is_raised_to_the_top_of_the_book() {
+        use crate::state::Position;
+
+        let asset = "btc-e60-settle-hold";
+        seed_flat_vol(asset);
+
+        let mut hourly = book(dec!(200), dec!(150));
+        hourly.no_bid = dec!(0.85); hourly.no_bid_depth = dec!(50);
+        hourly.no_ask = dec!(0.88); hourly.no_ask_depth = dec!(50);
+        hourly.yes_bid = dec!(0.12); hourly.yes_ask = dec!(0.15);
+        hourly.oracle_price = dec!(64700);
+        hourly.secs_to_expiry = 500;
+        let mut c = ctx(hourly, book(dec!(100), dec!(100)));
+        c.crypto_filter = asset.to_string();
+        c.market.market_close_time = Some(Utc::now() + chrono::Duration::seconds(500));
+        let mut dc = DynamicConfig::default();
+        dc.enable_fairvalue = true;
+        dc.fairvalue_target_profit_pct = dec!(0.20);
+        dc.fairvalue_stop_loss_pct = dec!(0.15);
+        dc.fairvalue_resting_tp_enabled = true;
+        dc.fairvalue_sigma_floor_horizon_secs = 0;
+        c.dynamic_config = Arc::new(dc);
+
+        let strat = FairValueStrategyImpl::default();
+        let fair_no = strat
+            .fair_prob_for_side(asset, &c.market, &c.snapshot, false, 0)
+            .expect("the seeded sampler must let the model price");
+        assert!(
+            fair_no >= config::FAIRVALUE_SETTLE_HOLD_MIN_PROB,
+            "the fixture must sit inside the settlement hold: fair(NO)={fair_no}"
+        );
+
+        let no_token = c.market.no_token.clone();
+        let opened = Utc::now() - chrono::Duration::seconds(600);
+        c.positions.lock().await.insert(
+            PositionKey::new(c.squadron_id.clone(), "FairValueStrategy", no_token.clone()),
+            Position {
+                shares: dec!(7), avg_entry: dec!(0.75), opened_at: opened,
+                close_time: c.market.market_close_time,
+                market_name: c.market.market_name.clone(),
+                pair_token_id: c.market.yes_token.clone(),
+                fill_confirmed_at: Some(opened), paired_leg_token_id: None,
+                entry_fee: dec!(0.0919),
+            },
+        );
+
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        let StrategySignal::MakerRestingExit { params, reason } = sig else {
+            panic!("inside the settlement hold the ask must be raised, not withdrawn, got {sig:?}");
+        };
+        assert_eq!(params.price, dec!(0.99));
+        assert!(reason.contains("(settle-hold: raised to $0.99)"), "{reason}");
+    }
+
 }
 
 #[cfg(test)]

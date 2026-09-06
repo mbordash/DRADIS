@@ -668,6 +668,27 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              On 2026-08-15 a NO entered at $0.50 stopped out at $0.44 — 1.4× the model's own 120s noise, with \
              3,800s left — while the model read edge +0.145 vs req 0.140; it settled at $1.00.")
             .range(0.0, 5.0).step(0.1));
+        v.push(F::new(g, e, "fairvalue_settle_snipe_hold", "Settlement-Snipe Posture", "bool", true,
+            "Manage an entry whose Take Profit is unreachable (entry × (1 + TP) ≥ $1.00, i.e. above $0.8333 at \
+             20%) as a settlement snipe. Such a position has no upside rung on its exit ladder — its profit is \
+             the $1.00 settlement, which beats any reachable target and pays no exit fee — so the percentage \
+             stop is the wrong instrument: a price that is also a probability touches a 15% stop from $0.92 \
+             about 4.6× as often as the contract actually settles against it. On, the percentage stop stands \
+             down for these entries and the position sells only when the bid net of the taker fee is worth at \
+             least the model's settlement value (the model's own EV test — its stop and its take-profit). The \
+             catastrophic stop (2× Stop Loss) is kept as insurance against a stale model, and the endgame \
+             bail-out still applies. 2026-09-06: NO at $0.92 stopped at $0.78 for −$0.79 with the model still \
+             at 0.846; it settled at $1.00. Off restores the percentage stop for every entry."));
+        v.push(F::new(g, e, "fairvalue_resting_tp_enabled", "Resting Take Profit", "bool", true,
+            "Take profit with a resting post-only ask at entry × (1 + Take Profit) instead of a taker FAK at \
+             the bid. Makers pay no fee, and an ask at the take-profit price is lifted only when the market runs \
+             through the price the viper would have sold at anyway — so unlike a resting bid, being filled is \
+             not evidence the thesis has turned. The ask sits at a fixed price for the life of the position (no \
+             chasing, no lost queue position); stops, the model-reversal exit and the endgame bail-out still \
+             cross with a FAK and pull the ask first; inside the settlement hold it is raised to $0.99; an entry \
+             in the settlement-snipe posture rests nothing because its target price does not exist. Replay of \
+             the first four live entries (2026-09-06): lifted in two, saving $0.362 — 40% of all fees paid \
+             across the first three trades. Off restores the taker take-profit."));
         v.push(F::new(g, e, "fairvalue_post_exit_cooldown_secs", "Post-Exit Cooldown", "secs", true,
             "Seconds a token is locked out after any FairValue exit. Second entries into a market the viper had \
              just left went 0-for-4 for −$1.88 gross on 2026-08-13/14 while first entries were flat, and the \

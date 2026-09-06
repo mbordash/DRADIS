@@ -198,6 +198,15 @@ struct MakerRestingExit {
     booked: Decimal,
     /// Entry price captured at placement, for P&L on fill.
     avg_entry: Decimal,
+    /// Entry fee still unbooked on the position at placement, in dollars.
+    ///
+    /// Zero for a maker-entered position (the Maker's quotes pay nothing), and
+    /// the taker fee for a FairValue position that crossed the spread to get
+    /// in. The lift is booked net of it — without this a taker-entered
+    /// position's resting exit reported the gross move as profit, the same
+    /// shape as B35. The live position is the authority while it exists;
+    /// this copy serves only once the position is gone from the map.
+    entry_fee: Decimal,
     market_name: String,
     /// Last time the on-chain balance was polled for this token.
     last_poll: Instant,
@@ -995,6 +1004,7 @@ impl Squadron {
                     // into the StrategyContext below.
                     let resting_exit_reprice_threshold = dyn_cfg.maker_resting_exit_reprice_threshold;
                     let resting_exit_enabled = dyn_cfg.maker_resting_exit_enabled;
+                    let fairvalue_resting_tp_enabled = dyn_cfg.fairvalue_resting_tp_enabled;
                     // Read through the floored accessor — see its doc for why the
                     // schema minimum alone is not enough.
                     let exit_retry_cooldown_secs = dyn_cfg.exit_retry_cooldown_secs_floored();
@@ -1431,20 +1441,23 @@ impl Squadron {
                                     let lifted = (prior_shares - held).max(matched).max(dec!(0));
 
                                     if lifted >= config::MIN_ORDER_SHARES {
-                                        let avg_entry = {
+                                        let (avg_entry, entry_fee) = {
                                             let map = positions.lock().await;
-                                            map.get(&pos_key).map(|p| p.avg_entry).unwrap_or(rest.avg_entry)
+                                            map.get(&pos_key).map(|p| (p.avg_entry, p.entry_fee))
+                                                .unwrap_or((rest.avg_entry, rest.entry_fee))
                                         };
-                                        let pnl = (rest.price - avg_entry) * lifted;
+                                        // Net of the entry fee this slice carries: zero for
+                                        // the Maker, the taker fee for FairValue.
+                                        let bk = resting_exit::book_lift(rest.price, avg_entry, entry_fee, lifted, prior_shares);
+                                        let pnl = bk.pnl;
                                         let side_label = side_of(&tid_m).to_string();
-                                        info!("✅ Maker resting exit filled [{}]: {:.4} shares lifted @ ${:.4} (entry ${:.4}) pnl=${:.4} — preempted \"{}\"",
-                                              sn, lifted, rest.price, avg_entry, pnl, reason);
+                                        info!("✅ {} filled [{}]: {:.4} shares lifted @ ${:.4} (entry ${:.4}) pnl=${:.4}{} — preempted \"{}\"",
+                                              resting_exit::label(&sn), sn, lifted, rest.price, avg_entry, pnl, bk.fee_note(), reason);
                                         *total_pnl.lock().await += pnl;
                                         metrics::record_trade(
-                                            &scope, Decimal::ZERO, sn.clone(), params.market_name.clone(), side_label,
+                                            &scope, bk.entry_fee_booked, sn.clone(), params.market_name.clone(), side_label,
                                             avg_entry, rest.price, lifted, pnl,
-                                            format!("Maker resting exit: lifted @ ${:.4} (spread captured, gain={:.2}%)",
-                                                    rest.price, (rest.price - avg_entry) / avg_entry * dec!(100)),
+                                            resting_exit::ledger_reason(&sn, rest.price, avg_entry),
                                         ).await;
                                         last_trade_time.insert(sn.clone(), Instant::now());
 
@@ -1457,8 +1470,12 @@ impl Squadron {
                                             }
                                             continue;
                                         }
-                                        // Partial lift: the stop still wants the rest out.
-                                        if let Some(p) = positions.lock().await.get_mut(&pos_key) { p.shares = held; }
+                                        // Partial lift: the stop still wants the rest out, and
+                                        // the FAK that follows nets the entry fee left with it.
+                                        if let Some(p) = positions.lock().await.get_mut(&pos_key) {
+                                            p.shares = held;
+                                            p.entry_fee = bk.entry_fee_left;
+                                        }
                                     } else {
                                         info!("🚫 EXIT [{}]: pulled resting ask to free shares for \"{}\"", sn, reason);
                                         if held >= config::MIN_ORDER_SHARES {
@@ -1602,12 +1619,12 @@ impl Squadron {
                                                             resting_ask_price, market_open, p.avg_entry, p.entry_fee, p.shares,
                                                         ).map(|(px, pnl)| {
                                                             info!(
-                                                                "✅ Maker resting exit filled [{}]: {:.4} shares lifted @ ${:.4} (entry ${:.4}) pnl=${:.4} — attributed: the venue rejected \"{}\" because the ask had already filled",
-                                                                sn, p.shares, px, p.avg_entry, pnl, reason
+                                                                "✅ {} filled [{}]: {:.4} shares lifted @ ${:.4} (entry ${:.4}) pnl=${:.4} — attributed: the venue rejected \"{}\" because the ask had already filled",
+                                                                resting_exit::label(&sn), sn, p.shares, px, p.avg_entry, pnl, reason
                                                             );
                                                             (px, pnl, format!(
-                                                                "Maker resting exit: lifted @ ${:.4} (spread captured, gain={:.2}%) (attributed from the resting ask after the venue rejected the stop)",
-                                                                px, (px - p.avg_entry) / p.avg_entry * dec!(100)
+                                                                "{} (attributed from the resting ask after the venue rejected the stop)",
+                                                                resting_exit::ledger_reason(&sn, px, p.avg_entry)
                                                             ))
                                                         }),
                                                     };
@@ -2588,16 +2605,18 @@ impl Squadron {
                             // to the bid. Idempotent by contract — the strategy re-emits
                             // this every tick, so the common path here is a no-op.
                             StrategySignal::MakerRestingExit { params, reason } => {
-                                if !resting_exit_enabled { continue; }
+                                // Each strategy that rests an exit owns its own knob.
+                                if !resting_exit::enabled_for(&sn, resting_exit_enabled, fairvalue_resting_tp_enabled) { continue; }
                                 let tok = params.token_id.clone();
                                 let pk = PositionKey::new(sq_key.clone(), sn.clone(), tok.clone());
+                                let label = resting_exit::label(&sn);
 
                                 // The position must still be live and confirmed —
                                 // a stop may have closed it earlier in this very tick.
-                                let (live_shares, avg_entry) = {
+                                let (live_shares, avg_entry, entry_fee) = {
                                     let map = positions.lock().await;
                                     match map.get(&pk) {
-                                        Some(p) if p.fill_confirmed_at.is_some() => (p.shares, p.avg_entry),
+                                        Some(p) if p.fill_confirmed_at.is_some() => (p.shares, p.avg_entry, p.entry_fee),
                                         _ => continue,
                                     }
                                 };
@@ -2605,10 +2624,10 @@ impl Squadron {
 
                                 if ghosting || params.ghost_mode {
                                     if !maker_resting_exits.contains_key(&pk) {
-                                        info!("👻 GHOST_MODE MakerRestingExit [{}]: {} | shares={:.2}, ask=${:.4} (simulated)",
-                                              sn, params.market_name, live_shares, params.price);
+                                        info!("👻 GHOST_MODE {} [{}]: {} | shares={:.2}, ask=${:.4} (simulated)",
+                                              label, sn, params.market_name, live_shares, params.price);
                                         maker_resting_exits.insert(pk.clone(), MakerRestingExit {
-                                            price: params.price, shares: live_shares, avg_entry,
+                                            price: params.price, shares: live_shares, avg_entry, entry_fee,
                                             market_name: params.market_name.clone(), last_poll: Instant::now(),
                                             short_reads: 0, max_short_read: dec!(0), booked: dec!(0),
                                         });
@@ -2667,17 +2686,18 @@ impl Squadron {
                                         // Lifted while we were deciding. Book that slice
                                         // here at the stale limit (a resting limit cannot
                                         // slip) — the fill-detection sweep can no longer
-                                        // see it now that the record is gone.
-                                        let pnl = (stale_price - avg_entry) * matched;
+                                        // see it now that the record is gone. Net of the
+                                        // entry fee the slice carries.
+                                        let bk = resting_exit::book_lift(stale_price, avg_entry, entry_fee, matched, live_shares);
+                                        let pnl = bk.pnl;
                                         let side_label = side_of(&tok).to_string();
-                                        info!("✅ Maker resting exit filled [{}]: {:.4} shares lifted @ ${:.4} (entry ${:.4}) pnl=${:.4} — caught while repricing",
-                                              sn, matched, stale_price, avg_entry, pnl);
+                                        info!("✅ {} filled [{}]: {:.4} shares lifted @ ${:.4} (entry ${:.4}) pnl=${:.4}{} — caught while repricing",
+                                              label, sn, matched, stale_price, avg_entry, pnl, bk.fee_note());
                                         *total_pnl.lock().await += pnl;
                                         metrics::record_trade(
-                                            &scope, Decimal::ZERO, sn.clone(), params.market_name.clone(), side_label,
+                                            &scope, bk.entry_fee_booked, sn.clone(), params.market_name.clone(), side_label,
                                             avg_entry, stale_price, matched, pnl,
-                                            format!("Maker resting exit: lifted @ ${:.4} (spread captured, gain={:.2}%)",
-                                                    stale_price, (stale_price - avg_entry) / avg_entry * dec!(100)),
+                                            resting_exit::ledger_reason(&sn, stale_price, avg_entry),
                                         ).await;
                                         last_trade_time.insert(sn.clone(), Instant::now());
 
@@ -2692,7 +2712,11 @@ impl Squadron {
                                         }
                                         // Re-post for the remainder on the next tick, once
                                         // the strategy has priced it against a fresh book.
-                                        if let Some(p) = positions.lock().await.get_mut(&pk) { p.shares = remaining; }
+                                        // The remainder keeps the entry fee not yet booked.
+                                        if let Some(p) = positions.lock().await.get_mut(&pk) {
+                                            p.shares = remaining;
+                                            p.entry_fee = bk.entry_fee_left;
+                                        }
                                         continue;
                                     } else if !cancel.ask_found {
                                         // Nothing verifiable sold: the ask is gone from the
@@ -2702,8 +2726,8 @@ impl Squadron {
                                         // re-post below fails on "not enough balance" if
                                         // the shares are gone, and the chain sweep then
                                         // closes the row from the wallet, not from a guess.
-                                        info!("ℹ️ Maker resting exit [{}]: ask @ ${:.4} was no longer on the book and the chain shows no lift — re-posting against a fresh book",
-                                              sn, stale_price);
+                                        info!("ℹ️ {} [{}]: ask @ ${:.4} was no longer on the book and the chain shows no lift — re-posting against a fresh book",
+                                              label, sn, stale_price);
                                     }
                                 }
 
@@ -2716,12 +2740,12 @@ impl Squadron {
                                 ).await {
                                     Ok(_order_id) => {
                                         maker_resting_exits.insert(pk.clone(), MakerRestingExit {
-                                            price: params.price, shares: live_shares, avg_entry,
+                                            price: params.price, shares: live_shares, avg_entry, entry_fee,
                                             market_name: params.market_name.clone(), last_poll: Instant::now(),
                                             short_reads: 0, max_short_read: dec!(0), booked: dec!(0),
                                         });
-                                        info!("📤 Maker resting exit [{}]: {} | ASK {:.4} shares @ ${:.4} (entry ${:.4}) | {}",
-                                              sn, params.market_name, live_shares, params.price, avg_entry, reason);
+                                        info!("📤 {} [{}]: {} | ASK {:.4} shares @ ${:.4} (entry ${:.4}) | {}",
+                                              label, sn, params.market_name, live_shares, params.price, avg_entry, reason);
                                     }
                                     Err(e) => {
                                         let es = e.to_string();
@@ -2729,16 +2753,16 @@ impl Squadron {
                                             // The book moved under us between pricing and
                                             // placement. Harmless: the strategy re-emits
                                             // next tick against a fresh snapshot.
-                                            debug!("⏸️ Maker resting exit [{}]: ask ${:.4} crossed the book — retrying next tick", sn, params.price);
+                                            debug!("⏸️ {} [{}]: ask ${:.4} crossed the book — retrying next tick", label, sn, params.price);
                                         } else if es.contains("not enough balance") || es.contains("balance: 0") {
                                             // Shares are still settling, or already gone.
                                             // Either way do NOT count it as a venue failure;
                                             // the next tick re-evaluates against real state.
-                                            debug!("⏸️ Maker resting exit [{}]: shares unavailable ({}) — retrying next tick",
-                                                   sn, es.chars().take(60).collect::<String>());
+                                            debug!("⏸️ {} [{}]: shares unavailable ({}) — retrying next tick",
+                                                   label, sn, es.chars().take(60).collect::<String>());
                                         } else {
-                                            warn!("⚠️ Maker resting exit placement failed [{}] (\"{}\") — position held, retrying next tick",
-                                                  sn, es.chars().take(120).collect::<String>());
+                                            warn!("⚠️ {} placement failed [{}] (\"{}\") — position held, retrying next tick",
+                                                  label, sn, es.chars().take(120).collect::<String>());
                                         }
                                     }
                                 }
@@ -2816,23 +2840,29 @@ impl Squadron {
                                 continue;
                             }
 
-                            let pnl = (rec.price - rec.avg_entry) * filled;
+                            // The live position is the authority on what this slice
+                            // cost to open; the record only stands in if it is gone.
+                            let (avg_entry, entry_fee) = positions.lock().await.get(&pk)
+                                .map(|p| (p.avg_entry, p.entry_fee))
+                                .unwrap_or((rec.avg_entry, rec.entry_fee));
+                            let bk = resting_exit::book_lift(rec.price, avg_entry, entry_fee, filled, rec.shares);
+                            let pnl = bk.pnl;
                             let side_label = if maker_market_config.as_ref().is_some_and(|m| m.yes_token == pk.market)
                                 || pk.market == hourly_yes_token { "YES" } else { "NO" }.to_string();
                             let fully_closed = held < config::MIN_ORDER_SHARES;
 
                             info!(
-                                "✅ Maker resting exit FILLED [{}]: {} | {:.4} shares lifted @ ${:.4} (entry ${:.4}) pnl=${:.4}{}",
-                                pk.strategy, rec.market_name, filled, rec.price, rec.avg_entry, pnl,
+                                "✅ {} FILLED [{}]: {} | {:.4} shares lifted @ ${:.4} (entry ${:.4}) pnl=${:.4}{}{}",
+                                resting_exit::label(&pk.strategy), pk.strategy, rec.market_name, filled, rec.price, avg_entry, pnl,
+                                bk.fee_note(),
                                 if fully_closed { "" } else { " (partial — remainder still resting)" },
                             );
 
                             *total_pnl.lock().await += pnl;
                             metrics::record_trade(
-                                &scope, Decimal::ZERO, pk.strategy.clone(), rec.market_name.clone(), side_label,
-                                rec.avg_entry, rec.price, filled, pnl,
-                                format!("Maker resting exit: lifted @ ${:.4} (spread captured, gain={:.2}%)",
-                                        rec.price, (rec.price - rec.avg_entry) / rec.avg_entry * dec!(100)),
+                                &scope, bk.entry_fee_booked, pk.strategy.clone(), rec.market_name.clone(), side_label,
+                                avg_entry, rec.price, filled, pnl,
+                                resting_exit::ledger_reason(&pk.strategy, rec.price, avg_entry),
                             ).await;
 
                             if fully_closed {
@@ -2848,8 +2878,13 @@ impl Squadron {
                                 // book. Re-sync both the position and the record to the
                                 // real on-chain size so the next poll measures against
                                 // the right baseline.
-                                if let Some(p) = positions.lock().await.get_mut(&pk) { p.shares = held; }
-                                if let Some(r) = maker_resting_exits.get_mut(&pk) { r.shares = held; r.booked += filled; }
+                                if let Some(p) = positions.lock().await.get_mut(&pk) {
+                                    p.shares = held;
+                                    p.entry_fee = bk.entry_fee_left;
+                                }
+                                if let Some(r) = maker_resting_exits.get_mut(&pk) {
+                                    r.shares = held; r.booked += filled; r.entry_fee = bk.entry_fee_left;
+                                }
                             }
                         }
                     }
@@ -2880,16 +2915,21 @@ impl Squadron {
                 if matched >= config::MIN_ORDER_SHARES {
                     // Lifted during tear-down: book it here at the resting price
                     // rather than leaving a silent cash move for the reconciler.
-                    let pnl = (rec.price - rec.avg_entry) * matched;
+                    // Net of the entry fee, as everywhere else a lift is booked.
+                    let (avg_entry, entry_fee) = positions.lock().await.get(pk)
+                        .map(|p| (p.avg_entry, p.entry_fee))
+                        .unwrap_or((rec.avg_entry, rec.entry_fee));
+                    let bk = resting_exit::book_lift(rec.price, avg_entry, entry_fee, matched, rec.shares);
+                    let pnl = bk.pnl;
                     *total_pnl.lock().await += pnl;
                     let side_label = if maker_market_config.as_ref().is_some_and(|m| m.yes_token == pk.market)
                         || pk.market == hourly_yes_token { "YES" } else { "NO" }.to_string();
-                    info!("✅ Maker resting exit filled during stand-down [{}]: {:.4} shares @ ${:.4} pnl=${:.4}",
-                          pk.strategy, matched, rec.price, pnl);
+                    info!("✅ {} filled during stand-down [{}]: {:.4} shares @ ${:.4} pnl=${:.4}{}",
+                          resting_exit::label(&pk.strategy), pk.strategy, matched, rec.price, pnl, bk.fee_note());
                     metrics::record_trade(
-                        &scope, Decimal::ZERO, pk.strategy.clone(), rec.market_name.clone(), side_label,
-                        rec.avg_entry, rec.price, matched, pnl,
-                        format!("Maker resting exit: lifted @ ${:.4} during stand-down", rec.price),
+                        &scope, bk.entry_fee_booked, pk.strategy.clone(), rec.market_name.clone(), side_label,
+                        avg_entry, rec.price, matched, pnl,
+                        format!("{}: lifted @ ${:.4} during stand-down", resting_exit::label(&pk.strategy), rec.price),
                     ).await;
                     positions.lock().await.remove(pk);
                     token_ownership.lock().await.remove(&pk.market);
@@ -2897,7 +2937,7 @@ impl Squadron {
                         db::close_open_position(&pool, &pk.strategy, pk.market.as_str()).await;
                     }
                 } else {
-                    info!("🚫 Maker resting exit cancelled on stand-down [{}]: ask ${:.4} pulled from the book", pk.strategy, rec.price);
+                    info!("🚫 {} cancelled on stand-down [{}]: ask ${:.4} pulled from the book", resting_exit::label(&pk.strategy), pk.strategy, rec.price);
                 }
             }
             maker_resting_exits.clear();
@@ -3475,6 +3515,94 @@ pub(crate) mod resting_exit {
         if held >= config::MIN_ORDER_SHARES && held < ledger { held } else { ledger }
     }
 
+    /// Which knob gates a strategy's resting exit.
+    ///
+    /// The Maker and FairValue each own theirs: turning the Maker's
+    /// spread-capture exit off must not silence FairValue's resting take-profit,
+    /// and the reverse. Any other strategy that starts emitting the signal
+    /// falls under the Maker's knob until it is given its own.
+    pub fn enabled_for(strategy: &str, maker_enabled: bool, fairvalue_enabled: bool) -> bool {
+        match strategy {
+            "FairValueStrategy" => fairvalue_enabled,
+            _ => maker_enabled,
+        }
+    }
+
+    /// The name a strategy's resting exit goes by in the log and the ledger.
+    /// The Maker's is unchanged from before FairValue shared the path.
+    pub fn label(strategy: &str) -> String {
+        match strategy {
+            "MakerStrategy" => "Maker resting exit".to_string(),
+            "FairValueStrategy" => "FairValue resting TP".to_string(),
+            other => format!("{other} resting exit"),
+        }
+    }
+
+    /// The ledger reason for a lift. Byte-for-byte the Maker's old text for
+    /// the Maker; FairValue's names the take-profit rather than a spread.
+    pub fn ledger_reason(strategy: &str, price: Decimal, entry: Decimal) -> String {
+        let gain = if entry > Decimal::ZERO { (price - entry) / entry * Decimal::ONE_HUNDRED } else { Decimal::ZERO };
+        match strategy {
+            "MakerStrategy" => format!("Maker resting exit: lifted @ ${:.4} (spread captured, gain={:.2}%)", price, gain),
+            _ => format!("{}: lifted @ ${:.4} (gain={:.2}%)", label(strategy), price, gain),
+        }
+    }
+
+    /// One booked lift of a resting ask: the P&L on the slice, net of the
+    /// entry fee it carries.
+    #[derive(Debug, Clone, PartialEq)]
+    pub struct LiftBooking {
+        /// Net P&L on the lifted shares.
+        pub pnl: Decimal,
+        /// The entry fee attributed to the lifted shares (prorated).
+        pub entry_fee_booked: Decimal,
+        /// The entry fee that stays with whatever is still held.
+        pub entry_fee_left: Decimal,
+    }
+
+    impl LiftBooking {
+        /// Log suffix naming the fee netted, empty when there was none — so
+        /// the Maker's lines read exactly as they did.
+        pub fn fee_note(&self) -> String {
+            if self.entry_fee_booked.is_zero() { String::new() }
+            else { format!(" (net of entry fee ${:.4})", self.entry_fee_booked) }
+        }
+    }
+
+    /// Book `lifted` shares sold at the resting `price` against a position
+    /// entered at `entry` that still carries `entry_fee` unbooked across
+    /// `held_before` shares.
+    ///
+    /// A resting ask pays no taker fee, so the only cost to net is the fee the
+    /// position paid to OPEN — zero for a Maker fill, the taker fee for a
+    /// FairValue entry that crossed the spread. Before this the lift was
+    /// booked as `(price − entry) × lifted` with no fee term, which was exact
+    /// for the Maker and would have overstated a FairValue round trip by the
+    /// whole entry fee (39% of the gross on the first live TP). The fee is
+    /// prorated by the share of the position sold, as `fak_exit::settle`
+    /// does, and never goes negative or beyond what was carried.
+    pub fn book_lift(
+        price: Decimal,
+        entry: Decimal,
+        entry_fee: Decimal,
+        lifted: Decimal,
+        held_before: Decimal,
+    ) -> LiftBooking {
+        let lifted = lifted.max(Decimal::ZERO);
+        let carried = entry_fee.max(Decimal::ZERO);
+        let frac = if held_before > Decimal::ZERO {
+            (lifted / held_before).min(Decimal::ONE)
+        } else {
+            Decimal::ONE
+        };
+        let entry_fee_booked = (carried * frac).min(carried);
+        LiftBooking {
+            pnl: (price - entry) * lifted - entry_fee_booked,
+            entry_fee_booked,
+            entry_fee_left: carried - entry_fee_booked,
+        }
+    }
+
     #[cfg(test)]
     mod tests {
         use super::*;
@@ -3533,6 +3661,83 @@ pub(crate) mod resting_exit {
             assert_eq!(remaining_after(dec!(7.35), dec!(5.314284), dec!(1.5)), dec!(1.5));
             assert_eq!(remaining_after(dec!(7.35), dec!(5.314284), dec!(9)), dec!(2.035716));
             assert_eq!(remaining_after(dec!(2), dec!(5), dec!(0)), dec!(0));
+        }
+
+        /// A Maker fill paid nothing to open, so its lift books exactly what
+        /// it always did: the gross move, no fee term, no note.
+        #[test]
+        fn a_maker_lift_books_the_gross_move_as_before() {
+            let bk = book_lift(dec!(0.35), dec!(0.33), dec!(0), dec!(7.35), dec!(7.35));
+            assert_eq!(bk.pnl, dec!(0.02) * dec!(7.35));
+            assert_eq!(bk.entry_fee_booked, dec!(0));
+            assert_eq!(bk.entry_fee_left, dec!(0));
+            assert_eq!(bk.fee_note(), "");
+        }
+
+        /// Live trade #3 (2026-09-06), had its take-profit rested: NO bought
+        /// at $0.20, 28 shares, taker entry fee 0.07 × 0.20 × 0.80 × 28 =
+        /// $0.3136, lifted in full at $0.24. The gross is $1.12; the round
+        /// trip is $0.8064. Booking the gross would overstate it by 39%.
+        #[test]
+        fn a_taker_entered_lift_is_net_of_the_entry_fee() {
+            let fee = crate::venues::intl::taker_fee(dec!(0.07), dec!(0.20), dec!(28));
+            assert_eq!(fee, dec!(0.3136));
+            let bk = book_lift(dec!(0.24), dec!(0.20), fee, dec!(28), dec!(28));
+            assert_eq!(bk.pnl, dec!(1.12) - dec!(0.3136));
+            assert_eq!(bk.entry_fee_booked, dec!(0.3136));
+            assert_eq!(bk.entry_fee_left, dec!(0));
+            assert_eq!(bk.fee_note(), " (net of entry fee $0.3136)");
+        }
+
+        /// Half the position lifted: half the fee goes with it, half stays
+        /// for the remainder — which a later FAK or lift nets in turn, so the
+        /// fee is booked exactly once across the whole position.
+        #[test]
+        fn a_partial_lift_prorates_the_entry_fee_and_leaves_the_rest() {
+            let bk = book_lift(dec!(0.24), dec!(0.20), dec!(0.3136), dec!(14), dec!(28));
+            assert_eq!(bk.entry_fee_booked, dec!(0.1568));
+            assert_eq!(bk.entry_fee_left, dec!(0.1568));
+            assert_eq!(bk.pnl, dec!(0.56) - dec!(0.1568));
+            let rest = book_lift(dec!(0.24), dec!(0.20), bk.entry_fee_left, dec!(14), dec!(14));
+            assert_eq!(bk.entry_fee_booked + rest.entry_fee_booked, dec!(0.3136));
+            assert_eq!(rest.entry_fee_left, dec!(0));
+        }
+
+        /// The fee can be booked no more than once and never goes negative,
+        /// whatever the caller's share arithmetic says.
+        #[test]
+        fn the_booked_fee_is_bounded_by_what_was_carried() {
+            let bk = book_lift(dec!(0.24), dec!(0.20), dec!(0.3136), dec!(30), dec!(28));
+            assert_eq!(bk.entry_fee_booked, dec!(0.3136));
+            assert_eq!(bk.entry_fee_left, dec!(0));
+            let bk = book_lift(dec!(0.24), dec!(0.20), dec!(-1), dec!(28), dec!(28));
+            assert_eq!(bk.entry_fee_booked, dec!(0));
+            let bk = book_lift(dec!(0.24), dec!(0.20), dec!(0.3136), dec!(28), dec!(0));
+            assert_eq!(bk.entry_fee_booked, dec!(0.3136));
+        }
+
+        /// Each strategy's resting exit answers to its own knob.
+        #[test]
+        fn each_strategy_is_gated_by_its_own_knob() {
+            assert!(enabled_for("MakerStrategy", true, false));
+            assert!(!enabled_for("MakerStrategy", false, true));
+            assert!(enabled_for("FairValueStrategy", false, true));
+            assert!(!enabled_for("FairValueStrategy", true, false));
+        }
+
+        /// The Maker's ledger text is unchanged; FairValue's names the target.
+        #[test]
+        fn the_ledger_reason_keeps_the_makers_text_and_names_fairvalues_target() {
+            assert_eq!(
+                ledger_reason("MakerStrategy", dec!(0.35), dec!(0.33)),
+                "Maker resting exit: lifted @ $0.3500 (spread captured, gain=6.06%)"
+            );
+            assert_eq!(
+                ledger_reason("FairValueStrategy", dec!(0.24), dec!(0.20)),
+                "FairValue resting TP: lifted @ $0.2400 (gain=20.00%)"
+            );
+            assert_eq!(label("MakerStrategy"), "Maker resting exit");
+            assert_eq!(label("FairValueStrategy"), "FairValue resting TP");
         }
     }
 }

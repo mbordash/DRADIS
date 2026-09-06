@@ -284,6 +284,8 @@ fn default_momentum_obi_exhaust_persist_secs()    -> i64     { config::MOMENTUM_
 fn default_momentum_tp_fee_margin_mult()          -> Decimal { config::MOMENTUM_TP_FEE_MARGIN_MULT          }
 fn default_maker_tp_fee_margin_mult()             -> Decimal { config::MAKER_TP_FEE_MARGIN_MULT             }
 fn default_fairvalue_stop_veto_max_model_decay_pct() -> Decimal { config::FAIRVALUE_STOP_VETO_MAX_MODEL_DECAY_PCT }
+fn default_fairvalue_settle_snipe_hold()  -> bool    { config::FAIRVALUE_SETTLE_SNIPE_HOLD             }
+fn default_fairvalue_resting_tp_enabled() -> bool    { config::FAIRVALUE_RESTING_TP_ENABLED            }
 
 fn default_time_decay_max_fast_velocity_pct()      -> Decimal { config::TIME_DECAY_MAX_FAST_VELOCITY_PCT      }
 fn default_time_decay_max_slow_drift_pct()         -> Decimal { config::TIME_DECAY_MAX_SLOW_DRIFT_PCT         }
@@ -825,6 +827,19 @@ pub struct DynamicConfig {
     /// the contract settled at $1.00. Realised −$0.48 against +$2.46 available.
     #[serde(default = "default_fairvalue_stop_model_confirm")]
     pub fairvalue_stop_model_confirm_frac: Decimal,
+    /// Manage an entry whose take-profit is unreachable (entry × (1 + TP) ≥ $1)
+    /// as a settlement snipe: no percentage stop, sell only when the fee-net
+    /// bid is worth at least the model's settlement value; catastrophic floor
+    /// and endgame bail-out kept. Off restores the percentage stop everywhere.
+    #[serde(default = "default_fairvalue_settle_snipe_hold")]
+    pub fairvalue_settle_snipe_hold:      bool,
+    /// Take profit with a resting post-only ask at entry × (1 + TP) instead of
+    /// a taker FAK at the bid. Lifted only when the market runs through the
+    /// price the viper would have sold at anyway, so it carries none of the
+    /// adverse selection of a resting bid; every stop still crosses and pulls
+    /// the ask first. Off restores the taker take-profit.
+    #[serde(default = "default_fairvalue_resting_tp_enabled")]
+    pub fairvalue_resting_tp_enabled:     bool,
 
     // ── Convergence Viper ─────────────────────────────────────────────────────
     #[serde(default = "default_convergence_enable")]
@@ -1108,6 +1123,8 @@ impl Default for DynamicConfig {
             fairvalue_max_stop_losses_per_market: config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET,
             fairvalue_edge_noise_multiple:    config::FAIRVALUE_EDGE_NOISE_MULTIPLE,
             fairvalue_stop_model_confirm_frac: config::FAIRVALUE_STOP_MODEL_CONFIRM_FRAC,
+            fairvalue_settle_snipe_hold:      config::FAIRVALUE_SETTLE_SNIPE_HOLD,
+            fairvalue_resting_tp_enabled:     config::FAIRVALUE_RESTING_TP_ENABLED,
 
             enable_convergence:               config::ENABLE_CONVERGENCE_TRADING,
             convergence_position_size_usdc:   config::CONVERGENCE_POSITION_SIZE_USDC,
@@ -1678,7 +1695,7 @@ mod tests {
     fn a_config_row_predating_the_newest_knobs_still_loads() {
         let mut legacy = serde_json::to_value(DynamicConfig::default()).unwrap();
         let obj = legacy.as_object_mut().unwrap();
-        for added in ["fairvalue_stop_model_confirm_frac", "arb_settle_grace_secs"] {
+        for added in ["fairvalue_stop_model_confirm_frac", "arb_settle_grace_secs", "fairvalue_settle_snipe_hold", "fairvalue_resting_tp_enabled"] {
             assert!(obj.remove(added).is_some(), "{added} must be a serialized field");
         }
         let cfg: DynamicConfig =
@@ -1689,6 +1706,8 @@ mod tests {
             config::FAIRVALUE_STOP_MODEL_CONFIRM_FRAC
         );
         assert_eq!(cfg.arb_settle_grace_secs, config::ARB_SETTLE_GRACE_SECS);
+        assert_eq!(cfg.fairvalue_settle_snipe_hold, config::FAIRVALUE_SETTLE_SNIPE_HOLD);
+        assert_eq!(cfg.fairvalue_resting_tp_enabled, config::FAIRVALUE_RESTING_TP_ENABLED);
     }
 
     /// The orphan settle grace is a naked-exposure window, so it must stay well

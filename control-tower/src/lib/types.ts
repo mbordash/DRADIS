@@ -49,6 +49,8 @@ export interface DynamicConfig {
   fairvalue_max_stop_losses_per_market: number;
   fairvalue_edge_noise_multiple:      string;
   fairvalue_stop_model_confirm_frac:  string;
+  fairvalue_settle_snipe_hold:        boolean;
+  fairvalue_resting_tp_enabled:       boolean;
 
   // Arbitrage Viper
   arbitrage_position_size_usdc: string;
