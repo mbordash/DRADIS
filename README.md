@@ -959,14 +959,28 @@ available to its users, even though you never distribute a binary.
 
 ### Commercial licensing
 
-The AGPL is not suitable for every deployment. If you want to:
+The AGPL and the commercial license are meant to pull in different directions,
+and which one suits you depends on whether your changes are your edge.
 
-- run DRADIS or a derivative as a **hosted / SaaS product** without publishing your changes,
-- **embed** it in a proprietary trading system or closed-source product, or
-- obtain it under terms **other than the AGPL** for any other reason,
+Under the AGPL, an improvement you make to a Viper is one you offer back to
+anyone who uses it, including over a network. That is a good deal if you want
+the core to improve around you, and it is how the project gets better for
+everyone.
 
-a separate commercial license is available. Contact **starbuck@dradis.live** with
-a short description of your intended use.
+The commercial license is for the case where that is exactly what you do not
+want. It gives you the right to modify DRADIS privately: fork a Viper, change
+its formulas, run your version alongside the original, and keep every bit of it
+to yourself. You owe nothing back. For a trading system that is the whole point,
+because a strategy you are obliged to publish stops being an advantage the
+moment you publish it.
+
+It also covers the ordinary cases where the AGPL does not fit:
+
+- running DRADIS or a derivative as a **hosted / SaaS product** without publishing your changes,
+- **embedding** it in a proprietary trading system or closed-source product, or
+- obtaining it under terms **other than the AGPL** for any other reason.
+
+Contact **starbuck@dradis.live** with a short description of your intended use.
 
 Dual licensing is possible because the project's contributions are covered by a
 Contributor License Agreement — see [CONTRIBUTING.md](docs/CONTRIBUTING.md).
