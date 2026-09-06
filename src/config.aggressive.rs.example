@@ -706,6 +706,13 @@ pub const BASIS_MAKER_BUY_PRICE_ADJUSTMENT: Decimal = dec!(0.01);
 
 pub const ENABLE_GBOOST_TRADING: bool = true;
 
+/// Observe-only default for GBoost (B38). Seeds the `gboost_shadow_mode` knob:
+/// while on, a signal that clears every entry gate is shadow-logged as a
+/// would-be entry and no order is placed. Same in every profile; this is
+/// validation state, not risk appetite. Turn it off from the Control Tower once
+/// the corrected model's shadow entries have been scored against settlement.
+pub const GBOOST_SHADOW_MODE: bool = true;
+
 /// Maximum token ask price allowed for GBoost entries (for YES side).
 /// Lowered from 0.60 → 0.55 after 2026-05-08 session analysis:
 ///   T3: YES $0.56 on daily (P(UP)=0.889) → SignalRev loss -$0.21 (market already priced 56% UP)
@@ -811,7 +818,30 @@ pub const GBOOST_TARGET_PROFIT_PERCENT: Decimal = dec!(0.12);
 pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.080); // aggressive: 8% — widest; model still bootstrapping
 pub const GBOOST_MIN_HOLD_SECS: i64 = 180;
 pub const GBOOST_SL_MIN_HOLD_SECS: i64 = 10;
-pub const GBOOST_MIN_USABLE_TREES: usize = 30;
+/// Structural floor on a retrain's tree count (B37). Seeds the
+/// `gboost_structural_min_trees` knob; the same in every profile because it is
+/// mechanism, not risk appetite. This is NOT a quality bar: tree count is a
+/// byproduct of how much loss structure the pool offers at the learning rate,
+/// and it does not track holdout quality (corr -0.33 on production data). It
+/// only catches the fit that finds nothing to learn: on featureless or
+/// homogeneous data perpetual stops at 1 tree when the labels are exactly
+/// balanced and at 3 when they are slightly off (the extra trees are base
+/// rate nudges, not splits) at any budget up to 1.0, and at 5 at budget 1.5;
+/// real fits on the production pool run 17 to 108. Five sits above that band
+/// at the shipped budget and below any real fit; the old 20-30 floor bisected
+/// the real fits. A nothing-fit that slips past the floor is still rejected
+/// by the holdout test (its skill is 0). Quality is judged by
+/// GBOOST_HOLDOUT_MIN_SKILL.
+pub const GBOOST_STRUCTURAL_MIN_TREES: usize = 5;
+/// Retrain acceptance bar (B37). Seeds the `gboost_holdout_min_skill` knob;
+/// the same in every profile. Before a retrain is adopted, a validation model
+/// fit on the older part of the pool is scored on the newest ten percent
+/// (separated by a purge gap of twice the label horizon), and its logloss skill
+/// over the best constant forecast, 1 - model_logloss / constant_logloss, must
+/// reach this. 0 is "no better than a coin weighted at the holdout's own base
+/// rate"; the margin above 0 is what separates a fit that generalizes from one
+/// that got lucky on a window of a few label runs.
+pub const GBOOST_HOLDOUT_MIN_SKILL: Decimal = dec!(0.05);
 pub const GBOOST_MODEL_FILENAME: &str = "gboost_model_v30g_o180.json";
 pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v30g_o180.json";
 /// Max fraction of identical labels before skipping a retrain cycle (avoids degenerate storms).

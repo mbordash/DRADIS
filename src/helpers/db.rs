@@ -1393,6 +1393,7 @@ impl VetoRegime {
 /// wrong knob. Defined once and interpolated into both queries below so the two
 /// can never drift apart.
 const VETO_GATE_CASE: &str = "CASE
+    WHEN veto_reason LIKE 'shadow mode%'         THEN 'shadow mode (would have entered)'
     WHEN veto_reason LIKE 'hourly%'              THEN 'hourly OBI cross-check'
     WHEN veto_reason LIKE '%price out of range%' THEN 'price band'
     WHEN veto_reason LIKE '%adverse OBI%'        THEN 'adverse OBI'

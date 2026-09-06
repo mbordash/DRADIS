@@ -304,6 +304,9 @@ fn default_gboost_concept_drift_threshold() -> Decimal { config::GBOOST_CONCEPT_
 fn default_gboost_drift_consecutive_required()  -> i64 { config::GBOOST_DRIFT_CONSECUTIVE_REQUIRED as i64 }
 fn default_gboost_drift_stable_clear_required() -> i64 { config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED as i64 }
 fn default_gboost_label_max_age_hours()     -> i64     { config::GBOOST_LABEL_MAX_AGE_HOURS             }
+fn default_gboost_shadow_mode()             -> bool    { config::GBOOST_SHADOW_MODE                     }
+fn default_gboost_structural_min_trees()    -> i64     { config::GBOOST_STRUCTURAL_MIN_TREES as i64     }
+fn default_gboost_holdout_min_skill()       -> Decimal { config::GBOOST_HOLDOUT_MIN_SKILL               }
 
 /// Bridge for knobs whose profile constant is an `f64` (`GBOOST_MIN_HIST_VOL`):
 /// every DynamicConfig knob is a `Decimal`, because the Control Tower edits and
@@ -695,6 +698,30 @@ pub struct DynamicConfig {
     /// train the model on a regime that is days gone. Values below 1 are clamped.
     #[serde(default = "default_gboost_label_max_age_hours")]
     pub gboost_label_max_age_hours: i64,
+    /// Observe-only. While on, a GBoost signal that clears every entry gate is
+    /// shadow-logged ("shadow mode: would enter ..." on the veto scoreboard)
+    /// instead of placed. Ships on (B38): every model before 2026-09-06 was fit
+    /// on a mislaid training matrix, and the corrected model's live behavior has
+    /// never been observed. Turn off only after its shadow entries have been
+    /// scored against settlement on /api/gboost/veto-scores.
+    #[serde(default = "default_gboost_shadow_mode")]
+    pub gboost_shadow_mode: bool,
+    /// Structural floor on a retrain's tree count (B37). Catches the fit that
+    /// stops at a single stump because the window's labels offered nothing to
+    /// learn (1 to 3 trees); it is not a quality bar, tree count does not track
+    /// holdout quality. Values below 1 are treated as 1.
+    #[serde(default = "default_gboost_structural_min_trees")]
+    pub gboost_structural_min_trees: i64,
+    /// Retrain acceptance bar (B37): the logloss skill a validation fit must
+    /// show on the newest tenth of the pool, held out behind a purge gap of
+    /// twice the label horizon, before the retrain is adopted. Skill is
+    /// 1 - model_logloss / best_constant_logloss: 0 matches a coin weighted at
+    /// the holdout's own base rate, negative is worse than that (usually an
+    /// overconfident fit). A rejected retrain keeps the previous model and
+    /// logs the measured skill, so a run of rejections in the log is the model
+    /// failing to generalize to the latest window, not a fault.
+    #[serde(default = "default_gboost_holdout_min_skill")]
+    pub gboost_holdout_min_skill: Decimal,
 
     // ── TrendCapture Viper ────────────────────────────────────────────────────
     #[serde(default = "default_trendcapture_min_trade_size")]
@@ -1040,6 +1067,9 @@ impl Default for DynamicConfig {
             gboost_drift_consecutive_required: config::GBOOST_DRIFT_CONSECUTIVE_REQUIRED as i64,
             gboost_drift_stable_clear_required: config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED as i64,
             gboost_label_max_age_hours: config::GBOOST_LABEL_MAX_AGE_HOURS,
+            gboost_shadow_mode:         config::GBOOST_SHADOW_MODE,
+            gboost_structural_min_trees: config::GBOOST_STRUCTURAL_MIN_TREES as i64,
+            gboost_holdout_min_skill:   config::GBOOST_HOLDOUT_MIN_SKILL,
 
             trendcapture_min_trade_size_usdc: config::TRENDCAPTURE_MIN_TRADE_SIZE_USDC,
             trendcapture_max_trade_size_usdc: config::TRENDCAPTURE_MAX_TRADE_SIZE_USDC,

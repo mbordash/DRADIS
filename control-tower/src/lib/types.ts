@@ -165,6 +165,9 @@ export interface DynamicConfig {
   gboost_drift_consecutive_required: number;
   gboost_drift_stable_clear_required: number;
   gboost_label_max_age_hours: number;
+  gboost_shadow_mode: boolean;
+  gboost_structural_min_trees: number;
+  gboost_holdout_min_skill: string;
 
   // TrendCapture Viper
   trendcapture_min_trade_size_usdc: string;

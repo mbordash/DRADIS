@@ -95,7 +95,7 @@ def const_values(path: Path) -> dict[str, object]:
 # operator following the Setup view's own advice — "start with conservative" —
 # silently disarmed simulation on their first run, because `apply_profile`
 # patches every field a profile declares.
-NON_PROFILE_FIELDS = {"ghost_mode"}
+NON_PROFILE_FIELDS = {"ghost_mode", "collateral_sweep_enabled"}
 
 
 def main() -> None:

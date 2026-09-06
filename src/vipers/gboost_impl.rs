@@ -96,6 +96,19 @@
 ///   4. predict_proba() produces P(YES_UP) for each new tick.
 ///   5. Model is serialized to GBOOST_MODEL_PATH after each successful retrain
 ///      and reloaded from disk on strategy construction.
+///   6. While the `gboost_shadow_mode` knob is on, a signal that clears every
+///      entry gate is shadow-logged as a veto ("shadow mode: would enter ...",
+///      scored as its own gate on /api/gboost/veto-scores) and no order is
+///      placed. It ships on, so a model whose live behavior has never been
+///      observed cannot start trading real money by default.
+///
+/// ── Matrix layout (B38) ──────────────────────────────────────────────────────
+///   `perpetual::Matrix::new(data, rows, cols)` is column major. Every multi-row
+///   matrix here is built by `column_major_matrix_data`; the single-row
+///   prediction matrix is the same in both layouts. Until 2026-09-06 the fills
+///   were row major, so every model ever trained learned scrambled columns.
+///   Persisted models carry a `feature_layout` metadata tag; a file without it
+///   predates the fix and is discarded at load rather than predicted from.
 
 use async_trait::async_trait;
 use anyhow::Result;
@@ -337,6 +350,47 @@ fn extract_features(s: &MarketSnapshot, prev_s: Option<&MarketSnapshot>, hist_vo
 /// Build and train a fresh `PerpetualBooster` from a slice of `TrainingSample`s.
 /// Called exclusively from `tokio::task::spawn_blocking` — never on an async thread.
 ///
+/// Lay `rows` out the way `perpetual::Matrix::new` reads them.
+///
+/// `Matrix::new(data, rows, cols)` is column major: perpetual 3.0.0-rc.2's
+/// `data.rs` sets `stride1: rows, stride2: 1`, so element (i, j) lives at
+/// `data[j * rows + i]`. Every fill in this file used to append each sample's
+/// features consecutively (row major), so the booster's "column 0" was the first
+/// `n` numbers of the stream, samples 0..n/30 interleaved, and every column was
+/// scrambled against its label (B38). `matrix_fill_matches_perpetual_column_major_layout`
+/// pins this against perpetual's own accessor.
+fn column_major_matrix_data(rows: &[[f64; NUM_FEATURES]]) -> Vec<f64> {
+    let n = rows.len();
+    let mut data = vec![0.0f64; n * NUM_FEATURES];
+    for (i, row) in rows.iter().enumerate() {
+        for (j, value) in row.iter().enumerate() {
+            data[j * n + i] = *value;
+        }
+    }
+    data
+}
+
+/// Metadata tag written into every model this build trains and required of every
+/// model it loads. Files without it were fit before B38, on a row-major buffer
+/// read as column major, and their predictions are noise; they are discarded at
+/// startup rather than predicted from, until the first accepted retrain.
+const MODEL_META_LAYOUT_KEY: &str = "feature_layout";
+const MODEL_META_LAYOUT_VALUE: &str = "column_major";
+
+/// True when `booster` carries the layout tag this build writes.
+fn model_has_current_layout(booster: &PerpetualBooster) -> bool {
+    booster.get_metadata(&MODEL_META_LAYOUT_KEY.to_string()).as_deref() == Some(MODEL_META_LAYOUT_VALUE)
+}
+
+/// When `booster` was accepted, in US/Eastern for the log, or a note that it
+/// carries no acceptance record (a model written before the holdout test).
+fn model_accepted_at_et(booster: &PerpetualBooster) -> String {
+    booster.get_metadata(&MODEL_META_ACCEPTED_AT_KEY.to_string())
+        .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+        .map(|dt| dt.with_timezone(&chrono_tz::US::Eastern).format("%H:%M %Z").to_string())
+        .unwrap_or_else(|| "before the holdout test existed".to_string())
+}
+
 /// `budget` and `iteration_limit` are passed in rather than read from `config`
 /// so they can be tuned live from the Control Tower: this runs on a blocking
 /// thread with no access to the dynamic config, so the caller reads them off its
@@ -353,17 +407,33 @@ fn train_model(
             "GBoost: too few training samples ({}) for training (need at least {})", n, config::GBOOST_MIN_TRAINING_SAMPLES
         ));
     }
+    train_model_unchecked(samples, budget, iteration_limit)
+}
 
-    let mut feature_data: Vec<f64> = Vec::with_capacity(n * NUM_FEATURES);
-    let mut labels: Vec<f64>       = Vec::with_capacity(n);
+/// `train_model` without the sample-count floor. The production path never
+/// calls this directly; the evidence harness uses it to fit decimated pools.
+fn train_model_unchecked(
+    samples: Vec<TrainingSample>,
+    budget: f32,
+    iteration_limit: u32,
+) -> Result<PerpetualBooster> {
+    let n = samples.len();
+    if n == 0 {
+        return Err(anyhow::anyhow!("GBoost: no training samples"));
+    }
+
+    let mut rows: Vec<[f64; NUM_FEATURES]> = Vec::with_capacity(n);
+    let mut labels: Vec<f64>               = Vec::with_capacity(n);
 
     for sample in samples {
-        feature_data.extend_from_slice(&sample.features);
+        rows.push(sample.features);
         // Label: 1.0 if profitable, 0.0 if not profitable
         labels.push(if sample.is_profitable { 1.0 } else { 0.0 });
     }
 
-    // Matrix<'a, T> borrows the slice; both Vec and Matrix live in this closure scope.
+    // Column major, the layout Matrix::new reads (B38). Matrix<'a, T> borrows
+    // the slice; both Vec and Matrix live in this closure scope.
+    let feature_data = column_major_matrix_data(&rows);
     let matrix = Matrix::new(&feature_data, n, NUM_FEATURES);
 
     let mut booster = PerpetualBooster::default()
@@ -382,8 +452,317 @@ fn train_model(
 
     booster.fit(&matrix, &labels, None, None)
         .map_err(|e| anyhow::anyhow!("perpetual fit error: {:?}", e))?;
+    // Provenance: fit on a correctly laid out matrix. The startup loader refuses
+    // persisted models without this tag (see MODEL_META_LAYOUT_KEY).
+    booster.insert_metadata(MODEL_META_LAYOUT_KEY.to_string(), MODEL_META_LAYOUT_VALUE.to_string());
 
     Ok(booster)
+}
+
+// ── Retrain acceptance (B37) ─────────────────────────────────────────────────
+//
+// A retrain used to be accepted on its tree count alone (`GBOOST_MIN_USABLE_TREES`,
+// 20 to 30 depending on profile). Tree count is a byproduct of how much loss
+// structure the data offers at the booster's learning rate, not a quality
+// signal: over the production pool corr(trees, holdout AUC) was -0.33, and the
+// floor bisected the 22..29 range most fits land in, so adoption was a coin
+// flip on sampling noise. The floor also rejected every correctly laid out
+// model (B38 fits ~26 trees on a full pool), which would have left GBoost idle.
+//
+// What replaces it: a time-ordered holdout. The newest HOLDOUT_FRACTION of the
+// pool is set aside, a purge gap wider than the label horizon separates it from
+// the training split, a validation model is fit on the older part and scored
+// on the newest part against the best constant forecast. The retrain is
+// adopted only when its logloss skill clears `gboost_holdout_min_skill`; the
+// adopted model is then refit on the whole pool so it also knows the newest
+// window. A small structural floor (`gboost_structural_min_trees`) still
+// catches the fit that stops at a single stump, which is the case the old
+// guard was written for.
+
+/// Fraction of the pool, newest first, held out from the validation fit. On a
+/// full conservative pool (8000 samples at ~1 s spacing) this is ~40 minutes,
+/// several label horizons of independent outcomes. Mechanism, not a knob: the
+/// thresholds applied to what it measures are the knobs.
+const HOLDOUT_FRACTION: f64 = 0.10;
+/// Below this many holdout samples the skill score is a handful of label runs
+/// and says nothing; the retrain is deferred until the pool is longer.
+const HOLDOUT_MIN_SAMPLES: usize = 100;
+/// Probabilities are clamped away from 0 and 1 before the log so one
+/// saturated wrong call costs ~13.8 nats rather than infinity. Overconfidence
+/// is still punished hard, which is the point: the model gates entries on
+/// P(UP) beyond 0.72, so confident wrong calls are the expensive kind.
+const LOGLOSS_EPS: f64 = 1e-6;
+
+/// Metadata keys written into an accepted model so a later process can see, in
+/// the startup log, what the model cleared when it was adopted.
+const MODEL_META_HOLDOUT_SKILL_KEY: &str = "holdout_skill";
+const MODEL_META_HOLDOUT_N_KEY: &str = "holdout_samples";
+const MODEL_META_ACCEPTED_AT_KEY: &str = "accepted_at";
+
+/// Purge gap between the last training sample and the first holdout sample.
+///
+/// A training sample at `t` carries a label settled at `t + horizon` (more
+/// precisely at the first snapshot at or after that instant). Any training
+/// sample whose label window reaches past the first holdout timestamp shares
+/// its outcome with the holdout, so the holdout would be scoring the model on
+/// moves it was shown. One horizon closes that; the second covers the
+/// snapshot-spacing slack in the labeler and leaves margin. Real trade
+/// outcomes (`training_data`) are labeled at exit, which has no bound; they
+/// are rare and the margin is documented rather than sized for them.
+fn holdout_gap() -> chrono::Duration {
+    chrono::Duration::seconds(2 * config::GBOOST_LABEL_HORIZON_SECS)
+}
+
+/// The pool cut for validation: everything older than the gap trains, the
+/// newest window scores.
+struct HoldoutSplit {
+    train: Vec<TrainingSample>,
+    holdout: Vec<TrainingSample>,
+    /// Samples between the two, discarded because their label horizon reaches
+    /// into the holdout.
+    gap_dropped: usize,
+}
+
+/// Cut `sorted` (ascending `entry_timestamp`) so that `sorted[start..start+len]`
+/// is the holdout and everything before `start` whose timestamp is at least
+/// `gap` before the holdout's first timestamp is the training split. Samples
+/// after the holdout are ignored, which lets a walk-forward evaluation reuse
+/// this on interior windows.
+fn split_for_holdout(sorted: &[TrainingSample], start: usize, len: usize, gap: chrono::Duration) -> HoldoutSplit {
+    let end = (start + len).min(sorted.len());
+    let holdout: Vec<TrainingSample> = sorted[start..end].to_vec();
+    let cutoff = holdout.first().map(|s| s.entry_timestamp - gap);
+    let mut train: Vec<TrainingSample> = Vec::with_capacity(start);
+    let mut gap_dropped = 0usize;
+    for s in &sorted[..start] {
+        match cutoff {
+            Some(c) if s.entry_timestamp > c => gap_dropped += 1,
+            _ => train.push(s.clone()),
+        }
+    }
+    HoldoutSplit { train, holdout, gap_dropped }
+}
+
+/// What the validation model did on the holdout. Everything the acceptance
+/// decision and the log line need, in one place.
+#[derive(Debug, Clone)]
+struct HoldoutReport {
+    train_n: usize,
+    holdout_n: usize,
+    gap_dropped: usize,
+    gap_secs: i64,
+    holdout_span_secs: i64,
+    /// Trees in the validation fit (not the adopted refit).
+    trees: usize,
+    train_pos_rate: f64,
+    holdout_pos_rate: f64,
+    /// Logloss of the best constant forecast on the holdout: the holdout's own
+    /// positive rate, which no real constant could know in advance. It is the
+    /// strictest constant baseline, so "skill above zero" means the model beat
+    /// even a hindsight-optimal coin.
+    base_logloss: f64,
+    model_logloss: f64,
+    /// `1 - model_logloss / base_logloss`. Zero is the constant forecast,
+    /// positive is better, negative is worse (usually overconfidence).
+    skill: f64,
+    auc: f64,
+    /// Holdout calls where P(UP) was beyond `confident_threshold` either way,
+    /// and how many were right: the calls the entry gate would act on.
+    confident_n: usize,
+    confident_hits: usize,
+}
+
+impl HoldoutReport {
+    /// One-line summary shared by the accept and reject log lines.
+    fn summary(&self) -> String {
+        format!(
+            "holdout skill {:+.1}% (logloss {:.3} vs {:.3} for the best constant; {} newest samples over {} min, \
+             {:.0}% up vs {:.0}% in training; {} s gap, {} dropped in the gap; AUC {:.2}; {}/{} confident calls right; \
+             {} trees on {} training samples)",
+            self.skill * 100.0, self.model_logloss, self.base_logloss,
+            self.holdout_n, self.holdout_span_secs / 60,
+            self.holdout_pos_rate * 100.0, self.train_pos_rate * 100.0,
+            self.gap_secs, self.gap_dropped,
+            self.auc, self.confident_hits, self.confident_n, self.trees, self.train_n,
+        )
+    }
+}
+
+/// Binary logloss with clamped probabilities (see `LOGLOSS_EPS`).
+fn logloss(probs: &[f64], labels: &[bool]) -> f64 {
+    let n = probs.len().max(1) as f64;
+    probs.iter().zip(labels).map(|(p, y)| {
+        let p = p.clamp(LOGLOSS_EPS, 1.0 - LOGLOSS_EPS);
+        if *y { -p.ln() } else { -(1.0 - p).ln() }
+    }).sum::<f64>() / n
+}
+
+/// Rank-based AUC (Mann-Whitney); 0.5 when either class is absent.
+fn rank_auc(scores: &[f64], labels: &[bool]) -> f64 {
+    let npos = labels.iter().filter(|l| **l).count() as f64;
+    let nneg = labels.len() as f64 - npos;
+    if npos == 0.0 || nneg == 0.0 { return 0.5; }
+    let mut idx: Vec<usize> = (0..scores.len()).collect();
+    idx.sort_by(|a, b| scores[*a].partial_cmp(&scores[*b]).unwrap_or(std::cmp::Ordering::Equal));
+    let rank_sum: f64 = idx.iter().enumerate()
+        .filter(|(_, i)| labels[**i])
+        .map(|(r, _)| (r + 1) as f64)
+        .sum();
+    (rank_sum - npos * (npos + 1.0) / 2.0) / (npos * nneg)
+}
+
+/// Score `model` on the holdout of `split`.
+fn evaluate_holdout(
+    model: &PerpetualBooster,
+    split: &HoldoutSplit,
+    gap: chrono::Duration,
+    confident_threshold: f64,
+) -> HoldoutReport {
+    let rows: Vec<[f64; NUM_FEATURES]> = split.holdout.iter().map(|s| s.features).collect();
+    let labels: Vec<bool> = split.holdout.iter().map(|s| s.is_profitable).collect();
+    let data = column_major_matrix_data(&rows);
+    let probs = model.predict_proba(&Matrix::new(&data, rows.len(), NUM_FEATURES), false, false);
+
+    let holdout_n = labels.len();
+    let holdout_pos = labels.iter().filter(|l| **l).count() as f64;
+    let holdout_pos_rate = holdout_pos / holdout_n.max(1) as f64;
+    let train_pos = split.train.iter().filter(|s| s.is_profitable).count() as f64;
+    let train_pos_rate = train_pos / split.train.len().max(1) as f64;
+
+    let base_probs = vec![holdout_pos_rate; holdout_n];
+    let base_logloss = logloss(&base_probs, &labels);
+    let model_logloss = logloss(&probs, &labels);
+    let skill = if base_logloss > 0.0 { 1.0 - model_logloss / base_logloss } else { 0.0 };
+
+    let margin = (confident_threshold - 0.5).abs();
+    let (mut confident_n, mut confident_hits) = (0usize, 0usize);
+    for (p, y) in probs.iter().zip(&labels) {
+        if (p - 0.5).abs() >= margin {
+            confident_n += 1;
+            if (*p >= 0.5) == *y { confident_hits += 1; }
+        }
+    }
+    let holdout_span_secs = match (split.holdout.first(), split.holdout.last()) {
+        (Some(a), Some(b)) => (b.entry_timestamp - a.entry_timestamp).num_seconds(),
+        _ => 0,
+    };
+
+    HoldoutReport {
+        train_n: split.train.len(),
+        holdout_n,
+        gap_dropped: split.gap_dropped,
+        gap_secs: gap.num_seconds(),
+        holdout_span_secs,
+        trees: model.trees.len(),
+        train_pos_rate,
+        holdout_pos_rate,
+        base_logloss,
+        model_logloss,
+        skill,
+        auc: rank_auc(&probs, &labels),
+        confident_n,
+        confident_hits,
+    }
+}
+
+/// Why a retrain was not adopted. Each variant carries what its log line
+/// needs, so the operator sees the specific reason rather than "degenerate".
+#[derive(Debug)]
+enum RetrainRejection {
+    /// The pool cannot be cut into a training split of at least
+    /// `GBOOST_MIN_TRAINING_SAMPLES` plus a `HOLDOUT_MIN_SAMPLES` holdout with
+    /// the purge gap between them. Not a fault: labeling continues and the next
+    /// cycle retries. Distinct from the other two because nothing was fit.
+    PoolTooShort { total: usize, train_n: usize, holdout_n: usize, gap_dropped: usize, gap_secs: i64 },
+    /// The fit stopped below the structural floor: nothing to learn in the
+    /// labels (homogeneous window, frozen features).
+    Structural { trees: usize, floor: usize, stage: &'static str },
+    /// The validation model scored below the skill floor on the newest window.
+    NoSkill { report: HoldoutReport, min_skill: f64 },
+}
+
+impl RetrainRejection {
+    fn describe(&self) -> String {
+        match self {
+            Self::PoolTooShort { total, train_n, holdout_n, gap_dropped, gap_secs } => format!(
+                "pool too short to validate: {} samples cut into {} for training, {} in the {} s gap and {} held out \
+                 (needs {} to train and {} to hold out); labeling continues",
+                total, train_n, gap_dropped, gap_secs, holdout_n,
+                config::GBOOST_MIN_TRAINING_SAMPLES, HOLDOUT_MIN_SAMPLES,
+            ),
+            Self::Structural { trees, floor, stage } => format!(
+                "{} fit stopped at {} tree{} (structural floor {}): the labels offered no structure to learn",
+                stage, trees, if *trees == 1 { "" } else { "s" }, floor,
+            ),
+            Self::NoSkill { report, min_skill } => format!(
+                "{} — below the {:+.1}% floor, the fit does not generalize to the newest window",
+                report.summary(), min_skill * 100.0,
+            ),
+        }
+    }
+}
+
+/// Outcome of one retrain attempt.
+enum RetrainVerdict {
+    Accepted {
+        /// Refit on the whole pool after the validation fit passed.
+        model: PerpetualBooster,
+        report: HoldoutReport,
+    },
+    Rejected(RetrainRejection),
+}
+
+/// Fit, validate on the newest window, and refit on everything if it passes.
+/// Runs on a blocking thread; every threshold is passed in from the caller's
+/// `DynamicConfig` snapshot, and `gap` is `holdout_gap()` in production (a
+/// parameter so a pool labeled at another horizon can be evaluated offline).
+/// `samples` need not be sorted.
+fn train_and_validate(
+    mut samples: Vec<TrainingSample>,
+    budget: f32,
+    iteration_limit: u32,
+    structural_min_trees: usize,
+    min_skill: f64,
+    confident_threshold: f64,
+    gap: chrono::Duration,
+) -> Result<RetrainVerdict> {
+    samples.sort_by_key(|s| s.entry_timestamp);
+    let total = samples.len();
+    let holdout_len = ((total as f64 * HOLDOUT_FRACTION).round() as usize).max(HOLDOUT_MIN_SAMPLES).min(total);
+    let start = total - holdout_len;
+    let split = split_for_holdout(&samples, start, holdout_len, gap);
+
+    if split.train.len() < config::GBOOST_MIN_TRAINING_SAMPLES || split.holdout.len() < HOLDOUT_MIN_SAMPLES {
+        return Ok(RetrainVerdict::Rejected(RetrainRejection::PoolTooShort {
+            total,
+            train_n: split.train.len(),
+            holdout_n: split.holdout.len(),
+            gap_dropped: split.gap_dropped,
+            gap_secs: gap.num_seconds(),
+        }));
+    }
+
+    let validation = train_model(split.train.clone(), budget, iteration_limit)?;
+    if validation.trees.len() < structural_min_trees {
+        return Ok(RetrainVerdict::Rejected(RetrainRejection::Structural {
+            trees: validation.trees.len(), floor: structural_min_trees, stage: "validation",
+        }));
+    }
+    let report = evaluate_holdout(&validation, &split, gap, confident_threshold);
+    if !(report.skill >= min_skill) {
+        return Ok(RetrainVerdict::Rejected(RetrainRejection::NoSkill { report, min_skill }));
+    }
+
+    let mut model = train_model(samples, budget, iteration_limit)?;
+    if model.trees.len() < structural_min_trees {
+        return Ok(RetrainVerdict::Rejected(RetrainRejection::Structural {
+            trees: model.trees.len(), floor: structural_min_trees, stage: "full-pool",
+        }));
+    }
+    model.insert_metadata(MODEL_META_HOLDOUT_SKILL_KEY.to_string(), format!("{:.4}", report.skill));
+    model.insert_metadata(MODEL_META_HOLDOUT_N_KEY.to_string(), report.holdout_n.to_string());
+    model.insert_metadata(MODEL_META_ACCEPTED_AT_KEY.to_string(), Utc::now().to_rfc3339());
+    Ok(RetrainVerdict::Accepted { model, report })
 }
 
 // ── Concept drift helper (runs inside spawn_blocking) ────────────────────────
@@ -403,14 +782,14 @@ fn compute_concept_drift(booster: &PerpetualBooster, recent_history: &[MarketSna
     if n < 10 {
         return 0.0;
     }
-    let mut feature_data: Vec<f64> = Vec::with_capacity(n * NUM_FEATURES);
-    for (i, snap) in recent_history.iter().enumerate() {
+    let rows: Vec<[f64; NUM_FEATURES]> = recent_history.iter().enumerate().map(|(i, snap)| {
         let prev = if i > 0 { Some(&recent_history[i - 1]) } else { None };
         let hv = hist_vol_from_slice(recent_history, i);
         let tm = tick_momentum_from_slice(recent_history, i);
-        let feats = extract_features(snap, prev, hv, tm);
-        feature_data.extend_from_slice(&feats);
-    }
+        extract_features(snap, prev, hv, tm)
+    }).collect();
+    // Column major (B38): the drift statistic reads the same layout the fit did.
+    let feature_data = column_major_matrix_data(&rows);
     let matrix = Matrix::new(&feature_data, n, NUM_FEATURES);
     perpetual_calculate_drift(booster, &matrix, "concept", false)
 }
@@ -443,9 +822,10 @@ pub struct GboostStrategyImpl {
     /// GBOOST_SL_POST_EXIT_COOLDOWN_SECS (longer, because an SL means the market
     /// moved adversely and re-entering quickly compounds the loss).
     post_exit_cooldowns: Arc<StdMutex<HashMap<MarketId, (chrono::DateTime<chrono::Utc>, i64)>>>,
-    /// Count of consecutive degenerate (< GBOOST_MIN_USABLE_TREES) retrain results.
-    /// Used to apply exponential backoff so a 10-second retrain storm doesn't burn CPU
-    /// for 110+ minutes as seen in the 2026-05-07 evening session.
+    /// Count of consecutive rejected retrains (structural floor or holdout skill,
+    /// see `RetrainRejection`). Used to apply exponential backoff so a 10-second
+    /// retrain storm doesn't burn CPU for 110+ minutes as seen in the 2026-05-07
+    /// evening session.
     consecutive_degenerate: Arc<StdMutex<usize>>,
     /// When set, `maybe_retrain` skips all retrain attempts until this instant passes.
     retrain_backoff_until: Arc<StdMutex<Option<Instant>>>,
@@ -905,21 +1285,42 @@ impl GboostStrategyImpl {
                 Ok(json) => match PerpetualBooster::from_json(&json) {
                     Ok(loaded) => {
                         let n = loaded.trees.len();
-                        // Discard a degenerate startup model — a stale 1-tree model is worse
+                        // Discard a stump startup model — a stale 1-tree model is worse
                         // than no model at all because it sticks as "previous" during retrain
                         // storms and prevents the engine from cold-starting cleanly.
                         // 2026-05-07 evening: startup model had 1 tree, kept as "previous"
                         // for 110 minutes while every retrain hit the same degenerate result.
-                        if n < config::GBOOST_MIN_USABLE_TREES {
+                        // The compile-time floor is used here because this runs before any
+                        // DynamicConfig snapshot exists; only accepted models reach the
+                        // disk, so a file's quality was judged when it was written (B37).
+                        if n < config::GBOOST_STRUCTURAL_MIN_TREES {
                             tracing::warn!(
-                                " GboostStrategy: discarding persisted model from '{}' ({} trees < min {}), cold-starting",
-                                model_path, n, config::GBOOST_MIN_USABLE_TREES
+                                " GboostStrategy: discarding persisted model from '{}' ({} trees, structural floor {}), cold-starting",
+                                model_path, n, config::GBOOST_STRUCTURAL_MIN_TREES
+                            );
+                        } else if !model_has_current_layout(&loaded) {
+                            // B38: fit on a row-major buffer read as column major,
+                            // so its columns were scrambled and its predictions
+                            // are noise. Idle until the first accepted retrain
+                            // rather than predict from it.
+                            tracing::warn!(
+                                " GboostStrategy: discarding persisted model from '{}' ({} trees): it predates the \
+                                 training-matrix layout fix (no '{}' metadata) and its predictions are noise; \
+                                 cold-starting, the first accepted retrain replaces it",
+                                model_path, n, MODEL_META_LAYOUT_KEY
                             );
                         } else {
+                            let provenance = loaded.get_metadata(&MODEL_META_HOLDOUT_SKILL_KEY.to_string())
+                                .zip(loaded.get_metadata(&MODEL_META_HOLDOUT_N_KEY.to_string()))
+                                .map(|(skill, hn)| format!(
+                                    "accepted {} with holdout skill {} on {} samples",
+                                    model_accepted_at_et(&loaded), skill, hn
+                                ))
+                                .unwrap_or_else(|| "no acceptance record; predates the holdout test".to_string());
                             *model_clone.lock().unwrap() = Some(loaded);
                             tracing::info!(
-                                " GboostStrategy: loaded persisted model from '{}' ({} trees)",
-                                model_path, n
+                                " GboostStrategy: loaded persisted model from '{}' ({} trees; {})",
+                                model_path, n, provenance
                             );
                         }
                     }
@@ -1305,42 +1706,74 @@ impl GboostStrategyImpl {
         // blocking closure outlives this scope.
         let train_budget = dc.gboost_budget.to_f32().unwrap_or(0.8);
         let train_iteration_limit = dc.gboost_iteration_limit.max(1);
+        // Acceptance thresholds (B37), hot-tunable. The entry threshold is only
+        // used to count "confident calls" in the holdout report.
+        let structural_min_trees = dc.gboost_structural_min_trees.max(1) as usize;
+        let min_skill = dc.gboost_holdout_min_skill.to_f64().unwrap_or(0.0);
+        let confident_threshold = dc.gboost_entry_threshold.to_f64().unwrap_or(0.72);
 
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
-                let model = train_model(training_samples, train_budget, train_iteration_limit)?;
-                let drift  = compute_concept_drift(&model, &history_for_drift);
-                Ok::<(PerpetualBooster, f32), anyhow::Error>((model, drift))
+                let verdict = train_and_validate(
+                    training_samples, train_budget, train_iteration_limit,
+                    structural_min_trees, min_skill, confident_threshold, holdout_gap(),
+                )?;
+                let drift = match &verdict {
+                    RetrainVerdict::Accepted { model, .. } => compute_concept_drift(model, &history_for_drift),
+                    RetrainVerdict::Rejected(_) => 0.0,
+                };
+                Ok::<(RetrainVerdict, f32), anyhow::Error>((verdict, drift))
             }).await;
 
             match result {
-                Ok(Ok((new_model, drift_score))) => {
-                    let n = new_model.trees.len();
-                    // Reject degenerate models BEFORE persisting — a model with fewer
-                    // than GBOOST_MIN_USABLE_TREES trees is essentially a random stump.
-                    // Keep the previous (better) model rather than regressing.
-                    // Apply exponential backoff so we don't storm every 10 seconds.
+                Ok(Ok((RetrainVerdict::Rejected(why), _))) => {
+                    // Rejected BEFORE persisting: keep the previous (validated) model
+                    // rather than regressing, and say exactly why, with what is being
+                    // kept. The old line said "degenerate model" for every rejection,
+                    // which read as a frozen model when 16 of 65 retrains were in fact
+                    // being adopted (B37).
                     //
                     // 2026-07-18/19: the save used to happen first ("crash safety"),
                     // which let a quiet-market 16-tree stump OVERWRITE the good model
                     // on disk; it was then rejected in memory, and the next deploy
                     // cold-started with nothing loadable — GBoost was blind for 21h.
                     // Only accepted models may touch the disk file.
-                    if n < config::GBOOST_MIN_USABLE_TREES {
-                        let mut count = consecutive_degenerate.lock().unwrap();
-                        *count += 1;
-                        let backoff_secs = (20u64 * 2u64.pow((*count).saturating_sub(1).min(4) as u32)).min(300);
-                        *retrain_backoff_until.lock().unwrap() =
-                            Some(Instant::now() + std::time::Duration::from_secs(backoff_secs));
-                        tracing::warn!(
-                            " GboostStrategy: retrain produced degenerate model ({} trees < min {}), keeping previous (backoff {}s, #{} consecutive)",
-                            n, config::GBOOST_MIN_USABLE_TREES, backoff_secs, *count
-                        );
-                        is_training.store(false, Ordering::Relaxed);
-                        return;
+                    let previous = {
+                        let m = model_arc.lock().unwrap();
+                        m.as_ref()
+                            .map(|m| format!("{} trees, accepted {}", m.trees.len(), model_accepted_at_et(m)))
+                            .unwrap_or_else(|| "none; GBoost stays idle".to_string())
+                    };
+                    match why {
+                        RetrainRejection::PoolTooShort { .. } => {
+                            // Nothing was fit and nothing is wrong; the wall-clock
+                            // retrain floor already spaces the next attempt.
+                            tracing::info!(
+                                " GboostStrategy: retrain deferred — {}; keeping previous model ({})",
+                                why.describe(), previous
+                            );
+                        }
+                        _ => {
+                            // Exponential backoff so a rejected fit does not storm
+                            // the CPU every trigger.
+                            let mut count = consecutive_degenerate.lock().unwrap();
+                            *count += 1;
+                            let backoff_secs = (20u64 * 2u64.pow((*count).saturating_sub(1).min(4) as u32)).min(300);
+                            *retrain_backoff_until.lock().unwrap() =
+                                Some(Instant::now() + std::time::Duration::from_secs(backoff_secs));
+                            tracing::warn!(
+                                " GboostStrategy: retrain rejected — {}; keeping previous model ({}) (backoff {}s, #{} consecutive)",
+                                why.describe(), previous, backoff_secs, *count
+                            );
+                        }
                     }
+                    is_training.store(false, Ordering::Relaxed);
+                    return;
+                }
+                Ok(Ok((RetrainVerdict::Accepted { model: new_model, report }, drift_score))) => {
+                    let n = new_model.trees.len();
 
-                    // Good model — reset degenerate backoff counters.
+                    // Accepted — reset the rejection backoff counters.
                     *consecutive_degenerate.lock().unwrap() = 0;
                     *retrain_backoff_until.lock().unwrap() = None;
 
@@ -1436,14 +1869,13 @@ impl GboostStrategyImpl {
                         old_model.as_ref().map(|m| m.trees.len()).unwrap_or(0)
                     };
 
-                    if n > old_tree_count + 5 || (old_tree_count >= 5 && n + 5 < old_tree_count) || (old_tree_count == 0 && n > 0) {
-                        tracing::info!(
-                            " GboostStrategy: retrained — {} trees (was {}) | drift={:.2}",
-                            n, old_tree_count, drift_score
-                        );
-                    } else {
-                        tracing::debug!(" GboostStrategy: retrained — {} trees | drift={:.2}", n, drift_score);
-                    }
+                    // Always INFO: an accepted retrain that logged only at DEBUG unless
+                    // the tree count moved by more than five made the accept/reject
+                    // tally impossible to read from the production log (B37).
+                    tracing::info!(
+                        " GboostStrategy: retrain accepted — {} | refit on the full pool: {} trees (was {}) | drift={:.2}",
+                        report.summary(), n, old_tree_count, drift_score
+                    );
 
                     *model_arc.lock().unwrap() = Some(new_model);
                 }
@@ -1459,8 +1891,10 @@ impl GboostStrategyImpl {
     fn predict(&self, snap: &MarketSnapshot) -> Option<f64> {
         let guard = self.model.lock().unwrap();
         let booster = guard.as_ref()?;
-        // Refuse to predict from degenerate models — a single stump is random noise.
-        if booster.trees.len() < config::GBOOST_MIN_USABLE_TREES {
+        // Refuse to predict from a stump — a single tree is random noise. Every
+        // model that reaches this slot was already judged (the holdout test at
+        // retrain, the structural floor at startup); this is the last-line guard.
+        if booster.trees.len() < config::GBOOST_STRUCTURAL_MIN_TREES {
             return None;
         }
         let h = self.history.lock().unwrap();
@@ -1470,6 +1904,7 @@ impl GboostStrategyImpl {
         let tick_momentum = if n > 0 { tick_momentum_from_deque(&h, n - 1) } else { 0.0 };
         let feats = extract_features(snap, prev_snap, hist_vol, tick_momentum); // Pass prev_snap
         // Stack-allocated array; Matrix borrows it for the duration of this call only.
+        // One row: row-major and column-major coincide, so no re-layout is needed (B38).
         let matrix = Matrix::new(&feats, 1, NUM_FEATURES);
         booster.predict_proba(&matrix, false, false).first().copied()
     }
@@ -2212,9 +2647,19 @@ impl Strategy for GboostStrategyImpl {
                     veto!(format!("net profit too low (est ${:.2} < min ${:.2})", net_expected, dc.gboost_min_net_profit_usdc));
                 }
             }
-            // ── Persistence debounce (final gate) ─────────────────────────────
+            // ── Persistence debounce ──────────────────────────────────────────
             if !signal_persisted {
                 veto!(format!("persistence debounce (signal must hold {}s)", config::GBOOST_ENTRY_PERSISTENCE_SECS));
+            }
+            // ── Shadow mode (final gate) ──────────────────────────────────────
+            // Every gate has passed: this is the order the model wants. While the
+            // operator keeps `gboost_shadow_mode` on, it is recorded through the
+            // veto shadow-log (gate "shadow mode" on /api/gboost/veto-scores, so
+            // it is scored against settlement like any other gate) and no order
+            // is placed. The model's live behavior has never been observed; this
+            // is how it gets observed before it trades (B38).
+            if dc.gboost_shadow_mode {
+                veto!(format!("shadow mode: would enter YES @ ${:.2} for ${:.2} (P(UP)={:.3})", price, trade_usdc, p_yes_up));
             }
             let shares = trade_usdc / price;
             tracing::info!(
@@ -2344,9 +2789,19 @@ impl Strategy for GboostStrategyImpl {
                     veto!(format!("net profit too low (est ${:.2} < min ${:.2})", net_expected, dc.gboost_min_net_profit_usdc));
                 }
             }
-            // ── Persistence debounce (final gate) ─────────────────────────────
+            // ── Persistence debounce ──────────────────────────────────────────
             if !signal_persisted {
                 veto!(format!("persistence debounce (signal must hold {}s)", config::GBOOST_ENTRY_PERSISTENCE_SECS));
+            }
+            // ── Shadow mode (final gate) ──────────────────────────────────────
+            // Every gate has passed: this is the order the model wants. While the
+            // operator keeps `gboost_shadow_mode` on, it is recorded through the
+            // veto shadow-log (gate "shadow mode" on /api/gboost/veto-scores, so
+            // it is scored against settlement like any other gate) and no order
+            // is placed. The model's live behavior has never been observed; this
+            // is how it gets observed before it trades (B38).
+            if dc.gboost_shadow_mode {
+                veto!(format!("shadow mode: would enter NO @ ${:.2} for ${:.2} (P(UP)={:.3})", price, trade_usdc, p_yes_up));
             }
             let shares = trade_usdc / price;
             tracing::info!(
@@ -2723,6 +3178,188 @@ mod tests {
         );
     }
 
+    // ── Training-matrix layout (B38) ─────────────────────────────────────────
+
+    /// Deterministic pseudo-random features in [0, 1) with a label that depends on
+    /// two of them and on nothing periodic, so the only way a fit can separate the
+    /// classes is by seeing each sample's own features in the columns perpetual
+    /// reads. The older `learnable_samples` fixture alternates labels with the
+    /// sample index, which a scrambled column can partly track by accident.
+    fn structured_samples(n: usize, seed: u64) -> Vec<TrainingSample> {
+        let mut state = seed;
+        let mut next = move || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((state >> 11) as f64) / ((1u64 << 53) as f64)
+        };
+        (0..n).map(|_| {
+            let mut features = [0.0f64; NUM_FEATURES];
+            for f in features.iter_mut() { *f = next(); }
+            let is_profitable = features[7] + 0.5 * features[19] > 0.75;
+            TrainingSample { features, is_profitable, entry_timestamp: Utc::now() }
+        }).collect()
+    }
+
+    /// Rank-based AUC (Mann-Whitney): 0.5 is chance, 1.0 is perfect ordering.
+    fn auc(scores: &[f64], labels: &[bool]) -> f64 {
+        let mut idx: Vec<usize> = (0..scores.len()).collect();
+        idx.sort_by(|a, b| scores[*a].partial_cmp(&scores[*b]).unwrap());
+        let npos = labels.iter().filter(|l| **l).count() as f64;
+        let nneg = labels.len() as f64 - npos;
+        let rank_sum: f64 = idx.iter().enumerate()
+            .filter(|(_, i)| labels[**i])
+            .map(|(r, _)| (r + 1) as f64)
+            .sum();
+        (rank_sum - npos * (npos + 1.0) / 2.0) / (npos * nneg)
+    }
+
+    /// The fill contract, pinned against perpetual's own accessor: element (i, j)
+    /// of the matrix handed to the booster must be feature j of sample i.
+    #[test]
+    fn matrix_fill_matches_perpetual_column_major_layout() {
+        let rows: Vec<[f64; NUM_FEATURES]> = (0..7).map(|i| {
+            let mut r = [0.0f64; NUM_FEATURES];
+            for (j, v) in r.iter_mut().enumerate() { *v = (i * 100 + j) as f64; }
+            r
+        }).collect();
+        let data = column_major_matrix_data(&rows);
+        let m = Matrix::new(&data, rows.len(), NUM_FEATURES);
+        for (i, row) in rows.iter().enumerate() {
+            for (j, expected) in row.iter().enumerate() {
+                assert_eq!(m.get(i, j), expected, "element ({i}, {j})");
+            }
+        }
+    }
+
+    /// A booster fit on a learnable dataset must be able to order its own training
+    /// data when asked about it the way production asks: one correctly laid out
+    /// row at a time (a one-row matrix is the same in both layouts). Under the
+    /// row-major fill the model learned scrambled columns and this AUC sits near
+    /// 0.5 (the production pool gave 0.536 in-sample); it is the regression guard
+    /// for B38. The batch matrix the drift check builds must agree with the
+    /// single-row path, which pins the helper's layout a second way.
+    #[test]
+    fn fitted_model_separates_its_own_training_data() {
+        let n = config::GBOOST_MIN_TRAINING_SAMPLES + 10;
+        let samples = structured_samples(n, 0x9E37_79B9_7F4A_7C15);
+        let labels: Vec<bool> = samples.iter().map(|s| s.is_profitable).collect();
+        let rows: Vec<[f64; NUM_FEATURES]> = samples.iter().map(|s| s.features).collect();
+        let booster = train_model(samples, 0.8, config::GBOOST_ITERATION_LIMIT).expect("fit succeeds");
+        assert!(model_has_current_layout(&booster), "a freshly trained model must carry the layout tag");
+        // The tag has to survive the disk round trip the startup loader checks;
+        // a model without it (every file written before B38) is refused there.
+        let reloaded = PerpetualBooster::from_json(&booster.json_dump().expect("dump")).expect("reload");
+        assert!(model_has_current_layout(&reloaded), "layout tag must survive json_dump/from_json");
+        let mut untagged = PerpetualBooster::default();
+        untagged.metadata.clear();
+        assert!(!model_has_current_layout(&untagged), "a model with no tag must be refused");
+
+        // Production path: one row per prediction.
+        let single: Vec<f64> = rows.iter()
+            .map(|row| booster.predict_proba(&Matrix::new(row, 1, NUM_FEATURES), false, false)[0])
+            .collect();
+        let a = auc(&single, &labels);
+        assert!(
+            a > 0.9,
+            "in-sample AUC {a:.3}: a booster that cannot order its own training data was fit on scrambled columns",
+        );
+
+        // Batch path (drift check): must be the same numbers.
+        let data = column_major_matrix_data(&rows);
+        let batch = booster.predict_proba(&Matrix::new(&data, n, NUM_FEATURES), false, false);
+        for (i, (s, b)) in single.iter().zip(&batch).enumerate() {
+            assert!((s - b).abs() < 1e-9, "row {i}: single-row {s} vs batch {b}");
+        }
+    }
+
+    // ── Shadow mode (B38 landing) ────────────────────────────────────────────
+
+    /// A model that is decisively bullish on `make_snapshot()`: the label follows
+    /// the oracle_price feature ([11]) and the fixture's oracle is 95000 (0.95).
+    /// Noise on the other features keeps the fit from collapsing to one stump, so
+    /// it clears GBOOST_STRUCTURAL_MIN_TREES.
+    fn model_bullish_on_fixture() -> PerpetualBooster {
+        let n = config::GBOOST_MIN_TRAINING_SAMPLES + 10;
+        let mut samples = structured_samples(n, 0xD1B5_4A32_D192_ED03);
+        for s in samples.iter_mut() {
+            s.is_profitable = s.features[11] + 0.3 * (s.features[19] - 0.5) > 0.5;
+        }
+        let booster = train_model(samples, 1.50, config::GBOOST_ITERATION_LIMIT).expect("fit succeeds");
+        assert!(
+            booster.trees.len() >= config::GBOOST_STRUCTURAL_MIN_TREES,
+            "fixture model has {} trees, below the {} the predictor requires",
+            booster.trees.len(), config::GBOOST_STRUCTURAL_MIN_TREES,
+        );
+        booster
+    }
+
+    /// A context that clears every deterministic entry gate for a YES entry, so
+    /// the only things between the model and an order are the persistence
+    /// debounce (satisfied by hand in `satisfy_persistence`) and shadow mode.
+    fn entry_ready_ctx(asset: &str, shadow: bool) -> StrategyContext {
+        let mut ctx = make_ctx();
+        ctx.crypto_filter = asset.to_string();
+        ctx.market_started_at = Utc::now() - chrono::Duration::seconds(config::GBOOST_MIN_MARKET_AGE_SECS + 60);
+        ctx.snapshot.yes_ask = dec!(0.42); // inside the YES band, clear of the coin-flip zone
+        ctx.snapshot.no_ask  = dec!(0.59);
+        let mut dc = DynamicConfig::default();
+        dc.enable_gboost              = true;
+        dc.gboost_shadow_mode         = shadow;
+        dc.gboost_entry_threshold     = dec!(0.60);
+        dc.gboost_min_entry_price     = dec!(0.40);
+        dc.gboost_max_yes_entry_price = dec!(0.55);
+        dc.gboost_min_edge_from_fair  = dec!(0.04);
+        dc.gboost_min_hist_vol        = dec!(0.0001);
+        dc.gboost_min_net_profit_usdc = dec!(0);
+        ctx.dynamic_config = Arc::new(dc);
+        ctx
+    }
+
+    fn satisfy_persistence(strategy: &GboostStrategyImpl, ctx: &StrategyContext) {
+        let held = std::time::Duration::from_secs(config::GBOOST_ENTRY_PERSISTENCE_SECS + 1);
+        *strategy.entry_signal_streak.lock().unwrap() =
+            Some((ctx.market.condition_id.clone(), true, Instant::now() - held, Instant::now()));
+    }
+
+    /// With shadow mode on, a signal that clears every gate is reported as a
+    /// would-be entry and nothing else happens: no Entry signal, no pending entry,
+    /// no market hold lock. With it off, the same tick emits the order. This is
+    /// the mechanism that keeps the corrected model observe-only until the
+    /// operator lifts it.
+    #[tokio::test]
+    async fn shadow_mode_records_the_would_be_entry_instead_of_placing_it() {
+        let strategy = GboostStrategyImpl::new_isolated();
+        *strategy.model.lock().unwrap() = Some(model_bullish_on_fixture());
+        let last_reason = |asset: &str| crate::helpers::viper_status::snapshot(Some(asset))
+            .into_iter()
+            .find(|r| r.strategy == "GboostStrategy")
+            .and_then(|r| r.last_reason)
+            .unwrap_or_default();
+
+        let ctx = entry_ready_ctx("btc-shadow-on", true);
+        satisfy_persistence(&strategy, &ctx);
+        let signal = strategy.evaluate_entry(&ctx).await.unwrap();
+        assert!(matches!(signal, StrategySignal::NoSignal), "shadow mode must not emit an order, got {signal:?}");
+        let reason = last_reason("btc-shadow-on");
+        assert!(
+            reason.starts_with("shadow mode: would enter YES @ $0.42"),
+            "expected the would-be entry to be reported, got {reason:?}",
+        );
+        assert!(strategy.pending_entries.lock().unwrap().is_empty(), "shadow mode must not latch a pending entry");
+        assert!(strategy.market_hold_locks.lock().unwrap().is_empty(), "shadow mode must not set a hold lock");
+
+        let ctx = entry_ready_ctx("btc-shadow-off", false);
+        satisfy_persistence(&strategy, &ctx);
+        let signal = strategy.evaluate_entry(&ctx).await.unwrap();
+        match signal {
+            StrategySignal::Entry { params, .. } => {
+                assert_eq!(params.token_id, ctx.market.yes_token);
+                assert_eq!(params.price, dec!(0.42));
+            }
+            other => panic!("with shadow mode off the same tick must emit the YES entry, got {other:?}"),
+        }
+        assert_eq!(strategy.pending_entries.lock().unwrap().len(), 1);
+    }
+
     #[tokio::test]
     async fn no_signal_without_model() {
         let strategy = GboostStrategyImpl::new_isolated();
@@ -2762,9 +3399,9 @@ mod tests {
         let booster = train_model(learnable_samples(n), 1.50, config::GBOOST_ITERATION_LIMIT)
             .expect("fit succeeds");
         assert!(
-            booster.trees.len() >= config::GBOOST_MIN_USABLE_TREES,
+            booster.trees.len() >= config::GBOOST_STRUCTURAL_MIN_TREES,
             "fixture model has {} trees, below the {} the predictor requires",
-            booster.trees.len(), config::GBOOST_MIN_USABLE_TREES,
+            booster.trees.len(), config::GBOOST_STRUCTURAL_MIN_TREES,
         );
         *strategy.model.lock().unwrap() = Some(booster);
 
@@ -3107,5 +3744,460 @@ mod tests {
 
         std::env::remove_var("GBOOST_LABEL_POOL_PATH");
         let _ = std::fs::remove_dir_all(path.parent().unwrap().parent().unwrap());
+    }
+
+    // ── Retrain acceptance evidence harness (B37) ────────────────────────────
+
+    /// Walk-forward evaluation of the acceptance test over a real label pool
+    /// file. Ignored by default: it needs a pool file and takes a minute in
+    /// release. Run with
+    ///
+    ///   GBOOST_POOL_EVAL_PATH=logs/btc-gboost_label_pool.json \
+    ///   cargo test --release eval_pool_walk_forward -- --ignored --nocapture
+    ///
+    /// Prints, for a series of interior holdout windows, what the validation
+    /// fit scores, what a label-shuffled null scores on the same window, the
+    /// reverse (oldest-window) split, and the verdict the production path
+    /// would return on the whole pool. This is how the skill floor was chosen
+    /// and how "would the corrected model be accepted" is shown rather than
+    /// asserted.
+    #[test]
+    #[ignore]
+    fn eval_pool_walk_forward() {
+        let Ok(path) = std::env::var("GBOOST_POOL_EVAL_PATH") else {
+            eprintln!("GBOOST_POOL_EVAL_PATH not set; nothing to evaluate");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("pool file readable");
+        let file: LabelPoolFile = serde_json::from_slice(&bytes).expect("pool file parses");
+        let mut samples = file.samples;
+        samples.sort_by_key(|s| s.entry_timestamp);
+        let n = samples.len();
+        let gap = chrono::Duration::seconds(2 * file.label_horizon_secs);
+        let budget = config::GBOOST_BUDGET.to_f32().unwrap_or(0.8);
+        let iters = config::GBOOST_ITERATION_LIMIT;
+        let threshold = config::GBOOST_ENTRY_THRESHOLD.to_f64().unwrap_or(0.72);
+        let holdout_len = ((n as f64 * HOLDOUT_FRACTION).round() as usize).max(HOLDOUT_MIN_SAMPLES);
+        eprintln!(
+            "pool {}: {} samples, horizon {} s, gap {} s, holdout {} samples, budget {}, {} pos",
+            path, n, file.label_horizon_secs, gap.num_seconds(), holdout_len, budget,
+            samples.iter().filter(|s| s.is_profitable).count(),
+        );
+
+        // Null model: the same features with labels rotated by an offset far
+        // larger than the gap, so autocorrelation survives but the feature to
+        // label relation is destroyed. Its skill on the true holdout is what a
+        // lucky model looks like.
+        let shifted = |train: &[TrainingSample], by: usize| -> Vec<TrainingSample> {
+            let m = train.len();
+            (0..m).map(|i| TrainingSample {
+                features: train[i].features,
+                is_profitable: train[(i + by) % m].is_profitable,
+                entry_timestamp: train[i].entry_timestamp,
+            }).collect()
+        };
+
+        let mut real_skills = Vec::new();
+        let mut null_skills = Vec::new();
+        for frac in [0.30, 0.40, 0.50, 0.60, 0.70, 0.80, 0.90] {
+            let start = ((n as f64) * frac) as usize;
+            let split = split_for_holdout(&samples, start, holdout_len, gap);
+            if split.train.len() < config::GBOOST_MIN_TRAINING_SAMPLES { continue; }
+            let model = train_model(split.train.clone(), budget, iters).expect("fit");
+            let r = evaluate_holdout(&model, &split, gap, threshold);
+            eprintln!("split @{:.0}%  REAL  {}  train_pos={:.2} holdout_pos={:.2}",
+                frac * 100.0, r.summary(), r.train_pos_rate, r.holdout_pos_rate);
+            real_skills.push(r.skill);
+            for by in [1500usize, 3000, 4500] {
+                let by = by % split.train.len().max(1);
+                let null_split = HoldoutSplit {
+                    train: shifted(&split.train, by),
+                    holdout: split.holdout.clone(),
+                    gap_dropped: split.gap_dropped,
+                };
+                let null_model = train_model(null_split.train.clone(), budget, iters).expect("fit");
+                let nr = evaluate_holdout(&null_model, &null_split, gap, threshold);
+                eprintln!("split @{:.0}%  NULL+{:<5} skill {:+.1}% auc {:.2} conf {}/{} trees {}",
+                    frac * 100.0, by, nr.skill * 100.0, nr.auc, nr.confident_hits, nr.confident_n, nr.trees);
+                null_skills.push(nr.skill);
+            }
+        }
+
+        // Reverse split: mirror time so the OLDEST window becomes the holdout.
+        {
+            let t0 = samples.first().unwrap().entry_timestamp;
+            let t1 = samples.last().unwrap().entry_timestamp;
+            let mut mirrored: Vec<TrainingSample> = samples.iter().map(|s| TrainingSample {
+                features: s.features,
+                is_profitable: s.is_profitable,
+                entry_timestamp: t1 - (s.entry_timestamp - t0),
+            }).collect();
+            mirrored.sort_by_key(|s| s.entry_timestamp);
+            let split = split_for_holdout(&mirrored, n - holdout_len, holdout_len, gap);
+            let model = train_model(split.train.clone(), budget, iters).expect("fit");
+            let r = evaluate_holdout(&model, &split, gap, threshold);
+            eprintln!("REVERSE (oldest window held out)  {}", r.summary());
+        }
+
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+        let mut sorted_null = null_skills.clone();
+        sorted_null.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        eprintln!(
+            "REAL skills: min {:+.1}% mean {:+.1}% max {:+.1}% | NULL skills ({}): min {:+.1}% mean {:+.1}% max {:+.1}%",
+            real_skills.iter().cloned().fold(f64::INFINITY, f64::min) * 100.0, mean(&real_skills) * 100.0,
+            real_skills.iter().cloned().fold(f64::NEG_INFINITY, f64::max) * 100.0,
+            null_skills.len(),
+            sorted_null.first().copied().unwrap_or(0.0) * 100.0, mean(&null_skills) * 100.0,
+            sorted_null.last().copied().unwrap_or(0.0) * 100.0,
+        );
+
+        // In-sample check on the production split: if the validation fit orders
+        // and scores its own training data well but not the holdout, the failure
+        // is generalization, not the evaluation plumbing.
+        {
+            let split = split_for_holdout(&samples, n - holdout_len, holdout_len, gap);
+            let model = train_model(split.train.clone(), budget, iters).expect("fit");
+            let in_sample = HoldoutSplit { train: split.train.clone(), holdout: split.train.clone(), gap_dropped: 0 };
+            let r = evaluate_holdout(&model, &in_sample, gap, threshold);
+            eprintln!("IN-SAMPLE (validation fit scored on its own training split): skill {:+.1}% logloss {:.3} auc {:.3} conf {}/{}",
+                r.skill * 100.0, r.model_logloss, r.auc, r.confident_hits, r.confident_n);
+            let probs = {
+                let rows: Vec<[f64; NUM_FEATURES]> = split.holdout.iter().map(|s| s.features).collect();
+                let data = column_major_matrix_data(&rows);
+                model.predict_proba(&Matrix::new(&data, rows.len(), NUM_FEATURES), false, false)
+            };
+            let saturated = probs.iter().filter(|p| **p < 0.01 || **p > 0.99).count();
+            let sat_wrong = probs.iter().zip(&split.holdout)
+                .filter(|(p, s)| (**p < 0.01 || **p > 0.99) && ((**p >= 0.5) != s.is_profitable)).count();
+            eprintln!("PRODUCTION SPLIT holdout: {} of {} predictions saturated beyond 0.01/0.99, {} of those wrong",
+                saturated, probs.len(), sat_wrong);
+        }
+
+        // Variant matrix: is the failure the learning rate, the time-proxy
+        // features (oracle_price [11], secs_to_expiry [12]), or the data?
+        eprintln!("VARIANTS (split%, budget, masked features) -> skill / logloss / auc / confident / trees");
+        for frac in [0.50, 0.70, 0.90] {
+            let start = ((n as f64) * frac) as usize;
+            for b in [0.3f32, 0.5, 0.8] {
+                for mask in [&[][..], &[11usize, 12][..], &[2usize, 3, 11, 12][..]] {
+                    let masked: Vec<TrainingSample> = samples.iter().map(|s| {
+                        let mut f = s.features;
+                        for &k in mask { f[k] = 0.0; }
+                        TrainingSample { features: f, is_profitable: s.is_profitable, entry_timestamp: s.entry_timestamp }
+                    }).collect();
+                    let split = split_for_holdout(&masked, start, holdout_len, gap);
+                    let model = train_model(split.train.clone(), b, iters).expect("fit");
+                    let r = evaluate_holdout(&model, &split, gap, threshold);
+                    eprintln!("  @{:.0}% budget {:.1} mask {:?}: skill {:+.1}% logloss {:.3} auc {:.2} conf {}/{} trees {}",
+                        frac * 100.0, b, mask, r.skill * 100.0, r.model_logloss, r.auc,
+                        r.confident_hits, r.confident_n, r.trees);
+                }
+            }
+        }
+
+        // Decimation: the pool holds ~300 near-duplicate rows per 300 s outcome
+        // (median spacing under 1 s). Keep one sample per `every` seconds and
+        // ask whether the features carry any signal once the duplicates are gone.
+        eprintln!("DECIMATED (one sample per N s; holdout = newest 10% by count, gap unchanged)");
+        for every in [30i64, 60, 120] {
+            let mut thinned: Vec<TrainingSample> = Vec::new();
+            for s in &samples {
+                if thinned.last().map_or(true, |l: &TrainingSample| (s.entry_timestamp - l.entry_timestamp).num_seconds() >= every) {
+                    thinned.push(s.clone());
+                }
+            }
+            let m = thinned.len();
+            let hl = ((m as f64) * HOLDOUT_FRACTION).round() as usize;
+            for frac in [0.50, 0.70, 0.90] {
+                let start = ((m as f64) * frac) as usize;
+                for b in [0.3f32, 0.5, 0.8] {
+                    let split = split_for_holdout(&thinned, start, hl, gap);
+                    if split.train.len() < 50 { continue; }
+                    let model = train_model_unchecked(split.train.clone(), b, iters).expect("fit");
+                    let r = evaluate_holdout(&model, &split, gap, threshold);
+                    eprintln!("  every {}s ({} samples) @{:.0}% budget {:.1}: skill {:+.1}% logloss {:.3} auc {:.2} conf {}/{} trees {} train {}",
+                        every, m, frac * 100.0, b, r.skill * 100.0, r.model_logloss, r.auc,
+                        r.confident_hits, r.confident_n, r.trees, r.train_n);
+                }
+            }
+        }
+
+        // The production path on the whole pool, with the shipped thresholds.
+        let verdict = train_and_validate(
+            samples.clone(), budget, iters,
+            config::GBOOST_STRUCTURAL_MIN_TREES,
+            config::GBOOST_HOLDOUT_MIN_SKILL.to_f64().unwrap_or(0.0),
+            threshold, gap,
+        ).expect("train_and_validate");
+        match verdict {
+            RetrainVerdict::Accepted { model, report } => eprintln!(
+                "PRODUCTION PATH: ACCEPTED — {} | refit on all {} samples -> {} trees",
+                report.summary(), n, model.trees.len()),
+            RetrainVerdict::Rejected(why) => eprintln!("PRODUCTION PATH: REJECTED — {}", why.describe()),
+        }
+    }
+
+    // ── Retrain acceptance (B37) ─────────────────────────────────────────────
+
+    /// Give `samples` distinct timestamps one second apart from `start`, the
+    /// spacing the live pool has (median 0.94 s on production).
+    fn timed(mut samples: Vec<TrainingSample>, start: chrono::DateTime<Utc>) -> Vec<TrainingSample> {
+        for (i, s) in samples.iter_mut().enumerate() {
+            s.entry_timestamp = start + chrono::Duration::seconds(i as i64);
+        }
+        samples
+    }
+
+    /// Enough one-second samples that, after the purge gap and a 10% holdout,
+    /// the training split still clears GBOOST_MIN_TRAINING_SAMPLES on every profile.
+    fn acceptance_pool_len() -> usize {
+        config::GBOOST_MIN_TRAINING_SAMPLES + holdout_gap().num_seconds() as usize + HOLDOUT_MIN_SAMPLES + 400
+    }
+
+    /// The production pathology: a clock feature and labels that come in runs,
+    /// so a fit can memorize when each run happened but learns nothing that
+    /// carries past the last training timestamp.
+    fn clock_memorizable_samples(n: usize, start: chrono::DateTime<Utc>) -> Vec<TrainingSample> {
+        timed(structured_samples(n, 5), start).into_iter().enumerate().map(|(i, mut s)| {
+            s.features[11] = i as f64 / n as f64;
+            s.is_profitable = (i / 150) % 2 == 0;
+            s
+        }).collect()
+    }
+
+    #[test]
+    fn holdout_split_purges_a_gap_wider_than_the_label_horizon() {
+        let n = 2000;
+        let samples = timed(structured_samples(n, 7), Utc::now() - chrono::Duration::seconds(n as i64));
+        let gap = holdout_gap();
+        let horizon = chrono::Duration::seconds(config::GBOOST_LABEL_HORIZON_SECS);
+        assert!(gap >= horizon * 2, "gap {} s must be at least twice the {} s label horizon", gap.num_seconds(), horizon.num_seconds());
+
+        let split = split_for_holdout(&samples, n - 200, 200, gap);
+        assert_eq!(split.holdout.len(), 200);
+        let first_holdout = split.holdout[0].entry_timestamp;
+        let last_train = split.train.last().unwrap().entry_timestamp;
+        assert!(first_holdout - last_train >= gap, "training ends {} s before the holdout, gap is {} s",
+            (first_holdout - last_train).num_seconds(), gap.num_seconds());
+        assert_eq!(split.train.len() + split.gap_dropped + split.holdout.len(), n, "every sample is accounted for");
+        assert!(split.gap_dropped as i64 >= gap.num_seconds() - 1 && split.gap_dropped as i64 <= gap.num_seconds());
+        // The property the gap exists for: no training label is settled inside the holdout.
+        assert!(split.train.iter().all(|s| s.entry_timestamp + horizon <= first_holdout));
+        // Sorted input is preserved in both halves.
+        assert!(split.train.windows(2).all(|w| w[0].entry_timestamp <= w[1].entry_timestamp));
+        assert!(split.holdout.windows(2).all(|w| w[0].entry_timestamp <= w[1].entry_timestamp));
+    }
+
+    #[test]
+    fn logloss_and_skill_score_what_they_claim() {
+        let labels = [true, false, true, false];
+        // A constant at the base rate scores exactly the base-rate entropy.
+        let base = logloss(&[0.5; 4], &labels);
+        assert!((base - std::f64::consts::LN_2).abs() < 1e-12);
+        // A perfect forecaster scores ~0; a perfectly wrong one is capped by the clamp, not infinite.
+        assert!(logloss(&[1.0, 0.0, 1.0, 0.0], &labels) < 1e-5);
+        let wrong = logloss(&[0.0, 1.0, 0.0, 1.0], &labels);
+        assert!(wrong.is_finite() && wrong > 13.0);
+        assert!((rank_auc(&[0.9, 0.1, 0.8, 0.2], &labels) - 1.0).abs() < 1e-12);
+        assert!((rank_auc(&[0.1, 0.9, 0.2, 0.8], &labels) - 0.0).abs() < 1e-12);
+        assert_eq!(rank_auc(&[0.3, 0.4], &[true, true]), 0.5, "one class only is chance, not NaN");
+    }
+
+    /// A fit whose labels follow the features is adopted with skill well above
+    /// the floor, and carries its acceptance record; the same machinery rejects
+    /// a fit that only memorized a clock, naming the measured skill.
+    #[test]
+    fn acceptance_adopts_a_generalizing_fit_and_rejects_a_clock_memorizing_one() {
+        let n = acceptance_pool_len();
+        let start = Utc::now() - chrono::Duration::seconds(n as i64);
+        let learnable = timed(structured_samples(n, 0xB37), start);
+        match train_and_validate(learnable, 0.8, config::GBOOST_ITERATION_LIMIT, 3, 0.05, 0.72, holdout_gap()).unwrap() {
+            RetrainVerdict::Accepted { model, report } => {
+                assert!(report.skill > 0.05, "expected clear skill on learnable labels, got {}", report.summary());
+                assert!(report.holdout_n >= HOLDOUT_MIN_SAMPLES);
+                assert!(report.gap_secs >= 2 * config::GBOOST_LABEL_HORIZON_SECS);
+                assert!(model.trees.len() >= 3);
+                assert!(model_has_current_layout(&model), "the adopted refit carries the B38 layout tag");
+                assert_eq!(
+                    model.get_metadata(&MODEL_META_HOLDOUT_SKILL_KEY.to_string()).as_deref(),
+                    Some(format!("{:.4}", report.skill).as_str()),
+                );
+                assert!(model.get_metadata(&MODEL_META_ACCEPTED_AT_KEY.to_string()).is_some());
+                assert!(!model_accepted_at_et(&model).contains("before"), "accepted_at renders as a time");
+            }
+            RetrainVerdict::Rejected(why) => panic!("learnable labels were rejected: {}", why.describe()),
+        }
+
+        match train_and_validate(clock_memorizable_samples(n, start), 0.8, config::GBOOST_ITERATION_LIMIT, 3, 0.05, 0.72, holdout_gap()).unwrap() {
+            RetrainVerdict::Rejected(RetrainRejection::NoSkill { report, min_skill }) => {
+                assert!(report.skill < min_skill, "{}", report.summary());
+                let msg = RetrainRejection::NoSkill { report, min_skill }.describe();
+                assert!(msg.contains("holdout skill") && msg.contains("does not generalize"), "{msg}");
+            }
+            RetrainVerdict::Rejected(other) => panic!("expected a skill rejection, got: {}", other.describe()),
+            RetrainVerdict::Accepted { report, .. } => panic!("a clock-memorizing fit must not be adopted: {}", report.summary()),
+        }
+    }
+
+    /// The knob is what decides: the same clock-memorizing fit is adopted when
+    /// the operator sets the floor below its measured skill (the documented
+    /// "collect shadow data anyway" setting).
+    #[test]
+    fn skill_floor_knob_decides_acceptance() {
+        let n = acceptance_pool_len();
+        let start = Utc::now() - chrono::Duration::seconds(n as i64);
+        let samples = clock_memorizable_samples(n, start);
+        let measured = match train_and_validate(samples.clone(), 0.8, config::GBOOST_ITERATION_LIMIT, 3, 0.05, 0.72, holdout_gap()).unwrap() {
+            RetrainVerdict::Rejected(RetrainRejection::NoSkill { report, .. }) => report.skill,
+            other => panic!("expected a skill rejection first, got {}", match other {
+                RetrainVerdict::Rejected(w) => w.describe(), RetrainVerdict::Accepted { report, .. } => report.summary() }),
+        };
+        match train_and_validate(samples, 0.8, config::GBOOST_ITERATION_LIMIT, 3, measured - 1.0, 0.72, holdout_gap()).unwrap() {
+            RetrainVerdict::Accepted { .. } => {}
+            RetrainVerdict::Rejected(why) => panic!("a floor below the measured skill must accept: {}", why.describe()),
+        }
+    }
+
+    #[test]
+    fn acceptance_defers_when_the_pool_is_too_short_to_validate() {
+        // Enough to fit outright, not enough to leave a training split behind
+        // the gap and a holdout in front of it.
+        let n = config::GBOOST_MIN_TRAINING_SAMPLES + 50;
+        let start = Utc::now() - chrono::Duration::seconds(n as i64);
+        match train_and_validate(timed(structured_samples(n, 3), start), 0.8, config::GBOOST_ITERATION_LIMIT, 3, 0.05, 0.72, holdout_gap()).unwrap() {
+            RetrainVerdict::Rejected(why @ RetrainRejection::PoolTooShort { .. }) => {
+                let msg = why.describe();
+                assert!(msg.contains("pool too short") && msg.contains("labeling continues"), "{msg}");
+            }
+            RetrainVerdict::Rejected(other) => panic!("expected deferral, got: {}", other.describe()),
+            RetrainVerdict::Accepted { report, .. } => panic!("nothing should be fit on a pool this short: {}", report.summary()),
+        }
+    }
+
+    /// Evidence probe for the structural floor: how many trees does perpetual
+    /// stop at when the features carry nothing (identical rows, alternating
+    /// labels), across pool sizes and budgets. Run with
+    ///
+    ///   cargo test --release probe_stump_tree_counts -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn probe_stump_tree_counts() {
+        let snap = make_snapshot();
+        for n in [320usize, 600, 679, 955, 1000, 2000, 2001, 4000, 8000] {
+            for b in [0.5f32, 0.8, 1.0, 1.5] {
+                let flat: Vec<TrainingSample> = (0..n).map(|i| TrainingSample {
+                    features: extract_features(&snap, None, 0.0, 0.0),
+                    is_profitable: i % 2 == 0,
+                    entry_timestamp: Utc::now(),
+                }).collect();
+                let m = train_model_unchecked(flat, b, config::GBOOST_ITERATION_LIMIT).unwrap();
+                eprintln!("flat n={n} budget={b}: {} trees", m.trees.len());
+            }
+        }
+        // Homogeneous labels (all up) with real-looking features: the other
+        // way a window gives the booster nothing.
+        for n in [600usize, 2000] {
+            let mut s = structured_samples(n, 11);
+            for x in s.iter_mut() { x.is_profitable = true; }
+            let m = train_model_unchecked(s, 0.8, config::GBOOST_ITERATION_LIMIT).unwrap();
+            eprintln!("all-up n={n} budget=0.8: {} trees", m.trees.len());
+        }
+    }
+
+    /// The case the original tree floor was written for: identical features
+    /// with alternating labels give the booster nothing to split on, so it
+    /// stops at a stump. The structural floor catches it before any holdout
+    /// arithmetic, with its own reason.
+    #[test]
+    fn structural_floor_catches_a_stump() {
+        let n = acceptance_pool_len();
+        let start = Utc::now() - chrono::Duration::seconds(n as i64);
+        let snap = make_snapshot();
+        let flat: Vec<TrainingSample> = (0..n).map(|i| TrainingSample {
+            features: extract_features(&snap, None, 0.0, 0.0),
+            is_profitable: i % 2 == 0,
+            entry_timestamp: start + chrono::Duration::seconds(i as i64),
+        }).collect();
+        let stump = train_model(flat.clone(), 0.8, config::GBOOST_ITERATION_LIMIT).unwrap();
+        assert!(stump.trees.len() < config::GBOOST_STRUCTURAL_MIN_TREES,
+            "a featureless fit produced {} trees; the structural floor of {} would not catch it",
+            stump.trees.len(), config::GBOOST_STRUCTURAL_MIN_TREES);
+        match train_and_validate(flat, 0.8, config::GBOOST_ITERATION_LIMIT, config::GBOOST_STRUCTURAL_MIN_TREES, 0.05, 0.72, holdout_gap()).unwrap() {
+            RetrainVerdict::Rejected(why @ RetrainRejection::Structural { .. }) => {
+                let msg = why.describe();
+                assert!(msg.contains("structural floor") && msg.contains("no structure"), "{msg}");
+            }
+            RetrainVerdict::Rejected(other) => panic!("expected a structural rejection, got: {}", other.describe()),
+            RetrainVerdict::Accepted { report, .. } => panic!("a stump must not be adopted: {}", report.summary()),
+        }
+    }
+
+    /// The retrain path on the real code, not its pieces: `maybe_retrain` with
+    /// enough real outcomes to train goes through spawn_blocking and
+    /// `train_and_validate`; an accepted verdict installs the refit model, a
+    /// rejected one leaves the installed model exactly as it was.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn maybe_retrain_installs_an_accepted_model_and_keeps_it_on_rejection() {
+        let model_path = scratch_path("b37-model").with_file_name("btc-gboost_model_test.json");
+        // The model writer assumes logs/ exists, as it does in every deployment.
+        std::fs::create_dir_all(model_path.parent().unwrap()).unwrap();
+        std::env::set_var("GBOOST_MODEL_PATH", &model_path);
+
+        let strategy = GboostStrategyImpl::new_isolated();
+        let n = acceptance_pool_len();
+        let start = Utc::now() - chrono::Duration::seconds(n as i64);
+        let training_flag = Arc::clone(&strategy.is_training);
+        let wait_for_verdict = move || {
+            let flag = Arc::clone(&training_flag);
+            async move {
+                let mut waited = 0;
+                while flag.load(Ordering::Relaxed) && waited < 1200 {
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    waited += 1;
+                }
+                assert!(!flag.load(Ordering::Relaxed), "retrain did not finish");
+            }
+        };
+        let arm = |strategy: &GboostStrategyImpl, samples: Vec<TrainingSample>| {
+            let mut td = strategy.training_data.lock().unwrap();
+            td.clear();
+            td.extend(samples);
+            // Real outcomes at or above GBOOST_MIN_TRAINING_SAMPLES take the
+            // real-samples branch, so the process-global label pool is untouched.
+            assert!(td.len() >= config::GBOOST_MIN_TRAINING_SAMPLES);
+            *strategy.ticks_since_retrain.lock().unwrap() = config::GBOOST_RETRAIN_EVERY_N - 1;
+            *strategy.last_retrain_at.lock().unwrap() = None;
+            *strategy.retrain_backoff_until.lock().unwrap() = None;
+        };
+
+        let dc = DynamicConfig::default();
+        arm(&strategy, timed(structured_samples(n, 0xB37), start));
+        strategy.maybe_retrain(&dc);
+        assert!(strategy.is_training.load(Ordering::Relaxed), "the trigger must spawn a training job");
+        wait_for_verdict().await;
+        let accepted_at = {
+            let m = strategy.model.lock().unwrap();
+            let model = m.as_ref().expect("an accepted retrain installs the model");
+            assert!(model.get_metadata(&MODEL_META_HOLDOUT_SKILL_KEY.to_string()).is_some());
+            model.get_metadata(&MODEL_META_ACCEPTED_AT_KEY.to_string()).expect("acceptance record")
+        };
+        assert!(model_path.exists(), "only accepted models reach the disk, and this one was accepted");
+        assert_eq!(*strategy.consecutive_degenerate.lock().unwrap(), 0);
+
+        arm(&strategy, clock_memorizable_samples(n, start));
+        strategy.maybe_retrain(&dc);
+        assert!(strategy.is_training.load(Ordering::Relaxed));
+        wait_for_verdict().await;
+        {
+            let m = strategy.model.lock().unwrap();
+            let model = m.as_ref().expect("a rejected retrain keeps the previous model");
+            assert_eq!(model.get_metadata(&MODEL_META_ACCEPTED_AT_KEY.to_string()).as_deref(), Some(accepted_at.as_str()),
+                "the installed model is the one accepted before, untouched");
+        }
+        assert_eq!(*strategy.consecutive_degenerate.lock().unwrap(), 1, "a rejection counts toward backoff");
+        assert!(strategy.retrain_backoff_until.lock().unwrap().is_some(), "a rejection arms the backoff");
+
+        std::env::remove_var("GBOOST_MODEL_PATH");
+        let _ = std::fs::remove_dir_all(model_path.parent().unwrap().parent().unwrap());
     }
 }

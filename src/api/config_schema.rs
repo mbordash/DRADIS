@@ -431,6 +431,13 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         let g = "GBoost"; let e = Some("enable_gboost");
         v.push(F::new(g, e, "enable_gboost", "Enabled", "bool", false,
             "Online gradient-boosted orderbook classifier."));
+        v.push(F::new(g, e, "gboost_shadow_mode", "Shadow Mode", "bool", false,
+            "Observe-only. When on, a GBoost signal that clears every entry gate is recorded as a would-be \
+             entry (gate \"shadow mode\" on the veto scoreboard, scored against settlement like any other \
+             gate) and no order is placed. On by default: the model's training matrix was laid out wrong \
+             until September 2026, so no model before then learned anything, and the corrected model has \
+             never been watched live. Leave it on until the scoreboard shows its shadow entries winning \
+             across enough distinct markets to trust, then turn it off to let GBoost trade."));
         v.push(F::new(g, e, "gboost_budget", "Training Budget", "decimal", true,
             "How hard the model works on each retrain. The booster keeps adding trees until this \
              budget is spent, so a higher number fits the recorded outcomes more closely and a \
@@ -494,6 +501,26 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              cannot retrain the model on a regime that is days gone. In normal operation the FIFO cap already \
              keeps the pool to a few hours of data, so this mostly governs what a reload is allowed to bring back.")
             .range(1.0, 720.0).step(1.0).unit("h"));
+        v.push(F::new(g, e, "gboost_holdout_min_skill", "Retrain Acceptance Skill", "decimal", true,
+            "How much better than a coin a retrain must be before it replaces the running model. Before \
+             adoption, a validation model is fit on the older part of the label pool and scored on the newest \
+             tenth, held out behind a gap of twice the label horizon so no training label overlaps a holdout \
+             outcome. Its logloss skill over the best constant forecast (1 - model / constant) must reach this: \
+             0 means no better than a coin weighted at the holdout's own base rate, 0.05 means five percent \
+             less loss than that coin. A rejected retrain keeps the previous model and logs the measured skill \
+             with the reason, so a run of rejections means the model is not generalizing to the latest window, \
+             not that anything is broken. Same in every profile; this is validation mechanism, not risk appetite. \
+             Setting it far below zero (say -10) adopts every retrain that is not a stump regardless of what it \
+             scored; that is only defensible with Shadow Mode on, to collect shadow entries from a model the \
+             test rejects, and never while GBoost is placing orders.")
+            .range(-10.0, 0.5).step(0.01));
+        v.push(F::new(g, e, "gboost_structural_min_trees", "Structural Tree Floor", "int", true,
+            "Fewest trees a retrain may have. This only catches the fit that stops at a single stump because \
+             the window's labels offered nothing to learn (a frozen oracle, one-directional drift). It is not \
+             a quality bar: tree count does not track holdout quality, and the old 20-30 floor rejected \
+             correctly fitted models. Quality is judged by Retrain Acceptance Skill. A fit that finds nothing \
+             stops at 1 to 3 trees; real fits run from the high teens up. Leave at 5.")
+            .range(1.0, 50.0).step(1.0));
     }
 
     // ── TrendReversal ─────────────────────────────────────────────────────────────
