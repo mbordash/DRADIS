@@ -170,6 +170,7 @@ export interface DynamicConfig {
   gboost_shadow_mode: boolean;
   gboost_structural_min_trees: number;
   gboost_holdout_min_skill: string;
+  gboost_holdout_min_independent: number;
 
   // TrendCapture Viper
   trendcapture_min_trade_size_usdc: string;

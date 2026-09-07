@@ -842,6 +842,18 @@ pub const GBOOST_STRUCTURAL_MIN_TREES: usize = 5;
 /// rate"; the margin above 0 is what separates a fit that generalizes from one
 /// that got lucky on a window of a few label runs.
 pub const GBOOST_HOLDOUT_MIN_SKILL: Decimal = dec!(0.05);
+/// Fewest independent outcomes the retrain holdout must hold before its skill
+/// score is treated as evidence (B37 review, 2026-09-07). Seeds the
+/// `gboost_holdout_min_independent` knob; the same in every profile. Pool rows
+/// land about a second apart and each label is settled one horizon later, so
+/// a holdout of 800 rows can hold three or four outcomes, and on such a window
+/// a lucky fit reads as +80% skill with AUC 1.00: production adopted eight
+/// retrains that way in a day while every walk-forward window of the same
+/// pool scored below zero. Measured as non-overlapping horizon-length blocks
+/// across the holdout. Twelve is an hour at the 300 s horizon; with 800-row
+/// holdouts spanning 14 to 60 minutes today this defers nearly every retrain,
+/// which is the honest state until the pool cadence is redesigned (B39).
+pub const GBOOST_HOLDOUT_MIN_INDEPENDENT: usize = 12;
 pub const GBOOST_MODEL_FILENAME: &str = "gboost_model_v30g_o180.json";
 pub const GBOOST_MODEL_PATH : &str = "logs/gboost_model_v30g_o180.json";
 /// Max fraction of identical labels before skipping a retrain cycle (avoids degenerate storms).

@@ -510,7 +510,48 @@ const MODEL_META_ACCEPTED_AT_KEY: &str = "accepted_at";
 /// outcomes (`training_data`) are labeled at exit, which has no bound; they
 /// are rare and the margin is documented rather than sized for them.
 fn holdout_gap() -> chrono::Duration {
-    chrono::Duration::seconds(2 * config::GBOOST_LABEL_HORIZON_SECS)
+    label_horizon() * 2
+}
+
+/// The lookahead each pool label is settled over.
+fn label_horizon() -> chrono::Duration {
+    chrono::Duration::seconds(config::GBOOST_LABEL_HORIZON_SECS)
+}
+
+/// How much independent evidence a holdout holds.
+///
+/// Rows land about a second apart and each label is the oracle's direction one
+/// horizon later, so consecutive rows share their outcome: the row count says
+/// nothing about how many outcomes the window contains. `independent_blocks`
+/// counts non-overlapping horizon-length spans by timestamp, an upper bound on
+/// the independent outcomes (a trend that runs through several blocks is
+/// really one). `label_runs` counts maximal runs of equal labels in time
+/// order, which is what a rank metric such as AUC actually orders: with two
+/// runs, any feature that trended across the window scores 1.0 or 0.0.
+struct HoldoutDensity {
+    independent_blocks: usize,
+    label_runs: usize,
+}
+
+fn holdout_density(holdout: &[TrainingSample], horizon: chrono::Duration) -> HoldoutDensity {
+    let mut blocks = 0usize;
+    let mut block_start: Option<chrono::DateTime<Utc>> = None;
+    let mut runs = 0usize;
+    let mut prev_label: Option<bool> = None;
+    for s in holdout {
+        match block_start {
+            Some(t0) if s.entry_timestamp - t0 < horizon => {}
+            _ => {
+                blocks += 1;
+                block_start = Some(s.entry_timestamp);
+            }
+        }
+        if prev_label != Some(s.is_profitable) {
+            runs += 1;
+            prev_label = Some(s.is_profitable);
+        }
+    }
+    HoldoutDensity { independent_blocks: blocks, label_runs: runs }
 }
 
 /// The pool cut for validation: everything older than the gap trains, the
@@ -552,6 +593,11 @@ struct HoldoutReport {
     gap_dropped: usize,
     gap_secs: i64,
     holdout_span_secs: i64,
+    horizon_secs: i64,
+    /// Upper bound on the independent outcomes in the holdout; see `holdout_density`.
+    independent_blocks: usize,
+    /// Runs of equal labels in the holdout; see `holdout_density`.
+    label_runs: usize,
     /// Trees in the validation fit (not the adopted refit).
     trees: usize,
     train_pos_rate: f64,
@@ -576,11 +622,13 @@ impl HoldoutReport {
     /// One-line summary shared by the accept and reject log lines.
     fn summary(&self) -> String {
         format!(
-            "holdout skill {:+.1}% (logloss {:.3} vs {:.3} for the best constant; {} newest samples over {} min, \
+            "holdout skill {:+.1}% (logloss {:.3} vs {:.3} for the best constant; {} newest samples over {} min \
+             holding at most {} independent {} s outcomes in {} label runs, \
              {:.0}% up vs {:.0}% in training; {} s gap, {} dropped in the gap; AUC {:.2}; {}/{} confident calls right; \
              {} trees on {} training samples)",
             self.skill * 100.0, self.model_logloss, self.base_logloss,
             self.holdout_n, self.holdout_span_secs / 60,
+            self.independent_blocks, self.horizon_secs, self.label_runs,
             self.holdout_pos_rate * 100.0, self.train_pos_rate * 100.0,
             self.gap_secs, self.gap_dropped,
             self.auc, self.confident_hits, self.confident_n, self.trees, self.train_n,
@@ -616,6 +664,7 @@ fn evaluate_holdout(
     model: &PerpetualBooster,
     split: &HoldoutSplit,
     gap: chrono::Duration,
+    horizon: chrono::Duration,
     confident_threshold: f64,
 ) -> HoldoutReport {
     let rows: Vec<[f64; NUM_FEATURES]> = split.holdout.iter().map(|s| s.features).collect();
@@ -646,6 +695,7 @@ fn evaluate_holdout(
         (Some(a), Some(b)) => (b.entry_timestamp - a.entry_timestamp).num_seconds(),
         _ => 0,
     };
+    let density = holdout_density(&split.holdout, horizon);
 
     HoldoutReport {
         train_n: split.train.len(),
@@ -653,6 +703,9 @@ fn evaluate_holdout(
         gap_dropped: split.gap_dropped,
         gap_secs: gap.num_seconds(),
         holdout_span_secs,
+        horizon_secs: horizon.num_seconds(),
+        independent_blocks: density.independent_blocks,
+        label_runs: density.label_runs,
         trees: model.trees.len(),
         train_pos_rate,
         holdout_pos_rate,
@@ -674,6 +727,22 @@ enum RetrainRejection {
     /// the purge gap between them. Not a fault: labeling continues and the next
     /// cycle retries. Distinct from the other two because nothing was fit.
     PoolTooShort { total: usize, train_n: usize, holdout_n: usize, gap_dropped: usize, gap_secs: i64 },
+    /// The holdout holds too few independent outcomes to judge a fit on. Rows
+    /// a second apart share a label, so a window of hundreds of rows can hold
+    /// three or four outcomes, and a fit that calls those right by luck reads
+    /// as near-perfect skill: on 2026-09-06 production adopted eight retrains
+    /// at +28% to +83% skill and AUC up to 1.00, on holdouts of 14 to 38
+    /// minutes, while every walk-forward window of the same pool scored below
+    /// zero. Like `PoolTooShort`, nothing was fit and the next cycle retries;
+    /// checked before the validation fit, so it costs nothing.
+    HoldoutTooThin {
+        holdout_n: usize,
+        holdout_span_secs: i64,
+        independent_blocks: usize,
+        label_runs: usize,
+        min_blocks: usize,
+        horizon_secs: i64,
+    },
     /// The fit stopped below the structural floor: nothing to learn in the
     /// labels (homogeneous window, frozen features).
     Structural { trees: usize, floor: usize, stage: &'static str },
@@ -689,6 +758,13 @@ impl RetrainRejection {
                  (needs {} to train and {} to hold out); labeling continues",
                 total, train_n, gap_dropped, gap_secs, holdout_n,
                 config::GBOOST_MIN_TRAINING_SAMPLES, HOLDOUT_MIN_SAMPLES,
+            ),
+            Self::HoldoutTooThin { holdout_n, holdout_span_secs, independent_blocks, label_runs, min_blocks, horizon_secs } => format!(
+                "holdout too thin to judge: {} newest samples over {} min hold at most {} independent {} s outcome{} \
+                 in {} label run{} (needs {}); labeling continues",
+                holdout_n, holdout_span_secs / 60, independent_blocks, horizon_secs,
+                if *independent_blocks == 1 { "" } else { "s" },
+                label_runs, if *label_runs == 1 { "" } else { "s" }, min_blocks,
             ),
             Self::Structural { trees, floor, stage } => format!(
                 "{} fit stopped at {} tree{} (structural floor {}): the labels offered no structure to learn",
@@ -714,9 +790,12 @@ enum RetrainVerdict {
 
 /// Fit, validate on the newest window, and refit on everything if it passes.
 /// Runs on a blocking thread; every threshold is passed in from the caller's
-/// `DynamicConfig` snapshot, and `gap` is `holdout_gap()` in production (a
-/// parameter so a pool labeled at another horizon can be evaluated offline).
-/// `samples` need not be sorted.
+/// `DynamicConfig` snapshot, and `gap` / `horizon` are `holdout_gap()` /
+/// `label_horizon()` in production (parameters so a pool labeled at another
+/// horizon can be evaluated offline). `min_independent` is the fewest
+/// horizon-length blocks the holdout must span before a skill score is
+/// treated as evidence (`gboost_holdout_min_independent`). `samples` need
+/// not be sorted.
 fn train_and_validate(
     mut samples: Vec<TrainingSample>,
     budget: f32,
@@ -725,6 +804,8 @@ fn train_and_validate(
     min_skill: f64,
     confident_threshold: f64,
     gap: chrono::Duration,
+    horizon: chrono::Duration,
+    min_independent: usize,
 ) -> Result<RetrainVerdict> {
     samples.sort_by_key(|s| s.entry_timestamp);
     let total = samples.len();
@@ -742,13 +823,31 @@ fn train_and_validate(
         }));
     }
 
+    // Cheap and before any fit: a holdout of a few label horizons cannot tell
+    // skill from luck whatever a fit scores on it.
+    let density = holdout_density(&split.holdout, horizon);
+    if density.independent_blocks < min_independent {
+        let holdout_span_secs = match (split.holdout.first(), split.holdout.last()) {
+            (Some(a), Some(b)) => (b.entry_timestamp - a.entry_timestamp).num_seconds(),
+            _ => 0,
+        };
+        return Ok(RetrainVerdict::Rejected(RetrainRejection::HoldoutTooThin {
+            holdout_n: split.holdout.len(),
+            holdout_span_secs,
+            independent_blocks: density.independent_blocks,
+            label_runs: density.label_runs,
+            min_blocks: min_independent,
+            horizon_secs: horizon.num_seconds(),
+        }));
+    }
+
     let validation = train_model(split.train.clone(), budget, iteration_limit)?;
     if validation.trees.len() < structural_min_trees {
         return Ok(RetrainVerdict::Rejected(RetrainRejection::Structural {
             trees: validation.trees.len(), floor: structural_min_trees, stage: "validation",
         }));
     }
-    let report = evaluate_holdout(&validation, &split, gap, confident_threshold);
+    let report = evaluate_holdout(&validation, &split, gap, horizon, confident_threshold);
     if !(report.skill >= min_skill) {
         return Ok(RetrainVerdict::Rejected(RetrainRejection::NoSkill { report, min_skill }));
     }
@@ -1710,13 +1809,15 @@ impl GboostStrategyImpl {
         // used to count "confident calls" in the holdout report.
         let structural_min_trees = dc.gboost_structural_min_trees.max(1) as usize;
         let min_skill = dc.gboost_holdout_min_skill.to_f64().unwrap_or(0.0);
+        let min_independent = dc.gboost_holdout_min_independent.max(1) as usize;
         let confident_threshold = dc.gboost_entry_threshold.to_f64().unwrap_or(0.72);
 
         tokio::spawn(async move {
             let result = tokio::task::spawn_blocking(move || {
                 let verdict = train_and_validate(
                     training_samples, train_budget, train_iteration_limit,
-                    structural_min_trees, min_skill, confident_threshold, holdout_gap(),
+                    structural_min_trees, min_skill, confident_threshold,
+                    holdout_gap(), label_horizon(), min_independent,
                 )?;
                 let drift = match &verdict {
                     RetrainVerdict::Accepted { model, .. } => compute_concept_drift(model, &history_for_drift),
@@ -1745,7 +1846,7 @@ impl GboostStrategyImpl {
                             .unwrap_or_else(|| "none; GBoost stays idle".to_string())
                     };
                     match why {
-                        RetrainRejection::PoolTooShort { .. } => {
+                        RetrainRejection::PoolTooShort { .. } | RetrainRejection::HoldoutTooThin { .. } => {
                             // Nothing was fit and nothing is wrong; the wall-clock
                             // retrain floor already spaces the next attempt.
                             tracing::info!(
@@ -3773,7 +3874,8 @@ mod tests {
         let mut samples = file.samples;
         samples.sort_by_key(|s| s.entry_timestamp);
         let n = samples.len();
-        let gap = chrono::Duration::seconds(2 * file.label_horizon_secs);
+        let horizon = chrono::Duration::seconds(file.label_horizon_secs);
+        let gap = horizon * 2;
         let budget = config::GBOOST_BUDGET.to_f32().unwrap_or(0.8);
         let iters = config::GBOOST_ITERATION_LIMIT;
         let threshold = config::GBOOST_ENTRY_THRESHOLD.to_f64().unwrap_or(0.72);
@@ -3804,7 +3906,7 @@ mod tests {
             let split = split_for_holdout(&samples, start, holdout_len, gap);
             if split.train.len() < config::GBOOST_MIN_TRAINING_SAMPLES { continue; }
             let model = train_model(split.train.clone(), budget, iters).expect("fit");
-            let r = evaluate_holdout(&model, &split, gap, threshold);
+            let r = evaluate_holdout(&model, &split, gap, horizon, threshold);
             eprintln!("split @{:.0}%  REAL  {}  train_pos={:.2} holdout_pos={:.2}",
                 frac * 100.0, r.summary(), r.train_pos_rate, r.holdout_pos_rate);
             real_skills.push(r.skill);
@@ -3816,7 +3918,7 @@ mod tests {
                     gap_dropped: split.gap_dropped,
                 };
                 let null_model = train_model(null_split.train.clone(), budget, iters).expect("fit");
-                let nr = evaluate_holdout(&null_model, &null_split, gap, threshold);
+                let nr = evaluate_holdout(&null_model, &null_split, gap, horizon, threshold);
                 eprintln!("split @{:.0}%  NULL+{:<5} skill {:+.1}% auc {:.2} conf {}/{} trees {}",
                     frac * 100.0, by, nr.skill * 100.0, nr.auc, nr.confident_hits, nr.confident_n, nr.trees);
                 null_skills.push(nr.skill);
@@ -3835,7 +3937,7 @@ mod tests {
             mirrored.sort_by_key(|s| s.entry_timestamp);
             let split = split_for_holdout(&mirrored, n - holdout_len, holdout_len, gap);
             let model = train_model(split.train.clone(), budget, iters).expect("fit");
-            let r = evaluate_holdout(&model, &split, gap, threshold);
+            let r = evaluate_holdout(&model, &split, gap, horizon, threshold);
             eprintln!("REVERSE (oldest window held out)  {}", r.summary());
         }
 
@@ -3858,7 +3960,7 @@ mod tests {
             let split = split_for_holdout(&samples, n - holdout_len, holdout_len, gap);
             let model = train_model(split.train.clone(), budget, iters).expect("fit");
             let in_sample = HoldoutSplit { train: split.train.clone(), holdout: split.train.clone(), gap_dropped: 0 };
-            let r = evaluate_holdout(&model, &in_sample, gap, threshold);
+            let r = evaluate_holdout(&model, &in_sample, gap, horizon, threshold);
             eprintln!("IN-SAMPLE (validation fit scored on its own training split): skill {:+.1}% logloss {:.3} auc {:.3} conf {}/{}",
                 r.skill * 100.0, r.model_logloss, r.auc, r.confident_hits, r.confident_n);
             let probs = {
@@ -3887,7 +3989,7 @@ mod tests {
                     }).collect();
                     let split = split_for_holdout(&masked, start, holdout_len, gap);
                     let model = train_model(split.train.clone(), b, iters).expect("fit");
-                    let r = evaluate_holdout(&model, &split, gap, threshold);
+                    let r = evaluate_holdout(&model, &split, gap, horizon, threshold);
                     eprintln!("  @{:.0}% budget {:.1} mask {:?}: skill {:+.1}% logloss {:.3} auc {:.2} conf {}/{} trees {}",
                         frac * 100.0, b, mask, r.skill * 100.0, r.model_logloss, r.auc,
                         r.confident_hits, r.confident_n, r.trees);
@@ -3914,7 +4016,7 @@ mod tests {
                     let split = split_for_holdout(&thinned, start, hl, gap);
                     if split.train.len() < 50 { continue; }
                     let model = train_model_unchecked(split.train.clone(), b, iters).expect("fit");
-                    let r = evaluate_holdout(&model, &split, gap, threshold);
+                    let r = evaluate_holdout(&model, &split, gap, horizon, threshold);
                     eprintln!("  every {}s ({} samples) @{:.0}% budget {:.1}: skill {:+.1}% logloss {:.3} auc {:.2} conf {}/{} trees {} train {}",
                         every, m, frac * 100.0, b, r.skill * 100.0, r.model_logloss, r.auc,
                         r.confident_hits, r.confident_n, r.trees, r.train_n);
@@ -3927,7 +4029,7 @@ mod tests {
             samples.clone(), budget, iters,
             config::GBOOST_STRUCTURAL_MIN_TREES,
             config::GBOOST_HOLDOUT_MIN_SKILL.to_f64().unwrap_or(0.0),
-            threshold, gap,
+            threshold, gap, horizon, config::GBOOST_HOLDOUT_MIN_INDEPENDENT,
         ).expect("train_and_validate");
         match verdict {
             RetrainVerdict::Accepted { model, report } => eprintln!(
@@ -4011,7 +4113,7 @@ mod tests {
         let n = acceptance_pool_len();
         let start = Utc::now() - chrono::Duration::seconds(n as i64);
         let learnable = timed(structured_samples(n, 0xB37), start);
-        match train_and_validate(learnable, 0.8, config::GBOOST_ITERATION_LIMIT, 3, 0.05, 0.72, holdout_gap()).unwrap() {
+        match train_and_validate(learnable, 0.8, config::GBOOST_ITERATION_LIMIT, 3, 0.05, 0.72, holdout_gap(), label_horizon(), 1).unwrap() {
             RetrainVerdict::Accepted { model, report } => {
                 assert!(report.skill > 0.05, "expected clear skill on learnable labels, got {}", report.summary());
                 assert!(report.holdout_n >= HOLDOUT_MIN_SAMPLES);
@@ -4028,7 +4130,7 @@ mod tests {
             RetrainVerdict::Rejected(why) => panic!("learnable labels were rejected: {}", why.describe()),
         }
 
-        match train_and_validate(clock_memorizable_samples(n, start), 0.8, config::GBOOST_ITERATION_LIMIT, 3, 0.05, 0.72, holdout_gap()).unwrap() {
+        match train_and_validate(clock_memorizable_samples(n, start), 0.8, config::GBOOST_ITERATION_LIMIT, 3, 0.05, 0.72, holdout_gap(), label_horizon(), 1).unwrap() {
             RetrainVerdict::Rejected(RetrainRejection::NoSkill { report, min_skill }) => {
                 assert!(report.skill < min_skill, "{}", report.summary());
                 let msg = RetrainRejection::NoSkill { report, min_skill }.describe();
@@ -4047,12 +4149,12 @@ mod tests {
         let n = acceptance_pool_len();
         let start = Utc::now() - chrono::Duration::seconds(n as i64);
         let samples = clock_memorizable_samples(n, start);
-        let measured = match train_and_validate(samples.clone(), 0.8, config::GBOOST_ITERATION_LIMIT, 3, 0.05, 0.72, holdout_gap()).unwrap() {
+        let measured = match train_and_validate(samples.clone(), 0.8, config::GBOOST_ITERATION_LIMIT, 3, 0.05, 0.72, holdout_gap(), label_horizon(), 1).unwrap() {
             RetrainVerdict::Rejected(RetrainRejection::NoSkill { report, .. }) => report.skill,
             other => panic!("expected a skill rejection first, got {}", match other {
                 RetrainVerdict::Rejected(w) => w.describe(), RetrainVerdict::Accepted { report, .. } => report.summary() }),
         };
-        match train_and_validate(samples, 0.8, config::GBOOST_ITERATION_LIMIT, 3, measured - 1.0, 0.72, holdout_gap()).unwrap() {
+        match train_and_validate(samples, 0.8, config::GBOOST_ITERATION_LIMIT, 3, measured - 1.0, 0.72, holdout_gap(), label_horizon(), 1).unwrap() {
             RetrainVerdict::Accepted { .. } => {}
             RetrainVerdict::Rejected(why) => panic!("a floor below the measured skill must accept: {}", why.describe()),
         }
@@ -4064,13 +4166,158 @@ mod tests {
         // the gap and a holdout in front of it.
         let n = config::GBOOST_MIN_TRAINING_SAMPLES + 50;
         let start = Utc::now() - chrono::Duration::seconds(n as i64);
-        match train_and_validate(timed(structured_samples(n, 3), start), 0.8, config::GBOOST_ITERATION_LIMIT, 3, 0.05, 0.72, holdout_gap()).unwrap() {
+        match train_and_validate(timed(structured_samples(n, 3), start), 0.8, config::GBOOST_ITERATION_LIMIT, 3, 0.05, 0.72, holdout_gap(), label_horizon(), 1).unwrap() {
             RetrainVerdict::Rejected(why @ RetrainRejection::PoolTooShort { .. }) => {
                 let msg = why.describe();
                 assert!(msg.contains("pool too short") && msg.contains("labeling continues"), "{msg}");
             }
             RetrainVerdict::Rejected(other) => panic!("expected deferral, got: {}", other.describe()),
             RetrainVerdict::Accepted { report, .. } => panic!("nothing should be fit on a pool this short: {}", report.summary()),
+        }
+    }
+
+    #[test]
+    fn holdout_density_counts_horizon_blocks_and_label_runs() {
+        let t0 = Utc::now();
+        let horizon = chrono::Duration::seconds(300);
+        let mut s = structured_samples(20, 9);
+        // Ten rows a second apart, then ten more starting 400 s later: two
+        // horizon blocks. Labels T x5, F x5, T x10: three runs.
+        for (i, x) in s.iter_mut().enumerate() {
+            x.entry_timestamp = t0 + chrono::Duration::seconds(if i < 10 { i as i64 } else { 400 + i as i64 });
+            x.is_profitable = i < 5 || i >= 10;
+        }
+        let d = holdout_density(&s, horizon);
+        assert_eq!(d.independent_blocks, 2);
+        assert_eq!(d.label_runs, 3);
+        // Rows spread one horizon apart each count as their own block.
+        for (i, x) in s.iter_mut().enumerate() {
+            x.entry_timestamp = t0 + horizon * (i as i32);
+        }
+        assert_eq!(holdout_density(&s, horizon).independent_blocks, 20);
+        let empty: Vec<TrainingSample> = Vec::new();
+        let d = holdout_density(&empty, horizon);
+        assert_eq!((d.independent_blocks, d.label_runs), (0, 0));
+    }
+
+    /// A holdout of one-second rows spanning fewer horizon blocks than the
+    /// guard asks for is deferred before anything is fit, with its own reason;
+    /// the same pool is judged once the guard is satisfied, and the report
+    /// carries the density it was judged on.
+    #[test]
+    fn thin_holdout_is_deferred_rather_than_judged() {
+        let n = acceptance_pool_len();
+        let start = Utc::now() - chrono::Duration::seconds(n as i64);
+        let learnable = timed(structured_samples(n, 0xB37), start);
+        // The holdout is ~10% of n one-second rows: well under two horizons.
+        let holdout_len = ((n as f64 * HOLDOUT_FRACTION).round() as usize).max(HOLDOUT_MIN_SAMPLES);
+        assert!((holdout_len as i64) < 2 * config::GBOOST_LABEL_HORIZON_SECS);
+
+        match train_and_validate(learnable.clone(), 0.8, config::GBOOST_ITERATION_LIMIT, 3, 0.05, 0.72, holdout_gap(), label_horizon(), 2).unwrap() {
+            RetrainVerdict::Rejected(why @ RetrainRejection::HoldoutTooThin { .. }) => {
+                if let RetrainRejection::HoldoutTooThin { independent_blocks, label_runs, min_blocks, horizon_secs, .. } = &why {
+                    assert_eq!(*independent_blocks, 1);
+                    assert!(*label_runs >= 1);
+                    assert_eq!(*min_blocks, 2);
+                    assert_eq!(*horizon_secs, config::GBOOST_LABEL_HORIZON_SECS);
+                }
+                let msg = why.describe();
+                assert!(msg.contains("too thin") && msg.contains("labeling continues"), "{msg}");
+            }
+            RetrainVerdict::Rejected(other) => panic!("expected a thin-holdout deferral, got: {}", other.describe()),
+            RetrainVerdict::Accepted { report, .. } => panic!("a one-block holdout must not be judged: {}", report.summary()),
+        }
+
+        match train_and_validate(learnable, 0.8, config::GBOOST_ITERATION_LIMIT, 3, 0.05, 0.72, holdout_gap(), label_horizon(), 1).unwrap() {
+            RetrainVerdict::Accepted { report, .. } => {
+                assert_eq!(report.independent_blocks, 1);
+                assert_eq!(report.horizon_secs, config::GBOOST_LABEL_HORIZON_SECS);
+                assert!(report.label_runs >= 1);
+                assert!(report.summary().contains("independent"), "{}", report.summary());
+            }
+            RetrainVerdict::Rejected(why) => panic!("with the guard at 1 the learnable pool is judged: {}", why.describe()),
+        }
+    }
+
+    /// Chance acceptance rate of the holdout test over a real pool: every
+    /// window at a 100-sample stride is scored by a real fit and by a
+    /// label-rotated null, and the pass rate at the shipped skill floor is
+    /// printed with and without the independence guard. Run with
+    ///
+    ///   GBOOST_POOL_EVAL_PATH=logs/btc-gboost_label_pool.json \
+    ///   cargo test --release eval_pool_acceptance_rate -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn eval_pool_acceptance_rate() {
+        let Ok(path) = std::env::var("GBOOST_POOL_EVAL_PATH") else {
+            eprintln!("GBOOST_POOL_EVAL_PATH not set; nothing to evaluate");
+            return;
+        };
+        let bytes = std::fs::read(&path).expect("pool file readable");
+        let file: LabelPoolFile = serde_json::from_slice(&bytes).expect("pool file parses");
+        let mut samples = file.samples;
+        samples.sort_by_key(|s| s.entry_timestamp);
+        let n = samples.len();
+        let horizon = chrono::Duration::seconds(file.label_horizon_secs);
+        let gap = horizon * 2;
+        let budget = config::GBOOST_BUDGET.to_f32().unwrap_or(0.8);
+        let iters = config::GBOOST_ITERATION_LIMIT;
+        let threshold = config::GBOOST_ENTRY_THRESHOLD.to_f64().unwrap_or(0.72);
+        let min_skill = config::GBOOST_HOLDOUT_MIN_SKILL.to_f64().unwrap_or(0.05);
+        let holdout_len = ((n as f64 * HOLDOUT_FRACTION).round() as usize).max(HOLDOUT_MIN_SAMPLES);
+        let stride = 100usize;
+        eprintln!("pool {}: {} samples, horizon {} s, holdout {} samples, stride {}, skill floor {:+.1}%",
+            path, n, file.label_horizon_secs, holdout_len, stride, min_skill * 100.0);
+
+        let rotate = |train: &[TrainingSample], by: usize| -> Vec<TrainingSample> {
+            let m = train.len();
+            (0..m).map(|i| TrainingSample {
+                features: train[i].features,
+                is_profitable: train[(i + by) % m].is_profitable,
+                entry_timestamp: train[i].entry_timestamp,
+            }).collect()
+        };
+
+        // (blocks, runs, real skill, null skill) per window
+        let mut rows: Vec<(usize, usize, f64, f64)> = Vec::new();
+        let mut start = 0usize;
+        while start + holdout_len <= n {
+            let split = split_for_holdout(&samples, start, holdout_len, gap);
+            if split.train.len() >= config::GBOOST_MIN_TRAINING_SAMPLES {
+                let model = train_model(split.train.clone(), budget, iters).expect("fit");
+                let r = evaluate_holdout(&model, &split, gap, horizon, threshold);
+                let by = 1500 % split.train.len().max(1);
+                let null_split = HoldoutSplit {
+                    train: rotate(&split.train, by),
+                    holdout: split.holdout.clone(),
+                    gap_dropped: split.gap_dropped,
+                };
+                let null_model = train_model(null_split.train.clone(), budget, iters).expect("fit");
+                let nr = evaluate_holdout(&null_model, &null_split, gap, horizon, threshold);
+                eprintln!("@{:>5}  {:>3} min  blocks {:>2}  runs {:>2}  up {:>3.0}%  REAL skill {:>+8.1}% auc {:.2}  NULL skill {:>+8.1}% auc {:.2}",
+                    start, r.holdout_span_secs / 60, r.independent_blocks, r.label_runs, r.holdout_pos_rate * 100.0,
+                    r.skill * 100.0, r.auc, nr.skill * 100.0, nr.auc);
+                rows.push((r.independent_blocks, r.label_runs, r.skill, nr.skill));
+            }
+            start += stride;
+        }
+
+        let total = rows.len().max(1);
+        let pass = |guard: usize, real: bool| rows.iter()
+            .filter(|(b, _, rs, ns)| *b >= guard && (if real { *rs } else { *ns }) >= min_skill).count();
+        let judged = |guard: usize| rows.iter().filter(|(b, _, _, _)| *b >= guard).count();
+        eprintln!("windows: {}", rows.len());
+        eprintln!("no guard: REAL passes {} ({:.1}%), NULL passes {} ({:.1}%)",
+            pass(1, true), 100.0 * pass(1, true) as f64 / total as f64,
+            pass(1, false), 100.0 * pass(1, false) as f64 / total as f64);
+        for guard in [4usize, 6, 8, 10, 12, 16] {
+            eprintln!("guard >= {:>2} blocks: {:>3} of {} windows judged; REAL passes {}, NULL passes {}",
+                guard, judged(guard), rows.len(), pass(guard, true), pass(guard, false));
+        }
+        let mut blocks: Vec<usize> = rows.iter().map(|r| r.0).collect();
+        blocks.sort_unstable();
+        if !blocks.is_empty() {
+            eprintln!("blocks per holdout: min {} median {} max {}", blocks[0], blocks[blocks.len() / 2], blocks[blocks.len() - 1]);
         }
     }
 
@@ -4122,7 +4369,7 @@ mod tests {
         assert!(stump.trees.len() < config::GBOOST_STRUCTURAL_MIN_TREES,
             "a featureless fit produced {} trees; the structural floor of {} would not catch it",
             stump.trees.len(), config::GBOOST_STRUCTURAL_MIN_TREES);
-        match train_and_validate(flat, 0.8, config::GBOOST_ITERATION_LIMIT, config::GBOOST_STRUCTURAL_MIN_TREES, 0.05, 0.72, holdout_gap()).unwrap() {
+        match train_and_validate(flat, 0.8, config::GBOOST_ITERATION_LIMIT, config::GBOOST_STRUCTURAL_MIN_TREES, 0.05, 0.72, holdout_gap(), label_horizon(), 1).unwrap() {
             RetrainVerdict::Rejected(why @ RetrainRejection::Structural { .. }) => {
                 let msg = why.describe();
                 assert!(msg.contains("structural floor") && msg.contains("no structure"), "{msg}");
@@ -4170,7 +4417,12 @@ mod tests {
             *strategy.retrain_backoff_until.lock().unwrap() = None;
         };
 
-        let dc = DynamicConfig::default();
+        // The synthetic pool is one-second rows, so its holdout spans a single
+        // label horizon; the independence guard would defer it before any fit.
+        // This test is about the verdict plumbing, so the guard is off here
+        // (`thin_holdout_is_deferred_rather_than_judged` covers the guard).
+        let mut dc = DynamicConfig::default();
+        dc.gboost_holdout_min_independent = 1;
         arm(&strategy, timed(structured_samples(n, 0xB37), start));
         strategy.maybe_retrain(&dc);
         assert!(strategy.is_training.load(Ordering::Relaxed), "the trigger must spawn a training job");

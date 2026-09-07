@@ -309,6 +309,7 @@ fn default_gboost_label_max_age_hours()     -> i64     { config::GBOOST_LABEL_MA
 fn default_gboost_shadow_mode()             -> bool    { config::GBOOST_SHADOW_MODE                     }
 fn default_gboost_structural_min_trees()    -> i64     { config::GBOOST_STRUCTURAL_MIN_TREES as i64     }
 fn default_gboost_holdout_min_skill()       -> Decimal { config::GBOOST_HOLDOUT_MIN_SKILL               }
+fn default_gboost_holdout_min_independent() -> i64     { config::GBOOST_HOLDOUT_MIN_INDEPENDENT as i64  }
 
 /// Bridge for knobs whose profile constant is an `f64` (`GBOOST_MIN_HIST_VOL`):
 /// every DynamicConfig knob is a `Decimal`, because the Control Tower edits and
@@ -724,6 +725,15 @@ pub struct DynamicConfig {
     /// failing to generalize to the latest window, not a fault.
     #[serde(default = "default_gboost_holdout_min_skill")]
     pub gboost_holdout_min_skill: Decimal,
+    /// Fewest independent outcomes the holdout must hold before its skill
+    /// score counts (B37 review). Pool rows land about a second apart and
+    /// each label is settled one horizon later, so a holdout of hundreds of
+    /// rows may contain only a few outcomes; measured as non-overlapping
+    /// horizon-length blocks by timestamp. Below this the retrain is deferred
+    /// ("holdout too thin to judge") before anything is fit. Values below 1
+    /// are treated as 1, which disables the guard.
+    #[serde(default = "default_gboost_holdout_min_independent")]
+    pub gboost_holdout_min_independent: i64,
 
     // ── TrendCapture Viper ────────────────────────────────────────────────────
     #[serde(default = "default_trendcapture_min_trade_size")]
@@ -1085,6 +1095,7 @@ impl Default for DynamicConfig {
             gboost_shadow_mode:         config::GBOOST_SHADOW_MODE,
             gboost_structural_min_trees: config::GBOOST_STRUCTURAL_MIN_TREES as i64,
             gboost_holdout_min_skill:   config::GBOOST_HOLDOUT_MIN_SKILL,
+            gboost_holdout_min_independent: config::GBOOST_HOLDOUT_MIN_INDEPENDENT as i64,
 
             trendcapture_min_trade_size_usdc: config::TRENDCAPTURE_MIN_TRADE_SIZE_USDC,
             trendcapture_max_trade_size_usdc: config::TRENDCAPTURE_MAX_TRADE_SIZE_USDC,

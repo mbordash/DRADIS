@@ -514,6 +514,20 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              scored; that is only defensible with Shadow Mode on, to collect shadow entries from a model the \
              test rejects, and never while GBoost is placing orders.")
             .range(-10.0, 0.5).step(0.01));
+        v.push(F::new(g, e, "gboost_holdout_min_independent", "Retrain Acceptance Min Outcomes", "int", true,
+            "Fewest independent outcomes the holdout must hold before its skill score counts. Pool rows land \
+             about a second apart and each label is the oracle's direction one label horizon later, so a \
+             holdout of hundreds of rows can hold only three or four outcomes, and a fit that calls those \
+             right by luck reads as near-perfect skill: on 2026-09-06 production adopted eight retrains at \
+             +28% to +83% skill on holdouts of 14 to 38 minutes while every walk-forward window scored below \
+             zero. Measured as non-overlapping horizon-length blocks across the holdout (an upper bound on \
+             its independent outcomes). Below this the retrain is deferred as 'holdout too thin to judge' \
+             before anything is fit, and the previous model stays. At the 300 s horizon 12 is one hour of \
+             holdout, about the point where a lucky pass drops from several a day to one a fortnight; the \
+             label pool must span roughly ten hours for a tenth of it to reach that. Set to 1 to disable the \
+             guard, which is only defensible with Shadow Mode on. Same in every profile: validation mechanism, \
+             not risk appetite.")
+            .range(1.0, 100.0).step(1.0));
         v.push(F::new(g, e, "gboost_structural_min_trees", "Structural Tree Floor", "int", true,
             "Fewest trees a retrain may have. This only catches the fit that stops at a single stump because \
              the window's labels offered nothing to learn (a frozen oracle, one-directional drift). It is not \
