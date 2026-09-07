@@ -970,7 +970,7 @@ everyone.
 The commercial license is for the case where that is exactly what you do not
 want. It gives you the right to modify DRADIS privately: fork a Viper, change
 its formulas, run your version alongside the original, and keep every bit of it
-to yourself. You owe nothing back. For a trading system that is the whole point,
+to yourself. You owe nothing back, and that is totally OK. For a trading system that is the whole point,
 because a strategy you are obliged to publish stops being an advantage the
 moment you publish it.
 
