@@ -95,6 +95,11 @@ export interface DynamicConfig {
   momentum_obi_exhaust_min_hold_secs:    number;
   momentum_obi_exhaust_persist_secs:     number;
   momentum_tp_fee_margin_mult:           string;
+  momentum_max_fee_to_target_ratio:      string;
+  momentum_reversal_ratio:               string;
+  momentum_reversal_min_hold_secs:       number;
+  momentum_reversal_persist_secs:        number;
+  momentum_resting_tp_enabled:           boolean;
 
   // Maker Viper
   maker_max_entry_price:   string;
@@ -205,6 +210,9 @@ export interface DynamicConfig {
   convergence_obi_adverse_block:    string;
   convergence_skip_band_low:        string;
   convergence_skip_band_high:       string;
+  convergence_max_fee_to_target_ratio: string;
+  convergence_tp_fee_margin_mult:   string;
+  convergence_resting_tp_enabled:   boolean;
 
   // Raptor polling — live cadence + budget thresholds for the two credentialed,
   // budget-metered Raptors. Numbers, not Decimal strings.

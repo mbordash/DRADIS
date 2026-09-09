@@ -255,6 +255,49 @@ pub const MOMENTUM_OBI_EXHAUST_MIN_HOLD_SECS: i64 = 60;
 /// resets the clock. Conservative: 20s — slowest, most confirmation.
 pub const MOMENTUM_OBI_EXHAUST_PERSIST_SECS: i64 = 20;
 
+/// Largest share of the configured take-profit target that the round-trip taker
+/// fee may consume before a Momentum entry is refused. Momentum has no fair-value
+/// model, so its only "edge" is the plan itself: a percentage target against a
+/// percentage stop. The fee is a fixed toll on that plan, and one that scales with
+/// the entry price — `2 x rate x (1 - p)` of notional — so at $0.53 it is 6.6% and
+/// at $0.15 it is 11.9%. First live trade on the aggressive profile (2026-09-09
+/// 11:00 ET): entered YES at $0.53 with a 15% target, the fee was 44% of the plan,
+/// and it fired the day's only loss where the fee was 116% of the gross loss.
+/// This is the entry-side counterpart of MOMENTUM_TP_FEE_MARGIN_MULT, which lifts
+/// the target to clear the fee; this one refuses the trade when the fee would
+/// dominate the target it is measured against. Zero on a venue with no taker fee,
+/// so the gate never binds there. Conservative: 0.40 — the fee may be at most 40% of the target.
+pub const MOMENTUM_MAX_FEE_TO_TARGET_RATIO: Decimal = dec!(0.40);
+
+/// How long the oracle must read reversed, continuously, before the Momentum
+/// reversal exit fires. `velocity` is a 5s window (MOMENTUM_WINDOW_SECS), so one
+/// opposing tick reads as a reversal for up to five seconds on its own; anything
+/// at or under that confirms nothing. The 2026-09-09 11:01 ET exit fired on a
+/// single reading 62s after entry, paid the second taker fee, and turned a -5.7%
+/// mark into a -12.3% realized loss. Any non-reversed reading resets the clock.
+/// The stop-loss and catastrophic stop are unaffected. Conservative: 12s.
+pub const MOMENTUM_REVERSAL_PERSIST_SECS: i64 = 12;
+
+/// Take Momentum's profit with a resting post-only ask instead of a taker FAK.
+///
+/// Momentum crosses the spread to get in and, before this, crossed it again to
+/// get out: every exit paid the taker fee a second time, so the whole round trip
+/// was the edge the signal had to supply. The take-profit half can rest. An ask
+/// at entry x (1 + target) is lifted only when the market runs through the price
+/// the take-profit would have sold at anyway, so being filled is not evidence the
+/// thesis has turned, and a maker fill pays nothing (and earns the venue's maker
+/// rebate). The ask sits at a fixed price for the life of the position (no
+/// chasing, no lost queue position), floored against the ENTRY fee alone, and
+/// capped at MOMENTUM_TAKE_PROFIT_CEILING. Every stop and the reversal, decay,
+/// OBI-exhaustion and near-expiry exits still cross with a FAK, and the patrol
+/// pulls the ask before any of them needs the shares. Only the winning leg goes
+/// fee-free -- a stop still pays both legs -- so the edge the signal must supply
+/// above a coin flip falls by about a quarter, not by half. Polymarket
+/// International only: Kalshi and Polymarket US ignore the signal and keep the
+/// taker take-profit. Off restores the taker take-profit everywhere.
+/// Conservative: on -- the cheaper exit is the safer one.
+pub const MOMENTUM_RESTING_TP_ENABLED: bool = true;
+
 /// Maximum OBI swing allowed at Momentum entry.
 /// Conservative: 0.65 — strictest gate; blocks any significant book-side oscillation.
 pub const MOMENTUM_OBI_SWING_BLOCK: Decimal = dec!(0.65);
@@ -1806,6 +1849,38 @@ pub const CONVERGENCE_OBI_ADVERSE_BLOCK: Decimal = dec!(0.45); // 2026-06-30: bl
 /// Entry-relative take-profit and stop-loss.
 pub const CONVERGENCE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.07); // 2026-07-10: conservative books profit sooner (still clears ~2.3pt fees).
 pub const CONVERGENCE_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
+
+/// Largest share of the take-profit target that the round-trip taker fee may
+/// consume before a Convergence entry is refused. Both legs cross the spread,
+/// so the round trip is `2 x rate x (1 - p)` of notional: 9.1% at the $0.35
+/// floor, 4.9% at the $0.65 cap, against the 7% target. With the 10% stop
+/// above the target the break-even hit rate is `(sl + f) / (tp + sl)` — 87%
+/// at $0.65 and over 100% below $0.47, where a trade that reached its target
+/// exactly still lost money (2026-09-09 audit: +2.45c gross against 3.23c of
+/// fees at $0.35). At 0.40 the gate refuses the whole band on Polymarket
+/// International and Kalshi, which is the honest reading; the refusal names
+/// this knob in the Control Tower. Zero on a venue with no taker fee, so the
+/// gate never binds there. The remedy is a wider target against a tighter
+/// stop, not a looser ratio. Conservative: 0.40 — same bar as every profile.
+pub const CONVERGENCE_MAX_FEE_TO_TARGET_RATIO: Decimal = dec!(0.40);
+
+/// Multiple of the taker fee the Convergence take-profit must clear: the round
+/// trip for the FAK take-profit, the entry leg alone for the resting ask. The
+/// flat 7% target sat below the fee everywhere under $0.50 — the "still clears
+/// ~2.3pt fees" in its comment assumed a fee that only exists near $0.84 — so a
+/// ConvergenceTP at the bottom of the band booked a loss under a reason string
+/// that said profit. Conservative: 1.50 — the widest margin over the fee.
+pub const CONVERGENCE_TP_FEE_MARGIN_MULT: Decimal = dec!(1.50);
+
+/// Take Convergence's profit with a resting post-only ask instead of a taker
+/// FAK. The Decay exit is the time-sensitive one and stays a FAK; the target
+/// is a price level, and an ask resting there is lifted by the same print that
+/// would have triggered the FAK, one fee cheaper. Fixed price for the life of
+/// the position, floored against the entry fee alone, held back during the
+/// soft-exit cooldown, pulled by the patrol before any FAK needs the shares.
+/// Only the winning leg goes fee-free: at $0.65 on a 7% target the break-even
+/// hit rate falls from 87% to 77%. Polymarket International only. Conservative: on.
+pub const CONVERGENCE_RESTING_TP_ENABLED: bool = true;
 
 /// Catastrophic stop applied BEFORE fill-confirmation (negative = loss fraction).
 pub const CONVERGENCE_CATASTROPHIC_SL_PCT: Decimal = dec!(-0.12); // 2026-07-10: conservative caps the catastrophic tail tightest.

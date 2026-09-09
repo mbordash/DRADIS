@@ -61,6 +61,31 @@ pub fn exit_only_fee_pct(entry_price: Decimal) -> Decimal {
     taker_fee_rate() * (Decimal::ONE - entry_price)
 }
 
+/// The taker fee on ONE leg that crossed the spread to open a position, as a
+/// fraction of the entry notional.
+///
+/// Numerically the same figure as [`exit_only_fee_pct`] — the schedule is
+/// symmetric and both are evaluated at the entry price — but named for the leg
+/// it describes. A taker entry that leaves by a resting post-only ask pays this
+/// and nothing else: the lift is free, so the only toll a resting take-profit
+/// has to clear is the one already paid to get in. Flooring that target against
+/// the round trip would put the ask a full leg higher than the trade needs.
+pub fn entry_only_fee_pct(entry_price: Decimal) -> Decimal {
+    exit_only_fee_pct(entry_price)
+}
+
+/// The taker fee charged per share for one fill at `price`, in dollars.
+///
+/// `rate × p × (1 − p)` on the quadratic venues, zero where no taker fee is
+/// charged, and zero outside the open interval — a contract at $0 or $1 has
+/// resolved and no fee applies. For an exit that is the toll a FAK at the bid
+/// actually pays, which is what an exit rule must net out before it can call
+/// a sale a profit.
+pub fn taker_fee_per_share(price: Decimal) -> Decimal {
+    if price <= Decimal::ZERO || price >= Decimal::ONE { return Decimal::ZERO; }
+    taker_fee_rate() * price * (Decimal::ONE - price)
+}
+
 /// Single-leg taker cost as a fraction of ENTRY notional, when the exit happens
 /// at a given gain above the entry price.
 ///

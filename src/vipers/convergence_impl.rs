@@ -43,6 +43,38 @@
 ///   live, capped by `CONVERGENCE_MAX_EXPOSURE_USDC`. One position per market.
 ///   Exits on take-profit, stop-loss, **signal decay/reversal** (the pulse flips
 ///   or coherence collapses), or near-expiry.
+///
+/// # Fees, and why the plan's shape matters
+///
+/// Convergence has no fair-value model: its edge is the plan, a percentage
+/// target against a percentage stop, and on Polymarket International and
+/// Kalshi both legs cross the spread and pay the taker fee. The round trip is
+/// `2 × rate × (1 − p)` of notional — 9.1% at the $0.35 floor, 4.9% at the
+/// $0.65 cap — and until 2026-09-09 nothing here looked at it. With a 7–8%
+/// target, a trade in the lower half of the band that reached its target
+/// exactly still lost money: at $0.35 the gross was +2.45¢ a share and the two
+/// fees 3.23¢.
+///
+/// The stop is at or above the target on every profile (10% against 7–10%),
+/// which is the inverse of Momentum's shape and makes the fee bite harder. The
+/// break-even hit rate is `(sl + f) / (tp + sl)`: with no fee a 7/10 plan
+/// already needs 59% winners, and the fee adds `f / (tp + sl)` on top —
+/// 29 points at $0.65, 37 at $0.55. Three things follow, each its own knob:
+///
+///   * **`convergence_max_fee_to_target_ratio`** refuses an entry whose
+///     round-trip fee is more than this share of the target, through the same
+///     [`crate::vipers::fee_dominated_entry`] Momentum uses. At the shipped
+///     targets this refuses the whole $0.35–$0.65 band on a fee venue, on every
+///     profile — the honest reading of the arithmetic, reported to the Control
+///     Tower as such. Polymarket US charges no taker fee and is unaffected.
+///   * **`convergence_tp_fee_margin_mult`** floors the take-profit at a
+///     multiple of the fee the exit will pay, so a ConvergenceTP can never book
+///     a loss under a reason string that says profit.
+///   * **`convergence_resting_tp_enabled`** takes the profit with a resting
+///     post-only ask at the target instead of a FAK at the bid. The Decay exit
+///     is the time-sensitive one and stays a FAK; the target is a price level,
+///     and an ask resting there is lifted by the same print that would have
+///     triggered the FAK, one fee cheaper. Only the winning leg goes fee-free.
 
 use async_trait::async_trait;
 use anyhow::Result;
@@ -50,13 +82,14 @@ use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use std::collections::HashMap;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Instant;
 use chrono::Utc;
 use tracing::debug;
 
 use crate::orchestrator::{Strategy, StrategyContext};
 use crate::state::{StrategySignal, StrategyStatus, OrderParams};
-use crate::vipers::is_drawdown_limit_hit;
+use crate::vipers::{is_drawdown_limit_hit, resting_tp_price};
 use crate::config;
 use crate::venues::core::{MarketId, TimeInForce};
 
@@ -372,6 +405,28 @@ impl Strategy for ConvergenceStrategyImpl {
             return Ok(StrategySignal::NoSignal);
         }
 
+        // ── Fee-dominated entry veto ──────────────────────────────────────────
+        // The band above bounds the price; it says nothing about what the trade
+        // costs. Both legs pay the taker fee and the round trip is
+        // 2 × rate × (1 − p) of notional — 9.1% at $0.35, 4.9% at $0.65 —
+        // against a plan whose whole edge is the percentage target. Measured
+        // against the configured target, not the fee-floored one the exit uses:
+        // the floor moves the finish line out on a fee-dominated plan, it does
+        // not make the plan a good bet. See the module doc for the break-even
+        // arithmetic and why the 10% stop makes it worse than Momentum's.
+        //
+        // Placed after the signal, band, and spread gates on purpose: the
+        // refusal the operator sees is "a live signal, in band, declined for
+        // its fee", which is the structural one. Zero on a venue with no taker
+        // fee, where this never binds.
+        if let Some(reason) = crate::vipers::fee_dominated_entry(
+            ask, dc.convergence_target_profit_pct, dc.convergence_max_fee_to_target_ratio,
+        ) {
+            debug!(" Convergence blocked: {}", reason);
+            idle(&reason);
+            return Ok(StrategySignal::NoSignal);
+        }
+
         // ── Per-token cooldown ────────────────────────────────────────────────
         if let Ok(map) = self.post_exit_cooldown.lock() {
             if let Some(t) = map.get(&token_id) {
@@ -519,6 +574,11 @@ impl Strategy for ConvergenceStrategyImpl {
             reason:       String,
         }
 
+        // Resting take-profit asks, deferred until every position has had its
+        // hard exits evaluated: a healthy position's ask must never preempt a
+        // stop still pending on another, since one signal leaves per tick.
+        let mut resting_tps: Vec<StrategySignal> = Vec::new();
+
         let pending: Option<PendingExit> = {
             let pos_map = ctx.positions.lock().await;
             let mut found: Option<PendingExit> = None;
@@ -630,9 +690,24 @@ impl Strategy for ConvergenceStrategyImpl {
                 }
 
                 // Take-profit (discretionary — suppressed during soft-exit cooldown).
-                if !soft_exit_cooldown_active
-                    && profit_margin >= dc.convergence_target_profit_pct
-                {
+                //
+                // Floored against the round-trip taker fee × the margin multiple.
+                // This is the TAKER target: the bar for selling at the bid with a
+                // FAK, which pays the second leg. At an 8% target the flat figure
+                // sat below the fee everywhere under $0.43, so a ConvergenceTP at
+                // the bottom of the band booked a loss under a reason string
+                // that said profit. The resting ask further down is floored
+                // against the entry leg alone, because a lift pays nothing.
+                let fee_floor = crate::venues::round_trip_fee_pct(avg_entry)
+                    * dc.convergence_tp_fee_margin_mult;
+                let base_target = dc.convergence_target_profit_pct;
+                let target = base_target.max(fee_floor);
+                if target > base_target {
+                    debug!(" Convergence TP floor: target {:.2}% → {:.2}% (round-trip fee {:.2}% at entry ${:.4})",
+                        base_target * dec!(100), target * dec!(100),
+                        crate::venues::round_trip_fee_pct(avg_entry) * dec!(100), avg_entry);
+                }
+                if !soft_exit_cooldown_active && profit_margin >= target {
                     found = Some(make_exit(format!(
                         "ConvergenceTP: bid=${:.4} profit={:.2}%", bid, profit_margin * dec!(100))));
                     break 'outer;
@@ -651,6 +726,49 @@ impl Strategy for ConvergenceStrategyImpl {
                             "ConvergenceDecay: bid=${:.4} pulse={:.2} coh={:.2} profit={:.2}%",
                             bid, pulse, coh, profit_margin * dec!(100))));
                         break 'outer;
+                    }
+                }
+
+                // ── Resting take-profit — the healthy position's way out ──────
+                // Every exit above declined this tick, so let the position leave
+                // by being LIFTED at the target instead of crossing back to the
+                // bid for a second taker fee. The patrol places the ask once,
+                // no-ops on the re-emission, and pulls it before any FAK above
+                // needs the shares — so no tick ever carries both a resting sell
+                // and a market sell for the same position.
+                //
+                // Not during the soft-exit cooldown: a Decay FAK that just missed
+                // is about to re-fire, and an ask placed in between would only
+                // be pulled again 20s later. Floored against the ENTRY fee
+                // alone, because a lift pays no taker fee; where the base target
+                // dominates both floors the ask sits at the FAK trigger and the
+                // FAK is the fallback for an ask that failed to rest.
+                if dc.convergence_resting_tp_enabled
+                    && !soft_exit_cooldown_active
+                    && position.shares >= config::MIN_ORDER_SHARES
+                {
+                    let maker_floor = crate::venues::entry_only_fee_pct(avg_entry)
+                        * dc.convergence_tp_fee_margin_mult;
+                    let maker_target = base_target.max(maker_floor);
+                    if let Some(price) = resting_tp_price(avg_entry, maker_target, bid, Decimal::ZERO) {
+                        resting_tps.push(StrategySignal::MakerRestingExit {
+                            params: OrderParams {
+                                token_id: token_id.clone(),
+                                price,
+                                shares: position.shares,
+                                fee_bps,
+                                is_neg_risk: market.is_neg_risk,
+                                market_name: market.market_name.clone(),
+                                condition_id: market.condition_id.clone(),
+                                order_type: TimeInForce::Gtc,
+                                post_only: true,
+                                ghost_mode: dc.ghost_mode,
+                            },
+                            reason: format!(
+                                "ConvergenceRestingTP: ask=${:.4} entry=${:.4} target={:+.2}%",
+                                price, avg_entry, (price - avg_entry) / avg_entry * dec!(100),
+                            ),
+                        });
                     }
                 }
             }
@@ -685,6 +803,16 @@ impl Strategy for ConvergenceStrategyImpl {
             });
         }
 
+        // One signal leaves per tick, so with more than one healthy position
+        // (reconciliation can leave one on each leg) each ask is emitted in
+        // turn. The consumer no-ops on the ones it already has resting, so
+        // rotation costs nothing and every position gets its ask within a few
+        // ticks.
+        if !resting_tps.is_empty() {
+            static ROTATION: AtomicUsize = AtomicUsize::new(0);
+            let i = ROTATION.fetch_add(1, Ordering::Relaxed) % resting_tps.len();
+            return Ok(resting_tps.swap_remove(i));
+        }
         Ok(StrategySignal::NoSignal)
     }
 
@@ -774,5 +902,279 @@ mod tests {
         // Inside the deadband nothing is vetoed, either way.
         assert!(!velocity_opposes_entry(dec!(1), true,  db));
         assert!(!velocity_opposes_entry(dec!(-1), false, db));
+    }
+
+    // ── Fees ─────────────────────────────────────────────────────────────────
+
+    use crate::helpers::dynamic_config::DynamicConfig;
+
+    /// Does this build's venue charge a taker fee at all?
+    fn fee_venue() -> bool {
+        crate::venues::round_trip_fee_pct(dec!(0.50)) > Decimal::ZERO
+    }
+
+    /// The conclusion this work item reached, pinned: at the shipped targets
+    /// the whole $0.35–$0.65 band is fee-dominated on a venue that charges a
+    /// taker fee, on every profile (the gate needs an entry at or above $0.71
+    /// even for the aggressive 10% target), and wide open on a venue that
+    /// charges none. A retune of the target or the ratio that lets part of the
+    /// band through on a fee venue is a deliberate change and should fail this
+    /// test loudly so the new break-even arithmetic gets written down.
+    #[test]
+    fn the_shipped_band_is_fee_dominated_on_a_fee_venue_and_open_on_a_free_one() {
+        let dc = DynamicConfig::default();
+        assert!(dc.convergence_max_fee_to_target_ratio > Decimal::ZERO, "a zero ratio refuses every fee-charging entry");
+        assert!(dc.convergence_max_fee_to_target_ratio < dec!(0.5), "the fee must stay a minority of the plan");
+        let mut ask = dc.convergence_min_entry_price;
+        while ask <= dc.convergence_max_entry_price {
+            let verdict = crate::vipers::fee_dominated_entry(
+                ask, dc.convergence_target_profit_pct, dc.convergence_max_fee_to_target_ratio);
+            if fee_venue() {
+                let reason = verdict.unwrap_or_else(|| panic!(
+                    "${ask} admitted: round trip {:.2}% against a {:.1}% target",
+                    crate::venues::round_trip_fee_pct(ask) * dec!(100), dc.convergence_target_profit_pct * dec!(100)));
+                assert!(reason.contains("fee-dominated"), "the advisor's needle must be present: {reason}");
+            } else {
+                assert_eq!(verdict, None, "a zero-fee venue must never refuse ${ask} on fees");
+            }
+            ask += dec!(0.01);
+        }
+    }
+
+    /// The fee-floored take-profit can never book a loss: at every entry in
+    /// the band, selling at the effective target with a FAK clears both taker
+    /// fees. Before the floor, an 8% target at $0.35 grossed 2.8¢ a share
+    /// against 3.2¢ of fees.
+    #[test]
+    fn a_take_profit_at_the_floored_target_is_net_positive_across_the_band() {
+        let dc = DynamicConfig::default();
+        assert!(dc.convergence_tp_fee_margin_mult > Decimal::ONE, "the floor must clear the fee with margin, not meet it");
+        let mut entry = dc.convergence_min_entry_price;
+        while entry <= dc.convergence_max_entry_price {
+            let target = dc.convergence_target_profit_pct
+                .max(crate::venues::round_trip_fee_pct(entry) * dc.convergence_tp_fee_margin_mult);
+            let exit = entry * (Decimal::ONE + target);
+            let net = exit - entry
+                - crate::venues::taker_fee_per_share(entry)
+                - crate::venues::taker_fee_per_share(exit);
+            assert!(net > Decimal::ZERO, "a ConvergenceTP at ${entry} → ${exit:.4} nets {net:.4} a share");
+            entry += dec!(0.01);
+        }
+    }
+
+    // ── evaluate_exit, driven end to end ─────────────────────────────────────
+
+    use crate::state::{MarketConfig, MarketSnapshot, Position, PositionKey, PositionMap};
+    use crate::orchestrator::StrategyContext;
+    use crate::venues::core::TimeInForce;
+    use std::sync::Arc;
+
+    fn market() -> MarketConfig {
+        MarketConfig {
+            yes_token: MarketId::new("h-yes"), no_token: MarketId::new("h-no"),
+            market_name: "Bitcoin Up or Down - September 9, 12PM ET".to_string(),
+            market_close_time: Some(Utc::now() + chrono::Duration::hours(1)),
+            strike_price: Some(dec!(65000)), is_neg_risk: false,
+            condition_id: "cid-hourly".to_string(), yes_fee_bps: 0, no_fee_bps: 0,
+        }
+    }
+
+    /// A quiet book with the given YES touch and a still-coherent tide, so
+    /// neither Decay leg (pulse reversal, coherence collapse) reads.
+    fn book(yes_bid: Decimal, yes_ask: Decimal) -> MarketSnapshot {
+        MarketSnapshot {
+            yes_bid, yes_bid_depth: dec!(100),
+            yes_ask, yes_ask_depth: dec!(100),
+            no_bid: dec!(1) - yes_ask, no_bid_depth: dec!(100),
+            no_ask: dec!(1) - yes_bid, no_ask_depth: dec!(100),
+            yes_bid_depth_total: dec!(100), yes_ask_depth_total: dec!(100),
+            no_bid_depth_total: dec!(100), no_ask_depth_total: dec!(100),
+            oracle_price: dec!(65000),
+            velocity: dec!(0), velocity_1s: dec!(0), acceleration: dec!(0),
+            funding_rate: dec!(0), oracle_drift_60m: dec!(0),
+            oracle_drift_10m: dec!(0), hist_vol: dec!(0.003),
+            institutional_pulse: dec!(0), tide_coherence: dec!(0.8),
+            tradfi_velocity: dec!(0), macro_coherence: dec!(0),
+            vix_proxy: dec!(0), vix_velocity: dec!(0),
+            oi_delta_pct: dec!(0), cvd_ratio: dec!(1),
+            secs_to_expiry: 3600, timestamp: Utc::now(),
+        }
+    }
+
+    /// The balanced plan, pinned explicitly so the test does not depend on
+    /// whichever profile the gitignored config.rs happens to hold.
+    fn plan() -> DynamicConfig {
+        let mut dc = DynamicConfig::default();
+        dc.enable_convergence = true;
+        dc.ghost_mode = false;
+        dc.convergence_target_profit_pct = dec!(0.08);
+        dc.convergence_stop_loss_pct = dec!(0.10);
+        dc.convergence_tp_fee_margin_mult = dec!(1.35);
+        dc.convergence_pulse_threshold = dec!(1.0);
+        dc.convergence_coherence_min = dec!(0.6);
+        dc.convergence_resting_tp_enabled = true;
+        dc
+    }
+
+    fn ctx(snapshot: MarketSnapshot, dc: DynamicConfig) -> StrategyContext {
+        StrategyContext {
+            squadron_id: "btc-open".to_string(),
+            market: market(),
+            snapshot,
+            positions: Arc::new(tokio::sync::Mutex::new(PositionMap::new())),
+            session_pnl: dec!(0), starting_collateral: dec!(100),
+            available_collateral: dec!(100),
+            crypto_filter: "btc".to_string(),
+            market_started_at: Utc::now() - chrono::Duration::minutes(10),
+            maker_snapshot: None,
+            maker_market: None,
+            dynamic_config: Arc::new(dc),
+            arb_market_lockouts: None,
+        }
+    }
+
+    /// Hold `shares` YES at `entry`, opened `secs_ago`, confirmed or not.
+    async fn hold_yes(c: &StrategyContext, entry: Decimal, shares: Decimal, secs_ago: i64, confirmed: bool) -> PositionKey {
+        let opened = Utc::now() - chrono::Duration::seconds(secs_ago);
+        let key = PositionKey::new(c.squadron_id.clone(), STRATEGY_NAME, c.market.yes_token.clone());
+        c.positions.lock().await.insert(key.clone(), Position {
+            shares, avg_entry: entry, opened_at: opened,
+            close_time: c.market.market_close_time,
+            market_name: c.market.market_name.clone(),
+            pair_token_id: c.market.yes_token.clone(),
+            fill_confirmed_at: if confirmed { Some(opened) } else { None },
+            paired_leg_token_id: None,
+            entry_fee: dec!(0.14),
+        });
+        key
+    }
+
+    /// A confirmed position with no harder exit pending rests its take-profit:
+    /// a post-only GTC ask at entry × (1 + target) rounded up to the tick, for
+    /// the whole position, re-emitted every tick. The knob turns it off, the
+    /// soft-exit cooldown holds it back, and an unconfirmed fill owns no
+    /// shares to sell.
+    #[tokio::test]
+    async fn a_healthy_confirmed_position_rests_its_take_profit() {
+        // Marked flat at the bid: nothing to take, nothing to stop, tide still coherent.
+        let c = ctx(book(dec!(0.60), dec!(0.62)), plan());
+        let key = hold_yes(&c, dec!(0.60), dec!(8), 200, true).await;
+
+        let strat = ConvergenceStrategyImpl::default();
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        let StrategySignal::MakerRestingExit { params, reason } = sig else {
+            panic!("a healthy confirmed position must rest its take-profit, got {sig:?}");
+        };
+        assert_eq!(params.token_id, c.market.yes_token);
+        // $0.60 × 1.08 = $0.648 → $0.65. The entry-leg floor (3.8% at $0.60 on
+        // a fee venue, zero elsewhere) sits under the 8% plan on every venue.
+        assert_eq!(params.price, dec!(0.65));
+        assert_eq!(params.shares, dec!(8));
+        assert!(params.post_only, "the ask must be post-only or it pays the taker fee it exists to avoid");
+        assert_eq!(params.order_type, TimeInForce::Gtc);
+        assert!(!params.ghost_mode);
+        assert!(reason.starts_with("ConvergenceRestingTP: ask=$0.6500 entry=$0.6000 target=+8.33%"), "{reason}");
+
+        let again = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        assert!(matches!(again, StrategySignal::MakerRestingExit { .. }), "{again:?}");
+        // Emitting the ask is not an exit: no cooldown, no post-exit clock.
+        assert!(strat.last_exit_signal_at.lock().unwrap().is_none());
+        assert!(strat.post_exit_cooldown.lock().unwrap().is_empty());
+
+        // Soft-exit cooldown live (a discretionary FAK just went out): rest nothing.
+        *strat.last_exit_signal_at.lock().unwrap() = Some(Instant::now());
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        assert!(matches!(sig, StrategySignal::NoSignal), "the cooldown must hold the ask back, got {sig:?}");
+        *strat.last_exit_signal_at.lock().unwrap() = None;
+
+        // Knob off: back to the taker take-profit, and at a flat mark it has nothing to do.
+        let mut off = plan();
+        off.convergence_resting_tp_enabled = false;
+        let c_off = ctx(book(dec!(0.60), dec!(0.62)), off);
+        hold_yes(&c_off, dec!(0.60), dec!(8), 200, true).await;
+        let sig = strat.evaluate_exit(&c_off).await.expect("exit evaluation runs");
+        assert!(matches!(sig, StrategySignal::NoSignal), "knob off must rest nothing, got {sig:?}");
+
+        // Fill not yet confirmed: no shares to back a sell order.
+        let mut pending = c.positions.lock().await.get(&key).cloned().expect("held");
+        pending.fill_confirmed_at = None;
+        c.positions.lock().await.insert(key.clone(), pending);
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        assert!(matches!(sig, StrategySignal::NoSignal), "an unconfirmed fill must rest nothing, got {sig:?}");
+    }
+
+    /// The hard exits always win the tick, and the patrol pulls the ask before
+    /// their FAK needs the shares. A bid through the floored target takes with
+    /// a FAK (the fallback for an ask that failed to rest); a mark past the
+    /// stop after the min-hold stops out. Neither offers a resting signal, and
+    /// both arm the cooldowns an exit is supposed to arm.
+    #[tokio::test]
+    async fn a_fak_exit_wins_the_tick_over_the_resting_ask() {
+        // +13.3% at the bid clears the 8% plan and its round-trip floor
+        // (5.6% × 1.35 = 7.6% at $0.60 on a fee venue).
+        let strat = ConvergenceStrategyImpl::default();
+        let c = ctx(book(dec!(0.68), dec!(0.70)), plan());
+        hold_yes(&c, dec!(0.60), dec!(8), 200, true).await;
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        let StrategySignal::Exit { params, reason, .. } = sig else {
+            panic!("a bid through the target must take with a FAK, got {sig:?}");
+        };
+        assert_eq!(params.price, dec!(0.68));
+        assert!(!params.post_only && params.order_type == TimeInForce::Fak, "a take-profit FAK crosses");
+        assert!(reason.starts_with("ConvergenceTP: bid=$0.6800"), "{reason}");
+        assert!(strat.last_exit_signal_at.lock().unwrap().is_some(), "a discretionary exit arms the soft cooldown");
+        assert!(strat.stop_market_cooldown.lock().unwrap().is_empty(), "a take-profit is not a stop");
+
+        // −11.7% past the 60s min-hold: the stop, not an ask, and the market cools down.
+        let strat = ConvergenceStrategyImpl::default();
+        let c = ctx(book(dec!(0.53), dec!(0.55)), plan());
+        hold_yes(&c, dec!(0.60), dec!(8), 200, true).await;
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        let StrategySignal::Exit { params, reason, .. } = sig else {
+            panic!("a −11.7% mark past the min-hold must stop out, got {sig:?}");
+        };
+        assert_eq!(params.price, dec!(0.53));
+        assert!(!params.post_only && params.order_type == TimeInForce::Fak, "a stop crosses");
+        assert!(reason.starts_with("ConvergenceSL: bid=$0.5300"), "{reason}");
+        assert!(strat.stop_market_cooldown.lock().unwrap().contains_key("cid-hourly"));
+    }
+
+    /// The floor only ever raises the bar. Where a fee is charged, a bid that
+    /// clears the flat 8% but not the fee-floored target at a cheap entry is
+    /// NOT a take-profit; where no fee is charged the flat target stands and
+    /// the same bid takes.
+    ///
+    /// On the fee venue this mark is also the one gap the fixed-ask rule
+    /// leaves open, shared with Momentum: the ask would sit at $0.39, which is
+    /// the bid, so it cannot rest, and the FAK bar is 12.1% away. The position
+    /// is simply held — it rests the ask the moment the bid ticks down, and
+    /// takes with the FAK if the bid runs on to the floored target.
+    #[tokio::test]
+    async fn the_take_profit_bar_is_the_floored_target() {
+        // $0.36 entry, bid $0.39: +8.33%, over the flat 8% plan. On a fee venue
+        // the FAK floor is 2 × 0.07 × 0.64 × 1.35 = 12.1%, so this is not a TP;
+        // the resting floor (entry leg alone, 6.0%) is under the plan, so the
+        // ask would be $0.36 × 1.08 = $0.3888 → $0.39 — at the bid.
+        let strat = ConvergenceStrategyImpl::default();
+        let c = ctx(book(dec!(0.39), dec!(0.41)), plan());
+        hold_yes(&c, dec!(0.36), dec!(13), 200, true).await;
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        if fee_venue() {
+            assert!(matches!(sig, StrategySignal::NoSignal),
+                "+8.3% under a 12.1% floored target must neither take nor rest at the bid, got {sig:?}");
+            // One tick lower and the ask rests at $0.39, above the bid.
+            let c = ctx(book(dec!(0.38), dec!(0.40)), plan());
+            hold_yes(&c, dec!(0.36), dec!(13), 200, true).await;
+            let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+            let StrategySignal::MakerRestingExit { params, .. } = sig else {
+                panic!("with the bid below the target the ask must rest, got {sig:?}");
+            };
+            assert_eq!(params.price, dec!(0.39));
+        } else {
+            let StrategySignal::Exit { reason, .. } = sig else {
+                panic!("with no fee the flat 8% stands and the bid takes, got {sig:?}");
+            };
+            assert!(reason.starts_with("ConvergenceTP"), "{reason}");
+        }
     }
 }

@@ -295,6 +295,40 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Deepest drawdown at which the OBI-exhaustion exit may still fire (negative). Past this the position is already wrecked and the stop-loss owns it. Keep it beyond the stop loss or the early exit can never fire.").range(-1.0, 0.0).step(0.01));
         v.push(F::new(g, e, "momentum_tp_fee_margin_mult", "TP Fee Margin", "decimal", true,
             "Multiple of the round-trip taker fee the take-profit must clear. Venue fees scale with entry price (2 × rate × (1 − entry) of notional), so a flat percentage target sits below break-even on cheap entries; the effective target is lifted to this multiple of the fee whenever it would not clear.").range(1.0, 3.0).step(0.05));
+        v.push(F::new(g, e, "momentum_max_fee_to_target_ratio", "Max Fee Share of Target", "decimal", true,
+            "Refuse an entry when the round-trip taker fee at the ask would consume more than this fraction of the \
+             take-profit target. Momentum has no fair-value model, so the plan (target vs stop) is its whole edge and \
+             the fee is a fixed toll on it: 2 × rate × (1 − ask) of notional, 6.6% at $0.53 and 11.9% at $0.15. The \
+             first live aggressive trade (2026-09-09) entered at $0.53 with a 15% target — the fee was 44% of the plan \
+             and 116% of the gross loss. 0.40 lets the fee take at most 40% of the target; on Polymarket International \
+             with the aggressive profile that admits entries at roughly $0.58–$0.69 and nothing else, and with the \
+             balanced profile (10% target, $0.60 max entry) it admits nothing. Inert on a venue with no taker fee.")
+            .range(0.0, 1.0).step(0.05));
+        v.push(F::new(g, e, "momentum_reversal_ratio", "Reversal Ratio", "decimal", true,
+            "Fraction of the entry velocity threshold that, read against the position, counts as a reversal for the \
+             in-position reversal exit. 0.75 means a 5s oracle move three-quarters the size of the one that triggered \
+             entry, in the opposite direction, is a reversal. Lower fires sooner on smaller moves.").range(0.1, 2.0).step(0.05));
+        v.push(F::new(g, e, "momentum_reversal_min_hold_secs", "Reversal Min Hold", "secs", true,
+            "Minimum hold before the reversal exit may fire. The stop-loss and catastrophic stop are not gated by this.")
+            .min(0.0).step(5.0).unit("s"));
+        v.push(F::new(g, e, "momentum_reversal_persist_secs", "Reversal Persistence", "secs", true,
+            "How long the oracle must read reversed, continuously, before the reversal exit fires. Velocity is a 5s \
+             window, so a single opposing tick reads as a reversal for up to five seconds by itself; a value above 5 \
+             requires a second, independent reading to agree. Any non-reversed reading resets the clock. The \
+             2026-09-09 11:01 ET exit fired on one reading 62s after entry, paid the second taker fee, and turned a \
+             −5.7% mark into a −12.3% realized loss. The stop-loss is unaffected.").range(0.0, 120.0).step(1.0).unit("s"));
+        v.push(F::new(g, e, "momentum_resting_tp_enabled", "Resting Take Profit", "bool", true,
+            "Take profit with a resting post-only ask at entry × (1 + Take Profit) instead of a taker FAK at the \
+             bid. Momentum crosses the spread to get in and used to cross it again to get out, paying the taker fee \
+             twice; a maker lift pays nothing and earns the venue's maker rebate. The ask is lifted only when the \
+             market runs through the price the take-profit would have sold at anyway, so being filled is not \
+             evidence the thesis has turned. It sits at a fixed price for the life of the position (no chasing, no \
+             lost queue position), is floored against the entry fee alone rather than the round trip, and is \
+             capped at the Take-Profit Ceiling. Every stop and the reversal, decay, OBI-exhaustion and near-expiry \
+             exits still cross with a FAK, and the patrol pulls the ask before any of them needs the shares. Only \
+             the winning leg goes fee-free — a stop still pays both legs — so the edge the signal must supply above \
+             a coin flip falls by about a quarter, not by half. Polymarket International only: Kalshi and Polymarket \
+             US ignore the signal and keep the taker take-profit. Off restores the taker take-profit everywhere."));
     }
 
     // ── Maker ─────────────────────────────────────────────────────────────────
@@ -622,6 +656,35 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(g, e, "convergence_velocity_opposition_pct", "Velocity Opposition Deadband", "pct", true,
             "Fraction of oracle price the 5s velocity must run AGAINST the intended side to veto entry. \
              Zero velocity never vetoes. Lower = stricter.").range(0.0, 0.005).step(0.00001));
+        v.push(F::new(g, e, "convergence_max_fee_to_target_ratio", "Max Fee Share of Target", "decimal", true,
+            "Refuse an entry when the round-trip taker fee at the ask would consume more than this fraction of \
+             the take-profit target. Both Convergence legs cross the spread, so the round trip is \
+             2 × rate × (1 − ask) of notional: 9.1% at the $0.35 floor, 4.9% at the $0.65 cap. Against a 7–10% \
+             target that is 49–130% of the plan, and with the 10% stop at or above the target the break-even hit \
+             rate is (stop + fee) / (target + stop): 87% at $0.65 on a 7% target, over 100% below $0.47, where a \
+             trade that reached its target exactly still lost money. At 0.40 the fee may take at most 40% of the \
+             target, which admits nothing in the shipped band on Polymarket International or Kalshi at any \
+             profile — the arithmetic's honest answer, and the refusal says so. Inert on Polymarket US, which \
+             charges no taker fee. To trade this band on a fee venue, retune the target and stop (a 15% target \
+             against an 8% stop clears at $0.60 and above), not this ratio.")
+            .range(0.0, 1.0).step(0.05));
+        v.push(F::new(g, e, "convergence_tp_fee_margin_mult", "TP Fee Margin", "decimal", true,
+            "Multiple of the taker fee the take-profit must clear: the round trip for the FAK take-profit, the \
+             entry leg alone for the resting ask. Venue fees scale with entry price, so a flat percentage target \
+             sits below break-even on cheap entries (an 8% target grosses 2.8¢ a share at $0.35 against 3.2¢ of \
+             fees); the effective target is lifted to this multiple of the fee whenever it would not clear. \
+             Convergence had no floor before 2026-09-09.").range(1.0, 3.0).step(0.05));
+        v.push(F::new(g, e, "convergence_resting_tp_enabled", "Resting Take Profit", "bool", true,
+            "Take profit with a resting post-only ask at entry × (1 + Take Profit) instead of a taker FAK at the \
+             bid. Convergence crosses the spread to get in and used to cross it again to get out; a maker lift \
+             pays nothing and earns the venue's maker rebate. The target is a price level, so an ask resting \
+             there is lifted by the same print that would have triggered the FAK. It sits at a fixed price for \
+             the life of the position (no chasing), is floored against the entry fee alone, and is held back \
+             during the soft-exit cooldown. Every stop and the Decay exit — the time-sensitive one — still cross \
+             with a FAK, and the patrol pulls the ask before any of them needs the shares. Only the winning leg \
+             goes fee-free: at $0.65 on a 7% target the break-even hit rate falls from 87% to 77%, which is a \
+             cheaper trade, not a tradeable one. Polymarket International only: Kalshi and Polymarket US ignore \
+             the signal and keep the taker take-profit."));
     }
 
     // ── FairValue ─────────────────────────────────────────────────────────────

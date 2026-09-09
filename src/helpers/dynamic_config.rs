@@ -221,6 +221,9 @@ fn default_convergence_drift_coherence_deadband_pct() -> Decimal { config::CONVE
 fn default_convergence_velocity_opposition_pct()      -> Decimal { config::CONVERGENCE_VELOCITY_OPPOSITION_PCT      }
 fn default_convergence_skip_band_low()      -> Decimal { config::CONVERGENCE_SKIP_BAND_LOW             }
 fn default_convergence_skip_band_high()     -> Decimal { config::CONVERGENCE_SKIP_BAND_HIGH            }
+fn default_convergence_max_fee_to_target_ratio() -> Decimal { config::CONVERGENCE_MAX_FEE_TO_TARGET_RATIO }
+fn default_convergence_tp_fee_margin_mult() -> Decimal { config::CONVERGENCE_TP_FEE_MARGIN_MULT         }
+fn default_convergence_resting_tp_enabled() -> bool    { config::CONVERGENCE_RESTING_TP_ENABLED         }
 fn default_fairvalue_obi_adverse_block()    -> Decimal { config::FAIRVALUE_OBI_ADVERSE_BLOCK           }
 fn default_fairvalue_obi_clear_secs()       -> u64     { config::FAIRVALUE_OBI_CLEAR_SECS              }
 fn default_sports_poll_secs()               -> u64     { config::SPORTS_POLL_SECS                      }
@@ -283,6 +286,11 @@ fn default_momentum_obi_exhaust_max_adverse_pct() -> Decimal { config::MOMENTUM_
 fn default_momentum_obi_exhaust_min_hold_secs()   -> i64     { config::MOMENTUM_OBI_EXHAUST_MIN_HOLD_SECS   }
 fn default_momentum_obi_exhaust_persist_secs()    -> i64     { config::MOMENTUM_OBI_EXHAUST_PERSIST_SECS    }
 fn default_momentum_tp_fee_margin_mult()          -> Decimal { config::MOMENTUM_TP_FEE_MARGIN_MULT          }
+fn default_momentum_max_fee_to_target_ratio()     -> Decimal { config::MOMENTUM_MAX_FEE_TO_TARGET_RATIO     }
+fn default_momentum_reversal_ratio()              -> Decimal { config::MOMENTUM_REVERSAL_RATIO              }
+fn default_momentum_reversal_min_hold_secs()      -> i64     { config::MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL }
+fn default_momentum_reversal_persist_secs()       -> i64     { config::MOMENTUM_REVERSAL_PERSIST_SECS       }
+fn default_momentum_resting_tp_enabled()          -> bool    { config::MOMENTUM_RESTING_TP_ENABLED          }
 fn default_maker_tp_fee_margin_mult()             -> Decimal { config::MAKER_TP_FEE_MARGIN_MULT             }
 fn default_fairvalue_stop_veto_max_model_decay_pct() -> Decimal { config::FAIRVALUE_STOP_VETO_MAX_MODEL_DECAY_PCT }
 fn default_fairvalue_settle_snipe_hold()  -> bool    { config::FAIRVALUE_SETTLE_SNIPE_HOLD             }
@@ -483,6 +491,28 @@ pub struct DynamicConfig {
     /// Multiple of the round-trip taker fee the take-profit target must clear.
     #[serde(default = "default_momentum_tp_fee_margin_mult")]
     pub momentum_tp_fee_margin_mult: Decimal,
+    /// Largest share of the take-profit target the round-trip taker fee may
+    /// consume before an entry is refused. The entry-side counterpart of
+    /// `momentum_tp_fee_margin_mult`: that one lifts the target to clear the fee,
+    /// this one declines the trade when the fee would dominate the plan.
+    #[serde(default = "default_momentum_max_fee_to_target_ratio")]
+    pub momentum_max_fee_to_target_ratio: Decimal,
+    /// Fraction of the entry velocity threshold that, read in the opposite
+    /// direction, counts as a reversal for the in-position reversal exit.
+    #[serde(default = "default_momentum_reversal_ratio")]
+    pub momentum_reversal_ratio: Decimal,
+    /// Minimum hold before the reversal exit may fire.
+    #[serde(default = "default_momentum_reversal_min_hold_secs")]
+    pub momentum_reversal_min_hold_secs: i64,
+    /// How long the oracle must read reversed, continuously, before the reversal
+    /// exit fires. Seconds rather than ticks: the patrol loop runs at 75ms, and
+    /// the velocity window itself is 5s.
+    #[serde(default = "default_momentum_reversal_persist_secs")]
+    pub momentum_reversal_persist_secs: i64,
+    /// Take profit with a resting post-only ask at the target instead of a
+    /// taker FAK at the bid. Stops and every signal-driven exit still cross.
+    #[serde(default = "default_momentum_resting_tp_enabled")]
+    pub momentum_resting_tp_enabled: bool,
 
     // ── Maker Viper ───────────────────────────────────────────────────────────
     pub maker_max_entry_price:    Decimal,
@@ -895,6 +925,19 @@ pub struct DynamicConfig {
     pub convergence_skip_band_low:        Decimal,
     #[serde(default = "default_convergence_skip_band_high")]
     pub convergence_skip_band_high:       Decimal,
+    /// Largest share of the take-profit target the round-trip taker fee may
+    /// consume before an entry is refused. At the shipped targets this refuses
+    /// the whole entry band on a fee venue; inert where no taker fee is charged.
+    #[serde(default = "default_convergence_max_fee_to_target_ratio")]
+    pub convergence_max_fee_to_target_ratio: Decimal,
+    /// Multiple of the taker fee the take-profit must clear: the round trip
+    /// for the FAK take-profit, the entry leg alone for the resting ask.
+    #[serde(default = "default_convergence_tp_fee_margin_mult")]
+    pub convergence_tp_fee_margin_mult:   Decimal,
+    /// Take profit with a resting post-only ask at the target instead of a
+    /// taker FAK at the bid. Stops and the Decay exit still cross.
+    #[serde(default = "default_convergence_resting_tp_enabled")]
+    pub convergence_resting_tp_enabled:   bool,
 
     // ── Raptor polling ────────────────────────────────────────────────────────
     // Cadence for the two credentialed, budget-metered Raptors. These are live
@@ -1022,6 +1065,11 @@ impl Default for DynamicConfig {
             momentum_obi_exhaust_min_hold_secs:   config::MOMENTUM_OBI_EXHAUST_MIN_HOLD_SECS,
             momentum_obi_exhaust_persist_secs:    config::MOMENTUM_OBI_EXHAUST_PERSIST_SECS,
             momentum_tp_fee_margin_mult:          config::MOMENTUM_TP_FEE_MARGIN_MULT,
+            momentum_max_fee_to_target_ratio:     config::MOMENTUM_MAX_FEE_TO_TARGET_RATIO,
+            momentum_reversal_ratio:              config::MOMENTUM_REVERSAL_RATIO,
+            momentum_reversal_min_hold_secs:      config::MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL,
+            momentum_reversal_persist_secs:       config::MOMENTUM_REVERSAL_PERSIST_SECS,
+            momentum_resting_tp_enabled:          config::MOMENTUM_RESTING_TP_ENABLED,
 
             maker_max_entry_price:    config::MAKER_MAX_ENTRY_PRICE,
             maker_min_entry_price:    config::MAKER_MIN_ENTRY_PRICE,
@@ -1161,6 +1209,9 @@ impl Default for DynamicConfig {
             convergence_velocity_opposition_pct: config::CONVERGENCE_VELOCITY_OPPOSITION_PCT,
             convergence_skip_band_low:        config::CONVERGENCE_SKIP_BAND_LOW,
             convergence_skip_band_high:       config::CONVERGENCE_SKIP_BAND_HIGH,
+            convergence_max_fee_to_target_ratio: config::CONVERGENCE_MAX_FEE_TO_TARGET_RATIO,
+            convergence_tp_fee_margin_mult:   config::CONVERGENCE_TP_FEE_MARGIN_MULT,
+            convergence_resting_tp_enabled:   config::CONVERGENCE_RESTING_TP_ENABLED,
 
             fairvalue_obi_adverse_block:      config::FAIRVALUE_OBI_ADVERSE_BLOCK,
             fairvalue_obi_clear_secs:         config::FAIRVALUE_OBI_CLEAR_SECS,
@@ -1714,11 +1765,20 @@ mod tests {
     fn a_config_row_predating_the_newest_knobs_still_loads() {
         let mut legacy = serde_json::to_value(DynamicConfig::default()).unwrap();
         let obj = legacy.as_object_mut().unwrap();
-        for added in ["fairvalue_stop_model_confirm_frac", "arb_settle_grace_secs", "fairvalue_settle_snipe_hold", "fairvalue_resting_tp_enabled"] {
+        for added in [
+            "fairvalue_stop_model_confirm_frac", "arb_settle_grace_secs", "fairvalue_settle_snipe_hold",
+            "fairvalue_resting_tp_enabled", "momentum_resting_tp_enabled",
+            "convergence_max_fee_to_target_ratio", "convergence_tp_fee_margin_mult", "convergence_resting_tp_enabled",
+        ] {
             assert!(obj.remove(added).is_some(), "{added} must be a serialized field");
         }
         let cfg: DynamicConfig =
             serde_json::from_value(legacy).expect("an old persisted row must still deserialize");
+
+        assert_eq!(cfg.momentum_resting_tp_enabled, config::MOMENTUM_RESTING_TP_ENABLED);
+        assert_eq!(cfg.convergence_max_fee_to_target_ratio, config::CONVERGENCE_MAX_FEE_TO_TARGET_RATIO);
+        assert_eq!(cfg.convergence_tp_fee_margin_mult, config::CONVERGENCE_TP_FEE_MARGIN_MULT);
+        assert_eq!(cfg.convergence_resting_tp_enabled, config::CONVERGENCE_RESTING_TP_ENABLED);
 
         assert_eq!(
             cfg.fairvalue_stop_model_confirm_frac,

@@ -30,6 +30,7 @@ pub mod convergence_impl;
 pub mod fairvalue_impl;
 
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use crate::config;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -87,6 +88,74 @@ pub fn entry_liquidity_gate(
         ));
     }
     None
+}
+
+/// Refuse a taker entry whose round-trip fee would dominate its take-profit plan.
+///
+/// For a strategy with no fair-value model — Momentum, and in the same shape
+/// Convergence and TrendReversal — the plan is the edge: a percentage target
+/// against a percentage stop. The venue's taker fee is a fixed toll on that plan
+/// and it scales with entry price, `2 × rate × (1 − p)` of notional (see
+/// [`crate::venues::round_trip_fee_pct`]): 6.6% at $0.53, 11.9% at $0.15. A
+/// take-profit floor (`*_tp_fee_margin_mult`) can lift the target so the trade
+/// clears the fee, but it cannot make a trade whose fee is most of its target a
+/// good bet — it just moves the finish line further out on a plan that was
+/// already fee-dominated. This is the refusal for that case.
+///
+/// Returns the refusal reason when `fee / target` exceeds `max_ratio`, else
+/// `None`. A zero target (nothing to clear) is refused outright when a fee is
+/// charged. On a venue with no taker fee the fee is zero at every price and
+/// the gate never binds, which is the correct answer there.
+///
+/// First live Momentum trade on the aggressive profile, 2026-09-09 11:00 ET:
+/// YES at $0.53, 15% target, round trip 6.58% of notional — the fee was 44% of
+/// the plan. The position was closed 62s later at −5.66% gross and the fee was
+/// 116% of that loss.
+pub fn fee_dominated_entry(ask: Decimal, target_pct: Decimal, max_ratio: Decimal) -> Option<String> {
+    let fee = crate::venues::round_trip_fee_pct(ask);
+    if fee <= Decimal::ZERO {
+        return None;
+    }
+    if target_pct <= Decimal::ZERO {
+        return Some(format!(
+            "fee-dominated: round-trip fee {:.2}% of notional at ${:.2} against no take-profit target",
+            fee * dec!(100), ask,
+        ));
+    }
+    let share = fee / target_pct;
+    if share > max_ratio {
+        return Some(format!(
+            "fee-dominated: round-trip fee {:.2}% is {:.0}% of the {:.1}% target at ${:.2} (max {:.0}%)",
+            fee * dec!(100), share * dec!(100), target_pct * dec!(100), ask, max_ratio * dec!(100),
+        ));
+    }
+    None
+}
+
+/// Price of a fixed resting post-only take-profit ask, or `None` when no ask
+/// can rest. Shared by Momentum and Convergence.
+///
+/// The ask sits at `entry × (1 + target)` rounded UP to the tick — the price
+/// the take-profit FAK would sell at — held fixed for the life of the position
+/// so it never chases the book or gives up its queue position, and capped at
+/// `ceiling` when one is given (Momentum's `momentum_take_profit_ceiling`, the
+/// price at which its FAK take-profit sells regardless of target; zero for a
+/// strategy with no ceiling). A lift at the ceiling is that same sale minus
+/// the fee. `None` when the price is at or through the bid (a post-only sell
+/// there crosses the book and is rejected; the FAK rules own that case), when
+/// rounding carries it to $1.00, or when there is no target.
+///
+/// Deliberately not FairValue's `resting_tp_price`: FairValue raises its ask
+/// to $0.99 inside a model-backed settlement hold and rests nothing when its
+/// target is unreachable, because settlement is its upside. Neither strategy
+/// here has a model to back a hold, so the ceiling is a cap and the target is
+/// the whole plan.
+pub fn resting_tp_price(avg_entry: Decimal, target_pct: Decimal, bid: Decimal, ceiling: Decimal) -> Option<Decimal> {
+    if avg_entry <= Decimal::ZERO || target_pct <= Decimal::ZERO { return None; }
+    let mut price = crate::helpers::price::ceil_to_tick_size(avg_entry * (Decimal::ONE + target_pct));
+    if ceiling > Decimal::ZERO && price > ceiling { price = ceiling; }
+    if price <= bid || price >= Decimal::ONE { return None; }
+    Some(price)
 }
 
 // ── Venue resolution for an open position ────────────────────────────────────

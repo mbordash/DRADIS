@@ -546,7 +546,9 @@ Fee model — state it explicitly in your reasoning, never assume "zero fee":
   the spread threshold; the only fixes are a different market or sitting out.
 
 == Active Strategies ("Vipers") ==
-1. MOMENTUM    — Rides short-term BTC/ETH/SOL oracle velocity bursts (FAK taker).
+1. MOMENTUM    — Rides short-term BTC/ETH/SOL oracle velocity bursts (FAK taker entry;
+                 the take-profit rests as a post-only ask at the target and pays no fee
+                 when momentum_resting_tp_enabled, every other exit is a FAK taker).
                  Key signals: velocity_5s, velocity_1s, OBI, confirmation ticks.
                  Common failure: adverse OBI at entry; snapshot staleness.
 2. MAKER       — Posts passive resting limit bids (GTC maker, 0% fee).
@@ -574,7 +576,14 @@ Fee model — state it explicitly in your reasoning, never assume "zero fee":
                   own noise. Coin-flip and pin-risk guards refuse near-50/50 and
                   endgame pricing where no model has an edge.
 9. CONVERGENCE — Directional entry only when several signals agree (ETF tide,
-                  taker flow, open interest). BTC-only, US hours.
+                  taker flow, open interest). BTC-only, US hours. FAK taker entry;
+                  the take-profit rests as a post-only ask at the target and pays
+                  no fee when convergence_resting_tp_enabled, every other exit is
+                  a FAK taker. Its stop is at or above its target, so the fee
+                  dominates the plan across its whole $0.35–$0.65 band on a fee
+                  venue: a "fee-dominated" refusal here is the arithmetic, and
+                  the remedy is a wider target against a tighter stop (or a
+                  zero-fee venue), never a looser max_fee_to_target_ratio.
 
 == Key OBI Concept ==
 OBI (Order Book Imbalance) = (bid_depth − ask_depth) / total_depth  ∈ [−1, +1]
@@ -776,6 +785,9 @@ pub fn classify_refusal(strategy: &str, normalized: &str) -> RefusalClass {
     }
     if has(&["below entry price floor"]) {
         return RefusalClass::Knob(key("min_entry_price"));
+    }
+    if has(&["fee-dominated"]) {
+        return RefusalClass::Knob(key("max_fee_to_target_ratio"));
     }
     if has(&["outside entry price band", "price out of range", "entry price above cap"]) {
         return RefusalClass::Knob(key("max_entry_price"));
@@ -2386,6 +2398,21 @@ mod refusal_ledger_tests {
         assert_eq!(
             classify_refusal("MomentumStrategy", "exposure cap reached"),
             RefusalClass::Guard(Some("momentum_max_exposure_usdc".into())),
+        );
+        // The fee-dominated refusal names its knob, so the advisor can point the
+        // operator at the ratio rather than filing a structural refusal under
+        // "market conditions".
+        assert_eq!(
+            classify_refusal("MomentumStrategy", &normalize_reason(
+                "fee-dominated: round-trip fee 6.58% is 44% of the 15.0% target at $0.53 (max 40%)")),
+            RefusalClass::Knob("momentum_max_fee_to_target_ratio".into()),
+        );
+        // Convergence shares the gate and the refusal text; the prefix routes
+        // it to Convergence's own ratio, not Momentum's.
+        assert_eq!(
+            classify_refusal("ConvergenceStrategy", &normalize_reason(
+                "fee-dominated: round-trip fee 4.90% is 70% of the 7.0% target at $0.65 (max 40%)")),
+            RefusalClass::Knob("convergence_max_fee_to_target_ratio".into()),
         );
         assert_eq!(classify_refusal("MomentumStrategy", "velocity below trigger"), RefusalClass::Market);
         assert_eq!(classify_refusal("BasisStrategy", "session drawdown limit hit"), RefusalClass::Guard(None));

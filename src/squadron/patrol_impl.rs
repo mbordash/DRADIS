@@ -1103,8 +1103,7 @@ impl Squadron {
                     // Snapshot the resting-exit knobs before `dyn_cfg` is moved
                     // into the StrategyContext below.
                     let resting_exit_reprice_threshold = dyn_cfg.maker_resting_exit_reprice_threshold;
-                    let resting_exit_enabled = dyn_cfg.maker_resting_exit_enabled;
-                    let fairvalue_resting_tp_enabled = dyn_cfg.fairvalue_resting_tp_enabled;
+                    let resting_exit_knobs = resting_exit::Knobs::snapshot(&dyn_cfg);
                     // Read through the floored accessor — see its doc for why the
                     // schema minimum alone is not enough.
                     let exit_retry_cooldown_secs = dyn_cfg.exit_retry_cooldown_secs_floored();
@@ -2706,7 +2705,7 @@ impl Squadron {
                             // this every tick, so the common path here is a no-op.
                             StrategySignal::MakerRestingExit { params, reason } => {
                                 // Each strategy that rests an exit owns its own knob.
-                                if !resting_exit::enabled_for(&sn, resting_exit_enabled, fairvalue_resting_tp_enabled) { continue; }
+                                if !resting_exit_knobs.enabled_for(&sn) { continue; }
                                 let tok = params.token_id.clone();
                                 let pk = PositionKey::new(sq_key.clone(), sn.clone(), tok.clone());
                                 let label = resting_exit::label(&sn);
@@ -3753,16 +3752,40 @@ pub(crate) mod resting_exit {
         if held >= config::MIN_ORDER_SHARES && held < ledger { held } else { ledger }
     }
 
-    /// Which knob gates a strategy's resting exit.
+    /// The per-strategy switches for resting exits, snapshotted from the
+    /// tick's config before it is moved into the `StrategyContext`.
     ///
-    /// The Maker and FairValue each own theirs: turning the Maker's
-    /// spread-capture exit off must not silence FairValue's resting take-profit,
-    /// and the reverse. Any other strategy that starts emitting the signal
-    /// falls under the Maker's knob until it is given its own.
-    pub fn enabled_for(strategy: &str, maker_enabled: bool, fairvalue_enabled: bool) -> bool {
-        match strategy {
-            "FairValueStrategy" => fairvalue_enabled,
-            _ => maker_enabled,
+    /// The Maker, FairValue, Momentum and Convergence each own theirs: turning
+    /// the Maker's spread-capture exit off must not silence another viper's
+    /// resting take-profit, and the reverse. Any other strategy that starts
+    /// emitting the signal falls under the Maker's knob until it is given its
+    /// own.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub struct Knobs {
+        pub maker: bool,
+        pub fairvalue: bool,
+        pub momentum: bool,
+        pub convergence: bool,
+    }
+
+    impl Knobs {
+        pub fn snapshot(dc: &crate::helpers::dynamic_config::DynamicConfig) -> Self {
+            Self {
+                maker: dc.maker_resting_exit_enabled,
+                fairvalue: dc.fairvalue_resting_tp_enabled,
+                momentum: dc.momentum_resting_tp_enabled,
+                convergence: dc.convergence_resting_tp_enabled,
+            }
+        }
+
+        /// Which knob gates `strategy`'s resting exit.
+        pub fn enabled_for(&self, strategy: &str) -> bool {
+            match strategy {
+                "FairValueStrategy" => self.fairvalue,
+                "MomentumStrategy" => self.momentum,
+                "ConvergenceStrategy" => self.convergence,
+                _ => self.maker,
+            }
         }
     }
 
@@ -3772,6 +3795,8 @@ pub(crate) mod resting_exit {
         match strategy {
             "MakerStrategy" => "Maker resting exit".to_string(),
             "FairValueStrategy" => "FairValue resting TP".to_string(),
+            "MomentumStrategy" => "Momentum resting TP".to_string(),
+            "ConvergenceStrategy" => "Convergence resting TP".to_string(),
             other => format!("{other} resting exit"),
         }
     }
@@ -3954,13 +3979,26 @@ pub(crate) mod resting_exit {
             assert_eq!(bk.entry_fee_booked, dec!(0.3136));
         }
 
-        /// Each strategy's resting exit answers to its own knob.
+        /// Each strategy's resting exit answers to its own knob, and the
+        /// snapshot reads each from the field that owns it.
         #[test]
         fn each_strategy_is_gated_by_its_own_knob() {
-            assert!(enabled_for("MakerStrategy", true, false));
-            assert!(!enabled_for("MakerStrategy", false, true));
-            assert!(enabled_for("FairValueStrategy", false, true));
-            assert!(!enabled_for("FairValueStrategy", true, false));
+            let only = |maker, fairvalue, momentum, convergence| Knobs { maker, fairvalue, momentum, convergence };
+            assert!(only(true, false, false, false).enabled_for("MakerStrategy"));
+            assert!(!only(false, true, true, true).enabled_for("MakerStrategy"));
+            assert!(only(false, true, false, false).enabled_for("FairValueStrategy"));
+            assert!(!only(true, false, true, true).enabled_for("FairValueStrategy"));
+            assert!(only(false, false, true, false).enabled_for("MomentumStrategy"));
+            assert!(!only(true, true, false, true).enabled_for("MomentumStrategy"));
+            assert!(only(false, false, false, true).enabled_for("ConvergenceStrategy"));
+            assert!(!only(true, true, true, false).enabled_for("ConvergenceStrategy"));
+
+            let mut dc = crate::helpers::dynamic_config::DynamicConfig::default();
+            dc.maker_resting_exit_enabled = false;
+            dc.fairvalue_resting_tp_enabled = true;
+            dc.momentum_resting_tp_enabled = false;
+            dc.convergence_resting_tp_enabled = true;
+            assert_eq!(Knobs::snapshot(&dc), only(false, true, false, true));
         }
 
         /// The Maker's ledger text is unchanged; FairValue's names the target.
@@ -3974,8 +4012,20 @@ pub(crate) mod resting_exit {
                 ledger_reason("FairValueStrategy", dec!(0.24), dec!(0.20)),
                 "FairValue resting TP: lifted @ $0.2400 (gain=20.00%)"
             );
+            // 26.4150…% — rust_decimal's precision formatting truncates, it
+            // does not round, so this reads 26.41 like every other {:.2} here.
+            assert_eq!(
+                ledger_reason("MomentumStrategy", dec!(0.67), dec!(0.53)),
+                "Momentum resting TP: lifted @ $0.6700 (gain=26.41%)"
+            );
+            assert_eq!(
+                ledger_reason("ConvergenceStrategy", dec!(0.65), dec!(0.60)),
+                "Convergence resting TP: lifted @ $0.6500 (gain=8.33%)"
+            );
             assert_eq!(label("MakerStrategy"), "Maker resting exit");
             assert_eq!(label("FairValueStrategy"), "FairValue resting TP");
+            assert_eq!(label("MomentumStrategy"), "Momentum resting TP");
+            assert_eq!(label("ConvergenceStrategy"), "Convergence resting TP");
         }
     }
 }
