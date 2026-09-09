@@ -108,7 +108,14 @@ mod tests {
     /// secret survives into the redacted form.
     #[test]
     fn secret_never_survives() {
-        let secret = "PPMQIewap9ta1XJfgnfnj";
+        // Synthetic, and deliberately self-describing: this test only needs a
+        // key-shaped string to feed the redactor, and it asserts nothing about
+        // the value. The literal that used to sit here was taken from the real
+        // endpoint whose leak this module was written to stop, which put a
+        // live-shaped provider key in a public repository and tripped code
+        // scanning's hard-coded-credential rule on top of that. A fake value
+        // tests the same behavior and cannot be mistaken for a real one.
+        let secret = "EXAMPLE0000NOTAREALKEY0000EXAMPLE";
         let out = redact_endpoint(&format!(
             "https://polygon-mainnet.g.alchemy.com/v2/{secret}"
         ));

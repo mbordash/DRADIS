@@ -1883,11 +1883,28 @@ mod tests {
 
     #[test]
     fn password_hash_roundtrip() {
-        // Construct at runtime so static analysis doesn't flag a hard-coded credential.
-        let pw = ["hunter2", "hunter2"].join("-");
+        // Derived from runtime entropy rather than written down. An earlier
+        // version split a literal across an array and joined it, on the theory
+        // that static analysis would not reassemble it; code scanning flagged
+        // it anyway, which is the right outcome — obfuscating a credential
+        // hides it from the reader without hiding it from the scanner, and a
+        // literal here is indistinguishable from a real one that leaked. The
+        // test asserts nothing about the value, only that hashing and
+        // verification round-trip, so no fixed string is needed at all.
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock before the Unix epoch")
+            .as_nanos();
+        let pw = format!("setup-roundtrip-{}-{nonce}", std::process::id());
+
         let h = hash_password(&pw).unwrap();
-        assert!(verify_password(&pw, &h));
-        assert!(!verify_password("wrong", &h));
+        assert!(verify_password(&pw, &h), "the password that was hashed must verify");
+
+        // Derived from `pw` so it cannot collide with it, and is not a literal.
+        assert!(
+            !verify_password(&format!("{pw}-mismatch"), &h),
+            "a different password must not verify",
+        );
     }
 
     /// A rejected Setup password must say which password was rejected.
