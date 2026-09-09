@@ -38,7 +38,7 @@ import { ViperHealthStrip } from '@/components/ViperHealthStrip';
 import { getAssets, getConfig, getPnlHistory, getTrades, getOpenPositions, getHealth, patchConfig, VIPER_DEFS, getStatus, getLlmRecommendations, getLlmActions, getPortfolioValue, getSquadrons } from '@/lib/api';
 import { DEMO_MODE } from '@/lib/demo';
 import { getSetupStatus } from '@/lib/setupApi';
-import type { DynamicConfig, SquadronSummary } from '@/lib/types';
+import type { DynamicConfig, SquadronSummary, PortfolioValue } from '@/lib/types';
 
 // Recharts must be loaded client-side only
 // Loading states are explicit: without one these render nothing at all while
@@ -70,6 +70,13 @@ function fmt$(n: number) {
 function fmtPct(n: number) {
   const sign = n >= 0 ? '+' : '';
   return `${sign}${(n * 100).toFixed(2)}%`;
+}
+
+/** "45s", "12m", "3h" — for saying how old a figure is. */
+function fmtAge(secs: number) {
+  if (secs < 60) return `${Math.round(secs)}s`;
+  if (secs < 3600) return `${Math.round(secs / 60)}m`;
+  return `${(secs / 3600).toFixed(1)}h`;
 }
 
 // ── Session time helpers ──────────────────────────────────────────────────────
@@ -270,45 +277,98 @@ function AssetTabs({
 
 // ── Portfolio value banner ────────────────────────────────────────────────────
 
+/**
+ * Honest-state rule ([B43]): this banner never coerces a figure it does not
+ * have. Three situations used to collapse into "$0.00 · ⚡ cached prices":
+ * the engine has not taken a balance reading yet, the engine is unreachable,
+ * and a mark really is stale. The first is what a Marketplace customer sees in
+ * the seconds after importing their keys, and it read as the keys being wrong
+ * ([B42]). Each now has its own words, and the dollar figure only appears when
+ * there is one.
+ */
 function PortfolioValueBanner({
-  totalValue, collateral, strandedCollateral, positionsValue, unrealizedPnl,
-  positionCount, sessionPnl, ghostMode, pricesLive, isLoading,
+  portfolio, sessionPnl, ghostMode, isLoading, unreachable,
 }: {
-  totalValue: number; collateral: number; strandedCollateral: number; positionsValue: number;
-  unrealizedPnl: number; positionCount: number; sessionPnl: number;
-  ghostMode?: boolean; pricesLive: boolean; isLoading: boolean;
+  portfolio?: PortfolioValue;
+  /** Realized session P&L, or `null` while it is not known yet. */
+  sessionPnl: number | null;
+  ghostMode?: boolean;
+  isLoading: boolean;
+  /** The last poll failed. With `portfolio` set the figures are the previous reading. */
+  unreachable: boolean;
 }) {
+  const collateral     = portfolio?.collateral != null ? parseFloat(portfolio.collateral) : null;
+  const totalValue     = portfolio?.total_value != null ? parseFloat(portfolio.total_value) : null;
+  const positionsValue = portfolio ? parseFloat(portfolio.positions_value) : null;
+  const unrealizedPnl  = portfolio ? parseFloat(portfolio.unrealized_pnl) : null;
+  const stranded       = portfolio ? parseFloat(portfolio.stranded_collateral) : 0;
+  const positionCount  = portfolio?.position_count ?? 0;
+  const unpriced       = portfolio?.unpriced_positions ?? 0;
+  const snapshotAge    = portfolio?.collateral_source === 'snapshot' ? portfolio.collateral_age_secs : null;
+  // Stale is a statement about a reading that exists; absent a reading it is
+  // neither true nor false, so it is never defaulted in either direction.
+  const pricesStale    = portfolio ? !portfolio.prices_live : false;
+  const cashStale      = snapshotAge != null && snapshotAge > 300;
+
+  // The engine answered and has not read the balance yet: a real, benign state
+  // on a fresh instance, named rather than rendered as an empty wallet.
+  const awaitingBalance = !isLoading && !!portfolio && collateral === null;
+
   // The true session delta is realized P&L + unrealized P&L.
   // This is correct whether or not positions were carried in from a prior session,
   // because it does NOT assume the starting portfolio was just cash — it derives
   // the starting portfolio value as (totalValue - delta) rather than using the
   // raw collateral snapshot which omits the cost basis of any open positions.
-  const delta                = sessionPnl + unrealizedPnl;
-  const startingPortfolioVal = totalValue - delta;
-  const deltaPct             = startingPortfolioVal > 0 ? delta / startingPortfolioVal : 0;
-  const isPositive           = delta >= 0;
+  // It needs all three figures; with any of them unknown there is no delta.
+  const delta = totalValue !== null && unrealizedPnl !== null && sessionPnl !== null
+    ? sessionPnl + unrealizedPnl
+    : null;
+  const startingPortfolioVal = delta !== null && totalValue !== null ? totalValue - delta : null;
+  const deltaPct = delta !== null && startingPortfolioVal !== null && startingPortfolioVal > 0
+    ? delta / startingPortfolioVal : 0;
+  const isPositive = (delta ?? 0) >= 0;
+
+  const badge = (cls: string, text: string, title: string) => (
+    <span className={`text-[10px] font-mono rounded px-1.5 py-0.5 border ${cls}`} title={title}>{text}</span>
+  );
 
   return (
     <div className="card px-5 py-4 flex flex-col sm:flex-row sm:items-center gap-3 border border-indigo-500/20 bg-[#0d0d1a]">
       {/* Main figure */}
       <div className="flex flex-col flex-1 min-w-0">
-        <div className="flex items-center gap-2 mb-0.5">
+        <div className="flex items-center gap-2 mb-0.5 flex-wrap">
           <span className="label-muted text-xs">Portfolio Value</span>
-          {!pricesLive && (
-            <span className="text-[10px] font-mono bg-yellow-500/10 text-yellow-400 border border-yellow-500/20 rounded px-1.5 py-0.5">
-              ⚡ cached prices
-            </span>
+          {unreachable && badge(
+            'bg-red-500/10 text-red-400 border-red-500/20',
+            portfolio ? '⚠ engine unreachable — last reading' : '⚠ engine unreachable',
+            'The last /api/portfolio poll failed. Figures shown are from the previous successful reading.',
           )}
-          {ghostMode && (
-            <span className="text-[10px] font-mono bg-amber-500/10 text-amber-400 border border-amber-500/20 rounded px-1.5 py-0.5">
-              virtual
-            </span>
+          {pricesStale && badge(
+            'bg-yellow-500/10 text-yellow-400 border-yellow-500/20',
+            '⚡ stale marks',
+            'At least one open position has not been marked to market in over five minutes. Its value is the last mark.',
           )}
+          {cashStale && snapshotAge != null && badge(
+            'bg-yellow-500/10 text-yellow-400 border-yellow-500/20',
+            `cash from a snapshot ${fmtAge(snapshotAge)} old`,
+            'No live balance query is available on this venue right now; Cash is the newest P&L snapshot.',
+          )}
+          {unpriced > 0 && badge(
+            'bg-gray-500/10 text-gray-400 border-gray-500/20',
+            `${unpriced} awaiting first mark`,
+            'New positions are valued at cost (or from the last snapshot) until the first mark-to-market sweep, about a minute.',
+          )}
+          {ghostMode && badge('bg-amber-500/10 text-amber-400 border-amber-500/20', 'virtual', 'Ghost mode: simulated fills, no real orders.')}
         </div>
-        <span className={`text-3xl font-mono font-bold tracking-tight ${isLoading ? 'text-gray-600' : 'text-white'}`}>
-          {isLoading ? '——' : fmt$(totalValue)}
+        <span className={`text-3xl font-mono font-bold tracking-tight ${isLoading || totalValue === null ? 'text-gray-600' : 'text-white'}`}>
+          {isLoading ? '——' : totalValue === null ? '—' : fmt$(totalValue)}
         </span>
-        {!isLoading && startingPortfolioVal > 0 && (
+        {awaitingBalance && (
+          <span className="text-sm font-mono mt-0.5 text-gray-500">
+            waiting for the first balance read — the engine has not queried the wallet yet
+          </span>
+        )}
+        {!isLoading && delta !== null && startingPortfolioVal !== null && startingPortfolioVal > 0 && (
           <span className={`text-sm font-mono mt-0.5 ${isPositive ? 'text-green-400' : 'text-red-400'}`}>
             {isPositive ? '▲' : '▼'} {fmt$(Math.abs(delta))} ({fmtPct(Math.abs(deltaPct))}) vs session start
           </span>
@@ -319,28 +379,35 @@ function PortfolioValueBanner({
       <div className="flex gap-4 sm:gap-6 text-xs font-mono flex-wrap">
         <div className="flex flex-col gap-0.5">
           <span className="text-gray-500">Cash</span>
-          <span className="text-gray-300">{isLoading ? '—' : fmt$(collateral)}</span>
+          <span
+            className={collateral === null ? 'text-gray-600' : 'text-gray-300'}
+            title={collateral === null ? 'No balance reading yet' : undefined}
+          >
+            {collateral === null ? '—' : fmt$(collateral)}
+          </span>
           {/* Settlement proceeds paid as USDC.e sit in the Safe until wrapped into
               pUSD; the exchange cannot see them, so they are shown here rather than
               folded into Cash. Not counted in Portfolio Value. */}
-          {!isLoading && strandedCollateral > 0 && (
+          {stranded > 0 && (
             <span
               className="text-amber-400"
               title="USDC.e settlement proceeds in your Safe, not yet wrapped into pUSD. Real cash, not tradeable, not counted above. Enable Collateral Sweep in Setup to wrap it."
             >
-              + {fmt$(strandedCollateral)} unwrapped
+              + {fmt$(stranded)} unwrapped
             </span>
           )}
         </div>
         <div className="flex flex-col gap-0.5">
           <span className="text-gray-500">Positions</span>
-          <span className="text-gray-300">{isLoading ? '—' : fmt$(positionsValue)}</span>
+          <span className={positionsValue === null ? 'text-gray-600' : 'text-gray-300'}>
+            {positionsValue === null ? '—' : fmt$(positionsValue)}
+          </span>
           {positionCount > 0 && <span className="text-gray-600">{positionCount} open</span>}
         </div>
         <div className="flex flex-col gap-0.5">
           <span className="text-gray-500">Unrealized P&L</span>
-          <span className={isLoading ? 'text-gray-600' : unrealizedPnl >= 0 ? 'text-green-400' : 'text-red-400'}>
-            {isLoading ? '—' : (unrealizedPnl >= 0 ? '+' : '') + fmt$(unrealizedPnl)}
+          <span className={unrealizedPnl === null ? 'text-gray-600' : unrealizedPnl >= 0 ? 'text-green-400' : 'text-red-400'}>
+            {unrealizedPnl === null ? '—' : (unrealizedPnl >= 0 ? '+' : '') + fmt$(unrealizedPnl)}
           </span>
         </div>
       </div>
@@ -578,7 +645,9 @@ export default function DashboardPage() {
 
   // Portfolio value: collateral + live mark-to-market on open positions.
   // Refresh every 30 s so the number stays fresh without hammering Polymarket CLOB.
-  const { data: portfolio, isLoading: portfolioLoading } =
+  // `error` is kept so the banner can say the engine is unreachable instead of
+  // showing a wallet that appears to have emptied itself ([B43]).
+  const { data: portfolio, isLoading: portfolioLoading, error: portfolioError } =
     useSWR('portfolio', getPortfolioValue, { refreshInterval: 30_000 });
 
   // CAG squadron registry — refresh every 10 s to catch state transitions quickly.
@@ -846,16 +915,11 @@ export default function DashboardPage() {
 
         {/* ── Portfolio Value Banner ─────────────────────────────────── */}
         <PortfolioValueBanner
-          totalValue={portfolioLoading ? 0 : parseFloat(portfolio?.total_value ?? '0')}
-          collateral={portfolioLoading ? 0 : parseFloat(portfolio?.collateral ?? '0')}
-          strandedCollateral={portfolioLoading ? 0 : parseFloat(portfolio?.stranded_collateral ?? '0')}
-          positionsValue={portfolioLoading ? 0 : parseFloat(portfolio?.positions_value ?? '0')}
-          unrealizedPnl={portfolioLoading ? 0 : parseFloat(portfolio?.unrealized_pnl ?? '0')}
-          positionCount={portfolio?.position_count ?? 0}
-          sessionPnl={pnlLoading ? 0 : sessionPnl}
+          portfolio={portfolio}
+          sessionPnl={pnlLoading || !latestSnap ? null : sessionPnl}
           ghostMode={config?.ghost_mode}
-          pricesLive={portfolio?.prices_live ?? true}
           isLoading={portfolioLoading}
+          unreachable={!!portfolioError}
         />
 
         {/* ── Portfolio History Chart (CAG-level) ───────────────────────── */}
@@ -886,7 +950,7 @@ export default function DashboardPage() {
         <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
           <StatCard
             label="Active Squadrons"
-            value={String(squadrons?.filter(s => s.state === 'PATROLLING' || s.state === 'DEPLOYED').length ?? 0)}
+            value={squadronsLoading ? '—' : String(squadrons?.filter(s => s.state === 'PATROLLING' || s.state === 'DEPLOYED').length ?? 0)}
             sub="deployed + patrolling"
           />
           <StatCard
@@ -897,7 +961,7 @@ export default function DashboardPage() {
           />
           <StatCard
             label="Total Squadrons"
-            value={String(squadrons?.length ?? 0)}
+            value={squadronsLoading ? '—' : String(squadrons?.length ?? 0)}
             sub="all states"
           />
         </div>

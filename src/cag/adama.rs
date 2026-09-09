@@ -364,6 +364,77 @@ async fn closed_market_question(http: &reqwest::Client, condition_id: &str) -> O
     m.get("question").and_then(|q| q.as_str()).map(String::from)
 }
 
+/// The venue's own answer to "can this market be traded right now?".
+///
+/// Read from the CLOB, not Gamma. Gamma is a catalog: its `endDate` on a
+/// sports market is a nominal date about a week after the game (a 2026-09-08
+/// tennis match carried 2026-09-15), its record of a closure lags the venue by
+/// about a minute, and a market that has been archived drops out of its
+/// `condition_ids` lookup entirely. The CLOB is the thing that accepts or
+/// refuses orders, so its `accepting_orders` is the fact that matters, and it
+/// still answers for an archived market.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VenueMarketStatus {
+    pub accepting_orders: bool,
+    pub active: bool,
+    pub closed: bool,
+    pub archived: bool,
+}
+
+impl VenueMarketStatus {
+    /// A word for the log line saying why the venue is not taking orders.
+    pub fn describe(&self) -> &'static str {
+        if self.accepting_orders { "open" }
+        else if self.closed { "resolved" }
+        else if self.archived { "archived" }
+        else if !self.active { "inactive" }
+        else { "orders paused" }
+    }
+}
+
+/// Parse the CLOB's `/markets/{condition_id}` body.
+///
+/// `accepting_orders` is required — without it the answer is unknown, and an
+/// unknown must never read as "closed", because "closed" is what stands a
+/// squadron down. The other flags only color the log line.
+pub(crate) fn parse_clob_market_status(m: &serde_json::Value) -> Option<VenueMarketStatus> {
+    let flag = |k: &str| m.get(k).and_then(|v| v.as_bool());
+    Some(VenueMarketStatus {
+        accepting_orders: flag("accepting_orders")?,
+        active: flag("active").unwrap_or(true),
+        closed: flag("closed").unwrap_or(false),
+        archived: flag("archived").unwrap_or(false),
+    })
+}
+
+/// Ask the CLOB whether it still accepts orders on `condition_id`.
+///
+/// `None` means the question could not be answered — transport failure,
+/// timeout, an unexpected body — and callers treat that as "no change", never
+/// as a closure. Bounded at five seconds because the patrol tick awaits it.
+pub async fn clob_market_status(http: &reqwest::Client, condition_id: &str) -> Option<VenueMarketStatus> {
+    let url = format!("{}/markets/{condition_id}", crate::config::CLOB_API_BASE);
+    let resp = match tokio::time::timeout(std::time::Duration::from_secs(5), http.get(&url).send()).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => { warn!(%url, "CLOB market status request failed: {e}"); return None; }
+        Err(_) => { warn!(%url, "CLOB market status request timed out"); return None; }
+    };
+    let status = resp.status();
+    if !status.is_success() {
+        warn!(%url, %status, "CLOB market status request refused");
+        return None;
+    }
+    let body: serde_json::Value = match resp.json().await {
+        Ok(v) => v,
+        Err(e) => { warn!(%url, "CLOB market status body unreadable: {e}"); return None; }
+    };
+    let parsed = parse_clob_market_status(&body);
+    if parsed.is_none() {
+        warn!(%url, "CLOB market status carried no accepting_orders flag");
+    }
+    parsed
+}
+
 /// Fetch full market details from Gamma API by condition id.
 ///
 /// The filter parameter is `condition_ids`, plural. Gamma does not reject an
@@ -505,6 +576,25 @@ where
             }
         };
 
+        // Gamma's record of a closure lags the venue by about a minute, and a
+        // seeded deploy can land inside it: on the demo box a US Open match
+        // closed at 23:37:15Z, was selected and deployed at 23:37:55Z off a
+        // listing that still showed it open, and Gamma only caught up at
+        // 23:38:15Z. The CLOB knew at 23:37:15Z. Asking it here turns that
+        // into the retire-and-repick path instead of a squadron on a market
+        // that was over before it started. A failed probe does not block the
+        // deploy; the patrol loop asks again every minute.
+        if let Some(status) = clob_market_status(&self.infra.shared_http, &dep.market_id).await {
+            if !status.accepting_orders {
+                return Err(anyhow::anyhow!(
+                    "{} — \"{}\" ({})",
+                    crate::venues::deployment::ERR_MARKET_CLOSED,
+                    info.question,
+                    status.describe(),
+                ));
+            }
+        }
+
         let (squadron_id, handle) = self.infra.spawn_squadron(
             dep.id.clone(),
             &dep.market_id,
@@ -541,12 +631,20 @@ where
         }
     }
 
-    async fn select_market(&self, class: &str, max_days_to_close: u32) -> Option<String> {
+    async fn select_market(
+        &self,
+        class: &str,
+        max_days_to_close: u32,
+        min_liquidity_usd: f64,
+    ) -> Option<String> {
         // The same discovery the Control Tower's deploy browser uses, so a
         // seeded squadron lands on the market an operator would have picked.
+        // The floor used to be a literal 0.0 here while the browser applied
+        // one, so on a thin slate the seeder could choose a market the
+        // operator would never have been shown.
         let horizon = max_days_to_close as i64 * 86_400;
         let found = crate::api::server::fetch_markets_by_type(
-            &self.infra.shared_http, class, horizon, 0.0,
+            &self.infra.shared_http, class, horizon, min_liquidity_usd,
         ).await;
         found.into_iter()
             .max_by(|a, b| a.liquidity.total_cmp(&b.liquidity))
@@ -682,5 +780,55 @@ mod deployed_squadron_wiring_tests {
             !crate::helpers::db::available_assets().contains(&"adamatest-politics".to_string()),
             "an alias must not surface as a separate asset",
         );
+    }
+}
+
+#[cfg(test)]
+mod venue_status_tests {
+    use super::{parse_clob_market_status, VenueMarketStatus};
+    use serde_json::json;
+
+    /// The archived Challenger match from 2026-09-08, as the CLOB returned it.
+    /// Gamma could not find this market at all; the CLOB still answered.
+    #[test]
+    fn an_archived_market_reads_as_not_accepting_orders() {
+        let m = json!({
+            "question": "Genoa: Thiago Seyboth Wild vs Francesco Ferrari",
+            "active": false, "closed": false, "accepting_orders": false, "archived": true
+        });
+        let s = parse_clob_market_status(&m).expect("a full record parses");
+        assert!(!s.accepting_orders);
+        assert_eq!(s.describe(), "archived");
+    }
+
+    #[test]
+    fn a_resolved_market_reads_as_resolved() {
+        let m = json!({ "active": true, "closed": true, "accepting_orders": false, "archived": false });
+        let s = parse_clob_market_status(&m).unwrap();
+        assert_eq!(s, VenueMarketStatus { accepting_orders: false, active: true, closed: true, archived: false });
+        assert_eq!(s.describe(), "resolved");
+    }
+
+    #[test]
+    fn an_open_market_reads_as_open() {
+        let m = json!({ "active": true, "closed": false, "accepting_orders": true, "archived": false });
+        assert_eq!(parse_clob_market_status(&m).unwrap().describe(), "open");
+    }
+
+    /// Without the one flag that matters there is no answer — and no answer
+    /// must never become "closed", because "closed" stands a squadron down.
+    #[test]
+    fn a_record_without_accepting_orders_is_no_answer() {
+        let m = json!({ "active": true, "closed": true });
+        assert_eq!(parse_clob_market_status(&m), None);
+    }
+
+    /// An open market with the secondary flags missing still parses: only
+    /// `accepting_orders` is load-bearing.
+    #[test]
+    fn secondary_flags_default_to_open_values() {
+        let m = json!({ "accepting_orders": true });
+        let s = parse_clob_market_status(&m).unwrap();
+        assert!(s.active && !s.closed && !s.archived);
     }
 }

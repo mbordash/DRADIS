@@ -648,6 +648,12 @@ impl MakerStrategyImpl {
         // Unthrottled: feed the "why no trades?" registry with the human-readable
         // gate detail every time a gate rejects (GET /api/vipers/status).
         crate::helpers::viper_status::report_reason(asset, "MakerStrategy", detail);
+        self.log_gate_throttled(key, detail).await;
+    }
+
+    /// The log half of `log_gate`, for a caller that has already fed the
+    /// registry itself (the per-leg refusal path).
+    async fn log_gate_throttled(&self, key: &str, detail: &str) {
         let mut guard = self.last_gate_log.lock().await;
         let should_log = match guard.as_ref() {
             Some((prev_key, at)) => {
@@ -995,10 +1001,14 @@ impl Strategy for MakerStrategyImpl {
                     snapshot.no_ask, yes_bid, velocity_bias_strong_positive, dc,
                 ).unwrap_or(("unknown", "unknown".to_string())),
             };
-            self.log_gate(&ctx.crypto_filter, 
-                &format!("noqual:{}/{}", yes_key, no_key),
-                &format!("no side qualifies | YES: {} | NO: {}", yes_detail, no_detail),
-            ).await;
+            // Displayed as one line, counted per leg: the advisor's refusal
+            // ledger needs "YES unquotable under the fee floor" and "NO has no
+            // seller" as separate tallies, not one "no side qualifies" bucket.
+            let composite = format!("no side qualifies | YES: {} | NO: {}", yes_detail, no_detail);
+            crate::helpers::viper_status::report_leg_refusals(
+                &ctx.crypto_filter, "MakerStrategy", &composite, &[&yes_detail, &no_detail],
+            );
+            self.log_gate_throttled(&format!("noqual:{}/{}", yes_key, no_key), &composite).await;
             return Ok(StrategySignal::NoSignal);
         }
 

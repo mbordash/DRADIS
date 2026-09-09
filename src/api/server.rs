@@ -2140,7 +2140,7 @@ async fn approve_llm_action(
     let current = DynamicConfig::load_for_squadron(&squadron_id).await;
     let to: serde_json::Value = serde_json::from_str(&row.to_value)
         .unwrap_or(serde_json::Value::String(row.to_value.clone()));
-    let raw = RawProposal { field: row.field.clone(), to, reason: row.reason.clone() };
+    let raw = RawProposal { field: row.field.clone(), to, reason: row.reason.clone(), unblocks: String::new() };
     let batch = llm_patch::validate_proposals(vec![raw], &current);
     let Some(change) = batch.accepted.first() else {
         let why = batch.rejected.first()
@@ -2208,27 +2208,94 @@ async fn reject_llm_action(AxumPath(id): AxumPath<i64>) -> Response {
 /// GET /api/portfolio
 ///
 /// Returns aggregated portfolio value across all assets:
-/// - collateral: total pUSD cash
+/// - collateral: total pUSD cash, or `null` until the first balance reading
 /// - positions_value: sum of (shares × current_mid_price) for all open positions
-/// - total_value: collateral + positions_value
+/// - total_value: collateral + positions_value, or `null` while collateral is unknown
 /// - unrealized_pnl: sum of (shares × (current_mid - entry_price))
 /// - position_count: total number of open positions
-/// - prices_live: true if CLOB prices are fresh
+/// - prices_live: false only when a mark exists but is stale
+/// - unpriced_positions: positions that have never been marked
 ///
 /// This endpoint aggregates data from all asset pools (BTC, ETH, SOL, etc.)
+///
+/// Honest-state rule ([B43]): where a figure is not yet known this endpoint
+/// says so (`null`, a source of `none`) rather than coercing it to zero, and
+/// no single flag stands in for two situations. Zero, empty and stale are all
+/// legitimate values; none of them is the encoding for "we have not looked".
 #[derive(Serialize)]
 struct PortfolioValue {
-    collateral: String,
+    /// Cash on deposit. `None` until a balance reading exists. On a fresh
+    /// instance both sources are empty for the first seconds — the CAG session
+    /// that answers a live balance query does not exist yet, and `pnl_snapshots`
+    /// is an empty table — and reporting `0` there told the operator their wallet
+    /// was empty when nobody had looked. Zero is a real balance (an unfunded
+    /// wallet, or working keys on an empty account), which is exactly why it
+    /// must not double as "unknown". [B42]
+    collateral: Option<String>,
+    /// Where `collateral` came from: a live venue query, the newest
+    /// `pnl_snapshots` row, or nowhere yet.
+    collateral_source: CollateralSource,
+    /// Age of the snapshot behind `collateral` when `collateral_source` is
+    /// `snapshot`; `None` for a live reading or no reading. Lets the banner say
+    /// how old the cash figure is instead of calling it "cached".
+    collateral_age_secs: Option<i64>,
     /// USDC.e settlement proceeds sitting in the Safe that are not yet wrapped
     /// into pUSD: real cash the exchange cannot see. Reported beside
     /// `collateral`, never added to `total_value`, so the figure stays one
     /// source of truth with `pnl_snapshots`. Zero on venues without a Safe.
     stranded_collateral: String,
     positions_value: String,
-    total_value: String,
+    /// `None` while `collateral` is unknown: a total that silently omits cash
+    /// is a wrong number, not a partial one.
+    total_value: Option<String>,
     unrealized_pnl: String,
     position_count: usize,
+    /// False only when some open position's mark is older than the freshness
+    /// threshold. It used to also flip false for "no live balance" and for "no
+    /// positions at all", so an empty portfolio on a fresh instance wore a
+    /// "cached prices" badge with nothing cached. Those cases now have their
+    /// own fields (`collateral_source`, `unpriced_positions`).
     prices_live: bool,
+    /// Open positions with no mark yet (a brand-new position before its first
+    /// chain-sync sweep). Valued from the last snapshot or at cost until the
+    /// first mark, which is "pending", not "stale".
+    unpriced_positions: usize,
+}
+
+/// Where the `collateral` figure in `/api/portfolio` came from.
+#[derive(Serialize, Clone, Copy, PartialEq, Eq, Debug)]
+#[serde(rename_all = "snake_case")]
+enum CollateralSource {
+    /// Answered by the venue just now.
+    Live,
+    /// The newest `pnl_snapshots` row (written by the 60s status task).
+    Snapshot,
+    /// No reading exists yet.
+    None,
+}
+
+/// Resolve the cash figure from its two sources in preference order, keeping
+/// "no reading" distinct from "zero".
+///
+/// `snapshot` is `(rfc3339 ts, collateral)` from the newest `pnl_snapshots`
+/// row. The age is measured against `now` and never clamped below zero.
+fn resolve_collateral(
+    live: Option<rust_decimal::Decimal>,
+    snapshot: Option<(String, rust_decimal::Decimal)>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> (Option<rust_decimal::Decimal>, CollateralSource, Option<i64>) {
+    if let Some(bal) = live {
+        return (Some(bal), CollateralSource::Live, None);
+    }
+    match snapshot {
+        Some((ts, c)) => {
+            let age = chrono::DateTime::parse_from_rfc3339(&ts)
+                .ok()
+                .map(|dt| (now - dt.with_timezone(&chrono::Utc)).num_seconds().max(0));
+            (Some(c), CollateralSource::Snapshot, age)
+        }
+        None => (None, CollateralSource::None, None),
+    }
 }
 
 async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
@@ -2266,10 +2333,20 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
                 sess.venue.trading_client().balance_allowance(req),
             ).await {
                 Ok(Ok(resp)) => {
-                    let balance = Decimal::from_str(&resp.balance.to_string())
-                        .unwrap_or(Decimal::ZERO) / Decimal::from_str("1000000").unwrap();
-                    debug!(" Live wallet collateral from CLOB: ${:.4}", balance);
-                    Some(balance)
+                    // A balance we cannot parse is "no reading", not a live
+                    // zero: reporting $0.00 as a fresh venue answer is the
+                    // one thing worse than reporting nothing.
+                    match Decimal::from_str(&resp.balance.to_string()) {
+                        Ok(raw) => {
+                            let balance = raw / Decimal::from_str("1000000").unwrap();
+                            debug!(" Live wallet collateral from CLOB: ${:.4}", balance);
+                            Some(balance)
+                        }
+                        Err(e) => {
+                            warn!("⚠️ CLOB balance '{}' did not parse in /api/portfolio: {}", resp.balance, e);
+                            None
+                        }
+                    }
                 }
                 Ok(Err(e)) => {
                     warn!("⚠️ CLOB balance fetch failed in /api/portfolio: {}", e);
@@ -2290,9 +2367,17 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
     let mut total_unrealized_pnl = Decimal::ZERO;
     let mut total_position_count = 0;
     let mut all_prices_live = true;
+    let mut unpriced_positions = 0usize;
 
-    // Freshness threshold: snapshots older than this are considered stale
-    let freshness_threshold = Utc::now() - Duration::minutes(5);
+    // Freshness threshold: snapshots and marks older than this are stale
+    let now = Utc::now();
+    let freshness_threshold = now - Duration::minutes(5);
+    let is_fresh = |ts: &str| {
+        chrono::DateTime::parse_from_rfc3339(ts)
+            .ok()
+            .map(|dt| dt.with_timezone(&Utc) > freshness_threshold)
+            .unwrap_or(false)
+    };
 
     // Aggregate across all asset pools
     for asset in &assets {
@@ -2366,11 +2451,9 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
         total_position_count += deduped_positions.len();
 
         // Check snapshot freshness before trusting mark-to-market valuation
-        let snapshot_is_fresh = pnl_snapshots.first().and_then(|snap| {
-            chrono::DateTime::parse_from_rfc3339(&snap.ts)
-                .ok()
-                .map(|dt| dt.with_timezone(&Utc) > freshness_threshold)
-        }).unwrap_or(false);
+        let snapshot_is_fresh = pnl_snapshots.first()
+            .map(|snap| is_fresh(&snap.ts))
+            .unwrap_or(false);
 
         // Compute positions value and unrealized P&L from deduped positions.
         // Prefer current_price (live mark-to-market from chain-sync) when available.
@@ -2410,6 +2493,14 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
                             };
                             asset_unrealized_pnl += market_value - cost_basis;
                             has_live_prices = true;
+                            // A mark that chain-sync has not refreshed in five
+                            // minutes is the one case "stale" is the honest
+                            // word. A row with no timestamp predates the
+                            // column; treat it as current rather than invent
+                            // an age for it.
+                            if pos.price_updated_at.as_deref().map(|t| !is_fresh(t)).unwrap_or(false) {
+                                all_prices_live = false;
+                            }
                             debug!(" [{}] token {} {} shares × cur=${:.4} = ${:.4} (entry=${:.4} pnl={:+.4})",
                                    asset.to_uppercase(), &pos.token_id[..pos.token_id.len().min(12)],
                                    shares, cur_price, market_value, entry_price,
@@ -2422,6 +2513,11 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
                 // (tracked separately so we can mix per-position accuracy).
                 // A simulated position with no mark has made nothing yet, so it
                 // contributes nothing rather than its cost.
+                //
+                // This is a position awaiting its first mark, not a stale one:
+                // counted in `unpriced_positions` so the banner can say
+                // "awaiting first mark" instead of "cached prices".
+                unpriced_positions += 1;
                 if !ghost {
                     asset_positions_value += cost_basis;
                 }
@@ -2444,14 +2540,11 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
                     }
                 }
             } else {
-                all_prices_live = false;
-                warn!("⚠️ [{}] No current_price and stale/missing snapshot — using cost basis",
-                      asset.to_uppercase());
+                // The positions are already counted as unpriced above; this
+                // is the fallback the count is explaining, not a second fault.
+                debug!("[{}] No current_price and stale/missing snapshot — using cost basis",
+                       asset.to_uppercase());
             }
-        }
-
-        if !has_live_prices {
-            all_prices_live = false;
         }
 
         total_positions_value += asset_positions_value;
@@ -2460,20 +2553,18 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
                asset.to_uppercase(), asset_positions_value, asset_unrealized_pnl);
     }
 
-    // Use live CLOB collateral if available, otherwise fall back to latest snapshot
-    let total_collateral = if let Some(live_bal) = live_collateral {
-        live_bal
-    } else {
-        all_prices_live = false;
-        latest_collateral
-            .map(|(_, c)| c)
-            .unwrap_or(Decimal::ZERO)
-    };
+    // Live venue balance first, then the newest snapshot, then — honestly —
+    // nothing. The snapshot fallback used to flip `prices_live` off as well,
+    // which put a "cached prices" badge on every venue without a live balance
+    // probe (Polymarket US, Kalshi) and on every fresh instance.
+    let (total_collateral, collateral_source, collateral_age_secs) =
+        resolve_collateral(live_collateral, latest_collateral, now);
 
-    let total_value = total_collateral + total_positions_value;
+    let total_value = total_collateral.map(|c| c + total_positions_value);
 
-    debug!(" Portfolio summary: collateral=${:.4} positions=${:.4} total=${:.4} count={} live={}",
-           total_collateral, total_positions_value, total_value, total_position_count, all_prices_live);
+    debug!(" Portfolio summary: collateral={:?} ({:?}) positions=${:.4} total={:?} count={} live={} unpriced={}",
+           total_collateral, collateral_source, total_positions_value, total_value,
+           total_position_count, all_prices_live, unpriced_positions);
 
     #[cfg(feature = "intl_clob")]
     let stranded_collateral = crate::tasks::collateral_sweep::stranded_usdce().unwrap_or(Decimal::ZERO);
@@ -2481,13 +2572,16 @@ async fn get_portfolio_value(State(s): State<ApiState>) -> Response {
     let stranded_collateral = Decimal::ZERO;
 
     Json(PortfolioValue {
-        collateral: total_collateral.to_string(),
+        collateral: total_collateral.map(|c| c.to_string()),
+        collateral_source,
+        collateral_age_secs,
         stranded_collateral: stranded_collateral.to_string(),
         positions_value: total_positions_value.to_string(),
-        total_value: total_value.to_string(),
+        total_value: total_value.map(|v| v.to_string()),
         unrealized_pnl: total_unrealized_pnl.to_string(),
         position_count: total_position_count,
         prices_live: all_prices_live,
+        unpriced_positions,
     }).into_response()
 }
 
@@ -3315,7 +3409,12 @@ pub(crate) async fn fetch_markets_by_type(
             if volume < min_liquidity {
                 continue;
             }
-            
+
+            // Same rule as the sports list: untradeable is unlistable.
+            if !gamma_accepting_orders(m) {
+                continue;
+            }
+
             // Check expiry
             let end_date_str = m.get("endDate")
                 .or_else(|| m.get("event").and_then(|e| e.get("endDate")))
@@ -3361,6 +3460,16 @@ pub(crate) async fn fetch_markets_by_type(
     // Limit to top 50
     out.truncate(50);
     out
+}
+
+/// Does this Gamma market record say the venue still takes orders on it?
+///
+/// An absent field is read as "yes": Gamma has always sent `acceptingOrders`,
+/// and dropping every market on the day it stops would empty the deploy list
+/// for a schema change rather than a closure. Only an explicit `false` excludes.
+#[cfg(feature = "intl_clob")]
+pub(crate) fn gamma_accepting_orders(m: &serde_json::Value) -> bool {
+    m.get("acceptingOrders").and_then(|v| v.as_bool()) != Some(false)
 }
 
 /// Fetch sports markets using tag IDs from the /sports endpoint.
@@ -3451,24 +3560,33 @@ async fn fetch_sports_markets_by_tags(
                 if volume < min_liquidity {
                     continue;
                 }
-                
+
+                // The listing is `active=true&closed=false`, but a market
+                // stops accepting orders before either flag flips — a match
+                // that just ended, a market on hold — and such a market cannot
+                // be traded. Nothing that cannot be traded belongs in a list
+                // whose only purpose is choosing what to trade.
+                if !gamma_accepting_orders(m) {
+                    continue;
+                }
+
                 // Check expiry
                 let end_date_str = m.get("endDate")
                     .or_else(|| m.get("event").and_then(|e| e.get("endDate")))
                     .and_then(|v| v.as_str())
                     .unwrap_or_default();
-                
+
                 let close_time = chrono::DateTime::parse_from_rfc3339(end_date_str)
                     .ok()
                     .map(|dt| dt.with_timezone(&chrono::Utc));
-                
+
                 if let Some(ct) = close_time {
                     let secs_left = (ct - now).num_seconds();
                     if secs_left < 300 || secs_left > max_expiry_secs {
                         continue;
                     }
                 }
-                
+
                 // Extract token IDs
                 let tokens = crate::helpers::json::extract_token_ids_u256(m);
                 if tokens.len() < 2 {
@@ -4264,6 +4382,8 @@ pub async fn run_api_server(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rust_decimal::Decimal;
+    use std::str::FromStr;
 
     fn snap(ts: &str, collateral: &str, total: &str) -> db::PnlSnapshotRow {
         db::PnlSnapshotRow {
@@ -4276,6 +4396,84 @@ mod tests {
 
     fn secs(ts: &str) -> i64 {
         chrono::DateTime::parse_from_rfc3339(ts).unwrap().timestamp()
+    }
+
+    // ── /api/portfolio collateral resolution ([B42] / [B43]) ──────────────
+
+    fn dec(s: &str) -> Decimal { Decimal::from_str(s).unwrap() }
+
+    /// The fresh-instance case that read as broken keys: no CAG session to
+    /// ask and an empty `pnl_snapshots` table. The answer is "unknown", never
+    /// `0` — zero is what an unfunded wallet reports, and the operator cannot
+    /// tell the two apart from a dollar figure.
+    #[test]
+    fn a_fresh_instance_reports_no_collateral_rather_than_zero() {
+        let now = chrono::Utc::now();
+        let (c, src, age) = resolve_collateral(None, None, now);
+        assert_eq!(c, None);
+        assert_eq!(src, CollateralSource::None);
+        assert_eq!(age, None);
+    }
+
+    /// Zero is a legitimate live reading and must survive as a value.
+    #[test]
+    fn a_live_zero_balance_is_reported_as_zero_from_the_venue() {
+        let now = chrono::Utc::now();
+        let stale_snap = Some(("2026-01-01T00:00:00+00:00".to_string(), dec("55.51")));
+        let (c, src, age) = resolve_collateral(Some(Decimal::ZERO), stale_snap, now);
+        assert_eq!(c, Some(Decimal::ZERO));
+        assert_eq!(src, CollateralSource::Live);
+        assert_eq!(age, None, "a live reading has no snapshot age");
+    }
+
+    /// Without a live probe (every venue but Polymarket International, and the
+    /// first seconds on that one) the newest snapshot is the figure, and its
+    /// age travels with it so the banner can say how old the cash figure is
+    /// instead of calling it "cached".
+    #[test]
+    fn a_snapshot_reading_carries_its_source_and_age() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-08T12:10:00+00:00").unwrap().with_timezone(&chrono::Utc);
+        let snap = Some(("2026-09-08T12:00:00+00:00".to_string(), dec("55.51")));
+        let (c, src, age) = resolve_collateral(None, snap, now);
+        assert_eq!(c, Some(dec("55.51")));
+        assert_eq!(src, CollateralSource::Snapshot);
+        assert_eq!(age, Some(600));
+    }
+
+    /// A snapshot timestamp that does not parse still yields the figure; only
+    /// the age is unknown. A clock skew that puts the snapshot in the future
+    /// reads as age zero, not negative.
+    #[test]
+    fn snapshot_age_is_unknown_when_unparseable_and_never_negative() {
+        let now = chrono::DateTime::parse_from_rfc3339("2026-09-08T12:00:00+00:00").unwrap().with_timezone(&chrono::Utc);
+        let (c, _, age) = resolve_collateral(None, Some(("garbage".to_string(), dec("1"))), now);
+        assert_eq!(c, Some(dec("1")));
+        assert_eq!(age, None);
+        let (_, _, age) = resolve_collateral(None, Some(("2026-09-08T12:05:00+00:00".to_string(), dec("1"))), now);
+        assert_eq!(age, Some(0));
+    }
+
+    /// The wire shape the Control Tower relies on: `null`, not `"0"`, for an
+    /// unknown figure, and the source spelled in snake_case.
+    #[test]
+    fn portfolio_json_encodes_unknown_collateral_as_null() {
+        let v = PortfolioValue {
+            collateral: None,
+            collateral_source: CollateralSource::None,
+            collateral_age_secs: None,
+            stranded_collateral: "0".into(),
+            positions_value: "0".into(),
+            total_value: None,
+            unrealized_pnl: "0".into(),
+            position_count: 0,
+            prices_live: true,
+            unpriced_positions: 0,
+        };
+        let j = serde_json::to_value(&v).unwrap();
+        assert!(j["collateral"].is_null());
+        assert!(j["total_value"].is_null());
+        assert_eq!(j["collateral_source"], "none");
+        assert_eq!(j["prices_live"], true, "an empty portfolio has nothing stale about it");
     }
 
     /// The exact production series that produced the phantom spike.

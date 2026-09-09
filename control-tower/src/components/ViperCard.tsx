@@ -320,6 +320,26 @@ export default function ViperCard({ viper, config, onPatch, market, status }: Pr
               )}
               </>)}
             </div>
+            {/* The refusal ledger: what has been holding this viper and how
+                often, not just what holds it now. Same data the LLM Advisor
+                reads, so an operator can check its reasoning against it. */}
+            {status && status.refusals && status.refusals.length > 0 && (
+              <div
+                className="text-[11px] font-mono leading-snug text-gray-600 truncate"
+                title={status.refusals
+                  .map((t) => `${t.count.toLocaleString()}× ${t.reason}\n    latest: ${t.last_detail}`)
+                  .join('\n')}
+              >
+                <span>refused: </span>
+                {status.refusals.slice(0, 3).map((t, i) => (
+                  <span key={t.reason}>
+                    {i > 0 && <span> · </span>}
+                    <span className="text-gray-500">{t.count.toLocaleString()}×</span>{' '}
+                    <span className="text-gray-400">{t.reason}</span>
+                  </span>
+                ))}
+              </div>
+            )}
             <div className="text-[11px] font-mono leading-snug" title={status?.last_signal_at ?? undefined}>
               <span className="text-gray-600">last signal: </span>
               <span className="text-gray-500">

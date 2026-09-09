@@ -236,6 +236,7 @@ fn default_llm_max_output_tokens()          -> u32     { config::LLM_MAX_OUTPUT_
 fn default_auto_deploy_politics()           -> bool    { config::AUTO_DEPLOY_POLITICS                 }
 fn default_auto_deploy_sports()             -> bool    { config::AUTO_DEPLOY_SPORTS                   }
 fn default_event_market_retire_grace_secs() -> i64     { config::EVENT_MARKET_RETIRE_GRACE_SECS       }
+fn default_deploy_min_liquidity_usd()  -> Decimal { config::DEPLOY_MIN_LIQUIDITY_USD        }
 fn default_collateral_sweep_enabled()       -> bool    { config::COLLATERAL_SWEEP_ENABLED             }
 fn default_collateral_sweep_min_usdc()      -> Decimal { config::COLLATERAL_SWEEP_MIN_USDC            }
 fn default_gboost_budget()                  -> Decimal { config::GBOOST_BUDGET                       }
@@ -505,11 +506,17 @@ pub struct DynamicConfig {
     /// Keep a sports squadron running without waiting for an operator deploy.
     #[serde(default = "default_auto_deploy_sports")]
     pub auto_deploy_sports:            bool,
-    /// Seconds after an event market closes before its squadron stands down,
-    /// freeing the class for the next auto-deploy. A squadron still holding a
-    /// position keeps patrolling regardless and retires once flat.
+    /// Seconds an event market must be closed — by its stated close time, or by
+    /// the venue itself no longer accepting orders on it — before its squadron
+    /// stands down, freeing the class for the next auto-deploy. A squadron
+    /// still holding a position keeps patrolling regardless and retires once
+    /// flat.
     #[serde(default = "default_event_market_retire_grace_secs")]
     pub event_market_retire_grace_secs: i64,
+    /// Smallest 24h volume, in dollars, an auto-deploy may settle on. Below it
+    /// the class stays empty until the next tick finds something better.
+    #[serde(default = "default_deploy_min_liquidity_usd")]
+    pub deploy_min_liquidity_usd: Decimal,
     /// Wrap USDC.e settlement proceeds sitting in the Safe back into pUSD so
     /// they count as tradeable collateral again. Off by default: it moves funds
     /// on-chain. Polymarket International only.
@@ -1027,6 +1034,7 @@ impl Default for DynamicConfig {
             auto_deploy_politics:          config::AUTO_DEPLOY_POLITICS,
             auto_deploy_sports:            config::AUTO_DEPLOY_SPORTS,
             event_market_retire_grace_secs: config::EVENT_MARKET_RETIRE_GRACE_SECS,
+            deploy_min_liquidity_usd: config::DEPLOY_MIN_LIQUIDITY_USD,
             collateral_sweep_enabled:      config::COLLATERAL_SWEEP_ENABLED,
             collateral_sweep_min_usdc:     config::COLLATERAL_SWEEP_MIN_USDC,
             gboost_budget:                 config::GBOOST_BUDGET,

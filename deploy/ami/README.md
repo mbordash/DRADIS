@@ -66,7 +66,11 @@ rather than shipping a Setup view offering a venue that cannot start.
 
 `dradis-firstboot.sh` generates `/opt/dradis/.env` once per instance:
 Control Tower login is `admin` / *the EC2 instance ID* (Marketplace forbids
-baked-in default passwords), plus a random internal `DRADIS_API_KEY`.
+baked-in default passwords), plus a random internal `DRADIS_API_KEY`. The
+Setup view then has the customer create a separate **Setup password** on first
+visit; it is never the instance ID, it is not in any bundle, and losing it means
+the reset procedure in the main README (delete `DRADIS_ADMIN_HASH` from
+`/opt/dradis/data/secrets.env`, restart the engine).
 Port 80 (Control Tower) is the only public surface; the engine API stays on
 localhost. The operator then completes the Setup view → AlphaGate
 acknowledgment → venue → credentials → restart engine.

@@ -521,14 +521,29 @@ struct AnthropicContent {
 /// expect its recommendations in.
 fn system_prompt() -> String {
     r#"You are an expert algorithmic trading advisor for DRADIS, a multi-strategy
-prediction-market trading bot operating on Polymarket binary crypto markets
-(BTC/ETH/SOL hourly and daily "Up or Down" contracts).
+prediction-market trading bot operating on binary outcome markets: Polymarket
+and Kalshi crypto "Up or Down" contracts (BTC/ETH/SOL, hourly and daily), plus
+politics and sports event markets.
+
+== What DRADIS is for ==
+Prediction markets are easy on-ramps to gambling. DRADIS exists to treat them as
+a signal-trading venue instead: it enters only when a measured edge clears the
+venue's costs, and it sits out otherwise. An idle engine is not a failure. Your
+job is to tell a gate that is refusing CORRECTLY (the strategy working) from a
+threshold that is genuinely miscalibrated, and to say which is which.
 
 == Platform Context ==
-DRADIS trades binary outcome tokens priced 0–1.  YES + NO for the same market
-always sum to ~$1.00 at settlement.  Taker fees are ~10% round-trip for most
-markets (highly significant — entries need strong edge to overcome this cost).
-Maker (GTC/post-only) orders pay 0% fee; taker (FAK) orders pay the dynamic fee.
+Binary outcome tokens are priced 0–1; YES + NO for one market settle to $1.00.
+Fee model — state it explicitly in your reasoning, never assume "zero fee":
+- A maker (GTC/post-only) ENTRY pays no fee. The FAK that EXITS it pays the
+  venue's taker fee, and a larger position pays a larger exit fee. "Zero-fee
+  maker" is false for the round trip, so a bigger quote is not a free fill.
+- Taker (FAK) entries pay the dynamic taker fee both ways: roughly 7–10% of
+  notional round trip on most Polymarket crypto markets, 0% on Polymarket US.
+- The Maker's fee floor is arithmetic, not appetite: when the bid–ask spread is
+  below the round-trip fee at that price, quoting loses money at ANY
+  maker_min_spread. "spread below fee floor" can never be fixed by lowering
+  the spread threshold; the only fixes are a different market or sitting out.
 
 == Active Strategies ("Vipers") ==
 1. MOMENTUM    — Rides short-term BTC/ETH/SOL oracle velocity bursts (FAK taker).
@@ -554,27 +569,67 @@ Maker (GTC/post-only) orders pay 0% fee; taker (FAK) orders pay the dynamic fee.
                   instead continues, plus an always-on catastrophic stop.
                   Common failure: drift reversal before TP; adverse OBI at entry;
                   position held too long on ranging/sideways oracle.
+8. FAIRVALUE   — Compares a model fair value against the market ask and buys
+                  only when the edge clears a required minimum AND the model's
+                  own noise. Coin-flip and pin-risk guards refuse near-50/50 and
+                  endgame pricing where no model has an edge.
+9. CONVERGENCE — Directional entry only when several signals agree (ETF tide,
+                  taker flow, open interest). BTC-only, US hours.
 
 == Key OBI Concept ==
 OBI (Order Book Imbalance) = (bid_depth − ask_depth) / total_depth  ∈ [−1, +1]
 Negative OBI on a token means the ask side dominates → smart money is selling.
 Entering YES when OBI_y is strongly negative is entering against the book.
 
+== The Refusal Ledger ==
+The user message carries "== Why entries were refused ==": for every viper, how
+many evaluation ticks each named gate vetoed during the window, and the latest
+verbatim line. Every entry is tagged with its class:
+  [arithmetic]  Venue economics. The market cannot pay: fee above the spread,
+                no seller, no bid to exit into, no profitable YES+NO sum, edge
+                inside the model's own noise, coin-flip or pin-risk pricing.
+                NEVER propose loosening anything to get past one of these. The
+                only correct responses are "wait" or "disable the viper here".
+  [guard]       A risk control the operator chose: drawdown limit, exposure cap,
+                adverse OBI, toxic-fill cooldown, stale data, warmup, debounce.
+                Keep it unless the ledger shows it misfiring. Loosening a guard
+                is a risk increase and must be argued as one, not as "more trades".
+  [market]      Nothing on offer right now: no tradeable market, signal below
+                its trigger, outside trading hours. No knob changes this.
+  [knob: X]     A preference threshold, and X is the parameter behind it. This
+                is the only class where loosening can be right. If X is marked
+                operator-only it is not in your Machine-Editable Keys: recommend
+                it in prose for the operator; do not put it in the json block.
+A high count is not evidence that a gate is wrong. 600 fee-floor refusals mean
+the book was unquotable for 600 ticks, and the correct number of trades in that
+window was zero. Inactivity is not a cost to be fixed; a losing trade is.
+
 == Tunable Parameters (DynamicConfig) ==
 These can be adjusted live without restarting the bot:
   Momentum:     stop_loss_pct, target_profit_pct, min/max_trade_size_usdc, max_exposure
-  Maker:        max_entry_price, stop_loss_pct, target_profit_pct, max_exposure
+  Maker:        max_entry_price, stop_loss_pct, target_profit_pct, max_exposure, quote_size_usdc
   Basis:        stop_loss_pct, target_profit_pct, max_exposure
   GBoost:       entry_threshold (0–1), stop_loss_pct, target_profit_pct, max_exposure
-  TimeDecay:    position_size_usdc, stop_loss_pct, max_entry_price, obi_adverse_block
+  TimeDecay:    position_size_usdc, stop_loss_pct, max_entry_price
   TrendCapture: stop_loss_pct, target_profit_pct, min/max_trade_size_usdc, max_entry_price, max_exposure
-  Global:    ghost_mode (true = paper trading, no real orders)
+  FairValue:    trade_size_usdc, max_exposure, stop_loss_pct, target_profit_pct, base_edge
+  Convergence:  position_size_usdc, max_exposure, stop_loss_pct, target_profit_pct, max_entry_price
+  Arbitrage:    position_size_usdc, max_exposure, profit_threshold, min_leg_conviction
   Enable flags: enable_momentum, enable_maker, enable_basis, enable_gboost,
-                enable_time_decay, enable_arbitrage
+                enable_time_decay, enable_arbitrage, enable_trendcapture,
+                enable_fairvalue, enable_convergence
 
 IMPORTANT: The CURRENT VALUES of every parameter are provided in the user message
 under "== Current Live Configuration ==". Always use those exact values as the
 "current" baseline in your recommendations — never guess or assume values.
+
+== Changes already in flight ==
+The user message may list proposals on this squadron that are pending approval
+or were applied recently. Those have already moved the baseline. Do NOT propose
+a further step on the same field in the same direction: each batch used to take
+the previous proposal's output as its new starting point and loosen again, so
+serial approval compounded without any single step looking unreasonable. If you
+think a pending change is wrong, say so in OBSERVATIONS.
 
 == Session Context ==
 The trade data is scoped to the CURRENT SESSION (process lifetime).  When prior-session
@@ -583,19 +638,17 @@ inform your pattern recognition, but your primary recommendations should address
 current session's trades and conditions.
 
 == Your Role ==
-Analyze the recent trades (or absence of trades) provided and:
+Analyze the trades, the open positions and the refusal ledger, and:
 1. Identify loss patterns (repeated stop-losses, short hold times, common exit reasons).
-2. Flag any signals of structural issues (high entry_hb_age_sec, adverse OBI at entry).
-3. Suggest 2–5 specific, actionable DynamicConfig parameter changes with rationale.
-4. Recommend which strategies to enable/disable given current session conditions.
-5. IMPORTANT — if few or zero trades have occurred: assess whether the current parameter
-   configuration is too stringent for present market conditions.  Consider that:
-   - entry thresholds, min/max_trade_size, stop_loss_pct, and target_profit_pct all gate entry;
-   - GBoost entry_threshold near 0.9+ may suppress trades in low-confidence regimes;
-   - Momentum velocity thresholds may be too tight for a ranging/low-vol market;
-   - Arbitrage MAX_SUM_PRICE may be too low for current book spreads.
-   Recommend specific loosening adjustments and explain why inactivity is itself a risk
-   (opportunity cost, inability to gather ML training data, stale model).
+2. Flag structural issues (high entry_hb_age_sec, adverse OBI at entry).
+3. Read the refusal ledger. For each viper with no trades, say whether its
+   dominant refusal is [arithmetic]/[guard]/[market] (working as intended) or
+   [knob] (worth a look), and name the refusal.
+4. Propose 0–4 specific DynamicConfig changes. Tightening is as valid as
+   loosening: propose a tighter stop, a smaller size or a higher edge when the
+   trades or the ledger argue for it. No proposals is a good answer when the
+   gates are refusing correctly.
+5. Recommend which strategies to keep enabled or disable for this squadron.
 
 == Output Format ==
 Reply ONLY in this exact structure (no preamble, no markdown headers outside this):
@@ -607,12 +660,14 @@ Session P&L: [value]  |  Trades analyzed: [n]
 • [bullet 1]
 • [bullet 2]
 • [bullet 3 — max 5 bullets total]
-(If trades = 0, focus observations on likely reasons for inactivity given current conditions.)
+
+🛡️ CORRECT REFUSALS
+• [viper]: [dominant refusal] — [why sitting out is right, 1 sentence]
+(or "none")
 
 ⚙️ RECOMMENDATIONS
-1. [param_name]: [current] → [suggested] — [reason, 1 sentence]
-2. [param_name]: [current] → [suggested] — [reason, 1 sentence]
-(up to 4 recommendations; if no trades, prioritize recommendations that would unlock entries)
+1. [param_name]: [current] → [suggested] — targets: [the ledger entry it unblocks, or "tighten"]; [reason, 1 sentence]
+(0–4 items; "none — gates are refusing correctly" is a complete answer)
 
 🟢 KEEP ENABLED: [comma-separated strategy names]
 🔴 CONSIDER DISABLING: [comma-separated strategy names, or "none"]
@@ -621,7 +676,7 @@ After the report, append EXACTLY ONE fenced json block translating your
 recommendations into machine-applicable changes:
 
 ```json
-{"proposals":[{"field":"<exact key>","to":<value>,"reason":"<short reason>"}]}
+{"proposals":[{"field":"<exact key>","to":<value>,"unblocks":"<ledger entry tagged [knob: this field], or 'tighten'>","reason":"<short reason>"}]}
 ```
 
 Proposal rules (strict):
@@ -629,11 +684,277 @@ Proposal rules (strict):
   in the user message. Any other key is discarded.
 - "to" is a plain JSON number for numeric keys (fractions, not percent strings:
   8% → 0.08) or true/false for boolean keys.
+- "unblocks" MUST name a ledger entry tagged [knob: <this same field>], or be
+  "tighten" for a change that reduces risk or size. A change justified only by
+  a low trade count, or aimed at an [arithmetic], [guard] or [market] entry, is
+  wrong: leave it out.
 - Maximum 4 proposals; stay within the [min..max] shown for the key.
 - If you have no config changes to propose, emit {"proposals":[]}.
 - The json block must be the LAST thing in your reply.
 
-Keep the entire response under 250 words (excluding the json block)."#.to_string()
+Keep the entire response under 300 words (excluding the json block)."#.to_string()
+}
+
+// ── Refusal ledger classification ────────────────────────────────────────────
+
+/// What kind of gate produced a refusal, and so whether loosening anything in
+/// response could ever be right.
+///
+/// This is the advisor's defense against its own input bias. Shown only trades
+/// and knob values, the one inference available to a model is "loosen
+/// something"; shown a count of refusals, the next failure is to read a large
+/// count as a large problem. The tag beside each ledger line says which counts
+/// are the strategy working — the fee floor is arithmetic, and a viper that
+/// refused to quote through it 600 times has been right 600 times.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefusalClass {
+    /// Venue economics: unquotable at any setting.
+    Arithmetic,
+    /// A risk control, with the knob behind it when there is one.
+    Guard(Option<String>),
+    /// Nothing on offer; no knob changes it.
+    Market,
+    /// A preference threshold; the key names the knob behind it.
+    Knob(String),
+}
+
+/// `DynamicConfig` key prefix for a strategy name as the registry reports it.
+fn viper_key_prefix(strategy: &str) -> &'static str {
+    let s = strategy.to_ascii_lowercase();
+    match s.trim_end_matches("strategy") {
+        "momentum" => "momentum",
+        "maker" => "maker",
+        "basis" => "basis",
+        "gboost" => "gboost",
+        "timedecay" => "time_decay",
+        "arbitrage" => "arbitrage",
+        "trendreversal" | "trendcapture" => "trendcapture",
+        "fairvalue" => "fairvalue",
+        "convergence" => "convergence",
+        _ => "",
+    }
+}
+
+/// Classify one normalized refusal reason (see `viper_status::normalize_reason`)
+/// for `strategy`. Substring rules, arithmetic first: several arithmetic lines
+/// also mention "spread", which the knob rules would otherwise claim.
+pub fn classify_refusal(strategy: &str, normalized: &str) -> RefusalClass {
+    let r = normalized.to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|n| r.contains(n));
+    let p = viper_key_prefix(strategy);
+    let key = |suffix: &str| format!("{p}_{suffix}");
+
+    if has(&[
+        "below fee floor", "no profitable spread", "spread unprofitable", "locked/inverted",
+        "no seller", "no ask", "no bid", "degenerate book", "no usable mid", "fees too high",
+        "theta below minimum", "net profit too low", "already converged", "coin-flip",
+        "pin-risk", "too close to 0.50", "price too close to #", "edge below model noise",
+        "orphan rescue", "combined_bid guard", "gap-through", "thin exit book",
+        "near-resolution",
+    ]) {
+        return RefusalClass::Arithmetic;
+    }
+
+    // Preference thresholds, each with the knob that owns it.
+    if has(&["market_age"]) {
+        return RefusalClass::Knob("maker_min_market_age_secs".into());
+    }
+    if has(&["secs_to_expiry"]) {
+        return RefusalClass::Knob("maker_min_secs_to_expiry".into());
+    }
+    if has(&["too close to expiry"]) {
+        return RefusalClass::Knob(match p {
+            "momentum" => "momentum_min_secs_to_expiry_for_entry".into(),
+            _ => key("min_secs_to_expiry"),
+        });
+    }
+    if has(&["too far from expiry", "outside theta window"]) {
+        return RefusalClass::Knob(key("max_secs_to_expiry"));
+    }
+    if has(&["spread # < min"]) {
+        return RefusalClass::Knob("maker_min_spread".into());
+    }
+    if has(&["below entry price floor"]) {
+        return RefusalClass::Knob(key("min_entry_price"));
+    }
+    if has(&["outside entry price band", "price out of range", "entry price above cap"]) {
+        return RefusalClass::Knob(key("max_entry_price"));
+    }
+    if has(&["edge below required"]) {
+        return RefusalClass::Knob("fairvalue_base_edge".into());
+    }
+    if has(&["oracle too flat"]) {
+        return RefusalClass::Knob("gboost_min_hist_vol".into());
+    }
+    if has(&["entry-side spread too wide"]) {
+        return RefusalClass::Knob("basis_max_spread_pct".into());
+    }
+    if has(&["spread too wide"]) && p == "convergence" {
+        return RefusalClass::Knob("convergence_max_token_spread_pct".into());
+    }
+
+    // Risk controls, with their knob where one exists.
+    if has(&["net_exposure", "exposure cap"]) {
+        return RefusalClass::Guard(Some(key("max_exposure_usdc")));
+    }
+    if has(&["adverse obi", "obi adverse", "book_imbalance", "book stacked", "obi exhaust", "adverse book imbalance"]) {
+        return RefusalClass::Guard(Some(match p {
+            "maker" => "maker_max_book_imbalance_ratio".into(),
+            _ => key("obi_adverse_block"),
+        }));
+    }
+    if has(&[
+        "drawdown", "insufficient collateral", "circuit breaker", "cascade guard", "lockout",
+        "post-stop", "cooldown", "toxic", "concept drift", "taker_flow", "taker flow",
+        "flow contradicts", "moving too fast", "stale", "warmup", "warming up", "debounce",
+        "hold lock", "already open", "pyramiding", "gate_dwell", "shadow mode",
+        "market too young", "counter-trend", "strong trend", "drift too large",
+        "no depth data",
+    ]) {
+        return RefusalClass::Guard(None);
+    }
+
+    RefusalClass::Market
+}
+
+/// The tag printed beside a ledger line.
+fn refusal_tag(class: &RefusalClass, schema: &[crate::api::config_schema::ConfigFieldSchema]) -> String {
+    let knob_suffix = |k: &str| {
+        match schema.iter().find(|f| f.key == k) {
+            Some(f) if f.advanced => format!("{k}, operator-only"),
+            Some(_) => k.to_string(),
+            None => format!("{k}, operator-only"),
+        }
+    };
+    match class {
+        RefusalClass::Arithmetic => "[arithmetic]".to_string(),
+        RefusalClass::Guard(None) => "[guard]".to_string(),
+        RefusalClass::Guard(Some(k)) => format!("[guard: {}]", knob_suffix(k)),
+        RefusalClass::Market => "[market]".to_string(),
+        RefusalClass::Knob(k) => format!("[knob: {}]", knob_suffix(k)),
+    }
+}
+
+/// Reason text as shown in the prompt: capped so one Maker line with three
+/// verbose legs does not eat the section's budget.
+const LEDGER_REASON_CHARS: usize = 60;
+const LEDGER_DETAIL_CHARS: usize = 96;
+
+fn short_strategy(name: &str) -> String {
+    name.replace("Strategy", "")
+}
+
+fn fmt_window(secs: i64) -> String {
+    if secs < 90 {
+        format!("{secs}s")
+    } else if secs < 5400 {
+        format!("{}m", (secs + 30) / 60)
+    } else {
+        format!("{:.1}h", secs as f64 / 3600.0)
+    }
+}
+
+/// Render the refusal ledger section of the user prompt.
+///
+/// Budget: one line per viper that was refused, `REPORT_REFUSAL_KINDS` reasons
+/// each with a class tag, and the latest verbatim line for the top reason when
+/// it carries numbers the normalized form dropped. Vipers with nothing in the
+/// window share one line. Measured at roughly 45 tokens per active viper with
+/// short literal reasons and about 80 with the Maker's verbose legs. A typical
+/// hour, where most vipers carry one or two reasons, costs 300–450 tokens for a
+/// nine-viper crypto squadron; the busy case the test below constructs (every
+/// viper refused by three gates, each with a "latest" line) measures ~720.
+fn refusal_ledger_lines(reports: &[crate::helpers::viper_status::ViperRefusalReport]) -> Vec<String> {
+    use crate::helpers::viper_status::{DISABLED_IN_CONFIG, IDLE_NO_MARKET};
+    let mut lines = Vec::new();
+    if reports.is_empty() {
+        return lines;
+    }
+    let schema = crate::api::config_schema::config_schema();
+    let window = reports.iter().map(|r| r.window_secs).max().unwrap_or(0);
+    lines.push(format!(
+        "== Why entries were refused (last {}; 50ms ticks per viper, count× reason [class]) ==",
+        fmt_window(window),
+    ));
+    lines.push(
+        "[arithmetic]/[guard]/[market] = the strategy working. Only [knob: X] is a candidate for change, \
+         and not when X is operator-only."
+            .to_string(),
+    );
+    let mut quiet: Vec<String> = Vec::new();
+    for r in reports {
+        let name = short_strategy(&r.strategy);
+        if r.ticks == 0 || r.reasons.is_empty() {
+            let state = match r.last_reason.as_deref() {
+                Some(DISABLED_IN_CONFIG) => "disabled".to_string(),
+                Some(IDLE_NO_MARKET) => "waiting for a market".to_string(),
+                Some(other) => truncate_on_char_boundary(other, 40).to_string(),
+                None => "no refusals".to_string(),
+            };
+            quiet.push(format!("{name} ({state})"));
+            continue;
+        }
+        let parts: Vec<String> = r.reasons.iter()
+            .filter(|t| t.count_since_report > 0)
+            .take(crate::helpers::viper_status::REPORT_REFUSAL_KINDS)
+            .map(|t| {
+                let class = classify_refusal(&r.strategy, &t.reason);
+                format!(
+                    "{}× {} {}",
+                    t.count_since_report,
+                    truncate_on_char_boundary(&t.reason, LEDGER_REASON_CHARS),
+                    refusal_tag(&class, &schema),
+                )
+            })
+            .collect();
+        lines.push(format!("{name}: {} refused — {}", r.ticks, parts.join("; ")));
+        if let Some(top) = r.reasons.first() {
+            if top.count_since_report > 0 && top.last_detail != top.reason && !top.last_detail.is_empty() {
+                lines.push(format!(
+                    "  latest: \"{}\"",
+                    truncate_on_char_boundary(&top.last_detail, LEDGER_DETAIL_CHARS),
+                ));
+            }
+        }
+    }
+    if !quiet.is_empty() {
+        lines.push(format!("No refusals in window: {}", quiet.join(", ")));
+    }
+    lines
+}
+
+/// Minutes-ago rendering for an RFC 3339 timestamp; blank when unparseable.
+fn ago_from_rfc3339(ts: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(ts)
+        .ok()
+        .map(|t| fmt_window((chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds().max(0)))
+        .map(|w| format!("{w} ago"))
+        .unwrap_or_default()
+}
+
+/// Render the proposals already pending or recently applied on this squadron,
+/// so a batch cannot take the last batch's output as a fresh baseline.
+fn in_flight_lines(actions: &[db::LlmActionRow]) -> Vec<String> {
+    let mut lines = Vec::new();
+    if actions.is_empty() {
+        return lines;
+    }
+    lines.push("== Changes already in flight on this squadron (do not stack another step on these) ==".to_string());
+    for a in actions {
+        let state = match a.status.as_str() {
+            "proposed" => format!("proposed {}, awaiting approval", ago_from_rfc3339(&a.ts)),
+            "applied" => format!("applied {}", ago_from_rfc3339(a.status_ts.as_deref().unwrap_or(&a.ts))),
+            other => other.to_string(),
+        };
+        lines.push(format!(
+            "- {}: {} -> {} — {}",
+            a.field,
+            a.from_value.trim_matches('"'),
+            a.to_value.trim_matches('"'),
+            state,
+        ));
+    }
+    lines
 }
 
 // ── Prompt builder ────────────────────────────────────────────────────────────
@@ -653,6 +974,12 @@ fn build_user_prompt(
     // offering the model, since a proposal into a viper the squadron does not
     // fly can never take effect.
     allowed_vipers: &[String],
+    // The refusal ledger for this squadron's vipers over the window since the
+    // advisor last looked: what stopped each entry, and how often.
+    refusals: &[crate::helpers::viper_status::ViperRefusalReport],
+    // Proposals on this squadron that are pending approval or were applied
+    // recently, so the model does not stack a further step on them.
+    in_flight: &[db::LlmActionRow],
 ) -> String {
     let mut lines = Vec::new();
 
@@ -723,13 +1050,29 @@ fn build_user_prompt(
             lines.push(format!("  {}: {} wins / {} losses / ${:.2}", strat.replace("Strategy", ""), w, l, p));
         }
     } else {
-        lines.push("⚠️  NO TRADES this session.".to_string());
+        lines.push("NO TRADES this session.".to_string());
         lines.push(
-            "The bot has been running but no entries have been triggered. \
-             Please assess whether the current parameter configuration is too stringent \
-             for the current market conditions and recommend adjustments to unlock trade opportunities."
+            "The engine has been evaluating every tick and every entry was refused. \
+             The refusal ledger below says by which gate and how often. Decide from it \
+             whether the gates are refusing correctly (then say so and propose nothing) \
+             or whether a specific [knob] threshold is miscalibrated."
                 .to_string(),
         );
+    }
+
+    // ── Refusal ledger ────────────────────────────────────────────────────────
+    // Placed ahead of the config so the model reads what happened before it
+    // reads what it may change.
+    let ledger = refusal_ledger_lines(refusals);
+    if !ledger.is_empty() {
+        lines.push(String::new());
+        lines.extend(ledger);
+    }
+
+    let in_flight_section = in_flight_lines(in_flight);
+    if !in_flight_section.is_empty() {
+        lines.push(String::new());
+        lines.extend(in_flight_section);
     }
 
     // ── Prior session context (supplemental) ─────────────────────────────────
@@ -823,7 +1166,7 @@ fn build_user_prompt(
     ));
 
     lines.push(String::new());
-    lines.push("Please analyze the above and provide recommendations as instructed.".to_string());
+    lines.push("Please analyze the above and provide recommendations as instructed. Tightening and no change are both valid outcomes.".to_string());
 
     // ── Open positions (in-flight, not yet closed) ───────────────────────────
     if !open_positions.is_empty() {
@@ -977,7 +1320,13 @@ async fn call_ollama(
         options: OllamaOptions {
             num_predict: max_output_tokens(),
             temperature: LLM_TEMPERATURE,
-            num_ctx: 4096,     // Room for prompt + machine-editable key list + full recommendation
+            // Room for the system prompt (~2,100 tokens), a user prompt that now
+            // carries the refusal ledger and the in-flight proposals (~2,000
+            // tokens on a busy nine-viper squadron), and the output cap. At 4096
+            // Ollama silently truncated the front of the prompt, which is where
+            // the system prompt lives. The KV cache for qwen2.5:3b at this size
+            // is about 300 MB.
+            num_ctx: 8192,
         },
     };
 
@@ -1153,11 +1502,21 @@ fn advisor_input_fingerprint(
     pnl: rust_decimal::Decimal,
     collateral: rust_decimal::Decimal,
     dyn_cfg: &DynamicConfig,
+    // The refusal ledger. Counts change every tick and would defeat the skip,
+    // so only the DOMINANT reason per viper is hashed: a squadron whose Maker
+    // moves from "spread below fee floor" to "no seller" is a different
+    // situation worth a call, and one that keeps refusing for the same reason
+    // is not.
+    refusals: &[crate::helpers::viper_status::ViperRefusalReport],
 ) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     trades.len().hash(&mut h);
     positions.len().hash(&mut h);
+    for r in refusals {
+        r.strategy.hash(&mut h);
+        r.reasons.first().map(|t| t.reason.as_str()).unwrap_or("").hash(&mut h);
+    }
     // TradeRow stores everything as strings and has no id column, so identity is
     // the timestamp plus market plus realized P&L. Hashing the rendered decimals
     // rather than floats keeps this exact and avoids float equality entirely.
@@ -1236,6 +1595,26 @@ fn advisor_error_is_durable(err: &str) -> bool {
     ]
     .iter()
     .any(|needle| e.contains(needle))
+}
+
+/// How far back an applied proposal still counts as "in flight" for the
+/// ratchet guard. One day covers every batch the outcome scorer has not yet
+/// closed the book on, and a few lines of prompt.
+const IN_FLIGHT_APPLIED_LOOKBACK_SECS: i64 = 24 * 3600;
+
+/// Proposals on `squadron_id` that are pending approval or were applied within
+/// the lookback, newest first. Rows without a squadron (pre-scoping) are
+/// ignored: they were written to a config nothing reads.
+async fn in_flight_actions(pool: &sqlx::SqlitePool, squadron_id: &str) -> Vec<db::LlmActionRow> {
+    let since = (chrono::Utc::now() - chrono::Duration::seconds(IN_FLIGHT_APPLIED_LOOKBACK_SECS)).to_rfc3339();
+    let mut rows: Vec<db::LlmActionRow> = db::fetch_pending_llm_actions(pool).await
+        .into_iter()
+        .chain(db::fetch_llm_actions_applied_since(pool, &since).await)
+        .filter(|a| a.squadron_id.as_deref() == Some(squadron_id))
+        .collect();
+    rows.sort_by(|a, b| b.id.cmp(&a.id));
+    rows.dedup_by_key(|a| a.id);
+    rows
 }
 
 /// Spawn this as a long-running tokio task at startup.
@@ -1588,24 +1967,28 @@ pub async fn run_llm_advisor_loop(
         //
         // Intersect with the live registry so a recommendation can always reach
         // the squadron it is about.
-        let live: std::collections::HashSet<String> = cag
+        // Squadron id → the asset key its vipers report under. The viper-status
+        // registry is keyed by the patrol context's `crypto_filter`, which every
+        // venue registers as the squadron summary's `asset` (lowercased on both
+        // sides), so the summary is the bridge between the two namespaces.
+        let live: std::collections::HashMap<String, String> = cag
             .list_squadrons()
             .into_iter()
             .filter(|sq| sq.state != "STOOD_DOWN")
-            .map(|sq| sq.id)
+            .map(|sq| (sq.id, sq.asset.to_lowercase()))
             .collect();
         let all_configured = db::list_squadron_configs(&primary_pool).await;
         let skipped: Vec<&str> = all_configured.iter()
-            .filter(|(id, _)| !live.contains(id))
+            .filter(|(id, _)| !live.contains_key(id))
             .map(|(id, _)| id.as_str())
             .collect();
         if !skipped.is_empty() {
             debug!("🤖 LLM Advisor: skipping {} squadron(s) with config but no live squadron: {}",
                    skipped.len(), skipped.join(", "));
         }
-        let squadrons: Vec<(String, String)> = all_configured
+        let squadrons: Vec<(String, String, String)> = all_configured
             .into_iter()
-            .filter(|(id, _)| live.contains(id))
+            .filter_map(|(id, class)| live.get(&id).map(|asset| (id.clone(), class, asset.clone())))
             .collect();
         if squadrons.is_empty() {
             info!("🤖 LLM Advisor: no squadrons configured yet — nothing to advise on this cycle");
@@ -1614,22 +1997,35 @@ pub async fn run_llm_advisor_loop(
         info!(
             "🤖 LLM Advisor: {} squadron(s) to advise: {}",
             squadrons.len(),
-            squadrons.iter().map(|(id, c)| format!("{id} ({c})")).collect::<Vec<_>>().join(", "),
+            squadrons.iter().map(|(id, c, _)| format!("{id} ({c})")).collect::<Vec<_>>().join(", "),
         );
 
-        for (squadron_id, market_class) in squadrons {
+        for (squadron_id, market_class, asset_key) in squadrons {
         let dyn_cfg = DynamicConfig::load_for_squadron(&squadron_id).await;
         let allowed_vipers = db::vipers_for_class(&primary_pool, &market_class).await;
+
+        // Peek at the refusal ledger first; it is only TAKEN (window reset)
+        // once a provider call is actually spent on it, so a skipped cycle
+        // lets the window keep accumulating rather than dropping its counts.
+        let refusals_peek = crate::helpers::viper_status::refusal_report(&asset_key, false);
 
         // Nothing new to analyze? Do not pay for a restatement. See
         // `advisor_should_call` for why this is not a regression of the
         // deliberate "0 trades is itself a signal" behavior.
         let fingerprint = advisor_input_fingerprint(
             &all_session_trades, &all_open_positions, current_pnl, collateral, &dyn_cfg,
+            &refusals_peek,
         );
         if !advisor_should_call(&squadron_id, fingerprint) {
             continue;
         }
+        let refusals = crate::helpers::viper_status::refusal_report(&asset_key, true);
+        let refused_ticks: u64 = refusals.iter().map(|r| r.ticks).sum();
+
+        // Proposals already pending or recently applied on THIS squadron, so
+        // the model sees the moved baseline rather than treating the previous
+        // batch's output as a fresh starting point.
+        let in_flight = in_flight_actions(&primary_pool, &squadron_id).await;
 
         // ── Build prompt & call LLM (with retries) ───────────────────────────
         // all_open_positions already collected above from all asset pools
@@ -1643,16 +2039,23 @@ pub async fn run_llm_advisor_loop(
             &dyn_cfg,
             &fewshot,
             &allowed_vipers,
+            &refusals,
+            &in_flight,
         );
 
         info!(
-            "🤖 LLM Advisor: calling {} ({}) for session {} ({} session + {} prior trades, P&L ${:.2})...",
+            "🤖 LLM Advisor: calling {} ({}) for session {} ({} session + {} prior trades, P&L ${:.2}, \
+             {} refused ticks across {} viper(s), {} change(s) in flight; prompt {} chars)...",
             provider.model(),
             provider.name(),
             truncate_on_char_boundary(&session_id, 16),
             session_trade_count,
             total_trade_count - session_trade_count,
             current_pnl,
+            refused_ticks,
+            refusals.len(),
+            in_flight.len(),
+            user_prompt.len(),
         );
 
         // Retry up to 2 times with a 30-second backoff on transient errors.
@@ -1894,6 +2297,227 @@ mod prompt_cache_tests {
         ).expect("parses");
         assert_eq!(r.usage.cache_creation_input_tokens, 1650);
         assert_eq!(r.usage.cache_read_input_tokens, 1650);
+    }
+}
+
+#[cfg(test)]
+mod refusal_ledger_tests {
+    use super::*;
+    use crate::helpers::viper_status::{normalize_reason, RefusalTally, ViperRefusalReport};
+
+    fn tally(reason: &str, n: u64, detail: &str) -> RefusalTally {
+        RefusalTally {
+            reason: normalize_reason(reason),
+            count: n,
+            count_since_report: n,
+            last_detail: detail.to_string(),
+        }
+    }
+
+    fn report(strategy: &str, reasons: Vec<RefusalTally>) -> ViperRefusalReport {
+        ViperRefusalReport {
+            asset: "btc".into(),
+            strategy: strategy.into(),
+            window_secs: 3480,
+            ticks: reasons.iter().map(|t| t.count_since_report).sum(),
+            reasons,
+            last_reason: None,
+        }
+    }
+
+    /// The production profile of 2026-09-07 (v1.1.5-rc1, last 24h). Every one
+    /// of these is a gate the advisor was blind to, and the first is the one
+    /// that must never read as a threshold: the venue's fee exceeds the
+    /// spread, so quoting there loses money at any `maker_min_spread`.
+    #[test]
+    fn the_fee_floor_is_arithmetic_not_a_knob() {
+        let fee = normalize_reason("spread 0.0100 below fee floor 0.0247 — unquotable at any min_spread");
+        assert_eq!(classify_refusal("MakerStrategy", &fee), RefusalClass::Arithmetic);
+        // ...while the ordinary spread gate, one line below it in the Maker,
+        // IS the knob and must be named as such.
+        let tight = normalize_reason("spread 0.030 < min 0.040 (nets 1 tick(s) if lifted; a forced exit pays ≈2.7 ticks of fee on top of the move)");
+        assert_eq!(classify_refusal("MakerStrategy", &tight), RefusalClass::Knob("maker_min_spread".into()));
+    }
+
+    #[test]
+    fn the_production_refusal_profile_classifies_as_the_strategy_working() {
+        for (viper, reason) in [
+            ("MakerStrategy", "no seller on this leg"),
+            ("ArbitrageStrategy", "no profitable spread"),
+            ("ArbitrageStrategy", "no seller on one leg"),
+            ("FairValueStrategy", "coin-flip guard (|d| below floor)"),
+            ("FairValueStrategy", "pin-risk guard (endgame coin-flip)"),
+            ("FairValueStrategy", "edge below model noise"),
+        ] {
+            assert_eq!(classify_refusal(viper, reason), RefusalClass::Arithmetic, "{viper}: {reason}");
+        }
+        assert_eq!(
+            classify_refusal("MakerStrategy", "book_imbalance"),
+            RefusalClass::Guard(Some("maker_max_book_imbalance_ratio".into())),
+        );
+        assert_eq!(
+            classify_refusal("FairValueStrategy", "edge below required"),
+            RefusalClass::Knob("fairvalue_base_edge".into()),
+        );
+        assert_eq!(
+            classify_refusal("GboostStrategy", &normalize_reason("oracle too flat (hist_vol=0.0004 < min=0.0010)")),
+            RefusalClass::Knob("gboost_min_hist_vol".into()),
+        );
+    }
+
+    #[test]
+    fn preference_gates_name_the_knob_behind_them() {
+        assert_eq!(
+            classify_refusal("MakerStrategy", &normalize_reason("market_age 12s < min 600s")),
+            RefusalClass::Knob("maker_min_market_age_secs".into()),
+        );
+        assert_eq!(
+            classify_refusal("MakerStrategy", &normalize_reason("secs_to_expiry 900s < min 1800s")),
+            RefusalClass::Knob("maker_min_secs_to_expiry".into()),
+        );
+        assert_eq!(
+            classify_refusal("MomentumStrategy", "too close to expiry"),
+            RefusalClass::Knob("momentum_min_secs_to_expiry_for_entry".into()),
+        );
+        assert_eq!(
+            classify_refusal("TrendReversalStrategy", "asks below entry price floor"),
+            RefusalClass::Knob("trendcapture_min_entry_price".into()),
+        );
+        assert_eq!(
+            classify_refusal("MomentumStrategy", "exposure cap reached"),
+            RefusalClass::Guard(Some("momentum_max_exposure_usdc".into())),
+        );
+        assert_eq!(classify_refusal("MomentumStrategy", "velocity below trigger"), RefusalClass::Market);
+        assert_eq!(classify_refusal("BasisStrategy", "session drawdown limit hit"), RefusalClass::Guard(None));
+    }
+
+    /// What the model actually sees. The fee floor must be tagged arithmetic
+    /// on the line itself, beside its count, because a 3B local model will not
+    /// reliably carry a rule from the system prompt down to a specific line.
+    #[test]
+    fn the_ledger_renders_counts_with_class_tags() {
+        let reports = vec![
+            report("MakerStrategy", vec![
+                tally("spread 0.0100 below fee floor 0.0247 — unquotable at any min_spread", 584,
+                      "spread 0.0100 below fee floor 0.0247 — unquotable at any min_spread"),
+                tally("no seller on this leg", 691, "no seller on this leg"),
+                tally("book_imbalance", 450, "book_imbalance"),
+            ]),
+            report("GboostStrategy", vec![
+                tally("oracle too flat (hist_vol=0.0004 < min=0.0010)", 1200, "oracle too flat (hist_vol=0.0004 < min=0.0010)"),
+            ]),
+            ViperRefusalReport {
+                asset: "btc".into(), strategy: "MomentumStrategy".into(), window_secs: 3480,
+                ticks: 0, reasons: vec![], last_reason: Some("velocity below trigger".into()),
+            },
+        ];
+        let text = refusal_ledger_lines(&reports).join("\n");
+        assert!(text.contains("== Why entries were refused (last 58m"), "{text}");
+        assert!(text.contains("Maker: 1725 refused"), "{text}");
+        assert!(text.contains("584× spread # below fee floor # — unquotable at any min_spread [arithmetic]"), "{text}");
+        assert!(text.contains("691× no seller on this leg [arithmetic]"), "{text}");
+        assert!(text.contains("450× book_imbalance [guard: maker_max_book_imbalance_ratio, operator-only]"), "{text}");
+        assert!(text.contains("latest: \"spread 0.0100 below fee floor 0.0247"), "{text}");
+        assert!(text.contains("1200× oracle too flat (hist_vol=# < min=#) [knob: gboost_min_hist_vol, operator-only]"), "{text}");
+        assert!(text.contains("No refusals in window: Momentum (velocity below trigger)"), "{text}");
+    }
+
+    /// The budget claim: a nine-viper crypto squadron in a busy hour, with the
+    /// Maker carrying its most verbose legs (it is the only viper that writes
+    /// lines that long) and every other viper refused by three literal gates.
+    /// The renderer caps reasons per viper itself, so a fourth is dropped even
+    /// if a caller hands it one. Four chars per token is the conventional
+    /// rough estimate.
+    #[test]
+    fn a_full_squadron_ledger_fits_the_budget() {
+        let mut reports = vec![report("MakerStrategy", vec![
+            tally("spread 0.0100 below fee floor 0.0247 — unquotable at any min_spread", 584, "spread 0.0100 below fee floor 0.0247 — unquotable at any min_spread"),
+            tally("book_imbalance both sides (ratio>3.0): yes_bidD=12 yes_askD=400 | no_bidD=9 no_askD=300", 450, "book_imbalance both sides (ratio>3.0): yes_bidD=12 yes_askD=400 | no_bidD=9 no_askD=300"),
+            tally("no seller on this leg", 691, "no seller on this leg"),
+            tally("market_age 12s < min 600s", 30, "market_age 12s < min 600s"),
+        ])];
+        for v in [
+            "MomentumStrategy", "ArbitrageStrategy", "TimeDecayStrategy", "BasisStrategy",
+            "GboostStrategy", "TrendReversalStrategy", "FairValueStrategy", "ConvergenceStrategy",
+        ] {
+            reports.push(report(v, vec![
+                tally("oracle too flat (hist_vol=0.0004 < min=0.0010)", 900, "oracle too flat (hist_vol=0.0004 < min=0.0010)"),
+                tally("coin-flip guard (|d| below floor)", 300, "coin-flip guard (|d| below floor)"),
+                tally("exposure cap reached", 40, "exposure cap reached"),
+            ]));
+        }
+        let text = refusal_ledger_lines(&reports).join("\n");
+        assert!(!text.contains("market_age"), "a fourth reason must be dropped by the renderer:\n{text}");
+        let approx_tokens = text.len() / 4;
+        assert!(approx_tokens < 800, "ledger is ~{approx_tokens} tokens:\n{text}");
+    }
+
+    #[test]
+    fn in_flight_changes_are_listed_with_their_state() {
+        let mk = |id: i64, field: &str, from: &str, to: &str, status: &str| db::LlmActionRow {
+            id, batch_id: "b".into(), session_id: "s".into(),
+            ts: chrono::Utc::now().to_rfc3339(), expires_at: String::new(), model: "m".into(),
+            tier: 1, ghost_mode: true, field: field.into(), from_value: from.into(),
+            to_value: to.into(), clamped: false, delta_pct: None, reason: String::new(),
+            status: status.into(), status_detail: None,
+            status_ts: Some((chrono::Utc::now() - chrono::Duration::hours(2)).to_rfc3339()),
+            squadron_id: Some("btc".into()), inverse_patch: None, pnl_at_apply: None,
+            outcome_score: None, outcome_detail: None,
+        };
+        let rows = vec![
+            mk(2, "maker_quote_size_usdc", "\"8\"", "\"12\"", "proposed"),
+            mk(1, "arbitrage_min_leg_conviction", "\"0.9\"", "\"0.8\"", "applied"),
+        ];
+        let text = in_flight_lines(&rows).join("\n");
+        assert!(text.contains("do not stack another step"), "{text}");
+        assert!(text.contains("- maker_quote_size_usdc: 8 -> 12 — proposed"), "{text}");
+        assert!(text.contains("awaiting approval"), "{text}");
+        assert!(text.contains("- arbitrage_min_leg_conviction: 0.9 -> 0.8 — applied 2.0h ago"), "{text}");
+        assert!(in_flight_lines(&[]).is_empty());
+    }
+
+    /// The instruction that produced 24 loosenings out of 24 must be gone, and
+    /// the replacements present. Checked as text because the prompt is a
+    /// literal: a future edit that quietly restores the bias would pass every
+    /// other test.
+    #[test]
+    fn the_system_prompt_no_longer_asks_for_loosening() {
+        let p = system_prompt();
+        assert!(!p.contains("Recommend specific loosening adjustments"));
+        assert!(!p.contains("inactivity is itself a risk"));
+        assert!(!p.contains("prioritize recommendations that would unlock entries"));
+        for must in [
+            "[arithmetic]", "[guard]", "[market]", "[knob: X]",
+            "unquotable", "ANY\n  maker_min_spread",
+            "Tightening is as valid as",
+            "\"unblocks\"",
+            "Changes already in flight",
+            "FAK that EXITS it pays the",
+        ] {
+            assert!(p.contains(must), "system prompt lost: {must:?}");
+        }
+    }
+
+    /// The no-trades framing in the user prompt used to ask for adjustments
+    /// "to unlock trade opportunities"; it now points at the ledger.
+    #[test]
+    fn an_empty_session_points_the_model_at_the_ledger() {
+        let dc = DynamicConfig::default();
+        let reports = vec![report("MakerStrategy", vec![
+            tally("spread 0.0100 below fee floor 0.0247 — unquotable at any min_spread", 584,
+                  "spread 0.0100 below fee floor 0.0247 — unquotable at any min_spread"),
+        ])];
+        let prompt = build_user_prompt(
+            &[], None, &[], rust_decimal::Decimal::ZERO, rust_decimal_macros::dec!(100),
+            "2026-09-08T12:00:00Z", &dc, &[], &["maker".to_string()], &reports, &[],
+        );
+        assert!(prompt.contains("NO TRADES this session."));
+        assert!(!prompt.contains("unlock trade opportunities"));
+        assert!(prompt.contains("propose nothing"), "{prompt}");
+        let ledger = prompt.find("== Why entries were refused").expect("ledger section present");
+        let config = prompt.find("== Current Live Configuration ==").expect("config section present");
+        assert!(ledger < config, "the ledger must precede the knobs");
+        assert!(prompt.contains("[arithmetic]"));
     }
 }
 

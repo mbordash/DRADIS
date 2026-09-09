@@ -608,8 +608,13 @@ impl crate::venues::deployment::DeploymentRunner for KalshiDeploymentRunner {
         Ok(())
     }
 
-    async fn select_market(&self, class: &str, max_days_to_close: u32) -> Option<String> {
-        select_auto_deploy_market(&self.venue, class, max_days_to_close).await
+    async fn select_market(
+        &self,
+        class: &str,
+        max_days_to_close: u32,
+        min_liquidity_usd: f64,
+    ) -> Option<String> {
+        select_auto_deploy_market(&self.venue, class, max_days_to_close, min_liquidity_usd).await
     }
 }
 
@@ -623,6 +628,10 @@ async fn select_auto_deploy_market(
     venue: &Arc<KalshiVenue>,
     class: &str,
     max_days_to_close: u32,
+    // Kalshi reports volume in contracts, each worth at most $1, so a dollar
+    // floor applied to it is if anything slightly lenient — never stricter
+    // than the operator asked for.
+    min_liquidity_usd: f64,
 ) -> Option<String> {
     let cats_raw = if class == "politics" {
         crate::config::KALSHI_POLITICS_CATEGORIES
@@ -653,6 +662,9 @@ async fn select_auto_deploy_market(
         let volume = crate::venues::kalshi::types::fp(&m.volume_fp)
             .and_then(|d| f64::try_from(d).ok())
             .unwrap_or(0.0);
+        if volume < min_liquidity_usd {
+            continue;
+        }
         if best.as_ref().is_none_or(|(v, _)| volume > *v) {
             best = Some((volume, m.ticker.clone()));
         }

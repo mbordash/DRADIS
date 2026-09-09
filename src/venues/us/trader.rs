@@ -584,7 +584,12 @@ impl crate::venues::deployment::DeploymentRunner for UsDeploymentRunner {
         Ok(())
     }
 
-    async fn select_market(&self, class: &str, max_days_to_close: u32) -> Option<String> {
+    async fn select_market(
+        &self,
+        class: &str,
+        max_days_to_close: u32,
+        min_liquidity_usd: f64,
+    ) -> Option<String> {
         let wing = wing_for_class(class);
         let pairs = match wing.discover(&self.venue).await {
             Ok(p) => p,
@@ -605,6 +610,11 @@ impl crate::venues::deployment::DeploymentRunner for UsDeploymentRunner {
                     left > 0 && left <= max_secs
                 }
             })
+            // The gateway reports no volume, so 0 means "not reported" rather
+            // than "no interest" and passes the floor — the same rule the
+            // market browser applies to this venue. Only a reported figure
+            // below the floor excludes.
+            .filter(|p| !(p.volume > 0.0 && p.volume < min_liquidity_usd))
             // Soonest close first, NOT highest volume: the Polymarket US
             // gateway reports no volume, so every pair is 0 and a max_by on it
             // returns whichever the iterator happened to reach first. Closing

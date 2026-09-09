@@ -1322,6 +1322,21 @@ pub const AUTO_DEPLOY_POLITICS: bool = true;
 /// signal, and without a key it idles and publishes a neutral snapshot.
 pub const AUTO_DEPLOY_SPORTS: bool = true;
 
+/// Smallest 24-hour venue volume, in dollars, an auto-deploy may settle on.
+///
+/// The seeder takes the highest-volume open market in its class, and until this
+/// existed it did so with no floor at all: on a thin slate — sports at 4am ET,
+/// a quiet politics week — the "highest" is whatever happens to top an empty
+/// list, and a squadron parked on a $12 market quotes into nothing while
+/// looking busy. Below this the seeder deploys nothing and tries again next
+/// tick. That idleness is deliberate: an empty class slot is honest, and the
+/// next tick can fill it, whereas a squadron on a dead market holds the slot
+/// against every live market behind it.
+///
+/// Matches the Control Tower's own browse-list floor, so the seeder chooses
+/// from the same slate an operator sees.
+pub const DEPLOY_MIN_LIQUIDITY_USD: Decimal = dec!(500);
+
 /// Grace period, in seconds, between an event market's close and the squadron
 /// on it standing itself down.
 ///
@@ -1336,10 +1351,20 @@ pub const AUTO_DEPLOY_SPORTS: bool = true;
 /// sports squadron sat on a resolved market for hours, arbitrage and maker both
 /// gated out, while live markets went unclaimed.
 ///
-/// The grace exists because "closed" is the venue's word against our clock, and
-/// because a position can still be exiting. A squadron still holding a position
-/// waits regardless of this value: it keeps patrolling so its exits evaluate,
-/// and retires once flat.
+/// Two clocks can start it. The stated close time is one; the venue itself is
+/// the other, and the venue's word wins in both directions. Polymarket stamps a
+/// sports market's `endDate` a week after the game (a 2026-09-08 tennis match
+/// carried 2026-09-15), so the market stops accepting orders days before its
+/// stated close and a squadron judging by the date alone sat on the resolved
+/// match for the rest of the week. The patrol loop therefore asks the CLOB on
+/// a cadence whether the market still accepts orders, and this grace runs from
+/// the first "no". Conversely a stated close that has passed on a market the
+/// venue still accepts orders on does not retire the squadron.
+///
+/// The grace exists because a closure can be a pause rather than an ending —
+/// a delayed game, a brief venue hold — and because a position can still be
+/// exiting. A squadron still holding a position waits regardless of this
+/// value: it keeps patrolling so its exits evaluate, and retires once flat.
 pub const EVENT_MARKET_RETIRE_GRACE_SECS: i64 = 300;
 
 /// Wrap USDC.e that settlement leaves in the trading Safe back into pUSD.

@@ -154,12 +154,19 @@ function authHeaders(): HeadersInit {
   return h;
 }
 
-/** Error carrying the HTTP status so callers can detect 401 → show login. */
+/**
+ * Error carrying the HTTP status so callers can detect 401 → show login, and
+ * the engine's machine `code` where it sends one: `bad_password` (the Setup
+ * password was wrong) versus `session_required` (no or expired session). Both
+ * are 401s, and the login card must say different things for them.
+ */
 export class SetupApiError extends Error {
   status: number;
-  constructor(status: number, message: string) {
+  code?: string;
+  constructor(status: number, message: string, code?: string) {
     super(message);
     this.status = status;
+    this.code = code;
   }
 }
 
@@ -171,11 +178,13 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
   });
   if (!res.ok) {
     let msg = `${init?.method ?? 'GET'} ${path} → ${res.status}`;
+    let code: string | undefined;
     try {
       const body = await res.json();
       if (body?.error) msg = body.error;
+      if (typeof body?.code === 'string') code = body.code;
     } catch { /* non-JSON error body */ }
-    throw new SetupApiError(res.status, msg);
+    throw new SetupApiError(res.status, msg, code);
   }
   return res.json();
 }

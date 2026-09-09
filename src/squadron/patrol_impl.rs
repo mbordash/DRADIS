@@ -69,6 +69,13 @@ const EXCHANGE_NEG_RISK: Address = address!("0xe2222d279d744050d28e0052001052000
 const MAX_CANCEL_RETRIES: u32 = 5;
 const BASE_CANCEL_RETRY_DELAY_MS: u64 = 200;
 
+/// How often a single-market squadron asks the venue whether its market still
+/// accepts orders. Operational plumbing on the same footing as the deploy
+/// queue's poll — one small GET a minute per event squadron — rather than a
+/// trading parameter, so it stays a constant; the operator-facing choice is the
+/// retire grace that runs from the first "no".
+const EVENT_MARKET_STATUS_POLL_SECS: u64 = 60;
+
 /// How often a resting maker exit's on-chain balance is polled to detect that
 /// the ask was lifted. The patrol tick is 50ms; polling the chain at that rate
 /// would be absurd, and a few seconds of booking latency costs nothing because
@@ -336,6 +343,19 @@ impl Squadron {
         let mut retire_wait_logged_at = Instant::now()
             .checked_sub(Duration::from_secs(60))
             .unwrap_or_else(Instant::now);
+        // Venue-status probe state for a single-market squadron. The probe
+        // fires on its first tick (so a market that was over before the deploy
+        // is caught at once) and then once a minute.
+        let mut venue_status_probed_at = Instant::now()
+            .checked_sub(Duration::from_secs(EVENT_MARKET_STATUS_POLL_SECS))
+            .unwrap_or_else(Instant::now);
+        // The venue's latest answer; `None` until the first probe succeeds and
+        // again whenever one fails, so a stale "open" can never outrank the
+        // stated close time once the venue has stopped answering.
+        let mut venue_accepting_orders: Option<bool> = None;
+        // When the venue first said it was no longer accepting orders. Cleared
+        // if it starts accepting again — a paused market is not a closed one.
+        let mut venue_closed_since: Option<Instant> = None;
 
         // Squadron's hourly market fields
         let hourly_yes_token         = self.market.yes_token.clone();
@@ -893,12 +913,74 @@ impl Squadron {
                         };
                         let now = Utc::now();
                         let grace = dynamic_config.read().unwrap().event_market_retire_grace_secs;
-                        if event_market_retire_due(true, hourly_market_close_time, now, grace, holding) {
-                            let overdue = hourly_market_close_time
-                                .map_or(0, |c| (now - c).num_seconds());
+
+                        // ── Venue status probe ──────────────────────────────
+                        // The stated close time is not enough on its own.
+                        // Polymarket dates a sports market about a week after
+                        // the game, so the market stops accepting orders days
+                        // before the clock above would ever fire; and the book
+                        // does not reliably go dark either — a resolved match
+                        // keeps a residual 0.99 bid on the winner for hours.
+                        // Observed on the demo box 2026-09-08: a Challenger
+                        // tennis market (endDate 09-15) held the sports slot
+                        // for the rest of the day after the match, and its
+                        // replacement was already resolved when deployed. The
+                        // venue's own accepting_orders flag is the fact; ask
+                        // for it once a minute.
+                        if venue_status_probed_at.elapsed() >= Duration::from_secs(EVENT_MARKET_STATUS_POLL_SECS) {
+                            venue_status_probed_at = Instant::now();
+                            match crate::cag::adama::clob_market_status(&shared_http, &hourly_condition_id).await {
+                                Some(status) => {
+                                    // Announced once so the log shows the probe
+                                    // is running; afterwards only a change of
+                                    // answer prints.
+                                    if venue_accepting_orders.is_none() {
+                                        info!(
+                                            "📡 Squadron [{}] venue reports \"{}\" is {} — re-checking every {}s",
+                                            self.id, hourly_market_name, status.describe(), EVENT_MARKET_STATUS_POLL_SECS,
+                                        );
+                                    }
+                                    venue_accepting_orders = Some(status.accepting_orders);
+                                    if status.accepting_orders {
+                                        if venue_closed_since.take().is_some() {
+                                            info!(
+                                                "🏁 Squadron [{}] venue is accepting orders on \"{}\" again — retirement clock reset",
+                                                self.id, hourly_market_name,
+                                            );
+                                        }
+                                    } else if venue_closed_since.is_none() {
+                                        venue_closed_since = Some(Instant::now());
+                                        info!(
+                                            "🏁 Squadron [{}] venue reports \"{}\" no longer accepts orders ({}) — retiring in {}s once flat",
+                                            self.id, hourly_market_name, status.describe(), grace,
+                                        );
+                                    }
+                                }
+                                // Unanswered is not "closed", and it is not
+                                // "still open" either: forget the last answer
+                                // so the stated close regains its authority.
+                                None => venue_accepting_orders = None,
+                            }
+                        }
+                        let venue_closed_for = venue_closed_since.map(|t| t.elapsed().as_secs() as i64);
+
+                        if let Some(reason) = event_market_retire_reason(
+                            true, hourly_market_close_time, now, grace, holding,
+                            venue_accepting_orders, venue_closed_for,
+                        ) {
+                            let why = match reason {
+                                RetireReason::PastClose => format!(
+                                    "passed its stated close {}s ago",
+                                    hourly_market_close_time.map_or(0, |c| (now - c).num_seconds()),
+                                ),
+                                RetireReason::VenueClosed => format!(
+                                    "stopped accepting orders {}s ago",
+                                    venue_closed_for.unwrap_or(0),
+                                ),
+                            };
                             info!(
-                                "🏁 Squadron [{}] retiring: market \"{}\" closed {}s ago and the squadron is flat — the class is free for the next deploy",
-                                self.id, hourly_market_name, overdue,
+                                "🏁 Squadron [{}] retiring: market \"{}\" {} and the squadron is flat — the class is free for the next deploy",
+                                self.id, hourly_market_name, why,
                             );
                             // Flat means no POSITION; resting quotes are still
                             // orders, and they hold collateral until the venue
@@ -912,19 +994,37 @@ impl Squadron {
                             cag.update_state(&self.id, crate::squadron::SquadronState::StoodDown);
                             cag.remove(&self.id);
                             self.cancel_ws();
+                            // The dark-feed banner is keyed by asset; a retired
+                            // market must not be reported dark until the next
+                            // squadron for the class happens to overwrite it.
+                            crate::state::price_state::book_feed::forget(&asset_lc);
                             break;
                         }
-                        // Past its close but still holding: say so, throttled,
-                        // because from the outside this is indistinguishable from
-                        // the squadron simply being stuck.
+                        // Closed but still holding: say so, throttled, because
+                        // from the outside this is indistinguishable from the
+                        // squadron simply being stuck. Deliberately NOT a
+                        // stand-down. If the closure is a feed or venue hiccup
+                        // the exits below are the only thing that will close
+                        // the position when the book returns; if it is a real
+                        // resolution there is no book to exit into and the
+                        // venue settles the position, so keeping the squadron
+                        // costs only the class slot — never the exposure.
+                        let closed_by_venue = venue_closed_for.is_some_and(|s| s >= grace);
+                        let closed_by_clock = venue_accepting_orders != Some(true)
+                            && hourly_market_close_time.is_some_and(|c| (now - c).num_seconds() >= grace);
                         if holding
-                            && hourly_market_close_time.is_some_and(|c| (now - c).num_seconds() >= grace)
+                            && (closed_by_venue || closed_by_clock)
                             && retire_wait_logged_at.elapsed() >= Duration::from_secs(60)
                         {
+                            let open_count = {
+                                let map = positions.lock().await;
+                                map.keys().filter(|k| k.squadron == squadron_id).count()
+                            };
                             info!(
-                                "🕰️ Squadron [{}] market \"{}\" closed {}s ago — holding to exit its position before standing down",
+                                "🕰️ Squadron [{}] market \"{}\" is closed ({}) — holding {} open position(s), staying up to exit or be settled before standing down",
                                 self.id, hourly_market_name,
-                                hourly_market_close_time.map_or(0, |c| (now - c).num_seconds()),
+                                if closed_by_venue { "venue no longer accepts orders" } else { "past its stated close" },
+                                open_count,
                             );
                             retire_wait_logged_at = Instant::now();
                         }
@@ -3050,6 +3150,56 @@ pub(crate) fn event_market_retire_due(
     }
 }
 
+/// Why a single-market squadron is standing itself down.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RetireReason {
+    /// The market's stated close time plus the grace has passed, and the venue
+    /// has not said the market is still open.
+    PastClose,
+    /// The venue has reported the market not accepting orders for at least the
+    /// grace.
+    VenueClosed,
+}
+
+/// Should a single-market squadron stand itself down, and why?
+///
+/// Layered over `event_market_retire_due` rather than replacing it: that rule
+/// (stated close + grace, never while holding) still stands, and its tests
+/// still hold. What this adds is the venue's word, which wins in both
+/// directions — it retires a market whose stated close is days away but which
+/// the venue has stopped trading, and it keeps a market whose stated close has
+/// passed but which the venue still trades. Polymarket produces both: sports
+/// markets are dated a week after the game, and an in-progress game can run
+/// past its stated close.
+///
+/// `venue_accepting_orders` is the venue's latest answer, `None` when there is
+/// none — in which case the stated close is trusted exactly as before, so a
+/// venue that stops answering cannot pin a squadron up forever.
+/// `venue_closed_for_secs` is how long the venue has continuously said "no".
+pub(crate) fn event_market_retire_reason(
+    single_market: bool,
+    close_time: Option<chrono::DateTime<Utc>>,
+    now: chrono::DateTime<Utc>,
+    grace_secs: i64,
+    holding_position: bool,
+    venue_accepting_orders: Option<bool>,
+    venue_closed_for_secs: Option<i64>,
+) -> Option<RetireReason> {
+    if !single_market || holding_position {
+        return None;
+    }
+    if venue_closed_for_secs.is_some_and(|s| s >= grace_secs) {
+        return Some(RetireReason::VenueClosed);
+    }
+    if venue_accepting_orders == Some(true) {
+        return None;
+    }
+    if event_market_retire_due(true, close_time, now, grace_secs, false) {
+        return Some(RetireReason::PastClose);
+    }
+    None
+}
+
 /// May this squadron's own market serve as its maker (window/daily) venue?
 ///
 /// True only when the squadron was deployed onto one market to begin with. The
@@ -3145,6 +3295,94 @@ mod event_market_retire_tests {
     fn zero_grace_retires_at_the_close() {
         let (close, now) = at(0);
         assert!(event_market_retire_due(true, Some(close), now, 0, false));
+    }
+
+    // ── The venue's word ────────────────────────────────────────────────────
+
+    /// The bug this exists for: a tennis market dated a week out whose venue
+    /// stopped trading it hours ago. The stated close would keep the squadron
+    /// up for the rest of the week.
+    #[test]
+    fn venue_closure_retires_a_market_whose_stated_close_is_days_away() {
+        let close = Utc::now() + chrono::Duration::days(7);
+        assert_eq!(
+            event_market_retire_reason(true, Some(close), Utc::now(), 300, false, Some(false), Some(300)),
+            Some(RetireReason::VenueClosed),
+        );
+    }
+
+    /// The grace applies to the venue's "no" too: a paused market is not a
+    /// closed one until it has stayed closed.
+    #[test]
+    fn venue_closure_waits_out_the_grace() {
+        let close = Utc::now() + chrono::Duration::days(7);
+        assert_eq!(
+            event_market_retire_reason(true, Some(close), Utc::now(), 300, false, Some(false), Some(299)),
+            None,
+        );
+    }
+
+    /// The other direction: a game running past its stated close on a market
+    /// the venue still trades must not be stood down.
+    #[test]
+    fn a_venue_still_accepting_orders_overrides_a_passed_close() {
+        let (close, now) = at(86_400);
+        assert_eq!(
+            event_market_retire_reason(true, Some(close), now, 300, false, Some(true), None),
+            None,
+        );
+    }
+
+    /// No answer from the venue leaves the stated close in charge, exactly as
+    /// before the probe existed. A venue that stops answering must not be able
+    /// to pin a squadron up forever.
+    #[test]
+    fn an_unanswered_venue_leaves_the_stated_close_in_charge() {
+        let (close, now) = at(300);
+        assert_eq!(
+            event_market_retire_reason(true, Some(close), now, 300, false, None, None),
+            Some(RetireReason::PastClose),
+        );
+    }
+
+    /// A market with no stated close AND no venue answer never retires — the
+    /// existing rule, unchanged.
+    #[test]
+    fn nothing_to_measure_against_never_retires() {
+        assert_eq!(
+            event_market_retire_reason(true, None, Utc::now(), 300, false, None, None),
+            None,
+        );
+    }
+
+    /// A venue closure on a market with no stated close does retire it: the
+    /// venue's word is a measurement where the date was not.
+    #[test]
+    fn venue_closure_retires_a_market_with_no_stated_close() {
+        assert_eq!(
+            event_market_retire_reason(true, None, Utc::now(), 300, false, Some(false), Some(300)),
+            Some(RetireReason::VenueClosed),
+        );
+    }
+
+    /// Holding a position vetoes both reasons. Standing down on top of a
+    /// position strands it with nothing left to evaluate its exit.
+    #[test]
+    fn holding_a_position_vetoes_the_venue_closure_too() {
+        let (close, now) = at(86_400);
+        assert_eq!(
+            event_market_retire_reason(true, Some(close), now, 300, true, Some(false), Some(86_400)),
+            None,
+        );
+    }
+
+    /// A crypto squadron never reaches either reason.
+    #[test]
+    fn a_split_venue_squadron_ignores_the_venue_closure() {
+        assert_eq!(
+            event_market_retire_reason(false, None, Utc::now(), 300, false, Some(false), Some(86_400)),
+            None,
+        );
     }
 
     #[test]

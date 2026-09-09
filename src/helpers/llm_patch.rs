@@ -71,6 +71,24 @@ pub struct RawProposal {
     /// Short rationale (surfaced in the approval UI / audit log).
     #[serde(default)]
     pub reason: String,
+    /// The refusal-ledger entry this change is meant to unblock, or "tighten"
+    /// for a change that reduces risk. Required by the system prompt so a
+    /// proposal has to name the refusal it targets rather than a trade count;
+    /// folded into `reason` on validation so the audit trail and the approval
+    /// card carry it without a schema change.
+    #[serde(default)]
+    pub unblocks: String,
+}
+
+/// The rationale as recorded: the targeted refusal ahead of the model's own
+/// reason, so the operator approving it sees what it claims to unblock.
+fn recorded_reason(p: &RawProposal) -> String {
+    let unblocks = p.unblocks.trim();
+    if unblocks.is_empty() {
+        p.reason.clone()
+    } else {
+        format!("[targets: {unblocks}] {}", p.reason)
+    }
 }
 
 /// A proposal that survived validation and is ready for the policy engine.
@@ -361,13 +379,14 @@ pub fn validate_proposals(raw: Vec<RawProposal>, current: &DynamicConfig) -> Pro
                     continue;
                 }
                 let delta_pct = numeric_delta_pct(&from, &to);
+                let reason = recorded_reason(&p);
                 batch.accepted.push(ValidatedChange {
                     key: field.key.to_string(),
                     from,
                     to,
                     clamped,
                     delta_pct,
-                    reason: p.reason,
+                    reason,
                 });
             }
             Err(why) => batch.rejected.push(RejectedProposal { field: p.field, to: p.to, why }),
@@ -515,6 +534,29 @@ fn numeric_delta_pct(from: &Value, to: &Value) -> Option<f64> {
 // ── Tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+mod unblocks_tests {
+    use super::*;
+
+    /// The system prompt requires every proposal to name the ledger entry it
+    /// targets. That claim must survive into the recorded reason, where the
+    /// operator approving the change can see it, and a block without it must
+    /// still parse: older prompts and weaker models omit fields.
+    #[test]
+    fn the_targeted_refusal_is_folded_into_the_recorded_reason() {
+        let raw = parse_proposals(
+            r#"{"proposals":[
+                {"field":"maker_quote_size_usdc","to":6,"unblocks":"tighten","reason":"exit fee scales with size"},
+                {"field":"momentum_stop_loss_pct","to":0.08,"reason":"no unblocks field at all"}
+            ]}"#,
+        ).expect("parses");
+        assert_eq!(raw[0].unblocks, "tighten");
+        assert_eq!(raw[1].unblocks, "");
+        assert_eq!(recorded_reason(&raw[0]), "[targets: tighten] exit fee scales with size");
+        assert_eq!(recorded_reason(&raw[1]), "no unblocks field at all");
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -524,7 +566,7 @@ mod tests {
 
     fn propose(field: &str, to: serde_json::Value) -> ProposalBatch {
         validate_proposals(
-            vec![RawProposal { field: field.into(), to, reason: "t".into() }],
+            vec![RawProposal { field: field.into(), to, reason: "t".into(), unblocks: String::new() }],
             &cfg(),
         )
     }
@@ -622,6 +664,7 @@ mod tests {
             field: "definitely_not_a_field".into(),
             to: serde_json::json!(1.0),
             reason: String::new(),
+            unblocks: String::new(),
         }];
         let batch = validate_proposals(raw, &cfg());
         assert!(batch.accepted.is_empty());
@@ -636,6 +679,7 @@ mod tests {
             field: "maker_min_entry".into(),
             to: serde_json::json!(0.01),
             reason: String::new(),
+            unblocks: String::new(),
         }];
         let batch = validate_proposals(raw, &cfg());
         assert_eq!(batch.rejected.len(), 1);
@@ -656,6 +700,7 @@ mod tests {
             field: "maker_min_entry_price".into(),
             to: serde_json::json!(0.01),
             reason: String::new(),
+            unblocks: String::new(),
         }];
         let batch = validate_proposals(raw, &cfg());
         assert_eq!(batch.accepted.len(), 0);
@@ -674,6 +719,7 @@ mod tests {
             field: "arbitrage_profit_threshold".into(),
             to: serde_json::json!(0.9), // above max → clamp to 0.5
             reason: "test".into(),
+            unblocks: String::new(),
         }];
         let batch = validate_proposals(raw, &cfg());
         assert_eq!(batch.accepted.len(), 1, "rejected: {:?}", batch.rejected);
@@ -691,7 +737,7 @@ mod tests {
         let d = cfg();
         let flip = !d.obi_use_whole_book;
         for to in [serde_json::json!(flip), serde_json::json!(flip.to_string())] {
-            let raw = vec![RawProposal { field: "obi_use_whole_book".into(), to, reason: String::new() }];
+            let raw = vec![RawProposal { field: "obi_use_whole_book".into(), to, reason: String::new(), unblocks: String::new() }];
             let batch = validate_proposals(raw, &d);
             assert_eq!(batch.accepted.len(), 1);
             assert_eq!(batch.accepted[0].to, serde_json::json!(flip));
@@ -706,6 +752,7 @@ mod tests {
             field: "obi_use_whole_book".into(),
             to: serde_json::json!(d.obi_use_whole_book),
             reason: String::new(),
+            unblocks: String::new(),
         }];
         let batch = validate_proposals(raw, &d);
         assert!(batch.accepted.is_empty());
@@ -719,6 +766,7 @@ mod tests {
                 field: "arbitrage_profit_threshold".into(),
                 to: serde_json::json!(0.02),
                 reason: String::new(),
+                unblocks: String::new(),
             })
             .collect();
         let batch = validate_proposals(raw, &cfg());
@@ -733,6 +781,7 @@ mod tests {
             field: "arbitrage_profit_threshold".into(),
             to: serde_json::json!(0.02),
             reason: String::new(),
+            unblocks: String::new(),
         }];
         let batch = validate_proposals(raw, &d);
         let patch = batch.patch_json();
@@ -763,6 +812,7 @@ mod tests {
                     field: "momentum_stop_loss_pct".into(),
                     to: serde_json::json!("8%"),
                     reason: String::new(),
+                    unblocks: String::new(),
                 }];
                 let batch = validate_proposals(raw, &cfg());
                 if let Some(c) = batch.accepted.first() {

@@ -96,12 +96,21 @@ pub trait DeploymentRunner: Send + Sync + 'static {
         cancel: CancellationToken,
     ) -> anyhow::Result<()>;
 
-    /// Highest-volume open market in `class` within `max_days_to_close`, or
-    /// `None` when the venue has nothing suitable open right now.
+    /// Highest-volume open market in `class` within `max_days_to_close` and
+    /// with at least `min_liquidity_usd` of 24h volume, or `None` when the
+    /// venue has nothing suitable open right now.
     ///
     /// `None` is not an error: an out-of-season sport or a quiet politics
-    /// calendar is ordinary, and the seeder simply tries again next tick.
-    async fn select_market(&self, class: &str, max_days_to_close: u32) -> Option<String>;
+    /// calendar is ordinary, and the seeder simply tries again next tick. The
+    /// volume floor is what makes a thin slate produce `None` rather than the
+    /// least-dead market on it — a venue that reports no volume at all
+    /// (Polymarket US) treats 0 as "not reported" and ignores the floor.
+    async fn select_market(
+        &self,
+        class: &str,
+        max_days_to_close: u32,
+        min_liquidity_usd: f64,
+    ) -> Option<String>;
 }
 
 
@@ -297,10 +306,16 @@ async fn seed_auto_deployments<R: DeploymentRunner + ?Sized>(runner: &R, cag: &C
             continue;
         }
 
-        let Some(market_id) = runner.select_market(class, cfg.deploy_max_days_to_close).await else {
+        // Decimal in the config so it edits like every other dollar knob; f64
+        // here because that is what every venue's volume figure is.
+        let floor = f64::try_from(cfg.deploy_min_liquidity_usd).unwrap_or(0.0).max(0.0);
+        let Some(market_id) = runner.select_market(class, cfg.deploy_max_days_to_close, floor).await else {
             // Nothing suitable open right now (out-of-season sports, a quiet
-            // politics calendar). Not an error — the next tick tries again.
-            debug!("📋 Auto-deploy: no {class} market available yet");
+            // politics calendar, or nothing above the volume floor). Not an
+            // error — the next tick tries again. Idle is the intended answer
+            // to a thin slate; the alternative is a squadron on a market with
+            // no book, which looks busier and does nothing.
+            debug!("📋 Auto-deploy: no {class} market available yet (volume floor ${floor:.0})");
             continue;
         };
 

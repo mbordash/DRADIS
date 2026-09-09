@@ -784,12 +784,32 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              itself down, in seconds. Standing down is what frees the class: DRADIS runs one \
              squadron per class and the auto-deploy seeder skips a class while a squadron for it \
              is still live, so a squadron that lingers on a resolved market blocks every fresh \
-             market behind it. The delay exists because the close time is the venue's, not \
-             yours, and a market can still print a late trade around it.\n\n\
+             market behind it.\n\n\
+             \"Closes\" means either of two things, and the venue's word wins. The market's stated \
+             close time is one; the venue no longer accepting orders on it is the other, and \
+             DRADIS asks the venue every minute. That second check is what actually retires a \
+             sports squadron: Polymarket dates a match market a week after the game, so the \
+             book is gone days before the stated close. A stated close that has passed on a \
+             market the venue still accepts orders on does not retire anything. The delay exists \
+             because a closure can be a pause — a delayed game, a brief hold — and a market can \
+             still print a late trade around its close.\n\n\
              A squadron still holding a position ignores this entirely — it keeps patrolling so \
              its exits keep evaluating, and retires once it is flat. Crypto squadrons never reach \
              this path; this venue's own loop rotates them onto the next market instead.")
             .range(0.0, 86_400.0).step(30.0).unit("s"));
+        v.push(F::new(g, e, "deploy_min_liquidity_usd", "Auto-Deploy Volume Floor", "usd", false,
+            "Smallest 24-hour trading volume, in dollars, that an auto-deployed squadron may be \
+             placed on. The seeder picks the busiest open market in its class; below this floor it \
+             picks nothing and tries again on the next pass. That is deliberate: on a thin slate — \
+             sports in the small hours, a quiet politics week — the busiest market can be one with \
+             almost no book, and a squadron parked there quotes into nothing while looking busy. An \
+             empty class slot is honest and refills on its own; a squadron on a dead market holds \
+             the slot against every live market behind it.\n\n\
+             The default matches the floor the Deploy browser applies, so the seeder chooses from \
+             the same list you see. Raise it to make the seeder pickier and idle more often; lower \
+             it if a class you care about is routinely left empty. Markets you deploy by hand are \
+             not affected. On Polymarket US, which reports no volume, this has no effect.")
+            .range(0.0, 1_000_000.0).step(100.0).unit("USD"));
         v.push(F::new(g, e, "position_quote_ttl_secs", "Position Quote Freshness", "secs", true,
             "How long a live price quote for an open position is reused before the venue is asked \
              again. This is what the Trade Log shows you when you are deciding whether to close a \
@@ -914,6 +934,7 @@ mod tests {
             "maker_maturation_max_fraction",
             "auto_deploy_politics",
             "auto_deploy_sports",
+            "deploy_min_liquidity_usd",
         ] {
             assert!(keys.contains(&key), "`{key}` is not exposed in the Control Tower");
         }

@@ -69,6 +69,23 @@ pub const IDLE_NO_MARKET: &str = "waiting for a tradeable market";
 /// because the Control Tower's health ribbon keys "active" off this exact string.
 pub const DISABLED_IN_CONFIG: &str = "disabled in config";
 
+/// Distinct refusal kinds tracked per viper before the rest are lumped into
+/// `other`. Reasons are normalized before keying (see [`normalize_reason`]), so
+/// a viper produces a few dozen kinds at most; the cap only guards against a
+/// gate that interpolates something the normalizer does not recognize.
+const MAX_REFUSAL_KINDS: usize = 32;
+
+/// One refusal kind's running tally.
+#[derive(Debug, Clone)]
+struct RefusalCounter {
+    /// Ticks refused for this reason since the process started.
+    total: u64,
+    /// Ticks refused since the ledger was last taken by the LLM Advisor.
+    since_report: u64,
+    /// The most recent verbatim reason, live numbers included.
+    last_detail: String,
+}
+
 #[derive(Debug, Clone)]
 struct ViperStatus {
     last_eval_at: DateTime<Utc>,
@@ -79,6 +96,99 @@ struct ViperStatus {
     last_reason_at: Option<DateTime<Utc>>,
     /// Last time this viper produced an actionable entry signal.
     last_signal_at: Option<DateTime<Utc>>,
+    /// Refusal ledger: how many ticks each named gate has vetoed this viper,
+    /// keyed by the reason with its live numbers normalized out.
+    ///
+    /// `last_reason` answers "what is holding it right now?"; this answers
+    /// "what has been holding it, and how often?" — the question the LLM
+    /// Advisor needs. Before this existed the advisor was shown executed
+    /// trades and knob values only, and from that input the one inference
+    /// available was "loosen something": on 2026-08-31 every one of 24 queued
+    /// proposals loosened a gate while the engine had logged ~1,100 refusals
+    /// with precise causes that never reached the model.
+    refusals: HashMap<String, RefusalCounter>,
+    /// When `since_report` counters were last zeroed; the advisor prints the
+    /// window so the counts have a denominator.
+    refusal_window_started_at: DateTime<Utc>,
+}
+
+impl ViperStatus {
+    fn fresh(now: DateTime<Utc>, outcome: EvalOutcome) -> Self {
+        Self {
+            last_eval_at: now,
+            last_outcome: outcome,
+            last_reason: None,
+            last_reason_at: None,
+            last_signal_at: None,
+            refusals: HashMap::new(),
+            refusal_window_started_at: now,
+        }
+    }
+
+    fn bump_refusal(&mut self, reason: &str) {
+        // A switched-off viper is not being refused by a gate; its config
+        // section already tells the advisor it is off.
+        if reason == DISABLED_IN_CONFIG {
+            return;
+        }
+        let kind = normalize_reason(reason);
+        let key = if self.refusals.contains_key(&kind) || self.refusals.len() < MAX_REFUSAL_KINDS {
+            kind
+        } else {
+            "other".to_string()
+        };
+        let c = self.refusals.entry(key).or_insert_with(|| RefusalCounter {
+            total: 0,
+            since_report: 0,
+            last_detail: String::new(),
+        });
+        c.total += 1;
+        c.since_report += 1;
+        if c.last_detail != reason {
+            c.last_detail = reason.to_string();
+        }
+    }
+}
+
+/// Collapse the live numbers out of a gate's reason so ticks that differ only
+/// in the quoted values count as one kind.
+///
+/// Every maximal run of `0-9 . , + - $` that contains a digit becomes `#`, so
+/// a currency sign, a sign and the digits collapse together. So
+/// `spread 0.0100 below fee floor 0.0247 — unquotable at any min_spread`
+/// becomes `spread # below fee floor # — unquotable at any min_spread`, and
+/// `net_exposure $12.50 > max $10.00` becomes `net_exposure # > max #`. Words
+/// containing digits (`velocity_5s`, `0.50`) are left alone only when the digit
+/// run is glued to letters on both sides — `drift_60m` keeps its name.
+pub fn normalize_reason(reason: &str) -> String {
+    let chars: Vec<char> = reason.chars().collect();
+    let mut out = String::with_capacity(reason.len());
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        let numeric = |ch: char| ch.is_ascii_digit() || matches!(ch, '.' | ',' | '+' | '-' | '$');
+        if numeric(c) {
+            let start = i;
+            let mut j = i;
+            while j < chars.len() && numeric(chars[j]) {
+                j += 1;
+            }
+            let run: String = chars[start..j].iter().collect();
+            let has_digit = run.chars().any(|ch| ch.is_ascii_digit());
+            let glued_before = start > 0 && (chars[start - 1].is_ascii_alphabetic() || chars[start - 1] == '_');
+            let glued_after = j < chars.len() && chars[j].is_ascii_alphabetic() && glued_before;
+            if has_digit && !glued_after {
+                out.push('#');
+            } else {
+                out.push_str(&run);
+            }
+            i = j;
+        } else {
+            out.push(c);
+            i += 1;
+        }
+    }
+    out
 }
 
 /// Registry key: (asset/squadron e.g. "btc", strategy name). Vipers are owned
@@ -125,13 +235,7 @@ pub fn record_eval(asset: &str, strategy: &str, outcome: EvalOutcome) {
         Ok(m) => m,
         Err(p) => p.into_inner(),
     };
-    let entry = map.entry(key(asset, strategy)).or_insert_with(|| ViperStatus {
-        last_eval_at: now,
-        last_outcome: outcome,
-        last_reason: None,
-        last_reason_at: None,
-        last_signal_at: None,
-    });
+    let entry = map.entry(key(asset, strategy)).or_insert_with(|| ViperStatus::fresh(now, outcome));
     entry.last_eval_at = now;
     entry.last_outcome = outcome;
     if outcome == EvalOutcome::Signal {
@@ -164,13 +268,7 @@ pub fn record_idle(asset: &str, strategy: &str, reason: &str) {
         Ok(m) => m,
         Err(p) => p.into_inner(),
     };
-    let entry = map.entry(key(asset, strategy)).or_insert_with(|| ViperStatus {
-        last_eval_at: now,
-        last_outcome: EvalOutcome::Idle,
-        last_reason: None,
-        last_reason_at: None,
-        last_signal_at: None,
-    });
+    let entry = map.entry(key(asset, strategy)).or_insert_with(|| ViperStatus::fresh(now, EvalOutcome::Idle));
     entry.last_eval_at = now;
     let already_idle = entry.last_outcome == EvalOutcome::Idle
         && entry.last_reason.as_deref() == Some(reason);
@@ -182,22 +280,54 @@ pub fn record_idle(asset: &str, strategy: &str, reason: &str) {
 }
 
 /// Report the named gate that vetoed the current entry attempt.
-/// Called from inside instrumented vipers' entry gates; cheap overwrite.
+/// Called from inside instrumented vipers' entry gates; cheap overwrite of
+/// the displayed reason, plus one tick on that reason's ledger entry.
 pub fn report_reason(asset: &str, strategy: &str, reason: &str) {
     let now = Utc::now();
     let mut map = match registry().lock() {
         Ok(m) => m,
         Err(p) => p.into_inner(),
     };
-    let entry = map.entry(key(asset, strategy)).or_insert_with(|| ViperStatus {
-        last_eval_at: now,
-        last_outcome: EvalOutcome::NoSignal,
-        last_reason: None,
-        last_reason_at: None,
-        last_signal_at: None,
-    });
+    let entry = map.entry(key(asset, strategy)).or_insert_with(|| ViperStatus::fresh(now, EvalOutcome::NoSignal));
     entry.last_reason = Some(reason.to_string());
     entry.last_reason_at = Some(now);
+    entry.bump_refusal(reason);
+}
+
+/// Report a refusal that has one displayed reason but several countable
+/// causes.
+///
+/// The Maker quotes two legs and, when neither qualifies, reports a single
+/// composite line — `no side qualifies | YES: <a> | NO: <b>` — which is the
+/// right thing to display and the wrong thing to count: the advisor needs to
+/// know that the YES leg was unquotable under the fee floor 584 times and the
+/// NO leg had no seller 691 times, not that "no side qualifies" happened 700
+/// times. `composite` becomes `last_reason`; each of `legs` gets a ledger tick.
+pub fn report_leg_refusals(asset: &str, strategy: &str, composite: &str, legs: &[&str]) {
+    let now = Utc::now();
+    let mut map = match registry().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    let entry = map.entry(key(asset, strategy)).or_insert_with(|| ViperStatus::fresh(now, EvalOutcome::NoSignal));
+    entry.last_reason = Some(composite.to_string());
+    entry.last_reason_at = Some(now);
+    for leg in legs {
+        entry.bump_refusal(leg);
+    }
+}
+
+/// One refusal kind's tally, as served to the Control Tower and the advisor.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct RefusalTally {
+    /// The reason with live numbers replaced by `#` — see [`normalize_reason`].
+    pub reason: String,
+    /// Ticks refused for this reason since the process started.
+    pub count: u64,
+    /// Ticks refused for this reason since the advisor last took the ledger.
+    pub count_since_report: u64,
+    /// The most recent verbatim reason, live numbers included.
+    pub last_detail: String,
 }
 
 /// One viper's status row as served by `GET /api/vipers/status`.
@@ -213,6 +343,94 @@ pub struct ViperStatusView {
     pub last_reason_secs_ago: Option<i64>,
     pub last_signal_at: Option<String>,
     pub last_signal_secs_ago: Option<i64>,
+    /// The refusal ledger, most frequent first, capped at
+    /// `VIEW_REFUSAL_KINDS` entries.
+    pub refusals: Vec<RefusalTally>,
+}
+
+/// How many ledger entries a status row carries. The Control Tower shows the
+/// top few; the advisor takes its own, fuller report.
+const VIEW_REFUSAL_KINDS: usize = 5;
+
+fn tallies(st: &ViperStatus, by_window: bool, limit: usize) -> Vec<RefusalTally> {
+    let mut v: Vec<RefusalTally> = st.refusals.iter()
+        .map(|(reason, c)| RefusalTally {
+            reason: reason.clone(),
+            count: c.total,
+            count_since_report: c.since_report,
+            last_detail: c.last_detail.clone(),
+        })
+        .collect();
+    // Ties broken by reason text so the order is stable between calls.
+    v.sort_by(|a, b| {
+        let (ka, kb) = if by_window {
+            (a.count_since_report, b.count_since_report)
+        } else {
+            (a.count, b.count)
+        };
+        kb.cmp(&ka).then_with(|| a.reason.cmp(&b.reason))
+    });
+    v.truncate(limit);
+    v
+}
+
+/// One viper's refusal ledger over the window since the advisor last took it.
+#[derive(Debug, Clone, Serialize)]
+pub struct ViperRefusalReport {
+    pub asset: String,
+    pub strategy: String,
+    /// Seconds the `since_report` counters have been accumulating.
+    pub window_secs: i64,
+    /// Refused ticks in the window, all reasons.
+    pub ticks: u64,
+    /// Most frequent first, by the window count.
+    pub reasons: Vec<RefusalTally>,
+    /// The viper's current displayed reason, so the report can say what is
+    /// holding it right now as well as what has been.
+    pub last_reason: Option<String>,
+}
+
+/// Distinct reasons carried per viper in an advisor report. Enough to show
+/// the shape of the refusals without pasting the whole ledger into a prompt
+/// that a 3B-parameter local model has to read.
+pub const REPORT_REFUSAL_KINDS: usize = 3;
+
+/// The refusal ledger for one asset's vipers, ranked by the window counts.
+///
+/// `take` zeroes the window counters and restarts the window, so the next
+/// report covers only what happened after this one. The advisor peeks first
+/// (to decide whether anything changed) and takes only when it actually
+/// spends a provider call, so a skipped cycle lets the window keep growing
+/// rather than losing its counts.
+pub fn refusal_report(asset: &str, take: bool) -> Vec<ViperRefusalReport> {
+    let now = Utc::now();
+    let asset = asset.to_lowercase();
+    let mut map = match registry().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    let mut out: Vec<ViperRefusalReport> = map.iter_mut()
+        .filter(|((a, _), _)| *a == asset)
+        .map(|((a, name), st)| {
+            let report = ViperRefusalReport {
+                asset: a.clone(),
+                strategy: name.clone(),
+                window_secs: (now - st.refusal_window_started_at).num_seconds(),
+                ticks: st.refusals.values().map(|c| c.since_report).sum(),
+                reasons: tallies(st, true, REPORT_REFUSAL_KINDS),
+                last_reason: st.last_reason.clone(),
+            };
+            if take {
+                for c in st.refusals.values_mut() {
+                    c.since_report = 0;
+                }
+                st.refusal_window_started_at = now;
+            }
+            report
+        })
+        .collect();
+    out.sort_by(|a, b| a.strategy.cmp(&b.strategy));
+    out
 }
 
 /// Snapshot of vipers seen since startup, sorted by (asset, strategy).
@@ -236,6 +454,7 @@ pub fn snapshot(asset_filter: Option<&str>) -> Vec<ViperStatusView> {
         last_reason_secs_ago: st.last_reason_at.map(|t| (now - t).num_seconds()),
         last_signal_at: st.last_signal_at.map(|t| t.to_rfc3339()),
         last_signal_secs_ago: st.last_signal_at.map(|t| (now - t).num_seconds()),
+        refusals: tallies(st, false, VIEW_REFUSAL_KINDS),
     }).collect();
     rows.sort_by(|a, b| (a.asset.as_str(), a.strategy.as_str()).cmp(&(b.asset.as_str(), b.strategy.as_str())));
     rows
@@ -421,5 +640,139 @@ mod forget_tests {
         assert_eq!(snapshot(Some("forgettest-case-eth")).len(), 1);
         forget("FORGETTEST-CASE-ETH");
         assert_eq!(snapshot(Some("forgettest-case-eth")).len(), 0);
+    }
+}
+
+#[cfg(test)]
+mod refusal_ledger_tests {
+    use super::*;
+
+    /// The Maker's fee-floor line carries two live prices that change every
+    /// tick. If they were part of the key, every tick would be its own kind and
+    /// the ledger would be a log, not a tally.
+    #[test]
+    fn live_numbers_are_normalized_out_of_the_reason() {
+        assert_eq!(
+            normalize_reason("spread 0.0100 below fee floor 0.0247 — unquotable at any min_spread"),
+            "spread # below fee floor # — unquotable at any min_spread",
+        );
+        assert_eq!(normalize_reason("market_age 12s < min 600s"), "market_age #s < min #s");
+        assert_eq!(normalize_reason("net_exposure $12.50 > max $10.00"), "net_exposure # > max #");
+        assert_eq!(normalize_reason("cooldown active (37s left)"), "cooldown active (#s left)");
+        assert_eq!(
+            normalize_reason("oracle too flat (hist_vol=0.0004 < min=0.0010)"),
+            "oracle too flat (hist_vol=# < min=#)",
+        );
+        assert_eq!(
+            normalize_reason("adverse OBI (yes_obi=-0.72 < -0.60)"),
+            "adverse OBI (yes_obi=# < #)",
+        );
+    }
+
+    /// Names that happen to contain digits are identity, not measurement.
+    #[test]
+    fn digits_inside_identifiers_survive_normalization() {
+        assert_eq!(
+            normalize_reason("counter-trend (drift_60m=$-1234 < -$500)"),
+            "counter-trend (drift_60m=# < #)",
+        );
+        assert_eq!(normalize_reason("10m/60m drift disagree (counter-trend)"), "#m/#m drift disagree (counter-trend)");
+        assert_eq!(normalize_reason("no seller on this leg"), "no seller on this leg");
+    }
+
+    /// Ticks that differ only in their numbers accumulate under one kind, and
+    /// the latest verbatim line is kept as the example.
+    #[test]
+    fn repeated_refusals_tally_under_one_kind() {
+        let a = "ledgertest-a";
+        report_reason(a, "MakerStrategy", "spread 0.0100 below fee floor 0.0247 — unquotable at any min_spread");
+        report_reason(a, "MakerStrategy", "spread 0.0090 below fee floor 0.0251 — unquotable at any min_spread");
+        report_reason(a, "MakerStrategy", "no seller on this leg");
+        let snap = snapshot(Some(a));
+        let row = snap.iter().find(|r| r.strategy == "MakerStrategy").unwrap();
+        assert_eq!(row.refusals.len(), 2);
+        let fee = &row.refusals[0];
+        assert_eq!(fee.reason, "spread # below fee floor # — unquotable at any min_spread");
+        assert_eq!(fee.count, 2);
+        assert_eq!(fee.last_detail, "spread 0.0090 below fee floor 0.0251 — unquotable at any min_spread");
+        assert_eq!(row.refusals[1].reason, "no seller on this leg");
+        assert_eq!(row.refusals[1].count, 1);
+        forget(a);
+    }
+
+    /// The Maker's composite "no side qualifies" line is what the operator
+    /// sees; the legs are what gets counted.
+    #[test]
+    fn leg_refusals_display_the_composite_and_count_each_leg() {
+        let a = "ledgertest-legs";
+        for _ in 0..3 {
+            report_leg_refusals(
+                a, "MakerStrategy",
+                "no side qualifies | YES: spread 0.010 below fee floor 0.025 — unquotable at any min_spread | NO: no seller on this leg",
+                &["spread 0.010 below fee floor 0.025 — unquotable at any min_spread", "no seller on this leg"],
+            );
+        }
+        let snap = snapshot(Some(a));
+        let row = snap.iter().find(|r| r.strategy == "MakerStrategy").unwrap();
+        assert!(row.last_reason.as_deref().unwrap().starts_with("no side qualifies"));
+        assert!(row.refusals.iter().all(|t| !t.reason.starts_with("no side qualifies")),
+            "the composite must not be tallied as a kind of its own");
+        assert_eq!(row.refusals.iter().map(|t| t.count).sum::<u64>(), 6);
+        forget(a);
+    }
+
+    /// The advisor's report covers the window since it last took the ledger:
+    /// a take zeroes the window counts, leaves the lifetime counts alone, and
+    /// a peek changes nothing.
+    #[test]
+    fn taking_the_report_resets_the_window_but_not_the_lifetime_counts() {
+        let a = "ledgertest-window";
+        for _ in 0..5 {
+            report_reason(a, "GboostStrategy", "oracle too flat (hist_vol=0.0004 < min=0.0010)");
+        }
+        let peek = refusal_report(a, false);
+        assert_eq!(peek.len(), 1);
+        assert_eq!(peek[0].ticks, 5);
+        assert_eq!(peek[0].reasons[0].count_since_report, 5);
+
+        let taken = refusal_report(a, true);
+        assert_eq!(taken[0].ticks, 5, "the take itself must still report the window it closes");
+
+        report_reason(a, "GboostStrategy", "oracle too flat (hist_vol=0.0003 < min=0.0010)");
+        let next = refusal_report(a, false);
+        assert_eq!(next[0].ticks, 1, "only ticks after the take belong to the new window");
+        assert_eq!(next[0].reasons[0].count_since_report, 1);
+        assert_eq!(next[0].reasons[0].count, 6, "lifetime count is untouched by a take");
+        assert_eq!(next[0].last_reason.as_deref(), Some("oracle too flat (hist_vol=0.0003 < min=0.0010)"));
+        forget(a);
+    }
+
+    /// "Disabled in config" is the operator's choice, not a gate refusing;
+    /// counting it would tell the advisor a switched-off viper is being blocked.
+    #[test]
+    fn a_disabled_viper_is_not_a_refusal() {
+        let a = "ledgertest-disabled";
+        report_reason(a, "BasisStrategy", DISABLED_IN_CONFIG);
+        let report = refusal_report(a, false);
+        assert_eq!(report[0].ticks, 0);
+        assert!(report[0].reasons.is_empty());
+        forget(a);
+    }
+
+    /// A gate that interpolates something the normalizer does not fold must
+    /// not grow the ledger without bound.
+    #[test]
+    fn the_ledger_is_bounded() {
+        let a = "ledgertest-bound";
+        for i in 0..(MAX_REFUSAL_KINDS + 10) {
+            report_reason(a, "MomentumStrategy", &format!("reason variant {}", char::from(b'a' + (i % 26) as u8).to_string().repeat(i + 1)));
+        }
+        let map = registry().lock().unwrap();
+        let st = map.get(&key(a, "MomentumStrategy")).unwrap();
+        assert!(st.refusals.len() <= MAX_REFUSAL_KINDS + 1, "at most the cap plus the 'other' bucket");
+        assert_eq!(st.refusals.values().map(|c| c.total).sum::<u64>() as usize, MAX_REFUSAL_KINDS + 10);
+        assert!(st.refusals.contains_key("other"));
+        drop(map);
+        forget(a);
     }
 }

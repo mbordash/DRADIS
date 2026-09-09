@@ -547,9 +547,11 @@ fn setup_auth_disabled() -> bool {
 /// Operator exception: DRADIS_SETUP_AUTH=off waives the gate entirely.
 async fn require_admin(req: Request, next: Next) -> Response {
     if !setup_auth_disabled() && admin_hash().is_some() && !request_is_admin(&req) {
+        // `code` lets the Control Tower say "your session expired" at the
+        // login card instead of re-showing the card with no explanation.
         return (
             StatusCode::UNAUTHORIZED,
-            Json(json!({"error": "admin session required", "login": "/api/auth/login"})),
+            Json(json!({"error": "admin session required", "code": "session_required", "login": "/api/auth/login"})),
         ).into_response();
     }
     next.run(req).await
@@ -887,17 +889,35 @@ struct Login { password: String }
 #[derive(Serialize)]
 struct LoginOk { token: String, expires_in: i64 }
 
+/// Body of the 401 for a wrong Setup password.
+///
+/// Two different passwords guard a Marketplace instance and only one of them
+/// is on the launch screen: the Control Tower login (`admin` / the EC2
+/// instance ID) and this one, created in the first-boot Setup wizard. An
+/// operator who reaches this dialog has already passed the first, so a bare
+/// "invalid password" reads as the documented credential having broken
+/// ([B41], 2026-09-08). The rejection names which password it is judging, and
+/// carries a machine `code` so the UI can tell it from the other 401 on these
+/// routes (an expired session, `admin session required`).
+fn bad_password_body() -> serde_json::Value {
+    json!({
+        "error": "Incorrect Setup password. This is the password created in the first-boot Setup wizard, not the Control Tower login.",
+        "code": "bad_password",
+    })
+}
+
 /// POST /api/auth/login — exchange the admin password for a bearer token.
 async fn login(Json(body): Json<Login>) -> Response {
     let Some(hash) = admin_hash() else {
         return (StatusCode::CONFLICT,
-                Json(json!({"error": "no admin password configured — complete first-boot setup"}))).into_response();
+                Json(json!({"error": "no admin password configured — complete first-boot setup",
+                            "code": "no_admin_password"}))).into_response();
     };
     if !verify_password(&body.password, &hash) {
         // Blunt brute-force damper.
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
         warn!("🔐 Setup: failed admin login attempt");
-        return (StatusCode::UNAUTHORIZED, Json(json!({"error": "invalid password"}))).into_response();
+        return (StatusCode::UNAUTHORIZED, Json(bad_password_body())).into_response();
     }
     Json(LoginOk { token: issue_token(), expires_in: SESSION_TTL_SECS }).into_response()
 }
@@ -1868,6 +1888,21 @@ mod tests {
         let h = hash_password(&pw).unwrap();
         assert!(verify_password(&pw, &h));
         assert!(!verify_password("wrong", &h));
+    }
+
+    /// A rejected Setup password must say which password was rejected.
+    ///
+    /// The operator who hit this had passed the Control Tower login (the
+    /// instance ID) and read a silent re-prompt as that credential having
+    /// stopped working. The body names the Setup password, and the `code`
+    /// is what the UI keys its copy on, so both are pinned here.
+    #[test]
+    fn a_wrong_setup_password_names_the_password_it_rejected() {
+        let body = bad_password_body();
+        assert_eq!(body["code"], "bad_password");
+        let msg = body["error"].as_str().unwrap();
+        assert!(msg.contains("Setup password"), "must name the Setup password: {msg}");
+        assert!(msg.contains("not the Control Tower login"), "must rule out the documented credential: {msg}");
     }
 
     /// A config bundle must not carry this box's identity to another box.

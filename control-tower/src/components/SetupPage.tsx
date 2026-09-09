@@ -360,11 +360,54 @@ function VenueCard({
 
 // ── Login / first-boot password card ─────────────────────────────────────────
 
+/**
+ * Lost-password copy for the Setup admin password.
+ *
+ * The password is stored only as an argon2id hash (`DRADIS_ADMIN_HASH` in
+ * `data/secrets.env`) and is deliberately unreadable and unsettable through the
+ * credentials API, so there is nothing the browser can do about a lost one. The
+ * honest answer is the reset procedure, spelled out here rather than left for
+ * a support ticket ([B41]). A config bundle never carries the hash, so the
+ * relaunch path does not carry the lock-out with it.
+ */
+function LostPasswordHelp() {
+  return (
+    <details className="text-xs text-gray-500 font-mono">
+      <summary className="cursor-pointer text-gray-400 hover:text-gray-300">Lost the Setup password?</summary>
+      <div className="mt-2 space-y-2 text-gray-500">
+        <p>
+          It is stored only as a hash and cannot be recovered or reset from the browser.
+          Everything else on the instance — venue credentials, strategy configuration,
+          positions — is untouched by a reset.
+        </p>
+        <p>
+          <span className="text-gray-400">From a shell on the instance</span> (SSH with the key pair
+          you launched with), remove the hash line and restart the engine; Setup will ask you to create
+          a new password:
+        </p>
+        <pre className="bg-[#0d0d1a] border border-[#1e1e32] rounded px-2 py-1.5 overflow-x-auto text-gray-300">{`sudo sed -i '/^DRADIS_ADMIN_HASH=/d' /opt/dradis/data/secrets.env
+sudo docker restart dradis`}</pre>
+        <p>
+          On a self-hosted deployment the file is <span className="text-gray-400">$DRADIS_DATA_DIR/secrets.env</span>{' '}
+          (default <span className="text-gray-400">./data/secrets.env</span>); restart the engine container the same way.
+        </p>
+        <p>
+          <span className="text-gray-400">Without shell access</span>, launch a fresh instance and
+          import a config bundle if you exported one. Bundles carry credentials and configuration but
+          never the Setup password, so the new instance asks you to create one.
+        </p>
+      </div>
+    </details>
+  );
+}
+
 function PasswordCard({
-  mode, onDone,
+  mode, onDone, notice,
 }: {
   mode: 'login' | 'create';
   onDone: () => void;
+  /** Why the login card is showing, when it was not the operator's choice (e.g. an expired session). */
+  notice?: string | null;
 }) {
   const [password, setPassword] = useState('');
   const [confirm, setConfirm] = useState('');
@@ -384,7 +427,17 @@ function PasswordCard({
       else await login(password);
       onDone();
     } catch (err) {
-      setError(err instanceof Error ? err.message : 'Request failed');
+      // A rejection must say what was rejected ([B41]). The engine names the
+      // password in its own message; a 401 without that shape is still a
+      // rejection of THIS password and is labeled as such rather than left
+      // as a bare status line.
+      if (err instanceof SetupApiError && err.status === 401) {
+        setError(err.code === 'bad_password' || err.message.includes('Setup password')
+          ? err.message
+          : 'Incorrect Setup password. This is the password created in the first-boot Setup wizard, not the Control Tower login.');
+      } else {
+        setError(err instanceof Error ? err.message : 'Request failed');
+      }
     } finally {
       setBusy(false);
     }
@@ -394,19 +447,27 @@ function PasswordCard({
     <div className="max-w-md mx-auto bg-[#13131f] border border-[#1e1e32] rounded-xl p-6 space-y-4">
       <div>
         <h2 className="text-sm font-mono text-gray-200">
-          {mode === 'create' ? '🛡️ Create admin password' : '🔐 Admin login'}
+          {mode === 'create' ? '🛡️ Create the Setup password' : '🔐 Setup password'}
         </h2>
+        {/* Two passwords guard a Marketplace instance and only one is on the
+            launch screen: the Control Tower login (admin / the EC2 instance ID)
+            and this one. Both cards say which one they mean, because an
+            operator who has just typed the documented credential into this box
+            and been refused concludes the documented credential is broken. */}
         <p className="text-xs text-gray-500 mt-1">
           {mode === 'create'
-            ? 'First-boot setup: this password protects credential management on this DRADIS instance.'
-            : 'Enter the admin password to manage credentials.'}
+            ? 'This password protects credential management (this Setup view) on this DRADIS instance. It is separate from the Control Tower login you used to open the dashboard, and it is stored only as a hash: if you lose it, it can be reset from a shell on the instance but never recovered.'
+            : 'Enter the Setup password created in the first-boot wizard on this instance. It is not the Control Tower login (admin / the EC2 instance ID on the Marketplace AMI) — you have already passed that one.'}
         </p>
       </div>
+      {mode === 'login' && notice && (
+        <div className="text-xs text-amber-300 font-mono bg-amber-500/10 border border-amber-500/20 rounded px-3 py-2">{notice}</div>
+      )}
       <form onSubmit={submit} className="space-y-3">
         <input
           type="password"
           className={inputCls}
-          placeholder="Password"
+          placeholder={mode === 'create' ? 'New Setup password' : 'Setup password'}
           value={password}
           onChange={e => setPassword(e.target.value)}
           autoFocus
@@ -425,6 +486,7 @@ function PasswordCard({
           {busy ? '…' : mode === 'create' ? 'Set password & continue' : 'Log in'}
         </button>
       </form>
+      {mode === 'login' && <LostPasswordHelp />}
     </div>
   );
 }
@@ -1475,6 +1537,11 @@ export default function SetupPage() {
   const [creds, setCreds] = useState<CredentialInfo[] | null>(null);
   const [drafts, setDrafts] = useState<Record<string, string>>({});
   const [authed, setAuthed] = useState(false);
+  // Why the login card is showing when the operator did not ask for it. A 401
+  // on a Setup route means the session token is missing, expired (24h) or
+  // minted by a different instance; re-showing the login with no words made
+  // that look like a loop ([B41]).
+  const [authNotice, setAuthNotice] = useState<string | null>(null);
   const [saving, setSaving] = useState(false);
   const [restarting, setRestarting] = useState(false);
   const [notice, setNotice] = useState<{ kind: 'ok' | 'err' | 'info'; text: string } | null>(null);
@@ -1483,6 +1550,13 @@ export default function SetupPage() {
   // Global SWR revalidator, used after a restart to drop every cached
   // dashboard read at once (see `restart` below).
   const { mutate: mutateAll } = useSWRConfig();
+
+  /** Drop the session and show the login card, saying why. */
+  const sessionLost = useCallback(() => {
+    clearAdminToken();
+    setAuthed(false);
+    setAuthNotice('Your Setup session is no longer valid — sessions last 24 hours and do not carry across instances. Log in again with the Setup password.');
+  }, []);
 
   const loadStatus = useCallback(async () => {
     try {
@@ -1505,13 +1579,12 @@ export default function SetupPage() {
       setCreds(r.credentials);
     } catch (err) {
       if (err instanceof SetupApiError && err.status === 401) {
-        clearAdminToken();
-        setAuthed(false);
+        sessionLost();
       } else {
         setNotice({ kind: 'err', text: err instanceof Error ? err.message : 'Failed to load credentials' });
       }
     }
-  }, []);
+  }, [sessionLost]);
 
   useEffect(() => { loadStatus(); }, [loadStatus]);
   useEffect(() => { if (authed) loadCreds(); }, [authed, loadCreds]);
@@ -1537,8 +1610,7 @@ export default function SetupPage() {
       });
     } catch (err) {
       if (err instanceof SetupApiError && err.status === 401) {
-        clearAdminToken();
-        setAuthed(false);
+        sessionLost();
       } else {
         setNotice({ kind: 'err', text: err instanceof Error ? err.message : 'Save failed' });
       }
@@ -1610,7 +1682,7 @@ export default function SetupPage() {
   }
 
   if (!authed) {
-    return <PasswordCard mode="login" onDone={() => { setAuthed(true); }} />;
+    return <PasswordCard mode="login" notice={authNotice} onDone={() => { setAuthNotice(null); setAuthed(true); }} />;
   }
 
   const groups = groupsForVenue(status.venue);
@@ -1645,7 +1717,7 @@ export default function SetupPage() {
                 {showChangePw ? 'Cancel' : 'Change password'}
               </button>
               <button
-                onClick={() => { clearAdminToken(); setAuthed(false); }}
+                onClick={() => { clearAdminToken(); setAuthNotice(null); setAuthed(false); }}
                 className={btnCls('ghost')}
               >
                 Log out
@@ -1696,24 +1768,25 @@ export default function SetupPage() {
           creds={creds}
           drafts={drafts}
           onDraft={(k, v) => setDrafts(d => ({ ...d, [k]: v }))}
-          onAuthError={() => { clearAdminToken(); setAuthed(false); }}
+          onAuthError={sessionLost}
         />
       )}
 
-      <ProfilesPanel onAuthError={() => { clearAdminToken(); setAuthed(false); }} />
+      <ProfilesPanel onAuthError={sessionLost} />
 
       <GlobalConfigPanel />
 
-      <AutonomyPanel onAuthError={() => { clearAdminToken(); setAuthed(false); }} />
+      <AutonomyPanel onAuthError={sessionLost} />
 
       {/* ── Config bundle export / import (instance migration) ────────────── */}
       <div className="bg-[#13131f] border border-[#1e1e32] rounded-xl p-4 space-y-3">
         <div>
           <h3 className="text-sm font-mono text-gray-200">📦 Instance Migration</h3>
           <p className="text-xs text-gray-500 mt-0.5">
-            Export this instance&apos;s full configuration — credentials, admin password,
+            Export this instance&apos;s configuration — venue and signal credentials,
             global + squadron configs — as a single bundle, then import it on a new
-            instance (e.g. a newer AMI) and restart. The bundle contains secrets; store it safely.
+            instance (e.g. a newer AMI) and restart. The Setup password is not included:
+            each instance keeps its own. The bundle contains secrets; store it safely.
           </p>
         </div>
         <div className="flex items-center gap-2">

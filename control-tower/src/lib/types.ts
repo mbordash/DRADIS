@@ -107,6 +107,7 @@ export interface DynamicConfig {
   auto_deploy_politics:          boolean;
   auto_deploy_sports:            boolean;
   event_market_retire_grace_secs: number;
+  deploy_min_liquidity_usd: string;
   collateral_sweep_enabled:      boolean;
   collateral_sweep_min_usdc:     string;
   gboost_budget:                 string;
@@ -508,15 +509,33 @@ export interface StatusResponse {
 }
 
 /** Portfolio value response from /api/portfolio — cash + open positions at live prices. */
+/**
+ * GET /api/portfolio.
+ *
+ * Honest-state rule ([B43]): a figure the engine does not have yet arrives as
+ * `null`, never as "0". Zero is a real balance (an unfunded wallet, or working
+ * keys on an empty account), so it cannot double as "not read yet" — that
+ * reading is what told an operator on a fresh instance that his keys were
+ * broken ([B42]). Render `null` as a dash and say what is being waited for.
+ */
 export interface PortfolioValue {
-  collateral:      string; // pUSD cash on deposit
+  /** pUSD cash on deposit; `null` until the first balance reading exists. */
+  collateral:      string | null;
+  /** Where `collateral` came from: a live venue query, the newest P&L snapshot, or nowhere yet. */
+  collateral_source: 'live' | 'snapshot' | 'none';
+  /** Age of the snapshot behind `collateral` when the source is `snapshot`; `null` otherwise. */
+  collateral_age_secs: number | null;
   /** USDC.e settlement proceeds sitting in the Safe that are not yet wrapped into pUSD — real cash, not tradeable, not counted in total_value. */
   stranded_collateral: string;
   positions_value: string; // Σ(shares × current mid-price)
-  total_value:     string; // collateral + positions_value
+  /** collateral + positions_value; `null` while collateral is unknown. */
+  total_value:     string | null;
   unrealized_pnl:  string; // Σ(shares × (current_mid − entry_price))
   position_count:  number;
-  prices_live:     boolean; // false when Polymarket CLOB was unreachable
+  /** False only when an open position's mark is older than five minutes. Not a stand-in for "no reading" or "no positions". */
+  prices_live:     boolean;
+  /** Open positions that have never been marked — valued from the last snapshot or at cost until the first mark. Pending, not stale. */
+  unpriced_positions: number;
 }
 
 // ── Squadron / CAG types (Phase 3d) ──────────────────────────────────────────

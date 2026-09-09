@@ -146,6 +146,18 @@ export interface ViperStatusRow {
   last_reason_secs_ago: number | null;
   last_signal_at: string | null;
   last_signal_secs_ago: number | null;
+  /** Refusal ledger: how many ticks each named gate vetoed this viper since
+   *  startup, most frequent first (top 5). `reason` has live numbers folded
+   *  to `#`; `last_detail` is the latest verbatim line. This is the same
+   *  ledger the LLM Advisor is shown, so what it reasons from is on screen. */
+  refusals: ViperRefusalTally[];
+}
+
+export interface ViperRefusalTally {
+  reason: string;
+  count: number;
+  count_since_report: number;
+  last_detail: string;
 }
 
 /** Per-viper "why aren't we trading?" registry. Omit `asset` for all squadrons. */

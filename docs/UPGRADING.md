@@ -24,8 +24,9 @@ Open the Control Tower, go to **Setup**, and find the **📦 Instance Migration*
 panel. Export the config bundle and save the file somewhere safe.
 
 The bundle contains your venue API credentials, your wallet private key, your
-admin password hash, your Raptor signal keys, and your global and per-squadron
-configuration. Treat the file exactly as you would treat the keys themselves.
+Raptor signal keys, and your global and per-squadron configuration. It does not
+contain the Setup password: each instance keeps its own. Treat the file exactly
+as you would treat the keys themselves.
 
 **2. Launch an instance of the new version.**
 
@@ -45,18 +46,22 @@ Do not enter any credentials on the new instance. The import will supply them.
 **3. Import the bundle.**
 
 Log in to the new instance's Control Tower with user `admin` and the password
-shown as the new instance's EC2 instance ID, then go to **Setup → 📦 Instance
-Migration** and import the bundle you saved in step 1.
+shown as the new instance's EC2 instance ID. The Setup tab on a fresh instance
+first asks you to create a **Setup password** — this is a second, separate
+password that protects the Setup view, and it is yours to choose; it is not the
+instance ID and it does not come from the old instance. Create it, then go to
+**Setup → 📦 Instance Migration** and import the bundle you saved in step 1.
 
 **4. Restart the engine.**
 
 Setup will prompt for a restart. Take it. The engine comes back in roughly 30 to
 60 seconds with your credentials and configuration applied.
 
-After this restart, log in with **your own admin password**, not the instance
-ID. The password travels in the bundle, which is why the instance ID stops
-working at this point. Your browser session does not carry over, because each
-instance mints its own session-signing key.
+After this restart the Control Tower login is unchanged (`admin` / the new
+instance ID), and the Setup tab asks for the Setup password you created in
+step 3, not the one from the old instance: the bundle never carries it. Your
+browser's Setup session does not carry over either, because each instance mints
+its own session-signing key, so expect to log in to Setup once more.
 
 **5. Verify, then stop the old instance.**
 
