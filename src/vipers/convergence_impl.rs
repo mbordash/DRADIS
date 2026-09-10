@@ -66,7 +66,8 @@
 ///     [`crate::vipers::fee_dominated_entry`] Momentum uses. At the shipped
 ///     targets this refuses the whole $0.35–$0.65 band on a fee venue, on every
 ///     profile — the honest reading of the arithmetic, reported to the Control
-///     Tower as such. Polymarket US charges no taker fee and is unaffected.
+///     Tower as such. Polymarket US charges 0.06 rather than 0.07 and the band
+///     is refused there too (4.2% of notional at $0.65 against a 7–10% target).
 ///   * **`convergence_tp_fee_margin_mult`** floors the take-profit at a
 ///     multiple of the fee the exit will pay, so a ConvergenceTP can never book
 ///     a loss under a reason string that says profit.

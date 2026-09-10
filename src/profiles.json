@@ -6,6 +6,7 @@
       "description": "The recommended starting point: capital preservation first \u2014 smaller position sizes, tighter stops, fewer concurrent strategies. Build confidence here, then move up the risk ramp.",
       "values": {
         "intl_taker_fee_rate": "0.07",
+        "us_taker_fee_rate": "0.06",
         "enable_arbitrage": true,
         "enable_time_decay": true,
         "enable_momentum": false,
@@ -74,6 +75,7 @@
         "deploy_max_days_to_close": 30,
         "auto_deploy_politics": true,
         "auto_deploy_sports": true,
+        "kalshi_sports_game_series": "KXNFLGAME,KXNBAGAME,KXMLBGAME,KXNHLGAME,KXNCAAFGAME,KXNCAAMBGAME,KXATPMATCH,KXWTAMATCH,KXMLSGAME,KXEPLGAME,KXUCLGAME",
         "event_market_retire_grace_secs": 300,
         "deploy_min_liquidity_usd": "500",
         "collateral_sweep_min_usdc": "1.00",
@@ -215,6 +217,7 @@
       "description": "The next step up: moderate sizing and risk limits across all core strategies.",
       "values": {
         "intl_taker_fee_rate": "0.07",
+        "us_taker_fee_rate": "0.06",
         "enable_arbitrage": true,
         "enable_time_decay": true,
         "enable_momentum": true,
@@ -283,6 +286,7 @@
         "deploy_max_days_to_close": 90,
         "auto_deploy_politics": true,
         "auto_deploy_sports": true,
+        "kalshi_sports_game_series": "KXNFLGAME,KXNBAGAME,KXMLBGAME,KXNHLGAME,KXNCAAFGAME,KXNCAAMBGAME,KXATPMATCH,KXWTAMATCH,KXMLSGAME,KXEPLGAME,KXUCLGAME",
         "event_market_retire_grace_secs": 300,
         "deploy_min_liquidity_usd": "500",
         "collateral_sweep_min_usdc": "1.00",
@@ -424,6 +428,7 @@
       "description": "Maximum opportunity capture: larger sizes, wider stops, all strategies enabled. Expect higher drawdowns.",
       "values": {
         "intl_taker_fee_rate": "0.07",
+        "us_taker_fee_rate": "0.06",
         "enable_arbitrage": true,
         "enable_time_decay": true,
         "enable_momentum": true,
@@ -492,6 +497,7 @@
         "deploy_max_days_to_close": 180,
         "auto_deploy_politics": true,
         "auto_deploy_sports": true,
+        "kalshi_sports_game_series": "KXNFLGAME,KXNBAGAME,KXMLBGAME,KXNHLGAME,KXNCAAFGAME,KXNCAAMBGAME,KXATPMATCH,KXWTAMATCH,KXMLSGAME,KXEPLGAME,KXUCLGAME",
         "event_market_retire_grace_secs": 300,
         "deploy_min_liquidity_usd": "500",
         "collateral_sweep_min_usdc": "1.00",

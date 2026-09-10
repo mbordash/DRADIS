@@ -110,8 +110,9 @@ fn side_reject_reason(
         // tell "raise your appetite" from "this market is unquotable".
         //
         // `round_trip_fee_pct` is a fraction of notional; multiplying by the
-        // price puts it in the same units as the spread. US Retail charges no
-        // taker fee, so this branch is inert there rather than wrong.
+        // price puts it in the same units as the spread. Binds on every venue —
+        // Polymarket US charges 0.06 and was wrongly carried as free until
+        // 2026-09-09, which let this branch quote into spreads under the fee.
         let fee_floor = crate::venues::round_trip_fee_pct(bid_price) * bid_price;
         if spread < fee_floor {
             return Some((
@@ -1989,13 +1990,10 @@ mod spread_gate_wording_tests {
         let spread = dec!(0.001);
         for price in [dec!(0.50), dec!(0.10), dec!(0.03)] {
             let floor = fee_floor(price);
-            // Venues with no taker fee cannot be below it — see the US case below.
-            if floor > Decimal::ZERO {
-                assert!(
-                    spread < floor,
-                    "at price {price} a 0.1c spread must be under the {floor} fee floor",
-                );
-            }
+            assert!(
+                spread < floor,
+                "at price {price} a 0.1c spread must be under the {floor} fee floor",
+            );
         }
     }
 
@@ -2004,19 +2002,22 @@ mod spread_gate_wording_tests {
     #[test]
     fn a_healthy_spread_is_above_the_fee_floor() {
         let floor = fee_floor(dec!(0.50));
-        assert!(dec!(0.04) > floor || floor == Decimal::ZERO,
-                "a 4c spread should clear the fee floor at mid");
+        assert!(dec!(0.04) > floor, "a 4c spread should clear the {floor} fee floor at mid");
     }
 
-    /// US Retail takes no taker fee, so the fee branch is inert there rather
-    /// than wrong — every spread is "above" a zero floor.
+    /// Every venue DRADIS ships charges a quadratic taker fee, so the floor is
+    /// real everywhere. Polymarket US was the exception in name only: it was
+    /// carried as free until 2026-09-09 while charging 0.06, and this test
+    /// asserted the zero. At mid the round trip there is 2 × 0.06 × 0.25 = 3¢
+    /// of spread — under the shipped 8-tick `maker_min_spread`, so the knob
+    /// binds first on a normal book, and this branch names the books that
+    /// cannot pay at any setting.
     #[test]
-    fn a_zero_fee_venue_never_reports_below_fee() {
+    fn every_venue_has_a_real_fee_floor() {
         let floor = fee_floor(dec!(0.50));
+        assert!(floor > Decimal::ZERO, "every shipped venue charges a taker fee; floor was {floor}");
         #[cfg(feature = "us_retail")]
-        assert_eq!(floor, Decimal::ZERO, "US Retail charges no taker fee");
-        #[cfg(not(feature = "us_retail"))]
-        assert!(floor > Decimal::ZERO, "fee-charging venues must have a real floor");
+        assert_eq!(floor, dec!(0.03), "Polymarket US: 2 × 0.06 × 0.50 × 0.50");
     }
 }
 

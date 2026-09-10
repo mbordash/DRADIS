@@ -151,6 +151,15 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
          from actual collateral movement — the venue's fee-rate endpoint advertises 1000 bps, but that is \
          the ceiling an order authorizes, not what is charged. Only change this if Polymarket's schedule \
          changes; setting it wrong silently skews every recorded trade.").range(0.0, 0.5).step(0.005));
+    v.push(F::new("Global", None, "us_taker_fee_rate", "Polymarket US Taker Fee Rate", "pct", true,
+        "Polymarket US only. The venue's taker fee coefficient: fee = rate × price × (1 − price) × shares on \
+         every fill that crosses the spread, entry and exit alike; a resting post-only order pays nothing and \
+         is paid a 0.0125 rebate on the same formula. Every fee floor and fee gate on this venue reads this \
+         figure, and recorded P&L is net of it. 0.06 is the published schedule (docs.polymarket.us/fees, \
+         effective July 2026) and the feeCoefficient the gateway sends on every market; DRADIS logs a warning \
+         at deploy if a market publishes a different one. DRADIS carried this as zero before 2026-09-09, \
+         which silently switched off every fee gate on the venue — setting it to zero does that again.")
+        .range(0.0, 0.5).step(0.005));
     v.push(F::new("Global", None, "book_apply_price_changes", "Apply Price Changes", "bool", false,
         "Polymarket International only. Keep the order book current between trades by folding the \
          venue's price_change messages (order placements and cancellations) into the book. Off, the \
@@ -302,7 +311,8 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              first live aggressive trade (2026-09-09) entered at $0.53 with a 15% target — the fee was 44% of the plan \
              and 116% of the gross loss. 0.40 lets the fee take at most 40% of the target; on Polymarket International \
              with the aggressive profile that admits entries at roughly $0.58–$0.69 and nothing else, and with the \
-             balanced profile (10% target, $0.60 max entry) it admits nothing. Inert on a venue with no taker fee.")
+             balanced profile (10% target, $0.60 max entry) it admits nothing. On Polymarket US (0.06) the same \
+             $0.53 entry is 38% of a 15% plan and passes; the balanced profile still admits nothing there.")
             .range(0.0, 1.0).step(0.05));
         v.push(F::new(g, e, "momentum_reversal_ratio", "Reversal Ratio", "decimal", true,
             "Fraction of the entry velocity threshold that, read against the position, counts as a reversal for the \
@@ -664,9 +674,10 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              rate is (stop + fee) / (target + stop): 87% at $0.65 on a 7% target, over 100% below $0.47, where a \
              trade that reached its target exactly still lost money. At 0.40 the fee may take at most 40% of the \
              target, which admits nothing in the shipped band on Polymarket International or Kalshi at any \
-             profile — the arithmetic's honest answer, and the refusal says so. Inert on Polymarket US, which \
-             charges no taker fee. To trade this band on a fee venue, retune the target and stop (a 15% target \
-             against an 8% stop clears at $0.60 and above), not this ratio.")
+             profile — the arithmetic's honest answer, and the refusal says so. Polymarket US charges 0.06 \
+             rather than 0.07 and the answer is the same: the whole band is refused at every profile. To \
+             trade this band on a fee venue, retune the target and stop (a 15% target against an 8% stop \
+             clears at $0.60 and above), not this ratio.")
             .range(0.0, 1.0).step(0.05));
         v.push(F::new(g, e, "convergence_tp_fee_margin_mult", "TP Fee Margin", "decimal", true,
             "Multiple of the taker fee the take-profit must clear: the round trip for the FAK take-profit, the \
@@ -842,6 +853,15 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              key: the class trades Arbitrage and Maker off the venue's own book, and the Sports \
              Raptor is an additive signal that idles harmlessly when no key is set.")
             );
+        v.push(F::new(g, e, "kalshi_sports_game_series", "Kalshi Sports Game Series", "string", true,
+            "Kalshi only. The series the sports class looks in for a market, comma-separated — one \
+             per league, each holding that league's game-winner markets (KXNFLGAME, KXMLBGAME, \
+             KXATPMATCH). The sports slot on this venue is defined by this list: a market outside \
+             it is never auto-deployed as sports, and when none of these series has an open game \
+             the slot stays empty until one does. Only game series are accepted — every Kalshi game \
+             series ends in GAME, MATCH or FIGHT — and anything else you enter is ignored with a \
+             warning in the log, so the list cannot put a coaching or awards market in the slot. \
+             The full catalog is at kalshi.com under each sport; the series ticker is in the URL."));
         v.push(F::new(g, e, "event_market_retire_grace_secs", "Event Market Retire Delay", "secs", false,
             "How long a politics or sports squadron waits after its market closes before standing \
              itself down, in seconds. Standing down is what frees the class: DRADIS runs one \

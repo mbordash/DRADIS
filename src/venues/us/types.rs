@@ -98,6 +98,20 @@ pub struct UsMarket {
     /// Cumulative trading volume, string form. See [`Self::volume_num`].
     #[serde(default, rename = "volume")]
     pub volume_str: Option<String>,
+    /// The market's taker fee coefficient Θ (`feeCoefficient`): the venue
+    /// charges `Θ · shares · p · (1 − p)` on every fill that crosses the
+    /// spread. 0.06 on every market checked 2026-09-09 (sports, crypto,
+    /// politics; open and resolved), matching the published schedule.
+    ///
+    /// `None` when the gateway sent nothing readable — deliberately NOT zero,
+    /// which is a real value meaning a free market. The trader falls back to
+    /// the venue-wide `us_taker_fee_rate` and says so. Accepted as a number
+    /// or a numeric string, like `volume`, and anything else is `None` in
+    /// keeping with this record's rule that a field the gateway reshapes must
+    /// not fail the whole listing. Parsed from the JSON text straight into a
+    /// `Decimal` so 0.06 arrives as 0.06 and not as a float's approximation.
+    #[serde(default, rename = "feeCoefficient", deserialize_with = "lenient_decimal")]
+    pub fee_coefficient: Option<rust_decimal::Decimal>,
     /// Primary instrument legs — contains `long: bool` + `identifier` fields.
     #[serde(default, rename = "marketSides")]
     pub market_sides: Vec<serde_json::Value>,
@@ -108,6 +122,22 @@ pub struct UsMarket {
     /// array — using `Value` here accepts both without panicking.
     #[serde(default)]
     pub outcomes: serde_json::Value,
+}
+
+/// A number the gateway may send as a JSON number, a numeric string, `null`,
+/// or not at all, read exactly from its text. Anything unreadable is `None`;
+/// see [`UsMarket::fee_coefficient`].
+fn lenient_decimal<'de, D>(deserializer: D) -> Result<Option<rust_decimal::Decimal>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use std::str::FromStr;
+    let value = Option::<serde_json::Value>::deserialize(deserializer)?;
+    Ok(match value {
+        Some(serde_json::Value::Number(n)) => rust_decimal::Decimal::from_str(&n.to_string()).ok(),
+        Some(serde_json::Value::String(s)) => rust_decimal::Decimal::from_str(s.trim()).ok(),
+        _ => None,
+    })
 }
 
 impl UsMarket {

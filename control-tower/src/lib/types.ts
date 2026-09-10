@@ -21,6 +21,7 @@ export interface DynamicConfig {
   // Global
   ghost_mode: boolean;
   intl_taker_fee_rate: string;
+  us_taker_fee_rate: string;
 
   // Viper enable flags
   enable_arbitrage:    boolean;

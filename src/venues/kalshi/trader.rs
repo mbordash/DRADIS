@@ -618,12 +618,99 @@ impl crate::venues::deployment::DeploymentRunner for KalshiDeploymentRunner {
     }
 }
 
+/// Does a Kalshi series ticker name a game series?
+///
+/// Kalshi's game-winner series all end in GAME, MATCH or FIGHT — `KXNFLGAME`,
+/// `KXATPMATCH`, `KXUFCFIGHT` — and nothing else filed under Sports does
+/// (checked against all 3,754 sports series on 2026-09-09). The suffix is the
+/// only structural signal the venue gives: a market record carries no category
+/// or shape of its own, and the event's "Sports" category is shared by season
+/// futures, retirements, relocations and coaching changes.
+pub(crate) fn is_game_series_ticker(ticker: &str) -> bool {
+    let t = ticker.trim().to_ascii_uppercase();
+    t.starts_with("KX") && (t.ends_with("GAME") || t.ends_with("MATCH") || t.ends_with("FIGHT"))
+}
+
+/// Split the operator's comma-separated series list into the game series it
+/// names and the entries that are not game series, each normalized to the
+/// venue's uppercase ticker form and deduplicated.
+///
+/// The rejected half is returned rather than dropped so the caller can say
+/// which entries were ignored: a list edit that silently did nothing is the
+/// failure mode this knob's description warns about.
+pub(crate) fn parse_game_series_list(csv: &str) -> (Vec<String>, Vec<String>) {
+    let mut accepted: Vec<String> = Vec::new();
+    let mut rejected: Vec<String> = Vec::new();
+    for raw in csv.split(',') {
+        let t = raw.trim().to_ascii_uppercase();
+        if t.is_empty() || accepted.contains(&t) || rejected.contains(&t) {
+            continue;
+        }
+        if is_game_series_ticker(&t) { accepted.push(t) } else { rejected.push(t) }
+    }
+    (accepted, rejected)
+}
+
+/// The operator's game-series list, from the live global config.
+///
+/// Read from the broadcast rather than `load_or_default`, which writes a
+/// config-history snapshot on every call and this runs on every idle seeder
+/// tick; the DB read covers only the pre-registration window.
+async fn sports_game_series_csv() -> String {
+    match crate::helpers::dynamic_config::global_config_tx() {
+        Some(tx) => tx.borrow().kalshi_sports_game_series.clone(),
+        None => DynamicConfig::load_or_default().await.kalshi_sports_game_series.clone(),
+    }
+}
+
+/// Every open game-winner market across the configured game series.
+///
+/// This is the sports class on Kalshi. It used to be "every open market under
+/// the Sports category", swept from `/events?status=open` — but that sweep is
+/// capped at 2,400 events and the venue lists its long-dated futures first, so
+/// the games never appeared in it (2026-09-09: 279 Sports events in the sweep,
+/// not one a game). The seeder's highest-volume pick from what did appear was
+/// "Will Steve Kerr be out before Oct 25, 2026?", a coaching personnel market
+/// nothing in the engine can price, which then held the sports slot. Querying
+/// the game series directly is both cheaper — about one request per league —
+/// and cannot return anything but games.
+///
+/// Shared by the seeder and the Control Tower's market browser, so the browser
+/// can only show a sports market the seeder would also choose.
+pub(crate) async fn open_sports_game_markets(venue: &KalshiVenue) -> Vec<KalshiMarket> {
+    let csv = sports_game_series_csv().await;
+    let (series, rejected) = parse_game_series_list(&csv);
+    if !rejected.is_empty() {
+        warn!(
+            "📋 Kalshi sports: ignoring {} configured series that are not game series \
+             (every game series ends in GAME, MATCH or FIGHT): {}",
+            rejected.len(), rejected.join(", "),
+        );
+    }
+    if series.is_empty() {
+        warn!("📋 Kalshi sports: no game series configured — the sports class has nothing to discover");
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for s in &series {
+        match venue.markets_for_series(s).await {
+            Ok(markets) => out.extend(
+                markets.into_iter().filter(|m| m.status == "active" || m.status.is_empty()),
+            ),
+            Err(e) => warn!("📋 Kalshi sports discovery for series {s} failed: {e:#}"),
+        }
+    }
+    out
+}
+
 /// Highest-volume open market in `class`, within the operator's deploy horizon.
 ///
-/// Mirrors the Control Tower's quick-deploy selection: same categories, same
-/// sort, same horizon. Discovery reaches years out because that is how Kalshi
-/// structures politics and sports, but Arbitrage locks collateral until the
-/// market resolves, so a 2028 market is a poor use of it.
+/// Mirrors the Control Tower's quick-deploy selection: same discovery, same
+/// sort, same horizon. Politics is Kalshi's own category taxonomy, which
+/// reaches years out because that is how the venue structures it — but
+/// Arbitrage locks collateral until the market resolves, so a 2028 market is a
+/// poor use of it. Sports is the configured game series, and nothing else —
+/// see [`open_sports_game_markets`].
 async fn select_auto_deploy_market(
     venue: &Arc<KalshiVenue>,
     class: &str,
@@ -633,24 +720,24 @@ async fn select_auto_deploy_market(
     // than the operator asked for.
     min_liquidity_usd: f64,
 ) -> Option<String> {
-    let cats_raw = if class == "politics" {
-        crate::config::KALSHI_POLITICS_CATEGORIES
+    let found: Vec<KalshiMarket> = if class == "sports" {
+        open_sports_game_markets(venue).await
     } else {
-        crate::config::KALSHI_SPORTS_CATEGORIES
-    };
-    let cats: Vec<&str> = cats_raw.split(',').map(str::trim).filter(|c| !c.is_empty()).collect();
-    let found = match venue.open_markets_for_categories(&cats).await {
-        Ok(f) => f,
-        Err(e) => {
-            warn!("📋 Auto-deploy {class} discovery failed: {e:#}");
-            return None;
+        let cats: Vec<&str> = crate::config::KALSHI_POLITICS_CATEGORIES
+            .split(',').map(str::trim).filter(|c| !c.is_empty()).collect();
+        match venue.open_markets_for_categories(&cats).await {
+            Ok(f) => f.into_iter().map(|(_cat, m)| m).collect(),
+            Err(e) => {
+                warn!("📋 Auto-deploy {class} discovery failed: {e:#}");
+                return None;
+            }
         }
     };
 
     let now = Utc::now();
     let max_secs = max_days_to_close as i64 * 86_400;
     let mut best: Option<(f64, String)> = None;
-    for (_cat, m) in found {
+    for m in found {
         if let Some(ct) = m.close_time_utc() {
             let secs_left = (ct - now).num_seconds();
             if secs_left < MIN_TIME_TO_CLOSE_SECS || secs_left > max_secs {
@@ -2388,6 +2475,81 @@ mod deployed_market_tests {
             pair_from_market_untethered(&m).question,
             "Who wins the 2027 Final? — Philadelphia",
         );
+    }
+}
+
+#[cfg(test)]
+mod sports_game_series_tests {
+    use super::{is_game_series_ticker, parse_game_series_list};
+
+    /// The shipped default must consist entirely of game series, or the
+    /// seeder would warn about its own configuration on every tick.
+    #[test]
+    fn the_default_series_list_is_all_game_series() {
+        let (accepted, rejected) = parse_game_series_list(crate::config::KALSHI_SPORTS_GAME_SERIES);
+        assert!(rejected.is_empty(), "default list carries non-game series: {rejected:?}");
+        assert!(accepted.len() >= 5, "default list is suspiciously short: {accepted:?}");
+        assert!(accepted.iter().any(|s| s == "KXNFLGAME"));
+    }
+
+    /// The market the seeder actually deployed on 2026-08-30 — a coaching
+    /// personnel series under Kalshi's Sports category — must not be
+    /// admittable through the list, however it is spelled.
+    #[test]
+    fn a_personnel_series_is_not_a_game_series() {
+        assert!(!is_game_series_ticker("KXCOACHOUTNBADATE"));
+        assert!(!is_game_series_ticker("KXNBAWINS"));
+        assert!(!is_game_series_ticker("KXNFLRETIRE"));
+        assert!(!is_game_series_ticker("KXBTC15M"));
+        assert!(!is_game_series_ticker(""));
+        let (accepted, rejected) = parse_game_series_list("KXNFLGAME, kxcoachoutnbadate ,KXATPMATCH");
+        assert_eq!(accepted, vec!["KXNFLGAME".to_string(), "KXATPMATCH".to_string()]);
+        assert_eq!(rejected, vec!["KXCOACHOUTNBADATE".to_string()]);
+    }
+
+    /// Every game-winner series Kalshi lists ends in one of three words
+    /// (live catalog, 2026-09-09) — and the operator's casing and spacing
+    /// must not matter, since the venue's tickers are uppercase.
+    #[test]
+    fn game_series_are_recognized_by_their_suffix_regardless_of_case() {
+        for t in ["KXNFLGAME", "kxmlbgame", " KXWTAMATCH ", "KXUFCFIGHT", "KXEPLGAME"] {
+            assert!(is_game_series_ticker(t), "{t:?} not recognized");
+        }
+        let (accepted, rejected) = parse_game_series_list("kxnflgame,KXNFLGAME,,KXMLBGAME");
+        assert_eq!(accepted, vec!["KXNFLGAME".to_string(), "KXMLBGAME".to_string()], "duplicates and blanks must collapse");
+        assert!(rejected.is_empty());
+    }
+}
+
+/// Live checks against Kalshi. Ignored by default: they need the API key in
+/// the environment and a network. Run with
+/// `cargo test --no-default-features --features kalshi -- --ignored live_`.
+#[cfg(test)]
+mod live_discovery_checks {
+    use super::*;
+
+    /// The seeder's own selection for the sports class, end to end: every
+    /// market discovered must belong to a game series, and the pick must be
+    /// one of them. This is the path that chose "Will Steve Kerr be out
+    /// before Oct 25, 2026?" on 2026-08-30.
+    #[tokio::test]
+    #[ignore = "live venue: needs credentials and network"]
+    async fn live_sports_seeder_picks_a_game_market() {
+        let venue = Arc::new(KalshiVenue::from_env().expect("Kalshi credentials"));
+        let found = open_sports_game_markets(&venue).await;
+        eprintln!("open game markets across configured series: {}", found.len());
+        for m in found.iter().take(6) {
+            eprintln!("  {} | {} | close={:?} | vol={}", m.ticker, m.title, m.close_time_utc(), m.volume_fp);
+        }
+        assert!(!found.is_empty(), "no open game markets in the configured series");
+        for m in &found {
+            let series = m.ticker.split('-').next().unwrap_or("");
+            assert!(is_game_series_ticker(series), "{} is not from a game series", m.ticker);
+        }
+        let pick = select_auto_deploy_market(&venue, "sports", 7, 0.0).await
+            .expect("a game market within 7 days");
+        eprintln!("seeder pick: {pick}");
+        assert!(is_game_series_ticker(pick.split('-').next().unwrap_or("")));
     }
 }
 

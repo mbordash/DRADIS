@@ -22,6 +22,7 @@
 pub mod core;
 
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use rust_decimal_macros::dec;
 
 /// Round-trip taker cost, expressed as a fraction of the entry notional.
@@ -38,8 +39,9 @@ use rust_decimal_macros::dec;
 /// entry range, and silently so — the trade closes "at target" and still loses
 /// money. Callers should floor their target against this.
 ///
-/// US Retail charges no taker fee (`yes_fee_bps: 0` throughout), so this is zero
-/// there and the floor becomes inert rather than wrong.
+/// Polymarket US charges the same quadratic schedule at 0.06 (`us_taker_fee_rate`),
+/// so the floor binds there too. It was carried as zero until 2026-09-09, which
+/// made every floor and gate built on this function inert on that venue.
 pub fn round_trip_fee_pct(entry_price: Decimal) -> Decimal {
     if entry_price <= Decimal::ZERO || entry_price >= Decimal::ONE { return Decimal::ZERO; }
     dec!(2) * taker_fee_rate() * (Decimal::ONE - entry_price)
@@ -107,6 +109,50 @@ pub fn exit_fee_pct_at_gain(entry_price: Decimal, gain: Decimal) -> Decimal {
     taker_fee_rate() * exit_price * (Decimal::ONE - exit_price) / entry_price
 }
 
+/// The most a taker can be charged per share under a quadratic schedule, in
+/// basis points of $1.
+///
+/// `rate × p × (1 − p)` peaks at `p = 0.5`, so the ceiling is `rate / 4`. This is
+/// the unit `MarketConfig::{yes,no}_fee_bps` carries wherever it is built from a
+/// published schedule rather than the CLOB's legacy `/fee-rate` figure: Kalshi's
+/// 0.07 is the 1.75¢ (175 bps) per-contract ceiling its trader has always used,
+/// and Polymarket International's published sports rate of 0.05 becomes 125 bps.
+///
+/// A flat per-share bound is what the Arbitrage early-exit gate needs. It has to
+/// know the MOST a FAK exit can cost before it can prefer that exit to settling
+/// at $1.00 for free, and the ceiling is the only flat figure that is never an
+/// underestimate. Zero for a zero or negative rate: a venue that charges nothing
+/// has a ceiling of nothing, and a negative "fee" is not a schedule.
+pub fn taker_fee_ceiling_bps(rate: Decimal) -> u32 {
+    if rate <= Decimal::ZERO { return 0; }
+    (rate / dec!(4) * dec!(10000)).round().to_u32().unwrap_or(0)
+}
+
+/// The per-share fee ceiling a market's `MarketConfig` carries, in basis points,
+/// from the market's own published schedule or the venue-wide rate.
+///
+/// A published rate is used as it stands, including a published zero. Anything
+/// else falls back to the venue-wide taker rate — the same knob every other
+/// fee-aware gate on the squadron (Maker's floor, Momentum's and Convergence's
+/// fee-dominance check) already reads — so the two fee channels on a squadron
+/// agree rather than a third number appearing. That fallback overstates the fee
+/// on a market the venue does not charge for, which only makes the Arbitrage
+/// early exit less eager and settlement the preferred close; it never
+/// understates it. Defaulting to zero was the defect this replaces, on both the
+/// Polymarket International event-market path (Gamma's `feeSchedule`) and the
+/// Polymarket US path (the gateway's `feeCoefficient`), and a zero the venue did
+/// not actually publish must not come back through a renamed field or a
+/// dropped one.
+///
+/// Returns the ceiling (see [`taker_fee_ceiling_bps`]) and `true` when the
+/// market's own schedule supplied it.
+pub fn published_or_venue_fee_bps(published: Option<Decimal>, venue_wide_rate: Decimal) -> (u32, bool) {
+    match published {
+        Some(rate) => (taker_fee_ceiling_bps(rate), true),
+        None => (taker_fee_ceiling_bps(venue_wide_rate), false),
+    }
+}
+
 /// The venue's quadratic taker-fee coefficient.
 #[cfg(feature = "intl_clob")]
 pub fn taker_fee_rate() -> Decimal { crate::venues::intl::live_taker_fee_rate() }
@@ -116,9 +162,16 @@ pub fn taker_fee_rate() -> Decimal { crate::venues::intl::live_taker_fee_rate() 
 #[cfg(feature = "kalshi")]
 pub fn taker_fee_rate() -> Decimal { dec!(0.07) }
 
-/// US Retail takes no taker fee.
+/// Polymarket US publishes the same quadratic schedule with Θ = 0.06 (taker) and
+/// a −0.0125 maker rebate, per fill (docs.polymarket.us/fees). The gateway sends
+/// the coefficient on every market record as `feeCoefficient`; this is the
+/// venue-wide figure, read from the `us_taker_fee_rate` knob, and the trader
+/// warns when a market publishes a different one.
+///
+/// Returned ZERO until 2026-09-09 on the belief that the venue charged no taker
+/// fee, which switched off every fee-aware gate and floor on that build.
 #[cfg(feature = "us_retail")]
-pub fn taker_fee_rate() -> Decimal { Decimal::ZERO }
+pub fn taker_fee_rate() -> Decimal { crate::venues::us::live_taker_fee_rate() }
 
 /// Cancel every resting order the VENUE reports, before trading begins.
 ///
@@ -250,6 +303,50 @@ compile_error!("Pick exactly one venue: intl_clob OR us_retail OR kalshi");
 #[cfg(not(any(feature = "intl_clob", feature = "us_retail", feature = "kalshi")))]
 compile_error!("Pick a venue: --features intl_clob | us_retail | kalshi");
 
+
+#[cfg(test)]
+mod fee_ceiling_tests {
+    use super::taker_fee_ceiling_bps;
+    use rust_decimal_macros::dec;
+
+    /// Kalshi's trader has always carried its 0.07 schedule as a 175 bps
+    /// per-contract ceiling (`KALSHI_FEE_BPS`). The shared derivation must land
+    /// on the same figure, or the two venues would describe the same schedule
+    /// in two units.
+    #[test]
+    fn the_kalshi_ceiling_is_reproduced_from_its_rate() {
+        assert_eq!(taker_fee_ceiling_bps(dec!(0.07)), 175);
+    }
+
+    /// Polymarket International's published sports rate (`feeSchedule.rate`
+    /// 0.05 on every `sports_fees_v3` market, checked live 2026-09-09) becomes a
+    /// 125 bps ceiling: 1.25¢ per share at the $0.50 peak.
+    #[test]
+    fn the_published_sports_rate_becomes_its_per_share_ceiling() {
+        assert_eq!(taker_fee_ceiling_bps(dec!(0.05)), 125);
+        assert_eq!(taker_fee_ceiling_bps(dec!(0.04)), 100);
+    }
+
+    /// No schedule, no ceiling — and a negative rate is not a schedule.
+    #[test]
+    fn a_free_market_has_a_zero_ceiling() {
+        assert_eq!(taker_fee_ceiling_bps(dec!(0)), 0);
+        assert_eq!(taker_fee_ceiling_bps(dec!(-0.05)), 0);
+    }
+
+    /// Polymarket US publishes 0.06 on every market (`feeCoefficient`, checked
+    /// live 2026-09-09): a 150 bps ceiling, 1.5¢ a share at mid — the "$1.50
+    /// per 100-lot at $0.50" on docs.polymarket.us/fees. A market that
+    /// publishes nothing takes the venue-wide rate and says so; a published
+    /// zero is a free market and stays zero rather than being "corrected".
+    #[test]
+    fn a_published_coefficient_wins_and_a_missing_one_falls_back_to_the_venue() {
+        use super::published_or_venue_fee_bps;
+        assert_eq!(published_or_venue_fee_bps(Some(dec!(0.06)), dec!(0.07)), (150, true));
+        assert_eq!(published_or_venue_fee_bps(None, dec!(0.06)), (150, false));
+        assert_eq!(published_or_venue_fee_bps(Some(dec!(0)), dec!(0.06)), (0, true));
+    }
+}
 
 #[cfg(test)]
 mod startup_sweep_gate_tests {

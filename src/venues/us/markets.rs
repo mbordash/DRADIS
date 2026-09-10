@@ -51,6 +51,7 @@ pub fn leg_is_long(symbol: &str) -> Option<bool> {
 }
 
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 
 /// A tradeable binary market reduced to its two neutral leg ids.
 #[derive(Debug, Clone)]
@@ -60,6 +61,10 @@ pub struct UsMarketPair {
     /// Venue category hint (e.g. `crypto`, `sports`) — feeds the shared
     /// market-class taxonomy so the trader can route pairs to the right wing.
     pub category: String,
+    /// The gateway's coarse market shape: `moneyline`, `spreads`, `totals`,
+    /// `props`, `futures`, `drawable_outcome` (checked live 2026-09-09). Read
+    /// by [`Self::is_game_moneyline`]; empty when the gateway sent none.
+    pub market_type: String,
     /// Venue long-form description — scanned as a strike-price fallback for
     /// crypto markets whose question omits the threshold.
     pub description: String,
@@ -71,6 +76,35 @@ pub struct UsMarketPair {
     pub close_time: Option<DateTime<Utc>>,
     /// Cumulative USD trading volume — used to rank and rotate to the hottest market.
     pub volume: f64,
+    /// The market's published taker fee coefficient Θ (`feeCoefficient`, 0.06
+    /// on every market checked 2026-09-09), or `None` when the gateway sent
+    /// none. Becomes `MarketConfig::{yes,no}_fee_bps` as the per-share ceiling
+    /// `Θ/4`; the trader falls back to the venue-wide `us_taker_fee_rate` for
+    /// `None` and warns. Never defaulted to zero: zero means a free market.
+    pub fee_coefficient: Option<Decimal>,
+}
+
+impl UsMarketPair {
+    /// Is this a game moneyline in the venue's sports category — the one shape
+    /// the sports wing trades?
+    ///
+    /// The wing used to claim everything that was not politics or crypto, on
+    /// the theory that an oddly labeled market was better traded than dropped.
+    /// What that admitted in production (2026-08-30) was "Highest temperature
+    /// in Miami on August 30?", a `climate` market the seeder chose because it
+    /// closed soonest, and which then held the sports slot with a $1.00 / $0.01
+    /// book nothing could work. The category alone is not enough either: the
+    /// venue files set-winner props, quarter spreads, team totals and season
+    /// futures under `sports`, none of which the wing's vipers price. Both the
+    /// category and the gateway's `marketType` have to say game moneyline.
+    /// Soccer's three-way `drawable_outcome` markets are excluded with the
+    /// rest; that costs a few tradeable games and is the safe side to err on,
+    /// because an empty slot refills on its own and a wrongly filled one
+    /// blocks the seeder until the market closes.
+    pub fn is_game_moneyline(&self) -> bool {
+        self.category.eq_ignore_ascii_case("sports")
+            && self.market_type.eq_ignore_ascii_case("moneyline")
+    }
 }
 
 /// Map one market's catalog entry to a leg's settlement answer.
@@ -256,11 +290,13 @@ pub fn pair_markets(markets: Vec<types::UsMarket>) -> Vec<UsMarketPair> {
                 slug: m.slug,
                 question: m.question,
                 category: m.category,
+                market_type: m.market_type,
                 description: m.description,
                 long: MarketId::new(l),
                 short: MarketId::new(s),
                 close_time: parse_close_time(&m.end_date),
                 volume,
+                fee_coefficient: m.fee_coefficient,
             });
         }
     }
@@ -348,6 +384,7 @@ mod tests {
             market_type: String::new(),
             volume_num: Some(10_000.0),
             volume_str: None,
+            fee_coefficient: Some(rust_decimal_macros::dec!(0.06)),
             market_sides: Vec::new(),
             instruments,
             outcomes: serde_json::Value::Array(Vec::new()),
@@ -507,3 +544,52 @@ mod tests {
     }
 }
 
+
+#[cfg(test)]
+mod fee_coefficient_tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    /// One market in the gateway's shape, trimmed to what pairing reads plus
+    /// the fee field under test.
+    fn market(fee: &str) -> String {
+        format!(
+            r#"{{"markets":[{{"slug":"cpc-btc-100k-09-30-2026","question":"When will Bitcoin cross $100k again?",
+                "category":"crypto","marketType":"futures","endDate":"2026-09-30T23:59:00Z",
+                "marketSides":[{{"identifier":"cpc-btc-100k-09-30-2026","long":true}},
+                               {{"identifier":"cpc-btc-100k-09-30-2026","long":false}}]{fee}}}]}}"#
+        )
+    }
+
+    fn pair_from(body: &str) -> UsMarketPair {
+        let resp: types::MarketsResponse = serde_json::from_str(body).expect("parse");
+        let mut pairs = pair_markets(resp.markets);
+        assert_eq!(pairs.len(), 1, "one binary market must pair");
+        pairs.remove(0)
+    }
+
+    /// The gateway sends `feeCoefficient: 0.06` on every market (checked live
+    /// 2026-09-09 across sports, crypto and politics, open and resolved). The
+    /// record dropped it until then, and every `MarketConfig` on this venue was
+    /// built with `fee_bps: 0`.
+    #[test]
+    fn the_published_coefficient_reaches_the_pair() {
+        let pair = pair_from(&market(r#","feeCoefficient":0.06"#));
+        assert_eq!(pair.fee_coefficient, Some(dec!(0.06)));
+        // As a numeric string, the gateway's other spelling for numbers.
+        let pair = pair_from(&market(r#","feeCoefficient":"0.06""#));
+        assert_eq!(pair.fee_coefficient, Some(dec!(0.06)));
+    }
+
+    /// Missing is `None`, never zero — zero is a real value meaning a free
+    /// market, and the trader falls back to the venue-wide rate for `None`.
+    #[test]
+    fn a_missing_or_unreadable_coefficient_is_none_not_zero() {
+        for fee in ["", r#","feeCoefficient":null"#, r#","feeCoefficient":"six percent""#] {
+            let pair = pair_from(&market(fee));
+            assert_eq!(pair.fee_coefficient, None, "{fee:?}");
+        }
+        let free = pair_from(&market(r#","feeCoefficient":0"#));
+        assert_eq!(free.fee_coefficient, Some(Decimal::ZERO), "an explicit zero survives as one");
+    }
+}

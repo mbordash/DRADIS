@@ -540,6 +540,13 @@ impl Strategy for ArbitrageStrategyImpl {
             // At 1000 bps per side the threshold is 1.20 — structurally unreachable
             // on a binary market — so positions correctly settle at $1.00 (0% fee).
             // If Polymarket ever lowers taker fees, this will start firing again.
+            //
+            // Event-market squadrons (sports, politics) carry the per-share
+            // CEILING of the market's published quadratic schedule instead —
+            // 125 bps for the 0.05 sports rate, see `venues::taker_fee_ceiling_bps`
+            // — so their threshold is 1.025. They used to carry 0, which made
+            // this gate fire at a $1.00 combined bid and pay two taker fees to
+            // collect what settlement pays for free.
             let yes_fee_rate = Decimal::from(market.yes_fee_bps) / dec!(10000);
             let no_fee_rate  = Decimal::from(market.no_fee_bps)  / dec!(10000);
             let early_exit_threshold = dec!(1.0) + yes_fee_rate + no_fee_rate;

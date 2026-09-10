@@ -25,12 +25,14 @@
 /// dummy `market_rx` that never fires.
 
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::{Arc, atomic::AtomicU64, RwLock};
 
 use alloy::primitives::Address;
 use alloy::providers::Provider;
 use alloy::signers::local::LocalSigner;
 use chrono::Utc;
+use rust_decimal::Decimal;
 use tokio::sync::{watch, Mutex};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
@@ -116,6 +118,10 @@ where
         viper_budgets: &HashMap<String, f64>,
         // Gamma's end date for this market, or None when it has none.
         market_close_time: Option<chrono::DateTime<chrono::Utc>>,
+        // The most a taker exit can cost per share on this market, in bps of
+        // $1 — see `event_market_fee_bps`. Resolved by the caller, which has
+        // the Gamma record and can say where the figure came from.
+        taker_fee_bps: u32,
         // The token the patrol task selects on. Supplied by the caller rather
         // than minted here: a token created inside this function and dropped at
         // its end is one nothing can ever fire, which is exactly how deployed
@@ -145,8 +151,15 @@ where
             strike_price: None,
             is_neg_risk: false,
             condition_id: market_id.to_string(),
-            yes_fee_bps: 0,
-            no_fee_bps: 0,
+            // These used to be literal zeros, which told every fee-aware gate
+            // that taker exits on this market were free: the Arbitrage
+            // early-exit gate would FAK both legs the moment the bids summed
+            // to $1.00, paying a taker fee on each leg to collect what
+            // settlement pays for nothing. The venue charges 0.05 on sports
+            // and 0.04 on politics takers; the caller reads that from the
+            // market's own fee schedule.
+            yes_fee_bps: taker_fee_bps,
+            no_fee_bps: taker_fee_bps,
         };
 
         // Create Squadron
@@ -342,6 +355,64 @@ pub struct MarketInfo {
     /// `no market_close_time` and TimeDecay 45 times with `market has no close
     /// time`. The squadrons patrolled, quoted nothing, and looked healthy.
     pub close_time: Option<chrono::DateTime<chrono::Utc>>,
+    /// The taker-fee coefficient Gamma publishes for this market, or `None`
+    /// when the record carries no schedule this code can read. See
+    /// [`parse_gamma_fee_rate`] for what counts as readable.
+    pub taker_fee_rate: Option<Decimal>,
+}
+
+/// The taker-fee coefficient Gamma publishes for a market, if it publishes one.
+///
+/// The market record carries `feeType` beside `feeSchedule { rate, exponent,
+/// takerOnly, rebateRate }`: `sports_fees_v3` is 0.05, `politics_fees` 0.04,
+/// `economics_fees` 0.05, `crypto_fees_v2` 0.07 (all checked live 2026-09-09),
+/// and both fields are absent on markets the venue does not charge for, such as
+/// geopolitics. The CLOB's own `/fee-rate` and `taker_base_fee` fields read 1000
+/// on every token regardless of category, so this record is the only place the
+/// category rate exists.
+///
+/// `None` for anything but a well-formed schedule: a missing schedule, a missing
+/// or non-numeric rate, a negative rate, or an exponent other than 1. With any
+/// other exponent the fee is no longer `rate × p × (1 − p)`, and a ceiling
+/// computed as if it were could be wrong in either direction. This function only
+/// reports what Gamma said; what an absent rate means is the caller's decision.
+pub(crate) fn parse_gamma_fee_rate(market: &serde_json::Value) -> Option<Decimal> {
+    let schedule = market.get("feeSchedule")?;
+    if let Some(exponent) = schedule.get("exponent") {
+        if exponent.as_f64()? != 1.0 {
+            return None;
+        }
+    }
+    let rate = match schedule.get("rate")? {
+        // Through the decimal string, not `f64`: 0.05 as a float is not 0.05.
+        serde_json::Value::Number(n) => Decimal::from_str(&n.to_string()).ok()?,
+        serde_json::Value::String(s) => Decimal::from_str(s.trim()).ok()?,
+        _ => return None,
+    };
+    (rate >= Decimal::ZERO).then_some(rate)
+}
+
+/// The fee figure an event-market squadron's `MarketConfig` is built with, and
+/// whether it came from the market itself.
+///
+/// A published rate is used as it stands, including a published zero. Anything
+/// else falls back to the venue-wide taker rate — the same `intl_taker_fee_rate`
+/// knob every other fee-aware gate on the squadron (Maker's floor, Momentum's
+/// and Convergence's fee-dominance check) already reads — so the two fee channels
+/// on a squadron agree rather than a third number appearing. That fallback
+/// overstates the fee on a market the venue does not charge for, which only
+/// makes the Arbitrage early exit less eager and settlement the preferred
+/// close; it never understates it. Defaulting to zero was the defect this
+/// replaces, and a zero that Gamma did not actually publish must not come back
+/// through a renamed field or a dropped one.
+///
+/// Returns the per-share ceiling in basis points (see
+/// [`crate::venues::taker_fee_ceiling_bps`]) and `true` when the market's own
+/// schedule supplied it.
+pub(crate) fn event_market_fee_bps(published: Option<Decimal>, venue_wide_rate: Decimal) -> (u32, bool) {
+    // Shared with the Polymarket US trader, which resolves the gateway's
+    // per-market `feeCoefficient` the same way.
+    crate::venues::published_or_venue_fee_bps(published, venue_wide_rate)
 }
 
 /// The question text if Gamma knows this market as CLOSED, else `None`.
@@ -527,7 +598,9 @@ pub async fn fetch_market_info(http: &reqwest::Client, condition_id: &str) -> Op
         warn!(%condition_id, "Gamma market has no usable endDate — close-time vipers will stay gated");
     }
 
-    Some(MarketInfo { question, yes_token, no_token, close_time })
+    let taker_fee_rate = parse_gamma_fee_rate(market);
+
+    Some(MarketInfo { question, yes_token, no_token, close_time, taker_fee_rate })
 }
 
 /// Run the Admiral Adama deployment processor.
@@ -595,6 +668,24 @@ where
             }
         }
 
+        // The fee this market actually charges, read from its own schedule.
+        // Said out loud either way: a squadron flying on the venue-wide rate
+        // because Gamma published nothing is a fact the operator should be
+        // able to find in the log, not infer from a gate's behavior.
+        let venue_wide_rate = crate::venues::taker_fee_rate();
+        let (taker_fee_bps, from_market) = event_market_fee_bps(info.taker_fee_rate, venue_wide_rate);
+        match info.taker_fee_rate {
+            Some(rate) if from_market => info!(
+                market = %dep.market_id, %rate, ceiling_bps = taker_fee_bps,
+                "💸 Gamma fee schedule read for \"{}\"", info.question,
+            ),
+            _ => warn!(
+                market = %dep.market_id, assumed_rate = %venue_wide_rate, ceiling_bps = taker_fee_bps,
+                "💸 Gamma publishes no readable fee schedule for \"{}\" — assuming the venue-wide \
+                 taker rate so no gate treats taker exits as free", info.question,
+            ),
+        }
+
         let (squadron_id, handle) = self.infra.spawn_squadron(
             dep.id.clone(),
             &dep.market_id,
@@ -607,6 +698,7 @@ where
             &dep.vipers,
             &dep.viper_budgets,
             info.close_time,
+            taker_fee_bps,
             cancel.clone(),
         ).await.map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -737,6 +829,7 @@ mod gamma_shape_tests {
 #[cfg(test)]
 mod deployed_squadron_wiring_tests {
     use super::*;
+    use rust_decimal_macros::dec;
 
     /// Gamma returns the market's end date as `endDate`, beside the tokens.
     ///
@@ -766,6 +859,71 @@ mod deployed_squadron_wiring_tests {
         assert!(parsed.is_none());
     }
 
+    /// The fee schedule as Gamma serves it on a sports moneyline (copied from
+    /// the live record for "Patriots vs. Seahawks", 2026-09-09). Every
+    /// deployed squadron used to be built with `yes_fee_bps: 0`, so the
+    /// Arbitrage early-exit gate on a sports squadron believed a FAK exit
+    /// cost nothing and would fire at a $1.00 combined bid — paying two taker
+    /// fees to collect what settlement pays for free.
+    #[test]
+    fn the_published_sports_rate_is_read_from_the_gamma_record() {
+        let market = serde_json::json!({
+            "question": "Patriots vs. Seahawks",
+            "feeType": "sports_fees_v3",
+            "feeSchedule": { "exponent": 1, "rate": 0.05, "takerOnly": true, "rebateRate": 0.15 },
+        });
+        assert_eq!(parse_gamma_fee_rate(&market), Some(dec!(0.05)));
+        assert_eq!(event_market_fee_bps(parse_gamma_fee_rate(&market), dec!(0.07)), (125, true));
+    }
+
+    /// Politics carries its own rate; the crypto figure must not leak onto it.
+    #[test]
+    fn the_politics_rate_is_its_own() {
+        let market = serde_json::json!({
+            "feeType": "politics_fees",
+            "feeSchedule": { "exponent": 1, "rate": 0.04, "takerOnly": true, "rebateRate": 0.25 },
+        });
+        assert_eq!(event_market_fee_bps(parse_gamma_fee_rate(&market), dec!(0.07)), (100, true));
+    }
+
+    /// A market Gamma lists with no schedule at all (geopolitics, live
+    /// 2026-09-09: `feeType: null, feeSchedule: null`) is NOT read as free.
+    /// Zero was the defect; a zero the venue did not publish must never come
+    /// back through an absent field. The venue-wide rate stands in, which can
+    /// only overstate the cost and so only ever makes the early exit less
+    /// eager than it could be.
+    #[test]
+    fn an_absent_schedule_falls_back_to_the_venue_wide_rate_not_zero() {
+        let market = serde_json::json!({ "question": "Ceasefire by September 4?" });
+        assert_eq!(parse_gamma_fee_rate(&market), None);
+        let (bps, from_market) = event_market_fee_bps(None, dec!(0.07));
+        assert_eq!(bps, 175, "the venue-wide rate's ceiling, never zero");
+        assert!(!from_market);
+    }
+
+    /// A schedule with a different exponent is a different formula, and the
+    /// ceiling derived for exponent 1 could be wrong either way — so it is
+    /// treated as unreadable rather than guessed at.
+    #[test]
+    fn an_unfamiliar_exponent_is_not_read() {
+        let market = serde_json::json!({
+            "feeSchedule": { "exponent": 2, "rate": 0.05 },
+        });
+        assert_eq!(parse_gamma_fee_rate(&market), None);
+        let odd = serde_json::json!({ "feeSchedule": { "rate": "abc" } });
+        assert_eq!(parse_gamma_fee_rate(&odd), None);
+        let negative = serde_json::json!({ "feeSchedule": { "rate": -0.05 } });
+        assert_eq!(parse_gamma_fee_rate(&negative), None);
+    }
+
+    /// A rate Gamma publishes as zero IS a published rate, and stands.
+    #[test]
+    fn a_published_zero_is_honored() {
+        let market = serde_json::json!({ "feeSchedule": { "exponent": 1, "rate": 0 } });
+        assert_eq!(parse_gamma_fee_rate(&market), Some(Decimal::ZERO));
+        assert_eq!(event_market_fee_bps(Some(Decimal::ZERO), dec!(0.07)), (0, true));
+    }
+
     /// A deployed squadron's asset must resolve to a pool via the alias.
     ///
     /// `pool_for` returns None on a miss rather than falling back, so without
@@ -780,6 +938,45 @@ mod deployed_squadron_wiring_tests {
             !crate::helpers::db::available_assets().contains(&"adamatest-politics".to_string()),
             "an alias must not surface as a separate asset",
         );
+    }
+}
+
+/// Live checks against Gamma. Ignored by default (network); run with
+/// `cargo test -- --ignored live_`. Gamma is public, so no credentials.
+#[cfg(test)]
+mod live_gamma_checks {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    /// The full deploy-time read for a sports moneyline the seeder could pick
+    /// today: `fetch_market_info` must surface the published 0.05 rate, and
+    /// the squadron must be built with its 125 bps ceiling.
+    #[tokio::test]
+    #[ignore = "live Gamma: network"]
+    async fn live_sports_moneyline_fee_schedule_reaches_the_squadron() {
+        let http = reqwest::Client::new();
+        let listing = crate::api::server::fetch_markets_by_type(&http, "sports", 14 * 86_400, 0.0).await;
+        let first = listing.first().expect("Gamma lists at least one sports moneyline in the next 14 days");
+        let info = fetch_market_info(&http, &first.condition_id).await.expect("market info");
+        eprintln!("{:?} [{}] published rate {:?}", info.question, first.condition_id, info.taker_fee_rate);
+        assert_eq!(info.taker_fee_rate, Some(dec!(0.05)), "sports_fees_v3 publishes 0.05");
+        assert_eq!(event_market_fee_bps(info.taker_fee_rate, crate::venues::taker_fee_rate()), (125, true));
+    }
+
+    /// The sports class on this venue lists game moneylines only.
+    #[tokio::test]
+    #[ignore = "live Gamma: network"]
+    async fn live_sports_class_lists_only_moneylines() {
+        let http = reqwest::Client::new();
+        let listing = crate::api::server::fetch_markets_by_type(&http, "sports", 14 * 86_400, 0.0).await;
+        assert!(!listing.is_empty(), "no sports moneylines listed at all");
+        for m in &listing {
+            let url = format!("https://gamma-api.polymarket.com/markets?condition_ids={}", m.condition_id);
+            let rec: Vec<serde_json::Value> = http.get(&url).send().await.unwrap().json().await.unwrap();
+            let kind = rec[0].get("sportsMarketType").and_then(|v| v.as_str()).unwrap_or("");
+            eprintln!("  {:?} → {kind}", m.question);
+            assert_eq!(kind, "moneyline", "{:?} is not a moneyline", m.question);
+        }
     }
 }
 

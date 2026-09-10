@@ -340,8 +340,8 @@ impl Strategy for MomentumStrategyImpl {
         // position closed 62s later at −5.66% gross, so the fee was 116% of the
         // loss. With no fee the same trade nets −$0.27; it booked −$0.59.
         //
-        // Per side, because the two asks differ. Zero on a venue with no taker fee,
-        // where this gate never binds.
+        // Per side, because the two asks differ. Binds on every venue: all three
+        // charge the quadratic taker fee (Polymarket US at 0.06).
         let fee_reason_bull = crate::vipers::fee_dominated_entry(
             yes_ask, base_take_profit(yes_ask, dc.momentum_target_profit_pct), dc.momentum_max_fee_to_target_ratio);
         let fee_reason_bear = crate::vipers::fee_dominated_entry(
@@ -740,8 +740,7 @@ impl Strategy for MomentumStrategyImpl {
             // with the balanced 10% target every entry under $0.286 books a "profit"
             // that is a net loss, and the conservative 6% target does so under $0.571,
             // i.e. across almost its whole $0.20–$0.50 entry band. Raising the target
-            // to a margin above the fee makes MomentumTP mean what it says; it also
-            // simply never binds on venues that charge no taker fee.
+            // to a margin above the fee makes MomentumTP mean what it says.
             //
             // This is the TAKER target: the bar for selling at the bid with a FAK,
             // which pays the second leg. The resting ask further down is floored
@@ -1116,20 +1115,35 @@ mod tests {
     /// 2026-09-09 11:00 ET, aggressive profile: YES at $0.53 with a 15% target.
     /// The round trip was 6.58% of notional — 44% of the plan — and it fired the
     /// only loss of the day with the fee at 116% of the gross loss. Under the
-    /// shipped 0.40 cap that entry is refused on every venue that charges a taker
-    /// fee, and the refusal names the knob that owns it. On a venue that charges
-    /// nothing the gate must be inert: the fee is zero at every price, and a
-    /// strategy that would have traded there yesterday still trades today.
+    /// shipped 0.40 cap that entry is refused on the 0.07 venues (Polymarket
+    /// International, Kalshi), and the refusal names the knob that owns it.
+    ///
+    /// The verdict follows the venue's rate, not the venue's name: on Polymarket
+    /// US the schedule is 0.06, the same trade is 5.64% of notional — 38% of the
+    /// plan — and it passes the 0.40 cap by two points. That is the arithmetic,
+    /// pinned here so the gate is never mistaken for a venue switch. (Until the
+    /// fix of 2026-09-09 that build carried a zero rate and this gate was inert.)
     #[test]
-    fn the_2026_09_09_entry_is_refused_where_a_taker_fee_is_charged() {
-        let charged = crate::venues::round_trip_fee_pct(dec!(0.53)) > Decimal::ZERO;
+    fn the_2026_09_09_entry_is_refused_where_the_fee_dominates_the_plan() {
+        let fee = crate::venues::round_trip_fee_pct(dec!(0.53));
+        let share = fee / dec!(0.15);
         let verdict = crate::vipers::fee_dominated_entry(dec!(0.53), dec!(0.15), dec!(0.40));
-        if charged {
-            let reason = verdict.expect("a 44% fee share must be refused under a 40% cap");
+        if share > dec!(0.40) {
+            let reason = verdict.as_deref().unwrap_or_else(|| panic!("a {share:.3} fee share must be refused under a 0.40 cap"));
             assert!(reason.contains("fee-dominated"), "reason must carry the advisor's needle: {reason}");
             assert!(reason.contains("max 40%"), "reason must show the cap it broke: {reason}");
         } else {
-            assert_eq!(verdict, None, "a zero-fee venue must never refuse on fees");
+            assert_eq!(verdict, None, "a {share:.3} fee share is under the cap and must pass");
+        }
+        // The venue's own rate decides which branch ran — and every shipped venue
+        // charges one, so the trade is never free.
+        assert!(fee > Decimal::ZERO, "every shipped venue charges a taker fee; got {fee}");
+        let rate = crate::venues::taker_fee_rate();
+        if rate >= dec!(0.07) {
+            assert!(verdict.is_some(), "at {rate} the 2026-09-09 entry is refused");
+        }
+        if rate == dec!(0.06) {
+            assert!(verdict.is_none(), "at 0.06 the same entry is 38% of the plan and passes");
         }
         // A cap that admits the fee lets the trade through on every venue.
         assert_eq!(crate::vipers::fee_dominated_entry(dec!(0.53), dec!(0.15), dec!(0.50)), None);
@@ -1210,11 +1224,10 @@ mod tests {
     /// take-profit target fails. Pins the shape so a venue-fee refactor cannot
     /// quietly flatten it.
     ///
-    /// The assertion is conditional on the venue actually charging a taker fee,
-    /// because US Retail charges none: there `round_trip_fee_pct` is zero at every
-    /// price and the fee floor is *correctly* inert. Asserting a decreasing curve
-    /// unconditionally fails the `us_retail` build for a venue that is behaving
-    /// exactly as intended, so each branch pins the property that venue should hold.
+    /// The assertion is conditional on the venue actually charging a taker fee.
+    /// Every venue DRADIS ships does today (Polymarket US at 0.06 since the fix
+    /// of 2026-09-09; it was carried as zero before that), so the zero branch is
+    /// kept only so a genuinely free venue would pin the property it should hold.
     #[test]
     fn round_trip_fee_falls_as_entry_price_rises() {
         let cheap = crate::venues::round_trip_fee_pct(dec!(0.20));

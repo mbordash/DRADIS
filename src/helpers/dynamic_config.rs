@@ -192,6 +192,7 @@ fn default_fairvalue_max_stop_losses()     -> u32     { config::FAIRVALUE_MAX_ST
 fn default_fairvalue_edge_noise_multiple() -> Decimal { config::FAIRVALUE_EDGE_NOISE_MULTIPLE         }
 fn default_fairvalue_stop_model_confirm() -> Decimal { config::FAIRVALUE_STOP_MODEL_CONFIRM_FRAC      }
 fn default_intl_taker_fee_rate()           -> Decimal { config::INTL_TAKER_FEE_RATE                   }
+fn default_us_taker_fee_rate()             -> Decimal { config::US_TAKER_FEE_RATE                     }
 fn default_convergence_position_size()     -> Decimal { config::CONVERGENCE_POSITION_SIZE_USDC        }
 fn default_convergence_max_exposure()      -> Decimal { config::CONVERGENCE_MAX_EXPOSURE_USDC         }
 fn default_convergence_stop_loss()         -> Decimal { config::CONVERGENCE_STOP_LOSS_PERCENT         }
@@ -238,6 +239,7 @@ fn default_deploy_max_days_to_close()       -> u32     { config::DEPLOY_MAX_DAYS
 fn default_llm_max_output_tokens()          -> u32     { config::LLM_MAX_OUTPUT_TOKENS                }
 fn default_auto_deploy_politics()           -> bool    { config::AUTO_DEPLOY_POLITICS                 }
 fn default_auto_deploy_sports()             -> bool    { config::AUTO_DEPLOY_SPORTS                   }
+fn default_kalshi_sports_game_series()      -> String  { config::KALSHI_SPORTS_GAME_SERIES.to_string() }
 fn default_event_market_retire_grace_secs() -> i64     { config::EVENT_MARKET_RETIRE_GRACE_SECS       }
 fn default_deploy_min_liquidity_usd()  -> Decimal { config::DEPLOY_MIN_LIQUIDITY_USD        }
 fn default_collateral_sweep_enabled()       -> bool    { config::COLLATERAL_SWEEP_ENABLED             }
@@ -359,6 +361,14 @@ pub struct DynamicConfig {
     /// `fee = rate · p · (1 − p) · shares`, charged on entry and exit alike.
     #[serde(default = "default_intl_taker_fee_rate")]
     pub intl_taker_fee_rate: Decimal,
+    /// Polymarket US taker fee coefficient — `venues::taker_fee_rate()` on that
+    /// build, so every price-dependent fee floor and gate reads it. The gateway
+    /// publishes a per-market `feeCoefficient` (0.06 everywhere as of
+    /// 2026-09-09) and the trader warns at deploy when a market's figure
+    /// differs from this one. Zero here switches every fee gate off, which is
+    /// exactly the defect this knob replaced.
+    #[serde(default = "default_us_taker_fee_rate")]
+    pub us_taker_fee_rate: Decimal,
 
     // ── Viper (strategy) enable flags ─────────────────────────────────────────
     pub enable_arbitrage:     bool,
@@ -536,6 +546,11 @@ pub struct DynamicConfig {
     /// Keep a sports squadron running without waiting for an operator deploy.
     #[serde(default = "default_auto_deploy_sports")]
     pub auto_deploy_sports:            bool,
+    /// Kalshi series tickers the sports class discovers on — see
+    /// `config::KALSHI_SPORTS_GAME_SERIES`. Read by that venue only; the
+    /// other venues label game moneylines on the market record itself.
+    #[serde(default = "default_kalshi_sports_game_series")]
+    pub kalshi_sports_game_series:     String,
     /// Seconds an event market must be closed — by its stated close time, or by
     /// the venue itself no longer accepting orders on it — before its squadron
     /// stands down, freeing the class for the next auto-deploy. A squadron
@@ -1008,6 +1023,7 @@ impl Default for DynamicConfig {
             // GHOST_MODE_DEFAULT, not GHOST_MODE: this seeds a fresh install only.
             ghost_mode: config::GHOST_MODE_DEFAULT,
             intl_taker_fee_rate: config::INTL_TAKER_FEE_RATE,
+            us_taker_fee_rate: config::US_TAKER_FEE_RATE,
 
             enable_arbitrage:     config::ENABLE_ARBITRAGE_TRADING,
             enable_time_decay:    config::ENABLE_TIME_DECAY_TRADING,
@@ -1081,6 +1097,7 @@ impl Default for DynamicConfig {
             deploy_max_days_to_close:      config::DEPLOY_MAX_DAYS_TO_CLOSE,
             auto_deploy_politics:          config::AUTO_DEPLOY_POLITICS,
             auto_deploy_sports:            config::AUTO_DEPLOY_SPORTS,
+            kalshi_sports_game_series:     config::KALSHI_SPORTS_GAME_SERIES.to_string(),
             event_market_retire_grace_secs: config::EVENT_MARKET_RETIRE_GRACE_SECS,
             deploy_min_liquidity_usd: config::DEPLOY_MIN_LIQUIDITY_USD,
             collateral_sweep_enabled:      config::COLLATERAL_SWEEP_ENABLED,

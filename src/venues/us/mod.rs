@@ -70,6 +70,37 @@ const DEFAULT_MIN_VOLUME: f64 = 5_000.0;
 /// are the ones still open; stale listings are resolved events awaiting settlement.
 const MARKET_START_LOOKBACK_DAYS: i64 = 7;
 
+/// The live Polymarket US taker fee coefficient, falling back to the compile-time
+/// default before the config channel is published (venue bootstrap) or if it has
+/// gone away. `venues::taker_fee_rate()` on this build.
+///
+/// Venue-wide by design: the gateway publishes a per-market `feeCoefficient`
+/// and the trader carries that on `MarketConfig::{yes,no}_fee_bps`, but the
+/// price-dependent fee floors and gates have no market in scope and read this.
+/// The trader warns at deploy if a market's published figure differs from it.
+pub fn live_taker_fee_rate() -> Decimal {
+    crate::helpers::dynamic_config::global_config_tx()
+        .map(|tx| tx.borrow().us_taker_fee_rate)
+        .unwrap_or(crate::config::US_TAKER_FEE_RATE)
+}
+
+/// The taker fee a fill pays, in dollars, or zero for a post-only order.
+///
+/// `Θ · p · (1 − p)` per share on the shares the venue acknowledged. A post-only
+/// order never crosses, so it never pays: it is a maker fill, which the venue
+/// REBATES rather than charges — that credit is not booked here. A resting
+/// `Gtc`/`Gtd` order that is not post-only pays only on what matched at the ack
+/// (`filled` is zero when it rested), and a later fill of the rested remainder
+/// is a maker fill too. Booked here so the fee reaches recorded P&L the way it
+/// does on Kalshi and Polymarket International, rather than vanishing into the
+/// balance; this venue booked zero on every fill until 2026-09-09.
+fn taker_fee_for(intent: &OrderIntent, filled: Decimal) -> Decimal {
+    if intent.post_only || filled <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    crate::venues::taker_fee_per_share(intent.price) * filled
+}
+
 /// The custodial US retail venue (web2 auth, no signer).
 pub struct UsRetailVenue {
     client: PolymarketUsClient,
@@ -599,11 +630,13 @@ impl UsRetailVenue {
         let body = Self::build_order(intent)?;
         let ack = self.client.orders().place(&body).await.context("order POST failed")?;
 
+        let filled = resolve_filled(ack.filled_quantity, intent);
         Ok(Fill {
             order_id: OrderId(ack.order_id),
             market: intent.market.clone(),
-            filled: resolve_filled(ack.filled_quantity, intent),
-            price: intent.price, fee: Decimal::ZERO
+            filled,
+            price: intent.price,
+            fee: taker_fee_for(intent, filled),
         })
     }
 
@@ -679,11 +712,15 @@ impl Execution for UsRetailVenue {
             );
         }
 
-        let to_fill = |ack: &types::PlaceOrderResponse, intent: &OrderIntent| Fill {
-            order_id: OrderId(ack.order_id.clone()),
-            market: intent.market.clone(),
-            filled: resolve_filled(ack.filled_quantity, intent),
-            price: intent.price, fee: Decimal::ZERO
+        let to_fill = |ack: &types::PlaceOrderResponse, intent: &OrderIntent| {
+            let filled = resolve_filled(ack.filled_quantity, intent);
+            Fill {
+                order_id: OrderId(ack.order_id.clone()),
+                market: intent.market.clone(),
+                filled,
+                price: intent.price,
+                fee: taker_fee_for(intent, filled),
+            }
         };
         Ok([to_fill(&ack.orders[0], &a), to_fill(&ack.orders[1], &b)])
     }
@@ -900,6 +937,36 @@ mod tests {
         assert_eq!(req.outcome_side, polymarket_us::types::OrderSide::Short);
     }
 
+    /// The fee booked on a fill is the published schedule, `Θ · p · (1 − p)`
+    /// per share on what the venue acknowledged. The figures are the venue's
+    /// own worked examples (docs.polymarket.us/fees): $1.50 on a 100-lot at
+    /// $0.50, $5.40 on 1,000 at $0.10, $13.65 on 1,000 at $0.65. Read through
+    /// `venues::taker_fee_rate()`, so the knob's compile-time default is what
+    /// this pins; nothing was booked on this venue before 2026-09-09.
+    #[test]
+    fn a_taker_fill_books_the_published_fee_and_a_post_only_fill_books_none() {
+        use rust_decimal_macros::dec;
+        let intent = |price, post_only| OrderIntent {
+            market: MarketId::new("game-yes#long"),
+            side: Side::Buy,
+            quantity: dec!(100),
+            price,
+            tif: if post_only { TimeInForce::Gtc } else { TimeInForce::Fak },
+            post_only,
+            expiration_secs: 0,
+            is_neg_risk: false,
+            fee_bps: 150,
+        };
+        assert_eq!(taker_fee_for(&intent(dec!(0.50), false), dec!(100)), dec!(1.50));
+        assert_eq!(taker_fee_for(&intent(dec!(0.10), false), dec!(1000)), dec!(5.40));
+        assert_eq!(taker_fee_for(&intent(dec!(0.65), false), dec!(1000)), dec!(13.65));
+        // A post-only order never crosses: no fee (it is paid a rebate instead).
+        assert_eq!(taker_fee_for(&intent(dec!(0.50), true), dec!(100)), Decimal::ZERO);
+        // Nothing filled, nothing charged — a rested GTC pays on its later
+        // maker fills nothing either.
+        assert_eq!(taker_fee_for(&intent(dec!(0.50), false), Decimal::ZERO), Decimal::ZERO);
+    }
+
     #[test]
     fn action_maps_from_side() {
         assert_eq!(UsRetailVenue::map_action(Side::Buy), sdk::OrderAction::Buy);
@@ -1001,6 +1068,40 @@ mod tests {
     }
 }
 
+
+// Live smoke for the fee coefficient — run with:
+// cargo test --no-default-features --features us_retail us_fee_coefficient_live_smoke -- --ignored --nocapture
+//
+// Parses a page of the public gateway listing through DRADIS's OWN market
+// record (the one discovery uses, not the SDK's) and asserts every market
+// carries a readable coefficient equal to the venue-wide default. If the venue
+// changes its schedule this fails, which is the signal to move
+// `US_TAKER_FEE_RATE` and the `us_taker_fee_rate` knob.
+#[cfg(test)]
+mod fee_coefficient_live_smoke {
+    #[tokio::test]
+    #[ignore = "hits the live gateway"]
+    async fn us_fee_coefficient_live_smoke() {
+        let text = reqwest::Client::new()
+            .get("https://gateway.polymarket.us/v1/markets?limit=100")
+            .send().await.expect("gateway reachable")
+            .text().await.expect("body");
+        let parsed: super::types::MarketsResponse = serde_json::from_str(&text).expect("listing parses");
+        assert!(!parsed.markets.is_empty(), "the gateway returned no markets");
+        let pairs = super::markets::pair_markets(parsed.markets.clone());
+        for m in &parsed.markets {
+            assert_eq!(
+                m.fee_coefficient, Some(crate::config::US_TAKER_FEE_RATE),
+                "{}: gateway coefficient {:?} differs from the venue-wide default", m.slug, m.fee_coefficient,
+            );
+        }
+        eprintln!("{} markets, {} paired, every coefficient {:?}",
+            parsed.markets.len(), pairs.len(), parsed.markets[0].fee_coefficient);
+        for p in pairs.iter().take(3) {
+            eprintln!("  {} → {:?}", p.slug, p.fee_coefficient);
+        }
+    }
+}
 
 // Live smoke for the settlement sweep's gateway lookup — run with:
 // cargo test --no-default-features --features us_retail us_settlement_resolution_live_smoke -- --ignored --nocapture

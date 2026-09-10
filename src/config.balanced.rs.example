@@ -141,6 +141,19 @@ pub const MIN_SELL_LIMIT_PRICE: Decimal = dec!(0.01);
 /// both legs of a round trip. Makers pay nothing. Venue fact, identical across
 /// profiles — see src/config.rs for why it is 7% and not the advertised 1000 bps.
 pub const INTL_TAKER_FEE_RATE: Decimal = dec!(0.07);
+
+/// Polymarket US taker fee coefficient Θ: `fee = Θ · p · (1 − p) · shares` on
+/// every fill that crosses the spread, on entry and exit alike. Makers pay
+/// nothing and are PAID a rebate of 0.0125 on the same formula, per fill, at the
+/// time of the fill (docs.polymarket.us/fees, effective exchange-wide 2026-07-01).
+/// Venue fact, identical across profiles. The gateway publishes the coefficient
+/// on every market record (`feeCoefficient`, 0.06 on every market checked
+/// 2026-09-09 across sports, crypto and politics); this is the venue-wide figure
+/// the price-dependent fee arithmetic reads, and the per-market figure is
+/// carried on `MarketConfig::{yes,no}_fee_bps` as its per-share ceiling.
+/// DRADIS carried this as ZERO until 2026-09-09, which switched off every
+/// fee-aware gate on the venue.
+pub const US_TAKER_FEE_RATE: Decimal = dec!(0.06);
 pub const EARLY_EXIT_COMBINED_BID_THRESHOLD: Decimal = dec!(0.995);
 
 
@@ -1324,8 +1337,22 @@ pub const EXIT_RETRY_COOLDOWN_SECS: u64 = 5;
 /// markets, Politics 644, Sports 815.
 pub const KALSHI_POLITICS_CATEGORIES: &str = "Elections,Politics";
 
-/// Kalshi categories that back DRADIS's `sports` market class.
-pub const KALSHI_SPORTS_CATEGORIES: &str = "Sports";
+/// Kalshi series tickers the `sports` market class discovers on: one per
+/// league, each holding that league's game-winner markets ("Texas wins" /
+/// "Arizona wins" under a `KXMLBGAME-...` event).
+///
+/// Discovery used to sweep `/events?status=open` for the "Sports" category,
+/// but that sweep is capped at 2,400 events and Kalshi lists its long-dated
+/// futures first, so the games — the only sports markets DRADIS can work —
+/// never appeared in it. What did appear, and what the seeder deployed on
+/// 2026-08-30, was "Will Steve Kerr be out before Oct 25, 2026?", a coaching
+/// personnel market nothing in the engine can price. Game series are queried
+/// directly instead. Every Kalshi game series ends in GAME, MATCH or FIGHT
+/// (324 of 3,754 sports series on 2026-09-09); entries that do not are
+/// ignored with a warning, so this list cannot put a non-game market in the
+/// sports slot. Comma-separated, case-insensitive. Editable at runtime as
+/// `kalshi_sports_game_series`.
+pub const KALSHI_SPORTS_GAME_SERIES: &str = "KXNFLGAME,KXNBAGAME,KXMLBGAME,KXNHLGAME,KXNCAAFGAME,KXNCAAMBGAME,KXATPMATCH,KXWTAMATCH,KXMLSGAME,KXEPLGAME,KXUCLGAME";
 
 /// Keep a politics squadron running without waiting to be asked.
 ///

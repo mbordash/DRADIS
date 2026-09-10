@@ -3472,8 +3472,31 @@ pub(crate) fn gamma_accepting_orders(m: &serde_json::Value) -> bool {
     m.get("acceptingOrders").and_then(|v| v.as_bool()) != Some(false)
 }
 
+/// Is this Gamma sports record a game moneyline — the one shape the sports
+/// class trades?
+///
+/// The sports tags admit everything Polymarket files under a sport: on the
+/// live umbrella tag (2026-09-09, top 100 by volume) 42 were moneylines, 30
+/// were season futures ("Will Liverpool win the Champions League?"), and the
+/// rest spreads, totals, esports map handicaps and per-map `child_moneyline`
+/// legs. The sports squadron prices none of those: its vipers work a single
+/// game's YES/NO book to its result, and a future ties collateral up for a
+/// season while a spread or total is a different bet with the same team
+/// names on it. Gamma labels the shape in `sportsMarketType`, so the class is
+/// defined by that field — a market without it, or with any other value, is
+/// not offered. An empty list is the honest answer to a slate with no games;
+/// a squadron on a season future would hold the class slot for months.
+#[cfg(feature = "intl_clob")]
+pub(crate) fn gamma_is_game_moneyline(m: &serde_json::Value) -> bool {
+    m.get("sportsMarketType")
+        .and_then(|v| v.as_str())
+        .is_some_and(|t| t.eq_ignore_ascii_case("moneyline"))
+}
+
 /// Fetch sports markets using tag IDs from the /sports endpoint.
 /// This is the official Polymarket approach per their API docs.
+///
+/// Only game moneylines are returned — see [`gamma_is_game_moneyline`].
 #[cfg(feature = "intl_clob")]
 async fn fetch_sports_markets_by_tags(
     http: &reqwest::Client,
@@ -3482,6 +3505,8 @@ async fn fetch_sports_markets_by_tags(
 ) -> Vec<AvailableMarket> {
     let mut out = Vec::new();
     let now = chrono::Utc::now();
+    // Sports-tagged markets that were not game moneylines, for the summary line.
+    let mut not_moneyline = 0usize;
     
     // Step 1: Fetch all sports and collect their tag IDs
     let sports_url = "https://gamma-api.polymarket.com/sports";
@@ -3552,6 +3577,14 @@ async fn fetch_sports_markets_by_tags(
                 if condition_id.is_empty() || out.iter().any(|e: &AvailableMarket| e.condition_id == condition_id) {
                     continue;
                 }
+
+                // The sports class is game moneylines. Futures, spreads,
+                // totals and per-map legs share the tags and must not fill
+                // the slot — see `gamma_is_game_moneyline`.
+                if !gamma_is_game_moneyline(m) {
+                    not_moneyline += 1;
+                    continue;
+                }
                 
                 // Check liquidity
                 let volume = m.get("volume24hrClob")
@@ -3611,7 +3644,37 @@ async fn fetch_sports_markets_by_tags(
     // Sort by liquidity and limit
     out.sort_by(|a, b| b.liquidity.partial_cmp(&a.liquidity).unwrap_or(std::cmp::Ordering::Equal));
     out.truncate(50);
+    info!(
+        "📊 fetch_markets_by_type: found {} sports moneylines ({} sports-tagged markets were futures, spreads, totals or map legs and were not offered)",
+        out.len(), not_moneyline,
+    );
     out
+}
+
+#[cfg(all(test, feature = "intl_clob"))]
+mod sports_class_tests {
+    use super::gamma_is_game_moneyline;
+    use serde_json::json;
+
+    /// The shapes Gamma files under the sports tags, as served live on
+    /// 2026-09-09. Only the game moneyline is the sports class; everything
+    /// else is a bet the squadron cannot price, and a season future would
+    /// hold the class slot for months while looking deployed.
+    #[test]
+    fn only_a_game_moneyline_is_the_sports_class() {
+        assert!(gamma_is_game_moneyline(&json!({ "question": "Patriots vs. Seahawks", "sportsMarketType": "moneyline" })));
+        for (q, kind) in [
+            ("Spread: Seahawks (-3.5)", "spreads"),
+            ("Patriots vs. Seahawks: O/U 44.5", "totals"),
+            ("Dota 2: MOUZ vs Klim Sani4 - Game 2 Winner", "child_moneyline"),
+            ("CS: 9z vs G2 - Map 1 Handicap", "map_handicap"),
+        ] {
+            assert!(!gamma_is_game_moneyline(&json!({ "question": q, "sportsMarketType": kind })), "{q} admitted as a moneyline");
+        }
+        // Season futures carry the sports tags and no `sportsMarketType` at all.
+        assert!(!gamma_is_game_moneyline(&json!({ "question": "Will Liverpool win the 2026-27 UEFA Champions League?" })));
+        assert!(!gamma_is_game_moneyline(&json!({ "question": "x", "sportsMarketType": null })));
+    }
 }
 
 /// Fetch markets for the US retail venue via `UsRetailVenue::discover_binary_markets`.
@@ -3738,19 +3801,25 @@ pub(crate) async fn fetch_markets_by_type(
     let now = chrono::Utc::now();
     let mut out: Vec<AvailableMarket> = Vec::new();
 
-    // Politics and sports come from Kalshi's own category taxonomy rather than
-    // from series tickers: there are thousands of series (2,226 under Politics
+    // Politics comes from Kalshi's own category taxonomy rather than from
+    // series tickers: there are thousands of series (2,226 under Politics
     // alone), so `/events?with_nested_markets=true` is the only viable sweep.
+    // Sports does NOT: that sweep never reaches the games, so the class is the
+    // configured game series — the same discovery the auto-deploy seeder uses,
+    // so the browser only offers what the seeder would choose. See
+    // `venues::kalshi::trader::open_sports_game_markets`.
     if market_type == "politics" || market_type == "sports" {
-        let cats_raw = if market_type == "politics" {
-            crate::config::KALSHI_POLITICS_CATEGORIES
+        let found: anyhow::Result<Vec<crate::venues::kalshi::types::KalshiMarket>> = if market_type == "sports" {
+            Ok(crate::venues::kalshi::trader::open_sports_game_markets(&venue).await)
         } else {
-            crate::config::KALSHI_SPORTS_CATEGORIES
+            let cats: Vec<&str> = crate::config::KALSHI_POLITICS_CATEGORIES
+                .split(',').map(str::trim).filter(|c| !c.is_empty()).collect();
+            venue.open_markets_for_categories(&cats).await
+                .map(|f| f.into_iter().map(|(_cat, m)| m).collect())
         };
-        let cats: Vec<&str> = cats_raw.split(',').map(str::trim).filter(|c| !c.is_empty()).collect();
-        match venue.open_markets_for_categories(&cats).await {
+        match found {
             Ok(found) => {
-                for (_cat, m) in found {
+                for m in found {
                     let close = m.close_time_utc();
                     let volume = crate::venues::kalshi::types::fp(&m.volume_fp)
                         .and_then(|d| f64::try_from(d).ok())

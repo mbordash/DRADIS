@@ -62,6 +62,20 @@ export function AdvancedRow({ field, config, onPatch, disabled }: RowProps) {
 
   const commit = useCallback(async () => {
     if (field.type === 'bool') return; // handled by the toggle path
+    if (field.type === 'string') {
+      // Free text passes through verbatim: no clamping, no number parsing.
+      // Trimmed, since a trailing space in a series list or a sport key is
+      // never intended and would only fail upstream.
+      const next = draft.trim();
+      if (next === stored) { setDraft(next); return; }
+      setSaving(true);
+      try {
+        await onPatch({ [field.key]: next } as unknown as Partial<DynamicConfig>);
+      } finally {
+        setSaving(false);
+      }
+      return;
+    }
     const n = parseFloat(draft);
     if (isNaN(n)) { setError('not a number'); setDraft(stored); return; }
     const clamped = clamp(n, field.min, field.max);
@@ -129,13 +143,14 @@ export function AdvancedRow({ field, config, onPatch, disabled }: RowProps) {
         ) : (
           <>
             <input
-              type="number"
-              className="input-field w-24"
+              type={field.type === 'string' ? 'text' : 'number'}
+              className={field.type === 'string' ? 'input-field w-72 font-mono text-[11px]' : 'input-field w-24'}
               value={draft}
               disabled={disabled || saving}
               min={field.min ?? undefined}
               max={field.max ?? undefined}
               step={field.step ?? undefined}
+              spellCheck={false}
               onChange={e => setDraft(e.target.value)}
               onBlur={commit}
               onKeyDown={e => {

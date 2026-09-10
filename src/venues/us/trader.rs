@@ -173,14 +173,19 @@ impl Wing {
     /// competing for the same market. The venue reports a `category` on every
     /// market, which is authoritative; `pair_is_crypto` remains the fallback for
     /// anything it does not label.
+    ///
+    /// Sports is no longer the residual bucket. It used to claim everything
+    /// that was neither politics nor crypto, which is how the auto-deploy
+    /// seeder put the sports squadron on a Miami temperature market (2026-08-30).
+    /// A market no wing claims is now simply not traded — an honest empty slot
+    /// rather than a squadron on something nothing can price. See
+    /// `UsMarketPair::is_game_moneyline` for what the sports class admits.
     async fn claims(self, pair: &super::markets::UsMarketPair) -> bool {
         let category = pair.category.to_ascii_lowercase();
         match self {
             Wing::Crypto => pair_is_crypto(pair).await,
             Wing::Politics => category == "politics",
-            // Sports keeps everything else that is not crypto, so a market the
-            // venue labels unusually still gets traded rather than dropped.
-            Wing::Sports => category != "politics" && !pair_is_crypto(pair).await,
+            Wing::Sports => pair.is_game_moneyline(),
         }
     }
 
@@ -530,9 +535,10 @@ pub async fn pair_matches_class(pair: &super::markets::UsMarketPair, class: &str
 ///
 /// A deployment names a class, and the wings already encode what each class
 /// trades — so a deployed market runs with the same raptors, vipers and DB
-/// shard as one the wing discovered itself. Anything unrecognized goes to
-/// Sports, matching `Wing::claims`, which keeps an oddly-labeled market traded
-/// rather than dropped.
+/// shard as one the wing discovered itself. An unrecognized class name routes
+/// to the Sports wing, but that wing only claims game moneylines
+/// (`Wing::claims`), so a deployment under an unknown class on a market that
+/// is not one fails at resolution rather than trading it.
 pub(crate) fn wing_for_class(class: &str) -> Wing {
     match class {
         "politics" => Wing::Politics,
@@ -564,6 +570,16 @@ impl crate::venues::deployment::DeploymentRunner for UsDeploymentRunner {
             .ok_or_else(|| anyhow::anyhow!(
                 "market {market_id} is no longer listed under {class} — it may have closed"
             ))?;
+        // The class is a definition, not a label: a market the wing does not
+        // claim runs on no wing. Refusing here is what makes the seeder's
+        // class filter above hold for hand deployments too, and it names the
+        // reason instead of trading something the class cannot price.
+        if !wing.claims(&pair).await {
+            anyhow::bail!(
+                "market {market_id} (\"{}\", category {:?}, type {:?}) is not a {class} market on this venue",
+                pair.question, pair.category, pair.market_type,
+            );
+        }
 
         info!("📋 Deploying {class} squadron on \"{}\" [{}]", pair.question, pair.slug);
         let outcome = trade_one_market(
@@ -598,9 +614,22 @@ impl crate::venues::deployment::DeploymentRunner for UsDeploymentRunner {
                 return None;
             }
         };
+        // Only markets the wing actually claims. This step was missing: the
+        // seeder chose from everything `/v1/markets` returned — the sports
+        // wing's discovery is the venue's whole unfiltered listing — and on
+        // 2026-08-30 the soonest-closing entry in it was a Miami temperature
+        // market, which then held the sports slot. The wing's own rotation
+        // loop and the Control Tower browser both applied `claims`; the
+        // seeder is the path that did not.
+        let mut claimed = Vec::with_capacity(pairs.len());
+        for p in pairs {
+            if wing.claims(&p).await {
+                claimed.push(p);
+            }
+        }
         let now = Utc::now();
         let max_secs = max_days_to_close as i64 * 86_400;
-        pairs.into_iter()
+        claimed.into_iter()
             .filter(|p| match p.close_time {
                 // A market with no close time is "always open" by this venue's
                 // convention and passes the horizon rather than being dropped.
@@ -1033,6 +1062,12 @@ async fn trade_one_market(
 
     // Venue-neutral market config (now carrying the real close time, so the
     // shared phase classifier can drive wind-down / rotation) + position map.
+    //
+    // The fee is the market's own published coefficient, as the per-share
+    // ceiling the flat `fee_bps` unit carries (150 bps for 0.06). It was
+    // hard-coded to zero until 2026-09-09 on the belief that this venue charged
+    // no taker fee; it charges 0.06 on every fill that crosses.
+    let fee_bps = market_fee_bps(&pair);
     let market_cfg = MarketConfig {
         yes_token: pair.long.clone(),
         no_token: pair.short.clone(),
@@ -1041,22 +1076,25 @@ async fn trade_one_market(
         strike_price,
         is_neg_risk: false,
         condition_id: String::new(),
-        yes_fee_bps: 0,
-        no_fee_bps: 0,
+        yes_fee_bps: fee_bps,
+        no_fee_bps: fee_bps,
     };
     // Secondary market the Window/Daily vipers quote on. Its own close time
     // matters: it is typically hours later than the primary's, which is the
     // whole reason a resting quote has a chance of filling there.
-    let maker_cfg = maker_pair.as_ref().map(|mk| MarketConfig {
-        yes_token: mk.long.clone(),
-        no_token: mk.short.clone(),
-        market_name: mk.question.clone(),
-        market_close_time: mk.close_time,
-        strike_price,
-        is_neg_risk: false,
-        condition_id: String::new(),
-        yes_fee_bps: 0,
-        no_fee_bps: 0,
+    let maker_cfg = maker_pair.as_ref().map(|mk| {
+        let fee_bps = market_fee_bps(mk);
+        MarketConfig {
+            yes_token: mk.long.clone(),
+            no_token: mk.short.clone(),
+            market_name: mk.question.clone(),
+            market_close_time: mk.close_time,
+            strike_price,
+            is_neg_risk: false,
+            condition_id: String::new(),
+            yes_fee_bps: fee_bps,
+            no_fee_bps: fee_bps,
+        }
     });
     let positions: Arc<Mutex<PositionMap>> = Arc::new(Mutex::new(HashMap::new()));
     // Shared, venue-neutral order lifecycle engine (Option C). Drives fill-confirm,
@@ -1487,15 +1525,21 @@ mod wing_claim_tests {
     use super::*;
 
     fn pair(category: &str, slug: &str) -> super::super::markets::UsMarketPair {
+        pair_of(category, "moneyline", slug)
+    }
+
+    fn pair_of(category: &str, market_type: &str, slug: &str) -> super::super::markets::UsMarketPair {
         super::super::markets::UsMarketPair {
             slug: slug.to_string(),
             question: "q".into(),
             category: category.to_string(),
+            market_type: market_type.to_string(),
             description: String::new(),
             long: MarketId::new(format!("{slug}#long")),
             short: MarketId::new(format!("{slug}#short")),
             close_time: None,
             volume: 0.0,
+            fee_coefficient: Some(dec!(0.06)),
         }
     }
 
@@ -1520,14 +1564,45 @@ mod wing_claim_tests {
         }
     }
 
-    /// A market the venue labels unusually must still be traded rather than
-    /// dropped — the sports wing keeps everything non-crypto that politics does
-    /// not claim.
+    /// The sports wing was the residual bucket — everything non-crypto that
+    /// politics did not claim — and on 2026-08-30 that put the auto-deployed
+    /// sports squadron on "Highest temperature in Miami on August 30?", a
+    /// `climate` market with a $1.00 / $0.01 book. A market outside the class
+    /// must now fall through every wing and stay untraded: an empty slot
+    /// refills on its own, a wrongly filled one blocks the seeder until the
+    /// market closes.
     #[tokio::test]
-    async fn an_unlabeled_market_still_finds_a_wing() {
-        let p = pair("", "aec-xyz-2026");
-        assert!(Wing::Sports.claims(&p).await, "an unlabeled market fell through every wing");
-        assert!(!Wing::Politics.claims(&p).await);
+    async fn a_market_outside_every_class_is_claimed_by_no_wing() {
+        for (category, market_type, slug) in [
+            ("climate", "futures",  "tc-temp-miahigh-2026-08-30-gte91lt92f"),
+            ("",        "",         "aec-xyz-2026"),
+        ] {
+            let p = pair_of(category, market_type, slug);
+            assert!(!Wing::Sports.claims(&p).await, "{slug} claimed by the sports wing");
+            assert!(!Wing::Politics.claims(&p).await, "{slug} claimed by the politics wing");
+        }
+    }
+
+    /// The venue files set-winner props, quarter spreads, team totals and
+    /// season futures under `sports` (live gateway, 2026-09-09). None is a game
+    /// the wing's vipers can price, so the category alone does not admit a
+    /// market — the gateway's `marketType` has to say moneyline too.
+    #[tokio::test]
+    async fn the_sports_wing_claims_game_moneylines_only() {
+        assert!(Wing::Sports.claims(&pair_of("sports", "moneyline", "aec-nfl-lac-ten-2025-11-02")).await);
+        assert!(Wing::Sports.claims(&pair_of("Sports", "Moneyline", "aec-nfl-lac-ten-2025-11-02")).await,
+            "the venue's casing must not matter");
+        for (market_type, slug) in [
+            ("props",            "ast-ttelite-set1-2026-09-09"),
+            ("spreads",          "asc-mls-laf-nyr-2026-09-09-sh-pos-2pt5"),
+            ("totals",           "tsc-nfl-ne-sea-2026-09-09-o44pt5"),
+            ("futures",          "ftsc-nfl-wrmostfp-w1-2026-09-14-jakomey"),
+            ("drawable_outcome", "atc-pl1-cie-gar-2026-08-30-gar"),
+            ("",                 "aec-unknown-2026"),
+        ] {
+            assert!(!Wing::Sports.claims(&pair_of("sports", market_type, slug)).await,
+                "{market_type} market {slug} admitted to the sports class");
+        }
     }
 
     /// Each wing needs its own shard, or two squadrons share one database.
@@ -1538,6 +1613,40 @@ mod wing_claim_tests {
         uniq.sort_unstable();
         uniq.dedup();
         assert_eq!(uniq.len(), 3, "wings share a shard: {assets:?}");
+    }
+}
+
+/// Live checks against the venue. Ignored by default: they need the venue's
+/// credentials in the environment and a network. Run with
+/// `cargo test --no-default-features --features us_retail -- --ignored live_`.
+#[cfg(test)]
+mod live_discovery_checks {
+    use super::*;
+
+    /// What the sports class actually discovers on the live gateway, through
+    /// the same path the auto-deploy seeder and the Control Tower use. Every
+    /// pair the class admits must be a game moneyline; the raw listing is
+    /// expected to carry props, spreads, totals and non-sports categories
+    /// that the class must have dropped.
+    #[tokio::test]
+    #[ignore = "live venue: needs credentials and network"]
+    async fn live_sports_class_admits_only_game_moneylines() {
+        let http = Arc::new(reqwest::Client::new());
+        let venue = UsRetailVenue::connect(http).await.expect("venue connect");
+        let raw = Wing::Sports.discover(&venue).await.expect("discovery");
+        let mut admitted = Vec::new();
+        for p in &raw {
+            if pair_matches_class(p, "sports").await { admitted.push(p.clone()); }
+        }
+        eprintln!("raw listing: {} pairs; sports class admits: {}", raw.len(), admitted.len());
+        for p in admitted.iter().take(8) {
+            eprintln!("  admitted: {:?} [{}] {} / {}", p.question, p.slug, p.category, p.market_type);
+        }
+        for p in raw.iter().filter(|p| !p.is_game_moneyline()).take(8) {
+            eprintln!("  dropped:  {:?} [{}] {} / {}", p.question, p.slug, p.category, p.market_type);
+        }
+        assert!(admitted.iter().all(|p| p.is_game_moneyline()));
+        assert!(admitted.iter().all(|p| p.category.eq_ignore_ascii_case("sports")));
     }
 }
 
@@ -1982,7 +2091,7 @@ async fn dispatch_signal(
                 .lock()
                 .await
                 .get(&PositionKey::new(squadron_id, strategy_name, params.token_id.clone()))
-                .map(|p| (p.avg_entry, p.shares));
+                .map(|p| (p.avg_entry, p.shares, p.entry_fee));
             let acted = dispatch_single(squadron_id, venue, pool, positions, lifecycle, scope, strategy_name, params, Side::Sell, starting).await;
             if acted {
                 record_round_trip(pool, scope, strategy_name, params, entered, reason).await;
@@ -2113,15 +2222,54 @@ async fn record_entry(
 /// `entered` is the (avg_entry, shares) read before the exit order was placed;
 /// `None` means no guard existed for this token, in which case there is no
 /// verifiable cost basis and we log loudly rather than invent P&L.
+/// The per-share fee ceiling, in basis points, a market's `MarketConfig` carries.
+///
+/// The market's own published coefficient when the gateway sent one (0.06 → 150
+/// bps), else the venue-wide `us_taker_fee_rate` — the same resolution the
+/// event-market deploy path uses on Polymarket International. Both cases are
+/// logged, and a market whose published figure differs from the venue-wide knob
+/// gets a warning, because the price-dependent floors and gates read the knob
+/// and would be pricing that market against the wrong schedule.
+fn market_fee_bps(pair: &super::markets::UsMarketPair) -> u32 {
+    let venue_wide = crate::venues::taker_fee_rate();
+    let (bps, from_market) = crate::venues::published_or_venue_fee_bps(pair.fee_coefficient, venue_wide);
+    match pair.fee_coefficient {
+        Some(rate) if rate != venue_wide => warn!(
+            "⚠️ \"{}\" publishes taker fee coefficient {rate} but us_taker_fee_rate is {venue_wide} — \
+             fee floors and gates on this market are priced against the knob, not the market. \
+             Set us_taker_fee_rate in the Control Tower if the venue's schedule has changed.",
+            pair.question,
+        ),
+        Some(rate) => info!("🧾 \"{}\" taker fee coefficient {rate} (ceiling {bps} bps), from the market record",
+            pair.question),
+        None => warn!(
+            "⚠️ \"{}\" published no taker fee coefficient — assuming the venue-wide {venue_wide} \
+             (ceiling {bps} bps, from_market={from_market})",
+            pair.question,
+        ),
+    }
+    bps
+}
+
+/// Book a completed round trip to the tradelog, net of both legs' taker fees.
+///
+/// `entered` is `(avg_entry, shares, entry_fee)` snapshotted from the guard
+/// before the sell. The exit fee is what the FAK at `params.price` pays under
+/// the venue schedule — a post-only exit pays nothing — computed here rather
+/// than read from the exit ack because the dispatch path reports only whether
+/// it acted. Until 2026-09-09 this booked zero fees with a note that the venue
+/// did not report them; it charges 0.06 on both legs and reports the collected
+/// commission on every execution report.
+#[allow(clippy::too_many_arguments)]
 async fn record_round_trip(
     pool: &Option<sqlx::SqlitePool>,
     scope: &TradeScope,
     strategy_name: &str,
     params: &OrderParams,
-    entered: Option<(Decimal, Decimal)>,
+    entered: Option<(Decimal, Decimal, Decimal)>,
     reason: &str,
 ) {
-    let Some((avg_entry, shares)) = entered else {
+    let Some((avg_entry, shares, entry_fee)) = entered else {
         warn!("⚠️ [{strategy_name}] exit booked for {} with no tracked entry — no trade recorded",
             params.token_id);
         return;
@@ -2129,11 +2277,21 @@ async fn record_round_trip(
     // Exit sizing follows the guard, not the signal: a partially-filled entry
     // must not book P&L on shares we never owned.
     let shares = shares.min(params.shares).max(Decimal::ZERO);
-    let pnl = (params.price - avg_entry) * shares;
+    let exit_fee = if params.post_only || params.ghost_mode {
+        Decimal::ZERO
+    } else {
+        crate::venues::taker_fee_per_share(params.price) * shares
+    };
+    let fees = entry_fee + exit_fee;
+    let gross = (params.price - avg_entry) * shares;
+    let pnl = gross - fees;
+    if !fees.is_zero() {
+        info!("🧾 [{strategy_name}] round trip {}: gross ${:.4} − fees ${:.4} (entry ${:.4} + exit ${:.4}) = ${:.4}",
+            params.token_id, gross, fees, entry_fee, exit_fee, pnl);
+    }
     metrics::record_trade(
         scope,
-        // Polymarket fees are taken from proceeds and not reported per fill, so no fee is booked on this venue.
-        Decimal::ZERO,
+        fees,
         strategy_name.to_string(),
         params.market_name.clone(),
         side_label(params.token_id.as_str()).to_string(),
@@ -2379,6 +2537,9 @@ fn register_us_squadron(
         }
     };
 
+    // Resolved once here and logged once; the trading loop resolves its own
+    // copy for the config the vipers read.
+    let fee_bps = market_fee_bps(pair);
     let market = MarketConfig {
         yes_token: pair.long.clone(),
         no_token: pair.short.clone(),
@@ -2391,8 +2552,8 @@ fn register_us_squadron(
         strike_price,
         is_neg_risk: false,
         condition_id: String::new(),
-        yes_fee_bps: 0,
-        no_fee_bps: 0,
+        yes_fee_bps: fee_bps,
+        no_fee_bps: fee_bps,
     };
 
     let name = match wing {
