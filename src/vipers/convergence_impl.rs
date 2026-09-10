@@ -914,32 +914,63 @@ mod tests {
         crate::venues::round_trip_fee_pct(dec!(0.50)) > Decimal::ZERO
     }
 
-    /// The conclusion this work item reached, pinned: at the shipped targets
-    /// the whole $0.35–$0.65 band is fee-dominated on a venue that charges a
-    /// taker fee, on every profile (the gate needs an entry at or above $0.71
-    /// even for the aggressive 10% target), and wide open on a venue that
-    /// charges none. A retune of the target or the ratio that lets part of the
-    /// band through on a fee venue is a deliberate change and should fail this
-    /// test loudly so the new break-even arithmetic gets written down.
+    /// The band is DERIVED from the gate, not chosen, and this pins that.
+    ///
+    /// History: the shipped $0.35–$0.65 band was fee-dominated at every price on
+    /// a fee-charging venue, on every profile — an 8% target at $0.35 grossed
+    /// 2.8¢ a share against 3.2¢ of fees, so a trade that hit its target still
+    /// lost money. The 2026-09-10 retune fixed that by moving the band instead
+    /// of the ratio: the floor is now the gate itself, `1 − ratio·target/(2·rate)`
+    /// rounded UP to the next cent, and the ceiling is the reach limit
+    /// `tp_ceiling/(1 + target)` above which the target price cannot be printed.
+    ///
+    /// So the invariant is no longer "the band is refused" but "the band is
+    /// entirely admitted, because its floor IS the gate". Rounding the floor
+    /// DOWN instead of up silently refuses the bottom cent, which is the bug
+    /// this catches. If a future retune moves target, ratio or band, this fails
+    /// loudly and the new arithmetic goes in the comment above.
     #[test]
-    fn the_shipped_band_is_fee_dominated_on_a_fee_venue_and_open_on_a_free_one() {
+    fn the_shipped_band_is_entirely_admitted_because_its_floor_is_the_gate() {
         let dc = DynamicConfig::default();
         assert!(dc.convergence_max_fee_to_target_ratio > Decimal::ZERO, "a zero ratio refuses every fee-charging entry");
         assert!(dc.convergence_max_fee_to_target_ratio < dec!(0.5), "the fee must stay a minority of the plan");
+        assert!(dc.convergence_min_entry_price < dc.convergence_max_entry_price, "the band must not be empty");
+
         let mut ask = dc.convergence_min_entry_price;
         while ask <= dc.convergence_max_entry_price {
             let verdict = crate::vipers::fee_dominated_entry(
                 ask, dc.convergence_target_profit_pct, dc.convergence_max_fee_to_target_ratio);
-            if fee_venue() {
-                let reason = verdict.unwrap_or_else(|| panic!(
-                    "${ask} admitted: round trip {:.2}% against a {:.1}% target",
-                    crate::venues::round_trip_fee_pct(ask) * dec!(100), dc.convergence_target_profit_pct * dec!(100)));
-                assert!(reason.contains("fee-dominated"), "the advisor's needle must be present: {reason}");
-            } else {
-                assert_eq!(verdict, None, "a zero-fee venue must never refuse ${ask} on fees");
-            }
+            assert_eq!(
+                verdict, None,
+                "${ask} is inside the shipped band but the fee gate refuses it: round trip {:.2}% \
+                 against a {:.1}% target. The band floor must sit at or above the gate floor — \
+                 round it UP to the next cent, never down.",
+                crate::venues::round_trip_fee_pct(ask) * dec!(100),
+                dc.convergence_target_profit_pct * dec!(100),
+            );
             ask += dec!(0.01);
         }
+
+        // The floor must also be TIGHT, or the band gives up tradeable prices for
+        // nothing. Tightness cannot be checked against the live venue, because one
+        // set of band constants is shared by venues with different rates: at the
+        // 2026-09-10 retune Polymarket International and Kalshi charge 0.07 while
+        // Polymarket US charges 0.06, so a floor tight for the first two sits well
+        // above the gate on the third. The band is deliberately derived for the
+        // HIGHEST rate — admitted everywhere, tight on the venues that cost most —
+        // so the derivation is pinned against that rate explicitly.
+        const DERIVED_FOR_RATE: Decimal = dec!(0.07);
+        let gate_floor = Decimal::ONE
+            - (dc.convergence_max_fee_to_target_ratio * dc.convergence_target_profit_pct)
+                / (dec!(2) * DERIVED_FOR_RATE);
+        let expected = (gate_floor * dec!(100)).ceil() / dec!(100); // round UP to the next cent
+        assert_eq!(
+            dc.convergence_min_entry_price, expected,
+            "band floor ${} does not match the gate floor derived at rate {DERIVED_FOR_RATE}: \
+             expected ${expected} (= ceil(1 − ratio·target / 2·rate) to the cent). Too low and the \
+             bottom cent is silently refused; too high and tradeable prices are given up.",
+            dc.convergence_min_entry_price,
+        );
     }
 
     /// The fee-floored take-profit can never book a loss: at every entry in

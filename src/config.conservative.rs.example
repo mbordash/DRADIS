@@ -187,7 +187,7 @@ pub const MOMENTUM_MAX_TRADE_SIZE_USDC: Decimal = dec!(10.0);
 /// Requires 3 consecutive confirming ticks to filter fakeouts aggressively.
 pub const MOMENTUM_CONFIRMATION_TICKS: u32 = 3;
 
-pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.06);
+pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.10);
 pub const MOMENTUM_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
 
 /// Requires a very strong reversal before exiting — avoids shaking out on noise.
@@ -215,9 +215,10 @@ pub const MOMENTUM_TP_FEE_MARGIN_MULT: Decimal = dec!(1.50);
 pub const STRIKE_BUFFER_PCT: Decimal = dec!(0.001);
 
 /// Lower max entry price — better risk/reward at conservative prices.
-pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.50);
+pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.82);
 pub const MAX_MOMENTUM_CROSSING_ENTRY_PRICE: Decimal = dec!(0.52);
-pub const MOMENTUM_MIN_ENTRY_PRICE: Decimal = dec!(0.20); // Conservative: 20-80% probability range only
+pub const MOMENTUM_MIN_ENTRY_PRICE: Decimal = dec!(0.72);  // Conservative: 72-82c band. Below 72c the round-trip fee exceeds 40% of the
+// 10% target; above 82c a 10% gain would breach the 0.90 take-profit ceiling.
 pub const MOMENTUM_CATASTROPHIC_SL_PCT: Decimal = dec!(0.15); // Conservative: 1.5x the 10% stop-loss — a true last-resort floor
 
 pub const MOMENTUM_WINDOW_SECS: u64 = 5;
@@ -1837,10 +1838,10 @@ pub const CONVERGENCE_CVD_CONFIRM_MARGIN: Decimal = dec!(0.10);
 pub const CONVERGENCE_OI_MIN_BUILD: Decimal = dec!(0.0);
 
 /// Highest token ask the strategy will pay to enter (no edge buying near $1).
-pub const CONVERGENCE_MAX_ENTRY_PRICE: Decimal = dec!(0.65);
+pub const CONVERGENCE_MAX_ENTRY_PRICE: Decimal = dec!(0.82);
 
 /// Lowest token ask considered tradable (avoid lottery-ticket tails).
-pub const CONVERGENCE_MIN_ENTRY_PRICE: Decimal = dec!(0.35);
+pub const CONVERGENCE_MIN_ENTRY_PRICE: Decimal = dec!(0.72);
 
 /// Max per-token bid-ask spread (fraction of ask). A hollow bid guarantees an
 /// instant stop-out, so skip when the spread is wider than this.
@@ -1874,7 +1875,7 @@ pub const CONVERGENCE_SKIP_BAND_HIGH: Decimal = dec!(0.57);
 pub const CONVERGENCE_OBI_ADVERSE_BLOCK: Decimal = dec!(0.45); // 2026-06-30: block entry into adverse order-book imbalance
 
 /// Entry-relative take-profit and stop-loss.
-pub const CONVERGENCE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.07); // 2026-07-10: conservative books profit sooner (still clears ~2.3pt fees).
+pub const CONVERGENCE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.10);
 pub const CONVERGENCE_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
 
 /// Largest share of the take-profit target that the round-trip taker fee may

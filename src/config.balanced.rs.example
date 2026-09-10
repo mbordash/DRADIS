@@ -176,7 +176,7 @@ pub const MOMENTUM_MAX_TRADE_SIZE_USDC: Decimal = dec!(25.0);
 
 pub const MOMENTUM_CONFIRMATION_TICKS: u32 = 3;
 
-pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.10);
+pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.15);
 pub const MOMENTUM_STOP_LOSS_PERCENT: Decimal = dec!(0.11);
 pub const MOMENTUM_REVERSAL_RATIO: Decimal = dec!(0.75);
 pub const MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL: i64 = 45;
@@ -201,9 +201,10 @@ pub const MOMENTUM_TP_FEE_MARGIN_MULT: Decimal = dec!(1.35);
 /// 0.0005 = 0.05% of price. Balanced: at BTC=$100k → $50.
 pub const STRIKE_BUFFER_PCT: Decimal = dec!(0.0001);
 
-pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.60);
+pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.78);
 pub const MAX_MOMENTUM_CROSSING_ENTRY_PRICE: Decimal = dec!(0.62);
-pub const MOMENTUM_MIN_ENTRY_PRICE: Decimal = dec!(0.20); // Balanced: 18-82% probability range
+pub const MOMENTUM_MIN_ENTRY_PRICE: Decimal = dec!(0.58);  // Balanced: 58-78c band. Below 58c the round-trip fee exceeds 40% of the
+// 15% target; above 78c a 15% gain would breach the 0.90 take-profit ceiling.
 pub const MOMENTUM_CATASTROPHIC_SL_PCT: Decimal = dec!(0.17); // Balanced: 1.5x the 11% stop-loss — a true last-resort floor
 
 pub const MOMENTUM_WINDOW_SECS: u64 = 5;
@@ -1772,10 +1773,10 @@ pub const CONVERGENCE_CVD_CONFIRM_MARGIN: Decimal = dec!(0.10);
 pub const CONVERGENCE_OI_MIN_BUILD: Decimal = dec!(0.0);
 
 /// Highest token ask the strategy will pay to enter (no edge buying near $1).
-pub const CONVERGENCE_MAX_ENTRY_PRICE: Decimal = dec!(0.65);
+pub const CONVERGENCE_MAX_ENTRY_PRICE: Decimal = dec!(0.78);
 
 /// Lowest token ask considered tradable (avoid lottery-ticket tails).
-pub const CONVERGENCE_MIN_ENTRY_PRICE: Decimal = dec!(0.35);
+pub const CONVERGENCE_MIN_ENTRY_PRICE: Decimal = dec!(0.58);
 
 /// Max per-token bid-ask spread (fraction of ask). A hollow bid guarantees an
 /// instant stop-out, so skip when the spread is wider than this.
@@ -1815,7 +1816,7 @@ pub const CONVERGENCE_SKIP_BAND_HIGH: Decimal = dec!(0.55);
 pub const CONVERGENCE_OBI_ADVERSE_BLOCK: Decimal = dec!(0.50); // 2026-06-30: block entry into adverse order-book imbalance
 
 /// Entry-relative take-profit and stop-loss.
-pub const CONVERGENCE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.08); // 2026-07-10: 0.15 never hit (decay-exit first); 8% (~+5.7% net) stops fee-eroded 5% scalps. LIVE knob overrides in prod.
+pub const CONVERGENCE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.15);
 pub const CONVERGENCE_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
 
 /// Largest share of the take-profit target that the round-trip taker fee may

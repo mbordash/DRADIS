@@ -184,7 +184,7 @@ pub const MOMENTUM_MAX_TRADE_SIZE_USDC: Decimal = dec!(30.0);
 pub const MOMENTUM_CONFIRMATION_TICKS: u32 = 3;
 
 /// Wider TP target — rides larger moves to maximize R:R on aggressive entries.
-pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.15);
+pub const MOMENTUM_TARGET_PROFIT_PERCENT: Decimal = dec!(0.20);
 pub const MOMENTUM_STOP_LOSS_PERCENT: Decimal = dec!(0.12);
 pub const MOMENTUM_REVERSAL_RATIO: Decimal = dec!(0.60);
 pub const MOMENTUM_MIN_HOLD_SECS_BEFORE_REVERSAL: i64 = 20;
@@ -210,7 +210,8 @@ pub const STRIKE_BUFFER_PCT: Decimal = dec!(0.0004);
 
 pub const MAX_MOMENTUM_ENTRY_PRICE: Decimal = dec!(0.75);
 pub const MAX_MOMENTUM_CROSSING_ENTRY_PRICE: Decimal = dec!(0.75);
-pub const MOMENTUM_MIN_ENTRY_PRICE: Decimal = dec!(0.15); // Aggressive: allow down to 15¢
+pub const MOMENTUM_MIN_ENTRY_PRICE: Decimal = dec!(0.43);  // Aggressive: 43-75c band. Below 43c the round-trip fee exceeds 40% of the
+// 20% target; above 75c a 20% gain would breach the 0.90 take-profit ceiling.
 pub const MOMENTUM_CATASTROPHIC_SL_PCT: Decimal = dec!(0.20); // Aggressive: 1.67x the 12% stop-loss — a true last-resort floor
 
 pub const MOMENTUM_WINDOW_SECS: u64 = 5;
@@ -1824,10 +1825,10 @@ pub const CONVERGENCE_CVD_CONFIRM_MARGIN: Decimal = dec!(0.10);
 pub const CONVERGENCE_OI_MIN_BUILD: Decimal = dec!(0.0);
 
 /// Highest token ask the strategy will pay to enter (no edge buying near $1).
-pub const CONVERGENCE_MAX_ENTRY_PRICE: Decimal = dec!(0.65);
+pub const CONVERGENCE_MAX_ENTRY_PRICE: Decimal = dec!(0.75);
 
 /// Lowest token ask considered tradable (avoid lottery-ticket tails).
-pub const CONVERGENCE_MIN_ENTRY_PRICE: Decimal = dec!(0.35);
+pub const CONVERGENCE_MIN_ENTRY_PRICE: Decimal = dec!(0.43);
 
 /// Max per-token bid-ask spread (fraction of ask). A hollow bid guarantees an
 /// instant stop-out, so skip when the spread is wider than this.
@@ -1861,7 +1862,7 @@ pub const CONVERGENCE_SKIP_BAND_HIGH: Decimal = dec!(0.50);
 pub const CONVERGENCE_OBI_ADVERSE_BLOCK: Decimal = dec!(0.55); // 2026-06-30: block entry into adverse order-book imbalance
 
 /// Entry-relative take-profit and stop-loss.
-pub const CONVERGENCE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.10); // 2026-07-10: aggressive lets winners run further before booking.
+pub const CONVERGENCE_TARGET_PROFIT_PERCENT: Decimal = dec!(0.20);
 pub const CONVERGENCE_STOP_LOSS_PERCENT: Decimal = dec!(0.10);
 
 /// Largest share of the take-profit target that the round-trip taker fee may
