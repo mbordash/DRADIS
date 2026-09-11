@@ -234,6 +234,11 @@ fn default_tennis_poll_secs()               -> u64     { config::TENNIS_POLL_SEC
 fn default_tennis_low_budget_warn()         -> i64     { config::TENNIS_LOW_BUDGET_WARN                }
 fn default_sports_odds_sport()              -> String  { config::SPORTS_ODDS_SPORT.to_string()         }
 fn default_sports_odds_regions()            -> String  { config::SPORTS_ODDS_REGIONS.to_string()       }
+fn default_sports_ledger_enabled()          -> bool    { config::SPORTS_LEDGER_ENABLED                 }
+fn default_sports_ledger_leagues()          -> String  { config::SPORTS_LEDGER_LEAGUES.to_string()     }
+fn default_sports_ledger_offsets()          -> String  { config::SPORTS_LEDGER_SNAPSHOT_OFFSETS_MINS.to_string() }
+fn default_sports_ledger_credit_reserve()   -> i64     { config::SPORTS_LEDGER_CREDIT_RESERVE          }
+fn default_sports_ledger_quota_reset_day()  -> u32     { config::SPORTS_LEDGER_QUOTA_RESET_DAY         }
 fn default_tennis_tour()                    -> String  { config::TENNIS_TOUR.to_string()               }
 
 fn default_deploy_max_days_to_close()       -> u32     { config::DEPLOY_MAX_DAYS_TO_CLOSE             }
@@ -1018,6 +1023,23 @@ pub struct DynamicConfig {
     /// `eu`, `au`.
     #[serde(default = "default_sports_odds_regions")]
     pub sports_odds_regions:              String,
+    /// Record sportsbook consensus against Polymarket prices for matched sports
+    /// moneylines (no trading). While on, it owns The Odds API budget and the
+    /// Sports Raptor stops polling.
+    #[serde(default = "default_sports_ledger_enabled")]
+    pub sports_ledger_enabled:            bool,
+    /// `code=sport_key` pairs: Polymarket league code (Gamma /sports) to The Odds API sport key.
+    #[serde(default = "default_sports_ledger_leagues")]
+    pub sports_ledger_leagues:            String,
+    /// Snapshot times in minutes relative to each game's start, e.g. `-120,-10`.
+    #[serde(default = "default_sports_ledger_offsets")]
+    pub sports_ledger_snapshot_offsets_mins: String,
+    /// Odds API credits the ledger never spends into.
+    #[serde(default = "default_sports_ledger_credit_reserve")]
+    pub sports_ledger_credit_reserve:     i64,
+    /// Day of the month (UTC) the Odds API quota resets.
+    #[serde(default = "default_sports_ledger_quota_reset_day")]
+    pub sports_ledger_quota_reset_day:    u32,
     /// Live Tennis API tour filter: `atp`, `wta`, `challenger`, `itf`,
     /// `juniors`, or empty for all tours.
     #[serde(default = "default_tennis_tour")]
@@ -1249,6 +1271,11 @@ impl Default for DynamicConfig {
             tennis_low_budget_warn:           config::TENNIS_LOW_BUDGET_WARN,
             sports_odds_sport:                config::SPORTS_ODDS_SPORT.to_string(),
             sports_odds_regions:              config::SPORTS_ODDS_REGIONS.to_string(),
+            sports_ledger_enabled:            config::SPORTS_LEDGER_ENABLED,
+            sports_ledger_leagues:            config::SPORTS_LEDGER_LEAGUES.to_string(),
+            sports_ledger_snapshot_offsets_mins: config::SPORTS_LEDGER_SNAPSHOT_OFFSETS_MINS.to_string(),
+            sports_ledger_credit_reserve:     config::SPORTS_LEDGER_CREDIT_RESERVE,
+            sports_ledger_quota_reset_day:    config::SPORTS_LEDGER_QUOTA_RESET_DAY,
             tennis_tour:                      config::TENNIS_TOUR.to_string(),
         }
     }

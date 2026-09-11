@@ -925,7 +925,7 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
     {
         let g = "Raptor Polling"; let e: Option<&'static str> = None;
         v.push(F::new(g, e, "sports_poll_secs", "Sports Poll Interval", "secs", false,
-            "Seconds between Sports Raptor (The Odds API) polls. The 300s default suits the free tier's ~500 requests/month; lower it only on a paid plan.")
+            "Seconds between Sports Raptor (The Odds API) polls. Each poll costs one request per region. The 7200s default (12 a day, ~360 a month) fits the free tier's 500 requests a month; 300s would need ~8,600. Lower it only on a paid plan. Paused while the Sports Line Ledger is on.")
             .range(10.0, 86_400.0).step(10.0).unit("s"));
         v.push(F::new(g, e, "sports_low_budget_warn", "Sports Budget Warning", "secs", true,
             "Warn when The Odds API reports this many requests remaining. Raise it on a large plan so the warning still gives useful notice.")
@@ -948,6 +948,18 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "The Odds API sport key, passed to the provider verbatim. 'upcoming' = next games across all in-season sports; or a specific key such as 'americanfootball_nfl'. ⚠️ Not validated — a wrong key returns no events and the raptor simply reads as offline. Valid keys: the-odds-api.com/sports-odds-data/sports-apis.html"));
         v.push(F::new(g, e, "sports_odds_regions", "Sports Regions", "string", true,
             "Comma-separated bookmaker regions for the odds query: us, us2, uk, eu, au. ⚠️ Not validated — an unrecognized region returns no bookmakers."));
+        v.push(F::new(g, e, "sports_ledger_enabled", "Sports Line Ledger", "bool", false,
+            "Record the sportsbook consensus against Polymarket prices for every matched sports moneyline, and each market's resolution. Research data for the sports spike's go/no-go statistics; nothing trades from it. While on, it owns The Odds API budget and the Sports Raptor stops polling. Enable it on ONE DRADIS instance per Odds API key: each instance budgets as if it had the whole quota."));
+        v.push(F::new(g, e, "sports_ledger_leagues", "Ledger Leagues", "string", true,
+            "Comma-separated code=sport_key pairs mapping Polymarket's league code (Gamma /sports, e.g. mlb, fl1) to The Odds API sport key (e.g. baseball_mlb). Discovery is free; only snapshots cost credits. ⚠️ Not validated — an unknown code or key simply matches no games."));
+        v.push(F::new(g, e, "sports_ledger_snapshot_offsets_mins", "Ledger Snapshot Offsets", "string", true,
+            "Snapshot times in minutes relative to each game's start, comma-separated (negative = before kickoff). One Odds API call covers every game of a sport, so games starting close together share a snapshot. Each added offset costs roughly one more credit per active sport-day. Offsets less than 30 minutes apart share a single snapshot."));
+        v.push(F::new(g, e, "sports_ledger_credit_reserve", "Ledger Credit Reserve", "int", true,
+            "Odds API credits the ledger never spends into. The rest of the month's credits are spread evenly over the days until the quota resets.")
+            .min(0.0).step(5.0));
+        v.push(F::new(g, e, "sports_ledger_quota_reset_day", "Ledger Quota Reset Day", "int", true,
+            "Day of the month (UTC) your Odds API quota resets, shown on your account page. Days after the 28th are treated as the 28th.")
+            .range(1.0, 28.0).step(1.0));
         v.push(F::new(g, e, "tennis_tour", "Tennis Tour", "string", true,
             "Live Tennis API tour filter: atp, wta, challenger, itf, juniors — or blank for all tours. ⚠️ Not validated, and this one fails SILENTLY: a misspelt tour returns an empty match list, which is indistinguishable from tennis being off-season or between sessions. Leave blank if unsure."));
     }

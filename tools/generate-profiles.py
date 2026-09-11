@@ -97,7 +97,15 @@ def const_values(path: Path) -> dict[str, object]:
 # operator following the Setup view's own advice — "start with conservative" —
 # silently disarmed simulation on their first run, because `apply_profile`
 # patches every field a profile declares.
-NON_PROFILE_FIELDS = {"ghost_mode", "collateral_sweep_enabled"}
+# The sports line ledger's fields are operational, not risk appetite: whether
+# research data is being collected, and settings tied to the operator's own
+# Odds API account (its quota reset day, the credits to hold back). Applying a
+# profile must not switch collection off or reset the account settings.
+NON_PROFILE_FIELDS = {
+    "ghost_mode", "collateral_sweep_enabled",
+    "sports_ledger_enabled", "sports_ledger_leagues", "sports_ledger_snapshot_offsets_mins",
+    "sports_ledger_credit_reserve", "sports_ledger_quota_reset_day",
+}
 
 
 def main() -> None:

@@ -708,6 +708,21 @@ pub const SPORTS_ODDS_REGIONS: &str = "us";
 pub const SPORTS_POLL_SECS: u64 = 7200;
 pub const SPORTS_ODDS_LOW_BUDGET_WARN: i64 = 50;
 
+/// Sports line ledger: Phase 0 of the sports spike. Records the sportsbook
+/// consensus against Polymarket prices for every matched sports moneyline, and
+/// each market's resolution. No trading. When enabled it owns The Odds API
+/// budget and the Sports Raptor stops polling.
+pub const SPORTS_LEDGER_ENABLED: bool = false;
+/// Polymarket league code (Gamma /sports) = The Odds API sport key.
+pub const SPORTS_LEDGER_LEAGUES: &str = "mlb=baseball_mlb,nfl=americanfootball_nfl,cfb=americanfootball_ncaaf,epl=soccer_epl,lal=soccer_spain_la_liga,bun=soccer_germany_bundesliga,fl1=soccer_france_ligue_one,sea=soccer_italy_serie_a,mls=soccer_usa_mls,ucl=soccer_uefa_champs_league,ufc=mma_mixed_martial_arts,wnba=basketball_wnba,nba=basketball_nba,nhl=icehockey_nhl";
+/// Snapshot times, in minutes relative to each game's start (negative = before).
+/// One Odds API call covers every game of a sport.
+pub const SPORTS_LEDGER_SNAPSHOT_OFFSETS_MINS: &str = "-120,-10";
+/// Odds API credits the ledger never spends into.
+pub const SPORTS_LEDGER_CREDIT_RESERVE: i64 = 25;
+/// Day of the month (UTC) the Odds API quota resets; spend is spread evenly until then.
+pub const SPORTS_LEDGER_QUOTA_RESET_DAY: u32 = 1;
+
 // ── Tennis Raptor (Live Tennis API live event-state feed) ────────────────────
 //
 /// Env var carrying the Live Tennis API (livetennisapi.com) key. Absent ⇒ the

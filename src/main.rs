@@ -503,6 +503,14 @@ async fn run() -> Result<()> {
             )
         });
     }
+    // Sports line ledger: off by default, research data only (no trading).
+    {
+        let http = Arc::clone(&shared_http);
+        let cfg = config_rx.clone();
+        spawn_supervised("sports-ledger", move || {
+            dradis::raptors::sports_ledger::run_sports_ledger(Arc::clone(&http), cfg.clone())
+        });
+    }
     let (tennis_tx, tennis_rx) =
         watch::channel(dradis::raptors::tennis::TennisSnapshot::default());
     {

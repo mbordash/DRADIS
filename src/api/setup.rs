@@ -1817,7 +1817,15 @@ mod tests {
             // `collateral_sweep_enabled` is absent for the same reason: it
             // decides whether DRADIS moves the operator's funds on-chain, and a
             // profile switch must not quietly flip that either way.
-            const NOT_IN_PROFILES: &[&str] = &["ghost_mode", "collateral_sweep_enabled"];
+            //
+            // The sports line ledger's fields are absent too: they decide whether
+            // research data is collected and carry the operator's own Odds API
+            // account settings, neither of which is risk appetite.
+            const NOT_IN_PROFILES: &[&str] = &[
+                "ghost_mode", "collateral_sweep_enabled",
+                "sports_ledger_enabled", "sports_ledger_leagues", "sports_ledger_snapshot_offsets_mins",
+                "sports_ledger_credit_reserve", "sports_ledger_quota_reset_day",
+            ];
             let missing: Vec<_> = schema_keys
                 .difference(&keys)
                 .filter(|k| !NOT_IN_PROFILES.contains(k))

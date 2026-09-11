@@ -705,6 +705,48 @@ async fn init_schema(pool: &SqlitePool) -> Result<()> {
         )"
     ).execute(pool).await?;
 
+    // Sports line ledger (Phase 0 of the sports spike): sportsbook consensus
+    // against Polymarket prices per matched moneyline outcome, one row per
+    // outcome per snapshot, and each market's resolution. Research data only;
+    // nothing trades from it. See `raptors::sports_ledger`.
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS sports_line_ledger (
+            id                INTEGER PRIMARY KEY AUTOINCREMENT,
+            ts                TEXT    NOT NULL,
+            league            TEXT    NOT NULL,
+            sport_key         TEXT    NOT NULL,
+            odds_event_id     TEXT    NOT NULL,
+            pm_slug           TEXT    NOT NULL,
+            condition_id      TEXT    NOT NULL,
+            token_id          TEXT    NOT NULL,
+            outcome_label     TEXT    NOT NULL,
+            odds_outcome      TEXT    NOT NULL,
+            commence          TEXT    NOT NULL,
+            secs_to_start     INTEGER NOT NULL,
+            consensus         REAL,
+            num_books         INTEGER NOT NULL,
+            dispersion        REAL,
+            max_book_age_secs INTEGER,
+            pm_bid            REAL,
+            pm_ask            REAL,
+            pm_bid_size       REAL,
+            pm_ask_size       REAL,
+            credits_remaining INTEGER
+        )"
+    ).execute(pool).await?;
+    let _ = sqlx::query("CREATE INDEX IF NOT EXISTS idx_sports_line_ledger_market ON sports_line_ledger(condition_id, ts)")
+        .execute(pool).await;
+    sqlx::query(
+        "CREATE TABLE IF NOT EXISTS sports_line_results (
+            condition_id   TEXT NOT NULL,
+            token_id       TEXT NOT NULL,
+            outcome_label  TEXT NOT NULL,
+            resolved_price REAL NOT NULL,
+            resolved_at    TEXT NOT NULL,
+            PRIMARY KEY (condition_id, token_id)
+        )"
+    ).execute(pool).await?;
+
     // Operator-chosen squadron name, so a second squadron of a class can be told
     // apart from the first. Blank for every deployment made before naming
     // existed, which keeps their squadron ids exactly as they were.
@@ -1678,6 +1720,95 @@ pub async fn lookup_open_position_strategy(pool: &SqlitePool, token_id_str: &str
 
 /// Persist a P&L checkpoint (called by the status ticker in main.rs).
 /// Provides the time-series data the Control Tower chart will query.
+/// One sports line ledger row: one outcome of one matched game at one snapshot.
+#[derive(Debug, Clone)]
+pub struct SportsLedgerRow {
+    pub ts: String,
+    pub league: String,
+    pub sport_key: String,
+    pub odds_event_id: String,
+    pub pm_slug: String,
+    pub condition_id: String,
+    pub token_id: String,
+    pub outcome_label: String,
+    pub odds_outcome: String,
+    pub commence: String,
+    pub secs_to_start: i64,
+    pub consensus: Option<f64>,
+    pub num_books: i64,
+    pub dispersion: Option<f64>,
+    pub max_book_age_secs: Option<i64>,
+    pub pm_bid: Option<f64>,
+    pub pm_ask: Option<f64>,
+    pub pm_bid_size: Option<f64>,
+    pub pm_ask_size: Option<f64>,
+    pub credits_remaining: Option<i64>,
+}
+
+pub async fn record_sports_ledger_rows(pool: &SqlitePool, rows: &[SportsLedgerRow]) {
+    for r in rows {
+        if let Err(e) = sqlx::query(
+            "INSERT INTO sports_line_ledger
+                (ts, league, sport_key, odds_event_id, pm_slug, condition_id, token_id, outcome_label,
+                 odds_outcome, commence, secs_to_start, consensus, num_books, dispersion, max_book_age_secs,
+                 pm_bid, pm_ask, pm_bid_size, pm_ask_size, credits_remaining)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+        )
+        .bind(&r.ts).bind(&r.league).bind(&r.sport_key).bind(&r.odds_event_id).bind(&r.pm_slug)
+        .bind(&r.condition_id).bind(&r.token_id).bind(&r.outcome_label).bind(&r.odds_outcome)
+        .bind(&r.commence).bind(r.secs_to_start).bind(r.consensus).bind(r.num_books).bind(r.dispersion)
+        .bind(r.max_book_age_secs).bind(r.pm_bid).bind(r.pm_ask).bind(r.pm_bid_size).bind(r.pm_ask_size)
+        .bind(r.credits_remaining)
+        .execute(pool).await
+        {
+            warn!("❌ DB sports_line_ledger insert failed: {}", e);
+            return;
+        }
+    }
+}
+
+/// Ledger outcomes whose game started between `started_after` and
+/// `started_before` (RFC 3339, as the ledger writes them) and have no recorded
+/// resolution, oldest game first: (condition_id, token_id, outcome_label).
+pub async fn sports_ledger_pending_results(pool: &SqlitePool, started_after: &str, started_before: &str) -> Vec<(String, String, String)> {
+    sqlx::query_as::<_, (String, String, String, String)>(
+        "SELECT l.condition_id, l.token_id, l.outcome_label, MIN(l.commence) AS c
+           FROM sports_line_ledger l
+           LEFT JOIN sports_line_results r ON r.condition_id = l.condition_id AND r.token_id = l.token_id
+          WHERE r.condition_id IS NULL AND l.commence >= ? AND l.commence <= ?
+          GROUP BY l.condition_id, l.token_id, l.outcome_label
+          ORDER BY c ASC"
+    )
+    .bind(started_after)
+    .bind(started_before)
+    .fetch_all(pool).await
+    .unwrap_or_default()
+    .into_iter()
+    .map(|(cid, token, label, _)| (cid, token, label))
+    .collect()
+}
+
+/// The latest snapshot time per sport key in the ledger: (sport_key, RFC 3339 ts).
+pub async fn sports_ledger_last_snapshots(pool: &SqlitePool) -> Vec<(String, String)> {
+    sqlx::query_as::<_, (String, String)>(
+        "SELECT sport_key, MAX(ts) FROM sports_line_ledger GROUP BY sport_key"
+    )
+    .fetch_all(pool).await
+    .unwrap_or_default()
+}
+
+pub async fn record_sports_line_result(pool: &SqlitePool, condition_id: &str, token_id: &str, outcome_label: &str, resolved_price: f64) {
+    if let Err(e) = sqlx::query(
+        "INSERT OR IGNORE INTO sports_line_results (condition_id, token_id, outcome_label, resolved_price, resolved_at)
+         VALUES (?, ?, ?, ?, ?)"
+    )
+    .bind(condition_id).bind(token_id).bind(outcome_label).bind(resolved_price).bind(Utc::now().to_rfc3339())
+    .execute(pool).await
+    {
+        warn!("❌ DB sports_line_results insert failed: {}", e);
+    }
+}
+
 pub async fn record_pnl_snapshot(pool: &SqlitePool, session_pnl: Decimal, collateral: Decimal, total_value: Decimal) {
     let ts = Utc::now().to_rfc3339();
     if let Err(e) = sqlx::query(
@@ -4461,6 +4592,48 @@ mod reconcile_tests {
         assert_eq!(rows[0].venue.as_deref(), Some("polymarket-intl"));
         assert_eq!(rows[0].market_class, None, "class must not be guessed");
         assert_eq!(rows[0].underlying, None, "underlying must not be guessed");
+    }
+
+    /// The sports ledger's two read paths against a real schema. Pending results
+    /// come back oldest game first, skip markets already resolved (a 0.5 tie or
+    /// cancellation included) and games outside the look-back window; the last
+    /// snapshot per sport is what a restarted ledger seeds from so it does not
+    /// buy a snapshot it already has.
+    #[tokio::test]
+    async fn sports_ledger_pending_results_and_last_snapshots() {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .unwrap();
+        init_schema(&pool).await.unwrap();
+        let row = |ts: &str, sport: &str, cid: &str, token: &str, commence: &str| SportsLedgerRow {
+            ts: ts.into(), league: "x".into(), sport_key: sport.into(), odds_event_id: format!("e-{cid}"),
+            pm_slug: cid.into(), condition_id: cid.into(), token_id: token.into(), outcome_label: token.into(),
+            odds_outcome: token.into(), commence: commence.into(), secs_to_start: 0, consensus: Some(0.5),
+            num_books: 3, dispersion: Some(0.01), max_book_age_secs: Some(10), pm_bid: Some(0.49), pm_ask: Some(0.5),
+            pm_bid_size: Some(10.0), pm_ask_size: Some(10.0), credits_remaining: Some(250),
+        };
+        record_sports_ledger_rows(&pool, &[
+            row("2026-09-11T20:00:00+00:00", "baseball_mlb", "c-late", "late-a", "2026-09-11T19:00:00+00:00"),
+            row("2026-09-11T21:02:43+00:00", "baseball_mlb", "c-late", "late-a", "2026-09-11T19:00:00+00:00"),
+            row("2026-09-11T21:02:34+00:00", "americanfootball_ncaaf", "c-early", "early-a", "2026-09-11T15:00:00+00:00"),
+            row("2026-09-11T21:02:34+00:00", "americanfootball_ncaaf", "c-tie", "tie-a", "2026-09-11T16:00:00+00:00"),
+            row("2026-08-01T12:00:00+00:00", "baseball_mlb", "c-ancient", "ancient-a", "2026-08-01T12:00:00+00:00"),
+            row("2026-09-11T21:02:43+00:00", "baseball_mlb", "c-future", "future-a", "2026-09-12T23:00:00+00:00"),
+        ]).await;
+        record_sports_line_result(&pool, "c-tie", "tie-a", "tie-a", 0.5).await;
+
+        let pending = sports_ledger_pending_results(&pool, "2026-08-28T00:00:00+00:00", "2026-09-11T20:00:00+00:00").await;
+        let cids: Vec<&str> = pending.iter().map(|(c, _, _)| c.as_str()).collect();
+        assert_eq!(cids, ["c-early", "c-late"], "oldest first; resolved, too-old and not-yet-started games excluded");
+
+        let mut last = sports_ledger_last_snapshots(&pool).await;
+        last.sort();
+        assert_eq!(last, [
+            ("americanfootball_ncaaf".to_string(), "2026-09-11T21:02:34+00:00".to_string()),
+            ("baseball_mlb".to_string(), "2026-09-11T21:02:43+00:00".to_string()),
+        ]);
     }
 
     /// Recorded P&L must be net of fees, with the gross figure recoverable.

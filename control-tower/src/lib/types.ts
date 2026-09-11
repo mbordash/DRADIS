@@ -227,6 +227,11 @@ export interface DynamicConfig {
   // the upstream API verbatim and NOT validated by DRADIS.
   sports_odds_sport:                string;
   sports_odds_regions:              string;
+  sports_ledger_enabled:            boolean;
+  sports_ledger_leagues:            string;
+  sports_ledger_snapshot_offsets_mins: string;
+  sports_ledger_credit_reserve:     number;
+  sports_ledger_quota_reset_day:    number;
   tennis_tour:                      string;
 }
 

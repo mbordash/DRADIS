@@ -124,8 +124,29 @@ pub async fn run_sports_raptor(
     // the SAME event and resets cleanly when the nearest event rotates.
     let mut prev_event: Option<(String, Decimal)> = None;
     let mut consecutive_failures: u32 = 0;
+    let mut ledger_notice = false;
 
     loop {
+        // The sports line ledger owns The Odds API budget while it runs. This
+        // raptor's single global consensus has no consumer, and polling here
+        // would spend the same credits.
+        let ledger_on = config_rx.borrow().sports_ledger_enabled;
+        if ledger_on {
+            if !ledger_notice {
+                info!("🏈 Sports Raptor paused — the sports line ledger owns The Odds API budget");
+                // Not polling means no fresh reading: say so rather than leave
+                // the Control Tower showing the last one as live.
+                raptor_health_tx.send_modify(|map| {
+                    map.entry(SPORTS_HEALTH_KEY.to_string()).or_default().sports_connected = false;
+                });
+                ledger_notice = true;
+            }
+            if config_rx.changed().await.is_err() {
+                std::future::pending::<()>().await;
+            }
+            continue;
+        }
+        ledger_notice = false;
         // Re-read each cycle so a budget-warning change applies without a restart.
         let (low_budget_warn, sport, regions) = {
             let c = config_rx.borrow();
@@ -229,7 +250,7 @@ struct EventSample {
 /// Deliberately operates on the rendered STRING rather than the URL, because the
 /// leak arrives inside an error message with surrounding prose, not as a bare
 /// URL that could be parsed and rebuilt.
-fn redact_url_secrets(s: &str) -> String {
+pub(crate) fn redact_url_secrets(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut rest = s;
     while let Some(i) = rest.find("apiKey=") {
@@ -419,7 +440,7 @@ fn first_h2h_outcome_name(books: &[serde_json::Value]) -> Option<String> {
 /// Vig-free implied probability of `ref_name` within a single book's two-way
 /// h2h market. Removes the overround by normalizing both raw `1/odds` implied
 /// probs to sum to 1. Returns `None` if the book lacks the outcome or has bad odds.
-fn vig_free_prob_for(book: &serde_json::Value, ref_name: &str) -> Option<Decimal> {
+pub(crate) fn vig_free_prob_for(book: &serde_json::Value, ref_name: &str) -> Option<Decimal> {
     let outcomes = h2h_outcomes(book)?;
     let mut raw: Vec<(String, Decimal)> = Vec::new();
     for o in outcomes {

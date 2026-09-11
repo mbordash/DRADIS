@@ -49,5 +49,6 @@ pub mod funding;
 pub mod derivatives;
 pub mod tide;
 pub mod sports;
+pub mod sports_ledger;
 pub mod tennis;
 pub mod horizon;
