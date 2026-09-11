@@ -200,6 +200,22 @@ struct FairValueGlobals {
     /// Keyed the same way as `sl_counted`: same token AND same open instant is
     /// the same position, so a genuine re-entry starts clean.
     veto_withdrawn: StdMutex<HashMap<String, DateTime<Utc>>>,
+    /// Positions whose resting take-profit has been raised to the $0.99
+    /// settlement-hold price, keyed token_id -> `Position::opened_at`.
+    ///
+    /// The hold is decided from fair value against
+    /// `FAIRVALUE_SETTLE_HOLD_MIN_PROB`, and near expiry fair value hovers
+    /// around that line. Recomputed per tick, the ask price flipped between the
+    /// target and $0.99, and every flip was a cancel-and-replace wherever the
+    /// reprice deadband is a cent (the aggressive profile): five within 13s on
+    /// 2026-09-11 at 01:52 ET, the last of them racing the lift it cancelled.
+    /// Once raised, the resting ask stays at $0.99 for the life of the position.
+    /// Only the ask PRICE is latched: rule 5 runs after every hard exit has
+    /// declined, so it cannot disarm one. Rule 1's taker take-profit keeps
+    /// re-deciding each tick, because its hold `continue`s past the reversal,
+    /// bail, snipe and stop rules, and latching it would leave a position whose
+    /// model collapsed with nothing armed.
+    settle_hold_latched: StdMutex<HashMap<String, DateTime<Utc>>>,
     /// When each (condition_id, side) book last became — and has since stayed —
     /// clear of `fairvalue_obi_adverse_block`. Feeds the OBI clear dwell.
     obi_clear_since: StdMutex<HashMap<(String, bool), Instant>>,
@@ -280,6 +296,7 @@ impl FairValueGlobals {
             fair_history:     StdMutex::new(HashMap::new()),
             sl_counted:       StdMutex::new(HashMap::new()),
             veto_withdrawn:   StdMutex::new(HashMap::new()),
+            settle_hold_latched: StdMutex::new(HashMap::new()),
             obi_clear_since:  StdMutex::new(HashMap::new()),
         }
     }
@@ -519,6 +536,34 @@ impl FairValueStrategyImpl {
             return (true, true);
         }
         (false, false)
+    }
+
+    /// Latch the settlement-hold price for the life of a position.
+    ///
+    /// True when the hold applies now or already applied on an earlier tick for
+    /// this same position. See `FairValueGlobals::settle_hold_latched`.
+    fn settle_hold_for_position(
+        &self,
+        asset: &str,
+        token_id: &str,
+        opened_at: DateTime<Utc>,
+        settle_hold_now: bool,
+    ) -> bool {
+        let mut latched = match globals(asset).settle_hold_latched.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        if latched.get(token_id) == Some(&opened_at) {
+            return true;
+        }
+        if settle_hold_now {
+            // Entries outlive their positions otherwise. Two days clears every
+            // hourly and daily market this viper trades.
+            let horizon = Utc::now() - chrono::Duration::days(2);
+            latched.retain(|_, opened| *opened > horizon);
+            latched.insert(token_id.to_string(), opened_at);
+        }
+        settle_hold_now
     }
 
     /// Does the model still justify holding a position that has hit its stop?
@@ -1319,6 +1364,12 @@ impl Strategy for FairValueStrategyImpl {
 
             // ── 1. Take profit — unless the settlement hold dominates ────────
             if profit_margin >= dc.fairvalue_target_profit_pct {
+                // Deliberately NOT latched, unlike rule 5's resting price. The
+                // `continue` below skips every hard exit for this position, so a
+                // latched hold would leave a position whose model has collapsed
+                // with nothing armed for as long as the bid stays above the target.
+                // Re-deciding each tick lets a collapse fall through to this taker
+                // take-profit, as it always has.
                 let settle_hold = secs_left < config::FAIRVALUE_SETTLE_HOLD_SECS
                     && fair_side.map_or(false, |p| p >= config::FAIRVALUE_SETTLE_HOLD_MIN_PROB);
                 if !settle_hold {
@@ -1566,8 +1617,11 @@ impl Strategy for FairValueStrategyImpl {
                 && position.fill_effective_at(dc.ghost_mode).is_some()
                 && position.shares >= config::MIN_ORDER_SHARES
             {
-                let settle_hold = secs_left < config::FAIRVALUE_SETTLE_HOLD_SECS
-                    && fair_side.map_or(false, |p| p >= config::FAIRVALUE_SETTLE_HOLD_MIN_PROB);
+                let settle_hold = self.settle_hold_for_position(
+                    &ctx.crypto_filter, token_id.as_str(), position.opened_at,
+                    secs_left < config::FAIRVALUE_SETTLE_HOLD_SECS
+                        && fair_side.map_or(false, |p| p >= config::FAIRVALUE_SETTLE_HOLD_MIN_PROB),
+                );
                 if let Some(price) = Self::resting_tp_price(
                     avg_entry, dc.fairvalue_target_profit_pct, bid, settle_hold,
                 ) {
@@ -1773,6 +1827,27 @@ mod tests {
     /// next tick falls back to `avg_entry` as the baseline — always below the
     /// true entry fair, because entry requires fair > ask — and the veto
     /// re-engages on the position the strategy just decided to dump.
+    /// 2026-09-11 01:50-01:52 ET: fair value near the settle-hold line moved
+    /// FairValue's resting take-profit between $0.98 and $0.99 five times in
+    /// 13s. Once raised, the hold must stay raised for that position, and a
+    /// re-entry on the same token must start from the ordinary target.
+    #[test]
+    fn the_settle_hold_price_latches_for_the_life_of_a_position() {
+        let strat = FairValueStrategyImpl::default();
+        let asset = "btc-settle-hold-latch";
+        let token = "tok-settle-hold-latch";
+        let opened = Utc::now();
+
+        assert!(!strat.settle_hold_for_position(asset, token, opened, false), "no hold before it ever applies");
+        assert!(strat.settle_hold_for_position(asset, token, opened, true), "fair crosses the line: raise to $0.99");
+        assert!(
+            strat.settle_hold_for_position(asset, token, opened, false),
+            "fair dipping back under the line must not pull the ask back to the target",
+        );
+        let reopened = opened + chrono::Duration::seconds(1);
+        assert!(!strat.settle_hold_for_position(asset, token, reopened, false), "a new position starts clean");
+    }
+
     #[test]
     fn a_withdrawn_veto_stays_withdrawn_after_a_missed_stop_fill() {
         let strat = FairValueStrategyImpl::default();
@@ -2449,6 +2524,97 @@ mod entry_book_tests {
         assert!((at_baked_floor - 0.280).abs() < 0.005, "fair(YES)={at_baked_floor} should match the logged 0.280");
         let at_aggressive_floor = fair_yes(3.5e-5);
         assert!((at_aggressive_floor - 0.203).abs() < 0.005, "fair(YES)={at_aggressive_floor} should be about 0.203");
+    }
+
+    /// 2026-09-11 01:50-01:52 ET, driven through the real exit path. Fair value
+    /// hovering at the settle-hold line moved FairValue's resting take-profit
+    /// between the target and $0.99, and every move was a cancel-and-replace.
+    /// Once raised, the resting ask must stay at $0.99 for that position. The
+    /// latch must NOT reach rule 1: a held position whose bid clears the target
+    /// while its model collapses still takes the taker take-profit, because rule
+    /// 1's hold skips every hard exit and latching it would leave nothing armed.
+    #[tokio::test]
+    async fn the_settle_hold_ask_latches_without_disarming_the_taker_take_profit() {
+        use crate::state::Position;
+
+        fn position(c: &StrategyContext, opened: DateTime<Utc>) -> Position {
+            Position {
+                shares: dec!(5), avg_entry: dec!(0.80), opened_at: opened,
+                close_time: c.market.market_close_time,
+                market_name: c.market.market_name.clone(),
+                pair_token_id: c.market.no_token.clone(),
+                fill_confirmed_at: Some(opened), paired_leg_token_id: None,
+                entry_fee: dec!(0.02),
+            }
+        }
+        fn resting_price(sig: &StrategySignal) -> Option<Decimal> {
+            match sig {
+                StrategySignal::MakerRestingExit { params, .. } => Some(params.price),
+                _ => None,
+            }
+        }
+
+        let asset = "btc-settle-hold-latch-exit-path";
+        seed_flat_vol(asset);
+
+        // Bid $0.94 against a $0.80 entry is +17.5%: under the 20% target, so
+        // rule 1 stays quiet and the position rests an ask (target $0.96).
+        let mut hourly = book(dec!(200), dec!(150));
+        hourly.yes_bid = dec!(0.94); hourly.yes_bid_depth = dec!(50);
+        hourly.yes_ask = dec!(0.95);
+        hourly.no_bid = dec!(0.05); hourly.no_ask = dec!(0.06);
+        let mut c = ctx(hourly, book(dec!(100), dec!(100)));
+        c.crypto_filter = asset.to_string();
+        // Five minutes left: inside the settle-hold window, outside the endgame bail.
+        c.market.market_close_time = Some(Utc::now() + chrono::Duration::seconds(300));
+        let mut dc = DynamicConfig::default();
+        dc.enable_fairvalue = true;
+        dc.fairvalue_resting_tp_enabled = true;
+        dc.fairvalue_target_profit_pct = dec!(0.20);
+        dc.fairvalue_stop_loss_pct = dec!(0.15);
+        dc.fairvalue_settle_snipe_hold = true;
+        dc.fairvalue_sigma_floor_horizon_secs = 0;
+        dc.fairvalue_min_sigma_per_sqrt_sec = dec!(0.000042);
+        // Wide enough that the entry-relative reversal (rule 2) stays out of the way.
+        dc.fairvalue_model_reversal_decay_pct = dec!(0.90);
+        c.dynamic_config = Arc::new(dc);
+
+        let strat = FairValueStrategyImpl::default();
+        let key = PositionKey::new(c.squadron_id.clone(), "FairValueStrategy", c.market.yes_token.clone());
+        let fair_yes = |c: &StrategyContext| strat
+            .fair_prob_for_side(asset, &c.market, &c.snapshot, true, 4.2e-5, 0)
+            .expect("the seeded sampler must let the model price");
+
+        // Fair clears the line: the resting ask is raised to $0.99.
+        let held = Utc::now() - chrono::Duration::seconds(100);
+        c.positions.lock().await.insert(key.clone(), position(&c, held));
+        c.snapshot.oracle_price = dec!(65110);
+        assert!(fair_yes(&c) >= config::FAIRVALUE_SETTLE_HOLD_MIN_PROB, "fair={}", fair_yes(&c));
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        assert_eq!(resting_price(&sig), Some(dec!(0.99)), "{sig:?}");
+
+        // Fair flickers back under the line: the ask stays where it is.
+        c.snapshot.oracle_price = dec!(65040);
+        assert!(fair_yes(&c) < config::FAIRVALUE_SETTLE_HOLD_MIN_PROB, "fair={}", fair_yes(&c));
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        assert_eq!(resting_price(&sig), Some(dec!(0.99)), "a flicker must not pull the ask back to the target: {sig:?}");
+
+        // A position that never qualified rests at the ordinary target.
+        let never_held = Utc::now() - chrono::Duration::seconds(200);
+        c.positions.lock().await.insert(key.clone(), position(&c, never_held));
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        assert_eq!(resting_price(&sig), Some(dec!(0.96)), "{sig:?}");
+
+        // Rule 1 stays armed for the held position: the bid clears the target
+        // (+21.25%) while fair sits under the line, so it sells at the bid.
+        c.positions.lock().await.insert(key.clone(), position(&c, held));
+        c.snapshot.yes_bid = dec!(0.97);
+        c.snapshot.yes_ask = dec!(0.98);
+        let sig = strat.evaluate_exit(&c).await.expect("exit evaluation runs");
+        let StrategySignal::Exit { reason, .. } = sig else {
+            panic!("the settle-hold latch must not disarm rule 1's taker take-profit, got {sig:?}");
+        };
+        assert!(reason.starts_with("FairValueTP"), "{reason}");
     }
 
     /// Trade #4 of 2026-09-06, driven through the real exit path: NO bought at

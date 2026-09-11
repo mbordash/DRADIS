@@ -81,6 +81,12 @@ const EVENT_MARKET_STATUS_POLL_SECS: u64 = 60;
 /// would be absurd, and a few seconds of booking latency costs nothing because
 /// the fill price is already known (it is the resting limit, which cannot slip).
 const MAKER_RESTING_EXIT_POLL_SECS: u64 = 5;
+/// How long a resting ask that disappeared from the book without a verifiable
+/// lift is held back from being re-posted, while the fill sweep reads the chain.
+/// See `MakerRestingExit::vanished_at`. Four times the ~15s the balance endpoint
+/// has been seen to lag a fill, and the re-post additionally waits for a poll
+/// that saw the shares still held, so a slow endpoint cannot trigger it.
+const MAKER_RESTING_EXIT_VANISHED_GRACE_SECS: u64 = 60;
 
 /// Book an exit the exchange says already happened, from the money.
 ///
@@ -228,6 +234,23 @@ struct MakerRestingExit {
     /// sized from this rather than the latest reading, so a transient 0 cannot
     /// inflate the booked quantity.
     max_short_read: Decimal,
+    /// Set when a reprice found no ask of ours on the book and could not verify
+    /// a lift, so the record is KEPT rather than forgotten.
+    ///
+    /// A fully lifted order leaves the open-orders list, and the balance
+    /// endpoint lags the fill, so "gone from the book, chain shows nothing" is
+    /// exactly what a lift looks like in its first seconds. Forgetting the ask
+    /// there lost a real win on 2026-09-11 at 01:52:48 ET: FairValue's $0.99
+    /// take-profit (6.07 shares) was lifted in the same second a settle-hold
+    /// reprice tried to move it to $0.98. The record was dropped, every re-post
+    /// failed for lack of shares, the fill sweep had nothing left to poll, and
+    /// the chain sweep later shrank the row to its 0.004-share remainder and
+    /// booked only that. Collateral rose $6.01; the ledger recorded $0.0003.
+    ///
+    /// While set, nothing re-posts: the sweep either confirms the drop and books
+    /// the lift at `price`, or reads the shares still held, after which the ask
+    /// is treated as pulled from outside and re-posted.
+    vanished_at: Option<Instant>,
 }
 
 /// Consecutive short balance reads required before a resting ask is booked as
@@ -2729,9 +2752,28 @@ impl Squadron {
                                             price: params.price, shares: live_shares, avg_entry, entry_fee,
                                             market_name: params.market_name.clone(), last_poll: Instant::now(),
                                             short_reads: 0, max_short_read: dec!(0), booked: dec!(0),
+                                            vanished_at: None,
                                         });
                                     }
                                     continue;
+                                }
+
+                                // An ask that vanished without a verifiable lift waits for
+                                // the fill sweep: re-posting now would fail for lack of
+                                // shares if it was lifted, and drop the record the sweep
+                                // books the lift from. See `MakerRestingExit::vanished_at`.
+                                let mut vanished_before_repost: Option<MakerRestingExit> = None;
+                                if let Some(existing) = maker_resting_exits.get(&pk) {
+                                    if let Some(since) = existing.vanished_at {
+                                        let held_seen = existing.last_poll > since && existing.short_reads == 0;
+                                        if !resting_exit::vanished_ask_may_repost(since.elapsed(), held_seen) {
+                                            continue;
+                                        }
+                                        info!("ℹ️ {} [{}]: ask @ ${:.4} left the book {}s ago and the chain still holds the shares — it was pulled, not lifted; re-posting",
+                                              label, sn, existing.price, since.elapsed().as_secs());
+                                        vanished_before_repost = Some(existing.clone());
+                                        maker_resting_exits.remove(&pk);
+                                    }
                                 }
 
                                 // Already resting near this price → leave it alone.
@@ -2748,6 +2790,7 @@ impl Squadron {
                                     let stale_price = existing.price;
                                     let already_booked = existing.booked;
                                     let ask_baseline = existing.shares;
+                                    let stale_rec = existing.clone();
                                     // Pull OUR ASK only. The Maker's entry bid can still be
                                     // resting on this same token (a GTC quote keeps working
                                     // after a partial fill), and it belongs to the quote
@@ -2780,8 +2823,9 @@ impl Squadron {
                                     let held = onchain_balance_for_token(&trading_client, &tok).await;
                                     let chain_lift = resting_exit::chain_drop(ask_baseline, held);
                                     let matched = venue_lift.max(chain_lift);
+                                    let outcome = resting_exit::reprice_outcome(cancel.ask_found, matched);
 
-                                    if matched >= config::MIN_ORDER_SHARES {
+                                    if outcome == resting_exit::RepriceOutcome::BookLift {
                                         // Lifted while we were deciding. Book that slice
                                         // here at the stale limit (a resting limit cannot
                                         // slip) — the fill-detection sweep can no longer
@@ -2817,16 +2861,25 @@ impl Squadron {
                                             p.entry_fee = bk.entry_fee_left;
                                         }
                                         continue;
-                                    } else if !cancel.ask_found {
+                                    } else if outcome == resting_exit::RepriceOutcome::AwaitSweep {
                                         // Nothing verifiable sold: the ask is gone from the
                                         // book and the chain shows no drop. Either it was
                                         // pulled from outside or a full lift has not reached
-                                        // the balance endpoint yet. Book nothing — the
-                                        // re-post below fails on "not enough balance" if
-                                        // the shares are gone, and the chain sweep then
-                                        // closes the row from the wallet, not from a guess.
-                                        info!("ℹ️ {} [{}]: ask @ ${:.4} was no longer on the book and the chain shows no lift — re-posting against a fresh book",
+                                        // the balance endpoint yet. Book nothing, and do NOT
+                                        // re-post: keep the record so the fill sweep can tell
+                                        // the two apart from the wallet and book a lift at
+                                        // the resting price. Re-posting here is what lost the
+                                        // 2026-09-11 01:52:48 ET take-profit from the ledger
+                                        // (see `MakerRestingExit::vanished_at`).
+                                        info!("ℹ️ {} [{}]: ask @ ${:.4} was no longer on the book and the chain shows no lift yet — holding the re-post while the fill sweep checks the wallet",
                                               label, sn, stale_price);
+                                        let now = Instant::now();
+                                        maker_resting_exits.insert(pk.clone(), MakerRestingExit {
+                                            vanished_at: Some(now), last_poll: now,
+                                            short_reads: 0, max_short_read: dec!(0),
+                                            ..stale_rec
+                                        });
+                                        continue;
                                     }
                                 }
 
@@ -2842,6 +2895,7 @@ impl Squadron {
                                             price: params.price, shares: live_shares, avg_entry, entry_fee,
                                             market_name: params.market_name.clone(), last_poll: Instant::now(),
                                             short_reads: 0, max_short_read: dec!(0), booked: dec!(0),
+                                            vanished_at: None,
                                         });
                                         info!("📤 {} [{}]: {} | ASK {:.4} shares @ ${:.4} (entry ${:.4}) | {}",
                                               label, sn, params.market_name, live_shares, params.price, avg_entry, reason);
@@ -2859,6 +2913,21 @@ impl Squadron {
                                             // the next tick re-evaluates against real state.
                                             debug!("⏸️ {} [{}]: shares unavailable ({}) — retrying next tick",
                                                    label, sn, es.chars().take(60).collect::<String>());
+                                            if let Some(rec) = vanished_before_repost {
+                                                // The re-post of a vanished ask found no shares to
+                                                // sell: it was lifted after all, later than the grace
+                                                // allowed for. Restore its record so the fill sweep
+                                                // books the lift at the resting price, rather than
+                                                // leaving the cash move for the chain sweep.
+                                                info!("ℹ️ {} [{}]: re-post found no shares — the ask @ ${:.4} was lifted after all; waiting for the fill sweep to book it",
+                                                      label, sn, rec.price);
+                                                let now = Instant::now();
+                                                maker_resting_exits.insert(pk.clone(), MakerRestingExit {
+                                                    vanished_at: Some(now), last_poll: now,
+                                                    short_reads: 0, max_short_read: dec!(0),
+                                                    ..rec
+                                                });
+                                            }
                                         } else {
                                             warn!("⚠️ {} placement failed [{}] (\"{}\") — position held, retrying next tick",
                                                   label, sn, es.chars().take(120).collect::<String>());
@@ -3009,8 +3078,23 @@ impl Squadron {
                     &trading_client, &pk.market, RestingSide::Both).await;
                 // Only the ask's fill is an exit, and only the part the sweep
                 // has not already booked.
-                let matched = resting_exit::lift_since_booking(
+                let mut matched = resting_exit::lift_since_booking(
                     cancel.ask_found, cancel.ask_matched, rec.booked, rec.shares);
+                // An ask that already vanished has no order left to report a
+                // matched size, so the wallet is the only witness to a lift. Read
+                // it with the same settlement-lag retries the stop path uses,
+                // keeping the LARGEST reading, rather than writing the ask off as
+                // cancelled and leaving the cash move for the chain sweep.
+                if matched < config::MIN_ORDER_SHARES && rec.vanished_at.is_some() {
+                    let mut held = onchain_balance_for_token(&trading_client, &pk.market).await;
+                    for _ in 1..config::SETTLEMENT_LAG_RETRY_ATTEMPTS {
+                        if rec.shares - held < config::MIN_ORDER_SHARES { break; }
+                        tokio::time::sleep(Duration::from_secs(config::SETTLEMENT_LAG_RETRY_DELAY_SECS)).await;
+                        let again = onchain_balance_for_token(&trading_client, &pk.market).await;
+                        if again > held { held = again; }
+                    }
+                    matched = (rec.shares - held).max(dec!(0));
+                }
                 if matched >= config::MIN_ORDER_SHARES {
                     // Lifted during tear-down: book it here at the resting price
                     // rather than leaving a silent cash move for the reconciler.
@@ -3752,6 +3836,41 @@ pub(crate) mod resting_exit {
         if held >= config::MIN_ORDER_SHARES && held < ledger { held } else { ledger }
     }
 
+    /// What a reprice does after pulling the stale ask.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum RepriceOutcome {
+        /// Shares verifiably left the ask: book them at its resting price.
+        BookLift,
+        /// The ask is gone from the book and nothing verifies a lift yet. Keep
+        /// the record and let the fill sweep read the wallet before re-posting.
+        AwaitSweep,
+        /// Our ask was found and cancelled with nothing matched: re-post.
+        Repost,
+    }
+
+    /// Decide a reprice from what the cancel found and what verifiably sold.
+    /// `matched` is the larger of the venue's unbooked matched size and the
+    /// chain's trusted drop.
+    pub fn reprice_outcome(ask_found: bool, matched: Decimal) -> RepriceOutcome {
+        if matched >= config::MIN_ORDER_SHARES {
+            RepriceOutcome::BookLift
+        } else if !ask_found {
+            RepriceOutcome::AwaitSweep
+        } else {
+            RepriceOutcome::Repost
+        }
+    }
+
+    /// May an ask that vanished without a verifiable lift be re-posted?
+    ///
+    /// Only once the grace has run AND a fill-sweep poll taken after it vanished
+    /// read the shares still held. A failed balance read returns 0, which the
+    /// sweep counts as short, so it can never be the reading that permits a
+    /// re-post; a slow endpoint just extends the wait.
+    pub fn vanished_ask_may_repost(since_vanished: std::time::Duration, held_seen_since: bool) -> bool {
+        since_vanished.as_secs() >= super::MAKER_RESTING_EXIT_VANISHED_GRACE_SECS && held_seen_since
+    }
+
     /// The per-strategy switches for resting exits, snapshotted from the
     /// tick's config before it is moved into the `StrategyContext`.
     ///
@@ -3870,6 +3989,37 @@ pub(crate) mod resting_exit {
     mod tests {
         use super::*;
         use rust_decimal_macros::dec;
+
+        /// 2026-09-11 01:52:48 ET, exactly. FairValue's $0.99 take-profit for 6.074
+        /// shares was fully lifted in the same second a settle-hold reprice pulled
+        /// it: the cancel found no ask (a filled order leaves the book) and the
+        /// balance endpoint had not caught up, so nothing verified the lift. That
+        /// must hold the re-post for the fill sweep, not re-post.
+        #[test]
+        fn an_ask_gone_from_the_book_with_no_verifiable_lift_waits_for_the_sweep() {
+            assert_eq!(reprice_outcome(false, dec!(0)), RepriceOutcome::AwaitSweep);
+            // Verifiable sales are still booked on the spot, found or not.
+            assert_eq!(reprice_outcome(false, dec!(6.07)), RepriceOutcome::BookLift);
+            assert_eq!(reprice_outcome(true, dec!(6.07)), RepriceOutcome::BookLift);
+            // Our ask was on the book and nothing matched: an ordinary reprice.
+            assert_eq!(reprice_outcome(true, dec!(0)), RepriceOutcome::Repost);
+            // Dust below the order minimum is not a lift to book.
+            assert_eq!(reprice_outcome(true, config::MIN_ORDER_SHARES / dec!(2)), RepriceOutcome::Repost);
+        }
+
+        /// A vanished ask re-posts only after the grace AND a later poll that saw
+        /// the shares still held. Neither alone is enough: the first seconds of a
+        /// lift look like "still held" to a lagging endpoint, and a long wait
+        /// proves nothing if every read since has failed.
+        #[test]
+        fn a_vanished_ask_re_posts_only_after_the_grace_and_a_held_reading() {
+            use std::time::Duration;
+            let grace = Duration::from_secs(super::super::MAKER_RESTING_EXIT_VANISHED_GRACE_SECS);
+            assert!(!vanished_ask_may_repost(Duration::from_secs(5), true));
+            assert!(!vanished_ask_may_repost(grace - Duration::from_secs(1), true));
+            assert!(!vanished_ask_may_repost(grace * 3, false), "failed or short reads never permit a re-post");
+            assert!(vanished_ask_may_repost(grace, true));
+        }
 
         /// 2026-09-03 trade 5, exactly. The ask (7.35 @ $0.35) had 5.314284
         /// matched, all of it booked by the sweep at 22:20:05; 2.035716 shares
