@@ -1108,6 +1108,7 @@ pub const FAIRVALUE_EDGE_TAPER_SECS: i64 = 1800;
 // Horizon-scaled edge: beyond the taper, req edge grows as sqrt(T/taper), capped.
 pub const FAIRVALUE_EDGE_HORIZON_CAP: Decimal = dec!(0.25);
 // Floor on sigma per sqrt-second — a quiet sampling hour must not collapse the model.
+// Default for the fairvalue_min_sigma_per_sqrt_sec runtime knob (Control Tower: FairValue, Vol Floor).
 pub const FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC: f64 = 4.2e-5;
 /// Horizon at or below which the sigma floor does not bind (ramps to full at 2x).
 /// Defaults to the vol window: trust the measurement as far out as we measured.

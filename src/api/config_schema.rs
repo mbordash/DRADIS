@@ -741,6 +741,16 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
              it to the absolute backstop): prod on 2026-08-13/14 ran hourly σ at 1.9-2.6e-5/√s = 13% annualized \
              BTC vol, roughly half what the book implied, and FairValue lost $3.79 over 15 trades.")
             .min(0.0).step(300.0).unit("s"));
+        v.push(F::new(g, e, "fairvalue_min_sigma_per_sqrt_sec", "Vol Floor", "decimal", true,
+            "Full-strength floor on the realized-vol input, per root second (5.0e-5 is about 28% annualized BTC \
+             vol). The model prices with max(realized vol, floor), so on a quiet hour this number, not the \
+             market, sets fair value. RAISING it pushes fair toward 0.5 and makes cheap tails look underpriced: \
+             on 2026-09-10 a YES tail was bought at $0.20 on fair 0.280 priced at the 5.0e-5 floor while \
+             realized vol (2.6e-5) put fair near 0.13, and it stopped out for -$1.45. LOWERING it pushes fair \
+             toward 0/1 and manufactures edge against the favorite: on 2026-08-13/14 realized vol ran about \
+             half of what the book implied and FairValue lost $3.79 over 15 trades. Values below the absolute \
+             backstop (1.0e-5) are raised to it.")
+            .range(0.00001, 0.0002).step(0.000005));
         v.push(F::new(g, e, "fairvalue_edge_noise_multiple", "Edge vs Noise", "decimal", true,
             "Multiple of the model's own recent fair-value noise the edge must clear, on top of Base Edge. \
              Noise is the std-dev of successive fair-value moves over the last 15 min, rescaled to a 2-minute \

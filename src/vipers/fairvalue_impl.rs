@@ -327,14 +327,17 @@ impl FairValueStrategyImpl {
 
     /// σ floor for a given forecast horizon.
     ///
-    /// Zero-strength (absolute backstop only) at or below `horizon_secs`,
+    /// `full` is the full-strength floor, the `fairvalue_min_sigma_per_sqrt_sec`
+    /// knob. Zero-strength (absolute backstop only) at or below `horizon_secs`,
     /// ramping linearly to the full floor at twice that. Rationale in
     /// `config::FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS`: inside the measurement
     /// window the realized-vol estimate is in-sample and should be trusted;
     /// beyond it, forecast error compounds and the floor earns its keep.
-    fn sigma_floor(horizon_secs: i64, secs_left: i64) -> f64 {
+    fn sigma_floor(full: f64, horizon_secs: i64, secs_left: i64) -> f64 {
         let abs = config::FAIRVALUE_ABSOLUTE_MIN_SIGMA_PER_SQRT_SEC;
-        let full = config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC;
+        // The knob is operator-editable and PATCH does no range check, so a zero
+        // or negative value still leaves the degenerate-input backstop in place.
+        let full = full.max(abs);
         if horizon_secs <= 0 {
             // Knob disabled — restore the unconditional floor.
             return full;
@@ -783,6 +786,14 @@ impl FairValueStrategyImpl {
     }
 
     /// Recompute the model's current fair probability for a held token's side.
+    /// The full-strength σ floor from the runtime knob, falling back to the
+    /// compile-time default only if the Decimal cannot be represented as f64.
+    fn min_sigma(dc: &crate::helpers::dynamic_config::DynamicConfig) -> f64 {
+        dc.fairvalue_min_sigma_per_sqrt_sec
+            .to_f64()
+            .unwrap_or(config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC)
+    }
+
     /// None when the model can't price (no strike/vol/time).
     fn fair_prob_for_side(
         &self,
@@ -790,6 +801,7 @@ impl FairValueStrategyImpl {
         market: &MarketConfig,
         snapshot: &MarketSnapshot,
         token_is_yes: bool,
+        min_sigma_per_sqrt_sec: f64,
         sigma_floor_horizon_secs: i64,
     ) -> Option<f64> {
         let strike = market.strike_price?.to_f64()?;
@@ -814,7 +826,7 @@ impl FairValueStrategyImpl {
         let prices: Vec<f64> = samples.iter().map(|(_, p)| *p).collect();
         drop(samples);
         let sigma = sigma_per_sqrt_sec(&prices, span_secs, config::FAIRVALUE_MIN_VOL_SAMPLES)?
-            .max(Self::sigma_floor(sigma_floor_horizon_secs, secs_left));
+            .max(Self::sigma_floor(min_sigma_per_sqrt_sec, sigma_floor_horizon_secs, secs_left));
         let fair_yes = fair_yes_probability(spot, strike, sigma, secs_left as f64)?;
         Some(if token_is_yes { fair_yes } else { 1.0 - fair_yes })
     }
@@ -909,7 +921,7 @@ impl Strategy for FairValueStrategyImpl {
         // depends on how far out we are forecasting.
         let sigma = match sigma_opt {
             // warmup complete, oracle alive
-            Some(s) => s.max(Self::sigma_floor(dc.fairvalue_sigma_floor_horizon_secs, secs_left)),
+            Some(s) => s.max(Self::sigma_floor(Self::min_sigma(dc), dc.fairvalue_sigma_floor_horizon_secs, secs_left)),
             None => {
                 // Warmup visibility: without this the viper is totally silent
                 // for the first FAIRVALUE_MIN_VOL_SAMPLES × SAMPLE_SECS.
@@ -1279,7 +1291,7 @@ impl Strategy for FairValueStrategyImpl {
                 .unwrap_or(i64::MAX);
             let fair_side = self.fair_prob_for_side(
                 &ctx.crypto_filter, market, snap, token_is_yes,
-                dc.fairvalue_sigma_floor_horizon_secs,
+                Self::min_sigma(dc), dc.fairvalue_sigma_floor_horizon_secs,
             );
 
             // ── Settlement-snipe posture ─────────────────────────────────────
@@ -1693,7 +1705,7 @@ mod tests {
         let full = config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC;
         // The three entries of that session, by seconds to expiry.
         for secs_left in [932_i64, 1206, 2371] {
-            let f = FairValueStrategyImpl::sigma_floor(h, secs_left);
+            let f = FairValueStrategyImpl::sigma_floor(full, h, secs_left);
             assert!(
                 (f - abs).abs() < 1e-12,
                 "T={secs_left}s is inside the vol window; floor should be the absolute backstop, got {f:e}"
@@ -1710,13 +1722,13 @@ mod tests {
         let h = 3600_i64;
         let full = config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC;
         for secs_left in [2 * h, 6 * h, 20 * h] {
-            let f = FairValueStrategyImpl::sigma_floor(h, secs_left);
+            let f = FairValueStrategyImpl::sigma_floor(full, h, secs_left);
             assert!((f - full).abs() < 1e-12, "T={secs_left}s should get the full floor, got {f:e}");
         }
         // Monotone ramp between the window and twice it — no discontinuity that
         // would reprice a market as it crosses the threshold.
-        let mid = FairValueStrategyImpl::sigma_floor(h, h + h / 2);
-        assert!(mid > FairValueStrategyImpl::sigma_floor(h, h));
+        let mid = FairValueStrategyImpl::sigma_floor(full, h, h + h / 2);
+        assert!(mid > FairValueStrategyImpl::sigma_floor(full, h, h));
         assert!(mid < full);
     }
 
@@ -2017,13 +2029,26 @@ mod tests {
         }
     }
 
+    /// The floor level is a runtime knob because the profiles disagree on it
+    /// (5.0e-5 / 4.2e-5 / 3.5e-5) and an image bakes only one profile's
+    /// constants. Whatever the knob says is the full-strength floor, and a value
+    /// typed below the absolute backstop still gets the backstop.
+    #[test]
+    fn floor_level_follows_the_knob_and_never_drops_below_the_backstop() {
+        let abs = config::FAIRVALUE_ABSOLUTE_MIN_SIGMA_PER_SQRT_SEC;
+        assert_eq!(FairValueStrategyImpl::sigma_floor(3.5e-5, 0, 1224), 3.5e-5);
+        assert_eq!(FairValueStrategyImpl::sigma_floor(5.0e-5, 600, 1224), 5.0e-5);
+        assert_eq!(FairValueStrategyImpl::sigma_floor(0.0, 0, 1224), abs);
+        assert_eq!(FairValueStrategyImpl::sigma_floor(-1.0, 600, 5000), abs);
+    }
+
     /// Setting the knob to zero restores the old unconditional floor, so the
     /// change can be reverted live without a redeploy.
     #[test]
     fn zero_horizon_restores_the_unconditional_floor() {
         let full = config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC;
         for secs_left in [60_i64, 932, 100_000] {
-            assert_eq!(FairValueStrategyImpl::sigma_floor(0, secs_left), full);
+            assert_eq!(FairValueStrategyImpl::sigma_floor(full, 0, secs_left), full);
         }
     }
 
@@ -2398,6 +2423,34 @@ mod entry_book_tests {
         }
     }
 
+    /// Real-money trade of 2026-09-10, 5PM ET: YES bought at $0.20 on a fair value
+    /// of 0.280, 1224s to expiry, spot $78.71 under the strike, σ priced at the
+    /// compile-time 5.0e-5 floor while realized vol ran about 2.6e-5. It stopped
+    /// out for -$1.45. The floor, now the `fairvalue_min_sigma_per_sqrt_sec`
+    /// knob, decides that fair value outright on a quiet hour: at the aggressive
+    /// profile's 3.5e-5 it is about 0.203, which leaves the $0.20 ask no edge
+    /// after fees. The knob must reach the pricing path, not just the schema.
+    #[test]
+    fn the_floor_knob_reprices_the_2026_09_10_tail_entry() {
+        let asset = "btc-floor-knob-2026-09-10";
+        seed_flat_vol(asset);
+        let mut hourly = book(dec!(200), dec!(150));
+        hourly.oracle_price = dec!(77189.37);
+        let mut c = ctx(hourly, book(dec!(100), dec!(100)));
+        c.crypto_filter = asset.to_string();
+        c.market.strike_price = Some(dec!(77268.08));
+        c.market.market_close_time = Some(Utc::now() + chrono::Duration::seconds(1224));
+
+        let strat = FairValueStrategyImpl::default();
+        let fair_yes = |floor: f64| strat
+            .fair_prob_for_side(asset, &c.market, &c.snapshot, true, floor, 0)
+            .expect("the seeded sampler must let the model price");
+        let at_baked_floor = fair_yes(5.0e-5);
+        assert!((at_baked_floor - 0.280).abs() < 0.005, "fair(YES)={at_baked_floor} should match the logged 0.280");
+        let at_aggressive_floor = fair_yes(3.5e-5);
+        assert!((at_aggressive_floor - 0.203).abs() < 0.005, "fair(YES)={at_aggressive_floor} should be about 0.203");
+    }
+
     /// Trade #4 of 2026-09-06, driven through the real exit path: NO bought at
     /// $0.92 (TP $1.104 — no such price), the book at bid $0.78 / ask $0.81,
     /// held 391s, the model still reading ~0.85 for NO. Production stopped it
@@ -2433,7 +2486,7 @@ mod entry_book_tests {
 
         let strat = FairValueStrategyImpl::default();
         let fair_no = strat
-            .fair_prob_for_side(asset, &c.market, &c.snapshot, false, 0)
+            .fair_prob_for_side(asset, &c.market, &c.snapshot, false, config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC, 0)
             .expect("the seeded sampler must let the model price");
         assert!((0.80..0.90).contains(&fair_no), "fair(NO)={fair_no} should sit near the logged 0.846");
 
@@ -2502,7 +2555,7 @@ mod entry_book_tests {
 
         let strat = FairValueStrategyImpl::default();
         let fair_no = strat
-            .fair_prob_for_side(asset, &c.market, &c.snapshot, false, 0)
+            .fair_prob_for_side(asset, &c.market, &c.snapshot, false, config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC, 0)
             .expect("the seeded sampler must let the model price");
         assert!(fair_no < 0.76, "fair(NO)={fair_no} must sit below the fee-net bid for the EV exit");
 
@@ -2546,7 +2599,7 @@ mod entry_book_tests {
         c2.crypto_filter = asset2.to_string();
         c2.dynamic_config = c.dynamic_config.clone();
         let fair_no = strat
-            .fair_prob_for_side(asset2, &c2.market, &c2.snapshot, false, 0)
+            .fair_prob_for_side(asset2, &c2.market, &c2.snapshot, false, config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC, 0)
             .expect("the seeded sampler must let the model price");
         assert!(fair_no > 0.60 - 0.02, "fair(NO)={fair_no}: the EV test must NOT be what fires here");
         c2.positions.lock().await.insert(
@@ -2802,7 +2855,7 @@ mod entry_book_tests {
 
         let strat = FairValueStrategyImpl::default();
         let fair_no = strat
-            .fair_prob_for_side(asset, &c.market, &c.snapshot, false, 0)
+            .fair_prob_for_side(asset, &c.market, &c.snapshot, false, config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC, 0)
             .expect("the seeded sampler must let the model price");
         assert!(
             fair_no >= config::FAIRVALUE_SETTLE_HOLD_MIN_PROB,

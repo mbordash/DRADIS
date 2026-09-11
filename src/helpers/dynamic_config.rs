@@ -187,6 +187,7 @@ fn default_fairvalue_target_profit()       -> Decimal { config::FAIRVALUE_TARGET
 fn default_fairvalue_stop_loss()           -> Decimal { config::FAIRVALUE_STOP_LOSS_PERCENT           }
 fn default_fairvalue_reversal_decay()      -> Decimal { config::FAIRVALUE_MODEL_REVERSAL_DECAY_PCT    }
 fn default_fairvalue_sigma_floor_horizon() -> i64     { config::FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS    }
+fn default_fairvalue_min_sigma()           -> Decimal { decimal_from_f64(config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC) }
 fn default_fairvalue_post_exit_cooldown()  -> i64     { config::FAIRVALUE_POST_EXIT_COOLDOWN_SECS     }
 fn default_fairvalue_max_stop_losses()     -> u32     { config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET  }
 fn default_fairvalue_edge_noise_multiple() -> Decimal { config::FAIRVALUE_EDGE_NOISE_MULTIPLE         }
@@ -866,6 +867,15 @@ pub struct DynamicConfig {
     /// only what it cannot see.
     #[serde(default = "default_fairvalue_sigma_floor_horizon")]
     pub fairvalue_sigma_floor_horizon_secs: i64,
+    /// Full-strength σ floor per √second on FairValue's realized-vol input, before
+    /// the horizon ramp. The model prices with max(realized σ, floor), so on a
+    /// quiet hour this value, not the market, sets fair value. Raising it pushes
+    /// fair toward 0.5 (cheap tails look underpriced); lowering it pushes fair
+    /// toward 0/1 (favorites look underpriced). Runtime rather than compile-time
+    /// because the profiles disagree on it and an image bakes only one profile's
+    /// constants. Values below the absolute backstop are raised to it.
+    #[serde(default = "default_fairvalue_min_sigma")]
+    pub fairvalue_min_sigma_per_sqrt_sec: Decimal,
     /// Seconds a token is locked out after any FairValue exit. Re-entries into a
     /// market the viper has just left were 0-for-4 in prod (2026-08-13/14).
     #[serde(default = "default_fairvalue_post_exit_cooldown")]
@@ -1203,6 +1213,7 @@ impl Default for DynamicConfig {
             fairvalue_model_reversal_decay_pct: config::FAIRVALUE_MODEL_REVERSAL_DECAY_PCT,
             fairvalue_stop_veto_max_model_decay_pct: config::FAIRVALUE_STOP_VETO_MAX_MODEL_DECAY_PCT,
             fairvalue_sigma_floor_horizon_secs: config::FAIRVALUE_SIGMA_FLOOR_HORIZON_SECS,
+            fairvalue_min_sigma_per_sqrt_sec: decimal_from_f64(config::FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC),
             fairvalue_post_exit_cooldown_secs: config::FAIRVALUE_POST_EXIT_COOLDOWN_SECS,
             fairvalue_max_stop_losses_per_market: config::FAIRVALUE_MAX_STOP_LOSSES_PER_MARKET,
             fairvalue_edge_noise_multiple:    config::FAIRVALUE_EDGE_NOISE_MULTIPLE,

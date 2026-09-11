@@ -46,6 +46,7 @@ export interface DynamicConfig {
   fairvalue_stop_loss_pct:     string;
   fairvalue_model_reversal_decay_pct: string;
   fairvalue_sigma_floor_horizon_secs: number;
+  fairvalue_min_sigma_per_sqrt_sec:   string;
   fairvalue_post_exit_cooldown_secs:  number;
   fairvalue_max_stop_losses_per_market: number;
   fairvalue_edge_noise_multiple:      string;

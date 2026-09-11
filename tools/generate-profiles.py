@@ -9,6 +9,7 @@ validated DynamicConfig::apply_patch path used by PATCH /api/config.
 Usage: python3 tools/generate-profiles.py   (run from repo root)
 """
 import json
+from decimal import Decimal
 import re
 import sys
 from pathlib import Path
@@ -75,7 +76,8 @@ def const_values(path: Path) -> dict[str, object]:
             if im:
                 out[name] = int(im.group(1).replace("_", ""))
         elif ty == "f64":
-            fm = re.match(r"(-?[0-9._]+)", raw)
+            # Exponent included: `5.0e-5` must not parse as 5.0.
+            fm = re.match(r"(-?[0-9._]+(?:[eE][-+]?[0-9]+)?)", raw)
             if fm:
                 out[name] = float(fm.group(1).replace("_", ""))
         elif ty.startswith("&") and "str" in ty:
@@ -111,7 +113,9 @@ def main() -> None:
             if const in consts:
                 value = consts[const]
                 if field in decimals and isinstance(value, float):
-                    value = repr(value)
+                    # Positional, never scientific: rust_decimal does not parse
+                    # "5e-05", and repr() produces exactly that for small floats.
+                    value = format(Decimal(repr(value)), "f")
                 values[field] = value
             else:
                 missing_report.append(f"{pname}: {field} <- config::{const}")
