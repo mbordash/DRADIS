@@ -446,6 +446,12 @@ pub struct OrphanExit {
     ///   re_hedge_cost = paired_ask + original_entry
     /// If re_hedge_cost < RE_HEDGE_THRESHOLD the arb is still profitable.
     pub original_entry: Decimal,
+    /// Strategy that held the orphan, for the trade row its sale writes.
+    pub strategy_name: String,
+    /// Market title, for the same row.
+    pub market_name: String,
+    /// The entry fee these shares carry, netted from the sale's P&L.
+    pub entry_fee: Decimal,
 }
 
 pub async fn reconcile_orphaned_positions(
@@ -605,6 +611,9 @@ pub async fn reconcile_orphaned_positions(
                 token_id,
                 shares: position.shares,
                 is_neg_risk: false, // ArbitrageStrategy only runs on standard binary markets
+                strategy_name,
+                market_name: position.market_name.clone(),
+                entry_fee: position.entry_fee,
                 paired_token_id: position.paired_leg_token_id,
                 original_entry: position.avg_entry,
             });
@@ -635,8 +644,16 @@ pub async fn reconcile_orphaned_positions(
         // Optimistically reduce the tracked shares to the hedged remainder so the
         // next cycle won't re-detect the same excess. Chain-sync self-heals this
         // if the FAK sell fails (it re-reads actual on-chain holdings).
+        // The entry fee follows the shares: the excess takes its share to the
+        // sale that books it, and the hedged remainder keeps the rest.
+        let excess_fee = if position.shares > Decimal::ZERO {
+            position.entry_fee * (excess / position.shares)
+        } else {
+            Decimal::ZERO
+        };
         if let Some(p) = pos_map.get_mut(&key) {
             p.shares = (p.shares - excess).max(Decimal::ZERO);
+            p.entry_fee = (p.entry_fee - excess_fee).max(Decimal::ZERO);
         }
         phantom_cooldowns.lock().await.insert(cooldown_key, tokio::time::Instant::now());
 
@@ -651,6 +668,9 @@ pub async fn reconcile_orphaned_positions(
                 is_neg_risk: false,
                 paired_token_id: None, // force flatten-only (no re-hedge atop existing opposite leg)
                 original_entry: position.avg_entry,
+                strategy_name,
+                market_name: position.market_name.clone(),
+                entry_fee: excess_fee,
             });
         }
     }

@@ -2508,6 +2508,35 @@ pub async fn set_open_position_entry_fee(pool: &SqlitePool, token_id: &str, entr
     }
 }
 
+/// Overwrite an open position's cost basis with a fill's real price.
+///
+/// `record_open_position` never touches an existing row, so a leg whose row was
+/// written at its resting quote keeps that quote as its cost when a taker fill
+/// later completes it — the orphan arbiter's re-hedge is that case.
+pub async fn set_open_position_entry_price(pool: &SqlitePool, token_id: &str, entry_price: Decimal) {
+    if entry_price <= Decimal::ZERO { return; }
+    if let Err(e) = sqlx::query("UPDATE open_positions SET entry_price = ? WHERE token_id = ?")
+        .bind(entry_price.to_string())
+        .bind(token_id)
+        .execute(pool)
+        .await
+    {
+        error!("❌ DB set_open_position_entry_price failed for {}: {}", token_id, e);
+    }
+}
+
+/// An in-memory database carrying the full schema, for tests outside this module.
+#[cfg(test)]
+pub(crate) async fn memory_pool_for_tests() -> SqlitePool {
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect("sqlite::memory:")
+        .await
+        .unwrap();
+    init_schema(&pool).await.unwrap();
+    pool
+}
+
 /// Read back the entry fee recorded for an open position, if any.
 ///
 /// The orphan arbiter needs this before it purges the row: `close_open_position`

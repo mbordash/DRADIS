@@ -657,6 +657,8 @@ pub fn spawn_cleanup_task(
     // venue/class/underlying as the leg it repairs, instead of leaving the
     // in-flight row's Venue column NULL.
     scope:                crate::state::TradeScope,
+    // Session P&L, credited by the orphan sales this task books.
+    total_pnl:            Arc<Mutex<Decimal>>,
     cancel:               CancellationToken,
 ) {
     tokio::spawn(async move {
@@ -781,7 +783,7 @@ pub fn spawn_cleanup_task(
                                 }
                             };
 
-                            if let Some(paired_id) = orphan.paired_token_id {
+                            if let Some(paired_id) = orphan.paired_token_id.clone() {
                                 let paired_ask = if paired_id == hourly_yes_token {
                                     yes_price_rx.borrow().2
                                 } else if paired_id == hourly_no_token {
@@ -976,21 +978,46 @@ pub fn spawn_cleanup_task(
                                     orphan.shares, orphan.token_id, sell_price, orphan_bid,
                                 );
 
-                                match place_limit_order(
+                                match place_limit_order_filled(
                                     &trading_client, &nonce_manager, &signer,
                                     safe_address, eoa_address,
                                     vc, &orphan.token_id, Side::Sell, orphan.shares,
                                     sell_price, 0, crate::venues::core::TimeInForce::Fak, false, 0, &shared_http,
                                 ).await {
-                                    Ok(order_id) => {
+                                    Ok((order_id, making, taking)) => {
                                         info!("✅ ORPHAN EXIT: FAK sell submitted (order {})", order_id);
+                                        // Book what sold. This sale used to write no trade row and no
+                                        // session P&L: 2026-09-12 (intl, real money) a TimeDecay trim
+                                        // sold 6 YES at $0.47 and the ledger never saw it.
+                                        let st = orphan_sale(&orphan, making, taking, sell_price,
+                                            crate::venues::intl::live_taker_fee_rate());
+                                        if st.filled >= config::MIN_ORDER_SHARES {
+                                            let side = if orphan.token_id == hourly_yes_token
+                                                || maker_market_config.as_ref().map_or(false, |mkc| mkc.yes_token == orphan.token_id)
+                                            { "YES" } else { "NO" };
+                                            info!("🧾 ORPHAN EXIT [{}]: {:.4} shares sold @ ${:.4} (entry ${:.4}) pnl=${:.4} (net of ${:.4} fees)",
+                                                  orphan.strategy_name, st.filled, st.exit_price, orphan.original_entry, st.pnl, st.fees());
+                                            *total_pnl.lock().await += st.pnl;
+                                            // This path only runs live, whatever the cloned scope's
+                                            // ghost flag last read.
+                                            let mut scope_o = scope.clone();
+                                            scope_o.ghost = false;
+                                            metrics::record_trade(
+                                                &scope_o, st.fees(), orphan.strategy_name.clone(), orphan.market_name.clone(),
+                                                side.to_string(), orphan.original_entry, st.exit_price, st.filled, st.pnl,
+                                                "Orphan exit (bid FAK)".to_string(),
+                                            ).await;
+                                        } else {
+                                            warn!("⚠️ ORPHAN EXIT [{}]: venue matched nothing on {:.4} shares at ${:.4} — no trade booked",
+                                                  orphan.strategy_name, orphan.shares, sell_price);
+                                        }
                                         let tok_o = tg_token.clone();
                                         let cid_o = tg_chat_id.clone();
-                                        let sh_o = orphan.shares;
+                                        let (sh_o, px_o) = (st.filled, st.exit_price);
                                         tokio::spawn(async move {
                                             let _ = send_notification(&tok_o, &cid_o, &format!(
                                                 " Orphan sold: {:.0} shares @ ${:.4} (bid-based FAK exit)",
-                                                sh_o, sell_price,
+                                                sh_o, px_o,
                                             )).await;
                                         });
                                     }
@@ -1333,5 +1360,54 @@ mod portfolio_valuation_tests {
         let now = chrono::Utc::now();
         assert!(!persist_chain_correction(dec!(0), "not-a-timestamp", now, "confirmed", true));
         assert!(persist_chain_correction(dec!(9), "not-a-timestamp", now, "confirmed", true));
+    }
+}
+
+/// Settle an orphan's bid FAK from the venue's matched amounts, net of the exit's
+/// taker fee and the entry fee these shares carry.
+fn orphan_sale(
+    orphan: &crate::tasks::cleanup::OrphanExit,
+    making: Decimal,
+    taking: Decimal,
+    limit: Decimal,
+    fee_rate: Decimal,
+) -> super::patrol_impl::fak_exit::Settlement {
+    let (matched, price) = super::patrol_impl::fak_exit::sell_fill(making, taking);
+    super::patrol_impl::fak_exit::settle(
+        orphan.shares, matched, price, limit, orphan.original_entry, orphan.entry_fee, fee_rate,
+    )
+}
+
+#[cfg(test)]
+mod orphan_sale_tests {
+    use super::*;
+    use crate::venues::core::MarketId;
+
+    fn trim(shares: Decimal, entry: Decimal, entry_fee: Decimal) -> crate::tasks::cleanup::OrphanExit {
+        crate::tasks::cleanup::OrphanExit {
+            token_id: MarketId::new("yes"), shares, is_neg_risk: false, paired_token_id: None,
+            original_entry: entry, strategy_name: "TimeDecayStrategy".into(),
+            market_name: "Bitcoin Up or Down - September 12, 12AM ET".into(), entry_fee,
+        }
+    }
+
+    /// 2026-09-12, 00:44 ET (intl, real money): the arbiter's re-hedge bought 20
+    /// NO against 26 YES, and the trim sold the 6 excess YES at $0.47 against a
+    /// $0.46 limit. Collateral rose $2.72 and no trade row was ever written.
+    #[test]
+    fn the_trim_sale_books_the_venues_price_net_of_the_taker_fee() {
+        let st = orphan_sale(&trim(dec!(6), dec!(0.34), dec!(0)), dec!(6), dec!(2.82), dec!(0.46), dec!(0.07));
+        assert_eq!(st.filled, dec!(6));
+        assert_eq!(st.exit_price, dec!(0.47));
+        // Proceeds $2.82 less 0.07 × 0.47 × 0.53 × 6 = $0.104622: the $2.72 step.
+        assert_eq!(st.exit_fee, dec!(0.104622));
+        assert_eq!(st.pnl, dec!(0.78) - dec!(0.104622));
+    }
+
+    #[test]
+    fn a_sale_the_venue_did_not_match_books_nothing() {
+        let st = orphan_sale(&trim(dec!(6), dec!(0.34), dec!(0.05)), dec!(0), dec!(0), dec!(0.46), dec!(0.07));
+        assert_eq!(st.filled, dec!(0));
+        assert_eq!(st.pnl, dec!(0));
     }
 }

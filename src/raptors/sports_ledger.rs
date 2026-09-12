@@ -572,7 +572,11 @@ async fn capture_results(http: &reqwest::Client, pool: &sqlx::SqlitePool, now: D
     let mut recorded = 0;
     for cid in order.into_iter().take(RESULTS_PER_PASS) {
         let tokens = by_cid.remove(&cid).unwrap_or_default();
-        let Ok((v, _, _)) = get_json(http, &format!("{GAMMA}/markets"), None, &[("condition_ids", cid.as_str())]).await else { continue };
+        // Gamma hides closed markets unless asked: without `closed=true` a
+        // finished game's market comes back as an empty list, so no result was
+        // ever recorded (0 from 919 ledger rows by 2026-09-12). Only a closed
+        // market can carry a result, so asking for closed ones alone loses nothing.
+        let Ok((v, _, _)) = get_json(http, &format!("{GAMMA}/markets"), None, &[("condition_ids", cid.as_str()), ("closed", "true")]).await else { continue };
         let Some(m) = v.as_array().and_then(|a| a.first()) else { continue };
         for (token, label) in tokens {
             if let Some(price) = resolved_price(m, &token) {
@@ -925,5 +929,39 @@ mod tests {
             "asks": [{"price": "0.52", "size": "10"}, {"price": "0.50", "size": "40"}]
         });
         assert_eq!(best_levels(&book), (Some(0.48), Some(25.0), Some(0.50), Some(40.0)));
+    }
+}
+
+#[cfg(test)]
+mod live_gamma_tests {
+    use super::*;
+
+    /// The 2026-09-11 Colorado Rockies at Detroit Tigers game, as the production
+    /// ledger recorded it. Gamma hides a closed market unless the query asks for
+    /// closed markets, so before `closed=true` this pass got an empty list and
+    /// recorded nothing.
+    #[tokio::test]
+    #[ignore = "live Gamma: network"]
+    async fn results_capture_records_a_finished_game_from_live_gamma() {
+        let pool = db::memory_pool_for_tests().await;
+        let cid = "0x5fb42ea94462e80ef345081e6886c77435130b5555db31dc15ca8c63d7e9deea";
+        let row = |token: &str, label: &str| db::SportsLedgerRow {
+            ts: "2026-09-11T22:10:18+00:00".into(), league: "mlb".into(), sport_key: "baseball_mlb".into(),
+            odds_event_id: "ef265df05ca10a02712319b8f7e74641".into(), pm_slug: "mlb-col-det-2026-09-11".into(),
+            condition_id: cid.into(), token_id: token.into(), outcome_label: label.into(), odds_outcome: label.into(),
+            commence: "2026-09-11T22:40:00+00:00".into(), secs_to_start: 1781, consensus: None, num_books: 9,
+            dispersion: None, max_book_age_secs: None, pm_bid: None, pm_ask: None, pm_bid_size: None,
+            pm_ask_size: None, credits_remaining: None,
+        };
+        db::record_sports_ledger_rows(&pool, &[
+            row("114532502496137932693089688451118145455360814432114926570975463361514518351293", "Colorado Rockies"),
+            row("29514720079430880907153855961681340086780539591746523903213318866605387663992", "Detroit Tigers"),
+        ]).await;
+        let now = parse_time("2026-09-12T13:00:00Z").unwrap();
+        capture_results(&reqwest::Client::new(), &pool, now).await;
+        let prices: Vec<f64> = sqlx::query_scalar("SELECT resolved_price FROM sports_line_results ORDER BY outcome_label")
+            .fetch_all(&pool).await.unwrap();
+        assert_eq!(prices.len(), 2, "both outcomes of a finished game resolve");
+        assert_eq!(prices.iter().sum::<f64>(), 1.0);
     }
 }

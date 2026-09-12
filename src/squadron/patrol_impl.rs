@@ -481,6 +481,8 @@ impl Squadron {
             // re-hedge). Only venue/class/underlying are read from this clone;
             // its ghost flag is NOT — the task's writes carry their own.
             scope.clone(),
+            // Orphan sales credit session P&L alongside their trade rows.
+            Arc::clone(&total_pnl),
             peripheral_cancel.clone(),
         );
 
@@ -1947,17 +1949,51 @@ impl Squadron {
                                             let other_bid = if other_tid == target_yes_token { exit_snap.yes_bid } else { exit_snap.no_bid };
                                             let other_fee_bps = if other_tid == target_yes_token { target_yes_fee_bps as u16 } else { target_no_fee_bps as u16 };
                                             let other_vc = if target_is_neg_risk { EXCHANGE_NEG_RISK } else { EXCHANGE_NORMAL };
-                                                if !ghosting { let _ = place_limit_order(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, &other_tid, Side::Sell, s, (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE), other_fee_bps, crate::venues::core::TimeInForce::Fak, false, 0, &shared_http).await; }
-                                                    let mut map = positions.lock().await; if let Some(p) = map.remove(&pk) { let actual_other_exit = (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE); let pnl = (actual_other_exit - p.avg_entry) * p.shares; paired_pnl = pnl; *total_pnl.lock().await += pnl;
-                                                // Release paired token claim.
-                                                token_ownership.lock().await.remove(&other_tid_m);
-                                                {
-                                                    let sn_pm = sn.clone(); let m_name = params.market_name.clone(); let sid = side_of(&other_tid).to_string(); let p_avg = p.avg_entry; let o_bid = actual_other_exit; let p_shares = p.shares; let pn = pnl; let scope_pm = scope.clone();
-                                                    tokio::spawn(async move { metrics::record_trade(&scope_pm, Decimal::ZERO, sn_pm, m_name, sid, p_avg, o_bid, p_shares, pn, "Convergence/PairedExit".to_string()).await; });
+                                            let other_limit = (other_bid - config::SELL_PRICE_OFFSET).max(config::MIN_SELL_LIMIT_PRICE);
+                                            // Settle the other leg from the venue's answer, exactly as the leg
+                                            // above is settled. This used to discard the order result and book
+                                            // every share sold at its own limit, with no fee. 2026-09-12 (intl,
+                                            // real money): TimeDecay's NO leg was booked sold at $0.69 for +$5.60
+                                            // while all 20 shares stayed in the wallet, unmanaged, for 26 minutes;
+                                            // releasing its token claim let FairValue buy the same token a minute
+                                            // later, and the two positions' shares merged in every per-token sweep
+                                            // that followed.
+                                            let (matched, venue_price) = if ghosting {
+                                                // In simulation the exit IS the fill, at the limit.
+                                                (Some(s), None)
+                                            } else {
+                                                match place_limit_order_filled(&trading_client, &nonce_manager, &signer, safe_address, eoa_address, other_vc, &other_tid, Side::Sell, s, other_limit, other_fee_bps, crate::venues::core::TimeInForce::Fak, false, 0, &shared_http).await {
+                                                    Ok((_oid, making, taking)) => fak_exit::sell_fill(making, taking),
+                                                    Err(e) => {
+                                                        warn!("⚠️ PAIRED EXIT [{}]: sell of the other leg ({:.4} shares @ ${:.4}) failed: \"{}\"", sn, s, other_limit, e.to_string().chars().take(120).collect::<String>());
+                                                        (None, None)
+                                                    }
                                                 }
-                                                {
-                                                    let sn_cp = sn.clone(); let tid_cp = other_tid.to_string(); let asset_c = asset_lc.clone();
+                                            };
+                                            let settled = { let mut map = positions.lock().await; fak_exit::settle_paired_leg(&mut map, &pk, matched, venue_price, other_limit, intl_taker_fee_rate) };
+                                            if let Some((p, st)) = settled {
+                                                if st.filled >= config::MIN_ORDER_SHARES {
+                                                    paired_pnl = st.pnl;
+                                                    *total_pnl.lock().await += st.pnl;
+                                                    let sn_pm = sn.clone(); let m_name = params.market_name.clone(); let sid = side_of(&other_tid).to_string(); let scope_pm = scope.clone();
+                                                    let (p_avg, fees, px, filled, pn) = (p.avg_entry, st.fees(), st.exit_price, st.filled, st.pnl);
+                                                    tokio::spawn(async move { metrics::record_trade(&scope_pm, fees, sn_pm, m_name, sid, p_avg, px, filled, pn, "Convergence/PairedExit".to_string()).await; });
+                                                }
+                                                let sn_cp = sn.clone(); let tid_cp = other_tid.to_string(); let asset_c = asset_lc.clone();
+                                                if st.remainder < config::MIN_ORDER_SHARES {
+                                                    // Release the paired token claim only when nothing is left to manage.
+                                                    token_ownership.lock().await.remove(&other_tid_m);
                                                     tokio::spawn(async move { if let Some(pool) = db::pool_for(&asset_c) { db::close_open_position(&pool, &sn_cp, &tid_cp).await; } });
+                                                } else {
+                                                    // Unsold shares stay as the SAME position, unlinked from the leg
+                                                    // just sold, and keep the token claimed. TimeDecay only exits
+                                                    // whole pairs, so a lone leg is the orphan sweep's to flatten and
+                                                    // book (Arbitrage also has its own naked-leg exit).
+                                                    warn!("⚠️ PAIRED EXIT [{}]: venue sold {:.4} of {:.4} shares on the other leg — {:.4} retained and still claimed; the orphan sweep flattens them", sn, st.filled, p.shares, st.remainder);
+                                                    if st.filled >= config::MIN_ORDER_SHARES {
+                                                        let (rem, avg) = (st.remainder, p.avg_entry);
+                                                        tokio::spawn(async move { if let Some(pool) = db::pool_for(&asset_c) { db::update_position_from_chain(&pool, &tid_cp, rem, avg, None).await; } });
+                                                    }
                                                 }
                                             }
                                         }
@@ -4188,7 +4224,7 @@ pub(crate) mod resting_exit {
 pub mod fak_exit {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use crate::state::Position;
+    use crate::state::{Position, PositionKey, PositionMap};
 
     /// What one FAK actually did.
     #[derive(Debug, Clone, PartialEq)]
@@ -4266,6 +4302,49 @@ pub mod fak_exit {
         kept.shares = remainder;
         kept.entry_fee = entry_fee_left.max(dec!(0));
         kept
+    }
+
+    /// Matched shares and average price from a SELL's response amounts
+    /// (`making` = shares given, `taking` = USDC received). The price is `None`
+    /// unless both are positive and their ratio is a valid binary price.
+    pub fn sell_fill(making: Decimal, taking: Decimal) -> (Option<Decimal>, Option<Decimal>) {
+        let price = if making > Decimal::ZERO && taking > Decimal::ZERO {
+            Some(taking / making).filter(|p| *p > Decimal::ZERO && *p <= dec!(1))
+        } else {
+            None
+        };
+        (Some(making), price)
+    }
+
+    /// Settle the other leg of a paired exit from what its FAK did.
+    ///
+    /// The position leaves the map and only what the venue sold counts; unsold
+    /// shares go back in as the SAME position, so the caller keeps its token
+    /// claim. `matched = None` (the order was rejected) sells nothing. Returns
+    /// the position as it was before the sale with its settlement, or `None`
+    /// when there was no leg to exit.
+    ///
+    /// The retained leg loses its pair link. Its partner was the leg this exit
+    /// just sold, and both naked-leg sweeps (the cleanup orphan sweep and the
+    /// order lifecycle's) read a linked partner that is no longer held as a
+    /// pair to COMPLETE, buying it back at the ask. Unlinked, the leg is simply
+    /// flattened, which is what the exit decided.
+    pub fn settle_paired_leg(
+        map: &mut PositionMap,
+        key: &PositionKey,
+        matched: Option<Decimal>,
+        venue_price: Option<Decimal>,
+        limit: Decimal,
+        fee_rate: Decimal,
+    ) -> Option<(Position, Settlement)> {
+        let p = map.remove(key)?;
+        let st = settle(p.shares, matched, venue_price, limit, p.avg_entry, p.entry_fee, fee_rate);
+        if st.remainder >= crate::config::MIN_ORDER_SHARES {
+            let mut kept = retain_remainder(&p, st.remainder, st.entry_fee_left);
+            kept.paired_leg_token_id = None;
+            map.insert(key.clone(), kept);
+        }
+        Some((p, st))
     }
 
     #[cfg(test)]
@@ -4373,6 +4452,81 @@ pub mod fak_exit {
             assert_eq!(kept.fill_confirmed_at, Some(confirmed), "the hold clock must not restart");
             assert_eq!(kept.opened_at, opened);
             assert_eq!(kept.paired_leg_token_id, Some(MarketId::new("pair")));
+        }
+
+        fn paired_leg(shares: Decimal, entry: Decimal, entry_fee: Decimal) -> (PositionMap, PositionKey) {
+            let key = PositionKey::new("btc-open", "TimeDecayStrategy", MarketId::new("no"));
+            let opened = Utc::now() - Duration::minutes(4);
+            let p = Position {
+                shares, avg_entry: entry, opened_at: opened,
+                close_time: Some(Utc::now() + Duration::minutes(13)),
+                market_name: "Bitcoin Up or Down - September 12, 12AM ET".into(),
+                pair_token_id: MarketId::new("no"), fill_confirmed_at: Some(opened),
+                paired_leg_token_id: Some(MarketId::new("yes")), entry_fee,
+            };
+            let mut map = PositionMap::new();
+            map.insert(key.clone(), p);
+            (map, key)
+        }
+
+        /// 2026-09-12, 00:47 ET (intl, real money): TimeDecay exited its pair,
+        /// the NO leg's sell never traded, and the engine still booked all 20
+        /// shares sold at its $0.69 limit (+$5.60, no fee), dropped the leg and
+        /// released its token claim. FairValue bought the same token a minute
+        /// later. A sale that did not happen must book nothing and leave the
+        /// leg in the map, where it keeps the claim.
+        #[test]
+        fn a_paired_leg_the_venue_did_not_sell_books_nothing_and_stays_managed() {
+            for matched in [None, Some(dec!(0))] {
+                let (mut map, key) = paired_leg(dec!(20), dec!(0.63), dec!(0.3263));
+                let (_, st) = settle_paired_leg(&mut map, &key, matched, None, dec!(0.69), RATE)
+                    .expect("there is a leg to exit");
+                assert_eq!(st.filled, dec!(0));
+                assert_eq!(st.pnl, dec!(0));
+                assert_eq!(st.fees(), dec!(0));
+                assert!(st.remainder >= crate::config::MIN_ORDER_SHARES, "the token claim is released only below this");
+                let kept = map.get(&key).expect("the unsold leg stays in the map");
+                assert_eq!(kept.shares, dec!(20));
+                assert_eq!(kept.entry_fee, dec!(0.3263));
+                // Its partner was just sold: a linked leg would read to the
+                // naked-leg sweeps as half a pair to complete, and they would
+                // buy the sold YES back instead of flattening this NO.
+                assert_eq!(kept.paired_leg_token_id, None);
+            }
+        }
+
+        /// A partial sale books the matched shares at the venue's price, net of
+        /// both fees, and the rest stays as the same position.
+        #[test]
+        fn a_paired_leg_books_only_what_sold_at_the_venues_price_net_of_fees() {
+            let (mut map, key) = paired_leg(dec!(20), dec!(0.63), dec!(0.32));
+            let (matched, px) = sell_fill(dec!(8), dec!(5.60));
+            let (before, st) = settle_paired_leg(&mut map, &key, matched, px, dec!(0.69), RATE).unwrap();
+            assert_eq!(st.filled, dec!(8));
+            assert_eq!(st.exit_price, dec!(0.70));
+            // (0.70 − 0.63) × 8 = 0.56, less 8/20 of the $0.32 entry fee and
+            // 0.07 × 0.70 × 0.30 × 8 = 0.1176 of exit fee.
+            assert_eq!(st.pnl, dec!(0.56) - dec!(0.128) - dec!(0.1176));
+            let kept = map.get(&key).expect("the remainder stays");
+            assert_eq!(kept.shares, dec!(12));
+            assert_eq!(kept.fill_confirmed_at, before.fill_confirmed_at);
+        }
+
+        /// Simulation has no venue answer: the whole leg sells at the limit.
+        #[test]
+        fn a_ghost_paired_leg_sells_whole_at_the_limit() {
+            let (mut map, key) = paired_leg(dec!(20), dec!(0.63), dec!(0));
+            let (_, st) = settle_paired_leg(&mut map, &key, Some(dec!(20)), None, dec!(0.69), RATE).unwrap();
+            assert_eq!(st.filled, dec!(20));
+            assert_eq!(st.exit_price, dec!(0.69));
+            assert!(map.get(&key).is_none());
+        }
+
+        #[test]
+        fn a_sell_response_without_a_valid_ratio_carries_no_price() {
+            assert_eq!(sell_fill(dec!(0), dec!(0)), (Some(dec!(0)), None));
+            assert_eq!(sell_fill(dec!(8), dec!(0)), (Some(dec!(8)), None));
+            assert_eq!(sell_fill(dec!(2), dec!(5)), (Some(dec!(2)), None), "a price above $1 is a misread orientation");
         }
     }
 }

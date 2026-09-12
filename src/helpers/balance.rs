@@ -36,7 +36,6 @@ use polymarket_client_sdk_v2::clob::types::request::{BalanceAllowanceRequest, Or
 use polymarket_client_sdk_v2::clob::types::{AssetType, Side};
 
 use crate::helpers::metrics;
-use crate::helpers::orders::place_limit_order;
 use crate::helpers::orders::place_limit_order_filled;
 use crate::venues::core::MarketId;
 use crate::venues::intl::{market_id_from_u256, u256_from_market_id};
@@ -1118,53 +1117,51 @@ pub async fn arb_pair_fill_monitor(
         warn!(" ARB ARBITER [{}]: Placing FAK taker buy re-hedge — token={} qty={} limit={:.4} (ask={:.4}, breakeven_ceil={:.4}, filled_entry={:.4})",
               strategy_name, missing_token, fak_qty, rehedge_price, ask_price, dynamic_ceiling, filled_avg_entry);
 
-        match place_limit_order(
+        match place_limit_order_filled(
             &client, &nonce_manager, &signer,
             safe_address, eoa_address, missing_vc,
             &missing_market, Side::Buy, fak_qty, rehedge_price,
             0, crate::venues::core::TimeInForce::Fak, false, 0, &*http,
         ).await {
-            Ok(order_id) => {
-                warn!("✅ ARB ARBITER [{}]: FAK re-hedge placed (order_id={}) — delta exposure closed",
-                      strategy_name, order_id);
+            Ok((order_id, making, taking)) => {
+                let fill = rehedge_fill(making, taking, fak_qty, rehedge_price,
+                    crate::venues::intl::live_taker_fee_rate());
+                if fill.reported {
+                    warn!("✅ ARB ARBITER [{}]: FAK re-hedge filled (order_id={}) — {:.4} shares @ ${:.4}, taker fee ${:.4} — delta exposure closed",
+                          strategy_name, order_id, fill.shares, fill.price, fill.fee);
+                } else {
+                    warn!("✅ ARB ARBITER [{}]: FAK re-hedge placed (order_id={}) — the venue reported no matched amounts; recorded as {} shares at the ${:.4} limit until position sync reads the chain",
+                          strategy_name, order_id, fill.shares, fill.price);
+                }
 
-                // Re-insert the missing leg into the positions map (the sync task already
-                // phantom-removed it; we restore it with the FAK fill data).
+                // Put the fill on the missing leg, overwriting the resting bid's row
+                // if the sync task has not phantom-removed it.
                 let reference = positions.lock().await
                     .get(&PositionKey::new(squadron_id, strategy_name.clone(), filled_market.clone()))
                     .cloned();
                 if let Some(ref_pos) = reference {
                     let key_m = PositionKey::new(squadron_id, strategy_name.clone(), missing_market.clone());
-                    let mut map = positions.lock().await;
-                    if !map.contains_key(&key_m) {
-                        map.insert(key_m.clone(), Position {
-                            shares: fak_qty,
-                            avg_entry: rehedge_price,
-                            opened_at: Utc::now(),
-                            close_time: ref_pos.close_time,
-                            market_name: ref_pos.market_name.clone(),
-                            pair_token_id: missing_market.clone(),
-                            fill_confirmed_at: Some(Utc::now()),
-                            paired_leg_token_id: Some(filled_market.clone()), entry_fee: Decimal::ZERO,
-                        });
-                    }
-                    drop(map);
+                    apply_rehedge_fill(&mut *positions.lock().await, key_m, &ref_pos, &filled_market, &fill);
 
                     // Clear phantom cooldown so a future cycle can enter this market again.
                     phantom_cooldowns.lock().await
                         .remove(&format!("{}:{}", strategy_name, missing_token));
 
-                    // Write the re-hedged fill to the DB.
+                    // Write the re-hedged fill to the DB. The insert skips an existing
+                    // row, so the fill's cost and fee are written onto it explicitly.
                     if let Some(pool) = crate::helpers::db::pool_for(&asset) {
+                        let token_s = missing_token.to_string();
                         crate::helpers::db::record_open_position(&pool, &scope, squadron_id,
                             &strategy_name,
-                            &missing_token.to_string(),
+                            &token_s,
                             &ref_pos.market_name,
                             missing_side,
-                            rehedge_price,
-                            fak_qty,
+                            fill.price,
+                            fill.shares,
                             false,
                         ).await;
+                        crate::helpers::db::set_open_position_entry_price(&pool, &token_s, fill.price).await;
+                        crate::helpers::db::set_open_position_entry_fee(&pool, &token_s, fill.fee).await;
                     }
                 }
                 // Re-hedge complete — the pair is whole again. Do NOT fall through to flatten.
@@ -1464,4 +1461,146 @@ pub async fn quick_confirm_fill(
         }
     }
     Ok(false)
+}
+/// What a FAK re-hedge BUY actually bought.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct RehedgeFill {
+    pub shares: Decimal,
+    pub price: Decimal,
+    /// Taker fee on the fill: a re-hedge crosses the ask, so it always pays one.
+    pub fee: Decimal,
+    /// False when the response carried no matched amounts, so the requested size
+    /// at the limit stands in until position sync reads the chain.
+    pub reported: bool,
+}
+
+/// Read a re-hedge BUY's response. BUY orientation: `making` = USDC paid,
+/// `taking` = shares received.
+pub(crate) fn rehedge_fill(
+    making: Decimal,
+    taking: Decimal,
+    requested: Decimal,
+    limit: Decimal,
+    fee_rate: Decimal,
+) -> RehedgeFill {
+    if making > Decimal::ZERO && taking > Decimal::ZERO {
+        let price = making / taking;
+        if price > Decimal::ZERO && price <= dec!(1) {
+            return RehedgeFill {
+                shares: taking, price,
+                fee: crate::venues::intl::taker_fee(fee_rate, price, taking),
+                reported: true,
+            };
+        }
+    }
+    RehedgeFill {
+        shares: requested, price: limit,
+        fee: crate::venues::intl::taker_fee(fee_rate, limit, requested),
+        reported: false,
+    }
+}
+
+/// Put a re-hedge fill on the missing leg's position.
+///
+/// The leg's row is usually still there: it is the resting entry bid that never
+/// filled, priced at its quote. 2026-09-12 (intl, real money): TimeDecay's NO bid
+/// rested at $0.41, the re-hedge paid the $0.63 ask, and because the fill was only
+/// written when the row was MISSING the leg carried $0.41 as its cost into the
+/// exit, overstating its profit by $0.22 a share. The fill is the cost, so it
+/// overwrites.
+pub(crate) fn apply_rehedge_fill(
+    map: &mut PositionMap,
+    key: PositionKey,
+    reference: &Position,
+    filled_market: &MarketId,
+    fill: &RehedgeFill,
+) {
+    let now = Utc::now();
+    match map.get_mut(&key) {
+        Some(p) => {
+            p.shares = fill.shares;
+            p.avg_entry = fill.price;
+            p.entry_fee = fill.fee;
+            p.fill_confirmed_at = Some(now);
+            p.paired_leg_token_id = Some(filled_market.clone());
+        }
+        None => {
+            let pair_token_id = key.market.clone();
+            map.insert(key, Position {
+                shares: fill.shares,
+                avg_entry: fill.price,
+                opened_at: now,
+                close_time: reference.close_time,
+                market_name: reference.market_name.clone(),
+                pair_token_id,
+                fill_confirmed_at: Some(now),
+                paired_leg_token_id: Some(filled_market.clone()),
+                entry_fee: fill.fee,
+            });
+        }
+    }
+}
+
+#[cfg(test)]
+mod rehedge_fill_tests {
+    use super::*;
+
+    const RATE: Decimal = dec!(0.07);
+
+    fn leg(market: &str, shares: Decimal, entry: Decimal, confirmed: bool) -> Position {
+        Position {
+            shares, avg_entry: entry, opened_at: Utc::now() - chrono::Duration::seconds(25),
+            close_time: None, market_name: "Bitcoin Up or Down - September 12, 12AM ET".into(),
+            pair_token_id: MarketId::new(market), fill_confirmed_at: confirmed.then(Utc::now),
+            paired_leg_token_id: None, entry_fee: Decimal::ZERO,
+        }
+    }
+
+    /// 2026-09-12, 00:43 ET (intl, real money): TimeDecay's NO bid rested at
+    /// $0.41 and never filled; the arbiter re-hedged with a taker buy at the
+    /// $0.63 ask. The resting bid's row was still in the map, so the fill was
+    /// never written and the leg carried $0.41 as its cost into the exit.
+    #[test]
+    fn a_rehedge_replaces_the_resting_bids_quote_with_the_fills_cost() {
+        let (yes, no) = (MarketId::new("yes"), MarketId::new("no"));
+        let key = PositionKey::new("btc-open", "TimeDecayStrategy", no);
+        let mut map = PositionMap::new();
+        map.insert(key.clone(), leg("no", dec!(26.6666), dec!(0.41), false));
+        let reference = leg("yes", dec!(26), dec!(0.34), true);
+
+        let fill = rehedge_fill(dec!(12.60), dec!(20), dec!(26), dec!(0.64), RATE);
+        assert!(fill.reported);
+        assert_eq!((fill.shares, fill.price), (dec!(20), dec!(0.63)));
+        apply_rehedge_fill(&mut map, key.clone(), &reference, &yes, &fill);
+
+        let p = &map[&key];
+        assert_eq!(p.avg_entry, dec!(0.63));
+        assert_eq!(p.shares, dec!(20));
+        // A crossing buy pays the taker fee: 0.07 × 0.63 × 0.37 × 20.
+        assert_eq!(p.entry_fee, dec!(0.32634));
+        assert!(p.fill_confirmed_at.is_some());
+        assert_eq!(p.paired_leg_token_id, Some(yes));
+    }
+
+    #[test]
+    fn a_rehedge_with_no_row_for_the_leg_inserts_one() {
+        let (yes, no) = (MarketId::new("yes"), MarketId::new("no"));
+        let key = PositionKey::new("btc-open", "TimeDecayStrategy", no);
+        let mut map = PositionMap::new();
+        let reference = leg("yes", dec!(26), dec!(0.34), true);
+        let fill = rehedge_fill(dec!(12.60), dec!(20), dec!(26), dec!(0.64), RATE);
+        apply_rehedge_fill(&mut map, key.clone(), &reference, &yes, &fill);
+        let p = &map[&key];
+        assert_eq!((p.shares, p.avg_entry), (dec!(20), dec!(0.63)));
+        assert_eq!(p.market_name, reference.market_name);
+    }
+
+    /// No matched amounts in the response: the request at the limit, the most
+    /// it could have cost, stands in until position sync reads the chain.
+    #[test]
+    fn an_unreported_rehedge_stands_in_at_the_limit_for_the_requested_size() {
+        let fill = rehedge_fill(dec!(0), dec!(0), dec!(26), dec!(0.64), RATE);
+        assert!(!fill.reported);
+        assert_eq!((fill.shares, fill.price), (dec!(26), dec!(0.64)));
+    }
 }
