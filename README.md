@@ -957,6 +957,8 @@ not answer "is this strategy profitable".
 
 Workflow: ghost overnight → `tools/session_parser.py` → tune `config.rs` → repeat until positive expectancy.
 
+**Can DRADIS link with quantum computing?** Possibly. See [QUANTUM.md](docs/QUANTUM.md) for the research proposal, including where a quantum solver could help and the conditions under which the work stops.
+
 ---
 
 ## License
