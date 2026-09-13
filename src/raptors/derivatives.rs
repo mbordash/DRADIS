@@ -93,6 +93,12 @@ pub async fn run_derivatives_raptor(
     let oi_primary  = format!("https://fapi.binance.com/fapi/v1/openInterest?symbol={}", symbol);
     let oi_fallback = format!("https://www.okx.com/api/v5/public/open-interest?instId={}", okx_inst);
     // Taker long/short (buy vs sell) volume ratio — perp aggression proxy (CVD).
+    // `limit=1` returns the last COMPLETED 5-minute bucket, never the one in
+    // progress. Probed from the production host on 2026-09-13: the returned
+    // bucket's start stamp was 436 s to 660 s old, and a finished bucket
+    // appeared 60 s to 136 s after it closed. So this reading carries no future
+    // flow and runs 2 to 7 minutes stale. `limit=2` is not fresher: in the same
+    // probe it once returned an older pair than `limit=1` within a second.
     let cvd_primary  = format!("https://fapi.binance.com/futures/data/takerlongshortRatio?symbol={}&period=5m&limit=1", symbol);
     let cvd_fallback = format!("https://www.okx.com/api/v5/rubik/stat/taker-volume?ccy={}&instType=CONTRACTS&period=5m", okx_ccy);
 
