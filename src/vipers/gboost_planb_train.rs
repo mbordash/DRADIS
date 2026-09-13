@@ -1332,7 +1332,16 @@ pub struct PipelineStatus {
     pub window_through: Option<String>,
     pub funding_source: Option<String>,
     pub funding_through: Option<String>,
+    /// The most recent standing error, or `None` when nothing is currently failing.
+    /// Derived from `errors`, so a failure that has since healed does not linger: on
+    /// 2026-09-13 production's backfill got one 429 on a May market, fetched it on the
+    /// next pass as designed, and kept showing the 429 on the card for hours.
     pub last_error: Option<String>,
+    /// Standing errors by source (`funding`, `bars`, `market:<window>`, `write`), each
+    /// cleared when that source next succeeds or, for a market, once its record is on
+    /// disk. A persistent failure stays here until it stops failing.
+    #[serde(default)]
+    pub errors: BTreeMap<String, String>,
     /// Memory a training run may count on, and why training is refused when it is
     /// too little (`phase` is then `memory_too_small`).
     pub memory_bytes: Option<u64>,
@@ -1341,6 +1350,37 @@ pub struct PipelineStatus {
     pub next_train_at: Option<String>,
     pub squadron_id: Option<String>,
     pub updated_at: String,
+}
+
+impl PipelineStatus {
+    /// Record that `source` is failing now. `last_error` shows it until it heals.
+    pub fn note_error(&mut self, source: &str, message: String) {
+        self.errors.insert(source.to_string(), message.clone());
+        self.last_error = Some(message);
+    }
+
+    /// `source` succeeded: its standing error, if any, is over.
+    pub fn clear_error(&mut self, source: &str) {
+        if self.errors.remove(source).is_some() {
+            self.refresh_last_error();
+        }
+    }
+
+    /// Drop every `market:<w>` error whose record `exists` on disk now, however it got
+    /// there (a later pass, a retry). What remains is still genuinely missing.
+    pub fn reconcile_market_errors(&mut self, exists: impl Fn(i64) -> bool) {
+        let before = self.errors.len();
+        self.errors.retain(|k, _| !k.strip_prefix("market:").and_then(|w| w.parse::<i64>().ok()).is_some_and(&exists));
+        if self.errors.len() != before {
+            self.refresh_last_error();
+        }
+    }
+
+    fn refresh_last_error(&mut self) {
+        // With no insertion order kept, any standing error is a fair "current trouble";
+        // the map itself is on the status endpoint for the full picture.
+        self.last_error = self.errors.values().next_back().cloned();
+    }
 }
 
 static STATUS: OnceLock<Mutex<HashMap<String, PipelineStatus>>> = OnceLock::new();
@@ -1470,11 +1510,11 @@ async fn catch_up(asset: &str, dir: &DataDir, knobs: &TrainingKnobs, now: i64) -
                     warn!("GBoost plan-B pipeline [{asset}]: cannot write funding.json: {e}");
                 }
                 let through = funding.last().map(|x| rfc3339(x.0));
-                update_status(asset, |s| { s.funding_source = Some(host.to_string()); s.funding_through = through; s.last_error = None; });
+                update_status(asset, |s| { s.funding_source = Some(host.to_string()); s.funding_through = through; s.clear_error("funding"); });
             }
             Err(e) => {
                 warn!("GBoost plan-B pipeline [{asset}]: funding history unavailable ({e}); rows will carry no funding until it is");
-                update_status(asset, |s| s.last_error = Some(format!("funding history unavailable: {e}")));
+                update_status(asset, |s| s.note_error("funding", format!("funding history unavailable: {e}")));
             }
         }
     }
@@ -1492,13 +1532,17 @@ async fn catch_up(asset: &str, dir: &DataDir, knobs: &TrainingKnobs, now: i64) -
         if refetch {
             match fetch_klines_day(day, now).await {
                 Ok(d) => {
-                    if let Err(e) = write_json_atomically(&path, &d) {
-                        warn!("GBoost plan-B pipeline [{asset}]: cannot write {}: {e}", path.display());
+                    match write_json_atomically(&path, &d) {
+                        Ok(()) => update_status(asset, |s| { s.clear_error("bars"); s.clear_error("write"); }),
+                        Err(e) => {
+                            warn!("GBoost plan-B pipeline [{asset}]: cannot write {}: {e}", path.display());
+                            update_status(asset, |s| s.note_error("write", format!("cannot write {}: {e}", path.display())));
+                        }
                     }
                 }
                 Err(e) => {
                     warn!("GBoost plan-B pipeline [{asset}]: Binance bars for {day} unavailable ({e})");
-                    update_status(asset, |s| s.last_error = Some(format!("Binance bars for {day} unavailable: {e}")));
+                    update_status(asset, |s| s.note_error("bars", format!("Binance bars for {day} unavailable: {e}")));
                     break;
                 }
             }
@@ -1535,16 +1579,17 @@ async fn catch_up(asset: &str, dir: &DataDir, knobs: &TrainingKnobs, now: i64) -
                 if rec.missing { missing += 1; }
                 if let Err(e) = write_json_atomically(&dir.market(w), &rec) {
                     warn!("GBoost plan-B pipeline [{asset}]: cannot write market {w}: {e}");
-                    update_status(asset, |s| s.last_error = Some(format!("cannot write market {w}: {e}")));
+                    update_status(asset, |s| s.note_error("write", format!("cannot write market {w}: {e}")));
                     break;
                 }
                 done += 1;
                 fetched_this_pass += 1;
+                update_status(asset, |s| { s.clear_error("write"); s.clear_error(&format!("market:{w}")); });
             }
             Ok(Fetched::NotResolved) => unresolved += 1,
             Err(e) => {
                 warn!("GBoost plan-B pipeline [{asset}]: market {} ({w}) not fetched: {e}", slug_for(w));
-                update_status(asset, |s| s.last_error = Some(format!("{}: {e}", slug_for(w))));
+                update_status(asset, |s| s.note_error(&format!("market:{w}"), format!("{}: {e}", slug_for(w))));
             }
         }
         update_status(asset, |s| { s.backfill_done = done; s.backfill_missing = missing; s.backfill_unresolved = unresolved; });
@@ -1552,6 +1597,8 @@ async fn catch_up(asset: &str, dir: &DataDir, knobs: &TrainingKnobs, now: i64) -
     if fetched_this_pass > 0 {
         info!("GBoost plan-B pipeline [{asset}]: {fetched_this_pass} market(s) fetched; {done} of {total} windows on disk ({missing} without a market)");
     }
+    // A market that failed on an earlier pass and is on disk now is no longer trouble.
+    update_status(asset, |s| s.reconcile_market_errors(|w| dir.market(w).exists()));
 
     // Prune records that have slid out of the window.
     if let Ok(entries) = std::fs::read_dir(dir.markets()) {
@@ -2009,6 +2056,45 @@ mod tests {
         println!("dead columns here: {dead:?}");
         assert_eq!(rows.iter().all(|r| !r.features[22].is_nan()), !funding.is_empty(), "funding is in every row exactly when a source answered");
         println!("memory: {:?} bytes, refusal {:?}", available_memory_bytes(), memory_refusal(available_memory_bytes()));
+    }
+
+    /// Production, 2026-09-13: one 429 on a May market during the backfill stayed on the
+    /// card as `last_error` for hours after the next pass had fetched it. A standing
+    /// error must clear when its source succeeds or its record appears on disk, and a
+    /// failure that keeps failing must stay visible.
+    #[test]
+    fn last_error_reflects_current_trouble_only() {
+        let mut st = PipelineStatus::default();
+        assert!(st.last_error.is_none());
+        st.note_error("market:1778950800", "bitcoin-up-or-down-may-16-2026-1pm-et: HTTP 429".into());
+        assert!(st.last_error.as_deref().unwrap().contains("HTTP 429"));
+        // The next pass fetched it: the record exists, so the error is over.
+        st.reconcile_market_errors(|w| w == 1778950800);
+        assert!(st.last_error.is_none(), "{:?}", st.last_error);
+        assert!(st.errors.is_empty());
+        // A retry that succeeds directly clears it too.
+        st.note_error("market:1778950800", "HTTP 429".into());
+        st.clear_error("market:1778950800");
+        assert!(st.last_error.is_none());
+        // Two markets failing, one heals: the other is still shown.
+        st.note_error("market:100", "a: HTTP 429".into());
+        st.note_error("market:200", "b: HTTP 503".into());
+        st.reconcile_market_errors(|w| w == 200);
+        assert_eq!(st.last_error.as_deref(), Some("a: HTTP 429"));
+        assert_eq!(st.errors.len(), 1);
+        // A persistent funding failure stays until funding succeeds, whatever the markets do.
+        st.note_error("funding", "funding history unavailable: HTTP 451".into());
+        st.reconcile_market_errors(|_| true);
+        assert_eq!(st.last_error.as_deref(), Some("funding history unavailable: HTTP 451"));
+        st.clear_error("bars"); // clearing a source that is not failing changes nothing
+        assert_eq!(st.last_error.as_deref(), Some("funding history unavailable: HTTP 451"));
+        st.clear_error("funding");
+        assert!(st.last_error.is_none() && st.errors.is_empty());
+        // The card line drops the error once it is gone.
+        update_status("testerr", |s| { s.phase = "idle".into(); s.note_error("bars", "Binance bars for 2026-09-13 unavailable: timeout".into()); });
+        assert!(status_line("testerr").unwrap().contains("last error: Binance bars"));
+        update_status("testerr", |s| s.clear_error("bars"));
+        assert_eq!(status_line("testerr").as_deref(), Some("data current"));
     }
 
     /// Below 4 GB the fit is refused with a reason that names the machine's memory and
