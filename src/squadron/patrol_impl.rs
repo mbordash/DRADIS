@@ -3921,6 +3921,7 @@ pub(crate) mod resting_exit {
         pub fairvalue: bool,
         pub momentum: bool,
         pub convergence: bool,
+        pub gboost: bool,
     }
 
     impl Knobs {
@@ -3930,6 +3931,7 @@ pub(crate) mod resting_exit {
                 fairvalue: dc.fairvalue_resting_tp_enabled,
                 momentum: dc.momentum_resting_tp_enabled,
                 convergence: dc.convergence_resting_tp_enabled,
+                gboost: dc.gboost_resting_tp_enabled,
             }
         }
 
@@ -3939,6 +3941,7 @@ pub(crate) mod resting_exit {
                 "FairValueStrategy" => self.fairvalue,
                 "MomentumStrategy" => self.momentum,
                 "ConvergenceStrategy" => self.convergence,
+                "GboostStrategy" => self.gboost,
                 _ => self.maker,
             }
         }
@@ -3952,6 +3955,7 @@ pub(crate) mod resting_exit {
             "FairValueStrategy" => "FairValue resting TP".to_string(),
             "MomentumStrategy" => "Momentum resting TP".to_string(),
             "ConvergenceStrategy" => "Convergence resting TP".to_string(),
+            "GboostStrategy" => "GBoost resting TP".to_string(),
             other => format!("{other} resting exit"),
         }
     }
@@ -4169,7 +4173,7 @@ pub(crate) mod resting_exit {
         /// snapshot reads each from the field that owns it.
         #[test]
         fn each_strategy_is_gated_by_its_own_knob() {
-            let only = |maker, fairvalue, momentum, convergence| Knobs { maker, fairvalue, momentum, convergence };
+            let only = |maker, fairvalue, momentum, convergence| Knobs { maker, fairvalue, momentum, convergence, gboost: false };
             assert!(only(true, false, false, false).enabled_for("MakerStrategy"));
             assert!(!only(false, true, true, true).enabled_for("MakerStrategy"));
             assert!(only(false, true, false, false).enabled_for("FairValueStrategy"));
@@ -4178,13 +4182,19 @@ pub(crate) mod resting_exit {
             assert!(!only(true, true, false, true).enabled_for("MomentumStrategy"));
             assert!(only(false, false, false, true).enabled_for("ConvergenceStrategy"));
             assert!(!only(true, true, true, false).enabled_for("ConvergenceStrategy"));
+            let gboost_only = Knobs { maker: false, fairvalue: false, momentum: false, convergence: false, gboost: true };
+            assert!(gboost_only.enabled_for("GboostStrategy"), "GBoost answers to its own knob, not the Maker's");
+            assert!(!Knobs { gboost: false, ..gboost_only }.enabled_for("GboostStrategy"));
 
             let mut dc = crate::helpers::dynamic_config::DynamicConfig::default();
             dc.maker_resting_exit_enabled = false;
             dc.fairvalue_resting_tp_enabled = true;
             dc.momentum_resting_tp_enabled = false;
             dc.convergence_resting_tp_enabled = true;
+            dc.gboost_resting_tp_enabled = false;
             assert_eq!(Knobs::snapshot(&dc), only(false, true, false, true));
+            dc.gboost_resting_tp_enabled = true;
+            assert!(Knobs::snapshot(&dc).gboost);
         }
 
         /// The Maker's ledger text is unchanged; FairValue's names the target.

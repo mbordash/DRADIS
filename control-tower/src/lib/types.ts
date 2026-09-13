@@ -176,6 +176,16 @@ export interface DynamicConfig {
   gboost_drift_stable_clear_required: number;
   gboost_label_max_age_hours: number;
   gboost_shadow_mode: boolean;
+  gboost_planb_trade_size_usdc: string;
+  gboost_planb_margin: string;
+  gboost_planb_take_profit_pct: string;
+  gboost_planb_stop_loss_pct: string;
+  gboost_planb_tp_ceiling: string;
+  gboost_planb_min_ask: string;
+  gboost_planb_max_ask: string;
+  gboost_planb_first_minute: number;
+  gboost_planb_last_minute: number;
+  gboost_resting_tp_enabled: boolean;
   gboost_structural_min_trees: number;
   gboost_holdout_min_skill: string;
   gboost_holdout_min_independent: number;

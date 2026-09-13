@@ -20,7 +20,7 @@ use crate::vipers::arbitrage_impl::ArbitrageStrategyImpl;
 use crate::vipers::time_decay_impl::TimeDecayStrategyImpl;
 use crate::vipers::maker_impl::MakerStrategyImpl;
 use crate::vipers::basis_impl::BasisStrategyImpl;
-use crate::vipers::gboost_impl::GboostStrategyImpl;
+use crate::vipers::gboost_planb::GboostPlanBStrategy;
 use crate::vipers::trendreversal_impl::TrendReversalStrategyImpl;
 use crate::vipers::convergence_impl::ConvergenceStrategyImpl;
 use crate::vipers::fairvalue_impl::FairValueStrategyImpl;
@@ -117,7 +117,7 @@ impl StrategyRegistry {
             Box::new(TimeDecayStrategyImpl)                as Box<dyn Strategy>,
             Box::new(MakerStrategyImpl::new())             as Box<dyn Strategy>,
             Box::new(BasisStrategyImpl::new())             as Box<dyn Strategy>,
-            Box::new(GboostStrategyImpl::default())        as Box<dyn Strategy>,
+            Box::new(GboostPlanBStrategy::new())           as Box<dyn Strategy>,
             Box::new(TrendReversalStrategyImpl::new())      as Box<dyn Strategy>,
             Box::new(ConvergenceStrategyImpl::new())       as Box<dyn Strategy>,
             Box::new(FairValueStrategyImpl::new())         as Box<dyn Strategy>,
@@ -212,8 +212,8 @@ pub fn strategy_name_to_kind(name: &str) -> &'static str {
 mod class_filter_tests {
     use super::*;
 
-    // These build real strategy impls, and `GboostStrategyImpl`'s constructor
-    // spawns its model-load task, so they need a runtime to exist.
+    // These build real strategy impls; some spawn background tasks on first
+    // use, so they run inside a runtime.
 
     fn kinds(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()

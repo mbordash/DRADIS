@@ -559,10 +559,12 @@ Fee model — state it explicitly in your reasoning, never assume "zero fee":
                  (short-gamma / theta strategy).  Needs flat oracle and calm book.
 5. BASIS       — Fades retail-skewed binary probabilities using Binance funding rate
                   as a smart-money confirmation signal.
-6. GBOOST      — Online gradient-boosted ML classifier predicts YES price direction
-                  from 19 orderbook + oracle features.  Retrained every 30s.
-                  Has concept-drift suppression: if market regime shifts significantly,
-                  entries are blocked until the next retrain clears the drift flag.
+6. GBOOST      — Offline-trained, calibrated gradient-boosted model, BTC hourly only.
+                  Once a minute (minutes 5-45) it scores both sides from Binance bars,
+                  the book and fair value, and buys one as a taker when its win
+                  probability clears the plan's break-even plus a margin.  Exits by a
+                  resting +20% take-profit, an 11% stop, a flatten before the hourly
+                  market rotates, or settlement.  Not retrained live.
 7. TRENDREVERSAL — Fades priced-in oracle drift on Window/Daily markets.
                   Buys NO when 10-min and 60-min drift are strongly BULL, YES when
                   strongly BEAR (the move is already in the token price and tends to
@@ -618,7 +620,7 @@ These can be adjusted live without restarting the bot:
   Momentum:     stop_loss_pct, target_profit_pct, min/max_trade_size_usdc, max_exposure
   Maker:        max_entry_price, stop_loss_pct, target_profit_pct, max_exposure, quote_size_usdc
   Basis:        stop_loss_pct, target_profit_pct, max_exposure
-  GBoost:       entry_threshold (0–1), stop_loss_pct, target_profit_pct, max_exposure
+  GBoost:       planb_margin, planb_trade_size_usdc, max_exposure (its take-profit and stop define the model's labels and are operator-only)
   TimeDecay:    position_size_usdc, stop_loss_pct, max_entry_price
   TrendCapture: stop_loss_pct, target_profit_pct, min/max_trade_size_usdc, max_entry_price, max_exposure
   FairValue:    trade_size_usdc, max_exposure, stop_loss_pct, target_profit_pct, base_edge
@@ -1148,11 +1150,13 @@ fn build_user_prompt(
         dyn_cfg.maker_max_exposure_usdc,
     ));
     lines.push(format!(
-        "GBoost: gboost_entry_threshold={}, gboost_stop_loss_pct={:.0}%, gboost_target_profit_pct={:.0}%, gboost_max_exposure_usdc=${}",
-        dyn_cfg.gboost_entry_threshold,
-        dyn_cfg.gboost_stop_loss_pct * rust_decimal::Decimal::ONE_HUNDRED,
-        dyn_cfg.gboost_target_profit_pct * rust_decimal::Decimal::ONE_HUNDRED,
+        "GBoost: gboost_shadow_mode={}, gboost_planb_margin={}, gboost_planb_trade_size_usdc=${}, gboost_max_exposure_usdc=${}, gboost_planb_take_profit_pct={:.0}%, gboost_planb_stop_loss_pct={:.0}%",
+        dyn_cfg.gboost_shadow_mode,
+        dyn_cfg.gboost_planb_margin,
+        dyn_cfg.gboost_planb_trade_size_usdc,
         dyn_cfg.gboost_max_exposure_usdc,
+        dyn_cfg.gboost_planb_take_profit_pct * rust_decimal::Decimal::ONE_HUNDRED,
+        dyn_cfg.gboost_planb_stop_loss_pct * rust_decimal::Decimal::ONE_HUNDRED,
     ));
     lines.push(format!(
         "Basis: basis_stop_loss_pct={:.0}%, basis_target_profit_pct={:.0}%, basis_max_exposure_usdc=${}",

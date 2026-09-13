@@ -324,6 +324,16 @@ fn default_gboost_drift_consecutive_required()  -> i64 { config::GBOOST_DRIFT_CO
 fn default_gboost_drift_stable_clear_required() -> i64 { config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED as i64 }
 fn default_gboost_label_max_age_hours()     -> i64     { config::GBOOST_LABEL_MAX_AGE_HOURS             }
 fn default_gboost_shadow_mode()             -> bool    { config::GBOOST_SHADOW_MODE                     }
+fn default_gboost_planb_trade_size_usdc()   -> Decimal { config::GBOOST_PLANB_TRADE_SIZE_USDC           }
+fn default_gboost_planb_margin()            -> Decimal { config::GBOOST_PLANB_MARGIN                    }
+fn default_gboost_planb_take_profit_pct()    -> Decimal { config::GBOOST_PLANB_TAKE_PROFIT_PCT           }
+fn default_gboost_planb_stop_loss_pct()      -> Decimal { config::GBOOST_PLANB_STOP_LOSS_PCT             }
+fn default_gboost_planb_tp_ceiling()         -> Decimal { config::GBOOST_PLANB_TP_CEILING                }
+fn default_gboost_planb_min_ask()            -> Decimal { config::GBOOST_PLANB_MIN_ASK                   }
+fn default_gboost_planb_max_ask()            -> Decimal { config::GBOOST_PLANB_MAX_ASK                   }
+fn default_gboost_planb_first_minute()       -> i64     { config::GBOOST_PLANB_FIRST_MINUTE              }
+fn default_gboost_planb_last_minute()        -> i64     { config::GBOOST_PLANB_LAST_MINUTE               }
+fn default_gboost_resting_tp_enabled()       -> bool    { config::GBOOST_RESTING_TP_ENABLED              }
 fn default_gboost_structural_min_trees()    -> i64     { config::GBOOST_STRUCTURAL_MIN_TREES as i64     }
 fn default_gboost_holdout_min_skill()       -> Decimal { config::GBOOST_HOLDOUT_MIN_SKILL               }
 fn default_gboost_holdout_min_independent() -> i64     { config::GBOOST_HOLDOUT_MIN_INDEPENDENT as i64  }
@@ -767,6 +777,37 @@ pub struct DynamicConfig {
     /// scored against settlement on /api/gboost/veto-scores.
     #[serde(default = "default_gboost_shadow_mode")]
     pub gboost_shadow_mode: bool,
+    // ── GBoost plan-B model (2026-09-13) ─────────────────────────────────────
+    /// USDC per plan-B entry, raised to the venue's 5-share minimum when it buys fewer.
+    #[serde(default = "default_gboost_planb_trade_size_usdc")]
+    pub gboost_planb_trade_size_usdc: Decimal,
+    /// Calibrated P(win) must clear the plan's break-even win rate by this much.
+    #[serde(default = "default_gboost_planb_margin")]
+    pub gboost_planb_margin: Decimal,
+    /// Resting take-profit target, entry-relative (the model's label used 20%).
+    #[serde(default = "default_gboost_planb_take_profit_pct")]
+    pub gboost_planb_take_profit_pct: Decimal,
+    /// Taker stop, entry-relative, marked against the bid (the label used 11%).
+    #[serde(default = "default_gboost_planb_stop_loss_pct")]
+    pub gboost_planb_stop_loss_pct: Decimal,
+    /// Highest price the take-profit may be set to.
+    #[serde(default = "default_gboost_planb_tp_ceiling")]
+    pub gboost_planb_tp_ceiling: Decimal,
+    /// Lowest ask the plan-B model may buy (the band the model was trained on starts at $0.43).
+    #[serde(default = "default_gboost_planb_min_ask")]
+    pub gboost_planb_min_ask: Decimal,
+    /// Highest ask the plan-B model may buy (the trained band ends at $0.75).
+    #[serde(default = "default_gboost_planb_max_ask")]
+    pub gboost_planb_max_ask: Decimal,
+    /// First minute of the hourly window at which the model decides (trained on minutes 5 to 45).
+    #[serde(default = "default_gboost_planb_first_minute")]
+    pub gboost_planb_first_minute: i64,
+    /// Last minute of the hourly window at which the model decides.
+    #[serde(default = "default_gboost_planb_last_minute")]
+    pub gboost_planb_last_minute: i64,
+    /// Whether GBoost rests its take-profit as a post-only ask instead of crossing the bid.
+    #[serde(default = "default_gboost_resting_tp_enabled")]
+    pub gboost_resting_tp_enabled: bool,
     /// Structural floor on a retrain's tree count (B37). Catches the fit that
     /// stops at a single stump because the window's labels offered nothing to
     /// learn (1 to 3 trees); it is not a quality bar, tree count does not track
@@ -1198,6 +1239,16 @@ impl Default for DynamicConfig {
             gboost_drift_stable_clear_required: config::GBOOST_DRIFT_STABLE_CLEAR_REQUIRED as i64,
             gboost_label_max_age_hours: config::GBOOST_LABEL_MAX_AGE_HOURS,
             gboost_shadow_mode:         config::GBOOST_SHADOW_MODE,
+            gboost_planb_trade_size_usdc: config::GBOOST_PLANB_TRADE_SIZE_USDC,
+            gboost_planb_margin:          config::GBOOST_PLANB_MARGIN,
+            gboost_planb_take_profit_pct: config::GBOOST_PLANB_TAKE_PROFIT_PCT,
+            gboost_planb_stop_loss_pct:   config::GBOOST_PLANB_STOP_LOSS_PCT,
+            gboost_planb_tp_ceiling:      config::GBOOST_PLANB_TP_CEILING,
+            gboost_planb_min_ask:         config::GBOOST_PLANB_MIN_ASK,
+            gboost_planb_max_ask:         config::GBOOST_PLANB_MAX_ASK,
+            gboost_planb_first_minute:    config::GBOOST_PLANB_FIRST_MINUTE,
+            gboost_planb_last_minute:     config::GBOOST_PLANB_LAST_MINUTE,
+            gboost_resting_tp_enabled:    config::GBOOST_RESTING_TP_ENABLED,
             gboost_structural_min_trees: config::GBOOST_STRUCTURAL_MIN_TREES as i64,
             gboost_holdout_min_skill:   config::GBOOST_HOLDOUT_MIN_SKILL,
             gboost_holdout_min_independent: config::GBOOST_HOLDOUT_MIN_INDEPENDENT as i64,
@@ -1824,6 +1875,9 @@ mod tests {
             "fairvalue_stop_model_confirm_frac", "arb_settle_grace_secs", "fairvalue_settle_snipe_hold",
             "fairvalue_resting_tp_enabled", "momentum_resting_tp_enabled",
             "convergence_max_fee_to_target_ratio", "convergence_tp_fee_margin_mult", "convergence_resting_tp_enabled",
+            "gboost_planb_trade_size_usdc", "gboost_planb_margin", "gboost_planb_take_profit_pct", "gboost_planb_stop_loss_pct", "gboost_planb_tp_ceiling",
+            "gboost_planb_min_ask", "gboost_planb_max_ask", "gboost_planb_first_minute", "gboost_planb_last_minute",
+            "gboost_resting_tp_enabled",
         ] {
             assert!(obj.remove(added).is_some(), "{added} must be a serialized field");
         }

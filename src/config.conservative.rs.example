@@ -894,6 +894,22 @@ pub const GBOOST_MIN_HIST_VOL: f64 = 0.0015; // Recalibrated from 0.005 (2026-07
 pub const GBOOST_SIGNAL_EXIT_THRESHOLD: Decimal = dec!(0.55);
 pub const GBOOST_MAX_EXPOSURE_USDC: Decimal = dec!(4.0);
 pub const GBOOST_MIN_MARKET_AGE_SECS: i64 = 300;
+// ── GBoost plan-B model (2026-09-13) ─────────────────────────────────────────
+// An offline-trained, Platt-calibrated perpetual model (research: gboost-holdout-2026-09-12,
+// Path B budget 2.0), loaded from logs/{asset}-GBOOST_PLANB_MODEL_FILENAME. Entry when the calibrated
+// P(win) clears the plan's break-even win rate plus the margin; exit by resting take-profit, taker
+// stop, or settlement. The plan values below are the ones the model's labels were built with.
+pub const GBOOST_PLANB_MODEL_FILENAME: &str = "gboost_planb_v1.json";
+pub const GBOOST_PLANB_TRADE_SIZE_USDC: Decimal = dec!(4.0);
+pub const GBOOST_PLANB_MARGIN: Decimal = dec!(0.10);
+pub const GBOOST_PLANB_TAKE_PROFIT_PCT: Decimal = dec!(0.20);
+pub const GBOOST_PLANB_STOP_LOSS_PCT: Decimal = dec!(0.11);
+pub const GBOOST_PLANB_TP_CEILING: Decimal = dec!(0.90);
+pub const GBOOST_PLANB_MIN_ASK: Decimal = dec!(0.43);
+pub const GBOOST_PLANB_MAX_ASK: Decimal = dec!(0.75);
+pub const GBOOST_PLANB_FIRST_MINUTE: i64 = 5;
+pub const GBOOST_PLANB_LAST_MINUTE: i64 = 45;
+pub const GBOOST_RESTING_TP_ENABLED: bool = true;
 pub const GBOOST_TARGET_PROFIT_PERCENT: Decimal = dec!(0.12);
 pub const GBOOST_STOP_LOSS_PERCENT: Decimal = dec!(0.070); // conservative: 7.0% — raised from 0.055; tighter than balanced
 pub const GBOOST_MIN_HOLD_SECS: i64 = 180;

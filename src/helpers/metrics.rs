@@ -48,13 +48,34 @@ pub fn stash_entry_signals_json(token_id: &str, json: serde_json::Value) {
     reg.insert(token_id.to_string(), json.to_string());
 }
 
-/// Take (and remove) the stashed gate-state JSON for `token_id`, if any.
-fn take_entry_signals_json(token_id: &str) -> Option<String> {
+/// Like `stash_entry_signals_json`, but only an entry recorded under `strategy` drains it.
+/// For a viper whose signal the patrol may drop before placing it (a cooldown, a pending
+/// order), so that a later entry by another viper on the same token does not inherit its
+/// decision record.
+pub fn stash_entry_signals_json_for(strategy: &str, token_id: &str, json: serde_json::Value) {
     let mut reg = match entry_signals_json_stash().lock() {
         Ok(g) => g,
         Err(poisoned) => poisoned.into_inner(),
     };
-    reg.remove(token_id)
+    // A dropped entry's scoped record is never drained or overwritten by another viper,
+    // so bound what can accumulate.
+    if reg.len() >= 256 {
+        reg.retain(|k, _| !k.contains('|'));
+    }
+    reg.insert(scoped_stash_key(strategy, token_id), json.to_string());
+}
+
+fn scoped_stash_key(strategy: &str, token_id: &str) -> String {
+    format!("{strategy}|{token_id}")
+}
+
+/// Take (and remove) the stashed gate-state JSON for `strategy`'s entry on `token_id`, if any.
+fn take_entry_signals_json(strategy: &str, token_id: &str) -> Option<String> {
+    let mut reg = match entry_signals_json_stash().lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    reg.remove(&scoped_stash_key(strategy, token_id)).or_else(|| reg.remove(token_id))
 }
 
 /// Records a completed trade to the SQLite database.
@@ -186,7 +207,7 @@ pub async fn record_entry_signal(
             dec!(0)
         };
         let row = db::EntrySignalRow {
-            signals_json: take_entry_signals_json(&token_id),
+            signals_json: take_entry_signals_json(&strategy, &token_id),
             strategy,
             token_id,
             market,
@@ -298,5 +319,21 @@ mod realised_pnl_tests {
                 "a -$26.42 session must trip a $4.00 drawdown limit");
 
         reset_realised_session_pnl();
+    }
+}
+
+#[cfg(test)]
+mod scoped_entry_signal_stash_tests {
+    use super::*;
+
+    #[test]
+    fn a_scoped_record_is_drained_only_by_its_own_strategy() {
+        let token = "90000000000000000000000000000000000000000000000000000000000000000001";
+        stash_entry_signals_json_for("GboostStrategy", token, serde_json::json!({"viper": "GBoostPlanB"}));
+        assert_eq!(take_entry_signals_json("FairValueStrategy", token), None, "another viper's entry must not inherit it");
+        stash_entry_signals_json(token, serde_json::json!({"viper": "FairValue"}));
+        assert_eq!(take_entry_signals_json("FairValueStrategy", token).as_deref(), Some(r#"{"viper":"FairValue"}"#));
+        assert_eq!(take_entry_signals_json("GboostStrategy", token).as_deref(), Some(r#"{"viper":"GBoostPlanB"}"#));
+        assert_eq!(take_entry_signals_json("GboostStrategy", token), None);
     }
 }
