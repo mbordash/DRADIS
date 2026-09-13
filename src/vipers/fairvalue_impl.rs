@@ -363,6 +363,51 @@ impl FairValueStrategyImpl {
         abs + (full - abs) * ramp
     }
 
+    /// Each side's fair value, priced against volatility error on that side's
+    /// own terms: `(fair_yes, fair_no)`, each the LOWER of the side's value at
+    /// the realized σ and at the floored σ.
+    ///
+    /// The floor exists because realized σ can understate what is coming, and
+    /// for the favorite it does the conservative thing: a larger σ pulls the
+    /// favorite's value down toward 0.5. For the longshot the same σ pushes its
+    /// value UP toward 0.5, so on a quiet hour a flat `max(realized, floor)`
+    /// manufactures edge on cheap contracts. Real money, both times: 2026-09-10
+    /// 5PM ET, YES at $0.20 priced 0.280 at the 5.0e-5 floor against 0.113 at
+    /// the realized 2.41e-5 (−$1.45); 2026-09-12 4PM ET, NO at $0.21 priced
+    /// 0.300 at the 3.5e-5 floor against 0.136 at the realized 1.67e-5
+    /// (−$1.61). Lowering the floor between the two only moved the failure to
+    /// a quieter hour.
+    ///
+    /// Taking the lower value per side leaves the favorite exactly as it was
+    /// and prices the longshot at the vol actually measured. That also keeps
+    /// the floor's time taper from moving a longshot: on 2026-09-12 the taper
+    /// alone took that NO from 0.300 to 0.260 in two minutes with spot
+    /// unchanged, which withdrew the stop veto. The realized σ keeps the
+    /// absolute backstop.
+    fn conservative_side_fairs(
+        spot: f64,
+        strike: f64,
+        sigma_realized: f64,
+        floor: f64,
+        secs_left: f64,
+    ) -> Option<(f64, f64)> {
+        let raw = sigma_realized.max(config::FAIRVALUE_ABSOLUTE_MIN_SIGMA_PER_SQRT_SEC);
+        let floored = sigma_realized.max(floor);
+        let yes_raw = fair_yes_probability(spot, strike, raw, secs_left)?;
+        let yes_floored = fair_yes_probability(spot, strike, floored, secs_left)?;
+        Some((yes_raw.min(yes_floored), (1.0 - yes_raw).min(1.0 - yes_floored)))
+    }
+
+    /// Edge of buying a side at `ask` against the side's fair value, net of
+    /// the round trip's taker fees. `NO_EDGE` when there is no usable ask.
+    fn side_edge(fair: Decimal, ask: Decimal) -> Decimal {
+        if ask > dec!(0) && ask < dec!(1) {
+            fair - ask - Self::fee_frac(ask) - Self::fee_frac(fair)
+        } else {
+            NO_EDGE
+        }
+    }
+
     /// Feed the vol sampler and return the **raw** σ per √second, or None
     /// during warmup / frozen oracle.
     ///
@@ -870,10 +915,11 @@ impl FairValueStrategyImpl {
         };
         let prices: Vec<f64> = samples.iter().map(|(_, p)| *p).collect();
         drop(samples);
-        let sigma = sigma_per_sqrt_sec(&prices, span_secs, config::FAIRVALUE_MIN_VOL_SAMPLES)?
-            .max(Self::sigma_floor(min_sigma_per_sqrt_sec, sigma_floor_horizon_secs, secs_left));
-        let fair_yes = fair_yes_probability(spot, strike, sigma, secs_left as f64)?;
-        Some(if token_is_yes { fair_yes } else { 1.0 - fair_yes })
+        let sigma_realized = sigma_per_sqrt_sec(&prices, span_secs, config::FAIRVALUE_MIN_VOL_SAMPLES)?;
+        let floor = Self::sigma_floor(min_sigma_per_sqrt_sec, sigma_floor_horizon_secs, secs_left);
+        let (fair_yes, fair_no) =
+            Self::conservative_side_fairs(spot, strike, sigma_realized, floor, secs_left as f64)?;
+        Some(if token_is_yes { fair_yes } else { fair_no })
     }
 }
 
@@ -964,9 +1010,10 @@ impl Strategy for FairValueStrategyImpl {
         // ── Model inputs: self-sampled realized vol (sampled above) ──────────
         // The floor is applied here, not in the sampler, because its strength
         // depends on how far out we are forecasting.
-        let sigma = match sigma_opt {
+        let floor = Self::sigma_floor(Self::min_sigma(dc), dc.fairvalue_sigma_floor_horizon_secs, secs_left);
+        let (sigma_realized, sigma) = match sigma_opt {
             // warmup complete, oracle alive
-            Some(s) => s.max(Self::sigma_floor(Self::min_sigma(dc), dc.fairvalue_sigma_floor_horizon_secs, secs_left)),
+            Some(s) => (s, s.max(floor)),
             None => {
                 // Warmup visibility: without this the viper is totally silent
                 // for the first FAIRVALUE_MIN_VOL_SAMPLES × SAMPLE_SECS.
@@ -986,15 +1033,32 @@ impl Strategy for FairValueStrategyImpl {
         };
 
         // ── Fair value ────────────────────────────────────────────────────────
+        // `fair_yes` at the floored σ is the market-level model reading: it
+        // feeds the noise gate, the pin guards and the diagnostic exactly as
+        // before. Each side's EDGE is priced from `conservative_side_fairs`,
+        // the same pricing every exit rule reads.
         let fair_yes = match fair_yes_probability(spot, strike, sigma, secs_left as f64) {
             Some(p) => p,
             None => { idle("fair value not computable"); return Ok(StrategySignal::NoSignal) },
         };
+        let (fair_yes_side, fair_no_side) =
+            match Self::conservative_side_fairs(spot, strike, sigma_realized, floor, secs_left as f64) {
+                Some(f) => f,
+                None => { idle("fair value not computable"); return Ok(StrategySignal::NoSignal) },
+            };
         let d_sigma = (spot / strike).ln() / (sigma * (secs_left as f64).sqrt());
 
         // Fed before the guards below, for the same reason the vol sampler is:
         // a gate that refuses entries must not also starve the measurement it
         // will later be judged against.
+        //
+        // Deliberately fed the FLOORED fair value, not the per-side prices. For
+        // a favorite that is exactly the priced value. For a longshot the
+        // realized-vol price moves more with spot, so this understates its
+        // noise; that is accepted because `conservative_side_fairs` already
+        // leaves floor-priced longshots without edge, and feeding the per-side
+        // price would make the gate's yardstick jump whenever spot crosses the
+        // strike.
         let fair_noise = self.update_and_read_fair_noise(&ctx.crypto_filter, &market.condition_id, fair_yes);
 
         // ── Pin-risk guard (endgame coin-flip zone) ──────────────────────────
@@ -1009,7 +1073,8 @@ impl Strategy for FairValueStrategyImpl {
 
         // ── Edge on each side (net of taker entry fee) ───────────────────────
         let req_edge = Self::required_edge(dc, secs_left);
-        let fair_yes_dec = Decimal::from_f64_retain(fair_yes).map(|d| d.round_dp(10)).unwrap_or(dec!(0.5));
+        let to_dec = |p: f64| Decimal::from_f64_retain(p).map(|d| d.round_dp(10)).unwrap_or(dec!(0.5));
+        let fair_yes_dec = to_dec(fair_yes_side);
         // Edge must clear the ROUND TRIP, not just the entry.
         //
         // Charging only the entry fee understated the true hurdle by roughly
@@ -1018,17 +1083,9 @@ impl Strategy for FairValueStrategyImpl {
         // estimated at the model's own fair value, because that is where the
         // contract trades if the thesis plays out. Holding to settlement pays
         // no exit fee at all, so this errs conservative on purpose.
-        let fair_no_dec = dec!(1) - fair_yes_dec;
-        let yes_edge = if snap.yes_ask > dec!(0) && snap.yes_ask < dec!(1) {
-            fair_yes_dec - snap.yes_ask - Self::fee_frac(snap.yes_ask) - Self::fee_frac(fair_yes_dec)
-        } else {
-            NO_EDGE
-        };
-        let no_edge = if snap.no_ask > dec!(0) && snap.no_ask < dec!(1) {
-            fair_no_dec - snap.no_ask - Self::fee_frac(snap.no_ask) - Self::fee_frac(fair_no_dec)
-        } else {
-            NO_EDGE
-        };
+        let fair_no_dec = to_dec(fair_no_side);
+        let yes_edge = Self::side_edge(fair_yes_dec, snap.yes_ask);
+        let no_edge = Self::side_edge(fair_no_dec, snap.no_ask);
 
         // ── Periodic diagnostic (calibration visibility, throttled) ──────────
         {
@@ -1037,9 +1094,9 @@ impl Strategy for FairValueStrategyImpl {
             if due {
                 *last = Some(Instant::now());
                 tracing::info!(
-                    " FairValue: fair(YES)={:.3} (d={:+.2}σ, σ/√s={:.2e}, T={}s, K=${:.2}) | yes_ask=${:.2} edge={:+.3} | no_ask=${:.2} edge={:+.3} | req={:.3} | noise{}={}{}",
-                    fair_yes, d_sigma, sigma, secs_left, strike,
-                    snap.yes_ask, yes_edge, snap.no_ask, no_edge, req_edge,
+                    " FairValue: fair(YES)={:.3} (d={:+.2}σ, σ/√s={:.2e} realized {:.2e}, T={}s, K=${:.2}) | yes_ask=${:.2} fair={:.3} edge={:+.3} | no_ask=${:.2} fair={:.3} edge={:+.3} | req={:.3} | noise{}={}{}",
+                    fair_yes, d_sigma, sigma, sigma_realized, secs_left, strike,
+                    snap.yes_ask, fair_yes_side, yes_edge, snap.no_ask, fair_no_side, no_edge, req_edge,
                     config::FAIRVALUE_EDGE_NOISE_HORIZON_SECS,
                     fair_noise.map_or_else(|| "warmup".to_string(), |n| format!("{:.3}", n)),
                     match (endgame_pin, coin_flip) {
@@ -1251,7 +1308,7 @@ impl Strategy for FairValueStrategyImpl {
         let side = if want_yes { "YES" } else { "NO" };
         let shares = (dc.fairvalue_trade_size_usdc / fee_headroom) / ask;
         // Anchor the model-reversal exit to the thesis we are entering on.
-        let entry_fair = if want_yes { fair_yes } else { 1.0 - fair_yes };
+        let entry_fair = if want_yes { fair_yes_side } else { fair_no_side };
         self.record_entry_fair(&ctx.crypto_filter, token_id.as_str(), entry_fair);
         {
             // Throttled: a passed persistence gate re-fires every tick.
@@ -1261,14 +1318,16 @@ impl Strategy for FairValueStrategyImpl {
                 *last = Some(Instant::now());
                 tracing::info!(
                     " FairValue {} entry: fair={:.3} ask=${:.2} edge={:+.3} (req {:.3}) | d={:+.2}σ T={}s K=${:.2} | shares={:.2}",
-                    side, if want_yes { fair_yes } else { 1.0 - fair_yes }, ask, edge, req_edge, d_sigma, secs_left, strike, shares,
+                    side, entry_fair, ask, edge, req_edge, d_sigma, secs_left, strike, shares,
                 );
                 crate::helpers::metrics::stash_entry_signals_json(token_id.as_str(), serde_json::json!({
                     "viper": "FairValue",
                     "side": side,
                     "fair_yes": fair_yes,
+                    "fair_side": entry_fair,
                     "d_sigma": d_sigma,
                     "sigma_per_sqrt_sec": sigma,
+                    "sigma_realized_per_sqrt_sec": sigma_realized,
                     "strike": strike,
                     "secs_left": secs_left,
                     "ask": ask.to_string(),
@@ -1672,6 +1731,74 @@ impl Strategy for FairValueStrategyImpl {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every entry FairValue has taken with real money (production
+    /// `entry_signals`, 2026-09-09 to 2026-09-12). σ used is solved from each
+    /// logged d. Where the floor was binding (#5, #11) the realized σ is
+    /// recomputed from Binance 1-second closes the way the sampler does;
+    /// elsewhere the engine's realized σ was the σ used. The eight favorites
+    /// must price exactly as they did, including on a quieter hour where the
+    /// floor would bind; the two longshots must lose their edge.
+    #[test]
+    fn floor_priced_longshots_lose_their_edge_and_every_live_favorite_is_unchanged() {
+        // (label, buys YES, ask, spot, strike, secs left, σ used, realized σ)
+        let rows: [(&str, bool, f64, f64, f64, f64, f64, f64); 10] = [
+            ("#2 Sep 9 7PM", true, 0.95, 78229.99, 77924.00, 908.0, 3.10e-5, 3.10e-5),
+            ("#3 Sep 10 5AM", false, 0.88, 77990.33, 78110.00, 756.0, 3.71e-5, 3.71e-5),
+            ("#4 Sep 10 8AM", false, 0.79, 77492.25, 77840.64, 1613.0, 7.98e-5, 7.98e-5),
+            ("#5 Sep 10 5PM", true, 0.20, 77189.37, 77268.08, 1219.0, 5.01e-5, 2.41e-5),
+            ("#6 Sep 10 5PM", false, 0.87, 77182.56, 77268.08, 652.0, 2.52e-5, 2.52e-5),
+            ("#7 Sep 11 1AM", true, 0.81, 77180.01, 77114.01, 806.0, 2.67e-5, 2.67e-5),
+            ("#8 Sep 11 8PM", true, 0.84, 77288.76, 77225.71, 793.0, 1.98e-5, 1.98e-5),
+            ("#9 Sep 12 12AM", false, 0.68, 77236.01, 77268.09, 712.0, 1.65e-5, 1.65e-5),
+            ("#10 Sep 12 3PM", false, 0.77, 77072.00, 77131.00, 869.0, 2.34e-5, 2.34e-5),
+            ("#11 Sep 12 4PM", false, 0.21, 77164.01, 77115.00, 1195.0, 3.51e-5, 1.67e-5),
+        ];
+        let dec = |p: f64| Decimal::from_f64_retain(p).unwrap().round_dp(10);
+        for (label, buys_yes, ask, spot, strike, t, used, realized) in rows {
+            let side = |fair_yes: f64| if buys_yes { fair_yes } else { 1.0 - fair_yes };
+            let before = side(fair_yes_probability(spot, strike, used, t).unwrap());
+            let favorite = buys_yes == (spot > strike);
+            if favorite {
+                // A quieter hour than the one traded must not change a favorite either.
+                for quieter in [realized, realized * 0.5] {
+                    let (yes, no) = FairValueStrategyImpl::conservative_side_fairs(spot, strike, quieter, used, t).unwrap();
+                    let after = if buys_yes { yes } else { no };
+                    assert_eq!(after, before, "{label}: a favorite must keep the floored price (realized {quieter:e})");
+                }
+            } else {
+                let (yes, no) = FairValueStrategyImpl::conservative_side_fairs(spot, strike, realized, used, t).unwrap();
+                let after = if buys_yes { yes } else { no };
+                assert!(FairValueStrategyImpl::side_edge(dec(before), dec(ask)) > dec!(0.045),
+                    "{label}: at the floor the longshot showed an entry-grade edge");
+                assert!(FairValueStrategyImpl::side_edge(dec(after), dec(ask)) < dec!(0),
+                    "{label}: at the realized σ the longshot must have no edge (fair {after:.3} vs ask {ask})");
+            }
+        }
+    }
+
+    /// 2026-09-12 4PM ET: spot sat at $77,164 from entry (1,195 s left) to the
+    /// stop two minutes later, but the floor tapered from 3.48e-5 to 2.98e-5,
+    /// and the NO's floored price fell 0.299 to 0.258, past the 8% veto decay
+    /// line with no price move at all. Priced at the realized σ the taper
+    /// cannot touch the longshot: at both instants it is exactly the
+    /// realized-vol price, and the favorite is exactly the floored price.
+    #[test]
+    fn the_floor_taper_does_not_move_a_longshot() {
+        let (spot, strike, realized, full, horizon) = (77164.01, 77115.00, 1.67e-5, 3.5e-5, 600);
+        let mut floored_no = Vec::new();
+        for secs_left in [1195_i64, 1075] {
+            let t = secs_left as f64;
+            let floor = FairValueStrategyImpl::sigma_floor(full, horizon, secs_left);
+            let at = |sigma: f64| fair_yes_probability(spot, strike, sigma, t).unwrap();
+            let (yes, no) = FairValueStrategyImpl::conservative_side_fairs(spot, strike, realized, floor, t).unwrap();
+            assert_eq!(no, 1.0 - at(realized), "at {secs_left}s the longshot is the realized-vol price");
+            assert_eq!(yes, at(floor), "at {secs_left}s the favorite is the floored price");
+            floored_no.push(1.0 - at(floor));
+        }
+        let taper_decay = 1.0 - floored_no[1] / floored_no[0];
+        assert!(taper_decay > 0.08, "the old pricing decayed {taper_decay:.3} from the taper alone");
+    }
 
     /// `Decimal::MIN` cannot be rendered with a precision specifier.
     ///
@@ -2498,17 +2625,34 @@ mod entry_book_tests {
         }
     }
 
+    /// Seed the per-asset vol sampler with a series whose realized σ is exactly
+    /// `sigma` per √s: log returns alternating ±σ·√(sample spacing) around
+    /// `spot` have that standard deviation and a zero mean.
+    fn seed_vol(asset: &str, spot: f64, sigma: f64) {
+        let mut samples = globals(asset).vol_samples.lock().unwrap();
+        samples.clear();
+        let now = Instant::now();
+        let n = config::FAIRVALUE_MIN_VOL_SAMPLES + 5 - (config::FAIRVALUE_MIN_VOL_SAMPLES + 5) % 2 + 1;
+        let step = sigma * (config::FAIRVALUE_VOL_SAMPLE_SECS as f64).sqrt();
+        for i in 0..n {
+            let age = std::time::Duration::from_secs(config::FAIRVALUE_VOL_SAMPLE_SECS * (n - i) as u64);
+            let px = spot * if i % 2 == 0 { 1.0 } else { step.exp() };
+            samples.push_back((now.checked_sub(age).unwrap_or(now), px));
+        }
+    }
+
     /// Real-money trade of 2026-09-10, 5PM ET: YES bought at $0.20 on a fair value
     /// of 0.280, 1224s to expiry, spot $78.71 under the strike, σ priced at the
-    /// compile-time 5.0e-5 floor while realized vol ran about 2.6e-5. It stopped
-    /// out for -$1.45. The floor, now the `fairvalue_min_sigma_per_sqrt_sec`
-    /// knob, decides that fair value outright on a quiet hour: at the aggressive
-    /// profile's 3.5e-5 it is about 0.203, which leaves the $0.20 ask no edge
-    /// after fees. The knob must reach the pricing path, not just the schema.
+    /// compile-time 5.0e-5 floor while realized vol ran about 2.4e-5. It stopped
+    /// out for -$1.45. Lowering the `fairvalue_min_sigma_per_sqrt_sec` knob to
+    /// 3.5e-5 left the same failure in place for a quieter hour (2026-09-12,
+    /// 4PM ET), so the longshot is now priced at the realized σ whatever the
+    /// knob says. The knob still has to reach the pricing path, and it does on
+    /// the favorite's side, which is where the floor is conservative.
     #[test]
-    fn the_floor_knob_reprices_the_2026_09_10_tail_entry() {
+    fn the_2026_09_10_tail_entry_is_priced_at_realized_vol_and_the_knob_prices_the_favorite() {
         let asset = "btc-floor-knob-2026-09-10";
-        seed_flat_vol(asset);
+        seed_vol(asset, 77189.37, 2.41e-5);
         let mut hourly = book(dec!(200), dec!(150));
         hourly.oracle_price = dec!(77189.37);
         let mut c = ctx(hourly, book(dec!(100), dec!(100)));
@@ -2517,13 +2661,44 @@ mod entry_book_tests {
         c.market.market_close_time = Some(Utc::now() + chrono::Duration::seconds(1224));
 
         let strat = FairValueStrategyImpl::default();
-        let fair_yes = |floor: f64| strat
-            .fair_prob_for_side(asset, &c.market, &c.snapshot, true, floor, 0)
+        let fair = |yes: bool, floor: f64| strat
+            .fair_prob_for_side(asset, &c.market, &c.snapshot, yes, floor, 0)
             .expect("the seeded sampler must let the model price");
-        let at_baked_floor = fair_yes(5.0e-5);
-        assert!((at_baked_floor - 0.280).abs() < 0.005, "fair(YES)={at_baked_floor} should match the logged 0.280");
-        let at_aggressive_floor = fair_yes(3.5e-5);
-        assert!((at_aggressive_floor - 0.203).abs() < 0.005, "fair(YES)={at_aggressive_floor} should be about 0.203");
+        for floor in [5.0e-5, 3.5e-5] {
+            let yes = fair(true, floor);
+            assert!((yes - 0.113).abs() < 0.005,
+                "fair(YES)={yes} at floor {floor}: the longshot must be the realized-vol 0.113, not the floor's 0.280 or 0.203");
+        }
+        let at_baked_floor = fair(false, 5.0e-5);
+        assert!((at_baked_floor - 0.720).abs() < 0.005, "fair(NO)={at_baked_floor}: the favorite keeps the floored price");
+        let at_aggressive_floor = fair(false, 3.5e-5);
+        assert!((at_aggressive_floor - 0.797).abs() < 0.005, "fair(NO)={at_aggressive_floor}: the knob must still move the favorite");
+    }
+
+    /// Real-money trade of 2026-09-12, 4PM ET, through the real pricing path:
+    /// NO bought at $0.21 with spot $49 over the strike, 1,195 s left, the
+    /// floor at 3.48e-5 and realized σ 1.67e-5. The floor priced the NO at
+    /// 0.300 and the entry saw a +0.063 edge; at the realized σ it is 0.136,
+    /// under the ask.
+    #[test]
+    fn the_2026_09_12_longshot_no_is_priced_at_realized_vol() {
+        let asset = "btc-longshot-2026-09-12";
+        seed_vol(asset, 77164.01, 1.67e-5);
+        let mut hourly = book(dec!(200), dec!(150));
+        hourly.oracle_price = dec!(77164.01);
+        let mut c = ctx(hourly, book(dec!(100), dec!(100)));
+        c.crypto_filter = asset.to_string();
+        c.market.strike_price = Some(dec!(77115.00));
+        c.market.market_close_time = Some(Utc::now() + chrono::Duration::seconds(1195));
+
+        let strat = FairValueStrategyImpl::default();
+        let fair = |yes: bool| strat
+            .fair_prob_for_side(asset, &c.market, &c.snapshot, yes, 3.5e-5, 600)
+            .expect("the seeded sampler must let the model price");
+        let no = fair(false);
+        assert!((no - 0.136).abs() < 0.005, "fair(NO)={no}: the floor priced it 0.300");
+        let yes = fair(true);
+        assert!((yes - 0.701).abs() < 0.005, "fair(YES)={yes}: the favorite keeps the floored price");
     }
 
     /// 2026-09-11 01:50-01:52 ET, driven through the real exit path. Fair value
