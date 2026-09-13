@@ -1391,6 +1391,14 @@ const GLOBAL_CONFIG_GROUPS: { group: string; title: string; blurb: string; omit?
       'same value, so they cannot be set per squadron.',
     omit: ['ghost_mode'],
   },
+  {
+    group: 'GBoost Training',
+    title: 'GBoost Training',
+    blurb: 'The in-engine pipeline that trains, validates and adopts the GBoost plan-B ' +
+      'model from public BTC hourly-market history on this instance. One pipeline ' +
+      'serves the BTC squadron; its plan (take-profit, stop, ask band) comes from that ' +
+      'squadron\'s GBoost settings. Progress and the last decision show on the GBoost card.',
+  },
 ];
 
 function GlobalConfigPanel() {

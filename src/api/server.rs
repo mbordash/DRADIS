@@ -856,6 +856,22 @@ async fn get_vipers_status(Query(q): Query<AssetQuery>) -> Response {
     Json(crate::helpers::viper_status::snapshot(q.asset.as_deref())).into_response()
 }
 
+/// GET /api/gboost/planb/status?asset=btc
+///
+/// The GBoost plan-B training pipeline's full state for one asset: backfill
+/// progress, data window, funding source, the last training cycle's report (fold
+/// statistics for the candidate and the incumbent, the gate's reasons, the
+/// decision) and when the next cycle is due. The GBoost card shows a one-line
+/// summary of the same; this is the detail behind it. 404 when no pipeline runs
+/// for the asset (every venue but Polymarket International, or a non-BTC asset).
+async fn get_gboost_planb_status(Query(q): Query<AssetQuery>) -> Response {
+    let asset = q.asset.as_deref().unwrap_or("btc");
+    match crate::vipers::gboost_planb_train::snapshot(asset) {
+        Some(st) => Json(st).into_response(),
+        None => (StatusCode::NOT_FOUND, format!("no GBoost plan-B pipeline for asset '{asset}'")).into_response(),
+    }
+}
+
 /// GET /api/trades/export?asset=btc
 ///
 /// Full tradelog as a CSV download (oldest first) for tax reporting or
@@ -4332,6 +4348,7 @@ pub async fn run_api_server(
         .route("/api/logs",                  get(get_logs))
         .route("/api/latency",               get(get_latency))
         .route("/api/vipers/status",         get(get_vipers_status))
+        .route("/api/gboost/planb/status",   get(get_gboost_planb_status))
         .route("/api/positions",             get(get_open_positions))
         .route("/api/positions/pending",     get(get_pending_positions))
         .route("/api/positions/confirmed",   get(get_confirmed_positions))

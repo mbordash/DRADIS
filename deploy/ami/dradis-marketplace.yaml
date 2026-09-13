@@ -126,7 +126,9 @@ Parameters:
     Type: String
     Default: t3.medium
     AllowedValues:
-      - t3.small
+      # t3.small (2 GB) is deliberately absent: the GBoost model training that
+      # every instance runs peaks at 1.2 to 2 GB, and the engine refuses to
+      # train on a machine with less than 4 GB.
       - t3.medium
       - t3.large
       - c5.large

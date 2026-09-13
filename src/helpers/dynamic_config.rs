@@ -128,6 +128,18 @@ pub fn register_squadron_config_handle(squadron_id: &str, handle: Arc<RwLock<Dyn
     }
 }
 
+/// The live config of one deployed squadron, as its patrol loop reads it this tick.
+///
+/// For work that runs beside a squadron rather than inside it and must honor the
+/// squadron's own knobs: the GBoost training pipeline builds its labels for the plan
+/// the BTC squadron trades, so it reads that squadron's row, not the global one.
+pub fn squadron_config_snapshot(squadron_id: &str) -> Option<DynamicConfig> {
+    let reg = squadron_config_registry().lock().ok()?;
+    let handle = reg.get(squadron_id)?;
+    let cfg = handle.read().ok()?;
+    Some((*cfg).clone())
+}
+
 /// Squadron IDs that currently hold a live config handle — i.e. the squadrons the
 /// CAG actually has deployed right now.  This is the correct scope for any
 /// fleet-wide config apply (see the Setup risk-profile picker).
@@ -317,6 +329,14 @@ fn default_gboost_planb_max_ask()            -> Decimal { config::GBOOST_PLANB_M
 fn default_gboost_planb_first_minute()       -> i64     { config::GBOOST_PLANB_FIRST_MINUTE              }
 fn default_gboost_planb_last_minute()        -> i64     { config::GBOOST_PLANB_LAST_MINUTE               }
 fn default_gboost_resting_tp_enabled()       -> bool    { config::GBOOST_RESTING_TP_ENABLED              }
+fn default_gboost_planb_training_enabled()   -> bool    { config::GBOOST_PLANB_TRAINING_ENABLED          }
+fn default_gboost_planb_auto_adopt()         -> bool    { config::GBOOST_PLANB_AUTO_ADOPT                }
+fn default_gboost_planb_train_window_days()  -> i64     { config::GBOOST_PLANB_TRAIN_WINDOW_DAYS         }
+fn default_gboost_planb_holdout_days()       -> i64     { config::GBOOST_PLANB_HOLDOUT_DAYS              }
+fn default_gboost_planb_retrain_hours()      -> i64     { config::GBOOST_PLANB_RETRAIN_HOURS             }
+fn default_gboost_planb_gate_min_trades()    -> i64     { config::GBOOST_PLANB_GATE_MIN_TRADES           }
+fn default_gboost_planb_gate_min_win_rate()  -> Decimal { config::GBOOST_PLANB_GATE_MIN_WIN_RATE         }
+fn default_gboost_planb_budget()             -> Decimal { config::GBOOST_PLANB_BUDGET                    }
 
 /// Bridge for knobs whose profile constant is an `f64` (`FAIRVALUE_MIN_SIGMA_PER_SQRT_SEC`):
 /// every DynamicConfig knob is a `Decimal`, because the Control Tower edits and
@@ -724,6 +744,24 @@ pub struct DynamicConfig {
     /// Whether GBoost rests its take-profit as a post-only ask instead of crossing the bid.
     #[serde(default = "default_gboost_resting_tp_enabled")]
     pub gboost_resting_tp_enabled: bool,
+    // In-engine training pipeline (instance-wide; the "GBoost Training" group, read
+    // from the global row by `vipers::gboost_planb_train`).
+    #[serde(default = "default_gboost_planb_training_enabled")]
+    pub gboost_planb_training_enabled: bool,
+    #[serde(default = "default_gboost_planb_auto_adopt")]
+    pub gboost_planb_auto_adopt: bool,
+    #[serde(default = "default_gboost_planb_train_window_days")]
+    pub gboost_planb_train_window_days: i64,
+    #[serde(default = "default_gboost_planb_holdout_days")]
+    pub gboost_planb_holdout_days: i64,
+    #[serde(default = "default_gboost_planb_retrain_hours")]
+    pub gboost_planb_retrain_hours: i64,
+    #[serde(default = "default_gboost_planb_gate_min_trades")]
+    pub gboost_planb_gate_min_trades: i64,
+    #[serde(default = "default_gboost_planb_gate_min_win_rate")]
+    pub gboost_planb_gate_min_win_rate: Decimal,
+    #[serde(default = "default_gboost_planb_budget")]
+    pub gboost_planb_budget: Decimal,
 
     // ── TrendCapture Viper ────────────────────────────────────────────────────
     #[serde(default = "default_trendcapture_min_trade_size")]
@@ -1120,6 +1158,14 @@ impl Default for DynamicConfig {
             gboost_planb_first_minute:    config::GBOOST_PLANB_FIRST_MINUTE,
             gboost_planb_last_minute:     config::GBOOST_PLANB_LAST_MINUTE,
             gboost_resting_tp_enabled:    config::GBOOST_RESTING_TP_ENABLED,
+            gboost_planb_training_enabled:  config::GBOOST_PLANB_TRAINING_ENABLED,
+            gboost_planb_auto_adopt:        config::GBOOST_PLANB_AUTO_ADOPT,
+            gboost_planb_train_window_days: config::GBOOST_PLANB_TRAIN_WINDOW_DAYS,
+            gboost_planb_holdout_days:      config::GBOOST_PLANB_HOLDOUT_DAYS,
+            gboost_planb_retrain_hours:     config::GBOOST_PLANB_RETRAIN_HOURS,
+            gboost_planb_gate_min_trades:   config::GBOOST_PLANB_GATE_MIN_TRADES,
+            gboost_planb_gate_min_win_rate: config::GBOOST_PLANB_GATE_MIN_WIN_RATE,
+            gboost_planb_budget:            config::GBOOST_PLANB_BUDGET,
 
             trendcapture_min_trade_size_usdc: config::TRENDCAPTURE_MIN_TRADE_SIZE_USDC,
             trendcapture_max_trade_size_usdc: config::TRENDCAPTURE_MAX_TRADE_SIZE_USDC,
@@ -1810,6 +1856,8 @@ mod tests {
             "gboost_planb_trade_size_usdc", "gboost_planb_margin", "gboost_planb_take_profit_pct", "gboost_planb_stop_loss_pct", "gboost_planb_tp_ceiling",
             "gboost_planb_min_ask", "gboost_planb_max_ask", "gboost_planb_first_minute", "gboost_planb_last_minute",
             "gboost_resting_tp_enabled",
+            "gboost_planb_training_enabled", "gboost_planb_auto_adopt", "gboost_planb_train_window_days", "gboost_planb_holdout_days",
+            "gboost_planb_retrain_hours", "gboost_planb_gate_min_trades", "gboost_planb_gate_min_win_rate", "gboost_planb_budget",
         ] {
             assert!(obj.remove(added).is_some(), "{added} must be a serialized field");
         }

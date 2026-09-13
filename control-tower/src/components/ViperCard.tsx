@@ -320,6 +320,18 @@ export default function ViperCard({ viper, config, onPatch, market, status }: Pr
               )}
               </>)}
             </div>
+            {/* The viper's standing context, when it keeps one. GBoost: which
+                model is serving and what its training pipeline is doing
+                (backfill progress, training, the last cycle's decision). */}
+            {status?.detail && (
+              <div
+                className="text-[11px] font-mono leading-snug text-gray-500 whitespace-pre-wrap break-words"
+                title={status.detail}
+              >
+                <span className="text-gray-600">model: </span>
+                <span className="text-gray-400">{status.detail}</span>
+              </div>
+            )}
             {/* The refusal ledger: what has been holding this viper and how
                 often, not just what holds it now. Same data the LLM Advisor
                 reads, so an operator can check its reasoning against it. */}

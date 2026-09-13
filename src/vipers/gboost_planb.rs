@@ -14,29 +14,44 @@
 // You should have received a copy of the GNU Affero General Public License along
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! GBoost plan B: an offline-trained, calibrated gradient-boosted model (2026-09-13).
+//! GBoost plan B: a calibrated gradient-boosted model, scored here, trained by the
+//! engine (2026-09-13).
 //!
 //! The `GboostStrategy` viper. It succeeded a self-retraining classifier that
 //! learned "is BTC higher in three minutes" from order-book snapshots and never
-//! showed a tradeable edge; that code is gone. This model is trained and validated
-//! offline: a perpetual booster at budget 2.0 with Platt calibration, fit on June 1
-//! to September 10 2026 BTC hourly markets to predict whether a trade entered at
-//! the ask reaches a 20% resting take-profit before an 11% stop. Validation was a
-//! walk-forward holdout on markets the fit never saw, where the configuration
-//! returned +3.4% per trade before this code existed; the live trial is the real
-//! test. The engine never trains: it loads the exported model file and scores it,
-//! and the exporter parity test below pins the scoring to the exporter's own.
+//! showed a tradeable edge; that code is gone. This model is a perpetual booster
+//! with Platt calibration that predicts whether a trade entered at the ask reaches a
+//! 20% resting take-profit before an 11% stop. The first production model was fit
+//! offline on June 1 to September 10 2026 BTC hourly markets and validated on a
+//! walk-forward holdout of markets the fit never saw, where the configuration
+//! returned +3.4% per trade. Since then the engine trains its own: the pipeline in
+//! `gboost_planb_train` backfills the same public data on every instance, fits,
+//! calibrates and validates a candidate on a held-out fold, and writes it into the
+//! serving file only when it passes the gate and does no worse than the model
+//! already there. This file only scores: it loads whatever model file is in place,
+//! and the exporter parity test below pins the scoring to the offline exporter's own.
 //!
 //! # Parity with the harness
 //!
 //! The model is only valid on inputs built exactly the way its training rows were
-//! (`build_holdout.py`). So the features come from 1-minute Binance klines fetched
-//! at each decision minute, not from the price raptor's ticker; realized volatility
-//! uses the harness's own 4.2e-5 floor, not FairValue's knob; the funding rate is
-//! the last SETTLED rate from Binance's history endpoint, not the funding raptor's
-//! value (which can silently fall back to OKX); and the four futures features the
-//! training run could not use are fed as zeros, as the evaluator fed them.
-//! `build_features` is tested against rows the harness produced.
+//! (`build_holdout.py`, and now `gboost_planb_train::build_market_rows`, which calls
+//! the `build_features` below). So the features come from 1-minute Binance klines
+//! fetched at each decision minute, not from the price raptor's ticker; realized
+//! volatility uses the harness's own 4.2e-5 floor, not FairValue's knob; the funding
+//! rate is the last SETTLED rate from Binance's history endpoint, not the funding
+//! raptor's value (which can silently fall back to OKX); and columns the model's
+//! training rows never had a value for (`zeroed_features` in its stamp: always the
+//! four futures features, and funding on an instance no funding source answers) are
+//! fed as zeros, as the evaluator fed them. `build_features` is tested against rows
+//! the harness produced.
+//!
+//! # What a model file must say about itself
+//!
+//! Beyond the layout, input names and calibration, the loader reads the venue the
+//! model was trained for and refuses another venue's; the plan its labels were built
+//! with (`plan_tp`, `plan_sl`, `plan_min_ask`, `plan_max_ask`, or the first model's
+//! `label=B_aggr20`), which the viper compares with the configured plan and idles on
+//! a mismatch until the pipeline retrains; and its provenance, shown on the card.
 //!
 //! # Trading rule
 //!
@@ -74,7 +89,21 @@ use crate::state::{OrderParams, PositionKey, StrategySignal, StrategyStatus};
 use crate::venues::core::TimeInForce;
 use crate::vipers::is_drawdown_limit_hit;
 
-const STRATEGY_NAME: &str = "GboostStrategy";
+pub const STRATEGY_NAME: &str = "GboostStrategy";
+
+/// The venue every plan-B model is trained for. Polymarket International's hourly
+/// markets, prices, prints and fees are what the rows describe; a model stamped for
+/// another venue is refused, and an unstamped one (the first production model) is
+/// taken to be this venue's, which it was.
+pub const TRAINED_VENUE: &str = "polymarket-intl";
+
+/// Column index of `funding`, the one input whose availability differs by instance.
+const FUNDING_COLUMN: usize = 22;
+/// The first production model's `label` stamp and the plan it was built with.
+const REFERENCE_LABEL: &str = "B_aggr20";
+const REFERENCE_PLAN: [f64; 4] = [0.20, 0.11, 0.43, 0.75];
+/// How often the pipeline's status line is refreshed on the card.
+const DETAIL_REFRESH_SECS: u64 = 2;
 
 /// Fewest trees a loaded model file may have. A calibrated export of a real fit
 /// has dozens; a file with fewer is a nothing-fit or a broken export, and is
@@ -156,8 +185,8 @@ pub struct DecisionInputs<'a> {
     pub mid_m5: [Option<f64>; 2],
     /// Ask each side would be bought at.
     pub ask: [f64; 2],
-    /// Last settled funding rate at or before `t`.
-    pub funding: f64,
+    /// Last settled funding rate at or before `t`; `None` is a missing input.
+    pub funding: Option<f64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -232,9 +261,10 @@ pub fn build_features(inp: &DecisionInputs) -> std::result::Result<[[f64; N_FEAT
             sgn * ret(1), sgn * ret(5), sgn * ret(15), sgn * ret(30), sgn * ret(60),
             sig_min, rv15, range30,
             sgn * dist, sgn * z, z.abs(), fair_side, fair_side - ask, mid_s - fair_side, frac,
-            inp.funding,
-            // oi_d5, oi_d30, tlsr, tlsr15: absent from every training row, zeroed as the evaluator zeroed them.
-            0.0, 0.0, 0.0, 0.0,
+            inp.funding.unwrap_or(f64::NAN),
+            // oi_d5, oi_d30, tlsr, tlsr15: the engine cannot compute them, so no training row
+            // has them; every model stamps them zeroed and `predict` zeroes them.
+            f64::NAN, f64::NAN, f64::NAN, f64::NAN,
             hour_utc, dow,
         ];
     }
@@ -386,10 +416,19 @@ pub struct PlanBModel {
     pub platt_b: f64,
     pub version: String,
     pub trees: usize,
+    /// Columns the model's training rows never had a value for, fed as zeros.
+    pub zeroed: Vec<usize>,
+    /// `[tp, sl, min_ask, max_ask]` the labels were built with, when stamped.
+    pub plan: Option<[f64; 4]>,
+    pub trained_by: Option<String>,
+    pub created_at: Option<String>,
+    /// End of the calibration slice: the newest market the model has seen.
+    pub calibrated_through: Option<String>,
+    pub holdout_summary: Option<String>,
 }
 
-/// Load and validate a model file: its layout, its input names, its calibration and
-/// its size must all be what this code feeds it.
+/// Load and validate a model file: its layout, its input names, its calibration, its
+/// venue and its size must all be what this code feeds it.
 pub fn load_model(path: &std::path::Path) -> std::result::Result<PlanBModel, String> {
     let json = std::fs::read_to_string(path).map_err(|e| format!("cannot read {}: {e}", path.display()))?;
     let booster = PerpetualBooster::from_json(&json).map_err(|e| format!("cannot parse {}: {e:?}", path.display()))?;
@@ -400,6 +439,11 @@ pub fn load_model(path: &std::path::Path) -> std::result::Result<PlanBModel, Str
     if meta("feature_names").as_deref() != Some(FEATURE_NAMES.join(",").as_str()) {
         return Err("model's feature_names do not match this build's inputs".to_string());
     }
+    if let Some(v) = meta("venue") {
+        if v != TRAINED_VENUE {
+            return Err(format!("model was trained for venue '{v}', not {TRAINED_VENUE}; plan B trades only Polymarket International"));
+        }
+    }
     let num = |key: &str| meta(key).and_then(|s| s.parse::<f64>().ok()).filter(|v| v.is_finite());
     let platt_a = num("platt_a").ok_or("model has no usable platt_a")?;
     let platt_b = num("platt_b").ok_or("model has no usable platt_b")?;
@@ -408,17 +452,54 @@ pub fn load_model(path: &std::path::Path) -> std::result::Result<PlanBModel, Str
         return Err(format!("model has {trees} trees, below the structural minimum {}", STRUCTURAL_MIN_TREES));
     }
     let version = meta("model_version").unwrap_or_else(|| "unversioned".to_string());
-    Ok(PlanBModel { booster, platt_a, platt_b, version, trees })
+    // The four futures columns are zeroed whatever the stamp says: no engine has ever
+    // computed them. Any other zeroed column must be a known input.
+    let mut zeroed: Vec<usize> = vec![23, 24, 25, 26];
+    for name in meta("zeroed_features").unwrap_or_default().split(',').map(str::trim).filter(|s| !s.is_empty()) {
+        let j = FEATURE_NAMES.iter().position(|n| *n == name).ok_or_else(|| format!("model zeroes unknown input '{name}'"))?;
+        if !zeroed.contains(&j) { zeroed.push(j); }
+    }
+    zeroed.sort_unstable();
+    let plan = match (num("plan_tp"), num("plan_sl"), num("plan_min_ask"), num("plan_max_ask")) {
+        (Some(tp), Some(sl), Some(lo), Some(hi)) => Some([tp, sl, lo, hi]),
+        _ if meta("label").as_deref() == Some(REFERENCE_LABEL) => Some(REFERENCE_PLAN),
+        _ => None,
+    };
+    let holdout_summary = match (meta("holdout_trades"), num("holdout_mean_ret"), num("holdout_win")) {
+        (Some(n), Some(r), Some(w)) => Some(format!("holdout {n} trades at {:+.2}% per trade, win {w:.3}", r * 100.0)),
+        _ => None,
+    };
+    let trained_by = meta("trained_by");
+    let created_at = meta("created_at");
+    let calibrated_through = meta("calibrated_through");
+    Ok(PlanBModel { booster, platt_a, platt_b, version, trees, zeroed, plan, trained_by, created_at, calibrated_through, holdout_summary })
 }
 
 impl PlanBModel {
-    /// `(raw, calibrated)` for each row.
+    /// Whether a decision needs the settled funding rate, or the model zeroes it.
+    pub fn needs_funding(&self) -> bool { !self.zeroed.contains(&FUNDING_COLUMN) }
+
+    /// The plan the model was built for differs from the configured one.
+    pub fn plan_mismatch(&self, tp: f64, sl: f64, lo: f64, hi: f64) -> Option<String> {
+        let p = self.plan?;
+        let same = |a: f64, b: f64| (a - b).abs() < 1e-9;
+        if same(p[0], tp) && same(p[1], sl) && same(p[2], lo) && same(p[3], hi) {
+            None
+        } else {
+            Some(format!(
+                "model {} was labeled for TP {:.0}%, SL {:.0}%, asks ${:.2} to ${:.2}; the configured plan is TP {:.0}%, SL {:.0}%, asks ${:.2} to ${:.2}",
+                self.version, p[0] * 100.0, p[1] * 100.0, p[2], p[3], tp * 100.0, sl * 100.0, lo, hi,
+            ))
+        }
+    }
+
+    /// `(raw, calibrated)` for each row, with the model's zeroed columns applied.
     pub fn predict(&self, rows: &[[f64; N_FEATURES]]) -> Vec<(f64, f64)> {
         let n = rows.len();
         let mut data = vec![0.0f64; n * N_FEATURES];
         for (i, row) in rows.iter().enumerate() {
             for (j, v) in row.iter().enumerate() {
-                data[j * n + i] = *v;
+                data[j * n + i] = if self.zeroed.contains(&j) { 0.0 } else { *v };
             }
         }
         let matrix = Matrix::new(&data, n, N_FEATURES);
@@ -460,6 +541,7 @@ struct PlanBGlobals {
     decided: StdMutex<HashSet<(String, i64)>>,
     attempted: StdMutex<HashSet<(String, usize)>>,
     below_minimum_noted: StdMutex<HashSet<String>>,
+    detail_refreshed: StdMutex<Option<Instant>>,
 }
 
 fn lock<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
@@ -478,8 +560,37 @@ fn globals(asset: &str) -> &'static PlanBGlobals {
         .or_insert_with(|| Box::leak(Box::new(PlanBGlobals::default())))
 }
 
-fn model_path(asset: &str) -> PathBuf {
+/// The serving model file: what the viper loads and what the pipeline adopts into.
+pub fn model_path(asset: &str) -> PathBuf {
     PathBuf::from(format!("logs/{}-{}", asset.to_ascii_lowercase(), config::GBOOST_PLANB_MODEL_FILENAME))
+}
+
+/// The card's detail line: which model is serving and where it came from, then what
+/// the training pipeline is doing.
+fn detail_line(model: Option<&PlanBModel>, asset: &str) -> String {
+    let serving = match model {
+        Some(m) => {
+            let by = match m.trained_by.as_deref() {
+                Some("dradis-engine") => "trained by this engine",
+                Some(other) => other,
+                None => "provided model",
+            };
+            let when = m.created_at.as_deref().map(fmt_et).map(|s| format!(", {s}")).unwrap_or_default();
+            let holdout = m.holdout_summary.as_deref().map(|h| format!("; {h}")).unwrap_or_default();
+            format!("serving {} ({} trees, {by}{when}{holdout})", m.version, m.trees)
+        }
+        None => "no model in service".to_string(),
+    };
+    match crate::vipers::gboost_planb_train::status_line(asset) {
+        Some(p) => format!("{serving} | {p}"),
+        None => serving,
+    }
+}
+
+fn fmt_et(rfc: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(rfc)
+        .map(|d| d.with_timezone(&chrono_tz::America::New_York).format("%Y-%m-%d %H:%M ET").to_string())
+        .unwrap_or_else(|_| rfc.to_string())
 }
 
 fn warn_due(last: &mut Option<Instant>) -> bool {
@@ -499,7 +610,7 @@ fn ensure_model(g: &'static PlanBGlobals, asset: &str) -> Option<Arc<PlanBModel>
         match mtime {
             None => {
                 if warn_due(&mut slot.last_warn) {
-                    warn!("GBoost plan-B: model file {} not found; the viper stays idle until it exists", path.display());
+                    warn!("GBoost plan-B: model file {} not found; the viper stays idle until the training pipeline adopts one", path.display());
                 }
             }
             Some(m) if Some(m) != slot.mtime => {
@@ -512,8 +623,10 @@ fn ensure_model(g: &'static PlanBGlobals, asset: &str) -> Option<Arc<PlanBModel>
                     match result {
                         Ok(model) => {
                             info!(
-                                "GBoost plan-B: loaded model {} from {} ({} trees, Platt a={:.6} b={:.6})",
+                                "GBoost plan-B: loaded model {} from {} ({} trees, Platt a={:.6} b={:.6}, zeroed {:?}, trained by {}, plan {:?})",
                                 model.version, path.display(), model.trees, model.platt_a, model.platt_b,
+                                model.zeroed.iter().map(|&j| FEATURE_NAMES[j]).collect::<Vec<_>>(),
+                                model.trained_by.as_deref().unwrap_or("unknown"), model.plan,
                             );
                             slot.model = Some(Arc::new(model));
                         }
@@ -572,7 +685,8 @@ async fn get_json(url: &str) -> std::result::Result<serde_json::Value, String> {
 }
 
 async fn fetch_bars() -> std::result::Result<Vec<Bar>, String> {
-    // The data mirror serves the same klines and answers where the main host is blocked.
+    // The data mirror is Binance's official public market-data host; it serves the same
+    // klines and answers where the main host is blocked (HTTP 451 from the US).
     let mut last = String::new();
     for host in ["https://api.binance.com", "https://data-api.binance.vision"] {
         match get_json(&format!("{host}/api/v3/klines?symbol=BTCUSDT&interval=1m&limit={KLINES_LIMIT}")).await {
@@ -584,14 +698,19 @@ async fn fetch_bars() -> std::result::Result<Vec<Bar>, String> {
 }
 
 async fn fetch_funding() -> std::result::Result<(f64, i64), String> {
+    // fapi is the only official source of the settled rate and answers 451 from the US.
+    // There is no fallback by design: where it does not answer, the training pipeline
+    // sees no funding either, trains a model that zeroes the column, and this viper
+    // serves that model without waiting for a rate (`PlanBModel::needs_funding`).
     parse_funding(&get_json("https://fapi.binance.com/fapi/v1/fundingRate?symbol=BTCUSDT&limit=1").await?)
 }
 
 /// Closed bars through `t` and the settled funding rate, fetching in the background
-/// until both are in hand.
-fn ensure_minute_data(g: &'static PlanBGlobals, t: i64) -> Option<(Vec<Bar>, f64)> {
+/// until both are in hand. A model that zeroes funding does not wait for it.
+fn ensure_minute_data(g: &'static PlanBGlobals, t: i64, need_funding: bool) -> Option<(Vec<Bar>, Option<f64>)> {
     let mut d = lock(&g.data);
-    let funding_due = !d.funding_fetching
+    let funding_due = need_funding
+        && !d.funding_fetching
         && d.funding_fetched.is_none_or(|x| x.elapsed() >= Duration::from_secs(FUNDING_REFRESH_SECS));
     if funding_due {
         d.funding_fetching = true;
@@ -642,8 +761,25 @@ fn ensure_minute_data(g: &'static PlanBGlobals, t: i64) -> Option<(Vec<Bar>, f64
             if d.fetching_t == Some(t) { d.fetching_t = None; }
         });
     }
-    let funding = d.funding.filter(|(_, settled)| *settled <= t).map(|(rate, _)| rate)?;
+    let funding = d.funding.filter(|(_, settled)| *settled <= t).map(|(rate, _)| rate);
+    if need_funding && funding.is_none() {
+        return None;
+    }
     (d.bars_t == Some(t)).then(|| (d.bars.clone(), funding))
+}
+
+/// Why plan B does not trade on this build's venue, or `None` on the venue it was
+/// validated for.
+///
+/// Plan B's rows, labels and fees describe Polymarket International's hourly markets,
+/// and its training pipeline fetches that venue's history. No model has been validated
+/// on Kalshi's or Polymarket US's markets, so on those builds the viper idles and says
+/// so, whatever model file happens to be on disk.
+pub fn venue_gate() -> Option<&'static str> {
+    #[cfg(feature = "intl_clob")]
+    { None }
+    #[cfg(not(feature = "intl_clob"))]
+    { Some("plan B is validated on Polymarket International BTC hourly markets only; it does not trade on this venue") }
 }
 
 fn fmt_features(v: &[f64; N_FEATURES]) -> String {
@@ -673,6 +809,10 @@ impl Strategy for GboostPlanBStrategy {
             idle("session drawdown limit hit");
             return Ok(StrategySignal::NoSignal);
         }
+        if let Some(why) = venue_gate() {
+            idle(why);
+            return Ok(StrategySignal::NoSignal);
+        }
         if !ctx.crypto_filter.eq_ignore_ascii_case("btc") {
             idle("the plan-B model is trained on BTC hourly markets only");
             return Ok(StrategySignal::NoSignal);
@@ -684,6 +824,21 @@ impl Strategy for GboostPlanBStrategy {
         let g = globals(&ctx.crypto_filter);
         // Checked on every tick, so a fresh start has the model loaded by its first decision minute.
         let model = ensure_model(g, &ctx.crypto_filter);
+        {
+            // The card's detail line: the serving model and the pipeline's state.
+            let mut last = lock(&g.detail_refreshed);
+            if last.is_none_or(|t| t.elapsed() >= Duration::from_secs(DETAIL_REFRESH_SECS)) {
+                *last = Some(Instant::now());
+                crate::helpers::viper_status::report_detail(&ctx.crypto_filter, STRATEGY_NAME, Some(detail_line(model.as_deref(), &ctx.crypto_filter)));
+            }
+        }
+        let f = |d: Decimal| d.to_f64().unwrap_or(0.0);
+        if let Some(m) = &model {
+            if let Some(why) = m.plan_mismatch(f(dc.gboost_planb_take_profit_pct), f(dc.gboost_planb_stop_loss_pct), f(dc.gboost_planb_min_ask), f(dc.gboost_planb_max_ask)) {
+                idle(&format!("{why}; waiting for the pipeline to train a model for the configured plan"));
+                return Ok(StrategySignal::NoSignal);
+            }
+        }
         let market = &ctx.market;
         let snap = &ctx.snapshot;
         let Some(close) = market.market_close_time else {
@@ -728,11 +883,14 @@ impl Strategy for GboostPlanBStrategy {
             return Ok(StrategySignal::NoSignal);
         }
         let Some(model) = model else {
-            idle("model not loaded");
+            match crate::vipers::gboost_planb_train::status_line(&ctx.crypto_filter) {
+                Some(line) => idle(&format!("no model in service; {line}")),
+                None => idle("no model in service and the training pipeline is not running on this build"),
+            }
             return Ok(StrategySignal::NoSignal);
         };
-        let Some((bars, funding)) = ensure_minute_data(g, t) else {
-            idle("waiting for Binance bars and the settled funding rate");
+        let Some((bars, funding)) = ensure_minute_data(g, t, model.needs_funding()) else {
+            idle(if model.needs_funding() { "waiting for Binance bars and the settled funding rate" } else { "waiting for Binance bars" });
             return Ok(StrategySignal::NoSignal);
         };
 
@@ -757,7 +915,6 @@ impl Strategy for GboostPlanBStrategy {
             }
         };
         let preds = model.predict(&features);
-        let f = |d: Decimal| d.to_f64().unwrap_or(0.0);
         let decisions: Vec<SideDecision> = (0..2)
             .map(|side| decide_side(
                 ask[side], preds[side].1, f(dc.intl_taker_fee_rate), f(dc.gboost_planb_take_profit_pct),
@@ -990,12 +1147,19 @@ mod tests {
                 mid_m1: pair("m1"),
                 mid_m5: pair("m5"),
                 ask: [fixture["ask"][0].as_f64().unwrap(), fixture["ask"][1].as_f64().unwrap()],
-                funding: fixture["funding"].as_f64().unwrap(),
+                funding: Some(fixture["funding"].as_f64().unwrap()),
             };
             let got = build_features(&inputs).expect("fixture inputs are complete");
             for side in 0..2 {
                 let expected = fixture["expected"][side].as_array().unwrap();
                 for (j, name) in FEATURE_NAMES.iter().enumerate() {
+                    // The builder leaves the four futures columns missing; the fixture carries
+                    // them as the evaluator's zeros, which is what `predict` feeds the model.
+                    if (23..=26).contains(&j) {
+                        assert!(got[side][j].is_nan(), "t={} side {side} {name}: the builder never computes this", inputs.t);
+                        assert_eq!(expected[j].as_f64(), Some(0.0));
+                        continue;
+                    }
                     match expected[j].as_f64() {
                         None => assert!(got[side][j].is_nan(), "t={} side {side} {name}: expected missing, got {}", inputs.t, got[side][j]),
                         // norm_cdf is a 1.5e-7 approximation of the harness's erf; everything else is exact arithmetic.
@@ -1006,18 +1170,56 @@ mod tests {
         }
     }
 
+    /// A missing funding input is a missing value, not a zero, so a model that was
+    /// trained with funding never sees a fabricated rate; a model that zeroes funding
+    /// does not wait for one.
+    #[test]
+    fn missing_funding_is_missing_until_a_model_zeroes_it() {
+        let bars: Vec<Bar> = (0..61).map(|i| Bar { open_s: 3600 + 60 * i, open: 1.0, high: 1.0, low: 1.0, close: 1.0 }).collect();
+        let f = build_features(&DecisionInputs {
+            w: 3600 + 30 * 60, t: 3600 + 61 * 60, bars: &bars, mid_now: [Some(0.5), Some(0.5)], mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.5, 0.5], funding: None,
+        }).unwrap();
+        assert!(f[0][22].is_nan() && f[1][22].is_nan());
+        assert!((23..=26).all(|j| f[0][j].is_nan()));
+    }
+
+    /// The plan a model was labeled for is compared with the configured plan; the first
+    /// production model carries it as `label=B_aggr20`.
+    #[test]
+    fn the_plan_stamp_is_compared_with_the_configured_plan() {
+        let json = include_str!("testdata/gboost_planb_features.json"); // any file: the model is built below
+        let _ = json;
+        // Exercise the comparison on the struct directly; loading is covered by the
+        // trainer's stamped-model test.
+        let m = |plan: Option<[f64; 4]>| {
+            // A booster is needed only to construct the struct; the smallest fit will do.
+            let data = vec![0.0, 1.0, 0.0, 1.0, 1.0, 0.0, 1.0, 0.0];
+            let matrix = Matrix::new(&data, 4, 2);
+            let mut b = PerpetualBooster::default().set_iteration_limit(Some(1)).set_num_threads(Some(1));
+            b.fit(&matrix, &[0.0, 1.0, 0.0, 1.0], None, None).unwrap();
+            PlanBModel { booster: b, platt_a: 1.0, platt_b: 0.0, version: "t".into(), trees: 1, zeroed: vec![23, 24, 25, 26], plan, trained_by: None, created_at: None, calibrated_through: None, holdout_summary: None }
+        };
+        assert!(m(Some(REFERENCE_PLAN)).plan_mismatch(0.20, 0.11, 0.43, 0.75).is_none());
+        assert!(m(Some(REFERENCE_PLAN)).plan_mismatch(0.15, 0.11, 0.43, 0.75).is_some());
+        assert!(m(None).plan_mismatch(0.15, 0.11, 0.43, 0.75).is_none(), "an unstamped model cannot be compared");
+        assert!(m(Some(REFERENCE_PLAN)).needs_funding());
+        let mut z = m(Some(REFERENCE_PLAN));
+        z.zeroed.push(FUNDING_COLUMN);
+        assert!(!z.needs_funding());
+    }
+
     #[test]
     fn missing_history_or_mids_are_reported_not_guessed() {
         let bars: Vec<Bar> = (0..61).map(|i| Bar { open_s: 3600 + 60 * i, open: 1.0, high: 1.0, low: 1.0, close: 1.0 }).collect();
         let base = |bars: &[Bar]| build_features(&DecisionInputs {
-            w: 7200, t: 3600 + 61 * 60, bars, mid_now: [Some(0.5), Some(0.5)], mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.5, 0.5], funding: 0.0,
+            w: 7200, t: 3600 + 61 * 60, bars, mid_now: [Some(0.5), Some(0.5)], mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.5, 0.5], funding: Some(0.0),
         });
         assert_eq!(base(&bars[1..]).unwrap_err(), FeatureGap::MissingBars);
         let mut with_strike = bars.clone();
         with_strike.retain(|b| b.open_s != 7200);
         assert_eq!(base(&with_strike).unwrap_err(), FeatureGap::MissingBars);
         let ok = build_features(&DecisionInputs {
-            w: 3600 + 30 * 60, t: 3600 + 61 * 60, bars: &bars, mid_now: [Some(0.5), None], mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.5, 0.5], funding: 0.0,
+            w: 3600 + 30 * 60, t: 3600 + 61 * 60, bars: &bars, mid_now: [Some(0.5), None], mid_m1: [None; 2], mid_m5: [None; 2], ask: [0.5, 0.5], funding: Some(0.0),
         });
         assert_eq!(ok.unwrap_err(), FeatureGap::MissingMid);
     }

@@ -1032,6 +1032,17 @@ async fn run() -> Result<()> {
             (None, None)
         };
 
+        // GBoost plan-B training pipeline: BTC only (the model trades BTC hourly
+        // markets) and this venue only (the public history it learns from is
+        // Polymarket International's). It backfills, trains, validates and adopts
+        // the model the GBoost viper serves; see `vipers::gboost_planb_train`.
+        if asset == "btc" {
+            let asset_c = asset.clone();
+            spawn_supervised("gboost-planb-pipeline", move || {
+                dradis::vipers::gboost_planb_train::run_pipeline(asset_c.clone())
+            });
+        }
+
         let mut raptor_signals = SquadronRaptors::full(oracle_rx, velocity_rx, drift_rx, funding_rx, deriv_rx, tide_rx, horizon_rx, Some(sports_rx.clone()));
         // Attach the venue-neutral Tennis Raptor feed (observe-only) the same
         // way the US general wing attaches its sports feed.

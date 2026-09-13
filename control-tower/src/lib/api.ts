@@ -146,6 +146,11 @@ export interface ViperStatusRow {
   last_reason_secs_ago: number | null;
   last_signal_at: string | null;
   last_signal_secs_ago: number | null;
+  /** A standing context line the viper keeps current beside the reason of the
+   *  moment. GBoost reports which model is serving, where it came from, and
+   *  what its in-engine training pipeline is doing (backfill progress, training,
+   *  the last cycle's decision). Null for vipers that keep none. */
+  detail: string | null;
   /** Refusal ledger: how many ticks each named gate vetoed this viper since
    *  startup, most frequent first (top 5). `reason` has live numbers folded
    *  to `#`; `last_detail` is the latest verbatim line. This is the same
@@ -469,7 +474,7 @@ export const VIPER_DEFS: ViperDef[] = [
     accentColor: 'purple',
     statusKey: 'gboost',
     strategyName: 'GboostStrategy',
-    description: 'Online gradient-boosted orderbook classifier',
+    description: 'Calibrated gradient-boosted model on BTC hourly markets, trained and validated in the engine',
   },
   {
     name: 'TrendReversal',

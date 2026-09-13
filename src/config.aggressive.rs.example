@@ -816,6 +816,30 @@ pub const GBOOST_PLANB_MAX_ASK: Decimal = dec!(0.75);
 pub const GBOOST_PLANB_FIRST_MINUTE: i64 = 5;
 pub const GBOOST_PLANB_LAST_MINUTE: i64 = 45;
 pub const GBOOST_RESTING_TP_ENABLED: bool = true;
+// ── GBoost plan-B in-engine training (2026-09-13) ─────────────────────────────
+// Every instance trains its own plan-B model from public data (Polymarket Gamma, data-api
+// and CLOB history; Binance bars and funding), validates it on a held-out fold behind a
+// gate, and adopts it only when it passes and does no worse than the serving model on the
+// same fold. These are instance-wide (the "GBoost Training" group in Setup); the plan the
+// labels are built for comes from the BTC squadron's GBoost knobs above.
+/// Run the pipeline at all. Off, the viper serves whatever model file is in place.
+pub const GBOOST_PLANB_TRAINING_ENABLED: bool = true;
+/// Put a validated candidate into service automatically. Off, candidates are written
+/// beside the data for inspection and never replace the serving model.
+pub const GBOOST_PLANB_AUTO_ADOPT: bool = true;
+/// Days of hourly markets kept and trained on. Polymarket's history reaches back to
+/// March 2026; the first production model used 102 days.
+pub const GBOOST_PLANB_TRAIN_WINDOW_DAYS: i64 = 120;
+/// Newest days held out to validate each candidate; never trained on.
+pub const GBOOST_PLANB_HOLDOUT_DAYS: i64 = 14;
+/// Hours between training cycles once the backfill is complete.
+pub const GBOOST_PLANB_RETRAIN_HOURS: i64 = 24;
+/// Fewest holdout trades a candidate must take to be judged at all.
+pub const GBOOST_PLANB_GATE_MIN_TRADES: i64 = 30;
+/// Holdout win rate a candidate must reach (break-even at plan-B prices is about 0.49).
+pub const GBOOST_PLANB_GATE_MIN_WIN_RATE: Decimal = dec!(0.53);
+/// perpetual's training budget; 2.0 was selected by the pre-registered sweep.
+pub const GBOOST_PLANB_BUDGET: Decimal = dec!(2.0);
 
 
 // ============================================================================

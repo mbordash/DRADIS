@@ -166,6 +166,15 @@ export interface DynamicConfig {
   gboost_planb_first_minute: number;
   gboost_planb_last_minute: number;
   gboost_resting_tp_enabled: boolean;
+  // GBoost Training (instance-wide; Setup page)
+  gboost_planb_training_enabled: boolean;
+  gboost_planb_auto_adopt: boolean;
+  gboost_planb_train_window_days: number;
+  gboost_planb_holdout_days: number;
+  gboost_planb_retrain_hours: number;
+  gboost_planb_gate_min_trades: number;
+  gboost_planb_gate_min_win_rate: string;
+  gboost_planb_budget: string;
 
   // TrendCapture Viper
   trendcapture_min_trade_size_usdc: string;

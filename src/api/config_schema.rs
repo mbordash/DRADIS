@@ -68,7 +68,7 @@ pub enum ConfigScope {
 pub fn scope_for_group(group: &str) -> Option<ConfigScope> {
     Some(match group {
         // Instance-wide: rendered in Setup, read from the global row.
-        "Global" | "Deployment" | "Raptor Polling" => ConfigScope::Global,
+        "Global" | "Deployment" | "Raptor Polling" | "GBoost Training" => ConfigScope::Global,
         // Per-squadron: rendered on a squadron page, read from its own row.
         "Order Book" | "Exit Accounting" => ConfigScope::Squadron,
         "Arbitrage" | "Basis" | "Convergence" | "FairValue" | "GBoost"
@@ -509,6 +509,43 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
         v.push(F::new(g, e, "gboost_planb_last_minute", "Last Decision Minute", "int", true,
             "Latest minute of each hourly window at which the model decides. Entries also stop two minutes \
              before the flatten that precedes the market rotation, so a setting past 47 adds nothing.").range(0.0, 59.0).step(1.0));
+    }
+
+    // ── GBoost Training (instance-wide, rendered in Setup) ──────────────────────
+    // The in-engine pipeline that trains, validates and adopts the plan-B model. It is
+    // not a viper, so it is not a squadron group: one pipeline serves the BTC asset and
+    // reads these from the global row. The plan its labels are built for (take-profit,
+    // stop, ask band, margin) is the BTC squadron's GBoost settings above.
+    {
+        let g = "GBoost Training";
+        v.push(F::new(g, None, "gboost_planb_training_enabled", "Train In Engine", "bool", false,
+            "Train the GBoost plan-B model on this instance: backfill public BTC hourly-market history, add each \
+             hour's market as it resolves, and retrain on the schedule below. Off, GBoost serves whatever model \
+             file is in logs/ and a fresh instance stays idle. Turning it off also stops a running backfill. \
+             Training needs 4 GB of memory; on a smaller machine the fit is refused and the GBoost card says so."));
+        v.push(F::new(g, None, "gboost_planb_auto_adopt", "Auto Adopt", "bool", false,
+            "Put a candidate into service on its own once it passes the holdout gate and does at least as well \
+             as the serving model on the same held-out fold. Off, every candidate is written to \
+             logs/gboost_planb/btc/candidate.json with its report and the serving model is never replaced."));
+        v.push(F::new(g, None, "gboost_planb_train_window_days", "Training Window", "int", false,
+            "Days of hourly markets the pipeline keeps and trains on. The first backfill fetches about 24 markets \
+             a day at one public API request a second (four to six requests a market), so 120 days takes four to \
+             five hours; Polymarket's history reaches back to March 2026.").range(30.0, 200.0).step(1.0).unit("d"));
+        v.push(F::new(g, None, "gboost_planb_holdout_days", "Holdout Days", "int", false,
+            "Newest days held out to validate each candidate; never trained on. At roughly four rule trades a \
+             day, 14 days gives the gate about 50 trades to judge.").range(3.0, 60.0).step(1.0).unit("d"));
+        v.push(F::new(g, None, "gboost_planb_retrain_hours", "Retrain Every", "int", false,
+            "Hours between training cycles once the backfill is complete. A change to the plan knobs \
+             (take-profit, stop, ask band) retrains at once regardless.").range(1.0, 168.0).step(1.0).unit("h"));
+        v.push(F::new(g, None, "gboost_planb_gate_min_trades", "Gate Min Trades", "int", true,
+            "Fewest holdout trades a candidate must take before it can be adopted; fewer is not enough evidence \
+             either way.").range(5.0, 500.0).step(1.0));
+        v.push(F::new(g, None, "gboost_planb_gate_min_win_rate", "Gate Min Win Rate", "decimal", true,
+            "Holdout win rate a candidate must reach. Break-even at plan-B prices is about 0.49; 0.53 is \
+             winning clearly more often than break-even requires, on top of a positive mean return.").range(0.40, 0.90).step(0.01));
+        v.push(F::new(g, None, "gboost_planb_budget", "Training Budget", "decimal", true,
+            "perpetual's budget: how hard the booster fits. 2.0 was chosen by the pre-registered sweep (AUC rose \
+             with every step up to it). Higher fits longer and larger; the fit stops at 30 minutes regardless.").range(0.1, 5.0).step(0.1));
     }
 
     // ── TrendReversal ─────────────────────────────────────────────────────────────

@@ -96,6 +96,10 @@ struct ViperStatus {
     last_reason_at: Option<DateTime<Utc>>,
     /// Last time this viper produced an actionable entry signal.
     last_signal_at: Option<DateTime<Utc>>,
+    /// A standing line of context the viper keeps current, beside the reason of
+    /// the moment: GBoost reports which model is serving and what its training
+    /// pipeline is doing. Survives signals; only the viper replaces it.
+    detail: Option<String>,
     /// Refusal ledger: how many ticks each named gate has vetoed this viper,
     /// keyed by the reason with its live numbers normalized out.
     ///
@@ -120,6 +124,7 @@ impl ViperStatus {
             last_reason: None,
             last_reason_at: None,
             last_signal_at: None,
+            detail: None,
             refusals: HashMap::new(),
             refusal_window_started_at: now,
         }
@@ -294,6 +299,17 @@ pub fn report_reason(asset: &str, strategy: &str, reason: &str) {
     entry.bump_refusal(reason);
 }
 
+/// Set (or clear) the viper's standing detail line. See `ViperStatus::detail`.
+pub fn report_detail(asset: &str, strategy: &str, detail: Option<String>) {
+    let now = Utc::now();
+    let mut map = match registry().lock() {
+        Ok(m) => m,
+        Err(p) => p.into_inner(),
+    };
+    let entry = map.entry(key(asset, strategy)).or_insert_with(|| ViperStatus::fresh(now, EvalOutcome::NoSignal));
+    entry.detail = detail;
+}
+
 /// Report a refusal that has one displayed reason but several countable
 /// causes.
 ///
@@ -343,6 +359,8 @@ pub struct ViperStatusView {
     pub last_reason_secs_ago: Option<i64>,
     pub last_signal_at: Option<String>,
     pub last_signal_secs_ago: Option<i64>,
+    /// The viper's standing context line, when it keeps one (see `report_detail`).
+    pub detail: Option<String>,
     /// The refusal ledger, most frequent first, capped at
     /// `VIEW_REFUSAL_KINDS` entries.
     pub refusals: Vec<RefusalTally>,
@@ -454,6 +472,7 @@ pub fn snapshot(asset_filter: Option<&str>) -> Vec<ViperStatusView> {
         last_reason_secs_ago: st.last_reason_at.map(|t| (now - t).num_seconds()),
         last_signal_at: st.last_signal_at.map(|t| t.to_rfc3339()),
         last_signal_secs_ago: st.last_signal_at.map(|t| (now - t).num_seconds()),
+        detail: st.detail.clone(),
         refusals: tallies(st, false, VIEW_REFUSAL_KINDS),
     }).collect();
     rows.sort_by(|a, b| (a.asset.as_str(), a.strategy.as_str()).cmp(&(b.asset.as_str(), b.strategy.as_str())));
