@@ -255,6 +255,176 @@ pub async fn fetch_specific_window_daily_market(
     None
 }
 
+/// One validated Gamma market in the shape the selection chain consumes:
+/// `(token_ids, question, slug, vol24h, is_high_priority, close_time, description, condition_id)`.
+pub type GammaCandidate = (Vec<U256>, String, String, f64, bool, Option<DateTime<Utc>>, String, String);
+
+/// How many windows past the current one the slug lookup probes.
+///
+/// Not a knob: rotation is structurally satisfied by the next hour. The monitor
+/// moves off the current market once it has less than
+/// `MIN_SECONDS_TO_EXPIRY_FOR_ENTRY` left, and the next window opens within
+/// minutes of that, so the market it needs is always the one after the current.
+/// Polymarket creates hourly markets two days ahead (the 2026-09-13 4PM ET
+/// market carries `createdAt` 2026-09-11T20:00:00Z), so the next slug resolves
+/// long before it is needed.
+const HOURLY_SLUG_LOOKAHEAD_HOURS: i64 = 1;
+
+/// The assets that have hourly "Up or Down" markets, as discovery filters.
+/// `"all"` (the single-asset `CRYPTO_FILTER` fallback) probes every one.
+fn hourly_assets_for(filter: &str) -> Vec<&'static str> {
+    match filter {
+        "btc" | "bitcoin" => vec!["btc"],
+        "eth" | "ethereum" => vec!["eth"],
+        "sol" | "solana" => vec!["sol"],
+        _ => vec!["btc", "eth", "sol"],
+    }
+}
+
+/// Parse and validate one Gamma market object into a candidate.
+///
+/// The single path every discovery source goes through, so a market found by
+/// slug is held to exactly the validation the listing scans apply: crypto
+/// filter, blocked names, two token ids, short-term name shape, expiry window
+/// (maker or hourly bounds by market class), `min_volume`, strike or binary,
+/// range and ultra-short exclusions, and an enabled order book. `include=event`
+/// on the listing endpoints embeds the parent as `event`; the slug endpoint
+/// embeds it as `events[]`. Either is accepted.
+pub fn candidate_from_gamma_market(
+    m: &serde_json::Value,
+    filter: &str,
+    now: DateTime<Utc>,
+    min_volume: f64,
+) -> Option<GammaCandidate> {
+    let null = serde_json::Value::Null;
+    let name = m.get("question").and_then(|v| v.as_str()).unwrap_or_default().to_string();
+    let event = m.get("event")
+        .or_else(|| m.get("events").and_then(|v| v.as_array()).and_then(|a| a.first()))
+        .unwrap_or(&null);
+    let tokens = extract_token_ids_u256(m);
+    let close = extract_close_time(event, m);
+    let vol = m.get("volume24hrClob").and_then(value_to_f64).unwrap_or(0.0);
+    let is_maker_venue = is_window_market(&name) || is_daily_market(&name);
+    let min_secs = if is_maker_venue { config::MAKER_MIN_SECS_TO_EXPIRY } else { config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY };
+    let max_secs = if is_maker_venue { config::MAKER_MAX_SECS_TO_EXPIRY } else { config::MAX_SECONDS_TO_EXPIRY_FOR_ENTRY };
+    let ctx = ValidationContext {
+        now,
+        crypto_filter: filter.to_string(),
+        min_seconds_to_expiry: min_secs,
+        max_seconds_to_expiry: max_secs,
+        safety_buffer_secs: config::MARKET_EXPIRY_SAFETY_BUFFER_SECS,
+        min_volume,
+    };
+    let event_title = event.get("title").and_then(|v| v.as_str()).unwrap_or_default();
+    let (valid, _, _) = validate_market(&name, event_title, &tokens, close, vol, &ctx);
+    if !(valid && !is_range_market(&name) && !is_ultra_short_window_market(&name) && get_enable_orderbook(m)) {
+        return None;
+    }
+    let hot = is_high_priority_text(&name);
+    Some((
+        tokens,
+        name,
+        m.get("slug").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        vol,
+        hot,
+        close,
+        m.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+        m.get("conditionId").and_then(|v| v.as_str()).unwrap_or_default().to_string(),
+    ))
+}
+
+/// The market array of a Gamma `/markets` response, or empty when the body is
+/// not one (Gamma answers an over-large offset with an error object, not an
+/// array).
+fn gamma_market_array(data: &serde_json::Value) -> Vec<serde_json::Value> {
+    data.as_array().cloned()
+        .or_else(|| data.get("data").and_then(|v| v.as_array()).cloned())
+        .unwrap_or_default()
+}
+
+/// A candidate whose name is an hourly market (not window, daily, or ultra-short).
+pub fn is_hourly_candidate(c: &GammaCandidate) -> bool {
+    !is_window_market(&c.1) && !is_daily_market(&c.1) && !is_ultra_short_window_market(&c.1)
+}
+
+/// A candidate whose name is a maker venue (window or daily market).
+pub fn is_maker_venue_candidate(c: &GammaCandidate) -> bool {
+    is_window_market(&c.1) || is_daily_market(&c.1)
+}
+
+/// Merge discovery sources into one list, first source wins on a shared
+/// condition id. Candidates with no condition id are kept from every source.
+pub fn merge_candidates(sources: Vec<Vec<GammaCandidate>>) -> Vec<GammaCandidate> {
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut merged = Vec::new();
+    for source in sources {
+        for c in source {
+            if c.7.is_empty() || seen.insert(c.7.clone()) {
+                merged.push(c);
+            }
+        }
+    }
+    merged
+}
+
+/// The hourly market to trade, from the merged candidates. Pure.
+///
+/// Sort:
+///   1. Binary "Up or Down" markets first (`is_high_priority_text`, field .4).
+///      Guarantees a freshly-published "Up or Down" beats any low-volume strike
+///      market. One log had the bot run 18 min on "Bitcoin above 83,800 (vol=15)"
+///      because the 9PM "Up or Down" had just appeared with vol=0 and ranked
+///      below it on pure volume.
+///   2. Volume desc (high-volume markets are liquidity-safe).
+///   3. Time left desc as tiebreak.
+///
+/// Then the three-tier chain:
+///   - Prefer hourly markets at or above `vol_floor` (`MIN_HOURLY_MARKET_VOL24H`).
+///   - Else any candidate with SOME volume, or a high-priority "Up or Down" at
+///     zero. Those legitimately start at vol24h=0: they are published fresh
+///     each hour and quoted immediately. A *strike* market at zero is a
+///     different animal: nobody has traded it and nobody is quoting it, so it
+///     has no order book to receive. On 2026-08-25 the fallback landed on
+///     "Bitcoin above 76,600 on August 25, 7PM ET?" (vol24h=0) one rotation
+///     after a market doing 26k, and the feed went dark for twenty minutes
+///     with every strategy pointed at an empty book.
+///   - Else NOTHING. This used to fall through to the unfiltered list, which
+///     is the branch that actually bites: in the gap between hourly markets
+///     every remaining strike market has zero volume and no "Up or Down" has
+///     opened yet. Ireland, 2026-08-27: the 5PM "Up or Down" (vol24h=14877)
+///     closed, the very next selection took "Bitcoin above 78,000 on August
+///     27, 7PM ET?" at vol24h=0, re-picked it every ~90s, and left the feed
+///     dark for 26 minutes. An empty selection is a supported state: the
+///     caller checks for it and the squadron sits idle until the next hourly
+///     market opens, which is the truthful state rather than a dead market
+///     dressed up as one.
+pub fn pick_hourly_candidate(merged: &[GammaCandidate], vol_floor: f64) -> Option<GammaCandidate> {
+    let mut hourly: Vec<&GammaCandidate> = merged.iter().filter(|c| is_hourly_candidate(c)).collect();
+    hourly.sort_by(|a, b| {
+        b.4.cmp(&a.4)
+            .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(Ordering::Equal))
+            .then_with(|| b.5.cmp(&a.5))
+    });
+    hourly.iter().find(|c| c.3 >= vol_floor)
+        .or_else(|| hourly.iter().find(|c| c.3 > 0.0 || c.4))
+        .map(|c| (*c).clone())
+}
+
+fn to_market_candidate(b: &GammaCandidate) -> MarketCandidate {
+    MarketCandidate {
+        yes_token: market_id_from_u256(b.0[0]),
+        no_token: market_id_from_u256(b.0[1]),
+        name: b.1.clone(),
+        link: b.2.clone(),
+        description: b.6.clone(),
+        is_hot: b.4,
+        close_time: b.5,
+        volume: b.3,
+        condition_id: b.7.clone(),
+        strike_price: None,
+    }
+}
+
 pub async fn get_market_pair(http: &reqwest::Client, asset_filter: &str) -> (MarketCandidate, Option<MarketCandidate>) {
     // Use the per-squadron asset filter passed in. Fall back to CRYPTO_FILTER env var
     // only if the passed filter is empty (backward-compat for single-asset mode).
@@ -265,109 +435,38 @@ pub async fn get_market_pair(http: &reqwest::Client, asset_filter: &str) -> (Mar
     };
     let now = Utc::now();
 
-    // Primary scan: volume-sorted (good for established markets with accumulated volume).
-    // Secondary scan: createdAt-sorted (finds fresh hourly markets that have zero 24h volume
-    // and therefore rank below the bottom of the volume-sorted pages).
-    // Merging both ensures we never miss the current-hour market regardless of its age.
-    let (all, recent) = tokio::join!(
+    // Three sources, merged in this order of authority:
+    //   1. Slug lookup: the current hour's "Up or Down" market and the next,
+    //      addressed directly. Volume-independent and independent of how many
+    //      markets Gamma lists. This is the source that finds the hourly market.
+    //   2. Volume-sorted scan: established markets with accumulated volume
+    //      (strike markets, window and daily maker venues).
+    //   3. createdAt-sorted scan: whatever is newest. It used to be how fresh
+    //      hourly markets were found, until Polymarket's catalogue outgrew it;
+    //      see `fetch_recent_crypto_candidates`.
+    let (by_slug, all, recent) = tokio::join!(
+        fetch_hourly_candidates_by_slug(http, &filter, now),
         fetch_simplified_crypto_candidates(http, &filter),
         fetch_recent_crypto_candidates(http, &filter),
     );
+    let merged = merge_candidates(vec![by_slug, all, recent]);
 
-    // Deduplicate by conditionId — prefer recent entry if conditionId matches, since it carries
-    // the validated time-window context.
-    let mut seen_cids: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut merged: Vec<_> = all.iter().collect();
-    for entry in &recent {
-        let cid = &entry.7;
-        if cid.is_empty() || seen_cids.insert(cid.clone()) {
-            // Only add from recent if not already in volume scan
-            if !all.iter().any(|a| !a.7.is_empty() && a.7 == *cid) {
-                merged.push(entry);
-            }
-        }
-    }
-    // Also populate seen_cids from all
-    for entry in &all { seen_cids.insert(entry.7.clone()); }
+    let hourly_count = merged.iter().filter(|c| is_hourly_candidate(c)).count();
+    // Prefer more time left; on a tie the earlier-listed candidate, as the
+    // stable descending sort this replaces did.
+    let maker_c = merged.iter()
+        .filter(|c| is_maker_venue_candidate(c))
+        .min_by(|a, b| b.5.cmp(&a.5));
 
-    let mut hourly_c: Vec<_> = merged.iter().filter(|c|
-        // Use the imported functions directly
-        !is_window_market(&c.1)
-            && !is_daily_market(&c.1)
-            && !is_ultra_short_window_market(&c.1)
-    ).collect();
-    // Use the imported functions directly
-    let mut maker_c: Vec<_> = merged.iter().filter(|c| is_window_market(&c.1) || is_daily_market(&c.1)).collect();
-
-    // Sort hourly by:
-    //   1. Binary "Up or Down" markets first (is_high_priority_text, field .4)
-    //      Guarantees a freshly-published "Up or Down" beats any low-volume strike market.
-    //      Today's log: bot ran 18 min on "Bitcoin above 83,800 (vol=15)" because the
-    //      9PM "Up or Down" had just appeared with vol=0 and ranked below it on pure volume.
-    //   2. Volume desc (high-volume markets are liquidity-safe)
-    //   3. Time left desc as tiebreak
-    hourly_c.sort_by(|a, b| {
-        b.4.cmp(&a.4)
-            .then_with(|| b.3.partial_cmp(&a.3).unwrap_or(Ordering::Equal))
-            .then_with(|| b.5.cmp(&a.5))
-    });
-    maker_c.sort_by(|a, b| b.5.cmp(&a.5)); // prefer more time left
-
-    // Soft vol24h floor: prefer hourly markets that meet the minimum volume threshold.
-    // If none qualify (e.g. a brand-new market with zero 24h vol at session open),
-    // fall back to the full sorted list so the bot doesn't sit idle.
-    let vol_floor = config::MIN_HOURLY_MARKET_VOL24H;
-    let high_vol_hourly: Vec<_> = hourly_c.iter().filter(|c| c.3 >= vol_floor).cloned().collect();
-
-    // The fallback keeps its own floor: a market with NO volume at all is only
-    // acceptable if it is a high-priority "Up or Down" market (field .4).
-    //
-    // Those legitimately start at vol24h=0 — they are published fresh each hour
-    // and quoted immediately — which is why the soft floor above exists. A
-    // *strike* market at zero is a different animal: nobody has traded it and
-    // nobody is quoting it, so it has no order book to receive. On 2026-08-25
-    // the fallback landed on "Bitcoin above 76,600 on August 25, 7PM ET?"
-    // (vol24h=0) one rotation after a market doing 26k, and the feed went dark
-    // for twenty minutes with every strategy pointed at an empty book. Falling
-    // back exists so the bot does not sit idle; a market that cannot be traded
-    // buys nothing over sitting idle, and costs a false connectivity alarm.
-    let tradeable_fallback: Vec<_> =
-        hourly_c.iter().filter(|c| c.3 > 0.0 || c.4).cloned().collect();
-    // Nothing tradeable → select NOTHING and wait for the next tick.
-    //
-    // This used to fall back to the unfiltered list, which is the branch that
-    // actually bites: the middle tier above only helps while SOME candidate is
-    // tradeable. In the gap between hourly markets there are none — every
-    // remaining strike market has zero volume and no "Up or Down" has opened yet
-    // — so the chain fell straight through and picked a dead market anyway.
-    //
-    // Ireland, 2026-08-27: the 5PM "Up or Down" (vol24h=14877) closed, and the
-    // very next selection took "Bitcoin above 78,000 on August 27, 7PM ET?" at
-    // vol24h=0, re-picked it every ~90s, and left the feed dark for 26 minutes
-    // with every strategy pointed at an empty book.
-    //
-    // An empty selection is already a supported state — `.first()` yields None,
-    // the ZERO-token candidate falls out below, and the caller checks for it. The
-    // squadron sits idle for the few minutes until the next hourly market opens,
-    // which is the truthful state rather than a dead market dressed up as one.
-    let nothing: Vec<_> = Vec::new();
-    let hourly_final = if !high_vol_hourly.is_empty() {
-        &high_vol_hourly
-    } else if !tradeable_fallback.is_empty() {
-        &tradeable_fallback
-    } else {
-        &nothing
-    };
-
-    let hourly = hourly_final.first()
-        .map(|b| MarketCandidate { yes_token: market_id_from_u256(b.0[0]), no_token: market_id_from_u256(b.0[1]), name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone(), strike_price: None })
+    let hourly = pick_hourly_candidate(&merged, config::MIN_HOURLY_MARKET_VOL24H)
+        .map(|b| to_market_candidate(&b))
         .unwrap_or(MarketCandidate { yes_token: market_id_from_u256(U256::ZERO), no_token: market_id_from_u256(U256::ZERO), name: String::new(), link: String::new(), description: String::new(), is_hot: false, close_time: None, volume: 0.0, condition_id: String::new(), strike_price: None });
 
-    if hourly.yes_token == market_id_from_u256(U256::ZERO) && !hourly_c.is_empty() {
+    if hourly.yes_token == market_id_from_u256(U256::ZERO) && hourly_count > 0 {
         info!(
             "⏳ No tradeable hourly market right now ({} candidate(s), all zero-volume strike \
              markets) — waiting for the next one rather than quoting into an empty book",
-            hourly_c.len(),
+            hourly_count,
         );
     }
     if hourly.yes_token != market_id_from_u256(U256::ZERO) {
@@ -378,9 +477,9 @@ pub async fn get_market_pair(http: &reqwest::Client, asset_filter: &str) -> (Mar
     // falling back to whatever the volume-scan turned up.
     let daily_direct = fetch_specific_window_daily_market(http, &filter, now).await;
     let maker = daily_direct.or_else(|| {
-        if let Some(b) = maker_c.first() {
+        if let Some(b) = maker_c {
             info!("📋 Using volume-scan window/daily fallback for maker venue");
-            Some(MarketCandidate { yes_token: market_id_from_u256(b.0[0]), no_token: market_id_from_u256(b.0[1]), name: b.1.clone(), link: b.2.clone(), description: b.6.clone(), is_hot: b.4, close_time: b.5, volume: b.3, condition_id: b.7.clone(), strike_price: None })
+            Some(to_market_candidate(b))
         } else {
             // No daily/window maker venue — expected for assets (e.g. BTC) where Polymarket
             // only lists hourly "Up or Down" markets.  Log at INFO at most once per hour to
@@ -398,86 +497,98 @@ pub async fn get_market_pair(http: &reqwest::Client, asset_filter: &str) -> (Mar
     (hourly, maker)
 }
 
-/// Fetch the most recently *created* active crypto markets.
+/// The current hour's "Up or Down" market and the next, fetched by slug.
 ///
-/// A fresh hourly market (e.g. "Bitcoin Up or Down - April 29, 11AM ET") is published
-/// minutes before the hour starts.  It has zero 24h volume and therefore falls completely
-/// outside the volume-sorted scan used by `fetch_simplified_crypto_candidates`.
+/// Production, 2026-09-13 16:00 ET: the BTC squadron released the expired 3PM
+/// market with "no replacement available" and every restart for the next
+/// quarter hour logged "No active hourly or maker market found", while Gamma
+/// listed the 4PM and 5PM markets as active and accepting orders. Neither
+/// listing scan could reach them. The createdAt scan's 100 newest markets all
+/// fell inside a 20-second span (Polymarket now creates markets faster than
+/// that, and creates hourly markets two days ahead, so the current hour is
+/// never among the newest). The volume scan's 2100 reachable markets (Gamma
+/// caps `offset` at 2000) bottomed out at $1770 of 24h volume; the 4PM market
+/// had $1361 and the 5PM $11. Earlier hours that day were found only because
+/// they happened to clear that floor.
 ///
-/// Sorting by `createdAt desc` guarantees the newest markets appear on page 1, so a single
-/// 100-market request reliably surfaces the current hour's market regardless of volume.
-pub async fn fetch_recent_crypto_candidates(http: &reqwest::Client, filter: &str) -> Vec<(Vec<U256>, String, String, f64, bool, Option<DateTime<Utc>>, String, String)> {
-    let mut out = vec![];
-    let now = Utc::now();
-    let url = "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&order=createdAt&ascending=false&include=event";
-    let resp = match http.get(url).send().await { Ok(r) => r, Err(_) => return out };
-    let data: serde_json::Value = match resp.json().await { Ok(d) => d, Err(_) => return out };
-    let markets = data.as_array().or_else(|| data.get("data").and_then(|v| v.as_array()));
-    if let Some(arr) = markets {
-        for m in arr {
-            let name = m.get("question").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-            let event = m.get("event").unwrap_or(&serde_json::Value::Null);
-            let tokens = extract_token_ids_u256(m);
-            let close = extract_close_time(event, m);
-            let vol = m.get("volume24hrClob").and_then(value_to_f64).unwrap_or(0.0);
-            // Use the imported functions directly
-            let is_maker_venue = is_window_market(&name) || is_daily_market(&name);
-            let min_secs = if is_maker_venue { config::MAKER_MIN_SECS_TO_EXPIRY } else { config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY };
-            let max_secs = if is_maker_venue { config::MAKER_MAX_SECS_TO_EXPIRY } else { config::MAX_SECONDS_TO_EXPIRY_FOR_ENTRY };
-            let ctx = ValidationContext {
-                now,
-                crypto_filter: filter.to_string(),
-                min_seconds_to_expiry: min_secs,
-                max_seconds_to_expiry: max_secs,
-                safety_buffer_secs: config::MARKET_EXPIRY_SAFETY_BUFFER_SECS,
-                min_volume: 0.0, // allow zero-volume fresh markets
-            };
-            let event_title = event.get("title").and_then(|v| v.as_str()).unwrap_or_default();
-            // Removed `blocked` argument from `validate_market` call
-            let (valid, _, _) = validate_market(&name, event_title, &tokens, close, vol, &ctx);
-            if valid && !is_range_market(&name) && !is_ultra_short_window_market(&name) && get_enable_orderbook(m) {
-                out.push((tokens, name.clone(), m.get("slug").and_then(|v| v.as_str()).unwrap_or_default().to_string(), vol, is_high_priority_text(&name), close, m.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(), m.get("conditionId").and_then(|v| v.as_str()).unwrap_or_default().to_string()));
+/// The slug is deterministic (`helpers::time::hourly_market_slug`), and one
+/// `markets?slug=` request per window answers regardless of listing volume or
+/// order. Each hit goes through `candidate_from_gamma_market` with a zero
+/// volume floor, so it is validated exactly as a scanned market would be.
+pub async fn fetch_hourly_candidates_by_slug(
+    http: &reqwest::Client,
+    filter: &str,
+    now: DateTime<Utc>,
+) -> Vec<GammaCandidate> {
+    let slugs: Vec<String> = hourly_assets_for(filter)
+        .into_iter()
+        .flat_map(|asset| crate::helpers::time::generate_hourly_market_slugs(asset, now, HOURLY_SLUG_LOOKAHEAD_HOURS))
+        .collect();
+    let mut out = Vec::new();
+    for slug in &slugs {
+        let url = format!("https://gamma-api.polymarket.com/markets?slug={}", slug);
+        let resp = match http.get(&url).send().await {
+            Ok(r) => r,
+            Err(e) => { warn!("⚠️ Hourly slug fetch failed for '{}': {}", slug, e); continue; }
+        };
+        let data: serde_json::Value = match resp.json().await {
+            Ok(d) => d,
+            Err(e) => { warn!("⚠️ Hourly slug response unreadable for '{}': {}", slug, e); continue; }
+        };
+        let markets = gamma_market_array(&data);
+        if markets.is_empty() {
+            debug!("Hourly slug '{}' is not listed (yet)", slug);
+            continue;
+        }
+        for m in &markets {
+            match candidate_from_gamma_market(m, filter, now, 0.0) {
+                Some(c) => {
+                    debug!("🎯 Hourly slug '{}' → \"{}\" (vol24h={:.0})", slug, c.1, c.3);
+                    out.push(c);
+                }
+                None => debug!("Hourly slug '{}' listed but failed validation", slug),
             }
         }
     }
     out
 }
 
-pub async fn fetch_simplified_crypto_candidates(http: &reqwest::Client, filter: &str) -> Vec<(Vec<U256>, String, String, f64, bool, Option<DateTime<Utc>>, String, String)> {
+/// Fetch the most recently *created* active crypto markets.
+///
+/// Kept as a supplementary source, and no longer the way hourly markets are
+/// found. Its premise was that a fresh hourly market is published minutes
+/// before the hour and so sits among the 100 newest markets. On 2026-09-13 the
+/// 100 newest were all created inside a 20-second span and the current hour's
+/// market had been created two days earlier. See
+/// `fetch_hourly_candidates_by_slug` for the source that replaced it.
+pub async fn fetch_recent_crypto_candidates(http: &reqwest::Client, filter: &str) -> Vec<GammaCandidate> {
+    let now = Utc::now();
+    let url = "https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&order=createdAt&ascending=false&include=event";
+    let resp = match http.get(url).send().await { Ok(r) => r, Err(_) => return Vec::new() };
+    let data: serde_json::Value = match resp.json().await { Ok(d) => d, Err(_) => return Vec::new() };
+    gamma_market_array(&data).iter()
+        .filter_map(|m| candidate_from_gamma_market(m, filter, now, 0.0)) // allow zero-volume fresh markets
+        .collect()
+}
+
+/// Fetch active crypto markets in descending 24h volume, page by page.
+///
+/// Finds established markets: strike markets and the window and daily maker
+/// venues. Fresh hourly markets rank below the reachable floor; they come from
+/// `fetch_hourly_candidates_by_slug`. Paging stops at the first empty or
+/// non-array page: Gamma rejects `offset` beyond 2000 with an error object, so
+/// with `GAMMA_API_MARKET_SCAN_PAGES` above 21 the remaining requests were
+/// answering nothing on every scan.
+pub async fn fetch_simplified_crypto_candidates(http: &reqwest::Client, filter: &str) -> Vec<GammaCandidate> {
     let mut out = vec![];
     let now = Utc::now();
     for page in 0..config::GAMMA_API_MARKET_SCAN_PAGES {
         let url = format!("https://gamma-api.polymarket.com/markets?active=true&closed=false&limit=100&offset={}&order=volume24hrClob&ascending=false&include=event", page * 100);
         let resp = match http.get(&url).send().await { Ok(r) => r, Err(_) => continue };
         let data: serde_json::Value = match resp.json().await { Ok(d) => d, Err(_) => break };
-        let markets = data.as_array().or_else(|| data.get("data").and_then(|v| v.as_array()));
-        if let Some(arr) = markets {
-            for m in arr {
-                let name = m.get("question").and_then(|v| v.as_str()).unwrap_or_default().to_string();
-                let event = m.get("event").unwrap_or(&serde_json::Value::Null);
-                let tokens = extract_token_ids_u256(m);
-                let close = extract_close_time(event, m);
-                let vol = m.get("volume24hrClob").and_then(value_to_f64).unwrap_or(0.0);
-                // Use the imported functions directly
-                let is_maker_venue = is_window_market(&name) || is_daily_market(&name);
-                let min_secs = if is_maker_venue { config::MAKER_MIN_SECS_TO_EXPIRY } else { config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY };
-                let max_secs = if is_maker_venue { config::MAKER_MAX_SECS_TO_EXPIRY } else { config::MAX_SECONDS_TO_EXPIRY_FOR_ENTRY };
-                let ctx = ValidationContext {
-                    now,
-                    crypto_filter: filter.to_string(),
-                    min_seconds_to_expiry: min_secs,
-                    max_seconds_to_expiry: max_secs,
-                    safety_buffer_secs: config::MARKET_EXPIRY_SAFETY_BUFFER_SECS,
-                    min_volume: config::MIN_MARKET_VOLUME,
-                };
-                let event_title = event.get("title").and_then(|v| v.as_str()).unwrap_or_default();
-                // Removed `blocked` argument from `validate_market` call
-                let (valid, _, _) = validate_market(&name, event_title, &tokens, close, vol, &ctx);
-                if valid && !is_range_market(&name) && !is_ultra_short_window_market(&name) && get_enable_orderbook(m) {
-                    out.push((tokens, name.clone(), m.get("slug").and_then(|v| v.as_str()).unwrap_or_default().to_string(), vol, is_high_priority_text(&name), close, m.get("description").and_then(|v| v.as_str()).unwrap_or_default().to_string(), m.get("conditionId").and_then(|v| v.as_str()).unwrap_or_default().to_string()));
-                }
-            }
-        }
+        let markets = gamma_market_array(&data);
+        if markets.is_empty() { break; }
+        out.extend(markets.iter().filter_map(|m| candidate_from_gamma_market(m, filter, now, config::MIN_MARKET_VOLUME)));
     }
     out
 }
@@ -880,5 +991,252 @@ mod gamma_mark_tests {
         assert_eq!(mark_from_gamma_market(&m, "333"), None);
         assert_eq!(mark_from_gamma_market(&m, "111"), None, "a settled $1.00 is not an open-market mark");
         assert_eq!(mark_from_gamma_market(&serde_json::json!({ "clobTokenIds": ["111"] }), "111"), None);
+    }
+}
+
+#[cfg(test)]
+mod hourly_slug_discovery_tests {
+    use super::*;
+
+    fn utc(s: &str) -> DateTime<Utc> { s.parse().unwrap() }
+
+    const FOUR_PM_CID: &str = "0xe4cefddbe0083990a47828ca4e4fdc37c9e2fa31ed45c08c9dc5aad8f89a1046";
+    const FIVE_PM_CID: &str = "0x4bab9f5308f4b079f40a0d16e26d0f375c18ffe2b7625d345793628ddb2c4a01";
+
+    /// A Gamma market object as `markets?slug=` returns it: parent event under
+    /// `events[]`, token ids as a JSON-encoded string.
+    fn slug_market(question: &str, slug: &str, end: &str, created: &str, vol: f64, cid: &str, yes: &str, no: &str) -> serde_json::Value {
+        serde_json::json!({
+            "question": question, "slug": slug, "conditionId": cid,
+            "endDate": end, "createdAt": created,
+            "active": true, "closed": false, "acceptingOrders": true, "enableOrderBook": true,
+            "volume24hrClob": vol,
+            "clobTokenIds": format!("[\"{yes}\", \"{no}\"]"),
+            "description": format!("This market will resolve to Up if the Binance 1 minute candle for BTC/USDT ... {question}"),
+            "events": [{ "slug": slug, "title": question, "endDate": end }],
+        })
+    }
+
+    /// A Gamma market object as the listing endpoints return it with
+    /// `include=event`: parent event under `event`.
+    fn listed_market(question: &str, slug: &str, end: &str, created: &str, vol: f64, cid: &str) -> serde_json::Value {
+        serde_json::json!({
+            "question": question, "slug": slug, "conditionId": cid,
+            "endDate": end, "createdAt": created,
+            "active": true, "closed": false, "enableOrderBook": true,
+            "volume24hrClob": vol,
+            "clobTokenIds": "[\"1000000000000000000000000000000000000000000000000000000000000000000000000001\", \"1000000000000000000000000000000000000000000000000000000000000000000000000002\"]",
+            "description": "",
+            "event": { "slug": slug, "title": question, "endDate": end },
+        })
+    }
+
+    /// The two markets Gamma served by slug at 16:17 ET on 2026-09-13, values
+    /// as returned live: both created two days ahead, the 4PM at $1361 of 24h
+    /// volume and the 5PM at $11.
+    fn four_pm() -> serde_json::Value {
+        slug_market(
+            "Bitcoin Up or Down - September 13, 4PM ET",
+            "bitcoin-up-or-down-september-13-2026-4pm-et",
+            "2026-09-13T21:00:00Z", "2026-09-11T20:00:00.262264Z", 1361.078, FOUR_PM_CID,
+            "77411799041470897868285929183687023254603857718033275284667243778086863802644",
+            "92182535393765438688240390781184158122538616088656169175442611934961656256751",
+        )
+    }
+    fn five_pm() -> serde_json::Value {
+        slug_market(
+            "Bitcoin Up or Down - September 13, 5PM ET",
+            "bitcoin-up-or-down-september-13-2026-5pm-et",
+            "2026-09-13T22:00:00Z", "2026-09-11T21:00:00.351839Z", 11.764707, FIVE_PM_CID,
+            "60436167959328677949501156435995009211532660197781615923929345465000095351628",
+            "83148093899217001583989567968425046575893348327871346899637942449162612303123",
+        )
+    }
+
+    /// The createdAt scan as replayed from the production box at 16:16 ET:
+    /// all 100 newest markets created inside a 20-second span, none of them a
+    /// BTC hourly market.
+    fn newest_hundred() -> Vec<serde_json::Value> {
+        (0..100).map(|i| {
+            let created = utc("2026-09-13T20:09:59Z") + chrono::Duration::milliseconds(i * 200);
+            listed_market(
+                &format!("Will entry {i} win its September 13 heat?"),
+                &format!("entry-{i}-september-13-heat"),
+                "2026-09-14T04:00:00Z",
+                &created.to_rfc3339(),
+                0.0,
+                &format!("0x{i:064x}"),
+            )
+        }).collect()
+    }
+
+    /// The volume scan's reachable floor: liquid markets, none a BTC hourly.
+    /// The one BTC market in it is a long-dated strike market, rejected on the
+    /// expiry window as it should be.
+    fn volume_ranked() -> Vec<serde_json::Value> {
+        let mut v: Vec<serde_json::Value> = (0..99).map(|i| listed_market(
+            &format!("Will team {i} win its September 13 game?"),
+            &format!("team-{i}-september-13"),
+            "2026-09-14T04:00:00Z", "2026-09-10T12:00:00Z",
+            83_196.0 - i as f64 * 800.0,
+            &format!("0xa{i:063x}"),
+        )).collect();
+        v.push(listed_market(
+            "Will Bitcoin be above $120,000 on December 31?",
+            "bitcoin-above-120000-december-31",
+            "2026-12-31T17:00:00Z", "2026-01-05T12:00:00Z",
+            40_000.0,
+            "0xb000000000000000000000000000000000000000000000000000000000000001",
+        ));
+        v
+    }
+
+    /// The 2026-09-13 16:03 ET outage, reproduced from the evidence. Both
+    /// listing scans come back with no BTC hourly market; the slug lookup
+    /// finds the 4PM and 5PM markets, and the 4PM market is selected.
+    #[test]
+    fn the_current_hour_is_found_by_slug_when_both_listing_scans_miss_it() {
+        let now = utc("2026-09-13T20:03:00Z"); // 16:03 ET, three minutes into the 4PM window
+
+        let recent: Vec<GammaCandidate> = newest_hundred().iter()
+            .filter_map(|m| candidate_from_gamma_market(m, "btc", now, 0.0)).collect();
+        let by_volume: Vec<GammaCandidate> = volume_ranked().iter()
+            .filter_map(|m| candidate_from_gamma_market(m, "btc", now, config::MIN_MARKET_VOLUME)).collect();
+        assert!(recent.is_empty(), "the failure shape: the newest 100 carry no BTC hourly market");
+        assert!(by_volume.is_empty(), "the failure shape: the volume-ranked pages carry no BTC hourly market");
+
+        let by_slug: Vec<GammaCandidate> = [four_pm(), five_pm()].iter()
+            .filter_map(|m| candidate_from_gamma_market(m, "btc", now, 0.0)).collect();
+        assert_eq!(by_slug.len(), 2, "both slug hits validate: {:?}", by_slug.iter().map(|c| &c.1).collect::<Vec<_>>());
+
+        let merged = merge_candidates(vec![by_slug, by_volume, recent]);
+        let pick = pick_hourly_candidate(&merged, config::MIN_HOURLY_MARKET_VOL24H)
+            .expect("the 4PM market is live, accepting orders, and inside the entry window");
+        assert_eq!(pick.7, FOUR_PM_CID);
+        assert_eq!(pick.1, "Bitcoin Up or Down - September 13, 4PM ET");
+        assert!(pick.4, "an Up or Down market is high priority");
+        assert_eq!(pick.5, Some(utc("2026-09-13T21:00:00Z")));
+    }
+
+    /// Rotation: once the 4PM market is inside the entry floor it drops out of
+    /// validation, and the 5PM market, at $11 of 24h volume, is the tradeable
+    /// fallback (an "Up or Down" needs no volume to be selectable).
+    #[test]
+    fn the_next_hour_takes_over_once_the_current_one_is_inside_the_entry_floor() {
+        let now = utc("2026-09-13T21:00:00Z") - chrono::Duration::seconds(config::MIN_SECONDS_TO_EXPIRY_FOR_ENTRY - 1);
+        let by_slug: Vec<GammaCandidate> = [four_pm(), five_pm()].iter()
+            .filter_map(|m| candidate_from_gamma_market(m, "btc", now, 0.0)).collect();
+        assert_eq!(by_slug.len(), 1, "the 4PM market is inside the entry floor and must not validate");
+        let pick = pick_hourly_candidate(&merge_candidates(vec![by_slug]), config::MIN_HOURLY_MARKET_VOL24H).unwrap();
+        assert_eq!(pick.7, FIVE_PM_CID);
+    }
+
+    /// Before the 5PM market is needed, the 4PM one outranks it: both are high
+    /// priority, so volume decides, and a market's volume accrues while it is
+    /// the live window.
+    #[test]
+    fn the_live_window_outranks_the_next_one() {
+        let now = utc("2026-09-13T20:30:00Z");
+        let by_slug: Vec<GammaCandidate> = [five_pm(), four_pm()].iter()
+            .filter_map(|m| candidate_from_gamma_market(m, "btc", now, 0.0)).collect();
+        let pick = pick_hourly_candidate(&merge_candidates(vec![by_slug]), config::MIN_HOURLY_MARKET_VOL24H).unwrap();
+        assert_eq!(pick.7, FOUR_PM_CID, "source order must not decide; the sort does");
+    }
+
+    /// The same market reached by slug and by a listing scan is one candidate,
+    /// and the slug copy (first source) is the one kept. Both Gamma shapes for
+    /// the parent event parse.
+    #[test]
+    fn a_market_found_by_slug_and_by_scan_is_one_candidate() {
+        let now = utc("2026-09-13T20:03:00Z");
+        let by_slug = candidate_from_gamma_market(&four_pm(), "btc", now, 0.0).unwrap();
+        let listed = listed_market(
+            "Bitcoin Up or Down - September 13, 4PM ET",
+            "bitcoin-up-or-down-september-13-2026-4pm-et",
+            "2026-09-13T21:00:00Z", "2026-09-11T20:00:00.262264Z", 1361.078, FOUR_PM_CID,
+        );
+        let by_scan = candidate_from_gamma_market(&listed, "btc", now, config::MIN_MARKET_VOLUME).unwrap();
+        assert_eq!(by_scan.5, Some(utc("2026-09-13T21:00:00Z")), "the `event` shape yields the close time");
+        let merged = merge_candidates(vec![vec![by_slug.clone()], vec![by_scan]]);
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0].0, by_slug.0, "the slug copy's tokens are the ones kept");
+    }
+
+    /// A slug hit is not trusted for being addressed directly: it is held to
+    /// every check a scanned market gets.
+    #[test]
+    fn a_slug_hit_is_held_to_the_same_validation_as_a_scanned_market() {
+        let now = utc("2026-09-13T20:03:00Z");
+        assert!(candidate_from_gamma_market(&four_pm(), "btc", now, 0.0).is_some());
+
+        let mut no_book = four_pm();
+        no_book["enableOrderBook"] = serde_json::json!(false);
+        assert!(candidate_from_gamma_market(&no_book, "btc", now, 0.0).is_none(), "order book disabled");
+
+        assert!(candidate_from_gamma_market(&four_pm(), "eth", now, 0.0).is_none(), "wrong asset");
+
+        let after_close = utc("2026-09-13T21:00:01Z");
+        assert!(candidate_from_gamma_market(&four_pm(), "btc", after_close, 0.0).is_none(), "expired");
+
+        let too_early = utc("2026-09-13T21:00:00Z") - chrono::Duration::seconds(config::MAX_SECONDS_TO_EXPIRY_FOR_ENTRY + 1);
+        assert!(candidate_from_gamma_market(&four_pm(), "btc", too_early, 0.0).is_none(), "beyond the entry horizon");
+
+        let mut one_token = four_pm();
+        one_token["clobTokenIds"] = serde_json::json!("[\"77411799041470897868285929183687023254603857718033275284667243778086863802644\"]");
+        assert!(candidate_from_gamma_market(&one_token, "btc", now, 0.0).is_none(), "one token id");
+    }
+
+    /// Gamma answers an offset past 2000 with an error object. That is the end
+    /// of the listing, not a page of markets.
+    #[test]
+    fn an_error_object_is_an_empty_page() {
+        let err = serde_json::json!({ "type": "validation error", "error": "offset too large, use /markets/keyset for deeper pagination" });
+        assert!(gamma_market_array(&err).is_empty());
+        assert_eq!(gamma_market_array(&serde_json::json!([four_pm()])).len(), 1);
+        assert_eq!(gamma_market_array(&serde_json::json!({ "data": [four_pm()] })).len(), 1);
+    }
+
+    /// The single-asset `CRYPTO_FILTER` fallback of `"all"` probes every asset
+    /// that has hourly markets; a named asset probes only itself.
+    #[test]
+    fn the_all_filter_probes_every_hourly_asset() {
+        assert_eq!(hourly_assets_for("all"), vec!["btc", "eth", "sol"]);
+        assert_eq!(hourly_assets_for("btc"), vec!["btc"]);
+        assert_eq!(hourly_assets_for("ethereum"), vec!["eth"]);
+        assert_eq!(hourly_assets_for("sol"), vec!["sol"]);
+    }
+}
+
+/// Live check against Gamma, run by hand: `cargo test live_gamma -- --ignored --nocapture`.
+///
+/// Exercises `get_market_pair`, the exact call the CAG bootstrap and the market
+/// monitor make, for each asset with hourly markets, and reports what the slug
+/// source alone found. Not part of the normal suite: it needs the network and
+/// its answer depends on the clock.
+#[cfg(test)]
+mod live_gamma_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "hits the live Gamma API"]
+    async fn live_gamma_slug_lookup_finds_the_current_hourly_market() {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build().unwrap();
+        let now = Utc::now();
+        for asset in ["btc", "eth", "sol"] {
+            let by_slug = fetch_hourly_candidates_by_slug(&http, asset, now).await;
+            println!("[{asset}] slug source at {}: {} candidate(s)", now.to_rfc3339(), by_slug.len());
+            for c in &by_slug {
+                println!("[{asset}]   \"{}\" vol24h={:.0} closes={:?} cid={}", c.1, c.3, c.5.map(|t| t.to_rfc3339()), c.7);
+            }
+            assert!(!by_slug.is_empty(), "[{asset}] the current hour's market must resolve by slug");
+
+            let (hourly, maker) = get_market_pair(&http, asset).await;
+            println!("[{asset}] get_market_pair → hourly=\"{}\" vol24h={:.0} closes={:?} | maker={:?}",
+                hourly.name, hourly.volume, hourly.close_time.map(|t| t.to_rfc3339()), maker.as_ref().map(|m| &m.name));
+            assert_ne!(hourly.yes_token, market_id_from_u256(U256::ZERO), "[{asset}] get_market_pair must select an hourly market");
+            assert!(hourly.name.to_lowercase().contains("up or down"), "[{asset}] selected: {}", hourly.name);
+        }
     }
 }

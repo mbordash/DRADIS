@@ -3299,10 +3299,16 @@ pub(crate) async fn fetch_markets_by_type(
         return fetch_sports_markets_by_tags(http, _max_expiry_secs, min_liquidity).await;
     }
     
-    // For crypto, use the existing market.rs helper that already handles
-    // slug-based filtering, window markets, daily markets, etc.
+    // For crypto, the same sources the squadron's own discovery uses: the
+    // current and next hourly "Up or Down" markets by slug (the volume scan
+    // cannot reach them; see `fetch_hourly_candidates_by_slug`), then the
+    // volume scan for strike, window and daily markets.
     if market_type == "crypto" {
-        let candidates = crate::helpers::market::fetch_simplified_crypto_candidates(http, "all").await;
+        let (by_slug, by_volume) = tokio::join!(
+            crate::helpers::market::fetch_hourly_candidates_by_slug(http, "all", chrono::Utc::now()),
+            crate::helpers::market::fetch_simplified_crypto_candidates(http, "all"),
+        );
+        let candidates = crate::helpers::market::merge_candidates(vec![by_slug, by_volume]);
         let mut out: Vec<AvailableMarket> = candidates
             .into_iter()
             .filter(|(_, _, _, vol, _, _, _, _)| *vol >= min_liquidity)

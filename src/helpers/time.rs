@@ -230,6 +230,67 @@ pub fn generate_hourly_market_names(crypto_filter: &str, current_time_utc: DateT
     names
 }
 
+/// The Gamma slug of the hourly "Up or Down" market whose window opens at
+/// `window_start_utc`, for one asset.
+///
+/// Format: `{bitcoin|ethereum|solana}-up-or-down-{month}-{day}-{year}-{h}{am|pm}-et`,
+/// e.g. `bitcoin-up-or-down-september-13-2026-4pm-et`. The hour is US/Eastern
+/// (DST-aware) because that is how Polymarket names the window. The year is
+/// load-bearing: without it Gamma answers with the previous year's market of
+/// the same name, or with nothing.
+///
+/// This is the only deterministic handle on an hourly market. Both listing
+/// scans in `helpers::market` are ordered views of a catalogue that has outgrown
+/// them (see `fetch_hourly_candidates_by_slug`), and the training pipeline has
+/// used this slug for its own market fetches since it was written.
+pub fn hourly_market_slug(crypto_filter: &str, window_start_utc: DateTime<Utc>) -> String {
+    let crypto_slug = match crypto_filter {
+        "btc" => "bitcoin",
+        "eth" => "ethereum",
+        "sol" => "solana",
+        _ => "bitcoin",
+    };
+    let et = window_start_utc.with_timezone(&Eastern);
+    let h = et.hour();
+    let ampm = if h < 12 { "am" } else { "pm" };
+    let h12 = if h % 12 == 0 { 12 } else { h % 12 };
+    format!(
+        "{}-up-or-down-{}-{}-{}-{}{}-et",
+        crypto_slug,
+        et.format("%B").to_string().to_ascii_lowercase(),
+        et.day(),
+        et.year(),
+        h12,
+        ampm,
+    )
+}
+
+/// Slugs of the hourly markets the squadron can need right now: the one whose
+/// window contains `now`, then the next `lookahead_hours` windows in order.
+///
+/// Rotation never needs more than the next hour: the monitor moves off the
+/// current market when it has less than `MIN_SECONDS_TO_EXPIRY_FOR_ENTRY` left,
+/// at which point the next window opens within minutes. Duplicates are
+/// dropped, which only matters on the autumn DST fall-back night when two
+/// consecutive UTC hours share an Eastern wall-clock hour.
+pub fn generate_hourly_market_slugs(
+    crypto_filter: &str,
+    now: DateTime<Utc>,
+    lookahead_hours: i64,
+) -> Vec<String> {
+    let window_start = now
+        .with_minute(0).and_then(|t| t.with_second(0)).and_then(|t| t.with_nanosecond(0))
+        .unwrap_or(now);
+    let mut slugs: Vec<String> = Vec::new();
+    for i in 0..=lookahead_hours.max(0) {
+        let slug = hourly_market_slug(crypto_filter, window_start + chrono::Duration::hours(i));
+        if !slugs.contains(&slug) {
+            slugs.push(slug);
+        }
+    }
+    slugs
+}
+
 /// Generate Polymarket event slugs for the daily "Up or Down on [date]?" event.
 ///
 /// Polymarket's slug format is: `{crypto}-up-or-down-on-{month}-{day}-{year}`
@@ -346,5 +407,63 @@ mod strike_reference_tests {
         // must not be mistaken for a price.
         assert_eq!(kline_open_price(&serde_json::json!([])), None);
         assert_eq!(kline_open_price(&serde_json::json!(null)), None);
+    }
+}
+
+#[cfg(test)]
+mod hourly_slug_tests {
+    use super::*;
+
+    fn utc(s: &str) -> DateTime<Utc> { s.parse().unwrap() }
+
+    /// The outage: at 16:03 ET on 2026-09-13 the squadron needed the 4PM
+    /// market and, for rotation, the 5PM one. These are the slugs Gamma
+    /// answered for that day, for every asset that has hourly markets.
+    #[test]
+    fn the_outage_hour_maps_to_the_4pm_and_5pm_slugs() {
+        let now = utc("2026-09-13T20:03:00Z");
+        assert_eq!(generate_hourly_market_slugs("btc", now, 1), vec![
+            "bitcoin-up-or-down-september-13-2026-4pm-et",
+            "bitcoin-up-or-down-september-13-2026-5pm-et",
+        ]);
+        assert_eq!(generate_hourly_market_slugs("eth", now, 1)[0], "ethereum-up-or-down-september-13-2026-4pm-et");
+        assert_eq!(generate_hourly_market_slugs("sol", now, 1)[0], "solana-up-or-down-september-13-2026-4pm-et");
+        assert_eq!(generate_hourly_market_slugs("btc", now, 0), vec!["bitcoin-up-or-down-september-13-2026-4pm-et"]);
+    }
+
+    /// The window that contains `now` is the floor of the hour, not the
+    /// nearest hour: at 16:59 ET the 4PM market is still the live one.
+    #[test]
+    fn the_current_window_is_the_floor_of_the_hour() {
+        assert_eq!(generate_hourly_market_slugs("btc", utc("2026-09-13T20:59:59Z"), 0)[0], "bitcoin-up-or-down-september-13-2026-4pm-et");
+        assert_eq!(generate_hourly_market_slugs("btc", utc("2026-09-13T21:00:00Z"), 0)[0], "bitcoin-up-or-down-september-13-2026-5pm-et");
+    }
+
+    /// Midnight and noon are 12am and 12pm, and the date rolls with Eastern
+    /// wall-clock time, not UTC: 03:30Z on the 14th is still the 13th in ET.
+    #[test]
+    fn midnight_and_noon_are_12am_and_12pm_and_the_date_rolls_in_eastern() {
+        assert_eq!(generate_hourly_market_slugs("btc", utc("2026-09-14T03:30:00Z"), 1), vec![
+            "bitcoin-up-or-down-september-13-2026-11pm-et",
+            "bitcoin-up-or-down-september-14-2026-12am-et",
+        ]);
+        assert_eq!(generate_hourly_market_slugs("btc", utc("2026-09-13T16:10:00Z"), 1), vec![
+            "bitcoin-up-or-down-september-13-2026-12pm-et",
+            "bitcoin-up-or-down-september-13-2026-1pm-et",
+        ]);
+    }
+
+    /// Standard time: in January 20:03Z is 3PM ET, not 4PM.
+    #[test]
+    fn the_hour_follows_eastern_dst() {
+        assert_eq!(generate_hourly_market_slugs("btc", utc("2026-01-13T20:03:00Z"), 0)[0], "bitcoin-up-or-down-january-13-2026-3pm-et");
+    }
+
+    /// On the fall-back night two consecutive UTC hours share the 1AM ET
+    /// wall-clock hour; the repeated slug is not requested twice.
+    #[test]
+    fn dst_fall_back_dedupes_the_repeated_hour() {
+        let slugs = generate_hourly_market_slugs("btc", utc("2026-11-01T05:30:00Z"), 1);
+        assert_eq!(slugs, vec!["bitcoin-up-or-down-november-1-2026-1am-et"]);
     }
 }

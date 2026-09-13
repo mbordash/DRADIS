@@ -78,7 +78,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use chrono::{DateTime, Datelike, TimeZone, Timelike, Utc};
+use chrono::{DateTime, TimeZone, Utc};
 use perpetual::booster::config::BoosterIO;
 use perpetual::objective::Objective;
 use perpetual::{Matrix, PerpetualBooster};
@@ -287,11 +287,10 @@ fn bars_from_day(d: &KlineDay) -> impl Iterator<Item = Bar> + '_ {
 /// Gamma slug of the BTC hourly market opening at `w`, year included: without the year
 /// Gamma answers with the 2025 market of the same name.
 pub fn slug_for(w: i64) -> String {
-    let et = Utc.timestamp_opt(w, 0).single().unwrap_or_default().with_timezone(&chrono_tz::America::New_York);
-    let h = et.hour();
-    let ampm = if h < 12 { "am" } else { "pm" };
-    let h12 = if h % 12 == 0 { 12 } else { h % 12 };
-    format!("bitcoin-up-or-down-{}-{}-{}-{h12}{ampm}-et", et.format("%B").to_string().to_ascii_lowercase(), et.day(), et.year())
+    // One slug format for the whole engine: live discovery builds the same
+    // string in `helpers::time`, so a format drift there would show up in the
+    // test below rather than only in a training fetch.
+    crate::helpers::time::hourly_market_slug("btc", Utc.timestamp_opt(w, 0).single().unwrap_or_default())
 }
 
 fn floor_hour(t: i64) -> i64 { t.div_euclid(3600) * 3600 }
