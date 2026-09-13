@@ -159,9 +159,21 @@ const KLINE_HOSTS: [&str; 2] = ["https://data-api.binance.vision", "https://api.
 /// that would need a live rate the same instance cannot fetch. So no archive, no
 /// unofficial host: an instance fapi refuses trains and serves without funding.
 const FUNDING_HOSTS: [&str; 1] = ["https://fapi.binance.com"];
-/// A machine with less than this much memory does not train: a fit peaks at 1.2 to
-/// 2 GB beside the running engine. The container's limit counts when it is smaller.
-const TRAIN_MIN_MEMORY_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+/// Free memory a training run must find before it starts. The fit runs inside the
+/// engine process, so an allocation the machine cannot serve gets the engine killed,
+/// not just the fit. The reference fit (66,328 rows, budget 2.0, 2 threads) peaked at
+/// 1.16 GB RSS; on a 2 vCPU instance the estimate is 1.5 to 2 GB, so the gate asks
+/// for the upper figure. This is headroom, not machine size: a nominal 4 GB instance
+/// reports 3.7 GB total after kernel reservations and, with the engine, Control Tower
+/// and proxy running, about 3.0 GB available (production t3.medium, 2026-09-13),
+/// which is room for a fit. A 2 GB instance has about 1.1 GB available and is not.
+const TRAIN_MIN_FREE_MEMORY_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Below this much total memory the machine can never make the room above beside the
+/// engine's own ~0.8 GB, whatever else it stops, so the refusal recommends a larger
+/// instance. Above it the machine is big enough and something else is using the
+/// memory, so the refusal says that instead of naming an instance type it would
+/// itself refuse. A t3.medium reports 3.7 GB, a t3.small 1.9 GB.
+const TRAIN_MIN_TOTAL_MEMORY_BYTES: u64 = 3 * 1024 * 1024 * 1024;
 
 // ── Data store ───────────────────────────────────────────────────────────────
 
@@ -1275,43 +1287,131 @@ async fn fetch_funding_since(since_s: i64) -> Result<(Vec<(i64, f64)>, &'static 
 
 // ── Memory ───────────────────────────────────────────────────────────────────
 
-/// Memory a training run may count on: the smaller of the machine's total and the
-/// container's limit, when one applies. `None` when neither can be read.
-pub fn available_memory_bytes() -> Option<u64> {
-    let mut readings: Vec<u64> = Vec::new();
-    // Linux: the machine.
-    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
-        readings.extend(s.lines().find_map(|l| {
-            let rest = l.strip_prefix("MemTotal:")?;
-            rest.split_whitespace().next()?.parse::<u64>().ok().map(|kb| kb * 1024)
-        }));
-    }
-    // Linux: the container (cgroup v2, then v1). "max" means no limit.
-    for path in ["/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"] {
-        if let Ok(s) = std::fs::read_to_string(path) {
-            readings.extend(s.trim().parse::<u64>().ok().filter(|v| *v < u64::MAX / 2));
-        }
-    }
-    // macOS (a developer's box): sysctl.
-    if readings.is_empty() && cfg!(target_os = "macos") {
-        if let Ok(out) = std::process::Command::new("sysctl").args(["-n", "hw.memsize"]).output() {
-            readings.extend(String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok());
-        }
-    }
-    readings.into_iter().min()
+/// What the machine and the container report about memory, each `None` where it
+/// cannot be read. The gate wants headroom: what a fit can allocate right now beside
+/// everything already running, which is neither the machine's size (a nominal 4 GB
+/// instance reports 3.7 GB and was refused for it on 2026-09-13) nor the container's
+/// limit alone (a limit is only room to the extent it is unused).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MemoryReading {
+    /// The machine: `MemTotal` and `MemAvailable` from `/proc/meminfo`.
+    pub total: Option<u64>,
+    pub available: Option<u64>,
+    /// The container's cgroup limit and, when one applies, its usage net of page
+    /// cache: the kernel reclaims cache before it kills, so, like `MemAvailable`,
+    /// the room under a limit counts cache as free.
+    pub limit: Option<u64>,
+    pub used: Option<u64>,
 }
 
-/// Why a training run may not start on this machine, or `None` when it may.
-pub fn memory_refusal(available: Option<u64>) -> Option<String> {
-    let gib = |b: u64| b as f64 / (1024.0 * 1024.0 * 1024.0);
-    match available {
-        Some(b) if b >= TRAIN_MIN_MEMORY_BYTES => None,
-        Some(b) => Some(format!(
-            "training refused: this machine has {:.1} GB of memory and a training run needs {:.0} GB (a fit peaks at 1.2 to 2 GB beside the engine); use a t3.medium or larger",
-            gib(b), gib(TRAIN_MIN_MEMORY_BYTES),
-        )),
-        None => None,
+impl MemoryReading {
+    /// Memory a fit can take now: the machine's available memory, capped by what is
+    /// left under the container's limit. Falls back to the machine's total where the
+    /// kernel does not report `MemAvailable` (or on a developer's Mac).
+    pub fn headroom(&self) -> Option<u64> {
+        let machine = self.available.or(self.total);
+        let container = self.limit.map(|l| l.saturating_sub(self.used.unwrap_or(0)));
+        match (machine, container) {
+            (Some(m), Some(c)) => Some(m.min(c)),
+            (m, c) => m.or(c),
+        }
     }
+
+    /// The machine's total, or the container's limit when that is smaller: the number
+    /// the status endpoint reports as `memory_bytes`.
+    pub fn capacity(&self) -> Option<u64> {
+        match (self.total, self.limit) {
+            (Some(t), Some(l)) => Some(t.min(l)),
+            (t, l) => t.or(l),
+        }
+    }
+
+    /// True when the container's limit, not the machine, is what caps the headroom.
+    fn container_bound(&self) -> bool {
+        match (self.limit.map(|l| l.saturating_sub(self.used.unwrap_or(0))), self.available.or(self.total)) {
+            (Some(c), Some(m)) => c < m,
+            (Some(_), None) => true,
+            _ => false,
+        }
+    }
+}
+
+/// `MemTotal` and `MemAvailable` from the text of `/proc/meminfo`, in bytes.
+pub fn parse_meminfo(text: &str) -> (Option<u64>, Option<u64>) {
+    let field = |name: &str| text.lines().find_map(|l| {
+        let rest = l.strip_prefix(name)?.strip_prefix(':')?;
+        rest.split_whitespace().next()?.parse::<u64>().ok().map(|kb| kb * 1024)
+    });
+    (field("MemTotal"), field("MemAvailable"))
+}
+
+/// One `key value` line of a cgroup `memory.stat`, in bytes.
+pub fn parse_cgroup_stat(text: &str, key: &str) -> Option<u64> {
+    text.lines().find_map(|l| {
+        let mut it = l.split_whitespace();
+        if it.next()? != key { return None; }
+        it.next()?.parse::<u64>().ok()
+    })
+}
+
+/// Read the machine and the container. Any part that cannot be read is `None`.
+pub fn read_memory() -> MemoryReading {
+    let mut r = MemoryReading::default();
+    // Linux: the machine.
+    if let Ok(s) = std::fs::read_to_string("/proc/meminfo") {
+        (r.total, r.available) = parse_meminfo(&s);
+    }
+    // Linux: the container (cgroup v2, then v1). v2 says "max" for no limit, v1 a
+    // number near u64::MAX; neither parses as a limit. Usage is taken net of the
+    // cgroup's page cache (`file` in v2, `total_cache` in v1).
+    let read_u64 = |path: &str| std::fs::read_to_string(path).ok().and_then(|s| s.trim().parse::<u64>().ok());
+    for (limit, used, stat, cache_key) in [
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current", "/sys/fs/cgroup/memory.stat", "file"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes", "/sys/fs/cgroup/memory/memory.stat", "total_cache"),
+    ] {
+        if let Some(l) = read_u64(limit).filter(|v| *v < u64::MAX / 2) {
+            r.limit = Some(l);
+            let cache = std::fs::read_to_string(stat).ok().and_then(|s| parse_cgroup_stat(&s, cache_key)).unwrap_or(0);
+            r.used = read_u64(used).map(|u| u.saturating_sub(cache));
+            break;
+        }
+    }
+    // macOS (a developer's box): sysctl gives the total; there is no cheap available.
+    if r.total.is_none() && cfg!(target_os = "macos") {
+        if let Ok(out) = std::process::Command::new("sysctl").args(["-n", "hw.memsize"]).output() {
+            r.total = String::from_utf8_lossy(&out.stdout).trim().parse::<u64>().ok();
+        }
+    }
+    r
+}
+
+/// Why a training run may not start on this machine, or `None` when it may (or when
+/// memory cannot be read at all: an unknown does not block training). The reason
+/// names what was measured and what would fix it, and never recommends an instance
+/// type the same gate would refuse.
+pub fn memory_refusal(m: &MemoryReading) -> Option<String> {
+    let gb = |b: u64| format!("{:.1} GB", b as f64 / (1024.0 * 1024.0 * 1024.0));
+    let free = m.headroom()?;
+    if free >= TRAIN_MIN_FREE_MEMORY_BYTES {
+        return None;
+    }
+    let need = gb(TRAIN_MIN_FREE_MEMORY_BYTES);
+    let why = match (m.container_bound(), m.limit, m.total) {
+        (true, Some(limit), _) => format!(
+            "the container's memory limit of {} leaves {}; raise the container's memory limit",
+            gb(limit), gb(free),
+        ),
+        (_, _, Some(total)) if total < TRAIN_MIN_TOTAL_MEMORY_BYTES => format!(
+            "this machine has {} free of {}; use a t3.medium (4 GB) or larger",
+            gb(free), gb(total),
+        ),
+        (_, _, Some(total)) => format!(
+            "this machine has {} free of {}, so something else is using the memory (a local LLM?); stop it or use a larger instance",
+            gb(free), gb(total),
+        ),
+        (_, _, None) => format!("this machine has {} free; use a larger instance", gb(free)),
+    };
+    Some(format!("training refused: a fit needs {need} free beside the engine and {why}"))
 }
 
 // ── Status ───────────────────────────────────────────────────────────────────
@@ -1341,9 +1441,12 @@ pub struct PipelineStatus {
     /// disk. A persistent failure stays here until it stops failing.
     #[serde(default)]
     pub errors: BTreeMap<String, String>,
-    /// Memory a training run may count on, and why training is refused when it is
-    /// too little (`phase` is then `memory_too_small`).
+    /// The machine's memory (or the container's limit when smaller), the headroom a
+    /// fit could take at the last check, and why training is refused when that is too
+    /// little (`phase` is then `memory_too_small`).
     pub memory_bytes: Option<u64>,
+    #[serde(default)]
+    pub memory_available_bytes: Option<u64>,
     pub memory_refusal: Option<String>,
     pub last_cycle: Option<CycleReport>,
     pub next_train_at: Option<String>,
@@ -1651,9 +1754,13 @@ pub async fn run_pipeline(asset: String) {
             s.phase = if complete { "idle".into() } else { s.phase.clone() };
             s.next_train_at = if complete && !due { due_at.map(rfc3339) } else { None };
         });
-        let memory = available_memory_bytes();
-        let refusal = memory_refusal(memory);
-        update_status(&asset, |s| { s.memory_bytes = memory; s.memory_refusal = refusal.clone(); });
+        let memory = read_memory();
+        let refusal = memory_refusal(&memory);
+        update_status(&asset, |s| {
+            s.memory_bytes = memory.capacity();
+            s.memory_available_bytes = memory.headroom();
+            s.memory_refusal = refusal.clone();
+        });
         if let Some(why) = refusal.filter(|_| due) {
             // The data stays current and the serving model keeps trading; only the fit is
             // refused, and the card says why. Checked again next pass, so a resize takes.
@@ -2054,7 +2161,7 @@ mod tests {
         let dead: Vec<&str> = dead_columns(&xs).into_iter().map(|j| FEATURE_NAMES[j]).collect();
         println!("dead columns here: {dead:?}");
         assert_eq!(rows.iter().all(|r| !r.features[22].is_nan()), !funding.is_empty(), "funding is in every row exactly when a source answered");
-        println!("memory: {:?} bytes, refusal {:?}", available_memory_bytes(), memory_refusal(available_memory_bytes()));
+        println!("memory: {:?}, refusal {:?}", read_memory(), memory_refusal(&read_memory()));
     }
 
     /// Production, 2026-09-13: one 429 on a May market during the backfill stayed on the
@@ -2096,22 +2203,94 @@ mod tests {
         assert_eq!(status_line("testerr").as_deref(), Some("data current"));
     }
 
-    /// Below 4 GB the fit is refused with a reason that names the machine's memory and
-    /// the requirement; at 4 GB or more, or where memory cannot be read, it proceeds.
+    /// Production, 2026-09-13, engine v1.1.6: a t3.medium (the template's default and
+    /// smallest type) was refused with "this machine has 3.7 GB of memory and a
+    /// training run needs 4 GB; use a t3.medium or larger". The gate compared the
+    /// kernel's MemTotal, which is always below the nominal size, against 4 GiB. It
+    /// now measures headroom against the fit's peak, so the machine that has room
+    /// trains and the reason, when there is one, is true of the machine it describes.
     #[test]
-    fn training_is_refused_below_four_gigabytes() {
+    fn a_t3_medium_trains_and_a_t3_small_is_refused() {
+        // The production t3.medium's /proc/meminfo, verbatim, with the engine, Control
+        // Tower and nginx running and no container limit (memory.max was "max").
+        let meminfo = "MemTotal:        3924236 kB\nMemFree:         2410844 kB\nMemAvailable:    3176132 kB\nBuffers:            2144 kB\nCached:           880412 kB\n";
+        let (total, available) = parse_meminfo(meminfo);
+        assert_eq!(total, Some(4_018_417_664), "MemTotal matches `free -b`");
+        assert_eq!(available, Some(3_252_359_168));
+        let medium = MemoryReading { total, available, limit: None, used: None };
+        assert_eq!(medium.headroom(), available);
+        assert_eq!(medium.capacity(), total);
+        assert_eq!(memory_refusal(&medium), None, "a t3.medium has 3.0 GB free: room for a 2 GB fit");
+
+        // A t3.small: 1.9 GB reported, about 1.1 GB free beside the same stack.
         let gib = 1024u64 * 1024 * 1024;
-        let why = memory_refusal(Some(2 * gib)).expect("2 GB is refused");
-        assert!(why.contains("2.0 GB") && why.contains("needs 4 GB"), "{why}");
-        assert!(memory_refusal(Some(4 * gib - 1)).is_some());
-        assert!(memory_refusal(Some(4 * gib)).is_none());
-        assert!(memory_refusal(Some(16 * gib)).is_none());
-        assert!(memory_refusal(None).is_none(), "unknown memory does not block training");
-        // This box reports something sensible.
-        let here = available_memory_bytes();
-        assert!(here.is_none_or(|b| b > 256 * 1024 * 1024), "{here:?}");
+        let small = MemoryReading { total: Some(2_002_000 * 1024), available: Some(1_150_000 * 1024), limit: None, used: None };
+        let why = memory_refusal(&small).expect("a t3.small is refused");
+        assert!(why.starts_with("training refused: a fit needs 2.0 GB free beside the engine"), "{why}");
+        assert!(why.contains("1.1 GB free of 1.9 GB"), "{why}");
+        assert!(why.contains("use a t3.medium (4 GB) or larger"), "{why}");
+        // The type it recommends is one it would not refuse.
+        assert!(memory_refusal(&medium).is_none());
+
+        // A t3.medium that something else has filled (a local LLM, say) is refused
+        // for the real reason and is not told to buy the instance it is already on.
+        let busy = MemoryReading { total, available: Some(gib + gib / 2), limit: None, used: None };
+        let why = memory_refusal(&busy).expect("1.5 GB free is refused");
+        assert!(why.contains("1.5 GB free of 3.7 GB") && why.contains("something else is using the memory"), "{why}");
+        assert!(!why.contains("t3.medium"), "{why}");
+
+        // The boundary is the fit's peak, on headroom alone.
+        let at = |free: u64| MemoryReading { total, available: Some(free), limit: None, used: None };
+        assert!(memory_refusal(&at(2 * gib - 1)).is_some());
+        assert!(memory_refusal(&at(2 * gib)).is_none());
+        // No MemAvailable (an old kernel, a Mac): the total stands in for it.
+        assert!(memory_refusal(&MemoryReading { total, ..Default::default() }).is_none());
+        assert!(memory_refusal(&MemoryReading { total: Some(1900 * 1024 * 1024), ..Default::default() }).is_some());
+        // Nothing readable at all does not block training.
+        assert_eq!(memory_refusal(&MemoryReading::default()), None);
+        // This box reports something sensible (printed so a run under a container
+        // limit shows what the kernel and cgroup gave it).
+        let here = read_memory();
+        eprintln!("this box: {here:?}, headroom {:?}, refusal {:?}", here.headroom(), memory_refusal(&here));
+        assert!(here.total.is_none_or(|b| b > 256 * 1024 * 1024), "{here:?}");
+        assert!(here.headroom().is_none_or(|b| b > 0), "{here:?}");
+        // The card shows the reason verbatim.
         update_status("testmem", |s| { s.phase = "memory_too_small".into(); s.memory_refusal = Some(why.clone()); });
         assert_eq!(status_line("testmem").as_deref(), Some(why.as_str()));
+    }
+
+    /// A container memory limit is respected: what counts is the room left under it,
+    /// and the reason names the limit, not the machine.
+    #[test]
+    fn a_container_limit_caps_the_headroom() {
+        let gib = 1024u64 * 1024 * 1024;
+        let host = (Some(16 * gib), Some(14 * gib));
+        // A 3 GB limit with 1.5 GB already used leaves 1.5 GB: refused, naming the limit.
+        let tight = MemoryReading { total: host.0, available: host.1, limit: Some(3 * gib), used: Some(gib + gib / 2) };
+        assert_eq!(tight.headroom(), Some(gib + gib / 2));
+        assert_eq!(tight.capacity(), Some(3 * gib), "memory_bytes reports the limit when it is the smaller");
+        let why = memory_refusal(&tight).expect("refused");
+        assert!(why.contains("the container's memory limit of 3.0 GB leaves 1.5 GB"), "{why}");
+        assert!(why.contains("raise the container's memory limit") && !why.contains("t3.medium"), "{why}");
+        // The same limit with 0.8 GB used leaves 2.2 GB: trains.
+        let roomy = MemoryReading { limit: Some(3 * gib), used: Some(800 * 1024 * 1024), ..tight };
+        assert_eq!(memory_refusal(&roomy), None);
+        // A limit whose usage cannot be read counts in full, and a limit below the
+        // fit's peak refuses however empty the machine is.
+        assert_eq!(memory_refusal(&MemoryReading { limit: Some(3 * gib), used: None, ..tight }), None);
+        assert!(memory_refusal(&MemoryReading { limit: Some(gib), used: None, ..tight }).is_some());
+        // A limit larger than the machine's room changes nothing: the machine binds.
+        let medium = MemoryReading { total: Some(4_018_417_664), available: Some(3_252_359_168), limit: Some(8 * gib), used: Some(gib) };
+        assert_eq!(medium.headroom(), Some(3_252_359_168));
+        assert_eq!(medium.capacity(), Some(4_018_417_664));
+        assert_eq!(memory_refusal(&medium), None);
+        // The cgroup's page cache is reclaimable and must not count as used: a v2
+        // memory.stat's `file` (and a v1 `total_cache`) is what read_memory subtracts.
+        let v2 = "anon 734003200\nfile 2147483648\nkernel 12345\nfile_mapped 1024\n";
+        assert_eq!(parse_cgroup_stat(v2, "file"), Some(2_147_483_648));
+        assert_eq!(parse_cgroup_stat(v2, "file_mapped"), Some(1024), "exact key, not a prefix");
+        assert_eq!(parse_cgroup_stat("cache 1\ntotal_cache 99\n", "total_cache"), Some(99));
+        assert_eq!(parse_cgroup_stat(v2, "swap"), None);
     }
 
     #[test]

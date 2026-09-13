@@ -522,7 +522,8 @@ pub fn config_schema() -> Vec<ConfigFieldSchema> {
             "Train the GBoost plan-B model on this instance: backfill public BTC hourly-market history, add each \
              hour's market as it resolves, and retrain on the schedule below. Off, GBoost serves whatever model \
              file is in logs/ and a fresh instance stays idle. Turning it off also stops a running backfill. \
-             Training needs 4 GB of memory; on a smaller machine the fit is refused and the GBoost card says so."));
+             A fit needs 2 GB of free memory beside the engine (a t3.medium has it, a t3.small does not); \
+             without it the fit is refused and the GBoost card says why."));
         v.push(F::new(g, None, "gboost_planb_auto_adopt", "Auto Adopt", "bool", false,
             "Put a candidate into service on its own once it passes the holdout gate and does at least as well \
              as the serving model on the same held-out fold. Off, every candidate is written to \

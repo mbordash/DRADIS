@@ -81,11 +81,17 @@ The engine and Control Tower run comfortably on the smallest type validated in
 QA. **Memory: 4 GB or more.** Every instance trains its own GBoost model in the
 engine (`src/vipers/gboost_planb_train.rs`); a training run peaks at 1.2 to 2 GB
 beside the running engine, so the template offers `t3.medium` (4 GB) as its
-smallest type and no 2 GB type. The engine checks the machine's memory (and the
-container's limit, where one applies) before every training run and refuses to
-train below 4 GB, saying so on the GBoost card and at
-`GET /api/gboost/planb/status`, so an undersized instance still trades on the
-model it has but never trains a new one. The first training backfill fetches
+smallest type and no 2 GB type. Before every training run the engine measures
+the memory a fit could take right then: the kernel's `MemAvailable`, capped by
+what is left under the container's limit where one applies. It refuses to train
+with less than 2 GB free, saying why on the GBoost card and at
+`GET /api/gboost/planb/status` (`memory_bytes`, `memory_available_bytes`,
+`memory_refusal`), so an undersized instance still trades on the model it has
+but never trains a new one. A t3.medium reports 3.7 GB total and about 3.0 GB
+available with the engine, Control Tower and proxy running, so it trains; a
+t3.small has about 1 GB available and is refused. The gate is on free memory,
+not nominal size, so a t3.medium running something else large (a local LLM, for
+instance) is also refused, and the reason says so. The first training backfill fetches
 about 120 days of public market history at one request per second, roughly four
 to five hours, and needs about 0.5 GB of disk for the data and model files.
 

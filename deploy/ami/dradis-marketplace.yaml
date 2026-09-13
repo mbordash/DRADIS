@@ -127,8 +127,8 @@ Parameters:
     Default: t3.medium
     AllowedValues:
       # t3.small (2 GB) is deliberately absent: the GBoost model training that
-      # every instance runs peaks at 1.2 to 2 GB, and the engine refuses to
-      # train on a machine with less than 4 GB.
+      # every instance runs peaks at 1.2 to 2 GB beside the engine, and the
+      # engine refuses to train unless 2 GB is free; a t3.small has about 1 GB.
       - t3.medium
       - t3.large
       - c5.large
